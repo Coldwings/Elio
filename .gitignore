@@ -1,0 +1,37 @@
+# Build directories
+build/
+cmake-build-*/
+*.build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled files
+*.o
+*.so
+*.a
+*.dylib
+
+# Executables
+elio_tests
+elio_tests_asan
+elio_tests_tsan
+hello_world
+chained_coroutines
+exception_handling
+parallel_tasks
+dynamic_threads
+benchmark
+
+# Sanitizer outputs
+*.log
+*.dSYM/
+
+# Temporary files
+*.tmp
+.DS_Store
+.qoder/

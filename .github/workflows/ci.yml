@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Release, Debug]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake \
+          ninja-build \
+          liburing-dev \
+          g++-14
+
+    - name: Configure CMake
+      run: |
+        cmake -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+          -DCMAKE_C_COMPILER=gcc-14 \
+          -DCMAKE_CXX_COMPILER=g++-14
+
+    - name: Build
+      run: cmake --build build --parallel
+
+    - name: Run unit tests
+      run: ./build/tests/elio_tests
+
+    - name: Run ASAN tests
+      if: matrix.build_type == 'Debug'
+      run: ./build/tests/elio_tests_asan
+      env:
+        ASAN_OPTIONS: detect_leaks=1:abort_on_error=1

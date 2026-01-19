@@ -1,6 +1,6 @@
 # Networking
 
-Elio provides async networking support for TCP, HTTP/1.1, and TLS/HTTPS.
+Elio provides async networking support for TCP, HTTP/1.1, HTTP/2, and TLS/HTTPS.
 
 ## TCP
 
@@ -185,6 +185,82 @@ coro::task<void> run_server(uint16_t port) {
 ## TLS/HTTPS
 
 TLS support is built on OpenSSL.
+
+### HTTP/2
+
+HTTP/2 support requires linking with `elio_http2`, OpenSSL, and nghttp2 (fetched automatically).
+
+> **Note**: HTTP/2 requires HTTPS (TLS with ALPN h2 negotiation). For plaintext HTTP, use the HTTP/1.1 client.
+
+### HTTP/2 Client
+
+```cpp
+#include <elio/http/http2.hpp>
+
+using namespace elio::http;
+
+coro::task<void> fetch_url(io::io_context& ctx) {
+    // Create HTTP/2 client
+    h2_client client(ctx);
+    
+    // Simple GET request (must use HTTPS)
+    auto result = co_await client.get("https://nghttp2.org/");
+    
+    if (result) {
+        ELIO_LOG_INFO("Status: {}", static_cast<int>(result->get_status()));
+        ELIO_LOG_INFO("Body: {}", result->body());
+    }
+    co_return;
+}
+```
+
+### HTTP/2 Client with Configuration
+
+```cpp
+coro::task<void> advanced_h2_client(io::io_context& ctx) {
+    h2_client_config config;
+    config.user_agent = "MyApp/1.0";
+    config.max_concurrent_streams = 100;
+    
+    h2_client client(ctx, config);
+    
+    // GET request
+    auto resp = co_await client.get("https://api.example.com/data");
+    
+    // POST JSON
+    std::string json = R"({"key": "value"})";
+    auto post_resp = co_await client.post(
+        "https://api.example.com/data",
+        json,
+        mime::application_json
+    );
+    
+    // Multiple requests reuse the same HTTP/2 connection (multiplexing)
+    for (int i = 0; i < 10; ++i) {
+        auto r = co_await client.get("https://api.example.com/items/" + std::to_string(i));
+    }
+    
+    co_return;
+}
+```
+
+### HTTP/2 vs HTTP/1.1
+
+| Feature | HTTP/1.1 (`client`) | HTTP/2 (`h2_client`) |
+|---------|---------------------|----------------------|
+| Protocol | HTTP/1.1 | HTTP/2 (h2) |
+| TLS Required | No (supports both) | Yes (HTTPS only) |
+| Multiplexing | No (one request per connection) | Yes (multiple streams) |
+| Header Compression | No | Yes (HPACK) |
+| CMake Target | `elio_http` | `elio_http2` |
+
+### When to Use HTTP/2
+
+- Use `h2_client` when connecting to modern APIs that support HTTP/2
+- Use `client` (HTTP/1.1) for plaintext HTTP or legacy servers
+- HTTP/2 provides better performance for multiple concurrent requests to the same host
+
+
 
 ### TLS Client
 

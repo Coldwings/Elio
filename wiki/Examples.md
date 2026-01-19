@@ -192,6 +192,57 @@ coro::task<void> http_examples(io::io_context& ctx) {
 }
 ```
 
+## HTTP/2 Client
+
+Making HTTP/2 requests with multiplexed streams:
+
+```cpp
+#include <elio/elio.hpp>
+#include <elio/http/http2.hpp>
+
+using namespace elio;
+using namespace elio::http;
+
+coro::task<void> http2_examples(io::io_context& ctx) {
+    h2_client_config config;
+    config.user_agent = "elio-example/1.0";
+    config.max_concurrent_streams = 100;
+    
+    h2_client client(ctx, config);
+    
+    // GET request (HTTP/2 requires HTTPS)
+    ELIO_LOG_INFO("=== HTTP/2 GET ===");
+    auto get_resp = co_await client.get("https://nghttp2.org/");
+    if (get_resp) {
+        ELIO_LOG_INFO("Status: {}", static_cast<int>(get_resp->get_status()));
+        ELIO_LOG_INFO("Body size: {} bytes", get_resp->body().size());
+    }
+    
+    // POST JSON
+    ELIO_LOG_INFO("=== HTTP/2 POST JSON ===");
+    auto post_resp = co_await client.post(
+        "https://httpbin.org/post",
+        R"({"name": "Elio", "protocol": "h2"})",
+        mime::application_json
+    );
+    if (post_resp) {
+        ELIO_LOG_INFO("Status: {}", static_cast<int>(post_resp->get_status()));
+    }
+    
+    // Multiple requests on same connection (HTTP/2 multiplexing)
+    ELIO_LOG_INFO("=== HTTP/2 Multiplexing ===");
+    for (int i = 0; i < 5; ++i) {
+        auto resp = co_await client.get("https://nghttp2.org/");
+        if (resp) {
+            ELIO_LOG_INFO("Request {}: {} bytes", i + 1, resp->body().size());
+        }
+    }
+    // All requests above reused the same underlying connection
+    
+    co_return;
+}
+```
+
 ## HTTP Server
 
 A simple REST API server:
@@ -370,10 +421,11 @@ All examples are built automatically with CMake:
 
 ```bash
 cd build
-make examples
+make
 
 # Run individual examples
 ./examples/hello_world
 ./examples/tcp_echo_server
 ./examples/http_client https://httpbin.org/get
+./examples/http2_client https://nghttp2.org/
 ```

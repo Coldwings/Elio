@@ -312,6 +312,101 @@ const char* status_reason(status s);
 
 ---
 
+## HTTP/2 (`elio::http`)
+
+HTTP/2 support requires linking with `elio_http2`.
+
+### `h2_client`
+
+HTTP/2 client with connection multiplexing.
+
+```cpp
+class h2_client {
+public:
+    explicit h2_client(io_context& ctx);
+    h2_client(io_context& ctx, const h2_client_config& config);
+    
+    // GET request (awaitable)
+    /* awaitable */ get(const std::string& url);
+    
+    // POST request (awaitable)
+    /* awaitable */ post(const std::string& url, 
+                         const std::string& body,
+                         const std::string& content_type);
+    
+    // PUT request (awaitable)
+    /* awaitable */ put(const std::string& url,
+                        const std::string& body,
+                        const std::string& content_type);
+    
+    // DELETE request (awaitable)
+    /* awaitable */ del(const std::string& url);
+    
+    // PATCH request (awaitable)
+    /* awaitable */ patch(const std::string& url,
+                          const std::string& body,
+                          const std::string& content_type);
+    
+    // Send custom request (awaitable)
+    /* awaitable */ send(method m, const url& target,
+                         std::string_view body = {},
+                         std::string_view content_type = {});
+    
+    // Access TLS context for configuration
+    tls_context& tls_context();
+};
+
+// Convenience function for one-off HTTP/2 GET
+/* awaitable */ h2_get(io_context& ctx, const std::string& url);
+
+// Convenience function for one-off HTTP/2 POST
+/* awaitable */ h2_post(io_context& ctx, const std::string& url,
+                        const std::string& body, const std::string& content_type);
+```
+
+### `h2_client_config`
+
+```cpp
+struct h2_client_config {
+    std::chrono::seconds connect_timeout{10};
+    std::chrono::seconds read_timeout{30};
+    size_t max_concurrent_streams = 100;
+    uint32_t initial_window_size = 65535;
+    std::string user_agent = "elio-http2/1.0";
+    bool enable_push = false;  // Server push (rarely needed)
+};
+```
+
+### `h2_session`
+
+Low-level HTTP/2 session (for advanced use).
+
+```cpp
+class h2_session {
+public:
+    explicit h2_session(tls::tls_stream& stream);
+    
+    // Submit a request, returns stream ID
+    int32_t submit_request(method m, const url& target,
+                           std::string_view body = {},
+                           std::string_view content_type = {});
+    
+    // Process session I/O (awaitable)
+    /* awaitable */ process();
+    
+    // Wait for stream to complete (awaitable)
+    /* awaitable */ wait_for_stream(int32_t stream_id);
+    
+    // Check if session is alive
+    bool is_alive() const;
+    
+    // Graceful shutdown (awaitable)
+    /* awaitable */ shutdown();
+};
+```
+
+---
+
 ## TLS (`elio::tls`)
 
 ### `tls_context`

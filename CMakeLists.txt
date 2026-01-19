@@ -74,8 +74,39 @@ if(OPENSSL_FOUND)
     )
     target_link_libraries(elio_http INTERFACE elio OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(elio_http INTERFACE ELIO_HAS_TLS=1)
+
+    # nghttp2 for HTTP/2 support (requires OpenSSL for ALPN)
+    FetchContent_Declare(nghttp2
+        GIT_REPOSITORY https://github.com/nghttp2/nghttp2.git
+        GIT_TAG v1.64.0
+    )
+    # Configure nghttp2 build options
+    set(ENABLE_LIB_ONLY ON CACHE BOOL "" FORCE)
+    set(ENABLE_STATIC_LIB ON CACHE BOOL "" FORCE)
+    set(ENABLE_SHARED_LIB OFF CACHE BOOL "" FORCE)
+    set(ENABLE_DOC OFF CACHE BOOL "" FORCE)
+    set(ENABLE_APP OFF CACHE BOOL "" FORCE)
+    set(ENABLE_HPACK_TOOLS OFF CACHE BOOL "" FORCE)
+    set(ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(ENABLE_FAILMALLOC OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(nghttp2)
+
+    # Create elio_http2 target with HTTP/2 support
+    add_library(elio_http2 INTERFACE)
+    target_include_directories(elio_http2 INTERFACE 
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${nghttp2_SOURCE_DIR}/lib/includes>
+        $<BUILD_INTERFACE:${nghttp2_BINARY_DIR}/lib/includes>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_link_libraries(elio_http2 INTERFACE elio_http nghttp2_static)
+    target_compile_definitions(elio_http2 INTERFACE ELIO_HAS_HTTP2=1)
+    message(STATUS "HTTP/2 support enabled via nghttp2")
 else()
-    message(STATUS "OpenSSL not found, TLS/HTTPS support will be disabled")
+    message(STATUS "OpenSSL not found, TLS/HTTPS and HTTP/2 support will be disabled")
 endif()
 
 # Testing

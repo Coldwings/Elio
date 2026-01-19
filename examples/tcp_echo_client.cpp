@@ -29,7 +29,7 @@ task<int> client_main(std::string_view host, uint16_t port) {
     auto stream_result = co_await tcp_connect(ctx, host, port);
     
     if (!stream_result) {
-        ELIO_LOG_ERROR("Connection failed: {}", strerror(stream_result.error()));
+        ELIO_LOG_ERROR("Connection failed: {}", strerror(errno));
         co_return 1;
     }
     
@@ -80,7 +80,7 @@ task<int> benchmark_main(std::string_view host, uint16_t port, int iterations) {
     
     auto stream_result = co_await tcp_connect(ctx, host, port);
     if (!stream_result) {
-        ELIO_LOG_ERROR("Connection failed: {}", strerror(stream_result.error()));
+        ELIO_LOG_ERROR("Connection failed: {}", strerror(errno));
         co_return 1;
     }
     

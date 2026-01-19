@@ -16,7 +16,6 @@
 #include <string>
 #include <string_view>
 #include <optional>
-#include <expected>
 #include <span>
 
 namespace elio::net {
@@ -232,14 +231,15 @@ public:
     /// @param addr Address to bind to
     /// @param ctx I/O context
     /// @param opts Socket options
-    static std::expected<tcp_listener, int> bind(
+    /// @return TCP listener on success, std::nullopt on error (check errno)
+    static std::optional<tcp_listener> bind(
         const ipv4_address& addr,
         io::io_context& ctx,
         const tcp_options& opts = {}) 
     {
         int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) {
-            return std::unexpected(errno);
+            return std::nullopt;
         }
         
         // Apply socket options
@@ -266,14 +266,16 @@ public:
         if (::bind(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) < 0) {
             int err = errno;
             ::close(fd);
-            return std::unexpected(err);
+            errno = err;
+            return std::nullopt;
         }
         
         // Listen
         if (::listen(fd, opts.backlog) < 0) {
             int err = errno;
             ::close(fd);
-            return std::unexpected(err);
+            errno = err;
+            return std::nullopt;
         }
         
         ELIO_LOG_INFO("TCP listener bound to {}", addr.to_string());
@@ -346,11 +348,12 @@ public:
             listener_.ctx_->submit();
         }
         
-        std::expected<tcp_stream, int> await_resume() {
+        std::optional<tcp_stream> await_resume() {
             result_ = io::io_context::get_last_result();
             
             if (!result_.success()) {
-                return std::unexpected(result_.error_code());
+                errno = result_.error_code();
+                return std::nullopt;
             }
             
             int client_fd = result_.result;
@@ -453,14 +456,15 @@ public:
         ctx_.submit();
     }
     
-    std::expected<tcp_stream, int> await_resume() {
+    std::optional<tcp_stream> await_resume() {
         result_ = io::io_context::get_last_result();
         
         if (!result_.success()) {
             if (fd_ >= 0) {
                 ::close(fd_);
             }
-            return std::unexpected(result_.error_code());
+            errno = result_.error_code();
+            return std::nullopt;
         }
         
         tcp_stream stream(fd_, ctx_);

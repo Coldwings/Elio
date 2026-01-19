@@ -6,8 +6,8 @@ if(NOT UNIX OR APPLE)
     message(FATAL_ERROR "Elio currently only supports Linux")
 endif()
 
-# C++23 requirement
-set(CMAKE_CXX_STANDARD 23)
+# C++20 requirement
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 

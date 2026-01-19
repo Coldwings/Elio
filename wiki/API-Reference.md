@@ -149,13 +149,13 @@ TCP server socket.
 ```cpp
 class tcp_listener {
 public:
-    // Bind to address
-    static std::expected<tcp_listener, int> bind(
+    // Bind to address (returns std::nullopt on error, check errno)
+    static std::optional<tcp_listener> bind(
         const ipv4_address& addr,
         io_context& ctx
     );
     
-    // Accept a connection (awaitable)
+    // Accept a connection (awaitable, returns std::optional<tcp_stream>)
     /* awaitable */ accept();
     
     // Get file descriptor
@@ -197,7 +197,7 @@ public:
     std::optional<ipv4_address> local_address() const;
 };
 
-// Connect to address (awaitable)
+// Connect to address (awaitable, returns std::optional<tcp_stream>)
 /* awaitable */ tcp_connect(const ipv4_address& addr, io_context& ctx);
 ```
 

@@ -153,7 +153,7 @@ public:
             
             auto result = co_await tls::tls_connect(*tls_ctx, io_ctx, host, port);
             if (!result) {
-                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(result.error()));
+                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(errno));
                 co_return std::nullopt;
             }
             
@@ -161,7 +161,7 @@ public:
         } else {
             auto result = co_await net::tcp_connect(io_ctx, host, port);
             if (!result) {
-                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(result.error()));
+                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(errno));
                 co_return std::nullopt;
             }
             
@@ -214,43 +214,50 @@ public:
     }
     
     /// Perform HTTP GET request
-    coro::task<std::expected<response, int>> get(std::string_view url_str) {
+    /// @return Response on success, std::nullopt on error (check errno)
+    coro::task<std::optional<response>> get(std::string_view url_str) {
         return request_url(method::GET, url_str, "");
     }
     
     /// Perform HTTP POST request
-    coro::task<std::expected<response, int>> post(std::string_view url_str, 
+    /// @return Response on success, std::nullopt on error (check errno)
+    coro::task<std::optional<response>> post(std::string_view url_str, 
                                                    std::string_view body,
                                                    std::string_view content_type = mime::application_form_urlencoded) {
         return request_url(method::POST, url_str, body, content_type);
     }
     
     /// Perform HTTP PUT request
-    coro::task<std::expected<response, int>> put(std::string_view url_str,
+    /// @return Response on success, std::nullopt on error (check errno)
+    coro::task<std::optional<response>> put(std::string_view url_str,
                                                   std::string_view body,
                                                   std::string_view content_type = mime::application_json) {
         return request_url(method::PUT, url_str, body, content_type);
     }
     
     /// Perform HTTP DELETE request
-    coro::task<std::expected<response, int>> del(std::string_view url_str) {
+    /// @return Response on success, std::nullopt on error (check errno)
+    coro::task<std::optional<response>> del(std::string_view url_str) {
         return request_url(method::DELETE_, url_str, "");
     }
     
     /// Perform HTTP PATCH request
-    coro::task<std::expected<response, int>> patch(std::string_view url_str,
+    /// @return Response on success, std::nullopt on error (check errno)
+    coro::task<std::optional<response>> patch(std::string_view url_str,
                                                     std::string_view body,
                                                     std::string_view content_type = mime::application_json) {
         return request_url(method::PATCH, url_str, body, content_type);
     }
     
     /// Perform HTTP HEAD request
-    coro::task<std::expected<response, int>> head(std::string_view url_str) {
+    /// @return Response on success, std::nullopt on error (check errno)
+    coro::task<std::optional<response>> head(std::string_view url_str) {
         return request_url(method::HEAD, url_str, "");
     }
     
     /// Send a custom request
-    coro::task<std::expected<response, int>> send(request& req, const url& target) {
+    /// @return Response on success, std::nullopt on error (check errno)
+    coro::task<std::optional<response>> send(request& req, const url& target) {
         return send_request(req, target, 0);
     }
     
@@ -263,14 +270,15 @@ public:
     
 private:
     /// Perform request to URL
-    coro::task<std::expected<response, int>> request_url(method m, 
+    coro::task<std::optional<response>> request_url(method m, 
                                                           std::string_view url_str,
                                                           std::string_view body,
                                                           std::string_view content_type = "") {
         auto parsed = url::parse(url_str);
         if (!parsed) {
             ELIO_LOG_ERROR("Invalid URL: {}", url_str);
-            co_return std::unexpected(EINVAL);
+            errno = EINVAL;
+            co_return std::nullopt;
         }
         
         request req(m, parsed->path_with_query());
@@ -291,12 +299,13 @@ private:
     }
     
     /// Send request with redirect handling
-    coro::task<std::expected<response, int>> send_request(request& req, const url& target, size_t redirect_count) {
+    coro::task<std::optional<response>> send_request(request& req, const url& target, size_t redirect_count) {
         // Get connection from pool
         auto conn_opt = co_await pool_.acquire(*io_ctx_, target.host, target.effective_port(),
                                                 target.is_secure(), &tls_ctx_);
         if (!conn_opt) {
-            co_return std::unexpected(ECONNREFUSED);
+            errno = ECONNREFUSED;
+            co_return std::nullopt;
         }
         
         auto& conn = *conn_opt;
@@ -319,7 +328,8 @@ private:
         auto write_result = co_await conn.write(request_data);
         if (write_result.result <= 0) {
             ELIO_LOG_ERROR("Failed to send request: {}", strerror(-write_result.result));
-            co_return std::unexpected(-write_result.result);
+            errno = -write_result.result;
+            co_return std::nullopt;
         }
         
         // Read and parse response
@@ -335,7 +345,8 @@ private:
                 }
                 ELIO_LOG_ERROR("Failed to read response: {}", 
                               read_result.result == 0 ? "connection closed" : strerror(-read_result.result));
-                co_return std::unexpected(read_result.result == 0 ? ECONNRESET : -read_result.result);
+                errno = read_result.result == 0 ? ECONNRESET : -read_result.result;
+                co_return std::nullopt;
             }
             
             auto [result, consumed] = parser.parse(
@@ -343,13 +354,15 @@ private:
             
             if (result == parse_result::error) {
                 ELIO_LOG_ERROR("Response parse error: {}", parser.error_message());
-                co_return std::unexpected(EBADMSG);
+                errno = EBADMSG;
+                co_return std::nullopt;
             }
         }
         
         if (parser.has_error()) {
             ELIO_LOG_ERROR("Response parse error: {}", parser.error_message());
-            co_return std::unexpected(EBADMSG);
+            errno = EBADMSG;
+            co_return std::nullopt;
         }
         
         auto resp = response::from_parser(parser);
@@ -432,13 +445,15 @@ private:
 /// Simple convenience functions for one-off requests
 
 /// Perform HTTP GET request
-inline coro::task<std::expected<response, int>> get(io::io_context& io_ctx, std::string_view url) {
+/// @return Response on success, std::nullopt on error (check errno)
+inline coro::task<std::optional<response>> get(io::io_context& io_ctx, std::string_view url) {
     client c(io_ctx);
     co_return co_await c.get(url);
 }
 
 /// Perform HTTP POST request
-inline coro::task<std::expected<response, int>> post(io::io_context& io_ctx, 
+/// @return Response on success, std::nullopt on error (check errno)
+inline coro::task<std::optional<response>> post(io::io_context& io_ctx, 
                                                       std::string_view url,
                                                       std::string_view body,
                                                       std::string_view content_type = mime::application_form_urlencoded) {

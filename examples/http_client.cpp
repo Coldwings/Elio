@@ -55,7 +55,7 @@ coro::task<void> run_client(io::io_context& io_ctx, const std::string& base_url)
                 ELIO_LOG_INFO("Body: {}", body);
             }
         } else {
-            ELIO_LOG_ERROR("GET request failed: {}", strerror(result.error()));
+            ELIO_LOG_ERROR("GET request failed: {}", strerror(errno));
         }
     }
     
@@ -75,7 +75,7 @@ coro::task<void> run_client(io::io_context& io_ctx, const std::string& base_url)
                 ELIO_LOG_INFO("Body: {}", body);
             }
         } else {
-            ELIO_LOG_ERROR("POST request failed: {}", strerror(result.error()));
+            ELIO_LOG_ERROR("POST request failed: {}", strerror(errno));
         }
     }
     
@@ -87,7 +87,7 @@ coro::task<void> run_client(io::io_context& io_ctx, const std::string& base_url)
         if (result) {
             ELIO_LOG_INFO("Status: {} {}", result->status_code(), status_reason(result->get_status()));
         } else {
-            ELIO_LOG_ERROR("Form POST failed: {}", strerror(result.error()));
+            ELIO_LOG_ERROR("Form POST failed: {}", strerror(errno));
         }
     }
     
@@ -114,7 +114,7 @@ coro::task<void> run_client(io::io_context& io_ctx, const std::string& base_url)
                 ELIO_LOG_INFO("Body: {}", body);
             }
         } else {
-            ELIO_LOG_ERROR("Custom headers request failed: {}", strerror(result.error()));
+            ELIO_LOG_ERROR("Custom headers request failed: {}", strerror(errno));
         }
     }
     
@@ -141,7 +141,7 @@ coro::task<void> run_client(io::io_context& io_ctx, const std::string& base_url)
         if (result) {
             ELIO_LOG_INFO("Final status: {} (followed redirects automatically)", result->status_code());
         } else {
-            ELIO_LOG_ERROR("Redirect request failed: {}", strerror(result.error()));
+            ELIO_LOG_ERROR("Redirect request failed: {}", strerror(errno));
         }
     }
     
@@ -169,7 +169,7 @@ coro::task<void> run_client(io::io_context& io_ctx, const std::string& base_url)
             ELIO_LOG_INFO("Content-Type: {}", result->header("Content-Type"));
             ELIO_LOG_INFO("Body size: {} (should be 0 for HEAD)", result->body().size());
         } else {
-            ELIO_LOG_ERROR("HEAD request failed: {}", strerror(result.error()));
+            ELIO_LOG_ERROR("HEAD request failed: {}", strerror(errno));
         }
     }
     
@@ -204,7 +204,7 @@ coro::task<void> simple_request(io::io_context& io_ctx, const std::string& url) 
             ELIO_LOG_INFO("Body:\n{}", body);
         }
     } else {
-        ELIO_LOG_ERROR("Request failed: {}", strerror(result.error()));
+        ELIO_LOG_ERROR("Request failed: {}", strerror(errno));
     }
     
     // Signal completion

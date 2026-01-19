@@ -4,7 +4,7 @@ This page explains the fundamental concepts behind Elio's design.
 
 ## Coroutines and Tasks
 
-Elio uses C++23 coroutines as the foundation for async programming. A coroutine is a function that can suspend and resume execution.
+Elio uses C++20 coroutines as the foundation for async programming. A coroutine is a function that can suspend and resume execution.
 
 ### The `task<T>` Type
 
@@ -181,7 +181,7 @@ coro::task<void> limited_work() {
 
 ## Error Handling
 
-Elio uses `std::expected` for error handling in I/O operations:
+Elio uses `std::optional` for error handling in I/O operations. On failure, functions return `std::nullopt` and set `errno`:
 
 ```cpp
 coro::task<void> handle_errors() {
@@ -195,6 +195,16 @@ coro::task<void> handle_errors() {
         // Error - result.result is negative errno
         ELIO_LOG_ERROR("Read error: {}", strerror(-result.result));
     }
+    co_return;
+}
+```
+
+For factory methods like `tcp_listener::bind()`, check for `std::nullopt` and use `errno` to get the error code:
+
+```cpp
+auto listener = tcp_listener::bind(ipv4_address(port), ctx);
+if (!listener) {
+    ELIO_LOG_ERROR("Bind failed: {}", strerror(errno));
     co_return;
 }
 ```

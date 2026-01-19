@@ -12,7 +12,7 @@
 #include <string>
 #include <string_view>
 #include <memory>
-#include <expected>
+#include <optional>
 
 namespace elio::tls {
 
@@ -95,7 +95,8 @@ public:
     }
     
     /// Perform TLS handshake asynchronously
-    coro::task<std::expected<void, int>> handshake() {
+    /// @return true on success, false on error (check errno)
+    coro::task<bool> handshake() {
         while (true) {
             ERR_clear_error();
             int ret = (mode_ == tls_mode::client) ? SSL_connect(ssl_) : SSL_accept(ssl_);
@@ -104,7 +105,7 @@ public:
                 handshake_complete_ = true;
                 ELIO_LOG_DEBUG("TLS handshake complete (protocol: {}, cipher: {})",
                               SSL_get_version(ssl_), SSL_get_cipher_name(ssl_));
-                co_return std::expected<void, int>{};
+                co_return true;
             }
             
             int err = SSL_get_error(ssl_, ret);
@@ -112,12 +113,14 @@ public:
             if (err == SSL_ERROR_WANT_READ) {
                 auto result = co_await tcp_.poll_read();
                 if (result.result < 0) {
-                    co_return std::unexpected(-result.result);
+                    errno = -result.result;
+                    co_return false;
                 }
             } else if (err == SSL_ERROR_WANT_WRITE) {
                 auto result = co_await tcp_.poll_write();
                 if (result.result < 0) {
-                    co_return std::unexpected(-result.result);
+                    errno = -result.result;
+                    co_return false;
                 }
             } else {
                 // Handshake failed
@@ -127,7 +130,8 @@ public:
                                   X509_verify_cert_error_string(verify_err), verify_err);
                 }
                 ELIO_LOG_ERROR("TLS handshake failed: {}", get_ssl_error_string(err));
-                co_return std::unexpected(err);
+                errno = err;
+                co_return false;
             }
         }
     }
@@ -140,7 +144,7 @@ public:
         if (!handshake_complete_) {
             auto hs = co_await handshake();
             if (!hs) {
-                co_return io::io_result{-hs.error(), 0};
+                co_return io::io_result{-errno, 0};
             }
         }
         
@@ -189,7 +193,7 @@ public:
         if (!handshake_complete_) {
             auto hs = co_await handshake();
             if (!hs) {
-                co_return io::io_result{-hs.error(), 0};
+                co_return io::io_result{-errno, 0};
             }
         }
         
@@ -332,13 +336,13 @@ private:
 /// @param io_ctx I/O context for async operations
 /// @param host Hostname to connect to
 /// @param port Port to connect to
-/// @return TLS stream or error code
-inline coro::task<std::expected<tls_stream, int>> 
+/// @return TLS stream on success, std::nullopt on error (check errno)
+inline coro::task<std::optional<tls_stream>> 
 tls_connect(tls_context& ctx, io::io_context& io_ctx, std::string_view host, uint16_t port) {
     // First establish TCP connection
     auto tcp_result = co_await net::tcp_connect(io_ctx, host, port);
     if (!tcp_result) {
-        co_return std::unexpected(tcp_result.error());
+        co_return std::nullopt;
     }
     
     // Create TLS stream
@@ -348,7 +352,7 @@ tls_connect(tls_context& ctx, io::io_context& io_ctx, std::string_view host, uin
     // Perform handshake
     auto hs_result = co_await stream.handshake();
     if (!hs_result) {
-        co_return std::unexpected(hs_result.error());
+        co_return std::nullopt;
     }
     
     co_return std::move(stream);
@@ -362,10 +366,11 @@ public:
         : tcp_(std::move(tcp)), ctx_(&ctx) {}
     
     /// Accept a new TLS connection
-    coro::task<std::expected<tls_stream, int>> accept() {
+    /// @return TLS stream on success, std::nullopt on error (check errno)
+    coro::task<std::optional<tls_stream>> accept() {
         auto tcp_result = co_await tcp_.accept();
         if (!tcp_result) {
-            co_return std::unexpected(tcp_result.error());
+            co_return std::nullopt;
         }
         
         tls_stream stream(std::move(*tcp_result), *ctx_);
@@ -373,7 +378,7 @@ public:
         // Perform handshake
         auto hs_result = co_await stream.handshake();
         if (!hs_result) {
-            co_return std::unexpected(hs_result.error());
+            co_return std::nullopt;
         }
         
         co_return std::move(stream);
@@ -383,11 +388,12 @@ public:
     int fd() const noexcept { return tcp_.fd(); }
     
     /// Bind and create a TLS listener
-    static std::expected<tls_listener, int> 
+    /// @return TLS listener on success, std::nullopt on error (check errno)
+    static std::optional<tls_listener> 
     bind(const net::ipv4_address& addr, io::io_context& io_ctx, tls_context& ctx) {
         auto tcp_result = net::tcp_listener::bind(addr, io_ctx);
         if (!tcp_result) {
-            return std::unexpected(tcp_result.error());
+            return std::nullopt;
         }
         return tls_listener(std::move(*tcp_result), ctx);
     }

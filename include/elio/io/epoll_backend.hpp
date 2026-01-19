@@ -52,19 +52,24 @@ public:
     
     /// Destructor
     ~epoll_backend() override {
-        // Complete any pending operations with ECANCELED
+        // Collect handles to resume after releasing mutex
+        std::vector<std::coroutine_handle<>> deferred_resumes;
+        
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (auto& [fd, state] : fd_states_) {
                 for (auto& op : state.pending_ops) {
                     if (op.awaiter && !op.awaiter.done()) {
                         last_result_ = io_result{-ECANCELED, 0};
-                        op.awaiter.resume();
+                        deferred_resumes.push_back(op.awaiter);
                     }
                 }
             }
             fd_states_.clear();
-        }
+        } // mutex released here
+        
+        // Resume outside lock to prevent deadlock
+        resume_deferred(deferred_resumes);
         
         if (epoll_fd_ >= 0) {
             close(epoll_fd_);
@@ -205,62 +210,71 @@ public:
         
         int completions = 0;
         
-        std::lock_guard<std::mutex> lock(mutex_);
+        // Collect handles to resume after releasing mutex (prevents deadlock
+        // when resumed coroutines call prepare())
+        std::vector<std::coroutine_handle<>> deferred_resumes;
         
-        for (int i = 0; i < nfds; ++i) {
-            int fd = events_[i].data.fd;
-            uint32_t revents = events_[i].events;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
             
-            auto it = fd_states_.find(fd);
-            if (it == fd_states_.end()) {
-                continue;
-            }
-            
-            fd_state& state = it->second;
-            
-            // Process pending operations for this fd
-            auto op_it = state.pending_ops.begin();
-            while (op_it != state.pending_ops.end()) {
-                bool ready = false;
+            for (int i = 0; i < nfds; ++i) {
+                int fd = events_[i].data.fd;
+                uint32_t revents = events_[i].events;
                 
-                switch (op_it->req.op) {
-                    case io_op::read:
-                    case io_op::readv:
-                    case io_op::recv:
-                    case io_op::accept:
-                    case io_op::poll_read:
-                        ready = (revents & (EPOLLIN | EPOLLHUP | EPOLLERR)) != 0;
-                        break;
-                        
-                    case io_op::write:
-                    case io_op::writev:
-                    case io_op::send:
-                    case io_op::connect:
-                    case io_op::poll_write:
-                        ready = (revents & (EPOLLOUT | EPOLLHUP | EPOLLERR)) != 0;
-                        break;
-                        
-                    default:
-                        break;
+                auto it = fd_states_.find(fd);
+                if (it == fd_states_.end()) {
+                    continue;
                 }
                 
-                if (ready) {
-                    execute_async_op(*op_it, revents);
-                    op_it = state.pending_ops.erase(op_it);
-                    pending_count_--;
-                    completions++;
-                } else {
-                    ++op_it;
+                fd_state& state = it->second;
+                
+                // Process pending operations for this fd
+                auto op_it = state.pending_ops.begin();
+                while (op_it != state.pending_ops.end()) {
+                    bool ready = false;
+                    
+                    switch (op_it->req.op) {
+                        case io_op::read:
+                        case io_op::readv:
+                        case io_op::recv:
+                        case io_op::accept:
+                        case io_op::poll_read:
+                            ready = (revents & (EPOLLIN | EPOLLHUP | EPOLLERR)) != 0;
+                            break;
+                            
+                        case io_op::write:
+                        case io_op::writev:
+                        case io_op::send:
+                        case io_op::connect:
+                        case io_op::poll_write:
+                            ready = (revents & (EPOLLOUT | EPOLLHUP | EPOLLERR)) != 0;
+                            break;
+                            
+                        default:
+                            break;
+                    }
+                    
+                    if (ready) {
+                        execute_async_op(*op_it, revents, &deferred_resumes);
+                        op_it = state.pending_ops.erase(op_it);
+                        pending_count_--;
+                        completions++;
+                    } else {
+                        ++op_it;
+                    }
+                }
+                
+                // Update epoll registration if no more pending ops for this fd
+                if (state.pending_ops.empty() && state.registered) {
+                    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                    state.registered = false;
+                    state.events = 0;
                 }
             }
-            
-            // Update epoll registration if no more pending ops for this fd
-            if (state.pending_ops.empty() && state.registered) {
-                epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                state.registered = false;
-                state.events = 0;
-            }
-        }
+        } // mutex released here
+        
+        // Resume coroutines outside the lock to prevent deadlock
+        resume_deferred(deferred_resumes);
         
         if (completions > 0) {
             ELIO_LOG_DEBUG("Processed {} completions", completions);
@@ -281,25 +295,35 @@ public:
     
     /// Cancel a pending operation
     bool cancel(void* user_data) override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::coroutine_handle<> to_resume;
         
-        for (auto& [fd, state] : fd_states_) {
-            auto it = std::find_if(state.pending_ops.begin(), 
-                                    state.pending_ops.end(),
-                                    [user_data](const pending_operation& op) {
-                                        return op.awaiter.address() == user_data;
-                                    });
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
             
-            if (it != state.pending_ops.end()) {
-                // Resume with ECANCELED
-                last_result_ = io_result{-ECANCELED, 0};
-                if (it->awaiter && !it->awaiter.done()) {
-                    it->awaiter.resume();
+            for (auto& [fd, state] : fd_states_) {
+                auto it = std::find_if(state.pending_ops.begin(), 
+                                        state.pending_ops.end(),
+                                        [user_data](const pending_operation& op) {
+                                            return op.awaiter.address() == user_data;
+                                        });
+                
+                if (it != state.pending_ops.end()) {
+                    // Collect handle for deferred resumption
+                    last_result_ = io_result{-ECANCELED, 0};
+                    if (it->awaiter && !it->awaiter.done()) {
+                        to_resume = it->awaiter;
+                    }
+                    state.pending_ops.erase(it);
+                    pending_count_--;
+                    break;
                 }
-                state.pending_ops.erase(it);
-                pending_count_--;
-                return true;
             }
+        } // mutex released here
+        
+        // Resume outside lock to prevent deadlock
+        if (to_resume && !to_resume.done()) {
+            to_resume.resume();
+            return true;
         }
         
         return false;
@@ -353,7 +377,12 @@ private:
         }
     }
     
-    void execute_async_op(pending_operation& op, uint32_t revents) {
+    /// Execute async I/O operation
+    /// @param op The pending operation to execute
+    /// @param revents The epoll events that triggered this operation
+    /// @param deferred_resumes If non-null, collect handle for later resumption (avoids deadlock)
+    void execute_async_op(pending_operation& op, uint32_t revents,
+                          std::vector<std::coroutine_handle<>>* deferred_resumes = nullptr) {
         int result = 0;
         
         // Check for errors first
@@ -456,7 +485,20 @@ private:
                        static_cast<int>(op.req.op), op.req.fd, result);
         
         if (op.awaiter && !op.awaiter.done()) {
-            op.awaiter.resume();
+            if (deferred_resumes) {
+                deferred_resumes->push_back(op.awaiter);
+            } else {
+                op.awaiter.resume();
+            }
+        }
+    }
+    
+    /// Resume collected coroutine handles (call outside of lock)
+    static void resume_deferred(std::vector<std::coroutine_handle<>>& handles) {
+        for (auto& h : handles) {
+            if (h && !h.done()) {
+                h.resume();
+            }
         }
     }
     

@@ -17,6 +17,7 @@
 - **I/O Backends**: io_uring (preferred) and epoll fallback
 - **TCP Networking**: async client/server with connection management
 - **HTTP/1.1**: full client and server implementation
+- **HTTP/2**: client with multiplexed streams via nghttp2
 - **TLS/HTTPS**: OpenSSL-based with ALPN and certificate verification
 - **Header-Only Library** for easy integration
 - **Comprehensive Testing** with Catch2 and ASAN
@@ -34,6 +35,7 @@
 - **Dependencies**: Automatically fetched via CMake FetchContent
   - fmtlib 10.2.1
   - Catch2 3.5.0 (for tests)
+  - nghttp2 1.64.0 (for HTTP/2, requires OpenSSL)
 
 ### Building
 
@@ -131,7 +133,9 @@ elio::
 │
 ├── http::                   // HTTP protocol
 │   ├── http_client          // HTTP/HTTPS client
-│   └── http_server          // HTTP server
+│   ├── http_server          // HTTP server
+│   ├── h2_client            // HTTP/2 client
+│   └── h2_session           // HTTP/2 session (nghttp2)
 │
 ├── tls::                    // TLS/SSL support
 │   └── tls_stream           // OpenSSL wrapper
@@ -180,6 +184,7 @@ Explore the `examples/` directory for detailed examples:
 - **tcp_echo_client.cpp** - TCP client example
 - **http_server.cpp** - HTTP server example
 - **http_client.cpp** - HTTP/HTTPS client example
+- **http2_client.cpp** - HTTP/2 client example
 - **async_file_io.cpp** - Async file operations
 - **benchmark.cpp** - Performance measurements
 
@@ -309,6 +314,7 @@ Run benchmarks:
 - I/O backends (io_uring, epoll)
 - TCP networking (client/server)
 - HTTP/1.1 (client/server)
+- HTTP/2 (client)
 - TLS/HTTPS support
 - Comprehensive test suite
 - CI/CD pipeline

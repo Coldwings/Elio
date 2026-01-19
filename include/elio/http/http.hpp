@@ -11,12 +11,18 @@
 /// - Keep-alive connection support
 /// - Chunked transfer encoding
 /// - Automatic redirect following
+///
+/// For HTTP/2 support, include <elio/http/http2.hpp> and link with elio_http2.
 
 #include <elio/http/http_common.hpp>
 #include <elio/http/http_parser.hpp>
 #include <elio/http/http_message.hpp>
 #include <elio/http/http_server.hpp>
 #include <elio/http/http_client.hpp>
+
+#if defined(ELIO_HAS_HTTP2) && ELIO_HAS_HTTP2
+#include <elio/http/http2.hpp>
+#endif
 
 namespace elio {
 

@@ -125,9 +125,11 @@ public:
         
         // Get or create fd state
         auto& state = fd_states_[req.fd];
+        bool is_sync = op.synchronous;
+        bool is_timo = op.is_timeout;
         state.pending_ops.push_back(std::move(op));
         
-        if (!op.synchronous && !op.is_timeout) {
+        if (!is_sync && !is_timo) {
             // Register with epoll
             state.events |= events;
             

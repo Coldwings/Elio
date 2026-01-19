@@ -1,0 +1,50 @@
+name: Sync Wiki
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'wiki/**'
+  workflow_dispatch:
+
+jobs:
+  sync-wiki:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Sync to Wiki
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Configure git
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Clone the wiki repository
+          wiki_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.wiki.git"
+          git clone "$wiki_url" wiki-repo || {
+            echo "Wiki not initialized. Please create at least one page in the wiki first."
+            exit 1
+          }
+
+          # Copy wiki files
+          rsync -av --delete --exclude='.git' wiki/ wiki-repo/
+
+          # Check for changes and push
+          cd wiki-repo
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "Sync wiki from main repository
+
+          Source commit: ${{ github.sha }}"
+            git push
+            echo "Wiki updated successfully."
+          else
+            echo "No changes to sync."
+          fi

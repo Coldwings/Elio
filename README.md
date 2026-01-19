@@ -329,8 +329,6 @@ Contributions are welcome! Please:
 5. Document public APIs
 6. Follow existing code style
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
-
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details.

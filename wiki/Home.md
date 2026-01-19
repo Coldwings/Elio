@@ -9,7 +9,7 @@
 - **C++20 Coroutines**: First-class coroutine support with `co_await` and `co_return`
 - **Multi-threaded Scheduler**: Work-stealing scheduler with configurable worker threads
 - **Async I/O Backends**: io_uring (preferred) and epoll fallback
-- **Synchronization Primitives**: mutex, semaphore, event, channel
+- **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel
 - **Timers**: sleep_for, sleep_until, yield
 - **TCP Networking**: Async TCP client/server with connection management
 - **HTTP/1.1**: Full HTTP client and server implementation

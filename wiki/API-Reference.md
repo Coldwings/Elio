@@ -486,6 +486,69 @@ public:
 };
 ```
 
+### `shared_mutex`
+
+Coroutine-aware read-write lock. Allows multiple concurrent readers or a single exclusive writer.
+
+```cpp
+class shared_mutex {
+public:
+    shared_mutex();
+    
+    // Acquire shared (read) lock (awaitable)
+    /* awaitable */ lock_shared();
+    
+    // Acquire exclusive (write) lock (awaitable)
+    /* awaitable */ lock();
+    
+    // Try to acquire shared lock without waiting
+    bool try_lock_shared();
+    
+    // Try to acquire exclusive lock without waiting
+    bool try_lock();
+    
+    // Release shared lock
+    void unlock_shared();
+    
+    // Release exclusive lock
+    void unlock();
+    
+    // Get current reader count
+    size_t reader_count() const;
+    
+    // Check if a writer holds the lock
+    bool is_writer_active() const;
+};
+```
+
+### `shared_lock_guard`
+
+RAII guard for shared (reader) locks.
+
+```cpp
+class shared_lock_guard {
+public:
+    explicit shared_lock_guard(shared_mutex& m);
+    ~shared_lock_guard();  // Calls unlock_shared()
+    
+    void unlock();  // Manual early unlock
+};
+```
+
+### `unique_lock_guard`
+
+RAII guard for exclusive (writer) locks.
+
+```cpp
+class unique_lock_guard {
+public:
+    explicit unique_lock_guard(shared_mutex& m);
+    ~unique_lock_guard();  // Calls unlock()
+    
+    void unlock();  // Manual early unlock
+};
+```
+
 ### `condition_variable`
 
 Coroutine-aware condition variable.

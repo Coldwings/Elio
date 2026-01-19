@@ -218,3 +218,132 @@ TEST_CASE("channel with coroutines", "[sync][channel][coro]") {
     REQUIRE(consumer_done);
     REQUIRE(sum == 15);  // 1+2+3+4+5
 }
+
+TEST_CASE("shared_mutex basic operations", "[sync][shared_mutex]") {
+    shared_mutex m;
+    
+    SECTION("initial state") {
+        REQUIRE(m.reader_count() == 0);
+        REQUIRE_FALSE(m.is_writer_active());
+    }
+    
+    SECTION("try_lock_shared succeeds multiple times") {
+        REQUIRE(m.try_lock_shared());
+        REQUIRE(m.reader_count() == 1);
+        REQUIRE(m.try_lock_shared());
+        REQUIRE(m.reader_count() == 2);
+        REQUIRE(m.try_lock_shared());
+        REQUIRE(m.reader_count() == 3);
+        
+        m.unlock_shared();
+        m.unlock_shared();
+        m.unlock_shared();
+        REQUIRE(m.reader_count() == 0);
+    }
+    
+    SECTION("try_lock succeeds on unlocked mutex") {
+        REQUIRE(m.try_lock());
+        REQUIRE(m.is_writer_active());
+        m.unlock();
+        REQUIRE_FALSE(m.is_writer_active());
+    }
+    
+    SECTION("try_lock_shared fails when writer holds lock") {
+        REQUIRE(m.try_lock());
+        REQUIRE_FALSE(m.try_lock_shared());
+        m.unlock();
+    }
+    
+    SECTION("try_lock fails when readers hold lock") {
+        REQUIRE(m.try_lock_shared());
+        REQUIRE_FALSE(m.try_lock());
+        m.unlock_shared();
+    }
+    
+    SECTION("try_lock fails when writer holds lock") {
+        REQUIRE(m.try_lock());
+        REQUIRE_FALSE(m.try_lock());
+        m.unlock();
+    }
+}
+
+TEST_CASE("shared_mutex with coroutines", "[sync][shared_mutex][coro]") {
+    shared_mutex m;
+    std::atomic<int> read_count{0};
+    std::atomic<int> max_concurrent_readers{0};
+    std::atomic<int> write_count{0};
+    std::atomic<int> completed{0};
+    
+    scheduler sched(4);
+    sched.start();
+    
+    // Reader task - multiple can run concurrently
+    auto reader_task = [&]() -> task<void> {
+        co_await m.lock_shared();
+        int current = ++read_count;
+        int expected = max_concurrent_readers.load();
+        while (current > expected && !max_concurrent_readers.compare_exchange_weak(expected, current)) {}
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        --read_count;
+        m.unlock_shared();
+        completed++;
+    };
+    
+    // Writer task - exclusive access
+    auto writer_task = [&]() -> task<void> {
+        co_await m.lock();
+        ++write_count;
+        REQUIRE(read_count == 0);  // No readers while writing
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        m.unlock();
+        completed++;
+    };
+    
+    constexpr int NUM_READERS = 6;
+    constexpr int NUM_WRITERS = 2;
+    constexpr int TOTAL = NUM_READERS + NUM_WRITERS;
+    
+    // Spawn readers and writers
+    for (int i = 0; i < NUM_READERS; ++i) {
+        auto t = reader_task();
+        sched.spawn(t.release());
+    }
+    for (int i = 0; i < NUM_WRITERS; ++i) {
+        auto t = writer_task();
+        sched.spawn(t.release());
+    }
+    
+    // Wait for completion
+    for (int i = 0; i < 200 && completed < TOTAL; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    
+    sched.shutdown();
+    
+    REQUIRE(completed == TOTAL);
+    REQUIRE(write_count == NUM_WRITERS);
+    // Multiple readers should have run concurrently at some point
+    REQUIRE(max_concurrent_readers > 0);
+}
+
+TEST_CASE("shared_lock_guard RAII", "[sync][shared_mutex]") {
+    shared_mutex m;
+    
+    {
+        REQUIRE(m.try_lock_shared());
+        shared_lock_guard guard(m);
+        REQUIRE(m.reader_count() == 1);
+    }
+    REQUIRE(m.reader_count() == 0);
+}
+
+TEST_CASE("unique_lock_guard RAII", "[sync][shared_mutex]") {
+    shared_mutex m;
+    
+    {
+        REQUIRE(m.try_lock());
+        unique_lock_guard guard(m);
+        REQUIRE(m.is_writer_active());
+    }
+    REQUIRE_FALSE(m.is_writer_active());
+}

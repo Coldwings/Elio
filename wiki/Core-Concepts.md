@@ -142,6 +142,30 @@ coro::task<void> critical_section() {
 }
 ```
 
+### Shared Mutex (Read-Write Lock)
+
+`shared_mutex` allows multiple concurrent readers or a single exclusive writer:
+
+```cpp
+sync::shared_mutex rwlock;
+
+// Multiple readers can run concurrently
+coro::task<void> reader() {
+    co_await rwlock.lock_shared();
+    sync::shared_lock_guard guard(rwlock);  // RAII unlock
+    // Read shared data
+    co_return;
+}
+
+// Writers get exclusive access
+coro::task<void> writer() {
+    co_await rwlock.lock();
+    sync::unique_lock_guard guard(rwlock);  // RAII unlock
+    // Modify shared data
+    co_return;
+}
+```
+
 ### Condition Variable
 
 ```cpp

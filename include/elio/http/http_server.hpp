@@ -245,7 +245,7 @@ public:
                            runtime::scheduler& sched) {
         auto listener_result = net::tcp_listener::bind(addr, io_ctx);
         if (!listener_result) {
-            ELIO_LOG_ERROR("Failed to bind HTTP server: {}", strerror(listener_result.error()));
+            ELIO_LOG_ERROR("Failed to bind HTTP server: {}", strerror(errno));
             co_return;
         }
         
@@ -258,7 +258,7 @@ public:
             auto stream_result = co_await listener.accept();
             if (!stream_result) {
                 if (running_) {
-                    ELIO_LOG_ERROR("Accept error: {}", strerror(stream_result.error()));
+                    ELIO_LOG_ERROR("Accept error: {}", strerror(errno));
                 }
                 continue;
             }
@@ -274,7 +274,7 @@ public:
                                 runtime::scheduler& sched, tls::tls_context& tls_ctx) {
         auto listener_result = net::tcp_listener::bind(addr, io_ctx);
         if (!listener_result) {
-            ELIO_LOG_ERROR("Failed to bind HTTPS server: {}", strerror(listener_result.error()));
+            ELIO_LOG_ERROR("Failed to bind HTTPS server: {}", strerror(errno));
             co_return;
         }
         
@@ -287,7 +287,7 @@ public:
             auto stream_result = co_await listener.accept();
             if (!stream_result) {
                 if (running_) {
-                    ELIO_LOG_ERROR("Accept error: {}", strerror(stream_result.error()));
+                    ELIO_LOG_ERROR("Accept error: {}", strerror(errno));
                 }
                 continue;
             }

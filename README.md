@@ -1,14 +1,14 @@
 # Elio Coroutine Library
 
-**Elio** is a modern, production-ready C++23 coroutine library for high-performance asynchronous programming on Linux. It provides stackless coroutines with virtual stack tracking, a multi-threaded work-stealing scheduler, and a foundation for efficient I/O operations.
+**Elio** is a modern, production-ready C++20 coroutine library for high-performance asynchronous programming on Linux. It provides stackless coroutines with virtual stack tracking, a multi-threaded work-stealing scheduler, and a foundation for efficient I/O operations.
 
 [![CI](https://github.com/Coldwings/Elio/actions/workflows/ci.yml/badge.svg)](https://github.com/Coldwings/Elio/actions/workflows/ci.yml)
-[![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 ## Features
 
-- **C++23 Stackless Coroutines** with `task<T>` type
+- **C++20 Stackless Coroutines** with `task<T>` type
 - **Virtual Stack Tracking** for natural exception propagation
 - **Work-Stealing Scheduler** with lock-free Chase-Lev deques
 - **Dynamic Thread Pool** with runtime adjustment
@@ -27,7 +27,7 @@
 
 ### Prerequisites
 
-- **Compiler**: GCC 14+ or Clang 18+ with C++23 support
+- **Compiler**: GCC 12+ or Clang 15+ with C++20 support
 - **OS**: Linux (kernel 5.1+ for io_uring, or any modern Linux for epoll)
 - **CMake**: 3.20 or higher
 - **Optional**: liburing (for io_uring backend), OpenSSL (for TLS/HTTPS)
@@ -38,7 +38,7 @@
 ### Building
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/Coldwings/Elio.git
 cd Elio
 mkdir build && cd build
 cmake ..
@@ -316,7 +316,7 @@ Run benchmarks:
 ## Contributing
 
 Contributions are welcome! Please:
-1. Follow C++23 best practices
+1. Follow C++20 best practices
 2. Write tests for new features
 3. Ensure ASAN tests pass
 4. Ensure CI passes

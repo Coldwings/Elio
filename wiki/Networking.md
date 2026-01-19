@@ -29,7 +29,7 @@ coro::task<void> server(uint16_t port, runtime::scheduler& sched) {
     
     auto listener = tcp_listener::bind(ipv4_address(port), ctx);
     if (!listener) {
-        ELIO_LOG_ERROR("Bind failed: {}", strerror(listener.error()));
+        ELIO_LOG_ERROR("Bind failed: {}", strerror(errno));
         co_return;
     }
     
@@ -52,7 +52,7 @@ coro::task<void> client(const std::string& host, uint16_t port) {
     // Connect to server (hostname is resolved automatically)
     auto stream = co_await tcp_connect(ipv4_address(host, port), ctx);
     if (!stream) {
-        ELIO_LOG_ERROR("Connect failed: {}", strerror(stream.error()));
+        ELIO_LOG_ERROR("Connect failed: {}", strerror(errno));
         co_return;
     }
     

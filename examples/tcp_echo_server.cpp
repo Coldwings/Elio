@@ -80,7 +80,7 @@ task<void> server_main(uint16_t port, scheduler& sched) {
     auto listener_result = tcp_listener::bind(ipv4_address(port), ctx);
     if (!listener_result) {
         ELIO_LOG_ERROR("Failed to bind to port {}: {}", port,
-                      strerror(listener_result.error()));
+                      strerror(errno));
         co_return;
     }
     
@@ -100,10 +100,10 @@ task<void> server_main(uint16_t port, scheduler& sched) {
         
         if (!stream_result) {
             if (g_running) {
-                ELIO_LOG_ERROR("Accept error: {}", strerror(stream_result.error()));
+                ELIO_LOG_ERROR("Accept error: {}", strerror(errno));
             }
             // Exit loop if listener was closed for shutdown
-            if (!g_running || stream_result.error() == EBADF) {
+            if (!g_running || errno == EBADF) {
                 break;
             }
             continue;

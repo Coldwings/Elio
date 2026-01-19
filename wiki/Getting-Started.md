@@ -7,8 +7,8 @@ This guide will help you get Elio up and running in your project.
 ### Prerequisites
 
 ```bash
-# Ubuntu/Debian (24.04+)
-sudo apt install build-essential cmake ninja-build g++-14 liburing-dev libssl-dev
+# Ubuntu/Debian (22.04+)
+sudo apt install build-essential cmake ninja-build g++-12 liburing-dev libssl-dev
 
 # Fedora
 sudo dnf install gcc-c++ cmake ninja-build liburing-devel openssl-devel
@@ -20,8 +20,8 @@ sudo pacman -S base-devel cmake ninja liburing openssl
 ### Building from Source
 
 ```bash
-git clone https://github.com/user/elio.git
-cd elio
+git clone https://github.com/Coldwings/Elio.git
+cd Elio
 cmake -B build -G Ninja
 cmake --build build
 ```
@@ -44,7 +44,7 @@ ctest --output-on-failure
 include(FetchContent)
 
 FetchContent_Declare(elio
-    GIT_REPOSITORY https://github.com/user/elio.git
+    GIT_REPOSITORY https://github.com/Coldwings/Elio.git
     GIT_TAG main
 )
 FetchContent_MakeAvailable(elio)

@@ -1,12 +1,12 @@
 # Elio
 
-**Elio** is a modern C++23 coroutine-based asynchronous I/O library for Linux. It provides high-performance networking primitives with native support for TCP, HTTP/1.1, and TLS.
+**Elio** is a modern C++20 coroutine-based asynchronous I/O library for Linux. It provides high-performance networking primitives with native support for TCP, HTTP/1.1, and TLS.
 
-[![CI](https://github.com/user/Elio/actions/workflows/ci.yml/badge.svg)](https://github.com/user/Elio/actions/workflows/ci.yml)
+[![CI](https://github.com/Coldwings/Elio/actions/workflows/ci.yml/badge.svg)](https://github.com/Coldwings/Elio/actions/workflows/ci.yml)
 
 ## Features
 
-- **C++23 Coroutines**: First-class coroutine support with `co_await` and `co_return`
+- **C++20 Coroutines**: First-class coroutine support with `co_await` and `co_return`
 - **Multi-threaded Scheduler**: Work-stealing scheduler with configurable worker threads
 - **Async I/O Backends**: io_uring (preferred) and epoll fallback
 - **Synchronization Primitives**: mutex, semaphore, event, channel
@@ -20,7 +20,7 @@
 ## Requirements
 
 - Linux (kernel 5.1+ for io_uring, or any modern Linux for epoll)
-- GCC 14+ with C++23 support
+- GCC 12+ with C++20 support
 - CMake 3.20+
 - liburing (optional, for io_uring backend)
 - OpenSSL (optional, for TLS/HTTPS support)

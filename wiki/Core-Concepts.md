@@ -45,7 +45,51 @@ coro::task<void> example() {
 
 The scheduler manages coroutine execution across multiple threads.
 
-### Creating a Scheduler
+### Using async_main (Recommended)
+
+The simplest way to run async code is with `ELIO_ASYNC_MAIN`:
+
+```cpp
+#include <elio/elio.hpp>
+
+coro::task<int> async_main() {
+    // Your async code here
+    co_return 0;
+}
+
+ELIO_ASYNC_MAIN(async_main)
+```
+
+For `async_main` functions returning `void`:
+
+```cpp
+coro::task<void> async_main() {
+    co_await do_work();
+    co_return;
+}
+
+ELIO_ASYNC_MAIN_VOID(async_main)
+```
+
+### Using elio::run()
+
+For more control, use `elio::run()` directly:
+
+```cpp
+int main() {
+    // Run with default thread count (hardware concurrency)
+    return elio::run(async_main());
+}
+
+// Or specify thread count
+int main() {
+    return elio::run(async_main(), 4);  // 4 worker threads
+}
+```
+
+### Manual Scheduler Control
+
+For advanced use cases, you can manage the scheduler manually:
 
 ```cpp
 #include <elio/runtime/scheduler.hpp>

@@ -1,6 +1,4 @@
-#include <elio/runtime/scheduler.hpp>
-#include <elio/coro/task.hpp>
-#include <elio/log/macros.hpp>
+#include <elio/elio.hpp>
 #include <iostream>
 #include <atomic>
 #include <chrono>
@@ -40,7 +38,8 @@ coro::task<void> worker_task([[maybe_unused]] int id, int work_amount, std::atom
     co_return;
 }
 
-int main() {
+// Orchestrator task that spawns and monitors parallel tasks
+coro::task<int> async_main() {
     // Set logging to info
     log::logger::instance().set_level(log::level::info);
     
@@ -48,17 +47,11 @@ int main() {
     std::cout << "Demonstrating work-stealing scheduler with multiple workers" << std::endl;
     std::cout << std::endl;
     
-    const int num_workers = 4;
     const int num_tasks = 50;
     
     std::cout << "Configuration:" << std::endl;
-    std::cout << "  Worker threads: " << num_workers << std::endl;
     std::cout << "  Total tasks: " << num_tasks << std::endl;
     std::cout << std::endl;
-    
-    // Create scheduler
-    runtime::scheduler sched(num_workers);
-    sched.start();
     
     std::atomic<int> completed{0};
     
@@ -67,18 +60,19 @@ int main() {
     
     // Spawn tasks with varying workloads
     std::cout << "Spawning tasks..." << std::endl;
+    auto* sched = runtime::scheduler::current();
     for (int i = 0; i < num_tasks; ++i) {
         // Vary work amount: some tasks do more work than others
         int work_amount = 10 + (i % 20);
         auto t = worker_task(i, work_amount, completed);
-        sched.spawn(t.release());
+        sched->spawn(t.release());
     }
     
-    // Monitor progress
+    // Monitor progress using yield
     std::cout << "Executing tasks..." << std::endl;
     int last_completed = 0;
     while (completed.load() < num_tasks) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        co_await time::yield();
         int current = completed.load();
         if (current != last_completed) {
             std::cout << "  Progress: " << current << "/" << num_tasks 
@@ -95,21 +89,19 @@ int main() {
     std::cout << "Results:" << std::endl;
     std::cout << "  Completed: " << completed.load() << "/" << num_tasks << " tasks" << std::endl;
     std::cout << "  Duration: " << duration.count() << " ms" << std::endl;
-    std::cout << "  Total tasks executed: " << sched.total_tasks_executed() << std::endl;
+    std::cout << "  Total tasks executed: " << sched->total_tasks_executed() << std::endl;
     std::cout << "  Tasks per second: " 
               << (num_tasks * 1000.0 / duration.count()) << std::endl;
     
     std::cout << std::endl;
     std::cout << "Work-stealing statistics:" << std::endl;
-    std::cout << "  Tasks were distributed across " << num_workers 
-              << " workers" << std::endl;
+    std::cout << "  Tasks were distributed across workers" << std::endl;
     std::cout << "  Work stealing occurred to balance load" << std::endl;
-    
-    // Shutdown
-    sched.shutdown();
     
     std::cout << std::endl;
     std::cout << "=== Example completed ===" << std::endl;
     
-    return 0;
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)

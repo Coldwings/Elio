@@ -74,7 +74,53 @@ public:
     
     // Get number of worker threads
     size_t worker_count() const noexcept;
+    
+    // Get the current scheduler (thread-local)
+    static scheduler* current() noexcept;
 };
+```
+
+### `run()`
+
+Run a coroutine to completion.
+
+```cpp
+// Run task with default thread count (hardware concurrency)
+template<typename T>
+T run(coro::task<T> task, size_t num_threads = std::thread::hardware_concurrency());
+```
+
+**Example:**
+```cpp
+coro::task<int> async_main() {
+    co_return 42;
+}
+
+int main() {
+    return elio::run(async_main());
+}
+```
+
+### `ELIO_ASYNC_MAIN`
+
+Macro to define main() that runs an async_main coroutine.
+
+```cpp
+// For async_main returning int (used as exit code)
+ELIO_ASYNC_MAIN(async_main_func)
+
+// For async_main returning void (exits with 0)
+ELIO_ASYNC_MAIN_VOID(async_main_func)
+```
+
+**Example:**
+```cpp
+coro::task<int> async_main() {
+    co_await do_work();
+    co_return 0;
+}
+
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ---

@@ -111,6 +111,11 @@ public:
     [[nodiscard]] bool is_running() const noexcept {
         return running_.load(std::memory_order_acquire);
     }
+    
+    /// Get the current worker thread (if called from a worker thread)
+    [[nodiscard]] static worker_thread* current() noexcept {
+        return current_worker_;
+    }
 
 private:
     void run();
@@ -127,6 +132,9 @@ private:
     std::thread thread_;
     std::atomic<bool> running_;
     std::atomic<size_t> tasks_executed_;
+    bool needs_sync_ = false;          // Whether current task needs memory synchronization
+    
+    static inline thread_local worker_thread* current_worker_ = nullptr;
 };
 
 } // namespace elio::runtime

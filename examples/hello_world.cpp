@@ -1,6 +1,4 @@
-#include <elio/runtime/scheduler.hpp>
-#include <elio/coro/task.hpp>
-#include <elio/log/macros.hpp>
+#include <elio/elio.hpp>
 #include <iostream>
 
 using namespace elio;
@@ -11,8 +9,13 @@ coro::task<std::string> get_greeting() {
     co_return "Hello from Elio!";
 }
 
-// Main coroutine
-coro::task<void> main_task() {
+// Async main coroutine
+coro::task<int> async_main() {
+    // Enable debug logging
+    log::logger::instance().set_level(log::level::debug);
+    
+    std::cout << "=== Elio Hello World Example ===" << std::endl;
+    
     ELIO_LOG_INFO("Main task started");
     
     // Co-await the greeting
@@ -21,32 +24,9 @@ coro::task<void> main_task() {
     std::cout << greeting << std::endl;
     
     ELIO_LOG_INFO("Main task completed");
-    co_return;
-}
-
-int main() {
-    // Enable debug logging
-    log::logger::instance().set_level(log::level::debug);
-    
-    std::cout << "=== Elio Hello World Example ===" << std::endl;
-    
-    // Create scheduler with 2 worker threads
-    runtime::scheduler sched(2);
-    
-    // Start the scheduler
-    sched.start();
-    
-    // Spawn the main task (release ownership to scheduler)
-    auto t = main_task();
-    sched.spawn(t.release());
-    
-    // Wait for task to complete
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    
-    // Shutdown the scheduler
-    sched.shutdown();
-    
     std::cout << "=== Example completed ===" << std::endl;
     
-    return 0;
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)

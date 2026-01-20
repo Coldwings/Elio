@@ -108,7 +108,14 @@ public:
     }
     
     void await_suspend(std::coroutine_handle<> awaiter) const {
-        // Reschedule on the current scheduler
+        // Fast path: if on a worker thread, push directly to local queue
+        auto* worker = runtime::worker_thread::current();
+        if (worker) {
+            worker->schedule_local(awaiter);
+            return;
+        }
+        
+        // Slow path: go through scheduler's spawn mechanism
         auto* sched = runtime::scheduler::current();
         if (sched) {
             sched->spawn(awaiter);

@@ -1,5 +1,6 @@
 #include <elio/runtime/scheduler.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/time/timer.hpp>
 #include <elio/log/macros.hpp>
 #include <iostream>
 #include <atomic>
@@ -177,6 +178,84 @@ void benchmark_context_switch() {
     std::cout << std::endl;
 }
 
+// Time-based yield benchmark - simulates vthreads calling yield
+// Uses single worker thread to measure pure yield overhead without work-stealing contention
+void benchmark_yield() {
+    const int yields_per_vthread = 1000;
+    
+    std::cout << "Yield Benchmark (single worker, each vthread count runs for " 
+              << duration_cast<seconds>(MIN_BENCH_DURATION).count() << "+ seconds):" << std::endl;
+    std::cout << std::endl;
+    
+    for (int num_vthreads : {2, 100, 1000}) {
+        std::vector<double> samples;  // ns per yield for each batch
+        size_t total_yields = 0;
+        
+        std::cout << "  " << num_vthreads << " vthreads: " << std::flush;
+        
+        auto bench_start = steady_clock::now();
+        
+        while (duration_cast<seconds>(steady_clock::now() - bench_start) < MIN_BENCH_DURATION) {
+            runtime::scheduler sched(1);  // Single worker thread
+            sched.start();
+            
+            std::atomic<int> completed{0};
+            std::atomic<int64_t> end_time_ns{0};  // Last task records end timestamp
+            
+            // Each vthread yields multiple times
+            auto yield_task = [&]() -> coro::task<void> {
+                for (int i = 0; i < yields_per_vthread; ++i) {
+                    co_await time::yield();
+                }
+                // Last task to complete records the end timestamp
+                if (completed.fetch_add(1, std::memory_order_acq_rel) == num_vthreads - 1) {
+                    end_time_ns.store(
+                        duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count(),
+                        std::memory_order_release);
+                }
+                co_return;
+            };
+            
+            // Capture start time in main thread
+            auto start_time_ns = duration_cast<nanoseconds>(
+                steady_clock::now().time_since_epoch()).count();
+            
+            // Spawn all vthreads
+            for (int i = 0; i < num_vthreads; ++i) {
+                auto t = yield_task();
+                sched.spawn(t.release());
+            }
+            
+            // Wait for end_time_ns to be set (spin-wait for accuracy)
+            while (end_time_ns.load(std::memory_order_acquire) == 0) {
+                // Spin without yielding for accurate measurement
+            }
+            
+            // Calculate duration in main thread
+            auto batch_ns = end_time_ns.load(std::memory_order_acquire) - start_time_ns;
+            
+            int batch_yields = num_vthreads * yields_per_vthread;
+            samples.push_back(static_cast<double>(batch_ns) / batch_yields);
+            total_yields += batch_yields;
+            
+            sched.shutdown();
+        }
+        
+        auto bench_end = steady_clock::now();
+        auto total_sec = duration_cast<milliseconds>(bench_end - bench_start).count() / 1000.0;
+        
+        auto stats = bench_stats::compute(samples);
+        
+        std::cout << std::fixed << std::setprecision(1) << total_sec << "s, "
+                  << total_yields << " yields, "
+                  << std::setprecision(2) << "avg=" << stats.avg << " ns/yield "
+                  << "(min=" << stats.min << ", max=" << stats.max 
+                  << ", stddev=" << stats.stddev << ")" << std::endl;
+    }
+    
+    std::cout << std::endl;
+}
+
 // Time-based work stealing benchmark
 void benchmark_work_stealing() {
     const int batch_size = 1000;
@@ -351,11 +430,16 @@ int main() {
     }
     
     {
-        std::cout << "--- Benchmark 3: Work Stealing Performance ---" << std::endl;
+        std::cout << "--- Benchmark 3: Yield Performance ---" << std::endl;
+        benchmark_yield();
+    }
+    
+    {
+        std::cout << "--- Benchmark 4: Work Stealing Performance ---" << std::endl;
         benchmark_work_stealing();
     }
     
-    std::cout << "--- Benchmark 4: Scalability ---" << std::endl;
+    std::cout << "--- Benchmark 5: Scalability ---" << std::endl;
     benchmark_scalability();
     
     std::cout << "=== Benchmarks completed ===" << std::endl;

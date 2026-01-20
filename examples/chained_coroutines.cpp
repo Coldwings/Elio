@@ -1,7 +1,4 @@
-#include <elio/runtime/scheduler.hpp>
-#include <elio/coro/task.hpp>
-#include <elio/coro/frame.hpp>
-#include <elio/log/macros.hpp>
+#include <elio/elio.hpp>
 #include <iostream>
 
 using namespace elio;
@@ -28,7 +25,7 @@ coro::task<int> level2_multiply(int multiplier) {
 }
 
 // Outer coroutine (level 1)
-coro::task<void> level1_orchestrate() {
+coro::task<int> level1_orchestrate() {
     ELIO_LOG_INFO("Level 1: Starting orchestration");
     size_t depth = coro::get_stack_depth();
     std::cout << "  [Level 1] Virtual stack depth: " << depth << std::endl;
@@ -40,10 +37,10 @@ coro::task<void> level1_orchestrate() {
     std::cout << "  [Level 1] Total: " << result1 << " + " << result2 << " = " << total << std::endl;
     
     ELIO_LOG_INFO("Level 1: Orchestration complete");
-    co_return;
+    co_return total;
 }
 
-int main() {
+coro::task<int> async_main() {
     // Enable debug logging
     log::logger::instance().set_level(log::level::debug);
     
@@ -51,24 +48,15 @@ int main() {
     std::cout << "Demonstrating virtual stack tracking across 3 levels of coroutines" << std::endl;
     std::cout << std::endl;
     
-    // Create scheduler
-    runtime::scheduler sched(2);
-    sched.start();
-    
-    // Spawn the orchestration task
-    auto t = level1_orchestrate();
-    sched.spawn(t.release());
-    
-    // Wait for completion
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    
-    // Shutdown
-    sched.shutdown();
+    int result = co_await level1_orchestrate();
     
     std::cout << std::endl;
     std::cout << "=== Example completed ===" << std::endl;
     std::cout << "Virtual stack automatically tracked call chain:" << std::endl;
     std::cout << "  level1_orchestrate -> level2_multiply -> level3_compute" << std::endl;
+    std::cout << "Final result: " << result << std::endl;
     
-    return 0;
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)

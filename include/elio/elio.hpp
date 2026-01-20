@@ -32,6 +32,7 @@
 
 // Networking
 #include "net/tcp.hpp"
+#include "net/uds.hpp"
 
 // Timers
 #include "time/timer.hpp"

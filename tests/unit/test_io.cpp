@@ -7,11 +7,13 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <cstring>
 #include <thread>
 #include <atomic>
+#include <array>
 
 using namespace elio::io;
 using namespace elio::coro;
@@ -455,4 +457,489 @@ TEST_CASE("epoll_backend write operation registration", "[io][epoll][write]") {
     
     close(sv[0]);
     close(sv[1]);
+}
+
+// ============================================================================
+// Unix Domain Socket (UDS) Tests
+// ============================================================================
+
+#include <elio/net/uds.hpp>
+
+using namespace elio::net;
+
+TEST_CASE("unix_address basic operations", "[uds][address]") {
+    SECTION("default constructor") {
+        unix_address addr;
+        REQUIRE(addr.path.empty());
+        REQUIRE(addr.to_string() == "(unnamed)");
+    }
+    
+    SECTION("filesystem path") {
+        unix_address addr("/tmp/test.sock");
+        REQUIRE(addr.path == "/tmp/test.sock");
+        REQUIRE(addr.to_string() == "/tmp/test.sock");
+        REQUIRE_FALSE(addr.is_abstract());
+        
+        auto sa = addr.to_sockaddr();
+        REQUIRE(sa.sun_family == AF_UNIX);
+        REQUIRE(std::string(sa.sun_path) == "/tmp/test.sock");
+    }
+    
+    SECTION("abstract socket") {
+        auto addr = unix_address::abstract("test_socket");
+        REQUIRE(addr.is_abstract());
+        REQUIRE(addr.to_string() == "@test_socket");
+        
+        auto sa = addr.to_sockaddr();
+        REQUIRE(sa.sun_family == AF_UNIX);
+        REQUIRE(sa.sun_path[0] == '\0');
+    }
+    
+    SECTION("sockaddr_len calculation") {
+        unix_address empty;
+        REQUIRE(empty.sockaddr_len() == sizeof(sa_family_t));
+        
+        unix_address fs("/tmp/x.sock");
+        // offsetof(sockaddr_un, sun_path) + path.size() + 1 (null terminator)
+        REQUIRE(fs.sockaddr_len() == static_cast<socklen_t>(
+            offsetof(struct sockaddr_un, sun_path) + fs.path.size() + 1));
+        
+        auto abstract = unix_address::abstract("test");
+        // offsetof(sockaddr_un, sun_path) + path.size() (includes leading null)
+        REQUIRE(abstract.sockaddr_len() == static_cast<socklen_t>(
+            offsetof(struct sockaddr_un, sun_path) + abstract.path.size()));
+    }
+}
+
+TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
+    io_context ctx(io_context::backend_type::epoll);
+    
+    // Use abstract socket to avoid filesystem cleanup issues
+    auto addr = unix_address::abstract("elio_test_listener_" + std::to_string(getpid()));
+    
+    SECTION("bind creates listener") {
+        auto listener = uds_listener::bind(addr, ctx);
+        REQUIRE(listener.has_value());
+        REQUIRE(listener->is_valid());
+        REQUIRE(listener->fd() >= 0);
+        REQUIRE(listener->local_address().to_string() == addr.to_string());
+    }
+    
+    SECTION("accept returns connection") {
+        auto listener = uds_listener::bind(addr, ctx);
+        REQUIRE(listener.has_value());
+        
+        // Create a client connection in a separate thread
+        std::atomic<bool> client_connected{false};
+        std::thread client_thread([&]() {
+            // Wait a bit for the accept to be registered
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            
+            int client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+            REQUIRE(client_fd >= 0);
+            
+            auto sa = addr.to_sockaddr();
+            int ret = connect(client_fd, reinterpret_cast<struct sockaddr*>(&sa), 
+                             addr.sockaddr_len());
+            REQUIRE(ret == 0);
+            client_connected = true;
+            
+            // Keep connection open briefly
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            close(client_fd);
+        });
+        
+        std::atomic<bool> accepted{false};
+        std::optional<uds_stream> accepted_stream;
+        
+        auto accept_coro = [&]() -> task<void> {
+            auto stream = co_await listener->accept();
+            accepted_stream = std::move(stream);
+            accepted = true;
+        };
+        
+        auto t = accept_coro();
+        t.handle().resume();
+        
+        // Poll for completion
+        for (int i = 0; i < 200 && !accepted; ++i) {
+            ctx.poll(std::chrono::milliseconds(10));
+        }
+        
+        REQUIRE(accepted);
+        REQUIRE(accepted_stream.has_value());
+        REQUIRE(accepted_stream->is_valid());
+        
+        client_thread.join();
+    }
+}
+
+TEST_CASE("UDS connect", "[uds][connect]") {
+    io_context ctx(io_context::backend_type::epoll);
+    
+    auto addr = unix_address::abstract("elio_test_connect_" + std::to_string(getpid()));
+    
+    // Create server listener
+    auto listener = uds_listener::bind(addr, ctx);
+    REQUIRE(listener.has_value());
+    
+    // Start accept in background
+    std::atomic<bool> server_accepted{false};
+    std::optional<uds_stream> server_stream;
+    
+    auto accept_coro = [&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        server_stream = std::move(stream);
+        server_accepted = true;
+    };
+    
+    auto accept_task = accept_coro();
+    accept_task.handle().resume();
+    
+    // Connect client
+    std::atomic<bool> client_connected{false};
+    std::optional<uds_stream> client_stream;
+    
+    auto connect_coro = [&]() -> task<void> {
+        auto stream = co_await uds_connect(ctx, addr);
+        client_stream = std::move(stream);
+        client_connected = true;
+    };
+    
+    auto connect_task = connect_coro();
+    connect_task.handle().resume();
+    
+    // Poll until both complete
+    for (int i = 0; i < 200 && (!server_accepted || !client_connected); ++i) {
+        ctx.poll(std::chrono::milliseconds(10));
+    }
+    
+    REQUIRE(server_accepted);
+    REQUIRE(client_connected);
+    REQUIRE(server_stream.has_value());
+    REQUIRE(client_stream.has_value());
+    REQUIRE(server_stream->is_valid());
+    REQUIRE(client_stream->is_valid());
+}
+
+TEST_CASE("UDS stream read/write", "[uds][stream]") {
+    io_context ctx(io_context::backend_type::epoll);
+    
+    auto addr = unix_address::abstract("elio_test_rw_" + std::to_string(getpid()));
+    
+    // Create server and client
+    auto listener = uds_listener::bind(addr, ctx);
+    REQUIRE(listener.has_value());
+    
+    std::optional<uds_stream> server_stream;
+    std::optional<uds_stream> client_stream;
+    std::atomic<int> setup_complete{0};
+    
+    auto accept_coro = [&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        server_stream = std::move(stream);
+        setup_complete++;
+    };
+    
+    auto connect_coro = [&]() -> task<void> {
+        auto stream = co_await uds_connect(ctx, addr);
+        client_stream = std::move(stream);
+        setup_complete++;
+    };
+    
+    auto accept_task = accept_coro();
+    auto connect_task = connect_coro();
+    accept_task.handle().resume();
+    connect_task.handle().resume();
+    
+    for (int i = 0; i < 200 && setup_complete < 2; ++i) {
+        ctx.poll(std::chrono::milliseconds(10));
+    }
+    
+    REQUIRE(setup_complete == 2);
+    REQUIRE(server_stream.has_value());
+    REQUIRE(client_stream.has_value());
+    
+    SECTION("client to server") {
+        const char* msg = "Hello from client!";
+        char buffer[64] = {0};
+        std::atomic<bool> write_done{false};
+        std::atomic<bool> read_done{false};
+        io_result write_result{};
+        io_result read_result{};
+        
+        auto write_coro = [&]() -> task<void> {
+            write_result = co_await client_stream->write(msg, strlen(msg));
+            write_done = true;
+        };
+        
+        auto read_coro = [&]() -> task<void> {
+            read_result = co_await server_stream->read(buffer, sizeof(buffer) - 1);
+            read_done = true;
+        };
+        
+        auto write_task = write_coro();
+        auto read_task = read_coro();
+        write_task.handle().resume();
+        read_task.handle().resume();
+        
+        for (int i = 0; i < 200 && (!write_done || !read_done); ++i) {
+            ctx.poll(std::chrono::milliseconds(10));
+        }
+        
+        REQUIRE(write_done);
+        REQUIRE(read_done);
+        REQUIRE(write_result.success());
+        REQUIRE(read_result.success());
+        REQUIRE(write_result.bytes_transferred() == static_cast<int>(strlen(msg)));
+        REQUIRE(read_result.bytes_transferred() == static_cast<int>(strlen(msg)));
+        REQUIRE(std::string(buffer) == msg);
+    }
+    
+    SECTION("server to client") {
+        const char* msg = "Hello from server!";
+        char buffer[64] = {0};
+        std::atomic<bool> write_done{false};
+        std::atomic<bool> read_done{false};
+        io_result write_result{};
+        io_result read_result{};
+        
+        auto write_coro = [&]() -> task<void> {
+            write_result = co_await server_stream->write(msg, strlen(msg));
+            write_done = true;
+        };
+        
+        auto read_coro = [&]() -> task<void> {
+            read_result = co_await client_stream->read(buffer, sizeof(buffer) - 1);
+            read_done = true;
+        };
+        
+        auto write_task = write_coro();
+        auto read_task = read_coro();
+        write_task.handle().resume();
+        read_task.handle().resume();
+        
+        for (int i = 0; i < 200 && (!write_done || !read_done); ++i) {
+            ctx.poll(std::chrono::milliseconds(10));
+        }
+        
+        REQUIRE(write_done);
+        REQUIRE(read_done);
+        REQUIRE(write_result.success());
+        REQUIRE(read_result.success());
+        REQUIRE(write_result.bytes_transferred() == static_cast<int>(strlen(msg)));
+        REQUIRE(read_result.bytes_transferred() == static_cast<int>(strlen(msg)));
+        REQUIRE(std::string(buffer) == msg);
+    }
+}
+
+TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
+    io_context ctx(io_context::backend_type::epoll);
+    
+    auto addr = unix_address::abstract("elio_test_concurrent_" + std::to_string(getpid()));
+    
+    auto listener = uds_listener::bind(addr, ctx);
+    REQUIRE(listener.has_value());
+    
+    constexpr int NUM_CLIENTS = 3;
+    std::array<std::optional<uds_stream>, NUM_CLIENTS> server_streams;
+    std::array<std::optional<uds_stream>, NUM_CLIENTS> client_streams;
+    std::atomic<int> accepts_done{0};
+    std::atomic<int> connects_done{0};
+    
+    // Accept coroutines - use array to avoid vector reallocation issues
+    auto accept0 = [&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        server_streams[0] = std::move(stream);
+        accepts_done++;
+    };
+    auto accept1 = [&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        server_streams[1] = std::move(stream);
+        accepts_done++;
+    };
+    auto accept2 = [&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        server_streams[2] = std::move(stream);
+        accepts_done++;
+    };
+    
+    // Connect coroutines
+    auto connect0 = [&]() -> task<void> {
+        auto stream = co_await uds_connect(ctx, addr);
+        client_streams[0] = std::move(stream);
+        connects_done++;
+    };
+    auto connect1 = [&]() -> task<void> {
+        auto stream = co_await uds_connect(ctx, addr);
+        client_streams[1] = std::move(stream);
+        connects_done++;
+    };
+    auto connect2 = [&]() -> task<void> {
+        auto stream = co_await uds_connect(ctx, addr);
+        client_streams[2] = std::move(stream);
+        connects_done++;
+    };
+    
+    auto a0 = accept0(); auto a1 = accept1(); auto a2 = accept2();
+    auto c0 = connect0(); auto c1 = connect1(); auto c2 = connect2();
+    
+    // Start all coroutines
+    a0.handle().resume();
+    a1.handle().resume();
+    a2.handle().resume();
+    c0.handle().resume();
+    c1.handle().resume();
+    c2.handle().resume();
+    
+    // Poll until all connections are made
+    for (int i = 0; i < 500 && (accepts_done < NUM_CLIENTS || connects_done < NUM_CLIENTS); ++i) {
+        ctx.poll(std::chrono::milliseconds(10));
+    }
+    
+    REQUIRE(accepts_done == NUM_CLIENTS);
+    REQUIRE(connects_done == NUM_CLIENTS);
+    
+    for (int i = 0; i < NUM_CLIENTS; ++i) {
+        REQUIRE(server_streams[i].has_value());
+        REQUIRE(client_streams[i].has_value());
+        REQUIRE(server_streams[i]->is_valid());
+        REQUIRE(client_streams[i]->is_valid());
+    }
+}
+
+TEST_CASE("UDS filesystem socket", "[uds][filesystem]") {
+    io_context ctx(io_context::backend_type::epoll);
+    
+    // Use filesystem socket
+    std::string path = "/tmp/elio_test_fs_" + std::to_string(getpid()) + ".sock";
+    unix_address addr(path);
+    
+    // Ensure socket file doesn't exist
+    ::unlink(path.c_str());
+    
+    auto listener = uds_listener::bind(addr, ctx);
+    REQUIRE(listener.has_value());
+    
+    // Socket file should exist
+    struct stat st;
+    REQUIRE(stat(path.c_str(), &st) == 0);
+    REQUIRE(S_ISSOCK(st.st_mode));
+    
+    // Create client connection
+    std::atomic<bool> connected{false};
+    std::optional<uds_stream> client_stream;
+    
+    auto connect_coro = [&]() -> task<void> {
+        auto stream = co_await uds_connect(ctx, addr);
+        client_stream = std::move(stream);
+        connected = true;
+    };
+    
+    // Accept on server
+    std::atomic<bool> accepted{false};
+    std::optional<uds_stream> server_stream;
+    
+    auto accept_coro = [&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        server_stream = std::move(stream);
+        accepted = true;
+    };
+    
+    auto accept_task = accept_coro();
+    auto connect_task = connect_coro();
+    accept_task.handle().resume();
+    connect_task.handle().resume();
+    
+    for (int i = 0; i < 200 && (!connected || !accepted); ++i) {
+        ctx.poll(std::chrono::milliseconds(10));
+    }
+    
+    REQUIRE(connected);
+    REQUIRE(accepted);
+    
+    // Close listener - should unlink socket file
+    listener->close();
+    REQUIRE(stat(path.c_str(), &st) != 0);  // File should be gone
+}
+
+TEST_CASE("UDS echo test", "[uds][echo]") {
+    io_context ctx(io_context::backend_type::epoll);
+    
+    auto addr = unix_address::abstract("elio_test_echo_" + std::to_string(getpid()));
+    
+    auto listener = uds_listener::bind(addr, ctx);
+    REQUIRE(listener.has_value());
+    
+    // Use a simpler pattern: thread for client, coroutine for server
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    char server_recv[64] = {0};
+    char client_recv[64] = {0};
+    int server_bytes = 0;
+    int client_bytes = 0;
+    
+    // Server coroutine
+    auto server_coro = [&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
+        
+        // Read
+        auto r = co_await stream->read(server_recv, sizeof(server_recv) - 1);
+        if (r.result > 0) {
+            server_bytes = r.result;
+            // Echo back
+            co_await stream->write(server_recv, r.result);
+        }
+        server_done = true;
+    };
+    
+    auto server_task = server_coro();
+    server_task.handle().resume();
+    
+    // Client in a thread (to avoid coroutine complexity)
+    std::thread client_thread([&]() {
+        // Wait briefly for server to be ready
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            client_done = true;
+            return;
+        }
+        
+        auto sa = addr.to_sockaddr();
+        if (connect(fd, reinterpret_cast<struct sockaddr*>(&sa), addr.sockaddr_len()) < 0) {
+            close(fd);
+            client_done = true;
+            return;
+        }
+        
+        const char* msg = "Hello!";
+        if (send(fd, msg, strlen(msg), 0) <= 0) {
+            close(fd);
+            client_done = true;
+            return;
+        }
+        
+        client_bytes = static_cast<int>(recv(fd, client_recv, sizeof(client_recv) - 1, 0));
+        close(fd);
+        client_done = true;
+    });
+    
+    // Poll until both complete
+    for (int i = 0; i < 500 && (!server_done || !client_done); ++i) {
+        ctx.poll(std::chrono::milliseconds(10));
+    }
+    
+    client_thread.join();
+    
+    REQUIRE(server_done);
+    REQUIRE(client_done);
+    REQUIRE(server_bytes == 6);  // "Hello!"
+    REQUIRE(client_bytes == 6);
+    REQUIRE(std::string(client_recv) == "Hello!");
 }

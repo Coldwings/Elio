@@ -1,6 +1,4 @@
-#include <elio/runtime/scheduler.hpp>
-#include <elio/coro/task.hpp>
-#include <elio/log/macros.hpp>
+#include <elio/elio.hpp>
 #include <iostream>
 #include <stdexcept>
 
@@ -34,9 +32,9 @@ coro::task<void> safe_executor() {
     
     try {
         int result = co_await process_batch(5, 10);
-        std::cout << "  ✓ Success: Result = " << result << std::endl;
+        std::cout << "  Success: Result = " << result << std::endl;
     } catch (const std::exception& e) {
-        std::cout << "  ✗ Should not happen: " << e.what() << std::endl;
+        std::cout << "  Should not happen: " << e.what() << std::endl;
     }
     
     std::cout << std::endl;
@@ -44,9 +42,9 @@ coro::task<void> safe_executor() {
     
     try {
         int result = co_await process_batch(5, -10);  // Will throw
-        std::cout << "  ✗ Should not reach here: " << result << std::endl;
+        std::cout << "  Should not reach here: " << result << std::endl;
     } catch (const std::exception& e) {
-        std::cout << "  ✓ Exception caught: " << e.what() << std::endl;
+        std::cout << "  Exception caught: " << e.what() << std::endl;
     }
     
     std::cout << std::endl;
@@ -54,9 +52,9 @@ coro::task<void> safe_executor() {
     
     try {
         int result = co_await process_batch(7, 8);
-        std::cout << "  ✓ Success after recovery: Result = " << result << std::endl;
+        std::cout << "  Success after recovery: Result = " << result << std::endl;
     } catch (const std::exception& e) {
-        std::cout << "  ✗ Unexpected error: " << e.what() << std::endl;
+        std::cout << "  Unexpected error: " << e.what() << std::endl;
     }
     
     co_return;
@@ -81,15 +79,15 @@ coro::task<void> level1() {
     
     try {
         int result = co_await level2();
-        std::cout << "  ✗ Should not reach: " << result << std::endl;
+        std::cout << "  Should not reach: " << result << std::endl;
     } catch (const std::runtime_error& e) {
-        std::cout << "  ✓ Exception propagated through 4 levels: " << e.what() << std::endl;
+        std::cout << "  Exception propagated through 4 levels: " << e.what() << std::endl;
     }
     
     co_return;
 }
 
-int main() {
+coro::task<int> async_main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
     // Enable info logging
     log::logger::instance().set_level(log::level::info);
     
@@ -97,30 +95,19 @@ int main() {
     std::cout << "Demonstrating exception propagation through virtual stack" << std::endl;
     std::cout << std::endl;
     
-    // Create scheduler
-    runtime::scheduler sched(2);
-    sched.start();
-    
     // Run safe executor
-    auto t1 = safe_executor();
-    sched.spawn(t1.release());
-    
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    co_await safe_executor();
     
     std::cout << std::endl;
     
     // Run deep propagation test
-    auto t2 = level1();
-    sched.spawn(t2.release());
-    
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    
-    // Shutdown
-    sched.shutdown();
+    co_await level1();
     
     std::cout << std::endl;
     std::cout << "=== Example completed ===" << std::endl;
     std::cout << "All exceptions were properly propagated and caught!" << std::endl;
     
-    return 0;
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)

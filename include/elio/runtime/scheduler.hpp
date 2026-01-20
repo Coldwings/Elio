@@ -343,10 +343,11 @@ inline void worker_thread::drain_inbox() noexcept {
 }
 
 inline void worker_thread::run() {
-    // Set the current scheduler for this worker thread so schedule_handle() works
+    // Set the current scheduler and worker for this thread
     scheduler::current_scheduler_ = scheduler_;
+    current_worker_ = this;
     
-    while (running_.load(std::memory_order_acquire)) {
+    while (running_.load(std::memory_order_relaxed)) {
         if (scheduler_->is_paused()) [[unlikely]] {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
@@ -361,29 +362,46 @@ inline void worker_thread::run() {
         }
     }
     
-    // Clear the scheduler reference when done
+    // Clear the references when done
     scheduler::current_scheduler_ = nullptr;
+    current_worker_ = nullptr;
     
     // Note: Cleanup of remaining tasks is handled in stop() AFTER join
     // to avoid race conditions with work stealing
 }
 
 inline std::coroutine_handle<> worker_thread::get_next_task() noexcept {
-    // First, drain any externally submitted tasks from inbox to local deque
+    // Fast path: pop from local deque first (no synchronization needed)
+    void* addr = queue_.pop();
+    if (addr) {
+        needs_sync_ = false;  // Local task, no sync needed
+        return std::coroutine_handle<>::from_address(addr);
+    }
+    
+    // Local queue empty - drain any externally submitted tasks from inbox
     drain_inbox();
     
-    // Pop from local deque (lock-free, owner-only operation)
-    void* addr = queue_.pop();
-    if (addr) return std::coroutine_handle<>::from_address(addr);
+    // Try local deque again after draining inbox
+    addr = queue_.pop();
+    if (addr) {
+        needs_sync_ = true;  // Came from inbox, needs sync
+        return std::coroutine_handle<>::from_address(addr);
+    }
     
     // Nothing local, try stealing from other workers
-    return try_steal();
+    auto handle = try_steal();
+    if (handle) {
+        needs_sync_ = true;  // Stolen task, needs sync
+    }
+    return handle;
 }
 
 inline void worker_thread::run_task(std::coroutine_handle<> handle) noexcept {
-    // Acquire fence synchronizes with the release fence in spawn()
-    // ensuring we see all writes to the coroutine frame
-    std::atomic_thread_fence(std::memory_order_acquire);
+    // Acquire fence only for tasks from external sources (inbox/steal)
+    // Local tasks don't need synchronization - same thread visibility
+    if (needs_sync_) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+    }
     
     if (!handle || handle.done()) [[unlikely]] return;
     

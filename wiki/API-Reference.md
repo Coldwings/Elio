@@ -74,7 +74,78 @@ public:
     
     // Get number of worker threads
     size_t worker_count() const noexcept;
+    
+    // Get the current scheduler (thread-local)
+    static scheduler* current() noexcept;
 };
+```
+
+### `run_config`
+
+Configuration for running async tasks.
+
+```cpp
+struct run_config {
+    size_t num_threads = 0;           // 0 = hardware concurrency
+    io::io_context* io_context = nullptr;  // nullptr = create default
+};
+```
+
+### `run()`
+
+Run a coroutine to completion.
+
+```cpp
+// Run task with configuration
+template<typename T>
+T run(coro::task<T> task, const run_config& config = {});
+
+// Run task with specified thread count
+template<typename T>
+T run(coro::task<T> task, size_t num_threads);
+```
+
+**Example:**
+```cpp
+coro::task<int> async_main(int argc, char* argv[]) {
+    co_return 42;
+}
+
+int main(int argc, char* argv[]) {
+    return elio::run(async_main(argc, argv));
+}
+
+// With configuration
+int main(int argc, char* argv[]) {
+    elio::run_config config;
+    config.num_threads = 4;
+    return elio::run(async_main(argc, argv), config);
+}
+```
+
+### `ELIO_ASYNC_MAIN` Macros
+
+Macros to define main() that runs an async_main coroutine.
+
+| Macro | async_main signature | Description |
+|-------|---------------------|-------------|
+| `ELIO_ASYNC_MAIN` | `task<int>(int, char**)` | With args, returns exit code |
+| `ELIO_ASYNC_MAIN_VOID` | `task<void>(int, char**)` | With args, always exits 0 |
+| `ELIO_ASYNC_MAIN_NOARGS` | `task<int>()` | No args, returns exit code |
+| `ELIO_ASYNC_MAIN_VOID_NOARGS` | `task<void>()` | No args, always exits 0 |
+
+**Example:**
+```cpp
+coro::task<int> async_main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <arg>\n";
+        co_return 1;
+    }
+    co_await do_work(argv[1]);
+    co_return 0;
+}
+
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ---

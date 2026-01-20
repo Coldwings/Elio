@@ -22,6 +22,7 @@
 #include "runtime/scheduler.hpp"
 #include "runtime/worker_thread.hpp"
 #include "runtime/chase_lev_deque.hpp"
+#include "runtime/async_main.hpp"
 
 // I/O backend
 #include "io/io_backend.hpp"
@@ -70,19 +71,11 @@ inline constexpr auto version_tuple() noexcept {
 ///     co_return 42;
 /// }
 /// 
-/// coro::task<void> main_task() {
+/// coro::task<int> async_main(int argc, char* argv[]) {
 ///     int result = co_await compute();
 ///     std::cout << "Result: " << result << std::endl;
+///     co_return 0;
 /// }
 /// 
-/// int main() {
-///     runtime::scheduler sched(4);  // 4 worker threads
-///     sched.start();
-///     
-///     auto t = main_task();
-///     sched.spawn(t.handle());
-///     
-///     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-///     sched.shutdown();
-/// }
+/// ELIO_ASYNC_MAIN(async_main)
 /// ```

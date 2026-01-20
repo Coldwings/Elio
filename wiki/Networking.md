@@ -1,6 +1,6 @@
 # Networking
 
-Elio provides async networking support for TCP, HTTP/1.1, HTTP/2, and TLS/HTTPS.
+Elio provides async networking support for TCP, Unix Domain Sockets (UDS), HTTP/1.1, HTTP/2, and TLS/HTTPS.
 
 ## TCP
 
@@ -84,6 +84,117 @@ if (peer) {
     ELIO_LOG_INFO("Connected to: {}", peer->to_string());
 }
 ```
+
+## Unix Domain Sockets (UDS)
+
+Unix Domain Sockets provide high-performance local inter-process communication. Elio supports both filesystem sockets and abstract sockets (Linux-specific).
+
+### UDS Server
+
+```cpp
+#include <elio/elio.hpp>
+
+using namespace elio;
+using namespace elio::net;
+
+coro::task<void> handle_client(uds_stream stream) {
+    char buffer[1024];
+    
+    while (true) {
+        auto result = co_await stream.read(buffer, sizeof(buffer));
+        if (result.result <= 0) break;
+        
+        co_await stream.write(buffer, result.result);
+    }
+    co_return;
+}
+
+coro::task<void> server(const unix_address& addr, runtime::scheduler& sched) {
+    auto& ctx = io::default_io_context();
+    
+    uds_options opts;
+    opts.unlink_on_bind = true;  // Remove existing socket file
+    
+    auto listener = uds_listener::bind(addr, ctx, opts);
+    if (!listener) {
+        ELIO_LOG_ERROR("Bind failed: {}", strerror(errno));
+        co_return;
+    }
+    
+    while (true) {
+        auto stream = co_await listener->accept();
+        if (!stream) continue;
+        
+        auto handler = handle_client(std::move(*stream));
+        sched.spawn(handler.release());
+    }
+}
+```
+
+### UDS Client
+
+```cpp
+coro::task<void> client(const unix_address& addr) {
+    auto& ctx = io::default_io_context();
+    
+    // Connect to server
+    auto stream = co_await uds_connect(ctx, addr);
+    if (!stream) {
+        ELIO_LOG_ERROR("Connect failed: {}", strerror(errno));
+        co_return;
+    }
+    
+    // Send data
+    const char* msg = "Hello via UDS!";
+    co_await stream->write(msg, strlen(msg));
+    
+    // Receive response
+    char buffer[1024];
+    auto result = co_await stream->read(buffer, sizeof(buffer));
+    if (result.result > 0) {
+        ELIO_LOG_INFO("Received: {}", std::string_view(buffer, result.result));
+    }
+    co_return;
+}
+```
+
+### UDS Address Types
+
+```cpp
+// Filesystem socket - creates a file at the specified path
+unix_address fs_addr("/tmp/my_server.sock");
+
+// Abstract socket (Linux-specific) - no filesystem entry
+auto abstract_addr = unix_address::abstract("my_service");
+
+// Check socket type
+if (addr.is_abstract()) {
+    ELIO_LOG_INFO("Using abstract socket");
+}
+
+// Get address string representation
+// Filesystem: "/tmp/my_server.sock"
+// Abstract: "@my_service"
+ELIO_LOG_INFO("Address: {}", addr.to_string());
+```
+
+### UDS vs TCP
+
+| Feature | UDS | TCP |
+|---------|-----|-----|
+| Scope | Local machine only | Network-wide |
+| Performance | Faster (no network stack) | Slower (full TCP/IP stack) |
+| Address | Filesystem path or abstract name | IP address + port |
+| Security | Filesystem permissions | Firewall rules |
+| Credential passing | Supported (SO_PASSCRED) | Not available |
+
+### When to Use UDS
+
+- Local inter-process communication (IPC)
+- Microservices on the same host
+- Database connections (e.g., PostgreSQL, MySQL)
+- Container-to-container communication within a pod
+- When you need higher throughput than TCP for local connections
 
 ## HTTP
 

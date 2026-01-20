@@ -5,10 +5,7 @@
 #include <elio/log/macros.hpp>
 
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <netdb.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
@@ -17,80 +14,103 @@
 #include <string_view>
 #include <optional>
 #include <span>
+#include <filesystem>
 
 namespace elio::net {
 
-/// TCP socket options
-struct tcp_options {
-    bool reuse_addr = true;      ///< SO_REUSEADDR
-    bool reuse_port = false;     ///< SO_REUSEPORT
-    bool no_delay = true;        ///< TCP_NODELAY (disable Nagle's algorithm)
-    bool keep_alive = false;     ///< SO_KEEPALIVE
+/// Unix Domain Socket options
+struct uds_options {
+    bool reuse_addr = false;     ///< SO_REUSEADDR (less common for UDS)
     int recv_buffer = 0;         ///< SO_RCVBUF (0 = system default)
     int send_buffer = 0;         ///< SO_SNDBUF (0 = system default)
     int backlog = 128;           ///< Listen backlog
+    bool unlink_on_bind = true;  ///< Unlink existing socket file before bind
 };
 
-/// IPv4 address wrapper
-struct ipv4_address {
-    uint32_t addr = INADDR_ANY;
-    uint16_t port = 0;
+/// Unix socket address wrapper
+struct unix_address {
+    std::string path;
     
-    ipv4_address() = default;
+    unix_address() = default;
     
-    ipv4_address(uint16_t p) : port(p) {}
+    /// Construct from path string
+    explicit unix_address(std::string_view p) : path(p) {}
     
-    /// Construct from IP address string and port
-    ipv4_address(std::string_view ip, uint16_t p) : port(p) {
-        if (ip.empty() || ip == "0.0.0.0") {
-            addr = INADDR_ANY;
+    /// Construct from sockaddr_un
+    explicit unix_address(const struct sockaddr_un& sa) {
+        if (sa.sun_path[0] == '\0') {
+            // Abstract socket (Linux-specific)
+            // The actual name starts at sun_path[1]
+            path = std::string(sa.sun_path, sizeof(sa.sun_path));
         } else {
-            // First try as numeric IP
-            if (inet_pton(AF_INET, std::string(ip).c_str(), &addr) != 1) {
-                // Not a numeric IP, try DNS resolution
-                struct addrinfo hints{};
-                struct addrinfo* result = nullptr;
-                hints.ai_family = AF_INET;
-                hints.ai_socktype = SOCK_STREAM;
-                
-                std::string ip_str(ip);
-                if (getaddrinfo(ip_str.c_str(), nullptr, &hints, &result) == 0 && result) {
-                    auto* sa = reinterpret_cast<struct sockaddr_in*>(result->ai_addr);
-                    addr = sa->sin_addr.s_addr;
-                    freeaddrinfo(result);
-                } else {
-                    ELIO_LOG_ERROR("Failed to resolve hostname: {}", ip);
-                    addr = INADDR_ANY;
-                }
-            }
+            path = sa.sun_path;
         }
     }
     
-    ipv4_address(const struct sockaddr_in& sa) 
-        : addr(sa.sin_addr.s_addr), port(ntohs(sa.sin_port)) {}
-    
-    struct sockaddr_in to_sockaddr() const {
-        struct sockaddr_in sa{};
-        sa.sin_family = AF_INET;
-        sa.sin_addr.s_addr = addr;
-        sa.sin_port = htons(port);
+    /// Convert to sockaddr_un
+    struct sockaddr_un to_sockaddr() const {
+        struct sockaddr_un sa{};
+        sa.sun_family = AF_UNIX;
+        
+        if (path.size() >= sizeof(sa.sun_path)) {
+            ELIO_LOG_ERROR("Unix socket path too long: {} (max {})", 
+                          path.size(), sizeof(sa.sun_path) - 1);
+            // Truncate to fit
+            std::memcpy(sa.sun_path, path.data(), sizeof(sa.sun_path) - 1);
+            sa.sun_path[sizeof(sa.sun_path) - 1] = '\0';
+        } else {
+            std::memcpy(sa.sun_path, path.data(), path.size());
+            sa.sun_path[path.size()] = '\0';
+        }
+        
         return sa;
     }
     
+    /// Get sockaddr length (varies for abstract sockets)
+    socklen_t sockaddr_len() const {
+        if (path.empty()) {
+            return sizeof(sa_family_t);
+        }
+        if (path[0] == '\0') {
+            // Abstract socket: length includes null byte and name
+            return static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + path.size());
+        }
+        // Filesystem socket: include null terminator
+        return static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) + path.size() + 1);
+    }
+    
+    /// Check if this is an abstract socket (Linux-specific)
+    bool is_abstract() const {
+        return !path.empty() && path[0] == '\0';
+    }
+    
+    /// Create an abstract socket address (Linux-specific)
+    /// Abstract sockets don't create filesystem entries and are automatically
+    /// cleaned up when all references are closed
+    static unix_address abstract(std::string_view name) {
+        unix_address addr;
+        addr.path.reserve(name.size() + 1);
+        addr.path.push_back('\0');
+        addr.path.append(name);
+        return addr;
+    }
+    
     std::string to_string() const {
-        char buf[INET_ADDRSTRLEN];
-        struct in_addr in{};
-        in.s_addr = addr;
-        inet_ntop(AF_INET, &in, buf, sizeof(buf));
-        return std::string(buf) + ":" + std::to_string(port);
+        if (path.empty()) {
+            return "(unnamed)";
+        }
+        if (path[0] == '\0') {
+            return "@" + path.substr(1);  // Convention: @ for abstract
+        }
+        return path;
     }
 };
 
-/// TCP stream for connected sockets
-class tcp_stream {
+/// Unix Domain Socket stream for connected sockets
+class uds_stream {
 public:
     /// Construct from file descriptor
-    explicit tcp_stream(int fd, io::io_context& ctx) 
+    explicit uds_stream(int fd, io::io_context& ctx) 
         : fd_(fd), ctx_(&ctx) {
         // Make non-blocking
         int flags = fcntl(fd_, F_GETFL, 0);
@@ -98,33 +118,33 @@ public:
     }
     
     /// Move constructor
-    tcp_stream(tcp_stream&& other) noexcept
+    uds_stream(uds_stream&& other) noexcept
         : fd_(other.fd_)
         , ctx_(other.ctx_)
-        , peer_addr_(other.peer_addr_) {
+        , peer_addr_(std::move(other.peer_addr_)) {
         other.fd_ = -1;
     }
     
     /// Move assignment
-    tcp_stream& operator=(tcp_stream&& other) noexcept {
+    uds_stream& operator=(uds_stream&& other) noexcept {
         if (this != &other) {
             close_sync();
             fd_ = other.fd_;
             ctx_ = other.ctx_;
-            peer_addr_ = other.peer_addr_;
+            peer_addr_ = std::move(other.peer_addr_);
             other.fd_ = -1;
         }
         return *this;
     }
     
     /// Destructor
-    ~tcp_stream() {
+    ~uds_stream() {
         close_sync();
     }
     
     // Non-copyable
-    tcp_stream(const tcp_stream&) = delete;
-    tcp_stream& operator=(const tcp_stream&) = delete;
+    uds_stream(const uds_stream&) = delete;
+    uds_stream& operator=(const uds_stream&) = delete;
     
     /// Check if stream is valid
     bool is_valid() const noexcept { return fd_ >= 0; }
@@ -137,21 +157,21 @@ public:
     const io::io_context& context() const noexcept { return *ctx_; }
     
     /// Get peer address
-    std::optional<ipv4_address> peer_address() const {
-        if (peer_addr_.port != 0) {
+    std::optional<unix_address> peer_address() const {
+        if (!peer_addr_.path.empty()) {
             return peer_addr_;
         }
         
-        struct sockaddr_in sa{};
+        struct sockaddr_un sa{};
         socklen_t len = sizeof(sa);
         if (getpeername(fd_, reinterpret_cast<struct sockaddr*>(&sa), &len) == 0) {
-            return ipv4_address(sa);
+            return unix_address(sa);
         }
         return std::nullopt;
     }
     
     /// Set peer address (used after accept)
-    void set_peer_address(const ipv4_address& addr) {
+    void set_peer_address(const unix_address& addr) {
         peer_addr_ = addr;
     }
     
@@ -199,16 +219,20 @@ public:
         return io::async_close(*ctx_, fd);
     }
     
-    /// Set TCP_NODELAY option
-    bool set_no_delay(bool enable) {
-        int flag = enable ? 1 : 0;
-        return setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) == 0;
+    /// Set SO_RCVBUF option
+    bool set_recv_buffer(int size) {
+        return setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) == 0;
     }
     
-    /// Set SO_KEEPALIVE option
-    bool set_keep_alive(bool enable) {
+    /// Set SO_SNDBUF option
+    bool set_send_buffer(int size) {
+        return setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) == 0;
+    }
+    
+    /// Enable/disable SO_PASSCRED (receive credentials)
+    bool set_pass_credentials(bool enable) {
         int flag = enable ? 1 : 0;
-        return setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag)) == 0;
+        return setsockopt(fd_, SOL_SOCKET, SO_PASSCRED, &flag, sizeof(flag)) == 0;
     }
     
 private:
@@ -221,23 +245,23 @@ private:
     
     int fd_ = -1;
     io::io_context* ctx_;
-    ipv4_address peer_addr_;
+    unix_address peer_addr_;
 };
 
-/// TCP listener for accepting connections
-class tcp_listener {
+/// Unix Domain Socket listener for accepting connections
+class uds_listener {
 public:
-    /// Create and bind a TCP listener
-    /// @param addr Address to bind to
+    /// Create and bind a Unix Domain Socket listener
+    /// @param addr Address (path) to bind to
     /// @param ctx I/O context
     /// @param opts Socket options
-    /// @return TCP listener on success, std::nullopt on error (check errno)
-    static std::optional<tcp_listener> bind(
-        const ipv4_address& addr,
+    /// @return UDS listener on success, std::nullopt on error (check errno)
+    static std::optional<uds_listener> bind(
+        const unix_address& addr,
         io::io_context& ctx,
-        const tcp_options& opts = {}) 
+        const uds_options& opts = {}) 
     {
-        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) {
             return std::nullopt;
         }
@@ -248,11 +272,6 @@ public:
             setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
         }
         
-        if (opts.reuse_port) {
-            int flag = 1;
-            setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag));
-        }
-        
         if (opts.recv_buffer > 0) {
             setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &opts.recv_buffer, sizeof(opts.recv_buffer));
         }
@@ -261,9 +280,15 @@ public:
             setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &opts.send_buffer, sizeof(opts.send_buffer));
         }
         
+        // Unlink existing socket file if requested (only for filesystem sockets)
+        if (opts.unlink_on_bind && !addr.is_abstract() && !addr.path.empty()) {
+            ::unlink(addr.path.c_str());
+        }
+        
         // Bind
         auto sa = addr.to_sockaddr();
-        if (::bind(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) < 0) {
+        socklen_t sa_len = addr.sockaddr_len();
+        if (::bind(fd, reinterpret_cast<struct sockaddr*>(&sa), sa_len) < 0) {
             int err = errno;
             ::close(fd);
             errno = err;
@@ -278,27 +303,27 @@ public:
             return std::nullopt;
         }
         
-        ELIO_LOG_INFO("TCP listener bound to {}", addr.to_string());
+        ELIO_LOG_INFO("UDS listener bound to {}", addr.to_string());
         
-        return tcp_listener(fd, ctx, addr, opts);
+        return uds_listener(fd, ctx, addr, opts);
     }
     
     /// Move constructor
-    tcp_listener(tcp_listener&& other) noexcept
+    uds_listener(uds_listener&& other) noexcept
         : fd_(other.fd_)
         , ctx_(other.ctx_)
-        , local_addr_(other.local_addr_)
+        , local_addr_(std::move(other.local_addr_))
         , opts_(other.opts_) {
         other.fd_ = -1;
     }
     
     /// Move assignment
-    tcp_listener& operator=(tcp_listener&& other) noexcept {
+    uds_listener& operator=(uds_listener&& other) noexcept {
         if (this != &other) {
             close_sync();
             fd_ = other.fd_;
             ctx_ = other.ctx_;
-            local_addr_ = other.local_addr_;
+            local_addr_ = std::move(other.local_addr_);
             opts_ = other.opts_;
             other.fd_ = -1;
         }
@@ -306,13 +331,13 @@ public:
     }
     
     /// Destructor
-    ~tcp_listener() {
+    ~uds_listener() {
         close_sync();
     }
     
     // Non-copyable
-    tcp_listener(const tcp_listener&) = delete;
-    tcp_listener& operator=(const tcp_listener&) = delete;
+    uds_listener(const uds_listener&) = delete;
+    uds_listener& operator=(const uds_listener&) = delete;
     
     /// Check if listener is valid
     bool is_valid() const noexcept { return fd_ >= 0; }
@@ -321,12 +346,12 @@ public:
     int fd() const noexcept { return fd_; }
     
     /// Get local address
-    const ipv4_address& local_address() const noexcept { return local_addr_; }
+    const unix_address& local_address() const noexcept { return local_addr_; }
     
     /// Accept a connection awaitable
     class accept_awaitable {
     public:
-        accept_awaitable(tcp_listener& listener)
+        accept_awaitable(uds_listener& listener)
             : listener_(listener) {}
         
         bool await_ready() const noexcept { return false; }
@@ -348,7 +373,7 @@ public:
             listener_.ctx_->submit();
         }
         
-        std::optional<tcp_stream> await_resume() {
+        std::optional<uds_stream> await_resume() {
             result_ = io::io_context::get_last_result();
             
             if (!result_.success()) {
@@ -357,28 +382,21 @@ public:
             }
             
             int client_fd = result_.result;
-            tcp_stream stream(client_fd, *listener_.ctx_);
+            uds_stream stream(client_fd, *listener_.ctx_);
             
-            // Apply TCP options
-            if (listener_.opts_.no_delay) {
-                stream.set_no_delay(true);
-            }
-            if (listener_.opts_.keep_alive) {
-                stream.set_keep_alive(true);
+            // Set peer address if available
+            if (peer_addr_len_ > offsetof(struct sockaddr_un, sun_path)) {
+                stream.set_peer_address(unix_address(peer_addr_));
             }
             
-            // Set peer address
-            stream.set_peer_address(ipv4_address(peer_addr_));
-            
-            ELIO_LOG_DEBUG("Accepted connection from {}", 
-                          ipv4_address(peer_addr_).to_string());
+            ELIO_LOG_DEBUG("Accepted UDS connection");
             
             return stream;
         }
         
     private:
-        tcp_listener& listener_;
-        struct sockaddr_in peer_addr_{};
+        uds_listener& listener_;
+        struct sockaddr_un peer_addr_{};
         socklen_t peer_addr_len_ = sizeof(peer_addr_);
         io::io_result result_{};
     };
@@ -394,52 +412,61 @@ public:
     }
     
 private:
-    tcp_listener(int fd, io::io_context& ctx, const ipv4_address& addr, const tcp_options& opts)
+    uds_listener(int fd, io::io_context& ctx, const unix_address& addr, const uds_options& opts)
         : fd_(fd), ctx_(&ctx), local_addr_(addr), opts_(opts) {}
     
     void close_sync() {
         if (fd_ >= 0) {
             ::close(fd_);
             fd_ = -1;
-            ELIO_LOG_INFO("TCP listener closed");
+            
+            // Unlink socket file (only for filesystem sockets)
+            if (!local_addr_.is_abstract() && !local_addr_.path.empty()) {
+                ::unlink(local_addr_.path.c_str());
+            }
+            
+            ELIO_LOG_INFO("UDS listener closed");
         }
     }
     
     int fd_ = -1;
     io::io_context* ctx_;
-    ipv4_address local_addr_;
-    tcp_options opts_;
+    unix_address local_addr_;
+    uds_options opts_;
 };
 
-/// Connect to a remote TCP server
-class tcp_connect_awaitable {
+/// Connect to a Unix Domain Socket server
+class uds_connect_awaitable {
 public:
-    tcp_connect_awaitable(io::io_context& ctx, const ipv4_address& addr, 
-                          const tcp_options& opts = {})
+    uds_connect_awaitable(io::io_context& ctx, const unix_address& addr,
+                          const uds_options& opts = {})
         : ctx_(ctx), addr_(addr), opts_(opts) {}
     
     bool await_ready() const noexcept { return false; }
     
     bool await_suspend(std::coroutine_handle<> awaiter) {
         // Create socket
-        fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd_ < 0) {
             result_ = io::io_result{-errno, 0};
             return false;  // Don't suspend, resume immediately
         }
         
-        // Apply options
-        if (opts_.no_delay) {
-            int flag = 1;
-            setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        // Apply buffer options if specified
+        if (opts_.recv_buffer > 0) {
+            setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &opts_.recv_buffer, sizeof(opts_.recv_buffer));
+        }
+        if (opts_.send_buffer > 0) {
+            setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &opts_.send_buffer, sizeof(opts_.send_buffer));
         }
         
         // Initiate non-blocking connect
         sa_ = addr_.to_sockaddr();
+        sa_len_ = addr_.sockaddr_len();
         
-        int ret = ::connect(fd_, reinterpret_cast<struct sockaddr*>(&sa_), sizeof(sa_));
+        int ret = ::connect(fd_, reinterpret_cast<struct sockaddr*>(&sa_), sa_len_);
         if (ret == 0) {
-            // Connected immediately (rare for TCP, but possible)
+            // Connected immediately (common for UDS)
             result_ = io::io_result{0, 0};
             return false;  // Don't suspend, resume immediately
         }
@@ -457,8 +484,7 @@ public:
         req.op = io::io_op::connect;
         req.fd = fd_;
         req.addr = reinterpret_cast<struct sockaddr*>(&sa_);
-        socklen_t len = sizeof(sa_);
-        req.addrlen = &len;
+        req.addrlen = &sa_len_;
         req.awaiter = awaiter;
         
         if (!ctx_.prepare(req)) {
@@ -471,13 +497,17 @@ public:
         return true;  // Suspend, will be resumed by epoll
     }
     
-    std::optional<tcp_stream> await_resume() {
-        // If result wasn't set (async path completed), get from io_context
-        if (result_.result == 0 && fd_ >= 0) {
+    std::optional<uds_stream> await_resume() {
+        // For async completion (EINPROGRESS path), get result from io_context
+        // For immediate completion, result_ is already set
+        if (result_.result == 0 && result_.flags == 0 && fd_ >= 0) {
+            // This could be immediate success ({0,0}) or we need to check async result
             auto ctx_result = io::io_context::get_last_result();
+            // Only use ctx_result if it looks like a real completion (not default)
             if (ctx_result.result != 0 || ctx_result.flags != 0) {
                 result_ = ctx_result;
             }
+            // If ctx_result is also {0,0}, keep our result_ (immediate success)
         }
         
         if (!result_.success()) {
@@ -488,7 +518,7 @@ public:
             return std::nullopt;
         }
         
-        tcp_stream stream(fd_, ctx_);
+        uds_stream stream(fd_, ctx_);
         fd_ = -1;  // Transfer ownership
         stream.set_peer_address(addr_);
         
@@ -499,23 +529,24 @@ public:
     
 private:
     io::io_context& ctx_;
-    ipv4_address addr_;
-    tcp_options opts_;
-    struct sockaddr_in sa_{};
+    unix_address addr_;
+    uds_options opts_;
+    struct sockaddr_un sa_{};
+    socklen_t sa_len_ = 0;
     int fd_ = -1;
     io::io_result result_{};
 };
 
-/// Connect to a remote TCP server
-inline auto tcp_connect(io::io_context& ctx, const ipv4_address& addr,
-                        const tcp_options& opts = {}) {
-    return tcp_connect_awaitable(ctx, addr, opts);
+/// Connect to a Unix Domain Socket server
+inline auto uds_connect(io::io_context& ctx, const unix_address& addr,
+                        const uds_options& opts = {}) {
+    return uds_connect_awaitable(ctx, addr, opts);
 }
 
-/// Connect to a remote TCP server by host and port
-inline auto tcp_connect(io::io_context& ctx, std::string_view host, uint16_t port,
-                        const tcp_options& opts = {}) {
-    return tcp_connect_awaitable(ctx, ipv4_address(host, port), opts);
+/// Connect to a Unix Domain Socket server by path
+inline auto uds_connect(io::io_context& ctx, std::string_view path,
+                        const uds_options& opts = {}) {
+    return uds_connect_awaitable(ctx, unix_address(path), opts);
 }
 
 } // namespace elio::net

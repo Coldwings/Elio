@@ -140,6 +140,151 @@ int main() {
 }
 ```
 
+## UDS Echo Server
+
+A concurrent Unix Domain Socket server that echoes data back to clients:
+
+```cpp
+#include <elio/elio.hpp>
+#include <csignal>
+#include <atomic>
+
+using namespace elio;
+
+std::atomic<bool> g_running{true};
+
+void signal_handler(int) { g_running = false; }
+
+coro::task<void> handle_client(net::uds_stream stream, int id) {
+    ELIO_LOG_INFO("[Client {}] Connected", id);
+    
+    char buffer[1024];
+    while (g_running) {
+        auto result = co_await stream.read(buffer, sizeof(buffer));
+        if (result.result <= 0) break;
+        
+        co_await stream.write(buffer, result.result);
+    }
+    
+    ELIO_LOG_INFO("[Client {}] Disconnected", id);
+    co_return;
+}
+
+coro::task<void> server(const net::unix_address& addr, runtime::scheduler& sched) {
+    auto& ctx = io::default_io_context();
+    
+    net::uds_options opts;
+    opts.unlink_on_bind = true;
+    
+    auto listener = net::uds_listener::bind(addr, ctx, opts);
+    
+    if (!listener) {
+        ELIO_LOG_ERROR("Failed to bind to {}", addr.to_string());
+        co_return;
+    }
+    
+    ELIO_LOG_INFO("Server listening on {}", addr.to_string());
+    
+    int client_id = 0;
+    while (g_running) {
+        auto stream = co_await listener->accept();
+        if (!stream) continue;
+        
+        auto handler = handle_client(std::move(*stream), ++client_id);
+        sched.spawn(handler.release());
+    }
+    co_return;
+}
+
+int main() {
+    std::signal(SIGINT, signal_handler);
+    
+    // Use filesystem socket
+    net::unix_address addr("/tmp/echo.sock");
+    // Or use abstract socket (Linux-specific):
+    // auto addr = net::unix_address::abstract("echo_server");
+    
+    runtime::scheduler sched(4);
+    sched.set_io_context(&io::default_io_context());
+    sched.start();
+    
+    auto srv = server(addr, sched);
+    sched.spawn(srv.release());
+    
+    while (g_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    sched.shutdown();
+    return 0;
+}
+```
+
+## UDS Client
+
+A Unix Domain Socket client that connects to a UDS server:
+
+```cpp
+#include <elio/elio.hpp>
+
+using namespace elio;
+
+coro::task<void> client_main(const net::unix_address& addr) {
+    auto& ctx = io::default_io_context();
+    
+    ELIO_LOG_INFO("Connecting to {}...", addr.to_string());
+    
+    auto stream = co_await net::uds_connect(ctx, addr);
+    if (!stream) {
+        ELIO_LOG_ERROR("Connect failed: {}", strerror(errno));
+        co_return;
+    }
+    
+    ELIO_LOG_INFO("Connected!");
+    
+    // Send message
+    const char* msg = "Hello via Unix Domain Socket!";
+    co_await stream->write(msg, strlen(msg));
+    
+    // Receive echo
+    char buffer[1024];
+    auto result = co_await stream->read(buffer, sizeof(buffer) - 1);
+    if (result.result > 0) {
+        buffer[result.result] = '\0';
+        ELIO_LOG_INFO("Received: {}", buffer);
+    }
+    
+    co_return;
+}
+
+int main() {
+    // Match server's socket path
+    net::unix_address addr("/tmp/echo.sock");
+    // Or abstract socket:
+    // auto addr = net::unix_address::abstract("echo_server");
+    
+    runtime::scheduler sched(2);
+    sched.set_io_context(&io::default_io_context());
+    sched.start();
+    
+    std::atomic<bool> done{false};
+    auto run = [&]() -> coro::task<void> {
+        co_await client_main(addr);
+        done = true;
+    };
+    
+    auto t = run();
+    sched.spawn(t.release());
+    
+    while (!done) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    
+    sched.shutdown();
+    return 0;
+}
+```
+
 ## HTTP Client
 
 Making HTTP requests with various methods:
@@ -426,6 +571,9 @@ make
 # Run individual examples
 ./examples/hello_world
 ./examples/tcp_echo_server
+./examples/uds_echo_server /tmp/echo.sock
+./examples/uds_echo_server @my_socket    # Abstract socket
+./examples/uds_echo_client /tmp/echo.sock
 ./examples/http_client https://httpbin.org/get
 ./examples/http2_client https://nghttp2.org/
 ```

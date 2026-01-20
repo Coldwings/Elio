@@ -36,6 +36,14 @@ add_executable(tcp_echo_client tcp_echo_client.cpp)
 target_link_libraries(tcp_echo_client PRIVATE elio)
 target_link_options(tcp_echo_client PRIVATE ${STATIC_LINK_FLAGS})
 
+add_executable(uds_echo_server uds_echo_server.cpp)
+target_link_libraries(uds_echo_server PRIVATE elio)
+target_link_options(uds_echo_server PRIVATE ${STATIC_LINK_FLAGS})
+
+add_executable(uds_echo_client uds_echo_client.cpp)
+target_link_libraries(uds_echo_client PRIVATE elio)
+target_link_options(uds_echo_client PRIVATE ${STATIC_LINK_FLAGS})
+
 # Filesystem examples
 add_executable(async_file_io async_file_io.cpp)
 target_link_libraries(async_file_io PRIVATE elio)

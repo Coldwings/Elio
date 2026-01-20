@@ -52,7 +52,15 @@ The simplest way to run async code is with `ELIO_ASYNC_MAIN`:
 ```cpp
 #include <elio/elio.hpp>
 
-coro::task<int> async_main() {
+coro::task<int> async_main(int argc, char* argv[]) {
+    // Access command line arguments
+    if (argc > 1) {
+        std::cout << "Argument: " << argv[1] << std::endl;
+    }
+    
+    // Access the I/O context for async operations
+    auto& ctx = io::default_io_context();
+    
     // Your async code here
     co_return 0;
 }
@@ -63,7 +71,7 @@ ELIO_ASYNC_MAIN(async_main)
 For `async_main` functions returning `void`:
 
 ```cpp
-coro::task<void> async_main() {
+coro::task<void> async_main(int argc, char* argv[]) {
     co_await do_work();
     co_return;
 }
@@ -71,19 +79,32 @@ coro::task<void> async_main() {
 ELIO_ASYNC_MAIN_VOID(async_main)
 ```
 
+For simple programs without command line arguments:
+
+```cpp
+coro::task<int> async_main() {
+    co_return 0;
+}
+
+ELIO_ASYNC_MAIN_NOARGS(async_main)
+```
+
 ### Using elio::run()
 
 For more control, use `elio::run()` directly:
 
 ```cpp
-int main() {
+int main(int argc, char* argv[]) {
     // Run with default thread count (hardware concurrency)
-    return elio::run(async_main());
+    return elio::run(async_main(argc, argv));
 }
 
-// Or specify thread count
-int main() {
-    return elio::run(async_main(), 4);  // 4 worker threads
+// Or use run_config for full control
+int main(int argc, char* argv[]) {
+    elio::run_config config;
+    config.num_threads = 4;  // 4 worker threads
+    
+    return elio::run(async_main(argc, argv), config);
 }
 ```
 

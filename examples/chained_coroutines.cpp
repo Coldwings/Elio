@@ -40,7 +40,7 @@ coro::task<int> level1_orchestrate() {
     co_return total;
 }
 
-coro::task<int> async_main() {
+coro::task<int> async_main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
     // Enable debug logging
     log::logger::instance().set_level(log::level::debug);
     

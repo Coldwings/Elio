@@ -9,12 +9,20 @@ coro::task<std::string> get_greeting() {
     co_return "Hello from Elio!";
 }
 
-// Async main coroutine
-coro::task<int> async_main() {
+// Async main coroutine with command line arguments
+coro::task<int> async_main(int argc, char* argv[]) {
     // Enable debug logging
     log::logger::instance().set_level(log::level::debug);
     
     std::cout << "=== Elio Hello World Example ===" << std::endl;
+    
+    if (argc > 1) {
+        std::cout << "Arguments: ";
+        for (int i = 1; i < argc; ++i) {
+            std::cout << argv[i] << " ";
+        }
+        std::cout << std::endl;
+    }
     
     ELIO_LOG_INFO("Main task started");
     

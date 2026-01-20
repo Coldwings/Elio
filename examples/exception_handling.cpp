@@ -87,7 +87,7 @@ coro::task<void> level1() {
     co_return;
 }
 
-coro::task<int> async_main() {
+coro::task<int> async_main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
     // Enable info logging
     log::logger::instance().set_level(log::level::info);
     

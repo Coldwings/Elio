@@ -39,7 +39,7 @@ coro::task<void> worker_task([[maybe_unused]] int id, int work_amount, std::atom
 }
 
 // Orchestrator task that spawns and monitors parallel tasks
-coro::task<int> async_main() {
+coro::task<int> async_main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
     // Set logging to info
     log::logger::instance().set_level(log::level::info);
     

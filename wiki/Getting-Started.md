@@ -76,7 +76,12 @@ coro::task<std::string> get_greeting() {
     co_return "Hello from Elio!";
 }
 
-coro::task<int> async_main() {
+coro::task<int> async_main(int argc, char* argv[]) {
+    std::cout << "Program: " << argv[0] << std::endl;
+    if (argc > 1) {
+        std::cout << "First argument: " << argv[1] << std::endl;
+    }
+    
     std::string greeting = co_await get_greeting();
     std::cout << greeting << std::endl;
     co_return 0;
@@ -85,22 +90,55 @@ coro::task<int> async_main() {
 ELIO_ASYNC_MAIN(async_main)
 ```
 
-The `ELIO_ASYNC_MAIN` macro handles scheduler setup and cleanup automatically. For more control, you can use `elio::run()` directly:
+The `ELIO_ASYNC_MAIN` macro handles scheduler setup, I/O context initialization, and cleanup automatically. It passes `argc` and `argv` to your async_main function.
+
+### Using I/O Context
+
+The scheduler automatically creates and manages an I/O context. Access it via `io::default_io_context()`:
 
 ```cpp
-int main() {
-    return elio::run(async_main());
+coro::task<int> async_main(int argc, char* argv[]) {
+    // Get the I/O context for async operations
+    auto& ctx = io::default_io_context();
+    
+    // Use ctx for networking, timers, etc.
+    co_await time::sleep_for(std::chrono::seconds(1));
+    
+    co_return 0;
+}
+
+ELIO_ASYNC_MAIN(async_main)
+```
+
+### Alternative: Using elio::run()
+
+For more control, use `elio::run()` directly:
+
+```cpp
+int main(int argc, char* argv[]) {
+    return elio::run(async_main(argc, argv));
 }
 ```
 
-Or configure the number of worker threads:
+Or configure via `run_config`:
 
 ```cpp
-int main() {
-    // Run with 4 worker threads
-    return elio::run(async_main(), 4);
+int main(int argc, char* argv[]) {
+    elio::run_config config;
+    config.num_threads = 4;  // Use 4 worker threads
+    
+    return elio::run(async_main(argc, argv), config);
 }
 ```
+
+### Macros Reference
+
+| Macro | async_main signature | Description |
+|-------|---------------------|-------------|
+| `ELIO_ASYNC_MAIN` | `task<int>(int, char**)` | With args, returns exit code |
+| `ELIO_ASYNC_MAIN_VOID` | `task<void>(int, char**)` | With args, always exits 0 |
+| `ELIO_ASYNC_MAIN_NOARGS` | `task<int>()` | No args, returns exit code |
+| `ELIO_ASYNC_MAIN_VOID_NOARGS` | `task<void>()` | No args, always exits 0 |
 
 ## Running the Examples
 

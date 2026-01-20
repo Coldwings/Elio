@@ -71,7 +71,7 @@ inline constexpr auto version_tuple() noexcept {
 ///     co_return 42;
 /// }
 /// 
-/// coro::task<int> async_main() {
+/// coro::task<int> async_main(int argc, char* argv[]) {
 ///     int result = co_await compute();
 ///     std::cout << "Result: " << result << std::endl;
 ///     co_return 0;

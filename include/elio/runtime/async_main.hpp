@@ -2,14 +2,26 @@
 
 #include "scheduler.hpp"
 #include <elio/coro/task.hpp>
+#include <elio/io/io_context.hpp>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
 #include <thread>
 #include <exception>
+#include <span>
+#include <string_view>
 
 namespace elio::runtime {
+
+/// Configuration for running async tasks
+struct run_config {
+    /// Number of worker threads (0 = hardware concurrency)
+    size_t num_threads = 0;
+    
+    /// Custom I/O context (nullptr = create default)
+    io::io_context* io_context = nullptr;
+};
 
 namespace detail {
 
@@ -100,24 +112,41 @@ coro::task<void> completion_wrapper(coro::task<T> inner, completion_signal<T>* s
 /// run async code from a synchronous context (like main()).
 /// 
 /// @param task The coroutine task to run
-/// @param num_threads Number of worker threads (default: hardware concurrency)
+/// @param config Configuration (threads, io_context)
 /// @return The result of the task
 /// 
 /// Example:
 /// @code
 /// coro::task<int> async_main() {
+///     auto& ctx = io::default_io_context();
+///     // Use ctx for async I/O
 ///     co_return 42;
 /// }
 /// 
 /// int main() {
-///     return elio::runtime::run(async_main());
+///     return elio::run(async_main());
 /// }
 /// @endcode
 template<typename T>
-T run(coro::task<T> task, size_t num_threads = std::thread::hardware_concurrency()) {
+T run(coro::task<T> task, const run_config& config = {}) {
     detail::completion_signal<T> signal;
     
-    scheduler sched(num_threads == 0 ? 1 : num_threads);
+    size_t threads = config.num_threads;
+    if (threads == 0) {
+        threads = std::thread::hardware_concurrency();
+        if (threads == 0) threads = 1;
+    }
+    
+    // Use provided io_context or create default
+    io::io_context* io_ctx = config.io_context;
+    std::unique_ptr<io::io_context> owned_ctx;
+    if (!io_ctx) {
+        owned_ctx = std::make_unique<io::io_context>();
+        io_ctx = owned_ctx.get();
+    }
+    
+    scheduler sched(threads);
+    sched.set_io_context(io_ctx);
     sched.start();
     
     // Create wrapper that signals completion
@@ -135,6 +164,12 @@ T run(coro::task<T> task, size_t num_threads = std::thread::hardware_concurrency
     }
 }
 
+/// Run a coroutine task with specified number of threads
+template<typename T>
+T run(coro::task<T> task, size_t num_threads) {
+    return run(std::move(task), run_config{.num_threads = num_threads});
+}
+
 } // namespace elio::runtime
 
 namespace elio {
@@ -142,13 +177,23 @@ namespace elio {
 /// Convenience alias - run a coroutine to completion
 using runtime::run;
 
+/// Convenience alias for run configuration
+using runtime::run_config;
+
 } // namespace elio
 
-/// Macro to define main() that runs an async_main coroutine
+/// Macro to define main() that runs an async_main coroutine with argc/argv
+/// 
+/// The async_main function should have signature:
+///   coro::task<int> async_main(int argc, char* argv[])
 /// 
 /// Usage:
 /// @code
-/// elio::coro::task<int> async_main() {
+/// elio::coro::task<int> async_main(int argc, char* argv[]) {
+///     if (argc < 2) {
+///         std::cerr << "Usage: " << argv[0] << " <arg>\n";
+///         co_return 1;
+///     }
 ///     // Your async code here
 ///     co_return 0;
 /// }
@@ -156,12 +201,34 @@ using runtime::run;
 /// ELIO_ASYNC_MAIN(async_main)
 /// @endcode
 #define ELIO_ASYNC_MAIN(async_main_func) \
+    int main(int argc, char* argv[]) { \
+        return elio::run(async_main_func(argc, argv)); \
+    }
+
+/// Macro for async_main that returns void (exits with 0)
+/// 
+/// The async_main function should have signature:
+///   coro::task<void> async_main(int argc, char* argv[])
+#define ELIO_ASYNC_MAIN_VOID(async_main_func) \
+    int main(int argc, char* argv[]) { \
+        elio::run(async_main_func(argc, argv)); \
+        return 0; \
+    }
+
+/// Macro for async_main without arguments
+/// 
+/// The async_main function should have signature:
+///   coro::task<int> async_main()
+#define ELIO_ASYNC_MAIN_NOARGS(async_main_func) \
     int main() { \
         return elio::run(async_main_func()); \
     }
 
-/// Macro for async_main that returns void (exits with 0)
-#define ELIO_ASYNC_MAIN_VOID(async_main_func) \
+/// Macro for async_main without arguments, returning void
+/// 
+/// The async_main function should have signature:
+///   coro::task<void> async_main()
+#define ELIO_ASYNC_MAIN_VOID_NOARGS(async_main_func) \
     int main() { \
         elio::run(async_main_func()); \
         return 0; \

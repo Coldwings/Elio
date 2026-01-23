@@ -134,6 +134,26 @@ public:
         bottom_.store(b + 1, std::memory_order_relaxed);
         return nullptr;
     }
+    
+    /// Pop without seq_cst fence - ONLY use when there are no concurrent stealers
+    /// This is safe in single-worker mode where no other thread can steal
+    [[nodiscard]] T* pop_local() noexcept {
+        size_t b = bottom_.load(std::memory_order_relaxed);
+        if (b == 0) return nullptr;
+        
+        circular_buffer* buf = buffer_.load(std::memory_order_relaxed);
+        b = b - 1;
+        bottom_.store(b, std::memory_order_relaxed);
+        
+        size_t t = top_.load(std::memory_order_relaxed);
+        if (t <= b) {
+            return buf->load(b);
+        }
+        
+        // Queue was empty
+        bottom_.store(b + 1, std::memory_order_relaxed);
+        return nullptr;
+    }
 
     /// Steal an element (thieves only) - lock-free
     [[nodiscard]] T* steal() noexcept {

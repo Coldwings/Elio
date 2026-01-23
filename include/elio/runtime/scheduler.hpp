@@ -347,9 +347,6 @@ inline void worker_thread::run() {
     scheduler::current_scheduler_ = scheduler_;
     current_worker_ = this;
     
-    // Optimization: track single-worker mode to skip synchronization
-    single_worker_ = (scheduler_->num_threads() == 1);
-    
     while (running_.load(std::memory_order_relaxed)) {
         if (scheduler_->is_paused()) [[unlikely]] {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -374,9 +371,13 @@ inline void worker_thread::run() {
 }
 
 inline std::coroutine_handle<> worker_thread::get_next_task() noexcept {
+    // Check single-worker mode dynamically (thread count can change at runtime)
+    // Use pop_local() only when there's definitely no stealer
+    bool single_worker = (scheduler_->num_threads() == 1);
+    
     // Fast path: pop from local deque first
     // In single-worker mode, use pop_local() to skip seq_cst fence
-    void* addr = single_worker_ ? queue_.pop_local() : queue_.pop();
+    void* addr = single_worker ? queue_.pop_local() : queue_.pop();
     if (addr) {
         needs_sync_ = false;  // Local task, no sync needed
         return std::coroutine_handle<>::from_address(addr);
@@ -386,14 +387,14 @@ inline std::coroutine_handle<> worker_thread::get_next_task() noexcept {
     drain_inbox();
     
     // Try local deque again after draining inbox
-    addr = single_worker_ ? queue_.pop_local() : queue_.pop();
+    addr = single_worker ? queue_.pop_local() : queue_.pop();
     if (addr) {
         needs_sync_ = true;  // Came from inbox, needs sync
         return std::coroutine_handle<>::from_address(addr);
     }
     
     // Nothing local, try stealing from other workers (skip in single-worker mode)
-    if (!single_worker_) {
+    if (!single_worker) {
         auto handle = try_steal();
         if (handle) {
             needs_sync_ = true;  // Stolen task, needs sync

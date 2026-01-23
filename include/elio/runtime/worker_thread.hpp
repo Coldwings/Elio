@@ -133,6 +133,7 @@ private:
     std::atomic<bool> running_;
     std::atomic<size_t> tasks_executed_;
     bool needs_sync_ = false;          // Whether current task needs memory synchronization
+    bool single_worker_ = false;       // True when scheduler has only 1 worker (no stealing)
     
     static inline thread_local worker_thread* current_worker_ = nullptr;
 };

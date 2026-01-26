@@ -2,6 +2,7 @@
 
 #include "worker_thread.hpp"
 #include <elio/log/macros.hpp>
+#include <elio/coro/frame.hpp>
 #include <vector>
 #include <memory>
 #include <atomic>
@@ -104,7 +105,21 @@ public:
             return;
         }
         
-        // Try to find a running worker (handles race with set_thread_count shrink)
+        // Check if task has affinity - if so, schedule to that specific worker
+        size_t affinity = coro::get_affinity(handle.address());
+        if (affinity != coro::NO_AFFINITY && affinity < n) {
+            if (workers_[affinity]->is_running()) {
+                workers_[affinity]->schedule(handle);
+                return;
+            }
+            // Target worker not running - clear affinity and fall through
+            auto* promise = coro::get_promise_base(handle.address());
+            if (promise) {
+                promise->clear_affinity();
+            }
+        }
+        
+        // No affinity or invalid affinity - round-robin to any running worker
         size_t start_index = spawn_index_.fetch_add(1, std::memory_order_relaxed) % n;
         for (size_t i = 0; i < n; ++i) {
             size_t index = (start_index + i) % n;
@@ -432,6 +447,10 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
     size_t start = steal_start;
     steal_start = (steal_start + 1) % num_workers;
     
+    // Limit retries to avoid infinite loops when all tasks have affinity
+    constexpr size_t max_retries = 8;
+    size_t retry_count = 0;
+    
     for (size_t i = 0; i < num_workers; ++i) {
         size_t victim_id = (start + i) % num_workers;
         if (victim_id == worker_id_) continue;
@@ -442,7 +461,33 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
         // Try single steal - batch stealing has race conditions with owner's pop
         auto handle = victim->steal_task();
         if (handle) {
-            return handle;
+            // Check if this task has affinity for a different worker
+            size_t affinity = coro::get_affinity(handle.address());
+            
+            if (affinity == coro::NO_AFFINITY || affinity == worker_id_) {
+                // No affinity or affinity matches this worker - we can run it
+                return handle;
+            }
+            
+            // Task has affinity for another worker - schedule it there
+            if (affinity < num_workers) {
+                scheduler_->spawn_to(affinity, handle);
+            } else {
+                // Invalid affinity (worker doesn't exist) - clear and run locally
+                auto* promise = coro::get_promise_base(handle.address());
+                if (promise) {
+                    promise->clear_affinity();
+                }
+                return handle;
+            }
+            
+            // Continue trying to steal, but limit retries
+            if (++retry_count >= max_retries) {
+                return nullptr;
+            }
+            // Restart the search from a different victim
+            i = static_cast<size_t>(-1);  // Will be 0 after increment
+            start = (steal_start + retry_count) % num_workers;
         }
     }
     

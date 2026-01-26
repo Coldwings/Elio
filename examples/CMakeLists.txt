@@ -23,6 +23,10 @@ add_executable(dynamic_threads dynamic_threads.cpp)
 target_link_libraries(dynamic_threads PRIVATE elio)
 target_link_options(dynamic_threads PRIVATE ${STATIC_LINK_FLAGS})
 
+add_executable(thread_affinity thread_affinity.cpp)
+target_link_libraries(thread_affinity PRIVATE elio)
+target_link_options(thread_affinity PRIVATE ${STATIC_LINK_FLAGS})
+
 add_executable(benchmark benchmark.cpp)
 target_link_libraries(benchmark PRIVATE elio)
 target_link_options(benchmark PRIVATE ${STATIC_LINK_FLAGS})

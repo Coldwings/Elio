@@ -108,15 +108,23 @@ public:
     }
     
     void await_suspend(std::coroutine_handle<> awaiter) const {
-        // Fast path: if on a worker thread, push directly to local queue
         auto* worker = runtime::worker_thread::current();
-        if (worker) {
+        auto* sched = runtime::scheduler::current();
+        
+        if (worker && sched) {
+            // Check if task has affinity for a different worker
+            size_t affinity = coro::get_affinity(awaiter.address());
+            if (affinity != coro::NO_AFFINITY && affinity != worker->worker_id()) {
+                // Task has affinity for different worker - use spawn to route correctly
+                sched->spawn(awaiter);
+                return;
+            }
+            // No affinity or affinity matches - use fast local path
             worker->schedule_local(awaiter);
             return;
         }
         
         // Slow path: go through scheduler's spawn mechanism
-        auto* sched = runtime::scheduler::current();
         if (sched) {
             sched->spawn(awaiter);
         } else {

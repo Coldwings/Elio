@@ -3,8 +3,12 @@
 #include <exception>
 #include <atomic>
 #include <cstdint>
+#include <limits>
 
 namespace elio::coro {
+
+/// Constant indicating no affinity (vthread can migrate freely)
+inline constexpr size_t NO_AFFINITY = std::numeric_limits<size_t>::max();
 
 /// Coroutine state for debugging
 enum class coroutine_state : uint8_t {
@@ -56,6 +60,7 @@ public:
         , debug_state_(coroutine_state::created)
         , debug_worker_id_(static_cast<uint32_t>(-1))
         , debug_id_(next_id_.fetch_add(1, std::memory_order_relaxed))
+        , affinity_(NO_AFFINITY)
     {
         current_frame_ = this;
     }
@@ -108,6 +113,21 @@ public:
         debug_worker_id_ = id;
     }
 
+    // Affinity accessors
+    /// Get the current thread affinity for this vthread
+    /// @return Worker ID this vthread is bound to, or NO_AFFINITY if unbound
+    [[nodiscard]] size_t affinity() const noexcept { return affinity_; }
+    
+    /// Set thread affinity for this vthread
+    /// @param worker_id Worker ID to bind to, or NO_AFFINITY to clear
+    void set_affinity(size_t worker_id) noexcept { affinity_ = worker_id; }
+    
+    /// Check if this vthread has affinity set
+    [[nodiscard]] bool has_affinity() const noexcept { return affinity_ != NO_AFFINITY; }
+    
+    /// Clear thread affinity, allowing this vthread to migrate freely
+    void clear_affinity() noexcept { affinity_ = NO_AFFINITY; }
+
 private:
     // Magic number at start for debugger validation
     uint64_t frame_magic_;
@@ -121,6 +141,9 @@ private:
     coroutine_state debug_state_;
     uint32_t debug_worker_id_;
     uint64_t debug_id_;
+    
+    // Thread affinity: NO_AFFINITY means can migrate freely
+    size_t affinity_;
     
     static inline thread_local promise_base* current_frame_ = nullptr;
     static inline std::atomic<uint64_t> next_id_{1};

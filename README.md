@@ -190,6 +190,7 @@ Explore the `examples/` directory for detailed examples:
 - **exception_handling.cpp** - Exception propagation
 - **parallel_tasks.cpp** - Work stealing in action
 - **dynamic_threads.cpp** - Dynamic thread pool
+- **thread_affinity.cpp** - Thread affinity for vthreads
 - **tcp_echo_server.cpp** - TCP server example
 - **tcp_echo_client.cpp** - TCP client example
 - **http_server.cpp** - HTTP server example

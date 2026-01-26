@@ -4,14 +4,25 @@
 /// This example demonstrates how to build an HTTP server using Elio's
 /// HTTP module with router-based request handling.
 ///
-/// Usage: ./http_server [port] [--https cert.pem key.pem]
-/// Default: HTTP on port 8080
+/// Supports both IPv4 and IPv6:
+///   - Default: Dual-stack (IPv6 socket accepting both IPv4 and IPv6)
+///   - Use -4 for IPv4-only mode
+///   - Use -6 for IPv6-only mode
+///   - Use -b <addr> to bind to a specific address
+///
+/// Usage: ./http_server [options] [port]
+///   -4               IPv4 only
+///   -6               IPv6 only
+///   -b <addr>        Bind to specific address
+///   --https cert key Enable HTTPS with certificate and key files
+/// Default: HTTP on port 8080 (dual-stack)
 
 #include <elio/elio.hpp>
 #include <elio/http/http.hpp>
 #include <elio/tls/tls.hpp>
 
 #include <atomic>
+#include <iostream>
 
 using namespace elio;
 using namespace elio::http;
@@ -171,6 +182,9 @@ int main(int argc, char* argv[]) {
     uint16_t port = 8080;
     bool use_https = false;
     std::string cert_file, key_file;
+    std::string bind_address;
+    bool ipv4_only = false;
+    bool ipv6_only = false;
     
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
@@ -179,9 +193,38 @@ int main(int argc, char* argv[]) {
             use_https = true;
             cert_file = argv[++i];
             key_file = argv[++i];
+        } else if (arg == "-4") {
+            ipv4_only = true;
+        } else if (arg == "-6") {
+            ipv6_only = true;
+        } else if (arg == "-b" && i + 1 < argc) {
+            bind_address = argv[++i];
+        } else if (arg == "-h" || arg == "--help") {
+            std::cout << "Usage: " << argv[0] << " [options] [port]\n"
+                      << "Options:\n"
+                      << "  -4               IPv4 only\n"
+                      << "  -6               IPv6 only\n"
+                      << "  -b <addr>        Bind to specific address\n"
+                      << "  --https cert key Enable HTTPS\n"
+                      << "  -h, --help       Show this help\n"
+                      << "Default: HTTP on port 8080 (dual-stack)\n";
+            return 0;
         } else if (arg[0] != '-') {
             port = static_cast<uint16_t>(std::stoi(arg));
         }
+    }
+    
+    // Determine bind address
+    net::socket_address bind_addr;
+    net::tcp_options opts;
+    
+    if (!bind_address.empty()) {
+        bind_addr = net::socket_address(bind_address, port);
+    } else if (ipv4_only) {
+        bind_addr = net::socket_address(net::ipv4_address(port));
+    } else {
+        bind_addr = net::socket_address(net::ipv6_address(port));
+        opts.ipv6_only = ipv6_only;
     }
     
     // Block signals BEFORE creating scheduler threads
@@ -228,27 +271,29 @@ int main(int argc, char* argv[]) {
             auto tls_ctx = tls::tls_context::make_server(cert_file, key_file);
             
             auto server_task = srv.listen_tls(
-                net::ipv4_address(port), 
+                bind_addr, 
                 io::default_io_context(), 
                 sched,
-                tls_ctx
+                tls_ctx,
+                opts
             );
             sched.spawn(server_task.release());
             
-            ELIO_LOG_INFO("HTTPS server started on port {}", port);
+            ELIO_LOG_INFO("HTTPS server started on {}", bind_addr.to_string());
         } catch (const std::exception& e) {
             ELIO_LOG_ERROR("Failed to start HTTPS server: {}", e.what());
             return 1;
         }
     } else {
         auto server_task = srv.listen(
-            net::ipv4_address(port), 
+            bind_addr, 
             io::default_io_context(), 
-            sched
+            sched,
+            opts
         );
         sched.spawn(server_task.release());
         
-        ELIO_LOG_INFO("HTTP server started on port {}", port);
+        ELIO_LOG_INFO("HTTP server started on {}", bind_addr.to_string());
     }
     
     ELIO_LOG_INFO("Press Ctrl+C to stop");

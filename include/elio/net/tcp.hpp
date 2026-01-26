@@ -9,6 +9,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <net/if.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
@@ -17,6 +18,7 @@
 #include <string_view>
 #include <optional>
 #include <span>
+#include <variant>
 
 namespace elio::net {
 
@@ -29,6 +31,7 @@ struct tcp_options {
     int recv_buffer = 0;         ///< SO_RCVBUF (0 = system default)
     int send_buffer = 0;         ///< SO_SNDBUF (0 = system default)
     int backlog = 128;           ///< Listen backlog
+    bool ipv6_only = false;      ///< IPV6_V6ONLY (disable dual-stack on IPv6 sockets)
 };
 
 /// IPv4 address wrapper
@@ -77,6 +80,8 @@ struct ipv4_address {
         return sa;
     }
     
+    int family() const noexcept { return AF_INET; }
+    
     std::string to_string() const {
         char buf[INET_ADDRSTRLEN];
         struct in_addr in{};
@@ -84,6 +89,183 @@ struct ipv4_address {
         inet_ntop(AF_INET, &in, buf, sizeof(buf));
         return std::string(buf) + ":" + std::to_string(port);
     }
+};
+
+/// IPv6 address wrapper
+struct ipv6_address {
+    struct in6_addr addr = IN6ADDR_ANY_INIT;
+    uint16_t port = 0;
+    uint32_t scope_id = 0;  ///< For link-local addresses
+    
+    ipv6_address() = default;
+    
+    ipv6_address(uint16_t p) : port(p) {}
+    
+    /// Construct from IPv6 address string and port
+    ipv6_address(std::string_view ip, uint16_t p) : port(p) {
+        if (ip.empty() || ip == "::") {
+            addr = IN6ADDR_ANY_INIT;
+        } else {
+            // Handle scope ID for link-local (e.g., "fe80::1%eth0")
+            std::string ip_str(ip);
+            size_t scope_pos = ip_str.find('%');
+            if (scope_pos != std::string::npos) {
+                std::string scope_name = ip_str.substr(scope_pos + 1);
+                ip_str = ip_str.substr(0, scope_pos);
+                scope_id = if_nametoindex(scope_name.c_str());
+            }
+            
+            // First try as numeric IP
+            if (inet_pton(AF_INET6, ip_str.c_str(), &addr) != 1) {
+                // Not a numeric IP, try DNS resolution
+                struct addrinfo hints{};
+                struct addrinfo* result = nullptr;
+                hints.ai_family = AF_INET6;
+                hints.ai_socktype = SOCK_STREAM;
+                
+                if (getaddrinfo(ip_str.c_str(), nullptr, &hints, &result) == 0 && result) {
+                    auto* sa = reinterpret_cast<struct sockaddr_in6*>(result->ai_addr);
+                    addr = sa->sin6_addr;
+                    scope_id = sa->sin6_scope_id;
+                    freeaddrinfo(result);
+                } else {
+                    ELIO_LOG_ERROR("Failed to resolve IPv6 hostname: {}", ip);
+                    addr = IN6ADDR_ANY_INIT;
+                }
+            }
+        }
+    }
+    
+    ipv6_address(const struct sockaddr_in6& sa) 
+        : addr(sa.sin6_addr), port(ntohs(sa.sin6_port)), scope_id(sa.sin6_scope_id) {}
+    
+    struct sockaddr_in6 to_sockaddr() const {
+        struct sockaddr_in6 sa{};
+        sa.sin6_family = AF_INET6;
+        sa.sin6_addr = addr;
+        sa.sin6_port = htons(port);
+        sa.sin6_scope_id = scope_id;
+        return sa;
+    }
+    
+    int family() const noexcept { return AF_INET6; }
+    
+    std::string to_string() const {
+        char buf[INET6_ADDRSTRLEN];
+        inet_ntop(AF_INET6, &addr, buf, sizeof(buf));
+        std::string result = "[" + std::string(buf) + "]:" + std::to_string(port);
+        return result;
+    }
+    
+    /// Check if this is an IPv4-mapped IPv6 address (::ffff:x.x.x.x)
+    bool is_v4_mapped() const {
+        return IN6_IS_ADDR_V4MAPPED(&addr);
+    }
+};
+
+/// Generic socket address that can hold IPv4 or IPv6
+class socket_address {
+public:
+    socket_address() : data_(ipv4_address{}) {}
+    
+    socket_address(const ipv4_address& addr) : data_(addr) {}
+    socket_address(const ipv6_address& addr) : data_(addr) {}
+    
+    /// Construct from port only (binds to all interfaces, IPv6 with dual-stack)
+    explicit socket_address(uint16_t port) : data_(ipv6_address(port)) {}
+    
+    /// Construct from host string and port (auto-detects IPv4/IPv6)
+    socket_address(std::string_view host, uint16_t port) {
+        if (host.empty() || host == "::" || host == "0.0.0.0") {
+            // Default to IPv6 with dual-stack
+            data_ = ipv6_address(port);
+            return;
+        }
+        
+        // Check if it looks like an IPv6 address
+        if (host.find(':') != std::string_view::npos) {
+            data_ = ipv6_address(host, port);
+            return;
+        }
+        
+        // Try to resolve and prefer IPv6
+        struct addrinfo hints{};
+        struct addrinfo* result = nullptr;
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        
+        std::string host_str(host);
+        if (getaddrinfo(host_str.c_str(), nullptr, &hints, &result) == 0 && result) {
+            // Use the first result
+            if (result->ai_family == AF_INET6) {
+                auto* sa = reinterpret_cast<struct sockaddr_in6*>(result->ai_addr);
+                ipv6_address addr(*sa);
+                addr.port = port;
+                data_ = addr;
+            } else {
+                auto* sa = reinterpret_cast<struct sockaddr_in*>(result->ai_addr);
+                ipv4_address addr(*sa);
+                addr.port = port;
+                data_ = addr;
+            }
+            freeaddrinfo(result);
+        } else {
+            // Fallback to IPv4
+            data_ = ipv4_address(host, port);
+        }
+    }
+    
+    /// Construct from sockaddr_storage
+    socket_address(const struct sockaddr_storage& ss) {
+        if (ss.ss_family == AF_INET) {
+            data_ = ipv4_address(*reinterpret_cast<const struct sockaddr_in*>(&ss));
+        } else if (ss.ss_family == AF_INET6) {
+            data_ = ipv6_address(*reinterpret_cast<const struct sockaddr_in6*>(&ss));
+        }
+    }
+    
+    /// Get address family
+    int family() const {
+        return std::visit([](const auto& addr) { return addr.family(); }, data_);
+    }
+    
+    /// Get port
+    uint16_t port() const {
+        return std::visit([](const auto& addr) { return addr.port; }, data_);
+    }
+    
+    /// Check if this is an IPv4 address
+    bool is_v4() const { return std::holds_alternative<ipv4_address>(data_); }
+    
+    /// Check if this is an IPv6 address
+    bool is_v6() const { return std::holds_alternative<ipv6_address>(data_); }
+    
+    /// Get as IPv4 address (throws if not IPv4)
+    const ipv4_address& as_v4() const { return std::get<ipv4_address>(data_); }
+    
+    /// Get as IPv6 address (throws if not IPv6)
+    const ipv6_address& as_v6() const { return std::get<ipv6_address>(data_); }
+    
+    /// Fill sockaddr_storage
+    socklen_t to_sockaddr(struct sockaddr_storage& ss) const {
+        std::memset(&ss, 0, sizeof(ss));
+        if (is_v4()) {
+            auto sa = as_v4().to_sockaddr();
+            std::memcpy(&ss, &sa, sizeof(sa));
+            return sizeof(sa);
+        } else {
+            auto sa = as_v6().to_sockaddr();
+            std::memcpy(&ss, &sa, sizeof(sa));
+            return sizeof(sa);
+        }
+    }
+    
+    std::string to_string() const {
+        return std::visit([](const auto& addr) { return addr.to_string(); }, data_);
+    }
+    
+private:
+    std::variant<ipv4_address, ipv6_address> data_;
 };
 
 /// TCP stream for connected sockets
@@ -101,7 +283,7 @@ public:
     tcp_stream(tcp_stream&& other) noexcept
         : fd_(other.fd_)
         , ctx_(other.ctx_)
-        , peer_addr_(other.peer_addr_) {
+        , peer_addr_(std::move(other.peer_addr_)) {
         other.fd_ = -1;
     }
     
@@ -111,7 +293,7 @@ public:
             close_sync();
             fd_ = other.fd_;
             ctx_ = other.ctx_;
-            peer_addr_ = other.peer_addr_;
+            peer_addr_ = std::move(other.peer_addr_);
             other.fd_ = -1;
         }
         return *this;
@@ -137,22 +319,32 @@ public:
     const io::io_context& context() const noexcept { return *ctx_; }
     
     /// Get peer address
-    std::optional<ipv4_address> peer_address() const {
-        if (peer_addr_.port != 0) {
+    std::optional<socket_address> peer_address() const {
+        if (peer_addr_) {
             return peer_addr_;
         }
         
-        struct sockaddr_in sa{};
-        socklen_t len = sizeof(sa);
-        if (getpeername(fd_, reinterpret_cast<struct sockaddr*>(&sa), &len) == 0) {
-            return ipv4_address(sa);
+        struct sockaddr_storage ss{};
+        socklen_t len = sizeof(ss);
+        if (getpeername(fd_, reinterpret_cast<struct sockaddr*>(&ss), &len) == 0) {
+            return socket_address(ss);
         }
         return std::nullopt;
     }
     
     /// Set peer address (used after accept)
-    void set_peer_address(const ipv4_address& addr) {
+    void set_peer_address(const socket_address& addr) {
         peer_addr_ = addr;
+    }
+    
+    /// Set peer address from IPv4
+    void set_peer_address(const ipv4_address& addr) {
+        peer_addr_ = socket_address(addr);
+    }
+    
+    /// Set peer address from IPv6
+    void set_peer_address(const ipv6_address& addr) {
+        peer_addr_ = socket_address(addr);
     }
     
     /// Async read
@@ -221,13 +413,13 @@ private:
     
     int fd_ = -1;
     io::io_context* ctx_;
-    ipv4_address peer_addr_;
+    std::optional<socket_address> peer_addr_;
 };
 
 /// TCP listener for accepting connections
 class tcp_listener {
 public:
-    /// Create and bind a TCP listener
+    /// Create and bind a TCP listener (IPv4)
     /// @param addr Address to bind to
     /// @param ctx I/O context
     /// @param opts Socket options
@@ -237,57 +429,32 @@ public:
         io::io_context& ctx,
         const tcp_options& opts = {}) 
     {
-        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        if (fd < 0) {
-            return std::nullopt;
-        }
-        
-        // Apply socket options
-        if (opts.reuse_addr) {
-            int flag = 1;
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
-        }
-        
-        if (opts.reuse_port) {
-            int flag = 1;
-            setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag));
-        }
-        
-        if (opts.recv_buffer > 0) {
-            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &opts.recv_buffer, sizeof(opts.recv_buffer));
-        }
-        
-        if (opts.send_buffer > 0) {
-            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &opts.send_buffer, sizeof(opts.send_buffer));
-        }
-        
-        // Bind
-        auto sa = addr.to_sockaddr();
-        if (::bind(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) < 0) {
-            int err = errno;
-            ::close(fd);
-            errno = err;
-            return std::nullopt;
-        }
-        
-        // Listen
-        if (::listen(fd, opts.backlog) < 0) {
-            int err = errno;
-            ::close(fd);
-            errno = err;
-            return std::nullopt;
-        }
-        
-        ELIO_LOG_INFO("TCP listener bound to {}", addr.to_string());
-        
-        return tcp_listener(fd, ctx, addr, opts);
+        return bind_impl(socket_address(addr), ctx, opts);
+    }
+    
+    /// Create and bind a TCP listener (IPv6)
+    static std::optional<tcp_listener> bind(
+        const ipv6_address& addr,
+        io::io_context& ctx,
+        const tcp_options& opts = {})
+    {
+        return bind_impl(socket_address(addr), ctx, opts);
+    }
+    
+    /// Create and bind a TCP listener (generic address)
+    static std::optional<tcp_listener> bind(
+        const socket_address& addr,
+        io::io_context& ctx,
+        const tcp_options& opts = {})
+    {
+        return bind_impl(addr, ctx, opts);
     }
     
     /// Move constructor
     tcp_listener(tcp_listener&& other) noexcept
         : fd_(other.fd_)
         , ctx_(other.ctx_)
-        , local_addr_(other.local_addr_)
+        , local_addr_(std::move(other.local_addr_))
         , opts_(other.opts_) {
         other.fd_ = -1;
     }
@@ -298,7 +465,7 @@ public:
             close_sync();
             fd_ = other.fd_;
             ctx_ = other.ctx_;
-            local_addr_ = other.local_addr_;
+            local_addr_ = std::move(other.local_addr_);
             opts_ = other.opts_;
             other.fd_ = -1;
         }
@@ -321,7 +488,7 @@ public:
     int fd() const noexcept { return fd_; }
     
     /// Get local address
-    const ipv4_address& local_address() const noexcept { return local_addr_; }
+    const socket_address& local_address() const noexcept { return local_addr_; }
     
     /// Accept a connection awaitable
     class accept_awaitable {
@@ -368,17 +535,17 @@ public:
             }
             
             // Set peer address
-            stream.set_peer_address(ipv4_address(peer_addr_));
+            socket_address peer(peer_addr_);
+            stream.set_peer_address(peer);
             
-            ELIO_LOG_DEBUG("Accepted connection from {}", 
-                          ipv4_address(peer_addr_).to_string());
+            ELIO_LOG_DEBUG("Accepted connection from {}", peer.to_string());
             
             return stream;
         }
         
     private:
         tcp_listener& listener_;
-        struct sockaddr_in peer_addr_{};
+        struct sockaddr_storage peer_addr_{};
         socklen_t peer_addr_len_ = sizeof(peer_addr_);
         io::io_result result_{};
     };
@@ -394,7 +561,74 @@ public:
     }
     
 private:
-    tcp_listener(int fd, io::io_context& ctx, const ipv4_address& addr, const tcp_options& opts)
+    static std::optional<tcp_listener> bind_impl(
+        const socket_address& addr,
+        io::io_context& ctx,
+        const tcp_options& opts)
+    {
+        int family = addr.family();
+        int fd = socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0) {
+            return std::nullopt;
+        }
+        
+        // Apply socket options
+        if (opts.reuse_addr) {
+            int flag = 1;
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+        }
+        
+        if (opts.reuse_port) {
+            int flag = 1;
+            setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag));
+        }
+        
+        if (opts.recv_buffer > 0) {
+            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &opts.recv_buffer, sizeof(opts.recv_buffer));
+        }
+        
+        if (opts.send_buffer > 0) {
+            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &opts.send_buffer, sizeof(opts.send_buffer));
+        }
+        
+        // IPv6-specific options
+        if (family == AF_INET6) {
+            int flag = opts.ipv6_only ? 1 : 0;
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &flag, sizeof(flag));
+        }
+        
+        // Bind
+        struct sockaddr_storage ss{};
+        socklen_t ss_len = addr.to_sockaddr(ss);
+        if (::bind(fd, reinterpret_cast<struct sockaddr*>(&ss), ss_len) < 0) {
+            int err = errno;
+            ::close(fd);
+            errno = err;
+            return std::nullopt;
+        }
+        
+        // Query actual bound address (important when binding to port 0)
+        socket_address bound_addr = addr;
+        struct sockaddr_storage bound_ss{};
+        socklen_t bound_len = sizeof(bound_ss);
+        if (getsockname(fd, reinterpret_cast<struct sockaddr*>(&bound_ss), &bound_len) == 0) {
+            bound_addr = socket_address(bound_ss);
+        }
+        
+        // Listen
+        if (::listen(fd, opts.backlog) < 0) {
+            int err = errno;
+            ::close(fd);
+            errno = err;
+            return std::nullopt;
+        }
+        
+        ELIO_LOG_INFO("TCP listener bound to {}", bound_addr.to_string());
+        
+        return tcp_listener(fd, ctx, bound_addr, opts);
+    }
+    
+    tcp_listener(int fd, io::io_context& ctx, const socket_address& addr, const tcp_options& opts)
         : fd_(fd), ctx_(&ctx), local_addr_(addr), opts_(opts) {}
     
     void close_sync() {
@@ -407,22 +641,22 @@ private:
     
     int fd_ = -1;
     io::io_context* ctx_;
-    ipv4_address local_addr_;
+    socket_address local_addr_;
     tcp_options opts_;
 };
 
 /// Connect to a remote TCP server
 class tcp_connect_awaitable {
 public:
-    tcp_connect_awaitable(io::io_context& ctx, const ipv4_address& addr, 
+    tcp_connect_awaitable(io::io_context& ctx, const socket_address& addr, 
                           const tcp_options& opts = {})
         : ctx_(ctx), addr_(addr), opts_(opts) {}
     
     bool await_ready() const noexcept { return false; }
     
     bool await_suspend(std::coroutine_handle<> awaiter) {
-        // Create socket
-        fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        // Create socket with appropriate address family
+        fd_ = socket(addr_.family(), SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd_ < 0) {
             result_ = io::io_result{-errno, 0};
             return false;  // Don't suspend, resume immediately
@@ -434,10 +668,10 @@ public:
             setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
         }
         
-        // Initiate non-blocking connect
-        sa_ = addr_.to_sockaddr();
+        // Get sockaddr
+        socklen_t sa_len = addr_.to_sockaddr(sa_);
         
-        int ret = ::connect(fd_, reinterpret_cast<struct sockaddr*>(&sa_), sizeof(sa_));
+        int ret = ::connect(fd_, reinterpret_cast<struct sockaddr*>(&sa_), sa_len);
         if (ret == 0) {
             // Connected immediately (rare for TCP, but possible)
             result_ = io::io_result{0, 0};
@@ -457,8 +691,7 @@ public:
         req.op = io::io_op::connect;
         req.fd = fd_;
         req.addr = reinterpret_cast<struct sockaddr*>(&sa_);
-        socklen_t len = sizeof(sa_);
-        req.addrlen = &len;
+        req.addrlen = &sa_len_;
         req.awaiter = awaiter;
         
         if (!ctx_.prepare(req)) {
@@ -499,23 +732,36 @@ public:
     
 private:
     io::io_context& ctx_;
-    ipv4_address addr_;
+    socket_address addr_;
     tcp_options opts_;
-    struct sockaddr_in sa_{};
+    struct sockaddr_storage sa_{};
+    socklen_t sa_len_ = sizeof(sa_);
     int fd_ = -1;
     io::io_result result_{};
 };
 
-/// Connect to a remote TCP server
+/// Connect to a remote TCP server (IPv4)
 inline auto tcp_connect(io::io_context& ctx, const ipv4_address& addr,
+                        const tcp_options& opts = {}) {
+    return tcp_connect_awaitable(ctx, socket_address(addr), opts);
+}
+
+/// Connect to a remote TCP server (IPv6)
+inline auto tcp_connect(io::io_context& ctx, const ipv6_address& addr,
+                        const tcp_options& opts = {}) {
+    return tcp_connect_awaitable(ctx, socket_address(addr), opts);
+}
+
+/// Connect to a remote TCP server (generic address)
+inline auto tcp_connect(io::io_context& ctx, const socket_address& addr,
                         const tcp_options& opts = {}) {
     return tcp_connect_awaitable(ctx, addr, opts);
 }
 
-/// Connect to a remote TCP server by host and port
+/// Connect to a remote TCP server by host and port (auto-detects IPv4/IPv6)
 inline auto tcp_connect(io::io_context& ctx, std::string_view host, uint16_t port,
                         const tcp_options& opts = {}) {
-    return tcp_connect_awaitable(ctx, ipv4_address(host, port), opts);
+    return tcp_connect_awaitable(ctx, socket_address(host, port), opts);
 }
 
 } // namespace elio::net

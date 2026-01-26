@@ -943,3 +943,220 @@ TEST_CASE("UDS echo test", "[uds][echo]") {
     REQUIRE(client_bytes == 6);
     REQUIRE(std::string(client_recv) == "Hello!");
 }
+
+// ============================================================================
+// TCP/IP Address and IPv6 Tests
+// ============================================================================
+
+#include <elio/net/tcp.hpp>
+
+TEST_CASE("ipv4_address basic operations", "[tcp][address][ipv4]") {
+    SECTION("default constructor") {
+        ipv4_address addr;
+        REQUIRE(addr.addr == INADDR_ANY);
+        REQUIRE(addr.port == 0);
+    }
+    
+    SECTION("port-only constructor") {
+        ipv4_address addr(8080);
+        REQUIRE(addr.addr == INADDR_ANY);
+        REQUIRE(addr.port == 8080);
+    }
+    
+    SECTION("ip and port constructor") {
+        ipv4_address addr("127.0.0.1", 8080);
+        REQUIRE(addr.port == 8080);
+        REQUIRE(addr.to_string() == "127.0.0.1:8080");
+    }
+    
+    SECTION("family returns AF_INET") {
+        ipv4_address addr;
+        REQUIRE(addr.family() == AF_INET);
+    }
+    
+    SECTION("to_sockaddr conversion") {
+        ipv4_address addr("192.168.1.1", 443);
+        auto sa = addr.to_sockaddr();
+        REQUIRE(sa.sin_family == AF_INET);
+        REQUIRE(ntohs(sa.sin_port) == 443);
+    }
+}
+
+TEST_CASE("ipv6_address basic operations", "[tcp][address][ipv6]") {
+    SECTION("default constructor") {
+        ipv6_address addr;
+        REQUIRE(addr.port == 0);
+        REQUIRE(addr.scope_id == 0);
+    }
+    
+    SECTION("port-only constructor") {
+        ipv6_address addr(8080);
+        REQUIRE(addr.port == 8080);
+    }
+    
+    SECTION("ipv6 loopback address") {
+        ipv6_address addr("::1", 8080);
+        REQUIRE(addr.port == 8080);
+        REQUIRE(addr.to_string() == "[::1]:8080");
+    }
+    
+    SECTION("ipv6 any address") {
+        ipv6_address addr("::", 80);
+        REQUIRE(addr.port == 80);
+        // to_string may vary, just check it contains "::" and port
+        auto str = addr.to_string();
+        REQUIRE(str.find("::") != std::string::npos);
+        REQUIRE(str.find(":80") != std::string::npos);
+    }
+    
+    SECTION("family returns AF_INET6") {
+        ipv6_address addr;
+        REQUIRE(addr.family() == AF_INET6);
+    }
+    
+    SECTION("to_sockaddr conversion") {
+        ipv6_address addr("::1", 443);
+        auto sa = addr.to_sockaddr();
+        REQUIRE(sa.sin6_family == AF_INET6);
+        REQUIRE(ntohs(sa.sin6_port) == 443);
+    }
+    
+    SECTION("v4-mapped detection") {
+        // Create an IPv4-mapped IPv6 address (::ffff:127.0.0.1)
+        ipv6_address addr;
+        addr.port = 80;
+        // Manually set IPv4-mapped address
+        std::memset(&addr.addr, 0, sizeof(addr.addr));
+        addr.addr.s6_addr[10] = 0xff;
+        addr.addr.s6_addr[11] = 0xff;
+        addr.addr.s6_addr[12] = 127;
+        addr.addr.s6_addr[13] = 0;
+        addr.addr.s6_addr[14] = 0;
+        addr.addr.s6_addr[15] = 1;
+        REQUIRE(addr.is_v4_mapped());
+    }
+}
+
+TEST_CASE("socket_address variant operations", "[tcp][address][socket_address]") {
+    SECTION("construct from ipv4_address") {
+        ipv4_address v4("127.0.0.1", 8080);
+        socket_address addr(v4);
+        REQUIRE(addr.is_v4());
+        REQUIRE_FALSE(addr.is_v6());
+        REQUIRE(addr.family() == AF_INET);
+        REQUIRE(addr.port() == 8080);
+    }
+    
+    SECTION("construct from ipv6_address") {
+        ipv6_address v6("::1", 8080);
+        socket_address addr(v6);
+        REQUIRE(addr.is_v6());
+        REQUIRE_FALSE(addr.is_v4());
+        REQUIRE(addr.family() == AF_INET6);
+        REQUIRE(addr.port() == 8080);
+    }
+    
+    SECTION("port-only defaults to IPv6") {
+        socket_address addr(8080);
+        REQUIRE(addr.is_v6());
+        REQUIRE(addr.port() == 8080);
+    }
+    
+    SECTION("host with colon parsed as IPv6") {
+        socket_address addr("::1", 443);
+        REQUIRE(addr.is_v6());
+        REQUIRE(addr.port() == 443);
+    }
+    
+    SECTION("dotted quad parsed as IPv4") {
+        socket_address addr("192.168.1.1", 80);
+        REQUIRE(addr.is_v4());
+        REQUIRE(addr.port() == 80);
+    }
+    
+    SECTION("to_sockaddr fills storage correctly") {
+        socket_address addr_v4(ipv4_address("10.0.0.1", 80));
+        struct sockaddr_storage ss;
+        socklen_t len = addr_v4.to_sockaddr(ss);
+        REQUIRE(ss.ss_family == AF_INET);
+        REQUIRE(len == sizeof(struct sockaddr_in));
+        
+        socket_address addr_v6(ipv6_address("::1", 443));
+        len = addr_v6.to_sockaddr(ss);
+        REQUIRE(ss.ss_family == AF_INET6);
+        REQUIRE(len == sizeof(struct sockaddr_in6));
+    }
+    
+    SECTION("to_string works for both families") {
+        socket_address v4(ipv4_address("1.2.3.4", 80));
+        REQUIRE(v4.to_string() == "1.2.3.4:80");
+        
+        socket_address v6(ipv6_address("::1", 443));
+        REQUIRE(v6.to_string() == "[::1]:443");
+    }
+}
+
+TEST_CASE("TCP IPv6 listener and connect", "[tcp][ipv6][integration]") {
+    io_context ctx(io_context::backend_type::epoll);
+    
+    SECTION("IPv6 listener binds successfully") {
+        // Use IPv6 loopback to avoid network issues
+        auto listener = tcp_listener::bind(ipv6_address("::1", 0), ctx);
+        REQUIRE(listener.has_value());
+        REQUIRE(listener->is_valid());
+        REQUIRE(listener->local_address().family() == AF_INET6);
+        REQUIRE(listener->local_address().port() > 0);
+    }
+    
+    SECTION("IPv6 accept and connect") {
+        // Create listener on IPv6 loopback
+        auto listener = tcp_listener::bind(ipv6_address("::1", 0), ctx);
+        REQUIRE(listener.has_value());
+        
+        // Get the assigned port
+        uint16_t port = listener->local_address().port();
+        REQUIRE(port > 0);
+        
+        std::atomic<bool> accepted{false};
+        std::atomic<bool> connected{false};
+        std::optional<tcp_stream> server_stream;
+        std::optional<tcp_stream> client_stream;
+        
+        auto accept_coro = [&]() -> task<void> {
+            auto stream = co_await listener->accept();
+            server_stream = std::move(stream);
+            accepted = true;
+        };
+        
+        auto connect_coro = [&]() -> task<void> {
+            auto stream = co_await tcp_connect(ctx, ipv6_address("::1", port));
+            client_stream = std::move(stream);
+            connected = true;
+        };
+        
+        auto accept_task = accept_coro();
+        auto connect_task = connect_coro();
+        accept_task.handle().resume();
+        connect_task.handle().resume();
+        
+        for (int i = 0; i < 200 && (!accepted || !connected); ++i) {
+            ctx.poll(std::chrono::milliseconds(10));
+        }
+        
+        REQUIRE(accepted);
+        REQUIRE(connected);
+        REQUIRE(server_stream.has_value());
+        REQUIRE(client_stream.has_value());
+    }
+}
+
+TEST_CASE("socket_address with hostname resolution", "[tcp][address][dns]") {
+    // Test that socket_address can be constructed from "localhost"
+    // This tests the DNS resolution path
+    SECTION("localhost resolves") {
+        socket_address addr("localhost", 80);
+        // Should resolve to either IPv4 or IPv6
+        REQUIRE((addr.is_v4() || addr.is_v6()));
+        REQUIRE(addr.port() == 80);
+    }
+}

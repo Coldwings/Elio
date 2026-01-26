@@ -5,11 +5,22 @@
 /// using Elio's async I/O and coroutine support. The server handles
 /// multiple client connections concurrently.
 ///
-/// Usage: ./tcp_echo_server [port]
+/// Supports both IPv4 and IPv6:
+///   - Default: Dual-stack (IPv6 socket accepting both IPv4 and IPv6)
+///   - Use -4 for IPv4-only mode
+///   - Use -6 for IPv6-only mode
+///   - Use -b <addr> to bind to a specific address
+///
+/// Usage: ./tcp_echo_server [options] [port]
+///   -4           IPv4 only (bind to 0.0.0.0)
+///   -6           IPv6 only (bind to :: with IPV6_V6ONLY)
+///   -b <addr>    Bind to specific address (e.g., 127.0.0.1, ::1, 192.168.1.1)
+///   -h, --help   Show help
 /// Default port: 8080
 
 #include <elio/elio.hpp>
 #include <atomic>
+#include <iostream>
 
 using namespace elio;
 using namespace elio::coro;
@@ -86,14 +97,14 @@ task<void> handle_client(tcp_stream stream, int client_id) {
 }
 
 /// Main server loop - accepts connections and spawns handlers
-task<void> server_main(uint16_t port, scheduler& sched) {
+task<void> server_main(const socket_address& bind_addr, const tcp_options& opts, scheduler& sched) {
     // Use the default io_context which is polled by scheduler workers
     auto& ctx = io::default_io_context();
     
     // Bind TCP listener
-    auto listener_result = tcp_listener::bind(ipv4_address(port), ctx);
+    auto listener_result = tcp_listener::bind(bind_addr, ctx, opts);
     if (!listener_result) {
-        ELIO_LOG_ERROR("Failed to bind to port {}: {}", port,
+        ELIO_LOG_ERROR("Failed to bind to {}: {}", bind_addr.to_string(),
                       strerror(errno));
         co_return;
     }
@@ -103,7 +114,7 @@ task<void> server_main(uint16_t port, scheduler& sched) {
     // Store listener fd for shutdown cancellation
     g_listener_fd.store(listener.fd(), std::memory_order_release);
     
-    ELIO_LOG_INFO("Echo server listening on port {}", port);
+    ELIO_LOG_INFO("Echo server listening on {}", bind_addr.to_string());
     ELIO_LOG_INFO("Press Ctrl+C to stop");
     
     int client_counter = 0;
@@ -134,11 +145,52 @@ task<void> server_main(uint16_t port, scheduler& sched) {
 }
 
 int main(int argc, char* argv[]) {
-    // Parse port from command line
+    // Parse command line options
     uint16_t port = 8080;
-    if (argc > 1) {
-        port = static_cast<uint16_t>(std::stoi(argv[1]));
+    std::string bind_address;
+    bool ipv4_only = false;
+    bool ipv6_only = false;
+    
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-4") {
+            ipv4_only = true;
+        } else if (arg == "-6") {
+            ipv6_only = true;
+        } else if (arg == "-b" && i + 1 < argc) {
+            bind_address = argv[++i];
+        } else if (arg == "-h" || arg == "--help") {
+            std::cout << "Usage: " << argv[0] << " [options] [port]\n"
+                      << "Options:\n"
+                      << "  -4           IPv4 only (bind to 0.0.0.0)\n"
+                      << "  -6           IPv6 only (bind to :: with IPV6_V6ONLY)\n"
+                      << "  -b <addr>    Bind to specific address\n"
+                      << "  -h, --help   Show this help\n"
+                      << "Default: Dual-stack on port 8080 (accepts IPv4 and IPv6)\n";
+            return 0;
+        } else if (arg[0] != '-') {
+            port = static_cast<uint16_t>(std::stoi(arg));
+        }
     }
+    
+    // Determine bind address
+    socket_address bind_addr;
+    tcp_options opts;
+    
+    if (!bind_address.empty()) {
+        // User specified address
+        bind_addr = socket_address(bind_address, port);
+    } else if (ipv4_only) {
+        // IPv4 only
+        bind_addr = socket_address(ipv4_address(port));
+    } else {
+        // Default: IPv6 dual-stack (accepts both IPv4 and IPv6)
+        bind_addr = socket_address(ipv6_address(port));
+        opts.ipv6_only = ipv6_only;  // If -6 specified, disable dual-stack
+    }
+    
+    ELIO_LOG_INFO("Binding to {} ({})", bind_addr.to_string(),
+                  ipv4_only ? "IPv4 only" : (ipv6_only ? "IPv6 only" : "dual-stack"));
     
     // Block signals BEFORE creating scheduler threads
     signal_set sigs{SIGINT, SIGTERM};
@@ -157,7 +209,7 @@ int main(int argc, char* argv[]) {
     sched.spawn(sig_handler.release());
     
     // Run server
-    auto server = server_main(port, sched);
+    auto server = server_main(bind_addr, opts, sched);
     sched.spawn(server.release());
     
     // Wait until interrupted

@@ -8,13 +8,14 @@
 /// - TLS stream wrapper for encrypted TCP connections
 /// - ALPN protocol negotiation (for HTTP/2)
 /// - Support for TLS 1.2 and TLS 1.3
+/// - Full IPv4 and IPv6 support
 
 #include <elio/tls/tls_context.hpp>
 #include <elio/tls/tls_stream.hpp>
 
 namespace elio::tls {
 
-/// @example TLS Client Example
+/// @example TLS Client Example (IPv4)
 /// @code
 /// #include <elio/elio.hpp>
 /// #include <elio/tls/tls.hpp>
@@ -49,7 +50,7 @@ namespace elio::tls {
 /// }
 /// @endcode
 
-/// @example TLS Server Example
+/// @example TLS Server Example (IPv6 dual-stack)
 /// @code
 /// #include <elio/elio.hpp>
 /// #include <elio/tls/tls.hpp>
@@ -63,12 +64,16 @@ namespace elio::tls {
 ///     // Create server TLS context with certificate
 ///     auto tls_ctx = tls_context::make_server("server.crt", "server.key");
 ///     
-///     // Create TLS listener
-///     auto listener = tls_listener::bind(net::ipv4_address(8443), ctx, tls_ctx);
+///     // Create TLS listener on IPv6 (accepts both IPv4 and IPv6 by default)
+///     auto listener = tls_listener::bind(net::ipv6_address(8443), ctx, tls_ctx);
 ///     if (!listener) {
 ///         std::cerr << "Failed to bind" << std::endl;
 ///         co_return;
 ///     }
+///     
+///     // Or bind to specific address:
+///     // auto listener = tls_listener::bind(net::socket_address("::1", 8443), ctx, tls_ctx);
+///     // auto listener = tls_listener::bind(net::ipv4_address("0.0.0.0", 8443), ctx, tls_ctx);
 ///     
 ///     while (true) {
 ///         auto stream = co_await listener->accept();

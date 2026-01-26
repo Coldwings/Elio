@@ -241,6 +241,17 @@ inline void deserialize_impl(buffer_view& reader, std::vector<uint8_t>& value) {
     value.assign(span.begin(), span.end());
 }
 
+/// Serialize buffer_ref (zero-copy reference to external data)
+inline void serialize_impl(buffer_writer& writer, const buffer_ref& ref) {
+    writer.write_blob(ref.span());
+}
+
+/// Deserialize buffer_ref (returns view into received buffer - zero copy)
+inline void deserialize_impl(buffer_view& reader, buffer_ref& ref) {
+    auto span = reader.read_blob();
+    ref = buffer_ref(span);
+}
+
 /// Serialize vector
 template<typename T, typename A>
 void serialize_impl(buffer_writer& writer, const std::vector<T, A>& vec) {

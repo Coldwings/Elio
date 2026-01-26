@@ -41,6 +41,9 @@ namespace elio::rpc {
 // RPC Context
 // ============================================================================
 
+/// Cleanup callback type - invoked after response is sent
+using cleanup_callback_t = std::function<void()>;
+
 /// Context passed to RPC handlers
 struct rpc_context {
     uint32_t request_id;                    ///< Request ID for correlation
@@ -57,8 +60,19 @@ struct rpc_context {
 // Handler types
 // ============================================================================
 
+/// Handler result containing success flag, payload, and optional cleanup callback
+struct handler_result {
+    bool success = false;
+    buffer_writer payload;
+    cleanup_callback_t cleanup;  ///< Optional cleanup callback (runs after response sent)
+    
+    handler_result() = default;
+    handler_result(bool s, buffer_writer p, cleanup_callback_t c = nullptr)
+        : success(s), payload(std::move(p)), cleanup(std::move(c)) {}
+};
+
 /// Type-erased handler that processes raw request data
-using raw_handler_t = std::function<coro::task<std::pair<bool, buffer_writer>>(
+using raw_handler_t = std::function<coro::task<handler_result>(
     const rpc_context& ctx,
     buffer_view payload
 )>;
@@ -170,14 +184,16 @@ private:
         // Call handler and capture result or error
         bool handler_success = false;
         buffer_writer response_payload;
+        cleanup_callback_t cleanup_cb;
         rpc_error error_code = rpc_error::success;
         std::string error_message;
         
         try {
-            auto [success, resp_payload] = co_await it->second(ctx, view);
-            handler_success = success;
-            response_payload = std::move(resp_payload);
-            if (!success) {
+            auto result = co_await it->second(ctx, view);
+            handler_success = result.success;
+            response_payload = std::move(result.payload);
+            cleanup_cb = std::move(result.cleanup);
+            if (!handler_success) {
                 error_code = rpc_error::internal_error;
                 error_message = "Handler failed";
             }
@@ -208,6 +224,15 @@ private:
                 error_message
             );
             co_await send_response(err_header, err_payload);
+        }
+        
+        // Invoke cleanup callback after response is sent
+        if (cleanup_cb) {
+            try {
+                cleanup_cb();
+            } catch (const std::exception& e) {
+                ELIO_LOG_ERROR("RPC session: cleanup callback exception: {}", e.what());
+            }
         }
     }
     
@@ -258,7 +283,7 @@ public:
         raw_handler_t raw_handler = [h = std::move(handler)](
             [[maybe_unused]] const rpc_context& ctx,
             buffer_view payload
-        ) -> coro::task<std::pair<bool, buffer_writer>> {
+        ) -> coro::task<handler_result> {
             // Deserialize request
             Request request;
             deserialize(payload, request);
@@ -270,7 +295,7 @@ public:
             buffer_writer response_data;
             serialize(response_data, response);
             
-            co_return std::make_pair(true, std::move(response_data));
+            co_return handler_result{true, std::move(response_data), nullptr};
         };
         
         handlers_[Method::id] = std::move(raw_handler);
@@ -287,7 +312,7 @@ public:
         raw_handler_t raw_handler = [h = std::move(handler)](
             const rpc_context& ctx,
             buffer_view payload
-        ) -> coro::task<std::pair<bool, buffer_writer>> {
+        ) -> coro::task<handler_result> {
             // Deserialize request
             Request request;
             deserialize(payload, request);
@@ -299,7 +324,7 @@ public:
             buffer_writer response_data;
             serialize(response_data, response);
             
-            co_return std::make_pair(true, std::move(response_data));
+            co_return handler_result{true, std::move(response_data), nullptr};
         };
         
         handlers_[Method::id] = std::move(raw_handler);
@@ -314,7 +339,7 @@ public:
         raw_handler_t raw_handler = [h = std::move(handler)](
             [[maybe_unused]] const rpc_context& ctx,
             buffer_view payload
-        ) -> coro::task<std::pair<bool, buffer_writer>> {
+        ) -> coro::task<handler_result> {
             // Deserialize request
             Request request;
             deserialize(payload, request);
@@ -326,7 +351,66 @@ public:
             buffer_writer response_data;
             serialize(response_data, response);
             
-            co_return std::make_pair(true, std::move(response_data));
+            co_return handler_result{true, std::move(response_data), nullptr};
+        };
+        
+        handlers_[Method::id] = std::move(raw_handler);
+    }
+    
+    /// Register a method handler with cleanup callback support
+    /// Handler should return std::pair<Response, cleanup_callback_t>
+    /// The cleanup callback is invoked after the response is successfully sent
+    /// @tparam Method The method descriptor type
+    /// @tparam Handler A callable returning task<std::pair<Response, cleanup_callback_t>>
+    template<typename Method, typename Handler>
+    void register_method_with_cleanup(Handler handler) {
+        using Request = typename Method::request_type;
+        
+        raw_handler_t raw_handler = [h = std::move(handler)](
+            [[maybe_unused]] const rpc_context& ctx,
+            buffer_view payload
+        ) -> coro::task<handler_result> {
+            // Deserialize request
+            Request request;
+            deserialize(payload, request);
+            
+            // Call handler - returns (response, cleanup_callback)
+            auto [response, cleanup] = co_await h(request);
+            
+            // Serialize response
+            buffer_writer response_data;
+            serialize(response_data, response);
+            
+            co_return handler_result{true, std::move(response_data), std::move(cleanup)};
+        };
+        
+        handlers_[Method::id] = std::move(raw_handler);
+    }
+    
+    /// Register a method handler with context and cleanup callback support
+    /// Handler should return std::pair<Response, cleanup_callback_t>
+    /// @tparam Method The method descriptor type
+    /// @tparam Handler A callable taking (ctx, request) and returning task<std::pair<Response, cleanup_callback_t>>
+    template<typename Method, typename Handler>
+    void register_method_with_context_and_cleanup(Handler handler) {
+        using Request = typename Method::request_type;
+        
+        raw_handler_t raw_handler = [h = std::move(handler)](
+            const rpc_context& ctx,
+            buffer_view payload
+        ) -> coro::task<handler_result> {
+            // Deserialize request
+            Request request;
+            deserialize(payload, request);
+            
+            // Call handler with context - returns (response, cleanup_callback)
+            auto [response, cleanup] = co_await h(ctx, request);
+            
+            // Serialize response
+            buffer_writer response_data;
+            serialize(response_data, response);
+            
+            co_return handler_result{true, std::move(response_data), std::move(cleanup)};
         };
         
         handlers_[Method::id] = std::move(raw_handler);

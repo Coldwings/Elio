@@ -11,6 +11,9 @@ Elio's RPC framework provides high-performance remote procedure calls over TCP a
 - **Variable-length data**: Strings, arrays, maps, and optionals
 - **TCP and UDS**: Works over TCP sockets or Unix domain sockets
 - **C++ templates**: No code generation needed - define schemas with C++ structs
+- **Message integrity**: Optional CRC32 checksum for data verification
+- **Zero-copy binary fields**: `buffer_ref` type for referencing external buffers without copying
+- **Resource cleanup**: Cleanup callbacks for releasing resources after response is sent
 
 ## Quick Start
 
@@ -212,6 +215,48 @@ struct BlobExample {
 };
 ```
 
+### Zero-Copy Binary References (buffer_ref)
+
+For zero-copy handling of binary data from external sources (e.g., mmap'd files, pre-allocated buffers), use `buffer_ref`:
+
+```cpp
+struct FileDataResponse {
+    std::string filename;
+    buffer_ref content;  // references external buffer without copying
+    
+    ELIO_RPC_FIELDS(FileDataResponse, filename, content)
+};
+
+// Server handler with external buffer
+server.register_method_with_cleanup<GetFileData>(
+    [](const GetFileDataRequest& req) 
+        -> coro::task<std::pair<FileDataResponse, cleanup_callback_t>> {
+        
+        // Map file into memory
+        void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        
+        FileDataResponse resp;
+        resp.filename = req.path;
+        resp.content = buffer_ref(mapped, file_size);
+        
+        // Cleanup callback runs after response is sent
+        auto cleanup = [mapped, file_size]() {
+            munmap(mapped, file_size);
+        };
+        
+        co_return std::make_pair(resp, cleanup);
+    });
+```
+
+`buffer_ref` provides:
+- Zero-copy serialization of external memory
+- Construction from pointer+size, `std::span`, or `iovec`
+- Conversion to `span`, `iovec`, or `string_view`
+
+**Important**: The referenced data must remain valid until:
+- For client: the RPC call completes
+- For server: the cleanup callback is invoked
+
 ## Wire Protocol
 
 ### Frame Format
@@ -224,16 +269,20 @@ All messages use a binary wire format with little-endian byte order:
 +----------+----------+-------+--------+------------+---------+
 | payload (len bytes)                                         |
 +-------------------------------------------------------------+
+| checksum(4) - optional, present if has_checksum flag set    |
++-------------------------------------------------------------+
 ```
 
 - **magic** (4 bytes): `0x454C494F` ("ELIO")
 - **request_id** (4 bytes): Correlation ID for matching responses
 - **type** (1 byte): Message type (request=0, response=1, error=2, ping=3, pong=4, cancel=5)
-- **flags** (1 byte): Message flags (has_timeout=0x01)
+- **flags** (1 byte): Message flags (has_timeout=0x01, has_checksum=0x02)
 - **method_id** (4 bytes): Method being called (for requests)
 - **payload_length** (4 bytes): Length of payload in bytes
+- **checksum** (4 bytes, optional): CRC32 checksum of header + payload
 
 Total header size: 18 bytes
+Checksum trailer: 4 bytes (optional)
 
 ### Message Types
 
@@ -331,6 +380,63 @@ server.register_sync_method<GetVersion>(
 });
 ```
 
+### Handlers with Cleanup Callbacks
+
+When your response references external resources that must be released after the response is sent, use cleanup callbacks:
+
+```cpp
+// Handler returns std::pair<Response, cleanup_callback_t>
+server.register_method_with_cleanup<ReadFile>(
+    [](const ReadFileRequest& req) 
+        -> coro::task<std::pair<ReadFileResponse, cleanup_callback_t>> {
+        
+        // Acquire resource
+        int fd = open(req.path.c_str(), O_RDONLY);
+        void* data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        
+        ReadFileResponse resp;
+        resp.content = buffer_ref(data, size);
+        
+        // Cleanup runs AFTER response is fully sent
+        auto cleanup = [data, size, fd]() {
+            munmap(data, size);
+            close(fd);
+        };
+        
+        co_return std::make_pair(resp, std::move(cleanup));
+    });
+
+// With context access
+server.register_method_with_context_and_cleanup<ReadFile>(
+    [](const rpc_context& ctx, const ReadFileRequest& req) 
+        -> coro::task<std::pair<ReadFileResponse, cleanup_callback_t>> {
+        // ... same pattern with ctx available
+    });
+```
+
+### Message Integrity with CRC32 Checksum
+
+Enable CRC32 checksums for message integrity verification:
+
+```cpp
+// Client: enable checksum for a specific call
+GetUserRequest req{42};
+auto [header, payload] = build_request(
+    request_id, GetUser::id, req,
+    std::chrono::milliseconds(5000),  // timeout
+    true  // enable_checksum
+);
+
+// Or when building responses (server-side)
+auto [header, payload] = build_response(request_id, response, true);
+
+// Error responses with checksum
+auto [header, payload] = build_error_response(
+    request_id, rpc_error::internal_error, "message", true);
+```
+
+The checksum covers both header and payload. If verification fails on receive, the frame is rejected and `read_frame()` returns `std::nullopt`.
+
 ### One-way Messages
 
 Send messages without waiting for response:
@@ -398,6 +504,27 @@ iov.add(payload_data, payload_size);
 struct msghdr msg = {};
 msg.msg_iov = iov.iovecs();
 msg.msg_iovlen = iov.count();
+```
+
+### CRC32 Checksum Utilities
+
+The RPC framework uses the hash module for checksums. See [[Hash Functions]] for full documentation.
+
+```cpp
+#include <elio/hash/crc32.hpp>
+
+// Single contiguous buffer
+uint32_t checksum = elio::hash::crc32(data, length);
+
+// From span
+uint32_t checksum = elio::hash::crc32(std::span<const uint8_t>(data));
+
+// Across multiple iovec buffers (scatter-gather)
+struct iovec iov[2] = {...};
+uint32_t checksum = elio::hash::crc32_iovec(iov, 2);
+
+// Also available via elio::rpc namespace for convenience
+uint32_t checksum = elio::rpc::crc32(data, length);
 ```
 
 ### Message Size Limits

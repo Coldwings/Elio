@@ -9,6 +9,9 @@
 /// - In-place deserialization with views
 /// - Little-endian wire format (host order assumed)
 /// - Variable-length data (strings, arrays, blobs)
+/// - Buffer references for zero-copy iovec fields
+
+#include <elio/hash/crc32.hpp>
 
 #include <cstdint>
 #include <cstddef>
@@ -18,10 +21,17 @@
 #include <string_view>
 #include <vector>
 #include <stdexcept>
+#include <functional>
 #include <sys/uio.h>
 #include <type_traits>
 
 namespace elio::rpc {
+
+// Import CRC32 functions from hash module for convenience
+using elio::hash::crc32;
+using elio::hash::crc32_iovec;
+using elio::hash::crc32_update;
+using elio::hash::crc32_finalize;
 
 /// Maximum message size (16MB)
 constexpr size_t max_message_size = 16 * 1024 * 1024;
@@ -31,6 +41,72 @@ class serialization_error : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
+
+// ============================================================================
+// Buffer reference (zero-copy external data reference)
+// ============================================================================
+
+/// A reference to external buffer data for zero-copy serialization
+/// This type allows including external memory regions (like mmap'd files or 
+/// pre-allocated buffers) in RPC messages without copying.
+/// 
+/// IMPORTANT: The referenced data must remain valid until:
+/// - For client: the RPC call completes
+/// - For server: the cleanup callback is invoked
+class buffer_ref {
+public:
+    buffer_ref() noexcept = default;
+    
+    /// Construct from raw pointer and size
+    buffer_ref(const void* data, size_t size) noexcept
+        : data_(static_cast<const uint8_t*>(data))
+        , size_(size) {}
+    
+    /// Construct from span
+    buffer_ref(std::span<const uint8_t> span) noexcept
+        : data_(span.data()), size_(span.size()) {}
+    
+    /// Construct from iovec
+    buffer_ref(const struct iovec& iov) noexcept
+        : data_(static_cast<const uint8_t*>(iov.iov_base))
+        , size_(iov.iov_len) {}
+    
+    /// Get data pointer
+    const uint8_t* data() const noexcept { return data_; }
+    
+    /// Get size
+    size_t size() const noexcept { return size_; }
+    
+    /// Check if empty
+    bool empty() const noexcept { return size_ == 0; }
+    
+    /// Get as span
+    std::span<const uint8_t> span() const noexcept { return {data_, size_}; }
+    
+    /// Get as iovec
+    struct iovec to_iovec() const noexcept {
+        return {const_cast<uint8_t*>(data_), size_};
+    }
+    
+    /// Convert to string_view (assumes UTF-8 data)
+    std::string_view as_string_view() const noexcept {
+        return {reinterpret_cast<const char*>(data_), size_};
+    }
+    
+private:
+    const uint8_t* data_ = nullptr;
+    size_t size_ = 0;
+};
+
+/// Type trait to detect buffer_ref
+template<typename T>
+struct is_buffer_ref : std::false_type {};
+
+template<>
+struct is_buffer_ref<buffer_ref> : std::true_type {};
+
+template<typename T>
+inline constexpr bool is_buffer_ref_v = is_buffer_ref<T>::value;
 
 /// A view into serialized data for zero-copy reading
 /// This class provides safe access to serialized fields without copying

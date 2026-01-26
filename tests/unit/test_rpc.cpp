@@ -649,3 +649,202 @@ TEST_CASE("type traits", "[rpc][traits]") {
     
     REQUIRE(has_rpc_fields_v<SimpleMessage>);
 }
+
+// ============================================================================
+// CRC32 tests
+// ============================================================================
+
+TEST_CASE("crc32 basic", "[rpc][crc32]") {
+    SECTION("empty buffer") {
+        uint32_t crc = crc32(nullptr, 0);
+        REQUIRE(crc == 0);
+    }
+    
+    SECTION("simple data") {
+        const char* data = "123456789";
+        uint32_t crc = crc32(data, 9);
+        // Standard CRC32 for "123456789" is 0xCBF43926
+        REQUIRE(crc == 0xCBF43926);
+    }
+    
+    SECTION("span overload") {
+        std::vector<uint8_t> data = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+        uint32_t crc = crc32(std::span<const uint8_t>(data));
+        REQUIRE(crc == 0xCBF43926);
+    }
+}
+
+TEST_CASE("crc32_iovec", "[rpc][crc32]") {
+    // Split "123456789" across multiple iovecs
+    const char* part1 = "12345";
+    const char* part2 = "6789";
+    
+    struct iovec iov[2];
+    iov[0].iov_base = const_cast<char*>(part1);
+    iov[0].iov_len = 5;
+    iov[1].iov_base = const_cast<char*>(part2);
+    iov[1].iov_len = 4;
+    
+    uint32_t crc = crc32_iovec(iov, 2);
+    REQUIRE(crc == 0xCBF43926);
+}
+
+// ============================================================================
+// buffer_ref tests
+// ============================================================================
+
+TEST_CASE("buffer_ref basic", "[rpc][buffer_ref]") {
+    std::vector<uint8_t> data = {1, 2, 3, 4, 5};
+    
+    SECTION("construct from pointer and size") {
+        buffer_ref ref(data.data(), data.size());
+        REQUIRE(ref.data() == data.data());
+        REQUIRE(ref.size() == 5);
+        REQUIRE_FALSE(ref.empty());
+    }
+    
+    SECTION("construct from span") {
+        buffer_ref ref{std::span<const uint8_t>(data)};
+        REQUIRE(ref.size() == 5);
+    }
+    
+    SECTION("construct from iovec") {
+        struct iovec iov{data.data(), data.size()};
+        buffer_ref ref(iov);
+        REQUIRE(ref.size() == 5);
+    }
+    
+    SECTION("empty buffer_ref") {
+        buffer_ref ref;
+        REQUIRE(ref.empty());
+        REQUIRE(ref.size() == 0);
+        REQUIRE(ref.data() == nullptr);
+    }
+    
+    SECTION("to_iovec") {
+        buffer_ref ref(data.data(), data.size());
+        auto iov = ref.to_iovec();
+        REQUIRE(iov.iov_base == data.data());
+        REQUIRE(iov.iov_len == 5);
+    }
+    
+    SECTION("as_string_view") {
+        const char* text = "hello";
+        buffer_ref ref(text, 5);
+        REQUIRE(ref.as_string_view() == "hello");
+    }
+}
+
+TEST_CASE("buffer_ref serialization", "[rpc][buffer_ref]") {
+    std::vector<uint8_t> original_data = {0xDE, 0xAD, 0xBE, 0xEF};
+    buffer_ref original(original_data.data(), original_data.size());
+    
+    // Serialize
+    buffer_writer writer;
+    serialize(writer, original);
+    
+    // Deserialize
+    buffer_view view = writer.view();
+    buffer_ref result;
+    deserialize(view, result);
+    
+    REQUIRE(result.size() == original.size());
+    // Data should match (view into serialized buffer)
+    auto result_span = result.span();
+    REQUIRE(std::equal(result_span.begin(), result_span.end(), 
+                       original_data.begin(), original_data.end()));
+}
+
+// Test struct with buffer_ref field
+struct MessageWithBufferRef {
+    int32_t id;
+    buffer_ref data;
+    std::string name;
+    
+    ELIO_RPC_FIELDS(MessageWithBufferRef, id, data, name)
+};
+
+TEST_CASE("struct with buffer_ref field", "[rpc][buffer_ref]") {
+    std::vector<uint8_t> blob_data = {1, 2, 3, 4, 5, 6, 7, 8};
+    
+    MessageWithBufferRef original;
+    original.id = 42;
+    original.data = buffer_ref(blob_data.data(), blob_data.size());
+    original.name = "test";
+    
+    // Serialize
+    buffer_writer writer;
+    serialize(writer, original);
+    
+    // Deserialize
+    buffer_view view = writer.view();
+    MessageWithBufferRef result;
+    deserialize(view, result);
+    
+    REQUIRE(result.id == 42);
+    REQUIRE(result.data.size() == 8);
+    REQUIRE(result.name == "test");
+    
+    auto data_span = result.data.span();
+    REQUIRE(std::equal(data_span.begin(), data_span.end(),
+                       blob_data.begin(), blob_data.end()));
+}
+
+// ============================================================================
+// Checksum flag tests
+// ============================================================================
+
+TEST_CASE("message flags operations", "[rpc][protocol]") {
+    SECTION("combine flags") {
+        auto flags = message_flags::has_timeout | message_flags::has_checksum;
+        REQUIRE(has_flag(flags, message_flags::has_timeout));
+        REQUIRE(has_flag(flags, message_flags::has_checksum));
+        REQUIRE_FALSE(has_flag(flags, message_flags::compressed));
+    }
+    
+    SECTION("has_checksum flag") {
+        auto flags = message_flags::has_checksum;
+        REQUIRE(has_flag(flags, message_flags::has_checksum));
+    }
+}
+
+TEST_CASE("build request with checksum", "[rpc][protocol]") {
+    TestRequest req{100};
+    auto [header, payload] = build_request(1, 1, req, std::nullopt, true);
+    
+    REQUIRE(has_flag(header.flags, message_flags::has_checksum));
+    REQUIRE_FALSE(has_flag(header.flags, message_flags::has_timeout));
+}
+
+TEST_CASE("build request with timeout and checksum", "[rpc][protocol]") {
+    TestRequest req{100};
+    auto [header, payload] = build_request(1, 1, req, 5000, true);
+    
+    REQUIRE(has_flag(header.flags, message_flags::has_checksum));
+    REQUIRE(has_flag(header.flags, message_flags::has_timeout));
+}
+
+TEST_CASE("build response with checksum", "[rpc][protocol]") {
+    TestResponse resp{"ok"};
+    auto [header, payload] = build_response(1, resp, true);
+    
+    REQUIRE(has_flag(header.flags, message_flags::has_checksum));
+}
+
+TEST_CASE("build error response with checksum", "[rpc][protocol]") {
+    auto [header, payload] = build_error_response(1, rpc_error::timeout, "timed out", true);
+    
+    REQUIRE(has_flag(header.flags, message_flags::has_checksum));
+    REQUIRE(header.type == message_type::error);
+}
+
+// ============================================================================
+// buffer_ref type trait tests
+// ============================================================================
+
+TEST_CASE("buffer_ref type traits", "[rpc][buffer_ref]") {
+    REQUIRE(is_buffer_ref_v<buffer_ref>);
+    REQUIRE_FALSE(is_buffer_ref_v<int>);
+    REQUIRE_FALSE(is_buffer_ref_v<std::string>);
+    REQUIRE_FALSE(is_buffer_ref_v<std::vector<uint8_t>>);
+}

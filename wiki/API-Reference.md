@@ -16,6 +16,8 @@ This page provides a reference for Elio's public API.
 | `elio::sync` | Synchronization primitives |
 | `elio::time` | Timers |
 | `elio::log` | Logging |
+| `elio::hash` | Hash and checksum functions |
+| `elio::rpc` | RPC framework |
 
 ---
 
@@ -711,4 +713,453 @@ enum class level {
     warning,
     error
 };
+```
+
+---
+
+## Hash (`elio::hash`)
+
+### CRC32
+
+```cpp
+// Compute CRC32 checksum
+uint32_t crc32(const void* data, size_t length, uint32_t crc = 0xFFFFFFFF);
+uint32_t crc32(std::span<const uint8_t> data, uint32_t crc = 0xFFFFFFFF);
+
+// CRC32 over scatter-gather buffers
+uint32_t crc32_iovec(const struct iovec* iov, size_t count);
+
+// Incremental CRC32
+uint32_t crc32_update(const void* data, size_t length, uint32_t crc);
+uint32_t crc32_finalize(uint32_t crc);
+```
+
+### SHA-1
+
+```cpp
+// Constants
+constexpr size_t sha1_digest_size = 20;
+constexpr size_t sha1_block_size = 64;
+
+// Digest type
+using sha1_digest = std::array<uint8_t, sha1_digest_size>;
+
+// Compute SHA-1 hash
+sha1_digest sha1(const void* data, size_t length);
+sha1_digest sha1(std::span<const uint8_t> data);
+sha1_digest sha1(std::string_view str);
+
+// Get hex string
+std::string sha1_hex(const sha1_digest& digest);
+std::string sha1_hex(const void* data, size_t length);
+std::string sha1_hex(std::string_view str);
+
+// Incremental hashing
+class sha1_context {
+public:
+    sha1_context() noexcept;
+    void reset() noexcept;
+    void update(const void* data, size_t length) noexcept;
+    void update(std::span<const uint8_t> data) noexcept;
+    void update(std::string_view str) noexcept;
+    sha1_digest finalize() noexcept;
+};
+```
+
+### SHA-256
+
+```cpp
+// Constants
+constexpr size_t sha256_digest_size = 32;
+constexpr size_t sha256_block_size = 64;
+
+// Digest type
+using sha256_digest = std::array<uint8_t, sha256_digest_size>;
+
+// Compute SHA-256 hash
+sha256_digest sha256(const void* data, size_t length);
+sha256_digest sha256(std::span<const uint8_t> data);
+sha256_digest sha256(std::string_view str);
+
+// Get hex string
+std::string sha256_hex(const sha256_digest& digest);
+std::string sha256_hex(const void* data, size_t length);
+std::string sha256_hex(std::string_view str);
+
+// Incremental hashing
+class sha256_context {
+public:
+    sha256_context() noexcept;
+    void reset() noexcept;
+    void update(const void* data, size_t length) noexcept;
+    void update(std::span<const uint8_t> data) noexcept;
+    void update(std::string_view str) noexcept;
+    sha256_digest finalize() noexcept;
+};
+```
+
+### Utilities
+
+```cpp
+// Convert digest to hex string
+template<size_t N>
+std::string to_hex(const std::array<uint8_t, N>& digest);
+
+// Convert raw bytes to hex
+std::string to_hex(const void* data, size_t length);
+```
+
+---
+
+## RPC (`elio::rpc`)
+
+### Buffer Types
+
+#### `buffer_view`
+
+Read-only view into serialized data.
+
+```cpp
+class buffer_view {
+public:
+    buffer_view(const void* data, size_t size);
+    buffer_view(std::span<const uint8_t> span);
+    
+    const uint8_t* data() const noexcept;
+    size_t size() const noexcept;
+    size_t remaining() const noexcept;
+    size_t position() const noexcept;
+    
+    void seek(size_t pos);
+    void skip(size_t n);
+    
+    template<typename T> T read();           // Read primitive
+    template<typename T> void read_into(T& value);
+    template<typename T> T peek() const;     // Peek without advancing
+    
+    std::string_view read_string();          // Zero-copy string read
+    std::span<const uint8_t> read_blob();    // Zero-copy blob read
+    uint32_t read_array_size();
+    
+    std::span<const uint8_t> remaining_span() const noexcept;
+};
+```
+
+#### `buffer_writer`
+
+Growable buffer for serialization.
+
+```cpp
+class buffer_writer {
+public:
+    explicit buffer_writer(size_t initial_capacity = 256);
+    
+    void clear() noexcept;
+    size_t size() const noexcept;
+    const uint8_t* data() const noexcept;
+    std::span<const uint8_t> span() const noexcept;
+    struct iovec to_iovec() const noexcept;
+    
+    template<typename T> void write(T value);  // Write primitive
+    void write_bytes(const void* src, size_t n);
+    void write_string(std::string_view str);
+    void write_blob(std::span<const uint8_t> blob);
+    void write_array_size(uint32_t count);
+    
+    size_t reserve_space(size_t n);            // For back-patching
+    template<typename T> void write_at(size_t offset, T value);
+    
+    buffer_view view() const noexcept;
+    std::vector<uint8_t> release() noexcept;
+};
+```
+
+#### `buffer_ref`
+
+Zero-copy reference to external buffer data.
+
+```cpp
+class buffer_ref {
+public:
+    buffer_ref() noexcept;
+    buffer_ref(const void* data, size_t size) noexcept;
+    buffer_ref(std::span<const uint8_t> span) noexcept;
+    buffer_ref(const struct iovec& iov) noexcept;
+    
+    const uint8_t* data() const noexcept;
+    size_t size() const noexcept;
+    bool empty() const noexcept;
+    
+    std::span<const uint8_t> span() const noexcept;
+    struct iovec to_iovec() const noexcept;
+    std::string_view as_string_view() const noexcept;
+};
+```
+
+#### `iovec_buffer`
+
+Discontinuous buffer for scatter-gather I/O.
+
+```cpp
+class iovec_buffer {
+public:
+    void add(const void* data, size_t size);
+    void add(std::span<const uint8_t> span);
+    void add(const buffer_writer& writer);
+    void clear() noexcept;
+    
+    struct iovec* iovecs() noexcept;
+    size_t count() const noexcept;
+    size_t total_size() const noexcept;
+    
+    std::vector<uint8_t> flatten() const;  // Copies all data
+};
+```
+
+### CRC32 Checksum
+
+```cpp
+// Compute CRC32 checksum
+uint32_t crc32(const void* data, size_t length, uint32_t crc = 0xFFFFFFFF);
+uint32_t crc32(std::span<const uint8_t> data, uint32_t crc = 0xFFFFFFFF);
+uint32_t crc32_iovec(const struct iovec* iov, size_t count);
+```
+
+### Serialization
+
+```cpp
+// Serialize value to buffer
+template<typename T>
+void serialize(buffer_writer& writer, const T& value);
+
+// Deserialize value from buffer
+template<typename T>
+void deserialize(buffer_view& reader, T& value);
+
+// Convenience functions
+template<typename T>
+buffer_writer serialize(const T& value);
+
+template<typename T>
+T deserialize(buffer_view& reader);
+```
+
+### Schema Definition Macros
+
+```cpp
+// Define serializable fields for a struct
+ELIO_RPC_FIELDS(ClassName, field1, field2, ...)
+
+// Define empty struct (no fields)
+ELIO_RPC_EMPTY_FIELDS(ClassName)
+
+// Define RPC method
+ELIO_RPC_METHOD(method_id, RequestType, ResponseType)
+```
+
+### Protocol Types
+
+#### `frame_header`
+
+```cpp
+struct frame_header {
+    uint32_t magic;           // 0x454C494F ("ELIO")
+    uint32_t request_id;
+    message_type type;
+    message_flags flags;
+    method_id_t method_id;
+    uint32_t payload_length;
+    
+    bool is_valid() const noexcept;
+    std::array<uint8_t, 18> to_bytes() const;
+    static frame_header from_bytes(const uint8_t* data);
+};
+```
+
+#### `message_type`
+
+```cpp
+enum class message_type : uint8_t {
+    request = 0,
+    response = 1,
+    error = 2,
+    ping = 3,
+    pong = 4,
+    cancel = 5,
+};
+```
+
+#### `message_flags`
+
+```cpp
+enum class message_flags : uint8_t {
+    none = 0,
+    has_timeout = 1 << 0,
+    has_checksum = 1 << 1,
+    compressed = 1 << 2,    // reserved
+    streaming = 1 << 3,     // reserved
+};
+
+bool has_flag(message_flags flags, message_flags flag);
+```
+
+#### `rpc_error`
+
+```cpp
+enum class rpc_error : uint32_t {
+    success = 0,
+    timeout = 1,
+    connection_closed = 2,
+    invalid_message = 3,
+    method_not_found = 4,
+    serialization_error = 5,
+    internal_error = 6,
+    cancelled = 7,
+};
+
+const char* rpc_error_str(rpc_error err);
+```
+
+### Message Builders
+
+```cpp
+// Build request frame
+template<typename Request>
+std::pair<frame_header, buffer_writer> build_request(
+    uint32_t request_id,
+    method_id_t method_id,
+    const Request& request,
+    std::optional<uint32_t> timeout_ms = std::nullopt,
+    bool enable_checksum = false);
+
+// Build response frame
+template<typename Response>
+std::pair<frame_header, buffer_writer> build_response(
+    uint32_t request_id,
+    const Response& response,
+    bool enable_checksum = false);
+
+// Build error response
+std::pair<frame_header, buffer_writer> build_error_response(
+    uint32_t request_id,
+    rpc_error error_code,
+    std::string_view error_message = "",
+    bool enable_checksum = false);
+
+// Build ping/pong/cancel
+frame_header build_ping(uint32_t ping_id);
+frame_header build_pong(uint32_t ping_id);
+frame_header build_cancel(uint32_t request_id);
+```
+
+### Server Types
+
+#### `rpc_context`
+
+```cpp
+struct rpc_context {
+    uint32_t request_id;
+    method_id_t method_id;
+    std::optional<uint32_t> timeout_ms;
+    
+    bool has_timeout() const noexcept;
+};
+```
+
+#### `cleanup_callback_t`
+
+```cpp
+using cleanup_callback_t = std::function<void()>;
+```
+
+#### `rpc_server<Stream>`
+
+```cpp
+template<typename Stream>
+class rpc_server {
+public:
+    // Register async handler
+    template<typename Method, typename Handler>
+    void register_method(Handler handler);
+    
+    // Register async handler with context
+    template<typename Method, typename Handler>
+    void register_method_with_context(Handler handler);
+    
+    // Register sync handler
+    template<typename Method, typename Handler>
+    void register_sync_method(Handler handler);
+    
+    // Register handler with cleanup callback
+    template<typename Method, typename Handler>
+    void register_method_with_cleanup(Handler handler);
+    
+    // Register handler with context and cleanup
+    template<typename Method, typename Handler>
+    void register_method_with_context_and_cleanup(Handler handler);
+    
+    // Serve connections (awaitable)
+    /* awaitable */ serve(net::tcp_listener& listener);
+    /* awaitable */ serve(net::uds_listener& listener);
+    
+    // Handle single client
+    /* awaitable */ handle_client(Stream stream);
+    
+    void stop();
+    bool is_running() const noexcept;
+    size_t session_count() const;
+};
+
+// Type aliases
+using tcp_rpc_server = rpc_server<net::tcp_stream>;
+using uds_rpc_server = rpc_server<net::uds_stream>;
+```
+
+### Client Types
+
+#### `rpc_result<T>`
+
+```cpp
+template<typename T>
+class rpc_result {
+public:
+    explicit rpc_result(T value);         // Success
+    explicit rpc_result(rpc_error err);   // Error
+    
+    bool ok() const noexcept;
+    explicit operator bool() const noexcept;
+    
+    rpc_error error() const noexcept;
+    const char* error_message() const noexcept;
+    
+    T& value() &;
+    const T& value() const&;
+    T&& value() &&;
+    
+    template<typename U> T value_or(U&& default_value) const&;
+    
+    T* operator->();
+    T& operator*();
+};
+
+// Specialization for void
+template<>
+class rpc_result<void> {
+    static rpc_result success();
+    bool ok() const noexcept;
+    rpc_error error() const noexcept;
+};
+```
+
+### Type Traits
+
+```cpp
+template<typename T> inline constexpr bool is_primitive_v;
+template<typename T> inline constexpr bool is_string_type_v;
+template<typename T> inline constexpr bool is_vector_v;
+template<typename T> inline constexpr bool is_std_array_v;
+template<typename T> inline constexpr bool is_map_type_v;
+template<typename T> inline constexpr bool is_optional_v;
+template<typename T> inline constexpr bool is_buffer_ref_v;
+template<typename T> inline constexpr bool has_rpc_fields_v;
 ```

@@ -6,6 +6,7 @@
 /// This module defines the binary wire format for RPC messages:
 /// - Frame header with request ID, method ID, flags, and payload length
 /// - Message types (request, response, error)
+/// - Optional CRC32 checksum for message integrity
 /// - Stream-based framing for TCP/UDS sockets
 ///
 /// Wire Format (all little-endian):
@@ -14,13 +15,17 @@
 /// +----------+----------+-------+--------+------------+---------+
 /// | payload (len bytes)                                         |
 /// +-------------------------------------------------------------+
+/// | checksum(4) - optional, present if has_checksum flag set    |
+/// +-------------------------------------------------------------+
 ///
 /// Total header size: 18 bytes
+/// Checksum trailer: 4 bytes (optional)
 
 #include "rpc_buffer.hpp"
 #include "rpc_types.hpp"
 
 #include <elio/coro/task.hpp>
+#include <elio/hash/crc32.hpp>
 #include <elio/net/tcp.hpp>
 #include <elio/net/uds.hpp>
 #include <elio/log/macros.hpp>
@@ -43,6 +48,9 @@ constexpr uint8_t protocol_version = 1;
 /// Frame header size
 constexpr size_t frame_header_size = 18;
 
+/// Checksum trailer size
+constexpr size_t checksum_size = 4;
+
 /// Default timeout for RPC calls (milliseconds)
 constexpr uint32_t default_timeout_ms = 30000;
 
@@ -64,8 +72,9 @@ enum class message_type : uint8_t {
 enum class message_flags : uint8_t {
     none = 0,
     has_timeout = 1 << 0,    ///< Request includes timeout value
-    compressed = 1 << 1,     ///< Payload is compressed (reserved)
-    streaming = 1 << 2,      ///< Part of a streaming call (reserved)
+    has_checksum = 1 << 1,   ///< Message has CRC32 checksum trailer
+    compressed = 1 << 2,     ///< Payload is compressed (reserved)
+    streaming = 1 << 3,      ///< Part of a streaming call (reserved)
 };
 
 inline message_flags operator|(message_flags a, message_flags b) {
@@ -228,6 +237,7 @@ coro::task<io::io_result> write_exact(Stream& stream, const void* buffer, size_t
 }
 
 /// Read a complete frame from stream
+/// If the frame has the has_checksum flag set, verifies the CRC32 checksum
 template<rpc_stream Stream>
 coro::task<std::optional<std::pair<frame_header, message_buffer>>> 
 read_frame(Stream& stream) {
@@ -255,10 +265,34 @@ read_frame(Stream& stream) {
         }
     }
     
+    // Verify checksum if present
+    if (has_flag(header.flags, message_flags::has_checksum)) {
+        // Read checksum trailer
+        uint32_t received_checksum = 0;
+        result = co_await read_exact(stream, &received_checksum, checksum_size);
+        if (result.result <= 0) {
+            co_return std::nullopt;
+        }
+        
+        // Compute checksum over header + payload
+        uint32_t crc = hash::crc32_update(header_buf.data(), frame_header_size, 0xFFFFFFFF);
+        if (header.payload_length > 0) {
+            crc = hash::crc32_update(payload.data(), header.payload_length, crc);
+        }
+        uint32_t computed = hash::crc32_finalize(crc);
+        
+        if (computed != received_checksum) {
+            ELIO_LOG_ERROR("Frame checksum mismatch: expected={:08x}, received={:08x}",
+                          computed, received_checksum);
+            co_return std::nullopt;
+        }
+    }
+    
     co_return std::make_pair(header, std::move(payload));
 }
 
 /// Write a frame to stream
+/// If the header has the has_checksum flag set, appends CRC32 checksum
 template<rpc_stream Stream>
 coro::task<bool> write_frame(Stream& stream, const frame_header& header, 
                               const buffer_writer& payload) {
@@ -277,10 +311,26 @@ coro::task<bool> write_frame(Stream& stream, const frame_header& header,
         }
     }
     
+    // Write checksum if requested
+    if (has_flag(header.flags, message_flags::has_checksum)) {
+        // Compute checksum over header + payload
+        uint32_t crc = hash::crc32_update(header_bytes.data(), frame_header_size, 0xFFFFFFFF);
+        if (payload.size() > 0) {
+            crc = hash::crc32_update(payload.data(), payload.size(), crc);
+        }
+        uint32_t checksum = hash::crc32_finalize(crc);
+        
+        result = co_await write_exact(stream, &checksum, checksum_size);
+        if (result.result <= 0) {
+            co_return false;
+        }
+    }
+    
     co_return true;
 }
 
 /// Write a frame with raw payload
+/// If the header has the has_checksum flag set, appends CRC32 checksum
 template<rpc_stream Stream>
 coro::task<bool> write_frame(Stream& stream, const frame_header& header,
                               const void* payload_data, size_t payload_size) {
@@ -299,6 +349,21 @@ coro::task<bool> write_frame(Stream& stream, const frame_header& header,
         }
     }
     
+    // Write checksum if requested
+    if (has_flag(header.flags, message_flags::has_checksum)) {
+        // Compute checksum over header + payload
+        uint32_t crc = hash::crc32_update(header_bytes.data(), frame_header_size, 0xFFFFFFFF);
+        if (payload_size > 0) {
+            crc = hash::crc32_update(payload_data, payload_size, crc);
+        }
+        uint32_t checksum = hash::crc32_finalize(crc);
+        
+        result = co_await write_exact(stream, &checksum, checksum_size);
+        if (result.result <= 0) {
+            co_return false;
+        }
+    }
+    
     co_return true;
 }
 
@@ -312,7 +377,8 @@ std::pair<frame_header, buffer_writer> build_request(
     uint32_t request_id,
     method_id_t method_id,
     const Request& request,
-    std::optional<uint32_t> timeout_ms = std::nullopt)
+    std::optional<uint32_t> timeout_ms = std::nullopt,
+    bool enable_checksum = false)
 {
     buffer_writer payload;
     
@@ -321,6 +387,9 @@ std::pair<frame_header, buffer_writer> build_request(
     if (timeout_ms) {
         flags = flags | message_flags::has_timeout;
         payload.write(*timeout_ms);
+    }
+    if (enable_checksum) {
+        flags = flags | message_flags::has_checksum;
     }
     
     // Serialize request
@@ -340,7 +409,8 @@ std::pair<frame_header, buffer_writer> build_request(
 template<typename Response>
 std::pair<frame_header, buffer_writer> build_response(
     uint32_t request_id,
-    const Response& response)
+    const Response& response,
+    bool enable_checksum = false)
 {
     buffer_writer payload;
     serialize(payload, response);
@@ -348,7 +418,7 @@ std::pair<frame_header, buffer_writer> build_response(
     frame_header header;
     header.request_id = request_id;
     header.type = message_type::response;
-    header.flags = message_flags::none;
+    header.flags = enable_checksum ? message_flags::has_checksum : message_flags::none;
     header.method_id = 0;
     header.payload_length = static_cast<uint32_t>(payload.size());
     
@@ -359,7 +429,8 @@ std::pair<frame_header, buffer_writer> build_response(
 inline std::pair<frame_header, buffer_writer> build_error_response(
     uint32_t request_id,
     rpc_error error_code,
-    std::string_view error_message = "")
+    std::string_view error_message = "",
+    bool enable_checksum = false)
 {
     buffer_writer payload;
     error_payload err{error_code, std::string(error_message)};
@@ -368,7 +439,7 @@ inline std::pair<frame_header, buffer_writer> build_error_response(
     frame_header header;
     header.request_id = request_id;
     header.type = message_type::error;
-    header.flags = message_flags::none;
+    header.flags = enable_checksum ? message_flags::has_checksum : message_flags::none;
     header.method_id = 0;
     header.payload_length = static_cast<uint32_t>(payload.size());
     

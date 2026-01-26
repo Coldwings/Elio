@@ -14,6 +14,8 @@
 - **TCP Networking**: Async TCP client/server with connection management
 - **HTTP/1.1**: Full HTTP client and server implementation
 - **TLS/HTTPS**: OpenSSL-based TLS with ALPN and certificate verification
+- **RPC Framework**: High-performance RPC with zero-copy serialization, checksums, and cleanup callbacks
+- **Hash Functions**: CRC32, SHA-1, and SHA-256 with incremental hashing support
 - **Header-only**: Easy integration - just include and go
 - **CI/CD**: Automated testing with GitHub Actions
 
@@ -54,6 +56,8 @@ int main() {
 - [[Getting Started]] - Installation and first steps
 - [[Core Concepts]] - Coroutines, tasks, and scheduler
 - [[Networking]] - TCP, HTTP, and TLS
+- [[RPC Framework]] - High-performance RPC with zero-copy serialization
+- [[Hash Functions]] - CRC32, SHA-1, and SHA-256
 - [[Debugging]] - GDB/LLDB extensions and elio-pstack
 - [[Examples]] - Code examples and use cases
 - [[API Reference]] - Detailed API documentation

@@ -10,6 +10,8 @@ set(TEST_SOURCES
     unit/test_io.cpp
     unit/test_sync.cpp
     unit/test_timer.cpp
+    unit/test_hash.cpp
+    unit/test_rpc.cpp
     integration/test_scheduler_integration.cpp
     integration/test_exception_propagation.cpp
     integration/test_parallel_tasks.cpp

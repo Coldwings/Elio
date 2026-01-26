@@ -5,7 +5,15 @@
 /// async I/O. The client connects to an echo server, sends messages,
 /// and receives the echoed responses.
 ///
-/// Usage: ./tcp_echo_client [host] [port]
+/// Supports both IPv4 and IPv6:
+///   - Hostname resolution auto-detects address family
+///   - Use IPv4 address (e.g., 127.0.0.1) for explicit IPv4
+///   - Use IPv6 address (e.g., ::1) for explicit IPv6
+///
+/// Usage: ./tcp_echo_client [options] [host] [port]
+///   -b, --benchmark    Run benchmark mode
+///   -n <count>         Number of iterations (default: 10000)
+///   -h, --help         Show help
 /// Default: localhost:8080
 
 #include <elio/elio.hpp>
@@ -129,7 +137,7 @@ task<int> benchmark_main(std::string_view host, uint16_t port, int iterations) {
 }
 
 int main(int argc, char* argv[]) {
-    std::string host = "127.0.0.1";
+    std::string host = "localhost";  // Will resolve via DNS (IPv4 or IPv6)
     uint16_t port = 8080;
     bool benchmark = false;
     int iterations = 10000;
@@ -150,7 +158,13 @@ int main(int argc, char* argv[]) {
             std::cout << "  -b, --benchmark    Run benchmark mode" << std::endl;
             std::cout << "  -n <count>         Number of iterations (default: 10000)" << std::endl;
             std::cout << "  -h, --help         Show this help" << std::endl;
-            std::cout << "Default: 127.0.0.1:8080" << std::endl;
+            std::cout << std::endl;
+            std::cout << "IPv4/IPv6 examples:" << std::endl;
+            std::cout << "  " << argv[0] << " localhost 8080     # Auto-detect" << std::endl;
+            std::cout << "  " << argv[0] << " 127.0.0.1 8080     # IPv4" << std::endl;
+            std::cout << "  " << argv[0] << " ::1 8080           # IPv6" << std::endl;
+            std::cout << std::endl;
+            std::cout << "Default: localhost:8080" << std::endl;
             return 0;
         } else if (arg[0] != '-') {
             positional.push_back(arg);

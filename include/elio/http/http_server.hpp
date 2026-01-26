@@ -241,9 +241,10 @@ public:
     }
     
     /// Start listening on address (plain HTTP)
-    coro::task<void> listen(net::ipv4_address addr, io::io_context& io_ctx, 
-                           runtime::scheduler& sched) {
-        auto listener_result = net::tcp_listener::bind(addr, io_ctx);
+    coro::task<void> listen(const net::socket_address& addr, io::io_context& io_ctx, 
+                           runtime::scheduler& sched,
+                           const net::tcp_options& opts = {}) {
+        auto listener_result = net::tcp_listener::bind(addr, io_ctx, opts);
         if (!listener_result) {
             ELIO_LOG_ERROR("Failed to bind HTTP server: {}", strerror(errno));
             co_return;
@@ -270,9 +271,10 @@ public:
     }
     
     /// Start listening with TLS (HTTPS)
-    coro::task<void> listen_tls(net::ipv4_address addr, io::io_context& io_ctx,
-                                runtime::scheduler& sched, tls::tls_context& tls_ctx) {
-        auto listener_result = net::tcp_listener::bind(addr, io_ctx);
+    coro::task<void> listen_tls(const net::socket_address& addr, io::io_context& io_ctx,
+                                runtime::scheduler& sched, tls::tls_context& tls_ctx,
+                                const net::tcp_options& opts = {}) {
+        auto listener_result = net::tcp_listener::bind(addr, io_ctx, opts);
         if (!listener_result) {
             ELIO_LOG_ERROR("Failed to bind HTTPS server: {}", strerror(errno));
             co_return;

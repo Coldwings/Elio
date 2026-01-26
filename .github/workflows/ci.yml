@@ -37,7 +37,12 @@ jobs:
         cmake -B build -G Ninja \
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
           -DCMAKE_C_COMPILER=gcc-14 \
-          -DCMAKE_CXX_COMPILER=g++-14
+          -DCMAKE_CXX_COMPILER=g++-14 \
+          -DELIO_BUILD_TESTS=ON \
+          -DELIO_BUILD_EXAMPLES=ON \
+          -DELIO_ENABLE_TLS=ON \
+          -DELIO_ENABLE_HTTP=ON \
+          -DELIO_ENABLE_HTTP2=ON
 
     - name: Build
       run: cmake --build build --parallel

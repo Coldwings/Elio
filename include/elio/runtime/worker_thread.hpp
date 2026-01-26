@@ -2,6 +2,7 @@
 
 #include "chase_lev_deque.hpp"
 #include "mpsc_queue.hpp"
+#include <elio/coro/promise_base.hpp>
 #include <coroutine>
 #include <thread>
 #include <atomic>
@@ -110,6 +111,11 @@ public:
 
     [[nodiscard]] bool is_running() const noexcept {
         return running_.load(std::memory_order_acquire);
+    }
+    
+    /// Get the worker ID for this worker thread
+    [[nodiscard]] size_t worker_id() const noexcept {
+        return worker_id_;
     }
     
     /// Get the current worker thread (if called from a worker thread)

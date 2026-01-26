@@ -7,6 +7,7 @@ set(TEST_SOURCES
     unit/test_awaitable_base.cpp
     unit/test_chase_lev_deque.cpp
     unit/test_scheduler.cpp
+    unit/test_affinity.cpp
     unit/test_io.cpp
     unit/test_sync.cpp
     unit/test_timer.cpp

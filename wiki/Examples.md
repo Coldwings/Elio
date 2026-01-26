@@ -524,6 +524,59 @@ coro::task<void> parallel_compute(runtime::scheduler& sched) {
 }
 ```
 
+## Thread Affinity
+
+Binding vthreads to specific worker threads:
+
+```cpp
+#include <elio/elio.hpp>
+#include <iostream>
+
+using namespace elio;
+
+// Task that stays pinned to a specific worker
+coro::task<void> pinned_worker(size_t target_worker) {
+    // Bind to target worker and migrate there
+    co_await set_affinity(target_worker);
+    
+    std::cout << "Running on worker " << current_worker_id() << std::endl;
+    
+    // Do work - will not be stolen by other workers
+    for (int i = 0; i < 5; ++i) {
+        co_await time::yield();
+        // Still on the same worker
+    }
+    
+    // Clear affinity to allow migration
+    co_await clear_affinity();
+    co_return;
+}
+
+// Task that pins to its current worker
+coro::task<void> stay_here() {
+    co_await bind_to_current_worker();
+    
+    // Will remain on this worker for rest of execution
+    std::cout << "Pinned to worker " << current_worker_id() << std::endl;
+    co_return;
+}
+
+coro::task<int> async_main(int argc, char* argv[]) {
+    auto* sched = runtime::scheduler::current();
+    
+    // Spawn tasks with different affinities
+    for (size_t i = 0; i < sched->num_threads(); ++i) {
+        auto t = pinned_worker(i);
+        sched->spawn(t.release());
+    }
+    
+    co_await time::sleep_for(std::chrono::milliseconds(100));
+    co_return 0;
+}
+
+ELIO_ASYNC_MAIN(async_main)
+```
+
 ## Timer Example
 
 Using timers for delays:

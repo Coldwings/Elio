@@ -23,6 +23,7 @@
 #include "runtime/worker_thread.hpp"
 #include "runtime/chase_lev_deque.hpp"
 #include "runtime/async_main.hpp"
+#include "runtime/affinity.hpp"
 
 // I/O backend
 #include "io/io_backend.hpp"

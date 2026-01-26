@@ -153,6 +153,112 @@ ELIO_ASYNC_MAIN(async_main)
 
 ---
 
+## Thread Affinity (`elio::runtime`)
+
+Thread affinity allows you to bind vthreads (coroutines) to specific worker threads, preventing work stealing and ensuring they run on a designated thread.
+
+### Constants
+
+```cpp
+// Constant indicating no affinity (vthread can migrate freely)
+inline constexpr size_t NO_AFFINITY = std::numeric_limits<size_t>::max();
+```
+
+### `current_worker_id()`
+
+Get the current worker thread ID.
+
+```cpp
+size_t current_worker_id() noexcept;
+```
+
+Returns the worker ID if called from a worker thread, or `NO_AFFINITY` if called from outside the scheduler.
+
+### `set_affinity()`
+
+Bind the current vthread to a specific worker thread.
+
+```cpp
+auto set_affinity(size_t worker_id, bool migrate = true);
+```
+
+- `worker_id`: The worker thread to bind to
+- `migrate`: If true (default), migrate to the target worker immediately
+
+**Example:**
+```cpp
+coro::task<void> pinned_task() {
+    // Bind to worker 0 and migrate there
+    co_await set_affinity(0);
+    
+    // Now all subsequent code runs on worker 0
+    // Work stealing is prevented for this vthread
+    co_return;
+}
+```
+
+### `clear_affinity()`
+
+Remove affinity binding, allowing the vthread to migrate freely.
+
+```cpp
+auto clear_affinity();
+```
+
+**Example:**
+```cpp
+coro::task<void> temporary_pin() {
+    co_await set_affinity(2);
+    // Critical section on worker 2...
+    
+    co_await clear_affinity();
+    // Can now migrate to any worker
+    co_return;
+}
+```
+
+### `bind_to_current_worker()`
+
+Bind the vthread to whatever worker it's currently running on.
+
+```cpp
+auto bind_to_current_worker();
+```
+
+**Example:**
+```cpp
+coro::task<void> stay_here() {
+    // Pin to current worker, wherever we are
+    co_await bind_to_current_worker();
+    
+    // Will not migrate for rest of execution
+    co_return;
+}
+```
+
+### Promise Base Affinity Methods
+
+The `promise_base` class provides direct access to affinity state:
+
+```cpp
+class promise_base {
+public:
+    // Get current affinity (NO_AFFINITY if not set)
+    size_t affinity() const noexcept;
+    
+    // Set affinity to a specific worker
+    void set_affinity(size_t worker_id) noexcept;
+    
+    // Check if affinity is set
+    bool has_affinity() const noexcept;
+    
+    // Clear affinity (allow migration)
+    void clear_affinity() noexcept;
+};
+```
+
+---
+
 ## I/O (`elio::io`)
 
 ### `io_context`

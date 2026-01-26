@@ -9,7 +9,6 @@
 
 #include <elio/elio.hpp>
 #include <elio/rpc/rpc.hpp>
-#include <csignal>
 #include <atomic>
 #include <map>
 
@@ -18,6 +17,7 @@ using namespace elio::coro;
 using namespace elio::runtime;
 using namespace elio::net;
 using namespace elio::rpc;
+using namespace elio::signal;
 
 // ============================================================================
 // Message definitions
@@ -164,12 +164,27 @@ std::atomic<bool> g_running{true};
 std::atomic<int> g_listener_fd{-1};
 UserStore g_user_store;
 
-void signal_handler(int) {
+/// Signal handler coroutine - waits for SIGINT/SIGTERM
+task<void> signal_handler_task() {
+    signal_set sigs{SIGINT, SIGTERM};
+    signal_fd sigfd(sigs);
+    
+    ELIO_LOG_DEBUG("Signal handler started, waiting for SIGINT/SIGTERM...");
+    
+    auto info = co_await sigfd.wait();
+    if (info) {
+        ELIO_LOG_INFO("Received signal: {} - initiating shutdown", info->full_name());
+    }
+    
     g_running = false;
+    
+    // Close the listener to interrupt the pending accept
     int fd = g_listener_fd.exchange(-1);
     if (fd >= 0) {
         ::close(fd);
     }
+    
+    co_return;
 }
 
 task<void> server_main(uint16_t port, [[maybe_unused]] scheduler& sched) {
@@ -297,14 +312,18 @@ int main(int argc, char* argv[]) {
         port = static_cast<uint16_t>(std::stoi(argv[1]));
     }
     
-    // Setup signal handlers
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
+    // Block signals BEFORE creating scheduler threads
+    signal_set sigs{SIGINT, SIGTERM};
+    sigs.block_all_threads();
     
     // Create and start scheduler
     scheduler sched(4);
     sched.set_io_context(&io::default_io_context());
     sched.start();
+    
+    // Spawn signal handler coroutine
+    auto sig_handler = signal_handler_task();
+    sched.spawn(sig_handler.release());
     
     // Run server
     auto server = server_main(port, sched);

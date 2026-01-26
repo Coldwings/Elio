@@ -10,6 +10,7 @@ This page provides a reference for Elio's public API.
 | `elio::coro` | Coroutine types |
 | `elio::runtime` | Scheduler and workers |
 | `elio::io` | I/O context and backends |
+| `elio::signal` | Signal handling with signalfd |
 | `elio::net` | TCP networking |
 | `elio::http` | HTTP client/server |
 | `elio::tls` | TLS/SSL support |
@@ -187,6 +188,163 @@ struct io_result {
     int result;  // Bytes transferred or negative errno
     int flags;   // Backend-specific flags
 };
+```
+
+---
+
+## Signal Handling (`elio::signal`)
+
+Coroutine-friendly signal handling using Linux signalfd.
+
+### `signal_set`
+
+Manages a set of signals.
+
+```cpp
+class signal_set {
+public:
+    signal_set();                                    // Empty set
+    signal_set(std::initializer_list<int> signals); // From list
+    
+    signal_set& add(int signo);     // Add signal (chainable)
+    signal_set& remove(int signo);  // Remove signal
+    signal_set& clear();            // Clear all signals
+    signal_set& fill();             // Add all signals
+    
+    bool contains(int signo) const; // Check membership
+    
+    const sigset_t& mask() const;   // Get underlying mask
+    
+    // Signal mask operations
+    bool block(sigset_t* old_mask = nullptr) const;  // Block for thread
+    bool unblock() const;                             // Unblock for thread
+    bool set_mask(sigset_t* old_mask = nullptr) const;
+    bool block_all_threads() const;  // Block process-wide (call before threads)
+};
+```
+
+### `signal_fd`
+
+Async-friendly signalfd wrapper.
+
+```cpp
+class signal_fd {
+public:
+    // Create signalfd (auto_block=true blocks signals automatically)
+    explicit signal_fd(const signal_set& signals,
+                       io::io_context& ctx = io::default_io_context(),
+                       bool auto_block = true);
+    
+    signal_fd(signal_fd&& other) noexcept;
+    signal_fd& operator=(signal_fd&& other) noexcept;
+    
+    int fd() const noexcept;             // Get file descriptor
+    bool valid() const noexcept;         // Check if valid
+    explicit operator bool() const;       // Bool conversion
+    
+    const signal_set& signals() const;   // Get signal set
+    
+    // Wait for signal (awaitable)
+    /* awaitable */ wait();              // Returns std::optional<signal_info>
+    
+    // Non-blocking read
+    std::optional<signal_info> try_read();
+    
+    // Update the signal set
+    bool update(const signal_set& new_signals, bool block = true);
+    
+    // Restore original signal mask
+    bool restore_mask() noexcept;
+    
+    void close();  // Close explicitly
+};
+```
+
+### `signal_info`
+
+Information about a received signal.
+
+```cpp
+struct signal_info {
+    int signo;              // Signal number
+    int32_t errno_value;    // Error number (if applicable)
+    int32_t code;           // Signal code (SI_USER, SI_KERNEL, etc.)
+    uint32_t pid;           // PID of sending process
+    uint32_t uid;           // UID of sending process
+    int32_t status;         // Exit status (for SIGCHLD)
+    
+    const char* name() const;      // "INT", "TERM", etc.
+    std::string full_name() const; // "SIGINT", "SIGTERM", etc.
+};
+```
+
+### `signal_block_guard`
+
+RAII guard for temporary signal blocking.
+
+```cpp
+class signal_block_guard {
+public:
+    explicit signal_block_guard(const signal_set& signals);
+    ~signal_block_guard();  // Restores original mask
+};
+```
+
+### Utility Functions
+
+```cpp
+// Wait for signals (convenience, creates temporary signal_fd)
+/* awaitable */ wait_signal(const signal_set& signals,
+                            io::io_context& ctx = io::default_io_context(),
+                            bool auto_block = true);
+
+/* awaitable */ wait_signal(int signo,
+                            io::io_context& ctx = io::default_io_context());
+
+// Signal name/number conversion
+const char* signal_name(int signo);        // SIGINT -> "INT"
+int signal_number(const char* name);       // "SIGINT" or "INT" -> 2
+```
+
+**Example:**
+```cpp
+#include <elio/elio.hpp>
+
+using namespace elio::signal;
+
+std::atomic<bool> g_running{true};
+
+coro::task<void> signal_handler_task() {
+    signal_set sigs{SIGINT, SIGTERM};
+    signal_fd sigfd(sigs);
+    
+    auto info = co_await sigfd.wait();
+    if (info) {
+        ELIO_LOG_INFO("Received: {}", info->full_name());
+    }
+    g_running = false;
+    co_return;
+}
+
+int main() {
+    // Block signals BEFORE creating threads
+    signal_set sigs{SIGINT, SIGTERM};
+    sigs.block_all_threads();
+    
+    runtime::scheduler sched(4);
+    sched.start();
+    
+    auto sig_handler = signal_handler_task();
+    sched.spawn(sig_handler.release());
+    
+    // ... spawn other tasks ...
+    
+    while (g_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    sched.shutdown();
+}
 ```
 
 ---

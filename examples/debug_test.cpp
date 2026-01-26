@@ -15,16 +15,26 @@
 #include <iostream>
 #include <chrono>
 #include <thread>
-#include <csignal>
 #include <atomic>
 
 using namespace elio;
+using namespace elio::signal;
 
 // Global flag for signal handling
 std::atomic<bool> g_running{true};
 
-void signal_handler(int) {
+/// Signal handler coroutine - waits for SIGINT/SIGTERM
+coro::task<void> signal_handler_task() {
+    signal_set sigs{SIGINT, SIGTERM};
+    signal_fd sigfd(sigs);
+    
+    auto info = co_await sigfd.wait();
+    if (info) {
+        std::cout << std::endl << "Received signal: " << info->full_name() << std::endl;
+    }
+    
     g_running = false;
+    co_return;
 }
 
 // Helper macro to set debug location in coroutine
@@ -110,10 +120,6 @@ coro::task<void> long_running_task([[maybe_unused]] int id) {
 }
 
 coro::task<int> async_main(int argc, char* argv[]) {
-    // Set up signal handler
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
-    
     bool pause_mode = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--pause") {
@@ -153,6 +159,10 @@ coro::task<int> async_main(int argc, char* argv[]) {
         co_return 1;
     }
     
+    // Spawn signal handler coroutine
+    auto sig_handler = signal_handler_task();
+    sched->spawn(sig_handler.release());
+    
     for (auto& w : workers) {
         sched->spawn(w.release());
     }
@@ -181,4 +191,11 @@ coro::task<int> async_main(int argc, char* argv[]) {
     co_return 0;
 }
 
-ELIO_ASYNC_MAIN(async_main)
+int main(int argc, char* argv[]) {
+    // Block signals BEFORE creating scheduler threads
+    signal_set sigs{SIGINT, SIGTERM};
+    sigs.block_all_threads();
+    
+    // Use elio::run() with the async_main coroutine
+    return elio::run(async_main(argc, argv));
+}

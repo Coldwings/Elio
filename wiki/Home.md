@@ -9,6 +9,7 @@
 - **C++20 Coroutines**: First-class coroutine support with `co_await` and `co_return`
 - **Multi-threaded Scheduler**: Work-stealing scheduler with configurable worker threads
 - **Async I/O Backends**: io_uring (preferred) and epoll fallback
+- **Signal Handling**: Coroutine-friendly signal handling via signalfd
 - **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel
 - **Timers**: sleep_for, sleep_until, yield
 - **TCP Networking**: Async TCP client/server with connection management
@@ -55,6 +56,7 @@ int main() {
 
 - [[Getting Started]] - Installation and first steps
 - [[Core Concepts]] - Coroutines, tasks, and scheduler
+- [[Signal Handling]] - Safe signal handling with signalfd
 - [[Networking]] - TCP, HTTP, and TLS
 - [[RPC Framework]] - High-performance RPC with zero-copy serialization
 - [[Hash Functions]] - CRC32, SHA-1, and SHA-256

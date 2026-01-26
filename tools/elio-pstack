@@ -1,0 +1,241 @@
+#!/bin/bash
+#
+# elio-pstack - Print stack traces of all Elio coroutines (vthreads)
+#
+# Usage:
+#   elio-pstack <pid>              - Attach to running process
+#   elio-pstack <executable> <corefile>  - Analyze coredump
+#   elio-pstack <corefile>         - Analyze coredump (auto-detect executable)
+#
+# This script uses GDB in batch mode to inspect Elio coroutine stacks.
+# It requires the elio-gdb.py extension to be available.
+#
+# Exit codes:
+#   0 - Success
+#   1 - Usage error
+#   2 - GDB not found
+#   3 - Target not found
+#   4 - GDB execution error
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GDB_SCRIPT="${SCRIPT_DIR}/elio-gdb.py"
+
+# Colors for output (disabled if not a terminal)
+if [ -t 1 ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m' # No Color
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    NC=''
+fi
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS] <target>
+
+Print stack traces of all Elio coroutines (vthreads).
+
+Arguments:
+  <pid>                     Process ID to attach to
+  <executable> <corefile>   Executable and core dump file
+  <corefile>                Core dump file (auto-detect executable)
+
+Options:
+  -h, --help       Show this help message
+  -v, --verbose    Show verbose output
+  -l, --list       Only list vthreads (no backtraces)
+  -i, --info <id>  Show detailed info for specific vthread
+  -s, --stats      Show statistics only
+
+Examples:
+  $(basename "$0") 12345              # Attach to PID 12345
+  $(basename "$0") ./myapp core.1234  # Analyze core dump
+  $(basename "$0") core.1234          # Analyze core dump (auto-detect)
+
+EOF
+    exit 1
+}
+
+error() {
+    echo -e "${RED}Error: $1${NC}" >&2
+    exit "${2:-1}"
+}
+
+info() {
+    echo -e "${BLUE}$1${NC}" >&2
+}
+
+# Check for GDB
+check_gdb() {
+    if ! command -v gdb &> /dev/null; then
+        error "GDB not found. Please install GDB." 2
+    fi
+}
+
+# Check for GDB Python script
+check_script() {
+    if [ ! -f "$GDB_SCRIPT" ]; then
+        # Try to find it in common locations
+        for path in \
+            "/usr/share/elio/elio-gdb.py" \
+            "/usr/local/share/elio/elio-gdb.py" \
+            "${HOME}/.local/share/elio/elio-gdb.py" \
+            "$(dirname "$0")/../share/elio/elio-gdb.py"
+        do
+            if [ -f "$path" ]; then
+                GDB_SCRIPT="$path"
+                return 0
+            fi
+        done
+        error "GDB Python script not found: $GDB_SCRIPT" 3
+    fi
+}
+
+# Generate GDB commands
+generate_gdb_commands() {
+    local cmd="$1"
+    cat <<EOF
+set pagination off
+set print thread-events off
+set confirm off
+source $GDB_SCRIPT
+$cmd
+quit
+EOF
+}
+
+# Run GDB on a process
+run_gdb_process() {
+    local pid="$1"
+    local cmd="$2"
+    
+    if ! kill -0 "$pid" 2>/dev/null; then
+        error "Process $pid not found or not accessible" 3
+    fi
+    
+    generate_gdb_commands "$cmd" | gdb -batch -q -p "$pid" 2>/dev/null || {
+        error "GDB execution failed" 4
+    }
+}
+
+# Run GDB on a core dump
+run_gdb_core() {
+    local executable="$1"
+    local corefile="$2"
+    local cmd="$3"
+    
+    if [ ! -f "$corefile" ]; then
+        error "Core file not found: $corefile" 3
+    fi
+    
+    if [ -n "$executable" ] && [ ! -f "$executable" ]; then
+        error "Executable not found: $executable" 3
+    fi
+    
+    if [ -z "$executable" ]; then
+        # Try to extract executable from core file
+        executable=$(file "$corefile" | grep -oP "execfn: '\K[^']+'" 2>/dev/null | tr -d "'" || true)
+        if [ -z "$executable" ]; then
+            # Try gdb to get it
+            executable=$(gdb -batch -q -c "$corefile" -ex "info proc exe" 2>/dev/null | grep -oP "exe = '\K[^']+" || true)
+        fi
+        if [ -z "$executable" ] || [ ! -f "$executable" ]; then
+            error "Could not determine executable for core file. Please specify it explicitly." 3
+        fi
+        info "Auto-detected executable: $executable"
+    fi
+    
+    generate_gdb_commands "$cmd" | gdb -batch -q "$executable" -c "$corefile" 2>/dev/null || {
+        error "GDB execution failed" 4
+    }
+}
+
+# Main
+main() {
+    local verbose=0
+    local list_only=0
+    local info_id=""
+    local stats_only=0
+    local positional=()
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                usage
+                ;;
+            -v|--verbose)
+                verbose=1
+                shift
+                ;;
+            -l|--list)
+                list_only=1
+                shift
+                ;;
+            -i|--info)
+                info_id="$2"
+                shift 2
+                ;;
+            -s|--stats)
+                stats_only=1
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                ;;
+            *)
+                positional+=("$1")
+                shift
+                ;;
+        esac
+    done
+    
+    if [ ${#positional[@]} -eq 0 ]; then
+        usage
+    fi
+    
+    check_gdb
+    check_script
+    
+    # Determine GDB command
+    local gdb_cmd="elio bt"
+    if [ $list_only -eq 1 ]; then
+        gdb_cmd="elio list"
+    elif [ -n "$info_id" ]; then
+        gdb_cmd="elio info $info_id"
+    elif [ $stats_only -eq 1 ]; then
+        gdb_cmd="elio stats"
+    fi
+    
+    # Determine target type
+    local target="${positional[0]}"
+    
+    if [[ "$target" =~ ^[0-9]+$ ]]; then
+        # Numeric argument - treat as PID
+        [ $verbose -eq 1 ] && info "Attaching to process $target..."
+        run_gdb_process "$target" "$gdb_cmd"
+    elif [ ${#positional[@]} -eq 2 ]; then
+        # Two arguments - executable and core file
+        [ $verbose -eq 1 ] && info "Analyzing core dump: ${positional[1]} with ${positional[0]}..."
+        run_gdb_core "${positional[0]}" "${positional[1]}" "$gdb_cmd"
+    elif [ -f "$target" ]; then
+        # Single file argument
+        if file "$target" | grep -q "core file"; then
+            [ $verbose -eq 1 ] && info "Analyzing core dump: $target..."
+            run_gdb_core "" "$target" "$gdb_cmd"
+        else
+            error "Cannot determine target type. For core dumps, specify: $(basename "$0") <executable> <corefile>"
+        fi
+    else
+        error "Target not found: $target"
+    fi
+}
+
+main "$@"

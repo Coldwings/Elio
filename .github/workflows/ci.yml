@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: [ main, develop ]
   pull_request:
-    branches: [ main, master, develop ]
+    branches: [ main, develop ]
 
 jobs:
   build-and-test:
@@ -46,3 +46,7 @@ jobs:
       run: ./build/tests/elio_tests_asan
       env:
         ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          
+    - name: Run benchmark 
+      if: matrix.build_type == 'Release'
+      run: ./build/examples/benchmark

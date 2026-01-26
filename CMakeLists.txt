@@ -124,3 +124,14 @@ install(EXPORT ElioTargets
     NAMESPACE Elio::
     DESTINATION lib/cmake/Elio
 )
+
+# Install debug tools
+install(PROGRAMS
+    tools/elio-pstack
+    DESTINATION bin
+)
+install(FILES
+    tools/elio-gdb.py
+    tools/elio-lldb.py
+    DESTINATION share/elio
+)

@@ -35,3 +35,4 @@ benchmark
 *.tmp
 .DS_Store
 .qoder/
+__pycache__

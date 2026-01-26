@@ -54,6 +54,7 @@ int main() {
 - [[Getting Started]] - Installation and first steps
 - [[Core Concepts]] - Coroutines, tasks, and scheduler
 - [[Networking]] - TCP, HTTP, and TLS
+- [[Debugging]] - GDB/LLDB extensions and elio-pstack
 - [[Examples]] - Code examples and use cases
 - [[API Reference]] - Detailed API documentation
 

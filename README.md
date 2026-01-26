@@ -20,6 +20,7 @@
 - **HTTP/2**: client with multiplexed streams via nghttp2
 - **TLS/HTTPS**: OpenSSL-based with ALPN and certificate verification
 - **Header-Only Library** for easy integration
+- **Debugging Tools**: GDB/LLDB extensions and pstack-like CLI
 - **Comprehensive Testing** with Catch2 and ASAN
 - **Integrated Logging** with fmtlib
 - **CI/CD** with GitHub Actions
@@ -143,6 +144,11 @@ elio::
 └── log::                    // Logging infrastructure
     ├── logger               // Thread-safe logger
     └── ELIO_LOG_* macros    // Logging macros
+
+tools/                       // Debugging tools
+├── elio-pstack              // pstack-like CLI tool
+├── elio-gdb.py              // GDB Python extension
+└── elio-lldb.py             // LLDB Python extension
 ```
 
 ### Virtual Stack
@@ -186,6 +192,7 @@ Explore the `examples/` directory for detailed examples:
 - **http_client.cpp** - HTTP/HTTPS client example
 - **http2_client.cpp** - HTTP/2 client example
 - **async_file_io.cpp** - Async file operations
+- **debug_test.cpp** - Debugging tools demonstration
 - **benchmark.cpp** - Performance measurements
 
 Build and run examples:
@@ -196,6 +203,29 @@ make
 ./parallel_tasks
 ./benchmark
 ```
+
+## Debugging
+
+Elio provides debugging tools to inspect coroutine states and virtual call stacks:
+
+```bash
+# pstack-like tool for coroutines
+elio-pstack <pid>              # Attach to running process
+elio-pstack ./myapp core.1234  # Analyze coredump
+
+# GDB extension
+gdb -ex 'source tools/elio-gdb.py' ./myapp
+(gdb) elio list                # List all vthreads
+(gdb) elio bt                  # Show all backtraces
+(gdb) elio bt 42               # Show backtrace for vthread #42
+
+# LLDB extension
+lldb -o 'command script import tools/elio-lldb.py' ./myapp
+(lldb) elio list
+(lldb) elio bt
+```
+
+See the [Debugging wiki page](wiki/Debugging.md) for detailed documentation.
 
 ## API Reference
 

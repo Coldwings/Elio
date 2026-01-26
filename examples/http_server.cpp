@@ -11,18 +11,30 @@
 #include <elio/http/http.hpp>
 #include <elio/tls/tls.hpp>
 
-#include <csignal>
 #include <atomic>
 
 using namespace elio;
 using namespace elio::http;
 using namespace elio::runtime;
+using namespace elio::signal;
 
 // Global flag for graceful shutdown
 std::atomic<bool> g_running{true};
 
-void signal_handler(int) {
+/// Signal handler coroutine - waits for SIGINT/SIGTERM
+coro::task<void> signal_handler_task() {
+    signal_set sigs{SIGINT, SIGTERM};
+    signal_fd sigfd(sigs);
+    
+    ELIO_LOG_DEBUG("Signal handler started, waiting for SIGINT/SIGTERM...");
+    
+    auto info = co_await sigfd.wait();
+    if (info) {
+        ELIO_LOG_INFO("Received signal: {} - initiating shutdown", info->full_name());
+    }
+    
     g_running = false;
+    co_return;
 }
 
 // Simple in-memory data store for demo
@@ -172,9 +184,9 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    // Setup signal handler
-    std::signal(SIGINT, signal_handler);
-    std::signal(SIGTERM, signal_handler);
+    // Block signals BEFORE creating scheduler threads
+    signal_set sigs{SIGINT, SIGTERM};
+    sigs.block_all_threads();
     
     // Create router
     router r;
@@ -205,6 +217,10 @@ int main(int argc, char* argv[]) {
     scheduler sched(4);
     sched.set_io_context(&io::default_io_context());
     sched.start();
+    
+    // Spawn signal handler coroutine
+    auto sig_handler = signal_handler_task();
+    sched.spawn(sig_handler.release());
     
     // Start server
     if (use_https) {

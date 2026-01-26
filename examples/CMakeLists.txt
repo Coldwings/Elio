@@ -27,6 +27,11 @@ add_executable(benchmark benchmark.cpp)
 target_link_libraries(benchmark PRIVATE elio)
 target_link_options(benchmark PRIVATE ${STATIC_LINK_FLAGS})
 
+# Signal handling example
+add_executable(signal_handling signal_handling.cpp)
+target_link_libraries(signal_handling PRIVATE elio)
+target_link_options(signal_handling PRIVATE ${STATIC_LINK_FLAGS})
+
 # Debug tools test
 add_executable(debug_test debug_test.cpp)
 target_link_libraries(debug_test PRIVATE elio)

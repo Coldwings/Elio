@@ -45,6 +45,9 @@
 #include "log/logger.hpp"
 #include "log/macros.hpp"
 
+// Signal handling
+#include "signal/signalfd.hpp"
+
 // Debug support
 #include "debug.hpp"
 

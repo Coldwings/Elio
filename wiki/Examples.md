@@ -71,18 +71,36 @@ coro::task<void> pipeline() {
 
 ## TCP Echo Server
 
-A concurrent TCP server that echoes data back to clients:
+A concurrent TCP server that echoes data back to clients, using signalfd for graceful shutdown:
 
 ```cpp
 #include <elio/elio.hpp>
-#include <csignal>
 #include <atomic>
 
 using namespace elio;
+using namespace elio::signal;
 
 std::atomic<bool> g_running{true};
+std::atomic<int> g_listener_fd{-1};
 
-void signal_handler(int) { g_running = false; }
+// Signal handler coroutine - waits for SIGINT/SIGTERM
+coro::task<void> signal_handler_task() {
+    signal_set sigs{SIGINT, SIGTERM};
+    signal_fd sigfd(sigs);
+    
+    auto info = co_await sigfd.wait();
+    if (info) {
+        ELIO_LOG_INFO("Received signal: {}", info->full_name());
+    }
+    
+    g_running = false;
+    
+    // Close listener to interrupt pending accept
+    int fd = g_listener_fd.exchange(-1);
+    if (fd >= 0) ::close(fd);
+    
+    co_return;
+}
 
 coro::task<void> handle_client(net::tcp_stream stream, int id) {
     ELIO_LOG_INFO("[Client {}] Connected", id);
@@ -108,6 +126,7 @@ coro::task<void> server(uint16_t port, runtime::scheduler& sched) {
         co_return;
     }
     
+    g_listener_fd.store(listener->fd());
     ELIO_LOG_INFO("Server listening on port {}", port);
     
     int client_id = 0;
@@ -122,11 +141,17 @@ coro::task<void> server(uint16_t port, runtime::scheduler& sched) {
 }
 
 int main() {
-    std::signal(SIGINT, signal_handler);
+    // Block signals BEFORE creating scheduler threads
+    signal_set sigs{SIGINT, SIGTERM};
+    sigs.block_all_threads();
     
     runtime::scheduler sched(4);
     sched.set_io_context(&io::default_io_context());
     sched.start();
+    
+    // Spawn signal handler coroutine
+    auto sig_handler = signal_handler_task();
+    sched.spawn(sig_handler.release());
     
     auto srv = server(8080, sched);
     sched.spawn(srv.release());
@@ -146,14 +171,30 @@ A concurrent Unix Domain Socket server that echoes data back to clients:
 
 ```cpp
 #include <elio/elio.hpp>
-#include <csignal>
 #include <atomic>
 
 using namespace elio;
+using namespace elio::signal;
 
 std::atomic<bool> g_running{true};
+std::atomic<int> g_listener_fd{-1};
 
-void signal_handler(int) { g_running = false; }
+// Signal handler coroutine
+coro::task<void> signal_handler_task() {
+    signal_set sigs{SIGINT, SIGTERM};
+    signal_fd sigfd(sigs);
+    
+    auto info = co_await sigfd.wait();
+    if (info) {
+        ELIO_LOG_INFO("Received signal: {}", info->full_name());
+    }
+    
+    g_running = false;
+    int fd = g_listener_fd.exchange(-1);
+    if (fd >= 0) ::close(fd);
+    
+    co_return;
+}
 
 coro::task<void> handle_client(net::uds_stream stream, int id) {
     ELIO_LOG_INFO("[Client {}] Connected", id);
@@ -183,6 +224,7 @@ coro::task<void> server(const net::unix_address& addr, runtime::scheduler& sched
         co_return;
     }
     
+    g_listener_fd.store(listener->fd());
     ELIO_LOG_INFO("Server listening on {}", addr.to_string());
     
     int client_id = 0;
@@ -197,7 +239,9 @@ coro::task<void> server(const net::unix_address& addr, runtime::scheduler& sched
 }
 
 int main() {
-    std::signal(SIGINT, signal_handler);
+    // Block signals BEFORE creating scheduler threads
+    signal_set sigs{SIGINT, SIGTERM};
+    sigs.block_all_threads();
     
     // Use filesystem socket
     net::unix_address addr("/tmp/echo.sock");
@@ -207,6 +251,10 @@ int main() {
     runtime::scheduler sched(4);
     sched.set_io_context(&io::default_io_context());
     sched.start();
+    
+    // Spawn signal handler
+    auto sig_handler = signal_handler_task();
+    sched.spawn(sig_handler.release());
     
     auto srv = server(addr, sched);
     sched.spawn(srv.release());
@@ -576,4 +624,11 @@ make
 ./examples/uds_echo_client /tmp/echo.sock
 ./examples/http_client https://httpbin.org/get
 ./examples/http2_client https://nghttp2.org/
+./examples/signal_handling              # Signal handling example
 ```
+
+## See Also
+
+- [[Signal-Handling]] - Detailed guide on signal handling with signalfd
+- [[Core-Concepts]] - Understanding Elio's architecture
+- [[Networking]] - TCP and HTTP usage

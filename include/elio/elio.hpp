@@ -45,6 +45,9 @@
 #include "log/logger.hpp"
 #include "log/macros.hpp"
 
+// Debug support
+#include "debug.hpp"
+
 /// Root namespace for the Elio library
 namespace elio {
 

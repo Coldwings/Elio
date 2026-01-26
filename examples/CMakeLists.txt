@@ -27,6 +27,12 @@ add_executable(benchmark benchmark.cpp)
 target_link_libraries(benchmark PRIVATE elio)
 target_link_options(benchmark PRIVATE ${STATIC_LINK_FLAGS})
 
+# Debug tools test
+add_executable(debug_test debug_test.cpp)
+target_link_libraries(debug_test PRIVATE elio)
+target_link_options(debug_test PRIVATE ${STATIC_LINK_FLAGS})
+target_compile_options(debug_test PRIVATE -g -O0)  # Full debug info
+
 # Network examples
 add_executable(tcp_echo_server tcp_echo_server.cpp)
 target_link_libraries(tcp_echo_server PRIVATE elio)

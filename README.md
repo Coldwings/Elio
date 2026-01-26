@@ -18,6 +18,8 @@
 - **TCP Networking**: async client/server with connection management
 - **HTTP/1.1**: full client and server implementation
 - **HTTP/2**: client with multiplexed streams via nghttp2
+- **WebSocket**: bidirectional real-time communication (RFC 6455)
+- **Server-Sent Events**: server-to-client event streaming
 - **TLS/HTTPS**: OpenSSL-based with ALPN and certificate verification
 - **Header-Only Library** for easy integration
 - **Debugging Tools**: GDB/LLDB extensions and pstack-like CLI
@@ -136,7 +138,9 @@ elio::
 │   ├── http_client          // HTTP/HTTPS client
 │   ├── http_server          // HTTP server
 │   ├── h2_client            // HTTP/2 client
-│   └── h2_session           // HTTP/2 session (nghttp2)
+│   ├── h2_session           // HTTP/2 session (nghttp2)
+│   ├── websocket            // WebSocket client/server
+│   └── sse                  // Server-Sent Events
 │
 ├── tls::                    // TLS/SSL support
 │   └── tls_stream           // OpenSSL wrapper
@@ -191,6 +195,10 @@ Explore the `examples/` directory for detailed examples:
 - **http_server.cpp** - HTTP server example
 - **http_client.cpp** - HTTP/HTTPS client example
 - **http2_client.cpp** - HTTP/2 client example
+- **websocket_server.cpp** - WebSocket server with echo and chat
+- **websocket_client.cpp** - WebSocket client example
+- **sse_server.cpp** - Server-Sent Events server
+- **sse_client.cpp** - SSE client example
 - **async_file_io.cpp** - Async file operations
 - **debug_test.cpp** - Debugging tools demonstration
 - **benchmark.cpp** - Performance measurements
@@ -345,6 +353,8 @@ Run benchmarks:
 - TCP networking (client/server)
 - HTTP/1.1 (client/server)
 - HTTP/2 (client)
+- WebSocket (client/server, RFC 6455)
+- Server-Sent Events (client/server)
 - TLS/HTTPS support
 - Comprehensive test suite
 - CI/CD pipeline

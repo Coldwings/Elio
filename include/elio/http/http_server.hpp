@@ -241,7 +241,7 @@ public:
     }
     
     /// Start listening on address (plain HTTP)
-    coro::task<void> listen(const net::ipv4_address& addr, io::io_context& io_ctx, 
+    coro::task<void> listen(net::ipv4_address addr, io::io_context& io_ctx, 
                            runtime::scheduler& sched) {
         auto listener_result = net::tcp_listener::bind(addr, io_ctx);
         if (!listener_result) {
@@ -270,7 +270,7 @@ public:
     }
     
     /// Start listening with TLS (HTTPS)
-    coro::task<void> listen_tls(const net::ipv4_address& addr, io::io_context& io_ctx,
+    coro::task<void> listen_tls(net::ipv4_address addr, io::io_context& io_ctx,
                                 runtime::scheduler& sched, tls::tls_context& tls_ctx) {
         auto listener_result = net::tcp_listener::bind(addr, io_ctx);
         if (!listener_result) {

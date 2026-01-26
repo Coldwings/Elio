@@ -69,4 +69,22 @@ if(OPENSSL_FOUND)
     add_executable(http2_client http2_client.cpp)
     target_link_libraries(http2_client PRIVATE elio_http2)
     target_link_options(http2_client PRIVATE ${STATIC_LINK_FLAGS})
+
+    # WebSocket examples
+    add_executable(websocket_server websocket_server.cpp)
+    target_link_libraries(websocket_server PRIVATE elio_http)
+    target_link_options(websocket_server PRIVATE ${STATIC_LINK_FLAGS})
+
+    add_executable(websocket_client websocket_client.cpp)
+    target_link_libraries(websocket_client PRIVATE elio_http)
+    target_link_options(websocket_client PRIVATE ${STATIC_LINK_FLAGS})
+
+    # Server-Sent Events examples
+    add_executable(sse_server sse_server.cpp)
+    target_link_libraries(sse_server PRIVATE elio_http)
+    target_link_options(sse_server PRIVATE ${STATIC_LINK_FLAGS})
+
+    add_executable(sse_client sse_client.cpp)
+    target_link_libraries(sse_client PRIVATE elio_http)
+    target_link_options(sse_client PRIVATE ${STATIC_LINK_FLAGS})
 endif()

@@ -461,7 +461,20 @@ coro::task<void> pooled_requests(io::io_context& ctx) {
 }
 ```
 
+## WebSocket and Server-Sent Events
+
+For real-time communication, see the dedicated [[WebSocket-SSE]] documentation:
+
+- **WebSocket**: Full-duplex communication for chat, games, and real-time apps
+- **Server-Sent Events (SSE)**: Server-to-client event streaming for notifications and feeds
+
+```cpp
+#include <elio/http/websocket.hpp>
+#include <elio/http/sse.hpp>
+```
+
 ## Next Steps
 
+- See [[WebSocket-SSE]] for WebSocket and SSE documentation
 - See [[Examples]] for complete networking examples
 - Check [[API Reference]] for detailed documentation

@@ -16,14 +16,28 @@ set(TEST_SOURCES
     integration/test_dynamic_threads.cpp
 )
 
+# Add WebSocket and SSE tests if OpenSSL is available
+if(OPENSSL_FOUND)
+    list(APPEND TEST_SOURCES
+        unit/test_websocket.cpp
+        unit/test_sse.cpp
+    )
+endif()
+
 # Standard test executable
 add_executable(elio_tests ${TEST_SOURCES})
 target_link_libraries(elio_tests PRIVATE elio Catch2::Catch2WithMain)
+if(OPENSSL_FOUND)
+    target_link_libraries(elio_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 target_compile_definitions(elio_tests PRIVATE ELIO_DEBUG)
 
 # ASAN-enabled test executable
 add_executable(elio_tests_asan ${TEST_SOURCES})
 target_link_libraries(elio_tests_asan PRIVATE elio Catch2::Catch2WithMain)
+if(OPENSSL_FOUND)
+    target_link_libraries(elio_tests_asan PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 target_compile_options(elio_tests_asan PRIVATE -fsanitize=address -g -fno-omit-frame-pointer)
 target_link_options(elio_tests_asan PRIVATE -fsanitize=address)
 target_compile_definitions(elio_tests_asan PRIVATE ELIO_DEBUG)
@@ -31,6 +45,9 @@ target_compile_definitions(elio_tests_asan PRIVATE ELIO_DEBUG)
 # TSAN-enabled test executable
 add_executable(elio_tests_tsan ${TEST_SOURCES})
 target_link_libraries(elio_tests_tsan PRIVATE elio Catch2::Catch2WithMain)
+if(OPENSSL_FOUND)
+    target_link_libraries(elio_tests_tsan PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 target_compile_options(elio_tests_tsan PRIVATE -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan)
 target_link_options(elio_tests_tsan PRIVATE -fsanitize=thread)
 target_compile_definitions(elio_tests_tsan PRIVATE ELIO_DEBUG)

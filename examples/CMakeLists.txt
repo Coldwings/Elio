@@ -50,6 +50,15 @@ add_executable(uds_echo_client uds_echo_client.cpp)
 target_link_libraries(uds_echo_client PRIVATE elio)
 target_link_options(uds_echo_client PRIVATE ${STATIC_LINK_FLAGS})
 
+# RPC examples
+add_executable(rpc_server_example rpc_server_example.cpp)
+target_link_libraries(rpc_server_example PRIVATE elio)
+target_link_options(rpc_server_example PRIVATE ${STATIC_LINK_FLAGS})
+
+add_executable(rpc_client_example rpc_client_example.cpp)
+target_link_libraries(rpc_client_example PRIVATE elio)
+target_link_options(rpc_client_example PRIVATE ${STATIC_LINK_FLAGS})
+
 # Filesystem examples
 add_executable(async_file_io async_file_io.cpp)
 target_link_libraries(async_file_io PRIVATE elio)

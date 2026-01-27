@@ -116,6 +116,96 @@ coro::task<void> main_task() {
 }
 ```
 
+### `cancel_token` and `cancel_source`
+
+Cooperative cancellation mechanism for async operations.
+
+```cpp
+namespace elio::coro {
+
+/// Result of a cancellable operation
+enum class cancel_result {
+    completed,   ///< Operation completed normally
+    cancelled    ///< Operation was cancelled
+};
+
+/// A token that can be checked for cancellation
+class cancel_token {
+public:
+    using registration = cancel_registration;
+    
+    cancel_token() = default;  // Empty token (never cancelled)
+    
+    // Check if cancellation has been requested
+    bool is_cancelled() const noexcept;
+    
+    // Implicit bool conversion (true if NOT cancelled)
+    explicit operator bool() const noexcept;
+    
+    // Register a callback for cancellation
+    template<typename F>
+    [[nodiscard]] registration on_cancel(F&& callback) const;
+    
+    // Register a coroutine to resume on cancellation
+    [[nodiscard]] registration on_cancel_resume(std::coroutine_handle<> h) const;
+};
+
+/// Source for creating cancel tokens and triggering cancellation
+class cancel_source {
+public:
+    cancel_source();  // Create new cancellation state
+    
+    // Get a token to pass to cancellable operations
+    cancel_token get_token() const noexcept;
+    
+    // Request cancellation (invokes all callbacks)
+    void cancel();
+    
+    // Check if cancelled
+    bool is_cancelled() const noexcept;
+};
+
+} // namespace elio::coro
+```
+
+**Basic Example:**
+```cpp
+task<void> cancellable_work(cancel_token token) {
+    while (!token.is_cancelled()) {
+        // Do some work...
+        
+        // Cancellable sleep
+        auto result = co_await time::sleep_for(100ms, token);
+        if (result == cancel_result::cancelled) {
+            break;  // Exit early
+        }
+    }
+}
+
+task<void> controller() {
+    cancel_source source;
+    
+    // Start work with token
+    cancellable_work(source.get_token()).go();
+    
+    // Later, cancel
+    co_await time::sleep_for(5s);
+    source.cancel();
+}
+```
+
+**Supported Cancellable Operations:**
+
+| Operation | Usage |
+|-----------|-------|
+| `time::sleep_for()` | `co_await sleep_for(duration, token)` |
+| `rpc_client::call()` | `co_await client->call<Method>(req, timeout, token)` |
+| `http::client::get()` | `co_await client.get(url, token)` |
+| `websocket::ws_client::connect()` | `co_await client.connect(url, token)` |
+| `websocket::ws_client::receive()` | `co_await client.receive(token)` |
+| `sse::sse_client::connect()` | `co_await client.connect(url, token)` |
+| `sse::sse_client::receive()` | `co_await client.receive(token)` |
+
 ---
 
 ## Runtime (`elio::runtime`)
@@ -1022,13 +1112,39 @@ public:
 ## Timers (`elio::time`)
 
 ```cpp
-// Sleep for duration (awaitable)
-/* awaitable */ sleep(io_context& ctx, std::chrono::nanoseconds duration);
+// Sleep for duration
+template<typename Rep, typename Period>
+/* awaitable */ sleep_for(std::chrono::duration<Rep, Period> duration);
 
-// Sleep until time point (awaitable)
+// Sleep for duration with cancellation support
+// Returns cancel_result::completed or cancel_result::cancelled
+template<typename Rep, typename Period>
+/* awaitable<cancel_result> */ sleep_for(std::chrono::duration<Rep, Period> duration,
+                                          coro::cancel_token token);
+
+// Sleep until time point
 template<typename Clock, typename Duration>
-/* awaitable */ sleep_until(io_context& ctx, 
-                            std::chrono::time_point<Clock, Duration> tp);
+/* awaitable */ sleep_until(std::chrono::time_point<Clock, Duration> tp);
+
+// Yield execution to other coroutines
+/* awaitable */ yield();
+```
+
+**Example:**
+```cpp
+task<void> example(coro::cancel_token token) {
+    // Simple sleep
+    co_await time::sleep_for(100ms);
+    
+    // Cancellable sleep
+    auto result = co_await time::sleep_for(5s, token);
+    if (result == coro::cancel_result::cancelled) {
+        // Cancelled early
+    }
+    
+    // Yield to other coroutines
+    co_await time::yield();
+}
 ```
 
 ---

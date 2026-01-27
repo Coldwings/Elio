@@ -8,6 +8,7 @@
 #include <elio/tls/tls_stream.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/log/macros.hpp>
 
 #include <string>
@@ -216,7 +217,12 @@ public:
     /// Perform HTTP GET request
     /// @return Response on success, std::nullopt on error (check errno)
     coro::task<std::optional<response>> get(std::string_view url_str) {
-        return request_url(method::GET, url_str, "");
+        return request_url(method::GET, url_str, "", "", coro::cancel_token{});
+    }
+    
+    /// Perform HTTP GET request with cancellation support
+    coro::task<std::optional<response>> get(std::string_view url_str, coro::cancel_token token) {
+        return request_url(method::GET, url_str, "", "", std::move(token));
     }
     
     /// Perform HTTP POST request
@@ -224,7 +230,15 @@ public:
     coro::task<std::optional<response>> post(std::string_view url_str, 
                                                    std::string_view body,
                                                    std::string_view content_type = mime::application_form_urlencoded) {
-        return request_url(method::POST, url_str, body, content_type);
+        return request_url(method::POST, url_str, body, content_type, coro::cancel_token{});
+    }
+    
+    /// Perform HTTP POST request with cancellation support
+    coro::task<std::optional<response>> post(std::string_view url_str, 
+                                                   std::string_view body,
+                                                   coro::cancel_token token,
+                                                   std::string_view content_type = mime::application_form_urlencoded) {
+        return request_url(method::POST, url_str, body, content_type, std::move(token));
     }
     
     /// Perform HTTP PUT request
@@ -232,13 +246,26 @@ public:
     coro::task<std::optional<response>> put(std::string_view url_str,
                                                   std::string_view body,
                                                   std::string_view content_type = mime::application_json) {
-        return request_url(method::PUT, url_str, body, content_type);
+        return request_url(method::PUT, url_str, body, content_type, coro::cancel_token{});
+    }
+    
+    /// Perform HTTP PUT request with cancellation support
+    coro::task<std::optional<response>> put(std::string_view url_str,
+                                                  std::string_view body,
+                                                  coro::cancel_token token,
+                                                  std::string_view content_type = mime::application_json) {
+        return request_url(method::PUT, url_str, body, content_type, std::move(token));
     }
     
     /// Perform HTTP DELETE request
     /// @return Response on success, std::nullopt on error (check errno)
     coro::task<std::optional<response>> del(std::string_view url_str) {
-        return request_url(method::DELETE_, url_str, "");
+        return request_url(method::DELETE_, url_str, "", "", coro::cancel_token{});
+    }
+    
+    /// Perform HTTP DELETE request with cancellation support
+    coro::task<std::optional<response>> del(std::string_view url_str, coro::cancel_token token) {
+        return request_url(method::DELETE_, url_str, "", "", std::move(token));
     }
     
     /// Perform HTTP PATCH request
@@ -246,19 +273,37 @@ public:
     coro::task<std::optional<response>> patch(std::string_view url_str,
                                                     std::string_view body,
                                                     std::string_view content_type = mime::application_json) {
-        return request_url(method::PATCH, url_str, body, content_type);
+        return request_url(method::PATCH, url_str, body, content_type, coro::cancel_token{});
+    }
+    
+    /// Perform HTTP PATCH request with cancellation support
+    coro::task<std::optional<response>> patch(std::string_view url_str,
+                                                    std::string_view body,
+                                                    coro::cancel_token token,
+                                                    std::string_view content_type = mime::application_json) {
+        return request_url(method::PATCH, url_str, body, content_type, std::move(token));
     }
     
     /// Perform HTTP HEAD request
     /// @return Response on success, std::nullopt on error (check errno)
     coro::task<std::optional<response>> head(std::string_view url_str) {
-        return request_url(method::HEAD, url_str, "");
+        return request_url(method::HEAD, url_str, "", "", coro::cancel_token{});
+    }
+    
+    /// Perform HTTP HEAD request with cancellation support
+    coro::task<std::optional<response>> head(std::string_view url_str, coro::cancel_token token) {
+        return request_url(method::HEAD, url_str, "", "", std::move(token));
     }
     
     /// Send a custom request
     /// @return Response on success, std::nullopt on error (check errno)
     coro::task<std::optional<response>> send(request& req, const url& target) {
-        return send_request(req, target, 0);
+        return send_request(req, target, 0, coro::cancel_token{});
+    }
+    
+    /// Send a custom request with cancellation support
+    coro::task<std::optional<response>> send(request& req, const url& target, coro::cancel_token token) {
+        return send_request(req, target, 0, std::move(token));
     }
     
     /// Get TLS context for configuration
@@ -273,7 +318,14 @@ private:
     coro::task<std::optional<response>> request_url(method m, 
                                                           std::string_view url_str,
                                                           std::string_view body,
-                                                          std::string_view content_type = "") {
+                                                          std::string_view content_type,
+                                                          coro::cancel_token token) {
+        // Check if already cancelled
+        if (token.is_cancelled()) {
+            errno = ECANCELED;
+            co_return std::nullopt;
+        }
+        
         auto parsed = url::parse(url_str);
         if (!parsed) {
             ELIO_LOG_ERROR("Invalid URL: {}", url_str);
@@ -295,11 +347,19 @@ private:
             req.set_header("User-Agent", config_.user_agent);
         }
         
-        co_return co_await send_request(req, *parsed, 0);
+        co_return co_await send_request(req, *parsed, 0, std::move(token));
     }
     
     /// Send request with redirect handling
-    coro::task<std::optional<response>> send_request(request& req, const url& target, size_t redirect_count) {
+    coro::task<std::optional<response>> send_request(request& req, const url& target, 
+                                                           size_t redirect_count,
+                                                           coro::cancel_token token) {
+        // Check if cancelled
+        if (token.is_cancelled()) {
+            errno = ECANCELED;
+            co_return std::nullopt;
+        }
+        
         // Get connection from pool
         auto conn_opt = co_await pool_.acquire(*io_ctx_, target.host, target.effective_port(),
                                                 target.is_secure(), &tls_ctx_);
@@ -325,6 +385,12 @@ private:
         
         ELIO_LOG_DEBUG("Sending request to {}:{}\n{}", target.host, target.effective_port(), request_data);
         
+        // Check cancellation before write
+        if (token.is_cancelled()) {
+            errno = ECANCELED;
+            co_return std::nullopt;
+        }
+        
         auto write_result = co_await conn.write(request_data);
         if (write_result.result <= 0) {
             ELIO_LOG_ERROR("Failed to send request: {}", strerror(-write_result.result));
@@ -337,6 +403,12 @@ private:
         response_parser parser;
         
         while (!parser.is_complete() && !parser.has_error()) {
+            // Check cancellation before read
+            if (token.is_cancelled()) {
+                errno = ECANCELED;
+                co_return std::nullopt;
+            }
+            
             auto read_result = co_await conn.read(buffer.data(), buffer.size());
             
             if (read_result.result <= 0) {
@@ -428,7 +500,7 @@ private:
                         }
                     }
                     
-                    co_return co_await send_request(redirect_req, *redirect_url, redirect_count + 1);
+                    co_return co_await send_request(redirect_req, *redirect_url, redirect_count + 1, token);
                 }
             }
         }
@@ -451,6 +523,13 @@ inline coro::task<std::optional<response>> get(io::io_context& io_ctx, std::stri
     co_return co_await c.get(url);
 }
 
+/// Perform HTTP GET request with cancellation support
+inline coro::task<std::optional<response>> get(io::io_context& io_ctx, std::string_view url, 
+                                                     coro::cancel_token token) {
+    client c(io_ctx);
+    co_return co_await c.get(url, std::move(token));
+}
+
 /// Perform HTTP POST request
 /// @return Response on success, std::nullopt on error (check errno)
 inline coro::task<std::optional<response>> post(io::io_context& io_ctx, 
@@ -459,6 +538,16 @@ inline coro::task<std::optional<response>> post(io::io_context& io_ctx,
                                                       std::string_view content_type = mime::application_form_urlencoded) {
     client c(io_ctx);
     co_return co_await c.post(url, body, content_type);
+}
+
+/// Perform HTTP POST request with cancellation support
+inline coro::task<std::optional<response>> post(io::io_context& io_ctx, 
+                                                      std::string_view url,
+                                                      std::string_view body,
+                                                      coro::cancel_token token,
+                                                      std::string_view content_type = mime::application_form_urlencoded) {
+    client c(io_ctx);
+    co_return co_await c.post(url, body, std::move(token), content_type);
 }
 
 } // namespace elio::http

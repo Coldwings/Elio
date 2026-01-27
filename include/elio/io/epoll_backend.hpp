@@ -14,6 +14,7 @@
 #include <vector>
 #include <queue>
 #include <mutex>
+#include <chrono>
 
 namespace elio::io {
 
@@ -66,6 +67,16 @@ public:
                 }
             }
             fd_states_.clear();
+            
+            // Cancel all pending timers
+            while (!timer_queue_.empty()) {
+                auto& entry = timer_queue_.top();
+                if (entry.awaiter && !entry.awaiter.done()) {
+                    last_result_ = io_result{-ECANCELED, 0};
+                    deferred_resumes.push_back(entry.awaiter);
+                }
+                timer_queue_.pop();
+            }
         } // mutex released here
         
         // Resume outside lock to prevent deadlock
@@ -117,11 +128,18 @@ public:
                 op.synchronous = true;
                 break;
                 
-            case io_op::timeout:
-                // Timeouts are handled separately
-                op.is_timeout = true;
-                op.timeout_ns = static_cast<int64_t>(req.length);
-                break;
+            case io_op::timeout: {
+                // Use timer queue for timeout operations
+                int64_t timeout_ns = static_cast<int64_t>(req.length);
+                auto deadline = std::chrono::steady_clock::now() + 
+                                std::chrono::nanoseconds(timeout_ns);
+                
+                timer_queue_.push(timer_entry{deadline, req.awaiter});
+                pending_count_++;
+                
+                ELIO_LOG_DEBUG("Prepared timeout: {}ns", timeout_ns);
+                return true;
+            }
                 
             case io_op::cancel:
             case io_op::none:
@@ -131,10 +149,9 @@ public:
         // Get or create fd state
         auto& state = fd_states_[req.fd];
         bool is_sync = op.synchronous;
-        bool is_timo = op.is_timeout;
         state.pending_ops.push_back(std::move(op));
         
-        if (!is_sync && !is_timo) {
+        if (!is_sync) {
             // Register with epoll
             state.events |= events;
             
@@ -197,6 +214,24 @@ public:
             timeout_ms = -1;  // Block indefinitely
         }
         
+        // Adjust timeout based on earliest timer deadline
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!timer_queue_.empty()) {
+                auto now = std::chrono::steady_clock::now();
+                auto earliest = timer_queue_.top().deadline;
+                if (earliest <= now) {
+                    timeout_ms = 0;  // Timer already expired
+                } else {
+                    auto timer_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        earliest - now).count();
+                    if (timeout_ms < 0 || timer_timeout < timeout_ms) {
+                        timeout_ms = static_cast<int>(timer_timeout);
+                    }
+                }
+            }
+        }
+        
         int nfds = epoll_wait(epoll_fd_, events_.data(), 
                               static_cast<int>(events_.size()), timeout_ms);
         
@@ -217,6 +252,25 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             
+            // Process expired timers
+            auto now = std::chrono::steady_clock::now();
+            while (!timer_queue_.empty() && timer_queue_.top().deadline <= now) {
+                auto entry = timer_queue_.top();
+                timer_queue_.pop();
+                
+                last_result_ = io_result{0, 0};  // Timeout completed successfully
+                
+                if (entry.awaiter && !entry.awaiter.done()) {
+                    deferred_resumes.push_back(entry.awaiter);
+                }
+                
+                pending_count_--;
+                completions++;
+                
+                ELIO_LOG_DEBUG("Timer expired");
+            }
+            
+            // Process epoll events
             for (int i = 0; i < nfds; ++i) {
                 int fd = events_[i].data.fd;
                 uint32_t revents = events_[i].events;
@@ -300,6 +354,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             
+            // Search in fd_states first
             for (auto& [fd, state] : fd_states_) {
                 auto it = std::find_if(state.pending_ops.begin(), 
                                         state.pending_ops.end(),
@@ -315,9 +370,40 @@ public:
                     }
                     state.pending_ops.erase(it);
                     pending_count_--;
-                    break;
+                    
+                    // Cleanup if no more pending ops
+                    if (state.pending_ops.empty() && state.registered) {
+                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                        state.registered = false;
+                        state.events = 0;
+                    }
+                    goto found;
                 }
             }
+            
+            // Search in timer queue - need to rebuild queue without the cancelled entry
+            if (!timer_queue_.empty()) {
+                std::vector<timer_entry> remaining;
+                while (!timer_queue_.empty()) {
+                    auto entry = timer_queue_.top();
+                    timer_queue_.pop();
+                    if (entry.awaiter.address() == user_data) {
+                        last_result_ = io_result{-ECANCELED, 0};
+                        if (entry.awaiter && !entry.awaiter.done()) {
+                            to_resume = entry.awaiter;
+                        }
+                        pending_count_--;
+                        // Don't add back to remaining
+                    } else {
+                        remaining.push_back(entry);
+                    }
+                }
+                // Rebuild queue
+                for (auto& e : remaining) {
+                    timer_queue_.push(std::move(e));
+                }
+            }
+        found:;
         } // mutex released here
         
         // Resume outside lock to prevent deadlock
@@ -344,8 +430,6 @@ private:
         io_request req;
         std::coroutine_handle<> awaiter;
         bool synchronous = false;
-        bool is_timeout = false;
-        int64_t timeout_ns = 0;
     };
     
     struct fd_state {
@@ -353,6 +437,22 @@ private:
         uint32_t events = 0;
         bool registered = false;
     };
+    
+    /// Timer entry for the timer queue
+    struct timer_entry {
+        std::chrono::steady_clock::time_point deadline;
+        std::coroutine_handle<> awaiter;
+        
+        /// Comparison for min-heap (earliest deadline first)
+        bool operator>(const timer_entry& other) const {
+            return deadline > other.deadline;
+        }
+    };
+    
+    /// Min-heap priority queue for timers
+    using timer_queue_t = std::priority_queue<timer_entry, 
+                                               std::vector<timer_entry>,
+                                               std::greater<timer_entry>>;
     
     void execute_sync_op(pending_operation& op) {
         int result = 0;
@@ -506,8 +606,9 @@ private:
     int epoll_fd_ = -1;                                    ///< epoll file descriptor
     std::vector<struct epoll_event> events_;              ///< Event buffer for epoll_wait
     std::unordered_map<int, fd_state> fd_states_;         ///< Per-fd state
+    timer_queue_t timer_queue_;                           ///< Timer queue for timeouts
     size_t pending_count_ = 0;                            ///< Number of pending operations
-    mutable std::mutex mutex_;                            ///< Protects fd_states_
+    mutable std::mutex mutex_;                            ///< Protects fd_states_ and timer_queue_
     
     static inline thread_local io_result last_result_{};
 };

@@ -17,6 +17,7 @@
 #include "coro/task.hpp"
 #include "coro/awaitable_base.hpp"
 #include "coro/frame.hpp"
+#include "coro/cancel_token.hpp"
 
 // Runtime scheduler
 #include "runtime/scheduler.hpp"

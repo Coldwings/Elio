@@ -121,12 +121,78 @@ runtime::scheduler sched(4);
 // Start the scheduler
 sched.start();
 
-// Spawn tasks
-auto task = my_coroutine();
-sched.spawn(task.release());
+// Spawn tasks (new simplified API)
+sched.spawn(my_coroutine());
 
 // Shutdown when done
 sched.shutdown();
+```
+
+### Task Spawning
+
+Elio provides several ways to spawn concurrent tasks:
+
+#### Fire-and-Forget with `go()`
+
+Use `go()` to spawn a task that runs independently:
+
+```cpp
+coro::task<void> background_work() {
+    // This runs in the background
+    co_return;
+}
+
+coro::task<void> main_task() {
+    // Spawn and continue immediately (don't wait)
+    background_work().go();
+    
+    // Continue with other work...
+    co_return;
+}
+```
+
+#### Joinable Tasks with `spawn()`
+
+Use `spawn()` to get a `join_handle` that lets you await the result later:
+
+```cpp
+coro::task<int> compute(int x) {
+    co_return x * 2;
+}
+
+coro::task<void> parallel_example() {
+    // Spawn multiple tasks concurrently
+    auto h1 = compute(10).spawn();
+    auto h2 = compute(20).spawn();
+    auto h3 = compute(30).spawn();
+    
+    // All three run in parallel
+    // Now wait for results
+    int a = co_await h1;  // 20
+    int b = co_await h2;  // 40
+    int c = co_await h3;  // 60
+    
+    ELIO_LOG_INFO("Sum: {}", a + b + c);  // 120
+    co_return;
+}
+```
+
+#### Checking Completion
+
+You can check if a spawned task is done without blocking:
+
+```cpp
+coro::task<void> poll_example() {
+    auto handle = slow_operation().spawn();
+    
+    while (!handle.is_ready()) {
+        // Do other work while waiting
+        co_await do_something_else();
+    }
+    
+    auto result = co_await handle;
+    co_return;
+}
 ```
 
 ### Work Stealing

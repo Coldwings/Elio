@@ -1,9 +1,14 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/coro/frame.hpp>
+#include <elio/runtime/scheduler.hpp>
 #include <string>
+#include <atomic>
+#include "../test_main.cpp"  // For scaled timeouts
 
 using namespace elio::coro;
+using namespace elio::runtime;
+using namespace elio::test;
 
 // Helper: Simple coroutine that returns a value
 task<int> simple_return_value() {
@@ -178,4 +183,253 @@ TEST_CASE("task<void> exception propagation", "[task]") {
     auto t = catcher();
     t.handle().resume();
     REQUIRE(t.handle().done());
+}
+
+// ============================================================================
+// Tests for new task spawning API: go(), spawn(), join_handle
+// ============================================================================
+
+TEST_CASE("task::go() spawns fire-and-forget task", "[task][spawn]") {
+    scheduler sched(2);
+    sched.start();
+    
+    std::atomic<bool> executed{false};
+    
+    auto coro = [&]() -> task<void> {
+        executed.store(true);
+        co_return;
+    };
+    
+    // Use go() to spawn fire-and-forget
+    coro().go();
+    
+    // Wait for execution
+    std::this_thread::sleep_for(scaled_ms(100));
+    
+    REQUIRE(executed.load());
+    
+    sched.shutdown();
+}
+
+TEST_CASE("task<int>::go() spawns fire-and-forget task with value", "[task][spawn]") {
+    scheduler sched(2);
+    sched.start();
+    
+    std::atomic<int> result{0};
+    
+    auto coro = [&]() -> task<int> {
+        result.store(42);
+        co_return 42;  // Value is discarded in fire-and-forget
+    };
+    
+    coro().go();
+    
+    std::this_thread::sleep_for(scaled_ms(100));
+    
+    REQUIRE(result.load() == 42);
+    
+    sched.shutdown();
+}
+
+TEST_CASE("task::spawn() returns joinable handle", "[task][spawn][join_handle]") {
+    scheduler sched(2);
+    sched.start();
+    
+    std::atomic<bool> completed{false};
+    
+    auto compute = []() -> task<int> {
+        co_return 100;
+    };
+    
+    auto driver = [&]() -> task<void> {
+        auto handle = compute().spawn();
+        int result = co_await handle;
+        REQUIRE(result == 100);
+        completed.store(true);
+    };
+    
+    driver().go();
+    
+    std::this_thread::sleep_for(scaled_ms(200));
+    
+    REQUIRE(completed.load());
+    
+    sched.shutdown();
+}
+
+TEST_CASE("task<void>::spawn() returns joinable handle", "[task][spawn][join_handle]") {
+    scheduler sched(2);
+    sched.start();
+    
+    std::atomic<int> counter{0};
+    std::atomic<bool> completed{false};
+    
+    auto work = [&]() -> task<void> {
+        counter.fetch_add(1);
+        co_return;
+    };
+    
+    auto driver = [&]() -> task<void> {
+        auto handle = work().spawn();
+        co_await handle;
+        REQUIRE(counter.load() == 1);
+        completed.store(true);
+    };
+    
+    driver().go();
+    
+    std::this_thread::sleep_for(scaled_ms(200));
+    
+    REQUIRE(completed.load());
+    
+    sched.shutdown();
+}
+
+TEST_CASE("join_handle propagates exceptions", "[task][spawn][join_handle]") {
+    scheduler sched(2);
+    sched.start();
+    
+    std::atomic<bool> caught_exception{false};
+    
+    auto thrower = []() -> task<int> {
+        throw std::runtime_error("spawn error");
+        co_return 0;
+    };
+    
+    auto catcher = [&]() -> task<void> {
+        try {
+            auto handle = thrower().spawn();
+            co_await handle;
+            FAIL("Should have thrown");
+        } catch (const std::runtime_error& e) {
+            REQUIRE(std::string(e.what()) == "spawn error");
+            caught_exception.store(true);
+        }
+    };
+    
+    catcher().go();
+    
+    std::this_thread::sleep_for(scaled_ms(200));
+    
+    REQUIRE(caught_exception.load());
+    
+    sched.shutdown();
+}
+
+TEST_CASE("multiple spawn() tasks run concurrently", "[task][spawn][join_handle]") {
+    scheduler sched(4);
+    sched.start();
+    
+    std::atomic<int> running{0};
+    std::atomic<int> max_concurrent{0};
+    std::atomic<bool> completed{false};
+    
+    auto work = [&]() -> task<int> {
+        int current = running.fetch_add(1) + 1;
+        // Update max_concurrent
+        int expected = max_concurrent.load();
+        while (current > expected && !max_concurrent.compare_exchange_weak(expected, current)) {}
+        
+        std::this_thread::sleep_for(scaled_ms(50));
+        running.fetch_sub(1);
+        co_return current;
+    };
+    
+    auto driver = [&]() -> task<void> {
+        auto h1 = work().spawn();
+        auto h2 = work().spawn();
+        auto h3 = work().spawn();
+        
+        co_await h1;
+        co_await h2;
+        co_await h3;
+        
+        completed.store(true);
+    };
+    
+    driver().go();
+    
+    std::this_thread::sleep_for(scaled_ms(500));
+    
+    REQUIRE(completed.load());
+    // With 4 threads and 3 tasks, at least 2 should run concurrently
+    REQUIRE(max_concurrent.load() >= 2);
+    
+    sched.shutdown();
+}
+
+TEST_CASE("join_handle::is_ready() reflects completion state", "[task][spawn][join_handle]") {
+    scheduler sched(2);
+    sched.start();
+    
+    std::atomic<bool> test_passed{false};
+    
+    auto slow_task = []() -> task<int> {
+        std::this_thread::sleep_for(scaled_ms(100));
+        co_return 42;
+    };
+    
+    auto driver = [&]() -> task<void> {
+        auto handle = slow_task().spawn();
+        
+        // Initially not ready
+        bool was_not_ready = !handle.is_ready();
+        
+        // Wait for completion
+        int result = co_await handle;
+        
+        // After await, should be ready
+        bool is_now_ready = handle.is_ready();
+        
+        test_passed.store(was_not_ready && is_now_ready && result == 42);
+    };
+    
+    driver().go();
+    
+    std::this_thread::sleep_for(scaled_ms(300));
+    
+    REQUIRE(test_passed.load());
+    
+    sched.shutdown();
+}
+
+TEST_CASE("scheduler::spawn() accepts task directly", "[scheduler][spawn]") {
+    scheduler sched(2);
+    sched.start();
+    
+    std::atomic<bool> executed{false};
+    
+    auto coro = [&]() -> task<void> {
+        executed.store(true);
+        co_return;
+    };
+    
+    // New API: spawn task directly without calling release()
+    sched.spawn(coro());
+    
+    std::this_thread::sleep_for(scaled_ms(100));
+    
+    REQUIRE(executed.load());
+    
+    sched.shutdown();
+}
+
+TEST_CASE("scheduler::spawn() accepts task<int> directly", "[scheduler][spawn]") {
+    scheduler sched(2);
+    sched.start();
+    
+    std::atomic<int> result{0};
+    
+    auto coro = [&]() -> task<int> {
+        result.store(99);
+        co_return 99;
+    };
+    
+    sched.spawn(coro());
+    
+    std::this_thread::sleep_for(scaled_ms(100));
+    
+    REQUIRE(result.load() == 99);
+    
+    sched.shutdown();
 }

@@ -321,6 +321,7 @@ inline void worker_thread::stop() {
     bool expected = true;
     if (!running_.compare_exchange_strong(expected, false, 
             std::memory_order_release, std::memory_order_relaxed)) return;
+    wake();  // Wake the worker if it's blocked on epoll_wait
     if (thread_.joinable()) thread_.join();
 }
 
@@ -506,9 +507,20 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
 }
 
 inline void worker_thread::poll_io_when_idle() {
-    // Try to poll IO, otherwise just yield to let other threads run
-    if (scheduler_->try_poll_io(std::chrono::milliseconds(0))) return;
-    std::this_thread::yield();
+    // Try to poll IO - only one worker can do this at a time
+    // Use a non-zero timeout so the polling thread blocks on epoll/io_uring
+    // while other workers block on their eventfd
+    constexpr int idle_timeout_ms = 10;
+    
+    if (scheduler_->try_poll_io(std::chrono::milliseconds(idle_timeout_ms))) {
+        // Successfully polled IO (with blocking timeout)
+        // Check for new tasks immediately after IO completions
+        return;
+    }
+    
+    // Couldn't acquire IO poll lock - another worker is handling IO
+    // Block on our eventfd until woken or timeout
+    wait_for_work(idle_timeout_ms);
 }
 
 } // namespace elio::runtime

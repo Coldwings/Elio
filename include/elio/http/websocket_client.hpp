@@ -19,6 +19,7 @@
 #include <elio/tls/tls_stream.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/log/macros.hpp>
 
 #include <string>
@@ -77,49 +78,15 @@ public:
     /// @param url WebSocket URL (ws:// or wss://)
     /// @return true on success, false on failure
     coro::task<bool> connect(std::string_view url_str) {
-        // Parse URL
-        auto parsed = parse_ws_url(url_str);
-        if (!parsed) {
-            ELIO_LOG_ERROR("Invalid WebSocket URL: {}", url_str);
-            co_return false;
-        }
-        
-        host_ = parsed->host;
-        path_ = parsed->path.empty() ? "/" : parsed->path;
-        secure_ = parsed->secure;
-        
-        uint16_t port = parsed->port;
-        if (port == 0) {
-            port = secure_ ? 443 : 80;
-        }
-        
-        ELIO_LOG_DEBUG("Connecting to WebSocket server {}:{}{}", host_, port, path_);
-        
-        // Establish TCP connection
-        if (secure_) {
-            auto result = co_await tls::tls_connect(tls_ctx_, *io_ctx_, host_, port);
-            if (!result) {
-                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host_, port, strerror(errno));
-                co_return false;
-            }
-            stream_ = std::move(*result);
-        } else {
-            auto result = co_await net::tcp_connect(*io_ctx_, host_, port);
-            if (!result) {
-                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host_, port, strerror(errno));
-                co_return false;
-            }
-            stream_ = std::move(*result);
-        }
-        
-        // Perform WebSocket handshake
-        bool success = co_await perform_handshake();
-        if (success) {
-            state_ = connection_state::open;
-            ELIO_LOG_DEBUG("WebSocket connected to {}{}", host_, path_);
-        }
-        
-        co_return success;
+        return connect_impl(url_str, coro::cancel_token{});
+    }
+    
+    /// Connect to a WebSocket server with cancellation support
+    /// @param url WebSocket URL (ws:// or wss://)
+    /// @param token Cancellation token
+    /// @return true on success, false on failure
+    coro::task<bool> connect(std::string_view url_str, coro::cancel_token token) {
+        return connect_impl(url_str, std::move(token));
     }
     
     /// Get connection state
@@ -193,7 +160,25 @@ public:
     
     /// Receive next message (blocks until message available or connection closed)
     coro::task<std::optional<message>> receive() {
+        return receive_impl(coro::cancel_token{});
+    }
+    
+    /// Receive next message with cancellation support
+    /// @param token Cancellation token
+    /// @return Message on success, std::nullopt on close/error/cancel
+    coro::task<std::optional<message>> receive(coro::cancel_token token) {
+        return receive_impl(std::move(token));
+    }
+    
+private:
+    /// Internal receive implementation
+    coro::task<std::optional<message>> receive_impl(coro::cancel_token token) {
         while (state_ == connection_state::open || state_ == connection_state::closing) {
+            // Check for cancellation
+            if (token.is_cancelled()) {
+                co_return std::nullopt;
+            }
+            
             // Check for already-parsed messages
             if (parser_.has_message()) {
                 co_return parser_.get_message();
@@ -239,6 +224,71 @@ public:
         
         co_return std::nullopt;
     }
+    
+    /// Internal connect implementation
+    coro::task<bool> connect_impl(std::string_view url_str, coro::cancel_token token) {
+        // Check if already cancelled
+        if (token.is_cancelled()) {
+            co_return false;
+        }
+        
+        // Parse URL
+        auto parsed = parse_ws_url(url_str);
+        if (!parsed) {
+            ELIO_LOG_ERROR("Invalid WebSocket URL: {}", url_str);
+            co_return false;
+        }
+        
+        host_ = parsed->host;
+        path_ = parsed->path.empty() ? "/" : parsed->path;
+        secure_ = parsed->secure;
+        
+        uint16_t port = parsed->port;
+        if (port == 0) {
+            port = secure_ ? 443 : 80;
+        }
+        
+        ELIO_LOG_DEBUG("Connecting to WebSocket server {}:{}{}", host_, port, path_);
+        
+        // Check cancellation before connection
+        if (token.is_cancelled()) {
+            co_return false;
+        }
+        
+        // Establish TCP connection
+        if (secure_) {
+            auto result = co_await tls::tls_connect(tls_ctx_, *io_ctx_, host_, port);
+            if (!result) {
+                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host_, port, strerror(errno));
+                co_return false;
+            }
+            stream_ = std::move(*result);
+        } else {
+            auto result = co_await net::tcp_connect(*io_ctx_, host_, port);
+            if (!result) {
+                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host_, port, strerror(errno));
+                co_return false;
+            }
+            stream_ = std::move(*result);
+        }
+        
+        // Check cancellation before handshake
+        if (token.is_cancelled()) {
+            stream_ = std::monostate{};
+            co_return false;
+        }
+        
+        // Perform WebSocket handshake
+        bool success = co_await perform_handshake();
+        if (success) {
+            state_ = connection_state::open;
+            ELIO_LOG_DEBUG("WebSocket connected to {}{}", host_, path_);
+        }
+        
+        co_return success;
+    }
+    
+public:
     
     /// Get TLS context for configuration
     tls::tls_context& tls_context() noexcept { return tls_ctx_; }

@@ -171,3 +171,164 @@ TEST_CASE("sleep_until past time", "[time][sleep]") {
     
     REQUIRE(completed);
 }
+
+TEST_CASE("cancellable sleep - normal completion", "[time][sleep][cancel]") {
+    std::atomic<bool> completed{false};
+    std::atomic<int> result_value{-1};
+    
+    cancel_source source;
+    
+    auto sleep_task = [&]() -> task<void> {
+        auto result = co_await sleep_for(50ms, source.get_token());
+        result_value = (result == cancel_result::completed) ? 1 : 0;
+        completed = true;
+    };
+    
+    scheduler sched(1);
+    sched.start();
+    
+    {
+        auto t = sleep_task();
+        sched.spawn(t.release());
+    }
+    
+    // Wait for completion without cancelling
+    for (int i = 0; i < 100 && !completed; ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    
+    sched.shutdown();
+    
+    REQUIRE(completed);
+    REQUIRE(result_value == 1);  // Should be completed, not cancelled
+}
+
+TEST_CASE("cancellable sleep - cancelled early", "[time][sleep][cancel]") {
+    std::atomic<bool> completed{false};
+    std::atomic<int> result_value{-1};
+    
+    cancel_source source;
+    
+    auto sleep_task = [&]() -> task<void> {
+        auto start = std::chrono::steady_clock::now();
+        auto result = co_await sleep_for(500ms, source.get_token());
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        
+        result_value = (result == cancel_result::cancelled) ? 1 : 0;
+        completed = true;
+        
+        // Should have been cancelled early, not waited full 500ms
+        REQUIRE(elapsed < 400ms);
+    };
+    
+    scheduler sched(1);
+    sched.start();
+    
+    {
+        auto t = sleep_task();
+        sched.spawn(t.release());
+    }
+    
+    // Wait a bit then cancel
+    std::this_thread::sleep_for(50ms);
+    source.cancel();
+    
+    // Wait for completion
+    for (int i = 0; i < 100 && !completed; ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    
+    sched.shutdown();
+    
+    REQUIRE(completed);
+    REQUIRE(result_value == 1);  // Should be cancelled
+}
+
+TEST_CASE("cancellable sleep - already cancelled token", "[time][sleep][cancel]") {
+    std::atomic<bool> completed{false};
+    std::atomic<int> result_value{-1};
+    
+    cancel_source source;
+    source.cancel();  // Cancel before sleep starts
+    
+    auto sleep_task = [&]() -> task<void> {
+        auto start = std::chrono::steady_clock::now();
+        auto result = co_await sleep_for(500ms, source.get_token());
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        
+        result_value = (result == cancel_result::cancelled) ? 1 : 0;
+        completed = true;
+        
+        // Should complete immediately since already cancelled
+        REQUIRE(elapsed < 50ms);
+    };
+    
+    scheduler sched(1);
+    sched.start();
+    
+    {
+        auto t = sleep_task();
+        sched.spawn(t.release());
+    }
+    
+    // Wait for completion
+    for (int i = 0; i < 50 && !completed; ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    
+    sched.shutdown();
+    
+    REQUIRE(completed);
+    REQUIRE(result_value == 1);  // Should be cancelled
+}
+
+TEST_CASE("cancel_token basic operations", "[time][cancel]") {
+    cancel_source source;
+    auto token = source.get_token();
+    
+    REQUIRE_FALSE(token.is_cancelled());
+    REQUIRE_FALSE(source.is_cancelled());
+    REQUIRE(static_cast<bool>(token));  // token is truthy when not cancelled
+    
+    source.cancel();
+    
+    REQUIRE(token.is_cancelled());
+    REQUIRE(source.is_cancelled());
+    REQUIRE_FALSE(static_cast<bool>(token));  // token is falsy when cancelled
+}
+
+TEST_CASE("cancel_token callback invocation", "[time][cancel]") {
+    cancel_source source;
+    auto token = source.get_token();
+    
+    std::atomic<int> callback_count{0};
+    
+    {
+        auto reg1 = token.on_cancel([&]() { callback_count++; });
+        auto reg2 = token.on_cancel([&]() { callback_count++; });
+        
+        REQUIRE(callback_count == 0);
+        
+        source.cancel();
+        
+        REQUIRE(callback_count == 2);
+    }
+    
+    // Registering after cancellation should invoke immediately
+    auto reg3 = token.on_cancel([&]() { callback_count++; });
+    REQUIRE(callback_count == 3);
+}
+
+TEST_CASE("cancel_token registration unregister", "[time][cancel]") {
+    cancel_source source;
+    auto token = source.get_token();
+    
+    std::atomic<int> callback_count{0};
+    
+    auto reg = token.on_cancel([&]() { callback_count++; });
+    reg.unregister();  // Unregister before cancel
+    
+    source.cancel();
+    
+    REQUIRE(callback_count == 0);  // Callback should not have been invoked
+}

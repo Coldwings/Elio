@@ -21,6 +21,7 @@
 #include "rpc_protocol.hpp"
 
 #include <elio/coro/task.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/sync/primitives.hpp>
 #include <elio/time/timer.hpp>
 #include <elio/runtime/scheduler.hpp>
@@ -153,7 +154,51 @@ public:
         const typename Method::request_type& request,
         std::chrono::duration<Rep, Period> timeout)
     {
+        return call_impl<Method>(request, timeout, coro::cancel_token{});
+    }
+    
+    /// Make an RPC call with cancellation support
+    /// @tparam Method The method descriptor type
+    /// @param request The request object
+    /// @param token Cancellation token
+    /// @return Result containing response or error (rpc_error::cancelled if cancelled)
+    template<typename Method>
+    coro::task<rpc_result<typename Method::response_type>> call(
+        const typename Method::request_type& request,
+        coro::cancel_token token)
+    {
+        return call_impl<Method>(request, std::chrono::milliseconds(default_timeout_ms), std::move(token));
+    }
+    
+    /// Make an RPC call with timeout and cancellation support
+    /// @tparam Method The method descriptor type
+    /// @param request The request object
+    /// @param timeout Per-call timeout duration
+    /// @param token Cancellation token
+    /// @return Result containing response or error
+    template<typename Method, typename Rep, typename Period>
+    coro::task<rpc_result<typename Method::response_type>> call(
+        const typename Method::request_type& request,
+        std::chrono::duration<Rep, Period> timeout,
+        coro::cancel_token token)
+    {
+        return call_impl<Method>(request, timeout, std::move(token));
+    }
+    
+private:
+    /// Internal implementation of call with cancellation support
+    template<typename Method, typename Rep, typename Period>
+    coro::task<rpc_result<typename Method::response_type>> call_impl(
+        const typename Method::request_type& request,
+        std::chrono::duration<Rep, Period> timeout,
+        coro::cancel_token token)
+    {
         using Response = typename Method::response_type;
+        
+        // Check if already cancelled
+        if (token.is_cancelled()) {
+            co_return rpc_result<Response>(rpc_error::cancelled);
+        }
         
         if (!is_connected()) {
             co_return rpc_result<Response>(rpc_error::connection_closed);
@@ -167,6 +212,16 @@ public:
             std::lock_guard<std::mutex> lock(pending_mutex_);
             pending_requests_[request_id] = pending;
         }
+        
+        // Register cancellation callback
+        auto cancel_registration = token.on_cancel([this, pending, request_id]() {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            if (!pending->completed) {
+                pending->error = rpc_error::cancelled;
+                pending->completed = true;
+                pending->completion_event.set();
+            }
+        });
         
         // Build and send request
         auto timeout_ms = static_cast<uint32_t>(
@@ -190,12 +245,14 @@ public:
         auto self = this->shared_from_this();
         auto timeout_task = [](ptr client, 
                                std::chrono::milliseconds ms,
-                               std::shared_ptr<pending_request> pending) 
+                               std::shared_ptr<pending_request> pending,
+                               coro::cancel_token tok) 
             -> coro::task<void> 
         {
-            co_await time::sleep_for(ms);
+            auto result = co_await time::sleep_for(ms, tok);
             
-            if (!pending->completed) {
+            // Only timeout if sleep completed normally (not cancelled)
+            if (result == coro::cancel_result::completed && !pending->completed) {
                 std::lock_guard<std::mutex> lock(client->pending_mutex_);
                 if (!pending->completed) {
                     pending->timed_out = true;
@@ -210,12 +267,15 @@ public:
         auto* sched = runtime::scheduler::current();
         if (sched) {
             auto task = timeout_task(self,
-                std::chrono::duration_cast<std::chrono::milliseconds>(timeout), pending);
+                std::chrono::duration_cast<std::chrono::milliseconds>(timeout), pending, token);
             sched->spawn(task.release());
         }
         
-        // Wait for completion (either response or timeout)
+        // Wait for completion (either response, timeout, or cancellation)
         co_await pending->completion_event.wait();
+        
+        // Unregister cancellation callback
+        cancel_registration.unregister();
         
         // Remove from pending
         {
@@ -245,6 +305,7 @@ public:
         }
     }
     
+public:
     /// Send a one-way message (no response expected)
     template<typename Method>
     coro::task<bool> send_oneway(const typename Method::request_type& request) {

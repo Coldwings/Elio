@@ -17,6 +17,7 @@
 #include <elio/tls/tls_stream.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/time/timer.hpp>
 #include <elio/log/macros.hpp>
 
@@ -229,17 +230,15 @@ public:
     /// @param url HTTP(S) URL
     /// @return true on success
     coro::task<bool> connect(std::string_view url_str) {
-        // Parse URL
-        auto parsed = url::parse(url_str);
-        if (!parsed) {
-            ELIO_LOG_ERROR("Invalid SSE URL: {}", url_str);
-            co_return false;
-        }
-        
-        url_ = *parsed;
-        state_ = client_state::connecting;
-        
-        co_return co_await do_connect();
+        return connect_impl(url_str, coro::cancel_token{});
+    }
+    
+    /// Connect to an SSE endpoint with cancellation support
+    /// @param url HTTP(S) URL
+    /// @param token Cancellation token
+    /// @return true on success
+    coro::task<bool> connect(std::string_view url_str, coro::cancel_token token) {
+        return connect_impl(url_str, std::move(token));
     }
     
     /// Get connection state
@@ -253,7 +252,66 @@ public:
     
     /// Receive next event (blocks until event available or connection closed)
     coro::task<std::optional<event>> receive() {
+        return receive_impl(coro::cancel_token{});
+    }
+    
+    /// Receive next event with cancellation support
+    /// @param token Cancellation token
+    /// @return Event on success, std::nullopt on close/error/cancel
+    coro::task<std::optional<event>> receive(coro::cancel_token token) {
+        return receive_impl(std::move(token));
+    }
+    
+    /// Close the connection
+    coro::task<void> close() {
+        state_ = client_state::closed;
+        
+        if (std::holds_alternative<tls::tls_stream>(stream_)) {
+            co_await std::get<tls::tls_stream>(stream_).shutdown();
+        }
+        stream_ = std::monostate{};
+    }
+    
+    /// Get TLS context for configuration
+    tls::tls_context& tls_context() noexcept { return tls_ctx_; }
+    
+    /// Get configuration
+    client_config& config() noexcept { return config_; }
+    const client_config& config() const noexcept { return config_; }
+    
+private:
+    /// Internal connect implementation
+    coro::task<bool> connect_impl(std::string_view url_str, coro::cancel_token token) {
+        // Check if already cancelled
+        if (token.is_cancelled()) {
+            co_return false;
+        }
+        
+        // Parse URL
+        auto parsed = url::parse(url_str);
+        if (!parsed) {
+            ELIO_LOG_ERROR("Invalid SSE URL: {}", url_str);
+            co_return false;
+        }
+        
+        url_ = *parsed;
+        token_ = std::move(token);
+        state_ = client_state::connecting;
+        
+        co_return co_await do_connect();
+    }
+    
+    /// Internal receive implementation
+    coro::task<std::optional<event>> receive_impl(coro::cancel_token token) {
+        // Use passed token or stored token
+        auto& active_token = token.is_cancelled() ? token_ : token;
+        
         while (state_ == client_state::connected) {
+            // Check for cancellation
+            if (active_token.is_cancelled()) {
+                co_return std::nullopt;
+            }
+            
             // Check for already-parsed events
             if (parser_.has_event()) {
                 auto evt = parser_.get_event();
@@ -271,6 +329,12 @@ public:
                     ELIO_LOG_DEBUG("SSE connection closed by server");
                 } else {
                     ELIO_LOG_ERROR("SSE read error: {}", strerror(-result.result));
+                }
+                
+                // Check cancellation before reconnect
+                if (active_token.is_cancelled()) {
+                    state_ = client_state::disconnected;
+                    co_return std::nullopt;
                 }
                 
                 // Handle reconnection
@@ -292,25 +356,7 @@ public:
         
         co_return std::nullopt;
     }
-    
-    /// Close the connection
-    coro::task<void> close() {
-        state_ = client_state::closed;
-        
-        if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_await std::get<tls::tls_stream>(stream_).shutdown();
-        }
-        stream_ = std::monostate{};
-    }
-    
-    /// Get TLS context for configuration
-    tls::tls_context& tls_context() noexcept { return tls_ctx_; }
-    
-    /// Get configuration
-    client_config& config() noexcept { return config_; }
-    const client_config& config() const noexcept { return config_; }
-    
-private:
+
     coro::task<bool> do_connect() {
         ELIO_LOG_DEBUG("Connecting to SSE endpoint {}:{}{}", 
                       url_.host, url_.effective_port(), url_.path);
@@ -448,6 +494,11 @@ private:
         
         size_t attempts = 0;
         while (state_ == client_state::reconnecting) {
+            // Check for cancellation
+            if (token_.is_cancelled()) {
+                co_return false;
+            }
+            
             ++attempts;
             
             if (config_.max_reconnect_attempts > 0 && 
@@ -458,8 +509,12 @@ private:
             
             ELIO_LOG_DEBUG("SSE reconnecting (attempt {}) in {}ms...", attempts, retry_ms);
             
-            // Wait before reconnecting
-            co_await elio::time::sleep_for(std::chrono::milliseconds(retry_ms));
+            // Wait before reconnecting (cancellable)
+            auto result = co_await elio::time::sleep_for(
+                std::chrono::milliseconds(retry_ms), token_);
+            if (result == coro::cancel_result::cancelled) {
+                co_return false;
+            }
             
             if (state_ != client_state::reconnecting) {
                 co_return false;
@@ -502,6 +557,7 @@ private:
     client_config config_;
     tls::tls_context tls_ctx_;
     stream_type stream_;
+    coro::cancel_token token_;  ///< Cancellation token for connection
     
     url url_;
     std::string last_event_id_;
@@ -515,6 +571,18 @@ inline coro::task<std::optional<sse_client>>
 sse_connect(io::io_context& io_ctx, std::string_view url, client_config config = {}) {
     auto client = std::make_optional<sse_client>(io_ctx, config);
     bool success = co_await client->connect(url);
+    if (!success) {
+        co_return std::nullopt;
+    }
+    co_return client;
+}
+
+/// Convenience function for one-off SSE connection with cancellation support
+inline coro::task<std::optional<sse_client>> 
+sse_connect(io::io_context& io_ctx, std::string_view url, coro::cancel_token token,
+            client_config config = {}) {
+    auto client = std::make_optional<sse_client>(io_ctx, config);
+    bool success = co_await client->connect(url, std::move(token));
     if (!success) {
         co_return std::nullopt;
     }

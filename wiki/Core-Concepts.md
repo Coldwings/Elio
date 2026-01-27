@@ -334,6 +334,89 @@ coro::task<void> limited_work() {
 }
 ```
 
+## Cancellation
+
+Elio provides a cooperative cancellation mechanism for async operations using `cancel_source` and `cancel_token`.
+
+### Basic Usage
+
+```cpp
+#include <elio/coro/cancel_token.hpp>
+
+coro::task<void> cancellable_work(coro::cancel_token token) {
+    while (!token.is_cancelled()) {
+        // Do work...
+        
+        // Cancellable sleep - returns early if cancelled
+        auto result = co_await time::sleep_for(100ms, token);
+        if (result == coro::cancel_result::cancelled) {
+            break;
+        }
+    }
+    co_return;
+}
+
+coro::task<void> controller() {
+    coro::cancel_source source;
+    
+    // Start work with a token
+    cancellable_work(source.get_token()).go();
+    
+    // Wait some time
+    co_await time::sleep_for(5s);
+    
+    // Cancel the operation
+    source.cancel();
+    co_return;
+}
+```
+
+### How It Works
+
+1. **`cancel_source`** - Creates and controls cancellation state
+2. **`cancel_token`** - Lightweight handle passed to operations
+3. Operations periodically check `token.is_cancelled()`
+4. Calling `source.cancel()` triggers all registered callbacks
+
+### Cancellable Operations
+
+Many Elio operations support cancellation:
+
+```cpp
+// Sleep with cancellation
+auto result = co_await time::sleep_for(1s, token);
+
+// HTTP request with cancellation
+auto response = co_await client.get(url, token);
+
+// RPC call with cancellation
+auto result = co_await rpc_client->call<Method>(req, timeout, token);
+
+// WebSocket receive with cancellation
+auto msg = co_await ws_client.receive(token);
+
+// SSE event receive with cancellation
+auto event = co_await sse_client.receive(token);
+```
+
+### Implementing Cancellable Operations
+
+Register callbacks to respond to cancellation:
+
+```cpp
+coro::task<void> custom_operation(coro::cancel_token token) {
+    // Register a callback
+    auto reg = token.on_cancel([&]() {
+        // Cleanup or signal early exit
+    });
+    
+    // Do work...
+    
+    // Registration automatically unregisters on destruction
+    co_return;
+}
+```
+
 ## Error Handling
 
 Elio uses `std::optional` for error handling in I/O operations. On failure, functions return `std::nullopt` and set `errno`:

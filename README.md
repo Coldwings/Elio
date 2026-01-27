@@ -9,6 +9,7 @@
 ## Features
 
 - **C++20 Stackless Coroutines** with `task<T>` type
+- **Ergonomic Task Spawning**: `go()` for fire-and-forget, `spawn()` for joinable tasks
 - **Virtual Stack Tracking** for natural exception propagation
 - **Work-Stealing Scheduler** with lock-free Chase-Lev deques
 - **Dynamic Thread Pool** with runtime adjustment
@@ -84,9 +85,8 @@ int main() {
     runtime::scheduler sched(4);
     sched.start();
     
-    // Spawn the main task
-    auto t = main_task();
-    sched.spawn(t.handle());
+    // Spawn the main task (simplified API)
+    sched.spawn(main_task());
     
     // Wait for completion
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -106,6 +106,7 @@ int main() {
 elio::
 ├── coro::                    // Coroutine primitives
 │   ├── task<T>              // Primary coroutine type
+│   ├── join_handle<T>       // Handle for awaiting spawned tasks
 │   ├── promise_base         // Virtual stack base class
 │   ├── awaitable_base<T>    // CRTP awaitable base
 │   └── frame utilities      // Virtual stack inspection
@@ -266,9 +267,8 @@ elio::coro::task<int> compute() {
 elio::runtime::scheduler sched(num_threads);
 sched.start();
 
-// Spawn coroutines
-auto t = my_coroutine();
-sched.spawn(t.handle());
+// Spawn coroutines (accepts task<T> directly)
+sched.spawn(my_coroutine());
 
 // Dynamic thread adjustment
 sched.set_thread_count(8);
@@ -280,6 +280,34 @@ size_t executed = sched.total_tasks_executed();
 
 // Shutdown (waits for completion)
 sched.shutdown();
+```
+
+### Task Spawning
+
+Elio provides flexible ways to spawn concurrent tasks:
+
+```cpp
+// Fire-and-forget: spawn and don't wait for result
+some_task().go();
+
+// Joinable spawn: get a handle to await later
+auto handle = compute_value().spawn();
+// ... do other work ...
+int result = co_await handle;  // Wait and get result
+
+// Multiple concurrent tasks
+auto h1 = task_a().spawn();
+auto h2 = task_b().spawn();
+auto h3 = task_c().spawn();
+// All three run concurrently
+int a = co_await h1;
+int b = co_await h2;
+int c = co_await h3;
+
+// Check if spawned task is ready without blocking
+if (handle.is_ready()) {
+    // Task has completed
+}
 ```
 
 ### Exception Handling
@@ -392,4 +420,4 @@ For questions, issues, or feature requests, please open an issue on the reposito
 
 ---
 
-**Status**: Feature Complete | **Version**: 0.1.0 | **Date**: 2026-01-18
+**Status**: Feature Complete | **Version**: 0.1.0 | **Date**: 2026-01-27

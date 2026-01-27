@@ -40,12 +40,80 @@ public:
     // Get the coroutine handle (does not transfer ownership)
     std::coroutine_handle<> handle() const noexcept;
     
-    // Release ownership of the coroutine handle
+    // Release ownership of the coroutine handle (marks as detached)
     std::coroutine_handle<> release() noexcept;
+    
+    // Spawn on current scheduler (fire-and-forget)
+    void go();
+    
+    // Spawn on current scheduler (joinable, returns handle to await)
+    join_handle<T> spawn();
     
     // Check if task holds a valid coroutine
     explicit operator bool() const noexcept;
 };
+```
+
+**Task Spawning Examples:**
+```cpp
+// Fire-and-forget: spawn and don't wait for result
+some_task().go();
+
+// Joinable spawn: get a handle to await later
+auto handle = compute_value().spawn();
+// ... do other work concurrently ...
+int result = co_await handle;  // Wait and get result
+
+// Multiple concurrent tasks
+auto h1 = task_a().spawn();
+auto h2 = task_b().spawn();
+auto h3 = task_c().spawn();
+// All three run concurrently
+int a = co_await h1;
+int b = co_await h2;
+int c = co_await h3;
+```
+
+### `join_handle<T>`
+
+Handle for awaiting spawned tasks. Returned by `task<T>::spawn()`.
+
+```cpp
+template<typename T = void>
+class join_handle {
+public:
+    join_handle(join_handle&& other) noexcept;
+    join_handle& operator=(join_handle&& other) noexcept;
+    
+    // Awaitable interface (use with co_await)
+    bool await_ready() const noexcept;
+    bool await_suspend(std::coroutine_handle<> awaiter) noexcept;
+    T await_resume();  // Returns result or rethrows exception
+    
+    // Check if the spawned task has completed (non-blocking)
+    bool is_ready() const noexcept;
+};
+```
+
+**Example:**
+```cpp
+coro::task<int> compute() {
+    co_return 42;
+}
+
+coro::task<void> main_task() {
+    // Spawn a joinable task
+    auto handle = compute().spawn();
+    
+    // Check completion without blocking
+    if (!handle.is_ready()) {
+        // Do other work while waiting...
+    }
+    
+    // Await the result
+    int result = co_await handle;
+    std::cout << "Result: " << result << std::endl;
+}
 ```
 
 ---
@@ -72,6 +140,10 @@ public:
     // Spawn a coroutine for execution
     void spawn(std::coroutine_handle<> handle);
     
+    // Spawn a task directly (convenience overload)
+    template<typename Task>
+    void spawn(Task&& t);  // Accepts any type with release() method
+    
     // Set the I/O context for workers to poll
     void set_io_context(io::io_context* ctx);
     
@@ -81,6 +153,21 @@ public:
     // Get the current scheduler (thread-local)
     static scheduler* current() noexcept;
 };
+```
+
+**Example:**
+```cpp
+runtime::scheduler sched(4);
+sched.start();
+
+// Old API (still works)
+auto t = my_coroutine();
+sched.spawn(t.release());
+
+// New simplified API
+sched.spawn(my_coroutine());  // Accepts task directly
+
+sched.shutdown();
 ```
 
 ### `run_config`

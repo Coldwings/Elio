@@ -94,48 +94,15 @@ public:
             handle.destroy();
             return;
         }
-        
-        // Release fence ensures all writes to the coroutine frame (including
-        // captured lambda state) are visible to the worker that will run this task
-        std::atomic_thread_fence(std::memory_order_release);
-        
-        size_t n = num_threads_.load(std::memory_order_acquire);
-        if (n == 0) [[unlikely]] {
-            handle.destroy();
-            return;
-        }
-        
-        // Check if task has affinity - if so, schedule to that specific worker
-        size_t affinity = coro::get_affinity(handle.address());
-        if (affinity != coro::NO_AFFINITY && affinity < n) {
-            if (workers_[affinity]->is_running()) {
-                workers_[affinity]->schedule(handle);
-                return;
-            }
-            // Target worker not running - clear affinity and fall through
-            auto* promise = coro::get_promise_base(handle.address());
-            if (promise) {
-                promise->clear_affinity();
-            }
-        }
-        
-        // No affinity or invalid affinity - round-robin to any running worker
-        size_t start_index = spawn_index_.fetch_add(1, std::memory_order_relaxed) % n;
-        for (size_t i = 0; i < n; ++i) {
-            size_t index = (start_index + i) % n;
-            if (workers_[index]->is_running()) {
-                workers_[index]->schedule(handle);
-                return;
-            }
-        }
-        
-        // All workers stopped, try again with current thread count
-        n = num_threads_.load(std::memory_order_acquire);
-        if (n > 0 && workers_[0]->is_running()) {
-            workers_[0]->schedule(handle);
-        } else {
-            handle.destroy();
-        }
+        do_spawn(handle);
+    }
+    
+    /// Spawn a task directly (convenience overload)
+    /// Accepts any type with a release() method that returns a coroutine_handle
+    template<typename Task>
+        requires requires(Task t) { { t.release() } -> std::convertible_to<std::coroutine_handle<>>; }
+    void spawn(Task&& t) {
+        spawn(std::forward<Task>(t).release());
     }
 
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle) {
@@ -256,6 +223,50 @@ public:
     bool try_poll_io(std::chrono::milliseconds timeout = std::chrono::milliseconds(0));
 
 private:
+    void do_spawn(std::coroutine_handle<> handle) {
+        // Release fence ensures all writes to the coroutine frame (including
+        // captured lambda state) are visible to the worker that will run this task
+        std::atomic_thread_fence(std::memory_order_release);
+        
+        size_t n = num_threads_.load(std::memory_order_acquire);
+        if (n == 0) [[unlikely]] {
+            handle.destroy();
+            return;
+        }
+        
+        // Check if task has affinity - if so, schedule to that specific worker
+        size_t affinity = coro::get_affinity(handle.address());
+        if (affinity != coro::NO_AFFINITY && affinity < n) {
+            if (workers_[affinity]->is_running()) {
+                workers_[affinity]->schedule(handle);
+                return;
+            }
+            // Target worker not running - clear affinity and fall through
+            auto* promise = coro::get_promise_base(handle.address());
+            if (promise) {
+                promise->clear_affinity();
+            }
+        }
+        
+        // No affinity or invalid affinity - round-robin to any running worker
+        size_t start_index = spawn_index_.fetch_add(1, std::memory_order_relaxed) % n;
+        for (size_t i = 0; i < n; ++i) {
+            size_t index = (start_index + i) % n;
+            if (workers_[index]->is_running()) {
+                workers_[index]->schedule(handle);
+                return;
+            }
+        }
+        
+        // All workers stopped, try again with current thread count
+        n = num_threads_.load(std::memory_order_acquire);
+        if (n > 0 && workers_[0]->is_running()) {
+            workers_[0]->schedule(handle);
+        } else {
+            handle.destroy();
+        }
+    }
+
     std::vector<std::unique_ptr<worker_thread>> workers_;
     std::atomic<size_t> num_threads_;
     std::atomic<bool> running_;

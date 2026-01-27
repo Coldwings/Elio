@@ -479,6 +479,16 @@ auto listener = net::uds_listener::bind(addr, ctx);
 
 ## Performance Considerations
 
+### Atomic Frame Writing
+
+The RPC framework uses scatter-gather I/O (`writev`) to write frames atomically. This means the header, payload, and optional checksum are written in a single syscall, which:
+
+- Reduces the number of syscalls (typically 1 instead of 2-3)
+- Minimizes context switching under high concurrency
+- Provides better behavior when multiple coroutines make parallel RPC calls with large payloads
+
+This is handled automatically by `write_frame()` - no special configuration needed.
+
 ### Zero-Copy Deserialization
 
 For read-only access, use `buffer_view` directly:

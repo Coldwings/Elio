@@ -202,6 +202,11 @@ public:
         return io::async_send(*ctx_, fd_, str.data(), str.size());
     }
     
+    /// Async writev (scatter-gather write)
+    auto writev(struct iovec* iovecs, size_t count) {
+        return io::async_writev(*ctx_, fd_, iovecs, count);
+    }
+    
     /// Wait for socket to be readable
     auto poll_read() {
         return io::async_poll_read(*ctx_, fd_);

@@ -731,6 +731,9 @@ public:
     // Write data (awaitable)
     /* awaitable */ write(const void* data, size_t size);
     
+    // Scatter-gather write (awaitable) - writes multiple buffers atomically
+    /* awaitable */ writev(struct iovec* iovecs, size_t count);
+    
     // Poll for readability (awaitable)
     /* awaitable */ poll_read();
     

@@ -194,9 +194,11 @@ private:
 
 /// Stream concept for TCP or UDS streams
 template<typename T>
-concept rpc_stream = requires(T& stream, void* buf, const void* cbuf, size_t len) {
+concept rpc_stream = requires(T& stream, void* buf, const void* cbuf, size_t len, 
+                              struct iovec* iovecs, size_t iov_count) {
     { stream.read(buf, len) };
     { stream.write(cbuf, len) };
+    { stream.writev(iovecs, iov_count) };
     { stream.is_valid() } -> std::same_as<bool>;
 };
 
@@ -234,6 +236,45 @@ coro::task<io::io_result> write_exact(Stream& stream, const void* buffer, size_t
     }
     
     co_return io::io_result{static_cast<int32_t>(length), 0};
+}
+
+/// Write all data from iovec array to stream (scatter-gather write)
+/// Handles partial writes by adjusting iovec entries
+template<rpc_stream Stream>
+coro::task<io::io_result> writev_exact(Stream& stream, struct iovec* iovecs, size_t iov_count) {
+    size_t total_length = 0;
+    for (size_t i = 0; i < iov_count; ++i) {
+        total_length += iovecs[i].iov_len;
+    }
+    
+    size_t current_iov = 0;
+    size_t bytes_written = 0;
+    
+    while (current_iov < iov_count) {
+        auto result = co_await stream.writev(&iovecs[current_iov], iov_count - current_iov);
+        if (result.result <= 0) {
+            co_return result;
+        }
+        
+        bytes_written += result.result;
+        size_t written = static_cast<size_t>(result.result);
+        
+        // Advance through iovecs based on how much was written
+        while (written > 0 && current_iov < iov_count) {
+            if (written >= iovecs[current_iov].iov_len) {
+                written -= iovecs[current_iov].iov_len;
+                ++current_iov;
+            } else {
+                // Partial write within this iovec entry
+                iovecs[current_iov].iov_base = 
+                    static_cast<uint8_t*>(iovecs[current_iov].iov_base) + written;
+                iovecs[current_iov].iov_len -= written;
+                written = 0;
+            }
+        }
+    }
+    
+    co_return io::io_result{static_cast<int32_t>(total_length), 0};
 }
 
 /// Read a complete frame from stream
@@ -291,80 +332,96 @@ read_frame(Stream& stream) {
     co_return std::make_pair(header, std::move(payload));
 }
 
-/// Write a frame to stream
+/// Write a frame to stream using scatter-gather I/O for atomicity
 /// If the header has the has_checksum flag set, appends CRC32 checksum
 template<rpc_stream Stream>
 coro::task<bool> write_frame(Stream& stream, const frame_header& header, 
                               const buffer_writer& payload) {
-    // Write header
+    // Prepare header bytes
     auto header_bytes = header.to_bytes();
-    auto result = co_await write_exact(stream, header_bytes.data(), frame_header_size);
-    if (result.result <= 0) {
-        co_return false;
-    }
     
-    // Write payload
-    if (payload.size() > 0) {
-        result = co_await write_exact(stream, payload.data(), payload.size());
-        if (result.result <= 0) {
-            co_return false;
-        }
-    }
-    
-    // Write checksum if requested
+    // Compute checksum if needed (must be done before building iovecs)
+    uint32_t checksum = 0;
     if (has_flag(header.flags, message_flags::has_checksum)) {
-        // Compute checksum over header + payload
         uint32_t crc = hash::crc32_update(header_bytes.data(), frame_header_size, 0xFFFFFFFF);
         if (payload.size() > 0) {
             crc = hash::crc32_update(payload.data(), payload.size(), crc);
         }
-        uint32_t checksum = hash::crc32_finalize(crc);
-        
-        result = co_await write_exact(stream, &checksum, checksum_size);
-        if (result.result <= 0) {
-            co_return false;
-        }
+        checksum = hash::crc32_finalize(crc);
     }
     
-    co_return true;
+    // Build iovec array for atomic write
+    struct iovec iovecs[3];
+    size_t iov_count = 0;
+    
+    // Header
+    iovecs[iov_count].iov_base = header_bytes.data();
+    iovecs[iov_count].iov_len = frame_header_size;
+    ++iov_count;
+    
+    // Payload
+    if (payload.size() > 0) {
+        iovecs[iov_count].iov_base = const_cast<uint8_t*>(payload.data());
+        iovecs[iov_count].iov_len = payload.size();
+        ++iov_count;
+    }
+    
+    // Checksum
+    if (has_flag(header.flags, message_flags::has_checksum)) {
+        iovecs[iov_count].iov_base = &checksum;
+        iovecs[iov_count].iov_len = checksum_size;
+        ++iov_count;
+    }
+    
+    // Write all data atomically using scatter-gather I/O
+    auto result = co_await writev_exact(stream, iovecs, iov_count);
+    co_return result.result > 0;
 }
 
-/// Write a frame with raw payload
+/// Write a frame with raw payload using scatter-gather I/O for atomicity
 /// If the header has the has_checksum flag set, appends CRC32 checksum
 template<rpc_stream Stream>
 coro::task<bool> write_frame(Stream& stream, const frame_header& header,
                               const void* payload_data, size_t payload_size) {
-    // Write header
+    // Prepare header bytes
     auto header_bytes = header.to_bytes();
-    auto result = co_await write_exact(stream, header_bytes.data(), frame_header_size);
-    if (result.result <= 0) {
-        co_return false;
-    }
     
-    // Write payload
-    if (payload_size > 0) {
-        result = co_await write_exact(stream, payload_data, payload_size);
-        if (result.result <= 0) {
-            co_return false;
-        }
-    }
-    
-    // Write checksum if requested
+    // Compute checksum if needed
+    uint32_t checksum = 0;
     if (has_flag(header.flags, message_flags::has_checksum)) {
-        // Compute checksum over header + payload
         uint32_t crc = hash::crc32_update(header_bytes.data(), frame_header_size, 0xFFFFFFFF);
         if (payload_size > 0) {
             crc = hash::crc32_update(payload_data, payload_size, crc);
         }
-        uint32_t checksum = hash::crc32_finalize(crc);
-        
-        result = co_await write_exact(stream, &checksum, checksum_size);
-        if (result.result <= 0) {
-            co_return false;
-        }
+        checksum = hash::crc32_finalize(crc);
     }
     
-    co_return true;
+    // Build iovec array for atomic write
+    struct iovec iovecs[3];
+    size_t iov_count = 0;
+    
+    // Header
+    iovecs[iov_count].iov_base = header_bytes.data();
+    iovecs[iov_count].iov_len = frame_header_size;
+    ++iov_count;
+    
+    // Payload
+    if (payload_size > 0) {
+        iovecs[iov_count].iov_base = const_cast<void*>(payload_data);
+        iovecs[iov_count].iov_len = payload_size;
+        ++iov_count;
+    }
+    
+    // Checksum
+    if (has_flag(header.flags, message_flags::has_checksum)) {
+        iovecs[iov_count].iov_base = &checksum;
+        iovecs[iov_count].iov_len = checksum_size;
+        ++iov_count;
+    }
+    
+    // Write all data atomically using scatter-gather I/O
+    auto result = co_await writev_exact(stream, iovecs, iov_count);
+    co_return result.result > 0;
 }
 
 // ============================================================================

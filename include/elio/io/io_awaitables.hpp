@@ -306,6 +306,43 @@ private:
     int fd_;
 };
 
+/// Awaitable for async writev operations (scatter-gather write)
+class async_writev_awaitable : public io_awaitable_base {
+public:
+    async_writev_awaitable(io_context& ctx, int fd, struct iovec* iovecs,
+                           size_t iovec_count) noexcept
+        : io_awaitable_base(ctx)
+        , fd_(fd)
+        , iovecs_(iovecs)
+        , iovec_count_(iovec_count) {}
+    
+    void await_suspend(std::coroutine_handle<> awaiter) {
+        io_request req{};
+        req.op = io_op::writev;
+        req.fd = fd_;
+        req.iovecs = iovecs_;
+        req.iovec_count = iovec_count_;
+        req.awaiter = awaiter;
+        
+        if (!ctx_.prepare(req)) {
+            result_ = io_result{-EAGAIN, 0};
+            awaiter.resume();
+            return;
+        }
+        ctx_.submit();
+    }
+    
+    io_result await_resume() noexcept {
+        result_ = io_context::get_last_result();
+        return result_;
+    }
+    
+private:
+    int fd_;
+    struct iovec* iovecs_;
+    size_t iovec_count_;
+};
+
 /// Awaitable for poll (wait for socket readable/writable)
 class async_poll_awaitable : public io_awaitable_base {
 public:
@@ -385,6 +422,12 @@ inline auto async_send(io_context& ctx, int fd, const void* buffer,
     return async_send_awaitable(ctx, fd, buffer, length, flags);
 }
 
+/// Create an async writev awaitable (scatter-gather write)
+inline auto async_writev(io_context& ctx, int fd, struct iovec* iovecs,
+                         size_t iovec_count) {
+    return async_writev_awaitable(ctx, fd, iovecs, iovec_count);
+}
+
 /// Create an async accept awaitable
 inline auto async_accept(io_context& ctx, int listen_fd,
                          struct sockaddr* addr = nullptr,
@@ -431,6 +474,10 @@ inline auto async_recv(int fd, void* buffer, size_t length, int flags = 0) {
 
 inline auto async_send(int fd, const void* buffer, size_t length, int flags = 0) {
     return async_send(default_io_context(), fd, buffer, length, flags);
+}
+
+inline auto async_writev(int fd, struct iovec* iovecs, size_t iovec_count) {
+    return async_writev(default_io_context(), fd, iovecs, iovec_count);
 }
 
 inline auto async_accept(int listen_fd, struct sockaddr* addr = nullptr,

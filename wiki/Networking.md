@@ -85,6 +85,36 @@ if (peer) {
 }
 ```
 
+### Scatter-Gather I/O (writev)
+
+For efficient writing of multiple buffers without copying, use `writev()`:
+
+```cpp
+coro::task<void> send_message(tcp_stream& stream) {
+    // Prepare header and payload separately
+    std::array<uint8_t, 8> header = {0x01, 0x02, ...};
+    std::string payload = "Hello, World!";
+    
+    // Write both in a single syscall using scatter-gather I/O
+    struct iovec iovecs[2];
+    iovecs[0].iov_base = header.data();
+    iovecs[0].iov_len = header.size();
+    iovecs[1].iov_base = const_cast<char*>(payload.data());
+    iovecs[1].iov_len = payload.size();
+    
+    auto result = co_await stream.writev(iovecs, 2);
+    if (result.result > 0) {
+        ELIO_LOG_INFO("Sent {} bytes", result.result);
+    }
+}
+```
+
+**Benefits of writev:**
+- Reduces syscall overhead by combining multiple writes into one
+- Avoids buffer copying when you have data in separate locations
+- More atomic writes - better behavior under high concurrency
+- Used internally by the RPC framework for efficient frame writing
+
 ## Unix Domain Sockets (UDS)
 
 Unix Domain Sockets provide high-performance local inter-process communication. Elio supports both filesystem sockets and abstract sockets (Linux-specific).

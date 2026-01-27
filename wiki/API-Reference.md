@@ -260,6 +260,42 @@ sched.spawn(my_coroutine());  // Accepts task directly
 sched.shutdown();
 ```
 
+### `worker_thread`
+
+Individual worker that executes tasks. Workers use an efficient idle mechanism with eventfd-based wake-up.
+
+```cpp
+class worker_thread {
+public:
+    // Schedule a task to this worker (thread-safe, wakes worker if sleeping)
+    void schedule(std::coroutine_handle<> handle);
+    
+    // Schedule from owner thread (faster, no wake needed)
+    void schedule_local(std::coroutine_handle<> handle);
+    
+    // Wake this worker if sleeping (called automatically by schedule())
+    void wake() noexcept;
+    
+    // Get the eventfd for external integration
+    int wake_fd() const noexcept;
+    
+    // Get worker ID
+    size_t worker_id() const noexcept;
+    
+    // Check if running
+    bool is_running() const noexcept;
+    
+    // Get current worker (thread-local)
+    static worker_thread* current() noexcept;
+};
+```
+
+**Idle Behavior:**
+- Workers block efficiently on `epoll_wait` when no tasks are available
+- When a task is scheduled via `schedule()`, the worker is automatically woken
+- One worker polls the IO backend while others sleep on their eventfd
+- Results in near-zero CPU usage (< 1%) when idle
+
 ### `run_config`
 
 Configuration for running async tasks.

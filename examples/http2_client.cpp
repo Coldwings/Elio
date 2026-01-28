@@ -1,6 +1,6 @@
 /// @file http2_client.cpp
 /// @brief HTTP/2 Client Example
-/// 
+///
 /// This example demonstrates how to make HTTP/2 requests using Elio's
 /// HTTP/2 client with multiplexed streams over TLS.
 ///
@@ -13,31 +13,23 @@
 #include <elio/elio.hpp>
 #include <elio/http/http2.hpp>
 
-#include <atomic>
-#include <condition_variable>
-#include <mutex>
+#include <iostream>
 
 using namespace elio;
 using namespace elio::http;
-using namespace elio::runtime;
-
-// Completion signaling
-std::atomic<bool> g_done{false};
-std::mutex g_mutex;
-std::condition_variable g_cv;
 
 /// Perform HTTP/2 requests demonstrating various features
-coro::task<void> run_client(const std::string& base_url) {
+coro::task<void> run_demo(const std::string& base_url) {
     // Create HTTP/2 client with custom config
     h2_client_config config;
     config.user_agent = "elio-http2-client-example/1.0";
     config.max_concurrent_streams = 100;
 
     h2_client client(config);
-    
+
     ELIO_LOG_INFO("=== HTTP/2 Client Example ===");
     ELIO_LOG_INFO("Base URL: {}", base_url);
-    
+
     // 1. Simple GET request
     ELIO_LOG_INFO("\n--- HTTP/2 GET Request ---");
     {
@@ -47,7 +39,7 @@ coro::task<void> run_client(const std::string& base_url) {
             ELIO_LOG_INFO("Status: {}", static_cast<int>(resp.get_status()));
             ELIO_LOG_INFO("Content-Type: {}", resp.content_type());
             ELIO_LOG_INFO("Body length: {} bytes", resp.body().size());
-            
+
             // Print first 200 chars of body
             auto body = resp.body();
             if (body.size() > 200) {
@@ -59,7 +51,7 @@ coro::task<void> run_client(const std::string& base_url) {
             ELIO_LOG_ERROR("HTTP/2 GET request failed: {}", strerror(errno));
         }
     }
-    
+
     // 2. Multiple requests using same connection (HTTP/2 multiplexing)
     ELIO_LOG_INFO("\n--- HTTP/2 Connection Multiplexing ---");
     {
@@ -68,7 +60,7 @@ coro::task<void> run_client(const std::string& base_url) {
             ELIO_LOG_INFO("Request {}/3...", i);
             auto result = co_await client.get(base_url);
             if (result) {
-                ELIO_LOG_INFO("  Status: {} (body: {} bytes)", 
+                ELIO_LOG_INFO("  Status: {} (body: {} bytes)",
                              static_cast<int>(result->get_status()),
                              result->body().size());
             } else {
@@ -77,36 +69,30 @@ coro::task<void> run_client(const std::string& base_url) {
         }
         ELIO_LOG_INFO("All requests used HTTP/2 multiplexed streams on single connection");
     }
-    
+
     ELIO_LOG_INFO("\n=== HTTP/2 Client Example Complete ===");
-    
-    // Signal completion
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_done = true;
-    }
-    g_cv.notify_all();
+    co_return;
 }
 
 /// Simple one-off HTTP/2 request demonstration
-coro::task<void> simple_request(const std::string& url) {
+coro::task<void> simple_fetch(const std::string& url) {
     ELIO_LOG_INFO("Fetching via HTTP/2: {}", url);
 
     // Use convenience function for one-off requests
     auto result = co_await h2_get(url);
-    
+
     if (result) {
         auto& resp = *result;
         ELIO_LOG_INFO("Status: {}", static_cast<int>(resp.get_status()));
         ELIO_LOG_INFO("Content-Type: {}", resp.content_type());
         ELIO_LOG_INFO("Content-Length: {}", resp.body().size());
-        
+
         // Print response headers
         ELIO_LOG_INFO("Response Headers:");
         for (const auto& [name, value] : resp.get_headers()) {
             ELIO_LOG_INFO("  {}: {}", name, value);
         }
-        
+
         // Print response body (truncated if too long)
         auto body = resp.body();
         if (body.size() > 500) {
@@ -118,25 +104,33 @@ coro::task<void> simple_request(const std::string& url) {
         ELIO_LOG_ERROR("HTTP/2 request failed: {}", strerror(errno));
         ELIO_LOG_INFO("Note: HTTP/2 requires HTTPS and server support for h2 ALPN.");
     }
-    
-    // Signal completion
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_done = true;
-    }
-    g_cv.notify_all();
+    co_return;
 }
 
-int main(int argc, char* argv[]) {
+/// Async main - uses ELIO_ASYNC_MAIN for automatic scheduler management
+coro::task<int> async_main(int argc, char* argv[]) {
     std::string url;
     bool full_demo = false;
-    
+
+    ELIO_LOG_INFO("HTTP/2 Client Example");
+    ELIO_LOG_INFO("Using nghttp2 library for HTTP/2 protocol support");
+
     // Parse arguments
     if (argc > 1) {
         std::string arg = argv[1];
         if (arg == "--demo" || arg == "-d") {
             full_demo = true;
             url = "https://nghttp2.org/";  // nghttp2.org always supports HTTP/2
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: " << argv[0] << " [options] [url]\n"
+                      << "\n"
+                      << "Options:\n"
+                      << "  --demo, -d    Run full feature demonstration\n"
+                      << "  --help, -h    Show this help\n"
+                      << "\n"
+                      << "Default: Fetches https://nghttp2.org/\n"
+                      << "Note: HTTP/2 requires HTTPS and server support for h2 ALPN.\n";
+            co_return 0;
         } else {
             url = arg;
         }
@@ -145,35 +139,16 @@ int main(int argc, char* argv[]) {
         full_demo = false;
         url = "https://nghttp2.org/";
     }
-    
-    ELIO_LOG_INFO("HTTP/2 Client Example");
-    ELIO_LOG_INFO("Using nghttp2 library for HTTP/2 protocol support");
-    
-    // Create scheduler
-    scheduler sched(2);
-    sched.start();
-    
+
     // Run appropriate mode
     if (full_demo) {
-        auto task = run_client(url);
-        sched.spawn(task.release());
+        co_await run_demo(url);
     } else {
-        auto task = simple_request(url);
-        sched.spawn(task.release());
+        co_await simple_fetch(url);
     }
-    
-    // Wait for completion with timeout
-    {
-        std::unique_lock<std::mutex> lock(g_mutex);
-        g_cv.wait_for(lock, std::chrono::seconds(60), [] { return g_done.load(); });
-    }
-    
-    // Brief drain before shutdown
-    auto& ctx = io::default_io_context();
-    for (int i = 0; i < 10 && ctx.has_pending(); ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
-    }
-    
-    sched.shutdown();
-    return 0;
+
+    co_return 0;
 }
+
+// Use ELIO_ASYNC_MAIN - handles scheduler creation, execution, and shutdown automatically
+ELIO_ASYNC_MAIN(async_main)

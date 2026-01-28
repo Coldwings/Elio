@@ -1,6 +1,6 @@
 /// @file http_client.cpp
 /// @brief HTTP Client Example
-/// 
+///
 /// This example demonstrates how to make HTTP requests using Elio's
 /// HTTP client with connection pooling and TLS support.
 ///
@@ -11,21 +11,13 @@
 #include <elio/http/http.hpp>
 #include <elio/tls/tls.hpp>
 
-#include <atomic>
-#include <condition_variable>
-#include <mutex>
+#include <iostream>
 
 using namespace elio;
 using namespace elio::http;
-using namespace elio::runtime;
-
-// Completion signaling
-std::atomic<bool> g_done{false};
-std::mutex g_mutex;
-std::condition_variable g_cv;
 
 /// Perform multiple HTTP requests demonstrating various features
-coro::task<void> run_client(const std::string& base_url) {
+coro::task<void> run_demo(const std::string& base_url) {
     // Create client with custom config
     client_config config;
     config.user_agent = "elio-http-client-example/1.0";
@@ -33,10 +25,10 @@ coro::task<void> run_client(const std::string& base_url) {
     config.max_redirects = 5;
 
     client c(config);
-    
+
     ELIO_LOG_INFO("=== HTTP Client Example ===");
     ELIO_LOG_INFO("Base URL: {}", base_url);
-    
+
     // 1. Simple GET request
     ELIO_LOG_INFO("\n--- GET Request ---");
     {
@@ -46,7 +38,7 @@ coro::task<void> run_client(const std::string& base_url) {
             ELIO_LOG_INFO("Status: {} {}", resp.status_code(), status_reason(resp.get_status()));
             ELIO_LOG_INFO("Content-Type: {}", resp.content_type());
             ELIO_LOG_INFO("Body length: {} bytes", resp.body().size());
-            
+
             // Print first 200 chars of body
             auto body = resp.body();
             if (body.size() > 200) {
@@ -58,7 +50,7 @@ coro::task<void> run_client(const std::string& base_url) {
             ELIO_LOG_ERROR("GET request failed: {}", strerror(errno));
         }
     }
-    
+
     // 2. POST request with JSON
     ELIO_LOG_INFO("\n--- POST Request (JSON) ---");
     {
@@ -67,7 +59,7 @@ coro::task<void> run_client(const std::string& base_url) {
         if (result) {
             auto& resp = *result;
             ELIO_LOG_INFO("Status: {} {}", resp.status_code(), status_reason(resp.get_status()));
-            
+
             auto body = resp.body();
             if (body.size() > 300) {
                 ELIO_LOG_INFO("Body (truncated): {}", body.substr(0, 300));
@@ -78,7 +70,7 @@ coro::task<void> run_client(const std::string& base_url) {
             ELIO_LOG_ERROR("POST request failed: {}", strerror(errno));
         }
     }
-    
+
     // 3. POST with form data
     ELIO_LOG_INFO("\n--- POST Request (Form) ---");
     {
@@ -90,7 +82,7 @@ coro::task<void> run_client(const std::string& base_url) {
             ELIO_LOG_ERROR("Form POST failed: {}", strerror(errno));
         }
     }
-    
+
     // 4. Custom headers
     ELIO_LOG_INFO("\n--- Custom Headers ---");
     {
@@ -98,12 +90,12 @@ coro::task<void> run_client(const std::string& base_url) {
         req.set_host("httpbin.org");
         req.set_header("X-Custom-Header", "elio-test-value");
         req.set_header("Accept", "application/json");
-        
+
         url target;
         target.scheme = "https";
         target.host = "httpbin.org";
         target.path = "/headers";
-        
+
         auto result = co_await c.send(req, target);
         if (result) {
             ELIO_LOG_INFO("Status: {} {}", result->status_code(), status_reason(result->get_status()));
@@ -117,7 +109,7 @@ coro::task<void> run_client(const std::string& base_url) {
             ELIO_LOG_ERROR("Custom headers request failed: {}", strerror(errno));
         }
     }
-    
+
     // 5. Connection reuse (multiple requests to same host)
     ELIO_LOG_INFO("\n--- Connection Reuse (Keep-Alive) ---");
     {
@@ -132,7 +124,7 @@ coro::task<void> run_client(const std::string& base_url) {
         }
         ELIO_LOG_INFO("All requests used keep-alive connection pooling");
     }
-    
+
     // 6. Redirect following
     ELIO_LOG_INFO("\n--- Redirect Following ---");
     {
@@ -144,7 +136,7 @@ coro::task<void> run_client(const std::string& base_url) {
             ELIO_LOG_ERROR("Redirect request failed: {}", strerror(errno));
         }
     }
-    
+
     // 7. Status codes
     ELIO_LOG_INFO("\n--- Various Status Codes ---");
     {
@@ -152,14 +144,14 @@ coro::task<void> run_client(const std::string& base_url) {
         for (int code : codes) {
             auto result = co_await c.get(base_url + "/status/" + std::to_string(code));
             if (result) {
-                ELIO_LOG_INFO("Requested {}: got {} {}", 
+                ELIO_LOG_INFO("Requested {}: got {} {}",
                              code, result->status_code(), status_reason(result->get_status()));
             } else {
                 ELIO_LOG_ERROR("Request for status {} failed", code);
             }
         }
     }
-    
+
     // 8. HEAD request
     ELIO_LOG_INFO("\n--- HEAD Request ---");
     {
@@ -172,30 +164,24 @@ coro::task<void> run_client(const std::string& base_url) {
             ELIO_LOG_ERROR("HEAD request failed: {}", strerror(errno));
         }
     }
-    
+
     ELIO_LOG_INFO("\n=== HTTP Client Example Complete ===");
-    
-    // Signal completion
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_done = true;
-    }
-    g_cv.notify_all();
+    co_return;
 }
 
 /// Simple one-off request demonstration
-coro::task<void> simple_request(const std::string& url) {
+coro::task<void> simple_fetch(const std::string& url) {
     ELIO_LOG_INFO("Fetching: {}", url);
 
     // Use convenience function for one-off requests
     auto result = co_await http::get(url);
-    
+
     if (result) {
         auto& resp = *result;
         ELIO_LOG_INFO("Status: {} {}", resp.status_code(), status_reason(resp.get_status()));
         ELIO_LOG_INFO("Content-Type: {}", resp.content_type());
         ELIO_LOG_INFO("Content-Length: {}", resp.body().size());
-        
+
         // Print response body (truncated if too long)
         auto body = resp.body();
         if (body.size() > 500) {
@@ -206,25 +192,30 @@ coro::task<void> simple_request(const std::string& url) {
     } else {
         ELIO_LOG_ERROR("Request failed: {}", strerror(errno));
     }
-    
-    // Signal completion
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_done = true;
-    }
-    g_cv.notify_all();
+    co_return;
 }
 
-int main(int argc, char* argv[]) {
+/// Async main - uses ELIO_ASYNC_MAIN for automatic scheduler management
+coro::task<int> async_main(int argc, char* argv[]) {
     std::string url;
     bool full_demo = false;
-    
+
     // Parse arguments
     if (argc > 1) {
         std::string arg = argv[1];
         if (arg == "--demo" || arg == "-d") {
             full_demo = true;
             url = "https://httpbin.org";
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: " << argv[0] << " [options] [url]\n"
+                      << "\n"
+                      << "Options:\n"
+                      << "  --demo, -d    Run full feature demonstration\n"
+                      << "  --help, -h    Show this help\n"
+                      << "\n"
+                      << "If url is provided, fetches that URL.\n"
+                      << "If no arguments, runs full demo with httpbin.org.\n";
+            co_return 0;
         } else {
             url = arg;
         }
@@ -233,32 +224,16 @@ int main(int argc, char* argv[]) {
         full_demo = true;
         url = "https://httpbin.org";
     }
-    
-    // Create scheduler
-    scheduler sched(2);
-    sched.start();
-    
+
     // Run appropriate mode
     if (full_demo) {
-        auto task = run_client(url);
-        sched.spawn(task.release());
+        co_await run_demo(url);
     } else {
-        auto task = simple_request(url);
-        sched.spawn(task.release());
+        co_await simple_fetch(url);
     }
-    
-    // Wait for completion with timeout
-    {
-        std::unique_lock<std::mutex> lock(g_mutex);
-        g_cv.wait_for(lock, std::chrono::seconds(60), [] { return g_done.load(); });
-    }
-    
-    // Brief drain before shutdown
-    auto& ctx = io::default_io_context();
-    for (int i = 0; i < 10 && ctx.has_pending(); ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
-    }
-    
-    sched.shutdown();
-    return 0;
+
+    co_return 0;
 }
+
+// Use ELIO_ASYNC_MAIN - handles scheduler creation, execution, and shutdown automatically
+ELIO_ASYNC_MAIN(async_main)

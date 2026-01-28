@@ -358,6 +358,92 @@ ELIO_ASYNC_MAIN(async_main)
 
 ---
 
+## Server Lifecycle (`elio`)
+
+### `serve()`
+
+Run a server until a shutdown signal is received.
+
+```cpp
+// Serve a single server with graceful shutdown
+template<typename Server, typename ListenTask>
+coro::task<void> serve(Server& server, ListenTask listen_task,
+                       std::initializer_list<int> signals = {SIGINT, SIGTERM});
+```
+
+The function:
+1. Spawns the listen task in the background
+2. Waits for a shutdown signal (SIGINT or SIGTERM by default)
+3. Calls `server.stop()` when signal is received
+4. Waits for the listen task to complete
+
+**Example:**
+```cpp
+coro::task<int> async_main(int argc, char* argv[]) {
+    http::router r;
+    r.get("/", handler);
+
+    http::server srv(r);
+
+    // serve() handles everything: listen, wait for Ctrl+C, stop cleanly
+    co_await elio::serve(srv, srv.listen(addr));
+
+    co_return 0;
+}
+
+ELIO_ASYNC_MAIN(async_main)
+```
+
+### `serve_all()`
+
+Run multiple servers until shutdown.
+
+```cpp
+template<typename... Servers, typename... ListenTasks>
+coro::task<void> serve_all(std::tuple<Servers&...> servers,
+                           std::tuple<ListenTasks...> listen_tasks,
+                           std::initializer_list<int> signals = {SIGINT, SIGTERM});
+```
+
+**Example:**
+```cpp
+coro::task<void> run_servers() {
+    http::server http_srv(http_router);
+    websocket::ws_server ws_srv(ws_router);
+
+    co_await elio::serve_all(
+        std::tie(http_srv, ws_srv),
+        std::make_tuple(
+            http_srv.listen(http_addr),
+            ws_srv.listen(ws_addr)
+        )
+    );
+}
+```
+
+### `wait_shutdown_signal()`
+
+Wait for shutdown signals without managing a server.
+
+```cpp
+coro::task<signal::signal_info> wait_shutdown_signal(
+    std::initializer_list<int> signals = {SIGINT, SIGTERM});
+```
+
+**Example:**
+```cpp
+coro::task<void> custom_server_loop() {
+    // Start server tasks...
+
+    auto sig = co_await elio::wait_shutdown_signal();
+    ELIO_LOG_INFO("Received {}, shutting down...", sig.full_name());
+
+    // Custom shutdown logic...
+}
+```
+
+---
+
 ## Thread Affinity (`elio::runtime`)
 
 Thread affinity allows you to bind vthreads (coroutines) to specific worker threads, preventing work stealing and ensuring they run on a designated thread.

@@ -22,8 +22,6 @@ using namespace elio::runtime;
 
 /// Async file copy using io_uring/epoll
 task<bool> async_copy_file(const std::string& src_path, const std::string& dst_path) {
-    auto& ctx = io::default_io_context();
-    
     // Open source file
     int src_fd = open(src_path.c_str(), O_RDONLY);
     if (src_fd < 0) {
@@ -62,7 +60,7 @@ task<bool> async_copy_file(const std::string& src_path, const std::string& dst_p
         size_t to_read = std::min(BUFFER_SIZE, file_size - total_copied);
         
         // Async read from source
-        auto read_result = co_await io::async_read(ctx, src_fd, buffer.data(), to_read, offset);
+        auto read_result = co_await io::async_read(src_fd, buffer.data(), to_read, offset);
         
         if (read_result.result <= 0) {
             if (read_result.result == 0) {
@@ -77,7 +75,7 @@ task<bool> async_copy_file(const std::string& src_path, const std::string& dst_p
         size_t bytes_read = read_result.result;
         
         // Async write to destination
-        auto write_result = co_await io::async_write(ctx, dst_fd, buffer.data(), bytes_read, offset);
+        auto write_result = co_await io::async_write(dst_fd, buffer.data(), bytes_read, offset);
         
         if (write_result.result <= 0) {
             std::cerr << "Write error: " << strerror(-write_result.result) << std::endl;
@@ -98,8 +96,8 @@ task<bool> async_copy_file(const std::string& src_path, const std::string& dst_p
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     
     // Close files
-    co_await io::async_close(ctx, src_fd);
-    co_await io::async_close(ctx, dst_fd);
+    co_await io::async_close(src_fd);
+    co_await io::async_close(dst_fd);
     
     std::cout << std::endl;
     std::cout << "Copy completed in " << duration_ms << " ms" << std::endl;
@@ -114,8 +112,6 @@ task<bool> async_copy_file(const std::string& src_path, const std::string& dst_p
 
 /// Concurrent file read demonstration
 task<void> concurrent_read_demo(const std::vector<std::string>& files) {
-    auto& ctx = io::default_io_context();
-    
     std::cout << "Reading " << files.size() << " files concurrently..." << std::endl;
     
     struct FileInfo {
@@ -148,7 +144,7 @@ task<void> concurrent_read_demo(const std::vector<std::string>& files) {
     // Read all files (would be more concurrent with multiple coroutines)
     size_t total_bytes = 0;
     for (auto& info : file_infos) {
-        auto result = co_await io::async_read(ctx, info.fd, info.buffer.data(), info.size, 0);
+        auto result = co_await io::async_read(info.fd, info.buffer.data(), info.size, 0);
         if (result.result > 0) {
             total_bytes += result.result;
             std::cout << "  Read " << result.result << " bytes from " << info.path << std::endl;
@@ -166,13 +162,11 @@ task<void> concurrent_read_demo(const std::vector<std::string>& files) {
 
 /// Benchmark async vs sync file I/O
 task<void> benchmark_io(size_t file_size_mb) {
-    auto& ctx = io::default_io_context();
-    
     const std::string test_file = "/tmp/elio_benchmark_test.dat";
     size_t file_size = file_size_mb * 1024 * 1024;
     
     std::cout << "Benchmark: " << file_size_mb << " MB file" << std::endl;
-    std::cout << "I/O Backend: " << ctx.get_backend_name() << std::endl;
+    std::cout << "I/O Backend: " << io::current_io_context().get_backend_name() << std::endl;
     std::cout << std::endl;
     
     // Create test file
@@ -201,7 +195,7 @@ task<void> benchmark_io(size_t file_size_mb) {
         size_t total_read = 0;
         int64_t offset = 0;
         while (total_read < file_size) {
-            auto result = co_await io::async_read(ctx, fd, buffer.data(), BUFFER_SIZE, offset);
+            auto result = co_await io::async_read(fd, buffer.data(), BUFFER_SIZE, offset);
             if (result.result <= 0) break;
             total_read += result.result;
             offset += result.result;
@@ -260,9 +254,6 @@ int main(int argc, char* argv[]) {
     }
     
     scheduler sched(2);
-    
-    // Set the I/O context so workers can poll for I/O completions
-    sched.set_io_context(&io::default_io_context());
     
     sched.start();
     

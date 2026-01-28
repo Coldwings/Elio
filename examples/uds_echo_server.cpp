@@ -162,9 +162,6 @@ int main(int argc, char* argv[]) {
     // Create scheduler with worker threads
     scheduler sched(4);
     
-    // Set the I/O context so workers can poll for I/O completions
-    sched.set_io_context(&io::default_io_context());
-    
     sched.start();
     
     // Spawn signal handler coroutine

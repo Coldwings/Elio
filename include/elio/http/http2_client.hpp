@@ -197,7 +197,7 @@ private:
         
         // Create new HTTP/2 connection
         // First establish TCP connection
-        auto tcp_result = co_await net::tcp_connect(*io_ctx_, host, port);
+        auto tcp_result = co_await net::tcp_connect(host, port);
         if (!tcp_result) {
             ELIO_LOG_ERROR("Failed to connect to {}:{}", host, port);
             co_return std::nullopt;

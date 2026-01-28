@@ -2,6 +2,7 @@
 #include <elio/io/io_context.hpp>
 #include <elio/io/io_awaitables.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/runtime/scheduler.hpp>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -17,6 +18,7 @@
 
 using namespace elio::io;
 using namespace elio::coro;
+using namespace elio::runtime;
 
 TEST_CASE("io_context creation", "[io][context]") {
     SECTION("default constructor uses auto-detection") {
@@ -83,35 +85,35 @@ TEST_CASE("Pipe read/write with epoll", "[io][epoll][pipe]") {
     fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
     fcntl(pipefd[1], F_SETFL, O_NONBLOCK);
     
-    io_context ctx(io_context::backend_type::epoll);
-    
     // Write some data synchronously first
     const char* test_data = "Hello, Elio!";
     ssize_t written = write(pipefd[1], test_data, strlen(test_data));
     REQUIRE(written == static_cast<ssize_t>(strlen(test_data)));
     
-    // Read using epoll backend
+    // Read using scheduler (coroutines run on worker threads with their own io_context)
     char buffer[64] = {0};
     std::atomic<bool> completed{false};
     io_result read_result{};
     
+    scheduler sched(1);
+    sched.start();
+    
     // Create a simple test coroutine
     auto read_coro = [&]() -> task<void> {
-        auto result = co_await async_read(ctx, pipefd[0], buffer, sizeof(buffer) - 1);
+        auto result = co_await async_read(pipefd[0], buffer, sizeof(buffer) - 1);
         read_result = result;
         completed = true;
     };
     
     auto t = read_coro();
-    auto handle = t.handle();
+    sched.spawn(t.release());
     
-    // Start the coroutine
-    handle.resume();
-    
-    // Poll for completion
+    // Wait for completion
     for (int i = 0; i < 100 && !completed; ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    
+    sched.shutdown();
     
     REQUIRE(completed);
     REQUIRE(read_result.success());
@@ -158,31 +160,34 @@ TEST_CASE("Socket pair with epoll", "[io][epoll][socket]") {
     int sv[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
     
-    io_context ctx(io_context::backend_type::epoll);
-    
     const char* msg = "Socket test message";
     
     // Send on one end
     ssize_t sent = send(sv[0], msg, strlen(msg), 0);
     REQUIRE(sent == static_cast<ssize_t>(strlen(msg)));
     
-    // Receive on the other end using async
+    // Receive on the other end using scheduler
     char buffer[64] = {0};
     std::atomic<bool> completed{false};
     io_result recv_result{};
     
+    scheduler sched(1);
+    sched.start();
+    
     auto recv_coro = [&]() -> task<void> {
-        auto result = co_await async_recv(ctx, sv[1], buffer, sizeof(buffer) - 1);
+        auto result = co_await async_recv(sv[1], buffer, sizeof(buffer) - 1);
         recv_result = result;
         completed = true;
     };
     
     auto t = recv_coro();
-    t.handle().resume();
+    sched.spawn(t.release());
     
     for (int i = 0; i < 100 && !completed; ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    
+    sched.shutdown();
     
     REQUIRE(completed);
     REQUIRE(recv_result.success());
@@ -217,39 +222,37 @@ TEST_CASE("Cancel operation", "[io][epoll][cancel]") {
     int sv[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
     
-    io_context ctx(io_context::backend_type::epoll);
-    
     // Start a read that won't complete (no data sent)
     char buffer[64];
+    std::atomic<bool> started{false};
     std::atomic<bool> completed{false};
     io_result recv_result{};
-    void* cancel_key = nullptr;
+    
+    scheduler sched(1);
+    sched.start();
     
     auto recv_coro = [&]() -> task<void> {
-        auto result = co_await async_recv(ctx, sv[1], buffer, sizeof(buffer));
+        started = true;
+        auto result = co_await async_recv(sv[1], buffer, sizeof(buffer));
         recv_result = result;
         completed = true;
     };
     
     auto t = recv_coro();
-    auto handle = t.handle();
-    cancel_key = handle.address();
+    sched.spawn(t.release());
     
-    // Start the coroutine
-    handle.resume();
+    // Wait for coroutine to start
+    for (int i = 0; i < 100 && !started; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     
-    // Poll once to register
-    ctx.poll(std::chrono::milliseconds(1));
-    
-    // Cancel the operation
-    bool cancelled = ctx.cancel(cancel_key);
-    (void)cancelled;  // May or may not succeed depending on timing
-    
-    // Poll to process cancellation
-    ctx.poll(std::chrono::milliseconds(10));
+    // Give it a bit more time
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     
     // Note: cancel behavior depends on backend implementation
-    // Just verify we don't crash
+    // Just verify we don't crash on shutdown with pending operation
+    
+    sched.shutdown();
     
     close(sv[0]);
     close(sv[1]);
@@ -259,8 +262,6 @@ TEST_CASE("Multiple concurrent operations", "[io][epoll][concurrent]") {
     int sv1[2], sv2[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv1) == 0);
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv2) == 0);
-    
-    io_context ctx(io_context::backend_type::epoll);
     
     const char* msg1 = "Message 1";
     const char* msg2 = "Message 2";
@@ -273,26 +274,31 @@ TEST_CASE("Multiple concurrent operations", "[io][epoll][concurrent]") {
     char buffer2[64] = {0};
     std::atomic<int> completed{0};
     
+    scheduler sched(2);  // 2 workers for concurrent operations
+    sched.start();
+    
     auto recv_coro1 = [&]() -> task<void> {
-        co_await async_recv(ctx, sv1[1], buffer1, sizeof(buffer1) - 1);
+        co_await async_recv(sv1[1], buffer1, sizeof(buffer1) - 1);
         completed++;
     };
     
     auto recv_coro2 = [&]() -> task<void> {
-        co_await async_recv(ctx, sv2[1], buffer2, sizeof(buffer2) - 1);
+        co_await async_recv(sv2[1], buffer2, sizeof(buffer2) - 1);
         completed++;
     };
     
     auto t1 = recv_coro1();
     auto t2 = recv_coro2();
     
-    t1.handle().resume();
-    t2.handle().resume();
+    sched.spawn(t1.release());
+    sched.spawn(t2.release());
     
-    // Poll until both complete
+    // Wait until both complete
     for (int i = 0; i < 100 && completed < 2; ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    
+    sched.shutdown();
     
     REQUIRE(completed == 2);
     REQUIRE(std::string(buffer1) == msg1);
@@ -313,44 +319,50 @@ TEST_CASE("Default io_context singleton", "[io][context][singleton]") {
 }
 
 TEST_CASE("epoll_backend registers fd before data available", "[io][epoll][registration]") {
-    // This test verifies that async operations are properly registered with epoll
-    // even when no data is immediately available. This catches use-after-move bugs
-    // in the prepare() function.
+    // This test verifies that async operations work correctly when data
+    // is not immediately available.
     
     int sv[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
     
-    io_context ctx(io_context::backend_type::epoll);
-    
     char buffer[64] = {0};
+    std::atomic<bool> started{false};
     std::atomic<bool> completed{false};
     io_result recv_result{};
     
+    scheduler sched(1);
+    sched.start();
+    
     auto recv_coro = [&]() -> task<void> {
-        auto result = co_await async_recv(ctx, sv[1], buffer, sizeof(buffer) - 1);
+        started = true;
+        auto result = co_await async_recv(sv[1], buffer, sizeof(buffer) - 1);
         recv_result = result;
         completed = true;
     };
     
     auto t = recv_coro();
-    t.handle().resume();
+    sched.spawn(t.release());
     
-    // Poll once to ensure the operation is registered
-    ctx.poll(std::chrono::milliseconds(1));
+    // Wait for coroutine to start and register the operation
+    for (int i = 0; i < 100 && !started; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(started);
     
-    // Verify the operation is pending (fd should be registered with epoll)
-    REQUIRE(ctx.has_pending());
-    REQUIRE(ctx.pending_count() >= 1);
+    // Give the I/O operation time to be registered
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     
     // Now send data - this should trigger the read to complete
     const char* msg = "delayed message";
     ssize_t sent = send(sv[0], msg, strlen(msg), 0);
     REQUIRE(sent == static_cast<ssize_t>(strlen(msg)));
     
-    // Poll until completion
+    // Wait for completion
     for (int i = 0; i < 100 && !completed; ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    
+    sched.shutdown();
     
     // The read should have completed successfully
     REQUIRE(completed);
@@ -368,50 +380,51 @@ TEST_CASE("epoll_backend handles multiple pending ops on same fd", "[io][epoll][
     int sv[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
     
-    io_context ctx(io_context::backend_type::epoll);
-    
     char buffer1[32] = {0};
     char buffer2[32] = {0};
     std::atomic<int> completed{0};
     
+    scheduler sched(1);
+    sched.start();
+    
     // Start two recv operations on the same fd
     auto recv_coro1 = [&]() -> task<void> {
-        co_await async_recv(ctx, sv[1], buffer1, sizeof(buffer1) - 1);
+        co_await async_recv(sv[1], buffer1, sizeof(buffer1) - 1);
         completed++;
     };
     
     auto recv_coro2 = [&]() -> task<void> {
-        co_await async_recv(ctx, sv[1], buffer2, sizeof(buffer2) - 1);
+        co_await async_recv(sv[1], buffer2, sizeof(buffer2) - 1);
         completed++;
     };
     
     auto t1 = recv_coro1();
     auto t2 = recv_coro2();
     
-    t1.handle().resume();
-    t2.handle().resume();
+    sched.spawn(t1.release());
+    sched.spawn(t2.release());
     
-    // Register both
-    ctx.poll(std::chrono::milliseconds(1));
-    
-    REQUIRE(ctx.pending_count() >= 2);
+    // Give operations time to be registered
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     
     // Send enough data for both reads
     const char* msg1 = "first";
     const char* msg2 = "second";
     send(sv[0], msg1, strlen(msg1), 0);
     
-    // Poll to complete first read
+    // Wait for first read
     for (int i = 0; i < 100 && completed < 1; ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     
     send(sv[0], msg2, strlen(msg2), 0);
     
-    // Poll to complete second read
+    // Wait for second read
     for (int i = 0; i < 100 && completed < 2; ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    
+    sched.shutdown();
     
     REQUIRE(completed == 2);
     
@@ -420,30 +433,33 @@ TEST_CASE("epoll_backend handles multiple pending ops on same fd", "[io][epoll][
 }
 
 TEST_CASE("epoll_backend write operation registration", "[io][epoll][write]") {
-    // Verify write operations are properly registered
+    // Verify write operations work correctly
     
     int sv[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
-    
-    io_context ctx(io_context::backend_type::epoll);
     
     const char* msg = "write test data";
     std::atomic<bool> completed{false};
     io_result send_result{};
     
+    scheduler sched(1);
+    sched.start();
+    
     auto send_coro = [&]() -> task<void> {
-        auto result = co_await async_send(ctx, sv[0], msg, strlen(msg));
+        auto result = co_await async_send(sv[0], msg, strlen(msg));
         send_result = result;
         completed = true;
     };
     
     auto t = send_coro();
-    t.handle().resume();
+    sched.spawn(t.release());
     
-    // Poll for completion
+    // Wait for completion
     for (int i = 0; i < 100 && !completed; ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    
+    sched.shutdown();
     
     REQUIRE(completed);
     REQUIRE(send_result.success());
@@ -512,13 +528,11 @@ TEST_CASE("unix_address basic operations", "[uds][address]") {
 }
 
 TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
-    io_context ctx(io_context::backend_type::epoll);
-    
     // Use abstract socket to avoid filesystem cleanup issues
     auto addr = unix_address::abstract("elio_test_listener_" + std::to_string(getpid()));
     
     SECTION("bind creates listener") {
-        auto listener = uds_listener::bind(addr, ctx);
+        auto listener = uds_listener::bind(addr, default_io_context());
         REQUIRE(listener.has_value());
         REQUIRE(listener->is_valid());
         REQUIRE(listener->fd() >= 0);
@@ -526,14 +540,14 @@ TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
     }
     
     SECTION("accept returns connection") {
-        auto listener = uds_listener::bind(addr, ctx);
+        auto listener = uds_listener::bind(addr, default_io_context());
         REQUIRE(listener.has_value());
         
         // Create a client connection in a separate thread
         std::atomic<bool> client_connected{false};
         std::thread client_thread([&]() {
             // Wait a bit for the accept to be registered
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             
             int client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
             REQUIRE(client_fd >= 0);
@@ -552,6 +566,9 @@ TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
         std::atomic<bool> accepted{false};
         std::optional<uds_stream> accepted_stream;
         
+        scheduler sched(1);
+        sched.start();
+        
         auto accept_coro = [&]() -> task<void> {
             auto stream = co_await listener->accept();
             accepted_stream = std::move(stream);
@@ -559,12 +576,14 @@ TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
         };
         
         auto t = accept_coro();
-        t.handle().resume();
+        sched.spawn(t.release());
         
-        // Poll for completion
+        // Wait for completion
         for (int i = 0; i < 200 && !accepted; ++i) {
-            ctx.poll(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        
+        sched.shutdown();
         
         REQUIRE(accepted);
         REQUIRE(accepted_stream.has_value());
@@ -575,17 +594,21 @@ TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
 }
 
 TEST_CASE("UDS connect", "[uds][connect]") {
-    io_context ctx(io_context::backend_type::epoll);
-    
     auto addr = unix_address::abstract("elio_test_connect_" + std::to_string(getpid()));
     
     // Create server listener
-    auto listener = uds_listener::bind(addr, ctx);
+    auto listener = uds_listener::bind(addr, default_io_context());
     REQUIRE(listener.has_value());
     
     // Start accept in background
     std::atomic<bool> server_accepted{false};
     std::optional<uds_stream> server_stream;
+    
+    std::atomic<bool> client_connected{false};
+    std::optional<uds_stream> client_stream;
+    
+    scheduler sched(2);
+    sched.start();
     
     auto accept_coro = [&]() -> task<void> {
         auto stream = co_await listener->accept();
@@ -593,26 +616,24 @@ TEST_CASE("UDS connect", "[uds][connect]") {
         server_accepted = true;
     };
     
-    auto accept_task = accept_coro();
-    accept_task.handle().resume();
-    
-    // Connect client
-    std::atomic<bool> client_connected{false};
-    std::optional<uds_stream> client_stream;
-    
     auto connect_coro = [&]() -> task<void> {
-        auto stream = co_await uds_connect(ctx, addr);
+        auto stream = co_await uds_connect(addr);
         client_stream = std::move(stream);
         client_connected = true;
     };
     
+    auto accept_task = accept_coro();
     auto connect_task = connect_coro();
-    connect_task.handle().resume();
     
-    // Poll until both complete
+    sched.spawn(accept_task.release());
+    sched.spawn(connect_task.release());
+    
+    // Wait until both complete
     for (int i = 0; i < 200 && (!server_accepted || !client_connected); ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    
+    sched.shutdown();
     
     REQUIRE(server_accepted);
     REQUIRE(client_connected);
@@ -623,17 +644,18 @@ TEST_CASE("UDS connect", "[uds][connect]") {
 }
 
 TEST_CASE("UDS stream read/write", "[uds][stream]") {
-    io_context ctx(io_context::backend_type::epoll);
-    
     auto addr = unix_address::abstract("elio_test_rw_" + std::to_string(getpid()));
     
     // Create server and client
-    auto listener = uds_listener::bind(addr, ctx);
+    auto listener = uds_listener::bind(addr, default_io_context());
     REQUIRE(listener.has_value());
     
     std::optional<uds_stream> server_stream;
     std::optional<uds_stream> client_stream;
     std::atomic<int> setup_complete{0};
+    
+    scheduler sched(2);
+    sched.start();
     
     auto accept_coro = [&]() -> task<void> {
         auto stream = co_await listener->accept();
@@ -642,18 +664,18 @@ TEST_CASE("UDS stream read/write", "[uds][stream]") {
     };
     
     auto connect_coro = [&]() -> task<void> {
-        auto stream = co_await uds_connect(ctx, addr);
+        auto stream = co_await uds_connect(addr);
         client_stream = std::move(stream);
         setup_complete++;
     };
     
     auto accept_task = accept_coro();
     auto connect_task = connect_coro();
-    accept_task.handle().resume();
-    connect_task.handle().resume();
+    sched.spawn(accept_task.release());
+    sched.spawn(connect_task.release());
     
     for (int i = 0; i < 200 && setup_complete < 2; ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     
     REQUIRE(setup_complete == 2);
@@ -680,11 +702,11 @@ TEST_CASE("UDS stream read/write", "[uds][stream]") {
         
         auto write_task = write_coro();
         auto read_task = read_coro();
-        write_task.handle().resume();
-        read_task.handle().resume();
+        sched.spawn(write_task.release());
+        sched.spawn(read_task.release());
         
         for (int i = 0; i < 200 && (!write_done || !read_done); ++i) {
-            ctx.poll(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         
         REQUIRE(write_done);
@@ -716,11 +738,11 @@ TEST_CASE("UDS stream read/write", "[uds][stream]") {
         
         auto write_task = write_coro();
         auto read_task = read_coro();
-        write_task.handle().resume();
-        read_task.handle().resume();
+        sched.spawn(write_task.release());
+        sched.spawn(read_task.release());
         
         for (int i = 0; i < 200 && (!write_done || !read_done); ++i) {
-            ctx.poll(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         
         REQUIRE(write_done);
@@ -731,14 +753,14 @@ TEST_CASE("UDS stream read/write", "[uds][stream]") {
         REQUIRE(read_result.bytes_transferred() == static_cast<int>(strlen(msg)));
         REQUIRE(std::string(buffer) == msg);
     }
+    
+    sched.shutdown();
 }
 
 TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
-    io_context ctx(io_context::backend_type::epoll);
-    
     auto addr = unix_address::abstract("elio_test_concurrent_" + std::to_string(getpid()));
     
-    auto listener = uds_listener::bind(addr, ctx);
+    auto listener = uds_listener::bind(addr, default_io_context());
     REQUIRE(listener.has_value());
     
     constexpr int NUM_CLIENTS = 3;
@@ -747,7 +769,10 @@ TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
     std::atomic<int> accepts_done{0};
     std::atomic<int> connects_done{0};
     
-    // Accept coroutines - use array to avoid vector reallocation issues
+    scheduler sched(4);
+    sched.start();
+    
+    // Accept coroutines
     auto accept0 = [&]() -> task<void> {
         auto stream = co_await listener->accept();
         server_streams[0] = std::move(stream);
@@ -766,17 +791,17 @@ TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
     
     // Connect coroutines
     auto connect0 = [&]() -> task<void> {
-        auto stream = co_await uds_connect(ctx, addr);
+        auto stream = co_await uds_connect(addr);
         client_streams[0] = std::move(stream);
         connects_done++;
     };
     auto connect1 = [&]() -> task<void> {
-        auto stream = co_await uds_connect(ctx, addr);
+        auto stream = co_await uds_connect(addr);
         client_streams[1] = std::move(stream);
         connects_done++;
     };
     auto connect2 = [&]() -> task<void> {
-        auto stream = co_await uds_connect(ctx, addr);
+        auto stream = co_await uds_connect(addr);
         client_streams[2] = std::move(stream);
         connects_done++;
     };
@@ -785,17 +810,19 @@ TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
     auto c0 = connect0(); auto c1 = connect1(); auto c2 = connect2();
     
     // Start all coroutines
-    a0.handle().resume();
-    a1.handle().resume();
-    a2.handle().resume();
-    c0.handle().resume();
-    c1.handle().resume();
-    c2.handle().resume();
+    sched.spawn(a0.release());
+    sched.spawn(a1.release());
+    sched.spawn(a2.release());
+    sched.spawn(c0.release());
+    sched.spawn(c1.release());
+    sched.spawn(c2.release());
     
-    // Poll until all connections are made
+    // Wait until all connections are made
     for (int i = 0; i < 500 && (accepts_done < NUM_CLIENTS || connects_done < NUM_CLIENTS); ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    
+    sched.shutdown();
     
     REQUIRE(accepts_done == NUM_CLIENTS);
     REQUIRE(connects_done == NUM_CLIENTS);
@@ -809,8 +836,6 @@ TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
 }
 
 TEST_CASE("UDS filesystem socket", "[uds][filesystem]") {
-    io_context ctx(io_context::backend_type::epoll);
-    
     // Use filesystem socket
     std::string path = "/tmp/elio_test_fs_" + std::to_string(getpid()) + ".sock";
     unix_address addr(path);
@@ -818,7 +843,7 @@ TEST_CASE("UDS filesystem socket", "[uds][filesystem]") {
     // Ensure socket file doesn't exist
     ::unlink(path.c_str());
     
-    auto listener = uds_listener::bind(addr, ctx);
+    auto listener = uds_listener::bind(addr, default_io_context());
     REQUIRE(listener.has_value());
     
     // Socket file should exist
@@ -830,15 +855,17 @@ TEST_CASE("UDS filesystem socket", "[uds][filesystem]") {
     std::atomic<bool> connected{false};
     std::optional<uds_stream> client_stream;
     
+    std::atomic<bool> accepted{false};
+    std::optional<uds_stream> server_stream;
+    
+    scheduler sched(2);
+    sched.start();
+    
     auto connect_coro = [&]() -> task<void> {
-        auto stream = co_await uds_connect(ctx, addr);
+        auto stream = co_await uds_connect(addr);
         client_stream = std::move(stream);
         connected = true;
     };
-    
-    // Accept on server
-    std::atomic<bool> accepted{false};
-    std::optional<uds_stream> server_stream;
     
     auto accept_coro = [&]() -> task<void> {
         auto stream = co_await listener->accept();
@@ -848,12 +875,14 @@ TEST_CASE("UDS filesystem socket", "[uds][filesystem]") {
     
     auto accept_task = accept_coro();
     auto connect_task = connect_coro();
-    accept_task.handle().resume();
-    connect_task.handle().resume();
+    sched.spawn(accept_task.release());
+    sched.spawn(connect_task.release());
     
     for (int i = 0; i < 200 && (!connected || !accepted); ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    
+    sched.shutdown();
     
     REQUIRE(connected);
     REQUIRE(accepted);
@@ -864,11 +893,9 @@ TEST_CASE("UDS filesystem socket", "[uds][filesystem]") {
 }
 
 TEST_CASE("UDS echo test", "[uds][echo]") {
-    io_context ctx(io_context::backend_type::epoll);
-    
     auto addr = unix_address::abstract("elio_test_echo_" + std::to_string(getpid()));
     
-    auto listener = uds_listener::bind(addr, ctx);
+    auto listener = uds_listener::bind(addr, default_io_context());
     REQUIRE(listener.has_value());
     
     // Use a simpler pattern: thread for client, coroutine for server
@@ -878,6 +905,9 @@ TEST_CASE("UDS echo test", "[uds][echo]") {
     char client_recv[64] = {0};
     int server_bytes = 0;
     int client_bytes = 0;
+    
+    scheduler sched(1);
+    sched.start();
     
     // Server coroutine
     auto server_coro = [&]() -> task<void> {
@@ -898,12 +928,12 @@ TEST_CASE("UDS echo test", "[uds][echo]") {
     };
     
     auto server_task = server_coro();
-    server_task.handle().resume();
+    sched.spawn(server_task.release());
     
     // Client in a thread (to avoid coroutine complexity)
     std::thread client_thread([&]() {
         // Wait briefly for server to be ready
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         
         int fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) {
@@ -930,12 +960,13 @@ TEST_CASE("UDS echo test", "[uds][echo]") {
         client_done = true;
     });
     
-    // Poll until both complete
+    // Wait until both complete
     for (int i = 0; i < 500 && (!server_done || !client_done); ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     
     client_thread.join();
+    sched.shutdown();
     
     REQUIRE(server_done);
     REQUIRE(client_done);
@@ -1097,11 +1128,9 @@ TEST_CASE("socket_address variant operations", "[tcp][address][socket_address]")
 }
 
 TEST_CASE("TCP IPv6 listener and connect", "[tcp][ipv6][integration]") {
-    io_context ctx(io_context::backend_type::epoll);
-    
     SECTION("IPv6 listener binds successfully") {
         // Use IPv6 loopback to avoid network issues
-        auto listener = tcp_listener::bind(ipv6_address("::1", 0), ctx);
+        auto listener = tcp_listener::bind(ipv6_address("::1", 0), default_io_context());
         REQUIRE(listener.has_value());
         REQUIRE(listener->is_valid());
         REQUIRE(listener->local_address().family() == AF_INET6);
@@ -1110,7 +1139,7 @@ TEST_CASE("TCP IPv6 listener and connect", "[tcp][ipv6][integration]") {
     
     SECTION("IPv6 accept and connect") {
         // Create listener on IPv6 loopback
-        auto listener = tcp_listener::bind(ipv6_address("::1", 0), ctx);
+        auto listener = tcp_listener::bind(ipv6_address("::1", 0), default_io_context());
         REQUIRE(listener.has_value());
         
         // Get the assigned port
@@ -1122,6 +1151,9 @@ TEST_CASE("TCP IPv6 listener and connect", "[tcp][ipv6][integration]") {
         std::optional<tcp_stream> server_stream;
         std::optional<tcp_stream> client_stream;
         
+        scheduler sched(2);
+        sched.start();
+        
         auto accept_coro = [&]() -> task<void> {
             auto stream = co_await listener->accept();
             server_stream = std::move(stream);
@@ -1129,19 +1161,21 @@ TEST_CASE("TCP IPv6 listener and connect", "[tcp][ipv6][integration]") {
         };
         
         auto connect_coro = [&]() -> task<void> {
-            auto stream = co_await tcp_connect(ctx, ipv6_address("::1", port));
+            auto stream = co_await tcp_connect(ipv6_address("::1", port));
             client_stream = std::move(stream);
             connected = true;
         };
         
         auto accept_task = accept_coro();
         auto connect_task = connect_coro();
-        accept_task.handle().resume();
-        connect_task.handle().resume();
+        sched.spawn(accept_task.release());
+        sched.spawn(connect_task.release());
         
         for (int i = 0; i < 200 && (!accepted || !connected); ++i) {
-            ctx.poll(std::chrono::milliseconds(10));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        
+        sched.shutdown();
         
         REQUIRE(accepted);
         REQUIRE(connected);

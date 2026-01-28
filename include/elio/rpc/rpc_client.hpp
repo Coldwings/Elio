@@ -11,7 +11,7 @@
 ///
 /// Usage:
 /// @code
-/// auto client = co_await rpc_client<tcp_stream>::connect(ctx, addr);
+/// auto client = co_await rpc_client<tcp_stream>::connect(addr);
 /// auto result = co_await client->call<MyMethod>(request, 5000ms);
 /// if (result.ok()) {
 ///     process(result.value());
@@ -81,12 +81,10 @@ public:
     
     /// Connect to a TCP server and create client
     template<typename... Args>
-    static coro::task<std::optional<ptr>> connect(
-        io::io_context& ctx, 
-        Args&&... args)
+    static coro::task<std::optional<ptr>> connect(Args&&... args)
     requires std::is_same_v<Stream, net::tcp_stream>
     {
-        auto stream = co_await net::tcp_connect(ctx, std::forward<Args>(args)...);
+        auto stream = co_await net::tcp_connect(std::forward<Args>(args)...);
         if (!stream) {
             co_return std::nullopt;
         }
@@ -97,12 +95,10 @@ public:
     
     /// Connect to a UDS server and create client
     template<typename... Args>
-    static coro::task<std::optional<ptr>> connect(
-        io::io_context& ctx,
-        Args&&... args)
+    static coro::task<std::optional<ptr>> connect(Args&&... args)
     requires std::is_same_v<Stream, net::uds_stream>
     {
-        auto stream = co_await net::uds_connect(ctx, std::forward<Args>(args)...);
+        auto stream = co_await net::uds_connect(std::forward<Args>(args)...);
         if (!stream) {
             co_return std::nullopt;
         }

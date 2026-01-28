@@ -52,7 +52,6 @@ namespace http {
 ///     server srv(std::move(r));
 ///     
 ///     runtime::scheduler sched(4);
-///     sched.set_io_context(&io::default_io_context());
 ///     sched.start();
 ///     
 ///     auto task = srv.listen(net::ipv4_address(8080), io::default_io_context(), sched);

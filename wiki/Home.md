@@ -7,18 +7,18 @@
 ## Features
 
 - **C++20 Coroutines**: First-class coroutine support with `co_await` and `co_return`
-- **Multi-threaded Scheduler**: Work-stealing scheduler with configurable worker threads
+- **Multi-threaded Scheduler**: Work-stealing scheduler with per-worker I/O contexts
 - **Async I/O Backends**: io_uring (preferred) and epoll fallback
 - **Signal Handling**: Coroutine-friendly signal handling via signalfd
 - **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel
-- **Timers**: sleep_for, sleep_until, yield
+- **Timers**: sleep_for, sleep_until, yield with cancellation support
 - **TCP Networking**: Async TCP client/server with connection management
 - **HTTP/1.1**: Full HTTP client and server implementation
 - **TLS/HTTPS**: OpenSSL-based TLS with ALPN and certificate verification
 - **RPC Framework**: High-performance RPC with zero-copy serialization, checksums, and cleanup callbacks
 - **Hash Functions**: CRC32, SHA-1, and SHA-256 with incremental hashing support
 - **Header-only**: Easy integration - just include and go
-- **CI/CD**: Automated testing with GitHub Actions
+- **CI/CD**: Automated testing with ASAN and TSAN
 
 ## Requirements
 

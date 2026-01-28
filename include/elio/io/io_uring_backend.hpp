@@ -283,6 +283,9 @@ public:
         io_uring_sqe_set_data(sqe, nullptr);  // No awaiter for cancel itself
         
         pending_ops_.fetch_add(1, std::memory_order_relaxed);
+        
+        // Submit immediately - cancel must be acted upon right away
+        io_uring_submit(&ring_);
         return true;
     }
     

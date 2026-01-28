@@ -336,11 +336,9 @@ task<void> run_demo(tcp_rpc_client::ptr client) {
 }
 
 task<void> client_main(const char* host, uint16_t port) {
-    auto& ctx = io::default_io_context();
-    
     std::cout << "Connecting to " << host << ":" << port << "..." << std::endl;
     
-    auto client = co_await tcp_rpc_client::connect(ctx, host, port);
+    auto client = co_await tcp_rpc_client::connect(host, port);
     if (!client) {
         std::cerr << "Failed to connect to server" << std::endl;
         co_return;
@@ -368,7 +366,6 @@ int main(int argc, char* argv[]) {
     
     // Create and start scheduler
     scheduler sched(2);
-    sched.set_io_context(&io::default_io_context());
     sched.start();
     
     // Run client

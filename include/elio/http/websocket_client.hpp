@@ -257,14 +257,14 @@ private:
         
         // Establish TCP connection
         if (secure_) {
-            auto result = co_await tls::tls_connect(tls_ctx_, *io_ctx_, host_, port);
+            auto result = co_await tls::tls_connect(tls_ctx_, host_, port);
             if (!result) {
                 ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host_, port, strerror(errno));
                 co_return false;
             }
             stream_ = std::move(*result);
         } else {
-            auto result = co_await net::tcp_connect(*io_ctx_, host_, port);
+            auto result = co_await net::tcp_connect(host_, port);
             if (!result) {
                 ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host_, port, strerror(errno));
                 co_return false;

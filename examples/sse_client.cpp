@@ -235,7 +235,6 @@ int main(int argc, char* argv[]) {
     
     // Create scheduler
     runtime::scheduler sched(2);
-    sched.set_io_context(&io::default_io_context());
     sched.start();
     
     // Run client based on mode

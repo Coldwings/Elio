@@ -215,18 +215,15 @@ This design ensures:
 
 ## I/O Context
 
-The I/O context manages async I/O operations.
+The I/O context manages async I/O operations. Each worker thread has its own I/O context for lock-free operation.
 
 ### Using the Default Context
 
 ```cpp
 #include <elio/io/io_context.hpp>
 
-// Get the global I/O context
+// Get the global I/O context (for TCP listeners, etc.)
 auto& ctx = io::default_io_context();
-
-// Associate with scheduler
-sched.set_io_context(&ctx);
 ```
 
 ### I/O Backends

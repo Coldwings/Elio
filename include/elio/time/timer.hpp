@@ -1,6 +1,6 @@
 #pragma once
 
-#include <elio/io/io_context.hpp>
+#include <elio/io/io_awaitables.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/coro/cancel_token.hpp>
 #include <elio/log/macros.hpp>
@@ -31,21 +31,10 @@ public:
     }
     
     void await_suspend(std::coroutine_handle<> awaiter) {
-        // Get io_context from scheduler or use provided one
+        // Get io_context from current worker or use provided one
         io::io_context* ctx = ctx_;
         if (!ctx) {
-            auto* sched = runtime::scheduler::current();
-            if (sched) {
-                ctx = sched->get_io_context();
-            }
-        }
-        
-        if (!ctx) {
-            // No io_context available, fall back to thread sleep
-            ELIO_LOG_DEBUG("sleep_awaitable: no io_context, using thread sleep");
-            std::this_thread::sleep_for(std::chrono::nanoseconds(duration_ns_));
-            awaiter.resume();
-            return;
+            ctx = &io::current_io_context();
         }
         
         // Use io_context timeout mechanism
@@ -111,29 +100,10 @@ public:
             return;
         }
         
-        // Get io_context from scheduler or use provided one
+        // Get io_context from current worker or use provided one
         io::io_context* ctx = ctx_;
         if (!ctx) {
-            auto* sched = runtime::scheduler::current();
-            if (sched) {
-                ctx = sched->get_io_context();
-            }
-        }
-        
-        if (!ctx) {
-            // No io_context available - check cancellation in a loop
-            ELIO_LOG_DEBUG("cancellable_sleep: no io_context, using polling sleep");
-            auto end_time = std::chrono::steady_clock::now() + 
-                           std::chrono::nanoseconds(duration_ns_);
-            while (std::chrono::steady_clock::now() < end_time) {
-                if (token_.is_cancelled()) {
-                    cancelled_ = true;
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            awaiter.resume();
-            return;
+            ctx = &io::current_io_context();
         }
         
         // Register cancellation callback before setting up the timer

@@ -2,6 +2,9 @@
 
 #include "io_context.hpp"
 #include <elio/log/macros.hpp>
+#include <elio/coro/promise_base.hpp>
+#include <elio/coro/frame.hpp>
+#include <elio/runtime/worker_thread.hpp>
 #include <coroutine>
 #include <span>
 #include <sys/socket.h>
@@ -9,12 +12,21 @@
 
 namespace elio::io {
 
+/// Get the io_context for the current worker thread
+/// Falls back to default_io_context if not running in a worker
+inline io_context& current_io_context() noexcept {
+    auto* worker = runtime::worker_thread::current();
+    if (worker) {
+        return worker->io_context();
+    }
+    return default_io_context();
+}
+
 /// Base class for I/O awaitables
 /// Provides common functionality for all async I/O operations
 class io_awaitable_base {
 public:
-    explicit io_awaitable_base(io_context& ctx) noexcept 
-        : ctx_(ctx) {}
+    io_awaitable_base() noexcept = default;
     
     /// Never ready immediately - always suspend
     bool await_ready() const noexcept {
@@ -27,22 +39,54 @@ public:
     }
     
 protected:
-    io_context& ctx_;
     io_result result_{};
+    size_t saved_affinity_ = coro::NO_AFFINITY;
+    void* handle_address_ = nullptr;
+    
+    /// Save current affinity and bind to current worker
+    template<typename Promise>
+    void bind_to_worker(std::coroutine_handle<Promise> handle) {
+        handle_address_ = handle.address();
+        if constexpr (std::is_base_of_v<coro::promise_base, Promise>) {
+            saved_affinity_ = handle.promise().affinity();
+            auto* worker = runtime::worker_thread::current();
+            if (worker) {
+                handle.promise().set_affinity(worker->worker_id());
+            }
+        }
+    }
+    
+    /// Restore previous affinity (called from await_resume)
+    void restore_affinity() {
+        if (handle_address_) {
+            auto* promise = coro::get_promise_base(handle_address_);
+            if (promise) {
+                if (saved_affinity_ == coro::NO_AFFINITY) {
+                    promise->clear_affinity();
+                } else {
+                    promise->set_affinity(saved_affinity_);
+                }
+            }
+        }
+    }
 };
 
 /// Awaitable for async read operations
 class async_read_awaitable : public io_awaitable_base {
 public:
-    async_read_awaitable(io_context& ctx, int fd, void* buffer, size_t length, 
+    async_read_awaitable(int fd, void* buffer, size_t length, 
                          int64_t offset = -1) noexcept
-        : io_awaitable_base(ctx)
+        : io_awaitable_base()
         , fd_(fd)
         , buffer_(buffer)
         , length_(length)
         , offset_(offset) {}
     
-    void await_suspend(std::coroutine_handle<> awaiter) {
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+        
         io_request req{};
         req.op = io_op::read;
         req.fd = fd_;
@@ -51,16 +95,17 @@ public:
         req.offset = offset_;
         req.awaiter = awaiter;
         
-        if (!ctx_.prepare(req)) {
+        if (!ctx.prepare(req)) {
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx_.submit();
+        ctx.submit();
     }
     
     io_result await_resume() noexcept {
         result_ = io_context::get_last_result();
+        restore_affinity();
         return result_;
     }
     
@@ -74,15 +119,19 @@ private:
 /// Awaitable for async write operations
 class async_write_awaitable : public io_awaitable_base {
 public:
-    async_write_awaitable(io_context& ctx, int fd, const void* buffer, 
+    async_write_awaitable(int fd, const void* buffer, 
                           size_t length, int64_t offset = -1) noexcept
-        : io_awaitable_base(ctx)
+        : io_awaitable_base()
         , fd_(fd)
         , buffer_(buffer)
         , length_(length)
         , offset_(offset) {}
     
-    void await_suspend(std::coroutine_handle<> awaiter) {
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+        
         io_request req{};
         req.op = io_op::write;
         req.fd = fd_;
@@ -91,16 +140,17 @@ public:
         req.offset = offset_;
         req.awaiter = awaiter;
         
-        if (!ctx_.prepare(req)) {
+        if (!ctx.prepare(req)) {
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx_.submit();
+        ctx.submit();
     }
     
     io_result await_resume() noexcept {
         result_ = io_context::get_last_result();
+        restore_affinity();
         return result_;
     }
     
@@ -114,15 +164,19 @@ private:
 /// Awaitable for async recv operations
 class async_recv_awaitable : public io_awaitable_base {
 public:
-    async_recv_awaitable(io_context& ctx, int fd, void* buffer, size_t length,
+    async_recv_awaitable(int fd, void* buffer, size_t length,
                          int flags = 0) noexcept
-        : io_awaitable_base(ctx)
+        : io_awaitable_base()
         , fd_(fd)
         , buffer_(buffer)
         , length_(length)
         , flags_(flags) {}
     
-    void await_suspend(std::coroutine_handle<> awaiter) {
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+        
         io_request req{};
         req.op = io_op::recv;
         req.fd = fd_;
@@ -131,16 +185,17 @@ public:
         req.socket_flags = flags_;
         req.awaiter = awaiter;
         
-        if (!ctx_.prepare(req)) {
+        if (!ctx.prepare(req)) {
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx_.submit();
+        ctx.submit();
     }
     
     io_result await_resume() noexcept {
         result_ = io_context::get_last_result();
+        restore_affinity();
         return result_;
     }
     
@@ -154,15 +209,19 @@ private:
 /// Awaitable for async send operations
 class async_send_awaitable : public io_awaitable_base {
 public:
-    async_send_awaitable(io_context& ctx, int fd, const void* buffer, 
+    async_send_awaitable(int fd, const void* buffer, 
                          size_t length, int flags = 0) noexcept
-        : io_awaitable_base(ctx)
+        : io_awaitable_base()
         , fd_(fd)
         , buffer_(buffer)
         , length_(length)
         , flags_(flags) {}
     
-    void await_suspend(std::coroutine_handle<> awaiter) {
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+        
         io_request req{};
         req.op = io_op::send;
         req.fd = fd_;
@@ -171,16 +230,17 @@ public:
         req.socket_flags = flags_;
         req.awaiter = awaiter;
         
-        if (!ctx_.prepare(req)) {
+        if (!ctx.prepare(req)) {
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx_.submit();
+        ctx.submit();
     }
     
     io_result await_resume() noexcept {
         result_ = io_context::get_last_result();
+        restore_affinity();
         return result_;
     }
     
@@ -194,17 +254,21 @@ private:
 /// Awaitable for async accept operations
 class async_accept_awaitable : public io_awaitable_base {
 public:
-    async_accept_awaitable(io_context& ctx, int listen_fd, 
+    async_accept_awaitable(int listen_fd, 
                            struct sockaddr* addr = nullptr,
                            socklen_t* addrlen = nullptr,
                            int flags = 0) noexcept
-        : io_awaitable_base(ctx)
+        : io_awaitable_base()
         , listen_fd_(listen_fd)
         , addr_(addr)
         , addrlen_(addrlen)
         , flags_(flags) {}
     
-    void await_suspend(std::coroutine_handle<> awaiter) {
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+        
         io_request req{};
         req.op = io_op::accept;
         req.fd = listen_fd_;
@@ -213,16 +277,17 @@ public:
         req.socket_flags = flags_;
         req.awaiter = awaiter;
         
-        if (!ctx_.prepare(req)) {
+        if (!ctx.prepare(req)) {
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx_.submit();
+        ctx.submit();
     }
     
     io_result await_resume() noexcept {
         result_ = io_context::get_last_result();
+        restore_affinity();
         return result_;
     }
     
@@ -241,15 +306,19 @@ private:
 /// Awaitable for async connect operations
 class async_connect_awaitable : public io_awaitable_base {
 public:
-    async_connect_awaitable(io_context& ctx, int fd, 
+    async_connect_awaitable(int fd, 
                             const struct sockaddr* addr,
                             socklen_t addrlen) noexcept
-        : io_awaitable_base(ctx)
+        : io_awaitable_base()
         , fd_(fd)
         , addr_(addr)
         , addrlen_(addrlen) {}
     
-    void await_suspend(std::coroutine_handle<> awaiter) {
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+        
         io_request req{};
         req.op = io_op::connect;
         req.fd = fd_;
@@ -257,16 +326,17 @@ public:
         req.addrlen = &addrlen_;
         req.awaiter = awaiter;
         
-        if (!ctx_.prepare(req)) {
+        if (!ctx.prepare(req)) {
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx_.submit();
+        ctx.submit();
     }
     
     io_result await_resume() noexcept {
         result_ = io_context::get_last_result();
+        restore_affinity();
         return result_;
     }
     
@@ -279,26 +349,31 @@ private:
 /// Awaitable for async close operations
 class async_close_awaitable : public io_awaitable_base {
 public:
-    async_close_awaitable(io_context& ctx, int fd) noexcept
-        : io_awaitable_base(ctx)
+    async_close_awaitable(int fd) noexcept
+        : io_awaitable_base()
         , fd_(fd) {}
     
-    void await_suspend(std::coroutine_handle<> awaiter) {
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+        
         io_request req{};
         req.op = io_op::close;
         req.fd = fd_;
         req.awaiter = awaiter;
         
-        if (!ctx_.prepare(req)) {
+        if (!ctx.prepare(req)) {
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx_.submit();
+        ctx.submit();
     }
     
     io_result await_resume() noexcept {
         result_ = io_context::get_last_result();
+        restore_affinity();
         return result_;
     }
     
@@ -309,14 +384,18 @@ private:
 /// Awaitable for async writev operations (scatter-gather write)
 class async_writev_awaitable : public io_awaitable_base {
 public:
-    async_writev_awaitable(io_context& ctx, int fd, struct iovec* iovecs,
+    async_writev_awaitable(int fd, struct iovec* iovecs,
                            size_t iovec_count) noexcept
-        : io_awaitable_base(ctx)
+        : io_awaitable_base()
         , fd_(fd)
         , iovecs_(iovecs)
         , iovec_count_(iovec_count) {}
     
-    void await_suspend(std::coroutine_handle<> awaiter) {
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+        
         io_request req{};
         req.op = io_op::writev;
         req.fd = fd_;
@@ -324,16 +403,17 @@ public:
         req.iovec_count = iovec_count_;
         req.awaiter = awaiter;
         
-        if (!ctx_.prepare(req)) {
+        if (!ctx.prepare(req)) {
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx_.submit();
+        ctx.submit();
     }
     
     io_result await_resume() noexcept {
         result_ = io_context::get_last_result();
+        restore_affinity();
         return result_;
     }
     
@@ -346,27 +426,32 @@ private:
 /// Awaitable for poll (wait for socket readable/writable)
 class async_poll_awaitable : public io_awaitable_base {
 public:
-    async_poll_awaitable(io_context& ctx, int fd, bool for_read) noexcept
-        : io_awaitable_base(ctx)
+    async_poll_awaitable(int fd, bool for_read) noexcept
+        : io_awaitable_base()
         , fd_(fd)
         , for_read_(for_read) {}
     
-    void await_suspend(std::coroutine_handle<> awaiter) {
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+        
         io_request req{};
         req.op = for_read_ ? io_op::poll_read : io_op::poll_write;
         req.fd = fd_;
         req.awaiter = awaiter;
         
-        if (!ctx_.prepare(req)) {
+        if (!ctx.prepare(req)) {
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx_.submit();
+        ctx.submit();
     }
     
     io_result await_resume() noexcept {
         result_ = io_context::get_last_result();
+        restore_affinity();
         return result_;
     }
     
@@ -378,119 +463,82 @@ private:
 /// Factory functions for creating awaitables
 
 /// Create an async read awaitable
-/// @param ctx The I/O context
 /// @param fd File descriptor to read from
 /// @param buffer Buffer to read into
 /// @param length Number of bytes to read
 /// @param offset File offset (-1 for current position)
-inline auto async_read(io_context& ctx, int fd, void* buffer, size_t length, 
+inline auto async_read(int fd, void* buffer, size_t length, 
                        int64_t offset = -1) {
-    return async_read_awaitable(ctx, fd, buffer, length, offset);
+    return async_read_awaitable(fd, buffer, length, offset);
 }
 
 /// Create an async read awaitable using span
 template<typename T>
-inline auto async_read(io_context& ctx, int fd, std::span<T> buffer, 
+inline auto async_read(int fd, std::span<T> buffer, 
                        int64_t offset = -1) {
-    return async_read_awaitable(ctx, fd, buffer.data(), 
+    return async_read_awaitable(fd, buffer.data(), 
                                 buffer.size_bytes(), offset);
 }
 
 /// Create an async write awaitable
-inline auto async_write(io_context& ctx, int fd, const void* buffer, 
+inline auto async_write(int fd, const void* buffer, 
                         size_t length, int64_t offset = -1) {
-    return async_write_awaitable(ctx, fd, buffer, length, offset);
+    return async_write_awaitable(fd, buffer, length, offset);
 }
 
 /// Create an async write awaitable using span
 template<typename T>
-inline auto async_write(io_context& ctx, int fd, std::span<const T> buffer,
+inline auto async_write(int fd, std::span<const T> buffer,
                         int64_t offset = -1) {
-    return async_write_awaitable(ctx, fd, buffer.data(), 
+    return async_write_awaitable(fd, buffer.data(), 
                                  buffer.size_bytes(), offset);
 }
 
 /// Create an async recv awaitable
-inline auto async_recv(io_context& ctx, int fd, void* buffer, size_t length,
+inline auto async_recv(int fd, void* buffer, size_t length,
                        int flags = 0) {
-    return async_recv_awaitable(ctx, fd, buffer, length, flags);
+    return async_recv_awaitable(fd, buffer, length, flags);
 }
 
 /// Create an async send awaitable
-inline auto async_send(io_context& ctx, int fd, const void* buffer, 
+inline auto async_send(int fd, const void* buffer, 
                        size_t length, int flags = 0) {
-    return async_send_awaitable(ctx, fd, buffer, length, flags);
+    return async_send_awaitable(fd, buffer, length, flags);
 }
 
 /// Create an async writev awaitable (scatter-gather write)
-inline auto async_writev(io_context& ctx, int fd, struct iovec* iovecs,
+inline auto async_writev(int fd, struct iovec* iovecs,
                          size_t iovec_count) {
-    return async_writev_awaitable(ctx, fd, iovecs, iovec_count);
+    return async_writev_awaitable(fd, iovecs, iovec_count);
 }
 
 /// Create an async accept awaitable
-inline auto async_accept(io_context& ctx, int listen_fd,
+inline auto async_accept(int listen_fd,
                          struct sockaddr* addr = nullptr,
                          socklen_t* addrlen = nullptr,
                          int flags = 0) {
-    return async_accept_awaitable(ctx, listen_fd, addr, addrlen, flags);
+    return async_accept_awaitable(listen_fd, addr, addrlen, flags);
 }
 
 /// Create an async connect awaitable
-inline auto async_connect(io_context& ctx, int fd, 
+inline auto async_connect(int fd, 
                           const struct sockaddr* addr, socklen_t addrlen) {
-    return async_connect_awaitable(ctx, fd, addr, addrlen);
+    return async_connect_awaitable(fd, addr, addrlen);
 }
 
 /// Create an async close awaitable
-inline auto async_close(io_context& ctx, int fd) {
-    return async_close_awaitable(ctx, fd);
+inline auto async_close(int fd) {
+    return async_close_awaitable(fd);
 }
 
 /// Create an async poll awaitable for reading
-inline auto async_poll_read(io_context& ctx, int fd) {
-    return async_poll_awaitable(ctx, fd, true);
+inline auto async_poll_read(int fd) {
+    return async_poll_awaitable(fd, true);
 }
 
 /// Create an async poll awaitable for writing
-inline auto async_poll_write(io_context& ctx, int fd) {
-    return async_poll_awaitable(ctx, fd, false);
-}
-
-// Convenience overloads using default io_context
-
-inline auto async_read(int fd, void* buffer, size_t length, int64_t offset = -1) {
-    return async_read(default_io_context(), fd, buffer, length, offset);
-}
-
-inline auto async_write(int fd, const void* buffer, size_t length, 
-                        int64_t offset = -1) {
-    return async_write(default_io_context(), fd, buffer, length, offset);
-}
-
-inline auto async_recv(int fd, void* buffer, size_t length, int flags = 0) {
-    return async_recv(default_io_context(), fd, buffer, length, flags);
-}
-
-inline auto async_send(int fd, const void* buffer, size_t length, int flags = 0) {
-    return async_send(default_io_context(), fd, buffer, length, flags);
-}
-
-inline auto async_writev(int fd, struct iovec* iovecs, size_t iovec_count) {
-    return async_writev(default_io_context(), fd, iovecs, iovec_count);
-}
-
-inline auto async_accept(int listen_fd, struct sockaddr* addr = nullptr,
-                         socklen_t* addrlen = nullptr, int flags = 0) {
-    return async_accept(default_io_context(), listen_fd, addr, addrlen, flags);
-}
-
-inline auto async_connect(int fd, const struct sockaddr* addr, socklen_t addrlen) {
-    return async_connect(default_io_context(), fd, addr, addrlen);
-}
-
-inline auto async_close(int fd) {
-    return async_close(default_io_context(), fd);
+inline auto async_poll_write(int fd) {
+    return async_poll_awaitable(fd, false);
 }
 
 } // namespace elio::io

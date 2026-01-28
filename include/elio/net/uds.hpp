@@ -177,51 +177,51 @@ public:
     
     /// Async read
     auto read(void* buffer, size_t length) {
-        return io::async_recv(*ctx_, fd_, buffer, length);
+        return io::async_recv(fd_, buffer, length);
     }
     
     /// Async read into span
     template<typename T>
     auto read(std::span<T> buffer) {
-        return io::async_recv(*ctx_, fd_, buffer.data(), buffer.size_bytes());
+        return io::async_recv(fd_, buffer.data(), buffer.size_bytes());
     }
     
     /// Async write
     auto write(const void* buffer, size_t length) {
-        return io::async_send(*ctx_, fd_, buffer, length);
+        return io::async_send(fd_, buffer, length);
     }
     
     /// Async write from span
     template<typename T>
     auto write(std::span<const T> buffer) {
-        return io::async_send(*ctx_, fd_, buffer.data(), buffer.size_bytes());
+        return io::async_send(fd_, buffer.data(), buffer.size_bytes());
     }
     
     /// Async write string
     auto write(std::string_view str) {
-        return io::async_send(*ctx_, fd_, str.data(), str.size());
+        return io::async_send(fd_, str.data(), str.size());
     }
     
     /// Async writev (scatter-gather write)
     auto writev(struct iovec* iovecs, size_t count) {
-        return io::async_writev(*ctx_, fd_, iovecs, count);
+        return io::async_writev(fd_, iovecs, count);
     }
     
     /// Wait for socket to be readable
     auto poll_read() {
-        return io::async_poll_read(*ctx_, fd_);
+        return io::async_poll_read(fd_);
     }
     
     /// Wait for socket to be writable
     auto poll_write() {
-        return io::async_poll_write(*ctx_, fd_);
+        return io::async_poll_write(fd_);
     }
     
     /// Async close
     auto close() {
         int fd = fd_;
         fd_ = -1;
-        return io::async_close(*ctx_, fd);
+        return io::async_close(fd);
     }
     
     /// Set SO_RCVBUF option
@@ -362,6 +362,8 @@ public:
         bool await_ready() const noexcept { return false; }
         
         void await_suspend(std::coroutine_handle<> awaiter) {
+            auto& ctx = io::current_io_context();
+            
             io::io_request req{};
             req.op = io::io_op::accept;
             req.fd = listener_.fd_;
@@ -370,12 +372,12 @@ public:
             req.socket_flags = SOCK_NONBLOCK | SOCK_CLOEXEC;
             req.awaiter = awaiter;
             
-            if (!listener_.ctx_->prepare(req)) {
+            if (!ctx.prepare(req)) {
                 result_ = io::io_result{-EAGAIN, 0};
                 awaiter.resume();
                 return;
             }
-            listener_.ctx_->submit();
+            ctx.submit();
         }
         
         std::optional<uds_stream> await_resume() {
@@ -443,9 +445,9 @@ private:
 /// Connect to a Unix Domain Socket server
 class uds_connect_awaitable {
 public:
-    uds_connect_awaitable(io::io_context& ctx, const unix_address& addr,
+    uds_connect_awaitable(const unix_address& addr,
                           const uds_options& opts = {})
-        : ctx_(ctx), addr_(addr), opts_(opts) {}
+        : addr_(addr), opts_(opts) {}
     
     bool await_ready() const noexcept { return false; }
     
@@ -485,6 +487,8 @@ public:
         }
         
         // Connection in progress, wait for socket to become writable
+        auto& ctx = io::current_io_context();
+        
         io::io_request req{};
         req.op = io::io_op::connect;
         req.fd = fd_;
@@ -492,13 +496,13 @@ public:
         req.addrlen = &sa_len_;
         req.awaiter = awaiter;
         
-        if (!ctx_.prepare(req)) {
+        if (!ctx.prepare(req)) {
             ::close(fd_);
             fd_ = -1;
             result_ = io::io_result{-EAGAIN, 0};
             return false;  // Don't suspend, resume immediately
         }
-        ctx_.submit();
+        ctx.submit();
         return true;  // Suspend, will be resumed by epoll
     }
     
@@ -523,7 +527,7 @@ public:
             return std::nullopt;
         }
         
-        uds_stream stream(fd_, ctx_);
+        uds_stream stream(fd_, io::current_io_context());
         fd_ = -1;  // Transfer ownership
         stream.set_peer_address(addr_);
         
@@ -533,7 +537,6 @@ public:
     }
     
 private:
-    io::io_context& ctx_;
     unix_address addr_;
     uds_options opts_;
     struct sockaddr_un sa_{};
@@ -543,15 +546,15 @@ private:
 };
 
 /// Connect to a Unix Domain Socket server
-inline auto uds_connect(io::io_context& ctx, const unix_address& addr,
+inline auto uds_connect(const unix_address& addr,
                         const uds_options& opts = {}) {
-    return uds_connect_awaitable(ctx, addr, opts);
+    return uds_connect_awaitable(addr, opts);
 }
 
 /// Connect to a Unix Domain Socket server by path
-inline auto uds_connect(io::io_context& ctx, std::string_view path,
+inline auto uds_connect(std::string_view path,
                         const uds_options& opts = {}) {
-    return uds_connect_awaitable(ctx, unix_address(path), opts);
+    return uds_connect_awaitable(unix_address(path), opts);
 }
 
 } // namespace elio::net

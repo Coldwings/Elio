@@ -146,7 +146,6 @@ int main() {
     sigs.block_all_threads();
     
     runtime::scheduler sched(4);
-    sched.set_io_context(&io::default_io_context());
     sched.start();
     
     // Spawn signal handler coroutine
@@ -249,7 +248,6 @@ int main() {
     // auto addr = net::unix_address::abstract("echo_server");
     
     runtime::scheduler sched(4);
-    sched.set_io_context(&io::default_io_context());
     sched.start();
     
     // Spawn signal handler
@@ -278,11 +276,9 @@ A Unix Domain Socket client that connects to a UDS server:
 using namespace elio;
 
 coro::task<void> client_main(const net::unix_address& addr) {
-    auto& ctx = io::default_io_context();
-    
     ELIO_LOG_INFO("Connecting to {}...", addr.to_string());
     
-    auto stream = co_await net::uds_connect(ctx, addr);
+    auto stream = co_await net::uds_connect(addr);
     if (!stream) {
         ELIO_LOG_ERROR("Connect failed: {}", strerror(errno));
         co_return;
@@ -312,7 +308,6 @@ int main() {
     // auto addr = net::unix_address::abstract("echo_server");
     
     runtime::scheduler sched(2);
-    sched.set_io_context(&io::default_io_context());
     sched.start();
     
     std::atomic<bool> done{false};
@@ -477,7 +472,6 @@ coro::task<void> router(request& req, response& resp) {
 
 int main() {
     runtime::scheduler sched(4);
-    sched.set_io_context(&io::default_io_context());
     sched.start();
     
     server_config config;

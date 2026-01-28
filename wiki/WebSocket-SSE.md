@@ -49,7 +49,6 @@ int main() {
     ws_server srv(std::move(router));
     
     runtime::scheduler sched(4);
-    sched.set_io_context(&io::default_io_context());
     sched.start();
     
     auto task = srv.listen(net::ipv4_address(8080), 

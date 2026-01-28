@@ -24,7 +24,7 @@
 - **TLS/HTTPS**: OpenSSL-based with ALPN and certificate verification
 - **Header-Only Library** for easy integration
 - **Debugging Tools**: GDB/LLDB extensions and pstack-like CLI
-- **Comprehensive Testing** with Catch2 and ASAN
+- **Comprehensive Testing** with Catch2, ASAN, and TSAN
 - **Integrated Logging** with fmtlib
 - **CI/CD** with GitHub Actions
 
@@ -59,6 +59,9 @@ ctest --output-on-failure
 
 # ASAN tests (memory safety)
 ./build/tests/elio_tests_asan
+
+# TSAN tests (thread safety)
+./build/tests/elio_tests_tsan
 ```
 
 ### Your First Coroutine
@@ -179,6 +182,7 @@ outer() -> middle() -> inner()
 The scheduler manages a pool of worker threads, each with a local task queue. Key features:
 - **Lock-free operations**: Chase-Lev deques for optimal performance
 - **Work stealing**: Idle threads steal tasks from busy threads
+- **Per-worker I/O context**: Each worker has its own io_uring/epoll backend for thread-safe I/O
 - **Dynamic sizing**: Adjust thread count at runtime
 - **Load balancing**: Automatic task distribution
 
@@ -343,7 +347,8 @@ Elio includes comprehensive tests:
 
 - **Unit Tests**: Test each component in isolation
 - **Integration Tests**: Test components working together
-- **ASAN Tests**: Detect memory errors
+- **ASAN Tests**: Detect memory errors (use-after-free, buffer overflow, etc.)
+- **TSAN Tests**: Detect data races and thread safety issues
 
 ```bash
 # Run all tests
@@ -354,7 +359,8 @@ ctest --test-dir build --output-on-failure
 ./build/tests/elio_tests "[integration]"
 
 # Run with sanitizers
-./build/tests/elio_tests_asan
+./build/tests/elio_tests_asan    # Memory safety
+./build/tests/elio_tests_tsan    # Thread safety
 ```
 
 ## Performance

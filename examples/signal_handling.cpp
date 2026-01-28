@@ -139,10 +139,6 @@ int main() {
     // Create scheduler with worker threads
     scheduler sched(4);
     
-    // Set up I/O context for async operations
-    io::io_context ctx;
-    sched.set_io_context(&ctx);
-    
     sched.start();
     
     // Spawn main task
@@ -151,17 +147,11 @@ int main() {
     
     // Run until shutdown
     while (g_running) {
-        ctx.poll(std::chrono::milliseconds(10));
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     
     // Give coroutines time to clean up
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    
-    // Poll any remaining I/O
-    for (int i = 0; i < 10 && ctx.has_pending(); ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
-    }
     
     sched.shutdown();
     

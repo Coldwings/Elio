@@ -234,9 +234,6 @@ public:
     template<typename Task>
     void spawn(Task&& t);  // Accepts any type with release() method
     
-    // Set the I/O context for workers to poll
-    void set_io_context(io::io_context* ctx);
-    
     // Get number of worker threads
     size_t worker_count() const noexcept;
     
@@ -250,11 +247,7 @@ public:
 runtime::scheduler sched(4);
 sched.start();
 
-// Old API (still works)
-auto t = my_coroutine();
-sched.spawn(t.release());
-
-// New simplified API
+// Spawn tasks directly
 sched.spawn(my_coroutine());  // Accepts task directly
 
 sched.shutdown();
@@ -303,7 +296,6 @@ Configuration for running async tasks.
 ```cpp
 struct run_config {
     size_t num_threads = 0;           // 0 = hardware concurrency
-    io::io_context* io_context = nullptr;  // nullptr = create default
 };
 ```
 
@@ -751,7 +743,7 @@ public:
 };
 
 // Connect to address (awaitable, returns std::optional<tcp_stream>)
-/* awaitable */ tcp_connect(const ipv4_address& addr, io_context& ctx);
+/* awaitable */ tcp_connect(const ipv4_address& addr);
 ```
 
 ---

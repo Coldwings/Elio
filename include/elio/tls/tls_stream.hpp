@@ -333,14 +333,13 @@ private:
 
 /// Connect to a TLS server
 /// @param ctx TLS context (client mode)
-/// @param io_ctx I/O context for async operations
 /// @param host Hostname to connect to
 /// @param port Port to connect to
 /// @return TLS stream on success, std::nullopt on error (check errno)
 inline coro::task<std::optional<tls_stream>> 
-tls_connect(tls_context& ctx, io::io_context& io_ctx, std::string_view host, uint16_t port) {
+tls_connect(tls_context& ctx, std::string_view host, uint16_t port) {
     // First establish TCP connection
-    auto tcp_result = co_await net::tcp_connect(io_ctx, host, port);
+    auto tcp_result = co_await net::tcp_connect(host, port);
     if (!tcp_result) {
         co_return std::nullopt;
     }

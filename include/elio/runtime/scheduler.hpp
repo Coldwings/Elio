@@ -11,10 +11,6 @@
 #include <thread>
 #include <array>
 
-namespace elio::io {
-class io_context;
-}
-
 namespace elio::runtime {
 
 /// Work-stealing scheduler for coroutines
@@ -212,16 +208,6 @@ public:
         return workers_[worker_id]->tasks_executed();
     }
 
-    void set_io_context(io::io_context* ctx) noexcept {
-        io_context_ = ctx;
-    }
-
-    [[nodiscard]] io::io_context* get_io_context() const noexcept {
-        return io_context_;
-    }
-
-    bool try_poll_io(std::chrono::milliseconds timeout = std::chrono::milliseconds(0));
-
 private:
     void do_spawn(std::coroutine_handle<> handle) {
         // Release fence ensures all writes to the coroutine frame (including
@@ -273,27 +259,13 @@ private:
     std::atomic<bool> paused_;
     std::atomic<size_t> spawn_index_;
     mutable std::mutex workers_mutex_;
-    io::io_context* io_context_ = nullptr;
-    mutable std::mutex io_poll_mutex_;
     
     static inline thread_local scheduler* current_scheduler_ = nullptr;
 };
 
 } // namespace elio::runtime
 
-#include <elio/io/io_context.hpp>
-
 namespace elio::runtime {
-
-inline bool scheduler::try_poll_io(std::chrono::milliseconds timeout) {
-    if (!io_context_) return false;
-    
-    std::unique_lock<std::mutex> lock(io_poll_mutex_, std::try_to_lock);
-    if (!lock.owns_lock()) return false;
-    
-    io_context_->poll(timeout);
-    return true;
-}
 
 inline scheduler* get_current_scheduler() noexcept {
     return scheduler::current();
@@ -507,19 +479,19 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
 }
 
 inline void worker_thread::poll_io_when_idle() {
-    // Try to poll IO - only one worker can do this at a time
-    // Use a non-zero timeout so the polling thread blocks on epoll/io_uring
-    // while other workers block on their eventfd
+    // Poll this worker's own io_context
+    // Each worker has its own io_context, so no locking needed
     constexpr int idle_timeout_ms = 10;
     
-    if (scheduler_->try_poll_io(std::chrono::milliseconds(idle_timeout_ms))) {
-        // Successfully polled IO (with blocking timeout)
-        // Check for new tasks immediately after IO completions
+    // Poll with timeout - will block on epoll/io_uring if no completions ready
+    int completions = io_context_->poll(std::chrono::milliseconds(idle_timeout_ms));
+    
+    if (completions > 0) {
+        // Got IO completions, return immediately to check for new tasks
         return;
     }
     
-    // Couldn't acquire IO poll lock - another worker is handling IO
-    // Block on our eventfd until woken or timeout
+    // No IO completions - wait on eventfd for task submissions
     wait_for_work(idle_timeout_ms);
 }
 

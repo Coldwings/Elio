@@ -318,7 +318,6 @@ int main(int argc, char* argv[]) {
     
     // Create and start scheduler
     scheduler sched(4);
-    sched.set_io_context(&io::default_io_context());
     sched.start();
     
     // Spawn signal handler coroutine

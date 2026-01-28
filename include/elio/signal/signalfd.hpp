@@ -214,11 +214,11 @@ class signal_fd {
 public:
     /// Construct a signal_fd for the given signal set
     /// @param signals The set of signals to handle
-    /// @param ctx Optional I/O context (defaults to the global context)
+    /// @param ctx Optional I/O context (defaults to the current worker's context)
     /// @param auto_block If true (default), automatically block the signals
     /// @throws std::system_error if signalfd creation fails
     explicit signal_fd(const signal_set& signals, 
-                       io::io_context& ctx = io::default_io_context(),
+                       io::io_context& ctx = io::current_io_context(),
                        bool auto_block = true)
         : ctx_(ctx)
         , signals_(signals)
@@ -387,7 +387,7 @@ private:
 /// @param auto_block If true (default), automatically block the signals
 /// @return task that yields signal_info when a signal is received
 inline coro::task<signal_info> wait_signal(const signal_set& signals,
-                                           io::io_context& ctx = io::default_io_context(),
+                                           io::io_context& ctx = io::current_io_context(),
                                            bool auto_block = true) {
     signal_fd sigfd(signals, ctx, auto_block);
     auto info = co_await sigfd.wait();
@@ -402,7 +402,7 @@ inline coro::task<signal_info> wait_signal(const signal_set& signals,
 /// @param ctx Optional I/O context
 /// @return task that yields signal_info when the signal is received
 inline coro::task<signal_info> wait_signal(int signo,
-                                           io::io_context& ctx = io::default_io_context()) {
+                                           io::io_context& ctx = io::current_io_context()) {
     signal_set signals;
     signals.add(signo);
     co_return co_await wait_signal(signals, ctx);

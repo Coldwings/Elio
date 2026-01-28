@@ -32,8 +32,11 @@ cmake --build build
 cd build
 ctest --output-on-failure
 
-# With AddressSanitizer
+# With AddressSanitizer (memory safety)
 ./tests/elio_tests_asan
+
+# With ThreadSanitizer (thread safety)
+./tests/elio_tests_tsan
 ```
 
 ### CMake Integration

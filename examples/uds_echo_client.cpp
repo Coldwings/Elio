@@ -21,13 +21,10 @@ using namespace elio::net;
 
 /// Client coroutine - connects, sends messages, receives responses
 task<int> client_main(const unix_address& addr) {
-    // Use the default io_context which is polled by scheduler workers
-    auto& ctx = io::default_io_context();
-    
     ELIO_LOG_INFO("Connecting to {}...", addr.to_string());
     
     // Connect to server
-    auto stream_result = co_await uds_connect(ctx, addr);
+    auto stream_result = co_await uds_connect(addr);
     
     if (!stream_result) {
         ELIO_LOG_ERROR("Connection failed: {}", strerror(errno));
@@ -74,12 +71,9 @@ task<int> client_main(const unix_address& addr) {
 
 /// Non-interactive benchmark mode
 task<int> benchmark_main(const unix_address& addr, int iterations) {
-    // Use the default io_context which is polled by scheduler workers
-    auto& ctx = io::default_io_context();
-    
     ELIO_LOG_INFO("Connecting to {} for benchmark...", addr.to_string());
     
-    auto stream_result = co_await uds_connect(ctx, addr);
+    auto stream_result = co_await uds_connect(addr);
     if (!stream_result) {
         ELIO_LOG_ERROR("Connection failed: {}", strerror(errno));
         co_return 1;
@@ -178,9 +172,6 @@ int main(int argc, char* argv[]) {
     
     // Create scheduler
     scheduler sched(2);
-    
-    // Set the I/O context so workers can poll for I/O completions
-    sched.set_io_context(&io::default_io_context());
     
     sched.start();
     

@@ -2,7 +2,6 @@
 
 #include "scheduler.hpp"
 #include <elio/coro/task.hpp>
-#include <elio/io/io_context.hpp>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -18,9 +17,6 @@ namespace elio::runtime {
 struct run_config {
     /// Number of worker threads (0 = hardware concurrency)
     size_t num_threads = 0;
-    
-    /// Custom I/O context (nullptr = create default)
-    io::io_context* io_context = nullptr;
 };
 
 namespace detail {
@@ -112,14 +108,13 @@ coro::task<void> completion_wrapper(coro::task<T> inner, completion_signal<T>* s
 /// run async code from a synchronous context (like main()).
 /// 
 /// @param task The coroutine task to run
-/// @param config Configuration (threads, io_context)
+/// @param config Configuration (threads)
 /// @return The result of the task
 /// 
 /// Example:
 /// @code
 /// coro::task<int> async_main() {
-///     auto& ctx = io::default_io_context();
-///     // Use ctx for async I/O
+///     // Your async code here - each worker has its own io_context
 ///     co_return 42;
 /// }
 /// 
@@ -137,16 +132,7 @@ T run(coro::task<T> task, const run_config& config = {}) {
         if (threads == 0) threads = 1;
     }
     
-    // Use provided io_context or create default
-    io::io_context* io_ctx = config.io_context;
-    std::unique_ptr<io::io_context> owned_ctx;
-    if (!io_ctx) {
-        owned_ctx = std::make_unique<io::io_context>();
-        io_ctx = owned_ctx.get();
-    }
-    
     scheduler sched(threads);
-    sched.set_io_context(io_ctx);
     sched.start();
     
     // Create wrapper that signals completion

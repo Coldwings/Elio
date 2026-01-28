@@ -201,11 +201,12 @@ public:
     int poll(std::chrono::milliseconds timeout) override {
         struct io_uring_cqe* cqe = nullptr;
         int completions = 0;
+        std::vector<deferred_resume_entry> deferred_resumes;
         
         if (timeout.count() == 0) {
             // Non-blocking: peek for available CQEs
             while (io_uring_peek_cqe(&ring_, &cqe) == 0 && cqe) {
-                process_completion(cqe);
+                process_completion(cqe, &deferred_resumes);
                 io_uring_cqe_seen(&ring_, cqe);
                 completions++;
                 cqe = nullptr;
@@ -214,14 +215,14 @@ public:
             // Blocking: wait for at least one CQE
             int ret = io_uring_wait_cqe(&ring_, &cqe);
             if (ret == 0 && cqe) {
-                process_completion(cqe);
+                process_completion(cqe, &deferred_resumes);
                 io_uring_cqe_seen(&ring_, cqe);
                 completions++;
                 
                 // Drain any additional ready CQEs
                 cqe = nullptr;
                 while (io_uring_peek_cqe(&ring_, &cqe) == 0 && cqe) {
-                    process_completion(cqe);
+                    process_completion(cqe, &deferred_resumes);
                     io_uring_cqe_seen(&ring_, cqe);
                     completions++;
                     cqe = nullptr;
@@ -235,20 +236,24 @@ public:
             
             int ret = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
             if (ret == 0 && cqe) {
-                process_completion(cqe);
+                process_completion(cqe, &deferred_resumes);
                 io_uring_cqe_seen(&ring_, cqe);
                 completions++;
                 
                 // Drain any additional ready CQEs
                 cqe = nullptr;
                 while (io_uring_peek_cqe(&ring_, &cqe) == 0 && cqe) {
-                    process_completion(cqe);
+                    process_completion(cqe, &deferred_resumes);
                     io_uring_cqe_seen(&ring_, cqe);
                     completions++;
                     cqe = nullptr;
                 }
             }
         }
+        
+        // Resume coroutines after processing all completions
+        // Each coroutine gets its correct result via deferred_resume_entry
+        resume_deferred(deferred_resumes);
         
         if (completions > 0) {
             ELIO_LOG_DEBUG("Processed {} completions", completions);
@@ -278,6 +283,9 @@ public:
         io_uring_sqe_set_data(sqe, nullptr);  // No awaiter for cancel itself
         
         pending_ops_.fetch_add(1, std::memory_order_relaxed);
+        
+        // Submit immediately - cancel must be acted upon right away
+        io_uring_submit(&ring_);
         return true;
     }
     
@@ -293,7 +301,14 @@ public:
     }
     
 private:
-    void process_completion(struct io_uring_cqe* cqe) {
+    /// Deferred resume entry - stores handle with its result
+    struct deferred_resume_entry {
+        std::coroutine_handle<> handle;
+        io_result result;
+    };
+    
+    void process_completion(struct io_uring_cqe* cqe, 
+                           std::vector<deferred_resume_entry>* deferred_resumes = nullptr) {
         void* user_data = io_uring_cqe_get_data(cqe);
         pending_ops_.fetch_sub(1, std::memory_order_relaxed);
         
@@ -304,16 +319,28 @@ private:
         
         // Store result in promise and resume coroutine
         auto handle = std::coroutine_handle<>::from_address(user_data);
-        
-        // The result is stored via the awaitable's promise
-        // We need a way to pass the result - use a thread-local for simplicity
-        last_result_ = io_result{cqe->res, cqe->flags};
+        io_result result{cqe->res, cqe->flags};
         
         ELIO_LOG_DEBUG("Completing operation: result={}, flags={}", 
                        cqe->res, cqe->flags);
         
         if (handle && !handle.done()) {
-            handle.resume();
+            if (deferred_resumes) {
+                deferred_resumes->push_back({handle, result});
+            } else {
+                last_result_ = result;
+                handle.resume();
+            }
+        }
+    }
+    
+    /// Resume collected coroutine handles (call outside of lock)
+    static void resume_deferred(std::vector<deferred_resume_entry>& entries) {
+        for (auto& entry : entries) {
+            if (entry.handle && !entry.handle.done()) {
+                last_result_ = entry.result;
+                entry.handle.resume();
+            }
         }
     }
     

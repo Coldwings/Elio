@@ -47,10 +47,8 @@ coro::task<void> server(uint16_t port, runtime::scheduler& sched) {
 
 ```cpp
 coro::task<void> client(const std::string& host, uint16_t port) {
-    auto& ctx = io::default_io_context();
-    
     // Connect to server (hostname is resolved automatically)
-    auto stream = co_await tcp_connect(ipv4_address(host, port), ctx);
+    auto stream = co_await tcp_connect(ipv4_address(host, port));
     if (!stream) {
         ELIO_LOG_ERROR("Connect failed: {}", strerror(errno));
         co_return;
@@ -165,10 +163,8 @@ coro::task<void> server(const unix_address& addr, runtime::scheduler& sched) {
 
 ```cpp
 coro::task<void> client(const unix_address& addr) {
-    auto& ctx = io::default_io_context();
-    
     // Connect to server
-    auto stream = co_await uds_connect(ctx, addr);
+    auto stream = co_await uds_connect(addr);
     if (!stream) {
         ELIO_LOG_ERROR("Connect failed: {}", strerror(errno));
         co_return;
@@ -410,14 +406,16 @@ coro::task<void> advanced_h2_client(io::io_context& ctx) {
 
 using namespace elio::tls;
 
-coro::task<void> secure_connection(io::io_context& ctx) {
+coro::task<void> secure_connection() {
+    auto& ctx = io::default_io_context();
+    
     // Create TLS context
     tls_context tls_ctx(tls_method::client);
     tls_ctx.use_default_verify_paths();
     tls_ctx.set_verify_mode(true);
     
     // Connect TCP
-    auto tcp = co_await tcp_connect(ipv4_address("example.com", 443), ctx);
+    auto tcp = co_await tcp_connect(ipv4_address("example.com", 443));
     if (!tcp) co_return;
     
     // Wrap with TLS

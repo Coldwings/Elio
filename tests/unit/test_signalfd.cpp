@@ -11,6 +11,7 @@
 using namespace elio::signal;
 using namespace elio::coro;
 using namespace elio::runtime;
+using namespace elio::io;
 using namespace std::chrono_literals;
 
 TEST_CASE("signal_set basic operations", "[signal][signal_set]") {
@@ -197,10 +198,8 @@ TEST_CASE("signal_fd async wait", "[signal][signal_fd]") {
     sigset_t old_mask;
     sigs.block(&old_mask);
     
-    elio::io::io_context ctx;
-    
     auto wait_task = [&]() -> task<void> {
-        signal_fd sigfd(sigs, ctx, false);  // Don't re-block, already blocked
+        signal_fd sigfd(sigs, current_io_context(), false);  // Don't re-block, already blocked
         
         auto info = co_await sigfd.wait();
         if (info) {
@@ -210,7 +209,6 @@ TEST_CASE("signal_fd async wait", "[signal][signal_fd]") {
     };
     
     scheduler sched(1);
-    sched.set_io_context(&ctx);
     sched.start();
     
     {
@@ -249,10 +247,8 @@ TEST_CASE("signal_fd multiple signals", "[signal][signal_fd]") {
     sigset_t old_mask;
     sigs.block(&old_mask);
     
-    elio::io::io_context ctx;
-    
     auto wait_task = [&]() -> task<void> {
-        signal_fd sigfd(sigs, ctx, false);  // Don't re-block, already blocked
+        signal_fd sigfd(sigs, current_io_context(), false);  // Don't re-block, already blocked
         
         for (int i = 0; i < 2; ++i) {
             auto info = co_await sigfd.wait();
@@ -265,7 +261,6 @@ TEST_CASE("signal_fd multiple signals", "[signal][signal_fd]") {
     };
     
     scheduler sched(1);
-    sched.set_io_context(&ctx);
     sched.start();
     
     {
@@ -378,16 +373,13 @@ TEST_CASE("wait_signal convenience function", "[signal][wait_signal]") {
     sigset_t old_mask;
     sigs.block(&old_mask);
     
-    elio::io::io_context ctx;
-    
     auto wait_task = [&]() -> task<void> {
-        auto info = co_await wait_signal(sigs, ctx, false);  // Don't re-block, already blocked
+        auto info = co_await wait_signal(sigs, current_io_context(), false);  // Don't re-block, already blocked
         REQUIRE(info.signo == SIGUSR1);
         received = true;
     };
     
     scheduler sched(1);
-    sched.set_io_context(&ctx);
     sched.start();
     
     {

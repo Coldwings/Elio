@@ -363,7 +363,7 @@ private:
         
         // Establish TCP connection
         if (url_.is_secure()) {
-            auto result = co_await tls::tls_connect(tls_ctx_, *io_ctx_, 
+            auto result = co_await tls::tls_connect(tls_ctx_, 
                                                      url_.host, url_.effective_port());
             if (!result) {
                 ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", 
@@ -373,7 +373,7 @@ private:
             }
             stream_ = std::move(*result);
         } else {
-            auto result = co_await net::tcp_connect(*io_ctx_, url_.host, 
+            auto result = co_await net::tcp_connect(url_.host, 
                                                      url_.effective_port());
             if (!result) {
                 ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", 

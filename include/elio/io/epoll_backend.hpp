@@ -13,7 +13,6 @@
 #include <unordered_map>
 #include <vector>
 #include <queue>
-#include <mutex>
 #include <chrono>
 
 namespace elio::io {
@@ -53,33 +52,28 @@ public:
     
     /// Destructor
     ~epoll_backend() override {
-        // Collect handles to resume after releasing mutex
-        std::vector<std::coroutine_handle<>> deferred_resumes;
+        // Collect handles to resume
+        std::vector<deferred_resume_entry> deferred_resumes;
         
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (auto& [fd, state] : fd_states_) {
-                for (auto& op : state.pending_ops) {
-                    if (op.awaiter && !op.awaiter.done()) {
-                        last_result_ = io_result{-ECANCELED, 0};
-                        deferred_resumes.push_back(op.awaiter);
-                    }
+        for (auto& [fd, state] : fd_states_) {
+            for (auto& op : state.pending_ops) {
+                if (op.awaiter && !op.awaiter.done()) {
+                    deferred_resumes.push_back({op.awaiter, io_result{-ECANCELED, 0}});
                 }
             }
-            fd_states_.clear();
-            
-            // Cancel all pending timers
-            while (!timer_queue_.empty()) {
-                auto& entry = timer_queue_.top();
-                if (entry.awaiter && !entry.awaiter.done()) {
-                    last_result_ = io_result{-ECANCELED, 0};
-                    deferred_resumes.push_back(entry.awaiter);
-                }
-                timer_queue_.pop();
-            }
-        } // mutex released here
+        }
+        fd_states_.clear();
         
-        // Resume outside lock to prevent deadlock
+        // Cancel all pending timers
+        while (!timer_queue_.empty()) {
+            auto& entry = timer_queue_.top();
+            if (entry.awaiter && !entry.awaiter.done()) {
+                deferred_resumes.push_back({entry.awaiter, io_result{-ECANCELED, 0}});
+            }
+            timer_queue_.pop();
+        }
+        
+        // Resume coroutines
         resume_deferred(deferred_resumes);
         
         if (epoll_fd_ >= 0) {
@@ -97,8 +91,6 @@ public:
     
     /// Prepare an I/O operation
     bool prepare(const io_request& req) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
         pending_operation op;
         op.req = req;
         op.awaiter = req.awaiter;
@@ -185,7 +177,6 @@ public:
     /// For epoll, operations are "submitted" when they're added
     /// This just executes any synchronous operations
     int submit() override {
-        std::lock_guard<std::mutex> lock(mutex_);
         int submitted = 0;
         
         // Execute synchronous operations (like close)
@@ -215,19 +206,16 @@ public:
         }
         
         // Adjust timeout based on earliest timer deadline
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!timer_queue_.empty()) {
-                auto now = std::chrono::steady_clock::now();
-                auto earliest = timer_queue_.top().deadline;
-                if (earliest <= now) {
-                    timeout_ms = 0;  // Timer already expired
-                } else {
-                    auto timer_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        earliest - now).count();
-                    if (timeout_ms < 0 || timer_timeout < timeout_ms) {
-                        timeout_ms = static_cast<int>(timer_timeout);
-                    }
+        if (!timer_queue_.empty()) {
+            auto now = std::chrono::steady_clock::now();
+            auto earliest = timer_queue_.top().deadline;
+            if (earliest <= now) {
+                timeout_ms = 0;  // Timer already expired
+            } else {
+                auto timer_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    earliest - now).count();
+                if (timeout_ms < 0 || timer_timeout < timeout_ms) {
+                    timeout_ms = static_cast<int>(timer_timeout);
                 }
             }
         }
@@ -245,42 +233,38 @@ public:
         
         int completions = 0;
         
-        // Collect handles to resume after releasing mutex (prevents deadlock
-        // when resumed coroutines call prepare())
-        std::vector<std::coroutine_handle<>> deferred_resumes;
+        // Collect handles to resume after processing all completions
+        std::vector<deferred_resume_entry> deferred_resumes;
         
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
+        // Process expired timers
+        auto now = std::chrono::steady_clock::now();
+        while (!timer_queue_.empty() && timer_queue_.top().deadline <= now) {
+            auto entry = timer_queue_.top();
+            timer_queue_.pop();
             
-            // Process expired timers
-            auto now = std::chrono::steady_clock::now();
-            while (!timer_queue_.empty() && timer_queue_.top().deadline <= now) {
-                auto entry = timer_queue_.top();
-                timer_queue_.pop();
-                
-                last_result_ = io_result{0, 0};  // Timeout completed successfully
-                
-                if (entry.awaiter && !entry.awaiter.done()) {
-                    deferred_resumes.push_back(entry.awaiter);
-                }
-                
-                pending_count_--;
-                completions++;
-                
-                ELIO_LOG_DEBUG("Timer expired");
+            io_result result{0, 0};  // Timeout completed successfully
+            
+            if (entry.awaiter && !entry.awaiter.done()) {
+                deferred_resumes.push_back({entry.awaiter, result});
             }
             
-            // Process epoll events
-            for (int i = 0; i < nfds; ++i) {
-                int fd = events_[i].data.fd;
-                uint32_t revents = events_[i].events;
-                
-                auto it = fd_states_.find(fd);
-                if (it == fd_states_.end()) {
-                    continue;
-                }
-                
-                fd_state& state = it->second;
+            pending_count_--;
+            completions++;
+            
+            ELIO_LOG_DEBUG("Timer expired");
+        }
+        
+        // Process epoll events
+        for (int i = 0; i < nfds; ++i) {
+            int fd = events_[i].data.fd;
+            uint32_t revents = events_[i].events;
+            
+            auto it = fd_states_.find(fd);
+            if (it == fd_states_.end()) {
+                continue;
+            }
+            
+            fd_state& state = it->second;
                 
                 // Process pending operations for this fd
                 auto op_it = state.pending_ops.begin();
@@ -325,9 +309,8 @@ public:
                     state.events = 0;
                 }
             }
-        } // mutex released here
         
-        // Resume coroutines outside the lock to prevent deadlock
+        // Resume coroutines after processing all completions
         resume_deferred(deferred_resumes);
         
         if (completions > 0) {
@@ -349,66 +332,64 @@ public:
     
     /// Cancel a pending operation
     bool cancel(void* user_data) override {
-        std::coroutine_handle<> to_resume;
+        deferred_resume_entry to_resume{};
+        bool found_entry = false;
         
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
+        // Search in fd_states first
+        for (auto& [fd, state] : fd_states_) {
+            auto it = std::find_if(state.pending_ops.begin(), 
+                                    state.pending_ops.end(),
+                                    [user_data](const pending_operation& op) {
+                                        return op.awaiter.address() == user_data;
+                                    });
             
-            // Search in fd_states first
-            for (auto& [fd, state] : fd_states_) {
-                auto it = std::find_if(state.pending_ops.begin(), 
-                                        state.pending_ops.end(),
-                                        [user_data](const pending_operation& op) {
-                                            return op.awaiter.address() == user_data;
-                                        });
+            if (it != state.pending_ops.end()) {
+                // Collect handle for deferred resumption
+                if (it->awaiter && !it->awaiter.done()) {
+                    to_resume = {it->awaiter, io_result{-ECANCELED, 0}};
+                    found_entry = true;
+                }
+                state.pending_ops.erase(it);
+                pending_count_--;
                 
-                if (it != state.pending_ops.end()) {
-                    // Collect handle for deferred resumption
-                    last_result_ = io_result{-ECANCELED, 0};
-                    if (it->awaiter && !it->awaiter.done()) {
-                        to_resume = it->awaiter;
-                    }
-                    state.pending_ops.erase(it);
-                    pending_count_--;
-                    
-                    // Cleanup if no more pending ops
-                    if (state.pending_ops.empty() && state.registered) {
-                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                        state.registered = false;
-                        state.events = 0;
-                    }
-                    goto found;
+                // Cleanup if no more pending ops
+                if (state.pending_ops.empty() && state.registered) {
+                    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                    state.registered = false;
+                    state.events = 0;
                 }
+                goto found;
             }
-            
-            // Search in timer queue - need to rebuild queue without the cancelled entry
-            if (!timer_queue_.empty()) {
-                std::vector<timer_entry> remaining;
-                while (!timer_queue_.empty()) {
-                    auto entry = timer_queue_.top();
-                    timer_queue_.pop();
-                    if (entry.awaiter.address() == user_data) {
-                        last_result_ = io_result{-ECANCELED, 0};
-                        if (entry.awaiter && !entry.awaiter.done()) {
-                            to_resume = entry.awaiter;
-                        }
-                        pending_count_--;
-                        // Don't add back to remaining
-                    } else {
-                        remaining.push_back(entry);
-                    }
-                }
-                // Rebuild queue
-                for (auto& e : remaining) {
-                    timer_queue_.push(std::move(e));
-                }
-            }
-        found:;
-        } // mutex released here
+        }
         
-        // Resume outside lock to prevent deadlock
-        if (to_resume && !to_resume.done()) {
-            to_resume.resume();
+        // Search in timer queue - need to rebuild queue without the cancelled entry
+        if (!timer_queue_.empty()) {
+            std::vector<timer_entry> remaining;
+            while (!timer_queue_.empty()) {
+                auto entry = timer_queue_.top();
+                timer_queue_.pop();
+                if (entry.awaiter.address() == user_data) {
+                    if (entry.awaiter && !entry.awaiter.done()) {
+                        to_resume = {entry.awaiter, io_result{-ECANCELED, 0}};
+                        found_entry = true;
+                    }
+                    pending_count_--;
+                    // Don't add back to remaining
+                } else {
+                    remaining.push_back(entry);
+                }
+            }
+            // Rebuild queue
+            for (auto& e : remaining) {
+                timer_queue_.push(std::move(e));
+            }
+        }
+    found:
+        
+        // Resume the cancelled coroutine
+        if (found_entry && to_resume.handle && !to_resume.handle.done()) {
+            last_result_ = to_resume.result;
+            to_resume.handle.resume();
             return true;
         }
         
@@ -449,6 +430,12 @@ private:
         }
     };
     
+    /// Deferred resume entry - stores handle with its result
+    struct deferred_resume_entry {
+        std::coroutine_handle<> handle;
+        io_result result;
+    };
+    
     /// Min-heap priority queue for timers
     using timer_queue_t = std::priority_queue<timer_entry, 
                                                std::vector<timer_entry>,
@@ -480,9 +467,9 @@ private:
     /// Execute async I/O operation
     /// @param op The pending operation to execute
     /// @param revents The epoll events that triggered this operation
-    /// @param deferred_resumes If non-null, collect handle for later resumption (avoids deadlock)
+    /// @param deferred_resumes If non-null, collect handle+result for later resumption (avoids deadlock)
     void execute_async_op(pending_operation& op, uint32_t revents,
-                          std::vector<std::coroutine_handle<>>* deferred_resumes = nullptr) {
+                          std::vector<deferred_resume_entry>* deferred_resumes = nullptr) {
         int result = 0;
         
         // Check for errors first
@@ -579,25 +566,28 @@ private:
             }
         }
         
-        last_result_ = io_result{result, 0};
+        io_result io_res{result, 0};
         
         ELIO_LOG_DEBUG("Completed io_op::{} on fd={}: result={}", 
                        static_cast<int>(op.req.op), op.req.fd, result);
         
         if (op.awaiter && !op.awaiter.done()) {
             if (deferred_resumes) {
-                deferred_resumes->push_back(op.awaiter);
+                deferred_resumes->push_back({op.awaiter, io_res});
             } else {
+                last_result_ = io_res;
                 op.awaiter.resume();
             }
         }
     }
     
     /// Resume collected coroutine handles (call outside of lock)
-    static void resume_deferred(std::vector<std::coroutine_handle<>>& handles) {
-        for (auto& h : handles) {
-            if (h && !h.done()) {
-                h.resume();
+    /// Sets last_result_ before resuming each coroutine
+    static void resume_deferred(std::vector<deferred_resume_entry>& entries) {
+        for (auto& entry : entries) {
+            if (entry.handle && !entry.handle.done()) {
+                last_result_ = entry.result;
+                entry.handle.resume();
             }
         }
     }
@@ -608,7 +598,6 @@ private:
     std::unordered_map<int, fd_state> fd_states_;         ///< Per-fd state
     timer_queue_t timer_queue_;                           ///< Timer queue for timeouts
     size_t pending_count_ = 0;                            ///< Number of pending operations
-    mutable std::mutex mutex_;                            ///< Protects fd_states_ and timer_queue_
     
     static inline thread_local io_result last_result_{};
 };

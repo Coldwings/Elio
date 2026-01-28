@@ -3,6 +3,7 @@
 #include "chase_lev_deque.hpp"
 #include "mpsc_queue.hpp"
 #include <elio/coro/promise_base.hpp>
+#include <elio/io/io_context.hpp>
 #include <coroutine>
 #include <thread>
 #include <atomic>
@@ -13,10 +14,6 @@
 #include <sys/epoll.h>
 #include <unistd.h>
 #include <cerrno>
-
-namespace elio::io {
-class io_context;
-}
 
 namespace elio::runtime {
 
@@ -41,7 +38,8 @@ public:
         , running_(false)
         , tasks_executed_(0)
         , wake_fd_(-1)
-        , wait_epoll_fd_(-1) {
+        , wait_epoll_fd_(-1)
+        , io_context_(std::make_unique<io::io_context>()) {
         
         // Create eventfd for wake-up notifications (non-blocking, semaphore mode)
         wake_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -161,6 +159,11 @@ public:
         return worker_id_;
     }
     
+    /// Get the io_context for this worker thread
+    [[nodiscard]] io::io_context& io_context() noexcept {
+        return *io_context_;
+    }
+    
     /// Get the current worker thread (if called from a worker thread)
     [[nodiscard]] static worker_thread* current() noexcept {
         return current_worker_;
@@ -226,6 +229,7 @@ private:
     bool needs_sync_ = false;          // Whether current task needs memory synchronization
     int wake_fd_;                      // eventfd for wake-up notifications
     int wait_epoll_fd_;                // epoll fd for waiting on wake_fd
+    std::unique_ptr<io::io_context> io_context_;  // Per-worker io_context
     
     static inline thread_local worker_thread* current_worker_ = nullptr;
 };

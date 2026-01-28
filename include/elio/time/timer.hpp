@@ -1,11 +1,12 @@
 #pragma once
 
-#include <elio/io/io_context.hpp>
+#include <elio/io/io_awaitables.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/coro/cancel_token.hpp>
 #include <elio/log/macros.hpp>
 #include <chrono>
 #include <coroutine>
+#include <atomic>
 
 namespace elio::time {
 
@@ -31,21 +32,10 @@ public:
     }
     
     void await_suspend(std::coroutine_handle<> awaiter) {
-        // Get io_context from scheduler or use provided one
+        // Get io_context from current worker or use provided one
         io::io_context* ctx = ctx_;
         if (!ctx) {
-            auto* sched = runtime::scheduler::current();
-            if (sched) {
-                ctx = sched->get_io_context();
-            }
-        }
-        
-        if (!ctx) {
-            // No io_context available, fall back to thread sleep
-            ELIO_LOG_DEBUG("sleep_awaitable: no io_context, using thread sleep");
-            std::this_thread::sleep_for(std::chrono::nanoseconds(duration_ns_));
-            awaiter.resume();
-            return;
+            ctx = &io::current_io_context();
         }
         
         // Use io_context timeout mechanism
@@ -111,43 +101,44 @@ public:
             return;
         }
         
-        // Get io_context from scheduler or use provided one
+        // Get io_context from current worker or use provided one
         io::io_context* ctx = ctx_;
         if (!ctx) {
-            auto* sched = runtime::scheduler::current();
-            if (sched) {
-                ctx = sched->get_io_context();
-            }
+            ctx = &io::current_io_context();
         }
+        ctx_ = ctx;  // Save for later cancel
         
-        if (!ctx) {
-            // No io_context available - check cancellation in a loop
-            ELIO_LOG_DEBUG("cancellable_sleep: no io_context, using polling sleep");
-            auto end_time = std::chrono::steady_clock::now() + 
-                           std::chrono::nanoseconds(duration_ns_);
-            while (std::chrono::steady_clock::now() < end_time) {
-                if (token_.is_cancelled()) {
-                    cancelled_ = true;
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            awaiter.resume();
-            return;
-        }
+        // Save worker pointer for thread-safe cancellation
+        worker_ = runtime::worker_thread::current();
+        
+        // Create a fire-and-forget cancel executor coroutine
+        // This will be scheduled on the worker thread to execute the actual cancel
+        cancel_executor_handle_ = create_cancel_executor();
         
         // Register cancellation callback before setting up the timer
-        // The callback will cancel the pending timeout operation
-        cancel_registration_ = token_.on_cancel([this, ctx]() {
+        // The callback schedules the cancel executor on the worker thread
+        // This ensures io_uring operations are only called from the owning thread
+        cancel_registration_ = token_.on_cancel([this]() {
             cancelled_ = true;
-            // Cancel the pending timeout operation
-            ctx->cancel(awaiter_.address());
+            // Schedule cancel execution on the correct worker thread
+            // This is thread-safe because schedule() uses lock-free MPSC queue
+            if (worker_ && cancel_executor_handle_) {
+                // Mark as handed off BEFORE scheduling - this prevents double-free
+                // since the coroutine will auto-destroy via final_suspend returning suspend_never
+                cancel_executor_handed_off_.store(true, std::memory_order_release);
+                worker_->schedule(cancel_executor_handle_);
+            }
         });
         
         // Check again after registration (in case cancelled between check and register)
         if (token_.is_cancelled()) {
             cancel_registration_.unregister();
             cancelled_ = true;
+            // Destroy unused cancel executor
+            if (cancel_executor_handle_) {
+                cancel_executor_handle_.destroy();
+                cancel_executor_handle_ = nullptr;
+            }
             awaiter.resume();
             return;
         }
@@ -160,6 +151,11 @@ public:
         
         if (!ctx->prepare(req)) {
             cancel_registration_.unregister();
+            // Destroy unused cancel executor
+            if (cancel_executor_handle_) {
+                cancel_executor_handle_.destroy();
+                cancel_executor_handle_ = nullptr;
+            }
             // Failed to prepare, fall back to polling sleep
             ELIO_LOG_WARNING("cancellable_sleep: failed to prepare timeout, using polling sleep");
             auto end_time = std::chrono::steady_clock::now() + 
@@ -181,17 +177,57 @@ public:
     cancel_result await_resume() noexcept {
         // Unregister callback to prevent use-after-free
         cancel_registration_.unregister();
+        // Only destroy cancel executor if it wasn't handed off to worker thread
+        // If handed off, it will auto-destroy via final_suspend returning suspend_never
+        if (!cancel_executor_handed_off_.load(std::memory_order_acquire) && cancel_executor_handle_) {
+            cancel_executor_handle_.destroy();
+        }
+        cancel_executor_handle_ = nullptr;
         // Check both the flag and the token state (for await_ready() early return case)
         return (cancelled_ || token_.is_cancelled()) ? cancel_result::cancelled 
                                                       : cancel_result::completed;
     }
     
 private:
+    /// Fire-and-forget coroutine that executes the actual cancel operation
+    /// This runs on the worker thread that owns the io_context
+    struct cancel_executor {
+        struct promise_type {
+            cancellable_sleep_awaitable* self = nullptr;
+            
+            cancel_executor get_return_object() { 
+                return {std::coroutine_handle<promise_type>::from_promise(*this)}; 
+            }
+            std::suspend_always initial_suspend() noexcept { return {}; }
+            std::suspend_never final_suspend() noexcept { return {}; }  // Self-destroy
+            void return_void() noexcept {}
+            void unhandled_exception() noexcept {}
+        };
+        std::coroutine_handle<promise_type> handle;
+    };
+    
+    std::coroutine_handle<> create_cancel_executor() {
+        auto executor = [](cancellable_sleep_awaitable* self) -> cancel_executor {
+            // Execute the actual cancel on the worker thread
+            if (self->ctx_) {
+                self->ctx_->cancel(self->awaiter_.address());
+            }
+            co_return;
+        }(this);
+        
+        // Store self pointer in promise for access during execution
+        executor.handle.promise().self = this;
+        return executor.handle;
+    }
+    
     io::io_context* ctx_ = nullptr;
+    runtime::worker_thread* worker_ = nullptr;
     int64_t duration_ns_;
     coro::cancel_token token_;
     coro::cancel_token::registration cancel_registration_;
     std::coroutine_handle<> awaiter_;
+    std::coroutine_handle<> cancel_executor_handle_;
+    std::atomic<bool> cancel_executor_handed_off_{false};
     bool cancelled_ = false;
 };
 

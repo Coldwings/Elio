@@ -236,7 +236,6 @@ int main(int argc, char* argv[]) {
     
     // Create scheduler
     scheduler sched(2);
-    sched.set_io_context(&io::default_io_context());
     sched.start();
     
     // Run appropriate mode

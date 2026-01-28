@@ -120,8 +120,7 @@ public:
         : config_(config) {}
     
     /// Get or create a connection to host
-    coro::task<std::optional<connection>> acquire(io::io_context& io_ctx,
-                                                   const std::string& host, 
+    coro::task<std::optional<connection>> acquire(const std::string& host, 
                                                    uint16_t port,
                                                    bool secure,
                                                    tls::tls_context* tls_ctx = nullptr) {
@@ -152,7 +151,7 @@ public:
                 co_return std::nullopt;
             }
             
-            auto result = co_await tls::tls_connect(*tls_ctx, io_ctx, host, port);
+            auto result = co_await tls::tls_connect(*tls_ctx, host, port);
             if (!result) {
                 ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(errno));
                 co_return std::nullopt;
@@ -160,7 +159,7 @@ public:
             
             co_return connection(std::move(*result));
         } else {
-            auto result = co_await net::tcp_connect(io_ctx, host, port);
+            auto result = co_await net::tcp_connect(host, port);
             if (!result) {
                 ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(errno));
                 co_return std::nullopt;
@@ -361,7 +360,7 @@ private:
         }
         
         // Get connection from pool
-        auto conn_opt = co_await pool_.acquire(*io_ctx_, target.host, target.effective_port(),
+        auto conn_opt = co_await pool_.acquire(target.host, target.effective_port(),
                                                 target.is_secure(), &tls_ctx_);
         if (!conn_opt) {
             errno = ECONNREFUSED;

@@ -17,18 +17,10 @@
 #include <elio/elio.hpp>
 #include <elio/http/sse.hpp>
 
-#include <atomic>
-#include <condition_variable>
-#include <mutex>
 #include <iostream>
 
 using namespace elio;
 using namespace elio::http::sse;
-
-// Completion signaling
-std::atomic<bool> g_done{false};
-std::mutex g_mutex;
-std::condition_variable g_cv;
 
 /// Listen to SSE events
 coro::task<void> listen_events(const std::string& url) {
@@ -43,26 +35,21 @@ coro::task<void> listen_events(const std::string& url) {
     config.verify_certificate = false;  // Allow self-signed certs for testing
 
     sse_client client(config);
-    
+
     // Connect
     bool connected = co_await client.connect(url);
     if (!connected) {
         ELIO_LOG_ERROR("Failed to connect to {}", url);
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            g_done = true;
-        }
-        g_cv.notify_all();
         co_return;
     }
-    
+
     ELIO_LOG_INFO("Connected! Listening for events...");
     ELIO_LOG_INFO("Press Ctrl+C to stop\n");
-    
+
     // Receive events
     int event_count = 0;
     int max_events = 20;  // Limit for demo
-    
+
     while (client.is_connected() && event_count < max_events) {
         auto evt = co_await client.receive();
         if (!evt) {
@@ -73,35 +60,29 @@ coro::task<void> listen_events(const std::string& url) {
             ELIO_LOG_INFO("Connection closed");
             break;
         }
-        
+
         ++event_count;
-        
+
         // Display event
         std::string type = evt->type.empty() ? "message" : evt->type;
         std::string id = evt->id.empty() ? "(none)" : evt->id;
-        
+
         ELIO_LOG_INFO("[Event #{:3}] type={} id={}", event_count, type, id);
         ELIO_LOG_INFO("  data: {}", evt->data);
-        
+
         // Track last event ID
         if (!evt->id.empty()) {
             ELIO_LOG_DEBUG("  Last-Event-ID is now: {}", client.last_event_id());
         }
     }
-    
+
     // Close connection
     ELIO_LOG_INFO("\nClosing connection...");
     co_await client.close();
-    
+
     ELIO_LOG_INFO("Received {} events total", event_count);
     ELIO_LOG_INFO("=== Demo Complete ===");
-    
-    // Signal completion
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_done = true;
-    }
-    g_cv.notify_all();
+    co_return;
 }
 
 /// Simple connection test
@@ -111,17 +92,12 @@ coro::task<void> simple_test(const std::string& url) {
     auto client_opt = co_await sse_connect(url);
     if (!client_opt) {
         ELIO_LOG_ERROR("Failed to connect");
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            g_done = true;
-        }
-        g_cv.notify_all();
         co_return;
     }
-    
+
     auto& client = *client_opt;
     ELIO_LOG_INFO("Connected! Waiting for events...");
-    
+
     // Receive a few events
     for (int i = 0; i < 5; ++i) {
         auto evt = co_await client.receive();
@@ -129,19 +105,14 @@ coro::task<void> simple_test(const std::string& url) {
             ELIO_LOG_INFO("Connection closed");
             break;
         }
-        
-        ELIO_LOG_INFO("Event {}: {} ({})", i + 1, evt->data, 
+
+        ELIO_LOG_INFO("Event {}: {} ({})", i + 1, evt->data,
                       evt->type.empty() ? "message" : evt->type);
     }
-    
+
     co_await client.close();
     ELIO_LOG_INFO("Test complete");
-    
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_done = true;
-    }
-    g_cv.notify_all();
+    co_return;
 }
 
 /// Test reconnection behavior
@@ -154,23 +125,18 @@ coro::task<void> reconnect_test(const std::string& url) {
     config.max_reconnect_attempts = 3;
 
     sse_client client(config);
-    
+
     if (!co_await client.connect(url)) {
         ELIO_LOG_ERROR("Initial connection failed");
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            g_done = true;
-        }
-        g_cv.notify_all();
         co_return;
     }
-    
+
     ELIO_LOG_INFO("Connected! Listening for events (reconnection enabled)...");
-    
+
     int event_count = 0;
     while (event_count < 30) {  // Receive up to 30 events
         auto evt = co_await client.receive();
-        
+
         if (!evt) {
             if (client.state() == client_state::reconnecting) {
                 ELIO_LOG_INFO("Connection lost, reconnecting...");
@@ -179,49 +145,41 @@ coro::task<void> reconnect_test(const std::string& url) {
             ELIO_LOG_INFO("Connection permanently closed");
             break;
         }
-        
+
         ++event_count;
-        ELIO_LOG_INFO("[{}] {}: {}", event_count, 
-                      evt->type.empty() ? "message" : evt->type, 
+        ELIO_LOG_INFO("[{}] {}: {}", event_count,
+                      evt->type.empty() ? "message" : evt->type,
                       evt->data);
     }
-    
+
     co_await client.close();
     ELIO_LOG_INFO("Reconnection test complete ({} events received)", event_count);
-    
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_done = true;
-    }
-    g_cv.notify_all();
+    co_return;
 }
 
-void print_usage(const char* program) {
-    std::cout << "Usage: " << program << " [options] [url]\n"
-              << "\n"
-              << "Options:\n"
-              << "  --demo        Run feature demonstration (default)\n"
-              << "  --simple      Run simple connection test\n"
-              << "  --reconnect   Test reconnection behavior\n"
-              << "  --help        Show this help\n"
-              << "\n"
-              << "Default URL: http://localhost:8080/events\n"
-              << "\n"
-              << "Examples:\n"
-              << "  " << program << " http://localhost:8080/events\n"
-              << "  " << program << " --simple http://localhost:3000/sse\n";
-}
-
-int main(int argc, char* argv[]) {
+/// Async main - uses ELIO_ASYNC_MAIN for automatic scheduler management
+coro::task<int> async_main(int argc, char* argv[]) {
     std::string url = "http://localhost:8080/events";
     enum class Mode { demo, simple, reconnect } mode = Mode::demo;
-    
+
     // Parse arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
-            print_usage(argv[0]);
-            return 0;
+            std::cout << "Usage: " << argv[0] << " [options] [url]\n"
+                      << "\n"
+                      << "Options:\n"
+                      << "  --demo, -d       Run feature demonstration (default)\n"
+                      << "  --simple, -s     Run simple connection test\n"
+                      << "  --reconnect, -r  Test reconnection behavior\n"
+                      << "  --help, -h       Show this help\n"
+                      << "\n"
+                      << "Default URL: http://localhost:8080/events\n"
+                      << "\n"
+                      << "Examples:\n"
+                      << "  " << argv[0] << " http://localhost:8080/events\n"
+                      << "  " << argv[0] << " --simple http://localhost:3000/sse\n";
+            co_return 0;
         } else if (arg == "--demo" || arg == "-d") {
             mode = Mode::demo;
         } else if (arg == "--simple" || arg == "-s") {
@@ -232,42 +190,22 @@ int main(int argc, char* argv[]) {
             url = arg;
         }
     }
-    
-    // Create scheduler
-    runtime::scheduler sched(2);
-    sched.start();
-    
+
     // Run client based on mode
     switch (mode) {
-        case Mode::demo: {
-            auto task = listen_events(url);
-            sched.spawn(task.release());
+        case Mode::demo:
+            co_await listen_events(url);
             break;
-        }
-        case Mode::simple: {
-            auto task = simple_test(url);
-            sched.spawn(task.release());
+        case Mode::simple:
+            co_await simple_test(url);
             break;
-        }
-        case Mode::reconnect: {
-            auto task = reconnect_test(url);
-            sched.spawn(task.release());
+        case Mode::reconnect:
+            co_await reconnect_test(url);
             break;
-        }
     }
-    
-    // Wait for completion with timeout
-    {
-        std::unique_lock<std::mutex> lock(g_mutex);
-        g_cv.wait_for(lock, std::chrono::seconds(120), [] { return g_done.load(); });
-    }
-    
-    // Brief drain before shutdown
-    auto& ctx = io::default_io_context();
-    for (int i = 0; i < 10 && ctx.has_pending(); ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
-    }
-    
-    sched.shutdown();
-    return 0;
+
+    co_return 0;
 }
+
+// Use ELIO_ASYNC_MAIN - handles scheduler creation, execution, and shutdown automatically
+ELIO_ASYNC_MAIN(async_main)

@@ -421,14 +421,15 @@ public:
         : router_(std::move(r)), http_config_(http_config) {}
     
     /// Start listening on address (plain HTTP/WS)
-    coro::task<void> listen(net::ipv4_address addr) {
+    coro::task<void> listen(const net::socket_address& addr,
+                            const net::tcp_options& opts = {}) {
         auto* sched = runtime::scheduler::current();
         if (!sched) {
             ELIO_LOG_ERROR("WebSocket server must be started from within a scheduler context");
             co_return;
         }
 
-        auto listener_result = net::tcp_listener::bind(addr);
+        auto listener_result = net::tcp_listener::bind(addr, opts);
         if (!listener_result) {
             ELIO_LOG_ERROR("Failed to bind WebSocket server: {}", strerror(errno));
             co_return;
@@ -455,14 +456,15 @@ public:
     }
 
     /// Start listening with TLS (HTTPS/WSS)
-    coro::task<void> listen_tls(net::ipv4_address addr, tls::tls_context& tls_ctx) {
+    coro::task<void> listen_tls(const net::socket_address& addr, tls::tls_context& tls_ctx,
+                                const net::tcp_options& opts = {}) {
         auto* sched = runtime::scheduler::current();
         if (!sched) {
             ELIO_LOG_ERROR("Secure WebSocket server must be started from within a scheduler context");
             co_return;
         }
 
-        auto listener_result = net::tcp_listener::bind(addr);
+        auto listener_result = net::tcp_listener::bind(addr, opts);
         if (!listener_result) {
             ELIO_LOG_ERROR("Failed to bind secure WebSocket server: {}", strerror(errno));
             co_return;

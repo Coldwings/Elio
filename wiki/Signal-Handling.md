@@ -216,13 +216,33 @@ coro::task<void> signal_router() {
 
 ### 3. Graceful Shutdown Pattern
 
+For simple server applications, use `elio::serve()` which handles all shutdown logic automatically:
+
+```cpp
+coro::task<int> async_main(int argc, char* argv[]) {
+    http::router r;
+    r.get("/", handler);
+
+    http::server srv(r);
+
+    // serve() waits for SIGINT/SIGTERM and calls srv.stop() automatically
+    co_await elio::serve(srv, srv.listen(addr));
+
+    co_return 0;
+}
+
+ELIO_ASYNC_MAIN(async_main)
+```
+
+For more complex scenarios with custom shutdown logic:
+
 ```cpp
 std::atomic<bool> g_running{true};
 
 coro::task<void> shutdown_handler() {
     signal_set sigs{SIGINT, SIGTERM};
     signal_fd sigfd(sigs);
-    
+
     auto info = co_await sigfd.wait();
     ELIO_LOG_INFO("Shutdown signal received: {}", info->full_name());
     g_running = false;

@@ -31,18 +31,18 @@ std::mutex g_mutex;
 std::condition_variable g_cv;
 
 /// Listen to SSE events
-coro::task<void> listen_events(io::io_context& io_ctx, const std::string& url) {
+coro::task<void> listen_events(const std::string& url) {
     ELIO_LOG_INFO("=== SSE Client Demo ===");
     ELIO_LOG_INFO("Connecting to: {}", url);
-    
+
     // Configure client
     client_config config;
     config.user_agent = "elio-sse-demo/1.0";
     config.auto_reconnect = true;
     config.default_retry_ms = 3000;
     config.verify_certificate = false;  // Allow self-signed certs for testing
-    
-    sse_client client(io_ctx, config);
+
+    sse_client client(config);
     
     // Connect
     bool connected = co_await client.connect(url);
@@ -105,10 +105,10 @@ coro::task<void> listen_events(io::io_context& io_ctx, const std::string& url) {
 }
 
 /// Simple connection test
-coro::task<void> simple_test(io::io_context& io_ctx, const std::string& url) {
+coro::task<void> simple_test(const std::string& url) {
     ELIO_LOG_INFO("Simple SSE test: connecting to {}", url);
-    
-    auto client_opt = co_await sse_connect(io_ctx, url);
+
+    auto client_opt = co_await sse_connect(url);
     if (!client_opt) {
         ELIO_LOG_ERROR("Failed to connect");
         {
@@ -145,15 +145,15 @@ coro::task<void> simple_test(io::io_context& io_ctx, const std::string& url) {
 }
 
 /// Test reconnection behavior
-coro::task<void> reconnect_test(io::io_context& io_ctx, const std::string& url) {
+coro::task<void> reconnect_test(const std::string& url) {
     ELIO_LOG_INFO("Reconnection test: connecting to {}", url);
-    
+
     client_config config;
     config.auto_reconnect = true;
     config.default_retry_ms = 2000;
     config.max_reconnect_attempts = 3;
-    
-    sse_client client(io_ctx, config);
+
+    sse_client client(config);
     
     if (!co_await client.connect(url)) {
         ELIO_LOG_ERROR("Initial connection failed");
@@ -240,17 +240,17 @@ int main(int argc, char* argv[]) {
     // Run client based on mode
     switch (mode) {
         case Mode::demo: {
-            auto task = listen_events(io::default_io_context(), url);
+            auto task = listen_events(url);
             sched.spawn(task.release());
             break;
         }
         case Mode::simple: {
-            auto task = simple_test(io::default_io_context(), url);
+            auto task = simple_test(url);
             sched.spawn(task.release());
             break;
         }
         case Mode::reconnect: {
-            auto task = reconnect_test(io::default_io_context(), url);
+            auto task = reconnect_test(url);
             sched.spawn(task.release());
             break;
         }

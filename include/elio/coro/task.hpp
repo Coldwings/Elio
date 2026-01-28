@@ -176,11 +176,20 @@ public:
     [[nodiscard]] bool await_ready() const noexcept {
         return state_->is_completed();
     }
-    
+
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        return state_->set_waiter(awaiter);
+        // Keep a local copy of the shared_ptr to prevent use-after-free.
+        // Without this, a race can occur:
+        // 1. set_waiter() stores the awaiter and checks completed_
+        // 2. Meanwhile, complete() is called, which schedules the awaiter
+        // 3. The awaiter runs on another thread, finishes, and destroys this join_handle
+        // 4. The last shared_ptr ref is gone, join_state is destroyed
+        // 5. set_waiter() tries to access destroyed memory
+        // Holding a local shared_ptr ensures join_state outlives set_waiter().
+        auto state = state_;
+        return state->set_waiter(awaiter);
     }
-    
+
     T await_resume() {
         return state_->get_value();
     }
@@ -210,15 +219,18 @@ public:
     [[nodiscard]] bool await_ready() const noexcept {
         return state_->is_completed();
     }
-    
+
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        return state_->set_waiter(awaiter);
+        // Keep a local copy of the shared_ptr to prevent use-after-free.
+        // See join_handle<T>::await_suspend for detailed explanation.
+        auto state = state_;
+        return state->set_waiter(awaiter);
     }
-    
+
     void await_resume() {
         state_->get_value();
     }
-    
+
     [[nodiscard]] bool is_ready() const noexcept {
         return state_->is_completed();
     }

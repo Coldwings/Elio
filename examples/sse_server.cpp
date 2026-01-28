@@ -119,9 +119,14 @@ public:
     explicit sse_http_server(router r, server_config config = {})
         : router_(std::move(r)), config_(config) {}
     
-    coro::task<void> listen(const net::ipv4_address& addr, io::io_context& io_ctx,
-                           runtime::scheduler& sched) {
-        auto listener_result = net::tcp_listener::bind(addr, io_ctx);
+    coro::task<void> listen(const net::ipv4_address& addr) {
+        auto* sched = runtime::scheduler::current();
+        if (!sched) {
+            ELIO_LOG_ERROR("SSE server must be started from within a scheduler context");
+            co_return;
+        }
+
+        auto listener_result = net::tcp_listener::bind(addr);
         if (!listener_result) {
             ELIO_LOG_ERROR("Failed to bind SSE server: {}", strerror(errno));
             co_return;
@@ -142,7 +147,7 @@ public:
             }
             
             auto handler = handle_connection(std::move(*stream_result));
-            sched.spawn(handler.release());
+            sched->spawn(handler.release());
         }
     }
     
@@ -373,11 +378,7 @@ int main(int argc, char* argv[]) {
     sched.spawn(sig_handler.release());
     
     // Start server
-    auto server_task = srv.listen(
-        net::ipv4_address(port),
-        io::default_io_context(),
-        sched
-    );
+    auto server_task = srv.listen(net::ipv4_address(port));
     sched.spawn(server_task.release());
     
     ELIO_LOG_INFO("SSE server started on port {}", port);

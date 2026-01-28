@@ -388,29 +388,29 @@ public:
     
     /// Bind and create a TLS listener (IPv4)
     /// @return TLS listener on success, std::nullopt on error (check errno)
-    static std::optional<tls_listener> 
-    bind(const net::ipv4_address& addr, io::io_context& io_ctx, tls_context& ctx) {
-        auto tcp_result = net::tcp_listener::bind(addr, io_ctx);
+    static std::optional<tls_listener>
+    bind(const net::ipv4_address& addr, tls_context& ctx) {
+        auto tcp_result = net::tcp_listener::bind(addr);
         if (!tcp_result) {
             return std::nullopt;
         }
         return tls_listener(std::move(*tcp_result), ctx);
     }
-    
+
     /// Bind and create a TLS listener (IPv6)
     static std::optional<tls_listener>
-    bind(const net::ipv6_address& addr, io::io_context& io_ctx, tls_context& ctx) {
-        auto tcp_result = net::tcp_listener::bind(addr, io_ctx);
+    bind(const net::ipv6_address& addr, tls_context& ctx) {
+        auto tcp_result = net::tcp_listener::bind(addr);
         if (!tcp_result) {
             return std::nullopt;
         }
         return tls_listener(std::move(*tcp_result), ctx);
     }
-    
+
     /// Bind and create a TLS listener (generic address)
     static std::optional<tls_listener>
-    bind(const net::socket_address& addr, io::io_context& io_ctx, tls_context& ctx) {
-        auto tcp_result = net::tcp_listener::bind(addr, io_ctx);
+    bind(const net::socket_address& addr, tls_context& ctx) {
+        auto tcp_result = net::tcp_listener::bind(addr);
         if (!tcp_result) {
             return std::nullopt;
         }

@@ -188,10 +188,8 @@ task<void> signal_handler_task() {
 }
 
 task<void> server_main(uint16_t port, [[maybe_unused]] scheduler& sched) {
-    auto& ctx = io::default_io_context();
-    
     // Bind TCP listener
-    auto listener_result = tcp_listener::bind(ipv4_address(port), ctx);
+    auto listener_result = tcp_listener::bind(ipv4_address(port));
     if (!listener_result) {
         ELIO_LOG_ERROR("Failed to bind to port {}: {}", port, strerror(errno));
         co_return;

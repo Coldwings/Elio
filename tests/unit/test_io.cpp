@@ -532,15 +532,15 @@ TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
     auto addr = unix_address::abstract("elio_test_listener_" + std::to_string(getpid()));
     
     SECTION("bind creates listener") {
-        auto listener = uds_listener::bind(addr, default_io_context());
+        auto listener = uds_listener::bind(addr);
         REQUIRE(listener.has_value());
         REQUIRE(listener->is_valid());
         REQUIRE(listener->fd() >= 0);
         REQUIRE(listener->local_address().to_string() == addr.to_string());
     }
-    
+
     SECTION("accept returns connection") {
-        auto listener = uds_listener::bind(addr, default_io_context());
+        auto listener = uds_listener::bind(addr);
         REQUIRE(listener.has_value());
         
         // Create a client connection in a separate thread
@@ -573,6 +573,7 @@ TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
             auto stream = co_await listener->accept();
             accepted_stream = std::move(stream);
             accepted = true;
+            co_return;
         };
         
         auto t = accept_coro();
@@ -595,9 +596,9 @@ TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
 
 TEST_CASE("UDS connect", "[uds][connect]") {
     auto addr = unix_address::abstract("elio_test_connect_" + std::to_string(getpid()));
-    
+
     // Create server listener
-    auto listener = uds_listener::bind(addr, default_io_context());
+    auto listener = uds_listener::bind(addr);
     REQUIRE(listener.has_value());
     
     // Start accept in background
@@ -614,27 +615,29 @@ TEST_CASE("UDS connect", "[uds][connect]") {
         auto stream = co_await listener->accept();
         server_stream = std::move(stream);
         server_accepted = true;
+        co_return;
     };
-    
+
     auto connect_coro = [&]() -> task<void> {
         auto stream = co_await uds_connect(addr);
         client_stream = std::move(stream);
         client_connected = true;
+        co_return;
     };
-    
+
     auto accept_task = accept_coro();
     auto connect_task = connect_coro();
-    
+
     sched.spawn(accept_task.release());
     sched.spawn(connect_task.release());
-    
+
     // Wait until both complete
     for (int i = 0; i < 200 && (!server_accepted || !client_connected); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    
+
     sched.shutdown();
-    
+
     REQUIRE(server_accepted);
     REQUIRE(client_connected);
     REQUIRE(server_stream.has_value());
@@ -645,9 +648,9 @@ TEST_CASE("UDS connect", "[uds][connect]") {
 
 TEST_CASE("UDS stream read/write", "[uds][stream]") {
     auto addr = unix_address::abstract("elio_test_rw_" + std::to_string(getpid()));
-    
+
     // Create server and client
-    auto listener = uds_listener::bind(addr, default_io_context());
+    auto listener = uds_listener::bind(addr);
     REQUIRE(listener.has_value());
     
     std::optional<uds_stream> server_stream;
@@ -661,12 +664,14 @@ TEST_CASE("UDS stream read/write", "[uds][stream]") {
         auto stream = co_await listener->accept();
         server_stream = std::move(stream);
         setup_complete++;
+        co_return;
     };
-    
+
     auto connect_coro = [&]() -> task<void> {
         auto stream = co_await uds_connect(addr);
         client_stream = std::move(stream);
         setup_complete++;
+        co_return;
     };
     
     auto accept_task = accept_coro();
@@ -759,8 +764,8 @@ TEST_CASE("UDS stream read/write", "[uds][stream]") {
 
 TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
     auto addr = unix_address::abstract("elio_test_concurrent_" + std::to_string(getpid()));
-    
-    auto listener = uds_listener::bind(addr, default_io_context());
+
+    auto listener = uds_listener::bind(addr);
     REQUIRE(listener.has_value());
     
     constexpr int NUM_CLIENTS = 3;
@@ -777,33 +782,39 @@ TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
         auto stream = co_await listener->accept();
         server_streams[0] = std::move(stream);
         accepts_done++;
+        co_return;
     };
     auto accept1 = [&]() -> task<void> {
         auto stream = co_await listener->accept();
         server_streams[1] = std::move(stream);
         accepts_done++;
+        co_return;
     };
     auto accept2 = [&]() -> task<void> {
         auto stream = co_await listener->accept();
         server_streams[2] = std::move(stream);
         accepts_done++;
+        co_return;
     };
-    
+
     // Connect coroutines
     auto connect0 = [&]() -> task<void> {
         auto stream = co_await uds_connect(addr);
         client_streams[0] = std::move(stream);
         connects_done++;
+        co_return;
     };
     auto connect1 = [&]() -> task<void> {
         auto stream = co_await uds_connect(addr);
         client_streams[1] = std::move(stream);
         connects_done++;
+        co_return;
     };
     auto connect2 = [&]() -> task<void> {
         auto stream = co_await uds_connect(addr);
         client_streams[2] = std::move(stream);
         connects_done++;
+        co_return;
     };
     
     auto a0 = accept0(); auto a1 = accept1(); auto a2 = accept2();
@@ -843,34 +854,36 @@ TEST_CASE("UDS filesystem socket", "[uds][filesystem]") {
     // Ensure socket file doesn't exist
     ::unlink(path.c_str());
     
-    auto listener = uds_listener::bind(addr, default_io_context());
+    auto listener = uds_listener::bind(addr);
     REQUIRE(listener.has_value());
-    
+
     // Socket file should exist
     struct stat st;
     REQUIRE(stat(path.c_str(), &st) == 0);
     REQUIRE(S_ISSOCK(st.st_mode));
-    
+
     // Create client connection
     std::atomic<bool> connected{false};
     std::optional<uds_stream> client_stream;
-    
+
     std::atomic<bool> accepted{false};
     std::optional<uds_stream> server_stream;
-    
+
     scheduler sched(2);
     sched.start();
-    
+
     auto connect_coro = [&]() -> task<void> {
         auto stream = co_await uds_connect(addr);
         client_stream = std::move(stream);
         connected = true;
+        co_return;
     };
-    
+
     auto accept_coro = [&]() -> task<void> {
         auto stream = co_await listener->accept();
         server_stream = std::move(stream);
         accepted = true;
+        co_return;
     };
     
     auto accept_task = accept_coro();
@@ -894,8 +907,8 @@ TEST_CASE("UDS filesystem socket", "[uds][filesystem]") {
 
 TEST_CASE("UDS echo test", "[uds][echo]") {
     auto addr = unix_address::abstract("elio_test_echo_" + std::to_string(getpid()));
-    
-    auto listener = uds_listener::bind(addr, default_io_context());
+
+    auto listener = uds_listener::bind(addr);
     REQUIRE(listener.has_value());
     
     // Use a simpler pattern: thread for client, coroutine for server
@@ -1130,16 +1143,16 @@ TEST_CASE("socket_address variant operations", "[tcp][address][socket_address]")
 TEST_CASE("TCP IPv6 listener and connect", "[tcp][ipv6][integration]") {
     SECTION("IPv6 listener binds successfully") {
         // Use IPv6 loopback to avoid network issues
-        auto listener = tcp_listener::bind(ipv6_address("::1", 0), default_io_context());
+        auto listener = tcp_listener::bind(ipv6_address("::1", 0));
         REQUIRE(listener.has_value());
         REQUIRE(listener->is_valid());
         REQUIRE(listener->local_address().family() == AF_INET6);
         REQUIRE(listener->local_address().port() > 0);
     }
-    
+
     SECTION("IPv6 accept and connect") {
         // Create listener on IPv6 loopback
-        auto listener = tcp_listener::bind(ipv6_address("::1", 0), default_io_context());
+        auto listener = tcp_listener::bind(ipv6_address("::1", 0));
         REQUIRE(listener.has_value());
         
         // Get the assigned port
@@ -1158,12 +1171,14 @@ TEST_CASE("TCP IPv6 listener and connect", "[tcp][ipv6][integration]") {
             auto stream = co_await listener->accept();
             server_stream = std::move(stream);
             accepted = true;
+            co_return;
         };
-        
+
         auto connect_coro = [&]() -> task<void> {
             auto stream = co_await tcp_connect(ipv6_address("::1", port));
             client_stream = std::move(stream);
             connected = true;
+            co_return;
         };
         
         auto accept_task = accept_coro();

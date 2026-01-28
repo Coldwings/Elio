@@ -268,16 +268,14 @@ int main(int argc, char* argv[]) {
     if (use_https) {
         try {
             auto tls_ctx = tls::tls_context::make_server(cert_file, key_file);
-            
+
             auto server_task = srv.listen_tls(
-                bind_addr, 
-                io::default_io_context(), 
-                sched,
+                bind_addr,
                 tls_ctx,
                 opts
             );
             sched.spawn(server_task.release());
-            
+
             ELIO_LOG_INFO("HTTPS server started on {}", bind_addr.to_string());
         } catch (const std::exception& e) {
             ELIO_LOG_ERROR("Failed to start HTTPS server: {}", e.what());
@@ -285,13 +283,11 @@ int main(int argc, char* argv[]) {
         }
     } else {
         auto server_task = srv.listen(
-            bind_addr, 
-            io::default_io_context(), 
-            sched,
+            bind_addr,
             opts
         );
         sched.spawn(server_task.release());
-        
+
         ELIO_LOG_INFO("HTTP server started on {}", bind_addr.to_string());
     }
     

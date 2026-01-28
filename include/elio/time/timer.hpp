@@ -8,6 +8,10 @@
 #include <coroutine>
 #include <atomic>
 
+#ifdef __linux__
+#include <linux/time_types.h>  // For __kernel_timespec (available on all Linux)
+#endif
+
 namespace elio::time {
 
 /// Awaitable for sleeping/delaying execution
@@ -19,31 +23,36 @@ public:
     template<typename Rep, typename Period>
     explicit sleep_awaitable(std::chrono::duration<Rep, Period> duration)
         : duration_ns_(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count()) {}
-    
+
     /// Construct with explicit io_context
     template<typename Rep, typename Period>
     sleep_awaitable(io::io_context& ctx, std::chrono::duration<Rep, Period> duration)
         : ctx_(&ctx)
         , duration_ns_(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count()) {}
-    
+
     bool await_ready() const noexcept {
         // If duration is zero or negative, complete immediately
         return duration_ns_ <= 0;
     }
-    
+
     void await_suspend(std::coroutine_handle<> awaiter) {
         // Get io_context from current worker or use provided one
         io::io_context* ctx = ctx_;
         if (!ctx) {
             ctx = &io::current_io_context();
         }
-        
+
         // Use io_context timeout mechanism
         io::io_request req{};
         req.op = io::io_op::timeout;
         req.length = static_cast<size_t>(duration_ns_);
         req.awaiter = awaiter;
-        
+#ifdef __linux__
+        // Provide our local timespec for io_uring backend (runtime check)
+        // epoll backend ignores this field
+        req.timeout_ts = &ts_;
+#endif
+
         if (!ctx->prepare(req)) {
             // Failed to prepare, fall back to thread sleep
             ELIO_LOG_WARNING("sleep_awaitable: failed to prepare timeout, using thread sleep");
@@ -51,17 +60,20 @@ public:
             awaiter.resume();
             return;
         }
-        
+
         ctx->submit();
     }
-    
+
     void await_resume() const noexcept {
         // Nothing to return
     }
-    
+
 private:
     io::io_context* ctx_ = nullptr;
     int64_t duration_ns_;
+#ifdef __linux__
+    mutable __kernel_timespec ts_{};  // Storage for io_uring timeout (always available on Linux)
+#endif
 };
 
 /// Awaitable for cancellable sleep operations
@@ -148,7 +160,12 @@ public:
         req.op = io::io_op::timeout;
         req.length = static_cast<size_t>(duration_ns_);
         req.awaiter = awaiter;
-        
+#ifdef __linux__
+        // Provide our local timespec for io_uring backend (runtime check)
+        // epoll backend ignores this field
+        req.timeout_ts = &ts_;
+#endif
+
         if (!ctx->prepare(req)) {
             cancel_registration_.unregister();
             // Destroy unused cancel executor
@@ -158,7 +175,7 @@ public:
             }
             // Failed to prepare, fall back to polling sleep
             ELIO_LOG_WARNING("cancellable_sleep: failed to prepare timeout, using polling sleep");
-            auto end_time = std::chrono::steady_clock::now() + 
+            auto end_time = std::chrono::steady_clock::now() +
                            std::chrono::nanoseconds(duration_ns_);
             while (std::chrono::steady_clock::now() < end_time) {
                 if (token_.is_cancelled()) {
@@ -170,7 +187,7 @@ public:
             awaiter.resume();
             return;
         }
-        
+
         ctx->submit();
     }
     
@@ -229,6 +246,9 @@ private:
     std::coroutine_handle<> cancel_executor_handle_;
     std::atomic<bool> cancel_executor_handed_off_{false};
     bool cancelled_ = false;
+#ifdef __linux__
+    mutable __kernel_timespec ts_{};  // Storage for io_uring timeout (always available on Linux)
+#endif
 };
 
 /// Sleep for a duration
@@ -239,12 +259,6 @@ inline auto sleep_for(std::chrono::duration<Rep, Period> duration) {
     return sleep_awaitable(duration);
 }
 
-/// Sleep for a duration using a specific io_context
-template<typename Rep, typename Period>
-inline auto sleep_for(io::io_context& ctx, std::chrono::duration<Rep, Period> duration) {
-    return sleep_awaitable(ctx, duration);
-}
-
 /// Sleep for a duration with cancellation support
 /// @param duration Duration to sleep
 /// @param token Cancellation token - sleep returns early if cancelled
@@ -252,13 +266,6 @@ inline auto sleep_for(io::io_context& ctx, std::chrono::duration<Rep, Period> du
 template<typename Rep, typename Period>
 inline auto sleep_for(std::chrono::duration<Rep, Period> duration, coro::cancel_token token) {
     return cancellable_sleep_awaitable(duration, std::move(token));
-}
-
-/// Sleep for a duration with cancellation support using a specific io_context
-template<typename Rep, typename Period>
-inline auto sleep_for(io::io_context& ctx, std::chrono::duration<Rep, Period> duration,
-                      coro::cancel_token token) {
-    return cancellable_sleep_awaitable(ctx, duration, std::move(token));
 }
 
 /// Sleep until a time point

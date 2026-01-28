@@ -27,13 +27,13 @@ std::mutex g_mutex;
 std::condition_variable g_cv;
 
 /// Perform HTTP/2 requests demonstrating various features
-coro::task<void> run_client(io::io_context& io_ctx, const std::string& base_url) {
+coro::task<void> run_client(const std::string& base_url) {
     // Create HTTP/2 client with custom config
     h2_client_config config;
     config.user_agent = "elio-http2-client-example/1.0";
     config.max_concurrent_streams = 100;
-    
-    h2_client client(io_ctx, config);
+
+    h2_client client(config);
     
     ELIO_LOG_INFO("=== HTTP/2 Client Example ===");
     ELIO_LOG_INFO("Base URL: {}", base_url);
@@ -89,11 +89,11 @@ coro::task<void> run_client(io::io_context& io_ctx, const std::string& base_url)
 }
 
 /// Simple one-off HTTP/2 request demonstration
-coro::task<void> simple_request(io::io_context& io_ctx, const std::string& url) {
+coro::task<void> simple_request(const std::string& url) {
     ELIO_LOG_INFO("Fetching via HTTP/2: {}", url);
-    
+
     // Use convenience function for one-off requests
-    auto result = co_await h2_get(io_ctx, url);
+    auto result = co_await h2_get(url);
     
     if (result) {
         auto& resp = *result;
@@ -155,10 +155,10 @@ int main(int argc, char* argv[]) {
     
     // Run appropriate mode
     if (full_demo) {
-        auto task = run_client(io::default_io_context(), url);
+        auto task = run_client(url);
         sched.spawn(task.release());
     } else {
-        auto task = simple_request(io::default_io_context(), url);
+        auto task = simple_request(url);
         sched.spawn(task.release());
     }
     

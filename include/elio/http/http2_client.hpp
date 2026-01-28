@@ -85,10 +85,12 @@ private:
 /// HTTP/2 client with connection management
 class h2_client {
 public:
-    /// Create HTTP/2 client with I/O context
-    explicit h2_client(io::io_context& io_ctx, h2_client_config config = {})
-        : io_ctx_(&io_ctx)
-        , config_(config)
+    /// Create HTTP/2 client with default configuration
+    h2_client() : h2_client(h2_client_config{}) {}
+
+    /// Create HTTP/2 client with configuration
+    explicit h2_client(h2_client_config config)
+        : config_(config)
         , tls_ctx_(tls::tls_mode::client) {
         // Setup TLS context for HTTP/2
         tls_ctx_.use_default_verify_paths();
@@ -245,24 +247,22 @@ private:
         connections_[key] = std::move(conn);
     }
     
-    io::io_context* io_ctx_;
     h2_client_config config_;
     tls::tls_context tls_ctx_;
     std::unordered_map<std::string, h2_connection> connections_;
 };
 
 /// Convenience function for one-off HTTP/2 GET request
-inline coro::task<std::optional<response>> h2_get(io::io_context& io_ctx, std::string_view url) {
-    h2_client client(io_ctx);
+inline coro::task<std::optional<response>> h2_get(std::string_view url) {
+    h2_client client;
     co_return co_await client.get(url);
 }
 
 /// Convenience function for one-off HTTP/2 POST request
-inline coro::task<std::optional<response>> h2_post(io::io_context& io_ctx,
-                                                   std::string_view url,
+inline coro::task<std::optional<response>> h2_post(std::string_view url,
                                                    std::string_view body,
                                                    std::string_view content_type = mime::application_form_urlencoded) {
-    h2_client client(io_ctx);
+    h2_client client;
     co_return co_await client.post(url, body, content_type);
 }
 

@@ -110,27 +110,25 @@ struct unix_address {
 class uds_stream {
 public:
     /// Construct from file descriptor
-    explicit uds_stream(int fd, io::io_context& ctx) 
-        : fd_(fd), ctx_(&ctx) {
+    explicit uds_stream(int fd)
+        : fd_(fd) {
         // Make non-blocking
         int flags = fcntl(fd_, F_GETFL, 0);
         fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
     }
-    
+
     /// Move constructor
     uds_stream(uds_stream&& other) noexcept
         : fd_(other.fd_)
-        , ctx_(other.ctx_)
         , peer_addr_(std::move(other.peer_addr_)) {
         other.fd_ = -1;
     }
-    
+
     /// Move assignment
     uds_stream& operator=(uds_stream&& other) noexcept {
         if (this != &other) {
             close_sync();
             fd_ = other.fd_;
-            ctx_ = other.ctx_;
             peer_addr_ = std::move(other.peer_addr_);
             other.fd_ = -1;
         }
@@ -151,10 +149,6 @@ public:
     
     /// Get the file descriptor
     int fd() const noexcept { return fd_; }
-    
-    /// Get the I/O context
-    io::io_context& context() noexcept { return *ctx_; }
-    const io::io_context& context() const noexcept { return *ctx_; }
     
     /// Get peer address
     std::optional<unix_address> peer_address() const {
@@ -249,7 +243,6 @@ private:
     }
     
     int fd_ = -1;
-    io::io_context* ctx_;
     unix_address peer_addr_;
 };
 
@@ -258,12 +251,10 @@ class uds_listener {
 public:
     /// Create and bind a Unix Domain Socket listener
     /// @param addr Address (path) to bind to
-    /// @param ctx I/O context
     /// @param opts Socket options
     /// @return UDS listener on success, std::nullopt on error (check errno)
     static std::optional<uds_listener> bind(
         const unix_address& addr,
-        io::io_context& ctx,
         const uds_options& opts = {}) 
     {
         int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -309,25 +300,23 @@ public:
         }
         
         ELIO_LOG_INFO("UDS listener bound to {}", addr.to_string());
-        
-        return uds_listener(fd, ctx, addr, opts);
+
+        return uds_listener(fd, addr, opts);
     }
-    
+
     /// Move constructor
     uds_listener(uds_listener&& other) noexcept
         : fd_(other.fd_)
-        , ctx_(other.ctx_)
         , local_addr_(std::move(other.local_addr_))
         , opts_(other.opts_) {
         other.fd_ = -1;
     }
-    
+
     /// Move assignment
     uds_listener& operator=(uds_listener&& other) noexcept {
         if (this != &other) {
             close_sync();
             fd_ = other.fd_;
-            ctx_ = other.ctx_;
             local_addr_ = std::move(other.local_addr_);
             opts_ = other.opts_;
             other.fd_ = -1;
@@ -389,7 +378,7 @@ public:
             }
             
             int client_fd = result_.result;
-            uds_stream stream(client_fd, *listener_.ctx_);
+            uds_stream stream(client_fd);
             
             // Set peer address if available
             if (peer_addr_len_ > offsetof(struct sockaddr_un, sun_path)) {
@@ -419,8 +408,8 @@ public:
     }
     
 private:
-    uds_listener(int fd, io::io_context& ctx, const unix_address& addr, const uds_options& opts)
-        : fd_(fd), ctx_(&ctx), local_addr_(addr), opts_(opts) {}
+    uds_listener(int fd, const unix_address& addr, const uds_options& opts)
+        : fd_(fd), local_addr_(addr), opts_(opts) {}
     
     void close_sync() {
         if (fd_ >= 0) {
@@ -437,7 +426,6 @@ private:
     }
     
     int fd_ = -1;
-    io::io_context* ctx_;
     unix_address local_addr_;
     uds_options opts_;
 };
@@ -527,7 +515,7 @@ public:
             return std::nullopt;
         }
         
-        uds_stream stream(fd_, io::current_io_context());
+        uds_stream stream(fd_);
         fd_ = -1;  // Transfer ownership
         stream.set_peer_address(addr_);
         

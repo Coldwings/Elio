@@ -97,11 +97,8 @@ Async-friendly signalfd wrapper.
 // Create with automatic blocking
 signal_fd sigfd(sigs);
 
-// Create with explicit I/O context
-signal_fd sigfd(sigs, my_io_context);
-
 // Don't auto-block (caller manages signal mask)
-signal_fd sigfd(sigs, ctx, false);
+signal_fd sigfd(sigs, false);
 
 // Check validity
 if (sigfd.valid()) { /* ... */ }
@@ -189,7 +186,7 @@ int main() {
 ### 2. Handle Multiple Signal Types
 
 ```cpp
-coro::task<void> signal_router(scheduler& sched) {
+coro::task<void> signal_router() {
     signal_set sigs{SIGINT, SIGTERM, SIGUSR1, SIGUSR2, SIGHUP};
     signal_fd sigfd(sigs);
     

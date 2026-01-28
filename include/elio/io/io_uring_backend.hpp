@@ -155,10 +155,15 @@ public:
                 
             case io_op::timeout: {
                 // Timeout in nanoseconds
+                // Store timespec in user_data area of the awaiter to avoid shared state
+                // The awaiter must have a ts_ member for this to work
                 auto ns = static_cast<int64_t>(req.length);
-                ts_.tv_sec = ns / 1000000000LL;
-                ts_.tv_nsec = ns % 1000000000LL;
-                io_uring_prep_timeout(sqe, &ts_, 0, 0);
+                auto* ts = static_cast<__kernel_timespec*>(req.timeout_ts);
+                if (ts) {
+                    ts->tv_sec = ns / 1000000000LL;
+                    ts->tv_nsec = ns % 1000000000LL;
+                    io_uring_prep_timeout(sqe, ts, 0, 0);
+                }
                 break;
             }
                 
@@ -299,6 +304,9 @@ public:
         }
         return false;
     }
+
+    /// Override to indicate this is an io_uring backend
+    bool is_io_uring() const noexcept override { return true; }
     
 private:
     /// Deferred resume entry - stores handle with its result
@@ -354,8 +362,7 @@ public:
 private:
     struct io_uring ring_;                     ///< io_uring instance
     std::atomic<size_t> pending_ops_;          ///< Number of pending operations
-    struct __kernel_timespec ts_ = {};         ///< Reusable timespec for timeout ops
-    
+
     static inline thread_local io_result last_result_{};
 };
 

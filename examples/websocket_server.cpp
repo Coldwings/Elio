@@ -316,11 +316,7 @@ int main(int argc, char* argv[]) {
     sched.spawn(sig_handler.release());
     
     // Start server
-    auto server_task = srv.listen(
-        net::ipv4_address(port),
-        io::default_io_context(),
-        sched
-    );
+    auto server_task = srv.listen(net::ipv4_address(port));
     sched.spawn(server_task.release());
     
     ELIO_LOG_INFO("WebSocket server started on port {}", port);

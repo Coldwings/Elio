@@ -1,0 +1,377 @@
+# Performance Tuning Guide
+
+This guide covers performance optimization techniques for Elio applications.
+
+## Overview
+
+Elio is designed for high performance through:
+- Lock-free data structures (Chase-Lev deque)
+- Work-stealing scheduler
+- Efficient I/O backends (io_uring, epoll)
+- Custom coroutine frame allocator
+- Minimal synchronization overhead
+
+## Scheduler Tuning
+
+### Thread Count
+
+```cpp
+#include <elio/runtime/scheduler.hpp>
+
+// Default: matches hardware concurrency
+scheduler sched;
+
+// Custom thread count
+scheduler sched(8);  // 8 worker threads
+
+// For I/O-bound workloads, consider more threads than cores
+scheduler sched(std::thread::hardware_concurrency() * 2);
+
+// For CPU-bound workloads, match core count
+scheduler sched(std::thread::hardware_concurrency());
+```
+
+### Dynamic Thread Adjustment
+
+```cpp
+// Enable dynamic thread pool sizing
+sched.set_min_threads(2);
+sched.set_max_threads(16);
+
+// Scheduler will add threads under load and remove idle threads
+```
+
+### Thread Affinity
+
+Pin coroutines to specific workers for cache locality:
+
+```cpp
+#include <elio/coro/affinity.hpp>
+
+coro::task<void> cache_sensitive_work() {
+    // Pin to current worker
+    co_await coro::pin_to_current_worker();
+
+    // All subsequent work stays on this worker
+    process_data();
+}
+
+// Or set affinity explicitly
+coro::set_affinity(handle, worker_id);
+```
+
+## I/O Backend Selection
+
+### io_uring vs epoll
+
+Elio auto-detects the best available backend:
+
+```cpp
+#include <elio/io/io_context.hpp>
+
+// Auto-detect (prefers io_uring)
+io::io_context ctx;
+
+// Force specific backend
+io::io_context ctx(io::io_context::backend_type::io_uring);
+io::io_context ctx(io::io_context::backend_type::epoll);
+
+// Check active backend
+std::cout << "Backend: " << ctx.get_backend_name() << std::endl;
+```
+
+**io_uring advantages:**
+- Batched syscalls (fewer context switches)
+- Kernel-side I/O completion
+- Better for high-throughput scenarios
+
+**epoll fallback:**
+- Works on older kernels (pre-5.1)
+- Lower memory overhead
+- Adequate for moderate workloads
+
+### io_uring Kernel Requirements
+
+For best io_uring performance:
+- Linux 5.1+: Basic io_uring
+- Linux 5.6+: Full features
+- Linux 5.11+: Multi-shot accept
+
+## Memory Management
+
+### Coroutine Frame Allocator
+
+Elio uses a thread-local pool allocator for coroutine frames:
+
+```cpp
+// Configured in frame_allocator.hpp
+static constexpr size_t MAX_FRAME_SIZE = 256;  // Max pooled size
+static constexpr size_t POOL_SIZE = 1024;       // Pool capacity
+
+// Statistics (if enabled)
+auto stats = coro::frame_allocator::get_stats();
+std::cout << "Allocations: " << stats.allocations << std::endl;
+std::cout << "Pool hits: " << stats.pool_hits << std::endl;
+```
+
+### Avoiding Allocations
+
+Keep coroutine frames small for pool allocation:
+
+```cpp
+// Bad: Large array in coroutine frame (can't use pool)
+coro::task<void> large_frame() {
+    char buffer[8192];  // Too large for pool
+    co_await read_data(buffer);
+}
+
+// Good: Allocate separately
+coro::task<void> small_frame() {
+    auto buffer = std::make_unique<char[]>(8192);
+    co_await read_data(buffer.get());
+}
+```
+
+## Synchronization Primitives
+
+### Mutex Performance
+
+Elio's mutex uses atomic fast-path for uncontended cases:
+
+```cpp
+#include <elio/sync/primitives.hpp>
+
+sync::mutex mtx;
+
+// Fast path: atomic CAS (~10ns)
+// Slow path: suspend and queue (~100ns + context switch)
+
+coro::task<void> critical_section() {
+    co_await mtx.lock();
+    // ... critical section ...
+    mtx.unlock();
+}
+
+// Use try_lock to avoid blocking
+if (mtx.try_lock()) {
+    // Got lock immediately
+    mtx.unlock();
+} else {
+    // Skip or retry later
+}
+```
+
+### Reader-Writer Lock
+
+For read-heavy workloads:
+
+```cpp
+sync::shared_mutex rw_mtx;
+
+// Multiple concurrent readers (atomic counter, no blocking)
+coro::task<void> reader() {
+    co_await rw_mtx.lock_shared();
+    auto data = read_data();
+    rw_mtx.unlock_shared();
+}
+
+// Exclusive writers
+coro::task<void> writer() {
+    co_await rw_mtx.lock();
+    write_data();
+    rw_mtx.unlock();
+}
+```
+
+### Channel Selection
+
+Choose appropriate channel type:
+
+```cpp
+// Bounded channel: back-pressure, bounded memory
+sync::channel<int> ch(100);
+
+// Unbounded channel: faster but can grow indefinitely
+sync::unbounded_channel<int> uch;
+
+// SPSC queue: single producer/consumer (fastest)
+runtime::spsc_queue<int> spsc(1000);
+```
+
+## Network Performance
+
+### Connection Pooling
+
+HTTP client uses connection pooling by default:
+
+```cpp
+http::client_config config;
+config.max_connections_per_host = 10;  // Pool size per host
+config.pool_idle_timeout = std::chrono::seconds(60);
+
+http::client client(ctx, config);
+```
+
+### Buffer Sizes
+
+Tune read buffer sizes for your workload:
+
+```cpp
+http::client_config config;
+config.read_buffer_size = 16384;  // 16KB (default: 8KB)
+
+// For large payloads
+config.read_buffer_size = 65536;  // 64KB
+```
+
+### TCP Settings
+
+Configure TCP options for performance:
+
+```cpp
+// Enable TCP_NODELAY for latency-sensitive applications
+net::tcp_stream stream = /* ... */;
+stream.set_nodelay(true);
+
+// Adjust send/receive buffers
+stream.set_send_buffer_size(65536);
+stream.set_recv_buffer_size(65536);
+```
+
+## Profiling and Monitoring
+
+### Scheduler Statistics
+
+```cpp
+// Get scheduler metrics
+auto stats = sched.get_stats();
+std::cout << "Tasks spawned: " << stats.tasks_spawned << std::endl;
+std::cout << "Tasks completed: " << stats.tasks_completed << std::endl;
+std::cout << "Steals: " << stats.work_steals << std::endl;
+std::cout << "Average queue depth: " << stats.avg_queue_depth << std::endl;
+```
+
+### Logging Overhead
+
+Debug logging has overhead; disable in production:
+
+```cpp
+// Set at compile time
+// cmake -DELIO_DEBUG=OFF ..
+
+// Or at runtime
+elio::log::set_level(elio::log::level::warning);
+```
+
+### Coroutine Stack Tracing
+
+Use virtual stack for debugging without significant overhead:
+
+```cpp
+// Enable in debug builds only
+#ifdef ELIO_DEBUG
+    auto* frame = coro::current_frame();
+    print_stack_trace(frame);
+#endif
+```
+
+## Benchmarking Tips
+
+### Warm-up
+
+```cpp
+// Warm up allocators and caches
+for (int i = 0; i < 1000; i++) {
+    warmup_task().go();
+}
+sched.sync();
+
+// Now measure
+auto start = std::chrono::steady_clock::now();
+// ... actual benchmark ...
+auto end = std::chrono::steady_clock::now();
+```
+
+### Avoid Measurement Overhead
+
+```cpp
+// Bad: timing inside hot loop
+for (int i = 0; i < 1000000; i++) {
+    auto start = now();  // Overhead!
+    do_work();
+    auto end = now();
+    record(end - start);
+}
+
+// Good: time the whole batch
+auto start = now();
+for (int i = 0; i < 1000000; i++) {
+    do_work();
+}
+auto end = now();
+auto avg = (end - start) / 1000000;
+```
+
+### Use Release Builds
+
+Always benchmark with optimizations:
+
+```bash
+cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake --build .
+```
+
+## Common Performance Issues
+
+### Problem: High Latency Spikes
+
+**Causes:**
+- Work stealing delays
+- GC pauses in other processes
+- Kernel scheduling
+
+**Solutions:**
+- Pin critical tasks to workers
+- Use CPU affinity for scheduler threads
+- Consider real-time scheduling
+
+### Problem: Low Throughput
+
+**Causes:**
+- Lock contention
+- Inefficient I/O batching
+- Small buffer sizes
+
+**Solutions:**
+- Profile lock contention
+- Use io_uring for batching
+- Increase buffer sizes
+
+### Problem: High Memory Usage
+
+**Causes:**
+- Unbounded channels
+- Large coroutine frames
+- Connection pool growth
+
+**Solutions:**
+- Use bounded channels
+- Allocate large buffers separately
+- Limit connection pool size
+
+## Quick Reference
+
+| Scenario | Recommendation |
+|----------|----------------|
+| I/O-bound | 2x core count threads |
+| CPU-bound | 1x core count threads |
+| Latency-critical | Pin to workers, io_uring |
+| Throughput-critical | Large buffers, batching |
+| Memory-constrained | Bounded channels, small pools |
+| Read-heavy sync | Use shared_mutex |
+
+## See Also
+
+- [Core Concepts](Core-Concepts.md)
+- [Debugging Guide](Debugging.md)
+- [HTTP/2 Guide](HTTP2-Guide.md)

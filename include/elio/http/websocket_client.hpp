@@ -14,9 +14,8 @@
 #include <elio/http/websocket_handshake.hpp>
 #include <elio/http/http_common.hpp>
 #include <elio/http/http_parser.hpp>
-#include <elio/net/tcp.hpp>
-#include <elio/tls/tls_context.hpp>
-#include <elio/tls/tls_stream.hpp>
+#include <elio/http/client_base.hpp>
+#include <elio/net/stream.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/coro/cancel_token.hpp>
@@ -25,42 +24,35 @@
 #include <string>
 #include <string_view>
 #include <memory>
-#include <variant>
 #include <optional>
 #include <vector>
 
 namespace elio::http::websocket {
 
 /// WebSocket client configuration
-struct client_config {
-    std::chrono::seconds connect_timeout{10};     ///< Connection timeout
-    std::chrono::seconds read_timeout{30};        ///< Read timeout
+struct client_config : http::base_client_config {
     size_t max_message_size = 16 * 1024 * 1024;   ///< Max message size (16MB)
-    size_t read_buffer_size = 8192;               ///< Read buffer size
     std::vector<std::string> subprotocols;        ///< Requested subprotocols
     std::string origin;                           ///< Origin header (for browser compatibility)
-    std::string user_agent = "elio-websocket/1.0"; ///< User-Agent header
-    bool verify_certificate = true;               ///< Verify TLS certificates
+
+    client_config() {
+        user_agent = "elio-websocket/1.0";
+    }
 };
 
 /// WebSocket client connection
 class ws_client {
 public:
-    using stream_type = std::variant<std::monostate, net::tcp_stream, tls::tls_stream>;
-    
-    /// Create WebSocket client with I/O context
-    explicit ws_client(io::io_context& io_ctx, client_config config = {})
-        : io_ctx_(&io_ctx)
-        , config_(config)
+    /// Create WebSocket client with default configuration
+    ws_client() : ws_client(client_config{}) {}
+
+    /// Create WebSocket client with configuration
+    explicit ws_client(client_config config)
+        : config_(config)
         , tls_ctx_(tls::tls_mode::client) {
-        // Setup TLS context
-        tls_ctx_.use_default_verify_paths();
-        if (config_.verify_certificate) {
-            tls_ctx_.set_verify_mode(tls::verify_mode::peer);
-        } else {
-            tls_ctx_.set_verify_mode(tls::verify_mode::none);
-        }
-        
+        // Setup TLS context using shared utility
+        http::init_client_tls_context(tls_ctx_, config_.verify_certificate);
+
         parser_.set_max_message_size(config_.max_message_size);
         buffer_.resize(config_.read_buffer_size);
     }
@@ -141,21 +133,18 @@ public:
         if (state_ != connection_state::open) {
             co_return;
         }
-        
+
         state_ = connection_state::closing;
-        
+
         auto frame = encode_close_frame(code, reason, true);
         co_await send_raw(frame);
-        
+
         // Wait for close response (with timeout)
         // Simplified: just mark as closed
         state_ = connection_state::closed;
-        
-        // Cleanup stream
-        if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_await std::get<tls::tls_stream>(stream_).shutdown();
-        }
-        stream_ = std::monostate{};
+
+        // Cleanup stream using unified close
+        co_await stream_.close();
     }
     
     /// Receive next message (blocks until message available or connection closed)
@@ -255,26 +244,16 @@ private:
             co_return false;
         }
         
-        // Establish TCP connection
-        if (secure_) {
-            auto result = co_await tls::tls_connect(tls_ctx_, host_, port);
-            if (!result) {
-                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host_, port, strerror(errno));
-                co_return false;
-            }
-            stream_ = std::move(*result);
-        } else {
-            auto result = co_await net::tcp_connect(host_, port);
-            if (!result) {
-                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host_, port, strerror(errno));
-                co_return false;
-            }
-            stream_ = std::move(*result);
+        // Establish connection using shared utility
+        auto conn_result = co_await http::client_connect(host_, port, secure_, &tls_ctx_);
+        if (!conn_result) {
+            co_return false;
         }
+        stream_ = std::move(*conn_result);
         
         // Check cancellation before handshake
         if (token.is_cancelled()) {
-            stream_ = std::monostate{};
+            stream_.disconnect();
             co_return false;
         }
         
@@ -449,21 +428,11 @@ private:
     }
     
     coro::task<io::io_result> read(void* buf, size_t len) {
-        if (std::holds_alternative<net::tcp_stream>(stream_)) {
-            co_return co_await std::get<net::tcp_stream>(stream_).read(buf, len);
-        } else if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_return co_await std::get<tls::tls_stream>(stream_).read(buf, len);
-        }
-        co_return io::io_result{-ENOTCONN, 0};
+        co_return co_await stream_.read(buf, len);
     }
-    
+
     coro::task<io::io_result> write(const void* buf, size_t len) {
-        if (std::holds_alternative<net::tcp_stream>(stream_)) {
-            co_return co_await std::get<net::tcp_stream>(stream_).write(buf, len);
-        } else if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_return co_await std::get<tls::tls_stream>(stream_).write(buf, len);
-        }
-        co_return io::io_result{-ENOTCONN, 0};
+        co_return co_await stream_.write(buf, len);
     }
     
     coro::task<bool> send_raw(const std::vector<uint8_t>& data) {
@@ -509,10 +478,9 @@ private:
         }
     }
     
-    io::io_context* io_ctx_;
     client_config config_;
     tls::tls_context tls_ctx_;
-    stream_type stream_;
+    net::stream stream_;
     
     std::string host_;
     std::string path_;
@@ -527,9 +495,9 @@ private:
 };
 
 /// Convenience function for one-off WebSocket connection
-inline coro::task<std::optional<ws_client>> 
-ws_connect(io::io_context& io_ctx, std::string_view url, client_config config = {}) {
-    auto client = std::make_optional<ws_client>(io_ctx, config);
+inline coro::task<std::optional<ws_client>>
+ws_connect(std::string_view url, client_config config = {}) {
+    auto client = std::make_optional<ws_client>(config);
     bool success = co_await client->connect(url);
     if (!success) {
         co_return std::nullopt;

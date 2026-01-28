@@ -12,9 +12,8 @@
 #include <elio/http/sse_server.hpp>
 #include <elio/http/http_common.hpp>
 #include <elio/http/http_parser.hpp>
-#include <elio/net/tcp.hpp>
-#include <elio/tls/tls_context.hpp>
-#include <elio/tls/tls_stream.hpp>
+#include <elio/http/client_base.hpp>
+#include <elio/net/stream.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/coro/cancel_token.hpp>
@@ -24,7 +23,6 @@
 #include <string>
 #include <string_view>
 #include <memory>
-#include <variant>
 #include <optional>
 #include <vector>
 #include <functional>
@@ -32,15 +30,16 @@
 namespace elio::http::sse {
 
 /// SSE client configuration
-struct client_config {
-    std::chrono::seconds connect_timeout{10};     ///< Connection timeout
-    size_t read_buffer_size = 4096;               ///< Read buffer size
+struct client_config : http::base_client_config {
     int default_retry_ms = 3000;                  ///< Default reconnect interval
     bool auto_reconnect = true;                   ///< Enable auto-reconnection
     size_t max_reconnect_attempts = 0;            ///< Max reconnect attempts (0 = unlimited)
     std::string last_event_id;                    ///< Initial Last-Event-ID
-    std::string user_agent = "elio-sse-client/1.0"; ///< User-Agent header
-    bool verify_certificate = true;               ///< Verify TLS certificates
+
+    client_config() {
+        user_agent = "elio-sse-client/1.0";
+        read_buffer_size = 4096;  // SSE uses smaller buffer
+    }
 };
 
 /// SSE connection state
@@ -195,23 +194,18 @@ private:
 /// SSE client
 class sse_client {
 public:
-    using stream_type = std::variant<std::monostate, net::tcp_stream, tls::tls_stream>;
-    
-    /// Create SSE client with I/O context
-    explicit sse_client(io::io_context& io_ctx, client_config config = {})
-        : io_ctx_(&io_ctx)
-        , config_(config)
+    /// Create SSE client with default configuration
+    sse_client() : sse_client(client_config{}) {}
+
+    /// Create SSE client with configuration
+    explicit sse_client(client_config config)
+        : config_(config)
         , tls_ctx_(tls::tls_mode::client) {
-        // Setup TLS context
-        tls_ctx_.use_default_verify_paths();
-        if (config_.verify_certificate) {
-            tls_ctx_.set_verify_mode(tls::verify_mode::peer);
-        } else {
-            tls_ctx_.set_verify_mode(tls::verify_mode::none);
-        }
-        
+        // Setup TLS context using shared utility
+        http::init_client_tls_context(tls_ctx_, config_.verify_certificate);
+
         buffer_.resize(config_.read_buffer_size);
-        
+
         if (!config_.last_event_id.empty()) {
             last_event_id_ = config_.last_event_id;
         }
@@ -265,11 +259,7 @@ public:
     /// Close the connection
     coro::task<void> close() {
         state_ = client_state::closed;
-        
-        if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_await std::get<tls::tls_stream>(stream_).shutdown();
-        }
-        stream_ = std::monostate{};
+        co_await stream_.close();
     }
     
     /// Get TLS context for configuration
@@ -358,31 +348,17 @@ private:
     }
 
     coro::task<bool> do_connect() {
-        ELIO_LOG_DEBUG("Connecting to SSE endpoint {}:{}{}", 
+        ELIO_LOG_DEBUG("Connecting to SSE endpoint {}:{}{}",
                       url_.host, url_.effective_port(), url_.path);
-        
-        // Establish TCP connection
-        if (url_.is_secure()) {
-            auto result = co_await tls::tls_connect(tls_ctx_, 
-                                                     url_.host, url_.effective_port());
-            if (!result) {
-                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", 
-                              url_.host, url_.effective_port(), strerror(errno));
-                state_ = client_state::disconnected;
-                co_return false;
-            }
-            stream_ = std::move(*result);
-        } else {
-            auto result = co_await net::tcp_connect(url_.host, 
-                                                     url_.effective_port());
-            if (!result) {
-                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", 
-                              url_.host, url_.effective_port(), strerror(errno));
-                state_ = client_state::disconnected;
-                co_return false;
-            }
-            stream_ = std::move(*result);
+
+        // Establish connection using shared utility
+        auto conn_result = co_await http::client_connect(
+            url_.host, url_.effective_port(), url_.is_secure(), &tls_ctx_);
+        if (!conn_result) {
+            state_ = client_state::disconnected;
+            co_return false;
         }
+        stream_ = std::move(*conn_result);
         
         // Send HTTP request
         std::string request;
@@ -479,12 +455,9 @@ private:
     coro::task<bool> try_reconnect() {
         // Reset parser but keep last_event_id
         parser_.reset();
-        
+
         // Close current connection
-        if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_await std::get<tls::tls_stream>(stream_).shutdown();
-        }
-        stream_ = std::monostate{};
+        co_await stream_.close();
         
         // Get retry interval
         int retry_ms = parser_.retry_ms();
@@ -536,27 +509,16 @@ private:
     }
     
     coro::task<io::io_result> read(void* buf, size_t len) {
-        if (std::holds_alternative<net::tcp_stream>(stream_)) {
-            co_return co_await std::get<net::tcp_stream>(stream_).read(buf, len);
-        } else if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_return co_await std::get<tls::tls_stream>(stream_).read(buf, len);
-        }
-        co_return io::io_result{-ENOTCONN, 0};
+        co_return co_await stream_.read(buf, len);
     }
-    
+
     coro::task<io::io_result> write(const void* buf, size_t len) {
-        if (std::holds_alternative<net::tcp_stream>(stream_)) {
-            co_return co_await std::get<net::tcp_stream>(stream_).write(buf, len);
-        } else if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_return co_await std::get<tls::tls_stream>(stream_).write(buf, len);
-        }
-        co_return io::io_result{-ENOTCONN, 0};
+        co_return co_await stream_.write(buf, len);
     }
     
-    io::io_context* io_ctx_;
     client_config config_;
     tls::tls_context tls_ctx_;
-    stream_type stream_;
+    net::stream stream_;
     coro::cancel_token token_;  ///< Cancellation token for connection
     
     url url_;
@@ -567,9 +529,9 @@ private:
 };
 
 /// Convenience function for one-off SSE connection
-inline coro::task<std::optional<sse_client>> 
-sse_connect(io::io_context& io_ctx, std::string_view url, client_config config = {}) {
-    auto client = std::make_optional<sse_client>(io_ctx, config);
+inline coro::task<std::optional<sse_client>>
+sse_connect(std::string_view url, client_config config = {}) {
+    auto client = std::make_optional<sse_client>(config);
     bool success = co_await client->connect(url);
     if (!success) {
         co_return std::nullopt;
@@ -578,10 +540,9 @@ sse_connect(io::io_context& io_ctx, std::string_view url, client_config config =
 }
 
 /// Convenience function for one-off SSE connection with cancellation support
-inline coro::task<std::optional<sse_client>> 
-sse_connect(io::io_context& io_ctx, std::string_view url, coro::cancel_token token,
-            client_config config = {}) {
-    auto client = std::make_optional<sse_client>(io_ctx, config);
+inline coro::task<std::optional<sse_client>>
+sse_connect(std::string_view url, coro::cancel_token token, client_config config = {}) {
+    auto client = std::make_optional<sse_client>(config);
     bool success = co_await client->connect(url, std::move(token));
     if (!success) {
         co_return std::nullopt;

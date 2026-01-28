@@ -88,14 +88,11 @@ task<void> handle_client(uds_stream stream, int client_id) {
 
 /// Main server loop - accepts connections and spawns handlers
 task<void> server_main(const unix_address& addr, scheduler& sched) {
-    // Use the default io_context which is polled by scheduler workers
-    auto& ctx = io::default_io_context();
-    
     // Bind UDS listener
     uds_options opts;
     opts.unlink_on_bind = true;  // Remove existing socket file if any
-    
-    auto listener_result = uds_listener::bind(addr, ctx, opts);
+
+    auto listener_result = uds_listener::bind(addr, opts);
     if (!listener_result) {
         ELIO_LOG_ERROR("Failed to bind to {}: {}", addr.to_string(),
                       strerror(errno));

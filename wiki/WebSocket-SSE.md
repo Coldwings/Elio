@@ -51,8 +51,7 @@ int main() {
     runtime::scheduler sched(4);
     sched.start();
     
-    auto task = srv.listen(net::ipv4_address(8080), 
-                          io::default_io_context(), sched);
+    auto task = srv.listen(net::ipv4_address(8080));
     sched.spawn(task.release());
     
     // Run until stopped...
@@ -71,13 +70,11 @@ using namespace elio;
 using namespace elio::http::websocket;
 
 coro::task<void> connect_example() {
-    auto& ctx = io::default_io_context();
-    
     // Create client
     client_config config;
     config.subprotocols = {"chat", "json"};  // Optional subprotocols
-    
-    ws_client client(ctx, config);
+
+    ws_client client(config);
     
     // Connect to server
     if (!co_await client.connect("ws://localhost:8080/ws")) {

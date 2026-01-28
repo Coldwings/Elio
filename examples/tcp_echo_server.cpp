@@ -98,11 +98,8 @@ task<void> handle_client(tcp_stream stream, int client_id) {
 
 /// Main server loop - accepts connections and spawns handlers
 task<void> server_main(const socket_address& bind_addr, const tcp_options& opts, scheduler& sched) {
-    // Use the default io_context which is polled by scheduler workers
-    auto& ctx = io::default_io_context();
-    
     // Bind TCP listener
-    auto listener_result = tcp_listener::bind(bind_addr, ctx, opts);
+    auto listener_result = tcp_listener::bind(bind_addr, opts);
     if (!listener_result) {
         ELIO_LOG_ERROR("Failed to bind to {}: {}", bind_addr.to_string(),
                       strerror(errno));

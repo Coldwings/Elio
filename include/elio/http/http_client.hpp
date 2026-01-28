@@ -3,9 +3,8 @@
 #include <elio/http/http_common.hpp>
 #include <elio/http/http_parser.hpp>
 #include <elio/http/http_message.hpp>
-#include <elio/net/tcp.hpp>
-#include <elio/tls/tls_context.hpp>
-#include <elio/tls/tls_stream.hpp>
+#include <elio/http/client_base.hpp>
+#include <elio/net/stream.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/coro/cancel_token.hpp>
@@ -14,7 +13,6 @@
 #include <string>
 #include <string_view>
 #include <memory>
-#include <variant>
 #include <deque>
 #include <mutex>
 #include <unordered_map>
@@ -24,94 +22,19 @@
 namespace elio::http {
 
 /// HTTP client configuration
-struct client_config {
-    std::chrono::seconds connect_timeout{10};     ///< Connection timeout
-    std::chrono::seconds read_timeout{30};        ///< Read timeout
+struct client_config : base_client_config {
     size_t max_redirects = 5;                     ///< Max redirects to follow
     bool follow_redirects = true;                 ///< Auto-follow redirects
-    size_t read_buffer_size = 8192;               ///< Read buffer size
     size_t max_connections_per_host = 6;          ///< Max connections per host
     std::chrono::seconds pool_idle_timeout{60};   ///< Idle connection timeout
-    std::string user_agent = "elio-http/1.0";     ///< User-Agent header
+
+    client_config() {
+        user_agent = "elio-http/1.0";
+    }
 };
 
-/// Connection wrapper (TCP or TLS)
-class connection {
-public:
-    using stream_type = std::variant<std::monostate, net::tcp_stream, tls::tls_stream>;
-    
-    connection() = default;
-    
-    /// Create plain TCP connection
-    explicit connection(net::tcp_stream tcp)
-        : stream_(std::move(tcp)), secure_(false) {}
-    
-    /// Create TLS connection
-    explicit connection(tls::tls_stream tls)
-        : stream_(std::move(tls)), secure_(true) {}
-    
-    // Move only
-    connection(connection&&) = default;
-    connection& operator=(connection&&) = default;
-    connection(const connection&) = delete;
-    connection& operator=(const connection&) = delete;
-    
-    /// Check if connected
-    bool is_connected() const noexcept {
-        return !std::holds_alternative<std::monostate>(stream_);
-    }
-    
-    /// Check if secure (TLS)
-    bool is_secure() const noexcept { return secure_; }
-    
-    /// Read data
-    coro::task<io::io_result> read(void* buffer, size_t length) {
-        if (std::holds_alternative<net::tcp_stream>(stream_)) {
-            co_return co_await std::get<net::tcp_stream>(stream_).read(buffer, length);
-        } else if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_return co_await std::get<tls::tls_stream>(stream_).read(buffer, length);
-        }
-        co_return io::io_result{-ENOTCONN, 0};
-    }
-    
-    /// Write data
-    coro::task<io::io_result> write(const void* buffer, size_t length) {
-        if (std::holds_alternative<net::tcp_stream>(stream_)) {
-            co_return co_await std::get<net::tcp_stream>(stream_).write(buffer, length);
-        } else if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_return co_await std::get<tls::tls_stream>(stream_).write(buffer, length);
-        }
-        co_return io::io_result{-ENOTCONN, 0};
-    }
-    
-    /// Write string
-    coro::task<io::io_result> write(std::string_view data) {
-        return write(data.data(), data.size());
-    }
-    
-    /// Close connection
-    coro::task<void> close() {
-        if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_await std::get<tls::tls_stream>(stream_).shutdown();
-        }
-        stream_ = std::monostate{};
-    }
-    
-    /// Get last use time
-    std::chrono::steady_clock::time_point last_use() const noexcept {
-        return last_use_;
-    }
-    
-    /// Update last use time
-    void touch() {
-        last_use_ = std::chrono::steady_clock::now();
-    }
-    
-private:
-    stream_type stream_;
-    bool secure_ = false;
-    std::chrono::steady_clock::time_point last_use_ = std::chrono::steady_clock::now();
-};
+/// Connection wrapper using unified net::stream
+using connection = net::stream;
 
 /// Connection pool for HTTP keep-alive
 class connection_pool {
@@ -120,12 +43,12 @@ public:
         : config_(config) {}
     
     /// Get or create a connection to host
-    coro::task<std::optional<connection>> acquire(const std::string& host, 
+    coro::task<std::optional<connection>> acquire(const std::string& host,
                                                    uint16_t port,
                                                    bool secure,
                                                    tls::tls_context* tls_ctx = nullptr) {
         std::string key = make_key(host, port, secure);
-        
+
         // Try to get an existing connection
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -133,7 +56,7 @@ public:
             if (it != pools_.end() && !it->second.empty()) {
                 auto conn = std::move(it->second.front());
                 it->second.pop_front();
-                
+
                 // Check if connection is still valid (not too old)
                 auto age = std::chrono::steady_clock::now() - conn.last_use();
                 if (age < config_.pool_idle_timeout) {
@@ -143,30 +66,14 @@ public:
                 // Connection too old, let it close
             }
         }
-        
-        // Create new connection
-        if (secure) {
-            if (!tls_ctx) {
-                ELIO_LOG_ERROR("TLS context required for HTTPS connection");
-                co_return std::nullopt;
-            }
-            
-            auto result = co_await tls::tls_connect(*tls_ctx, host, port);
-            if (!result) {
-                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(errno));
-                co_return std::nullopt;
-            }
-            
-            co_return connection(std::move(*result));
-        } else {
-            auto result = co_await net::tcp_connect(host, port);
-            if (!result) {
-                ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(errno));
-                co_return std::nullopt;
-            }
-            
-            co_return connection(std::move(*result));
+
+        // Create new connection using client_connect utility
+        auto result = co_await client_connect(host, port, secure, tls_ctx);
+        if (!result) {
+            co_return std::nullopt;
         }
+
+        co_return std::move(*result);
     }
     
     /// Return a connection to the pool
@@ -202,15 +109,16 @@ private:
 /// HTTP client
 class client {
 public:
-    /// Create client with I/O context
-    explicit client(io::io_context& io_ctx, client_config config = {})
-        : io_ctx_(&io_ctx)
-        , config_(config)
+    /// Create client with default configuration
+    client() : client(client_config{}) {}
+
+    /// Create client with configuration
+    explicit client(client_config config)
+        : config_(config)
         , pool_(config)
         , tls_ctx_(tls::tls_mode::client) {
-        // Setup default TLS context
-        tls_ctx_.use_default_verify_paths();
-        tls_ctx_.set_verify_mode(tls::verify_mode::peer);
+        // Setup TLS context using shared utility
+        init_client_tls_context(tls_ctx_, config_.verify_certificate);
     }
     
     /// Perform HTTP GET request
@@ -507,7 +415,6 @@ private:
         co_return resp;
     }
     
-    io::io_context* io_ctx_;
     client_config config_;
     connection_pool pool_;
     tls::tls_context tls_ctx_;
@@ -517,35 +424,32 @@ private:
 
 /// Perform HTTP GET request
 /// @return Response on success, std::nullopt on error (check errno)
-inline coro::task<std::optional<response>> get(io::io_context& io_ctx, std::string_view url) {
-    client c(io_ctx);
+inline coro::task<std::optional<response>> get(std::string_view url) {
+    client c;
     co_return co_await c.get(url);
 }
 
 /// Perform HTTP GET request with cancellation support
-inline coro::task<std::optional<response>> get(io::io_context& io_ctx, std::string_view url, 
-                                                     coro::cancel_token token) {
-    client c(io_ctx);
+inline coro::task<std::optional<response>> get(std::string_view url, coro::cancel_token token) {
+    client c;
     co_return co_await c.get(url, std::move(token));
 }
 
 /// Perform HTTP POST request
 /// @return Response on success, std::nullopt on error (check errno)
-inline coro::task<std::optional<response>> post(io::io_context& io_ctx, 
-                                                      std::string_view url,
-                                                      std::string_view body,
-                                                      std::string_view content_type = mime::application_form_urlencoded) {
-    client c(io_ctx);
+inline coro::task<std::optional<response>> post(std::string_view url,
+                                                std::string_view body,
+                                                std::string_view content_type = mime::application_form_urlencoded) {
+    client c;
     co_return co_await c.post(url, body, content_type);
 }
 
 /// Perform HTTP POST request with cancellation support
-inline coro::task<std::optional<response>> post(io::io_context& io_ctx, 
-                                                      std::string_view url,
-                                                      std::string_view body,
-                                                      coro::cancel_token token,
-                                                      std::string_view content_type = mime::application_form_urlencoded) {
-    client c(io_ctx);
+inline coro::task<std::optional<response>> post(std::string_view url,
+                                                std::string_view body,
+                                                coro::cancel_token token,
+                                                std::string_view content_type = mime::application_form_urlencoded) {
+    client c;
     co_return co_await c.post(url, body, std::move(token), content_type);
 }
 

@@ -241,20 +241,25 @@ public:
     }
     
     /// Start listening on address (plain HTTP)
-    coro::task<void> listen(const net::socket_address& addr, io::io_context& io_ctx, 
-                           runtime::scheduler& sched,
+    coro::task<void> listen(const net::socket_address& addr,
                            const net::tcp_options& opts = {}) {
-        auto listener_result = net::tcp_listener::bind(addr, io_ctx, opts);
+        auto* sched = runtime::scheduler::current();
+        if (!sched) {
+            ELIO_LOG_ERROR("HTTP server must be started from within a scheduler context");
+            co_return;
+        }
+
+        auto listener_result = net::tcp_listener::bind(addr, opts);
         if (!listener_result) {
             ELIO_LOG_ERROR("Failed to bind HTTP server: {}", strerror(errno));
             co_return;
         }
-        
+
         ELIO_LOG_INFO("HTTP server listening on {}", addr.to_string());
-        
+
         auto& listener = *listener_result;
         running_ = true;
-        
+
         while (running_) {
             auto stream_result = co_await listener.accept();
             if (!stream_result) {
@@ -263,28 +268,34 @@ public:
                 }
                 continue;
             }
-            
+
             // Spawn connection handler
             auto handler = handle_connection(std::move(*stream_result));
-            sched.spawn(handler.release());
+            sched->spawn(handler.release());
         }
     }
-    
+
     /// Start listening with TLS (HTTPS)
-    coro::task<void> listen_tls(const net::socket_address& addr, io::io_context& io_ctx,
-                                runtime::scheduler& sched, tls::tls_context& tls_ctx,
+    coro::task<void> listen_tls(const net::socket_address& addr,
+                                tls::tls_context& tls_ctx,
                                 const net::tcp_options& opts = {}) {
-        auto listener_result = net::tcp_listener::bind(addr, io_ctx, opts);
+        auto* sched = runtime::scheduler::current();
+        if (!sched) {
+            ELIO_LOG_ERROR("HTTPS server must be started from within a scheduler context");
+            co_return;
+        }
+
+        auto listener_result = net::tcp_listener::bind(addr, opts);
         if (!listener_result) {
             ELIO_LOG_ERROR("Failed to bind HTTPS server: {}", strerror(errno));
             co_return;
         }
-        
+
         ELIO_LOG_INFO("HTTPS server listening on {}", addr.to_string());
-        
+
         auto& listener = *listener_result;
         running_ = true;
-        
+
         while (running_) {
             auto stream_result = co_await listener.accept();
             if (!stream_result) {
@@ -293,10 +304,10 @@ public:
                 }
                 continue;
             }
-            
+
             // Create TLS stream and spawn handler
             auto handler = handle_tls_connection(std::move(*stream_result), tls_ctx);
-            sched.spawn(handler.release());
+            sched->spawn(handler.release());
         }
     }
     

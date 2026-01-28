@@ -38,28 +38,59 @@ struct debug_location {
     uint32_t line = 0;
 };
 
+/// Thread-local ID allocator for coroutine debug IDs
+/// Allocates IDs in batches to avoid global atomic contention
+class id_allocator {
+public:
+    static constexpr uint64_t BATCH_SIZE = 1024;
+
+    static uint64_t allocate() noexcept {
+        auto& alloc = instance();
+        if (alloc.next_id_ >= alloc.end_id_) {
+            // Batch exhausted - get a new batch
+            uint64_t batch_start = global_counter_.fetch_add(BATCH_SIZE, std::memory_order_relaxed);
+            alloc.next_id_ = batch_start;
+            alloc.end_id_ = batch_start + BATCH_SIZE;
+        }
+        return alloc.next_id_++;
+    }
+
+private:
+    id_allocator() noexcept : next_id_(0), end_id_(0) {}
+
+    static id_allocator& instance() noexcept {
+        static thread_local id_allocator alloc;
+        return alloc;
+    }
+
+    uint64_t next_id_;
+    uint64_t end_id_;
+
+    static inline std::atomic<uint64_t> global_counter_{1};
+};
+
 /// Base class for all coroutine promise types
 /// Implements lightweight virtual stack tracking via thread-local intrusive list
-/// 
+///
 /// Debug support:
 /// - Each frame has a unique ID for identification
 /// - Source location can be set for debugging
 /// - State tracking (created/running/suspended/completed/failed)
 /// - Virtual stack via parent_ pointer chain
-/// 
+///
 /// Note: No global frame registry to avoid synchronization overhead.
 /// Debuggers should find coroutine frames through scheduler's worker queues.
 class promise_base {
 public:
-    /// Magic number for debugger validation: "ELIOFRME"  
+    /// Magic number for debugger validation: "ELIOFRME"
     static constexpr uint64_t FRAME_MAGIC = 0x454C494F46524D45ULL;
 
-    promise_base() noexcept 
+    promise_base() noexcept
         : frame_magic_(FRAME_MAGIC)
         , parent_(current_frame_)
         , debug_state_(coroutine_state::created)
         , debug_worker_id_(static_cast<uint32_t>(-1))
-        , debug_id_(next_id_.fetch_add(1, std::memory_order_relaxed))
+        , debug_id_(id_allocator::allocate())
         , affinity_(NO_AFFINITY)
     {
         current_frame_ = this;
@@ -146,7 +177,6 @@ private:
     size_t affinity_;
     
     static inline thread_local promise_base* current_frame_ = nullptr;
-    static inline std::atomic<uint64_t> next_id_{1};
 };
 
 } // namespace elio::coro

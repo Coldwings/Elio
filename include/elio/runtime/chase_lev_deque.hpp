@@ -90,12 +90,14 @@ public:
         size_t b = bottom_.load(std::memory_order_relaxed);
         size_t t = top_.load(std::memory_order_acquire);
         circular_buffer* buf = buffer_.load(std::memory_order_relaxed);
-        
+
         if (b - t >= buf->capacity() - 1) {
             buf = resize(buf, t, b);
         }
-        
+
         buf->store(b, item);
+        // Release fence ensures the store to buffer is visible before bottom update
+        // This is sufficient - no need for seq_cst here since push doesn't race with pop
         std::atomic_thread_fence(std::memory_order_release);
         bottom_.store(b + 1, std::memory_order_relaxed);
     }
@@ -104,22 +106,27 @@ public:
     [[nodiscard]] T* pop() noexcept {
         size_t b = bottom_.load(std::memory_order_relaxed);
         circular_buffer* buf = buffer_.load(std::memory_order_relaxed);
-        
+
         if (b == 0) return nullptr;
-        
+
         b = b - 1;
-        // Use relaxed store - the seq_cst fence provides synchronization
+        // Use relaxed store - the seq_cst fence provides synchronization with steal()
         bottom_.store(b, std::memory_order_relaxed);
+        // seq_cst fence is REQUIRED here for correctness with steal()
+        // It ensures the bottom store is visible to thieves before we read top,
+        // and that we see any concurrent top updates from thieves
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        
+
         size_t t = top_.load(std::memory_order_relaxed);
-        
+
         if (t <= b) {
             T* item = buf->load(b);
             if (t == b) {
                 // Last element - race with thieves
+                // acq_rel is sufficient here: acquire ensures we see the item,
+                // release ensures our update to top is visible
                 if (!top_.compare_exchange_strong(t, t + 1,
-                                                   std::memory_order_seq_cst,
+                                                   std::memory_order_acq_rel,
                                                    std::memory_order_relaxed)) {
                     // Lost race to thief
                     bottom_.store(b + 1, std::memory_order_relaxed);
@@ -129,7 +136,7 @@ public:
             }
             return item;
         }
-        
+
         // Queue was empty
         bottom_.store(b + 1, std::memory_order_relaxed);
         return nullptr;
@@ -158,14 +165,18 @@ public:
     /// Steal an element (thieves only) - lock-free
     [[nodiscard]] T* steal() noexcept {
         size_t t = top_.load(std::memory_order_acquire);
+        // seq_cst fence is REQUIRED here for correctness with pop()
+        // It ensures we see the latest bottom value after any concurrent pop
         std::atomic_thread_fence(std::memory_order_seq_cst);
         size_t b = bottom_.load(std::memory_order_acquire);
-        
+
         if (t < b) {
             circular_buffer* buf = buffer_.load(std::memory_order_acquire);
             T* item = buf->load(t);
+            // acq_rel CAS: acquire ensures we see the item data,
+            // release ensures our top update is visible to owner's pop
             if (top_.compare_exchange_strong(t, t + 1,
-                                              std::memory_order_seq_cst,
+                                              std::memory_order_acq_rel,
                                               std::memory_order_relaxed)) {
                 return item;
             }

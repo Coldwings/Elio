@@ -272,27 +272,25 @@ private:
 class tcp_stream {
 public:
     /// Construct from file descriptor
-    explicit tcp_stream(int fd, io::io_context& ctx) 
-        : fd_(fd), ctx_(&ctx) {
+    explicit tcp_stream(int fd)
+        : fd_(fd) {
         // Make non-blocking
         int flags = fcntl(fd_, F_GETFL, 0);
         fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
     }
-    
+
     /// Move constructor
     tcp_stream(tcp_stream&& other) noexcept
         : fd_(other.fd_)
-        , ctx_(other.ctx_)
         , peer_addr_(std::move(other.peer_addr_)) {
         other.fd_ = -1;
     }
-    
+
     /// Move assignment
     tcp_stream& operator=(tcp_stream&& other) noexcept {
         if (this != &other) {
             close_sync();
             fd_ = other.fd_;
-            ctx_ = other.ctx_;
             peer_addr_ = std::move(other.peer_addr_);
             other.fd_ = -1;
         }
@@ -313,10 +311,6 @@ public:
     
     /// Get the file descriptor
     int fd() const noexcept { return fd_; }
-    
-    /// Get the I/O context
-    io::io_context& context() noexcept { return *ctx_; }
-    const io::io_context& context() const noexcept { return *ctx_; }
     
     /// Get peer address
     std::optional<socket_address> peer_address() const {
@@ -417,7 +411,6 @@ private:
     }
     
     int fd_ = -1;
-    io::io_context* ctx_;
     std::optional<socket_address> peer_addr_;
 };
 
@@ -426,50 +419,44 @@ class tcp_listener {
 public:
     /// Create and bind a TCP listener (IPv4)
     /// @param addr Address to bind to
-    /// @param ctx I/O context
     /// @param opts Socket options
     /// @return TCP listener on success, std::nullopt on error (check errno)
     static std::optional<tcp_listener> bind(
         const ipv4_address& addr,
-        io::io_context& ctx,
-        const tcp_options& opts = {}) 
+        const tcp_options& opts = {})
     {
-        return bind_impl(socket_address(addr), ctx, opts);
+        return bind_impl(socket_address(addr), opts);
     }
-    
+
     /// Create and bind a TCP listener (IPv6)
     static std::optional<tcp_listener> bind(
         const ipv6_address& addr,
-        io::io_context& ctx,
         const tcp_options& opts = {})
     {
-        return bind_impl(socket_address(addr), ctx, opts);
+        return bind_impl(socket_address(addr), opts);
     }
-    
+
     /// Create and bind a TCP listener (generic address)
     static std::optional<tcp_listener> bind(
         const socket_address& addr,
-        io::io_context& ctx,
         const tcp_options& opts = {})
     {
-        return bind_impl(addr, ctx, opts);
+        return bind_impl(addr, opts);
     }
     
     /// Move constructor
     tcp_listener(tcp_listener&& other) noexcept
         : fd_(other.fd_)
-        , ctx_(other.ctx_)
         , local_addr_(std::move(other.local_addr_))
         , opts_(other.opts_) {
         other.fd_ = -1;
     }
-    
+
     /// Move assignment
     tcp_listener& operator=(tcp_listener&& other) noexcept {
         if (this != &other) {
             close_sync();
             fd_ = other.fd_;
-            ctx_ = other.ctx_;
             local_addr_ = std::move(other.local_addr_);
             opts_ = other.opts_;
             other.fd_ = -1;
@@ -524,14 +511,14 @@ public:
         
         std::optional<tcp_stream> await_resume() {
             result_ = io::io_context::get_last_result();
-            
+
             if (!result_.success()) {
                 errno = result_.error_code();
                 return std::nullopt;
             }
-            
+
             int client_fd = result_.result;
-            tcp_stream stream(client_fd, *listener_.ctx_);
+            tcp_stream stream(client_fd);
             
             // Apply TCP options
             if (listener_.opts_.no_delay) {
@@ -570,7 +557,6 @@ public:
 private:
     static std::optional<tcp_listener> bind_impl(
         const socket_address& addr,
-        io::io_context& ctx,
         const tcp_options& opts)
     {
         int family = addr.family();
@@ -631,12 +617,12 @@ private:
         }
         
         ELIO_LOG_INFO("TCP listener bound to {}", bound_addr.to_string());
-        
-        return tcp_listener(fd, ctx, bound_addr, opts);
+
+        return tcp_listener(fd, bound_addr, opts);
     }
-    
-    tcp_listener(int fd, io::io_context& ctx, const socket_address& addr, const tcp_options& opts)
-        : fd_(fd), ctx_(&ctx), local_addr_(addr), opts_(opts) {}
+
+    tcp_listener(int fd, const socket_address& addr, const tcp_options& opts)
+        : fd_(fd), local_addr_(addr), opts_(opts) {}
     
     void close_sync() {
         if (fd_ >= 0) {
@@ -647,7 +633,6 @@ private:
     }
     
     int fd_ = -1;
-    io::io_context* ctx_;
     socket_address local_addr_;
     tcp_options opts_;
 };
@@ -730,7 +715,7 @@ public:
             return std::nullopt;
         }
         
-        tcp_stream stream(fd_, io::current_io_context());
+        tcp_stream stream(fd_);
         fd_ = -1;  // Transfer ownership
         stream.set_peer_address(addr_);
         

@@ -542,9 +542,7 @@ Async-friendly signalfd wrapper.
 class signal_fd {
 public:
     // Create signalfd (auto_block=true blocks signals automatically)
-    explicit signal_fd(const signal_set& signals,
-                       io::io_context& ctx = io::default_io_context(),
-                       bool auto_block = true);
+    explicit signal_fd(const signal_set& signals, bool auto_block = true);
     
     signal_fd(signal_fd&& other) noexcept;
     signal_fd& operator=(signal_fd&& other) noexcept;
@@ -605,12 +603,9 @@ public:
 
 ```cpp
 // Wait for signals (convenience, creates temporary signal_fd)
-/* awaitable */ wait_signal(const signal_set& signals,
-                            io::io_context& ctx = io::default_io_context(),
-                            bool auto_block = true);
+/* awaitable */ wait_signal(const signal_set& signals, bool auto_block = true);
 
-/* awaitable */ wait_signal(int signo,
-                            io::io_context& ctx = io::default_io_context());
+/* awaitable */ wait_signal(int signo);
 
 // Signal name/number conversion
 const char* signal_name(int signo);        // SIGINT -> "INT"
@@ -694,7 +689,7 @@ public:
     // Bind to address (returns std::nullopt on error, check errno)
     static std::optional<tcp_listener> bind(
         const ipv4_address& addr,
-        io_context& ctx
+        const tcp_options& opts = {}
     );
     
     // Accept a connection (awaitable, returns std::optional<tcp_stream>)
@@ -757,26 +752,26 @@ HTTP client with connection pooling.
 ```cpp
 class client {
 public:
-    explicit client(io_context& ctx);
-    client(io_context& ctx, const client_config& config);
-    
+    client();
+    explicit client(const client_config& config);
+
     // GET request (awaitable)
     /* awaitable */ get(const std::string& url);
-    
+
     // POST request (awaitable)
-    /* awaitable */ post(const std::string& url, 
+    /* awaitable */ post(const std::string& url,
                          const std::string& body,
                          const std::string& content_type);
-    
+
     // HEAD request (awaitable)
     /* awaitable */ head(const std::string& url);
-    
+
     // Send custom request (awaitable)
     /* awaitable */ send(const request& req, const url& target);
 };
 
 // Convenience function for one-off GET
-/* awaitable */ get(io_context& ctx, const std::string& url);
+/* awaitable */ get(const std::string& url);
 ```
 
 ### `client_config`
@@ -868,44 +863,44 @@ HTTP/2 client with connection multiplexing.
 ```cpp
 class h2_client {
 public:
-    explicit h2_client(io_context& ctx);
-    h2_client(io_context& ctx, const h2_client_config& config);
-    
+    h2_client();
+    explicit h2_client(const h2_client_config& config);
+
     // GET request (awaitable)
     /* awaitable */ get(const std::string& url);
-    
+
     // POST request (awaitable)
-    /* awaitable */ post(const std::string& url, 
+    /* awaitable */ post(const std::string& url,
                          const std::string& body,
                          const std::string& content_type);
-    
+
     // PUT request (awaitable)
     /* awaitable */ put(const std::string& url,
                         const std::string& body,
                         const std::string& content_type);
-    
+
     // DELETE request (awaitable)
     /* awaitable */ del(const std::string& url);
-    
+
     // PATCH request (awaitable)
     /* awaitable */ patch(const std::string& url,
                           const std::string& body,
                           const std::string& content_type);
-    
+
     // Send custom request (awaitable)
     /* awaitable */ send(method m, const url& target,
                          std::string_view body = {},
                          std::string_view content_type = {});
-    
+
     // Access TLS context for configuration
     tls_context& tls_context();
 };
 
 // Convenience function for one-off HTTP/2 GET
-/* awaitable */ h2_get(io_context& ctx, const std::string& url);
+/* awaitable */ h2_get(const std::string& url);
 
 // Convenience function for one-off HTTP/2 POST
-/* awaitable */ h2_post(io_context& ctx, const std::string& url,
+/* awaitable */ h2_post(const std::string& url,
                         const std::string& body, const std::string& content_type);
 ```
 
@@ -988,7 +983,7 @@ TLS-wrapped TCP stream.
 ```cpp
 class tls_stream {
 public:
-    tls_stream(tcp_stream tcp, tls_context& ctx, io_context& io_ctx);
+    tls_stream(tcp_stream tcp, tls_context& ctx);
     
     // Set SNI hostname
     void set_hostname(const std::string& hostname);

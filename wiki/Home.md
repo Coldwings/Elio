@@ -57,9 +57,13 @@ int main() {
 - [[Getting Started]] - Installation and first steps
 - [[Core Concepts]] - Coroutines, tasks, and scheduler
 - [[Signal Handling]] - Safe signal handling with signalfd
-- [[Networking]] - TCP, HTTP, and TLS
+- [[Networking]] - TCP, HTTP/1.1, and connections
+- [[HTTP2 Guide]] - HTTP/2 client usage and multiplexing
+- [[TLS Configuration]] - TLS/SSL setup and certificate management
+- [[WebSocket SSE]] - WebSocket and Server-Sent Events
 - [[RPC Framework]] - High-performance RPC with zero-copy serialization
 - [[Hash Functions]] - CRC32, SHA-1, and SHA-256
+- [[Performance Tuning]] - Optimization and benchmarking
 - [[Debugging]] - GDB/LLDB extensions and elio-pstack
 - [[Examples]] - Code examples and use cases
 - [[API Reference]] - Detailed API documentation

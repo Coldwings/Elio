@@ -20,6 +20,18 @@ set(TEST_SOURCES
     integration/test_dynamic_threads.cpp
 )
 
+# Add HTTP tests (no TLS dependency for parser tests)
+list(APPEND TEST_SOURCES
+    unit/test_http_parser.cpp
+)
+
+# Add HTTP/2 tests if nghttp2 is available
+if(TARGET nghttp2_static)
+    list(APPEND TEST_SOURCES
+        unit/test_http2.cpp
+    )
+endif()
+
 # Add WebSocket and SSE tests if TLS is available
 if(TARGET elio_tls)
     list(APPEND TEST_SOURCES
@@ -34,6 +46,9 @@ target_link_libraries(elio_tests PRIVATE elio Catch2::Catch2WithMain)
 if(TARGET elio_tls)
     target_link_libraries(elio_tests PRIVATE elio_tls)
 endif()
+if(TARGET nghttp2_static)
+    target_link_libraries(elio_tests PRIVATE nghttp2_static)
+endif()
 target_compile_definitions(elio_tests PRIVATE ELIO_DEBUG)
 
 # ASAN-enabled test executable
@@ -41,6 +56,9 @@ add_executable(elio_tests_asan ${TEST_SOURCES})
 target_link_libraries(elio_tests_asan PRIVATE elio Catch2::Catch2WithMain)
 if(TARGET elio_tls)
     target_link_libraries(elio_tests_asan PRIVATE elio_tls)
+endif()
+if(TARGET nghttp2_static)
+    target_link_libraries(elio_tests_asan PRIVATE nghttp2_static)
 endif()
 target_compile_options(elio_tests_asan PRIVATE -fsanitize=address -g -fno-omit-frame-pointer)
 target_link_options(elio_tests_asan PRIVATE -fsanitize=address)
@@ -51,6 +69,9 @@ add_executable(elio_tests_tsan ${TEST_SOURCES})
 target_link_libraries(elio_tests_tsan PRIVATE elio Catch2::Catch2WithMain)
 if(TARGET elio_tls)
     target_link_libraries(elio_tests_tsan PRIVATE elio_tls)
+endif()
+if(TARGET nghttp2_static)
+    target_link_libraries(elio_tests_tsan PRIVATE nghttp2_static)
 endif()
 target_compile_options(elio_tests_tsan PRIVATE -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan)
 target_link_options(elio_tests_tsan PRIVATE -fsanitize=thread)

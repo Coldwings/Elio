@@ -57,10 +57,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
     if (argc > 1) {
         std::cout << "Argument: " << argv[1] << std::endl;
     }
-    
-    // Access the I/O context for async operations
-    auto& ctx = io::default_io_context();
-    
+
     // Your async code here
     co_return 0;
 }
@@ -215,15 +212,15 @@ This design ensures:
 
 ## I/O Context
 
-The I/O context manages async I/O operations. Each worker thread has its own I/O context for lock-free operation.
+The I/O context manages async I/O operations. Each worker thread has its own I/O context for lock-free operation. In most cases, you don't need to interact with io_context directly - the library automatically uses the per-thread io_context.
 
-### Using the Default Context
+### Accessing the Current Context
 
 ```cpp
 #include <elio/io/io_context.hpp>
 
-// Get the global I/O context (for TCP listeners, etc.)
-auto& ctx = io::default_io_context();
+// Get the current thread's I/O context (from within a coroutine)
+auto& ctx = io::current_io_context();
 ```
 
 ### I/O Backends

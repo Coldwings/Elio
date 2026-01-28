@@ -24,21 +24,21 @@ coro::task<void> handle_client(tcp_stream stream) {
     co_return;
 }
 
-coro::task<void> server(uint16_t port, runtime::scheduler& sched) {
-    auto& ctx = io::default_io_context();
-    
-    auto listener = tcp_listener::bind(ipv4_address(port), ctx);
+coro::task<void> server(uint16_t port) {
+    auto* sched = runtime::scheduler::current();
+
+    auto listener = tcp_listener::bind(ipv4_address(port));
     if (!listener) {
         ELIO_LOG_ERROR("Bind failed: {}", strerror(errno));
         co_return;
     }
-    
+
     while (true) {
         auto stream = co_await listener->accept();
         if (!stream) continue;
-        
+
         auto handler = handle_client(std::move(*stream));
-        sched.spawn(handler.release());
+        sched->spawn(handler.release());
     }
 }
 ```
@@ -137,24 +137,24 @@ coro::task<void> handle_client(uds_stream stream) {
     co_return;
 }
 
-coro::task<void> server(const unix_address& addr, runtime::scheduler& sched) {
-    auto& ctx = io::default_io_context();
-    
+coro::task<void> server(const unix_address& addr) {
+    auto* sched = runtime::scheduler::current();
+
     uds_options opts;
     opts.unlink_on_bind = true;  // Remove existing socket file
-    
-    auto listener = uds_listener::bind(addr, ctx, opts);
+
+    auto listener = uds_listener::bind(addr, opts);
     if (!listener) {
         ELIO_LOG_ERROR("Bind failed: {}", strerror(errno));
         co_return;
     }
-    
+
     while (true) {
         auto stream = co_await listener->accept();
         if (!stream) continue;
-        
+
         auto handler = handle_client(std::move(*stream));
-        sched.spawn(handler.release());
+        sched->spawn(handler.release());
     }
 }
 ```
@@ -234,10 +234,10 @@ HTTP support requires linking with `elio_http` and OpenSSL.
 
 using namespace elio::http;
 
-coro::task<void> fetch_url(io::io_context& ctx) {
+coro::task<void> fetch_url() {
     // Simple one-off request
-    auto result = co_await http::get(ctx, "https://httpbin.org/get");
-    
+    auto result = co_await http::get("https://httpbin.org/get");
+
     if (result) {
         ELIO_LOG_INFO("Status: {}", result->status_code());
         ELIO_LOG_INFO("Body: {}", result->body());
@@ -249,13 +249,13 @@ coro::task<void> fetch_url(io::io_context& ctx) {
 ### HTTP Client with Configuration
 
 ```cpp
-coro::task<void> advanced_client(io::io_context& ctx) {
+coro::task<void> advanced_client() {
     client_config config;
     config.user_agent = "MyApp/1.0";
     config.follow_redirects = true;
     config.max_redirects = 5;
-    
-    client c(ctx, config);
+
+    client c(config);
     
     // GET request
     auto resp = co_await c.get("https://api.example.com/data");
@@ -308,14 +308,16 @@ coro::task<void> handle_request(request& req, response& resp) {
 }
 
 coro::task<void> run_server(uint16_t port) {
-    auto& ctx = io::default_io_context();
-    
-    server_config config;
-    config.port = port;
-    config.handler = handle_request;
-    
-    server srv(ctx, config);
-    co_await srv.run();
+    router r;
+    r.get("/", [](context& ctx) {
+        return response::ok("<h1>Hello from Elio!</h1>", "text/html");
+    });
+    r.get("/api/data", [](context& ctx) {
+        return response::ok(R"({"message": "Hello, World!"})", "application/json");
+    });
+
+    server srv(r);
+    co_await srv.listen(net::ipv4_address(port));
 }
 ```
 
@@ -336,13 +338,13 @@ HTTP/2 support requires linking with `elio_http2`, OpenSSL, and nghttp2 (fetched
 
 using namespace elio::http;
 
-coro::task<void> fetch_url(io::io_context& ctx) {
+coro::task<void> fetch_url_h2() {
     // Create HTTP/2 client
-    h2_client client(ctx);
-    
+    h2_client client;
+
     // Simple GET request (must use HTTPS)
     auto result = co_await client.get("https://nghttp2.org/");
-    
+
     if (result) {
         ELIO_LOG_INFO("Status: {}", static_cast<int>(result->get_status()));
         ELIO_LOG_INFO("Body: {}", result->body());
@@ -354,12 +356,12 @@ coro::task<void> fetch_url(io::io_context& ctx) {
 ### HTTP/2 Client with Configuration
 
 ```cpp
-coro::task<void> advanced_h2_client(io::io_context& ctx) {
+coro::task<void> advanced_h2_client() {
     h2_client_config config;
     config.user_agent = "MyApp/1.0";
     config.max_concurrent_streams = 100;
-    
-    h2_client client(ctx, config);
+
+    h2_client client(config);
     
     // GET request
     auto resp = co_await client.get("https://api.example.com/data");
@@ -407,19 +409,17 @@ coro::task<void> advanced_h2_client(io::io_context& ctx) {
 using namespace elio::tls;
 
 coro::task<void> secure_connection() {
-    auto& ctx = io::default_io_context();
-    
     // Create TLS context
     tls_context tls_ctx(tls_method::client);
     tls_ctx.use_default_verify_paths();
     tls_ctx.set_verify_mode(true);
-    
+
     // Connect TCP
     auto tcp = co_await tcp_connect(ipv4_address("example.com", 443));
     if (!tcp) co_return;
-    
+
     // Wrap with TLS
-    tls_stream stream(std::move(*tcp), tls_ctx, ctx);
+    tls_stream stream(std::move(*tcp), tls_ctx);
     stream.set_hostname("example.com");  // SNI
     
     // Perform handshake
@@ -447,23 +447,21 @@ coro::task<void> secure_connection() {
 
 ```cpp
 coro::task<void> tls_server(uint16_t port) {
-    auto& ctx = io::default_io_context();
-    
     // Create TLS context with certificate
     tls_context tls_ctx(tls_method::server);
     tls_ctx.use_certificate_file("server.crt");
     tls_ctx.use_private_key_file("server.key");
-    
-    auto listener = tcp_listener::bind(ipv4_address(port), ctx);
+
+    auto listener = tcp_listener::bind(ipv4_address(port));
     if (!listener) co_return;
-    
+
     while (true) {
         auto tcp = co_await listener->accept();
         if (!tcp) continue;
-        
+
         // Wrap accepted connection with TLS
-        tls_stream stream(std::move(*tcp), tls_ctx, ctx);
-        
+        tls_stream stream(std::move(*tcp), tls_ctx);
+
         auto hs = co_await stream.handshake();
         if (hs) {
             // Handle secure connection
@@ -477,8 +475,8 @@ coro::task<void> tls_server(uint16_t port) {
 The HTTP client automatically manages connection pooling for keep-alive connections:
 
 ```cpp
-coro::task<void> pooled_requests(io::io_context& ctx) {
-    client c(ctx);
+coro::task<void> pooled_requests() {
+    client c;
     
     // These requests reuse connections when possible
     for (int i = 0; i < 10; ++i) {

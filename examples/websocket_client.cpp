@@ -73,16 +73,16 @@ coro::task<void> interactive_session(ws_client& client) {
 }
 
 /// Demonstrate various WebSocket features
-coro::task<void> demo_features(io::io_context& io_ctx, const std::string& url) {
+coro::task<void> demo_features(const std::string& url) {
     ELIO_LOG_INFO("=== WebSocket Client Demo ===");
     ELIO_LOG_INFO("Connecting to: {}", url);
-    
+
     // Configure client
     client_config config;
     config.user_agent = "elio-websocket-demo/1.0";
     config.verify_certificate = false;  // Allow self-signed certs for testing
-    
-    ws_client client(io_ctx, config);
+
+    ws_client client(config);
     
     // Connect
     bool connected = co_await client.connect(url);
@@ -176,10 +176,10 @@ coro::task<void> demo_features(io::io_context& io_ctx, const std::string& url) {
 }
 
 /// Simple echo test
-coro::task<void> echo_test(io::io_context& io_ctx, const std::string& url) {
+coro::task<void> echo_test(const std::string& url) {
     ELIO_LOG_INFO("Echo test: connecting to {}", url);
-    
-    auto client_opt = co_await ws_connect(io_ctx, url);
+
+    auto client_opt = co_await ws_connect(url);
     if (!client_opt) {
         ELIO_LOG_ERROR("Failed to connect");
         {
@@ -262,10 +262,10 @@ int main(int argc, char* argv[]) {
     
     // Run client
     if (demo_mode) {
-        auto task = demo_features(io::default_io_context(), url);
+        auto task = demo_features(url);
         sched.spawn(task.release());
     } else {
-        auto task = echo_test(io::default_io_context(), url);
+        auto task = echo_test(url);
         sched.spawn(task.release());
     }
     

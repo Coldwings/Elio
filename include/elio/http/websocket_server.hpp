@@ -421,19 +421,24 @@ public:
         : router_(std::move(r)), http_config_(http_config) {}
     
     /// Start listening on address (plain HTTP/WS)
-    coro::task<void> listen(net::ipv4_address addr, io::io_context& io_ctx,
-                           runtime::scheduler& sched) {
-        auto listener_result = net::tcp_listener::bind(addr, io_ctx);
+    coro::task<void> listen(net::ipv4_address addr) {
+        auto* sched = runtime::scheduler::current();
+        if (!sched) {
+            ELIO_LOG_ERROR("WebSocket server must be started from within a scheduler context");
+            co_return;
+        }
+
+        auto listener_result = net::tcp_listener::bind(addr);
         if (!listener_result) {
             ELIO_LOG_ERROR("Failed to bind WebSocket server: {}", strerror(errno));
             co_return;
         }
-        
+
         ELIO_LOG_INFO("WebSocket server listening on {}", addr.to_string());
-        
+
         auto& listener = *listener_result;
         running_ = true;
-        
+
         while (running_) {
             auto stream_result = co_await listener.accept();
             if (!stream_result) {
@@ -442,27 +447,32 @@ public:
                 }
                 continue;
             }
-            
+
             // Spawn connection handler
             auto handler = handle_connection(std::move(*stream_result));
-            sched.spawn(handler.release());
+            sched->spawn(handler.release());
         }
     }
-    
+
     /// Start listening with TLS (HTTPS/WSS)
-    coro::task<void> listen_tls(net::ipv4_address addr, io::io_context& io_ctx,
-                                runtime::scheduler& sched, tls::tls_context& tls_ctx) {
-        auto listener_result = net::tcp_listener::bind(addr, io_ctx);
+    coro::task<void> listen_tls(net::ipv4_address addr, tls::tls_context& tls_ctx) {
+        auto* sched = runtime::scheduler::current();
+        if (!sched) {
+            ELIO_LOG_ERROR("Secure WebSocket server must be started from within a scheduler context");
+            co_return;
+        }
+
+        auto listener_result = net::tcp_listener::bind(addr);
         if (!listener_result) {
             ELIO_LOG_ERROR("Failed to bind secure WebSocket server: {}", strerror(errno));
             co_return;
         }
-        
+
         ELIO_LOG_INFO("Secure WebSocket server listening on {}", addr.to_string());
-        
+
         auto& listener = *listener_result;
         running_ = true;
-        
+
         while (running_) {
             auto stream_result = co_await listener.accept();
             if (!stream_result) {
@@ -471,10 +481,10 @@ public:
                 }
                 continue;
             }
-            
+
             // Spawn TLS connection handler
             auto handler = handle_tls_connection(std::move(*stream_result), tls_ctx);
-            sched.spawn(handler.release());
+            sched->spawn(handler.release());
         }
     }
     

@@ -176,6 +176,12 @@ public:
         return backend_.get();
     }
 
+    /// Check if the current backend is io_uring
+    /// @return true if using io_uring backend
+    bool is_io_uring() const noexcept {
+        return backend_ && backend_->is_io_uring();
+    }
+
 private:
     std::unique_ptr<io_backend> backend_;   ///< Active I/O backend
     backend_type backend_type_;              ///< Current backend type

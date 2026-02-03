@@ -207,7 +207,10 @@ Explore the `examples/` directory for detailed examples:
 - **sse_client.cpp** - SSE client example
 - **async_file_io.cpp** - Async file operations
 - **debug_test.cpp** - Debugging tools demonstration
-- **benchmark.cpp** - Performance measurements
+- **benchmark.cpp** - Full performance measurements
+- **quick_benchmark.cpp** - Fast spawn/switch/yield benchmarks
+- **microbench.cpp** - Individual operation microbenchmarks
+- **io_benchmark.cpp** - I/O throughput benchmarks
 
 Build and run examples:
 ```bash
@@ -365,16 +368,45 @@ ctest --test-dir build --output-on-failure
 
 ## Performance
 
-Phase 1 benchmarks (on typical hardware):
-- **Task spawn overhead**: < 200ns per task
-- **Context switch**: < 100ns per suspend/resume
-- **Work stealing**: Efficient load balancing across threads
-- **Scalability**: Near-linear with thread count
+### Benchmark Results
 
-Run benchmarks:
+Elio achieves competitive performance through careful optimization:
+
+| Metric | Typical Value | Best Case |
+|--------|---------------|-----------|
+| Task Spawn | ~1300 ns | ~570 ns (pre-allocated) |
+| Context Switch | ~230 ns | ~212 ns |
+| Yield (1000 vthreads) | ~30 ns | ~16 ns |
+| File I/O (single thread) | 1.46 μs/read | 685K IOPS |
+| File I/O (4 threads) | 0.93 μs/read | 1.07M IOPS |
+
+### Key Optimizations
+
+- **Lazy Wake**: Workers only receive wake signals when idle, reducing syscall overhead
+- **io_uring Batch Submit**: Automatic batching of I/O operations
+- **Coroutine Frame Pooling**: Hot path allocation ~72 ns vs cold ~250 ns
+- **Lock-free Scheduling**: MPSC inbox (~5 ns) + Chase-Lev deque (~13 ns)
+
+### Running Benchmarks
+
 ```bash
+cd build
+cmake --build .
+
+# Quick benchmark (spawn, context switch, yield)
+./quick_benchmark
+
+# Microbenchmarks (individual operations)
+./microbench
+
+# I/O throughput benchmark
+./io_benchmark
+
+# Full benchmark suite
 ./benchmark
 ```
+
+See [Performance Tuning Guide](wiki/Performance-Tuning.md) for optimization tips.
 
 ## Project Status
 
@@ -426,4 +458,4 @@ For questions, issues, or feature requests, please open an issue on the reposito
 
 ---
 
-**Status**: Feature Complete | **Version**: 0.1.0 | **Date**: 2026-01-27
+**Status**: Feature Complete | **Version**: 0.1.0 | **Date**: 2026-02-03

@@ -96,13 +96,18 @@ public:
     /// Retries with back-off if inbox is temporarily full
     void schedule(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return;
-        
+
         // Try fast path: push to lock-free inbox
         if (inbox_.push(handle.address())) [[likely]] {
-            wake();  // Wake the worker if it's sleeping
+            // Lazy wake: only wake if worker is idle (waiting for work)
+            // This avoids expensive eventfd write syscalls when worker is busy
+            // Use relaxed load - occasional extra wake is fine, we optimize for the common case
+            if (idle_.load(std::memory_order_relaxed)) {
+                wake();
+            }
             return;
         }
-        
+
         // Slow path: inbox full, retry with exponential back-off
         // Keep retrying - inbox will eventually have space as worker drains it
         int backoff = 1;
@@ -115,7 +120,10 @@ public:
                 #endif
             }
             if (inbox_.push(handle.address())) {
-                wake();  // Wake the worker if it's sleeping
+                // Lazy wake: only wake if worker is idle
+                if (idle_.load(std::memory_order_relaxed)) {
+                    wake();
+                }
                 return;
             }
             backoff = std::min(backoff * 2, 1024);
@@ -208,10 +216,10 @@ private:
             std::this_thread::yield();
             return;
         }
-        
+
         struct epoll_event ev;
         int ret = epoll_wait(wait_epoll_fd_, &ev, 1, timeout_ms);
-        
+
         if (ret > 0) {
             // Got wake-up signal, drain the eventfd
             drain_wake_fd();
@@ -226,6 +234,7 @@ private:
     std::thread thread_;
     std::atomic<bool> running_;
     std::atomic<size_t> tasks_executed_;
+    std::atomic<bool> idle_{false};    // True when worker is waiting for work (for lazy wake)
     bool needs_sync_ = false;          // Whether current task needs memory synchronization
     int wake_fd_;                      // eventfd for wake-up notifications
     int wait_epoll_fd_;                // epoll fd for waiting on wake_fd

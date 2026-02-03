@@ -213,13 +213,13 @@ private:
         // Release fence ensures all writes to the coroutine frame (including
         // captured lambda state) are visible to the worker that will run this task
         std::atomic_thread_fence(std::memory_order_release);
-        
+
         size_t n = num_threads_.load(std::memory_order_acquire);
         if (n == 0) [[unlikely]] {
             handle.destroy();
             return;
         }
-        
+
         // Check if task has affinity - if so, schedule to that specific worker
         size_t affinity = coro::get_affinity(handle.address());
         if (affinity != coro::NO_AFFINITY && affinity < n) {
@@ -233,7 +233,7 @@ private:
                 promise->clear_affinity();
             }
         }
-        
+
         // No affinity or invalid affinity - round-robin to any running worker
         size_t start_index = spawn_index_.fetch_add(1, std::memory_order_relaxed) % n;
         for (size_t i = 0; i < n; ++i) {
@@ -243,7 +243,7 @@ private:
                 return;
             }
         }
-        
+
         // All workers stopped, try again with current thread count
         n = num_threads_.load(std::memory_order_acquire);
         if (n > 0 && workers_[0]->is_running()) {
@@ -482,17 +482,20 @@ inline void worker_thread::poll_io_when_idle() {
     // Poll this worker's own io_context
     // Each worker has its own io_context, so no locking needed
     constexpr int idle_timeout_ms = 10;
-    
+
+    // Mark as idle before any blocking - enables lazy wake optimization
+    idle_.store(true, std::memory_order_release);
+
     // Poll with timeout - will block on epoll/io_uring if no completions ready
     int completions = io_context_->poll(std::chrono::milliseconds(idle_timeout_ms));
-    
-    if (completions > 0) {
-        // Got IO completions, return immediately to check for new tasks
-        return;
+
+    if (completions == 0) {
+        // No IO completions - wait on eventfd for task submissions
+        wait_for_work(idle_timeout_ms);
     }
-    
-    // No IO completions - wait on eventfd for task submissions
-    wait_for_work(idle_timeout_ms);
+
+    // Clear idle flag after waking up
+    idle_.store(false, std::memory_order_relaxed);
 }
 
 } // namespace elio::runtime

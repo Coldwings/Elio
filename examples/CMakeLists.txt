@@ -31,6 +31,18 @@ add_executable(benchmark benchmark.cpp)
 target_link_libraries(benchmark PRIVATE elio)
 target_link_options(benchmark PRIVATE ${STATIC_LINK_FLAGS})
 
+add_executable(quick_benchmark quick_benchmark.cpp)
+target_link_libraries(quick_benchmark PRIVATE elio)
+target_link_options(quick_benchmark PRIVATE ${STATIC_LINK_FLAGS})
+
+add_executable(microbench microbench.cpp)
+target_link_libraries(microbench PRIVATE elio)
+target_link_options(microbench PRIVATE ${STATIC_LINK_FLAGS})
+
+add_executable(io_benchmark io_benchmark.cpp)
+target_link_libraries(io_benchmark PRIVATE elio)
+target_link_options(io_benchmark PRIVATE ${STATIC_LINK_FLAGS})
+
 # Signal handling example
 add_executable(signal_handling signal_handling.cpp)
 target_link_libraries(signal_handling PRIVATE elio)

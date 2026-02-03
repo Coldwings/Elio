@@ -153,7 +153,12 @@ struct ipv6_address {
     std::string to_string() const {
         char buf[INET6_ADDRSTRLEN];
         inet_ntop(AF_INET6, &addr, buf, sizeof(buf));
-        std::string result = "[" + std::string(buf) + "]:" + std::to_string(port);
+        std::string result;
+        result.reserve(INET6_ADDRSTRLEN + 10);
+        result.append("[");
+        result.append(buf);
+        result.append("]:");
+        result.append(std::to_string(port));
         return result;
     }
     

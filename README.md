@@ -387,6 +387,17 @@ Elio achieves competitive performance through careful optimization:
 - **Coroutine Frame Pooling**: Hot path allocation ~72 ns vs cold ~250 ns
 - **Lock-free Scheduling**: MPSC inbox (~5 ns) + Chase-Lev deque (~13 ns)
 
+### Scalability
+
+| Threads | Throughput | Speedup |
+|---------|-----------|---------|
+| 1 | ~18K tasks/sec | 1.0x |
+| 2 | ~33K tasks/sec | 1.9x |
+| 4 | ~56K tasks/sec | 3.2x |
+| 8 | ~86K tasks/sec | 4.9x |
+
+*CPU-bound workload with 100K iterations per task*
+
 ### Running Benchmarks
 
 ```bash
@@ -404,6 +415,9 @@ cmake --build .
 
 # Full benchmark suite
 ./benchmark
+
+# Scalability test
+./scalability_test
 ```
 
 See [Performance Tuning Guide](wiki/Performance-Tuning.md) for optimization tips.

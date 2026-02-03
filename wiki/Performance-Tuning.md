@@ -32,6 +32,19 @@ Elio is designed for high performance through:
 | Single-thread file read | 1.46 μs/read | 685K IOPS |
 | 4-thread concurrent read | 0.93 μs/read | 1.07M IOPS |
 
+### Scalability
+
+CPU-bound workload with 100K iterations per task:
+
+| Threads | Throughput | Speedup |
+|---------|-----------|---------|
+| 1 | ~18K tasks/sec | 1.0x |
+| 2 | ~33K tasks/sec | 1.9x |
+| 4 | ~56K tasks/sec | 3.2x |
+| 8 | ~86K tasks/sec | 4.9x |
+
+Scaling efficiency depends on workload characteristics. Tasks with more computation relative to scheduling overhead will show better scaling.
+
 ### Main Bottleneck
 
 The primary scheduling overhead comes from `eventfd write` (~500-1500 ns with high variance). This is mitigated by **Lazy Wake optimization** which avoids the syscall when workers are busy.
@@ -464,6 +477,9 @@ cmake --build .
 
 # Full benchmark suite
 ./benchmark
+
+# Scalability test - multi-thread scaling
+./scalability_test
 ```
 
 ### Interpreting Results

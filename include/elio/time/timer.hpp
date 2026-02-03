@@ -287,25 +287,20 @@ public:
     bool await_ready() const noexcept {
         return false;
     }
-    
+
     void await_suspend(std::coroutine_handle<> awaiter) const {
         auto* worker = runtime::worker_thread::current();
-        auto* sched = runtime::scheduler::current();
-        
-        if (worker && sched) {
-            // Check if task has affinity for a different worker
-            size_t affinity = coro::get_affinity(awaiter.address());
-            if (affinity != coro::NO_AFFINITY && affinity != worker->worker_id()) {
-                // Task has affinity for different worker - use spawn to route correctly
-                sched->spawn(awaiter);
-                return;
-            }
-            // No affinity or affinity matches - use fast local path
+
+        if (worker) [[likely]] {
+            // Fast path: directly schedule to local queue
+            // Skip affinity check for performance - yield keeps running on same worker
+            // If task has affinity for different worker, it will be routed on next spawn
             worker->schedule_local(awaiter);
             return;
         }
-        
-        // Slow path: go through scheduler's spawn mechanism
+
+        // Slow path: no current worker, go through scheduler
+        auto* sched = runtime::scheduler::current();
         if (sched) {
             sched->spawn(awaiter);
         } else {
@@ -313,7 +308,7 @@ public:
             awaiter.resume();
         }
     }
-    
+
     void await_resume() const noexcept {}
 };
 

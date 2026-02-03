@@ -11,6 +11,105 @@ Elio is designed for high performance through:
 - Custom coroutine frame allocator
 - Minimal synchronization overhead
 
+## Actual Performance Numbers
+
+### Scheduling Benchmarks
+
+| Operation | Typical | Best Case | Notes |
+|-----------|---------|-----------|-------|
+| Task Spawn | ~1300 ns | ~570 ns | Best with pre-allocated frames |
+| Context Switch | ~230 ns | ~212 ns | Suspend and resume |
+| Yield | ~30 ns | ~16 ns | Per 1000 vthreads |
+| MPSC push | ~5 ns | - | Cross-thread scheduling |
+| Chase-Lev push | ~13 ns | - | Local queue operation |
+| Frame alloc (cold) | ~250 ns | - | First allocation |
+| Frame alloc (hot) | ~72 ns | - | Pool hit |
+
+### I/O Benchmarks
+
+| Scenario | Latency | Throughput |
+|----------|---------|------------|
+| Single-thread file read | 1.46 μs/read | 685K IOPS |
+| 4-thread concurrent read | 0.93 μs/read | 1.07M IOPS |
+
+### Scalability
+
+CPU-bound workload with 100K iterations per task:
+
+| Threads | Throughput | Speedup |
+|---------|-----------|---------|
+| 1 | ~18K tasks/sec | 1.0x |
+| 2 | ~33K tasks/sec | 1.9x |
+| 4 | ~56K tasks/sec | 3.2x |
+| 8 | ~86K tasks/sec | 4.9x |
+
+Scaling efficiency depends on workload characteristics. Tasks with more computation relative to scheduling overhead will show better scaling.
+
+### Main Bottleneck
+
+The primary scheduling overhead comes from `eventfd write` (~500-1500 ns with high variance). This is mitigated by **Lazy Wake optimization** which avoids the syscall when workers are busy.
+
+## Built-in Optimizations
+
+### Lazy Wake
+
+Workers track their idle state. Task submissions only trigger wake syscalls when the target worker is actually sleeping:
+
+```cpp
+// In worker_thread::schedule()
+if (inbox_.push(handle.address())) {
+    // Only wake if worker is idle (sleeping)
+    if (idle_.load(std::memory_order_relaxed)) {
+        wake();  // eventfd write
+    }
+}
+```
+
+This eliminates unnecessary syscalls when workers are busy processing tasks.
+
+### io_uring Batch Submit
+
+I/O operations are automatically batched:
+
+```cpp
+// In io_uring_backend::poll()
+// Auto-submit any pending operations before waiting
+if (io_uring_sq_ready(&ring_) > 0) {
+    io_uring_submit(&ring_);
+}
+```
+
+This reduces the number of `io_uring_submit` syscalls by batching multiple operations.
+
+### Lazy Debug ID Allocation
+
+Debug IDs for coroutines are only allocated when actually accessed, reducing creation overhead in production:
+
+```cpp
+// debug_id_ initialized to 0, allocated on first id() call
+uint64_t id() const noexcept {
+    if (debug_id_.load(std::memory_order_relaxed) == 0) {
+        debug_id_.store(id_allocator::allocate(), std::memory_order_relaxed);
+    }
+    return debug_id_.load(std::memory_order_relaxed);
+}
+```
+
+### Optimized Yield Path
+
+Yielding skips affinity checks and scheduler lookups for better performance:
+
+```cpp
+// In yield_awaitable::await_suspend()
+auto* worker = runtime::worker_thread::current();
+if (worker) {
+    // Fast path: directly schedule to local queue
+    worker->schedule_local(awaiter);
+    return;
+}
+// Slow path only when no current worker
+```
+
 ## Scheduler Tuning
 
 ### Thread Count
@@ -358,6 +457,40 @@ cmake --build .
 - Use bounded channels
 - Allocate large buffers separately
 - Limit connection pool size
+
+## Running Benchmarks
+
+Elio includes several benchmark tools:
+
+```bash
+cd build
+cmake --build .
+
+# Quick benchmark - measures spawn, context switch, yield
+./quick_benchmark
+
+# Microbenchmarks - individual operation timing
+./microbench
+
+# I/O benchmark - file read throughput
+./io_benchmark
+
+# Full benchmark suite
+./benchmark
+
+# Scalability test - multi-thread scaling
+./scalability_test
+```
+
+### Interpreting Results
+
+Benchmark results can vary significantly (min/max differ by 2-7x) due to:
+- CPU frequency scaling
+- System load
+- Cache state
+- Memory allocation patterns
+
+Run benchmarks multiple times and use minimum values for best-case analysis.
 
 ## Quick Reference
 

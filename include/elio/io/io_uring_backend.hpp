@@ -192,18 +192,30 @@ public:
     
     /// Submit all prepared operations
     int submit() override {
+        // Fast path: if no pending submissions, skip syscall
+        size_t pending = io_uring_sq_ready(&ring_);
+        if (pending == 0) {
+            return 0;
+        }
+
         int submitted = io_uring_submit(&ring_);
         if (submitted < 0) {
             ELIO_LOG_ERROR("io_uring_submit failed: {}", strerror(-submitted));
             return submitted;
         }
-        
+
         ELIO_LOG_DEBUG("Submitted {} operations", submitted);
         return submitted;
     }
     
     /// Poll for completed operations
     int poll(std::chrono::milliseconds timeout) override {
+        // Auto-submit any pending operations before polling
+        // This enables batching: multiple prepares followed by one submit
+        if (io_uring_sq_ready(&ring_) > 0) {
+            io_uring_submit(&ring_);
+        }
+
         struct io_uring_cqe* cqe = nullptr;
         int completions = 0;
         std::vector<deferred_resume_entry> deferred_resumes;

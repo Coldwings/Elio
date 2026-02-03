@@ -90,7 +90,7 @@ public:
         , parent_(current_frame_)
         , debug_state_(coroutine_state::created)
         , debug_worker_id_(static_cast<uint32_t>(-1))
-        , debug_id_(id_allocator::allocate())
+        , debug_id_(0)  // Lazy allocation - only allocated when id() is called
         , affinity_(NO_AFFINITY)
     {
         current_frame_ = this;
@@ -127,7 +127,13 @@ public:
     [[nodiscard]] const debug_location& location() const noexcept { return debug_location_; }
     [[nodiscard]] coroutine_state state() const noexcept { return debug_state_; }
     [[nodiscard]] uint32_t worker_id() const noexcept { return debug_worker_id_; }
-    [[nodiscard]] uint64_t id() const noexcept { return debug_id_; }
+    [[nodiscard]] uint64_t id() noexcept {
+        // Lazy allocation - only allocate ID when first requested
+        if (debug_id_ == 0) {
+            debug_id_ = id_allocator::allocate();
+        }
+        return debug_id_;
+    }
 
     // Debug setters
     void set_location(const char* file, const char* func, uint32_t line) noexcept {

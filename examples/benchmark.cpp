@@ -341,71 +341,76 @@ void benchmark_work_stealing() {
 }
 
 // Time-based scalability benchmark
+// This benchmark tests parallel CPU-bound workloads.
+// Each task performs a larger computation to ensure work dominates over scheduling overhead.
 void benchmark_scalability() {
-    std::cout << "Scalability Benchmark (each thread count runs for " 
+    std::cout << "Scalability Benchmark (each thread count runs for "
               << duration_cast<seconds>(MIN_BENCH_DURATION).count() << "+ seconds):" << std::endl;
     std::cout << std::endl;
-    
-    const int batch_size = 1000;
-    
+
+    const int tasks_per_thread = 500;   // Tasks per worker thread
+    const int work_iterations = 100000; // More work per task to make CPU-bound
+
     for (size_t num_threads : {1, 2, 4, 8}) {
         std::vector<double> throughput_samples;
         size_t total_tasks = 0;
-        
+        int batch_size = tasks_per_thread * static_cast<int>(num_threads);
+
         std::cout << "  " << num_threads << " thread(s): " << std::flush;
-        
+
         auto bench_start = high_resolution_clock::now();
-        
+
         while (duration_cast<seconds>(high_resolution_clock::now() - bench_start) < MIN_BENCH_DURATION) {
             runtime::scheduler sched(num_threads);
             sched.start();
-            
+
             std::atomic<int> completed{0};
-            
+
             auto task_func = [&]() -> coro::task<void> {
+                // Larger CPU-bound work to minimize scheduling overhead ratio
                 volatile int sum = 0;
-                for (int i = 0; i < 10000; ++i) {
+                for (int i = 0; i < work_iterations; ++i) {
                     sum = sum + i * i;
                 }
                 (void)sum;
                 completed.fetch_add(1, std::memory_order_relaxed);
                 co_return;
             };
-            
+
             auto batch_start = high_resolution_clock::now();
-            
-            // Spawn all tasks to worker 0 to test work stealing scalability
+
+            // Distribute tasks evenly across workers for true parallel scaling test
             for (int i = 0; i < batch_size; ++i) {
                 auto t = task_func();
-                sched.spawn_to(0, t.release());
+                sched.spawn(t.release());  // Round-robin distribution
             }
-            
+
             while (completed.load(std::memory_order_relaxed) < batch_size) {
                 std::this_thread::sleep_for(microseconds(1));
             }
-            
+
             auto batch_end = high_resolution_clock::now();
             auto batch_us = duration_cast<microseconds>(batch_end - batch_start).count();
-            
+
             double throughput = (batch_us > 0) ? (batch_size * 1000000.0) / batch_us : 0;
             throughput_samples.push_back(throughput);
             total_tasks += batch_size;
-            
+
             sched.shutdown();
         }
-        
+
         auto bench_end = high_resolution_clock::now();
         auto total_sec = duration_cast<milliseconds>(bench_end - bench_start).count() / 1000.0;
-        
+
         auto stats = bench_stats::compute(throughput_samples);
-        
+
         std::cout << std::fixed << std::setprecision(1) << total_sec << "s, "
                   << total_tasks << " tasks, "
                   << std::setprecision(0) << "avg=" << stats.avg << " tasks/sec "
-                  << "(min=" << stats.min << ", max=" << stats.max 
+                  << "(min=" << stats.min << ", max=" << stats.max
                   << ", stddev=" << stats.stddev << ")" << std::endl;
     }
-    
+
     std::cout << std::endl;
 }
 

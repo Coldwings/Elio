@@ -100,7 +100,10 @@ struct unix_address {
             return "(unnamed)";
         }
         if (path[0] == '\0') {
-            return "@" + path.substr(1);  // Convention: @ for abstract
+            // Convention: @ for abstract socket names
+            std::string result("@");
+            result.append(path, 1);
+            return result;
         }
         return path;
     }

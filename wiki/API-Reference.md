@@ -217,8 +217,9 @@ Manages coroutine execution across worker threads.
 ```cpp
 class scheduler {
 public:
-    // Create scheduler with specified number of workers
-    explicit scheduler(size_t num_workers = std::thread::hardware_concurrency());
+    // Create scheduler with specified number of workers and wait strategy
+    explicit scheduler(size_t num_workers = std::thread::hardware_concurrency(),
+                       wait_strategy strategy = wait_strategy::blocking());
     ~scheduler();
     
     // Start worker threads
@@ -255,39 +256,66 @@ sched.shutdown();
 
 ### `worker_thread`
 
-Individual worker that executes tasks. Workers use an efficient idle mechanism with eventfd-based wake-up.
+Individual worker that executes tasks. Workers use an efficient idle mechanism with futex-based wake-up.
 
 ```cpp
 class worker_thread {
 public:
     // Schedule a task to this worker (thread-safe, wakes worker if sleeping)
     void schedule(std::coroutine_handle<> handle);
-    
+
     // Schedule from owner thread (faster, no wake needed)
     void schedule_local(std::coroutine_handle<> handle);
-    
+
     // Wake this worker if sleeping (called automatically by schedule())
     void wake() noexcept;
-    
-    // Get the eventfd for external integration
-    int wake_fd() const noexcept;
-    
+
+    // Get/set the wait strategy for this worker
+    const wait_strategy& get_wait_strategy() const noexcept;
+    void set_wait_strategy(wait_strategy strategy) noexcept;
+
     // Get worker ID
     size_t worker_id() const noexcept;
-    
+
     // Check if running
     bool is_running() const noexcept;
-    
+
     // Get current worker (thread-local)
     static worker_thread* current() noexcept;
 };
 ```
 
 **Idle Behavior:**
-- Workers block efficiently on `epoll_wait` when no tasks are available
+- Workers block efficiently on futex when no tasks are available
+- Optional spin phase before blocking (configurable via `wait_strategy`)
 - When a task is scheduled via `schedule()`, the worker is automatically woken
-- One worker polls the IO backend while others sleep on their eventfd
-- Results in near-zero CPU usage (< 1%) when idle
+- Results in near-zero CPU usage (< 1%) when idle with default blocking strategy
+
+### `wait_strategy`
+
+Configuration for how workers wait when idle.
+
+```cpp
+struct wait_strategy {
+    size_t spin_iterations = 0;  // Spin count before blocking (0 = pure blocking)
+    bool spin_yield = false;     // Yield during spin (true = friendlier to other threads)
+
+    // Preset strategies
+    static constexpr wait_strategy blocking() noexcept;      // Default: pure blocking
+    static constexpr wait_strategy spinning(size_t n) noexcept;  // Spin with pause
+    static constexpr wait_strategy hybrid(size_t n) noexcept;    // Spin with yield, then block
+    static constexpr wait_strategy aggressive(size_t n = 1000) noexcept;  // More spinning
+};
+```
+
+**Example:**
+```cpp
+// Low-latency scheduler with hybrid waiting
+scheduler sched(4, wait_strategy::hybrid(1000));
+
+// Ultra-low latency with dedicated CPUs
+scheduler sched(4, wait_strategy::spinning(2000));
+```
 
 ### `run_config`
 

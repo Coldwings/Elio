@@ -45,9 +45,9 @@ CPU-bound workload with 100K iterations per task:
 
 Scaling efficiency depends on workload characteristics. Tasks with more computation relative to scheduling overhead will show better scaling.
 
-### Main Bottleneck
+### Wake-up Mechanism
 
-The primary scheduling overhead comes from `eventfd write` (~500-1500 ns with high variance). This is mitigated by **Lazy Wake optimization** which avoids the syscall when workers are busy.
+Elio uses Linux **futex** with `FUTEX_PRIVATE` for low-overhead cross-thread notifications. Futex provides faster wake-up than eventfd+epoll (typically ~100-300 ns vs ~500-1500 ns). Combined with **Lazy Wake optimization**, which avoids syscalls when workers are busy, this minimizes scheduling overhead.
 
 ## Built-in Optimizations
 
@@ -60,12 +60,59 @@ Workers track their idle state. Task submissions only trigger wake syscalls when
 if (inbox_.push(handle.address())) {
     // Only wake if worker is idle (sleeping)
     if (idle_.load(std::memory_order_relaxed)) {
-        wake();  // eventfd write
+        wake();  // futex wake
     }
 }
 ```
 
 This eliminates unnecessary syscalls when workers are busy processing tasks.
+
+### Wait Strategy
+
+Elio supports configurable wait strategies to balance latency vs CPU usage:
+
+```cpp
+#include <elio/runtime/scheduler.hpp>
+#include <elio/runtime/wait_strategy.hpp>
+
+using namespace elio::runtime;
+
+// Pure blocking (default) - lowest CPU usage
+scheduler sched(4, wait_strategy::blocking());
+
+// Hybrid spin-then-block - good for low-latency workloads
+// Spins for 1000 iterations with yield, then blocks on futex
+scheduler sched(4, wait_strategy::hybrid(1000));
+
+// Aggressive spinning - ultra-low latency (uses pause instruction)
+scheduler sched(4, wait_strategy::spinning(1000));
+
+// Custom strategy
+wait_strategy custom{
+    .spin_iterations = 500,   // Spin count before blocking
+    .spin_yield = true       // Yield during spin (friendlier to other threads)
+};
+scheduler sched(4, custom);
+```
+
+**Strategy Selection Guide:**
+
+| Strategy | CPU Usage | Wake Latency | Use Case |
+|----------|-----------|--------------|----------|
+| `blocking()` | Lowest | ~1-10 μs | General workloads (default) |
+| `hybrid(N)` | Low-Medium | ~1-5 μs | Latency-sensitive with mixed load |
+| `spinning(N)` | High | ~100-500 ns | Ultra-low latency, dedicated CPUs |
+| `aggressive(N)` | Medium-High | ~100-1000 ns | Low latency, shared CPUs |
+
+The `spin_yield` flag controls whether the spin phase uses `std::this_thread::yield()` (true) or the CPU pause instruction (false). Yielding is friendlier to other threads but slightly slower.
+
+**Runtime Configuration:**
+
+```cpp
+// Change per-worker strategy at runtime
+auto* worker = sched.get_worker(0);
+worker->set_wait_strategy(wait_strategy::spinning(2000));
+```
 
 ### io_uring Batch Submit
 

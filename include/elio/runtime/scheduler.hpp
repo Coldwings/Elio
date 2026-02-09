@@ -19,19 +19,21 @@ class scheduler {
     
 public:
     static constexpr size_t MAX_THREADS = 256;
-    
-    explicit scheduler(size_t num_threads = std::thread::hardware_concurrency())
+
+    explicit scheduler(size_t num_threads = std::thread::hardware_concurrency(),
+                       wait_strategy strategy = wait_strategy::blocking())
         : num_threads_(num_threads == 0 ? 1 : num_threads)
         , running_(false)
         , paused_(false)
-        , spawn_index_(0) {
-        
+        , spawn_index_(0)
+        , wait_strategy_(strategy) {
+
         size_t n = num_threads_.load(std::memory_order_relaxed);
         // Pre-reserve to MAX_THREADS to prevent reallocation during runtime
         // This ensures get_worker() is safe while set_thread_count() adds workers
         workers_.reserve(MAX_THREADS);
         for (size_t i = 0; i < n; ++i) {
-            workers_.push_back(std::make_unique<worker_thread>(this, i));
+            workers_.push_back(std::make_unique<worker_thread>(this, i, strategy));
         }
     }
 
@@ -142,7 +144,7 @@ public:
                         workers_[i]->start();
                     }
                 } else {
-                    auto worker = std::make_unique<worker_thread>(this, i);
+                    auto worker = std::make_unique<worker_thread>(this, i, wait_strategy_);
                     if (running_.load(std::memory_order_relaxed)) {
                         worker->start();
                     }
@@ -208,6 +210,11 @@ public:
         return workers_[worker_id]->tasks_executed();
     }
 
+    /// Get the wait strategy used by this scheduler
+    [[nodiscard]] const wait_strategy& get_wait_strategy() const noexcept {
+        return wait_strategy_;
+    }
+
 private:
     void do_spawn(std::coroutine_handle<> handle) {
         // Release fence ensures all writes to the coroutine frame (including
@@ -259,7 +266,8 @@ private:
     std::atomic<bool> paused_;
     std::atomic<size_t> spawn_index_;
     mutable std::mutex workers_mutex_;
-    
+    wait_strategy wait_strategy_;
+
     static inline thread_local scheduler* current_scheduler_ = nullptr;
 };
 
@@ -293,7 +301,7 @@ inline void worker_thread::stop() {
     bool expected = true;
     if (!running_.compare_exchange_strong(expected, false, 
             std::memory_order_release, std::memory_order_relaxed)) return;
-    wake();  // Wake the worker if it's blocked on epoll_wait
+    wake();  // Wake the worker if it's blocked on futex
     if (thread_.joinable()) thread_.join();
 }
 

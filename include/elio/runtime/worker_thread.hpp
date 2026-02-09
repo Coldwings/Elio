@@ -1,7 +1,9 @@
 #pragma once
 
 #include "chase_lev_deque.hpp"
+#include "futex_notifier.hpp"
 #include "mpsc_queue.hpp"
+#include "wait_strategy.hpp"
 #include <elio/coro/promise_base.hpp>
 #include <elio/io/io_context.hpp>
 #include <coroutine>
@@ -10,10 +12,6 @@
 #include <mutex>
 #include <random>
 #include <chrono>
-#include <sys/eventfd.h>
-#include <sys/epoll.h>
-#include <unistd.h>
-#include <cerrno>
 
 namespace elio::runtime {
 
@@ -30,52 +28,20 @@ class scheduler;
 /// the owner thread, enabling linear scaling with thread count.
 class worker_thread {
 public:
-    worker_thread(scheduler* sched, size_t worker_id)
+    worker_thread(scheduler* sched, size_t worker_id,
+                   wait_strategy strategy = wait_strategy::blocking())
         : scheduler_(sched)
         , worker_id_(worker_id)
         , queue_()
         , inbox_()
         , running_(false)
         , tasks_executed_(0)
-        , wake_fd_(-1)
-        , wait_epoll_fd_(-1)
+        , strategy_(strategy)
         , io_context_(std::make_unique<io::io_context>()) {
-        
-        // Create eventfd for wake-up notifications (non-blocking, semaphore mode)
-        wake_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (wake_fd_ < 0) {
-            // Fall back to busy-wait if eventfd fails
-            return;
-        }
-        
-        // Create a private epoll instance for this worker's idle wait
-        wait_epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
-        if (wait_epoll_fd_ < 0) {
-            close(wake_fd_);
-            wake_fd_ = -1;
-            return;
-        }
-        
-        // Register wake_fd with our private epoll
-        struct epoll_event ev;
-        ev.events = EPOLLIN;
-        ev.data.fd = wake_fd_;
-        if (epoll_ctl(wait_epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &ev) < 0) {
-            close(wait_epoll_fd_);
-            close(wake_fd_);
-            wait_epoll_fd_ = -1;
-            wake_fd_ = -1;
-        }
     }
 
     ~worker_thread() {
         stop();
-        if (wait_epoll_fd_ >= 0) {
-            close(wait_epoll_fd_);
-        }
-        if (wake_fd_ >= 0) {
-            close(wake_fd_);
-        }
     }
 
     worker_thread(const worker_thread&) = delete;
@@ -179,16 +145,17 @@ public:
     
     /// Wake this worker if it's sleeping (called from other threads)
     void wake() noexcept {
-        if (wake_fd_ >= 0) {
-            uint64_t val = 1;
-            // Write to eventfd to signal wake-up (ignore errors, best-effort)
-            [[maybe_unused]] auto ret = ::write(wake_fd_, &val, sizeof(val));
-        }
+        notifier_.notify_one();
     }
-    
-    /// Get the eventfd for this worker (for external integration)
-    [[nodiscard]] int wake_fd() const noexcept {
-        return wake_fd_;
+
+    /// Get the wait strategy for this worker
+    [[nodiscard]] const wait_strategy& get_wait_strategy() const noexcept {
+        return strategy_;
+    }
+
+    /// Set the wait strategy for this worker
+    void set_wait_strategy(wait_strategy strategy) noexcept {
+        strategy_ = strategy;
     }
 
 private:
@@ -198,33 +165,30 @@ private:
     void run_task(std::coroutine_handle<> handle) noexcept;
     [[nodiscard]] std::coroutine_handle<> try_steal() noexcept;
     void poll_io_when_idle();
-    
-    /// Drain eventfd counter after wake-up
-    void drain_wake_fd() noexcept {
-        if (wake_fd_ >= 0) {
-            uint64_t val;
-            // Read to reset the eventfd counter (non-blocking, ignore errors)
-            [[maybe_unused]] auto ret = ::read(wake_fd_, &val, sizeof(val));
-        }
-    }
-    
-    /// Wait for work with efficient blocking using epoll
-    /// @param timeout_ms Maximum time to wait in milliseconds
+
+    /// Wait for work with configurable spin-then-block strategy
+    /// @param timeout_ms Maximum time to block in milliseconds (after spinning)
     void wait_for_work(int timeout_ms) noexcept {
-        if (wait_epoll_fd_ < 0) {
-            // Fallback: no eventfd support, just yield
-            std::this_thread::yield();
-            return;
+        // Phase 1: Optional spinning (if configured)
+        if (strategy_.spin_iterations > 0) {
+            for (size_t i = 0; i < strategy_.spin_iterations; ++i) {
+                // Check for work
+                if (inbox_.size_approx() > 0 || notifier_.is_notified()) {
+                    notifier_.reset();
+                    return;
+                }
+                // Spin
+                if (strategy_.spin_yield) {
+                    std::this_thread::yield();
+                } else {
+                    cpu_relax();
+                }
+            }
         }
 
-        struct epoll_event ev;
-        int ret = epoll_wait(wait_epoll_fd_, &ev, 1, timeout_ms);
-
-        if (ret > 0) {
-            // Got wake-up signal, drain the eventfd
-            drain_wake_fd();
-        }
-        // ret == 0: timeout, ret < 0: error (EINTR) - all fine, just return
+        // Phase 2: Block on futex with timeout
+        notifier_.wait_for(timeout_ms);
+        notifier_.reset();
     }
 
     scheduler* scheduler_;
@@ -236,8 +200,8 @@ private:
     std::atomic<size_t> tasks_executed_;
     std::atomic<bool> idle_{false};    // True when worker is waiting for work (for lazy wake)
     bool needs_sync_ = false;          // Whether current task needs memory synchronization
-    int wake_fd_;                      // eventfd for wake-up notifications
-    int wait_epoll_fd_;                // epoll fd for waiting on wake_fd
+    futex_notifier notifier_;          // Futex-based notification for wake-up
+    wait_strategy strategy_;           // Configurable wait strategy
     std::unique_ptr<io::io_context> io_context_;  // Per-worker io_context
     
     static inline thread_local worker_thread* current_worker_ = nullptr;

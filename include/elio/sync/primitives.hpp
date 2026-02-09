@@ -1,11 +1,13 @@
 #pragma once
 
 #include <elio/log/macros.hpp>
+#include <elio/runtime/wait_strategy.hpp>
 #include <coroutine>
 #include <atomic>
 #include <mutex>
 #include <queue>
 #include <optional>
+#include <vector>
 
 namespace elio::runtime {
 class scheduler;  // Forward declaration
@@ -902,6 +904,312 @@ private:
     std::queue<std::pair<std::coroutine_handle<>, T>> send_waiters_;
     size_t capacity_;
     bool closed_;
+};
+
+/// Coroutine-aware spinlock
+/// Uses atomic CAS with cpu_relax() for low-latency locking.
+/// Suitable for short critical sections where contention is low.
+/// Unlike std::mutex-based elio::sync::mutex, this avoids OS-level synchronization
+/// entirely, trading CPU cycles for lower latency.
+///
+/// For coroutine suspension under contention, use elio::sync::mutex instead.
+/// This spinlock is designed for scenarios where the lock is held very briefly
+/// and the overhead of thread/coroutine suspension would exceed the spin time.
+class spinlock {
+public:
+    spinlock() = default;
+    ~spinlock() = default;
+
+    // Non-copyable, non-movable
+    spinlock(const spinlock&) = delete;
+    spinlock& operator=(const spinlock&) = delete;
+    spinlock(spinlock&&) = delete;
+    spinlock& operator=(spinlock&&) = delete;
+
+    /// Acquire the spinlock (spins until acquired)
+    void lock() noexcept {
+        // Fast path: try once with CAS
+        bool expected = false;
+        if (locked_.compare_exchange_weak(expected, true,
+                std::memory_order_acquire, std::memory_order_relaxed)) {
+            return;
+        }
+
+        // Slow path: TTAS (Test-and-Test-and-Set) with backoff
+        lock_slow();
+    }
+
+    /// Try to acquire without spinning
+    bool try_lock() noexcept {
+        bool expected = false;
+        return locked_.compare_exchange_strong(expected, true,
+            std::memory_order_acquire, std::memory_order_relaxed);
+    }
+
+    /// Release the spinlock
+    void unlock() noexcept {
+        locked_.store(false, std::memory_order_release);
+    }
+
+    /// Check if locked (for debugging only, not reliable for synchronization)
+    bool is_locked() const noexcept {
+        return locked_.load(std::memory_order_relaxed);
+    }
+
+private:
+    void lock_slow() noexcept {
+        for (;;) {
+            // TTAS: spin on read first (avoids cache-line bouncing from CAS)
+            while (locked_.load(std::memory_order_relaxed)) {
+                runtime::cpu_relax();
+            }
+
+            // Try to acquire
+            bool expected = false;
+            if (locked_.compare_exchange_weak(expected, true,
+                    std::memory_order_acquire, std::memory_order_relaxed)) {
+                return;
+            }
+        }
+    }
+
+    std::atomic<bool> locked_{false};
+};
+
+/// RAII lock guard for spinlock
+class spinlock_guard {
+public:
+    explicit spinlock_guard(spinlock& s) : spinlock_(&s) {
+        spinlock_->lock();
+    }
+
+    ~spinlock_guard() {
+        if (owns_lock_) {
+            spinlock_->unlock();
+        }
+    }
+
+    // Non-copyable, movable
+    spinlock_guard(const spinlock_guard&) = delete;
+    spinlock_guard& operator=(const spinlock_guard&) = delete;
+
+    spinlock_guard(spinlock_guard&& other) noexcept
+        : spinlock_(other.spinlock_), owns_lock_(other.owns_lock_) {
+        other.owns_lock_ = false;
+    }
+
+    spinlock_guard& operator=(spinlock_guard&& other) noexcept {
+        if (this != &other) {
+            if (owns_lock_) {
+                spinlock_->unlock();
+            }
+            spinlock_ = other.spinlock_;
+            owns_lock_ = other.owns_lock_;
+            other.owns_lock_ = false;
+        }
+        return *this;
+    }
+
+    void unlock() {
+        if (owns_lock_) {
+            spinlock_->unlock();
+            owns_lock_ = false;
+        }
+    }
+
+private:
+    spinlock* spinlock_;
+    bool owns_lock_ = true;
+};
+
+/// Lock concept for condition_variable - any type with lock()/unlock()
+/// that can be used with the condition_variable
+namespace detail {
+
+template<typename Lock>
+concept lockable = requires(Lock& l) {
+    l.unlock();
+};
+
+} // namespace detail
+
+/// Coroutine-aware condition variable
+/// Suspends the coroutine instead of blocking the thread.
+///
+/// Can be used with:
+/// - elio::sync::mutex (via co_await cv.wait(mutex))
+/// - elio::sync::spinlock (via co_await cv.wait(spinlock))
+/// - No lock at all (via co_await cv.wait_unlocked()) when all participants
+///   are guaranteed to run on the same worker thread
+///
+/// Supports both notify_one() and notify_all() semantics.
+/// The predicate-based wait variants provide spurious-wakeup protection.
+class condition_variable {
+public:
+    condition_variable() = default;
+    ~condition_variable() = default;
+
+    // Non-copyable, non-movable
+    condition_variable(const condition_variable&) = delete;
+    condition_variable& operator=(const condition_variable&) = delete;
+    condition_variable(condition_variable&&) = delete;
+    condition_variable& operator=(condition_variable&&) = delete;
+
+    /// Wait awaitable for use with elio::sync::mutex
+    /// Atomically releases the mutex and suspends the coroutine.
+    /// Re-acquires the mutex before resuming.
+    class wait_awaitable_mutex {
+    public:
+        wait_awaitable_mutex(condition_variable& cv, mutex& m)
+            : cv_(cv), mutex_(m) {}
+
+        bool await_ready() const noexcept { return false; }
+
+        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+            awaiter_ = awaiter;
+            {
+                std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+                cv_.waiters_.push(awaiter);
+            }
+            // Release the user's mutex after enqueuing
+            // This ensures no signal is lost between unlock and suspend
+            mutex_.unlock();
+            return true;
+        }
+
+        // Re-acquire the mutex upon resume by returning a lock awaitable
+        // The caller must co_await this result
+        auto await_resume() {
+            return mutex_.lock();
+        }
+
+    private:
+        condition_variable& cv_;
+        mutex& mutex_;
+        std::coroutine_handle<> awaiter_;
+    };
+
+    /// Wait awaitable for use with a generic lockable type (e.g., spinlock)
+    /// Atomically releases the lock and suspends the coroutine.
+    /// Re-acquires the lock before resuming.
+    template<detail::lockable Lock>
+    class wait_awaitable_lock {
+    public:
+        wait_awaitable_lock(condition_variable& cv, Lock& lock)
+            : cv_(cv), lock_(lock) {}
+
+        bool await_ready() const noexcept { return false; }
+
+        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+            {
+                std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+                cv_.waiters_.push(awaiter);
+            }
+            // Release the user's lock after enqueuing
+            lock_.unlock();
+            return true;
+        }
+
+        void await_resume() {
+            // Re-acquire the lock synchronously (spinlock)
+            lock_.lock();
+        }
+
+    private:
+        condition_variable& cv_;
+        Lock& lock_;
+    };
+
+    /// Wait awaitable without any external lock
+    /// Use only when all participants are guaranteed to run on the same worker thread.
+    class wait_awaitable_unlocked {
+    public:
+        explicit wait_awaitable_unlocked(condition_variable& cv) : cv_(cv) {}
+
+        bool await_ready() const noexcept { return false; }
+
+        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+            cv_.waiters_.push(awaiter);
+            return true;
+        }
+
+        void await_resume() const noexcept {}
+
+    private:
+        condition_variable& cv_;
+    };
+
+    /// Wait with elio::sync::mutex
+    /// The mutex must be locked before calling wait().
+    /// Usage:
+    ///   co_await mtx.lock();
+    ///   while (!condition) {
+    ///       co_await co_await cv.wait(mtx);  // double co_await: outer suspends, inner re-locks
+    ///   }
+    ///   mtx.unlock();
+    auto wait(mutex& m) {
+        return wait_awaitable_mutex(*this, m);
+    }
+
+    /// Wait with a generic lockable (e.g., spinlock)
+    /// The lock must be held before calling wait().
+    /// Usage:
+    ///   sl.lock();
+    ///   while (!condition) {
+    ///       co_await cv.wait(sl);
+    ///   }
+    ///   sl.unlock();
+    template<detail::lockable Lock>
+    auto wait(Lock& lock) {
+        return wait_awaitable_lock<Lock>(*this, lock);
+    }
+
+    /// Wait without external lock (single-worker only)
+    /// Usage:
+    ///   while (!condition) {
+    ///       co_await cv.wait_unlocked();
+    ///   }
+    auto wait_unlocked() {
+        return wait_awaitable_unlocked(*this);
+    }
+
+    /// Wake one waiting coroutine
+    void notify_one() {
+        std::coroutine_handle<> to_resume;
+        {
+            std::lock_guard<std::mutex> guard(internal_mutex_);
+            if (waiters_.empty()) return;
+            to_resume = waiters_.front();
+            waiters_.pop();
+        }
+        runtime::schedule_handle(to_resume);
+    }
+
+    /// Wake all waiting coroutines
+    void notify_all() {
+        std::vector<std::coroutine_handle<>> to_resume;
+        {
+            std::lock_guard<std::mutex> guard(internal_mutex_);
+            while (!waiters_.empty()) {
+                to_resume.push_back(waiters_.front());
+                waiters_.pop();
+            }
+        }
+        for (auto& h : to_resume) {
+            runtime::schedule_handle(h);
+        }
+    }
+
+    /// Check if there are waiting coroutines
+    bool has_waiters() const noexcept {
+        std::lock_guard<std::mutex> guard(internal_mutex_);
+        return !waiters_.empty();
+    }
+
+private:
+    mutable std::mutex internal_mutex_;
+    std::queue<std::coroutine_handle<>> waiters_;
 };
 
 } // namespace elio::sync

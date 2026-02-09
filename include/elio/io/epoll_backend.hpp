@@ -442,12 +442,18 @@ public:
 
     void notify() override {
         uint64_t val = 1;
-        ::write(wake_fd_, &val, sizeof(val));
+        ssize_t ret = ::write(wake_fd_, &val, sizeof(val));
+        if (ret < 0 && errno != EAGAIN) {
+            ELIO_LOG_WARNING("eventfd write failed: {}", strerror(errno));
+        }
     }
 
     void drain_notify() override {
         uint64_t val;
-        ::read(wake_fd_, &val, sizeof(val));
+        ssize_t ret = ::read(wake_fd_, &val, sizeof(val));
+        if (ret < 0 && errno != EAGAIN) {
+            ELIO_LOG_WARNING("eventfd read failed: {}", strerror(errno));
+        }
     }
 
 private:

@@ -9,6 +9,10 @@ TLS (Transport Layer Security) provides:
 - **Authentication**: Verify server (and optionally client) identity
 - **Integrity**: Detect tampering with data
 
+## Why OpenSSL
+
+Elio uses OpenSSL as its TLS backend. OpenSSL is mature, widely available on Linux distributions, and supports modern TLS 1.3 with ALPN for HTTP/2 negotiation. It provides industry-standard certificate management and is the most broadly deployed TLS library, ensuring compatibility with existing infrastructure and tooling.
+
 ## Requirements
 
 TLS support requires:
@@ -44,12 +48,12 @@ ctx.set_verify_mode(verify_mode::peer);
 tls_context ctx(tls_mode::server);
 
 // Load server certificate and private key
-ctx.use_certificate_file("/path/to/server.crt");
-ctx.use_private_key_file("/path/to/server.key");
+ctx.load_certificate("/path/to/server.crt");
+ctx.load_private_key("/path/to/server.key");
 
 // Optionally require client certificates
-ctx.set_verify_mode(verify_mode::peer | verify_mode::fail_if_no_peer_cert);
-ctx.load_verify_file("/path/to/ca.crt");
+ctx.set_verify_mode(verify_mode::fail_if_no_cert);
+ctx.load_verify_locations("/path/to/ca.crt");
 ```
 
 ## Certificate Verification
@@ -60,22 +64,23 @@ ctx.load_verify_file("/path/to/ca.crt");
 enum class verify_mode {
     none,               // No verification (insecure!)
     peer,               // Verify peer certificate
-    fail_if_no_peer_cert,  // Fail if peer has no certificate
-    client_once         // Only verify client cert once
+    fail_if_no_cert     // Fail if peer has no certificate (server mode)
 };
 
-// Combine modes with bitwise OR
-ctx.set_verify_mode(verify_mode::peer | verify_mode::fail_if_no_peer_cert);
+ctx.set_verify_mode(verify_mode::fail_if_no_cert);
 ```
 
 ### Custom Verification
 
 ```cpp
-// Load specific CA certificate
-ctx.load_verify_file("/path/to/ca-bundle.crt");
+// Load specific CA certificate file
+ctx.load_verify_locations("/path/to/ca-bundle.crt");
 
 // Load directory of CA certificates
-ctx.load_verify_dir("/etc/ssl/certs/");
+ctx.load_verify_locations("", "/etc/ssl/certs/");
+
+// Load both file and directory
+ctx.load_verify_locations("/path/to/ca-bundle.crt", "/etc/ssl/certs/");
 
 // Use system default CA store
 ctx.use_default_verify_paths();
@@ -89,15 +94,10 @@ For mutual TLS authentication:
 tls_context ctx(tls_mode::client);
 
 // Load client certificate
-ctx.use_certificate_file("/path/to/client.crt");
+ctx.load_certificate("/path/to/client.crt");
 
-// Load client private key
-ctx.use_private_key_file("/path/to/client.key");
-
-// Optionally set password callback for encrypted keys
-ctx.set_password_callback([](int max_len, int purpose) -> std::string {
-    return "my_secret_password";
-});
+// Load client private key (with optional password for encrypted keys)
+ctx.load_private_key("/path/to/client.key", "my_secret_password");
 ```
 
 ## ALPN (Application-Layer Protocol Negotiation)
@@ -105,9 +105,8 @@ ctx.set_password_callback([](int max_len, int purpose) -> std::string {
 ALPN is required for HTTP/2:
 
 ```cpp
-// For HTTP/2 client
-std::vector<std::string> protocols = {"h2", "http/1.1"};
-ctx.set_alpn_protocols(protocols);
+// For HTTP/2 client (comma-separated protocol list)
+ctx.set_alpn_protocols("h2,http/1.1");
 
 // After connection, check negotiated protocol
 tls_stream stream = /* ... */;
@@ -154,8 +153,8 @@ coro::task<void> connect_example() {
 ```cpp
 coro::task<void> server_example() {
     tls_context ctx(tls_mode::server);
-    ctx.use_certificate_file("/path/to/server.crt");
-    ctx.use_private_key_file("/path/to/server.key");
+    ctx.load_certificate("/path/to/server.crt");
+    ctx.load_private_key("/path/to/server.key");
 
     auto listener = tls_listener::bind(
         net::ipv4_address("0.0.0.0", 8443),
@@ -178,21 +177,26 @@ coro::task<void> server_example() {
 
 ## Protocol Configuration
 
-### Minimum TLS Version
+### TLS Version
+
+The TLS version is configured via the `tls_version` enum passed to the `tls_context` constructor:
 
 ```cpp
-// Require TLS 1.2 or higher
-ctx.set_min_protocol_version(TLS1_2_VERSION);
+// Require TLS 1.2 or higher (default)
+tls_context ctx(tls_mode::client, tls_version::tls_1_2_or_higher);
 
 // Require TLS 1.3 only
-ctx.set_min_protocol_version(TLS1_3_VERSION);
+tls_context ctx(tls_mode::client, tls_version::tls_1_3_only);
+
+// Exactly TLS 1.2
+tls_context ctx(tls_mode::client, tls_version::tls_1_2);
 ```
 
 ### Cipher Suites
 
 ```cpp
 // Set preferred cipher suites (TLS 1.2)
-ctx.set_cipher_list("ECDHE+AESGCM:DHE+AESGCM:ECDHE+CHACHA20");
+ctx.set_ciphers("ECDHE+AESGCM:DHE+AESGCM:ECDHE+CHACHA20");
 
 // Set cipher suites for TLS 1.3
 ctx.set_ciphersuites("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256");
@@ -269,7 +273,7 @@ http::client client(ctx, config);
 
 // Access and customize TLS context
 auto& tls_ctx = client.tls_context();
-tls_ctx.load_verify_file("/path/to/custom-ca.crt");
+tls_ctx.load_verify_locations("/path/to/custom-ca.crt");
 
 auto resp = co_await client.get("https://example.com/");
 ```

@@ -4,7 +4,7 @@ This page provides complete, runnable examples demonstrating Elio's features.
 
 ## Hello World
 
-The simplest Elio program:
+The simplest Elio program using `ELIO_ASYNC_MAIN`:
 
 ```cpp
 #include <elio/elio.hpp>
@@ -16,23 +16,13 @@ coro::task<std::string> get_greeting() {
     co_return "Hello from Elio!";
 }
 
-coro::task<void> main_task() {
+coro::task<int> async_main(int argc, char* argv[]) {
     std::string greeting = co_await get_greeting();
     std::cout << greeting << std::endl;
-    co_return;
+    co_return 0;
 }
 
-int main() {
-    runtime::scheduler sched(2);
-    sched.start();
-    
-    auto t = main_task();
-    sched.spawn(t.release());
-    
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    sched.shutdown();
-    return 0;
-}
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ## Chained Coroutines
@@ -59,14 +49,16 @@ coro::task<int> step3(int input) {
     co_return input + 5;
 }
 
-coro::task<void> pipeline() {
+coro::task<int> async_main(int argc, char* argv[]) {
     int a = co_await step1();        // 10
     int b = co_await step2(a);       // 20
     int c = co_await step3(b);       // 25
-    
+
     ELIO_LOG_INFO("Final result: {}", c);
-    co_return;
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ## TCP Echo Server
@@ -87,81 +79,61 @@ std::atomic<int> g_listener_fd{-1};
 coro::task<void> signal_handler_task() {
     signal_set sigs{SIGINT, SIGTERM};
     signal_fd sigfd(sigs);
-    
+
     auto info = co_await sigfd.wait();
     if (info) {
         ELIO_LOG_INFO("Received signal: {}", info->full_name());
     }
-    
+
     g_running = false;
-    
+
     // Close listener to interrupt pending accept
     int fd = g_listener_fd.exchange(-1);
     if (fd >= 0) ::close(fd);
-    
-    co_return;
 }
 
 coro::task<void> handle_client(net::tcp_stream stream, int id) {
     ELIO_LOG_INFO("[Client {}] Connected", id);
-    
+
     char buffer[1024];
     while (g_running) {
         auto result = co_await stream.read(buffer, sizeof(buffer));
         if (result.result <= 0) break;
-        
+
         co_await stream.write(buffer, result.result);
     }
-    
+
     ELIO_LOG_INFO("[Client {}] Disconnected", id);
-    co_return;
 }
 
-coro::task<void> server(uint16_t port, runtime::scheduler& sched) {
-    auto& ctx = io::default_io_context();
-    auto listener = net::tcp_listener::bind(net::ipv4_address(port), ctx);
-    
+coro::task<int> async_main(int argc, char* argv[]) {
+    // Block signals before they can be delivered to worker threads
+    signal_set sigs{SIGINT, SIGTERM};
+    sigs.block_all_threads();
+
+    // Spawn signal handler
+    signal_handler_task().go();
+
+    auto listener = net::tcp_listener::bind(net::ipv4_address(8080));
     if (!listener) {
         ELIO_LOG_ERROR("Failed to bind");
-        co_return;
+        co_return 1;
     }
-    
+
     g_listener_fd.store(listener->fd());
-    ELIO_LOG_INFO("Server listening on port {}", port);
-    
+    ELIO_LOG_INFO("Server listening on port 8080");
+
     int client_id = 0;
     while (g_running) {
         auto stream = co_await listener->accept();
         if (!stream) continue;
-        
-        auto handler = handle_client(std::move(*stream), ++client_id);
-        sched.spawn(handler.release());
+
+        handle_client(std::move(*stream), ++client_id).go();
     }
-    co_return;
+    co_return 0;
 }
 
-int main() {
-    // Block signals BEFORE creating scheduler threads
-    signal_set sigs{SIGINT, SIGTERM};
-    sigs.block_all_threads();
-    
-    runtime::scheduler sched(4);
-    sched.start();
-    
-    // Spawn signal handler coroutine
-    auto sig_handler = signal_handler_task();
-    sched.spawn(sig_handler.release());
-    
-    auto srv = server(8080, sched);
-    sched.spawn(srv.release());
-    
-    while (g_running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    
-    sched.shutdown();
-    return 0;
-}
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ## UDS Echo Server
@@ -182,88 +154,67 @@ std::atomic<int> g_listener_fd{-1};
 coro::task<void> signal_handler_task() {
     signal_set sigs{SIGINT, SIGTERM};
     signal_fd sigfd(sigs);
-    
+
     auto info = co_await sigfd.wait();
     if (info) {
         ELIO_LOG_INFO("Received signal: {}", info->full_name());
     }
-    
+
     g_running = false;
     int fd = g_listener_fd.exchange(-1);
     if (fd >= 0) ::close(fd);
-    
-    co_return;
 }
 
 coro::task<void> handle_client(net::uds_stream stream, int id) {
     ELIO_LOG_INFO("[Client {}] Connected", id);
-    
+
     char buffer[1024];
     while (g_running) {
         auto result = co_await stream.read(buffer, sizeof(buffer));
         if (result.result <= 0) break;
-        
+
         co_await stream.write(buffer, result.result);
     }
-    
+
     ELIO_LOG_INFO("[Client {}] Disconnected", id);
-    co_return;
 }
 
-coro::task<void> server(const net::unix_address& addr, runtime::scheduler& sched) {
-    auto& ctx = io::default_io_context();
-    
-    net::uds_options opts;
-    opts.unlink_on_bind = true;
-    
-    auto listener = net::uds_listener::bind(addr, ctx, opts);
-    
-    if (!listener) {
-        ELIO_LOG_ERROR("Failed to bind to {}", addr.to_string());
-        co_return;
-    }
-    
-    g_listener_fd.store(listener->fd());
-    ELIO_LOG_INFO("Server listening on {}", addr.to_string());
-    
-    int client_id = 0;
-    while (g_running) {
-        auto stream = co_await listener->accept();
-        if (!stream) continue;
-        
-        auto handler = handle_client(std::move(*stream), ++client_id);
-        sched.spawn(handler.release());
-    }
-    co_return;
-}
-
-int main() {
-    // Block signals BEFORE creating scheduler threads
+coro::task<int> async_main(int argc, char* argv[]) {
+    // Block signals before they can be delivered to worker threads
     signal_set sigs{SIGINT, SIGTERM};
     sigs.block_all_threads();
-    
+
+    // Spawn signal handler
+    signal_handler_task().go();
+
     // Use filesystem socket
     net::unix_address addr("/tmp/echo.sock");
     // Or use abstract socket (Linux-specific):
     // auto addr = net::unix_address::abstract("echo_server");
-    
-    runtime::scheduler sched(4);
-    sched.start();
-    
-    // Spawn signal handler
-    auto sig_handler = signal_handler_task();
-    sched.spawn(sig_handler.release());
-    
-    auto srv = server(addr, sched);
-    sched.spawn(srv.release());
-    
-    while (g_running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    net::uds_options opts;
+    opts.unlink_on_bind = true;
+
+    auto listener = net::uds_listener::bind(addr, opts);
+    if (!listener) {
+        ELIO_LOG_ERROR("Failed to bind to {}", addr.to_string());
+        co_return 1;
     }
-    
-    sched.shutdown();
-    return 0;
+
+    g_listener_fd.store(listener->fd());
+    ELIO_LOG_INFO("Server listening on {}", addr.to_string());
+
+    int client_id = 0;
+    while (g_running) {
+        auto stream = co_await listener->accept();
+        if (!stream) continue;
+
+        handle_client(std::move(*stream), ++client_id).go();
+    }
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ## UDS Client
@@ -277,19 +228,19 @@ using namespace elio;
 
 coro::task<void> client_main(const net::unix_address& addr) {
     ELIO_LOG_INFO("Connecting to {}...", addr.to_string());
-    
+
     auto stream = co_await net::uds_connect(addr);
     if (!stream) {
         ELIO_LOG_ERROR("Connect failed: {}", strerror(errno));
         co_return;
     }
-    
+
     ELIO_LOG_INFO("Connected!");
-    
+
     // Send message
     const char* msg = "Hello via Unix Domain Socket!";
     co_await stream->write(msg, strlen(msg));
-    
+
     // Receive echo
     char buffer[1024];
     auto result = co_await stream->read(buffer, sizeof(buffer) - 1);
@@ -297,35 +248,19 @@ coro::task<void> client_main(const net::unix_address& addr) {
         buffer[result.result] = '\0';
         ELIO_LOG_INFO("Received: {}", buffer);
     }
-    
-    co_return;
 }
 
-int main() {
+coro::task<int> async_main(int argc, char* argv[]) {
     // Match server's socket path
     net::unix_address addr("/tmp/echo.sock");
     // Or abstract socket:
     // auto addr = net::unix_address::abstract("echo_server");
-    
-    runtime::scheduler sched(2);
-    sched.start();
-    
-    std::atomic<bool> done{false};
-    auto run = [&]() -> coro::task<void> {
-        co_await client_main(addr);
-        done = true;
-    };
-    
-    auto t = run();
-    sched.spawn(t.release());
-    
-    while (!done) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    
-    sched.shutdown();
-    return 0;
+
+    co_await client_main(addr);
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ## HTTP Client
@@ -340,20 +275,20 @@ Making HTTP requests with various methods:
 using namespace elio;
 using namespace elio::http;
 
-coro::task<void> http_examples(io::io_context& ctx) {
+coro::task<int> async_main(int argc, char* argv[]) {
     client_config config;
     config.user_agent = "elio-example/1.0";
     config.follow_redirects = true;
-    
-    client c(ctx, config);
-    
+
+    client c(config);
+
     // GET request
     ELIO_LOG_INFO("=== GET ===");
     auto get_resp = co_await c.get("https://httpbin.org/get");
     if (get_resp) {
         ELIO_LOG_INFO("Status: {}", get_resp->status_code());
     }
-    
+
     // POST JSON
     ELIO_LOG_INFO("=== POST JSON ===");
     auto post_resp = co_await c.post(
@@ -364,7 +299,7 @@ coro::task<void> http_examples(io::io_context& ctx) {
     if (post_resp) {
         ELIO_LOG_INFO("Status: {}", post_resp->status_code());
     }
-    
+
     // POST Form
     ELIO_LOG_INFO("=== POST Form ===");
     auto form_resp = co_await c.post(
@@ -375,9 +310,11 @@ coro::task<void> http_examples(io::io_context& ctx) {
     if (form_resp) {
         ELIO_LOG_INFO("Status: {}", form_resp->status_code());
     }
-    
-    co_return;
+
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ## HTTP/2 Client
@@ -391,13 +328,13 @@ Making HTTP/2 requests with multiplexed streams:
 using namespace elio;
 using namespace elio::http;
 
-coro::task<void> http2_examples(io::io_context& ctx) {
+coro::task<int> async_main(int argc, char* argv[]) {
     h2_client_config config;
     config.user_agent = "elio-example/1.0";
     config.max_concurrent_streams = 100;
-    
-    h2_client client(ctx, config);
-    
+
+    h2_client client(config);
+
     // GET request (HTTP/2 requires HTTPS)
     ELIO_LOG_INFO("=== HTTP/2 GET ===");
     auto get_resp = co_await client.get("https://nghttp2.org/");
@@ -405,7 +342,7 @@ coro::task<void> http2_examples(io::io_context& ctx) {
         ELIO_LOG_INFO("Status: {}", static_cast<int>(get_resp->get_status()));
         ELIO_LOG_INFO("Body size: {} bytes", get_resp->body().size());
     }
-    
+
     // POST JSON
     ELIO_LOG_INFO("=== HTTP/2 POST JSON ===");
     auto post_resp = co_await client.post(
@@ -416,7 +353,7 @@ coro::task<void> http2_examples(io::io_context& ctx) {
     if (post_resp) {
         ELIO_LOG_INFO("Status: {}", static_cast<int>(post_resp->get_status()));
     }
-    
+
     // Multiple requests on same connection (HTTP/2 multiplexing)
     ELIO_LOG_INFO("=== HTTP/2 Multiplexing ===");
     for (int i = 0; i < 5; ++i) {
@@ -426,14 +363,16 @@ coro::task<void> http2_examples(io::io_context& ctx) {
         }
     }
     // All requests above reused the same underlying connection
-    
-    co_return;
+
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ## HTTP Server
 
-A simple REST API server:
+A REST API server using the router and `elio::serve` for graceful shutdown:
 
 ```cpp
 #include <elio/elio.hpp>
@@ -442,52 +381,42 @@ A simple REST API server:
 using namespace elio;
 using namespace elio::http;
 
-coro::task<void> router(request& req, response& resp) {
-    auto path = req.path();
-    auto method = req.method();
-    
-    if (method == method::GET && path == "/") {
-        resp.set_status(status::ok);
-        resp.set_header("Content-Type", "text/html");
-        resp.set_body("<h1>Welcome to Elio!</h1>");
-    }
-    else if (method == method::GET && path == "/api/status") {
-        resp.set_status(status::ok);
-        resp.set_header("Content-Type", "application/json");
-        resp.set_body(R"({"status": "ok", "version": "1.0"})");
-    }
-    else if (method == method::POST && path == "/api/echo") {
-        resp.set_status(status::ok);
-        resp.set_header("Content-Type", req.content_type());
-        resp.set_body(req.body());
-    }
-    else {
-        resp.set_status(status::not_found);
-        resp.set_header("Content-Type", "application/json");
-        resp.set_body(R"({"error": "Not Found"})");
-    }
-    
-    co_return;
+response hello_handler(context& ctx) {
+    return response(status::ok, "<h1>Welcome to Elio!</h1>", mime::text_html);
 }
 
-int main() {
-    runtime::scheduler sched(4);
-    sched.start();
-    
-    server_config config;
-    config.port = 8080;
-    config.handler = router;
-    
-    // Start server...
-    
-    sched.shutdown();
-    return 0;
+coro::task<response> status_handler(context& ctx) {
+    co_return response(status::ok,
+        R"({"status": "ok", "version": "1.0"})",
+        mime::application_json);
 }
+
+coro::task<response> echo_handler(context& ctx) {
+    auto& req = ctx.req();
+    response resp(status::ok);
+    resp.set_header("Content-Type", req.content_type());
+    resp.set_body(req.body());
+    co_return resp;
+}
+
+coro::task<int> async_main(int argc, char* argv[]) {
+    router r;
+    r.get("/", hello_handler);
+    r.get("/api/status", status_handler);
+    r.post("/api/echo", echo_handler);
+
+    server srv(r);
+    co_await elio::serve(srv, srv.listen(net::ipv4_address(8080)));
+
+    co_return 0;
+}
+
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ## Parallel Tasks
 
-Running multiple tasks concurrently:
+Running multiple tasks concurrently using `spawn()` and `go()`:
 
 ```cpp
 #include <elio/elio.hpp>
@@ -497,25 +426,33 @@ using namespace elio;
 
 coro::task<int> compute(int id, int value) {
     ELIO_LOG_INFO("Task {} computing...", id);
-    // Simulate work
     co_return value * value;
 }
 
-coro::task<void> parallel_compute(runtime::scheduler& sched) {
-    std::vector<coro::task<int>> tasks;
-    
-    // Create multiple tasks
+coro::task<int> async_main(int argc, char* argv[]) {
+    // Spawn tasks and collect join handles to await results
+    std::vector<coro::join_handle<int>> handles;
     for (int i = 0; i < 10; ++i) {
-        tasks.push_back(compute(i, i + 1));
+        handles.push_back(compute(i, i + 1).spawn());
     }
-    
-    // Spawn all tasks
-    for (auto& t : tasks) {
-        sched.spawn(t.release());
+
+    // Await all results
+    int total = 0;
+    for (auto& h : handles) {
+        total += co_await h;
     }
-    
-    co_return;
+    ELIO_LOG_INFO("Sum of squares: {}", total);
+
+    // Fire-and-forget tasks (no result collection)
+    for (int i = 0; i < 5; ++i) {
+        compute(i, i).go();
+    }
+
+    co_await time::sleep_for(std::chrono::milliseconds(100));
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ## Thread Affinity
@@ -532,38 +469,35 @@ using namespace elio;
 coro::task<void> pinned_worker(size_t target_worker) {
     // Bind to target worker and migrate there
     co_await set_affinity(target_worker);
-    
+
     std::cout << "Running on worker " << current_worker_id() << std::endl;
-    
+
     // Do work - will not be stolen by other workers
     for (int i = 0; i < 5; ++i) {
         co_await time::yield();
         // Still on the same worker
     }
-    
+
     // Clear affinity to allow migration
     co_await clear_affinity();
-    co_return;
 }
 
 // Task that pins to its current worker
 coro::task<void> stay_here() {
     co_await bind_to_current_worker();
-    
+
     // Will remain on this worker for rest of execution
     std::cout << "Pinned to worker " << current_worker_id() << std::endl;
-    co_return;
 }
 
 coro::task<int> async_main(int argc, char* argv[]) {
     auto* sched = runtime::scheduler::current();
-    
+
     // Spawn tasks with different affinities
     for (size_t i = 0; i < sched->num_threads(); ++i) {
-        auto t = pinned_worker(i);
-        sched->spawn(t.release());
+        pinned_worker(i).go();
     }
-    
+
     co_await time::sleep_for(std::chrono::milliseconds(100));
     co_return 0;
 }
@@ -580,17 +514,19 @@ Using timers for delays:
 
 using namespace elio;
 
-coro::task<void> delayed_task(io::io_context& ctx) {
+coro::task<int> async_main(int argc, char* argv[]) {
     ELIO_LOG_INFO("Starting...");
-    
-    co_await time::sleep(ctx, std::chrono::seconds(1));
+
+    co_await time::sleep_for(std::chrono::seconds(1));
     ELIO_LOG_INFO("1 second passed");
-    
-    co_await time::sleep(ctx, std::chrono::milliseconds(500));
+
+    co_await time::sleep_for(std::chrono::milliseconds(500));
     ELIO_LOG_INFO("500ms more passed");
-    
-    co_return;
+
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ## Exception Handling
@@ -610,23 +546,25 @@ coro::task<int> may_fail(bool should_fail) {
     co_return 42;
 }
 
-coro::task<void> error_handling() {
+coro::task<int> async_main(int argc, char* argv[]) {
     try {
         int result = co_await may_fail(false);
         ELIO_LOG_INFO("Success: {}", result);
-        
+
         int fail = co_await may_fail(true);  // Throws
         ELIO_LOG_INFO("Never reached: {}", fail);
     } catch (const std::exception& e) {
         ELIO_LOG_ERROR("Caught: {}", e.what());
     }
-    co_return;
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ## Synchronization
 
-Using mutex and condition variables:
+Using async mutex:
 
 ```cpp
 #include <elio/elio.hpp>
@@ -642,16 +580,106 @@ coro::task<void> increment(int id) {
         ++g_counter;
         ELIO_LOG_DEBUG("Task {} incremented to {}", id, g_counter);
     }
-    co_return;
 }
 
-coro::task<void> run_concurrent(runtime::scheduler& sched) {
-    // Spawn multiple incrementers
+coro::task<int> async_main(int argc, char* argv[]) {
+    // Spawn multiple incrementers and collect handles
+    std::vector<coro::join_handle<void>> handles;
     for (int i = 0; i < 4; ++i) {
-        auto task = increment(i);
-        sched.spawn(task.release());
+        handles.push_back(increment(i).spawn());
     }
-    co_return;
+
+    // Wait for all to finish
+    for (auto& h : handles) {
+        co_await h;
+    }
+
+    ELIO_LOG_INFO("Final counter: {}", g_counter);
+    co_return 0;
+}
+
+ELIO_ASYNC_MAIN(async_main)
+```
+
+## RPC Framework
+
+A minimal RPC server and client using Elio's binary RPC framework:
+
+```cpp
+#include <elio/elio.hpp>
+#include <elio/rpc/rpc.hpp>
+
+using namespace elio;
+
+// Define messages
+struct GreetRequest {
+    std::string name;
+    ELIO_RPC_FIELDS(GreetRequest, name);
+};
+
+struct GreetResponse {
+    std::string message;
+    ELIO_RPC_FIELDS(GreetResponse, message);
+};
+
+// Define method (id=1)
+using Greet = ELIO_RPC_METHOD(1, GreetRequest, GreetResponse);
+
+// Server
+coro::task<void> run_server() {
+    auto listener = net::tcp_listener::bind(net::ipv4_address("0.0.0.0", 9000));
+    if (!listener) co_return;
+
+    rpc::tcp_rpc_server server;
+    server.register_method<Greet>([](const GreetRequest& req) -> coro::task<GreetResponse> {
+        co_return GreetResponse{.message = "Hello, " + req.name + "!"};
+    });
+
+    co_await server.serve(*listener);
+}
+
+// Client
+coro::task<void> run_client() {
+    auto client = co_await rpc::tcp_rpc_client::connect("127.0.0.1", 9000);
+    if (!client) co_return;
+
+    auto result = co_await (*client)->call<Greet>(GreetRequest{.name = "World"});
+    if (result) {
+        ELIO_LOG_INFO("Response: {}", result->message);
+    }
+}
+```
+
+## Hash Functions
+
+Using CRC32 and SHA-256 hash functions:
+
+```cpp
+#include <elio/hash/sha256.hpp>
+#include <elio/hash/crc32.hpp>
+
+using namespace elio::hash;
+
+void hash_example() {
+    // One-shot SHA-256
+    std::string hex = sha256_hex("Hello, World!");
+
+    // Incremental hashing
+    sha256_context ctx;
+    ctx.update("Hello, ");
+    ctx.update("World!");
+    auto digest = ctx.finalize();
+    std::string hex2 = to_hex(digest);
+
+    // CRC32 checksum
+    uint32_t crc = crc32("data", 4);
+
+    // CRC32 over scatter-gather buffers
+    struct iovec iov[2] = {
+        {(void*)"Hello", 5},
+        {(void*)" World", 6}
+    };
+    uint32_t sg_crc = crc32_iovec(iov, 2);
 }
 ```
 
@@ -677,5 +705,7 @@ make
 ## See Also
 
 - [[Signal-Handling]] - Detailed guide on signal handling with signalfd
+- [[RPC-Framework]] - RPC system documentation
+- [[Hash-Functions]] - Hash function documentation
 - [[Core-Concepts]] - Understanding Elio's architecture
 - [[Networking]] - TCP and HTTP usage

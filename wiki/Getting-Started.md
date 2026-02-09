@@ -53,9 +53,6 @@ FetchContent_Declare(elio
 FetchContent_MakeAvailable(elio)
 
 target_link_libraries(your_target PRIVATE elio)
-
-# For HTTP/TLS support
-target_link_libraries(your_target PRIVATE elio_http)
 ```
 
 #### Using add_subdirectory
@@ -64,6 +61,24 @@ target_link_libraries(your_target PRIVATE elio_http)
 add_subdirectory(path/to/elio)
 target_link_libraries(your_target PRIVATE elio)
 ```
+
+#### Optional Features
+
+Elio has three optional feature flags, each controlled by a CMake option:
+
+| CMake option | Dependency | What it enables |
+|---|---|---|
+| `ELIO_ENABLE_TLS` | OpenSSL | TLS/SSL streams, HTTPS support |
+| `ELIO_ENABLE_HTTP` | (none beyond TLS if HTTPS needed) | HTTP/1.1 client and server, WebSocket, SSE |
+| `ELIO_ENABLE_HTTP2` | nghttp2 | HTTP/2 multiplexed connections |
+
+Enable them at configure time:
+
+```bash
+cmake -B build -DELIO_ENABLE_TLS=ON -DELIO_ENABLE_HTTP=ON -DELIO_ENABLE_HTTP2=ON
+```
+
+When `ELIO_ENABLE_HTTP2` is set, nghttp2 is fetched automatically via CMake's `FetchContent` if it is not already installed on the system. OpenSSL and liburing must be installed separately (see Prerequisites above).
 
 ## Your First Program
 
@@ -143,6 +158,22 @@ int main(int argc, char* argv[]) {
 | `ELIO_ASYNC_MAIN_NOARGS` | `task<int>()` | No args, returns exit code |
 | `ELIO_ASYNC_MAIN_VOID_NOARGS` | `task<void>()` | No args, always exits 0 |
 
+## Design Philosophy
+
+A few deliberate choices shaped how Elio is built.
+
+### Header-only
+
+Elio ships as a header-only library. Coroutine-heavy code is inherently template-heavy -- the compiler needs to see full definitions to instantiate coroutine frames, promise types, and awaitables. A separate compilation model would add link-time complexity for very little gain. Header-only also means zero build integration friction: add the include path and you are done. There are no ABI compatibility concerns between your code and the library, because there is no compiled library.
+
+### C++20 coroutines
+
+C++20 stackless coroutines give us suspension and resumption without allocating a full thread stack per concurrent operation. The compiler manages coroutine frame layout and lifetime, which means the optimizer can see through `co_await` boundaries. When you are not using coroutines, you pay nothing -- no background threads, no hidden allocations. The trade-off is that C++20 coroutine support requires a reasonably modern compiler (GCC 12+, Clang 14+), but that is a reasonable baseline in 2024.
+
+### Linux-only
+
+Elio targets Linux exclusively. This is not an arbitrary limitation -- it enables deep integration with Linux-specific facilities like `io_uring` for high-throughput async I/O and `signalfd` for clean signal handling inside the event loop. Epoll is supported as a fallback for older kernels, but both backends assume Linux semantics. Targeting a single platform means the library can provide consistent behavior guarantees without `#ifdef` complexity or lowest-common-denominator abstractions.
+
 ## Running the Examples
 
 ```bash
@@ -166,22 +197,65 @@ cd build
 
 ## Project Structure
 
+Elio is a header-only library. Everything lives under `include/elio/`:
+
 ```
-elio/
-├── include/elio/          # Header files
-│   ├── coro/              # Coroutine primitives
-│   ├── runtime/           # Scheduler and workers
-│   ├── io/                # I/O backends
-│   ├── net/               # TCP networking
-│   ├── http/              # HTTP client/server
-│   ├── tls/               # TLS/SSL support
-│   ├── sync/              # Synchronization primitives
-│   ├── time/              # Timers
-│   └── log/               # Logging
-├── examples/              # Example programs
-├── tests/                 # Unit tests
-└── CMakeLists.txt
+include/elio/
+├── elio.hpp              # Main include
+├── coro/                 # Coroutine primitives
+│   ├── task.hpp          # task<T>
+│   ├── promise_base.hpp  # Virtual stack base
+│   ├── frame.hpp         # Stack introspection
+│   ├── frame_allocator.hpp # Frame memory pool
+│   ├── cancel_token.hpp  # Cooperative cancellation
+│   └── awaitable_base.hpp # Awaitable interface
+├── runtime/              # Scheduler and threading
+│   ├── scheduler.hpp     # Work-stealing scheduler
+│   ├── worker_thread.hpp # Worker implementation
+│   ├── chase_lev_deque.hpp # Lock-free deque
+│   ├── mpsc_queue.hpp    # Cross-thread queue
+│   ├── wait_strategy.hpp # Idle wait policies
+│   ├── affinity.hpp      # Thread affinity
+│   ├── async_main.hpp    # Entry point macros
+│   └── serve.hpp         # Server lifecycle
+├── io/                   # I/O backends
+│   ├── io_context.hpp
+│   ├── io_backend.hpp
+│   ├── io_uring_backend.hpp
+│   └── epoll_backend.hpp
+├── net/                  # Networking
+│   ├── tcp.hpp
+│   └── uds.hpp
+├── sync/                 # Synchronization
+│   └── primitives.hpp    # mutex, shared_mutex, semaphore, event, channel
+├── time/                 # Timers
+│   └── timer.hpp
+├── signal/               # Signal handling
+│   └── signalfd.hpp
+├── http/                 # HTTP stack
+│   ├── http_client.hpp
+│   ├── http_server.hpp
+│   ├── http2.hpp
+│   ├── websocket.hpp
+│   └── sse.hpp
+├── tls/                  # TLS/SSL
+│   ├── tls_context.hpp
+│   └── tls_stream.hpp
+├── rpc/                  # RPC framework
+│   ├── rpc.hpp
+│   ├── rpc_types.hpp
+│   ├── rpc_buffer.hpp
+│   ├── rpc_client.hpp
+│   └── rpc_server.hpp
+├── hash/                 # Hash functions
+│   ├── crc32.hpp
+│   ├── sha1.hpp
+│   └── sha256.hpp
+└── log/                  # Logging
+    └── logger.hpp
 ```
+
+The repository also contains `examples/` with runnable programs, `tests/` with Catch2 tests, and `tools/` with debugging utilities (`elio-pstack`, GDB/LLDB extensions).
 
 ## Next Steps
 

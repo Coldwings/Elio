@@ -13,6 +13,35 @@ Elio coroutines maintain debug metadata in each frame:
 
 The debugger extensions find coroutine frames by traversing the scheduler's worker queues (Chase-Lev deque and MPSC inbox). This approach has **zero runtime overhead** - no global registry or synchronization is required.
 
+## Virtual Stack
+
+C++20 stackless coroutines allocate each frame independently on the heap. When a coroutine suspends, the native call stack unwinds completely, so traditional stack traces cannot show the logical call chain. Elio reconstructs this information through an intrusive virtual stack built into every coroutine frame.
+
+### How It Works
+
+Each coroutine's promise type inherits from `promise_base`, which contains a `parent_` pointer. When coroutine A `co_await`s coroutine B, B's promise stores a pointer back to A's promise. This forms a singly-linked list from the innermost frame to the outermost caller, mirroring what a native call stack would look like if the coroutines were regular functions.
+
+The thread-local `current_frame_` tracks which frame is currently executing. When a new coroutine starts, it reads `current_frame_` to set its `parent_`, then installs itself as the new `current_frame_`. On completion or suspension, the previous frame is restored.
+
+### Frame Validation
+
+Each `promise_base` contains a `frame_magic_` field set to `0x454C494F46524D45` (the ASCII string "ELIOFRMR"). The debugger tools check this magic value when traversing memory to distinguish valid Elio coroutine frames from arbitrary data. This is especially important during coredump analysis, where the debugger walks raw memory without type information.
+
+### Debug Metadata
+
+Every frame carries the following debug metadata with no additional allocation:
+
+| Field | Description |
+|-------|-------------|
+| `id_` | Unique monotonic identifier assigned at creation |
+| `state_` | Current state: created, running, suspended, completed, or failed |
+| `worker_id_` | Index of the worker thread the frame is assigned to (or -1 if unassigned) |
+| `file_`, `function_`, `line_` | Source location captured via `std::source_location` or manual `set_location()` |
+| `parent_` | Pointer to the calling frame's promise, forming the virtual stack chain |
+| `frame_magic_` | Magic number for frame integrity validation |
+
+The debugger tools (`elio-pstack`, `elio-gdb.py`, `elio-lldb.py`) use this metadata to present coroutine state in a format familiar to anyone who has used `pstack` or `thread apply all bt`.
+
 ## Tools
 
 | Tool | Description |
@@ -209,6 +238,22 @@ elio::coro::task<void> my_coroutine() {
     
     co_return;
 }
+```
+
+## Sanitizer Support
+
+Elio's test suite builds with both AddressSanitizer (ASAN) and ThreadSanitizer (TSAN). When either sanitizer is active, the custom frame allocator is automatically disabled and coroutine frames are allocated with standard `new`/`delete` instead. This ensures that sanitizers can properly track all allocations, detect use-after-free errors, and report accurate stack traces for memory and threading issues.
+
+No source changes or build flags are needed beyond enabling the sanitizer itself:
+
+```bash
+# Build and run with ASAN
+cmake --build . --target elio_tests_asan
+./tests/elio_tests_asan
+
+# Build and run with TSAN
+cmake --build . --target elio_tests_tsan
+./tests/elio_tests_tsan
 ```
 
 ## Limitations

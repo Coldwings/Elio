@@ -236,8 +236,28 @@ public:
     void spawn(Task&& t);  // Accepts any type with release() method
     
     // Get number of worker threads
-    size_t worker_count() const noexcept;
-    
+    size_t num_threads() const noexcept;
+
+    // Get total pending tasks across all workers
+    size_t pending_tasks() const noexcept;
+
+    // Get total tasks executed across all workers
+    size_t total_tasks_executed() const noexcept;
+
+    // Get tasks executed by a specific worker
+    size_t worker_tasks_executed(size_t worker_id) const noexcept;
+
+    // Check scheduler state
+    bool is_running() const noexcept;
+    bool is_paused() const noexcept;
+
+    // Pause/resume task execution
+    void pause();
+    void resume();
+
+    // Dynamically resize the thread pool
+    void set_thread_count(size_t count);
+
     // Get the current scheduler (thread-local)
     static scheduler* current() noexcept;
 };
@@ -1200,30 +1220,6 @@ public:
     ~unique_lock_guard();  // Calls unlock()
     
     void unlock();  // Manual early unlock
-};
-```
-
-### `condition_variable`
-
-Coroutine-aware condition variable.
-
-```cpp
-class condition_variable {
-public:
-    condition_variable();
-    
-    // Wait for notification (awaitable)
-    /* awaitable */ wait(unique_lock<mutex>& lock);
-    
-    // Wait with predicate (awaitable)
-    template<typename Pred>
-    /* awaitable */ wait(unique_lock<mutex>& lock, Pred pred);
-    
-    // Notify one waiter
-    void notify_one();
-    
-    // Notify all waiters
-    void notify_all();
 };
 ```
 

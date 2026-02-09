@@ -4,6 +4,8 @@
 #include <iostream>
 #include <chrono>
 #include <vector>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 using namespace elio;
 using namespace std::chrono;

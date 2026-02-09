@@ -200,14 +200,15 @@ Elio uses a work-stealing scheduler for load balancing. Each worker thread has a
 
 When workers have no tasks to execute, they enter an efficient sleep state instead of busy-waiting:
 
-- **eventfd-based wake mechanism**: Each worker has an `eventfd` that external threads can signal to wake it up
-- **Blocking epoll wait**: Idle workers block on `epoll_wait` with a timeout, consuming near-zero CPU
-- **Automatic wake-up**: When tasks are scheduled to a worker, it is automatically woken via `eventfd`
-- **IO integration**: One worker polls the IO backend (io_uring/epoll) while others sleep on their eventfd
+- **Unified wake mechanism**: Each worker's I/O backend contains an eventfd that external threads can write to, waking the worker from its I/O poll
+- **Configurable wait strategy**: Workers can spin before blocking (for low-latency) or block immediately (for CPU efficiency)
+- **Automatic wake-up**: When tasks are scheduled to a worker, it is automatically woken via eventfd write to the I/O backend
+- **IO integration**: Workers poll the IO backend (io_uring/epoll) before sleeping
 
 This design ensures:
-- Near-zero CPU usage when idle (< 1%)
-- Fast wake-up latency when new work arrives (< 10ms)
+- Near-zero CPU usage when idle with default blocking strategy (< 1%)
+- Configurable spin-before-block for low-latency workloads
+- Fast wake-up latency when new work arrives
 - Efficient coordination between task scheduling and IO polling
 
 ## I/O Context

@@ -4,6 +4,7 @@
 #include <elio/log/macros.hpp>
 
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -48,6 +49,27 @@ public:
         }
         
         ELIO_LOG_INFO("epoll_backend initialized (max_events={})", cfg.max_events);
+
+        // Create eventfd for cross-thread wake notifications
+        wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (wake_fd_ < 0) {
+            ::close(epoll_fd_);
+            throw std::runtime_error(
+                std::string("eventfd creation failed: ") + strerror(errno)
+            );
+        }
+
+        // Register wake_fd_ with epoll for read events
+        struct epoll_event wake_ev;
+        wake_ev.events = EPOLLIN;
+        wake_ev.data.fd = wake_fd_;
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, wake_fd_, &wake_ev) < 0) {
+            ::close(wake_fd_);
+            ::close(epoll_fd_);
+            throw std::runtime_error(
+                std::string("epoll_ctl for wake_fd failed: ") + strerror(errno)
+            );
+        }
     }
     
     /// Destructor
@@ -75,7 +97,11 @@ public:
         
         // Resume coroutines
         resume_deferred(deferred_resumes);
-        
+
+        if (wake_fd_ >= 0) {
+            ::close(wake_fd_);
+        }
+
         if (epoll_fd_ >= 0) {
             close(epoll_fd_);
         }
@@ -257,6 +283,14 @@ public:
         // Process epoll events
         for (int i = 0; i < nfds; ++i) {
             int fd = events_[i].data.fd;
+
+            // Wake notification event - drain eventfd to prevent busy-loop
+            // (level-triggered epoll will keep firing until eventfd counter is zero)
+            if (fd == wake_fd_) {
+                drain_notify();
+                continue;
+            }
+
             uint32_t revents = events_[i].events;
             
             auto it = fd_states_.find(fd);
@@ -405,7 +439,23 @@ public:
     static io_result get_last_result() noexcept {
         return last_result_;
     }
-    
+
+    void notify() override {
+        uint64_t val = 1;
+        ssize_t ret = ::write(wake_fd_, &val, sizeof(val));
+        if (ret < 0 && errno != EAGAIN) {
+            ELIO_LOG_WARNING("eventfd write failed: {}", strerror(errno));
+        }
+    }
+
+    void drain_notify() override {
+        uint64_t val;
+        ssize_t ret = ::read(wake_fd_, &val, sizeof(val));
+        if (ret < 0 && errno != EAGAIN) {
+            ELIO_LOG_WARNING("eventfd read failed: {}", strerror(errno));
+        }
+    }
+
 private:
     struct pending_operation {
         io_request req;
@@ -598,7 +648,8 @@ private:
     std::unordered_map<int, fd_state> fd_states_;         ///< Per-fd state
     timer_queue_t timer_queue_;                           ///< Timer queue for timeouts
     size_t pending_count_ = 0;                            ///< Number of pending operations
-    
+    int wake_fd_ = -1;  ///< eventfd for cross-thread wake-up
+
     static inline thread_local io_result last_result_{};
 };
 

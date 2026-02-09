@@ -6,6 +6,7 @@
 #if ELIO_HAS_IO_URING
 
 #include <liburing.h>
+#include <sys/eventfd.h>
 #include <sys/uio.h>
 #include <sys/socket.h>
 #include <poll.h>
@@ -55,8 +56,21 @@ public:
             );
         }
         
-        ELIO_LOG_INFO("io_uring_backend initialized (queue_depth={}, flags=0x{:x})", 
+        ELIO_LOG_INFO("io_uring_backend initialized (queue_depth={}, flags=0x{:x})",
                       cfg.queue_depth, params.flags);
+
+        // Create eventfd for cross-thread wake notifications
+        wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (wake_fd_ < 0) {
+            io_uring_queue_exit(&ring_);
+            throw std::runtime_error(
+                std::string("eventfd creation failed: ") + strerror(errno)
+            );
+        }
+
+        // Submit initial poll_add to watch wake_fd_
+        submit_wake_poll();
+        io_uring_submit(&ring_);
     }
     
     /// Destructor
@@ -73,6 +87,11 @@ public:
                             pending_ops_.load(std::memory_order_relaxed));
         }
         
+        if (wake_fd_ >= 0) {
+            ::close(wake_fd_);
+            wake_fd_ = -1;
+        }
+
         io_uring_queue_exit(&ring_);
         ELIO_LOG_INFO("io_uring_backend destroyed");
     }
@@ -319,7 +338,23 @@ public:
 
     /// Override to indicate this is an io_uring backend
     bool is_io_uring() const noexcept override { return true; }
-    
+
+    void notify() override {
+        uint64_t val = 1;
+        ssize_t ret = ::write(wake_fd_, &val, sizeof(val));
+        if (ret < 0 && errno != EAGAIN) {
+            ELIO_LOG_WARNING("eventfd write failed: {}", strerror(errno));
+        }
+    }
+
+    void drain_notify() override {
+        uint64_t val;
+        ssize_t ret = ::read(wake_fd_, &val, sizeof(val));
+        if (ret < 0 && errno != EAGAIN) {
+            ELIO_LOG_WARNING("eventfd read failed: {}", strerror(errno));
+        }
+    }
+
 private:
     /// Deferred resume entry - stores handle with its result
     struct deferred_resume_entry {
@@ -327,11 +362,19 @@ private:
         io_result result;
     };
     
-    void process_completion(struct io_uring_cqe* cqe, 
+    void process_completion(struct io_uring_cqe* cqe,
                            std::vector<deferred_resume_entry>* deferred_resumes = nullptr) {
         void* user_data = io_uring_cqe_get_data(cqe);
+
+        // Check for wake notification sentinel
+        if (user_data == reinterpret_cast<void*>(WAKE_SENTINEL)) {
+            drain_notify();
+            submit_wake_poll();
+            return;
+        }
+
         pending_ops_.fetch_sub(1, std::memory_order_relaxed);
-        
+
         if (!user_data) {
             // Cancel operation or internal operation, no awaiter to resume
             return;
@@ -363,6 +406,18 @@ private:
             }
         }
     }
+
+    /// Submit a poll_add SQE to watch the wake eventfd
+    void submit_wake_poll() {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+        if (sqe) {
+            io_uring_prep_poll_add(sqe, wake_fd_, POLLIN);
+            io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(WAKE_SENTINEL));
+            // Don't count this as a pending user operation
+        } else {
+            ELIO_LOG_WARNING("Failed to submit wake poll: SQ full");
+        }
+    }
     
 public:
     /// Get the last completion result (thread-local)
@@ -374,6 +429,9 @@ public:
 private:
     struct io_uring ring_;                     ///< io_uring instance
     std::atomic<size_t> pending_ops_;          ///< Number of pending operations
+    int wake_fd_ = -1;  ///< eventfd for cross-thread wake-up
+    /// Sentinel user_data to identify wake notifications in CQE
+    static constexpr uintptr_t WAKE_SENTINEL = 1;
 
     static inline thread_local io_result last_result_{};
 };
@@ -400,6 +458,9 @@ public:
     
     static bool is_available() noexcept { return false; }
     static io_result get_last_result() noexcept { return {}; }
+
+    void notify() override {}
+    void drain_notify() override {}
 };
 
 } // namespace elio::io

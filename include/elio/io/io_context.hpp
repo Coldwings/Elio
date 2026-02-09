@@ -108,6 +108,12 @@ public:
     bool cancel(void* user_data) {
         return backend_->cancel(user_data);
     }
+
+    /// Wake up a thread blocked in poll()
+    /// Called from external threads to interrupt blocking I/O wait
+    void notify() {
+        backend_->notify();
+    }
     
     /// Get the active backend type
     backend_type get_backend_type() const noexcept {

@@ -104,6 +104,14 @@ public:
     /// Check if this backend supports io_uring features (like timeout_ts)
     /// @return true if this is an io_uring backend
     virtual bool is_io_uring() const noexcept { return false; }
+
+    /// Wake up a thread blocked in poll()
+    /// Called from external threads to interrupt blocking I/O wait
+    virtual void notify() = 0;
+
+    /// Drain the wake notification (call after poll returns due to notify)
+    /// This is a no-op if poll returned due to I/O completion
+    virtual void drain_notify() = 0;
 };
 
 } // namespace elio::io

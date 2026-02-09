@@ -19,19 +19,21 @@ class scheduler {
     
 public:
     static constexpr size_t MAX_THREADS = 256;
-    
-    explicit scheduler(size_t num_threads = std::thread::hardware_concurrency())
+
+    explicit scheduler(size_t num_threads = std::thread::hardware_concurrency(),
+                       wait_strategy strategy = wait_strategy::blocking())
         : num_threads_(num_threads == 0 ? 1 : num_threads)
         , running_(false)
         , paused_(false)
-        , spawn_index_(0) {
-        
+        , spawn_index_(0)
+        , wait_strategy_(strategy) {
+
         size_t n = num_threads_.load(std::memory_order_relaxed);
         // Pre-reserve to MAX_THREADS to prevent reallocation during runtime
         // This ensures get_worker() is safe while set_thread_count() adds workers
         workers_.reserve(MAX_THREADS);
         for (size_t i = 0; i < n; ++i) {
-            workers_.push_back(std::make_unique<worker_thread>(this, i));
+            workers_.push_back(std::make_unique<worker_thread>(this, i, strategy));
         }
     }
 
@@ -142,7 +144,7 @@ public:
                         workers_[i]->start();
                     }
                 } else {
-                    auto worker = std::make_unique<worker_thread>(this, i);
+                    auto worker = std::make_unique<worker_thread>(this, i, wait_strategy_);
                     if (running_.load(std::memory_order_relaxed)) {
                         worker->start();
                     }
@@ -208,6 +210,11 @@ public:
         return workers_[worker_id]->tasks_executed();
     }
 
+    /// Get the wait strategy used by this scheduler
+    [[nodiscard]] const wait_strategy& get_wait_strategy() const noexcept {
+        return wait_strategy_;
+    }
+
 private:
     void do_spawn(std::coroutine_handle<> handle) {
         // Release fence ensures all writes to the coroutine frame (including
@@ -259,7 +266,8 @@ private:
     std::atomic<bool> paused_;
     std::atomic<size_t> spawn_index_;
     mutable std::mutex workers_mutex_;
-    
+    wait_strategy wait_strategy_;
+
     static inline thread_local scheduler* current_scheduler_ = nullptr;
 };
 
@@ -293,7 +301,7 @@ inline void worker_thread::stop() {
     bool expected = true;
     if (!running_.compare_exchange_strong(expected, false, 
             std::memory_order_release, std::memory_order_relaxed)) return;
-    wake();  // Wake the worker if it's blocked on epoll_wait
+    wake();  // Wake the worker if it's blocked in I/O poll
     if (thread_.joinable()) thread_.join();
 }
 
@@ -479,20 +487,29 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
 }
 
 inline void worker_thread::poll_io_when_idle() {
-    // Poll this worker's own io_context
-    // Each worker has its own io_context, so no locking needed
     constexpr int idle_timeout_ms = 10;
 
     // Mark as idle before any blocking - enables lazy wake optimization
     idle_.store(true, std::memory_order_release);
 
-    // Poll with timeout - will block on epoll/io_uring if no completions ready
-    int completions = io_context_->poll(std::chrono::milliseconds(idle_timeout_ms));
-
-    if (completions == 0) {
-        // No IO completions - wait on eventfd for task submissions
-        wait_for_work(idle_timeout_ms);
+    // Optional spinning phase (if configured via wait_strategy)
+    if (strategy_.spin_iterations > 0) {
+        for (size_t i = 0; i < strategy_.spin_iterations; ++i) {
+            if (inbox_.size_approx() > 0) {
+                idle_.store(false, std::memory_order_relaxed);
+                return;
+            }
+            if (strategy_.spin_yield) {
+                std::this_thread::yield();
+            } else {
+                cpu_relax();
+            }
+        }
     }
+
+    // Single unified wait: blocks on I/O backend (epoll/io_uring)
+    // Both I/O completions AND task wake-ups (via eventfd) will unblock this
+    io_context_->poll(std::chrono::milliseconds(idle_timeout_ms));
 
     // Clear idle flag after waking up
     idle_.store(false, std::memory_order_relaxed);

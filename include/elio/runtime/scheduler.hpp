@@ -301,7 +301,7 @@ inline void worker_thread::stop() {
     bool expected = true;
     if (!running_.compare_exchange_strong(expected, false, 
             std::memory_order_release, std::memory_order_relaxed)) return;
-    wake();  // Wake the worker if it's blocked on futex
+    wake();  // Wake the worker if it's blocked in I/O poll
     if (thread_.joinable()) thread_.join();
 }
 
@@ -487,20 +487,29 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
 }
 
 inline void worker_thread::poll_io_when_idle() {
-    // Poll this worker's own io_context
-    // Each worker has its own io_context, so no locking needed
     constexpr int idle_timeout_ms = 10;
 
     // Mark as idle before any blocking - enables lazy wake optimization
     idle_.store(true, std::memory_order_release);
 
-    // Poll with timeout - will block on epoll/io_uring if no completions ready
-    int completions = io_context_->poll(std::chrono::milliseconds(idle_timeout_ms));
-
-    if (completions == 0) {
-        // No IO completions - wait on eventfd for task submissions
-        wait_for_work(idle_timeout_ms);
+    // Optional spinning phase (if configured via wait_strategy)
+    if (strategy_.spin_iterations > 0) {
+        for (size_t i = 0; i < strategy_.spin_iterations; ++i) {
+            if (inbox_.size_approx() > 0) {
+                idle_.store(false, std::memory_order_relaxed);
+                return;
+            }
+            if (strategy_.spin_yield) {
+                std::this_thread::yield();
+            } else {
+                cpu_relax();
+            }
+        }
     }
+
+    // Single unified wait: blocks on I/O backend (epoll/io_uring)
+    // Both I/O completions AND task wake-ups (via eventfd) will unblock this
+    io_context_->poll(std::chrono::milliseconds(idle_timeout_ms));
 
     // Clear idle flag after waking up
     idle_.store(false, std::memory_order_relaxed);

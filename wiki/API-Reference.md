@@ -256,7 +256,7 @@ sched.shutdown();
 
 ### `worker_thread`
 
-Individual worker that executes tasks. Workers use an efficient idle mechanism with futex-based wake-up.
+Individual worker that executes tasks. Workers use a unified idle mechanism where both I/O completions and task submissions wake the same poll wait.
 
 ```cpp
 class worker_thread {
@@ -286,7 +286,7 @@ public:
 ```
 
 **Idle Behavior:**
-- Workers block efficiently on futex when no tasks are available
+- Workers block efficiently on I/O poll (with eventfd wake support) when no tasks are available
 - Optional spin phase before blocking (configurable via `wait_strategy`)
 - When a task is scheduled via `schedule()`, the worker is automatically woken
 - Results in near-zero CPU usage (< 1%) when idle with default blocking strategy

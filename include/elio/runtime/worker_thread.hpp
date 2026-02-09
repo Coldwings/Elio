@@ -1,7 +1,6 @@
 #pragma once
 
 #include "chase_lev_deque.hpp"
-#include "futex_notifier.hpp"
 #include "mpsc_queue.hpp"
 #include "wait_strategy.hpp"
 #include <elio/coro/promise_base.hpp>
@@ -66,7 +65,7 @@ public:
         // Try fast path: push to lock-free inbox
         if (inbox_.push(handle.address())) [[likely]] {
             // Lazy wake: only wake if worker is idle (waiting for work)
-            // This avoids expensive eventfd write syscalls when worker is busy
+            // This avoids unnecessary wake syscalls when worker is busy
             // Use relaxed load - occasional extra wake is fine, we optimize for the common case
             if (idle_.load(std::memory_order_relaxed)) {
                 wake();
@@ -145,7 +144,7 @@ public:
     
     /// Wake this worker if it's sleeping (called from other threads)
     void wake() noexcept {
-        notifier_.notify_one();
+        io_context_->notify();
     }
 
     /// Get the wait strategy for this worker
@@ -166,31 +165,6 @@ private:
     [[nodiscard]] std::coroutine_handle<> try_steal() noexcept;
     void poll_io_when_idle();
 
-    /// Wait for work with configurable spin-then-block strategy
-    /// @param timeout_ms Maximum time to block in milliseconds (after spinning)
-    void wait_for_work(int timeout_ms) noexcept {
-        // Phase 1: Optional spinning (if configured)
-        if (strategy_.spin_iterations > 0) {
-            for (size_t i = 0; i < strategy_.spin_iterations; ++i) {
-                // Check for work
-                if (inbox_.size_approx() > 0 || notifier_.is_notified()) {
-                    notifier_.reset();
-                    return;
-                }
-                // Spin
-                if (strategy_.spin_yield) {
-                    std::this_thread::yield();
-                } else {
-                    cpu_relax();
-                }
-            }
-        }
-
-        // Phase 2: Block on futex with timeout
-        notifier_.wait_for(timeout_ms);
-        notifier_.reset();
-    }
-
     scheduler* scheduler_;
     size_t worker_id_;
     chase_lev_deque<void> queue_;      // Owner's local deque (SPMC)
@@ -200,7 +174,6 @@ private:
     std::atomic<size_t> tasks_executed_;
     std::atomic<bool> idle_{false};    // True when worker is waiting for work (for lazy wake)
     bool needs_sync_ = false;          // Whether current task needs memory synchronization
-    futex_notifier notifier_;          // Futex-based notification for wake-up
     wait_strategy strategy_;           // Configurable wait strategy
     std::unique_ptr<io::io_context> io_context_;  // Per-worker io_context
     

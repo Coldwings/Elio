@@ -47,7 +47,7 @@ Scaling efficiency depends on workload characteristics. Tasks with more computat
 
 ### Wake-up Mechanism
 
-Elio uses Linux **futex** with `FUTEX_PRIVATE` for low-overhead cross-thread notifications. Futex provides faster wake-up than eventfd+epoll (typically ~100-300 ns vs ~500-1500 ns). Combined with **Lazy Wake optimization**, which avoids syscalls when workers are busy, this minimizes scheduling overhead.
+Elio uses an **eventfd embedded in each worker's I/O backend** (epoll/io_uring) for cross-thread notifications. This provides a single unified wait point — both I/O completions and task wake-ups unblock the same `poll()` call, eliminating the latency gap that exists with separate wait mechanisms. Combined with **Lazy Wake optimization**, which avoids unnecessary syscalls when workers are busy, this minimizes scheduling overhead.
 
 ## Built-in Optimizations
 
@@ -60,7 +60,7 @@ Workers track their idle state. Task submissions only trigger wake syscalls when
 if (inbox_.push(handle.address())) {
     // Only wake if worker is idle (sleeping)
     if (idle_.load(std::memory_order_relaxed)) {
-        wake();  // futex wake
+        wake();  // eventfd write → interrupts I/O poll
     }
 }
 ```
@@ -81,7 +81,7 @@ using namespace elio::runtime;
 scheduler sched(4, wait_strategy::blocking());
 
 // Hybrid spin-then-block - good for low-latency workloads
-// Spins for 1000 iterations with yield, then blocks on futex
+// Spins for 1000 iterations with yield, then blocks on I/O poll
 scheduler sched(4, wait_strategy::hybrid(1000));
 
 // Aggressive spinning - ultra-low latency (uses pause instruction)

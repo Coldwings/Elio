@@ -139,6 +139,12 @@ struct ipv6_address {
     ipv6_address(const struct sockaddr_in6& sa) 
         : addr(sa.sin6_addr), port(ntohs(sa.sin6_port)), scope_id(sa.sin6_scope_id) {}
     
+    // GCC false positive with std::variant: when socket_address::to_sockaddr()
+    // is inlined for an ipv4 variant, GCC thinks ipv6 fields may be uninitialized.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
     struct sockaddr_in6 to_sockaddr() const {
         struct sockaddr_in6 sa{};
         sa.sin6_family = AF_INET6;
@@ -147,6 +153,9 @@ struct ipv6_address {
         sa.sin6_scope_id = scope_id;
         return sa;
     }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     
     int family() const noexcept { return AF_INET6; }
     
@@ -254,15 +263,11 @@ public:
     /// Fill sockaddr_storage
     socklen_t to_sockaddr(struct sockaddr_storage& ss) const {
         std::memset(&ss, 0, sizeof(ss));
-        if (is_v4()) {
-            auto sa = as_v4().to_sockaddr();
+        return std::visit([&ss](const auto& addr) -> socklen_t {
+            auto sa = addr.to_sockaddr();
             std::memcpy(&ss, &sa, sizeof(sa));
             return sizeof(sa);
-        } else {
-            auto sa = as_v6().to_sockaddr();
-            std::memcpy(&ss, &sa, sizeof(sa));
-            return sizeof(sa);
-        }
+        }, data_);
     }
     
     std::string to_string() const {

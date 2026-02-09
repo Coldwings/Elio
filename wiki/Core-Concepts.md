@@ -430,6 +430,99 @@ coro::task<void> limited_work() {
 }
 ```
 
+### Spinlock
+
+`spinlock` is a lightweight, non-suspending lock for very short critical sections. It uses a TTAS (Test-and-Test-and-Set) algorithm with CPU pause instructions for efficient spinning:
+
+```cpp
+sync::spinlock sl;
+
+coro::task<void> quick_update() {
+    sl.lock();          // Spins until acquired (does not suspend coroutine)
+    // Very short critical section
+    sl.unlock();
+    co_return;
+}
+```
+
+Use `spinlock_guard` for RAII-style locking:
+
+```cpp
+sync::spinlock sl;
+
+coro::task<void> safe_update() {
+    sync::spinlock_guard guard(sl);  // Locks on construction
+    // Critical section
+    co_return;
+    // Automatically unlocked on destruction
+}
+```
+
+**When to use spinlock vs mutex:** Use `spinlock` when the critical section is very short (a few assignments or pointer swaps) and contention is low. Use `mutex` when the critical section might suspend (e.g., performing I/O) or when contention is high — `mutex` suspends the coroutine instead of busy-waiting, allowing other coroutines to run.
+
+### Condition Variable
+
+`condition_variable` allows coroutines to wait for a condition to become true. It works with `mutex`, `spinlock`, or in an unlocked mode:
+
+**With mutex** (recommended for most cases):
+
+```cpp
+sync::mutex mtx;
+sync::condition_variable cv;
+bool ready = false;
+
+coro::task<void> waiter() {
+    co_await mtx.lock();
+    while (!ready) {
+        // Double co_await: outer suspends for signal, inner re-acquires mutex
+        co_await co_await cv.wait(mtx);
+    }
+    mtx.unlock();
+    co_return;
+}
+
+coro::task<void> notifier() {
+    co_await mtx.lock();
+    ready = true;
+    mtx.unlock();
+    cv.notify_one();  // Wake one waiter
+    co_return;
+}
+```
+
+**With spinlock:**
+
+```cpp
+sync::spinlock sl;
+sync::condition_variable cv;
+bool ready = false;
+
+coro::task<void> waiter() {
+    sl.lock();
+    while (!ready) {
+        co_await cv.wait(sl);  // Single co_await (spinlock re-lock is synchronous)
+    }
+    sl.unlock();
+    co_return;
+}
+```
+
+**Unlocked mode** (for single-worker scenarios where all coroutines run on the same thread):
+
+```cpp
+sync::condition_variable cv;
+bool ready = false;
+
+coro::task<void> waiter() {
+    while (!ready) {
+        co_await cv.wait_unlocked();
+    }
+    co_return;
+}
+```
+
+`notify_one()` wakes exactly one waiting coroutine; `notify_all()` wakes all of them.
+
 ## Cancellation
 
 Elio provides a cooperative cancellation mechanism for async operations using `cancel_source` and `cancel_token`.

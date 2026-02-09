@@ -1223,6 +1223,120 @@ public:
 };
 ```
 
+### `spinlock`
+
+Lightweight spinlock using TTAS (Test-and-Test-and-Set) algorithm. Suitable for short critical sections with low contention where the overhead of coroutine suspension would exceed the spin time.
+
+```cpp
+class spinlock {
+public:
+    spinlock();
+
+    // Acquire the lock (spins until acquired)
+    void lock() noexcept;
+
+    // Try to acquire without spinning
+    bool try_lock() noexcept;
+
+    // Release the lock
+    void unlock() noexcept;
+
+    // Check if locked (debugging only)
+    bool is_locked() const noexcept;
+};
+```
+
+### `spinlock_guard`
+
+RAII guard for spinlock. Movable, non-copyable.
+
+```cpp
+class spinlock_guard {
+public:
+    explicit spinlock_guard(spinlock& s);  // Locks on construction
+    ~spinlock_guard();                      // Unlocks on destruction
+
+    spinlock_guard(spinlock_guard&& other) noexcept;
+    spinlock_guard& operator=(spinlock_guard&& other) noexcept;
+
+    void unlock();  // Manual early unlock (safe to call multiple times)
+};
+```
+
+### `condition_variable`
+
+Coroutine-aware condition variable that suspends coroutines instead of blocking threads.
+
+Supports three modes of use:
+- With `elio::sync::mutex` (coroutine-aware async re-lock)
+- With `elio::sync::spinlock` or any lockable type (synchronous re-lock)
+- Without any lock (`wait_unlocked()`) for single-worker scenarios
+
+```cpp
+class condition_variable {
+public:
+    condition_variable();
+
+    // Wait with elio::sync::mutex (requires double co_await)
+    // Returns a lock awaitable that re-acquires the mutex
+    /* awaitable<lock_awaitable> */ wait(mutex& m);
+
+    // Wait with a generic lockable (e.g., spinlock)
+    // Re-acquires the lock synchronously before resuming
+    template<lockable Lock>
+    /* awaitable */ wait(Lock& lock);
+
+    // Wait without external lock (single-worker-thread only)
+    /* awaitable */ wait_unlocked();
+
+    // Wake one waiting coroutine
+    void notify_one();
+
+    // Wake all waiting coroutines
+    void notify_all();
+
+    // Check if there are waiting coroutines
+    bool has_waiters() const noexcept;
+};
+```
+
+**Usage with mutex (double co_await):**
+```cpp
+sync::mutex mtx;
+sync::condition_variable cv;
+bool ready = false;
+
+coro::task<void> waiter() {
+    co_await mtx.lock();
+    while (!ready) {
+        co_await co_await cv.wait(mtx);  // double co_await required
+    }
+    mtx.unlock();
+}
+
+coro::task<void> notifier() {
+    co_await mtx.lock();
+    ready = true;
+    mtx.unlock();
+    cv.notify_one();
+}
+```
+
+**Usage with spinlock (single co_await):**
+```cpp
+sync::spinlock sl;
+sync::condition_variable cv;
+bool ready = false;
+
+coro::task<void> waiter() {
+    sl.lock();
+    while (!ready) {
+        co_await cv.wait(sl);
+    }
+    sl.unlock();
+}
+```
+
 ### `semaphore`
 
 Counting semaphore.
@@ -1231,13 +1345,13 @@ Counting semaphore.
 class semaphore {
 public:
     explicit semaphore(int initial_count);
-    
+
     // Acquire (awaitable)
     /* awaitable */ acquire();
-    
+
     // Try acquire without waiting
     bool try_acquire();
-    
+
     // Release
     void release();
 };

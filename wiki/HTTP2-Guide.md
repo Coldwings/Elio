@@ -10,6 +10,10 @@ HTTP/2 offers several advantages over HTTP/1.1:
 - **Binary framing**: More efficient parsing
 - **Stream prioritization**: Clients can hint at request importance
 
+## Why nghttp2
+
+Elio uses the nghttp2 library for HTTP/2 support. nghttp2 is the reference implementation of the HTTP/2 protocol (RFC 7540) and handles the substantial complexity of HTTP/2 streams, flow control, and HPACK header compression. It is well-tested and widely deployed -- used by curl, Apache httpd, and many other projects. Elio wraps nghttp2 to expose a simple coroutine-based interface, letting the library manage the protocol state machine while Elio handles I/O scheduling and connection lifecycle.
+
 ## Requirements
 
 HTTP/2 support requires:

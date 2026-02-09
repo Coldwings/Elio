@@ -211,6 +211,78 @@ This design ensures:
 - Fast wake-up latency when new work arrives
 - Efficient coordination between task scheduling and IO polling
 
+### Thread Affinity
+
+Tasks can be pinned to specific worker threads using the affinity API. A pinned task will not be stolen by other workers.
+
+```cpp
+#include <elio/runtime/affinity.hpp>
+
+coro::task<void> affinity_example() {
+    // Bind to worker 2 and migrate there immediately
+    co_await elio::runtime::set_affinity(2);
+
+    // Bind to the current worker (prevent migration)
+    co_await elio::runtime::bind_to_current_worker();
+
+    // Remove affinity (allow free migration again)
+    co_await elio::runtime::clear_affinity();
+
+    co_return;
+}
+```
+
+All three functions are also available in the `elio` namespace as convenience aliases (`elio::set_affinity`, `elio::bind_to_current_worker`, `elio::clear_affinity`).
+
+`set_affinity` accepts an optional second parameter `migrate` (default `true`). When `true`, the coroutine is immediately rescheduled on the target worker. When `false`, the affinity is recorded but the coroutine continues on its current worker until its next suspension point.
+
+### Design Rationale
+
+**Why work-stealing.** A centralized task queue becomes a contention bottleneck under high concurrency. Work-stealing distributes scheduling decisions: each worker thread operates on its own local deque, and idle workers steal from busy ones. This provides automatic load balancing without requiring a central coordinator. The owner-side LIFO order also has a cache-locality benefit -- the most recently pushed task is the one most likely to have hot data in the current core's cache.
+
+**Why Chase-Lev deque.** The Chase-Lev algorithm gives the owner thread lock-free push and pop operations with no atomic read-modify-write on the fast path. Contention only occurs when the deque has a single element and both the owner and a thief attempt to take it simultaneously. The deque also supports dynamic resizing by replacing the underlying circular buffer, which avoids the need to pre-allocate a fixed upper bound.
+
+**Why MPSC inbox for external submissions.** Cross-thread task submissions (e.g., spawning a task onto a specific worker from another thread) go through a bounded MPSC ring buffer rather than directly into the Chase-Lev deque. This separation keeps the deque's invariants simple -- only the owner ever pushes -- and the bounded capacity with cache-line aligned slots (`alignas(64)`) eliminates false sharing between producers and the consumer.
+
+## Virtual Stack
+
+C++20 stackless coroutines do not maintain a call stack in the traditional sense. When a coroutine suspends, the compiler-generated frame is stored on the heap, but the chain of callers that led to that suspension point is lost. This makes debugging difficult -- tools like `gdb bt` show the scheduler's dispatch loop rather than the logical call chain of coroutines.
+
+Elio reconstructs this information through a **virtual stack**: an intrusive linked list of `promise_base` objects connected by `parent_` pointers. Each `promise_base` constructor links itself to the current frame via the `current_frame_` thread-local, and the destructor restores the previous frame. This gives every coroutine a pointer to the coroutine that `co_await`ed it.
+
+The overhead is minimal -- one pointer per coroutine frame, set during construction and cleared during destruction.
+
+### What it enables
+
+- **`elio-pstack`**: A CLI tool that attaches to a running process (or reads a coredump) and walks the virtual stack chains to print coroutine backtraces, similar to `pstack` for threads.
+- **Debugger extensions**: `elio-gdb.py` and `elio-lldb.py` use the same frame linkage to implement `elio bt` (backtrace) and `elio list` (list active coroutines).
+- **Exception propagation**: When a coroutine throws, `unhandled_exception()` captures it in the promise. The parent coroutine can then rethrow the exception when it `co_await`s the child's result, propagating errors up the logical call chain.
+
+### Frame metadata
+
+Each `promise_base` also carries debug metadata:
+
+- **`frame_magic_`**: A constant (`0x454C494F46524D45`, ASCII "ELIOFRME") that debuggers use to validate that a memory region is a live coroutine frame.
+- **`debug_id_`**: A lazily-allocated unique ID (batch-allocated per thread to avoid global contention).
+- **`debug_location_`**: Source file, function name, and line number.
+- **`debug_state_`**: Current state (created, running, suspended, completed, failed).
+
+## Frame Allocator
+
+Coroutine frames are heap-allocated by default. In workloads that create and destroy many short-lived coroutines, this can cause significant allocator contention across threads.
+
+`frame_allocator` is a thread-local free-list pool that handles small coroutine frames (up to 256 bytes, with up to 1024 pooled slots). When a coroutine frame is allocated, the allocator checks the thread-local pool first. When freed, the frame is returned to the pool instead of the global heap.
+
+### Cross-thread returns
+
+Work-stealing means a coroutine may be allocated on thread A but destroyed on thread B. The frame allocator handles this with an MPSC (multi-producer, single-consumer) return queue per pool. When a frame is freed on a different thread than the one that allocated it, the frame is pushed onto the source pool's MPSC queue. The owning thread reclaims these returns in batches during subsequent allocations.
+
+Each allocated block carries a hidden header that records its source pool ID, so the deallocator knows which pool to return it to.
+
+### Sanitizer compatibility
+
+Under AddressSanitizer or ThreadSanitizer, the pool is bypassed entirely -- all allocations go directly through `::operator new` and `::operator delete`. This ensures that sanitizers can accurately detect leaks, use-after-free, and data races without being confused by the pooling layer.
+
 ## I/O Context
 
 The I/O context manages async I/O operations. Each worker thread has its own I/O context for lock-free operation. In most cases, you don't need to interact with io_context directly - the library automatically uses the per-thread io_context.
@@ -306,26 +378,41 @@ coro::task<void> writer() {
 }
 ```
 
-### Condition Variable
+### Event
+
+`event` is a one-shot signaling primitive. One or more coroutines wait for the event to be set:
 
 ```cpp
-sync::condition_variable cv;
-sync::mutex mtx;
-bool ready = false;
+sync::event evt;
 
 coro::task<void> waiter() {
-    auto lock = co_await mtx.lock();
-    co_await cv.wait(lock, [&] { return ready; });
-    // Condition met
+    co_await evt.wait();
+    // Event was set
     co_return;
 }
 
-coro::task<void> notifier() {
-    {
-        auto lock = co_await mtx.lock();
-        ready = true;
-    }
-    cv.notify_one();
+coro::task<void> signaler() {
+    // Wake all waiters
+    evt.set();
+    co_return;
+}
+```
+
+### Channel
+
+`channel<T>` provides a bounded, multi-producer multi-consumer queue for passing values between coroutines:
+
+```cpp
+sync::channel<int> ch(16);  // Bounded capacity of 16
+
+coro::task<void> producer() {
+    co_await ch.send(42);
+    co_return;
+}
+
+coro::task<void> consumer() {
+    auto value = co_await ch.receive();
+    // value == 42
     co_return;
 }
 ```

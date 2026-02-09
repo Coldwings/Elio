@@ -67,6 +67,18 @@ if (inbox_.push(handle.address())) {
 
 This eliminates unnecessary syscalls when workers are busy processing tasks.
 
+### Unified Wake Mechanism
+
+Each worker's I/O backend (epoll or io_uring) contains an embedded `eventfd`. When a task is submitted to a worker from another thread, the submitter writes to that worker's eventfd. Because the eventfd is registered with the same epoll/io_uring instance that handles I/O completions, both I/O events and task wake-ups unblock the same `poll()` call.
+
+This unified design has two key benefits:
+
+1. **Single wait point.** A worker blocked on I/O poll is immediately woken by a cross-thread task submission. There is no separate condition variable or futex that could introduce a latency gap between "I/O ready" and "task ready" paths.
+
+2. **No redundant syscalls.** Combined with Lazy Wake, an eventfd write is only issued when the target worker is actually idle. If the worker is busy executing tasks or processing I/O completions, the submitter skips the write entirely. The submitted task is picked up when the worker next drains its inbox.
+
+The result is that cross-thread scheduling latency equals one `eventfd_write` plus one `epoll_wait`/`io_uring_enter` return — typically under 5 microseconds — while avoiding any syscall overhead when the worker is already active.
+
 ### Wait Strategy
 
 Elio supports configurable wait strategies to balance latency vs CPU usage:
@@ -179,32 +191,43 @@ scheduler sched(std::thread::hardware_concurrency());
 
 ### Dynamic Thread Adjustment
 
-```cpp
-// Enable dynamic thread pool sizing
-sched.set_min_threads(2);
-sched.set_max_threads(16);
+The scheduler supports changing the worker thread count at runtime. There is no automatic min/max scaling — you control the thread count explicitly:
 
-// Scheduler will add threads under load and remove idle threads
+```cpp
+// Adjust thread count at runtime
+sched.set_thread_count(8);  // Grow to 8 workers
+sched.set_thread_count(2);  // Shrink to 2 workers
+// Note: set_thread_count handles starting/stopping workers dynamically
 ```
+
+This is useful for adapting to load changes detected by your own monitoring logic (see [Scheduler Statistics](#scheduler-statistics)).
 
 ### Thread Affinity
 
 Pin coroutines to specific workers for cache locality:
 
 ```cpp
-#include <elio/coro/affinity.hpp>
+#include <elio/runtime/affinity.hpp>
 
 coro::task<void> cache_sensitive_work() {
-    // Pin to current worker
-    co_await coro::pin_to_current_worker();
+    // Bind to current worker for cache locality
+    co_await elio::bind_to_current_worker();
 
     // All subsequent work stays on this worker
     process_data();
 }
 
-// Or set affinity explicitly
-coro::set_affinity(handle, worker_id);
+// Or set affinity to a specific worker
+coro::task<void> pinned_work() {
+    co_await elio::set_affinity(2);  // Bind to worker 2 and migrate there
+    co_await elio::set_affinity(2, false);  // Bind without migrating
+
+    // Later, allow free migration again
+    co_await elio::clear_affinity();
+}
 ```
+
+`set_affinity` is an awaitable. When called with `migrate=true` (the default), the coroutine is immediately rescheduled on the target worker. With `migrate=false`, the affinity is recorded but migration is deferred until the next scheduling point. `clear_affinity` removes the binding so the task can be freely stolen by any worker again.
 
 ## I/O Backend Selection
 
@@ -226,15 +249,16 @@ io::io_context ctx(io::io_context::backend_type::epoll);
 std::cout << "Backend: " << ctx.get_backend_name() << std::endl;
 ```
 
-**io_uring advantages:**
-- Batched syscalls (fewer context switches)
-- Kernel-side I/O completion
-- Better for high-throughput scenarios
+**Why io_uring is preferred:**
+- **Submission batching.** Multiple I/O operations can be queued in the submission ring before a single `io_uring_enter` syscall, amortizing syscall overhead across many operations.
+- **Completion batching.** Completions accumulate in the completion ring and can be reaped in bulk without per-operation syscalls, unlike epoll where each I/O still requires a separate `read`/`write`/`accept` call after readiness notification.
+- **Registered resources.** File descriptors and buffers can be pre-registered with the kernel, reducing per-operation kernel crossing cost by avoiding repeated `fget`/`fput` and page table walks.
+- **Native async semantics.** Operations are inherently asynchronous — submit and forget until completion — which aligns naturally with coroutine suspension and resumption. There is no "readiness" vs "completion" mismatch as with epoll.
 
 **epoll fallback:**
 - Works on older kernels (pre-5.1)
-- Lower memory overhead
-- Adequate for moderate workloads
+- Lower memory overhead (no shared ring buffers)
+- Adequate for moderate workloads where per-operation syscall cost is not the bottleneck
 
 ### io_uring Kernel Requirements
 
@@ -388,14 +412,17 @@ stream.set_recv_buffer_size(65536);
 
 ### Scheduler Statistics
 
+The scheduler exposes individual metric accessors rather than a single stats struct:
+
 ```cpp
-// Get scheduler metrics
-auto stats = sched.get_stats();
-std::cout << "Tasks spawned: " << stats.tasks_spawned << std::endl;
-std::cout << "Tasks completed: " << stats.tasks_completed << std::endl;
-std::cout << "Steals: " << stats.work_steals << std::endl;
-std::cout << "Average queue depth: " << stats.avg_queue_depth << std::endl;
+// Available scheduler metrics
+size_t total = sched.total_tasks_executed();     // Total across all workers
+size_t w0 = sched.worker_tasks_executed(0);      // Worker 0's count
+size_t pending = sched.pending_tasks();          // Currently pending tasks
+size_t threads = sched.num_threads();            // Current thread count
 ```
+
+These are lightweight atomic reads suitable for periodic monitoring in production. Combine with `set_thread_count` to implement your own adaptive scaling.
 
 ### Logging Overhead
 

@@ -2,6 +2,12 @@
 
 Elio provides full support for WebSocket (RFC 6455) and Server-Sent Events (SSE) for real-time bidirectional and unidirectional communication.
 
+## Design Notes
+
+The **WebSocket** implementation follows RFC 6455, including frame masking for all client-to-server messages as required by the specification. Masking prevents cache poisoning attacks on intermediary proxies that might misinterpret WebSocket frames as HTTP. The server-side does not mask frames, as the RFC only mandates client-to-server masking.
+
+**Server-Sent Events (SSE)** provides a simpler alternative to WebSocket for server-to-client streaming. SSE operates over standard HTTP, requires no protocol upgrade, and benefits from automatic reconnection built into the browser EventSource API. The tradeoff is that SSE is unidirectional (server to client only), but for many use cases -- notifications, live feeds, progress updates -- this is sufficient and avoids the complexity of a bidirectional protocol.
+
 ## WebSocket
 
 WebSocket provides full-duplex communication channels over a single TCP connection.

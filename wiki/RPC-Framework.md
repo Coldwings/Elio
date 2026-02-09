@@ -15,6 +15,20 @@ Elio's RPC framework provides high-performance remote procedure calls over TCP a
 - **Zero-copy binary fields**: `buffer_ref` type for referencing external buffers without copying
 - **Resource cleanup**: Cleanup callbacks for releasing resources after response is sent
 
+## Design Choices
+
+### Why a custom wire format instead of protobuf/gRPC
+
+The RPC framework uses a custom binary wire format to maintain zero external dependencies for the core protocol. The 18-byte fixed header enables fast parsing without schema negotiation -- the receiver always knows exactly how many bytes to read before it can dispatch a message. CRC32 checksums provide integrity verification without the overhead of a full serialization framework. This keeps the library header-only and avoids pulling in protobuf's code generator toolchain or gRPC's runtime.
+
+### Why zero-copy with buffer_ref
+
+Large payloads such as file contents or binary data can be sent without copying into a serialization buffer. The `buffer_ref` type holds a pointer and size, referencing memory that lives elsewhere (e.g., an mmap'd file or a pre-allocated buffer). Combined with `iovec_buffer`, this enables scatter-gather writes that combine the header and payload in a single `writev()` syscall, avoiding intermediate copies and reducing memory allocations on the send path.
+
+### Why cleanup callbacks
+
+When a response references data that must outlive the send operation (e.g., memory-mapped files, shared buffers), cleanup callbacks ensure that the referenced data is released only after the response is fully transmitted. Without this mechanism, the server would need to either copy all response data into owned buffers (defeating zero-copy) or risk use-after-free if the backing memory is released before the write completes.
+
 ## Quick Start
 
 ### Include the Header

@@ -2,6 +2,31 @@
 
 Elio provides async networking support for TCP, Unix Domain Sockets (UDS), HTTP/1.1, HTTP/2, and TLS/HTTPS.
 
+## Design Rationale
+
+### Per-Worker I/O Contexts
+
+Each worker thread in the Elio scheduler owns its own io_uring or epoll backend instance. When a coroutine performs an I/O operation, the request is submitted to the worker's local backend. This means I/O operations never require locking or cross-thread synchronization. The result is lower latency and higher throughput, especially under heavy concurrent I/O loads. If a task migrates to a different worker (via work-stealing), subsequent I/O operations simply use the new worker's local context.
+
+### Separate TCP and UDS Modules
+
+TCP and Unix Domain Sockets live in separate modules (`net/tcp.hpp` and `net/uds.hpp`) because they serve different socket domains with distinct setup and configuration needs. TCP deals with IPv4/IPv6 addressing, DNS resolution, Nagle's algorithm, and keep-alive. UDS, on the other hand, supports filesystem paths, Linux-specific abstract sockets (which have no filesystem entry and are automatically cleaned up), and credential passing via `SO_PASSCRED`. Keeping them separate avoids leaking domain-specific concerns into a shared abstraction.
+
+### The `tcp_options` Struct
+
+Rather than requiring separate `setsockopt()` calls after creating a listener or connection, Elio consolidates socket configuration into a single `tcp_options` struct. This struct is passed at bind or connect time and supports `reuse_addr`, `reuse_port`, `no_delay`, `keep_alive`, `recv_buffer`, `send_buffer`, `backlog`, and `ipv6_only`. This declarative approach reduces boilerplate and makes it harder to forget important options:
+
+```cpp
+tcp_options opts;
+opts.reuse_port = true;     // SO_REUSEPORT for load balancing across processes
+opts.no_delay = true;       // TCP_NODELAY (enabled by default)
+opts.keep_alive = true;     // SO_KEEPALIVE
+opts.recv_buffer = 65536;   // SO_RCVBUF
+opts.backlog = 512;         // Listen backlog
+
+auto listener = tcp_listener::bind(ipv4_address(8080), opts);
+```
+
 ## TCP
 
 ### TCP Server
@@ -70,37 +95,57 @@ coro::task<void> client(const std::string& host, uint16_t port) {
 
 ### Address Types
 
+Elio provides three address types for TCP networking: `ipv4_address`, `ipv6_address`, and `socket_address` (a variant wrapper that holds either).
+
 ```cpp
 // IPv4 address with port
 ipv4_address addr1(8080);                    // 0.0.0.0:8080
 ipv4_address addr2("192.168.1.1", 8080);     // 192.168.1.1:8080
 ipv4_address addr3("example.com", 80);       // DNS resolved
 
-// Get address info
+// IPv6 address with port
+ipv6_address addr4(8080);                    // [::]:8080
+ipv6_address addr5("::1", 8080);             // [::1]:8080
+ipv6_address addr6("fe80::1%eth0", 8080);   // Link-local with scope ID
+ipv6_address addr7("example.com", 443);      // DNS resolved (AAAA)
+
+// Generic socket_address (variant of ipv4_address | ipv6_address)
+socket_address sa1(ipv4_address(8080));              // From IPv4
+socket_address sa2(ipv6_address("::1", 8080));       // From IPv6
+socket_address sa3("example.com", 443);              // Auto-detects v4/v6
+
+// Inspect address type
+if (sa3.is_v6()) {
+    const auto& v6 = sa3.as_v6();
+    ELIO_LOG_INFO("IPv6: {}", v6.to_string());
+}
+
+// Get peer address from a connected stream
 auto peer = stream.peer_address();
 if (peer) {
     ELIO_LOG_INFO("Connected to: {}", peer->to_string());
 }
 ```
 
+Both `tcp_listener::bind()` and `tcp_connect()` accept any of the three address types.
+
 ### Scatter-Gather I/O (writev)
 
-For efficient writing of multiple buffers without copying, use `writev()`:
+For efficient writing of multiple buffers without copying, use `writev()`. Both `tcp_stream` and `uds_stream` support this method.
 
 ```cpp
 coro::task<void> send_message(tcp_stream& stream) {
     // Prepare header and payload separately
-    std::array<uint8_t, 8> header = {0x01, 0x02, ...};
-    std::string payload = "Hello, World!";
-    
+    std::string header = "HEADER:";
+    std::string body = "Hello, World!";
+
     // Write both in a single syscall using scatter-gather I/O
-    struct iovec iovecs[2];
-    iovecs[0].iov_base = header.data();
-    iovecs[0].iov_len = header.size();
-    iovecs[1].iov_base = const_cast<char*>(payload.data());
-    iovecs[1].iov_len = payload.size();
-    
-    auto result = co_await stream.writev(iovecs, 2);
+    struct iovec iov[2] = {
+        {(void*)header.data(), header.size()},
+        {(void*)body.data(), body.size()}
+    };
+
+    auto result = co_await stream.writev(iov, 2);
     if (result.result > 0) {
         ELIO_LOG_INFO("Sent {} bytes", result.result);
     }
@@ -202,6 +247,14 @@ if (addr.is_abstract()) {
 // Filesystem: "/tmp/my_server.sock"
 // Abstract: "@my_service"
 ELIO_LOG_INFO("Address: {}", addr.to_string());
+```
+
+Abstract sockets are useful when you want IPC without creating files on the filesystem. They are automatically cleaned up when all references are closed:
+
+```cpp
+// Abstract socket (Linux-specific, no filesystem path)
+auto addr = net::unix_address::abstract("my_service");
+auto listener = net::uds_listener::bind(addr);
 ```
 
 ### UDS vs TCP

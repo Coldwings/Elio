@@ -472,4 +472,4 @@ For questions, issues, or feature requests, please open an issue on the reposito
 
 ---
 
-**Status**: Feature Complete | **Version**: 0.1.0 | **Date**: 2026-02-03
+**Status**: Feature Complete | **Version**: 0.3.0 | **Date**: 2026-02-03

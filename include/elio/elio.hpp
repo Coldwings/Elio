@@ -26,6 +26,10 @@
 #include "runtime/async_main.hpp"
 #include "runtime/affinity.hpp"
 #include "runtime/serve.hpp"
+#include "runtime/autoscaler_config.hpp"
+#include "runtime/autoscaler_triggers.hpp"
+#include "runtime/autoscaler_actions.hpp"
+#include "runtime/autoscaler.hpp"
 
 // I/O backend
 #include "io/io_backend.hpp"

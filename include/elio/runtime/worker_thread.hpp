@@ -126,6 +126,21 @@ public:
     [[nodiscard]] bool is_running() const noexcept {
         return running_.load(std::memory_order_acquire);
     }
+
+    /// Check if worker is idle (waiting for work)
+    [[nodiscard]] bool is_idle() const noexcept {
+        return idle_.load(std::memory_order_relaxed);
+    }
+
+    /// Get the last time a task was executed
+    [[nodiscard]] std::chrono::steady_clock::time_point last_task_time() const noexcept {
+        return last_task_time_.load(std::memory_order_relaxed);
+    }
+
+    /// Update the last task execution time (called after task completes)
+    void update_last_task_time() noexcept {
+        last_task_time_.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
+    }
     
     /// Get the worker ID for this worker thread
     [[nodiscard]] size_t worker_id() const noexcept {
@@ -173,6 +188,7 @@ private:
     std::atomic<bool> running_;
     std::atomic<size_t> tasks_executed_;
     std::atomic<bool> idle_{false};    // True when worker is waiting for work (for lazy wake)
+    std::atomic<std::chrono::steady_clock::time_point> last_task_time_{std::chrono::steady_clock::now()};
     bool needs_sync_ = false;          // Whether current task needs memory synchronization
     wait_strategy strategy_;           // Configurable wait strategy
     std::unique_ptr<io::io_context> io_context_;  // Per-worker io_context

@@ -13,6 +13,7 @@
 - **Virtual Stack Tracking** for natural exception propagation
 - **Work-Stealing Scheduler** with lock-free Chase-Lev deques
 - **Dynamic Thread Pool** with runtime adjustment
+- **Autoscaler** for automatic worker thread scaling under load
 - **Synchronization Primitives**: mutex, semaphore, event, channel
 - **Timers**: sleep_for, sleep_until, yield
 - **I/O Backends**: io_uring (preferred) and epoll fallback

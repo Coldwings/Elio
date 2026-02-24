@@ -423,7 +423,8 @@ inline void worker_thread::run_task(std::coroutine_handle<> handle) noexcept {
     
     handle.resume();
     tasks_executed_.fetch_add(1, std::memory_order_relaxed);
-    
+    update_last_task_time();
+
     // Note: We do NOT check done() or call destroy() here.
     // If the task completed, its final_suspend will self-destruct (fire-and-forget)
     // or resume a continuation. If it suspended mid-execution (e.g., yield),

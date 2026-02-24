@@ -23,6 +23,10 @@ add_executable(dynamic_threads dynamic_threads.cpp)
 target_link_libraries(dynamic_threads PRIVATE elio)
 target_link_options(dynamic_threads PRIVATE ${STATIC_LINK_FLAGS})
 
+add_executable(autoscaler_example autoscaler_example.cpp)
+target_link_libraries(autoscaler_example PRIVATE elio)
+target_link_options(autoscaler_example PRIVATE ${STATIC_LINK_FLAGS})
+
 add_executable(thread_affinity thread_affinity.cpp)
 target_link_libraries(thread_affinity PRIVATE elio)
 target_link_options(thread_affinity PRIVATE ${STATIC_LINK_FLAGS})

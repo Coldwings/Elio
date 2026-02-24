@@ -702,6 +702,75 @@ make
 ./examples/signal_handling              # Signal handling example
 ```
 
+## Autoscaler
+
+Automatic worker thread scaling based on load:
+
+```cpp
+#include <elio/elio.hpp>
+#include <elio/runtime/autoscaler.hpp>
+#include <atomic>
+#include <chrono>
+#include <random>
+
+using namespace elio;
+
+// Task that simulates work
+coro::task<void> workload_task(std::atomic<int>& counter) {
+    static thread_local std::mt19937 rng(
+        std::hash<std::thread::id>{}(std::this_thread::get_id())
+    );
+    std::uniform_int_distribution<int> dist(1, 50);
+    std::this_thread::sleep_for(std::chrono::milliseconds(dist(rng)));
+    counter.fetch_add(1, std::memory_order_relaxed);
+    co_return;
+}
+
+int main() {
+    // Configure autoscaler
+    elio::runtime::autoscaler_config config;
+    config.tick_interval = std::chrono::milliseconds(200);
+    config.overload_threshold = 20;      // Scale up when queue > 20
+    config.idle_threshold = 5;          // Scale down when queue < 5
+    config.idle_delay = std::chrono::seconds(5);
+    config.min_workers = 2;
+    config.max_workers = 8;
+
+    // Create scheduler and autoscaler
+    elio::runtime::scheduler sched(2);
+    sched.start();
+
+    elio::runtime::autoscaler<elio::runtime::scheduler,
+        elio::runtime::on_overload<elio::runtime::scale_up<elio::runtime::null>>,
+        elio::runtime::on_idle<elio::runtime::scale_down<elio::runtime::null>>,
+        elio::runtime::on_block<elio::runtime::log>
+    > autoscaler(config);
+
+    autoscaler.start(&sched);
+
+    // Submit workload...
+    std::atomic<int> completed{0};
+    for (int i = 0; i < 1000; ++i) {
+        sched.spawn(workload_task(completed).release());
+    }
+
+    // Monitor autoscaler behavior
+    while (completed.load() < 1000) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::cout << "Workers: " << sched.num_threads()
+                  << ", Pending: " << sched.pending_tasks() << std::endl;
+    }
+
+    autoscaler.stop();
+    sched.shutdown();
+}
+```
+
+The autoscaler supports:
+- **Triggers**: `on_overload`, `on_idle`, `on_block`
+- **Actions**: `scale_up`, `scale_down`, `log`, `null`
+- **Combinators**: `on_success`, `on_failure`
+
 ## See Also
 
 - [[Signal-Handling]] - Detailed guide on signal handling with signalfd

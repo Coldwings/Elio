@@ -191,7 +191,7 @@ scheduler sched(std::thread::hardware_concurrency());
 
 ### Dynamic Thread Adjustment
 
-The scheduler supports changing the worker thread count at runtime. There is no automatic min/max scaling — you control the thread count explicitly:
+The scheduler supports changing the worker thread count at runtime:
 
 ```cpp
 // Adjust thread count at runtime
@@ -200,7 +200,28 @@ sched.set_thread_count(2);  // Shrink to 2 workers
 // Note: set_thread_count handles starting/stopping workers dynamically
 ```
 
-This is useful for adapting to load changes detected by your own monitoring logic (see [Scheduler Statistics](#scheduler-statistics)).
+For automatic scaling, use the **Autoscaler** component. It monitors queue length and automatically scales worker threads based on configurable thresholds:
+
+```cpp
+#include <elio/runtime/autoscaler.hpp>
+
+elio::runtime::autoscaler_config config;
+config.overload_threshold = 20;    // Scale up when queue > 20
+config.idle_threshold = 5;       // Scale down when queue < 5
+config.idle_delay = std::chrono::seconds(30);
+config.min_workers = 2;
+config.max_workers = 16;
+
+elio::runtime::autoscaler<runtime::scheduler,
+    elio::runtime::on_overload<elio::runtime::scale_up<elio::runtime::null>>,
+    elio::runtime::on_idle<elio::runtime::scale_down<elio::runtime::null>>,
+    elio::runtime::on_block<elio::runtime::log>
+> autoscaler(config);
+
+autoscaler.start(&sched);
+```
+
+This is useful for adapting to load changes automatically (see [Scheduler Statistics](#scheduler-statistics)).
 
 ### Thread Affinity
 

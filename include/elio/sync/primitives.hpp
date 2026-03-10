@@ -8,6 +8,8 @@
 #include <queue>
 #include <optional>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 namespace elio::runtime {
 class scheduler;  // Forward declaration
@@ -352,8 +354,12 @@ public:
                     to_resume.push_back(reader_waiters_.front());
                     reader_waiters_.pop();
                 }
-                // Clear writer flags and set reader count
-                state_.store(reader_count, std::memory_order_release);
+                // Set reader count, preserve WRITER_WAITING if there are pending writers
+                uint64_t new_state = reader_count;
+                if (pending_writers_ > 0) {
+                    new_state |= WRITER_WAITING;
+                }
+                state_.store(new_state, std::memory_order_release);
             }
         }
 
@@ -525,19 +531,24 @@ public:
     /// Release (increment) the semaphore
     void release(int count = 1) {
         std::vector<std::coroutine_handle<>> to_resume;
-        
+
         {
             std::lock_guard<std::mutex> guard(mutex_);
-            
-            while (count > 0 && !waiters_.empty()) {
+
+            // Calculate how many waiters to wake (up to 'count')
+            const int to_wake = std::min(count, static_cast<int>(waiters_.size()));
+
+            // Wake up the calculated number of waiters
+            for (int i = 0; i < to_wake; ++i) {
                 to_resume.push_back(waiters_.front());
                 waiters_.pop();
-                --count;
             }
-            
-            count_ += count;  // Add remaining to count
+
+            // Always add the full release count to count_
+            // (waiters that were woken will consume permits when they run)
+            count_ += count;
         }
-        
+
         // Re-schedule waiters through the scheduler
         for (auto& h : to_resume) {
             runtime::schedule_handle(h);
@@ -639,16 +650,41 @@ class channel {
 public:
     /// Create a channel with the given capacity
     /// @param capacity Maximum number of items (0 = unbounded)
-    explicit channel(size_t capacity = 0) 
+    explicit channel(size_t capacity = 0)
         : capacity_(capacity), closed_(false) {}
-    
+
     ~channel() {
         close();
     }
-    
-    // Non-copyable, non-movable
+
+    // Non-copyable
     channel(const channel&) = delete;
     channel& operator=(const channel&) = delete;
+
+    // Movable
+    channel(channel&& other) noexcept
+        : capacity_(other.capacity_)
+        , closed_(other.closed_)
+        , queue_(std::move(other.queue_))
+        , recv_waiters_(std::move(other.recv_waiters_))
+        , send_waiters_(std::move(other.send_waiters_)) {
+        other.capacity_ = 0;
+        other.closed_ = true;
+    }
+
+    channel& operator=(channel&& other) noexcept {
+        if (this != &other) {
+            close();
+            capacity_ = other.capacity_;
+            closed_ = other.closed_;
+            queue_ = std::move(other.queue_);
+            recv_waiters_ = std::move(other.recv_waiters_);
+            send_waiters_ = std::move(other.send_waiters_);
+            other.capacity_ = 0;
+            other.closed_ = true;
+        }
+        return *this;
+    }
     
     /// Send awaitable
     class send_awaitable {
@@ -958,10 +994,30 @@ public:
 
 private:
     void lock_slow() noexcept {
+        // Exponential backoff parameters
+        constexpr int spin_threshold = 8;    // spins before yielding
+        constexpr int yield_threshold = 64;  // iterations before sleeping
+        constexpr auto max_sleep = std::chrono::microseconds{512};
+
+        int iterations = 0;
+        auto sleep_duration = std::chrono::microseconds{1};
+
         for (;;) {
             // TTAS: spin on read first (avoids cache-line bouncing from CAS)
             while (locked_.load(std::memory_order_relaxed)) {
-                runtime::cpu_relax();
+                ++iterations;
+
+                if (iterations < spin_threshold) {
+                    // Initial spinning phase - burn CPU cycles
+                    runtime::cpu_relax();
+                } else if (iterations < yield_threshold) {
+                    // Yield phase - allow other threads to run
+                    std::this_thread::yield();
+                } else {
+                    // Sleep phase - exponential backoff sleep
+                    std::this_thread::sleep_for(sleep_duration);
+                    sleep_duration = std::min(sleep_duration * 2, max_sleep);
+                }
             }
 
             // Try to acquire
@@ -969,6 +1025,12 @@ private:
             if (locked_.compare_exchange_weak(expected, true,
                     std::memory_order_acquire, std::memory_order_relaxed)) {
                 return;
+            }
+
+            // Reset iterations on CAS failure to give the lock holder
+            // a chance to release the lock
+            if (iterations >= yield_threshold) {
+                sleep_duration = std::chrono::microseconds{1};
             }
         }
     }
@@ -979,8 +1041,9 @@ private:
 /// RAII lock guard for spinlock
 class spinlock_guard {
 public:
-    explicit spinlock_guard(spinlock& s) : spinlock_(&s) {
+    explicit spinlock_guard(spinlock& s) : spinlock_(&s), owns_lock_(false) {
         spinlock_->lock();
+        owns_lock_ = true;
     }
 
     ~spinlock_guard() {

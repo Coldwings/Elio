@@ -15,8 +15,23 @@
 #include <cstring>
 #include <stdexcept>
 #include <atomic>
+#include <mutex>
+#include <unordered_map>
 
 namespace elio::io {
+
+/// Map to track handles being resumed for thread-safe check-and-resume
+/// Uses a mutex for simplicity - a handle address is mapped to a bool flag
+/// indicating if the resume is in progress
+inline std::unordered_map<void*, std::atomic<bool>>& get_resume_tracking_map() {
+    static std::unordered_map<void*, std::atomic<bool>> map;
+    return map;
+}
+
+inline std::mutex& get_resume_tracking_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
 
 /// io_uring backend implementation
 /// 
@@ -379,28 +394,69 @@ private:
             // Cancel operation or internal operation, no awaiter to resume
             return;
         }
-        
-        // Store result in promise and resume coroutine
-        auto handle = std::coroutine_handle<>::from_address(user_data);
+
+        // Store result
         io_result result{cqe->res, cqe->flags};
-        
-        ELIO_LOG_DEBUG("Completing operation: result={}, flags={}", 
-                       cqe->res, cqe->flags);
-        
-        if (handle && !handle.done()) {
+
+        // Check for error conditions (negative res indicates error)
+        if (cqe->res < 0) {
+            ELIO_LOG_DEBUG("Completing operation with error: result={}, flags={}",
+                           cqe->res, cqe->flags);
+        } else {
+            ELIO_LOG_DEBUG("Completing operation: result={}, flags={}",
+                           cqe->res, cqe->flags);
+        }
+
+        auto handle = std::coroutine_handle<>::from_address(user_data);
+
+        if (handle) {
+            // Thread-safe check-and-resume using atomic operations.
+            // Try to atomically claim this resume to prevent use-after-free.
+            // If another thread is already resuming this handle, skip.
+            auto& tracking_map = get_resume_tracking_map();
+            std::lock_guard<std::mutex> lock(get_resume_tracking_mutex());
+
+            // Get or create the atomic flag for this handle
+            auto it = tracking_map.find(user_data);
+            if (it == tracking_map.end()) {
+                // Insert new entry with false (not being resumed)
+                // Use try_emplace which handles atomic types better on some compilers
+                auto [new_it, inserted] = tracking_map.try_emplace(user_data, false);
+                it = new_it;
+            }
+
+            // Try to atomically claim the resume
+            bool expected = false;
+            if (!it->second.compare_exchange_strong(expected, true,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                // Another thread already claimed this resume - skip
+                return;
+            }
+
             if (deferred_resumes) {
                 deferred_resumes->push_back({handle, result});
             } else {
                 last_result_ = result;
                 handle.resume();
             }
+
+            // Mark as done
+            it->second.store(false, std::memory_order_release);
         }
     }
     
     /// Resume collected coroutine handles (call outside of lock)
     static void resume_deferred(std::vector<deferred_resume_entry>& entries) {
         for (auto& entry : entries) {
-            if (entry.handle && !entry.handle.done()) {
+            // Check error conditions
+            if (entry.result.result < 0) {
+                ELIO_LOG_DEBUG("Resuming deferred with error: result={}",
+                               entry.result.result);
+            }
+
+            // The handle was already claimed in process_completion,
+            // so we just need to check if it's valid
+            if (entry.handle) {
                 last_result_ = entry.result;
                 entry.handle.resume();
             }

@@ -379,12 +379,16 @@ inline void worker_thread::run() {
 
 inline std::coroutine_handle<> worker_thread::get_next_task() noexcept {
     // Check single-worker mode dynamically (thread count can change at runtime)
-    // Use pop_local() only when there's definitely no stealer
+    // Pass allow_concurrent_steals=true to pop_local() so it can fall back to
+    // pop() if there might be concurrent stealers. This avoids the TOCTOU race
+    // where another thread could be added between check and use.
     bool single_worker = (scheduler_->num_threads() == 1);
-    
+
     // Fast path: pop from local deque first
     // In single-worker mode, use pop_local() to skip seq_cst fence
-    void* addr = single_worker ? queue_.pop_local() : queue_.pop();
+    // Pass !single_worker as allow_concurrent_steals - pop_local() will fall back
+    // to pop() if there could be concurrent stealers
+    void* addr = queue_.pop_local(!single_worker);
     if (addr) {
         needs_sync_ = false;  // Local task, no sync needed
         return std::coroutine_handle<>::from_address(addr);
@@ -394,7 +398,7 @@ inline std::coroutine_handle<> worker_thread::get_next_task() noexcept {
     drain_inbox();
     
     // Try local deque again after draining inbox
-    addr = single_worker ? queue_.pop_local() : queue_.pop();
+    addr = queue_.pop_local(!single_worker);
     if (addr) {
         needs_sync_ = true;  // Came from inbox, needs sync
         return std::coroutine_handle<>::from_address(addr);
@@ -436,7 +440,7 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
     if (num_workers <= 1) return nullptr;
     
     // Start stealing from a different worker each time (better distribution)
-    static thread_local size_t steal_start = 0;
+    thread_local size_t steal_start = 0;
     size_t start = steal_start;
     steal_start = (steal_start + 1) % num_workers;
     

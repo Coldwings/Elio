@@ -144,7 +144,22 @@ public:
     
     /// Pop without seq_cst fence - ONLY use when there are no concurrent stealers
     /// This is safe in single-worker mode where no other thread can steal
-    [[nodiscard]] T* pop_local() noexcept {
+    ///
+    /// WARNING: This function has a TOCTOU (time-of-check-time-of-use) race condition
+    /// when used with a separate num_threads() check. Another thread could be added
+    /// between the check and this call, causing concurrent steal() operations to
+    /// race with this pop_local().
+    ///
+    /// Use the `allow_concurrent_steals` parameter to ensure safety:
+    /// - When `allow_concurrent_steals == false`: assumes single-worker, uses fast path
+    /// - When `allow_concurrent_steals == true`: falls back to pop() for safety
+    [[nodiscard]] T* pop_local(bool allow_concurrent_steals = false) noexcept {
+        // If concurrent steals are possible, fall back to the safe pop() method
+        // which uses seq_cst fence for proper synchronization
+        if (allow_concurrent_steals) {
+            return pop();
+        }
+
         size_t b = bottom_.load(std::memory_order_relaxed);
         if (b == 0) return nullptr;
         

@@ -124,9 +124,18 @@ struct task_state {
     }
     
     bool set_waiter(std::coroutine_handle<> h) noexcept {
+        // Fast path: check if already done before trying to set waiter
+        // This avoids the race of setting a waiter on an already-completed task
+        if (is_done()) {
+            return false;
+        }
+
+        // Try to atomically set the waiter
         void* expected = nullptr;
         if (waiter_.compare_exchange_strong(expected, h.address(),
                 std::memory_order_release, std::memory_order_acquire)) {
+            // Double-check if task completed between our initial check and CAS
+            // If so, we need to notify the waiter we just set
             if (is_done()) {
                 void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
                 if (addr) {
@@ -136,6 +145,7 @@ struct task_state {
             }
             return true;
         }
+        // Another waiter already set (shouldn't happen with single await)
         return false;
     }
     
@@ -201,9 +211,18 @@ struct task_state<void> {
     }
     
     bool set_waiter(std::coroutine_handle<> h) noexcept {
+        // Fast path: check if already done before trying to set waiter
+        // This avoids the race of setting a waiter on an already-completed task
+        if (is_done()) {
+            return false;
+        }
+
+        // Try to atomically set the waiter
         void* expected = nullptr;
         if (waiter_.compare_exchange_strong(expected, h.address(),
                 std::memory_order_release, std::memory_order_acquire)) {
+            // Double-check if task completed between our initial check and CAS
+            // If so, we need to notify the waiter we just set
             if (is_done()) {
                 void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
                 if (addr) {
@@ -213,6 +232,7 @@ struct task_state<void> {
             }
             return true;
         }
+        // Another waiter already set (shouldn't happen with single await)
         return false;
     }
     

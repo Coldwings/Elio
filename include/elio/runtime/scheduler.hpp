@@ -309,11 +309,11 @@ inline void worker_thread::stop() {
 inline void worker_thread::drain_remaining_tasks() noexcept {
     // First drain inbox to deque
     void* addr;
-    while ((addr = inbox_.pop()) != nullptr) {
-        queue_.push(addr);
+    while ((addr = inbox_->pop()) != nullptr) {
+        queue_->push(addr);
     }
     // Then destroy all tasks in the deque
-    while ((addr = queue_.pop()) != nullptr) {
+    while ((addr = queue_->pop()) != nullptr) {
         auto handle = std::coroutine_handle<>::from_address(addr);
         if (handle) {
             handle.destroy();
@@ -325,11 +325,11 @@ inline void worker_thread::drain_remaining_tasks() noexcept {
 inline void worker_thread::redistribute_tasks(scheduler* sched) noexcept {
     // First drain inbox to deque
     void* addr;
-    while ((addr = inbox_.pop()) != nullptr) {
-        queue_.push(addr);
+    while ((addr = inbox_->pop()) != nullptr) {
+        queue_->push(addr);
     }
     // Then redistribute all tasks to active workers
-    while ((addr = queue_.pop()) != nullptr) {
+    while ((addr = queue_->pop()) != nullptr) {
         auto handle = std::coroutine_handle<>::from_address(addr);
         if (handle && !handle.done()) {
             // Respawn to an active worker
@@ -344,8 +344,8 @@ inline void worker_thread::drain_inbox() noexcept {
     // Drain MPSC inbox into local Chase-Lev deque
     // Drain all available items to ensure tasks aren't stuck in inbox
     void* item;
-    while ((item = inbox_.pop()) != nullptr) {
-        queue_.push(item);
+    while ((item = inbox_->pop()) != nullptr) {
+        queue_->push(item);
     }
 }
 
@@ -388,17 +388,17 @@ inline std::coroutine_handle<> worker_thread::get_next_task() noexcept {
     // In single-worker mode, use pop_local() to skip seq_cst fence
     // Pass !single_worker as allow_concurrent_steals - pop_local() will fall back
     // to pop() if there could be concurrent stealers
-    void* addr = queue_.pop_local(!single_worker);
+    void* addr = queue_->pop_local(!single_worker);
     if (addr) {
         needs_sync_ = false;  // Local task, no sync needed
         return std::coroutine_handle<>::from_address(addr);
     }
-    
+
     // Local queue empty - drain any externally submitted tasks from inbox
     drain_inbox();
-    
+
     // Try local deque again after draining inbox
-    addr = queue_.pop_local(!single_worker);
+    addr = queue_->pop_local(!single_worker);
     if (addr) {
         needs_sync_ = true;  // Came from inbox, needs sync
         return std::coroutine_handle<>::from_address(addr);
@@ -500,7 +500,7 @@ inline void worker_thread::poll_io_when_idle() {
     // Optional spinning phase (if configured via wait_strategy)
     if (strategy_.spin_iterations > 0) {
         for (size_t i = 0; i < strategy_.spin_iterations; ++i) {
-            if (inbox_.size_approx() > 0) {
+            if (inbox_->size_approx() > 0) {
                 idle_.store(false, std::memory_order_relaxed);
                 return;
             }

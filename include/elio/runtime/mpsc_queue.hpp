@@ -39,7 +39,7 @@ public:
     mpsc_queue& operator=(const mpsc_queue&) = delete;
     mpsc_queue(mpsc_queue&&) = delete;
     mpsc_queue& operator=(mpsc_queue&&) = delete;
-    
+
     /// Push an item (multiple producers allowed) - lock-free, wait-free for non-full queue
     bool push(T* item) noexcept {
         size_t pos = tail_.load(std::memory_order_relaxed);

@@ -31,8 +31,8 @@ public:
                    wait_strategy strategy = wait_strategy::blocking())
         : scheduler_(sched)
         , worker_id_(worker_id)
-        , queue_()
-        , inbox_()
+        , queue_(std::make_unique<chase_lev_deque<void>>())
+        , inbox_(std::make_unique<mpsc_queue<void>>())
         , running_(false)
         , tasks_executed_(0)
         , strategy_(strategy)
@@ -45,8 +45,48 @@ public:
 
     worker_thread(const worker_thread&) = delete;
     worker_thread& operator=(const worker_thread&) = delete;
-    worker_thread(worker_thread&&) = delete;
-    worker_thread& operator=(worker_thread&&) = delete;
+
+    worker_thread(worker_thread&& other) noexcept
+        : scheduler_(other.scheduler_)
+        , worker_id_(other.worker_id_)
+        , queue_(std::move(other.queue_))
+        , inbox_(std::move(other.inbox_))
+        , thread_(std::move(other.thread_))
+        , running_(other.running_.load(std::memory_order_relaxed))
+        , tasks_executed_(other.tasks_executed_.load(std::memory_order_relaxed))
+        , idle_(other.idle_.load(std::memory_order_relaxed))
+        , last_task_time_(other.last_task_time_.load(std::memory_order_relaxed))
+        , needs_sync_(other.needs_sync_)
+        , strategy_(std::move(other.strategy_))
+        , io_context_(std::move(other.io_context_)) {
+        // Reset other's pointers to empty states to prevent double-free
+        other.queue_ = std::make_unique<chase_lev_deque<void>>();
+        other.inbox_ = std::make_unique<mpsc_queue<void>>();
+    }
+
+    worker_thread& operator=(worker_thread&& other) noexcept {
+        if (this != &other) {
+            stop();
+
+            scheduler_ = other.scheduler_;
+            worker_id_ = other.worker_id_;
+            queue_ = std::move(other.queue_);
+            inbox_ = std::move(other.inbox_);
+            thread_ = std::move(other.thread_);
+            running_.store(other.running_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            tasks_executed_.store(other.tasks_executed_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            idle_.store(other.idle_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            last_task_time_.store(other.last_task_time_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            needs_sync_ = other.needs_sync_;
+            strategy_ = std::move(other.strategy_);
+            io_context_ = std::move(other.io_context_);
+
+            // Reset other's pointers to empty states to prevent double-free
+            other.queue_ = std::make_unique<chase_lev_deque<void>>();
+            other.inbox_ = std::make_unique<mpsc_queue<void>>();
+        }
+        return *this;
+    }
 
     void start();
     void stop();
@@ -63,7 +103,7 @@ public:
         if (!handle) [[unlikely]] return;
 
         // Try fast path: push to lock-free inbox
-        if (inbox_.push(handle.address())) [[likely]] {
+        if (inbox_->push(handle.address())) [[likely]] {
             // Lazy wake: only wake if worker is idle (waiting for work)
             // This avoids unnecessary wake syscalls when worker is busy
             // Use relaxed load - occasional extra wake is fine, we optimize for the common case
@@ -84,7 +124,7 @@ public:
                 std::this_thread::yield();
                 #endif
             }
-            if (inbox_.push(handle.address())) {
+            if (inbox_->push(handle.address())) {
                 // Lazy wake: only wake if worker is idle
                 if (idle_.load(std::memory_order_relaxed)) {
                     wake();
@@ -99,7 +139,7 @@ public:
     /// Schedule a task from owner thread - pushes directly to local deque
     void schedule_local(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return;
-        queue_.push(handle.address());
+        queue_->push(handle.address());
     }
 
     [[nodiscard]] size_t tasks_executed() const noexcept {
@@ -107,20 +147,20 @@ public:
     }
 
     [[nodiscard]] size_t queue_size() const noexcept {
-        return queue_.size() + inbox_.size_approx();
+        return queue_->size() + inbox_->size_approx();
     }
 
     [[nodiscard]] std::coroutine_handle<> steal_task() noexcept {
         // Don't allow stealing from stopped workers
         if (!running_.load(std::memory_order_acquire)) return nullptr;
-        void* addr = queue_.steal();
+        void* addr = queue_->steal();
         return addr ? std::coroutine_handle<>::from_address(addr) : nullptr;
     }
 
     /// Steal multiple tasks at once for better throughput
     template<size_t N>
     size_t steal_batch(std::array<void*, N>& output) noexcept {
-        return queue_.steal_batch(output);
+        return queue_->steal_batch(output);
     }
 
     [[nodiscard]] bool is_running() const noexcept {
@@ -182,8 +222,8 @@ private:
 
     scheduler* scheduler_;
     size_t worker_id_;
-    chase_lev_deque<void> queue_;      // Owner's local deque (SPMC)
-    mpsc_queue<void> inbox_;           // External submissions (MPSC)
+    std::unique_ptr<chase_lev_deque<void>> queue_;      // Owner's local deque (SPMC)
+    std::unique_ptr<mpsc_queue<void>> inbox_;           // External submissions (MPSC)
     std::thread thread_;
     std::atomic<bool> running_;
     std::atomic<size_t> tasks_executed_;

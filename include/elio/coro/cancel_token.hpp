@@ -26,13 +26,13 @@ struct cancel_state {
     uint64_t next_id = 1;
     
     uint64_t add_callback(std::function<void()> cb) {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(mutex);
         if (cancelled.load(std::memory_order_relaxed)) {
-            // Already cancelled, invoke immediately outside lock
-            // Need to release lock first
-            mutex.unlock();
+            // Already cancelled, invoke callback outside lock
+            // Release the unique_lock to avoid double-unlock UB
+            lock.release();
             cb();
-            mutex.lock();
+            // Don't re-acquire - we're done
             return 0;
         }
         uint64_t id = next_id++;

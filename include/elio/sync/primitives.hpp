@@ -672,7 +672,7 @@ public:
         other.closed_ = true;
     }
 
-    channel& operator=(channel&& other) noexcept {
+    channel& operator=(channel&& other) noexcept(false) {
         if (this != &other) {
             close();
             capacity_ = other.capacity_;

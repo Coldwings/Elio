@@ -20,17 +20,30 @@
 
 namespace elio::io {
 
-/// Map to track handles being resumed for thread-safe check-and-resume
-/// Uses a mutex for simplicity - a handle address is mapped to a bool flag
-/// indicating if the resume is in progress
-inline std::unordered_map<void*, std::atomic<bool>>& get_resume_tracking_map() {
-    static std::unordered_map<void*, std::atomic<bool>> map;
-    return map;
+/// Number of shards for resume tracking map to reduce lock contention
+/// Using a power of 2 allows fast modulo via bitwise AND
+static constexpr size_t kResumeTrackingShards = 16;
+
+/// Get the shard index for a given user_data pointer
+inline size_t get_resume_tracking_shard(const void* user_data) {
+    // Use pointer value to distribute across shards
+    // Mix bits to get better distribution
+    uintptr_t addr = reinterpret_cast<uintptr_t>(user_data);
+    return (addr ^ (addr >> 8) ^ (addr >> 16)) & (kResumeTrackingShards - 1);
 }
 
-inline std::mutex& get_resume_tracking_mutex() {
-    static std::mutex mutex;
-    return mutex;
+/// Per-shard tracking data
+struct resume_tracking_shard {
+    std::unordered_map<void*, std::atomic<bool>> map;
+    std::mutex mutex;
+};
+
+/// Get the sharded resume tracking maps and mutexes
+/// Using sharding to reduce lock contention under high I/O load
+inline std::array<resume_tracking_shard, kResumeTrackingShards>&
+get_resume_tracking_shards() {
+    static std::array<resume_tracking_shard, kResumeTrackingShards> shards;
+    return shards;
 }
 
 /// io_uring backend implementation
@@ -410,11 +423,17 @@ private:
         auto handle = std::coroutine_handle<>::from_address(user_data);
 
         if (handle) {
-            // Thread-safe check-and-resume using atomic operations.
+            // Thread-safe check-and-resume using sharded atomic operations.
+            // Uses per-shard locking to reduce lock contention under high I/O load.
             // Try to atomically claim this resume to prevent use-after-free.
             // If another thread is already resuming this handle, skip.
-            auto& tracking_map = get_resume_tracking_map();
-            std::lock_guard<std::mutex> lock(get_resume_tracking_mutex());
+
+            // Get the shard for this user_data to reduce contention
+            size_t shard = get_resume_tracking_shard(user_data);
+            auto& shards = get_resume_tracking_shards();
+
+            std::lock_guard<std::mutex> lock(shards[shard].mutex);
+            auto& tracking_map = shards[shard].map;
 
             // Get or create the atomic flag for this handle
             auto it = tracking_map.find(user_data);

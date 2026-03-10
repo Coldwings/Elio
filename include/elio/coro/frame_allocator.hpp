@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 
 namespace elio::coro {
 
@@ -216,6 +217,10 @@ private:
     // Pool registry for cross-thread access
     static constexpr size_t MAX_POOLS = 256;
 
+    // Registry entries - atomic for lock-free reads, protected by mutex for writes
+    static inline std::atomic<frame_allocator*> pool_registry_[MAX_POOLS]{};
+    static inline std::mutex registry_mutex_;  // Protects unregister operations
+
     static void register_pool(frame_allocator* pool) noexcept {
         uint32_t id = pool->pool_id_;
         if (id < MAX_POOLS) {
@@ -226,10 +231,15 @@ private:
     static void unregister_pool(frame_allocator* pool) noexcept {
         uint32_t id = pool->pool_id_;
         if (id < MAX_POOLS) {
+            // Use mutex to ensure no concurrent lookups during unregister
+            // This prevents the race where a lookup sees a valid pointer
+            // but the pool is being destroyed
+            std::lock_guard<std::mutex> lock(registry_mutex_);
             pool_registry_[id].store(nullptr, std::memory_order_release);
         }
     }
 
+    // Get pool by ID - returns nullptr if pool was unregistered
     static frame_allocator* get_pool_by_id(uint32_t id) noexcept {
         if (id < MAX_POOLS) {
             return pool_registry_[id].load(std::memory_order_acquire);
@@ -247,9 +257,6 @@ private:
 
     // Global pool ID counter
     static inline std::atomic<uint32_t> next_pool_id_{0};
-
-    // Global pool registry for cross-thread lookups
-    static inline std::array<std::atomic<frame_allocator*>, MAX_POOLS> pool_registry_{};
 };
 
 } // namespace elio::coro

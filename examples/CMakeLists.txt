@@ -1,5 +1,12 @@
 # Example programs
 
+if(ELIO_ENABLE_DEVELOPER_WARNINGS)
+    add_compile_options(-Wall -Wextra -Wpedantic)
+    if(ELIO_WARNINGS_AS_ERRORS)
+        add_compile_options(-Werror)
+    endif()
+endif()
+
 # Static linking for libgcc and libstdc++ for portability
 set(STATIC_LINK_FLAGS -static-libgcc -static-libstdc++)
 

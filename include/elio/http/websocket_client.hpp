@@ -175,8 +175,11 @@ private:
             
             // Process control frames
             while (parser_.has_control_frame()) {
-                auto [op, payload] = *parser_.get_control_frame();
-                co_await handle_control_frame(op, payload);
+                auto control_frame = parser_.get_control_frame();
+                if (!control_frame) {
+                    break;
+                }
+                co_await handle_control_frame(control_frame->first, control_frame->second);
             }
             
             // Check for errors
@@ -459,7 +462,9 @@ private:
                 break;
                 
             case opcode::close: {
-                auto [code, reason] = parse_close_payload(payload);
+                auto close_info = parse_close_payload(payload);
+                auto code = close_info.first;
+                auto& reason = close_info.second;
                 ELIO_LOG_DEBUG("WebSocket close received: {} {}", 
                               static_cast<uint16_t>(code), reason);
                 

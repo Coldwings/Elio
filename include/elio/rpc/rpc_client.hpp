@@ -231,13 +231,13 @@ private:
         // Build and send request
         auto timeout_ms = static_cast<uint32_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count());
-        auto [header, payload] = build_request(request_id, Method::id, request, timeout_ms);
+        auto request_frame = build_request(request_id, Method::id, request, timeout_ms);
         
         {
             co_await send_mutex_.lock();
             sync::lock_guard send_guard(send_mutex_);
             
-            bool sent = co_await write_frame(stream_, header, payload);
+            bool sent = co_await write_frame(stream_, request_frame.first, request_frame.second);
             if (!sent) {
                 std::lock_guard<std::mutex> lock(pending_mutex_);
                 pending_requests_.erase(request_id);
@@ -314,12 +314,12 @@ public:
         }
         
         uint32_t request_id = id_generator_.next();
-        auto [header, payload] = build_request(request_id, Method::id, request);
+        auto request_frame = build_request(request_id, Method::id, request);
         
         co_await send_mutex_.lock();
         sync::lock_guard send_guard(send_mutex_);
         
-        co_return co_await write_frame(stream_, header, payload);
+        co_return co_await write_frame(stream_, request_frame.first, request_frame.second);
     }
     
     /// Send a ping and wait for pong

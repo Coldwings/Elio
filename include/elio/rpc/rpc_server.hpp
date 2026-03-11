@@ -161,12 +161,12 @@ private:
         auto it = handlers_.find(header.method_id);
         if (it == handlers_.end()) {
             ELIO_LOG_WARNING("RPC session: method {} not found", header.method_id);
-            auto [err_header, err_payload] = build_error_response(
+            auto error_frame = build_error_response(
                 header.request_id, 
                 rpc_error::method_not_found,
                 "Method not found"
             );
-            co_await send_response(err_header, err_payload);
+            co_await send_response(error_frame.first, error_frame.second);
             co_return;
         }
         
@@ -218,12 +218,12 @@ private:
             
             co_await send_response(resp_header, response_payload);
         } else {
-            auto [err_header, err_payload] = build_error_response(
+            auto error_frame = build_error_response(
                 header.request_id,
                 error_code,
                 error_message
             );
-            co_await send_response(err_header, err_payload);
+            co_await send_response(error_frame.first, error_frame.second);
         }
         
         // Invoke cleanup callback after response is sent

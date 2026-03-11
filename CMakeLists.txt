@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(Elio VERSION 0.3.0 LANGUAGES CXX)
 
+include(CMakePackageConfigHelpers)
+
 # Determine if Elio is the top-level project or included via add_subdirectory/FetchContent
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(ELIO_IS_TOP_LEVEL TRUE)
@@ -14,6 +16,8 @@ option(ELIO_BUILD_EXAMPLES "Build Elio examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_TLS "Enable TLS support (requires OpenSSL)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_HTTP "Enable HTTP client/server support (requires TLS)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_HTTP2 "Enable HTTP/2 support (requires nghttp2)" ${ELIO_IS_TOP_LEVEL})
+option(ELIO_ENABLE_DEVELOPER_WARNINGS "Enable strict warning flags for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
+option(ELIO_WARNINGS_AS_ERRORS "Treat warnings as errors for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 
 # Platform check - Linux only
 if(NOT UNIX OR APPLE)
@@ -33,14 +37,6 @@ add_library(elio INTERFACE)
 target_include_directories(elio INTERFACE 
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
-)
-
-# Compiler flags for our code only (not dependencies)
-target_compile_options(elio INTERFACE
-    -Wall
-    -Wextra
-    -Werror
-    -Wpedantic
 )
 
 # Dependencies via FetchContent
@@ -70,7 +66,7 @@ if(URING_LIBRARY AND URING_INCLUDE_DIR)
     message(STATUS "Found liburing: ${URING_LIBRARY}")
     target_compile_definitions(elio INTERFACE ELIO_HAS_IO_URING=1)
     target_include_directories(elio INTERFACE ${URING_INCLUDE_DIR})
-    target_link_libraries(elio INTERFACE fmt::fmt pthread ${URING_LIBRARY})
+    target_link_libraries(elio INTERFACE fmt::fmt pthread uring)
 else()
     message(STATUS "liburing not found, io_uring backend will be disabled")
     target_compile_definitions(elio INTERFACE ELIO_HAS_IO_URING=0)
@@ -139,7 +135,11 @@ if(ELIO_ENABLE_HTTP AND TARGET elio_tls)
             $<BUILD_INTERFACE:${nghttp2_BINARY_DIR}/lib/includes>
             $<INSTALL_INTERFACE:include>
         )
-        target_link_libraries(elio_http2 INTERFACE elio_http nghttp2_static)
+        target_link_libraries(elio_http2 INTERFACE
+            elio_http
+            $<BUILD_INTERFACE:nghttp2_static>
+            $<INSTALL_INTERFACE:nghttp2>
+        )
         target_compile_definitions(elio_http2 INTERFACE ELIO_HAS_HTTP2=1)
         message(STATUS "HTTP/2 support enabled via nghttp2")
     endif()
@@ -162,10 +162,50 @@ endif()
 
 # Installation
 install(DIRECTORY include/ DESTINATION include)
-install(TARGETS elio EXPORT ElioTargets)
+
+set(ELIO_EXPORT_TARGETS elio)
+if(TARGET elio_tls)
+    list(APPEND ELIO_EXPORT_TARGETS elio_tls)
+endif()
+if(TARGET elio_http)
+    list(APPEND ELIO_EXPORT_TARGETS elio_http)
+endif()
+if(TARGET elio_http2)
+    list(APPEND ELIO_EXPORT_TARGETS elio_http2)
+endif()
+
+set(ELIO_PACKAGE_NEEDS_OPENSSL OFF)
+if(TARGET elio_tls)
+    set(ELIO_PACKAGE_NEEDS_OPENSSL ON)
+endif()
+
+set(ELIO_PACKAGE_NEEDS_NGHTTP2 OFF)
+if(TARGET elio_http2)
+    set(ELIO_PACKAGE_NEEDS_NGHTTP2 ON)
+endif()
+
+install(TARGETS ${ELIO_EXPORT_TARGETS} EXPORT ElioTargets)
 install(EXPORT ElioTargets
     FILE ElioTargets.cmake
     NAMESPACE Elio::
+    DESTINATION lib/cmake/Elio
+)
+
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ElioConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/ElioConfig.cmake
+    INSTALL_DESTINATION lib/cmake/Elio
+)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/ElioConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/ElioConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/ElioConfigVersion.cmake
     DESTINATION lib/cmake/Elio
 )
 

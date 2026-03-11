@@ -52,6 +52,37 @@ cmake ..
 cmake --build .
 ```
 
+### CMake Options
+
+```bash
+# Core toggles
+cmake .. -DELIO_BUILD_TESTS=ON -DELIO_BUILD_EXAMPLES=ON
+cmake .. -DELIO_ENABLE_TLS=ON -DELIO_ENABLE_HTTP=ON -DELIO_ENABLE_HTTP2=ON
+
+# Warning policy for repository-local targets (tests/examples only)
+cmake .. -DELIO_ENABLE_DEVELOPER_WARNINGS=ON -DELIO_WARNINGS_AS_ERRORS=ON
+```
+
+Note: strict warning flags are applied only to Elio's tests/examples targets and are not propagated through exported interface targets.
+
+### Install And Use As A Package
+
+```bash
+cmake --install build --prefix /your/prefix
+```
+
+Then in another CMake project:
+
+```cmake
+find_package(Elio REQUIRED)
+target_link_libraries(your_target PRIVATE Elio::elio)
+
+# Optional targets when enabled during Elio build
+# Elio::elio_tls
+# Elio::elio_http
+# Elio::elio_http2
+```
+
 ### Running Tests
 
 ```bash

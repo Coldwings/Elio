@@ -59,3 +59,90 @@ jobs:
     - name: Run benchmark 
       if: matrix.build_type == 'Release'
       run: ./build/examples/benchmark
+
+  package-consumer-check:
+    runs-on: ubuntu-24.04
+    name: package-consumer-check
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake \
+          ninja-build \
+          liburing-dev \
+          libssl-dev \
+          libnghttp2-dev \
+          g++-14
+
+    - name: Configure CMake (installable build)
+      run: |
+        cmake -B build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=gcc-14 \
+          -DCMAKE_CXX_COMPILER=g++-14 \
+          -DELIO_BUILD_TESTS=OFF \
+          -DELIO_BUILD_EXAMPLES=OFF \
+          -DELIO_ENABLE_TLS=ON \
+          -DELIO_ENABLE_HTTP=ON \
+          -DELIO_ENABLE_HTTP2=ON
+
+    - name: Build and install
+      run: |
+        cmake --build build --parallel
+        cmake --install build --prefix ${{ github.workspace }}/_install
+
+    - name: Verify downstream consumption
+      run: |
+        mkdir -p consumer
+        cat > consumer/CMakeLists.txt << 'EOF'
+        cmake_minimum_required(VERSION 3.20)
+        project(ElioConsumer LANGUAGES CXX)
+        set(CMAKE_CXX_STANDARD 20)
+
+        find_package(Elio REQUIRED)
+
+        add_executable(consumer main.cpp)
+        target_link_libraries(consumer PRIVATE Elio::elio)
+
+        if(TARGET Elio::elio_tls)
+          target_link_libraries(consumer PRIVATE Elio::elio_tls)
+          target_compile_definitions(consumer PRIVATE ELIO_HAS_TLS_TARGET=1)
+        endif()
+
+        if(TARGET Elio::elio_http)
+          target_link_libraries(consumer PRIVATE Elio::elio_http)
+          target_compile_definitions(consumer PRIVATE ELIO_HAS_HTTP_TARGET=1)
+        endif()
+
+        if(TARGET Elio::elio_http2)
+          target_link_libraries(consumer PRIVATE Elio::elio_http2)
+          target_compile_definitions(consumer PRIVATE ELIO_HAS_HTTP2_TARGET=1)
+        endif()
+        EOF
+
+        cat > consumer/main.cpp << 'EOF'
+        #include <elio/elio.hpp>
+        #if defined(ELIO_HAS_TLS_TARGET)
+        #include <elio/tls/tls.hpp>
+        #endif
+        #if defined(ELIO_HAS_HTTP_TARGET)
+        #include <elio/http/http.hpp>
+        #endif
+        #if defined(ELIO_HAS_HTTP2_TARGET)
+        #include <elio/http/http2.hpp>
+        #endif
+
+        int main() {
+            return 0;
+        }
+        EOF
+
+        cmake -S consumer -B consumer/build -G Ninja \
+          -DCMAKE_CXX_COMPILER=g++-14 \
+          -DCMAKE_PREFIX_PATH=${{ github.workspace }}/_install
+        cmake --build consumer/build --parallel

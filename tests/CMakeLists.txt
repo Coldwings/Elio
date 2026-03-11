@@ -1,4 +1,11 @@
 # Test sources
+if(ELIO_ENABLE_DEVELOPER_WARNINGS)
+    add_compile_options(-Wall -Wextra -Wpedantic)
+    if(ELIO_WARNINGS_AS_ERRORS)
+        add_compile_options(-Werror)
+    endif()
+endif()
+
 set(TEST_SOURCES
     test_main.cpp
     unit/test_logger.cpp

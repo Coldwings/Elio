@@ -52,7 +52,11 @@ template<typename T>
 struct join_state {
     std::optional<T> value_;
     std::exception_ptr exception_;
-    std::atomic<void*> waiter_{nullptr};  // Stores coroutine_handle address
+    // waiter_/completed_ are the hot path: written by the coroutine producer
+    // (complete()) and the awaiting consumer (set_waiter()).  Aligning them
+    // to a new cache line separates them from value_/exception_ which may
+    // be large and written only once, preventing false sharing.
+    alignas(64) std::atomic<void*> waiter_{nullptr};  // Stores coroutine_handle address
     std::atomic<bool> completed_{false};
     
     void set_value(T&& value) {
@@ -109,7 +113,8 @@ struct join_state {
 template<>
 struct join_state<void> {
     std::exception_ptr exception_;
-    std::atomic<void*> waiter_{nullptr};
+    // Hot atomics on their own cache line (see join_state<T> comment above)
+    alignas(64) std::atomic<void*> waiter_{nullptr};
     std::atomic<bool> completed_{false};
     
     void set_value() {

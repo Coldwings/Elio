@@ -261,11 +261,20 @@ private:
     }
 
     std::vector<std::unique_ptr<worker_thread>> workers_;
-    std::atomic<size_t> num_threads_;
+
+    // Frequently-read fields on their own cache line to avoid false sharing
+    // with the spawn counter and the slow-path workers_mutex_.
+    alignas(64) std::atomic<size_t> num_threads_;
     std::atomic<bool> running_;
     std::atomic<bool> paused_;
-    std::atomic<size_t> spawn_index_;
-    mutable std::mutex workers_mutex_;
+
+    // spawn_index_ is incremented on every spawn(); isolate it so modifications
+    // don't invalidate the num_threads_/running_ cache line on other cores.
+    alignas(64) std::atomic<size_t> spawn_index_;
+
+    // workers_mutex_ is only touched on slow-path resize operations;
+    // keep it away from the hot read fields above.
+    alignas(64) mutable std::mutex workers_mutex_;
     wait_strategy wait_strategy_;
 
     static inline thread_local scheduler* current_scheduler_ = nullptr;

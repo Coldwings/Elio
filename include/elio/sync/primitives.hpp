@@ -26,8 +26,16 @@ namespace elio::sync {
 /// Coroutine-aware mutex
 /// Unlike std::mutex, this suspends the coroutine instead of blocking the thread
 ///
-/// Optimized with atomic fast path for try_lock - avoids mutex acquisition
-/// in the uncontended case for ~10x performance improvement.
+/// Lock-free implementation using an intrusive LIFO waiter stack.
+/// A single atomic pointer encodes the full lock state:
+///   nullptr           — unlocked
+///   (void*)this       — locked, no waiters  (LOCKED_NO_WAITERS sentinel)
+///   <lock_awaitable*> — locked, head of intrusive LIFO waiter stack
+///
+/// The uncontended fast path is a single CAS (~3 cycles) with no heap
+/// allocation and no OS mutex.  On contention, waiters chain themselves
+/// into a lock-free LIFO stack; unlock pops the head and re-schedules it
+/// via the coroutine scheduler.
 class mutex {
 public:
     mutex() = default;
@@ -39,84 +47,114 @@ public:
     mutex(mutex&&) = delete;
     mutex& operator=(mutex&&) = delete;
 
-    /// Lock awaitable
+    /// Lock awaitable — lives in the coroutine frame for the duration of a
+    /// co_await m.lock() expression, so it is safe to store 'this' in the
+    /// mutex's intrusive waiter list.
     class lock_awaitable {
     public:
-        explicit lock_awaitable(mutex& m) : mutex_(m) {}
+        explicit lock_awaitable(mutex& m) noexcept : mutex_(m) {}
 
         bool await_ready() const noexcept {
-            // Try to acquire without waiting using atomic fast path
             return mutex_.try_lock();
         }
 
-        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            std::lock_guard<std::mutex> guard(mutex_.internal_mutex_);
-
-            // Double-check after acquiring internal lock
-            // Use relaxed here since we hold the mutex
-            if (!mutex_.locked_.load(std::memory_order_relaxed)) {
-                mutex_.locked_.store(true, std::memory_order_relaxed);
-                return false;  // Don't suspend, we got the lock
+        /// Either acquires the lock inline (returns false = do not suspend) or
+        /// pushes this awaitable onto the mutex's LIFO waiter stack and returns
+        /// true (suspend).  Loops until one of these two outcomes is achieved
+        /// via lock-free CAS.
+        bool await_suspend(std::coroutine_handle<> h) noexcept {
+            handle_ = h;
+            void* old_state = mutex_.state_.load(std::memory_order_acquire);
+            while (true) {
+                if (old_state == nullptr) {
+                    // Unlocked — try to acquire inline
+                    if (mutex_.state_.compare_exchange_weak(
+                            old_state, mutex_.locked_no_waiters(),
+                            std::memory_order_acquire,
+                            std::memory_order_relaxed)) {
+                        return false;  // acquired, do not suspend
+                    }
+                    // CAS failed, old_state refreshed — retry
+                } else {
+                    // Locked — push this awaitable onto the LIFO stack
+                    next_ = (old_state == mutex_.locked_no_waiters())
+                                ? nullptr
+                                : static_cast<lock_awaitable*>(old_state);
+                    if (mutex_.state_.compare_exchange_weak(
+                            old_state, this,
+                            std::memory_order_release,
+                            std::memory_order_relaxed)) {
+                        return true;  // enqueued, suspend
+                    }
+                    // CAS failed, old_state refreshed — retry
+                }
             }
-
-            // Add to wait queue
-            mutex_.waiters_.push(awaiter);
-            return true;  // Suspend
         }
 
         void await_resume() const noexcept {}
 
     private:
+        friend class mutex;
         mutex& mutex_;
+        lock_awaitable* next_{nullptr};      // intrusive LIFO linkage
+        std::coroutine_handle<> handle_;     // handle to resume on unlock
     };
 
     /// Acquire the mutex
-    auto lock() {
-        return lock_awaitable(*this);
-    }
+    [[nodiscard]] auto lock() noexcept { return lock_awaitable(*this); }
 
-    /// Try to acquire the mutex without waiting
-    /// Lock-free fast path using atomic CAS - no mutex acquisition needed
+    /// Try to acquire the mutex without waiting (lock-free, single CAS)
     bool try_lock() noexcept {
-        bool expected = false;
-        return locked_.compare_exchange_strong(expected, true,
-            std::memory_order_acquire, std::memory_order_relaxed);
+        void* expected = nullptr;
+        return state_.compare_exchange_strong(
+            expected, locked_no_waiters(),
+            std::memory_order_acquire,
+            std::memory_order_relaxed);
     }
 
     /// Release the mutex
-    void unlock() {
-        std::coroutine_handle<> to_resume;
+    void unlock() noexcept {
+        void* state = state_.load(std::memory_order_relaxed);
 
-        {
-            std::lock_guard<std::mutex> guard(internal_mutex_);
-
-            if (!waiters_.empty()) {
-                // Wake up next waiter
-                to_resume = waiters_.front();
-                waiters_.pop();
-                // Lock remains held by the woken coroutine (locked_ stays true)
-            } else {
-                // No waiters - release the lock
-                locked_.store(false, std::memory_order_release);
+        if (state == locked_no_waiters()) {
+            // Fast path: no waiters — just release
+            if (state_.compare_exchange_strong(
+                    state, nullptr,
+                    std::memory_order_release,
+                    std::memory_order_relaxed)) {
+                return;
             }
+            // A waiter pushed itself between our load and CAS; reload
+            state = state_.load(std::memory_order_acquire);
         }
 
-        // Re-schedule the waiter through the scheduler instead of resuming directly
-        // This avoids deep recursion and ownership confusion
-        if (to_resume) {
-            runtime::schedule_handle(to_resume);
-        }
+        // Pop head waiter and transfer lock ownership to it (LIFO)
+        auto* head = static_cast<lock_awaitable*>(state);
+        void* next_state = (head->next_ == nullptr)
+                               ? locked_no_waiters()
+                               : static_cast<void*>(head->next_);
+        state_.store(next_state, std::memory_order_release);
+
+        // Schedule the waiter — it now holds the lock
+        runtime::schedule_handle(head->handle_);
     }
 
     /// Check if mutex is currently locked
     bool is_locked() const noexcept {
-        return locked_.load(std::memory_order_acquire);
+        return state_.load(std::memory_order_acquire) != nullptr;
     }
 
 private:
-    mutable std::mutex internal_mutex_;
-    std::atomic<bool> locked_{false};
-    std::queue<std::coroutine_handle<>> waiters_;
+    /// Sentinel value meaning "locked but no waiters".
+    /// Uses the mutex's own address — guaranteed to differ from any
+    /// lock_awaitable* (awaitables live in coroutine frames, not inside mutexes).
+    void* locked_no_waiters() const noexcept {
+        return const_cast<void*>(static_cast<const void*>(this));
+    }
+
+    // Single atomic encodes the full state (see class-level comment).
+    // No separate std::mutex or std::queue needed.
+    std::atomic<void*> state_{nullptr};
 };
 
 /// RAII lock guard for coroutine mutex
@@ -379,8 +417,13 @@ public:
     }
 
 private:
-    mutable std::mutex internal_mutex_;
-    std::atomic<uint64_t> state_{0};  // Packed: [writer_waiting:1][writer_active:1][readers:62]
+    // state_ is the hot field: read on every lock_shared() fast path,
+    // and written on every reader acquire/release.  Keeping it isolated
+    // avoids false sharing with the slow-path internal_mutex_.
+    alignas(64) std::atomic<uint64_t> state_{0};  // Packed: [writer_waiting:1][writer_active:1][readers:62]
+
+    // slow-path fields: only accessed under internal_mutex_
+    alignas(64) mutable std::mutex internal_mutex_;
     size_t pending_writers_ = 0;       // Count of pending writers (for WRITER_WAITING flag management)
     std::queue<std::coroutine_handle<>> reader_waiters_;
     std::queue<std::coroutine_handle<>> writer_waiters_;

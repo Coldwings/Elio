@@ -17,12 +17,15 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <algorithm>
+#include <thread>
 
 namespace elio::io {
 
-/// Number of shards for resume tracking map to reduce lock contention
-/// Using a power of 2 allows fast modulo via bitwise AND
-static constexpr size_t kResumeTrackingShards = 16;
+/// Number of shards for resume tracking map to reduce lock contention.
+/// 64 shards accommodate up to ~64-core machines without measurable contention;
+/// must be a power of 2 for efficient bitwise modulo.
+static constexpr size_t kResumeTrackingShards = 64;
 
 /// Get the shard index for a given user_data pointer
 inline size_t get_resume_tracking_shard(const void* user_data) {
@@ -57,7 +60,15 @@ class io_uring_backend : public io_backend {
 public:
     /// Configuration options
     struct config {
-        uint32_t queue_depth = 256;     ///< SQ/CQ depth
+        /// SQ/CQ depth: defaults to 512 * num_hw_threads, clamped to [1024, 32768].
+        /// A larger ring reduces SQE exhaustion under high concurrency without
+        /// wasting memory on small machines.
+        uint32_t queue_depth = []() -> uint32_t {
+            unsigned hw = std::thread::hardware_concurrency();
+            if (hw == 0) hw = 4;  // conservative default if detection fails
+            auto d = static_cast<uint32_t>(hw) * 512u;
+            return std::clamp(d, 1024u, 32768u);
+        }();
         uint32_t flags = 0;             ///< io_uring_setup flags
         bool sq_poll = false;           ///< Enable SQ polling (requires privileges)
     };

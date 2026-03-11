@@ -8,6 +8,17 @@
 #include <cstdint>
 #include <mutex>
 
+// Architecture-specific CPU pause/yield hint for tight spin loops.
+// Reduces power consumption and allows the HT sibling to run.
+#if defined(__x86_64__) || defined(__i386__)
+#  define ELIO_CPU_PAUSE() __builtin_ia32_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#  define ELIO_CPU_PAUSE() __asm__ __volatile__("yield" ::: "memory")
+#else
+#  include <thread>
+#  define ELIO_CPU_PAUSE() std::this_thread::yield()
+#endif
+
 namespace elio::coro {
 
 /// Thread-local free-list based frame allocator for small coroutine frames
@@ -167,14 +178,19 @@ private:
         while (head && count < REMOTE_QUEUE_BATCH && free_count_ < POOL_SIZE) {
             block_header* next = head->next.load(std::memory_order_acquire);
 
-            // If next is null but tail points elsewhere, spin briefly
-            // (producer is in the middle of push)
+            // If next is null but tail points elsewhere, the producer is in the
+            // middle of push() (has done the tail exchange but not yet written
+            // prev->next).  Spin briefly with a CPU pause hint.
             if (!next && remote_tail_.load(std::memory_order_acquire) != head) {
-                // Spin wait for producer to complete
-                for (int i = 0; i < 100 && !head->next.load(std::memory_order_acquire); ++i) {
-                    // Brief spin
+                for (int i = 0; i < 16; ++i) {
+                    ELIO_CPU_PAUSE();
+                    next = head->next.load(std::memory_order_acquire);
+                    if (next) break;
                 }
-                next = head->next.load(std::memory_order_acquire);
+                // If the link still isn't ready, stop without consuming 'head'.
+                // Consuming it would leave the queue in a broken state because
+                // the producer would later write through a recycled pointer.
+                if (!next) break;
             }
 
             pool_[free_count_++] = head;
@@ -190,12 +206,16 @@ private:
         while (head) {
             block_header* next = head->next.load(std::memory_order_acquire);
 
-            // If next is null but tail points elsewhere, spin briefly
+            // Same safe spin pattern as reclaim_remote_returns(), but with more
+            // retries because we're in teardown and really want to drain the queue.
             if (!next && remote_tail_.load(std::memory_order_acquire) != head) {
-                for (int i = 0; i < 1000 && !head->next.load(std::memory_order_acquire); ++i) {
-                    // Brief spin
+                for (int i = 0; i < 32; ++i) {
+                    ELIO_CPU_PAUSE();
+                    next = head->next.load(std::memory_order_acquire);
+                    if (next) break;
                 }
-                next = head->next.load(std::memory_order_acquire);
+                // Stop safely rather than risk corrupting a partially-linked node.
+                if (!next) break;
             }
 
             if (free_count_ < POOL_SIZE) {

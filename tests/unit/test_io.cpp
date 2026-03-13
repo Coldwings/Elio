@@ -994,6 +994,23 @@ TEST_CASE("UDS echo test", "[uds][echo]") {
 
 #include <elio/net/tcp.hpp>
 
+static task<void> tcp_connect_regression_attempt(
+    uint16_t port,
+    std::atomic<int>& connected,
+    std::atomic<int>& failed,
+    std::atomic<int>& first_error) {
+    auto stream = co_await tcp_connect(ipv6_address("::1", port));
+    if (stream) {
+        connected.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        failed.fetch_add(1, std::memory_order_relaxed);
+        int err = errno;
+        int expected = 0;
+        first_error.compare_exchange_strong(expected, err);
+    }
+    co_return;
+}
+
 TEST_CASE("ipv4_address basic operations", "[tcp][address][ipv4]") {
     SECTION("default constructor") {
         ipv4_address addr;
@@ -1197,6 +1214,37 @@ TEST_CASE("TCP IPv6 listener and connect", "[tcp][ipv6][integration]") {
         REQUIRE(server_stream.has_value());
         REQUIRE(client_stream.has_value());
     }
+}
+
+TEST_CASE("TCP connect regression avoids double connect", "[tcp][connect][regression]") {
+    auto listener = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener.has_value());
+
+    uint16_t port = listener->local_address().port();
+    REQUIRE(port > 0);
+
+    std::atomic<int> connected{0};
+    std::atomic<int> failed{0};
+    std::atomic<int> first_error{0};
+
+    scheduler sched(2);
+    sched.start();
+
+    constexpr int kAttempts = 64;
+    for (int i = 0; i < kAttempts; ++i) {
+        auto t = tcp_connect_regression_attempt(port, connected, failed, first_error);
+        sched.spawn(t.release());
+    }
+
+    for (int i = 0; i < 500 && (connected + failed) < kAttempts; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    INFO("connect failures=" << failed.load() << ", first errno=" << first_error.load());
+    REQUIRE(connected == kAttempts);
+    REQUIRE(failed == 0);
 }
 
 TEST_CASE("socket_address with hostname resolution", "[tcp][address][dns]") {

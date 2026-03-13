@@ -465,6 +465,7 @@ public:
         int ret = ::connect(fd_, reinterpret_cast<struct sockaddr*>(&sa_), sa_len_);
         if (ret == 0) {
             // Connected immediately (common for UDS)
+            connect_in_progress_ = false;
             result_ = io::io_result{0, 0};
             return false;  // Don't suspend, resume immediately
         }
@@ -478,10 +479,11 @@ public:
         }
         
         // Connection in progress, wait for socket to become writable
+        connect_in_progress_ = true;
         auto& ctx = io::current_io_context();
         
         io::io_request req{};
-        req.op = io::io_op::connect;
+        req.op = io::io_op::poll_write;
         req.fd = fd_;
         req.addr = reinterpret_cast<struct sockaddr*>(&sa_);
         req.addrlen = &sa_len_;
@@ -498,16 +500,21 @@ public:
     }
     
     std::optional<uds_stream> await_resume() {
-        // For async completion (EINPROGRESS path), get result from io_context
-        // For immediate completion, result_ is already set
-        if (result_.result == 0 && result_.flags == 0 && fd_ >= 0) {
-            // This could be immediate success ({0,0}) or we need to check async result
-            auto ctx_result = io::io_context::get_last_result();
-            // Only use ctx_result if it looks like a real completion (not default)
-            if (ctx_result.result != 0 || ctx_result.flags != 0) {
-                result_ = ctx_result;
+        // Async path completion result comes from io_context.
+        if (connect_in_progress_ && fd_ >= 0) {
+            result_ = io::io_context::get_last_result();
+        }
+
+        // For non-blocking connect, writability means completion, not success.
+        // Use SO_ERROR to fetch the actual connect result.
+        if (connect_in_progress_ && result_.success() && fd_ >= 0) {
+            int so_error = 0;
+            socklen_t len = sizeof(so_error);
+            if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &so_error, &len) != 0) {
+                result_ = io::io_result{-errno, 0};
+            } else if (so_error != 0) {
+                result_ = io::io_result{-so_error, 0};
             }
-            // If ctx_result is also {0,0}, keep our result_ (immediate success)
         }
         
         if (!result_.success()) {
@@ -533,6 +540,7 @@ private:
     struct sockaddr_un sa_{};
     socklen_t sa_len_ = 0;
     int fd_ = -1;
+    bool connect_in_progress_ = false;
     io::io_result result_{};
 };
 

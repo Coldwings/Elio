@@ -9,7 +9,6 @@
 #include <mutex>
 #include <coroutine>
 #include <thread>
-#include <array>
 
 namespace elio::runtime {
 

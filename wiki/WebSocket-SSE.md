@@ -109,6 +109,21 @@ coro::task<void> connect_example() {
 }
 ```
 
+### WebSocket Resolve/Cache Configuration
+
+```cpp
+#include <elio/net/resolve.hpp>
+
+websocket::client_config cfg;
+cfg.resolve_options = net::default_cached_resolve_options();
+cfg.resolve_options.positive_ttl = std::chrono::seconds(20);
+cfg.resolve_options.negative_ttl = std::chrono::seconds(3);
+cfg.rotate_resolved_addresses = true;
+
+websocket::ws_client client(cfg);
+co_await client.connect("wss://example.com/ws");
+```
+
 ### WebSocket Frame Types
 
 | Opcode | Name | Description |
@@ -198,14 +213,15 @@ using namespace elio;
 using namespace elio::http::sse;
 
 coro::task<void> listen_events() {
-    auto& ctx = io::default_io_context();
-    
     // Configure client
     client_config config;
     config.auto_reconnect = true;
     config.default_retry_ms = 3000;
+    config.resolve_options.use_cache = true;
+    config.resolve_options.positive_ttl = std::chrono::seconds(15);
+    config.rotate_resolved_addresses = true;
     
-    sse_client client(ctx, config);
+    sse_client client(config);
     
     // Connect
     if (!co_await client.connect("http://localhost:8080/events")) {
@@ -224,6 +240,19 @@ coro::task<void> listen_events() {
                       evt->data);
     }
 }
+```
+
+### SSE Resolve/Cache Configuration
+
+```cpp
+#include <elio/net/resolve.hpp>
+
+sse::client_config cfg;
+cfg.resolve_options.use_cache = false;      // disable cache for dynamic DNS targets
+cfg.rotate_resolved_addresses = false;      // always try first resolved address first
+
+sse::sse_client client(cfg);
+co_await client.connect("https://example.com/events");
 ```
 
 ### SSE Event Format

@@ -102,10 +102,8 @@ coro::task<void> run_server(uint16_t port) {
 
 ```cpp
 coro::task<void> run_client(const char* host, uint16_t port) {
-    auto& ctx = io::default_io_context();
-    
     // Connect to server
-    auto client = co_await tcp_rpc_client::connect(ctx, host, port);
+    auto client = co_await tcp_rpc_client::connect(host, port);
     if (!client) {
         ELIO_LOG_ERROR("Failed to connect");
         co_return;
@@ -120,6 +118,30 @@ coro::task<void> run_client(const char* host, uint16_t port) {
         std::cout << "Age: " << result->age << std::endl;
     } else {
         std::cerr << "RPC failed: " << result.error_message() << std::endl;
+    }
+}
+```
+
+### Client Resolve/Cache Configuration
+
+```cpp
+#include <elio/net/resolve.hpp>
+
+coro::task<void> run_client_with_resolver(std::string_view host, uint16_t port) {
+    net::resolve_options opts = net::default_cached_resolve_options();
+    opts.positive_ttl = std::chrono::seconds(30);
+    opts.negative_ttl = std::chrono::seconds(2);
+
+    auto client = co_await tcp_rpc_client::connect(host, port, opts);
+    if (!client) {
+        ELIO_LOG_ERROR("Failed to connect");
+        co_return;
+    }
+
+    GetUserRequest req{42};
+    auto result = co_await (*client)->call<GetUser>(req, std::chrono::seconds(5));
+    if (!result.ok()) {
+        ELIO_LOG_ERROR("RPC failed: {}", result.error_message());
     }
 }
 ```

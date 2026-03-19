@@ -32,11 +32,18 @@ namespace elio::coro {
 /// Note: Under sanitizers, pooling is disabled to allow proper leak/error detection.
 class frame_allocator {
 public:
+    struct owner_metadata {
+        void* owner = nullptr;
+        bool is_root = false;
+        bool found = false;
+    };
+
     // Support frames up to 256 bytes (covers most simple tasks)
     // Actual allocation includes header, so user-visible size is MAX_FRAME_SIZE
     static constexpr size_t MAX_FRAME_SIZE = 256;
     static constexpr size_t POOL_SIZE = 1024;
     static constexpr size_t REMOTE_QUEUE_BATCH = 64;  // Process remote returns in batches
+    static constexpr uint32_t INVALID_POOL_ID = UINT32_MAX;
 
 // Detect sanitizers: GCC uses __SANITIZE_*, Clang uses __has_feature
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
@@ -48,13 +55,20 @@ public:
 #endif
 
 #ifdef ELIO_SANITIZER_ACTIVE
-    // Under sanitizers, bypass pooling entirely for accurate leak detection
+    // Under sanitizers, bypass pooling entirely, but still keep the hidden
+    // header so delete-path metadata inspection remains valid.
     static void* allocate(size_t size) {
-        return ::operator new(size);
+        void* block = ::operator new(HEADER_SIZE + size);
+        auto* header = static_cast<block_header*>(block);
+        header->source_pool_id = INVALID_POOL_ID;
+        header->next.store(nullptr, std::memory_order_relaxed);
+        header->owner = nullptr;
+        header->is_root = false;
+        return block_to_user(block);
     }
 
     static void deallocate(void* ptr, [[maybe_unused]] size_t size) noexcept {
-        ::operator delete(ptr);
+        delete_block(user_to_block(ptr));
     }
 #else
     static void* allocate(size_t size) {
@@ -70,6 +84,8 @@ public:
                 // This is important because blocks may have been returned from remote threads
                 auto* header = static_cast<block_header*>(block);
                 header->source_pool_id = alloc.pool_id_;
+                header->owner = nullptr;
+                header->is_root = false;
                 return block_to_user(block);
             }
 
@@ -78,10 +94,19 @@ public:
             auto* header = static_cast<block_header*>(block);
             header->source_pool_id = alloc.pool_id_;
             header->next.store(nullptr, std::memory_order_relaxed);
+            header->owner = nullptr;
+            header->is_root = false;
             return block_to_user(block);
         }
-        // Fall back to standard allocation for large frames (no header)
-        return ::operator new(size);
+        // Large frames still carry a small header so owner metadata can be
+        // attached later without touching promise memory in operator delete.
+        void* block = ::operator new(HEADER_SIZE + size);
+        auto* header = static_cast<block_header*>(block);
+        header->source_pool_id = INVALID_POOL_ID;
+        header->next.store(nullptr, std::memory_order_relaxed);
+        header->owner = nullptr;
+        header->is_root = false;
+        return block_to_user(block);
     }
 
     static void deallocate(void* ptr, size_t size) noexcept {
@@ -97,7 +122,7 @@ public:
                     return;
                 }
                 // Pool full, delete the block (not the user pointer!)
-                ::operator delete(block);
+                delete_block(block);
                 return;
             } else {
                 // Cross-thread deallocation: push to source pool's remote queue
@@ -107,20 +132,50 @@ public:
                     return;
                 }
                 // Source pool no longer exists (thread exited), delete the block
-                ::operator delete(block);
+                delete_block(block);
                 return;
             }
         }
-        // Large allocation - was allocated without header
-        ::operator delete(ptr);
+        // Large allocation - free the underlying block carrying the header
+        delete_block(user_to_block(ptr));
     }
 #endif
 
+    static void set_owner_metadata(void* ptr, void* owner, bool is_root) noexcept {
+        if (!ptr) return;
+        auto* header = static_cast<block_header*>(user_to_block(ptr));
+        header->owner = owner;
+        header->is_root = is_root;
+    }
+
+    [[nodiscard]] static owner_metadata inspect_owner_metadata(void* ptr) noexcept {
+        if (!ptr) return {};
+        auto* header = static_cast<block_header*>(user_to_block(ptr));
+        return owner_metadata{
+            .owner = header->owner,
+            .is_root = header->is_root,
+            .found = header->owner != nullptr,
+        };
+    }
+
 private:
+    static void delete_block(void* block) noexcept {
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
+        ::operator delete(block);
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+    }
+
     // Block header stored before user data
     struct block_header {
         uint32_t source_pool_id;              // ID of the pool that allocated this block
         std::atomic<block_header*> next;      // For MPSC queue linkage
+        void* owner;                          // Owning vthread domain, if attached later
+        bool is_root;                         // Root frame responsible for owner lifetime
     };
 
     // Total block size including header, aligned for user data
@@ -139,7 +194,7 @@ private:
     frame_allocator()
         : free_count_(0)
         , pool_id_(next_pool_id_.fetch_add(1, std::memory_order_relaxed))
-        , remote_head_{0, {nullptr}}  // Initialize dummy head: pool_id=0, next=nullptr
+        , remote_head_{0, {nullptr}, nullptr, false}  // Dummy head for remote queue
         , remote_tail_(&remote_head_) {
         // Register this pool for cross-thread access
         register_pool(this);

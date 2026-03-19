@@ -72,8 +72,14 @@ coro::task<void> server(uint16_t port) {
 
 ```cpp
 coro::task<void> client(const std::string& host, uint16_t port) {
-    // Connect to server (hostname is resolved automatically)
-    auto stream = co_await tcp_connect(ipv4_address(host, port));
+    // Resolve host to concrete address, then connect
+    auto resolved = co_await resolve_hostname(host, port);
+    if (!resolved) {
+        ELIO_LOG_ERROR("Resolve failed: {}", strerror(errno));
+        co_return;
+    }
+
+    auto stream = co_await tcp_connect(*resolved);
     if (!stream) {
         ELIO_LOG_ERROR("Connect failed: {}", strerror(errno));
         co_return;
@@ -97,26 +103,33 @@ coro::task<void> client(const std::string& host, uint16_t port) {
 
 Elio provides three address types for TCP networking: `ipv4_address`, `ipv6_address`, and `socket_address` (a variant wrapper that holds either).
 
+These types are value objects for already-parsed socket addresses. Their string constructors accept numeric IP literals only and do not perform DNS. For hostname resolution, use `co_await resolve_hostname(host, port)` (single best address) or `co_await resolve_all(host, port)` (all candidate addresses), then call `tcp_connect()` with a concrete address.
+
 ```cpp
 // IPv4 address with port
 ipv4_address addr1(8080);                    // 0.0.0.0:8080
 ipv4_address addr2("192.168.1.1", 8080);     // 192.168.1.1:8080
-ipv4_address addr3("example.com", 80);       // DNS resolved
 
 // IPv6 address with port
 ipv6_address addr4(8080);                    // [::]:8080
 ipv6_address addr5("::1", 8080);             // [::1]:8080
 ipv6_address addr6("fe80::1%eth0", 8080);   // Link-local with scope ID
-ipv6_address addr7("example.com", 443);      // DNS resolved (AAAA)
 
 // Generic socket_address (variant of ipv4_address | ipv6_address)
 socket_address sa1(ipv4_address(8080));              // From IPv4
 socket_address sa2(ipv6_address("::1", 8080));       // From IPv6
-socket_address sa3("example.com", 443);              // Auto-detects v4/v6
+socket_address sa3("127.0.0.1", 443);               // From literal IPv4
+
+// Explicit async hostname resolution
+auto resolved = co_await resolve_hostname("example.com", 443);
+if (resolved && resolved->is_v6()) {
+    const auto& v6 = resolved->as_v6();
+    ELIO_LOG_INFO("IPv6: {}", v6.to_string());
+}
 
 // Inspect address type
-if (sa3.is_v6()) {
-    const auto& v6 = sa3.as_v6();
+if (sa2.is_v6()) {
+    const auto& v6 = sa2.as_v6();
     ELIO_LOG_INFO("IPv6: {}", v6.to_string());
 }
 
@@ -337,6 +350,40 @@ coro::task<void> advanced_client() {
 }
 ```
 
+### Hostname Resolve Configuration (HTTP/HTTP2/WS/SSE)
+
+All HTTP-family clients now expose DNS resolve/cache behavior via client config.
+
+```cpp
+#include <elio/net/resolve.hpp>
+
+// HTTP/1.1
+http::client_config http_cfg;
+http_cfg.resolve_options.use_cache = true;
+http_cfg.resolve_options.positive_ttl = std::chrono::seconds(30);
+http_cfg.resolve_options.negative_ttl = std::chrono::seconds(2);
+http_cfg.rotate_resolved_addresses = true;  // round-robin start address
+http::client http_client(http_cfg);
+
+// HTTP/2
+http::h2_client_config h2_cfg;
+h2_cfg.resolve_options = net::default_cached_resolve_options();
+h2_cfg.rotate_resolved_addresses = true;
+http::h2_client h2_client(h2_cfg);
+
+// WebSocket
+http::websocket::client_config ws_cfg;
+ws_cfg.resolve_options.use_cache = false;   // always resolve fresh
+ws_cfg.rotate_resolved_addresses = false;   // deterministic order
+http::websocket::ws_client ws(ws_cfg);
+
+// SSE
+http::sse::client_config sse_cfg;
+sse_cfg.resolve_options.use_cache = true;
+sse_cfg.resolve_options.positive_ttl = std::chrono::seconds(10);
+http::sse::sse_client sse(sse_cfg);
+```
+
 ### HTTP Server
 
 ```cpp
@@ -467,8 +514,11 @@ coro::task<void> secure_connection() {
     tls_ctx.use_default_verify_paths();
     tls_ctx.set_verify_mode(true);
 
-    // Connect TCP
-    auto tcp = co_await tcp_connect(ipv4_address("example.com", 443));
+    // Resolve hostname, then connect using a concrete socket address
+    auto resolved = co_await resolve_hostname("example.com", 443);
+    if (!resolved) co_return;
+
+    auto tcp = co_await tcp_connect(*resolved);
     if (!tcp) co_return;
 
     // Wrap with TLS

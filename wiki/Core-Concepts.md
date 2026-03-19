@@ -244,19 +244,37 @@ All three functions are also available in the `elio` namespace as convenience al
 
 **Why MPSC inbox for external submissions.** Cross-thread task submissions (e.g., spawning a task onto a specific worker from another thread) go through a bounded MPSC ring buffer rather than directly into the Chase-Lev deque. This separation keeps the deque's invariants simple -- only the owner ever pushes -- and the bounded capacity with cache-line aligned slots (`alignas(64)`) eliminates false sharing between producers and the consumer.
 
-## Virtual Stack
+## Virtual Stack And VThread Ownership
 
 C++20 stackless coroutines do not maintain a call stack in the traditional sense. When a coroutine suspends, the compiler-generated frame is stored on the heap, but the chain of callers that led to that suspension point is lost. This makes debugging difficult -- tools like `gdb bt` show the scheduler's dispatch loop rather than the logical call chain of coroutines.
 
-Elio reconstructs this information through a **virtual stack**: an intrusive linked list of `promise_base` objects connected by `parent_` pointers. Each `promise_base` constructor links itself to the current frame via the `current_frame_` thread-local, and the destructor restores the previous frame. This gives every coroutine a pointer to the coroutine that `co_await`ed it.
+Elio now tracks three related but different concepts:
 
-The overhead is minimal -- one pointer per coroutine frame, set during construction and cleared during destruction.
+- **Construction parent**: recorded in `parent_` when the promise is constructed from `current_frame_`. This is cheap and still useful for debugging, but it reflects construction nesting, not necessarily the true await chain.
+- **Activation parent**: recorded when a cold coroutine is first activated via direct `co_await` or by a detached/joinable spawn boundary. This reflects the logical runtime relationship more accurately than construction order.
+- **Vthread owner**: the ownership domain that is responsible for the frame's memory and for propagating vthread-local execution context across suspension and resumption.
+
+This distinction matters because construction order and first execution order can differ. In an expression such as `co_await bar(foo())`, `foo()` is constructed before `bar(...)`, but `bar` executes first and only later activates `foo`. A single parent pointer is therefore not enough to describe both debug lineage and runtime ownership.
+
+### Attachment And Relocation Rules
+
+- **Direct `co_await child`**: the common fast path. If the child is first activated inside the caller's current vthread, no relocation is needed.
+- **`spawn()` / `go()`**: these create a new vthread boundary. The spawned root frame is cold-relocated exactly once into a fresh owner domain before first resume.
+- **Work stealing**: no relocation is needed. A suspended leaf may migrate to another worker, but frame ownership remains unchanged; only the executing worker changes.
+
+The overhead remains small: metadata is still stored in `promise_base`, while owner-backed roots use segmented storage and cold-frame relocation only when ownership boundaries require it.
 
 ### What it enables
 
 - **`elio-pstack`**: A CLI tool that attaches to a running process (or reads a coredump) and walks the virtual stack chains to print coroutine backtraces, similar to `pstack` for threads.
-- **Debugger extensions**: `elio-gdb.py` and `elio-lldb.py` use the same frame linkage to implement `elio bt` (backtrace) and `elio list` (list active coroutines).
+- **Debugger extensions**: `elio-gdb.py` and the LLDB entrypoint `elio_lldb.py` (loading `elio-lldb.py`) use the same frame linkage to implement `elio bt` (backtrace) and `elio list` (list active coroutines).
 - **Exception propagation**: When a coroutine throws, `unhandled_exception()` captures it in the promise. The parent coroutine can then rethrow the exception when it `co_await`s the child's result, propagating errors up the logical call chain.
+
+### Current limits
+
+- Construction-parent traversal is still the most stable always-available chain for debugger tooling.
+- Activation-parent and vthread-owner metadata are the runtime-accurate semantics for ownership and first activation.
+- A nested direct-`co_await` expression may still have different construction order and execution order; this is expected and documented behavior.
 
 ### Frame metadata
 

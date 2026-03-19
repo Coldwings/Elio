@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <memory>
+#include <array>
 #include <deque>
 #include <mutex>
 #include <unordered_map>
@@ -39,6 +40,8 @@ using connection = net::stream;
 /// Connection pool for HTTP keep-alive
 class connection_pool {
 public:
+    static constexpr size_t shard_count = 16;
+
     explicit connection_pool(client_config config = {})
         : config_(config) {}
     
@@ -48,12 +51,13 @@ public:
                                                    bool secure,
                                                    tls::tls_context* tls_ctx = nullptr) {
         std::string key = make_key(host, port, secure);
+        auto& shard = shard_for(key);
 
         // Try to get an existing connection
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            auto it = pools_.find(key);
-            if (it != pools_.end() && !it->second.empty()) {
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            auto it = shard.pools.find(key);
+            if (it != shard.pools.end() && !it->second.empty()) {
                 auto conn = std::move(it->second.front());
                 it->second.pop_front();
 
@@ -68,7 +72,13 @@ public:
         }
 
         // Create new connection using client_connect utility
-        auto result = co_await client_connect(host, port, secure, tls_ctx);
+        auto result = co_await client_connect(
+            host,
+            port,
+            secure,
+            tls_ctx,
+            config_.resolve_options,
+            config_.rotate_resolved_addresses);
         if (!result) {
             co_return std::nullopt;
         }
@@ -79,9 +89,10 @@ public:
     /// Return a connection to the pool
     void release(const std::string& host, uint16_t port, bool secure, connection conn) {
         std::string key = make_key(host, port, secure);
+        auto& shard = shard_for(key);
         
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto& pool = pools_[key];
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto& pool = shard.pools[key];
         
         if (pool.size() < config_.max_connections_per_host) {
             conn.touch();
@@ -92,18 +103,28 @@ public:
     
     /// Clear all pooled connections
     void clear() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pools_.clear();
+        for (auto& shard : shards_) {
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            shard.pools.clear();
+        }
     }
     
 private:
     static std::string make_key(const std::string& host, uint16_t port, bool secure) {
         return (secure ? "https://" : "http://") + host + ":" + std::to_string(port);
     }
+
+    struct pool_shard {
+        std::mutex mutex;
+        std::unordered_map<std::string, std::deque<connection>> pools;
+    };
+
+    pool_shard& shard_for(const std::string& key) noexcept {
+        return shards_[std::hash<std::string>{}(key) % shard_count];
+    }
     
     client_config config_;
-    std::mutex mutex_;
-    std::unordered_map<std::string, std::deque<connection>> pools_;
+    std::array<pool_shard, shard_count> shards_;
 };
 
 /// HTTP client

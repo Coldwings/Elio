@@ -4,6 +4,7 @@
 #include <elio/http/http_message.hpp>
 #include <elio/http/http2_session.hpp>
 #include <elio/net/tcp.hpp>
+#include <elio/net/resolve.hpp>
 #include <elio/tls/tls_context.hpp>
 #include <elio/tls/tls_stream.hpp>
 #include <elio/io/io_context.hpp>
@@ -16,6 +17,7 @@
 #include <optional>
 #include <unordered_map>
 #include <chrono>
+#include <mutex>
 
 namespace elio::http {
 
@@ -27,6 +29,8 @@ struct h2_client_config {
     uint32_t initial_window_size = 65535;         ///< Initial flow control window size
     std::string user_agent = "elio-http2/1.0";    ///< User-Agent header
     bool enable_push = false;                     ///< Enable server push (rarely needed)
+    net::resolve_options resolve_options = net::default_cached_resolve_options();  ///< DNS resolve/cache behavior
+    bool rotate_resolved_addresses = true;        ///< Rotate start index across resolved addresses
 };
 
 /// HTTP/2 connection wrapper
@@ -197,44 +201,58 @@ private:
             co_return std::move(conn);
         }
         
-        // Create new HTTP/2 connection
-        // First establish TCP connection
-        auto tcp_result = co_await net::tcp_connect(host, port);
-        if (!tcp_result) {
-            ELIO_LOG_ERROR("Failed to connect to {}:{}", host, port);
+        auto addresses = co_await net::resolve_all(host, port, config_.resolve_options);
+        if (addresses.empty()) {
+            ELIO_LOG_ERROR("Failed to resolve {}:{}", host, port);
             co_return std::nullopt;
         }
-        
-        // Create TLS stream with ALPN
-        tls::tls_stream tls_stream(std::move(*tcp_result), tls_ctx_);
-        tls_stream.set_hostname(host);
-        
-        // Perform TLS handshake
-        auto hs_result = co_await tls_stream.handshake();
-        if (!hs_result) {
-            ELIO_LOG_ERROR("TLS handshake failed for {}:{}", host, port);
-            co_return std::nullopt;
+
+        size_t offset = 0;
+        if (config_.rotate_resolved_addresses) {
+            static std::mutex rotation_mutex;
+            static std::unordered_map<std::string, size_t> rotation_cursor;
+            std::lock_guard<std::mutex> lock(rotation_mutex);
+            size_t& cursor = rotation_cursor[key];
+            offset = cursor % addresses.size();
+            cursor = (cursor + 1) % addresses.size();
         }
-        
-        // Verify ALPN negotiated h2
-        auto alpn = tls_stream.alpn_protocol();
-        if (alpn != "h2") {
-            ELIO_LOG_ERROR("Server does not support HTTP/2 (ALPN: {})", 
-                          alpn.empty() ? "(none)" : std::string(alpn));
-            co_return std::nullopt;
+
+        for (size_t i = 0; i < addresses.size(); ++i) {
+            const auto& addr = addresses[(offset + i) % addresses.size()];
+
+            auto tcp_result = co_await net::tcp_connect(addr);
+            if (!tcp_result) {
+                continue;
+            }
+
+            tls::tls_stream tls_stream(std::move(*tcp_result), tls_ctx_);
+            tls_stream.set_hostname(host);
+
+            auto hs_result = co_await tls_stream.handshake();
+            if (!hs_result) {
+                continue;
+            }
+
+            auto alpn = tls_stream.alpn_protocol();
+            if (alpn != "h2") {
+                ELIO_LOG_ERROR("Server does not support HTTP/2 (ALPN: {})",
+                               alpn.empty() ? "(none)" : std::string(alpn));
+                continue;
+            }
+
+            ELIO_LOG_DEBUG("HTTP/2 connection established to {}:{}", host, port);
+
+            h2_connection conn(std::move(tls_stream));
+            if (!co_await conn.session()->process()) {
+                ELIO_LOG_ERROR("HTTP/2 session initialization failed");
+                continue;
+            }
+
+            co_return std::move(conn);
         }
-        
-        ELIO_LOG_DEBUG("HTTP/2 connection established to {}:{}", host, port);
-        
-        h2_connection conn(std::move(tls_stream));
-        
-        // Process initial frames (settings exchange)
-        if (!co_await conn.session()->process()) {
-            ELIO_LOG_ERROR("HTTP/2 session initialization failed");
-            co_return std::nullopt;
-        }
-        
-        co_return std::move(conn);
+
+        ELIO_LOG_ERROR("Failed to connect to any resolved address for {}:{}", host, port);
+        co_return std::nullopt;
     }
     
     /// Return a connection to the pool

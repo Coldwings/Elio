@@ -296,7 +296,24 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
         sched->spawn(handle);
     } else {
         // No scheduler - run synchronously. Task self-destructs via final_suspend.
-        if (!handle.done()) handle.resume();
+        if (!handle.done()) {
+            coro::ensure_vthread_owner(handle);
+            auto* frame = coro::get_promise_base(handle.address());
+            void* previous_owner = nullptr;
+            if (frame) {
+                previous_owner = coro::promise_base::current_owner();
+                coro::promise_base::set_current_owner(frame->vthread_owner());
+                frame->mark_started();
+                if (!frame->vthread_owner()) {
+                    coro::promise_base::record_ownerless_resume();
+                }
+            }
+            handle.resume();
+            if (frame) {
+                coro::promise_base::set_current_owner(previous_owner);
+                coro::promise_base::record_owner_context_restore();
+            }
+        }
     }
 }
 
@@ -433,8 +450,28 @@ inline void worker_thread::run_task(std::coroutine_handle<> handle) noexcept {
     }
     
     if (!handle || handle.done()) [[unlikely]] return;
+
+    coro::ensure_vthread_owner(handle);
+    auto* frame = coro::get_promise_base(handle.address());
+    void* previous_owner = nullptr;
+    if (frame) {
+        previous_owner = coro::promise_base::current_owner();
+        coro::promise_base::set_current_owner(frame->vthread_owner());
+        frame->mark_started();
+        frame->set_worker_id(static_cast<uint32_t>(worker_id_));
+        frame->set_state(coro::coroutine_state::running);
+        if (!frame->vthread_owner()) {
+            coro::promise_base::record_ownerless_resume();
+        }
+    }
     
     handle.resume();
+
+    if (frame) {
+        coro::promise_base::set_current_owner(previous_owner);
+        coro::promise_base::record_owner_context_restore();
+    }
+
     tasks_executed_.fetch_add(1, std::memory_order_relaxed);
     update_last_task_time();
 

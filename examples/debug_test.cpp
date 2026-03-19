@@ -4,7 +4,7 @@
 /// coroutines that run concurrently and can be inspected using:
 /// - elio-pstack (command line)
 /// - GDB with elio-gdb.py
-/// - LLDB with elio-lldb.py
+/// - LLDB with elio_lldb.py (entrypoint wrapper)
 /// 
 /// Usage:
 ///   ./debug_test                    # Run normally
@@ -135,6 +135,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
         std::cout << "Paused for debugger. Use one of:" << std::endl;
         std::cout << "  elio-pstack " << getpid() << std::endl;
         std::cout << "  gdb -p " << getpid() << " -ex 'source tools/elio-gdb.py' -ex 'elio bt'" << std::endl;
+        std::cout << "  lldb -p " << getpid() << " -o 'command script import tools/elio_lldb.py' -o 'elio bt'" << std::endl;
         std::cout << std::endl;
         std::cout << "Press Ctrl+C to exit." << std::endl;
         std::cout << std::endl;

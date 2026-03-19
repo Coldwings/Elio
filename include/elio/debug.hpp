@@ -17,7 +17,7 @@
 ///            elio list        # List all vthreads
 ///            elio workers     # Show worker information
 ///
-///   In LLDB: command script import /path/to/elio-lldb.py
+///   In LLDB: command script import /path/to/elio_lldb.py
 ///            elio bt          # Show all vthread backtraces
 ///
 ///   Command line:

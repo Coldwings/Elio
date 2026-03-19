@@ -353,7 +353,12 @@ private:
 
         // Establish connection using shared utility
         auto conn_result = co_await http::client_connect(
-            url_.host, url_.effective_port(), url_.is_secure(), &tls_ctx_);
+            url_.host,
+            url_.effective_port(),
+            url_.is_secure(),
+            &tls_ctx_,
+            config_.resolve_options,
+            config_.rotate_resolved_addresses);
         if (!conn_result) {
             state_ = client_state::disconnected;
             co_return false;

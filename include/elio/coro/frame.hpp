@@ -1,9 +1,11 @@
 #pragma once
 
 #include "promise_base.hpp"
+#include "frame_allocator.hpp"
+#include "vthread_owner.hpp"
+#include <coroutine>
 #include <vector>
 #include <string>
-#include <coroutine>
 #include <fmt/format.h>
 
 namespace elio::coro {
@@ -49,21 +51,19 @@ inline void log_virtual_stack() {
 ///       but is portable across GCC and Clang. The frame layout is:
 ///       [resume_fn_ptr][destroy_fn_ptr][promise...]
 inline promise_base* get_promise_base(void* handle_addr) noexcept {
-    if (!handle_addr) return nullptr;
-    
-    // The coroutine frame layout has the promise after two function pointers
-    // (resume and destroy). This is consistent across GCC and Clang.
-    constexpr size_t promise_offset = 2 * sizeof(void*);
-    
-    auto* candidate = reinterpret_cast<promise_base*>(
-        static_cast<char*>(handle_addr) + promise_offset);
-    
-    // Validate using the magic number
-    if (candidate->frame_magic() == promise_base::FRAME_MAGIC) {
-        return candidate;
-    }
-    
-    return nullptr;
+    return promise_base::from_handle_address(handle_addr);
+}
+
+inline void ensure_vthread_owner(std::coroutine_handle<> handle) {
+    auto* promise = get_promise_base(handle.address());
+    if (!promise) return;
+    if (promise->vthread_owner()) return;
+
+    auto* owner = new vthread_owner();
+    promise->bind_vthread_owner_once(owner);
+    promise->set_vthread_root(true);
+    frame_allocator::set_owner_metadata(handle.address(), owner, true);
+    promise_base::record_root_owner_creation();
 }
 
 /// Check if a coroutine has affinity for a specific worker

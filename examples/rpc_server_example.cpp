@@ -118,6 +118,11 @@ using Echo = ELIO_RPC_METHOD(5, EchoRequest, EchoResponse);
 // In-memory user store
 class UserStore {
 public:
+    struct UserListSnapshot {
+        std::vector<User> users;
+        int32_t total_count;
+    };
+
     std::optional<User> get_user(int32_t id) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = users_.find(id);
@@ -135,22 +140,18 @@ public:
         return id;
     }
     
-    std::vector<User> list_users(int32_t offset, int32_t limit) {
+    UserListSnapshot list_users_snapshot(int32_t offset, int32_t limit) {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<User> result;
+        UserListSnapshot snapshot;
+        snapshot.total_count = static_cast<int32_t>(users_.size());
         int32_t count = 0;
         for (const auto& [id, user] : users_) {
-            if (count >= offset && result.size() < static_cast<size_t>(limit)) {
-                result.push_back(user);
+            if (count >= offset && snapshot.users.size() < static_cast<size_t>(limit)) {
+                snapshot.users.push_back(user);
             }
             ++count;
         }
-        return result;
-    }
-    
-    int32_t total_count() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return static_cast<int32_t>(users_.size());
+        return snapshot;
     }
     
 private:
@@ -235,8 +236,9 @@ task<void> server_main(uint16_t port, [[maybe_unused]] scheduler& sched) {
     server.register_method<ListUsers>([](const ListUsersRequest& req)
         -> task<ListUsersResponse> {
         ListUsersResponse resp;
-        resp.users = g_user_store.list_users(req.offset, req.limit);
-        resp.total_count = g_user_store.total_count();
+        auto snapshot = g_user_store.list_users_snapshot(req.offset, req.limit);
+        resp.users = std::move(snapshot.users);
+        resp.total_count = snapshot.total_count;
         co_return resp;
     });
     

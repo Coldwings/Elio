@@ -216,6 +216,7 @@ install(PROGRAMS
 )
 install(FILES
     tools/elio-gdb.py
+    tools/elio_lldb.py
     tools/elio-lldb.py
     DESTINATION share/elio
 )

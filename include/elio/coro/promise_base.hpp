@@ -163,6 +163,15 @@ public:
             owner_bindings_.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
+        // Construction-time owner can differ from first-activation owner.
+        // For cold frames (not started yet), allow one-way owner transfer
+        // during first activation binding (e.g. task created in A, first
+        // awaited in B via spawn/join wrapper).
+        if (!started_ && vthread_owner_ != owner) {
+            vthread_owner_ = owner;
+            owner_bindings_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
         assert(vthread_owner_ == owner && "vthread_owner rebound inconsistently");
         return false;
     }

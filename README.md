@@ -188,7 +188,8 @@ elio::
 tools/                       // Debugging tools
 ├── elio-pstack              // pstack-like CLI tool
 ├── elio-gdb.py              // GDB Python extension
-└── elio-lldb.py             // LLDB Python extension
+├── elio_lldb.py             // LLDB import entrypoint
+└── elio-lldb.py             // LLDB implementation script
 ```
 
 ### Virtual Stack
@@ -269,7 +270,7 @@ gdb -ex 'source tools/elio-gdb.py' ./myapp
 (gdb) elio bt 42               # Show backtrace for vthread #42
 
 # LLDB extension
-lldb -o 'command script import tools/elio-lldb.py' ./myapp
+lldb -o 'command script import tools/elio_lldb.py' ./myapp
 (lldb) elio list
 (lldb) elio bt
 ```

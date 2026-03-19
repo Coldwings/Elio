@@ -8,6 +8,7 @@
 /// duplication in HTTP, WebSocket, and SSE clients.
 
 #include <elio/net/tcp.hpp>
+#include <elio/net/resolve.hpp>
 #include <elio/tls/tls_context.hpp>
 #include <elio/tls/tls_stream.hpp>
 #include <elio/io/io_context.hpp>
@@ -178,18 +179,24 @@ private:
 /// @return Connected stream on success, std::nullopt on error
 inline coro::task<std::optional<stream>>
 connect(std::string_view host, uint16_t port, bool secure = false,
-        tls::tls_context* tls_ctx = nullptr) {
+        tls::tls_context* tls_ctx = nullptr,
+        resolve_options resolve_opts = default_cached_resolve_options()) {
     if (secure) {
         if (!tls_ctx) {
             co_return std::nullopt;
         }
-        auto result = co_await tls::tls_connect(*tls_ctx, host, port);
+        auto result = co_await tls::tls_connect(*tls_ctx, host, port, resolve_opts);
         if (!result) {
             co_return std::nullopt;
         }
         co_return stream(std::move(*result));
     } else {
-        auto result = co_await tcp_connect(host, port);
+        auto resolved = co_await resolve_hostname(host, port, resolve_opts);
+        if (!resolved) {
+            co_return std::nullopt;
+        }
+
+        auto result = co_await tcp_connect(*resolved);
         if (!result) {
             co_return std::nullopt;
         }

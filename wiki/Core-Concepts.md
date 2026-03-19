@@ -255,7 +255,7 @@ The overhead is minimal -- one pointer per coroutine frame, set during construct
 ### What it enables
 
 - **`elio-pstack`**: A CLI tool that attaches to a running process (or reads a coredump) and walks the virtual stack chains to print coroutine backtraces, similar to `pstack` for threads.
-- **Debugger extensions**: `elio-gdb.py` and `elio-lldb.py` use the same frame linkage to implement `elio bt` (backtrace) and `elio list` (list active coroutines).
+- **Debugger extensions**: `elio-gdb.py` and `elio_lldb.py` use the same frame linkage to implement `elio bt` (backtrace) and `elio list` (list active coroutines).
 - **Exception propagation**: When a coroutine throws, `unhandled_exception()` captures it in the promise. The parent coroutine can then rethrow the exception when it `co_await`s the child's result, propagating errors up the logical call chain.
 
 ### Frame metadata

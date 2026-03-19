@@ -40,6 +40,7 @@
 
 // Networking
 #include "net/tcp.hpp"
+#include "net/resolve.hpp"
 #include "net/uds.hpp"
 
 // Timers

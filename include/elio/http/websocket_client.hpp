@@ -248,7 +248,13 @@ private:
         }
         
         // Establish connection using shared utility
-        auto conn_result = co_await http::client_connect(host_, port, secure_, &tls_ctx_);
+        auto conn_result = co_await http::client_connect(
+            host_,
+            port,
+            secure_,
+            &tls_ctx_,
+            config_.resolve_options,
+            config_.rotate_resolved_addresses);
         if (!conn_result) {
             co_return false;
         }

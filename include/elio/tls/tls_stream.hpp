@@ -2,6 +2,7 @@
 
 #include <elio/tls/tls_context.hpp>
 #include <elio/net/tcp.hpp>
+#include <elio/net/resolve.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/log/macros.hpp>
@@ -337,24 +338,33 @@ private:
 /// @param port Port to connect to
 /// @return TLS stream on success, std::nullopt on error (check errno)
 inline coro::task<std::optional<tls_stream>> 
-tls_connect(tls_context& ctx, std::string_view host, uint16_t port) {
-    // First establish TCP connection
-    auto tcp_result = co_await net::tcp_connect(host, port);
-    if (!tcp_result) {
+tls_connect(tls_context& ctx,
+            std::string_view host,
+            uint16_t port,
+            net::resolve_options resolve_opts = net::default_cached_resolve_options()) {
+    auto resolved = co_await net::resolve_all(host, port, resolve_opts);
+    if (resolved.empty()) {
         co_return std::nullopt;
     }
-    
-    // Create TLS stream
-    tls_stream stream(std::move(*tcp_result), ctx);
-    stream.set_hostname(host);
-    
-    // Perform handshake
-    auto hs_result = co_await stream.handshake();
-    if (!hs_result) {
-        co_return std::nullopt;
+
+    for (const auto& addr : resolved) {
+        auto tcp_result = co_await net::tcp_connect(addr);
+        if (!tcp_result) {
+            continue;
+        }
+
+        tls_stream stream(std::move(*tcp_result), ctx);
+        stream.set_hostname(host);
+
+        auto hs_result = co_await stream.handshake();
+        if (!hs_result) {
+            continue;
+        }
+
+        co_return std::move(stream);
     }
-    
-    co_return std::move(stream);
+
+    co_return std::nullopt;
 }
 
 /// TLS listener for accepting secure connections

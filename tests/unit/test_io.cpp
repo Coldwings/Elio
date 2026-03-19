@@ -3,6 +3,7 @@
 #include <elio/io/io_awaitables.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/net/resolve.hpp>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -1011,6 +1012,75 @@ static task<void> tcp_connect_regression_attempt(
     co_return;
 }
 
+static task<void> accept_n_connections(
+    tcp_listener& listener,
+    int count,
+    std::atomic<int>& accepted) {
+    for (int i = 0; i < count; ++i) {
+        auto stream = co_await listener.accept();
+        if (stream) {
+            accepted.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    co_return;
+}
+
+static task<void> tcp_connect_hostname_attempt(
+    std::string host,
+    uint16_t port,
+    std::atomic<int>& connected,
+    std::atomic<int>& failed,
+    std::atomic<int>& first_error) {
+    resolve_options options;
+    options.use_cache = true;
+
+    auto addresses = co_await resolve_all(host, port, options);
+    if (addresses.empty()) {
+        failed.fetch_add(1, std::memory_order_relaxed);
+        int err = errno ? errno : EHOSTUNREACH;
+        int expected = 0;
+        first_error.compare_exchange_strong(expected, err);
+        co_return;
+    }
+
+    int last_error = 0;
+    for (const auto& addr : addresses) {
+        auto stream = co_await tcp_connect(addr);
+        if (stream) {
+            connected.fetch_add(1, std::memory_order_relaxed);
+            co_return;
+        }
+        last_error = errno;
+    }
+
+    failed.fetch_add(1, std::memory_order_relaxed);
+    int err = last_error ? last_error : EHOSTUNREACH;
+    int expected = 0;
+    first_error.compare_exchange_strong(expected, err);
+    co_return;
+}
+
+static task<void> resolve_hostname_attempt(
+    std::string host,
+    uint16_t port,
+    std::optional<socket_address>& resolved,
+    std::atomic<bool>& done) {
+    resolved = co_await resolve_hostname(host, port);
+    done.store(true, std::memory_order_relaxed);
+    co_return;
+}
+
+static task<void> resolve_all_attempt_with_options(
+    std::string host,
+    uint16_t port,
+    resolve_options options,
+    std::vector<socket_address>& resolved,
+    std::atomic<bool>& done) {
+    resolved = co_await resolve_all(host, port, options);
+    done.store(true, std::memory_order_relaxed);
+    co_return;
+}
+
 TEST_CASE("ipv4_address basic operations", "[tcp][address][ipv4]") {
     SECTION("default constructor") {
         ipv4_address addr;
@@ -1247,13 +1317,229 @@ TEST_CASE("TCP connect regression avoids double connect", "[tcp][connect][regres
     REQUIRE(failed == 0);
 }
 
-TEST_CASE("socket_address with hostname resolution", "[tcp][address][dns]") {
-    // Test that socket_address can be constructed from "localhost"
-    // This tests the DNS resolution path
-    SECTION("localhost resolves") {
-        socket_address addr("localhost", 80);
-        // Should resolve to either IPv4 or IPv6
-        REQUIRE((addr.is_v4() || addr.is_v6()));
-        REQUIRE(addr.port() == 80);
+TEST_CASE("explicit hostname resolution", "[tcp][address][dns]") {
+    SECTION("localhost resolves asynchronously") {
+        scheduler sched(1);
+        sched.start();
+
+        std::optional<socket_address> resolved;
+        std::atomic<bool> done{false};
+
+        auto task = resolve_hostname_attempt("localhost", 80, resolved, done);
+        sched.spawn(task.release());
+
+        for (int i = 0; i < 200 && !done.load(std::memory_order_relaxed); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        sched.shutdown();
+
+        REQUIRE(done.load(std::memory_order_relaxed));
+        REQUIRE(resolved.has_value());
+        REQUIRE((resolved->is_v4() || resolved->is_v6()));
+        REQUIRE(resolved->port() == 80);
     }
+}
+
+TEST_CASE("tcp_connect hostname resolution uses cache", "[tcp][connect][dns][cache]") {
+    default_resolve_cache().clear();
+
+    auto listener = tcp_listener::bind(socket_address(0));
+    REQUIRE(listener.has_value());
+
+    const uint16_t port = listener->local_address().port();
+    REQUIRE(port > 0);
+
+    std::atomic<int> accepted{0};
+    std::atomic<int> connected{0};
+    std::atomic<int> failed{0};
+    std::atomic<int> first_error{0};
+
+    scheduler sched(2);
+    sched.start();
+
+    auto stats_before = default_resolve_cache().stats();
+
+    auto accept_task = accept_n_connections(*listener, 2, accepted);
+    sched.spawn(accept_task.release());
+
+    auto first_task = tcp_connect_hostname_attempt("localhost", port, connected, failed, first_error);
+    sched.spawn(first_task.release());
+
+    for (int i = 0; i < 300 && connected.load(std::memory_order_relaxed) < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto stats_after_first = default_resolve_cache().stats();
+
+    auto second_task = tcp_connect_hostname_attempt("localhost", port, connected, failed, first_error);
+    sched.spawn(second_task.release());
+
+    for (int i = 0; i < 300 && (accepted.load(std::memory_order_relaxed) < 2
+            || connected.load(std::memory_order_relaxed) < 2
+            || failed.load(std::memory_order_relaxed) != 0); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    auto stats_after_second = default_resolve_cache().stats();
+
+    INFO("connected=" << connected.load() << ", failed=" << failed.load()
+         << ", first errno=" << first_error.load());
+    INFO("before stats: hits=" << stats_before.cache_hits
+         << ", misses=" << stats_before.cache_misses
+         << ", stores=" << stats_before.cache_stores
+         << ", invalidations=" << stats_before.cache_invalidations);
+    INFO("first stats: hits=" << stats_after_first.cache_hits
+         << ", misses=" << stats_after_first.cache_misses
+         << ", stores=" << stats_after_first.cache_stores
+         << ", invalidations=" << stats_after_first.cache_invalidations);
+    INFO("second stats: hits=" << stats_after_second.cache_hits
+         << ", misses=" << stats_after_second.cache_misses
+         << ", stores=" << stats_after_second.cache_stores
+         << ", invalidations=" << stats_after_second.cache_invalidations);
+
+    REQUIRE(accepted == 2);
+    REQUIRE(connected == 2);
+    REQUIRE(failed == 0);
+    REQUIRE(stats_after_first.cache_misses >= (stats_before.cache_misses + 1));
+    REQUIRE(stats_after_first.cache_stores >= (stats_before.cache_stores + 1));
+    REQUIRE(stats_after_second.cache_hits >= (stats_after_first.cache_hits + 1));
+    REQUIRE(stats_after_second.cache_misses == stats_after_first.cache_misses);
+}
+
+TEST_CASE("resolve_options can disable cache", "[tcp][dns][cache][config]") {
+    default_resolve_cache().clear();
+    auto stats_before = default_resolve_cache().stats();
+
+    resolve_options options;
+    options.use_cache = false;
+
+    scheduler sched(1);
+    sched.start();
+
+    std::vector<socket_address> resolved_first;
+    std::vector<socket_address> resolved_second;
+    std::atomic<bool> done_first{false};
+    std::atomic<bool> done_second{false};
+
+    auto first = resolve_all_attempt_with_options(
+        "localhost", 80, options, resolved_first, done_first);
+    sched.spawn(first.release());
+
+    for (int i = 0; i < 200 && !done_first.load(std::memory_order_relaxed); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto second = resolve_all_attempt_with_options(
+        "localhost", 80, options, resolved_second, done_second);
+    sched.spawn(second.release());
+
+    for (int i = 0; i < 200 && !done_second.load(std::memory_order_relaxed); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    auto stats_after = default_resolve_cache().stats();
+    REQUIRE(done_first.load(std::memory_order_relaxed));
+    REQUIRE(done_second.load(std::memory_order_relaxed));
+    REQUIRE_FALSE(resolved_first.empty());
+    REQUIRE_FALSE(resolved_second.empty());
+    REQUIRE(stats_after.cache_hits == stats_before.cache_hits);
+    REQUIRE(stats_after.cache_misses == stats_before.cache_misses);
+    REQUIRE(stats_after.cache_stores == stats_before.cache_stores);
+}
+
+TEST_CASE("resolve_options can use custom cache instance", "[tcp][dns][cache][config]") {
+    default_resolve_cache().clear();
+    auto default_before = default_resolve_cache().stats();
+
+    resolve_cache custom_cache;
+    resolve_options options;
+    options.use_cache = true;
+    options.cache = &custom_cache;
+
+    scheduler sched(1);
+    sched.start();
+
+    std::vector<socket_address> resolved_first;
+    std::vector<socket_address> resolved_second;
+    std::atomic<bool> done_first{false};
+    std::atomic<bool> done_second{false};
+
+    auto first = resolve_all_attempt_with_options(
+        "localhost", 80, options, resolved_first, done_first);
+    sched.spawn(first.release());
+
+    for (int i = 0; i < 200 && !done_first.load(std::memory_order_relaxed); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto second = resolve_all_attempt_with_options(
+        "localhost", 80, options, resolved_second, done_second);
+    sched.spawn(second.release());
+
+    for (int i = 0; i < 200 && !done_second.load(std::memory_order_relaxed); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    auto custom_after = custom_cache.stats();
+    auto default_after = default_resolve_cache().stats();
+
+    REQUIRE(done_first.load(std::memory_order_relaxed));
+    REQUIRE(done_second.load(std::memory_order_relaxed));
+    REQUIRE_FALSE(resolved_first.empty());
+    REQUIRE_FALSE(resolved_second.empty());
+    REQUIRE(custom_after.cache_misses >= 1);
+    REQUIRE(custom_after.cache_stores >= 1);
+    REQUIRE(custom_after.cache_hits >= 1);
+    REQUIRE(default_after.cache_hits == default_before.cache_hits);
+    REQUIRE(default_after.cache_misses == default_before.cache_misses);
+    REQUIRE(default_after.cache_stores == default_before.cache_stores);
+}
+
+TEST_CASE("resolve_options ttl controls cache expiry", "[tcp][dns][cache][config]") {
+    resolve_cache cache;
+    resolve_options options;
+    options.use_cache = true;
+    options.cache = &cache;
+    options.positive_ttl = std::chrono::seconds(0);
+
+    scheduler sched(1);
+    sched.start();
+
+    std::vector<socket_address> resolved_first;
+    std::vector<socket_address> resolved_second;
+    std::atomic<bool> done_first{false};
+    std::atomic<bool> done_second{false};
+
+    auto first = resolve_all_attempt_with_options(
+        "localhost", 80, options, resolved_first, done_first);
+    sched.spawn(first.release());
+
+    for (int i = 0; i < 200 && !done_first.load(std::memory_order_relaxed); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto second = resolve_all_attempt_with_options(
+        "localhost", 80, options, resolved_second, done_second);
+    sched.spawn(second.release());
+
+    for (int i = 0; i < 200 && !done_second.load(std::memory_order_relaxed); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    auto stats = cache.stats();
+    REQUIRE(done_first.load(std::memory_order_relaxed));
+    REQUIRE(done_second.load(std::memory_order_relaxed));
+    REQUIRE_FALSE(resolved_first.empty());
+    REQUIRE_FALSE(resolved_second.empty());
+    REQUIRE(stats.cache_misses >= 2);
+    REQUIRE(stats.cache_hits == 0);
 }

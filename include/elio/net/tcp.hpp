@@ -48,23 +48,10 @@ struct ipv4_address {
         if (ip.empty() || ip == "0.0.0.0") {
             addr = INADDR_ANY;
         } else {
-            // First try as numeric IP
-            if (inet_pton(AF_INET, std::string(ip).c_str(), &addr) != 1) {
-                // Not a numeric IP, try DNS resolution
-                struct addrinfo hints{};
-                struct addrinfo* result = nullptr;
-                hints.ai_family = AF_INET;
-                hints.ai_socktype = SOCK_STREAM;
-                
-                std::string ip_str(ip);
-                if (getaddrinfo(ip_str.c_str(), nullptr, &hints, &result) == 0 && result) {
-                    auto* sa = reinterpret_cast<struct sockaddr_in*>(result->ai_addr);
-                    addr = sa->sin_addr.s_addr;
-                    freeaddrinfo(result);
-                } else {
-                    ELIO_LOG_ERROR("Failed to resolve hostname: {}", ip);
-                    addr = INADDR_ANY;
-                }
+            std::string ip_str(ip);
+            if (inet_pton(AF_INET, ip_str.c_str(), &addr) != 1) {
+                ELIO_LOG_ERROR("ipv4_address only accepts numeric IPv4 literals: {}", ip);
+                addr = INADDR_ANY;
             }
         }
     }
@@ -115,23 +102,9 @@ struct ipv6_address {
                 scope_id = if_nametoindex(scope_name.c_str());
             }
             
-            // First try as numeric IP
             if (inet_pton(AF_INET6, ip_str.c_str(), &addr) != 1) {
-                // Not a numeric IP, try DNS resolution
-                struct addrinfo hints{};
-                struct addrinfo* result = nullptr;
-                hints.ai_family = AF_INET6;
-                hints.ai_socktype = SOCK_STREAM;
-                
-                if (getaddrinfo(ip_str.c_str(), nullptr, &hints, &result) == 0 && result) {
-                    auto* sa = reinterpret_cast<struct sockaddr_in6*>(result->ai_addr);
-                    addr = sa->sin6_addr;
-                    scope_id = sa->sin6_scope_id;
-                    freeaddrinfo(result);
-                } else {
-                    ELIO_LOG_ERROR("Failed to resolve IPv6 hostname: {}", ip);
-                    addr = IN6ADDR_ANY_INIT;
-                }
+                ELIO_LOG_ERROR("ipv6_address only accepts numeric IPv6 literals: {}", ip);
+                addr = IN6ADDR_ANY_INIT;
             }
         }
     }
@@ -201,32 +174,8 @@ public:
             data_ = ipv6_address(host, port);
             return;
         }
-        
-        // Try to resolve and prefer IPv6
-        struct addrinfo hints{};
-        struct addrinfo* result = nullptr;
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        
-        std::string host_str(host);
-        if (getaddrinfo(host_str.c_str(), nullptr, &hints, &result) == 0 && result) {
-            // Use the first result
-            if (result->ai_family == AF_INET6) {
-                auto* sa = reinterpret_cast<struct sockaddr_in6*>(result->ai_addr);
-                ipv6_address addr(*sa);
-                addr.port = port;
-                data_ = addr;
-            } else {
-                auto* sa = reinterpret_cast<struct sockaddr_in*>(result->ai_addr);
-                ipv4_address addr(*sa);
-                addr.port = port;
-                data_ = addr;
-            }
-            freeaddrinfo(result);
-        } else {
-            // Fallback to IPv4
-            data_ = ipv4_address(host, port);
-        }
+
+        data_ = ipv4_address(host, port);
     }
     
     /// Construct from sockaddr_storage
@@ -771,12 +720,6 @@ inline auto tcp_connect(const ipv6_address& addr,
 inline auto tcp_connect(const socket_address& addr,
                         const tcp_options& opts = {}) {
     return tcp_connect_awaitable(addr, opts);
-}
-
-/// Connect to a remote TCP server by host and port (auto-detects IPv4/IPv6)
-inline auto tcp_connect(std::string_view host, uint16_t port,
-                        const tcp_options& opts = {}) {
-    return tcp_connect_awaitable(socket_address(host, port), opts);
 }
 
 } // namespace elio::net

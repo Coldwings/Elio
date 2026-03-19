@@ -29,9 +29,14 @@ using namespace elio::net;
 /// Client coroutine - connects, sends messages, receives responses
 task<int> client_main(std::string_view host, uint16_t port) {
     ELIO_LOG_INFO("Connecting to {}:{}...", host, port);
-    
-    // Connect to server
-    auto stream_result = co_await tcp_connect(host, port);
+
+    auto resolved = co_await resolve_hostname(host, port);
+    if (!resolved) {
+        ELIO_LOG_ERROR("Resolve failed: {}", strerror(errno));
+        co_return 1;
+    }
+
+    auto stream_result = co_await tcp_connect(*resolved);
     
     if (!stream_result) {
         ELIO_LOG_ERROR("Connection failed: {}", strerror(errno));
@@ -79,8 +84,14 @@ task<int> client_main(std::string_view host, uint16_t port) {
 /// Non-interactive benchmark mode
 task<int> benchmark_main(std::string_view host, uint16_t port, int iterations) {
     ELIO_LOG_INFO("Connecting to {}:{} for benchmark...", host, port);
-    
-    auto stream_result = co_await tcp_connect(host, port);
+
+    auto resolved = co_await resolve_hostname(host, port);
+    if (!resolved) {
+        ELIO_LOG_ERROR("Resolve failed: {}", strerror(errno));
+        co_return 1;
+    }
+
+    auto stream_result = co_await tcp_connect(*resolved);
     if (!stream_result) {
         ELIO_LOG_ERROR("Connection failed: {}", strerror(errno));
         co_return 1;

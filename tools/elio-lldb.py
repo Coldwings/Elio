@@ -6,7 +6,8 @@ This script provides LLDB commands for debugging Elio coroutines (vthreads).
 It finds coroutine frames by traversing the scheduler's worker queues.
 
 Usage:
-    In LLDB: command script import /path/to/elio-lldb.py
+    Preferred: command script import /path/to/elio_lldb.py
+    (This file remains the implementation module.)
 
 Commands:
     elio list              - List all vthreads from worker queues

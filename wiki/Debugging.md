@@ -40,7 +40,7 @@ Every frame carries the following debug metadata with no additional allocation:
 | `parent_` | Pointer to the calling frame's promise, forming the virtual stack chain |
 | `frame_magic_` | Magic number for frame integrity validation |
 
-The debugger tools (`elio-pstack`, `elio-gdb.py`, `elio-lldb.py`) use this metadata to present coroutine state in a format familiar to anyone who has used `pstack` or `thread apply all bt`.
+The debugger tools (`elio-pstack`, `elio-gdb.py`, `elio_lldb.py`) use this metadata to present coroutine state in a format familiar to anyone who has used `pstack` or `thread apply all bt`.
 
 ## Tools
 
@@ -48,7 +48,7 @@ The debugger tools (`elio-pstack`, `elio-gdb.py`, `elio-lldb.py`) use this metad
 |------|-------------|
 | `elio-pstack` | Command-line tool similar to `pstack` |
 | `elio-gdb.py` | GDB Python extension |
-| `elio-lldb.py` | LLDB Python extension |
+| `elio_lldb.py` | LLDB import entrypoint (loads `elio-lldb.py`) |
 
 ## elio-pstack
 
@@ -177,13 +177,13 @@ Total tasks executed: 4780
 
 ```bash
 # From LLDB command line
-lldb -o 'command script import /path/to/tools/elio-lldb.py' ./myapp
+lldb -o 'command script import /path/to/tools/elio_lldb.py' ./myapp
 
 # Or in LLDB session
-(lldb) command script import /path/to/tools/elio-lldb.py
+(lldb) command script import /path/to/tools/elio_lldb.py
 
 # Or add to ~/.lldbinit
-command script import /path/to/tools/elio-lldb.py
+command script import /path/to/tools/elio_lldb.py
 ```
 
 ### Commands

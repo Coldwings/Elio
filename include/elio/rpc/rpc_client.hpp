@@ -26,11 +26,16 @@
 #include <elio/time/timer.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/log/macros.hpp>
+#include <elio/net/resolve.hpp>
 
 #include <memory>
+#include <array>
+#include <mutex>
 #include <unordered_map>
 #include <chrono>
-#include <functional>
+#include <tuple>
+#include <type_traits>
+#include <string_view>
 
 namespace elio::rpc {
 
@@ -73,6 +78,8 @@ class rpc_client : public std::enable_shared_from_this<rpc_client<Stream>> {
 public:
     using stream_type = Stream;
     using ptr = std::shared_ptr<rpc_client>;
+
+    static constexpr size_t pending_shard_count = 16;
     
     /// Create a new RPC client from an existing stream
     static ptr create(Stream stream) {
@@ -84,13 +91,54 @@ public:
     static coro::task<std::optional<ptr>> connect(Args&&... args)
     requires std::is_same_v<Stream, net::tcp_stream>
     {
-        auto stream = co_await net::tcp_connect(std::forward<Args>(args)...);
-        if (!stream) {
+        if constexpr (requires { net::tcp_connect(std::forward<Args>(args)...); }) {
+            auto stream = co_await net::tcp_connect(std::forward<Args>(args)...);
+            if (!stream) {
+                co_return std::nullopt;
+            }
+            auto client = create(std::move(*stream));
+            client->start_receive_loop();
+            co_return client;
+        } else if constexpr (
+            sizeof...(Args) == 2 &&
+            std::is_convertible_v<std::tuple_element_t<0, std::tuple<std::decay_t<Args>...>>, std::string_view> &&
+            std::is_integral_v<std::tuple_element_t<1, std::tuple<std::decay_t<Args>...>>>) {
+            auto forwarded = std::forward_as_tuple(std::forward<Args>(args)...);
+            std::string_view host = std::get<0>(forwarded);
+            uint16_t port = static_cast<uint16_t>(std::get<1>(forwarded));
+
+            auto addresses = co_await net::resolve_all(host, port);
+            for (const auto& addr : addresses) {
+                auto stream = co_await net::tcp_connect(addr);
+                if (stream) {
+                    auto client = create(std::move(*stream));
+                    client->start_receive_loop();
+                    co_return client;
+                }
+            }
             co_return std::nullopt;
+        } else {
+            static_assert(sizeof...(Args) == 0,
+                          "rpc_client<tcp_stream>::connect arguments are not supported");
         }
-        auto client = create(std::move(*stream));
-        client->start_receive_loop();
-        co_return client;
+    }
+
+    /// Connect to a TCP server and create client with explicit resolve options
+    static coro::task<std::optional<ptr>> connect(std::string_view host,
+                                                  uint16_t port,
+                                                  net::resolve_options resolve_opts)
+    requires std::is_same_v<Stream, net::tcp_stream>
+    {
+        auto addresses = co_await net::resolve_all(host, port, resolve_opts);
+        for (const auto& addr : addresses) {
+            auto stream = co_await net::tcp_connect(addr);
+            if (stream) {
+                auto client = create(std::move(*stream));
+                client->start_receive_loop();
+                co_return client;
+            }
+        }
+        co_return std::nullopt;
     }
     
     /// Connect to a UDS server and create client
@@ -128,15 +176,15 @@ public:
         }
         
         // Cancel all pending requests
-        {
-            std::lock_guard<std::mutex> lock(pending_mutex_);
-            for (auto& [id, req] : pending_requests_) {
+        for (auto& shard : pending_shards_) {
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            for (auto& [id, req] : shard.requests) {
                 if (req->try_complete()) {
                     req->error = rpc_error::connection_closed;
                     req->completion_event.set();
                 }
             }
-            pending_requests_.clear();
+            shard.requests.clear();
         }
     }
     
@@ -216,8 +264,9 @@ private:
         auto pending = std::make_shared<pending_request>();
         
         {
-            std::lock_guard<std::mutex> lock(pending_mutex_);
-            pending_requests_[request_id] = pending;
+            auto& shard = pending_shard_for(request_id);
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            shard.requests[request_id] = pending;
         }
         
         // Register cancellation callback
@@ -239,8 +288,9 @@ private:
             
             bool sent = co_await write_frame(stream_, request_frame.first, request_frame.second);
             if (!sent) {
-                std::lock_guard<std::mutex> lock(pending_mutex_);
-                pending_requests_.erase(request_id);
+                auto& shard = pending_shard_for(request_id);
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                shard.requests.erase(request_id);
                 co_return rpc_result<Response>(rpc_error::connection_closed);
             }
         }
@@ -279,8 +329,9 @@ private:
         
         // Remove from pending
         {
-            std::lock_guard<std::mutex> lock(pending_mutex_);
-            pending_requests_.erase(request_id);
+            auto& shard = pending_shard_for(request_id);
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            shard.requests.erase(request_id);
         }
         
         // Check result
@@ -332,8 +383,9 @@ public:
         auto pending = std::make_shared<pending_request>();
         
         {
-            std::lock_guard<std::mutex> lock(pending_mutex_);
-            pending_requests_[ping_id] = pending;
+            auto& shard = pending_shard_for(ping_id);
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            shard.requests[ping_id] = pending;
         }
         
         // Send ping
@@ -345,8 +397,9 @@ public:
             buffer_writer empty;
             bool sent = co_await write_frame(stream_, header, empty);
             if (!sent) {
-                std::lock_guard<std::mutex> lock(pending_mutex_);
-                pending_requests_.erase(ping_id);
+                auto& shard = pending_shard_for(ping_id);
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                shard.requests.erase(ping_id);
                 co_return false;
             }
         }
@@ -374,8 +427,9 @@ public:
         co_await pending->completion_event.wait();
         
         {
-            std::lock_guard<std::mutex> lock(pending_mutex_);
-            pending_requests_.erase(ping_id);
+            auto& shard = pending_shard_for(ping_id);
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            shard.requests.erase(ping_id);
         }
         
         co_return !pending->timed_out;
@@ -449,9 +503,10 @@ private:
         std::shared_ptr<pending_request> pending;
         
         {
-            std::lock_guard<std::mutex> lock(pending_mutex_);
-            auto it = pending_requests_.find(header.request_id);
-            if (it == pending_requests_.end()) {
+            auto& shard = pending_shard_for(header.request_id);
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            auto it = shard.requests.find(header.request_id);
+            if (it == shard.requests.end()) {
                 ELIO_LOG_WARNING("RPC client: received response for unknown request {}",
                                 header.request_id);
                 return;
@@ -472,9 +527,10 @@ private:
         std::shared_ptr<pending_request> pending;
         
         {
-            std::lock_guard<std::mutex> lock(pending_mutex_);
-            auto it = pending_requests_.find(request_id);
-            if (it == pending_requests_.end()) {
+            auto& shard = pending_shard_for(request_id);
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            auto it = shard.requests.find(request_id);
+            if (it == shard.requests.end()) {
                 return;
             }
             pending = it->second;
@@ -488,10 +544,17 @@ private:
     Stream stream_;
     std::atomic<bool> closed_{false};
     request_id_generator id_generator_;
-    
-    // Pending requests map
-    std::mutex pending_mutex_;
-    std::unordered_map<uint32_t, std::shared_ptr<pending_request>> pending_requests_;
+
+    struct pending_shard {
+        std::mutex mutex;
+        std::unordered_map<uint32_t, std::shared_ptr<pending_request>> requests;
+    };
+
+    pending_shard& pending_shard_for(uint32_t request_id) noexcept {
+        return pending_shards_[request_id % pending_shard_count];
+    }
+
+    std::array<pending_shard, pending_shard_count> pending_shards_;
     
     // Send mutex for serializing writes
     sync::mutex send_mutex_;

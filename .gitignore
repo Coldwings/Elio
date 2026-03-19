@@ -35,5 +35,5 @@ benchmark
 # Temporary files
 *.tmp
 .DS_Store
-.qoder/
+.clangd
 __pycache__

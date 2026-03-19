@@ -1,8 +1,6 @@
 #pragma once
 
-#include <cstddef>
 #include <exception>
-#include <cassert>
 #include <atomic>
 #include <cstdint>
 #include <limits>
@@ -90,15 +88,10 @@ public:
     promise_base() noexcept
         : frame_magic_(FRAME_MAGIC)
         , parent_(current_frame_)
-        , activation_parent_(nullptr)
-        , vthread_owner_(current_owner_)
         , debug_state_(coroutine_state::created)
         , debug_worker_id_(static_cast<uint32_t>(-1))
         , debug_id_(0)  // Lazy allocation - only allocated when id() is called
         , affinity_(NO_AFFINITY)
-        , frame_size_(consume_next_frame_size())
-        , started_(false)
-        , vthread_root_(false)
     {
         current_frame_ = this;
     }
@@ -125,135 +118,8 @@ public:
         return parent_;
     }
 
-    // Construction-time parent relationship (legacy parent semantics)
-    [[nodiscard]] promise_base* construction_parent() const noexcept {
-        return parent_;
-    }
-
-    // First-activation parent relationship (runtime await-chain semantics)
-    [[nodiscard]] promise_base* activation_parent() const noexcept {
-        return activation_parent_;
-    }
-
-    void set_activation_parent(promise_base* parent) noexcept {
-        activation_parent_ = parent;
-    }
-
-    bool bind_activation_parent_once(promise_base* parent) noexcept {
-        if (activation_parent_ == nullptr) {
-            activation_parent_ = parent;
-            activation_bindings_.fetch_add(1, std::memory_order_relaxed);
-            return true;
-        }
-        assert(activation_parent_ == parent && "activation_parent rebound inconsistently");
-        return false;
-    }
-
-    [[nodiscard]] void* vthread_owner() const noexcept {
-        return vthread_owner_;
-    }
-
-    void set_vthread_owner(void* owner) noexcept {
-        vthread_owner_ = owner;
-    }
-
-    bool bind_vthread_owner_once(void* owner) noexcept {
-        if (vthread_owner_ == nullptr) {
-            vthread_owner_ = owner;
-            owner_bindings_.fetch_add(1, std::memory_order_relaxed);
-            return true;
-        }
-        // Construction-time owner can differ from first-activation owner.
-        // For cold frames (not started yet), allow one-way owner transfer
-        // during first activation binding (e.g. task created in A, first
-        // awaited in B via spawn/join wrapper).
-        if (!started_ && vthread_owner_ != owner) {
-            vthread_owner_ = owner;
-            owner_bindings_.fetch_add(1, std::memory_order_relaxed);
-            return true;
-        }
-        assert(vthread_owner_ == owner && "vthread_owner rebound inconsistently");
-        return false;
-    }
-
-    [[nodiscard]] size_t frame_size() const noexcept {
-        return frame_size_;
-    }
-
-    [[nodiscard]] bool started() const noexcept {
-        return started_;
-    }
-
-    void mark_started() noexcept {
-        started_ = true;
-    }
-
-    [[nodiscard]] bool is_vthread_root() const noexcept {
-        return vthread_root_;
-    }
-
-    void set_vthread_root(bool value) noexcept {
-        vthread_root_ = value;
-    }
-
     [[nodiscard]] static promise_base* current_frame() noexcept {
         return current_frame_;
-    }
-
-    [[nodiscard]] static void* current_owner() noexcept {
-        return current_owner_;
-    }
-
-    static void set_current_owner(void* owner) noexcept {
-        current_owner_ = owner;
-    }
-
-    static void set_next_frame_size(size_t size) noexcept {
-        next_frame_size_ = size;
-    }
-
-    static void record_root_owner_creation() noexcept {
-        root_owner_creations_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    static void record_owner_context_restore() noexcept {
-        owner_context_restores_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    static void record_ownerless_resume() noexcept {
-        ownerless_resumes_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    [[nodiscard]] static uint64_t owner_bindings() noexcept {
-        return owner_bindings_.load(std::memory_order_relaxed);
-    }
-
-    [[nodiscard]] static uint64_t activation_bindings() noexcept {
-        return activation_bindings_.load(std::memory_order_relaxed);
-    }
-
-    [[nodiscard]] static uint64_t root_owner_creations() noexcept {
-        return root_owner_creations_.load(std::memory_order_relaxed);
-    }
-
-    [[nodiscard]] static uint64_t owner_context_restores() noexcept {
-        return owner_context_restores_.load(std::memory_order_relaxed);
-    }
-
-    [[nodiscard]] static uint64_t ownerless_resumes() noexcept {
-        return ownerless_resumes_.load(std::memory_order_relaxed);
-    }
-
-    [[nodiscard]] static promise_base* from_handle_address(void* handle_addr) noexcept {
-        if (!handle_addr) return nullptr;
-
-        // GCC/Clang coroutine frame layout:
-        // [resume_fn_ptr][destroy_fn_ptr][promise...]
-        constexpr size_t promise_offset = 2 * sizeof(void*);
-        auto* candidate = reinterpret_cast<promise_base*>(
-            static_cast<char*>(handle_addr) + promise_offset);
-
-        return candidate->frame_magic() == FRAME_MAGIC ? candidate : nullptr;
     }
 
     // Debug accessors
@@ -300,21 +166,11 @@ public:
     void clear_affinity() noexcept { affinity_ = NO_AFFINITY; }
 
 private:
-    static size_t consume_next_frame_size() noexcept {
-        size_t size = next_frame_size_;
-        next_frame_size_ = 0;
-        return size;
-    }
-
     // Magic number at start for debugger validation
     uint64_t frame_magic_;
     
-    // Construction-time stack tracking
+    // Virtual stack tracking
     promise_base* parent_;
-    // Runtime activation relationship
-    promise_base* activation_parent_;
-    // Runtime vthread ownership context
-    void* vthread_owner_;
     std::exception_ptr exception_;
     
     // Debug metadata
@@ -325,21 +181,8 @@ private:
     
     // Thread affinity: NO_AFFINITY means can migrate freely
     size_t affinity_;
-
-    // Frame metadata
-    size_t frame_size_;
-    bool started_;
-    bool vthread_root_;
     
     static inline thread_local promise_base* current_frame_ = nullptr;
-    static inline thread_local void* current_owner_ = nullptr;
-    static inline thread_local size_t next_frame_size_ = 0;
-
-    static inline std::atomic<uint64_t> owner_bindings_{0};
-    static inline std::atomic<uint64_t> activation_bindings_{0};
-    static inline std::atomic<uint64_t> root_owner_creations_{0};
-    static inline std::atomic<uint64_t> owner_context_restores_{0};
-    static inline std::atomic<uint64_t> ownerless_resumes_{0};
 };
 
 } // namespace elio::coro

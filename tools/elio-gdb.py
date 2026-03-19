@@ -32,8 +32,6 @@ COROUTINE_STATES = {
     4: "failed"
 }
 
-EXCEPTION_PTR_SIZE = 8
-
 
 def read_atomic(val):
     """Read value from std::atomic."""
@@ -79,13 +77,6 @@ def read_cstring(addr):
         addr_val = int(addr)
     except:
         return None
-
-
-def promise_to_handle_addr(promise_addr, ptr_size):
-    """Convert a promise_base* back to the coroutine handle address."""
-    if promise_addr == 0:
-        return 0
-    return promise_addr - 2 * ptr_size
     
     if addr_val == 0:
         return None
@@ -129,22 +120,14 @@ def get_frame_from_handle(handle_addr):
         if magic != FRAME_MAGIC:
             return None
         
-        # Read promise_base fields.
-        # Current layout begins with:
-        # magic(8) + parent(ptr) + activation_parent(ptr) + vthread_owner(ptr)
-        # + exception_ptr + debug_location + debug_state + debug_worker_id + debug_id
-
+        # Read promise_base fields
+        # Layout: magic(8) + parent(8) + exception(16) + debug_location(24) + state(1) + pad(3) + worker_id(4) + debug_id(8)
+        
         parent_bytes = inferior.read_memory(promise_addr + 8, ptr_size)
         parent = int.from_bytes(bytes(parent_bytes), 'little')
-
-        activation_parent_bytes = inferior.read_memory(promise_addr + 8 + ptr_size, ptr_size)
-        activation_parent = int.from_bytes(bytes(activation_parent_bytes), 'little')
-
-        owner_bytes = inferior.read_memory(promise_addr + 8 + 2 * ptr_size, ptr_size)
-        owner = int.from_bytes(bytes(owner_bytes), 'little')
         
-        # debug_location follows magic + 3 pointers + exception_ptr
-        loc_offset = 8 + 3 * ptr_size + EXCEPTION_PTR_SIZE
+        # debug_location starts at offset 8+8+16=32
+        loc_offset = 8 + ptr_size + 16  # magic + parent + exception_ptr
         file_ptr_bytes = inferior.read_memory(promise_addr + loc_offset, ptr_size)
         file_ptr = int.from_bytes(bytes(file_ptr_bytes), 'little')
         
@@ -154,8 +137,8 @@ def get_frame_from_handle(handle_addr):
         line_bytes = inferior.read_memory(promise_addr + loc_offset + 2 * ptr_size, 4)
         line = int.from_bytes(bytes(line_bytes), 'little')
         
-        # debug_location = file(ptr) + function(ptr) + line(u32) + padding(4)
-        state_offset = loc_offset + 2 * ptr_size + 8
+        # state at loc_offset + 24
+        state_offset = loc_offset + 2 * ptr_size + 4
         state_byte = inferior.read_memory(promise_addr + state_offset, 1)
         state = int.from_bytes(bytes(state_byte), 'little')
         
@@ -166,18 +149,6 @@ def get_frame_from_handle(handle_addr):
         # debug_id at worker_id + 4
         debug_id_bytes = inferior.read_memory(promise_addr + state_offset + 8, 8)
         debug_id = int.from_bytes(bytes(debug_id_bytes), 'little')
-
-        affinity_bytes = inferior.read_memory(promise_addr + state_offset + 16, ptr_size)
-        affinity = int.from_bytes(bytes(affinity_bytes), 'little')
-
-        frame_size_bytes = inferior.read_memory(promise_addr + state_offset + 16 + ptr_size, ptr_size)
-        frame_size = int.from_bytes(bytes(frame_size_bytes), 'little')
-
-        started_byte = inferior.read_memory(promise_addr + state_offset + 16 + 2 * ptr_size, 1)
-        started = int.from_bytes(bytes(started_byte), 'little') != 0
-
-        root_byte = inferior.read_memory(promise_addr + state_offset + 16 + 2 * ptr_size + 1, 1)
-        is_root = int.from_bytes(bytes(root_byte), 'little') != 0
         
         # Read strings
         file_str = None
@@ -200,15 +171,9 @@ def get_frame_from_handle(handle_addr):
             "state": COROUTINE_STATES.get(state, "unknown"),
             "worker_id": worker_id,
             "parent": parent,
-            "activation_parent": activation_parent,
-            "owner": owner,
             "file": file_str,
             "function": func_str,
             "line": line,
-            "affinity": affinity,
-            "frame_size": frame_size,
-            "started": started,
-            "is_root": is_root,
             "address": handle_addr,
             "promise_addr": promise_addr
         }
@@ -220,36 +185,21 @@ def walk_virtual_stack(handle_addr):
     """Walk the virtual stack from a coroutine handle."""
     stack = []
     visited = set()
-    ptr_size = gdb.lookup_type("void").pointer().sizeof
     
     info = get_frame_from_handle(handle_addr)
     if info:
-        relation = "activation_parent" if info["activation_parent"] != 0 else "parent"
-        info["edge"] = "self"
         stack.append(info)
-        visited.add(info["promise_addr"])
+        visited.add(handle_addr)
         
-        parent = info[relation]
+        # Walk parent chain
+        parent = info["parent"]
         while parent != 0 and parent not in visited:
             visited.add(parent)
-            parent_handle = promise_to_handle_addr(parent, ptr_size)
-            parent_info = get_frame_from_handle(parent_handle)
-            if parent_info is None:
-                stack.append({
-                    "id": 0,
-                    "address": parent_handle,
-                    "promise_addr": parent,
-                    "state": relation,
-                    "function": None,
-                    "file": None,
-                    "line": 0,
-                    "worker_id": 0xFFFFFFFF,
-                    "edge": relation,
-                })
-                break
-            parent_info["edge"] = relation
-            stack.append(parent_info)
-            parent = parent_info[relation]
+            # Parent is a promise_base*, need to find the frame address
+            # This is tricky - for now just note we have a parent
+            stack.append({"id": 0, "address": parent, "state": "parent", 
+                         "function": None, "file": None, "line": 0, "worker_id": 0xFFFFFFFF})
+            break
     
     return stack
 
@@ -553,12 +503,6 @@ class ElioInfoCommand(gdb.Command):
             print(f"  Worker:   {worker_id}")
             print(f"  Handle:   0x{info['address']:016x}")
             print(f"  Promise:  0x{info['promise_addr']:016x}")
-            print(f"  Owner:    0x{info['owner']:016x}")
-            print(f"  Root:     {'yes' if info['is_root'] else 'no'}")
-            print(f"  Started:  {'yes' if info['started'] else 'no'}")
-            print(f"  FrameSz:  {info['frame_size']}")
-            print(f"  Parent:   0x{info['parent']:016x}")
-            print(f"  ActParent:0x{info['activation_parent']:016x}")
             
             if info["function"]:
                 print(f"  Function: {info['function']}")
@@ -568,8 +512,7 @@ class ElioInfoCommand(gdb.Command):
                     loc += f":{info['line']}"
                 print(f"  Location: {loc}")
             
-            chain_name = "activation" if info["activation_parent"] != 0 else "construction"
-            print(f"\n  Virtual Call Stack ({chain_name} chain):")
+            print(f"\n  Virtual Call Stack:")
             stack = walk_virtual_stack(task_addr)
             for i, frame in enumerate(stack):
                 func = frame["function"] or "<unknown>"
@@ -578,8 +521,7 @@ class ElioInfoCommand(gdb.Command):
                     loc = f" at {frame['file']}"
                     if frame["line"] > 0:
                         loc += f":{frame['line']}"
-                edge = frame.get("edge", "self")
-                print(f"    #{i:<3} [{edge}] {func}{loc}")
+                print(f"    #{i:<3} {func}{loc}")
             
             return
         

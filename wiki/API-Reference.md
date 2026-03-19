@@ -74,12 +74,6 @@ int b = co_await h2;
 int c = co_await h3;
 ```
 
-**Semantics Notes:**
-
-- Direct `co_await child` usually keeps `child` in the caller's current vthread and does not require relocation.
-- `spawn()` and `go()` always establish a new vthread root. The root frame is attached to a fresh owner domain before first execution.
-- Work stealing may move execution to another worker thread, but does not by itself change frame ownership.
-
 ### `join_handle<T>`
 
 Handle for awaiting spawned tasks. Returned by `task<T>::spawn()`.

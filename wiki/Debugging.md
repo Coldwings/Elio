@@ -9,35 +9,23 @@ Elio coroutines maintain debug metadata in each frame:
 - State (created, running, suspended, completed, failed)
 - Source location (file, function, line)
 - Worker thread assignment
-- Construction parent, activation parent, and vthread ownership metadata
+- Parent pointer for virtual stack traversal
 
 The debugger extensions find coroutine frames by traversing the scheduler's worker queues (Chase-Lev deque and MPSC inbox). This approach has **zero runtime overhead** - no global registry or synchronization is required.
 
-Important limitation: today these tools primarily see **queued** coroutines. A coroutine that is currently running on a worker thread is not guaranteed to appear until it suspends or is re-enqueued.
-
 ## Virtual Stack
 
-C++20 stackless coroutines allocate each frame independently on the heap. When a coroutine suspends, the native call stack unwinds completely, so traditional stack traces cannot show the logical call chain. Elio reconstructs this information through an intrusive virtual-stack and vthread metadata model built into every coroutine frame.
+C++20 stackless coroutines allocate each frame independently on the heap. When a coroutine suspends, the native call stack unwinds completely, so traditional stack traces cannot show the logical call chain. Elio reconstructs this information through an intrusive virtual stack built into every coroutine frame.
 
 ### How It Works
 
-Each coroutine's promise type inherits from `promise_base`, which now carries multiple relationships:
+Each coroutine's promise type inherits from `promise_base`, which contains a `parent_` pointer. When coroutine A `co_await`s coroutine B, B's promise stores a pointer back to A's promise. This forms a singly-linked list from the innermost frame to the outermost caller, mirroring what a native call stack would look like if the coroutines were regular functions.
 
-- `parent_`: the construction-time parent captured from `current_frame_`
-- `activation_parent_`: the coroutine that first activates a cold child
-- `vthread_owner_`: the owner domain responsible for memory ownership and resume context
-
-`current_frame_` is still used to capture low-cost construction lineage. Runtime execution, however, is determined later:
-
-- direct `co_await` binds activation-parent metadata when the child is first awaited
-- `spawn()` and `go()` create a fresh vthread owner and cold-relocate the spawned root before first resume
-- work stealing resumes an already-owned suspended leaf on a different worker without changing frame ownership
-
-This means the debugger-visible construction chain and the runtime ownership chain are related, but not identical. In particular, nested expressions such as `co_await bar(foo())` may have construction order different from first execution order.
+The thread-local `current_frame_` tracks which frame is currently executing. When a new coroutine starts, it reads `current_frame_` to set its `parent_`, then installs itself as the new `current_frame_`. On completion or suspension, the previous frame is restored.
 
 ### Frame Validation
 
-Each `promise_base` contains a `frame_magic_` field set to `0x454C494F46524D45` (the ASCII string "ELIOFRME"). The debugger tools check this magic value when traversing memory to distinguish valid Elio coroutine frames from arbitrary data. This is especially important during coredump analysis, where the debugger walks raw memory without type information.
+Each `promise_base` contains a `frame_magic_` field set to `0x454C494F46524D45` (the ASCII string "ELIOFRMR"). The debugger tools check this magic value when traversing memory to distinguish valid Elio coroutine frames from arbitrary data. This is especially important during coredump analysis, where the debugger walks raw memory without type information.
 
 ### Debug Metadata
 
@@ -45,16 +33,14 @@ Every frame carries the following debug metadata with no additional allocation:
 
 | Field | Description |
 |-------|-------------|
-| `debug_id_` | Unique monotonic identifier assigned on demand |
-| `debug_state_` | Current state: created, running, suspended, completed, or failed |
-| `debug_worker_id_` | Index of the worker thread the frame is assigned to (or -1 if unassigned) |
-| `debug_location_` | Source file, function name, and line number |
-| `parent_` | Construction-time parent pointer used for low-overhead lineage/debug traversal |
-| `activation_parent_` | Runtime first-activation parent for direct await / detached activation semantics |
-| `vthread_owner_` | Owner domain used for frame ownership and vthread context restoration |
+| `id_` | Unique monotonic identifier assigned at creation |
+| `state_` | Current state: created, running, suspended, completed, or failed |
+| `worker_id_` | Index of the worker thread the frame is assigned to (or -1 if unassigned) |
+| `file_`, `function_`, `line_` | Source location captured via `std::source_location` or manual `set_location()` |
+| `parent_` | Pointer to the calling frame's promise, forming the virtual stack chain |
 | `frame_magic_` | Magic number for frame integrity validation |
 
-The debugger tools (`elio-pstack`, `elio-gdb.py`, `elio_lldb.py`) use this metadata to present coroutine state in a format familiar to anyone who has used `pstack` or `thread apply all bt`. They now prefer the activation-parent chain when it is present, and fall back to the construction-parent chain otherwise. Owner metadata is shown separately in `elio info` style output.
+The debugger tools (`elio-pstack`, `elio-gdb.py`, `elio_lldb.py`) use this metadata to present coroutine state in a format familiar to anyone who has used `pstack` or `thread apply all bt`.
 
 ## Tools
 
@@ -62,7 +48,7 @@ The debugger tools (`elio-pstack`, `elio-gdb.py`, `elio_lldb.py`) use this metad
 |------|-------------|
 | `elio-pstack` | Command-line tool similar to `pstack` |
 | `elio-gdb.py` | GDB Python extension |
-| `elio_lldb.py` | LLDB Python entrypoint |
+| `elio_lldb.py` | LLDB import entrypoint (loads `elio-lldb.py`) |
 
 ## elio-pstack
 
@@ -160,18 +146,12 @@ vthread #1
   Worker:   0
   Handle:   0x00007f1234567890
   Promise:  0x00007f12345678a0
-    Owner:    0x00007f1234500000
-    Root:     no
-    Started:  yes
-    FrameSz:  160
-    Parent:   0x00007f1234567000
-    ActParent:0x00007f1234567000
   Function: worker_task
   Location: debug_test.cpp:84
 
-    Virtual Call Stack (activation chain):
-        #0   [self] worker_task at debug_test.cpp:84
-        #1   [activation_parent] async_main at debug_test.cpp:112
+  Virtual Call Stack:
+    #0   worker_task at debug_test.cpp:84
+    #1   async_main at debug_test.cpp:112
 
 (gdb) elio workers
 Scheduler: running
@@ -218,8 +198,6 @@ The LLDB extension provides the same commands as GDB:
 | `elio info <id>` | Show detailed info for a vthread |
 | `elio workers` | Show worker thread information |
 | `elio stats` | Show scheduler statistics |
-
-`elio info` in both GDB and LLDB now prints owner/root/started metadata in addition to source location and queue worker information.
 
 ## Setting Debug Location
 

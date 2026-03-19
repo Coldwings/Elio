@@ -204,8 +204,8 @@ include/elio/
 ├── elio.hpp              # Main include
 ├── coro/                 # Coroutine primitives
 │   ├── task.hpp          # task<T>
-│   ├── promise_base.hpp  # Vthread metadata base
-│   ├── frame.hpp         # Frame and owner introspection
+│   ├── promise_base.hpp  # Virtual stack base
+│   ├── frame.hpp         # Stack introspection
 │   ├── frame_allocator.hpp # Frame memory pool
 │   ├── cancel_token.hpp  # Cooperative cancellation
 │   └── awaitable_base.hpp # Awaitable interface
@@ -256,18 +256,6 @@ include/elio/
 ```
 
 The repository also contains `examples/` with runnable programs, `tests/` with Catch2 tests, and `tools/` with debugging utilities (`elio-pstack`, GDB/LLDB extensions).
-
-## VThread Model At A Glance
-
-Elio's coroutine runtime distinguishes three relationships that are easy to conflate if you only think in terms of a single parent pointer:
-
-- **Construction parent**: captured when the promise is created
-- **Activation parent**: captured when a cold coroutine is first activated
-- **Vthread owner**: the owner domain responsible for frame memory and resume context
-
-In the common direct-`co_await` case, these relationships often line up and no relocation is needed. In `spawn()` and `go()` cases, however, Elio creates a new vthread boundary and moves the cold root frame into a fresh owner domain before first execution.
-
-The debugging tools expose this distinction explicitly: `elio info` reports owner/root/parent metadata, while stack-style output prefers the activation-parent chain when it is available.
 
 ## Next Steps
 

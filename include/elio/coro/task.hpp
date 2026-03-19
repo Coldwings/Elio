@@ -2,9 +2,7 @@
 
 #include "promise_base.hpp"
 #include "frame_allocator.hpp"
-#include "vthread_owner.hpp"
 #include <coroutine>
-#include <cstring>
 #include <optional>
 #include <exception>
 #include <utility>
@@ -19,66 +17,6 @@ void schedule_handle(std::coroutine_handle<> handle) noexcept;
 }
 
 namespace elio::coro {
-
-inline void* relocate_spawn_go_root_frame(void* source, size_t frame_size) {
-    if (!source || frame_size == 0) return source;
-
-    auto* owner = new vthread_owner();
-    void* destination = owner->allocate(frame_size);
-    if (!destination) {
-        delete owner;
-        return source;
-    }
-
-    std::memcpy(destination, source, frame_size);
-
-    // GCC stores the get_return_object() return value (task<T>{h}) inside the
-    // coroutine frame. That stored task contains a coroutine_handle whose
-    // _M_fr_ptr == source (the old frame address). After memcpy this stale
-    // self-reference remains, causing final_awaiter::await_suspend to receive
-    // the OLD frame address via h.  Fix up every pointer-sized slot that still
-    // holds the old address.
-    auto* dst_bytes = static_cast<char*>(destination);
-    const auto old_val = reinterpret_cast<uintptr_t>(source);
-    const auto new_val = reinterpret_cast<uintptr_t>(destination);
-    for (size_t i = 0; i + sizeof(void*) <= frame_size; i += sizeof(void*)) {
-        uintptr_t slot;
-        std::memcpy(&slot, dst_bytes + i, sizeof(slot));
-        if (slot == old_val) {
-            std::memcpy(dst_bytes + i, &new_val, sizeof(new_val));
-        }
-    }
-
-    auto* destination_promise = promise_base::from_handle_address(destination);
-    if (!destination_promise) {
-        delete owner;
-        return source;
-    }
-
-    destination_promise->set_vthread_owner(owner);
-    destination_promise->set_activation_parent(nullptr);
-    destination_promise->set_vthread_root(true);
-    vthread_owner::mark_root_allocation(destination, true);
-    return destination;
-}
-
-/// Free the backing allocation of a cold (pre-resume) coroutine frame
-/// WITHOUT invoking C++ destructors.
-///
-/// Used after memcpy relocation: the "live" state has been copied to a new address;
-/// 'ptr' is the abandoned source. Running destructors here would double-destroy
-/// objects already owned by the relocated frame (e.g. captured task<T> handles,
-/// shared_ptr ref counts would be incorrectly decremented).
-inline void free_cold_frame_backing(void* ptr, size_t frame_size) noexcept {
-    if (!ptr) return;
-    // vthread_owner uses bump allocation; individual frees are no-ops.
-    // Memory is reclaimed when the owning domain is destroyed.
-    if (vthread_owner::inspect_allocation(ptr).found) {
-        return;
-    }
-    // frame_allocator: return the block to the pool without running any destructor.
-    frame_allocator::deallocate(ptr, frame_size);
-}
 
 template<typename T = void>
 class task;
@@ -331,28 +269,10 @@ public:
 
         // Custom allocator for coroutine frames
         void* operator new(size_t size) {
-            promise_base::set_next_frame_size(size);
-            if (auto* owner = static_cast<::elio::coro::vthread_owner*>(promise_base::current_owner())) {
-                if (void* ptr = owner->allocate(size)) {
-                    return ptr;
-                }
-            }
             return frame_allocator::allocate(size);
         }
         
         void operator delete(void* ptr, size_t size) noexcept {
-            auto owner_alloc = ::elio::coro::vthread_owner::inspect_allocation(ptr);
-            if (owner_alloc.found) {
-                if (owner_alloc.is_root) {
-                    delete static_cast<::elio::coro::vthread_owner*>(owner_alloc.owner);
-                }
-                return;
-            }
-
-            auto frame_owner = frame_allocator::inspect_owner_metadata(ptr);
-            if (frame_owner.found && frame_owner.is_root) {
-                delete static_cast<::elio::coro::vthread_owner*>(frame_owner.owner);
-            }
             frame_allocator::deallocate(ptr, size);
         }
     };
@@ -384,18 +304,6 @@ public:
     /// Spawn this task on the current scheduler (fire-and-forget)
     /// The task will run asynchronously and self-destruct when complete
     void go() {
-        if (handle_) {
-            const size_t frame_size = handle_.promise().frame_size();
-            void* old_ptr = handle_.address();
-            void* relocated = relocate_spawn_go_root_frame(old_ptr, frame_size);
-            if (relocated != old_ptr) {
-                handle_ = handle_type::from_address(relocated);
-                // Do NOT call old.destroy(): that would run destructors and
-                // double-destroy captured objects now owned by the relocated frame.
-                // Instead, free only the backing allocation.
-                free_cold_frame_backing(old_ptr, frame_size);
-            }
-        }
         runtime::schedule_handle(release());
     }
     
@@ -406,15 +314,7 @@ public:
     [[nodiscard]] bool await_ready() const noexcept { return false; }
 
     [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        auto& promise = handle_.promise();
-        auto* activation_parent = promise_base::from_handle_address(awaiter.address());
-        promise.bind_activation_parent_once(activation_parent);
-
-        void* owner = promise_base::current_owner();
-        if (owner) {
-            promise.bind_vthread_owner_once(owner);
-        }
-        promise.continuation_ = awaiter;
+        handle_.promise().continuation_ = awaiter;
         return handle_;
     }
 
@@ -451,28 +351,10 @@ public:
 
         // Custom allocator for coroutine frames
         void* operator new(size_t size) {
-            promise_base::set_next_frame_size(size);
-            if (auto* owner = static_cast<::elio::coro::vthread_owner*>(promise_base::current_owner())) {
-                if (void* ptr = owner->allocate(size)) {
-                    return ptr;
-                }
-            }
             return frame_allocator::allocate(size);
         }
         
         void operator delete(void* ptr, size_t size) noexcept {
-            auto owner_alloc = ::elio::coro::vthread_owner::inspect_allocation(ptr);
-            if (owner_alloc.found) {
-                if (owner_alloc.is_root) {
-                    delete static_cast<::elio::coro::vthread_owner*>(owner_alloc.owner);
-                }
-                return;
-            }
-
-            auto frame_owner = frame_allocator::inspect_owner_metadata(ptr);
-            if (frame_owner.found && frame_owner.is_root) {
-                delete static_cast<::elio::coro::vthread_owner*>(frame_owner.owner);
-            }
             frame_allocator::deallocate(ptr, size);
         }
     };
@@ -504,18 +386,6 @@ public:
     /// Spawn this task on the current scheduler (fire-and-forget)
     /// The task will run asynchronously and self-destruct when complete
     void go() {
-        if (handle_) {
-            const size_t frame_size = handle_.promise().frame_size();
-            void* old_ptr = handle_.address();
-            void* relocated = relocate_spawn_go_root_frame(old_ptr, frame_size);
-            if (relocated != old_ptr) {
-                handle_ = handle_type::from_address(relocated);
-                // Do NOT call old.destroy(): that would run destructors and
-                // double-destroy captured objects now owned by the relocated frame.
-                // Instead, free only the backing allocation.
-                free_cold_frame_backing(old_ptr, frame_size);
-            }
-        }
         runtime::schedule_handle(release());
     }
     
@@ -526,15 +396,7 @@ public:
     [[nodiscard]] bool await_ready() const noexcept { return false; }
 
     [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        auto& promise = handle_.promise();
-        auto* activation_parent = promise_base::from_handle_address(awaiter.address());
-        promise.bind_activation_parent_once(activation_parent);
-
-        void* owner = promise_base::current_owner();
-        if (owner) {
-            promise.bind_vthread_owner_once(owner);
-        }
-        promise.continuation_ = awaiter;
+        handle_.promise().continuation_ = awaiter;
         return handle_;
     }
 

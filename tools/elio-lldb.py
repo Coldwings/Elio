@@ -6,7 +6,8 @@ This script provides LLDB commands for debugging Elio coroutines (vthreads).
 It finds coroutine frames by traversing the scheduler's worker queues.
 
 Usage:
-    In LLDB: command script import /path/to/elio-lldb.py
+    Preferred: command script import /path/to/elio_lldb.py
+    (This file remains the implementation module.)
 
 Commands:
     elio list              - List all vthreads from worker queues
@@ -31,8 +32,6 @@ COROUTINE_STATES = {
     3: "completed",
     4: "failed"
 }
-
-EXCEPTION_PTR_SIZE = 8
 
 
 def read_cstring(process, addr):
@@ -76,13 +75,6 @@ def read_pointer(process, addr):
     error = lldb.SBError()
     ptr_size = process.GetAddressByteSize()
     return process.ReadUnsignedFromMemory(addr, ptr_size, error)
-
-
-def promise_to_handle_addr(promise_addr, ptr_size):
-    """Convert a promise_base* back to a coroutine handle address."""
-    if promise_addr == 0:
-        return 0
-    return promise_addr - 2 * ptr_size
 
 
 def get_scheduler(target, process):
@@ -137,21 +129,19 @@ def get_frame_from_handle(process, handle_addr):
         if magic != FRAME_MAGIC:
             return None
         
-        # Read promise_base fields.
-        # Current layout begins with:
-        # magic(8) + parent(ptr) + activation_parent(ptr) + vthread_owner(ptr)
-        # + exception_ptr + debug_location + debug_state + debug_worker_id + debug_id
-
-        parent = read_pointer(process, promise_addr + 8)
-        activation_parent = read_pointer(process, promise_addr + 8 + ptr_size)
-        owner = read_pointer(process, promise_addr + 8 + 2 * ptr_size)
+        # Read promise_base fields
+        # Layout: magic(8) + parent(8) + exception(16) + debug_location(24) + state(1) + pad(3) + worker_id(4) + debug_id(8)
         
-        loc_offset = 8 + 3 * ptr_size + EXCEPTION_PTR_SIZE
+        parent = read_pointer(process, promise_addr + 8)
+        
+        # debug_location starts at offset 8+8+16=32
+        loc_offset = 8 + ptr_size + 16  # magic + parent + exception_ptr
         file_ptr = read_pointer(process, promise_addr + loc_offset)
         func_ptr = read_pointer(process, promise_addr + loc_offset + ptr_size)
         line = read_uint32(process, promise_addr + loc_offset + 2 * ptr_size)
         
-        state_offset = loc_offset + 2 * ptr_size + 8
+        # state at loc_offset + 24
+        state_offset = loc_offset + 2 * ptr_size + 4
         state = read_uint8(process, promise_addr + state_offset)
         
         # worker_id at state_offset + 4 (after 3 bytes padding)
@@ -159,26 +149,15 @@ def get_frame_from_handle(process, handle_addr):
         
         # debug_id at worker_id + 4
         debug_id = read_uint64(process, promise_addr + state_offset + 8)
-
-        affinity = read_pointer(process, promise_addr + state_offset + 16)
-        frame_size = read_pointer(process, promise_addr + state_offset + 16 + ptr_size)
-        started = read_uint8(process, promise_addr + state_offset + 16 + 2 * ptr_size) != 0
-        is_root = read_uint8(process, promise_addr + state_offset + 16 + 2 * ptr_size + 1) != 0
         
         return {
             "id": debug_id,
             "state": COROUTINE_STATES.get(state, "unknown"),
             "worker_id": worker_id,
             "parent": parent,
-            "activation_parent": activation_parent,
-            "owner": owner,
             "file": read_cstring(process, file_ptr),
             "function": read_cstring(process, func_ptr),
             "line": line,
-            "affinity": affinity,
-            "frame_size": frame_size,
-            "started": started,
-            "is_root": is_root,
             "address": handle_addr,
             "promise_addr": promise_addr
         }
@@ -193,33 +172,18 @@ def walk_virtual_stack(process, handle_addr):
     
     info = get_frame_from_handle(process, handle_addr)
     if info:
-        ptr_size = process.GetAddressByteSize()
-        relation = "activation_parent" if info["activation_parent"] != 0 else "parent"
-        info["edge"] = "self"
         stack.append(info)
-        visited.add(info["promise_addr"])
+        visited.add(handle_addr)
         
-        parent = info[relation]
+        # Walk parent chain
+        parent = info["parent"]
         while parent != 0 and parent not in visited:
             visited.add(parent)
-            parent_handle = promise_to_handle_addr(parent, ptr_size)
-            parent_info = get_frame_from_handle(process, parent_handle)
-            if parent_info is None:
-                stack.append({
-                    "id": 0,
-                    "address": parent_handle,
-                    "promise_addr": parent,
-                    "state": relation,
-                    "function": None,
-                    "file": None,
-                    "line": 0,
-                    "worker_id": 0xFFFFFFFF,
-                    "edge": relation,
-                })
-                break
-            parent_info["edge"] = relation
-            stack.append(parent_info)
-            parent = parent_info[relation]
+            # Parent is a promise_base*, need to find the frame address
+            # For now just note we have a parent
+            stack.append({"id": 0, "address": parent, "state": "parent", 
+                         "function": None, "file": None, "line": 0, "worker_id": 0xFFFFFFFF})
+            break
     
     return stack
 
@@ -506,12 +470,6 @@ def elio_info(debugger, command, result, internal_dict):
         result.AppendMessage(f"  Worker:   {worker}")
         result.AppendMessage(f"  Handle:   0x{info['address']:016x}")
         result.AppendMessage(f"  Promise:  0x{info['promise_addr']:016x}")
-        result.AppendMessage(f"  Owner:    0x{info['owner']:016x}")
-        result.AppendMessage(f"  Root:     {'yes' if info['is_root'] else 'no'}")
-        result.AppendMessage(f"  Started:  {'yes' if info['started'] else 'no'}")
-        result.AppendMessage(f"  FrameSz:  {info['frame_size']}")
-        result.AppendMessage(f"  Parent:   0x{info['parent']:016x}")
-        result.AppendMessage(f"  ActParent:0x{info['activation_parent']:016x}")
         
         if info["function"]:
             result.AppendMessage(f"  Function: {info['function']}")
@@ -521,8 +479,7 @@ def elio_info(debugger, command, result, internal_dict):
                 loc += f":{info['line']}"
             result.AppendMessage(f"  Location: {loc}")
         
-        chain_name = "activation" if info["activation_parent"] != 0 else "construction"
-        result.AppendMessage(f"\n  Virtual Call Stack ({chain_name} chain):")
+        result.AppendMessage(f"\n  Virtual Call Stack:")
         stack = walk_virtual_stack(process, task_addr)
         for i, frame in enumerate(stack):
             func = frame["function"] or "<unknown>"
@@ -531,8 +488,7 @@ def elio_info(debugger, command, result, internal_dict):
                 loc = f" at {frame['file']}"
                 if frame["line"] > 0:
                     loc += f":{frame['line']}"
-            edge = frame.get("edge", "self")
-            result.AppendMessage(f"    #{i:<3} [{edge}] {func}{loc}")
+            result.AppendMessage(f"    #{i:<3} {func}{loc}")
         
         return
     

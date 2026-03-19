@@ -33,7 +33,6 @@
 #include <mutex>
 #include <unordered_map>
 #include <chrono>
-#include <functional>
 #include <tuple>
 #include <type_traits>
 #include <string_view>

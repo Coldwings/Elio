@@ -1,6 +1,6 @@
 # Elio Coroutine Library
 
-**Elio** is a modern, production-ready C++20 coroutine library for high-performance asynchronous programming on Linux. It provides stackless coroutines with extended vthread tracking, a multi-threaded work-stealing scheduler, and a foundation for efficient I/O operations.
+**Elio** is a modern, production-ready C++20 coroutine library for high-performance asynchronous programming on Linux. It provides stackless coroutines with virtual stack tracking, a multi-threaded work-stealing scheduler, and a foundation for efficient I/O operations.
 
 [![CI](https://github.com/Coldwings/Elio/actions/workflows/ci.yml/badge.svg)](https://github.com/Coldwings/Elio/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
@@ -10,7 +10,7 @@
 
 - **C++20 Stackless Coroutines** with `task<T>` type
 - **Ergonomic Task Spawning**: `go()` for fire-and-forget, `spawn()` for joinable tasks
-- **Extended VThread Tracking** covering construction lineage, first activation, and owner-domain semantics
+- **Virtual Stack Tracking** for natural exception propagation
 - **Work-Stealing Scheduler** with lock-free Chase-Lev deques
 - **Dynamic Thread Pool** with runtime adjustment
 - **Autoscaler** for automatic worker thread scaling under load
@@ -142,9 +142,9 @@ elio::
 ├── coro::                    // Coroutine primitives
 │   ├── task<T>              // Primary coroutine type
 │   ├── join_handle<T>       // Handle for awaiting spawned tasks
-│   ├── promise_base         // Vthread metadata base class
+│   ├── promise_base         // Virtual stack base class
 │   ├── awaitable_base<T>    // CRTP awaitable base
-│   └── frame utilities      // Frame and owner inspection
+│   └── frame utilities      // Virtual stack inspection
 │
 ├── runtime::                // Scheduler and execution
 │   ├── scheduler            // Work-stealing scheduler
@@ -192,17 +192,12 @@ tools/                       // Debugging tools
 └── elio-lldb.py             // LLDB implementation script
 ```
 
-### Virtual Stack And VThreads
+### Virtual Stack
 
-Elio tracks coroutine relationships at three levels:
-- construction lineage via `parent_`
-- first-activation lineage via `activation_parent_`
-- memory and execution ownership via `vthread_owner_`
-
-This enables:
+Elio implements a **virtual stack** by linking coroutine frames together. This enables:
 - Natural exception propagation through `co_await` chains
-- Call chain inspection for debugging and postmortem analysis
-- Explicit semantics for `spawn()`, `go()`, and worker migration
+- Call chain inspection for debugging
+- Automatic cleanup on coroutine completion
 
 ```cpp
 outer() -> middle() -> inner()
@@ -261,7 +256,7 @@ make
 
 ## Debugging
 
-Elio provides debugging tools to inspect queued coroutine states, virtual call stacks, and vthread ownership metadata:
+Elio provides debugging tools to inspect coroutine states and virtual call stacks:
 
 ```bash
 # pstack-like tool for coroutines
@@ -273,16 +268,12 @@ gdb -ex 'source tools/elio-gdb.py' ./myapp
 (gdb) elio list                # List all vthreads
 (gdb) elio bt                  # Show all backtraces
 (gdb) elio bt 42               # Show backtrace for vthread #42
-(gdb) elio info 42             # Show owner/root/parent metadata
 
-# LLDB extension (use entrypoint wrapper)
+# LLDB extension
 lldb -o 'command script import tools/elio_lldb.py' ./myapp
 (lldb) elio list
 (lldb) elio bt
-(lldb) elio info 42
 ```
-
-The debugger tools currently enumerate queued coroutines from worker queues. They prefer the activation-parent chain when it exists, and fall back to the construction-parent chain otherwise.
 
 See the [Debugging wiki page](wiki/Debugging.md) for detailed documentation.
 
@@ -357,38 +348,6 @@ int c = co_await h3;
 if (handle.is_ready()) {
     // Task has completed
 }
-```
-
-### Hostname Resolution Configuration
-
-Hostname resolution is explicit and configurable via `net::resolve_options`.
-`tcp_connect` accepts concrete addresses only, so host+port callers should resolve first.
-
-```cpp
-#include <elio/net/resolve.hpp>
-
-// Common options with cache enabled
-auto opts = elio::net::default_cached_resolve_options();
-opts.positive_ttl = std::chrono::seconds(30);
-opts.negative_ttl = std::chrono::seconds(2);
-
-// Resolve + connect (single best address)
-auto addr = co_await elio::net::resolve_hostname("api.example.com", 443, opts);
-if (addr) {
-    auto tcp = co_await elio::net::tcp_connect(*addr);
-}
-
-// HTTP-family clients can set this in config directly
-elio::http::client_config http_cfg;
-http_cfg.resolve_options = opts;
-http_cfg.rotate_resolved_addresses = true;
-
-elio::http::h2_client_config h2_cfg;
-h2_cfg.resolve_options = opts;
-h2_cfg.rotate_resolved_addresses = true;
-
-// RPC client explicit resolve configuration
-auto rpc = co_await elio::rpc::tcp_rpc_client::connect("rpc.example.com", 9000, opts);
 ```
 
 ### Exception Handling

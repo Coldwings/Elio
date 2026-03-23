@@ -18,6 +18,7 @@ option(ELIO_ENABLE_HTTP "Enable HTTP client/server support (requires TLS)" ${ELI
 option(ELIO_ENABLE_HTTP2 "Enable HTTP/2 support (requires nghttp2)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_DEVELOPER_WARNINGS "Enable strict warning flags for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_WARNINGS_AS_ERRORS "Treat warnings as errors for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
+option(ELIO_ENABLE_DEBUG_METADATA "Enable coroutine debug metadata" ON)
 
 # Platform check - Linux only
 if(NOT UNIX OR APPLE)
@@ -34,10 +35,17 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Header-only library interface
 add_library(elio INTERFACE)
-target_include_directories(elio INTERFACE 
+target_include_directories(elio INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+
+# Debug metadata option
+if(ELIO_ENABLE_DEBUG_METADATA)
+    target_compile_definitions(elio INTERFACE ELIO_ENABLE_DEBUG_METADATA=1)
+else()
+    target_compile_definitions(elio INTERFACE ELIO_ENABLE_DEBUG_METADATA=0)
+endif()
 
 # Dependencies via FetchContent
 include(FetchContent)

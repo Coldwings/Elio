@@ -72,7 +72,7 @@ private:
 /// Base class for all coroutine promise types
 /// Implements lightweight virtual stack tracking via thread-local intrusive list
 ///
-/// Debug support:
+/// Debug support (when ELIO_ENABLE_DEBUG_METADATA=1):
 /// - Each frame has a unique ID for identification
 /// - Source location can be set for debugging
 /// - State tracking (created/running/suspended/completed/failed)
@@ -88,14 +88,16 @@ public:
     promise_base() noexcept
         : frame_magic_(FRAME_MAGIC)
         , parent_(current_frame_)
+#if ELIO_ENABLE_DEBUG_METADATA
         , debug_state_(coroutine_state::created)
         , debug_worker_id_(static_cast<uint32_t>(-1))
         , debug_id_(0)  // Lazy allocation - only allocated when id() is called
+#endif
         , affinity_(NO_AFFINITY)
     {
         current_frame_ = this;
     }
-    
+
     ~promise_base() noexcept {
         current_frame_ = parent_;
     }
@@ -107,13 +109,15 @@ public:
 
     void unhandled_exception() noexcept {
         exception_ = std::current_exception();
+#if ELIO_ENABLE_DEBUG_METADATA
         debug_state_ = coroutine_state::failed;
+#endif
     }
-    
+
     [[nodiscard]] std::exception_ptr exception() const noexcept {
         return exception_;
     }
-    
+
     [[nodiscard]] promise_base* parent() const noexcept {
         return parent_;
     }
@@ -122,7 +126,8 @@ public:
         return current_frame_;
     }
 
-    // Debug accessors
+    // Debug accessors (available only when debug metadata is enabled)
+#if ELIO_ENABLE_DEBUG_METADATA
     [[nodiscard]] uint64_t frame_magic() const noexcept { return frame_magic_; }
     [[nodiscard]] const debug_location& location() const noexcept { return debug_location_; }
     [[nodiscard]] coroutine_state state() const noexcept { return debug_state_; }
@@ -149,39 +154,55 @@ public:
     void set_worker_id(uint32_t id) noexcept {
         debug_worker_id_ = id;
     }
+#else
+    // Stub accessors when debug metadata is disabled
+    [[nodiscard]] uint64_t frame_magic() const noexcept { return frame_magic_; }
+    [[nodiscard]] uint64_t id() noexcept { return 0; }
+    [[nodiscard]] uint32_t worker_id() const noexcept { return static_cast<uint32_t>(-1); }
+    [[nodiscard]] coroutine_state state() const noexcept { return coroutine_state::running; }
+    [[nodiscard]] const debug_location& location() const noexcept {
+        static const debug_location empty{};
+        return empty;
+    }
+    void set_location(const char*, const char*, uint32_t) noexcept {}
+    void set_state(coroutine_state) noexcept {}
+    void set_worker_id(uint32_t) noexcept {}
+#endif
 
     // Affinity accessors
     /// Get the current thread affinity for this vthread
     /// @return Worker ID this vthread is bound to, or NO_AFFINITY if unbound
     [[nodiscard]] size_t affinity() const noexcept { return affinity_; }
-    
+
     /// Set thread affinity for this vthread
     /// @param worker_id Worker ID to bind to, or NO_AFFINITY to clear
     void set_affinity(size_t worker_id) noexcept { affinity_ = worker_id; }
-    
+
     /// Check if this vthread has affinity set
     [[nodiscard]] bool has_affinity() const noexcept { return affinity_ != NO_AFFINITY; }
-    
+
     /// Clear thread affinity, allowing this vthread to migrate freely
     void clear_affinity() noexcept { affinity_ = NO_AFFINITY; }
 
 private:
     // Magic number at start for debugger validation
     uint64_t frame_magic_;
-    
+
     // Virtual stack tracking
     promise_base* parent_;
     std::exception_ptr exception_;
-    
-    // Debug metadata
+
+#if ELIO_ENABLE_DEBUG_METADATA
+    // Debug metadata (conditionally compiled)
     debug_location debug_location_;
     coroutine_state debug_state_;
     uint32_t debug_worker_id_;
     uint64_t debug_id_;
-    
+#endif
+
     // Thread affinity: NO_AFFINITY means can migrate freely
     size_t affinity_;
-    
+
     static inline thread_local promise_base* current_frame_ = nullptr;
 };
 

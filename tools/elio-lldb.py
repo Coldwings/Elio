@@ -109,57 +109,82 @@ def get_scheduler(target, process):
 
 
 def get_frame_from_handle(process, handle_addr):
-    """Extract promise_base info from a coroutine handle address."""
+    """Extract promise_base info from a coroutine handle address.
+
+    Note: Debug metadata fields (location, state, worker_id, id) are only
+    available when ELIO_ENABLE_DEBUG_METADATA=1. When disabled, these fields
+    will return default/None values.
+    """
     if handle_addr == 0:
         return None
-    
+
     try:
         ptr_size = process.GetAddressByteSize()
-        
+
         # Coroutine frame layout (typical):
         # - resume function pointer
-        # - destroy function pointer  
+        # - destroy function pointer
         # - promise object
-        
+
         # Promise is typically at offset 2*ptr_size (after resume and destroy)
         promise_addr = handle_addr + 2 * ptr_size
-        
+
         # Read magic to validate
         magic = read_uint64(process, promise_addr)
         if magic != FRAME_MAGIC:
             return None
-        
-        # Read promise_base fields
-        # Layout: magic(8) + parent(8) + exception(16) + debug_location(24) + state(1) + pad(3) + worker_id(4) + debug_id(8)
-        
+
+        # Read promise_base fields (layout varies based on ELIO_ENABLE_DEBUG_METADATA)
+        # Base layout (always present): magic(8) + parent(8) + exception(16)
+        # Debug layout (when enabled): + debug_location(24) + state(1) + pad(3) + worker_id(4) + debug_id(8)
+        # Affinity: size_t (8 bytes on 64-bit)
+
+        # Read parent pointer (always present)
         parent = read_pointer(process, promise_addr + 8)
-        
-        # debug_location starts at offset 8+8+16=32
-        loc_offset = 8 + ptr_size + 16  # magic + parent + exception_ptr
-        file_ptr = read_pointer(process, promise_addr + loc_offset)
-        func_ptr = read_pointer(process, promise_addr + loc_offset + ptr_size)
-        line = read_uint32(process, promise_addr + loc_offset + 2 * ptr_size)
-        
-        # state at loc_offset + 24
-        state_offset = loc_offset + 2 * ptr_size + 4
-        state = read_uint8(process, promise_addr + state_offset)
-        
-        # worker_id at state_offset + 4 (after 3 bytes padding)
-        worker_id = read_uint32(process, promise_addr + state_offset + 4)
-        
-        # debug_id at worker_id + 4
-        debug_id = read_uint64(process, promise_addr + state_offset + 8)
-        
+
+        # Try to detect if debug metadata is present
+        # We'll try to read the debug fields and gracefully handle failures
+
+        # First, try to read debug metadata (assume enabled by default)
+        has_debug_metadata = True
+        debug_location_offset = 8 + ptr_size + 16  # magic + parent + exception_ptr
+
+        try:
+            # Try reading debug_location.file pointer
+            file_ptr = read_pointer(process, promise_addr + debug_location_offset)
+            func_ptr = read_pointer(process, promise_addr + debug_location_offset + ptr_size)
+            line = read_uint32(process, promise_addr + debug_location_offset + 2 * ptr_size)
+
+            # state at debug_location_offset + 24
+            state_offset = debug_location_offset + 2 * ptr_size + 4
+            state = read_uint8(process, promise_addr + state_offset)
+
+            # worker_id at state_offset + 4 (after 3 bytes padding)
+            worker_id = read_uint32(process, promise_addr + state_offset + 4)
+
+            # debug_id at worker_id + 4
+            debug_id = read_uint64(process, promise_addr + state_offset + 8)
+        except Exception as e:
+            # Debug metadata not available - use defaults
+            has_debug_metadata = False
+            file_ptr = 0
+            func_ptr = 0
+            line = 0
+            state = 1  # running
+            worker_id = 0xFFFFFFFF  # Unknown
+            debug_id = 0
+
         return {
             "id": debug_id,
             "state": COROUTINE_STATES.get(state, "unknown"),
             "worker_id": worker_id,
             "parent": parent,
-            "file": read_cstring(process, file_ptr),
-            "function": read_cstring(process, func_ptr),
-            "line": line,
+            "file": read_cstring(process, file_ptr) if has_debug_metadata else None,
+            "function": read_cstring(process, func_ptr) if has_debug_metadata else None,
+            "line": line if has_debug_metadata else 0,
             "address": handle_addr,
-            "promise_addr": promise_addr
+            "promise_addr": promise_addr,
+            "has_debug_metadata": has_debug_metadata
         }
     except Exception as e:
         return None
@@ -169,22 +194,23 @@ def walk_virtual_stack(process, handle_addr):
     """Walk the virtual stack from a coroutine handle."""
     stack = []
     visited = set()
-    
+
     info = get_frame_from_handle(process, handle_addr)
     if info:
         stack.append(info)
         visited.add(handle_addr)
-        
+
         # Walk parent chain
         parent = info["parent"]
         while parent != 0 and parent not in visited:
             visited.add(parent)
             # Parent is a promise_base*, need to find the frame address
             # For now just note we have a parent
-            stack.append({"id": 0, "address": parent, "state": "parent", 
-                         "function": None, "file": None, "line": 0, "worker_id": 0xFFFFFFFF})
+            stack.append({"id": 0, "address": parent, "state": "parent",
+                         "function": None, "file": None, "line": 0, "worker_id": 0xFFFFFFFF,
+                         "has_debug_metadata": False})
             break
-    
+
     return stack
 
 
@@ -355,38 +381,43 @@ def elio_list(debugger, command, result, internal_dict):
     """List all Elio vthreads from worker queues."""
     target = debugger.GetSelectedTarget()
     process = target.GetProcess()
-    
+
     if not process.IsValid():
         result.AppendMessage("Error: No process")
         return
-    
+
     sched_addr = get_scheduler(target, process)
     if sched_addr is None:
         result.AppendMessage("Error: No active scheduler found")
         return
-    
+
     result.AppendMessage("-" * 80)
     result.AppendMessage(f"{'ID':<8} {'State':<12} {'Worker':<8} {'Function':<30} {'Location'}")
     result.AppendMessage("-" * 80)
-    
+
     count = 0
+    has_debug_metadata_warning = False
     for task_addr, info in get_all_frames(target, process):
         count += 1
         func = info["function"] or "<unknown>"
         if len(func) > 28:
             func = func[:25] + "..."
-        
+
         loc = ""
-        if info["file"]:
+        if info.get("has_debug_metadata") and info["file"]:
             loc = f"{info['file']}"
             if info["line"] > 0:
                 loc += f":{info['line']}"
-        
+        elif info.get("has_debug_metadata") is False:
+            has_debug_metadata_warning = True
+
         worker = str(info.get("queue_worker_id", info["worker_id"]))
-        
+
         result.AppendMessage(f"{info['id']:<8} {info['state']:<12} {worker:<8} {func:<30} {loc}")
-    
+
     result.AppendMessage(f"\nTotal queued coroutines: {count}")
+    if has_debug_metadata_warning:
+        result.AppendMessage("(Note: Debug metadata is disabled - location info not available)")
     result.AppendMessage("Note: Only queued (not currently executing) coroutines are shown.")
 
 
@@ -394,16 +425,16 @@ def elio_bt(debugger, command, result, internal_dict):
     """Show backtrace for Elio vthread(s)."""
     target = debugger.GetSelectedTarget()
     process = target.GetProcess()
-    
+
     if not process.IsValid():
         result.AppendMessage("Error: No process")
         return
-    
+
     sched_addr = get_scheduler(target, process)
     if sched_addr is None:
         result.AppendMessage("Error: No active scheduler found")
         return
-    
+
     target_id = None
     if command.strip():
         try:
@@ -411,29 +442,29 @@ def elio_bt(debugger, command, result, internal_dict):
         except ValueError:
             result.AppendMessage(f"Error: Invalid vthread ID: {command}")
             return
-    
+
     found = False
     for task_addr, info in get_all_frames(target, process):
         if target_id is not None and info["id"] != target_id:
             continue
-        
+
         found = True
         worker_id = info.get("queue_worker_id", info["worker_id"])
         result.AppendMessage(f"vthread #{info['id']} [{info['state']}] (worker {worker_id})")
-        
+
         stack = walk_virtual_stack(process, task_addr)
         for i, frame in enumerate(stack):
             func = frame["function"] or "<unknown>"
             loc = ""
-            if frame.get("file"):
+            if frame.get("has_debug_metadata") and frame.get("file"):
                 loc = f" at {frame['file']}"
                 if frame["line"] > 0:
                     loc += f":{frame['line']}"
-            
+
             result.AppendMessage(f"  #{i:<3} 0x{frame['address']:016x} in {func}{loc}")
-        
+
         result.AppendMessage("")
-    
+
     if not found:
         if target_id is not None:
             result.AppendMessage(f"Error: vthread #{target_id} not found in queues")

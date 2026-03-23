@@ -16,6 +16,9 @@ Commands:
     elio stats             - Show scheduler statistics
 
 Works with both live processes and coredumps.
+
+Note: Debug metadata (location, state, worker_id, id) is only available
+when ELIO_ENABLE_DEBUG_METADATA=1 (default for Debug builds).
 """
 
 import gdb
@@ -31,6 +34,16 @@ COROUTINE_STATES = {
     3: "completed",
     4: "failed"
 }
+
+# Check if debug metadata is enabled in the build
+def is_debug_metadata_enabled():
+    """Check if ELIO_ENABLE_DEBUG_METADATA is enabled."""
+    try:
+        # Try to find the macro definition in compile commands or symbols
+        # This is a best-effort check - we'll also detect at runtime
+        return True  # Default assume enabled, detect via missing data below
+    except:
+        return False
 
 
 def read_atomic(val):
@@ -96,76 +109,100 @@ def read_cstring(addr):
 
 
 def get_frame_from_handle(handle_addr):
-    """Extract promise_base info from a coroutine handle address."""
+    """Extract promise_base info from a coroutine handle address.
+
+    Note: Debug metadata fields (location, state, worker_id, id) are only
+    available when ELIO_ENABLE_DEBUG_METADATA=1. When disabled, these fields
+    will return default/None values.
+    """
     if handle_addr == 0:
         return None
-    
+
     try:
         # Coroutine frame layout (typical):
         # - resume function pointer
-        # - destroy function pointer  
+        # - destroy function pointer
         # - promise object
-        
+
         # Read pointer size
         ptr_size = gdb.lookup_type("void").pointer().sizeof
-        
+
         # Promise is typically at offset 2*ptr_size (after resume and destroy)
         promise_addr = handle_addr + 2 * ptr_size
-        
+
         # Read magic to validate
         inferior = gdb.selected_inferior()
         magic_bytes = inferior.read_memory(promise_addr, 8)
         magic = int.from_bytes(bytes(magic_bytes), 'little')
-        
+
         if magic != FRAME_MAGIC:
             return None
-        
-        # Read promise_base fields
-        # Layout: magic(8) + parent(8) + exception(16) + debug_location(24) + state(1) + pad(3) + worker_id(4) + debug_id(8)
-        
+
+        # Read promise_base fields (layout varies based on ELIO_ENABLE_DEBUG_METADATA)
+        # Base layout (always present): magic(8) + parent(8) + exception(16)
+        # Debug layout (when enabled): + debug_location(24) + state(1) + pad(3) + worker_id(4) + debug_id(8)
+        # Affinity: size_t (8 bytes on 64-bit)
+
+        # Read parent pointer (always present)
         parent_bytes = inferior.read_memory(promise_addr + 8, ptr_size)
         parent = int.from_bytes(bytes(parent_bytes), 'little')
-        
-        # debug_location starts at offset 8+8+16=32
-        loc_offset = 8 + ptr_size + 16  # magic + parent + exception_ptr
-        file_ptr_bytes = inferior.read_memory(promise_addr + loc_offset, ptr_size)
-        file_ptr = int.from_bytes(bytes(file_ptr_bytes), 'little')
-        
-        func_ptr_bytes = inferior.read_memory(promise_addr + loc_offset + ptr_size, ptr_size)
-        func_ptr = int.from_bytes(bytes(func_ptr_bytes), 'little')
-        
-        line_bytes = inferior.read_memory(promise_addr + loc_offset + 2 * ptr_size, 4)
-        line = int.from_bytes(bytes(line_bytes), 'little')
-        
-        # state at loc_offset + 24
-        state_offset = loc_offset + 2 * ptr_size + 4
-        state_byte = inferior.read_memory(promise_addr + state_offset, 1)
-        state = int.from_bytes(bytes(state_byte), 'little')
-        
-        # worker_id at state_offset + 4 (after 3 bytes padding)
-        worker_id_bytes = inferior.read_memory(promise_addr + state_offset + 4, 4)
-        worker_id = int.from_bytes(bytes(worker_id_bytes), 'little')
-        
-        # debug_id at worker_id + 4
-        debug_id_bytes = inferior.read_memory(promise_addr + state_offset + 8, 8)
-        debug_id = int.from_bytes(bytes(debug_id_bytes), 'little')
-        
-        # Read strings
+
+        # Try to detect if debug metadata is present by checking if debug_state_ exists
+        # We'll try to read the debug fields and gracefully handle failures
+
+        # First, try to read debug metadata (assume enabled by default)
+        has_debug_metadata = True
+        debug_location_offset = 8 + ptr_size + 16  # magic + parent + exception_ptr
+
+        try:
+            # Try reading debug_location.file pointer
+            file_ptr_bytes = inferior.read_memory(promise_addr + debug_location_offset, ptr_size)
+            file_ptr = int.from_bytes(bytes(file_ptr_bytes), 'little')
+
+            func_ptr_bytes = inferior.read_memory(promise_addr + debug_location_offset + ptr_size, ptr_size)
+            func_ptr = int.from_bytes(bytes(func_ptr_bytes), 'little')
+
+            line_bytes = inferior.read_memory(promise_addr + debug_location_offset + 2 * ptr_size, 4)
+            line = int.from_bytes(bytes(line_bytes), 'little')
+
+            # state at debug_location_offset + 24
+            state_offset = debug_location_offset + 2 * ptr_size + 4
+            state_byte = inferior.read_memory(promise_addr + state_offset, 1)
+            state = int.from_bytes(bytes(state_byte), 'little')
+
+            # worker_id at state_offset + 4 (after 3 bytes padding)
+            worker_id_bytes = inferior.read_memory(promise_addr + state_offset + 4, 4)
+            worker_id = int.from_bytes(bytes(worker_id_bytes), 'little')
+
+            # debug_id at worker_id + 4
+            debug_id_bytes = inferior.read_memory(promise_addr + state_offset + 8, 8)
+            debug_id = int.from_bytes(bytes(debug_id_bytes), 'little')
+        except Exception as e:
+            # Debug metadata not available - use defaults
+            has_debug_metadata = False
+            file_ptr = 0
+            func_ptr = 0
+            line = 0
+            state = 1  # running
+            worker_id = 0xFFFFFFFF  # Unknown
+            debug_id = 0
+
+        # Read strings (only if debug metadata enabled)
         file_str = None
         func_str = None
-        if file_ptr != 0:
+        if has_debug_metadata and file_ptr != 0:
             try:
                 file_mem = inferior.read_memory(file_ptr, 256)
                 file_str = bytes(file_mem).split(b'\x00')[0].decode('utf-8', errors='replace')
             except:
                 pass
-        if func_ptr != 0:
+        if has_debug_metadata and func_ptr != 0:
             try:
                 func_mem = inferior.read_memory(func_ptr, 256)
                 func_str = bytes(func_mem).split(b'\x00')[0].decode('utf-8', errors='replace')
             except:
                 pass
-        
+
         return {
             "id": debug_id,
             "state": COROUTINE_STATES.get(state, "unknown"),
@@ -175,7 +212,8 @@ def get_frame_from_handle(handle_addr):
             "function": func_str,
             "line": line,
             "address": handle_addr,
-            "promise_addr": promise_addr
+            "promise_addr": promise_addr,
+            "has_debug_metadata": has_debug_metadata
         }
     except Exception as e:
         return None
@@ -185,22 +223,23 @@ def walk_virtual_stack(handle_addr):
     """Walk the virtual stack from a coroutine handle."""
     stack = []
     visited = set()
-    
+
     info = get_frame_from_handle(handle_addr)
     if info:
         stack.append(info)
         visited.add(handle_addr)
-        
+
         # Walk parent chain
         parent = info["parent"]
         while parent != 0 and parent not in visited:
             visited.add(parent)
             # Parent is a promise_base*, need to find the frame address
             # This is tricky - for now just note we have a parent
-            stack.append({"id": 0, "address": parent, "state": "parent", 
-                         "function": None, "file": None, "line": 0, "worker_id": 0xFFFFFFFF})
+            stack.append({"id": 0, "address": parent, "state": "parent",
+                         "function": None, "file": None, "line": 0, "worker_id": 0xFFFFFFFF,
+                         "has_debug_metadata": False})
             break
-    
+
     return stack
 
 
@@ -322,62 +361,67 @@ class ElioCommand(gdb.Command):
 
 class ElioListCommand(gdb.Command):
     """List all vthreads from worker queues."""
-    
+
     def __init__(self):
         super(ElioListCommand, self).__init__(
             "elio list",
             gdb.COMMAND_USER
         )
-    
+
     def invoke(self, arg, from_tty):
         scheduler = get_scheduler()
         if scheduler is None:
             print("Error: No active scheduler found")
             return
-        
+
         print("-" * 80)
         print(f"{'ID':<8} {'State':<12} {'Worker':<8} {'Function':<30} {'Location'}")
         print("-" * 80)
-        
+
         count = 0
+        has_debug_metadata_warning = False
         for task_addr, worker_id in iterate_all_tasks(scheduler):
             info = get_frame_from_handle(task_addr)
             if info is None:
                 continue
-            
+
             count += 1
             func = info["function"] or "<unknown>"
             if len(func) > 28:
                 func = func[:25] + "..."
-            
+
             loc = ""
-            if info["file"]:
+            if info.get("has_debug_metadata") and info["file"]:
                 loc = f"{info['file']}"
                 if info["line"] > 0:
                     loc += f":{info['line']}"
-            
+            elif info.get("has_debug_metadata") is False:
+                has_debug_metadata_warning = True
+
             worker = str(worker_id)
-            
+
             print(f"{info['id']:<8} {info['state']:<12} {worker:<8} {func:<30} {loc}")
-        
+
         print(f"\nTotal queued coroutines: {count}")
+        if has_debug_metadata_warning:
+            print("(Note: Debug metadata is disabled - location info not available)")
 
 
 class ElioBtCommand(gdb.Command):
     """Show backtrace for vthread(s)."""
-    
+
     def __init__(self):
         super(ElioBtCommand, self).__init__(
             "elio bt",
             gdb.COMMAND_USER
         )
-    
+
     def invoke(self, arg, from_tty):
         scheduler = get_scheduler()
         if scheduler is None:
             print("Error: No active scheduler found")
             return
-        
+
         target_id = None
         if arg.strip():
             try:
@@ -385,31 +429,31 @@ class ElioBtCommand(gdb.Command):
             except ValueError:
                 print(f"Error: Invalid vthread ID: {arg}")
                 return
-        
+
         found = False
         for task_addr, worker_id in iterate_all_tasks(scheduler):
             info = get_frame_from_handle(task_addr)
             if info is None:
                 continue
-            
+
             if target_id is not None and info["id"] != target_id:
                 continue
-            
+
             found = True
             print(f"vthread #{info['id']} [{info['state']}] (worker {worker_id})")
-            
+
             stack = walk_virtual_stack(task_addr)
             for i, frame in enumerate(stack):
                 func = frame["function"] or "<unknown>"
                 loc = ""
-                if frame.get("file"):
+                if frame.get("has_debug_metadata") and frame.get("file"):
                     loc = f" at {frame['file']}"
                     if frame["line"] > 0:
                         loc += f":{frame['line']}"
-                
+
                 print(f"  #{i:<3} 0x{frame['address']:016x} in {func}{loc}")
             print()
-        
+
         if not found:
             if target_id is not None:
                 print(f"Error: vthread #{target_id} not found in queues")
@@ -467,64 +511,67 @@ class ElioWorkersCommand(gdb.Command):
 
 class ElioInfoCommand(gdb.Command):
     """Show detailed info for a specific vthread."""
-    
+
     def __init__(self):
         super(ElioInfoCommand, self).__init__(
             "elio info",
             gdb.COMMAND_USER
         )
-    
+
     def invoke(self, arg, from_tty):
         if not arg.strip():
             print("Usage: elio info <vthread-id>")
             return
-        
+
         try:
             target_id = int(arg.strip())
         except ValueError:
             print(f"Error: Invalid vthread ID: {arg}")
             return
-        
+
         scheduler = get_scheduler()
         if scheduler is None:
             print("Error: No active scheduler found")
             return
-        
+
         for task_addr, worker_id in iterate_all_tasks(scheduler):
             info = get_frame_from_handle(task_addr)
             if info is None:
                 continue
-            
+
             if info["id"] != target_id:
                 continue
-            
+
             print(f"vthread #{info['id']}")
             print(f"  State:    {info['state']}")
             print(f"  Worker:   {worker_id}")
             print(f"  Handle:   0x{info['address']:016x}")
             print(f"  Promise:  0x{info['promise_addr']:016x}")
-            
-            if info["function"]:
-                print(f"  Function: {info['function']}")
-            if info["file"]:
-                loc = info["file"]
-                if info["line"] > 0:
-                    loc += f":{info['line']}"
-                print(f"  Location: {loc}")
-            
+
+            if info.get("has_debug_metadata"):
+                if info["function"]:
+                    print(f"  Function: {info['function']}")
+                if info["file"]:
+                    loc = info["file"]
+                    if info["line"] > 0:
+                        loc += f":{info['line']}"
+                    print(f"  Location: {loc}")
+            else:
+                print("  (Debug metadata disabled - function/location not available)")
+
             print(f"\n  Virtual Call Stack:")
             stack = walk_virtual_stack(task_addr)
             for i, frame in enumerate(stack):
                 func = frame["function"] or "<unknown>"
                 loc = ""
-                if frame.get("file"):
+                if frame.get("has_debug_metadata") and frame.get("file"):
                     loc = f" at {frame['file']}"
                     if frame["line"] > 0:
                         loc += f":{frame['line']}"
                 print(f"    #{i:<3} {func}{loc}")
-            
+
             return
-        
+
         print(f"Error: vthread #{target_id} not found in queues")
 
 

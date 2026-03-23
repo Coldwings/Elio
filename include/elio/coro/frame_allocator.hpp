@@ -24,18 +24,21 @@ namespace elio::coro {
 /// Thread-local free-list based frame allocator for small coroutine frames
 /// Dramatically reduces allocation overhead for frequently created/destroyed coroutines
 ///
-/// Design: Each allocated frame has a hidden header storing the source pool ID.
+/// Design: Each allocated frame has a hidden header storing the source pool ID and size class.
 /// When deallocated on a different thread, the frame is returned via an MPSC queue
 /// to its source pool. This handles work-stealing scenarios where coroutines
 /// are allocated on thread A but deallocated on thread B.
 ///
+/// Size Classes: Multiple pools for different frame sizes (32, 64, 128, 256 bytes)
+/// reduce memory waste for small frames while maintaining allocation performance.
+///
 /// Note: Under sanitizers, pooling is disabled to allow proper leak/error detection.
 class frame_allocator {
 public:
-    // Support frames up to 256 bytes (covers most simple tasks)
-    // Actual allocation includes header, so user-visible size is MAX_FRAME_SIZE
-    static constexpr size_t MAX_FRAME_SIZE = 256;
-    static constexpr size_t POOL_SIZE = 1024;
+    // Size classes for different frame sizes
+    static constexpr size_t SIZE_CLASSES[] = {32, 64, 128, 256};
+    static constexpr size_t NUM_SIZE_CLASSES = 4;
+    static constexpr size_t POOL_SIZE = 512;  // Per size class
     static constexpr size_t REMOTE_QUEUE_BATCH = 64;  // Process remote returns in batches
 
 // Detect sanitizers: GCC uses __SANITIZE_*, Clang uses __has_feature
@@ -58,45 +61,48 @@ public:
     }
 #else
     static void* allocate(size_t size) {
-        if (size <= MAX_FRAME_SIZE) {
+        size_t sc = find_size_class(size);
+        if (sc < NUM_SIZE_CLASSES) {
             auto& alloc = instance();
 
             // First try to reclaim remote returns periodically
             alloc.reclaim_remote_returns();
 
-            if (alloc.free_count_ > 0) {
-                void* block = alloc.pool_[--alloc.free_count_];
+            if (alloc.free_count_[sc] > 0) {
+                void* block = alloc.pool_[sc][--alloc.free_count_[sc]];
                 // Update header to reflect current pool ownership
-                // This is important because blocks may have been returned from remote threads
                 auto* header = static_cast<block_header*>(block);
                 header->source_pool_id = alloc.pool_id_;
+                header->size_class = static_cast<uint8_t>(sc);
                 return block_to_user(block);
             }
 
             // Allocate new block with header
-            void* block = ::operator new(ALLOC_BLOCK_SIZE);
+            void* block = ::operator new(alloc_block_size(sc));
             auto* header = static_cast<block_header*>(block);
             header->source_pool_id = alloc.pool_id_;
+            header->size_class = static_cast<uint8_t>(sc);
             header->next.store(nullptr, std::memory_order_relaxed);
             return block_to_user(block);
         }
-        // Fall back to standard allocation for large frames (no header)
+        // Fall back to standard allocation for large frames
         return ::operator new(size);
     }
 
     static void deallocate(void* ptr, size_t size) noexcept {
-        if (size <= MAX_FRAME_SIZE) {
+        size_t sc = find_size_class(size);
+        if (sc < NUM_SIZE_CLASSES) {
             void* block = user_to_block(ptr);
             auto* header = static_cast<block_header*>(block);
             auto& alloc = instance();
 
             // Fast path: same thread - return directly to local pool
             if (header->source_pool_id == alloc.pool_id_) {
-                if (alloc.free_count_ < POOL_SIZE) {
-                    alloc.pool_[alloc.free_count_++] = block;
+                if (alloc.free_count_[sc] < POOL_SIZE) {
+                    alloc.pool_[sc][alloc.free_count_[sc]++] = block;
                     return;
                 }
-                // Pool full, delete the block (not the user pointer!)
+                // Pool full, delete the block
                 ::operator delete(block);
                 return;
             } else {
@@ -119,13 +125,33 @@ public:
 private:
     // Block header stored before user data
     struct block_header {
-        uint32_t source_pool_id;              // ID of the pool that allocated this block
-        std::atomic<block_header*> next;      // For MPSC queue linkage
+        uint32_t source_pool_id;      // ID of the pool that allocated this block
+        uint8_t size_class;           // Size class index (0-3)
+        std::atomic<block_header*> next;  // For MPSC queue linkage
     };
 
-    // Total block size including header, aligned for user data
+    // Header size
     static constexpr size_t HEADER_SIZE = sizeof(block_header);
-    static constexpr size_t ALLOC_BLOCK_SIZE = HEADER_SIZE + MAX_FRAME_SIZE;
+
+    // Find size class index for requested size
+    static size_t find_size_class(size_t size) noexcept {
+        for (size_t i = 0; i < NUM_SIZE_CLASSES; ++i) {
+            if (size <= SIZE_CLASSES[i]) {
+                return i;
+            }
+        }
+        return NUM_SIZE_CLASSES; // Not found (for sizes > 256)
+    }
+
+    // Get actual size for a size class
+    static size_t size_class_size(size_t idx) noexcept {
+        return SIZE_CLASSES[idx];
+    }
+
+    // Total block size including header for a given size class
+    static size_t alloc_block_size(size_t size_class_idx) noexcept {
+        return HEADER_SIZE + SIZE_CLASSES[size_class_idx];
+    }
 
     // Convert between block (with header) and user pointer
     static void* block_to_user(void* block) noexcept {
@@ -137,10 +163,17 @@ private:
     }
 
     frame_allocator()
-        : free_count_(0)
-        , pool_id_(next_pool_id_.fetch_add(1, std::memory_order_relaxed))
-        , remote_head_{0, {nullptr}}  // Initialize dummy head: pool_id=0, next=nullptr
+        : pool_id_(next_pool_id_.fetch_add(1, std::memory_order_relaxed))
+        , remote_head_{}
         , remote_tail_(&remote_head_) {
+        // Initialize remote_head_ fields after default construction
+        remote_head_.source_pool_id = 0;
+        remote_head_.size_class = 0;
+        remote_head_.next.store(nullptr, std::memory_order_relaxed);
+        // Initialize free counts to 0
+        for (size_t i = 0; i < NUM_SIZE_CLASSES; ++i) {
+            free_count_[i] = 0;
+        }
         // Register this pool for cross-thread access
         register_pool(this);
     }
@@ -153,8 +186,10 @@ private:
         reclaim_all_remote_returns();
 
         // Free all cached frames when thread exits
-        for (size_t i = 0; i < free_count_; ++i) {
-            ::operator delete(pool_[i]);
+        for (size_t sc = 0; sc < NUM_SIZE_CLASSES; ++sc) {
+            for (size_t i = 0; i < free_count_[sc]; ++i) {
+                ::operator delete(pool_[sc][i]);
+            }
         }
     }
 
@@ -168,14 +203,14 @@ private:
         prev->next.store(header, std::memory_order_release);
     }
 
-    // Called by owner thread to reclaim remote returns
+    // Called by owner thread to reclaim remote returns for all size classes
     void reclaim_remote_returns() noexcept {
         // Quick check without full synchronization
         block_header* head = remote_head_.next.load(std::memory_order_acquire);
         if (!head) return;
 
         size_t count = 0;
-        while (head && count < REMOTE_QUEUE_BATCH && free_count_ < POOL_SIZE) {
+        while (head && count < REMOTE_QUEUE_BATCH) {
             block_header* next = head->next.load(std::memory_order_acquire);
 
             // If next is null but tail points elsewhere, the producer is in the
@@ -193,10 +228,21 @@ private:
                 if (!next) break;
             }
 
-            pool_[free_count_++] = head;
-            remote_head_.next.store(next, std::memory_order_release);
+            // Add to appropriate size class pool
+            size_t sc = head->size_class;
+            if (sc < NUM_SIZE_CLASSES && free_count_[sc] < POOL_SIZE) {
+                pool_[sc][free_count_[sc]++] = head;
+                remote_head_.next.store(next, std::memory_order_release);
+                ++count;
+            } else if (sc >= NUM_SIZE_CLASSES) {
+                // Invalid size class - delete the block
+                ::operator delete(head);
+                remote_head_.next.store(next, std::memory_order_release);
+            } else {
+                // Pool full - leave it in the queue for later
+                break;
+            }
             head = next;
-            ++count;
         }
     }
 
@@ -218,8 +264,9 @@ private:
                 if (!next) break;
             }
 
-            if (free_count_ < POOL_SIZE) {
-                pool_[free_count_++] = head;
+            size_t sc = head->size_class;
+            if (sc < NUM_SIZE_CLASSES && free_count_[sc] < POOL_SIZE) {
+                pool_[sc][free_count_[sc]++] = head;
             } else {
                 ::operator delete(head);
             }
@@ -267,8 +314,8 @@ private:
         return nullptr;
     }
 
-    std::array<void*, POOL_SIZE> pool_;
-    size_t free_count_;
+    std::array<std::array<void*, POOL_SIZE>, NUM_SIZE_CLASSES> pool_;
+    std::array<size_t, NUM_SIZE_CLASSES> free_count_;
     uint32_t pool_id_;
 
     // MPSC queue for remote returns (dummy head node pattern)

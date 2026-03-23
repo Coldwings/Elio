@@ -169,8 +169,8 @@ struct join_state<void> {
 template<typename T>
 class join_handle {
 public:
-    explicit join_handle(std::shared_ptr<detail::join_state<T>> state) noexcept
-        : state_(std::move(state)) {}
+    explicit join_handle(detail::join_state<T>* state) noexcept
+        : state_(state) {}
 
     join_handle(join_handle&&) noexcept = default;
     join_handle& operator=(join_handle&&) noexcept = default;
@@ -183,9 +183,7 @@ public:
     }
 
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        // Keep a local copy of the shared_ptr to prevent use-after-free.
-        auto state = state_;
-        return state->set_waiter(awaiter);
+        return state_->set_waiter(awaiter);
     }
 
     T await_resume() {
@@ -198,31 +196,28 @@ public:
     }
 
 private:
-    std::shared_ptr<detail::join_state<T>> state_;
+    detail::join_state<T>* state_;
 };
 
 /// Specialization for void
 template<>
 class join_handle<void> {
 public:
-    explicit join_handle(std::shared_ptr<detail::join_state<void>> state) noexcept
-        : state_(std::move(state)) {}
-    
+    explicit join_handle(detail::join_state<void>* state) noexcept
+        : state_(state) {}
+
     join_handle(join_handle&&) noexcept = default;
     join_handle& operator=(join_handle&&) noexcept = default;
-    
+
     join_handle(const join_handle&) = delete;
     join_handle& operator=(const join_handle&) = delete;
-    
+
     [[nodiscard]] bool await_ready() const noexcept {
         return state_->is_completed();
     }
 
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        // Keep a local copy of the shared_ptr to prevent use-after-free.
-        // See join_handle<T>::await_suspend for detailed explanation.
-        auto state = state_;
-        return state->set_waiter(awaiter);
+        return state_->set_waiter(awaiter);
     }
 
     void await_resume() {
@@ -234,7 +229,7 @@ public:
     }
 
 private:
-    std::shared_ptr<detail::join_state<void>> state_;
+    detail::join_state<void>* state_;
 };
 
 /// Primary template for task<T> where T is not void
@@ -245,8 +240,8 @@ public:
         std::optional<T> value_;
         std::coroutine_handle<> continuation_;
         bool detached_ = false;
-        // Join state for spawn() - only used when task is spawned
-        std::shared_ptr<detail::join_state<T>> join_state_;
+        // Join state for spawn() - embedded directly to avoid heap allocation
+        detail::join_state<T> join_state_;
 
         promise_type() noexcept = default;
 
@@ -260,18 +255,14 @@ public:
         template<typename U>
         void return_value(U&& value) {
             value_.emplace(std::forward<U>(value));
-            // Notify join state if present
-            if (join_state_) {
-                join_state_->set_value(std::move(*value_));
-            }
+            // Notify join state if spawned
+            join_state_.set_value(std::move(*value_));
         }
 
         void unhandled_exception() noexcept {
             promise_base::unhandled_exception();
-            // Notify join state if present
-            if (join_state_) {
-                join_state_->set_exception(exception());
-            }
+            // Notify join state if spawned
+            join_state_.set_exception(exception());
         }
 
         // Custom allocator for coroutine frames
@@ -344,8 +335,8 @@ public:
     struct promise_type : promise_base {
         std::coroutine_handle<> continuation_;
         bool detached_ = false;
-        // Join state for spawn() - only used when task is spawned
-        std::shared_ptr<detail::join_state<void>> join_state_;
+        // Join state for spawn() - embedded directly to avoid heap allocation
+        detail::join_state<void> join_state_;
 
         promise_type() noexcept = default;
 
@@ -357,18 +348,14 @@ public:
         [[nodiscard]] detail::final_awaiter final_suspend() noexcept { return {}; }
 
         void return_void() noexcept {
-            // Notify join state if present
-            if (join_state_) {
-                join_state_->set_value();
-            }
+            // Notify join state if spawned
+            join_state_.set_value();
         }
 
         void unhandled_exception() noexcept {
             promise_base::unhandled_exception();
-            // Notify join state if present
-            if (join_state_) {
-                join_state_->set_exception(exception());
-            }
+            // Notify join state if spawned
+            join_state_.set_exception(exception());
         }
 
         // Custom allocator for coroutine frames
@@ -436,19 +423,14 @@ private:
 // Out-of-line definitions for spawn() methods
 template<typename T>
 join_handle<T> task<T>::spawn() {
-    // Create join state and attach to task's promise
-    auto state = std::make_shared<detail::join_state<T>>();
-    handle_.promise().join_state_ = state;
     // Release and schedule - the promise will notify join state on completion
     runtime::schedule_handle(release());
-    return join_handle<T>(std::move(state));
+    return join_handle<T>(std::addressof(handle_.promise().join_state_));
 }
 
 inline join_handle<void> task<void>::spawn() {
-    auto state = std::make_shared<detail::join_state<void>>();
-    handle_.promise().join_state_ = state;
     runtime::schedule_handle(release());
-    return join_handle<void>(std::move(state));
+    return join_handle<void>(std::addressof(handle_.promise().join_state_));
 }
 
 } // namespace elio::coro

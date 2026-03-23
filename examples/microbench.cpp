@@ -4,6 +4,7 @@
 #include <iostream>
 #include <chrono>
 #include <vector>
+#include <thread>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -182,6 +183,75 @@ int main() {
         std::cout << "spawn() only (workers idle): " << (ns / N) << " ns/spawn" << std::endl;
 
         sched.shutdown();
+    }
+
+    // 9. Measure spawn+join overhead (baseline for shared_ptr elimination)
+    {
+        runtime::scheduler sched(4);
+        sched.start();
+
+        auto task_with_result = []() -> coro::task<int> {
+            co_return 42;
+        };
+
+        auto start = high_resolution_clock::now();
+        for (int i = 0; i < N; ++i) {
+            [[maybe_unused]] auto handle = task_with_result().spawn();
+            // Immediately await - this measures spawn + join overhead
+            // We can't actually await in a loop without async context,
+            // so we just measure the spawn+join_handle creation
+        }
+        auto end = high_resolution_clock::now();
+        auto ns = duration_cast<nanoseconds>(end - start).count();
+
+        std::cout << "spawn+join_handle creation: " << (ns / N) << " ns/spawn" << std::endl;
+
+        // Wait for completion
+        while (sched.pending_tasks() > 0) {
+            std::this_thread::sleep_for(microseconds(10));
+        }
+
+        sched.shutdown();
+    }
+
+    // 10. Measure multi-threaded spawn contention (baseline for thread-local index)
+    {
+        constexpr int NUM_THREADS = 4;
+        constexpr int SPAWNS_PER_THREAD = 10000;
+
+        std::vector<std::thread> threads;
+        std::atomic<size_t> total_spawns{0};
+
+        auto start = high_resolution_clock::now();
+
+        for (int t = 0; t < NUM_THREADS; ++t) {
+            threads.emplace_back([&]() {
+                runtime::scheduler sched(4);
+                sched.start();
+
+                for (int i = 0; i < SPAWNS_PER_THREAD; ++i) {
+                    auto task_handle = empty_task().release();
+                    sched.spawn(task_handle);
+                    total_spawns.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                while (sched.pending_tasks() > 0) {
+                    std::this_thread::sleep_for(microseconds(10));
+                }
+
+                sched.shutdown();
+            });
+        }
+
+        for (auto& t : threads) {
+            t.join();
+        }
+
+        auto end = high_resolution_clock::now();
+        auto ns = duration_cast<nanoseconds>(end - start).count();
+
+        std::cout << "Multi-threaded spawn (4 threads): " << (ns / total_spawns.load())
+                  << " ns/spawn" << std::endl;
     }
 
     return 0;

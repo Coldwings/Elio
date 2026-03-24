@@ -147,12 +147,10 @@ TEST_CASE("chase_lev_deque concurrent push and steal", "[chase_lev_deque]") {
     
     // Thief threads: steal items
     auto thief_func = [&]() {
-        int local_stolen = 0;
         while (stolen_count.load() < num_items) {
             if (int* value = deque.steal()) {
-                local_stolen++;
                 stolen_count++;
-                
+
                 std::lock_guard<std::mutex> lock(stolen_mutex);
                 stolen_values.push_back(*value);
             } else {
@@ -246,17 +244,17 @@ TEST_CASE("chase_lev_deque contention on single element", "[chase_lev_deque]") {
 
 TEST_CASE("chase_lev_deque multiple thieves", "[chase_lev_deque]") {
     chase_lev_deque<int> deque;
-    
+
     const int num_items = 500;
     std::vector<int> values(num_items);
     for (int i = 0; i < num_items; ++i) {
         values[i] = i;
         deque.push(&values[i]);
     }
-    
+
     std::atomic<int> total_stolen{0};
     const int num_thieves = 5;
-    
+
     auto thief_func = [&]() {
         int local_stolen = 0;
         while (total_stolen.load() < num_items) {
@@ -269,16 +267,127 @@ TEST_CASE("chase_lev_deque multiple thieves", "[chase_lev_deque]") {
         }
         (void)local_stolen;  // Suppress unused warning
     };
-    
+
     std::vector<std::thread> thieves;
     for (int i = 0; i < num_thieves; ++i) {
         thieves.emplace_back(thief_func);
     }
-    
+
     for (auto& t : thieves) {
         t.join();
     }
-    
+
     REQUIRE(total_stolen.load() == num_items);
     REQUIRE(deque.empty());
+}
+
+TEST_CASE("chase_lev_deque steal_batch basic", "[chase_lev_deque]") {
+    chase_lev_deque<int> deque;
+
+    int values[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+
+    // Push 10 values
+    for (int i = 0; i < 10; ++i) {
+        deque.push(&values[i]);
+    }
+
+    REQUIRE(deque.size() == 10);
+
+    // Steal batch of up to 4 items
+    std::array<int*, 4> batch;
+    size_t stolen = deque.steal_batch(batch);
+
+    // Should steal min(10/2, 4) = 4
+    REQUIRE(stolen == 4);
+
+    // Verify stolen values (FIFO order: 1, 2, 3, 4)
+    for (int i = 0; i < 4; ++i) {
+        REQUIRE(batch[i] != nullptr);
+        REQUIRE(*batch[i] == i + 1);
+    }
+
+    // Remaining: 6 items
+    REQUIRE(deque.size() == 6);
+}
+
+TEST_CASE("chase_lev_deque steal_batch then pop all", "[chase_lev_deque]") {
+    chase_lev_deque<int> deque;
+
+    int values[] = {1, 2, 3, 4, 5, 6};
+
+    // Push 6 values
+    for (int i = 0; i < 6; ++i) {
+        deque.push(&values[i]);
+    }
+
+    // Steal batch (should steal 3 items: 1, 2, 3)
+    std::array<int*, 4> batch;
+    size_t stolen = deque.steal_batch(batch);
+    REQUIRE(stolen == 3);
+
+    // Pop remaining 3 items
+    int pop_count = 0;
+    while (deque.pop() != nullptr) {
+        pop_count++;
+    }
+    REQUIRE(pop_count == 3);
+    REQUIRE(deque.empty());
+}
+
+TEST_CASE("chase_lev_deque steal_batch concurrent", "[chase_lev_deque]") {
+    chase_lev_deque<int> deque;
+
+    const int num_items = 1000;
+    std::vector<int> values(num_items);
+    for (int i = 0; i < num_items; ++i) {
+        values[i] = i;
+    }
+
+    std::atomic<int> total_stolen{0};
+    const int num_thieves = 4;
+
+    // Owner pushes items
+    std::thread owner([&]() {
+        for (int i = 0; i < num_items; ++i) {
+            deque.push(&values[i]);
+            if (i % 10 == 0) {
+                std::this_thread::yield();
+            }
+        }
+    });
+
+    // Thieves steal using batch operations
+    auto thief_func = [&]() {
+        std::array<int*, 4> batch;
+        while (total_stolen.load() < num_items) {
+            size_t stolen = deque.steal_batch(batch);
+            if (stolen > 0) {
+                total_stolen.fetch_add(stolen, std::memory_order_relaxed);
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    };
+
+    std::vector<std::thread> thieves;
+    for (int i = 0; i < num_thieves; ++i) {
+        thieves.emplace_back(thief_func);
+    }
+
+    owner.join();
+
+    // Wait for thieves to finish
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (auto& t : thieves) {
+        t.join();
+    }
+
+    // Owner pops remaining items
+    int popped_count = 0;
+    while (deque.pop() != nullptr) {
+        popped_count++;
+    }
+
+    // All items should be accounted for
+    REQUIRE(total_stolen.load() + popped_count == num_items);
 }

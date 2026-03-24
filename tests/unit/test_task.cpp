@@ -260,28 +260,30 @@ TEST_CASE("task::spawn() returns joinable handle", "[task][spawn][join_handle]")
 TEST_CASE("task<void>::spawn() returns joinable handle", "[task][spawn][join_handle]") {
     scheduler sched(2);
     sched.start();
-    
+
     std::atomic<int> counter{0};
     std::atomic<bool> completed{false};
-    
+
     auto work = [&]() -> task<void> {
         counter.fetch_add(1);
         co_return;
     };
-    
+
     auto driver = [&]() -> task<void> {
         auto handle = work().spawn();
         co_await handle;
+        // handle is automatically destroyed here after co_await completes
+        // This ensures the join_state is not accessed after handle destruction
         REQUIRE(counter.load() == 1);
         completed.store(true);
     };
-    
+
     driver().go();
-    
+
     std::this_thread::sleep_for(scaled_ms(200));
-    
+
     REQUIRE(completed.load());
-    
+
     sched.shutdown();
 }
 

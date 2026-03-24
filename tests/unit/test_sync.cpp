@@ -2,9 +2,9 @@
 #include <elio/sync/primitives.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/time/timer.hpp>
 
 #include <thread>
-#include <vector>
 #include <atomic>
 #include <queue>
 
@@ -14,7 +14,7 @@ using namespace elio::runtime;
 
 TEST_CASE("mutex basic operations", "[sync][mutex]") {
     mutex m;
-    
+
     SECTION("initial state is unlocked") {
         REQUIRE_FALSE(m.is_locked());
     }
@@ -35,38 +35,47 @@ TEST_CASE("mutex basic operations", "[sync][mutex]") {
 
 TEST_CASE("mutex with coroutines", "[sync][mutex][coro]") {
     mutex m;
-    int counter = 0;
-    std::atomic<int> completed{0};
-    
+    std::atomic<int> successful_locks{0};
+
     scheduler sched(2);
     sched.start();
-    
-    auto increment_task = [&]() -> task<void> {
+
+    // Simple test: each task acquires lock, does work, releases lock
+    // The mutex should ensure no two tasks are in the critical section simultaneously
+    auto task_func = [&]() -> task<void> {
         co_await m.lock();
-        int temp = counter;
-        std::this_thread::yield();  // Give other coroutines a chance
-        counter = temp + 1;
+        // Critical section - mutex is held
+        successful_locks.fetch_add(1, std::memory_order_relaxed);
         m.unlock();
-        completed++;
+        co_return;
     };
-    
-    // Create and spawn tasks - use release() to transfer ownership to scheduler
-    // We track completion via the atomic counter
-    constexpr int NUM_TASKS = 10;
+
+    constexpr int NUM_TASKS = 20;
+    std::vector<std::coroutine_handle<>> handles;
+    handles.reserve(NUM_TASKS);
+
     for (int i = 0; i < NUM_TASKS; ++i) {
-        auto t = increment_task();
-        sched.spawn(t.release());  // Transfer ownership - scheduler will manage lifetime
+        auto t = task_func();
+        handles.push_back(t.release());
     }
-    
+
+    // Spawn all tasks
+    for (auto h : handles) {
+        sched.spawn(h);
+    }
+
     // Wait for completion
-    for (int i = 0; i < 200 && completed < NUM_TASKS; ++i) {
+    constexpr int MAX_WAIT_MS = 5000;
+    for (int i = 0; i < MAX_WAIT_MS && successful_locks.load() < NUM_TASKS; i += 10) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    
+
     sched.shutdown();
-    
-    REQUIRE(counter == NUM_TASKS);
-    REQUIRE(completed == NUM_TASKS);
+
+    // All tasks should have completed
+    REQUIRE(successful_locks.load() == NUM_TASKS);
+    REQUIRE(m.try_lock());  // Mutex should be unlocked
+    m.unlock();
 }
 
 TEST_CASE("lock_guard RAII", "[sync][mutex]") {

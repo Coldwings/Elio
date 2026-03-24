@@ -93,7 +93,6 @@ public:
         , debug_worker_id_(static_cast<uint32_t>(-1))
         , debug_id_(0)  // Lazy allocation - only allocated when id() is called
 #endif
-        , affinity_(NO_AFFINITY)
     {
         current_frame_ = this;
     }
@@ -201,7 +200,7 @@ private:
 #endif
 
     // Thread affinity: NO_AFFINITY means can migrate freely
-    size_t affinity_;
+    size_t affinity_ = NO_AFFINITY;
 
     static inline thread_local promise_base* current_frame_ = nullptr;
 };

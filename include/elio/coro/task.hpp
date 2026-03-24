@@ -37,7 +37,7 @@ struct join_state {
     std::atomic<bool> completed_{false};
 
     void add_ref() noexcept {
-        ref_count_.fetch_add(1, std::memory_order_relaxed);
+        ref_count_.fetch_add(1, std::memory_order_acq_rel);
     }
 
     void release() noexcept {
@@ -71,15 +71,10 @@ struct join_state {
 
     bool set_waiter(std::coroutine_handle<> h) noexcept {
         void* expected = nullptr;
+        // Try to set waiter - if CAS succeeds, we own the waiter slot
+        // The completion path (complete()) will handle waking us up
         if (waiter_.compare_exchange_strong(expected, h.address(),
-                std::memory_order_release, std::memory_order_acquire)) {
-            if (completed_.load(std::memory_order_acquire)) {
-                void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-                if (addr) {
-                    runtime::schedule_handle(std::coroutine_handle<>::from_address(addr));
-                }
-                return false;
-            }
+                std::memory_order_seq_cst, std::memory_order_acquire)) {
             return true;
         }
         return false;
@@ -102,7 +97,7 @@ struct join_state<void> {
     std::atomic<bool> completed_{false};
 
     void add_ref() noexcept {
-        ref_count_.fetch_add(1, std::memory_order_relaxed);
+        ref_count_.fetch_add(1, std::memory_order_acq_rel);
     }
 
     void release() noexcept {
@@ -135,15 +130,10 @@ struct join_state<void> {
 
     bool set_waiter(std::coroutine_handle<> h) noexcept {
         void* expected = nullptr;
+        // Try to set waiter - if CAS succeeds, we own the waiter slot
+        // The completion path (complete()) will handle waking us up
         if (waiter_.compare_exchange_strong(expected, h.address(),
-                std::memory_order_release, std::memory_order_acquire)) {
-            if (completed_.load(std::memory_order_acquire)) {
-                void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-                if (addr) {
-                    runtime::schedule_handle(std::coroutine_handle<>::from_address(addr));
-                }
-                return false;
-            }
+                std::memory_order_seq_cst, std::memory_order_acquire)) {
             return true;
         }
         return false;
@@ -161,10 +151,18 @@ struct final_awaiter {
 
     template<typename Promise>
     [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) noexcept {
-        auto continuation = h.promise().continuation_;
+        auto& promise = h.promise();
+
+        // Release join_state reference if this is a spawned task
+        if (promise.join_state_) {
+            promise.join_state_->release();
+            promise.join_state_ = nullptr;
+        }
+
+        auto continuation = promise.continuation_;
         if (continuation) {
             return continuation;
-        } else if (h.promise().detached_) {
+        } else if (promise.detached_) {
             // Detached task with no continuation - self-destruct
             h.destroy();
             return std::noop_coroutine();

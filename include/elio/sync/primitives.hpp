@@ -64,7 +64,7 @@ public:
         /// via lock-free CAS.
         bool await_suspend(std::coroutine_handle<> h) noexcept {
             handle_ = h;
-            void* old_state = mutex_.state_.load(std::memory_order_acquire);
+            void* old_state = mutex_.state_.load(std::memory_order_relaxed);
             while (true) {
                 if (old_state == nullptr) {
                     // Unlocked — try to acquire inline
@@ -82,7 +82,7 @@ public:
                                 : static_cast<lock_awaitable*>(old_state);
                     if (mutex_.state_.compare_exchange_weak(
                             old_state, this,
-                            std::memory_order_release,
+                            std::memory_order_acq_rel,
                             std::memory_order_relaxed)) {
                         return true;  // enqueued, suspend
                     }
@@ -114,7 +114,7 @@ public:
 
     /// Release the mutex
     void unlock() noexcept {
-        void* state = state_.load(std::memory_order_relaxed);
+        void* state = state_.load(std::memory_order_acquire);
 
         if (state == locked_no_waiters()) {
             // Fast path: no waiters — just release

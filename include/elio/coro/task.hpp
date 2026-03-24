@@ -243,7 +243,7 @@ public:
         // Join state for spawn() - embedded directly to avoid heap allocation
         detail::join_state<T> join_state_;
 
-        promise_type() noexcept = default;
+        promise_type() noexcept : promise_base() {}
 
         [[nodiscard]] task get_return_object() noexcept {
             return task{std::coroutine_handle<promise_type>::from_promise(*this)};
@@ -338,7 +338,7 @@ public:
         // Join state for spawn() - embedded directly to avoid heap allocation
         detail::join_state<void> join_state_;
 
-        promise_type() noexcept = default;
+        promise_type() noexcept : promise_base() {}
 
         [[nodiscard]] task get_return_object() noexcept {
             return task{std::coroutine_handle<promise_type>::from_promise(*this)};

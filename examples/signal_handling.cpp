@@ -105,14 +105,12 @@ task<void> main_task(scheduler& sched) {
     ELIO_LOG_INFO("Starting application with PID {}", getpid());
     
     // Spawn the signal handler
-    auto sig_handler = signal_handler_task(sched);
-    sched.spawn(sig_handler.release());
+    sched.go([&sched]() { return signal_handler_task(sched); });
     
     // Spawn some worker coroutines
     constexpr int num_workers = 3;
     for (int i = 0; i < num_workers; ++i) {
-        auto worker = worker_task(i);
-        sched.spawn(worker.release());
+        sched.go([i]() { return worker_task(i); });
     }
     
     ELIO_LOG_INFO("All workers started");
@@ -142,8 +140,7 @@ int main() {
     sched.start();
     
     // Spawn main task
-    auto main = main_task(sched);
-    sched.spawn(main.release());
+    sched.go([&sched]() { return main_task(sched); });
     
     // Run until shutdown
     while (g_running) {

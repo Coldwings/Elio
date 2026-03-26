@@ -14,6 +14,16 @@ using namespace elio::runtime;
 using namespace elio::io;
 using namespace std::chrono_literals;
 
+// Helper to spawn a task to scheduler
+template<typename T>
+void spawn_task(scheduler& sched, task<T>& t) {
+    elio::coro::detail::heap_alloc_guard guard;
+    auto handle = elio::coro::detail::task_access::release(t);
+    auto* vstack = new elio::coro::vthread_stack();
+    handle.promise().set_vstack_owner(vstack);
+    sched.spawn(handle);
+}
+
 TEST_CASE("signal_set basic operations", "[signal][signal_set]") {
     SECTION("default constructor creates empty set") {
         signal_set sigs;
@@ -213,7 +223,7 @@ TEST_CASE("signal_fd async wait", "[signal][signal_fd]") {
     
     {
         auto t = wait_task();
-        sched.spawn(t.release());
+        spawn_task(sched, t);
     }
     
     // Give the coroutine time to start and enter wait
@@ -265,7 +275,7 @@ TEST_CASE("signal_fd multiple signals", "[signal][signal_fd]") {
     
     {
         auto t = wait_task();
-        sched.spawn(t.release());
+        spawn_task(sched, t);
     }
     
     std::this_thread::sleep_for(50ms);
@@ -384,7 +394,7 @@ TEST_CASE("wait_signal convenience function", "[signal][wait_signal]") {
     
     {
         auto t = wait_task();
-        sched.spawn(t.release());
+        spawn_task(sched, t);
     }
     
     std::this_thread::sleep_for(50ms);

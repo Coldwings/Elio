@@ -296,29 +296,26 @@ private:
         }
         
         // Wait for response with timeout
-        // Start a timeout coroutine
-        auto self = this->shared_from_this();
-        auto timeout_task = [](std::chrono::milliseconds ms,
-                               std::shared_ptr<pending_request> pending,
-                               coro::cancel_token tok) 
-            -> coro::task<void> 
-        {
-            auto result = co_await time::sleep_for(ms, tok);
-            
-            // Only timeout if sleep completed normally (not cancelled)
-            if (result == coro::cancel_result::completed && pending->try_complete()) {
-                pending->timed_out = true;
-                pending->error = rpc_error::timeout;
-                pending->completion_event.set();
-            }
-        };
-        
         // Spawn timeout watcher
         auto* sched = runtime::scheduler::current();
         if (sched) {
-            auto task = timeout_task(
-                std::chrono::duration_cast<std::chrono::milliseconds>(timeout), pending, token);
-            sched->spawn(task.release());
+            sched->go([ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
+                       p = pending, tok = token]() mutable {
+                return [](std::chrono::milliseconds ms,
+                          std::shared_ptr<pending_request> pending,
+                          coro::cancel_token tok)
+                    -> coro::task<void>
+                {
+                    auto result = co_await time::sleep_for(ms, tok);
+                    
+                    // Only timeout if sleep completed normally (not cancelled)
+                    if (result == coro::cancel_result::completed && pending->try_complete()) {
+                        pending->timed_out = true;
+                        pending->error = rpc_error::timeout;
+                        pending->completion_event.set();
+                    }
+                }(ms, p, std::move(tok));
+            });
         }
         
         // Wait for completion (either response, timeout, or cancellation)
@@ -405,22 +402,18 @@ public:
         }
         
         // Setup timeout
-        auto self = this->shared_from_this();
-        auto timeout_task = [](std::chrono::milliseconds ms,
-                               std::shared_ptr<pending_request> pending)
-            -> coro::task<void>
-        {
-            co_await time::sleep_for(ms);
-            if (pending->try_complete()) {
-                pending->timed_out = true;
-                pending->completion_event.set();
-            }
-        };
-        
         auto* sched = runtime::scheduler::current();
         if (sched) {
-            auto task = timeout_task(timeout, pending);
-            sched->spawn(task.release());
+            sched->go([ms = timeout, p = pending]() { 
+                return [](std::chrono::milliseconds ms, std::shared_ptr<pending_request> p)
+                    -> coro::task<void> {
+                    co_await time::sleep_for(ms);
+                    if (p->try_complete()) {
+                        p->timed_out = true;
+                        p->completion_event.set();
+                    }
+                }(ms, p);
+            });
         }
         
         // Wait for pong
@@ -448,8 +441,7 @@ private:
         auto self = this->shared_from_this();
         auto* sched = runtime::scheduler::current();
         if (sched) {
-            auto task = receive_loop(self);
-            sched->spawn(task.release());
+            sched->go([s = self]() { return receive_loop(s); });
         }
     }
     

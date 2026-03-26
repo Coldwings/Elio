@@ -25,8 +25,7 @@ TEST_CASE("Parallel task execution stress test", "[parallel]") {
     };
     
     for (int i = 0; i < num_tasks; ++i) {
-        auto t = task_func();
-        sched.spawn(t.release());
+        sched.go(task_func);
     }
     
     // Wait for completion with scaled timeout
@@ -68,13 +67,11 @@ TEST_CASE("Parallel tasks with varying workloads", "[parallel]") {
     
     // Mix of light and heavy tasks
     for (int i = 0; i < 100; ++i) {
-        auto t = light_task();
-        sched.spawn(t.release());
+        sched.go(light_task);
     }
     
     for (int i = 0; i < 20; ++i) {
-        auto t = heavy_task();
-        sched.spawn(t.release());
+        sched.go(heavy_task);
     }
     
     std::this_thread::sleep_for(scaled_ms(1000));
@@ -107,8 +104,7 @@ TEST_CASE("Parallel tasks with dependencies", "[parallel]") {
     
     const int num_chains = 50;
     for (int i = 0; i < num_chains; ++i) {
-        auto t = stage2_task();
-        sched.spawn(t.release());
+        sched.go(stage2_task);
     }
     
     // Active wait for completion with timeout
@@ -147,8 +143,7 @@ TEST_CASE("Work stealing under heavy load", "[parallel]") {
     
     // Spawn all tasks quickly
     for (int i = 0; i < num_tasks; ++i) {
-        auto t = task_func();
-        sched.spawn(t.release());
+        sched.go(task_func);
     }
     
     std::this_thread::sleep_for(scaled_ms(1500));
@@ -179,8 +174,7 @@ TEST_CASE("Concurrent spawn and execution", "[parallel]") {
     for (int i = 0; i < spawner_threads; ++i) {
         spawners.emplace_back([&]() {
             for (int j = 0; j < tasks_per_thread; ++j) {
-                auto t = task_func();
-                sched.spawn(t.release());
+                sched.go(task_func);
                 std::this_thread::yield();
             }
         });
@@ -213,8 +207,7 @@ TEST_CASE("Parallel tasks with shared atomic counter", "[parallel]") {
     };
     
     for (int i = 0; i < num_tasks; ++i) {
-        auto t = increment_task();
-        sched.spawn(t.release());
+        sched.go(increment_task);
     }
     
     std::this_thread::sleep_for(scaled_ms(800));
@@ -250,8 +243,7 @@ TEST_CASE("Nested parallel tasks", "[parallel]") {
     
     const int num_outer = 20;
     for (int i = 0; i < num_outer; ++i) {
-        auto t = outer_task();
-        sched.spawn(t.release());
+        sched.go(outer_task);
     }
     
     std::this_thread::sleep_for(scaled_ms(800));

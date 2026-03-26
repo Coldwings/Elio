@@ -69,8 +69,7 @@ void benchmark_spawn_overhead() {
         auto batch_start = high_resolution_clock::now();
 
         for (int i = 0; i < batch_size; ++i) {
-            auto t = empty_task();
-            sched.spawn(t.release());
+            sched.go(empty_task);
         }
 
         while (sched.pending_tasks() > 0) {
@@ -125,8 +124,7 @@ void benchmark_context_switch() {
         auto batch_start = high_resolution_clock::now();
 
         for (int i = 0; i < batch_size; ++i) {
-            auto t = task_with_await();
-            sched.spawn(t.release());
+            sched.go(task_with_await);
         }
 
         while (completed.load(std::memory_order_relaxed) < batch_size) {
@@ -188,8 +186,7 @@ void benchmark_yield() {
             steady_clock::now().time_since_epoch()).count();
 
         for (int i = 0; i < num_vthreads; ++i) {
-            auto t = yield_task();
-            sched.spawn(t.release());
+            sched.go(yield_task);
         }
 
         while (end_time_ns.load(std::memory_order_acquire) == 0) {}

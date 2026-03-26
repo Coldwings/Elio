@@ -70,16 +70,22 @@ void benchmark_spawn_overhead() {
     while (duration_cast<seconds>(high_resolution_clock::now() - bench_start) < MIN_BENCH_DURATION) {
         runtime::scheduler sched(4);
         sched.start();
-        
+
+        std::atomic<int> completed(0);
+
         auto batch_start = high_resolution_clock::now();
-        
+
+        auto taskdef = [&completed]() -> coro::task<void> {
+            completed.fetch_add(1, std::memory_order_release);
+            co_return;
+        };
+
         for (int i = 0; i < batch_size; ++i) {
-            auto t = empty_task();
-            sched.spawn(t.release());
+            sched.go(taskdef);
         }
-        
+
         // Wait for all to complete
-        while (sched.pending_tasks() > 0) {
+        while (completed.load(std::memory_order_acquire) < batch_size) {
             std::this_thread::sleep_for(microseconds(1));
         }
         
@@ -127,24 +133,23 @@ void benchmark_context_switch() {
         runtime::scheduler sched(4);
         sched.start();
         
-        std::atomic<int> completed{0};
-        
-        auto task_with_await = [&]() -> coro::task<void> {
-            for (int i = 0; i < awaits_per_task; ++i) {
-                int value = co_await compute_task(i);
+        std::atomic<int> completed(0);
+
+        auto taskdef = [&completed]() -> coro::task<void> {
+            for (int j = 0; j < awaits_per_task; ++j) {
+                int value = co_await compute_task(j);
                 (void)value;
             }
             completed.fetch_add(1, std::memory_order_relaxed);
             co_return;
         };
-        
+
         auto batch_start = high_resolution_clock::now();
-        
+
         for (int i = 0; i < batch_size; ++i) {
-            auto t = task_with_await();
-            sched.spawn(t.release());
+            sched.go(taskdef);
         }
-        
+
         while (completed.load(std::memory_order_relaxed) < batch_size) {
             std::this_thread::sleep_for(microseconds(1));
         }
@@ -199,12 +204,11 @@ void benchmark_yield() {
             runtime::scheduler sched(1);  // Single worker thread
             sched.start();
             
-            std::atomic<int> completed{0};
-            std::atomic<int64_t> end_time_ns{0};  // Last task records end timestamp
-            
-            // Each vthread yields multiple times
-            auto yield_task = [&]() -> coro::task<void> {
-                for (int i = 0; i < yields_per_vthread; ++i) {
+            std::atomic<int> completed(0);
+            std::atomic<int64_t> end_time_ns(0);  // Last task records end timestamp
+
+            auto taskdef = [&completed, &end_time_ns, num_vthreads]() -> coro::task<void> {
+                for (int j = 0; j < yields_per_vthread; ++j) {
                     co_await time::yield();
                 }
                 // Last task to complete records the end timestamp
@@ -215,17 +219,17 @@ void benchmark_yield() {
                 }
                 co_return;
             };
-            
+
+
             // Capture start time in main thread
             auto start_time_ns = duration_cast<nanoseconds>(
                 steady_clock::now().time_since_epoch()).count();
-            
+
             // Spawn all vthreads
             for (int i = 0; i < num_vthreads; ++i) {
-                auto t = yield_task();
-                sched.spawn(t.release());
+                sched.go(taskdef);
             }
-            
+
             // Wait for end_time_ns to be set (spin-wait for accuracy)
             while (end_time_ns.load(std::memory_order_acquire) == 0) {
                 // Spin without yielding for accurate measurement
@@ -272,32 +276,31 @@ void benchmark_work_stealing() {
         runtime::scheduler sched(4);
         sched.start();
         
-        std::atomic<int> completed{0};
-        
+        std::atomic<int> completed(0);
+
         // Record initial per-worker task counts
         std::vector<size_t> initial_counts(4);
         for (size_t i = 0; i < 4; ++i) {
             initial_counts[i] = sched.worker_tasks_executed(i);
         }
-        
-        auto heavy_task = [&]() -> coro::task<void> {
+
+        auto taskdef = [&completed]() -> coro::task<void> {
             volatile int sum = 0;
-            for (int i = 0; i < 10000; ++i) {
-                sum = sum + i * i;
+            for (int j = 0; j < 10000; ++j) {
+                sum = sum + j * j;
             }
             (void)sum;
             completed.fetch_add(1, std::memory_order_relaxed);
             co_return;
         };
-        
+
         auto batch_start = high_resolution_clock::now();
-        
+
         // Spawn ALL tasks to worker 0 to test work stealing
         for (int i = 0; i < batch_size; ++i) {
-            auto t = heavy_task();
-            sched.spawn_to(0, t.release());
+            sched.go_to(0, taskdef);
         }
-        
+
         while (completed.load(std::memory_order_relaxed) < batch_size) {
             std::this_thread::sleep_for(microseconds(1));
         }
@@ -364,13 +367,13 @@ void benchmark_scalability() {
             runtime::scheduler sched(num_threads);
             sched.start();
 
-            std::atomic<int> completed{0};
+            std::atomic<int> completed(0);
 
-            auto task_func = [&]() -> coro::task<void> {
+            auto taskdef = [&completed]() -> coro::task<void> {
                 // Larger CPU-bound work to minimize scheduling overhead ratio
                 volatile int sum = 0;
-                for (int i = 0; i < work_iterations; ++i) {
-                    sum = sum + i * i;
+                for (int j = 0; j < work_iterations; ++j) {
+                    sum = sum + j * j;
                 }
                 (void)sum;
                 completed.fetch_add(1, std::memory_order_relaxed);
@@ -381,8 +384,7 @@ void benchmark_scalability() {
 
             // Distribute tasks evenly across workers for true parallel scaling test
             for (int i = 0; i < batch_size; ++i) {
-                auto t = task_func();
-                sched.spawn(t.release());  // Round-robin distribution
+                sched.go(taskdef);
             }
 
             while (completed.load(std::memory_order_relaxed) < batch_size) {

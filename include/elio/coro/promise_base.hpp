@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <limits>
 
+#include "vthread_stack.hpp"
+
 namespace elio::coro {
 
 /// Constant indicating no affinity (vthread can migrate freely)
@@ -94,12 +96,38 @@ public:
         , debug_id_(0)  // Lazy allocation - only allocated when id() is called
 #endif
         , affinity_(NO_AFFINITY)
+        , vstack_(current_frame_ ? current_frame_->vstack() : nullptr)
+        , owns_vstack_(false)
     {
         current_frame_ = this;
     }
 
     ~promise_base() noexcept {
         current_frame_ = parent_;
+        if (owns_vstack_) {
+            // Clear current_ before deleting vstack. When operator delete later
+            // calls tagged_dealloc() -> vthread_stack::deallocate(), it will find
+            // current_ is nullptr and correctly no-op (memory already freed by vstack).
+            auto* vs = vstack_.exchange(nullptr, std::memory_order_acq_rel);
+            if (vthread_stack::current() == vs) {
+                vthread_stack::set_current(nullptr);
+            }
+            delete vs;
+        }
+    }
+
+    /// Detach this frame from the current thread's frame chain.
+    /// Call this before spawning a coroutine to another thread to avoid
+    /// use-after-free when the original thread creates another coroutine.
+    void detach_from_parent() noexcept {
+        if (current_frame_ == this) {
+            // Set to nullptr instead of parent_ to avoid use-after-free.
+            // parent_ may have been spawned to another thread and destroyed.
+            current_frame_ = nullptr;
+        }
+        parent_ = nullptr;
+        // Ensure all writes before detach are visible to the thread that will execute this coroutine
+        std::atomic_thread_fence(std::memory_order_release);
     }
 
     promise_base(const promise_base&) = delete;
@@ -124,6 +152,10 @@ public:
 
     [[nodiscard]] static promise_base* current_frame() noexcept {
         return current_frame_;
+    }
+
+    static void set_current_frame(promise_base* frame) noexcept {
+        current_frame_ = frame;
     }
 
     // Debug accessors (available only when debug metadata is enabled)
@@ -172,17 +204,41 @@ public:
     // Affinity accessors
     /// Get the current thread affinity for this vthread
     /// @return Worker ID this vthread is bound to, or NO_AFFINITY if unbound
-    [[nodiscard]] size_t affinity() const noexcept { return affinity_; }
+    [[nodiscard]] size_t affinity() const noexcept { 
+        return affinity_.load(std::memory_order_acquire); 
+    }
 
     /// Set thread affinity for this vthread
     /// @param worker_id Worker ID to bind to, or NO_AFFINITY to clear
-    void set_affinity(size_t worker_id) noexcept { affinity_ = worker_id; }
+    void set_affinity(size_t worker_id) noexcept { 
+        affinity_.store(worker_id, std::memory_order_release); 
+    }
 
     /// Check if this vthread has affinity set
-    [[nodiscard]] bool has_affinity() const noexcept { return affinity_ != NO_AFFINITY; }
+    [[nodiscard]] bool has_affinity() const noexcept { 
+        return affinity_.load(std::memory_order_acquire) != NO_AFFINITY; 
+    }
 
     /// Clear thread affinity, allowing this vthread to migrate freely
-    void clear_affinity() noexcept { affinity_ = NO_AFFINITY; }
+    void clear_affinity() noexcept { 
+        affinity_.store(NO_AFFINITY, std::memory_order_release); 
+    }
+
+    // vthread_stack accessors
+    [[nodiscard]] vthread_stack* vstack() const noexcept { 
+        return vstack_.load(std::memory_order_acquire); 
+    }
+
+    void set_vstack(vthread_stack* vs) noexcept { 
+        vstack_.store(vs, std::memory_order_release); 
+    }
+
+    void set_vstack_owner(vthread_stack* vs) noexcept {
+        vstack_.store(vs, std::memory_order_release);
+        owns_vstack_ = true;
+    }
+
+    [[nodiscard]] bool owns_vstack() const noexcept { return owns_vstack_; }
 
 private:
     // Magic number at start for debugger validation
@@ -201,7 +257,12 @@ private:
 #endif
 
     // Thread affinity: NO_AFFINITY means can migrate freely
-    size_t affinity_;
+    // Must be atomic to avoid data races in work-stealing scenarios
+    std::atomic<size_t> affinity_;
+
+    // vthread_stack support
+    std::atomic<vthread_stack*> vstack_{nullptr};
+    bool owns_vstack_ = false;
 
     static inline thread_local promise_base* current_frame_ = nullptr;
 };

@@ -29,8 +29,7 @@ TEST_CASE("Dynamic thread pool growth under load", "[dynamic_threads]") {
     
     // Spawn initial batch
     for (int i = 0; i < 50; ++i) {
-        auto t = task_func();
-        sched.spawn(t.release());
+        sched.go(task_func);
     }
     
     std::this_thread::sleep_for(scaled_ms(100));
@@ -41,8 +40,7 @@ TEST_CASE("Dynamic thread pool growth under load", "[dynamic_threads]") {
     
     // Spawn more tasks
     for (int i = 50; i < num_tasks; ++i) {
-        auto t = task_func();
-        sched.spawn(t.release());
+        sched.go(task_func);
     }
     
     std::this_thread::sleep_for(scaled_ms(1000));
@@ -72,8 +70,7 @@ TEST_CASE("Dynamic thread pool shrink under load", "[dynamic_threads]") {
     
     // Spawn initial batch
     for (int i = 0; i < 50; ++i) {
-        auto t = task_func();
-        sched.spawn(t.release());
+        sched.go(task_func);
     }
     
     std::this_thread::sleep_for(scaled_ms(100));
@@ -84,8 +81,7 @@ TEST_CASE("Dynamic thread pool shrink under load", "[dynamic_threads]") {
     
     // Spawn more tasks
     for (int i = 50; i < num_tasks; ++i) {
-        auto t = task_func();
-        sched.spawn(t.release());
+        sched.go(task_func);
     }
     
     std::this_thread::sleep_for(scaled_ms(1000));
@@ -114,8 +110,7 @@ TEST_CASE("Multiple thread pool adjustments", "[dynamic_threads]") {
     
     // Start with 2 threads
     for (int i = 0; i < 20; ++i) {
-        auto t = task_func();
-        sched.spawn(t.release());
+        sched.go(task_func);
     }
     
     std::this_thread::sleep_for(scaled_ms(50));
@@ -125,8 +120,7 @@ TEST_CASE("Multiple thread pool adjustments", "[dynamic_threads]") {
     REQUIRE(sched.num_threads() == 4);
     
     for (int i = 0; i < 20; ++i) {
-        auto t = task_func();
-        sched.spawn(t.release());
+        sched.go(task_func);
     }
     
     std::this_thread::sleep_for(scaled_ms(50));
@@ -136,8 +130,7 @@ TEST_CASE("Multiple thread pool adjustments", "[dynamic_threads]") {
     REQUIRE(sched.num_threads() == 8);
     
     for (int i = 0; i < 20; ++i) {
-        auto t = task_func();
-        sched.spawn(t.release());
+        sched.go(task_func);
     }
     
     std::this_thread::sleep_for(scaled_ms(50));
@@ -147,8 +140,7 @@ TEST_CASE("Multiple thread pool adjustments", "[dynamic_threads]") {
     REQUIRE(sched.num_threads() == 4);
     
     for (int i = 0; i < 20; ++i) {
-        auto t = task_func();
-        sched.spawn(t.release());
+        sched.go(task_func);
     }
     
     std::this_thread::sleep_for(scaled_ms(50));
@@ -158,8 +150,7 @@ TEST_CASE("Multiple thread pool adjustments", "[dynamic_threads]") {
     REQUIRE(sched.num_threads() == 2);
     
     for (int i = 0; i < 20; ++i) {
-        auto t = task_func();
-        sched.spawn(t.release());
+        sched.go(task_func);
     }
     
     // Active wait for completion with timeout
@@ -191,8 +182,7 @@ TEST_CASE("Thread pool growth from 1 to many", "[dynamic_threads]") {
     
     // With 1 thread, tasks execute slowly
     for (int i = 0; i < 50; ++i) {
-        auto t = task_func();
-        sched.spawn(t.release());
+        sched.go(task_func);
     }
     
     std::this_thread::sleep_for(scaled_ms(100));
@@ -229,8 +219,7 @@ TEST_CASE("Thread pool maintains correctness during resize", "[dynamic_threads]"
     // Spawn tasks while resizing
     std::thread spawner([&]() {
         for (int i = 0; i < num_tasks; ++i) {
-            auto t = task_func();
-            sched.spawn(t.release());
+            sched.go(task_func);
             
             // Resize periodically
             if (i % 10 == 0) {
@@ -269,8 +258,7 @@ TEST_CASE("Thread pool resize to 0 treated as 1", "[dynamic_threads]") {
         co_return;
     };
     
-    auto t = task_func();
-    sched.spawn(t.release());
+    sched.go(task_func);
     
     std::this_thread::sleep_for(scaled_ms(100));
     
@@ -299,8 +287,7 @@ TEST_CASE("Rapid thread pool adjustments", "[dynamic_threads]") {
         
         // Spawn some tasks
         for (int i = 0; i < 10; ++i) {
-            auto t = task_func();
-            sched.spawn(t.release());
+            sched.go(task_func);
         }
         
         std::this_thread::sleep_for(scaled_ms(20));

@@ -9,6 +9,16 @@ using namespace elio::runtime;
 using namespace elio::coro;
 using namespace elio::test;
 
+// Helper to spawn a task to scheduler
+template<typename T>
+void spawn_task(scheduler& sched, task<T>& t) {
+    elio::coro::detail::heap_alloc_guard guard;
+    auto handle = elio::coro::detail::task_access::release(t);
+    auto* vstack = new elio::coro::vthread_stack();
+    handle.promise().set_vstack_owner(vstack);
+    sched.spawn(handle);
+}
+
 TEST_CASE("Scheduler construction", "[scheduler]") {
     scheduler sched(4);
     REQUIRE(sched.num_threads() == 4);
@@ -38,7 +48,7 @@ TEST_CASE("Scheduler spawn and execute simple coroutine", "[scheduler]") {
     };
     
     auto t = coro();
-    sched.spawn(t.release());  // Transfer ownership to scheduler
+    spawn_task(sched, t);  // Transfer ownership to scheduler
     
     // Wait for execution
     std::this_thread::sleep_for(scaled_ms(100));
@@ -78,7 +88,7 @@ TEST_CASE("Scheduler spawn multiple coroutines", "[scheduler]") {
     // Spawn many tasks - scheduler takes ownership via release()
     for (int i = 0; i < num_tasks; ++i) {
         auto t = coro();
-        sched.spawn(t.release());
+        spawn_task(sched, t);
     }
     
     // Active wait for completion with timeout
@@ -117,7 +127,7 @@ TEST_CASE("Scheduler work stealing occurs", "[scheduler]") {
     // Spawn many tasks quickly - scheduler takes ownership
     for (int i = 0; i < num_tasks; ++i) {
         auto t = coro();
-        sched.spawn(t.release());
+        spawn_task(sched, t);
     }
     
     // Wait for all to complete
@@ -151,7 +161,7 @@ TEST_CASE("Scheduler dynamic thread pool growth", "[scheduler]") {
     
     for (int i = 0; i < 50; ++i) {
         auto t = coro();
-        sched.spawn(t.release());
+        spawn_task(sched, t);
     }
     
     std::this_thread::sleep_for(scaled_ms(200));
@@ -179,7 +189,7 @@ TEST_CASE("Scheduler dynamic thread pool shrink", "[scheduler]") {
     
     for (int i = 0; i < 50; ++i) {
         auto t = coro();
-        sched.spawn(t.release());
+        spawn_task(sched, t);
     }
     
     std::this_thread::sleep_for(scaled_ms(200));
@@ -202,7 +212,7 @@ TEST_CASE("Scheduler statistics", "[scheduler]") {
     
     for (int i = 0; i < num_tasks; ++i) {
         auto t = coro();
-        sched.spawn(t.release());
+        spawn_task(sched, t);
     }
     
     std::this_thread::sleep_for(scaled_ms(200));
@@ -245,8 +255,8 @@ TEST_CASE("Scheduler handles spawn before start", "[scheduler]") {
     auto t = coro();
     
     // Should not crash, but task won't execute (scheduler not running)
-    // We still need to release() since spawn stores the handle
-    sched.spawn(t.release());
+    // We still need to spawn since it stores the handle
+    spawn_task(sched, t);
     
     // Now start - but the task was already queued
     sched.start();

@@ -51,7 +51,7 @@ int main() {
 
         // Submit heavy workload
         for (int i = 0; i < 2000; ++i) {
-            sched.spawn(workload_task(completed).release());
+            sched.go([&completed]() { return workload_task(completed); });
         }
 
         std::cout << "Phase 1: High load - expecting scale-up..." << std::endl;
@@ -80,7 +80,7 @@ int main() {
 
         // Submit even heavier workload
         for (int i = 0; i < 3000; ++i) {
-            sched.spawn(workload_task(completed2).release());
+            sched.go([&completed2]() { return workload_task(completed2); });
         }
 
         std::cout << "Phase 2: Higher load - expecting more scale-up..." << std::endl;

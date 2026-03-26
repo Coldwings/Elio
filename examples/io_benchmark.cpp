@@ -1,4 +1,5 @@
 #include <elio/runtime/scheduler.hpp>
+#include <elio/runtime/spawn.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/io/io_awaitables.hpp>
 #include <elio/log/macros.hpp>
@@ -48,7 +49,7 @@ void benchmark_file_io() {
     };
 
     auto start = high_resolution_clock::now();
-    io_task().go();
+    elio::go(io_task);
 
     while (completed.load(std::memory_order_acquire) == 0) {
         std::this_thread::sleep_for(microseconds(100));
@@ -104,7 +105,7 @@ void benchmark_concurrent_file_io() {
 
     auto start = high_resolution_clock::now();
     for (int i = 0; i < NUM_TASKS; ++i) {
-        io_task().go();
+        elio::go(io_task);
     }
 
     while (completed.load(std::memory_order_acquire) < NUM_TASKS) {

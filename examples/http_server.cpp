@@ -231,14 +231,14 @@ coro::task<int> async_main(int argc, char* argv[]) {
         try {
             auto tls_ctx = tls::tls_context::make_server(cert_file, key_file);
             ELIO_LOG_INFO("Starting HTTPS server on {}", bind_addr.to_string());
-            co_await elio::serve(srv, srv.listen_tls(bind_addr, tls_ctx, opts));
+            co_await elio::serve(srv, [&]() { return srv.listen_tls(bind_addr, tls_ctx, opts); });
         } catch (const std::exception& e) {
             ELIO_LOG_ERROR("Failed to start HTTPS server: {}", e.what());
             co_return 1;
         }
     } else {
         ELIO_LOG_INFO("Starting HTTP server on {}", bind_addr.to_string());
-        co_await elio::serve(srv, srv.listen(bind_addr, opts));
+        co_await elio::serve(srv, [&]() { return srv.listen(bind_addr, opts); });
     }
 
     co_return 0;

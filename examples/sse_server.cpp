@@ -129,8 +129,9 @@ public:
                 continue;
             }
 
-            auto handler = handle_connection(std::move(*stream_result));
-            sched->spawn(handler.release());
+            sched->go([this, stream = std::move(*stream_result)]() mutable {
+                return handle_connection(std::move(stream));
+            });
         }
     }
 
@@ -367,7 +368,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
 
     // Start server and wait for shutdown signal
     // elio::serve() handles signal waiting and graceful shutdown automatically
-    co_await elio::serve(srv, srv.listen(bind_addr));
+    co_await elio::serve(srv, [&]() { return srv.listen(bind_addr); });
 
     co_return 0;
 }

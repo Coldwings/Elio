@@ -33,8 +33,7 @@ TEST_CASE("Exception propagation through single level", "[exception]") {
         co_return;
     };
     
-    auto t = catcher();
-    sched.spawn(t.release());
+    sched.go(catcher);
     
     std::this_thread::sleep_for(scaled_ms(200));
     
@@ -79,8 +78,7 @@ TEST_CASE("Exception propagation through multiple levels", "[exception]") {
         co_return;
     };
     
-    auto t = level1();
-    sched.spawn(t.release());
+    sched.go(level1);
     
     std::this_thread::sleep_for(scaled_ms(300));
     
@@ -111,8 +109,7 @@ TEST_CASE("Exception propagation with void tasks", "[exception]") {
         co_return;
     };
     
-    auto t = catcher();
-    sched.spawn(t.release());
+    sched.go(catcher);
     
     std::this_thread::sleep_for(scaled_ms(200));
     
@@ -143,8 +140,7 @@ TEST_CASE("Multiple exceptions in different coroutines", "[exception]") {
     
     const int num_tasks = 10;
     for (int i = 0; i < num_tasks; ++i) {
-        auto t = catcher(i);
-        sched.spawn(t.release());
+        sched.go([&, i]() { return catcher(i); });
     }
     
     // Active wait for completion with timeout
@@ -193,8 +189,7 @@ TEST_CASE("Exception in middle of chain", "[exception]") {
         co_return;
     };
     
-    auto t = level1();
-    sched.spawn(t.release());
+    sched.go(level1);
     
     std::this_thread::sleep_for(scaled_ms(300));
     
@@ -232,8 +227,7 @@ TEST_CASE("Exception with custom exception type", "[exception]") {
         co_return;
     };
     
-    auto t = catcher();
-    sched.spawn(t.release());
+    sched.go(catcher);
     
     std::this_thread::sleep_for(scaled_ms(200));
     
@@ -251,8 +245,7 @@ TEST_CASE("Uncaught exception in coroutine", "[exception]") {
         co_return;
     };
     
-    auto t = thrower();
-    sched.spawn(t.release());
+    sched.go(thrower);
     
     // Should not crash the scheduler
     std::this_thread::sleep_for(scaled_ms(200));
@@ -291,8 +284,7 @@ TEST_CASE("Exception propagation preserves exception message", "[exception]") {
         co_return;
     };
     
-    auto t = level1();
-    sched.spawn(t.release());
+    sched.go(level1);
     
     std::this_thread::sleep_for(scaled_ms(300));
     

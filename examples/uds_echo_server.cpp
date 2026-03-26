@@ -126,8 +126,9 @@ task<void> server_main(const unix_address& addr, scheduler& sched) {
         
         // Spawn handler coroutine for this client
         int client_id = ++client_counter;
-        auto handler = handle_client(std::move(*stream_result), client_id);
-        sched.spawn(handler.release());
+        sched.go([stream = std::move(*stream_result), client_id]() mutable {
+            return handle_client(std::move(stream), client_id);
+        });
     }
     
     ELIO_LOG_INFO("Server shutting down...");
@@ -162,12 +163,10 @@ int main(int argc, char* argv[]) {
     sched.start();
     
     // Spawn signal handler coroutine
-    auto sig_handler = signal_handler_task();
-    sched.spawn(sig_handler.release());
+    sched.go(signal_handler_task);
     
     // Run server
-    auto server = server_main(addr, sched);
-    sched.spawn(server.release());
+    sched.go([&addr, &sched]() { return server_main(addr, sched); });
     
     // Wait until interrupted
     while (g_running) {

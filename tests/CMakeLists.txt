@@ -10,6 +10,7 @@ set(TEST_SOURCES
     test_main.cpp
     unit/test_logger.cpp
     unit/test_virtual_stack.cpp
+    unit/test_vthread_stack.cpp
     unit/test_task.cpp
     unit/test_awaitable_base.cpp
     unit/test_chase_lev_deque.cpp

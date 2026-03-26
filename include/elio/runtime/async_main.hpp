@@ -2,8 +2,10 @@
 
 #include "scheduler.hpp"
 #include <elio/coro/task.hpp>
+#include <elio/coro/vthread_stack.hpp>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -17,9 +19,14 @@ namespace elio::runtime {
 struct run_config {
     /// Number of worker threads (0 = hardware concurrency)
     size_t num_threads = 0;
+    /// Blocking thread pool size (0 = fallback to std::thread per task)
+    size_t blocking_threads = 4;
 };
 
 namespace detail {
+
+/// Type alias using definitions from scheduler.hpp
+template<typename T> using task_value_t = typename task_value<T>::type;
 
 /// Completion signal for async_main
 template<typename T>
@@ -84,15 +91,14 @@ struct completion_signal<void> {
 };
 
 /// Wrapper task that signals completion
-template<typename T>
-coro::task<void> completion_wrapper(coro::task<T> inner, completion_signal<T>* signal) {
+template<typename T, typename F>
+coro::task<void> completion_wrapper(F f, completion_signal<T>* signal) {
     try {
         if constexpr (std::is_void_v<T>) {
-            co_await std::move(inner);
+            co_await std::invoke(std::move(f));
             signal->set_result();
         } else {
-            T result = co_await std::move(inner);
-            signal->set_result(std::move(result));
+            signal->set_result(co_await std::invoke(std::move(f)));
         }
     } catch (...) {
         signal->set_exception(std::current_exception());
@@ -101,13 +107,13 @@ coro::task<void> completion_wrapper(coro::task<T> inner, completion_signal<T>* s
 
 } // namespace detail
 
-/// Run a coroutine task to completion and return its result
+/// Run a callable that returns a coroutine task to completion
 /// 
 /// This function creates a scheduler, runs the given task, waits for
 /// completion, and returns the result. It's the recommended way to
 /// run async code from a synchronous context (like main()).
 /// 
-/// @param task The coroutine task to run
+/// @param f The callable that returns a coroutine task
 /// @param config Configuration (threads)
 /// @return The result of the task
 /// 
@@ -119,27 +125,41 @@ coro::task<void> completion_wrapper(coro::task<T> inner, completion_signal<T>* s
 /// }
 /// 
 /// int main() {
-///     return elio::run(async_main());
+///     return elio::run(async_main);
 /// }
 /// @endcode
-template<typename T>
-T run(coro::task<T> task, const run_config& config = {}) {
+
+/// Overload 1: no-arg callable + optional config
+template<typename F>
+    requires (std::invocable<F> && detail::is_task_v<std::invoke_result_t<F>>)
+auto run(F&& f, const run_config& config = {})
+    -> detail::task_value_t<std::invoke_result_t<F>>
+{
+    using T = detail::task_value_t<std::invoke_result_t<F>>;
     detail::completion_signal<T> signal;
-    
+
     size_t threads = config.num_threads;
     if (threads == 0) {
         threads = std::thread::hardware_concurrency();
         if (threads == 0) threads = 1;
     }
-    
-    scheduler sched(threads);
+
+    scheduler sched(threads, wait_strategy::blocking(),
+                    config.blocking_threads);
     sched.start();
-    
-    // Create wrapper that signals completion
-    auto wrapper = detail::completion_wrapper(std::move(task), &signal);
-    sched.spawn(wrapper.release());
-    
-    // Wait for completion
+
+    // Wrap user function
+    auto bound = [&f]() { return std::invoke(std::forward<F>(f)); };
+
+    {
+        coro::detail::heap_alloc_guard guard;
+        auto wrapper = detail::completion_wrapper<T>(std::move(bound), &signal);
+        auto handle = coro::detail::task_access::release(wrapper);
+        auto* root_vstack = new coro::vthread_stack();
+        handle.promise().set_vstack_owner(root_vstack);
+        sched.spawn(handle);
+    }
+
     if constexpr (std::is_void_v<T>) {
         signal.wait();
         sched.shutdown();
@@ -150,10 +170,26 @@ T run(coro::task<T> task, const run_config& config = {}) {
     }
 }
 
-/// Run a coroutine task with specified number of threads
-template<typename T>
-T run(coro::task<T> task, size_t num_threads) {
-    return run(std::move(task), run_config{.num_threads = num_threads});
+/// Overload 2: (func, args...) with config first
+template<typename F, typename... Args>
+    requires (sizeof...(Args) > 0 && std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
+auto run(const run_config& config, F&& f, Args&&... args)
+    -> detail::task_value_t<std::invoke_result_t<F, Args...>>
+{
+    auto bound = [f = std::forward<F>(f),
+                  ...args = std::forward<Args>(args)]() mutable {
+        return std::invoke(std::move(f), std::move(args)...);
+    };
+    return run(std::move(bound), config);
+}
+
+/// Overload 3: (func, args...) without config
+template<typename F, typename Arg0, typename... Args>
+    requires (!std::is_same_v<std::decay_t<Arg0>, run_config> && std::invocable<F, Arg0, Args...> && detail::is_task_v<std::invoke_result_t<F, Arg0, Args...>>)
+auto run(F&& f, Arg0&& arg0, Args&&... args)
+    -> detail::task_value_t<std::invoke_result_t<F, Arg0, Args...>>
+{
+    return run(run_config{}, std::forward<F>(f), std::forward<Arg0>(arg0), std::forward<Args>(args)...);
 }
 
 } // namespace elio::runtime
@@ -188,7 +224,7 @@ using runtime::run_config;
 /// @endcode
 #define ELIO_ASYNC_MAIN(async_main_func) \
     int main(int argc, char* argv[]) { \
-        return elio::run(async_main_func(argc, argv)); \
+        return elio::run(async_main_func, argc, argv); \
     }
 
 /// Macro for async_main that returns void (exits with 0)
@@ -197,7 +233,7 @@ using runtime::run_config;
 ///   coro::task<void> async_main(int argc, char* argv[])
 #define ELIO_ASYNC_MAIN_VOID(async_main_func) \
     int main(int argc, char* argv[]) { \
-        elio::run(async_main_func(argc, argv)); \
+        elio::run(async_main_func, argc, argv); \
         return 0; \
     }
 
@@ -207,7 +243,7 @@ using runtime::run_config;
 ///   coro::task<int> async_main()
 #define ELIO_ASYNC_MAIN_NOARGS(async_main_func) \
     int main() { \
-        return elio::run(async_main_func()); \
+        return elio::run(async_main_func); \
     }
 
 /// Macro for async_main without arguments, returning void
@@ -216,6 +252,6 @@ using runtime::run_config;
 ///   coro::task<void> async_main()
 #define ELIO_ASYNC_MAIN_VOID_NOARGS(async_main_func) \
     int main() { \
-        elio::run(async_main_func()); \
+        elio::run(async_main_func); \
         return 0; \
     }

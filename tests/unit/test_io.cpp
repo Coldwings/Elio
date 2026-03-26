@@ -106,8 +106,7 @@ TEST_CASE("Pipe read/write with epoll", "[io][epoll][pipe]") {
         completed = true;
     };
     
-    auto t = read_coro();
-    sched.spawn(t.release());
+    sched.go(read_coro);
     
     // Wait for completion
     for (int i = 0; i < 100 && !completed; ++i) {
@@ -181,8 +180,7 @@ TEST_CASE("Socket pair with epoll", "[io][epoll][socket]") {
         completed = true;
     };
     
-    auto t = recv_coro();
-    sched.spawn(t.release());
+    sched.go(recv_coro);
     
     for (int i = 0; i < 100 && !completed; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -239,8 +237,7 @@ TEST_CASE("Cancel operation", "[io][epoll][cancel]") {
         completed = true;
     };
     
-    auto t = recv_coro();
-    sched.spawn(t.release());
+    sched.go(recv_coro);
     
     // Wait for coroutine to start
     for (int i = 0; i < 100 && !started; ++i) {
@@ -288,11 +285,8 @@ TEST_CASE("Multiple concurrent operations", "[io][epoll][concurrent]") {
         completed++;
     };
     
-    auto t1 = recv_coro1();
-    auto t2 = recv_coro2();
-    
-    sched.spawn(t1.release());
-    sched.spawn(t2.release());
+    sched.go(recv_coro1);
+    sched.go(recv_coro2);
     
     // Wait until both complete
     for (int i = 0; i < 100 && completed < 2; ++i) {
@@ -341,8 +335,7 @@ TEST_CASE("epoll_backend registers fd before data available", "[io][epoll][regis
         completed = true;
     };
     
-    auto t = recv_coro();
-    sched.spawn(t.release());
+    sched.go(recv_coro);
     
     // Wait for coroutine to start and register the operation
     for (int i = 0; i < 100 && !started; ++i) {
@@ -399,11 +392,8 @@ TEST_CASE("epoll_backend handles multiple pending ops on same fd", "[io][epoll][
         completed++;
     };
     
-    auto t1 = recv_coro1();
-    auto t2 = recv_coro2();
-    
-    sched.spawn(t1.release());
-    sched.spawn(t2.release());
+    sched.go(recv_coro1);
+    sched.go(recv_coro2);
     
     // Give operations time to be registered
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -452,8 +442,7 @@ TEST_CASE("epoll_backend write operation registration", "[io][epoll][write]") {
         completed = true;
     };
     
-    auto t = send_coro();
-    sched.spawn(t.release());
+    sched.go(send_coro);
     
     // Wait for completion
     for (int i = 0; i < 100 && !completed; ++i) {
@@ -577,8 +566,7 @@ TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
             co_return;
         };
         
-        auto t = accept_coro();
-        sched.spawn(t.release());
+        sched.go(accept_coro);
         
         // Wait for completion
         for (int i = 0; i < 200 && !accepted; ++i) {
@@ -626,11 +614,8 @@ TEST_CASE("UDS connect", "[uds][connect]") {
         co_return;
     };
 
-    auto accept_task = accept_coro();
-    auto connect_task = connect_coro();
-
-    sched.spawn(accept_task.release());
-    sched.spawn(connect_task.release());
+    sched.go(accept_coro);
+    sched.go(connect_coro);
 
     // Wait until both complete
     for (int i = 0; i < 200 && (!server_accepted || !client_connected); ++i) {
@@ -675,10 +660,8 @@ TEST_CASE("UDS stream read/write", "[uds][stream]") {
         co_return;
     };
     
-    auto accept_task = accept_coro();
-    auto connect_task = connect_coro();
-    sched.spawn(accept_task.release());
-    sched.spawn(connect_task.release());
+    sched.go(accept_coro);
+    sched.go(connect_coro);
     
     for (int i = 0; i < 200 && setup_complete < 2; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -706,10 +689,8 @@ TEST_CASE("UDS stream read/write", "[uds][stream]") {
             read_done = true;
         };
         
-        auto write_task = write_coro();
-        auto read_task = read_coro();
-        sched.spawn(write_task.release());
-        sched.spawn(read_task.release());
+        sched.go(write_coro);
+        sched.go(read_coro);
         
         for (int i = 0; i < 200 && (!write_done || !read_done); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -742,10 +723,8 @@ TEST_CASE("UDS stream read/write", "[uds][stream]") {
             read_done = true;
         };
         
-        auto write_task = write_coro();
-        auto read_task = read_coro();
-        sched.spawn(write_task.release());
-        sched.spawn(read_task.release());
+        sched.go(write_coro);
+        sched.go(read_coro);
         
         for (int i = 0; i < 200 && (!write_done || !read_done); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -818,16 +797,13 @@ TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
         co_return;
     };
     
-    auto a0 = accept0(); auto a1 = accept1(); auto a2 = accept2();
-    auto c0 = connect0(); auto c1 = connect1(); auto c2 = connect2();
-    
     // Start all coroutines
-    sched.spawn(a0.release());
-    sched.spawn(a1.release());
-    sched.spawn(a2.release());
-    sched.spawn(c0.release());
-    sched.spawn(c1.release());
-    sched.spawn(c2.release());
+    sched.go(accept0);
+    sched.go(accept1);
+    sched.go(accept2);
+    sched.go(connect0);
+    sched.go(connect1);
+    sched.go(connect2);
     
     // Wait until all connections are made
     for (int i = 0; i < 500 && (accepts_done < NUM_CLIENTS || connects_done < NUM_CLIENTS); ++i) {
@@ -887,10 +863,8 @@ TEST_CASE("UDS filesystem socket", "[uds][filesystem]") {
         co_return;
     };
     
-    auto accept_task = accept_coro();
-    auto connect_task = connect_coro();
-    sched.spawn(accept_task.release());
-    sched.spawn(connect_task.release());
+    sched.go(accept_coro);
+    sched.go(connect_coro);
     
     for (int i = 0; i < 200 && (!connected || !accepted); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -941,8 +915,7 @@ TEST_CASE("UDS echo test", "[uds][echo]") {
         server_done = true;
     };
     
-    auto server_task = server_coro();
-    sched.spawn(server_task.release());
+    sched.go(server_coro);
     
     // Client in a thread (to avoid coroutine complexity)
     std::thread client_thread([&]() {
@@ -1268,10 +1241,8 @@ TEST_CASE("TCP IPv6 listener and connect", "[tcp][ipv6][integration]") {
             co_return;
         };
         
-        auto accept_task = accept_coro();
-        auto connect_task = connect_coro();
-        sched.spawn(accept_task.release());
-        sched.spawn(connect_task.release());
+        sched.go(accept_coro);
+        sched.go(connect_coro);
         
         for (int i = 0; i < 200 && (!accepted || !connected); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1302,8 +1273,7 @@ TEST_CASE("TCP connect regression avoids double connect", "[tcp][connect][regres
 
     constexpr int kAttempts = 64;
     for (int i = 0; i < kAttempts; ++i) {
-        auto t = tcp_connect_regression_attempt(port, connected, failed, first_error);
-        sched.spawn(t.release());
+        sched.go([&]() { return tcp_connect_regression_attempt(port, connected, failed, first_error); });
     }
 
     for (int i = 0; i < 500 && (connected + failed) < kAttempts; ++i) {
@@ -1325,8 +1295,7 @@ TEST_CASE("explicit hostname resolution", "[tcp][address][dns]") {
         std::optional<socket_address> resolved;
         std::atomic<bool> done{false};
 
-        auto task = resolve_hostname_attempt("localhost", 80, resolved, done);
-        sched.spawn(task.release());
+        sched.go([&]() { return resolve_hostname_attempt("localhost", 80, resolved, done); });
 
         for (int i = 0; i < 200 && !done.load(std::memory_order_relaxed); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1360,11 +1329,9 @@ TEST_CASE("tcp_connect hostname resolution uses cache", "[tcp][connect][dns][cac
 
     auto stats_before = default_resolve_cache().stats();
 
-    auto accept_task = accept_n_connections(*listener, 2, accepted);
-    sched.spawn(accept_task.release());
+    sched.go([&]() { return accept_n_connections(*listener, 2, accepted); });
 
-    auto first_task = tcp_connect_hostname_attempt("localhost", port, connected, failed, first_error);
-    sched.spawn(first_task.release());
+    sched.go([&]() { return tcp_connect_hostname_attempt("localhost", port, connected, failed, first_error); });
 
     for (int i = 0; i < 300 && connected.load(std::memory_order_relaxed) < 1; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1372,8 +1339,7 @@ TEST_CASE("tcp_connect hostname resolution uses cache", "[tcp][connect][dns][cac
 
     auto stats_after_first = default_resolve_cache().stats();
 
-    auto second_task = tcp_connect_hostname_attempt("localhost", port, connected, failed, first_error);
-    sched.spawn(second_task.release());
+    sched.go([&]() { return tcp_connect_hostname_attempt("localhost", port, connected, failed, first_error); });
 
     for (int i = 0; i < 300 && (accepted.load(std::memory_order_relaxed) < 2
             || connected.load(std::memory_order_relaxed) < 2
@@ -1424,17 +1390,15 @@ TEST_CASE("resolve_options can disable cache", "[tcp][dns][cache][config]") {
     std::atomic<bool> done_first{false};
     std::atomic<bool> done_second{false};
 
-    auto first = resolve_all_attempt_with_options(
-        "localhost", 80, options, resolved_first, done_first);
-    sched.spawn(first.release());
+    sched.go([&]() { return resolve_all_attempt_with_options(
+        "localhost", 80, options, resolved_first, done_first); });
 
     for (int i = 0; i < 200 && !done_first.load(std::memory_order_relaxed); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    auto second = resolve_all_attempt_with_options(
-        "localhost", 80, options, resolved_second, done_second);
-    sched.spawn(second.release());
+    sched.go([&]() { return resolve_all_attempt_with_options(
+        "localhost", 80, options, resolved_second, done_second); });
 
     for (int i = 0; i < 200 && !done_second.load(std::memory_order_relaxed); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1469,17 +1433,15 @@ TEST_CASE("resolve_options can use custom cache instance", "[tcp][dns][cache][co
     std::atomic<bool> done_first{false};
     std::atomic<bool> done_second{false};
 
-    auto first = resolve_all_attempt_with_options(
-        "localhost", 80, options, resolved_first, done_first);
-    sched.spawn(first.release());
+    sched.go([&]() { return resolve_all_attempt_with_options(
+        "localhost", 80, options, resolved_first, done_first); });
 
     for (int i = 0; i < 200 && !done_first.load(std::memory_order_relaxed); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    auto second = resolve_all_attempt_with_options(
-        "localhost", 80, options, resolved_second, done_second);
-    sched.spawn(second.release());
+    sched.go([&]() { return resolve_all_attempt_with_options(
+        "localhost", 80, options, resolved_second, done_second); });
 
     for (int i = 0; i < 200 && !done_second.load(std::memory_order_relaxed); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1517,17 +1479,15 @@ TEST_CASE("resolve_options ttl controls cache expiry", "[tcp][dns][cache][config
     std::atomic<bool> done_first{false};
     std::atomic<bool> done_second{false};
 
-    auto first = resolve_all_attempt_with_options(
-        "localhost", 80, options, resolved_first, done_first);
-    sched.spawn(first.release());
+    sched.go([&]() { return resolve_all_attempt_with_options(
+        "localhost", 80, options, resolved_first, done_first); });
 
     for (int i = 0; i < 200 && !done_first.load(std::memory_order_relaxed); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    auto second = resolve_all_attempt_with_options(
-        "localhost", 80, options, resolved_second, done_second);
-    sched.spawn(second.release());
+    sched.go([&]() { return resolve_all_attempt_with_options(
+        "localhost", 80, options, resolved_second, done_second); });
 
     for (int i = 0; i < 200 && !done_second.load(std::memory_order_relaxed); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

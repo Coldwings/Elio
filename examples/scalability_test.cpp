@@ -52,8 +52,7 @@ int main() {
 
             // Distribute tasks evenly via spawn (round-robin)
             for (int i = 0; i < batch_size; ++i) {
-                auto t = task_func();
-                sched.spawn(t.release());
+                sched.go(task_func);
             }
 
             while (completed.load(std::memory_order_relaxed) < batch_size) {

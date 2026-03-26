@@ -270,8 +270,10 @@ int main(int argc, char* argv[]) {
             done = true;
         };
         
+        coro::detail::heap_alloc_guard guard;
         auto t = run();
-        sched.spawn(t.release());
+        auto handle = coro::detail::task_access::release(t);
+        sched.spawn(handle);
     } else if (mode == "--read") {
         std::vector<std::string> files;
         for (int i = 2; i < argc; ++i) {
@@ -283,8 +285,10 @@ int main(int argc, char* argv[]) {
             done = true;
         };
         
+        coro::detail::heap_alloc_guard guard;
         auto t = run();
-        sched.spawn(t.release());
+        auto handle = coro::detail::task_access::release(t);
+        sched.spawn(handle);
     } else if (argc >= 3) {
         // File copy mode
         std::string src = argv[1];
@@ -296,8 +300,10 @@ int main(int argc, char* argv[]) {
             done = true;
         };
         
+        coro::detail::heap_alloc_guard guard;
         auto t = run();
-        sched.spawn(t.release());
+        auto handle = coro::detail::task_access::release(t);
+        sched.spawn(handle);
     } else {
         std::cerr << "Invalid arguments" << std::endl;
         return 1;

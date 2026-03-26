@@ -268,8 +268,7 @@ task<void> run_demo(tcp_rpc_client::ptr client) {
             
             auto* sched = scheduler::current();
             if (sched) {
-                auto t = call_task();
-                sched->spawn(t.release());
+                sched->go(call_task);
             }
         }
         
@@ -369,8 +368,7 @@ int main(int argc, char* argv[]) {
     sched.start();
     
     // Run client
-    auto client = client_main(host, port);
-    sched.spawn(client.release());
+    sched.go([&]() { return client_main(host, port); });
     
     // Wait for completion
     std::this_thread::sleep_for(std::chrono::seconds(5));

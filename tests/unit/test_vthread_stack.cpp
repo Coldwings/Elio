@@ -196,18 +196,20 @@ TEST_CASE("nested co_await chain LIFO", "[vthread_stack]") {
 // elio::go(func) — no-argument function
 // ============================================================================
 
+namespace {
+task<void> simple_work(std::atomic<bool>* done) {
+    done->store(true);
+    co_return;
+}
+}
+
 TEST_CASE("elio::go() with no-arg function", "[vthread_stack][spawn]") {
     scheduler sched(2);
     sched.start();
     
     std::atomic<bool> done{false};
     
-    auto work = [&done]() -> task<void> {
-        done.store(true);
-        co_return;
-    };
-    
-    elio::go(work);
+    elio::go(simple_work, &done);
     
     // Wait for completion
     std::this_thread::sleep_for(scaled_ms(100));
@@ -247,20 +249,22 @@ TEST_CASE("elio::go() with arguments", "[vthread_stack][spawn]") {
 // elio::spawn(func) — returns join_handle
 // ============================================================================
 
+namespace {
+task<void> spawn_driver(std::atomic<bool>* completed) {
+    auto h = elio::spawn(compute, 21);
+    int result = co_await h;
+    REQUIRE(result == 42);
+    completed->store(true);
+}
+}
+
 TEST_CASE("elio::spawn() returns join_handle", "[vthread_stack][spawn]") {
     scheduler sched(2);
     sched.start();
     
     std::atomic<bool> completed{false};
     
-    auto driver = [&]() -> task<void> {
-        auto h = elio::spawn(compute, 21);
-        int result = co_await h;
-        REQUIRE(result == 42);
-        completed.store(true);
-    };
-    
-    elio::go(driver);
+    elio::go(spawn_driver, &completed);
     
     std::this_thread::sleep_for(scaled_ms(200));
     
@@ -277,6 +281,13 @@ namespace {
 task<int> add_values(int a, int b) {
     co_return a + b;
 }
+
+task<void> spawn_args_driver(std::atomic<bool>* completed) {
+    auto h = elio::spawn(add_values, 10, 20);
+    int result = co_await h;
+    REQUIRE(result == 30);
+    completed->store(true);
+}
 }
 
 TEST_CASE("elio::spawn() with arguments", "[vthread_stack][spawn]") {
@@ -285,14 +296,7 @@ TEST_CASE("elio::spawn() with arguments", "[vthread_stack][spawn]") {
     
     std::atomic<bool> completed{false};
     
-    auto driver = [&]() -> task<void> {
-        auto h = elio::spawn(add_values, 10, 20);
-        int result = co_await h;
-        REQUIRE(result == 30);
-        completed.store(true);
-    };
-    
-    elio::go(driver);
+    elio::go(spawn_args_driver, &completed);
     
     std::this_thread::sleep_for(scaled_ms(200));
     
@@ -305,18 +309,27 @@ TEST_CASE("elio::spawn() with arguments", "[vthread_stack][spawn]") {
 // ELIO_GO(expr) / ELIO_SPAWN(expr) macro forms
 // ============================================================================
 
+namespace {
+task<void> macro_work(std::atomic<bool>* done) {
+    done->store(true);
+    co_return;
+}
+
+task<void> macro_spawn_driver(std::atomic<bool>* completed) {
+    auto h = ELIO_SPAWN(compute(21));
+    int result = co_await h;
+    REQUIRE(result == 42);
+    completed->store(true);
+}
+}
+
 TEST_CASE("ELIO_GO macro", "[vthread_stack][spawn]") {
     scheduler sched(2);
     sched.start();
     
     std::atomic<bool> done{false};
     
-    auto work = [&done]() -> task<void> {
-        done.store(true);
-        co_return;
-    };
-    
-    ELIO_GO(work());
+    ELIO_GO(macro_work(&done));
     
     std::this_thread::sleep_for(scaled_ms(100));
     
@@ -331,14 +344,7 @@ TEST_CASE("ELIO_SPAWN macro", "[vthread_stack][spawn]") {
     
     std::atomic<bool> completed{false};
     
-    auto driver = [&]() -> task<void> {
-        auto h = ELIO_SPAWN(compute(21));
-        int result = co_await h;
-        REQUIRE(result == 42);
-        completed.store(true);
-    };
-    
-    elio::go(driver);
+    elio::go(macro_spawn_driver, &completed);
     
     std::this_thread::sleep_for(scaled_ms(200));
     
@@ -351,24 +357,26 @@ TEST_CASE("ELIO_SPAWN macro", "[vthread_stack][spawn]") {
 // elio::run(func) — entry execution
 // ============================================================================
 
+namespace {
+task<int> run_return_42() {
+    co_return 42;
+}
+
+task<void> run_set_flag(std::atomic<bool>* executed) {
+    executed->store(true);
+    co_return;
+}
+}
+
 TEST_CASE("elio::run() executes task to completion", "[vthread_stack]") {
-    auto main_task = []() -> task<int> {
-        co_return 42;
-    };
-    
-    int result = elio::run(main_task);
+    int result = elio::run(run_return_42);
     REQUIRE(result == 42);
 }
 
 TEST_CASE("elio::run() with void task", "[vthread_stack]") {
     std::atomic<bool> executed{false};
     
-    auto main_task = [&executed]() -> task<void> {
-        executed.store(true);
-        co_return;
-    };
-    
-    elio::run(main_task);
+    elio::run(run_set_flag, &executed);
     REQUIRE(executed.load());
 }
 
@@ -376,21 +384,23 @@ TEST_CASE("elio::run() with void task", "[vthread_stack]") {
 // Mixed scenario: elio::go + internal co_await chain
 // ============================================================================
 
+namespace {
+task<void> complex_chain_task(std::atomic<int>* final_result) {
+    // Multi-level co_await chain inside a go'd task
+    int r1 = co_await level1();  // Returns 3
+    int r2 = co_await compute(r1);  // 3 * 2 = 6
+    int r3 = co_await add_values(r2, 4);  // 6 + 4 = 10
+    final_result->store(r3);
+}
+}
+
 TEST_CASE("elio::go with internal co_await chain", "[vthread_stack][spawn]") {
     scheduler sched(2);
     sched.start();
     
     std::atomic<int> final_result{0};
     
-    auto complex_task = [&]() -> task<void> {
-        // Multi-level co_await chain inside a go'd task
-        int r1 = co_await level1();  // Returns 3
-        int r2 = co_await compute(r1);  // 3 * 2 = 6
-        int r3 = co_await add_values(r2, 4);  // 6 + 4 = 10
-        final_result.store(r3);
-    };
-    
-    elio::go(complex_task);
+    elio::go(complex_chain_task, &final_result);
     
     std::this_thread::sleep_for(scaled_ms(200));
     
@@ -403,52 +413,58 @@ TEST_CASE("elio::go with internal co_await chain", "[vthread_stack][spawn]") {
 // Independent vstack isolation verification
 // ============================================================================
 
+namespace {
+struct VstackTestState {
+    std::atomic<int> unique_vstacks{0};
+    std::atomic<int> completed{0};
+    std::vector<vthread_stack*> observed_vstacks;
+    std::mutex vstacks_mutex;
+};
+
+task<void> vstack_worker(VstackTestState* state) {
+    auto* my_vstack = vthread_stack::current();
+    
+    {
+        std::lock_guard<std::mutex> lock(state->vstacks_mutex);
+        // Check if this vstack was seen before
+        bool is_unique = true;
+        for (auto* vs : state->observed_vstacks) {
+            if (vs == my_vstack) {
+                is_unique = false;
+                break;
+            }
+        }
+        if (is_unique && my_vstack != nullptr) {
+            state->observed_vstacks.push_back(my_vstack);
+            state->unique_vstacks.fetch_add(1);
+        }
+    }
+    
+    state->completed.fetch_add(1);
+    co_return;
+}
+}
+
 TEST_CASE("independent vstack isolation between spawned coroutines", "[vthread_stack][spawn]") {
     scheduler sched(4);
     sched.start();
     
     // Each spawned coroutine should have its own vstack
-    std::atomic<int> unique_vstacks{0};
-    std::atomic<int> completed{0};
-    std::vector<vthread_stack*> observed_vstacks;
-    std::mutex vstacks_mutex;
-    
-    auto worker = [&]([[maybe_unused]] int id) -> task<void> {
-        auto* my_vstack = vthread_stack::current();
-        
-        {
-            std::lock_guard<std::mutex> lock(vstacks_mutex);
-            // Check if this vstack was seen before
-            bool is_unique = true;
-            for (auto* vs : observed_vstacks) {
-                if (vs == my_vstack) {
-                    is_unique = false;
-                    break;
-                }
-            }
-            if (is_unique && my_vstack != nullptr) {
-                observed_vstacks.push_back(my_vstack);
-                unique_vstacks.fetch_add(1);
-            }
-        }
-        
-        completed.fetch_add(1);
-        co_return;
-    };
+    VstackTestState state;
     
     // Spawn multiple tasks
     constexpr int num_tasks = 10;
     for (int i = 0; i < num_tasks; ++i) {
-        elio::go([&worker, i]() { return worker(i); });
+        elio::go(vstack_worker, &state);
     }
     
     // Wait for all to complete
-    while (completed.load() < num_tasks) {
+    while (state.completed.load() < num_tasks) {
         std::this_thread::sleep_for(scaled_ms(10));
     }
     
     // Each task should have had a unique vstack
-    REQUIRE(unique_vstacks.load() == num_tasks);
+    REQUIRE(state.unique_vstacks.load() == num_tasks);
     
     sched.shutdown();
 }
@@ -462,21 +478,31 @@ task<int> throwing_task() {
     throw std::runtime_error("test exception");
     co_return 0;
 }
+
+task<void> exception_test_task() {
+    bool caught = false;
+    try {
+        co_await throwing_task();
+    } catch (const std::runtime_error& e) {
+        REQUIRE(std::string(e.what()) == "test exception");
+        caught = true;
+    }
+    REQUIRE(caught);
+}
+
+task<void> exception_catcher(std::atomic<bool>* caught_exception) {
+    try {
+        auto h = elio::spawn(throwing_task);
+        co_await h;
+    } catch (const std::runtime_error& e) {
+        REQUIRE(std::string(e.what()) == "test exception");
+        caught_exception->store(true);
+    }
+}
 }
 
 TEST_CASE("exception propagation through co_await", "[vthread_stack]") {
-    auto test_task = []() -> task<void> {
-        bool caught = false;
-        try {
-            co_await throwing_task();
-        } catch (const std::runtime_error& e) {
-            REQUIRE(std::string(e.what()) == "test exception");
-            caught = true;
-        }
-        REQUIRE(caught);
-    };
-    
-    elio::run(test_task);
+    elio::run(exception_test_task);
 }
 
 TEST_CASE("exception propagation through spawn", "[vthread_stack][spawn]") {
@@ -485,17 +511,7 @@ TEST_CASE("exception propagation through spawn", "[vthread_stack][spawn]") {
     
     std::atomic<bool> caught_exception{false};
     
-    auto catcher = [&]() -> task<void> {
-        try {
-            auto h = elio::spawn(throwing_task);
-            co_await h;
-        } catch (const std::runtime_error& e) {
-            REQUIRE(std::string(e.what()) == "test exception");
-            caught_exception.store(true);
-        }
-    };
-    
-    elio::go(catcher);
+    elio::go(exception_catcher, &caught_exception);
     
     std::this_thread::sleep_for(scaled_ms(200));
     
@@ -531,13 +547,13 @@ task<int> deep_recursion(int depth) {
     }
     co_return co_await deep_recursion(depth - 1) + 1;
 }
+
+task<void> deep_test() {
+    int result = co_await deep_recursion(10);
+    REQUIRE(result == 11);  // 10 levels + 1 base
+}
 }
 
 TEST_CASE("deep nested co_await chain", "[vthread_stack]") {
-    auto test = []() -> task<void> {
-        int result = co_await deep_recursion(10);
-        REQUIRE(result == 11);  // 10 levels + 1 base
-    };
-    
-    elio::run(test);
+    elio::run(deep_test);
 }

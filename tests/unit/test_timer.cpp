@@ -17,14 +17,10 @@ auto get_handle(task<T>& t) {
     return elio::coro::detail::task_access::handle(t);
 }
 
-// Helper to spawn a task to scheduler
-template<typename T>
-void spawn_task(scheduler& sched, task<T>& t) {
-    elio::coro::detail::heap_alloc_guard guard;
-    auto handle = elio::coro::detail::task_access::release(t);
-    auto* vstack = new elio::coro::vthread_stack();
-    handle.promise().set_vstack_owner(vstack);
-    sched.spawn(handle);
+// Helper to spawn a task to scheduler using high-level API (fire-and-forget)
+template<typename F>
+void spawn_task(scheduler& sched, F&& f) {
+    sched.go(std::forward<F>(f));
 }
 
 TEST_CASE("sleep_for basic", "[time][sleep]") {
@@ -46,8 +42,7 @@ TEST_CASE("sleep_for basic", "[time][sleep]") {
     sched.start();
     
     {
-        auto t = sleep_task();
-        spawn_task(sched, t);  // Transfer ownership to scheduler
+        spawn_task(sched, sleep_task);  // Transfer ownership to scheduler
     }
     
     // Wait for completion
@@ -90,10 +85,8 @@ TEST_CASE("yield execution", "[time][yield]") {
     sched.start();
     
     {
-        auto t1 = yield_task();
-        auto t2 = yield_task();
-        spawn_task(sched, t1);
-        spawn_task(sched, t2);
+        spawn_task(sched, yield_task);
+        spawn_task(sched, yield_task);
     }
     
     // Wait for completion
@@ -129,8 +122,7 @@ TEST_CASE("multiple sleeps sequential", "[time][sleep]") {
     sched.start();
     
     {
-        auto t = multi_sleep();
-        spawn_task(sched, t);
+        spawn_task(sched, multi_sleep);
     }
     
     for (int i = 0; i < 100 && !completed; ++i) {
@@ -160,8 +152,7 @@ TEST_CASE("sleep_until", "[time][sleep]") {
     sched.start();
     
     {
-        auto t = sleep_until_task();
-        spawn_task(sched, t);
+        spawn_task(sched, sleep_until_task);
     }
     
     for (int i = 0; i < 100 && !completed; ++i) {
@@ -204,8 +195,7 @@ TEST_CASE("cancellable sleep - normal completion", "[time][sleep][cancel]") {
     sched.start();
     
     {
-        auto t = sleep_task();
-        spawn_task(sched, t);
+        spawn_task(sched, sleep_task);
     }
     
     // Wait for completion without cancelling
@@ -241,8 +231,7 @@ TEST_CASE("cancellable sleep - cancelled early", "[time][sleep][cancel]") {
     sched.start();
     
     {
-        auto t = sleep_task();
-        spawn_task(sched, t);
+        spawn_task(sched, sleep_task);
     }
     
     // Wait a bit then cancel
@@ -283,8 +272,7 @@ TEST_CASE("cancellable sleep - already cancelled token", "[time][sleep][cancel]"
     sched.start();
     
     {
-        auto t = sleep_task();
-        spawn_task(sched, t);
+        spawn_task(sched, sleep_task);
     }
     
     // Wait for completion

@@ -36,7 +36,15 @@ struct final_awaiter {
             return continuation;
         } else if (h.promise().detached_) {
             // Detached task with no continuation - self-destruct
+            // IMPORTANT: If this coroutine owns its vstack, we must release ownership
+            // BEFORE destroying the coroutine frame, because the frame itself is allocated
+            // on the vstack. Destroying the frame triggers ~promise_base() which would
+            // delete the vstack, causing the frame (and its members) to become invalid
+            // while still being accessed.
+            auto* vstack_to_delete = h.promise().release_vstack_ownership();
             h.destroy();
+            // Now safe to delete vstack - the coroutine frame is fully destroyed
+            delete vstack_to_delete;
             return std::noop_coroutine();
         } else {
             // Owned task with no continuation - stay suspended for owner to destroy
@@ -46,38 +54,6 @@ struct final_awaiter {
     
     void await_resume() const noexcept {}
 };
-
-// Allocation modes
-enum class alloc_mode : uint8_t { stack = 0, heap = 1 };
-inline thread_local alloc_mode current_alloc_mode_ = alloc_mode::stack;
-
-// RAII guard: temporarily switch to heap allocation
-struct heap_alloc_guard {
-    heap_alloc_guard() noexcept { current_alloc_mode_ = alloc_mode::heap; }
-    ~heap_alloc_guard() noexcept { current_alloc_mode_ = alloc_mode::stack; }
-    heap_alloc_guard(const heap_alloc_guard&) = delete;
-    heap_alloc_guard& operator=(const heap_alloc_guard&) = delete;
-};
-
-// Tagged allocation
-static constexpr size_t TAG_OFFSET = alignof(std::max_align_t);
-
-inline void* tagged_alloc(size_t size, alloc_mode tag) {
-    void* raw = (tag == alloc_mode::heap)
-        ? ::operator new(size + TAG_OFFSET)
-        : vthread_stack::allocate(size + TAG_OFFSET);
-    *static_cast<alloc_mode*>(raw) = tag;
-    return static_cast<char*>(raw) + TAG_OFFSET;
-}
-
-inline void tagged_dealloc(void* ptr, size_t size) noexcept {
-    void* raw = static_cast<char*>(ptr) - TAG_OFFSET;
-    auto tag = *static_cast<alloc_mode*>(raw);
-    if (tag == alloc_mode::heap)
-        ::operator delete(raw);
-    else
-        vthread_stack::deallocate(raw, size + TAG_OFFSET);
-}
 
 // Friend accessor: extract handle from immovable task<T>
 struct task_access {
@@ -299,10 +275,10 @@ public:
         std::shared_ptr<detail::join_state<T>> join_state_;
 
         void* operator new(size_t size) {
-            return detail::tagged_alloc(size, detail::current_alloc_mode_);
+            return vthread_stack::allocate(size);
         }
         void operator delete(void* ptr, size_t size) noexcept {
-            detail::tagged_dealloc(ptr, size);
+            vthread_stack::deallocate(ptr, size);
         }
 
         [[nodiscard]] task get_return_object() noexcept {
@@ -364,10 +340,10 @@ public:
         std::shared_ptr<detail::join_state<void>> join_state_;
 
         void* operator new(size_t size) {
-            return detail::tagged_alloc(size, detail::current_alloc_mode_);
+            return vthread_stack::allocate(size);
         }
         void operator delete(void* ptr, size_t size) noexcept {
-            detail::tagged_dealloc(ptr, size);
+            vthread_stack::deallocate(ptr, size);
         }
 
         [[nodiscard]] task get_return_object() noexcept {

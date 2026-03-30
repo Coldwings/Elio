@@ -152,10 +152,18 @@ auto run(F&& f, const run_config& config = {})
     auto bound = [&f]() { return std::invoke(std::forward<F>(f)); };
 
     {
-        coro::detail::heap_alloc_guard guard;
-        auto wrapper = detail::completion_wrapper<T>(std::move(bound), &signal);
-        auto handle = coro::detail::task_access::release(wrapper);
+        // Create root vthread_stack and set as current context
         auto* root_vstack = new coro::vthread_stack();
+        auto* old_vstack = coro::vthread_stack::current();
+        coro::vthread_stack::set_current(root_vstack);
+        
+        // Construct coroutine (will allocate from root_vstack)
+        auto wrapper = detail::completion_wrapper<T>(std::move(bound), &signal);
+        
+        // Restore previous context (likely nullptr)
+        coro::vthread_stack::set_current(old_vstack);
+        
+        auto handle = coro::detail::task_access::release(wrapper);
         handle.promise().set_vstack_owner(root_vstack);
         sched.spawn(handle);
     }

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <new>
 #include <cassert>
+#include <functional>
 
 // Sanitizer detection for vthread_stack
 #ifndef ELIO_SANITIZER_ACTIVE

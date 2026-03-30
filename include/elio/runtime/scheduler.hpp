@@ -6,6 +6,7 @@
 #include <elio/coro/frame.hpp>
 #include <elio/coro/vthread_stack.hpp>
 #include <elio/coro/task.hpp>
+#include <type_traits>
 #include <vector>
 #include <memory>
 #include <atomic>
@@ -25,6 +26,26 @@ namespace detail {
     template<typename T> struct is_task : std::false_type {};
     template<typename T> struct is_task<coro::task<T>> : std::true_type {};
     template<typename T> inline constexpr bool is_task_v = is_task<T>::value;
+
+    /// Wrapper coroutine for fire-and-forget (go/go_to).
+    /// Stores callable and args in its coroutine frame, ensuring lambda lifetime
+    /// safety even when temporary lambdas are passed.
+    ///
+    /// The inner coroutine's frame holds a reference to the lambda (via this pointer),
+    /// which remains valid because this wrapper's frame outlives the inner coroutine.
+    template<typename F, typename... Args>
+        requires (std::invocable<F, Args...> && is_task_v<std::invoke_result_t<F, Args...>>)
+    coro::task<void> callable_wrapper_void(F f, Args... args) {
+        co_await std::invoke(std::move(f), std::move(args)...);
+    }
+
+    /// Wrapper coroutine for joinable spawn (go_joinable).
+    /// Same lifetime safety as callable_wrapper_void, but preserves return value.
+    template<typename F, typename... Args>
+        requires (std::invocable<F, Args...> && is_task_v<std::invoke_result_t<F, Args...>>)
+    auto callable_wrapper(F f, Args... args) -> std::invoke_result_t<F, Args...> {
+        co_return co_await std::invoke(std::move(f), std::move(args)...);
+    }
 } // namespace detail
 
 /// Work-stealing scheduler for coroutines
@@ -133,15 +154,29 @@ public:
     /// High-level API: fire-and-forget, spawn to this scheduler
     /// @param f  Callable that returns a task<T>
     /// @param args  Arguments to forward to the callable
+    ///
+    /// Note: f and args are safely stored in a wrapper coroutine's frame,
+    /// so temporary lambdas with captures are safe to use.
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
     void go(F&& f, Args&&... args) {
-        coro::detail::heap_alloc_guard guard;
-        auto t = std::invoke(std::forward<F>(f), std::forward<Args>(args)...);
-        auto handle = coro::detail::task_access::release(t);
+        // Create independent vthread_stack for spawned coroutine
+        auto* new_vstack = new coro::vthread_stack();
+        
+        // Save current vstack context and switch to new one
+        auto* old_vstack = coro::vthread_stack::current();
+        coro::vthread_stack::set_current(new_vstack);
+        
+        // Create wrapper coroutine - f and args are stored in wrapper's frame
+        // This ensures lambda captures remain valid for the entire coroutine lifetime
+        auto wrapper = detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
+        
+        // Restore previous vstack context
+        coro::vthread_stack::set_current(old_vstack);
+        
+        auto handle = coro::detail::task_access::release(wrapper);
         handle.promise().detached_ = true;
-        auto* vstack = new coro::vthread_stack();
-        handle.promise().set_vstack_owner(vstack);
+        handle.promise().set_vstack_owner(new_vstack);
         // Detach from current thread's frame chain before spawning to another thread
         // to avoid use-after-free when this thread creates another coroutine.
         handle.promise().detach_from_parent();
@@ -152,15 +187,29 @@ public:
     /// @param worker_id  Target worker index
     /// @param f  Callable that returns a task<T>
     /// @param args  Arguments to forward to the callable
+    ///
+    /// Note: f and args are safely stored in a wrapper coroutine's frame,
+    /// so temporary lambdas with captures are safe to use.
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
     void go_to(size_t worker_id, F&& f, Args&&... args) {
-        coro::detail::heap_alloc_guard guard;
-        auto t = std::invoke(std::forward<F>(f), std::forward<Args>(args)...);
-        auto handle = coro::detail::task_access::release(t);
+        // Create independent vthread_stack for spawned coroutine
+        auto* new_vstack = new coro::vthread_stack();
+        
+        // Save current vstack context and switch to new one
+        auto* old_vstack = coro::vthread_stack::current();
+        coro::vthread_stack::set_current(new_vstack);
+        
+        // Create wrapper coroutine - f and args are stored in wrapper's frame
+        // This ensures lambda captures remain valid for the entire coroutine lifetime
+        auto wrapper = detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
+        
+        // Restore previous vstack context
+        coro::vthread_stack::set_current(old_vstack);
+        
+        auto handle = coro::detail::task_access::release(wrapper);
         handle.promise().detached_ = true;
-        auto* vstack = new coro::vthread_stack();
-        handle.promise().set_vstack_owner(vstack);
+        handle.promise().set_vstack_owner(new_vstack);
         // Detach from current thread's frame chain before spawning to another thread
         // to avoid use-after-free when this thread creates another coroutine.
         handle.promise().detach_from_parent();
@@ -171,19 +220,34 @@ public:
     /// @param f  Callable that returns a task<T>
     /// @param args  Arguments to forward to the callable
     /// @return join_handle<T> that can be awaited to get the result
+    ///
+    /// Note: f and args are safely stored in a wrapper coroutine's frame,
+    /// so temporary lambdas with captures are safe to use.
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
     auto go_joinable(F&& f, Args&&... args)
         -> coro::join_handle<detail::task_value_t<std::invoke_result_t<F, Args...>>>
     {
         using T = detail::task_value_t<std::invoke_result_t<F, Args...>>;
-        coro::detail::heap_alloc_guard guard;
-        auto t = std::invoke(std::forward<F>(f), std::forward<Args>(args)...);
-        auto handle = coro::detail::task_access::release(t);
+        
+        // Create independent vthread_stack for spawned coroutine
+        auto* new_vstack = new coro::vthread_stack();
+        
+        // Save current vstack context and switch to new one
+        auto* old_vstack = coro::vthread_stack::current();
+        coro::vthread_stack::set_current(new_vstack);
+        
+        // Create wrapper coroutine - f and args are stored in wrapper's frame
+        // This ensures lambda captures remain valid for the entire coroutine lifetime
+        auto wrapper = detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
+        
+        // Restore previous vstack context
+        coro::vthread_stack::set_current(old_vstack);
+        
+        auto handle = coro::detail::task_access::release(wrapper);
         auto state = std::make_shared<coro::detail::join_state<T>>();
         handle.promise().join_state_ = state;
-        auto* vstack = new coro::vthread_stack();
-        handle.promise().set_vstack_owner(vstack);
+        handle.promise().set_vstack_owner(new_vstack);
         // Detach from current thread's frame chain before spawning to another thread
         // to avoid use-after-free when this thread creates another coroutine.
         handle.promise().detach_from_parent();

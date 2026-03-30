@@ -10,7 +10,7 @@
 namespace elio {
 
 namespace detail {
-    // Type traits for task<T>
+    // Type traits for task<T> (shared with scheduler.hpp)
     template<typename T> struct task_value;
     template<typename T> struct task_value<coro::task<T>> { using type = T; };
     template<typename T> using task_value_t = typename task_value<T>::type;
@@ -35,17 +35,12 @@ namespace detail {
 template<typename F, typename... Args>
     requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
 void go(F&& f, Args&&... args) {
-    coro::detail::heap_alloc_guard guard;
-    auto t = std::invoke(std::forward<F>(f), std::forward<Args>(args)...);
-
-    auto handle = coro::detail::task_access::release(t);
-    handle.promise().detached_ = true;
-    auto* vstack = new coro::vthread_stack();
-    handle.promise().set_vstack_owner(vstack);
-    // Detach from current thread's frame chain before spawning to another thread
-    // to avoid use-after-free when this thread creates another coroutine.
-    handle.promise().detach_from_parent();
-    runtime::schedule_handle(handle);
+    auto* sched = runtime::scheduler::current();
+    if (sched && sched->is_running()) {
+        sched->go(std::forward<F>(f), std::forward<Args>(args)...);
+    }
+    // No running scheduler: task is not scheduled (programming error)
+    // The caller should ensure a scheduler is running before calling elio::go()
 }
 
 /// Spawn a coroutine and return a join_handle to await its result.
@@ -65,20 +60,13 @@ template<typename F, typename... Args>
 auto spawn(F&& f, Args&&... args)
     -> coro::join_handle<detail::task_value_t<std::invoke_result_t<F, Args...>>>
 {
+    auto* sched = runtime::scheduler::current();
+    if (sched && sched->is_running()) {
+        return sched->go_joinable(std::forward<F>(f), std::forward<Args>(args)...);
+    }
+    // No running scheduler: return empty join_handle (programming error)
     using T = detail::task_value_t<std::invoke_result_t<F, Args...>>;
-    coro::detail::heap_alloc_guard guard;
-    auto t = std::invoke(std::forward<F>(f), std::forward<Args>(args)...);
-
-    auto handle = coro::detail::task_access::release(t);
-    auto state = std::make_shared<coro::detail::join_state<T>>();
-    handle.promise().join_state_ = state;
-    auto* vstack = new coro::vthread_stack();
-    handle.promise().set_vstack_owner(vstack);
-    // Detach from current thread's frame chain before spawning to another thread
-    // to avoid use-after-free when this thread creates another coroutine.
-    handle.promise().detach_from_parent();
-    runtime::schedule_handle(handle);
-    return coro::join_handle<T>(std::move(state));
+    return coro::join_handle<T>{nullptr};
 }
 
 } // namespace elio

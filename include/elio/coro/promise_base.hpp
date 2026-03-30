@@ -96,7 +96,7 @@ public:
         , debug_id_(0)  // Lazy allocation - only allocated when id() is called
 #endif
         , affinity_(NO_AFFINITY)
-        , vstack_(current_frame_ ? current_frame_->vstack() : nullptr)
+        , vstack_(vthread_stack::current())  // Use current vstack from thread-local
         , owns_vstack_(false)
     {
         current_frame_ = this;
@@ -239,6 +239,21 @@ public:
     }
 
     [[nodiscard]] bool owns_vstack() const noexcept { return owns_vstack_; }
+
+    /// Release ownership of vstack without deleting it.
+    /// Returns the vstack pointer for caller to delete after coroutine frame is destroyed.
+    /// Used by final_awaiter to avoid use-after-free when self-destructing.
+    vthread_stack* release_vstack_ownership() noexcept {
+        if (owns_vstack_) {
+            owns_vstack_ = false;
+            auto* vs = vstack_.exchange(nullptr, std::memory_order_acq_rel);
+            if (vthread_stack::current() == vs) {
+                vthread_stack::set_current(nullptr);
+            }
+            return vs;
+        }
+        return nullptr;
+    }
 
 private:
     // Magic number at start for debugger validation

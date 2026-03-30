@@ -56,6 +56,64 @@ coro::task<int> compute_task(int value) {
     co_return value * 2;
 }
 
+// Standalone task functions to avoid lambda capture lifetime issues
+namespace {
+
+coro::task<void> spawn_overhead_task(std::atomic<int>* completed) {
+    completed->fetch_add(1, std::memory_order_release);
+    co_return;
+}
+
+constexpr int kAwaitsPerTask = 10;
+
+coro::task<void> context_switch_task(std::atomic<int>* completed) {
+    for (int j = 0; j < kAwaitsPerTask; ++j) {
+        int value = co_await compute_task(j);
+        (void)value;
+    }
+    completed->fetch_add(1, std::memory_order_relaxed);
+    co_return;
+}
+
+coro::task<void> yield_task(std::atomic<int>* completed, std::atomic<int64_t>* end_time_ns, 
+                            int num_vthreads, int yields_per_vthread) {
+    for (int j = 0; j < yields_per_vthread; ++j) {
+        co_await time::yield();
+    }
+    // Last task to complete records the end timestamp
+    if (completed->fetch_add(1, std::memory_order_acq_rel) == num_vthreads - 1) {
+        end_time_ns->store(
+            duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_release);
+    }
+    co_return;
+}
+
+coro::task<void> work_stealing_task(std::atomic<int>* completed) {
+    volatile int sum = 0;
+    for (int j = 0; j < 10000; ++j) {
+        sum = sum + j * j;
+    }
+    (void)sum;
+    completed->fetch_add(1, std::memory_order_relaxed);
+    co_return;
+}
+
+constexpr int kScalabilityWorkIterations = 100000;
+
+coro::task<void> scalability_task(std::atomic<int>* completed) {
+    // Larger CPU-bound work to minimize scheduling overhead ratio
+    volatile int sum = 0;
+    for (int j = 0; j < kScalabilityWorkIterations; ++j) {
+        sum = sum + j * j;
+    }
+    (void)sum;
+    completed->fetch_add(1, std::memory_order_relaxed);
+    co_return;
+}
+
+} // namespace
+
 // Time-based spawn overhead benchmark
 void benchmark_spawn_overhead() {
     const int batch_size = 10000;
@@ -75,13 +133,8 @@ void benchmark_spawn_overhead() {
 
         auto batch_start = high_resolution_clock::now();
 
-        auto taskdef = [&completed]() -> coro::task<void> {
-            completed.fetch_add(1, std::memory_order_release);
-            co_return;
-        };
-
         for (int i = 0; i < batch_size; ++i) {
-            sched.go(taskdef);
+            sched.go(spawn_overhead_task, &completed);
         }
 
         // Wait for all to complete
@@ -120,7 +173,6 @@ void benchmark_spawn_overhead() {
 // Time-based context switch benchmark
 void benchmark_context_switch() {
     const int batch_size = 5000;
-    const int awaits_per_task = 10;
     std::vector<double> samples;  // ns per switch for each batch
     size_t total_switches = 0;
     
@@ -135,19 +187,10 @@ void benchmark_context_switch() {
         
         std::atomic<int> completed(0);
 
-        auto taskdef = [&completed]() -> coro::task<void> {
-            for (int j = 0; j < awaits_per_task; ++j) {
-                int value = co_await compute_task(j);
-                (void)value;
-            }
-            completed.fetch_add(1, std::memory_order_relaxed);
-            co_return;
-        };
-
         auto batch_start = high_resolution_clock::now();
 
         for (int i = 0; i < batch_size; ++i) {
-            sched.go(taskdef);
+            sched.go(context_switch_task, &completed);
         }
 
         while (completed.load(std::memory_order_relaxed) < batch_size) {
@@ -157,7 +200,7 @@ void benchmark_context_switch() {
         auto batch_end = high_resolution_clock::now();
         auto batch_ns = duration_cast<nanoseconds>(batch_end - batch_start).count();
         
-        int batch_switches = batch_size * awaits_per_task;
+        int batch_switches = batch_size * kAwaitsPerTask;
         samples.push_back(static_cast<double>(batch_ns) / batch_switches);
         total_switches += batch_switches;
         
@@ -173,7 +216,7 @@ void benchmark_context_switch() {
     std::cout << "Context Switch Performance Results:" << std::endl;
     std::cout << "  Duration:       " << std::fixed << std::setprecision(2) << total_sec << " seconds" << std::endl;
     std::cout << "  Total switches: " << total_switches << std::endl;
-    std::cout << "  Batches:        " << samples.size() << " x " << (batch_size * awaits_per_task) << " switches" << std::endl;
+    std::cout << "  Batches:        " << samples.size() << " x " << (batch_size * kAwaitsPerTask) << " switches" << std::endl;
     std::cout << "  Average:        " << std::fixed << std::setprecision(2) << stats.avg << " ns/switch" << std::endl;
     std::cout << "  Min:            " << std::fixed << std::setprecision(2) << stats.min << " ns/switch" << std::endl;
     std::cout << "  Max:            " << std::fixed << std::setprecision(2) << stats.max << " ns/switch" << std::endl;
@@ -207,27 +250,13 @@ void benchmark_yield() {
             std::atomic<int> completed(0);
             std::atomic<int64_t> end_time_ns(0);  // Last task records end timestamp
 
-            auto taskdef = [&completed, &end_time_ns, num_vthreads]() -> coro::task<void> {
-                for (int j = 0; j < yields_per_vthread; ++j) {
-                    co_await time::yield();
-                }
-                // Last task to complete records the end timestamp
-                if (completed.fetch_add(1, std::memory_order_acq_rel) == num_vthreads - 1) {
-                    end_time_ns.store(
-                        duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count(),
-                        std::memory_order_release);
-                }
-                co_return;
-            };
-
-
             // Capture start time in main thread
             auto start_time_ns = duration_cast<nanoseconds>(
                 steady_clock::now().time_since_epoch()).count();
 
             // Spawn all vthreads
             for (int i = 0; i < num_vthreads; ++i) {
-                sched.go(taskdef);
+                sched.go(yield_task, &completed, &end_time_ns, num_vthreads, yields_per_vthread);
             }
 
             // Wait for end_time_ns to be set (spin-wait for accuracy)
@@ -284,21 +313,11 @@ void benchmark_work_stealing() {
             initial_counts[i] = sched.worker_tasks_executed(i);
         }
 
-        auto taskdef = [&completed]() -> coro::task<void> {
-            volatile int sum = 0;
-            for (int j = 0; j < 10000; ++j) {
-                sum = sum + j * j;
-            }
-            (void)sum;
-            completed.fetch_add(1, std::memory_order_relaxed);
-            co_return;
-        };
-
         auto batch_start = high_resolution_clock::now();
 
         // Spawn ALL tasks to worker 0 to test work stealing
         for (int i = 0; i < batch_size; ++i) {
-            sched.go_to(0, taskdef);
+            sched.go_to(0, work_stealing_task, &completed);
         }
 
         while (completed.load(std::memory_order_relaxed) < batch_size) {
@@ -352,7 +371,6 @@ void benchmark_scalability() {
     std::cout << std::endl;
 
     const int tasks_per_thread = 500;   // Tasks per worker thread
-    const int work_iterations = 100000; // More work per task to make CPU-bound
 
     for (size_t num_threads : {1, 2, 4, 8}) {
         std::vector<double> throughput_samples;
@@ -369,22 +387,11 @@ void benchmark_scalability() {
 
             std::atomic<int> completed(0);
 
-            auto taskdef = [&completed]() -> coro::task<void> {
-                // Larger CPU-bound work to minimize scheduling overhead ratio
-                volatile int sum = 0;
-                for (int j = 0; j < work_iterations; ++j) {
-                    sum = sum + j * j;
-                }
-                (void)sum;
-                completed.fetch_add(1, std::memory_order_relaxed);
-                co_return;
-            };
-
             auto batch_start = high_resolution_clock::now();
 
             // Distribute tasks evenly across workers for true parallel scaling test
             for (int i = 0; i < batch_size; ++i) {
-                sched.go(taskdef);
+                sched.go(scalability_task, &completed);
             }
 
             while (completed.load(std::memory_order_relaxed) < batch_size) {

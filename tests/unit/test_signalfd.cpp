@@ -14,14 +14,10 @@ using namespace elio::runtime;
 using namespace elio::io;
 using namespace std::chrono_literals;
 
-// Helper to spawn a task to scheduler
-template<typename T>
-void spawn_task(scheduler& sched, task<T>& t) {
-    elio::coro::detail::heap_alloc_guard guard;
-    auto handle = elio::coro::detail::task_access::release(t);
-    auto* vstack = new elio::coro::vthread_stack();
-    handle.promise().set_vstack_owner(vstack);
-    sched.spawn(handle);
+// Helper to spawn a task to scheduler using high-level API (fire-and-forget)
+template<typename F>
+void spawn_task(scheduler& sched, F&& f) {
+    sched.go(std::forward<F>(f));
 }
 
 TEST_CASE("signal_set basic operations", "[signal][signal_set]") {
@@ -222,8 +218,7 @@ TEST_CASE("signal_fd async wait", "[signal][signal_fd]") {
     sched.start();
     
     {
-        auto t = wait_task();
-        spawn_task(sched, t);
+        spawn_task(sched, wait_task);
     }
     
     // Give the coroutine time to start and enter wait
@@ -274,8 +269,7 @@ TEST_CASE("signal_fd multiple signals", "[signal][signal_fd]") {
     sched.start();
     
     {
-        auto t = wait_task();
-        spawn_task(sched, t);
+        spawn_task(sched, wait_task);
     }
     
     std::this_thread::sleep_for(50ms);
@@ -393,8 +387,7 @@ TEST_CASE("wait_signal convenience function", "[signal][wait_signal]") {
     sched.start();
     
     {
-        auto t = wait_task();
-        spawn_task(sched, t);
+        spawn_task(sched, wait_task);
     }
     
     std::this_thread::sleep_for(50ms);

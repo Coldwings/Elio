@@ -111,9 +111,9 @@ coro::task<void> parallel_requests() {
     h2_client client;
 
     // Spawn multiple requests concurrently
-    auto h1 = client.get("https://api.example.com/users/1").spawn();
-    auto h2 = client.get("https://api.example.com/users/2").spawn();
-    auto h3 = client.get("https://api.example.com/users/3").spawn();
+    auto h1 = elio::spawn([&]() { return client.get("https://api.example.com/users/1"); });
+    auto h2 = elio::spawn([&]() { return client.get("https://api.example.com/users/2"); });
+    auto h3 = elio::spawn([&]() { return client.get("https://api.example.com/users/3"); });
 
     // Wait for all responses
     auto r1 = co_await h1;

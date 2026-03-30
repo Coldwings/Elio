@@ -112,7 +112,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
     sigs.block_all_threads();
 
     // Spawn signal handler
-    signal_handler_task().go();
+    elio::go(signal_handler_task);
 
     auto listener = net::tcp_listener::bind(net::ipv4_address(8080));
     if (!listener) {
@@ -128,7 +128,9 @@ coro::task<int> async_main(int argc, char* argv[]) {
         auto stream = co_await listener->accept();
         if (!stream) continue;
 
-        handle_client(std::move(*stream), ++client_id).go();
+        elio::go([stream = std::move(*stream), id = ++client_id]() mutable {
+            return handle_client(std::move(stream), id);
+        });
     }
     co_return 0;
 }
@@ -185,7 +187,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
     sigs.block_all_threads();
 
     // Spawn signal handler
-    signal_handler_task().go();
+    elio::go(signal_handler_task);
 
     // Use filesystem socket
     net::unix_address addr("/tmp/echo.sock");
@@ -209,7 +211,9 @@ coro::task<int> async_main(int argc, char* argv[]) {
         auto stream = co_await listener->accept();
         if (!stream) continue;
 
-        handle_client(std::move(*stream), ++client_id).go();
+        elio::go([stream = std::move(*stream), id = ++client_id]() mutable {
+            return handle_client(std::move(stream), id);
+        });
     }
     co_return 0;
 }
@@ -433,7 +437,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
     // Spawn tasks and collect join handles to await results
     std::vector<coro::join_handle<int>> handles;
     for (int i = 0; i < 10; ++i) {
-        handles.push_back(compute(i, i + 1).spawn());
+        handles.push_back(elio::spawn(compute, i, i + 1));
     }
 
     // Await all results
@@ -445,7 +449,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
 
     // Fire-and-forget tasks (no result collection)
     for (int i = 0; i < 5; ++i) {
-        compute(i, i).go();
+        elio::go(compute, i, i);
     }
 
     co_await time::sleep_for(std::chrono::milliseconds(100));
@@ -495,7 +499,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
 
     // Spawn tasks with different affinities
     for (size_t i = 0; i < sched->num_threads(); ++i) {
-        pinned_worker(i).go();
+        elio::go(pinned_worker, i);
     }
 
     co_await time::sleep_for(std::chrono::milliseconds(100));
@@ -586,7 +590,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
     // Spawn multiple incrementers and collect handles
     std::vector<coro::join_handle<void>> handles;
     for (int i = 0; i < 4; ++i) {
-        handles.push_back(increment(i).spawn());
+        handles.push_back(elio::spawn(increment, i));
     }
 
     // Wait for all to finish

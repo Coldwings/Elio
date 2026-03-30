@@ -328,17 +328,27 @@ Elio provides flexible ways to spawn concurrent tasks:
 
 ```cpp
 // Fire-and-forget: spawn and don't wait for result
-some_task().go();
+elio::go(some_task);
+
+// With arguments
+elio::go(task_with_args, arg1, arg2);
+
+// Lambda with captures (safe - copied into coroutine frame)
+int value = 42;
+elio::go([value]() -> coro::task<void> {
+    // Use captured value safely
+    co_return;
+});
 
 // Joinable spawn: get a handle to await later
-auto handle = compute_value().spawn();
+auto handle = elio::spawn(compute_value);
 // ... do other work ...
 int result = co_await handle;  // Wait and get result
 
 // Multiple concurrent tasks
-auto h1 = task_a().spawn();
-auto h2 = task_b().spawn();
-auto h3 = task_c().spawn();
+auto h1 = elio::spawn(task_a);
+auto h2 = elio::spawn(task_b);
+auto h3 = elio::spawn(task_c);
 // All three run concurrently
 int a = co_await h1;
 int b = co_await h2;

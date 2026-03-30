@@ -169,7 +169,9 @@ coro::task<void> server_example() {
     while (true) {
         auto client = co_await listener->accept();
         if (client) {
-            handle_client(std::move(*client)).go();
+            elio::go([client = std::move(*client)]() mutable {
+                return handle_client(std::move(client));
+            });
         }
     }
 }

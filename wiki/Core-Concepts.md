@@ -129,9 +129,9 @@ sched.shutdown();
 
 Elio provides several ways to spawn concurrent tasks:
 
-#### Fire-and-Forget with `go()`
+#### Fire-and-Forget with `elio::go()`
 
-Use `go()` to spawn a task that runs independently:
+Use `elio::go()` to spawn a task that runs independently:
 
 ```cpp
 coro::task<void> background_work() {
@@ -141,16 +141,23 @@ coro::task<void> background_work() {
 
 coro::task<void> main_task() {
     // Spawn and continue immediately (don't wait)
-    background_work().go();
+    elio::go(background_work);
+    
+    // Lambda with captures is also safe
+    int value = 42;
+    elio::go([value]() -> coro::task<void> {
+        // 'value' is safely copied into the coroutine frame
+        co_return;
+    });
     
     // Continue with other work...
     co_return;
 }
 ```
 
-#### Joinable Tasks with `spawn()`
+#### Joinable Tasks with `elio::spawn()`
 
-Use `spawn()` to get a `join_handle` that lets you await the result later:
+Use `elio::spawn()` to get a `join_handle` that lets you await the result later:
 
 ```cpp
 coro::task<int> compute(int x) {
@@ -159,9 +166,9 @@ coro::task<int> compute(int x) {
 
 coro::task<void> parallel_example() {
     // Spawn multiple tasks concurrently
-    auto h1 = compute(10).spawn();
-    auto h2 = compute(20).spawn();
-    auto h3 = compute(30).spawn();
+    auto h1 = elio::spawn(compute, 10);
+    auto h2 = elio::spawn(compute, 20);
+    auto h3 = elio::spawn(compute, 30);
     
     // All three run in parallel
     // Now wait for results
@@ -180,7 +187,7 @@ You can check if a spawned task is done without blocking:
 
 ```cpp
 coro::task<void> poll_example() {
-    auto handle = slow_operation().spawn();
+    auto handle = elio::spawn(slow_operation);
     
     while (!handle.is_ready()) {
         // Do other work while waiting
@@ -549,7 +556,7 @@ coro::task<void> controller() {
     coro::cancel_source source;
     
     // Start work with a token
-    cancellable_work(source.get_token()).go();
+    elio::go(cancellable_work, source.get_token());
     
     // Wait some time
     co_await time::sleep_for(5s);

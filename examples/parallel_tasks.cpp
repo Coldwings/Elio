@@ -64,8 +64,7 @@ coro::task<int> async_main([[maybe_unused]] int argc, [[maybe_unused]] char* arg
     for (int i = 0; i < num_tasks; ++i) {
         // Vary work amount: some tasks do more work than others
         int work_amount = 10 + (i % 20);
-        auto t = worker_task(i, work_amount, completed);
-        sched->spawn(t.release());
+        sched->go([i, work_amount, &completed]() { return worker_task(i, work_amount, completed); });
     }
     
     // Monitor progress using yield

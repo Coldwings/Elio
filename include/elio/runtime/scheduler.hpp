@@ -1,16 +1,52 @@
 #pragma once
 
 #include "worker_thread.hpp"
+#include "blocking_pool.hpp"
 #include <elio/log/macros.hpp>
 #include <elio/coro/frame.hpp>
+#include <elio/coro/vthread_stack.hpp>
+#include <elio/coro/task.hpp>
+#include <type_traits>
 #include <vector>
 #include <memory>
 #include <atomic>
 #include <mutex>
 #include <coroutine>
 #include <thread>
+#include <functional>
 
 namespace elio::runtime {
+
+namespace detail {
+    // Type traits for task<T>
+    template<typename T> struct task_value;
+    template<typename T> struct task_value<coro::task<T>> { using type = T; };
+    template<typename T> using task_value_t = typename task_value<T>::type;
+
+    template<typename T> struct is_task : std::false_type {};
+    template<typename T> struct is_task<coro::task<T>> : std::true_type {};
+    template<typename T> inline constexpr bool is_task_v = is_task<T>::value;
+
+    /// Wrapper coroutine for fire-and-forget (go/go_to).
+    /// Stores callable and args in its coroutine frame, ensuring lambda lifetime
+    /// safety even when temporary lambdas are passed.
+    ///
+    /// The inner coroutine's frame holds a reference to the lambda (via this pointer),
+    /// which remains valid because this wrapper's frame outlives the inner coroutine.
+    template<typename F, typename... Args>
+        requires (std::invocable<F, Args...> && is_task_v<std::invoke_result_t<F, Args...>>)
+    coro::task<void> callable_wrapper_void(F f, Args... args) {
+        co_await std::invoke(std::move(f), std::move(args)...);
+    }
+
+    /// Wrapper coroutine for joinable spawn (go_joinable).
+    /// Same lifetime safety as callable_wrapper_void, but preserves return value.
+    template<typename F, typename... Args>
+        requires (std::invocable<F, Args...> && is_task_v<std::invoke_result_t<F, Args...>>)
+    auto callable_wrapper(F f, Args... args) -> std::invoke_result_t<F, Args...> {
+        co_return co_await std::invoke(std::move(f), std::move(args)...);
+    }
+} // namespace detail
 
 /// Work-stealing scheduler for coroutines
 class scheduler {
@@ -20,12 +56,14 @@ public:
     static constexpr size_t MAX_THREADS = 256;
 
     explicit scheduler(size_t num_threads = std::thread::hardware_concurrency(),
-                       wait_strategy strategy = wait_strategy::blocking())
+                       wait_strategy strategy = wait_strategy::blocking(),
+                       size_t blocking_threads = 4)
         : num_threads_(num_threads == 0 ? 1 : num_threads)
         , running_(false)
         , paused_(false)
         , spawn_index_(0)
-        , wait_strategy_(strategy) {
+        , wait_strategy_(strategy)
+        , blocking_pool_(std::make_unique<blocking_pool>(blocking_threads)) {
 
         size_t n = num_threads_.load(std::memory_order_relaxed);
         // Pre-reserve to MAX_THREADS to prevent reallocation during runtime
@@ -66,7 +104,12 @@ public:
             return;
         }
         
-        // First stop all workers (sets running_=false and joins threads)
+        // First shutdown blocking pool (before stopping workers)
+        if (blocking_pool_) {
+            blocking_pool_->shutdown();
+        }
+        
+        // Then stop all workers (sets running_=false and joins threads)
         for (auto& worker : workers_) {
             worker->stop();
         }
@@ -91,6 +134,12 @@ public:
             handle.destroy();
             return;
         }
+        // Detach from current thread's frame chain before spawning to another thread
+        // to avoid use-after-free when this thread creates another coroutine.
+        auto* promise = coro::get_promise_base(handle.address());
+        if (promise) {
+            promise->detach_from_parent();
+        }
         do_spawn(handle);
     }
     
@@ -102,11 +151,122 @@ public:
         spawn(std::forward<Task>(t).release());
     }
 
+    /// High-level API: fire-and-forget, spawn to this scheduler
+    /// @param f  Callable that returns a task<T>
+    /// @param args  Arguments to forward to the callable
+    ///
+    /// Note: f and args are safely stored in a wrapper coroutine's frame,
+    /// so temporary lambdas with captures are safe to use.
+    template<typename F, typename... Args>
+        requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
+    void go(F&& f, Args&&... args) {
+        // Create independent vthread_stack for spawned coroutine
+        auto* new_vstack = new coro::vthread_stack();
+        
+        // Save current vstack context and switch to new one
+        auto* old_vstack = coro::vthread_stack::current();
+        coro::vthread_stack::set_current(new_vstack);
+        
+        // Create wrapper coroutine - f and args are stored in wrapper's frame
+        // This ensures lambda captures remain valid for the entire coroutine lifetime
+        auto wrapper = detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
+        
+        // Restore previous vstack context
+        coro::vthread_stack::set_current(old_vstack);
+        
+        auto handle = coro::detail::task_access::release(wrapper);
+        handle.promise().detached_ = true;
+        handle.promise().set_vstack_owner(new_vstack);
+        // Detach from current thread's frame chain before spawning to another thread
+        // to avoid use-after-free when this thread creates another coroutine.
+        handle.promise().detach_from_parent();
+        do_spawn(handle);
+    }
+
+    /// High-level API: fire-and-forget, spawn to specific worker
+    /// @param worker_id  Target worker index
+    /// @param f  Callable that returns a task<T>
+    /// @param args  Arguments to forward to the callable
+    ///
+    /// Note: f and args are safely stored in a wrapper coroutine's frame,
+    /// so temporary lambdas with captures are safe to use.
+    template<typename F, typename... Args>
+        requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
+    void go_to(size_t worker_id, F&& f, Args&&... args) {
+        // Create independent vthread_stack for spawned coroutine
+        auto* new_vstack = new coro::vthread_stack();
+        
+        // Save current vstack context and switch to new one
+        auto* old_vstack = coro::vthread_stack::current();
+        coro::vthread_stack::set_current(new_vstack);
+        
+        // Create wrapper coroutine - f and args are stored in wrapper's frame
+        // This ensures lambda captures remain valid for the entire coroutine lifetime
+        auto wrapper = detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
+        
+        // Restore previous vstack context
+        coro::vthread_stack::set_current(old_vstack);
+        
+        auto handle = coro::detail::task_access::release(wrapper);
+        handle.promise().detached_ = true;
+        handle.promise().set_vstack_owner(new_vstack);
+        // Detach from current thread's frame chain before spawning to another thread
+        // to avoid use-after-free when this thread creates another coroutine.
+        handle.promise().detach_from_parent();
+        spawn_to(worker_id, handle);
+    }
+
+    /// High-level API: spawn + join, spawn to this scheduler
+    /// @param f  Callable that returns a task<T>
+    /// @param args  Arguments to forward to the callable
+    /// @return join_handle<T> that can be awaited to get the result
+    ///
+    /// Note: f and args are safely stored in a wrapper coroutine's frame,
+    /// so temporary lambdas with captures are safe to use.
+    template<typename F, typename... Args>
+        requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
+    auto go_joinable(F&& f, Args&&... args)
+        -> coro::join_handle<detail::task_value_t<std::invoke_result_t<F, Args...>>>
+    {
+        using T = detail::task_value_t<std::invoke_result_t<F, Args...>>;
+        
+        // Create independent vthread_stack for spawned coroutine
+        auto* new_vstack = new coro::vthread_stack();
+        
+        // Save current vstack context and switch to new one
+        auto* old_vstack = coro::vthread_stack::current();
+        coro::vthread_stack::set_current(new_vstack);
+        
+        // Create wrapper coroutine - f and args are stored in wrapper's frame
+        // This ensures lambda captures remain valid for the entire coroutine lifetime
+        auto wrapper = detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
+        
+        // Restore previous vstack context
+        coro::vthread_stack::set_current(old_vstack);
+        
+        auto handle = coro::detail::task_access::release(wrapper);
+        auto state = std::make_shared<coro::detail::join_state<T>>();
+        handle.promise().join_state_ = state;
+        handle.promise().set_vstack_owner(new_vstack);
+        // Detach from current thread's frame chain before spawning to another thread
+        // to avoid use-after-free when this thread creates another coroutine.
+        handle.promise().detach_from_parent();
+        do_spawn(handle);
+        return coro::join_handle<T>(std::move(state));
+    }
+
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return;
         if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
             handle.destroy();
             return;
+        }
+        
+        // Detach from current thread's frame chain before spawning to another thread
+        // to avoid use-after-free when this thread creates another coroutine.
+        auto* promise = coro::get_promise_base(handle.address());
+        if (promise) {
+            promise->detach_from_parent();
         }
         
         size_t n = num_threads_.load(std::memory_order_acquire);
@@ -214,6 +374,11 @@ public:
         return wait_strategy_;
     }
 
+    /// Get the blocking pool for spawn_blocking operations
+    [[nodiscard]] blocking_pool* get_blocking_pool() noexcept {
+        return blocking_pool_.get();
+    }
+
 private:
     void do_spawn(std::coroutine_handle<> handle) {
         // Release fence ensures all writes to the coroutine frame (including
@@ -276,6 +441,9 @@ private:
     alignas(64) mutable std::mutex workers_mutex_;
     wait_strategy wait_strategy_;
 
+    // Blocking pool for spawn_blocking operations
+    std::unique_ptr<blocking_pool> blocking_pool_;
+
     static inline thread_local scheduler* current_scheduler_ = nullptr;
 };
 
@@ -313,14 +481,15 @@ inline void worker_thread::stop() {
     if (thread_.joinable()) thread_.join();
 }
 
-/// Drain and destroy remaining tasks - only call after ALL workers have stopped
+/// Final cleanup for any orphaned tasks - only call after ALL workers have stopped.
+/// This is a safety net for edge cases where tasks might still exist after drain phase.
 inline void worker_thread::drain_remaining_tasks() noexcept {
     // First drain inbox to deque
     void* addr;
     while ((addr = inbox_->pop()) != nullptr) {
         queue_->push(addr);
     }
-    // Then destroy all tasks in the deque
+    // Destroy any remaining tasks (should be rare after drain phase in run())
     while ((addr = queue_->pop()) != nullptr) {
         auto handle = std::coroutine_handle<>::from_address(addr);
         if (handle) {
@@ -377,12 +546,25 @@ inline void worker_thread::run() {
         }
     }
     
+    // Drain phase: after running_ becomes false, continue executing all
+    // remaining tasks until both local queue and inbox are empty.
+    // This ensures shutdown() returns only when all submitted tasks have
+    // fully completed (including coroutine cleanup and lambda destruction).
+    while (true) {
+        drain_inbox();
+        void* addr = queue_->pop_local(false);  // No concurrent stealers, workers are stopping
+        if (!addr) break;
+        
+        auto handle = std::coroutine_handle<>::from_address(addr);
+        if (handle && !handle.done()) {
+            needs_sync_ = true;  // Conservatively ensure memory visibility for drained tasks
+            run_task(handle);
+        }
+    }
+    
     // Clear the references when done
     scheduler::current_scheduler_ = nullptr;
     current_worker_ = nullptr;
-    
-    // Note: Cleanup of remaining tasks is handled in stop() AFTER join
-    // to avoid race conditions with work stealing
 }
 
 inline std::coroutine_handle<> worker_thread::get_next_task() noexcept {
@@ -432,8 +614,20 @@ inline void worker_thread::run_task(std::coroutine_handle<> handle) noexcept {
     }
     
     if (!handle || handle.done()) [[unlikely]] return;
-    
+
+    // Context switch: set vstack and current_frame before resume, restore after
+    auto* promise = coro::get_promise_base(handle.address());
+    auto* prev_vstack = coro::vthread_stack::current();
+    auto* prev_frame = coro::promise_base::current_frame();
+    if (promise) {
+        coro::vthread_stack::set_current(promise->vstack());
+        coro::promise_base::set_current_frame(promise);
+    }
+
     handle.resume();
+
+    coro::vthread_stack::set_current(prev_vstack);
+    coro::promise_base::set_current_frame(prev_frame);
     tasks_executed_.fetch_add(1, std::memory_order_relaxed);
     update_last_task_time();
 

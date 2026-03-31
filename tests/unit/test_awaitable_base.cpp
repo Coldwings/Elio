@@ -5,6 +5,18 @@
 
 using namespace elio::coro;
 
+// Helper to access handle from task
+template<typename T>
+auto get_handle(task<T>& t) {
+    return elio::coro::detail::task_access::handle(t);
+}
+
+// Helper to access promise value from task
+template<typename T>
+auto& get_promise(task<T>& t) {
+    return get_handle(t).promise();
+}
+
 // Test awaitable that returns an int
 class test_awaitable : public awaitable_base<test_awaitable> {
 public:
@@ -68,7 +80,7 @@ TEST_CASE("awaitable_base forwards await_suspend", "[awaitable_base]") {
     };
     
     auto t = coro();
-    t.handle().resume();
+    get_handle(t).resume();
     
     REQUIRE(suspended == true);
 }
@@ -82,9 +94,9 @@ TEST_CASE("awaitable_base forwards await_resume with return value", "[awaitable_
     };
     
     auto t = coro();
-    t.handle().resume();
+    get_handle(t).resume();
     
-    REQUIRE(t.handle().promise().value_.value() == 123);
+    REQUIRE(get_promise(t).value_.value() == 123);
 }
 
 TEST_CASE("awaitable_base works with void return", "[awaitable_base]") {
@@ -96,9 +108,9 @@ TEST_CASE("awaitable_base works with void return", "[awaitable_base]") {
     };
     
     auto t = coro();
-    t.handle().resume();
+    get_handle(t).resume();
     
-    REQUIRE(t.handle().done());
+    REQUIRE(get_handle(t).done());
 }
 
 TEST_CASE("awaitable_base in nested coroutines", "[awaitable_base]") {
@@ -114,10 +126,10 @@ TEST_CASE("awaitable_base in nested coroutines", "[awaitable_base]") {
     };
     
     auto t = outer();
-    t.handle().resume();
+    get_handle(t).resume();
     
     // Should be (50 * 2) + 10 = 110
-    REQUIRE(t.handle().promise().value_.value() == 110);
+    REQUIRE(get_promise(t).value_.value() == 110);
 }
 
 // Test awaitable with symmetric transfer
@@ -150,7 +162,7 @@ TEST_CASE("awaitable_base supports symmetric transfer", "[awaitable_base]") {
     };
     
     auto t = coro();
-    t.handle().resume();
+    get_handle(t).resume();
     
-    REQUIRE(t.handle().promise().value_.value() == 999);
+    REQUIRE(get_promise(t).value_.value() == 999);
 }

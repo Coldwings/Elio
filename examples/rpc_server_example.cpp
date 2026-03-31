@@ -321,12 +321,10 @@ int main(int argc, char* argv[]) {
     sched.start();
     
     // Spawn signal handler coroutine
-    auto sig_handler = signal_handler_task();
-    sched.spawn(sig_handler.release());
+    sched.go(signal_handler_task);
     
     // Run server
-    auto server = server_main(port, sched);
-    sched.spawn(server.release());
+    sched.go([port, &sched]() { return server_main(port, sched); });
     
     // Wait for shutdown
     while (g_running) {

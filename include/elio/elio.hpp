@@ -18,6 +18,7 @@
 #include "coro/awaitable_base.hpp"
 #include "coro/frame.hpp"
 #include "coro/cancel_token.hpp"
+#include "coro/vthread_stack.hpp"
 
 // Runtime scheduler
 #include "runtime/scheduler.hpp"
@@ -26,6 +27,9 @@
 #include "runtime/async_main.hpp"
 #include "runtime/affinity.hpp"
 #include "runtime/serve.hpp"
+#include "runtime/spawn.hpp"
+#include "runtime/blocking_pool.hpp"
+#include "runtime/spawn_blocking.hpp"
 #include "runtime/autoscaler_config.hpp"
 #include "runtime/autoscaler_triggers.hpp"
 #include "runtime/autoscaler_actions.hpp"

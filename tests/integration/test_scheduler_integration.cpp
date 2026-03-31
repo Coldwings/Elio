@@ -33,8 +33,7 @@ TEST_CASE("Chained coroutines integration", "[integration]") {
         co_return;
     };
     
-    auto t = outer();
-    sched.spawn(t.release());
+    sched.go(outer);
     
     // Wait for completion
     std::this_thread::sleep_for(scaled_ms(200));
@@ -67,8 +66,7 @@ TEST_CASE("Deep coroutine chain", "[integration]") {
         co_return;
     };
     
-    auto t = level1();
-    sched.spawn(t.release());
+    sched.go(level1);
     
     std::this_thread::sleep_for(scaled_ms(300));
     
@@ -103,8 +101,7 @@ TEST_CASE("Parallel independent coroutines", "[integration]") {
     
     // Spawn all tasks
     for (int i = 0; i < num_tasks; ++i) {
-        auto t = task_func(i);
-        sched.spawn(t.release());
+        sched.go([&, i]() { return task_func(i); });
     }
     
     // Wait for all to complete
@@ -143,8 +140,7 @@ TEST_CASE("Mixed chain and parallel coroutines", "[integration]") {
         co_return;
     };
     
-    auto t = aggregator();
-    sched.spawn(t.release());
+    sched.go(aggregator);
     
     std::this_thread::sleep_for(scaled_ms(300));
     
@@ -179,8 +175,7 @@ TEST_CASE("Virtual stack tracking in scheduler", "[integration]") {
         co_return;
     };
     
-    auto t = outer();
-    sched.spawn(t.release());
+    sched.go(outer);
     
     std::this_thread::sleep_for(scaled_ms(200));
     
@@ -208,8 +203,7 @@ TEST_CASE("Scheduler load distribution", "[integration]") {
     
     // Spawn all tasks at once
     for (int i = 0; i < num_tasks; ++i) {
-        auto t = heavy_task();
-        sched.spawn(t.release());
+        sched.go(heavy_task);
     }
     
     // Wait for completion

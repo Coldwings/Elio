@@ -34,44 +34,110 @@ class task {
 public:
     using promise_type = /* implementation */;
     
-    task(task&& other) noexcept;
-    task& operator=(task&& other) noexcept;
+    // Non-copyable, non-movable (ensures LIFO destruction order)
+    task(const task&) = delete;
+    task& operator=(const task&) = delete;
+    task(task&&) = delete;
+    task& operator=(task&&) = delete;
     
-    // Get the coroutine handle (does not transfer ownership)
-    std::coroutine_handle<> handle() const noexcept;
+    ~task();  // Destroys the coroutine frame
     
-    // Release ownership of the coroutine handle (marks as detached)
-    std::coroutine_handle<> release() noexcept;
-    
-    // Spawn on current scheduler (fire-and-forget)
-    void go();
-    
-    // Spawn on current scheduler (joinable, returns handle to await)
-    join_handle<T> spawn();
-    
-    // Check if task holds a valid coroutine
-    explicit operator bool() const noexcept;
+    // Awaitable interface (use with co_await)
+    bool await_ready() const noexcept;
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept;
+    T await_resume();  // Returns result or rethrows exception
 };
 ```
 
-**Task Spawning Examples:**
+**Basic Usage:**
 ```cpp
-// Fire-and-forget: spawn and don't wait for result
-some_task().go();
+coro::task<int> compute() {
+    co_return 42;
+}
 
-// Joinable spawn: get a handle to await later
-auto handle = compute_value().spawn();
-// ... do other work concurrently ...
-int result = co_await handle;  // Wait and get result
+coro::task<void> example() {
+    int result = co_await compute();  // Direct await
+    std::cout << result << std::endl;
+}
+```
 
-// Multiple concurrent tasks
-auto h1 = task_a().spawn();
-auto h2 = task_b().spawn();
-auto h3 = task_c().spawn();
-// All three run concurrently
-int a = co_await h1;
-int b = co_await h2;
-int c = co_await h3;
+### Spawn Functions
+
+Elio provides free functions for spawning concurrent tasks with automatic lambda lifetime safety.
+
+#### `elio::go()` - Fire-and-Forget
+
+Spawn a coroutine without awaiting its result. The coroutine runs independently and self-destructs on completion.
+
+```cpp
+template<typename F, typename... Args>
+void go(F&& f, Args&&... args);
+```
+
+**Example:**
+```cpp
+coro::task<void> background_work(int x) {
+    // Do some work...
+    co_return;
+}
+
+coro::task<void> main_task() {
+    // Spawn and continue immediately (fire-and-forget)
+    elio::go(background_work, 42);
+    
+    // Lambda with captures is also safe
+    int value = 100;
+    elio::go([value]() -> coro::task<void> {
+        // 'value' is safely copied into the coroutine frame
+        co_return;
+    });
+    
+    co_return;
+}
+```
+
+#### `elio::spawn()` - Joinable
+
+Spawn a coroutine and return a `join_handle` to await the result later.
+
+```cpp
+template<typename F, typename... Args>
+auto spawn(F&& f, Args&&... args) -> coro::join_handle<T>;
+```
+
+**Example:**
+```cpp
+coro::task<int> compute(int x) {
+    co_return x * 2;
+}
+
+coro::task<void> parallel_example() {
+    // Spawn multiple tasks concurrently
+    auto h1 = elio::spawn(compute, 10);
+    auto h2 = elio::spawn(compute, 20);
+    auto h3 = elio::spawn(compute, 30);
+    
+    // All three run in parallel
+    // Now wait for results
+    int a = co_await h1;  // 20
+    int b = co_await h2;  // 40
+    int c = co_await h3;  // 60
+    
+    ELIO_LOG_INFO("Sum: {}", a + b + c);  // 120
+}
+```
+
+#### Spawn Macros
+
+For inline coroutine expressions:
+
+```cpp
+// Fire-and-forget macro
+ELIO_GO(some_async_operation());
+
+// Spawn macro returning join_handle
+auto h = ELIO_SPAWN(compute_async());
+auto result = co_await h;
 ```
 
 ### `join_handle<T>`
@@ -103,7 +169,7 @@ coro::task<int> compute() {
 
 coro::task<void> main_task() {
     // Spawn a joinable task
-    auto handle = compute().spawn();
+    auto handle = elio::spawn(compute);
     
     // Check completion without blocking
     if (!handle.is_ready()) {
@@ -186,7 +252,7 @@ task<void> controller() {
     cancel_source source;
     
     // Start work with token
-    cancellable_work(source.get_token()).go();
+    elio::go(cancellable_work, source.get_token());
     
     // Later, cancel
     co_await time::sleep_for(5s);

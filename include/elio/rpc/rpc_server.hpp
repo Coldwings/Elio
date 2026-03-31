@@ -445,8 +445,7 @@ public:
             // Spawn session handler
             auto* sched = runtime::scheduler::current();
             if (sched) {
-                auto task = run_session(session);
-                sched->spawn(task.release());
+                sched->go([this, s = session]() { return run_session(s); });
             }
         }
         
@@ -482,8 +481,7 @@ public:
             // Spawn session handler
             auto* sched = runtime::scheduler::current();
             if (sched) {
-                auto task = run_session(session);
-                sched->spawn(task.release());
+                sched->go([this, s = session]() { return run_session(s); });
             }
         }
         

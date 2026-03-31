@@ -9,6 +9,35 @@ using namespace elio::runtime;
 using namespace elio::coro;
 using namespace elio::test;
 
+// Standalone task functions to avoid lambda capture lifetime issues
+namespace {
+
+task<void> set_executed_task(std::atomic<bool>* executed) {
+    executed->store(true);
+    co_return;
+}
+
+task<void> increment_counter_task(std::atomic<int>* counter) {
+    counter->fetch_add(1);
+    co_return;
+}
+
+task<void> work_stealing_task(std::atomic<int>* counter) {
+    // Simulate some work
+    for (int i = 0; i < 1000; ++i) {
+        volatile int x = i * i;
+        (void)x;
+    }
+    counter->fetch_add(1);
+    co_return;
+}
+
+task<void> empty_task() {
+    co_return;
+}
+
+} // namespace
+
 TEST_CASE("Scheduler construction", "[scheduler]") {
     scheduler sched(4);
     REQUIRE(sched.num_threads() == 4);
@@ -32,13 +61,7 @@ TEST_CASE("Scheduler spawn and execute simple coroutine", "[scheduler]") {
     
     std::atomic<bool> executed{false};
     
-    auto coro = [&]() -> task<void> {
-        executed.store(true);
-        co_return;
-    };
-    
-    auto t = coro();
-    sched.spawn(t.release());  // Transfer ownership to scheduler
+    sched.go(set_executed_task, &executed);
     
     // Wait for execution
     std::this_thread::sleep_for(scaled_ms(100));
@@ -70,15 +93,9 @@ TEST_CASE("Scheduler spawn multiple coroutines", "[scheduler]") {
     const int num_tasks = 100;
     std::atomic<int> completed{0};
     
-    auto coro = [&]() -> task<void> {
-        completed.fetch_add(1);
-        co_return;
-    };
-    
-    // Spawn many tasks - scheduler takes ownership via release()
+    // Spawn many tasks using parameter passing
     for (int i = 0; i < num_tasks; ++i) {
-        auto t = coro();
-        sched.spawn(t.release());
+        sched.go(increment_counter_task, &completed);
     }
     
     // Active wait for completion with timeout
@@ -103,21 +120,9 @@ TEST_CASE("Scheduler work stealing occurs", "[scheduler]") {
     const int num_tasks = 200;
     std::atomic<int> completed{0};
     
-    // Create tasks with slight delay
-    auto coro = [&]() -> task<void> {
-        // Simulate some work
-        for (int i = 0; i < 1000; ++i) {
-            volatile int x = i * i;
-            (void)x;
-        }
-        completed.fetch_add(1);
-        co_return;
-    };
-    
-    // Spawn many tasks quickly - scheduler takes ownership
+    // Spawn many tasks quickly using parameter passing
     for (int i = 0; i < num_tasks; ++i) {
-        auto t = coro();
-        sched.spawn(t.release());
+        sched.go(work_stealing_task, &completed);
     }
     
     // Wait for all to complete
@@ -144,14 +149,9 @@ TEST_CASE("Scheduler dynamic thread pool growth", "[scheduler]") {
     
     // Spawn some tasks
     std::atomic<int> completed{0};
-    auto coro = [&]() -> task<void> {
-        completed.fetch_add(1);
-        co_return;
-    };
     
     for (int i = 0; i < 50; ++i) {
-        auto t = coro();
-        sched.spawn(t.release());
+        sched.go(increment_counter_task, &completed);
     }
     
     std::this_thread::sleep_for(scaled_ms(200));
@@ -172,14 +172,9 @@ TEST_CASE("Scheduler dynamic thread pool shrink", "[scheduler]") {
     
     // Spawn some tasks
     std::atomic<int> completed{0};
-    auto coro = [&]() -> task<void> {
-        completed.fetch_add(1);
-        co_return;
-    };
     
     for (int i = 0; i < 50; ++i) {
-        auto t = coro();
-        sched.spawn(t.release());
+        sched.go(increment_counter_task, &completed);
     }
     
     std::this_thread::sleep_for(scaled_ms(200));
@@ -195,14 +190,8 @@ TEST_CASE("Scheduler statistics", "[scheduler]") {
     const int num_tasks = 20;
     std::atomic<int> completed{0};
     
-    auto coro = [&]() -> task<void> {
-        completed.fetch_add(1);
-        co_return;
-    };
-    
     for (int i = 0; i < num_tasks; ++i) {
-        auto t = coro();
-        sched.spawn(t.release());
+        sched.go(increment_counter_task, &completed);
     }
     
     std::this_thread::sleep_for(scaled_ms(200));
@@ -238,15 +227,8 @@ TEST_CASE("Scheduler handles empty spawn", "[scheduler]") {
 TEST_CASE("Scheduler handles spawn before start", "[scheduler]") {
     scheduler sched(2);
     
-    auto coro = []() -> task<void> {
-        co_return;
-    };
-    
-    auto t = coro();
-    
     // Should not crash, but task won't execute (scheduler not running)
-    // We still need to release() since spawn stores the handle
-    sched.spawn(t.release());
+    sched.go(empty_task);
     
     // Now start - but the task was already queued
     sched.start();

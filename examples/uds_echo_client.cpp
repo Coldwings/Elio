@@ -188,8 +188,7 @@ int main(int argc, char* argv[]) {
         done = true;
     };
     
-    auto client = run_client();
-    sched.spawn(client.release());
+    sched.go(run_client);
     
     // Wait for completion
     while (!done) {

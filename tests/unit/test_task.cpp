@@ -2,6 +2,7 @@
 #include <elio/coro/task.hpp>
 #include <elio/coro/frame.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/runtime/spawn.hpp>
 #include <string>
 #include <atomic>
 #include "../test_main.cpp"  // For scaled timeouts
@@ -9,6 +10,12 @@
 using namespace elio::coro;
 using namespace elio::runtime;
 using namespace elio::test;
+
+// Helper: access handle from immovable task (for testing only)
+template<typename T>
+auto get_handle(task<T>& t) {
+    return elio::coro::detail::task_access::handle(t);
+}
 
 // Helper: Simple coroutine that returns a value
 task<int> simple_return_value() {
@@ -39,50 +46,53 @@ task<int> nested_outer() {
 TEST_CASE("task construction and destruction", "[task]") {
     {
         auto t = simple_return_value();
-        REQUIRE(t.handle() != nullptr);
+        REQUIRE(get_handle(t) != nullptr);
     }
     // Task should destroy handle in destructor
 }
 
-TEST_CASE("task move semantics", "[task]") {
-    auto t1 = simple_return_value();
-    auto h1 = t1.handle();
-    REQUIRE(h1 != nullptr);
+TEST_CASE("task is non-movable", "[task]") {
+    // Verify task<T> is non-movable and non-copyable
+    STATIC_REQUIRE_FALSE(std::is_move_constructible_v<task<int>>);
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<task<int>>);
+    STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<task<int>>);
+    STATIC_REQUIRE_FALSE(std::is_copy_assignable_v<task<int>>);
     
-    auto t2 = std::move(t1);
-    REQUIRE(t1.handle() == nullptr);  // Moved-from
-    REQUIRE(t2.handle() == h1);       // Moved-to
+    STATIC_REQUIRE_FALSE(std::is_move_constructible_v<task<void>>);
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<task<void>>);
+    STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<task<void>>);
+    STATIC_REQUIRE_FALSE(std::is_copy_assignable_v<task<void>>);
 }
 
 TEST_CASE("task<int> co_return value", "[task]") {
     auto t = simple_return_value();
     
     // Start the coroutine
-    t.handle().resume();
+    get_handle(t).resume();
     
     // The promise should have the value
-    REQUIRE(t.handle().promise().value_.has_value());
-    REQUIRE(t.handle().promise().value_.value() == 42);
+    REQUIRE(get_handle(t).promise().value_.has_value());
+    REQUIRE(get_handle(t).promise().value_.value() == 42);
 }
 
 TEST_CASE("task<void> co_return void", "[task]") {
     auto t = simple_void();
     
     // Start the coroutine
-    t.handle().resume();
+    get_handle(t).resume();
     
     // Should complete without error
-    REQUIRE(t.handle().done());
+    REQUIRE(get_handle(t).done());
 }
 
 TEST_CASE("task stores exception", "[task]") {
     auto t = throwing_coroutine();
     
     // Start the coroutine
-    t.handle().resume();
+    get_handle(t).resume();
     
     // The promise should have an exception
-    REQUIRE(t.handle().promise().exception() != nullptr);
+    REQUIRE(get_handle(t).promise().exception() != nullptr);
 }
 
 TEST_CASE("task co_await basic", "[task]") {
@@ -94,18 +104,18 @@ TEST_CASE("task co_await basic", "[task]") {
     };
     
     auto t = outer();
-    t.handle().resume();
+    get_handle(t).resume();
     
     // The outer task should have result 43
-    REQUIRE(t.handle().promise().value_.value() == 43);
+    REQUIRE(get_handle(t).promise().value_.value() == 43);
 }
 
 TEST_CASE("task nested co_await", "[task]") {
     auto t = nested_outer();
-    t.handle().resume();
+    get_handle(t).resume();
     
     // The outer coroutine should return 20 (10 * 2)
-    REQUIRE(t.handle().promise().value_.value() == 20);
+    REQUIRE(get_handle(t).promise().value_.value() == 20);
 }
 
 TEST_CASE("task exception propagation via co_await", "[task]") {
@@ -120,32 +130,54 @@ TEST_CASE("task exception propagation via co_await", "[task]") {
     };
     
     auto t = outer();
-    t.handle().resume();
+    get_handle(t).resume();
     
     // Should complete without unhandled exception
-    REQUIRE(t.handle().done());
+    REQUIRE(get_handle(t).done());
 }
 
-TEST_CASE("task virtual stack integration", "[task]") {
-    auto inner = []() -> task<int> {
-        // Inside inner coroutine, virtual stack should be at least 1 deep
-        size_t depth = get_stack_depth();
-        REQUIRE(depth >= 1);
-        co_return 100;
-    };
+TEST_CASE("task virtual stack integration", "[task][.integration]") {
+    // This test requires scheduler context, run with elio::run()
+    scheduler sched(2);
+    sched.start();
     
-    auto outer = [&]() -> task<int> {
-        size_t outer_depth = get_stack_depth();
-        int result = co_await inner();
-        size_t inner_depth = get_stack_depth();
+    std::atomic<bool> passed{false};
+    
+    auto test_coro = []() -> task<void> {
+        auto inner = []() -> task<int> {
+            // Inside inner coroutine, virtual stack should be at least 1 deep
+            size_t depth = get_stack_depth();
+            REQUIRE(depth >= 1);
+            co_return 100;
+        };
         
-        // After co_await, we should be back to outer depth
-        REQUIRE(inner_depth == outer_depth);
-        co_return result;
+        auto outer = [&]() -> task<int> {
+            size_t outer_depth = get_stack_depth();
+            int result = co_await inner();
+            size_t after_depth = get_stack_depth();
+            
+            // After co_await, we should be back to outer depth
+            REQUIRE(after_depth == outer_depth);
+            co_return result;
+        };
+        
+        int result = co_await outer();
+        REQUIRE(result == 100);
+        co_return;
     };
     
-    auto t = outer();
-    t.handle().resume();
+    auto driver = [&]() -> task<void> {
+        co_await test_coro();
+        passed.store(true);
+    };
+    
+    elio::go(driver);
+    
+    std::this_thread::sleep_for(scaled_ms(200));
+    
+    sched.shutdown();
+    
+    REQUIRE(passed.load());
 }
 
 TEST_CASE("task multiple levels", "[task]") {
@@ -160,9 +192,9 @@ TEST_CASE("task multiple levels", "[task]") {
     };
     
     auto t = level1();
-    t.handle().resume();
+    get_handle(t).resume();
     
-    REQUIRE(t.handle().promise().value_.value() == 3);
+    REQUIRE(get_handle(t).promise().value_.value() == 3);
 }
 
 TEST_CASE("task<void> exception propagation", "[task]") {
@@ -181,15 +213,15 @@ TEST_CASE("task<void> exception propagation", "[task]") {
     };
     
     auto t = catcher();
-    t.handle().resume();
-    REQUIRE(t.handle().done());
+    get_handle(t).resume();
+    REQUIRE(get_handle(t).done());
 }
 
 // ============================================================================
-// Tests for new task spawning API: go(), spawn(), join_handle
+// Tests for new task spawning API: elio::go(), elio::spawn(), join_handle
 // ============================================================================
 
-TEST_CASE("task::go() spawns fire-and-forget task", "[task][spawn]") {
+TEST_CASE("elio::go() spawns fire-and-forget task", "[task][spawn]") {
     scheduler sched(2);
     sched.start();
     
@@ -200,8 +232,8 @@ TEST_CASE("task::go() spawns fire-and-forget task", "[task][spawn]") {
         co_return;
     };
     
-    // Use go() to spawn fire-and-forget
-    coro().go();
+    // Use elio::go() to spawn fire-and-forget
+    elio::go(coro);
     
     // Wait for execution
     std::this_thread::sleep_for(scaled_ms(100));
@@ -211,7 +243,7 @@ TEST_CASE("task::go() spawns fire-and-forget task", "[task][spawn]") {
     sched.shutdown();
 }
 
-TEST_CASE("task<int>::go() spawns fire-and-forget task with value", "[task][spawn]") {
+TEST_CASE("elio::go() spawns fire-and-forget task with value", "[task][spawn]") {
     scheduler sched(2);
     sched.start();
     
@@ -222,7 +254,7 @@ TEST_CASE("task<int>::go() spawns fire-and-forget task with value", "[task][spaw
         co_return 42;  // Value is discarded in fire-and-forget
     };
     
-    coro().go();
+    elio::go(coro);
     
     std::this_thread::sleep_for(scaled_ms(100));
     
@@ -231,7 +263,7 @@ TEST_CASE("task<int>::go() spawns fire-and-forget task with value", "[task][spaw
     sched.shutdown();
 }
 
-TEST_CASE("task::spawn() returns joinable handle", "[task][spawn][join_handle]") {
+TEST_CASE("elio::spawn() returns joinable handle", "[task][spawn][join_handle]") {
     scheduler sched(2);
     sched.start();
     
@@ -242,13 +274,13 @@ TEST_CASE("task::spawn() returns joinable handle", "[task][spawn][join_handle]")
     };
     
     auto driver = [&]() -> task<void> {
-        auto handle = compute().spawn();
+        auto handle = elio::spawn(compute);
         int result = co_await handle;
         REQUIRE(result == 100);
         completed.store(true);
     };
     
-    driver().go();
+    elio::go(driver);
     
     std::this_thread::sleep_for(scaled_ms(200));
     
@@ -257,7 +289,7 @@ TEST_CASE("task::spawn() returns joinable handle", "[task][spawn][join_handle]")
     sched.shutdown();
 }
 
-TEST_CASE("task<void>::spawn() returns joinable handle", "[task][spawn][join_handle]") {
+TEST_CASE("elio::spawn() with void task returns joinable handle", "[task][spawn][join_handle]") {
     scheduler sched(2);
     sched.start();
     
@@ -270,13 +302,13 @@ TEST_CASE("task<void>::spawn() returns joinable handle", "[task][spawn][join_han
     };
     
     auto driver = [&]() -> task<void> {
-        auto handle = work().spawn();
+        auto handle = elio::spawn(work);
         co_await handle;
         REQUIRE(counter.load() == 1);
         completed.store(true);
     };
     
-    driver().go();
+    elio::go(driver);
     
     std::this_thread::sleep_for(scaled_ms(200));
     
@@ -298,7 +330,7 @@ TEST_CASE("join_handle propagates exceptions", "[task][spawn][join_handle]") {
     
     auto catcher = [&]() -> task<void> {
         try {
-            auto handle = thrower().spawn();
+            auto handle = elio::spawn(thrower);
             co_await handle;
             FAIL("Should have thrown");
         } catch (const std::runtime_error& e) {
@@ -307,7 +339,7 @@ TEST_CASE("join_handle propagates exceptions", "[task][spawn][join_handle]") {
         }
     };
     
-    catcher().go();
+    elio::go(catcher);
     
     std::this_thread::sleep_for(scaled_ms(200));
     
@@ -316,7 +348,7 @@ TEST_CASE("join_handle propagates exceptions", "[task][spawn][join_handle]") {
     sched.shutdown();
 }
 
-TEST_CASE("multiple spawn() tasks run concurrently", "[task][spawn][join_handle]") {
+TEST_CASE("multiple elio::spawn() tasks run concurrently", "[task][spawn][join_handle]") {
     scheduler sched(4);
     sched.start();
     
@@ -336,9 +368,9 @@ TEST_CASE("multiple spawn() tasks run concurrently", "[task][spawn][join_handle]
     };
     
     auto driver = [&]() -> task<void> {
-        auto h1 = work().spawn();
-        auto h2 = work().spawn();
-        auto h3 = work().spawn();
+        auto h1 = elio::spawn(work);
+        auto h2 = elio::spawn(work);
+        auto h3 = elio::spawn(work);
         
         co_await h1;
         co_await h2;
@@ -347,7 +379,7 @@ TEST_CASE("multiple spawn() tasks run concurrently", "[task][spawn][join_handle]
         completed.store(true);
     };
     
-    driver().go();
+    elio::go(driver);
     
     std::this_thread::sleep_for(scaled_ms(500));
     
@@ -370,7 +402,7 @@ TEST_CASE("join_handle::is_ready() reflects completion state", "[task][spawn][jo
     };
     
     auto driver = [&]() -> task<void> {
-        auto handle = slow_task().spawn();
+        auto handle = elio::spawn(slow_task);
         
         // Initially not ready
         bool was_not_ready = !handle.is_ready();
@@ -384,7 +416,7 @@ TEST_CASE("join_handle::is_ready() reflects completion state", "[task][spawn][jo
         test_passed.store(was_not_ready && is_now_ready && result == 42);
     };
     
-    driver().go();
+    elio::go(driver);
     
     std::this_thread::sleep_for(scaled_ms(300));
     
@@ -393,7 +425,7 @@ TEST_CASE("join_handle::is_ready() reflects completion state", "[task][spawn][jo
     sched.shutdown();
 }
 
-TEST_CASE("scheduler::spawn() accepts task directly", "[scheduler][spawn]") {
+TEST_CASE("elio::go() works with scheduler context", "[scheduler][spawn]") {
     scheduler sched(2);
     sched.start();
     
@@ -404,8 +436,8 @@ TEST_CASE("scheduler::spawn() accepts task directly", "[scheduler][spawn]") {
         co_return;
     };
     
-    // New API: spawn task directly without calling release()
-    sched.spawn(coro());
+    // Use elio::go() to spawn fire-and-forget task
+    elio::go(coro);
     
     std::this_thread::sleep_for(scaled_ms(100));
     
@@ -414,7 +446,7 @@ TEST_CASE("scheduler::spawn() accepts task directly", "[scheduler][spawn]") {
     sched.shutdown();
 }
 
-TEST_CASE("scheduler::spawn() accepts task<int> directly", "[scheduler][spawn]") {
+TEST_CASE("elio::go() works with task<int>", "[scheduler][spawn]") {
     scheduler sched(2);
     sched.start();
     
@@ -425,7 +457,7 @@ TEST_CASE("scheduler::spawn() accepts task<int> directly", "[scheduler][spawn]")
         co_return 99;
     };
     
-    sched.spawn(coro());
+    elio::go(coro);
     
     std::this_thread::sleep_for(scaled_ms(100));
     

@@ -2,7 +2,6 @@
 
 #include "promise_base.hpp"
 #include "cancel_token.hpp"
-#include "frame_allocator.hpp"
 #include <coroutine>
 #include <optional>
 #include <exception>
@@ -23,28 +22,28 @@ void schedule_handle(std::coroutine_handle<> handle) noexcept;
 
 namespace elio::coro {
 
-/// 任务执行状态
+/// Task execution status
 enum class task_status {
-    pending,       ///< 尚未开始或正在执行
-    completed,     ///< 正常完成（成功）
-    logic_failed,  ///< 业务失败（显式失败，非异常）
-    exception,     ///< 异常失败（抛出异常）
-    cancelled      ///< 被取消
+    pending,       ///< Not started or currently executing
+    completed,     ///< Normal completion (success)
+    logic_failed,  ///< Business failure (explicit failure, not exception)
+    exception,     ///< Exception failure (exception thrown)
+    cancelled      ///< Cancelled
 };
 
-/// 任务结果状态（用于 task_result / awaitable_result）
+/// Task result status (for task_result / awaitable_result)
 enum class result_status {
-    completed,     ///< 正常完成
-    logic_failed,  ///< 业务失败
-    timeout,       ///< 超时
-    cancelled,     ///< 被取消
-    exception      ///< 异常失败
+    completed,     ///< Normal completion
+    logic_failed,  ///< Business failure
+    timeout,       ///< Timeout
+    cancelled,     ///< Cancelled
+    exception      ///< Exception failure
 };
 
-/// 失败信息（业务失败，非异常）
+/// Failure info (business failure, not exception)
 struct failure {
-    int code = 0;              ///< 错误码
-    std::string message;       ///< 错误信息
+    int code = 0;              ///< Error code
+    std::string message;       ///< Error message
     
     failure() = default;
     failure(int c, std::string msg) : code(c), message(std::move(msg)) {}
@@ -52,8 +51,8 @@ struct failure {
     explicit failure(std::string msg) : code(0), message(std::move(msg)) {}
 };
 
-/// 辅助函数：创建 failure（用于 co_return，仅适用于非 void task）
-/// 用法: co_return coro::fail(404, "not found");
+/// Helper function: create failure (for co_return, only for non-void task)
+/// Usage: co_return coro::fail(404, "not found");
 inline failure fail(int code, std::string message) {
     return failure{code, std::move(message)};
 }
@@ -64,20 +63,20 @@ inline failure fail(std::string message) {
 
 namespace detail {
 
-/// 内部共享状态
+/// Internal shared state
 template<typename T>
 struct task_state {
-    // 状态与结果存储
+    // State and result storage
     std::atomic<task_status> status_{task_status::pending};
     std::optional<T> value_;
     failure failure_;
     std::exception_ptr exception_;
     
-    // 等待者管理
+    // Waiter management
     std::atomic<void*> waiter_{nullptr};
     std::mutex mutex_;
     
-    // 取消控制
+    // Cancel control
     std::atomic<bool> cancel_requested_{false};
     
     void set_value(T&& val) {
@@ -158,7 +157,7 @@ struct task_state {
     }
 };
 
-/// void 特化
+/// void specialization
 template<>
 struct task_state<void> {
     std::atomic<task_status> status_{task_status::pending};
@@ -248,7 +247,7 @@ struct task_state<void> {
 } // namespace detail
 
 // ============================================================================
-// task_result<T> - 结果包装器
+// task_result<T> - Result wrapper
 // ============================================================================
 
 template<typename T>
@@ -258,34 +257,34 @@ public:
     
     task_result() = default;
     
-    /// 构造成功结果
+    /// Construct success result
     explicit task_result(T value)
         : status_(result_status::completed)
         , value_(std::move(value)) {}
     
-    /// 构造业务失败结果
+    /// Construct business failure result
     explicit task_result(result_status status, failure f)
         : status_(status)
         , failure_(std::move(f)) {}
     
-    /// 构造异常结果
+    /// Construct exception result
     explicit task_result(result_status status, std::exception_ptr ep)
         : status_(status)
         , exception_(std::move(ep)) {}
     
-    /// 构造 timeout/cancelled 结果
+    /// Construct timeout/cancelled result
     explicit task_result(result_status status)
         : status_(status) {}
     
-    // 移动语义
+    // Move semantics
     task_result(task_result&&) = default;
     task_result& operator=(task_result&&) = default;
     
-    // 不支持拷贝
+    // No copy support
     task_result(const task_result&) = delete;
     task_result& operator=(const task_result&) = delete;
     
-    // ===== 状态查询 =====
+    // ===== Status query =====
     [[nodiscard]] bool has_value() const noexcept {
         return status_ == result_status::completed;
     }
@@ -314,7 +313,7 @@ public:
         return status_ == result_status::logic_failed;
     }
     
-    // ===== 值访问 =====
+    // ===== Value access =====
     T& value() & {
         return *value_;
     }
@@ -337,7 +336,7 @@ public:
         return has_value() ? std::move(value()) : static_cast<T>(std::forward<U>(default_value));
     }
     
-    // ===== 结果访问 =====
+    // ===== Result access =====
     const failure& failure_info() const {
         return failure_;
     }
@@ -360,7 +359,7 @@ public:
         }
     }
     
-    // ===== 隐式转换 =====
+    // ===== Implicit conversion =====
     explicit operator bool() const noexcept {
         return has_value();
     }
@@ -372,7 +371,7 @@ private:
     std::exception_ptr exception_;
 };
 
-// ===== void 特化 =====
+// ===== void specialization =====
 template<>
 class task_result<void> {
 public:
@@ -380,28 +379,28 @@ public:
     
     task_result() = default;
     
-    /// 构造成功/timeout/cancelled 结果
+    /// Construct success/timeout/cancelled result
     explicit task_result(result_status status)
         : status_(status) {}
     
-    /// 构造业务失败结果
+    /// Construct business failure result
     explicit task_result(result_status status, failure f)
         : status_(status)
         , failure_(std::move(f)) {}
     
-    /// 构造异常结果
+    /// Construct exception result
     explicit task_result(result_status status, std::exception_ptr ep)
         : status_(status)
         , exception_(std::move(ep)) {}
     
-    // 移动语义
+    // Move semantics
     task_result(task_result&&) = default;
     task_result& operator=(task_result&&) = default;
     
     task_result(const task_result&) = delete;
     task_result& operator=(const task_result&) = delete;
     
-    // ===== 状态查询 =====
+    // ===== Status query =====
     [[nodiscard]] bool has_value() const noexcept {
         return status_ == result_status::completed;
     }
@@ -430,7 +429,7 @@ public:
         return status_ == result_status::logic_failed;
     }
     
-    // ===== 结果访问 =====
+    // ===== Result access =====
     const failure& failure_info() const {
         return failure_;
     }
@@ -464,7 +463,7 @@ private:
 };
 
 // ============================================================================
-// task_handle<T> - 任务句柄
+// task_handle<T> - Task handle
 // ============================================================================
 
 template<typename T>
@@ -479,15 +478,15 @@ public:
     
     ~task_handle() = default;
     
-    // 移动语义
+    // Move semantics
     task_handle(task_handle&&) noexcept = default;
     task_handle& operator=(task_handle&&) noexcept = default;
     
-    // 不支持拷贝
+    // No copy support
     task_handle(const task_handle&) = delete;
     task_handle& operator=(const task_handle&) = delete;
     
-    // ===== 有效性检查 =====
+    // ===== Validity check =====
     [[nodiscard]] bool valid() const noexcept {
         return state_ != nullptr;
     }
@@ -496,7 +495,7 @@ public:
         return valid();
     }
     
-    // ===== 状态查询 =====
+    // ===== Status query =====
     [[nodiscard]] task_status status() const noexcept {
         if (!state_) return task_status::exception;
         return state_->status_.load(std::memory_order_acquire);
@@ -527,7 +526,7 @@ public:
         return status() == task_status::pending;
     }
     
-    // ===== 显式结果获取 =====
+    // ===== Explicit result retrieval =====
     bool try_get(T& out) const {
         if (!state_) return false;
         std::lock_guard<std::mutex> lock(state_->mutex_);
@@ -569,7 +568,7 @@ public:
         return static_cast<T>(std::forward<U>(default_value));
     }
     
-    // ===== 获取完整结果 =====
+    // ===== Get complete result =====
     task_result<T> get_result() const {
         if (!state_) {
             return task_result<T>(result_status::exception,
@@ -598,7 +597,7 @@ public:
         }
     }
     
-    // ===== 同步等待 =====
+    // ===== Synchronous wait =====
     task_status wait() {
         if (!state_) return task_status::exception;
         
@@ -619,7 +618,7 @@ public:
         std::unique_lock<std::mutex> lock(state_->mutex_);
         while (!state_->is_done()) {
             if (std::chrono::steady_clock::now() >= deadline) {
-                return status();  // 可能仍为 pending
+                return status();  // May still be pending
             }
             lock.unlock();
             std::this_thread::yield();
@@ -628,7 +627,7 @@ public:
         return status();
     }
     
-    // ===== 取消控制 =====
+    // ===== Cancel control =====
     void request_cancel() {
         if (!state_) return;
         state_->request_cancel();
@@ -639,7 +638,7 @@ public:
         return state_->is_cancellation_requested();
     }
     
-    // ===== 协程等待（返回 task_result，不抛异常）=====
+    // ===== Coroutine await (returns task_result, no exception thrown) =====
     auto operator co_await() const {
         struct awaiter {
             std::shared_ptr<detail::task_state<T>> state;
@@ -688,7 +687,7 @@ private:
 };
 
 // ============================================================================
-// task_handle<void> - void 特化
+// task_handle<void> - void specialization
 // ============================================================================
 
 template<>
@@ -709,7 +708,7 @@ public:
     task_handle(const task_handle&) = delete;
     task_handle& operator=(const task_handle&) = delete;
     
-    // ===== 有效性检查 =====
+    // ===== Validity check =====
     [[nodiscard]] bool valid() const noexcept {
         return state_ != nullptr;
     }
@@ -718,7 +717,7 @@ public:
         return valid();
     }
     
-    // ===== 状态查询 =====
+    // ===== Status query =====
     [[nodiscard]] task_status status() const noexcept {
         if (!state_) return task_status::exception;
         return state_->status_.load(std::memory_order_acquire);
@@ -749,7 +748,7 @@ public:
         return status() == task_status::pending;
     }
     
-    // ===== 显式结果获取 =====
+    // ===== Explicit result retrieval =====
     bool try_get(failure& out) const {
         if (!state_) return false;
         std::lock_guard<std::mutex> lock(state_->mutex_);
@@ -770,7 +769,7 @@ public:
         return false;
     }
     
-    // ===== 获取完整结果 =====
+    // ===== Get complete result =====
     task_result<void> get_result() const {
         if (!state_) {
             return task_result<void>(result_status::exception,
@@ -795,7 +794,7 @@ public:
         }
     }
     
-    // ===== 同步等待 =====
+    // ===== Synchronous wait =====
     task_status wait() {
         if (!state_) return task_status::exception;
         
@@ -825,7 +824,7 @@ public:
         return status();
     }
     
-    // ===== 取消控制 =====
+    // ===== Cancel control =====
     void request_cancel() {
         if (!state_) return;
         state_->request_cancel();
@@ -836,7 +835,7 @@ public:
         return state_->is_cancellation_requested();
     }
     
-    // ===== 协程等待（返回 task_result，不抛异常）=====
+    // ===== Coroutine await (returns task_result, no exception thrown) =====
     auto operator co_await() const {
         struct awaiter {
             std::shared_ptr<detail::task_state<void>> state;

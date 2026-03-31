@@ -9,6 +9,24 @@ using namespace elio::runtime;
 using namespace elio::coro;
 using namespace elio::test;
 
+// Helper to access handle from task
+template<typename T>
+auto get_handle(task<T>& t) {
+    return elio::coro::detail::task_access::handle(t);
+}
+
+// Helper to spawn a task to scheduler using high-level API (fire-and-forget)
+template<typename F>
+void spawn_task(scheduler& sched, F&& f) {
+    sched.go(std::forward<F>(f));
+}
+
+// Helper to spawn a task to specific worker using high-level API (fire-and-forget)
+template<typename F>
+void spawn_task_to(scheduler& sched, size_t worker_id, F&& f) {
+    sched.go_to(worker_id, std::forward<F>(f));
+}
+
 TEST_CASE("Affinity constants", "[affinity]") {
     REQUIRE(NO_AFFINITY == std::numeric_limits<size_t>::max());
 }
@@ -19,7 +37,7 @@ TEST_CASE("Promise base affinity default", "[affinity]") {
     };
     
     auto t = coro();
-    auto& promise = t.handle().promise();
+    auto& promise = get_handle(t).promise();
     
     // Default should be NO_AFFINITY
     REQUIRE(promise.affinity() == NO_AFFINITY);
@@ -32,7 +50,7 @@ TEST_CASE("Promise base affinity set/get/clear", "[affinity]") {
     };
     
     auto t = coro();
-    auto& promise = t.handle().promise();
+    auto& promise = get_handle(t).promise();
     
     // Set affinity
     promise.set_affinity(2);
@@ -63,8 +81,7 @@ TEST_CASE("current_worker_id inside scheduler", "[affinity]") {
         co_return;
     };
     
-    auto t = coro();
-    sched.spawn(t.release());
+    spawn_task(sched, coro);
     
     // Wait for execution
     auto start = std::chrono::steady_clock::now();
@@ -96,8 +113,7 @@ TEST_CASE("set_affinity awaitable binds to worker", "[affinity]") {
         co_return;
     };
     
-    auto t = coro();
-    sched.spawn(t.release());
+    spawn_task(sched, coro);
     
     // Wait for execution
     auto start = std::chrono::steady_clock::now();
@@ -132,8 +148,7 @@ TEST_CASE("set_affinity without migration", "[affinity]") {
         co_return;
     };
     
-    auto t = coro();
-    sched.spawn(t.release());
+    spawn_task(sched, coro);
     
     // Wait for execution
     auto start = std::chrono::steady_clock::now();
@@ -176,8 +191,7 @@ TEST_CASE("clear_affinity allows migration", "[affinity]") {
         co_return;
     };
     
-    auto t = coro();
-    sched.spawn(t.release());
+    spawn_task(sched, coro);
     
     // Wait for execution
     auto start = std::chrono::steady_clock::now();
@@ -222,8 +236,7 @@ TEST_CASE("bind_to_current_worker pins to current", "[affinity]") {
         co_return;
     };
     
-    auto t = coro();
-    sched.spawn(t.release());
+    spawn_task(sched, coro);
     
     // Wait for execution
     auto start = std::chrono::steady_clock::now();
@@ -274,8 +287,7 @@ TEST_CASE("Affinity prevents work stealing", "[affinity]") {
     
     // Spawn many tasks
     for (int i = 0; i < num_iterations; ++i) {
-        auto t = coro();
-        sched.spawn(t.release());
+        spawn_task(sched, coro);
     }
     
     // Wait for all to complete
@@ -305,15 +317,14 @@ TEST_CASE("Affinity with spawn_to respects binding", "[affinity]") {
         co_return;
     };
     
-    auto t = coro();
     // Explicitly spawn to worker 2
-    sched.spawn_to(2, t.release());
+    spawn_task_to(sched, 2, coro);
     
     // Wait for execution
-    auto start = std::chrono::steady_clock::now();
+    auto start2 = std::chrono::steady_clock::now();
     while (!completed.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        if (std::chrono::steady_clock::now() - start > scaled_sec(5)) break;
+        if (std::chrono::steady_clock::now() - start2 > scaled_sec(5)) break;
     }
     
     REQUIRE(completed.load());
@@ -328,7 +339,7 @@ TEST_CASE("get_promise_base from handle address", "[affinity]") {
     };
     
     auto t = coro();
-    void* addr = t.handle().address();
+    void* addr = get_handle(t).address();
     
     // Should be able to extract promise_base
     auto* promise = get_promise_base(addr);
@@ -348,7 +359,7 @@ TEST_CASE("check_affinity_allows with NO_AFFINITY", "[affinity]") {
     };
     
     auto t = coro();
-    void* addr = t.handle().address();
+    void* addr = get_handle(t).address();
     
     // With NO_AFFINITY, any worker should be allowed
     REQUIRE(check_affinity_allows(addr, 0));
@@ -364,24 +375,24 @@ TEST_CASE("Multiple tasks with different affinities", "[affinity]") {
     std::array<std::atomic<size_t>, 4> task_workers;
     for (auto& w : task_workers) w.store(NO_AFFINITY);
     
-    auto make_coro = [&](size_t target) -> task<void> {
-        co_await elio::set_affinity(target);
-        task_workers[target].store(elio::current_worker_id());
-        completed.fetch_add(1);
+    // Define coroutine function with parameters (not lambda capture)
+    auto make_task = [](size_t idx, std::atomic<int>& done, std::atomic<size_t>& worker) -> task<void> {
+        co_await elio::set_affinity(idx);
+        worker.store(elio::current_worker_id());
+        done.fetch_add(1);
         co_return;
     };
     
     // Spawn tasks with different affinities
     for (size_t i = 0; i < 4; ++i) {
-        auto t = make_coro(i);
-        sched.spawn(t.release());
+        sched.go(make_task, i, std::ref(completed), std::ref(task_workers[i]));
     }
     
     // Wait for all to complete
-    auto start = std::chrono::steady_clock::now();
+    auto start3 = std::chrono::steady_clock::now();
     while (completed.load() < 4) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        if (std::chrono::steady_clock::now() - start > scaled_sec(5)) break;
+        if (std::chrono::steady_clock::now() - start3 > scaled_sec(5)) break;
     }
     
     REQUIRE(completed.load() == 4);

@@ -52,7 +52,12 @@ public:
     /// mutex's intrusive waiter list.
     class lock_awaitable {
     public:
-        explicit lock_awaitable(mutex& m) noexcept : mutex_(m) {}
+        explicit lock_awaitable(mutex& m) noexcept : mutex_(m) {
+            // Use release stores to ensure writes are visible to other threads
+            // This also helps TSAN understand the synchronization
+            next_.store(nullptr, std::memory_order_release);
+            handle_.store(nullptr, std::memory_order_release);
+        }
 
         bool await_ready() const noexcept {
             return mutex_.try_lock();
@@ -63,7 +68,7 @@ public:
         /// true (suspend).  Loops until one of these two outcomes is achieved
         /// via lock-free CAS.
         bool await_suspend(std::coroutine_handle<> h) noexcept {
-            handle_ = h;
+            handle_.store(h.address(), std::memory_order_relaxed);
             void* old_state = mutex_.state_.load(std::memory_order_acquire);
             while (true) {
                 if (old_state == nullptr) {
@@ -77,9 +82,10 @@ public:
                     // CAS failed, old_state refreshed — retry
                 } else {
                     // Locked — push this awaitable onto the LIFO stack
-                    next_ = (old_state == mutex_.locked_no_waiters())
+                    next_.store((old_state == mutex_.locked_no_waiters())
                                 ? nullptr
-                                : static_cast<lock_awaitable*>(old_state);
+                                : static_cast<lock_awaitable*>(old_state),
+                                std::memory_order_relaxed);
                     if (mutex_.state_.compare_exchange_weak(
                             old_state, this,
                             std::memory_order_release,
@@ -96,8 +102,8 @@ public:
     private:
         friend class mutex;
         mutex& mutex_;
-        lock_awaitable* next_{nullptr};      // intrusive LIFO linkage
-        std::coroutine_handle<> handle_;     // handle to resume on unlock
+        std::atomic<lock_awaitable*> next_;      // intrusive LIFO linkage
+        std::atomic<void*> handle_;     // handle to resume on unlock
     };
 
     /// Acquire the mutex
@@ -130,13 +136,15 @@ public:
 
         // Pop head waiter and transfer lock ownership to it (LIFO)
         auto* head = static_cast<lock_awaitable*>(state);
-        void* next_state = (head->next_ == nullptr)
+        auto* next = head->next_.load(std::memory_order_acquire);
+        void* next_state = (next == nullptr)
                                ? locked_no_waiters()
-                               : static_cast<void*>(head->next_);
+                               : static_cast<void*>(next);
         state_.store(next_state, std::memory_order_release);
 
         // Schedule the waiter — it now holds the lock
-        runtime::schedule_handle(head->handle_);
+        auto handle_addr = head->handle_.load(std::memory_order_acquire);
+        runtime::schedule_handle(std::coroutine_handle<>::from_address(handle_addr));
     }
 
     /// Check if mutex is currently locked

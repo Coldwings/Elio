@@ -1,7 +1,7 @@
 #pragma once
 
 #include "promise_base.hpp"
-#include "frame_allocator.hpp"
+#include "vthread_stack.hpp"
 #include <coroutine>
 #include <optional>
 #include <exception>
@@ -36,7 +36,15 @@ struct final_awaiter {
             return continuation;
         } else if (h.promise().detached_) {
             // Detached task with no continuation - self-destruct
+            // IMPORTANT: If this coroutine owns its vstack, we must release ownership
+            // BEFORE destroying the coroutine frame, because the frame itself is allocated
+            // on the vstack. Destroying the frame triggers ~promise_base() which would
+            // delete the vstack, causing the frame (and its members) to become invalid
+            // while still being accessed.
+            auto* vstack_to_delete = h.promise().release_vstack_ownership();
             h.destroy();
+            // Now safe to delete vstack - the coroutine frame is fully destroyed
+            delete vstack_to_delete;
             return std::noop_coroutine();
         } else {
             // Owned task with no continuation - stay suspended for owner to destroy
@@ -45,6 +53,22 @@ struct final_awaiter {
     }
     
     void await_resume() const noexcept {}
+};
+
+// Friend accessor: extract handle from immovable task<T>
+struct task_access {
+    template<typename TaskT>
+    static auto release(TaskT& t) noexcept {
+        if (t.handle_) {
+            t.handle_.promise().detached_ = true;
+        }
+        return std::exchange(t.handle_, nullptr);
+    }
+    // Get handle without transferring ownership (for testing)
+    template<typename TaskT>
+    static auto handle(TaskT& t) noexcept {
+        return t.handle_;
+    }
 };
 
 /// Shared state for join_handle<T> - stores result and waiter
@@ -240,96 +264,62 @@ private:
 /// Primary template for task<T> where T is not void
 template<typename T>
 class task {
+    friend struct detail::task_access;
 public:
+    using value_type = T;
+
     struct promise_type : promise_base {
         std::optional<T> value_;
         std::coroutine_handle<> continuation_;
         bool detached_ = false;
-        // Join state for spawn() - only used when task is spawned
         std::shared_ptr<detail::join_state<T>> join_state_;
 
-        promise_type() noexcept = default;
+        void* operator new(size_t size) {
+            return vthread_stack::allocate(size);
+        }
+        void operator delete(void* ptr, size_t size) noexcept {
+            vthread_stack::deallocate(ptr, size);
+        }
 
         [[nodiscard]] task get_return_object() noexcept {
             return task{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
-
         [[nodiscard]] std::suspend_always initial_suspend() noexcept { return {}; }
         [[nodiscard]] detail::final_awaiter final_suspend() noexcept { return {}; }
 
         template<typename U>
         void return_value(U&& value) {
             value_.emplace(std::forward<U>(value));
-            // Notify join state if present
-            if (join_state_) {
-                join_state_->set_value(std::move(*value_));
-            }
+            if (join_state_) join_state_->set_value(std::move(*value_));
         }
 
         void unhandled_exception() noexcept {
             promise_base::unhandled_exception();
-            // Notify join state if present
-            if (join_state_) {
-                join_state_->set_exception(exception());
-            }
-        }
-
-        // Custom allocator for coroutine frames
-        void* operator new(size_t size) {
-            return frame_allocator::allocate(size);
-        }
-
-        void operator delete(void* ptr, size_t size) noexcept {
-            frame_allocator::deallocate(ptr, size);
+            if (join_state_) join_state_->set_exception(exception());
         }
     };
 
     using handle_type = std::coroutine_handle<promise_type>;
 
-    explicit task(handle_type handle) noexcept : handle_(handle) {}
-    task(task&& other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
+    explicit task(handle_type h) noexcept : handle_(h) {}
 
-    task& operator=(task&& other) noexcept {
-        if (this != &other) {
-            if (handle_) handle_.destroy();
-            handle_ = std::exchange(other.handle_, nullptr);
-        }
-        return *this;
-    }
+    // Non-copyable, non-movable
+    task(const task&) = delete;
+    task& operator=(const task&) = delete;
+    task(task&&) = delete;
+    task& operator=(task&&) = delete;
 
     ~task() { if (handle_) handle_.destroy(); }
 
-    task(const task&) = delete;
-    task& operator=(const task&) = delete;
-
-    [[nodiscard]] handle_type handle() const noexcept { return handle_; }
-    [[nodiscard]] handle_type release() noexcept { 
-        if (handle_) handle_.promise().detached_ = true;
-        return std::exchange(handle_, nullptr); 
-    }
-    
-    /// Spawn this task on the current scheduler (fire-and-forget)
-    /// The task will run asynchronously and self-destruct when complete
-    void go() {
-        runtime::schedule_handle(release());
-    }
-    
-    /// Spawn this task and return a join_handle for awaiting the result
-    /// Usage: auto handle = some_task().spawn(); T result = co_await handle;
-    [[nodiscard]] join_handle<T> spawn();
-
+    // co_await interface
     [[nodiscard]] bool await_ready() const noexcept { return false; }
-
     [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept {
         handle_.promise().continuation_ = awaiter;
         return handle_;
     }
-
     T await_resume() {
         auto& promise = handle_.promise();
-        if (promise.exception()) {
-            std::rethrow_exception(promise.exception());
-        }
+        if (promise.exception()) std::rethrow_exception(promise.exception());
         return std::move(*promise.value_);
     }
 
@@ -340,115 +330,63 @@ private:
 /// Specialization for task<void>
 template<>
 class task<void> {
+    friend struct detail::task_access;
 public:
+    using value_type = void;
+
     struct promise_type : promise_base {
         std::coroutine_handle<> continuation_;
         bool detached_ = false;
-        // Join state for spawn() - only used when task is spawned
         std::shared_ptr<detail::join_state<void>> join_state_;
 
-        promise_type() noexcept = default;
+        void* operator new(size_t size) {
+            return vthread_stack::allocate(size);
+        }
+        void operator delete(void* ptr, size_t size) noexcept {
+            vthread_stack::deallocate(ptr, size);
+        }
 
         [[nodiscard]] task get_return_object() noexcept {
             return task{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
-
         [[nodiscard]] std::suspend_always initial_suspend() noexcept { return {}; }
         [[nodiscard]] detail::final_awaiter final_suspend() noexcept { return {}; }
 
         void return_void() noexcept {
-            // Notify join state if present
-            if (join_state_) {
-                join_state_->set_value();
-            }
+            if (join_state_) join_state_->set_value();
         }
 
         void unhandled_exception() noexcept {
             promise_base::unhandled_exception();
-            // Notify join state if present
-            if (join_state_) {
-                join_state_->set_exception(exception());
-            }
-        }
-
-        // Custom allocator for coroutine frames
-        void* operator new(size_t size) {
-            return frame_allocator::allocate(size);
-        }
-
-        void operator delete(void* ptr, size_t size) noexcept {
-            frame_allocator::deallocate(ptr, size);
+            if (join_state_) join_state_->set_exception(exception());
         }
     };
 
     using handle_type = std::coroutine_handle<promise_type>;
 
-    explicit task(handle_type handle) noexcept : handle_(handle) {}
-    task(task&& other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
+    explicit task(handle_type h) noexcept : handle_(h) {}
 
-    task& operator=(task&& other) noexcept {
-        if (this != &other) {
-            if (handle_) handle_.destroy();
-            handle_ = std::exchange(other.handle_, nullptr);
-        }
-        return *this;
-    }
+    // Non-copyable, non-movable
+    task(const task&) = delete;
+    task& operator=(const task&) = delete;
+    task(task&&) = delete;
+    task& operator=(task&&) = delete;
 
     ~task() { if (handle_) handle_.destroy(); }
 
-    task(const task&) = delete;
-    task& operator=(const task&) = delete;
-
-    [[nodiscard]] handle_type handle() const noexcept { return handle_; }
-    [[nodiscard]] handle_type release() noexcept { 
-        if (handle_) handle_.promise().detached_ = true;
-        return std::exchange(handle_, nullptr); 
-    }
-    
-    /// Spawn this task on the current scheduler (fire-and-forget)
-    /// The task will run asynchronously and self-destruct when complete
-    void go() {
-        runtime::schedule_handle(release());
-    }
-    
-    /// Spawn this task and return a join_handle for awaiting completion
-    /// Usage: auto handle = some_task().spawn(); co_await handle;
-    [[nodiscard]] join_handle<void> spawn();
-
+    // co_await interface
     [[nodiscard]] bool await_ready() const noexcept { return false; }
-
     [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept {
         handle_.promise().continuation_ = awaiter;
         return handle_;
     }
-
     void await_resume() {
         auto& promise = handle_.promise();
-        if (promise.exception()) {
-            std::rethrow_exception(promise.exception());
-        }
+        if (promise.exception()) std::rethrow_exception(promise.exception());
     }
 
 private:
     handle_type handle_;
 };
-
-// Out-of-line definitions for spawn() methods
-template<typename T>
-join_handle<T> task<T>::spawn() {
-    // Create join state and attach to task's promise
-    auto state = std::make_shared<detail::join_state<T>>();
-    handle_.promise().join_state_ = state;
-    // Release and schedule - the promise will notify join state on completion
-    runtime::schedule_handle(release());
-    return join_handle<T>(std::move(state));
-}
-
-inline join_handle<void> task<void>::spawn() {
-    auto state = std::make_shared<detail::join_state<void>>();
-    handle_.promise().join_state_ = state;
-    runtime::schedule_handle(release());
-    return join_handle<void>(std::move(state));
-}
 
 } // namespace elio::coro

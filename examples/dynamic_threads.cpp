@@ -21,8 +21,7 @@ void run_batch(runtime::scheduler& sched, int num_tasks, const std::string& labe
     
     // Spawn tasks
     for (int i = 0; i < num_tasks; ++i) {
-        auto t = simple_task(completed);
-        sched.spawn(t.release());
+        sched.go([&completed]() { return simple_task(completed); });
     }
     
     // Wait for completion

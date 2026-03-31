@@ -106,8 +106,7 @@ coro::task<void> thread_local_state_example() {
     // Spawn multiple tasks bound to different workers
     for (int i = 0; i < 8; ++i) {
         size_t target = i % std::min(num_workers, size_t(2));  // Distribute across 2 workers
-        auto t = thread_local_state_task(i, target);
-        sched->spawn(t.release());
+        sched->go([i, target]() { return thread_local_state_task(i, target); });
     }
     
     // Give tasks time to complete
@@ -175,8 +174,7 @@ coro::task<void> multi_worker_example() {
     std::cout << "Spawning " << num_workers << " tasks, one per worker..." << std::endl;
     
     for (size_t i = 0; i < num_workers; ++i) {
-        auto t = worker_task(i, counters[i]);
-        sched->spawn(t.release());
+        sched->go([i, &counters]() { return worker_task(i, counters[i]); });
     }
     
     // Wait for completion

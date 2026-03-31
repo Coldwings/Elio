@@ -476,7 +476,7 @@ Use virtual stack for debugging without significant overhead:
 ```cpp
 // Warm up allocators and caches
 for (int i = 0; i < 1000; i++) {
-    warmup_task().go();
+    elio::go(warmup_task);
 }
 sched.sync();
 

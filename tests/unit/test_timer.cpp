@@ -11,6 +11,18 @@ using namespace elio::coro;
 using namespace elio::runtime;
 using namespace std::chrono_literals;
 
+// Helper to access handle from task
+template<typename T>
+auto get_handle(task<T>& t) {
+    return elio::coro::detail::task_access::handle(t);
+}
+
+// Helper to spawn a task to scheduler using high-level API (fire-and-forget)
+template<typename F>
+void spawn_task(scheduler& sched, F&& f) {
+    sched.go(std::forward<F>(f));
+}
+
 TEST_CASE("sleep_for basic", "[time][sleep]") {
     std::atomic<bool> completed{false};
     
@@ -30,8 +42,7 @@ TEST_CASE("sleep_for basic", "[time][sleep]") {
     sched.start();
     
     {
-        auto t = sleep_task();
-        sched.spawn(t.release());  // Transfer ownership to scheduler
+        spawn_task(sched, sleep_task);  // Transfer ownership to scheduler
     }
     
     // Wait for completion
@@ -53,7 +64,7 @@ TEST_CASE("sleep_for zero duration", "[time][sleep]") {
     };
     
     auto t = sleep_task();
-    t.handle().resume();
+    get_handle(t).resume();
     
     REQUIRE(completed);
 }
@@ -74,10 +85,8 @@ TEST_CASE("yield execution", "[time][yield]") {
     sched.start();
     
     {
-        auto t1 = yield_task();
-        auto t2 = yield_task();
-        sched.spawn(t1.release());
-        sched.spawn(t2.release());
+        spawn_task(sched, yield_task);
+        spawn_task(sched, yield_task);
     }
     
     // Wait for completion
@@ -113,8 +122,7 @@ TEST_CASE("multiple sleeps sequential", "[time][sleep]") {
     sched.start();
     
     {
-        auto t = multi_sleep();
-        sched.spawn(t.release());
+        spawn_task(sched, multi_sleep);
     }
     
     for (int i = 0; i < 100 && !completed; ++i) {
@@ -144,8 +152,7 @@ TEST_CASE("sleep_until", "[time][sleep]") {
     sched.start();
     
     {
-        auto t = sleep_until_task();
-        sched.spawn(t.release());
+        spawn_task(sched, sleep_until_task);
     }
     
     for (int i = 0; i < 100 && !completed; ++i) {
@@ -167,7 +174,7 @@ TEST_CASE("sleep_until past time", "[time][sleep]") {
     };
     
     auto t = past_sleep();
-    t.handle().resume();
+    get_handle(t).resume();
     
     REQUIRE(completed);
 }
@@ -188,8 +195,7 @@ TEST_CASE("cancellable sleep - normal completion", "[time][sleep][cancel]") {
     sched.start();
     
     {
-        auto t = sleep_task();
-        sched.spawn(t.release());
+        spawn_task(sched, sleep_task);
     }
     
     // Wait for completion without cancelling
@@ -225,8 +231,7 @@ TEST_CASE("cancellable sleep - cancelled early", "[time][sleep][cancel]") {
     sched.start();
     
     {
-        auto t = sleep_task();
-        sched.spawn(t.release());
+        spawn_task(sched, sleep_task);
     }
     
     // Wait a bit then cancel
@@ -267,8 +272,7 @@ TEST_CASE("cancellable sleep - already cancelled token", "[time][sleep][cancel]"
     sched.start();
     
     {
-        auto t = sleep_task();
-        sched.spawn(t.release());
+        spawn_task(sched, sleep_task);
     }
     
     // Wait for completion

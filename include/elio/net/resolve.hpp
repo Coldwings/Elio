@@ -2,7 +2,7 @@
 
 #include <elio/net/tcp.hpp>
 #include <elio/coro/task.hpp>
-#include <elio/runtime/scheduler.hpp>
+#include <elio/runtime/spawn_blocking.hpp>
 
 #include <netdb.h>
 #include <net/if.h>
@@ -11,13 +11,10 @@
 #include <atomic>
 #include <array>
 #include <chrono>
-#include <coroutine>
-#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -186,30 +183,6 @@ inline resolve_options default_cached_resolve_options() {
     return opts;
 }
 
-struct resolve_waiter_state {
-    std::vector<socket_address> results;
-    int error = 0;
-    runtime::scheduler* scheduler = nullptr;
-    std::coroutine_handle<> handle;
-    size_t saved_affinity = coro::NO_AFFINITY;
-    void* handle_address = nullptr;
-
-    void restore_affinity() const noexcept {
-        if (!handle_address) {
-            return;
-        }
-        auto* promise = coro::get_promise_base(handle_address);
-        if (!promise) {
-            return;
-        }
-        if (saved_affinity == coro::NO_AFFINITY) {
-            promise->clear_affinity();
-        } else {
-            promise->set_affinity(saved_affinity);
-        }
-    }
-};
-
 inline bool try_parse_ipv4_literal(std::string_view host, uint16_t port,
                                    std::vector<socket_address>& out) {
     struct in_addr addr{};
@@ -249,124 +222,92 @@ inline bool try_parse_ipv6_literal(std::string_view host, uint16_t port,
     return true;
 }
 
-class resolve_all_awaitable {
-public:
-    resolve_all_awaitable(std::string_view host, uint16_t port, resolve_options options)
-        : host_(host)
-        , key_{std::string(host), port}
-        , options_(options)
-        , state_(std::make_shared<resolve_waiter_state>()) {
-        if (host.empty() || host == "::" || host == "0.0.0.0") {
-            state_->results.push_back(socket_address(host, port));
-            return;
-        }
+inline coro::task<std::vector<socket_address>> resolve_all(
+    std::string_view host,
+    uint16_t port,
+    resolve_options options = {}) {
 
-        if (host.find(':') != std::string_view::npos) {
-            try_parse_ipv6_literal(host, port, state_->results);
-            return;
-        }
+    std::vector<socket_address> results;
 
-        try_parse_ipv4_literal(host, port, state_->results);
+    // Handle empty host or wildcard addresses
+    if (host.empty() || host == "::" || host == "0.0.0.0") {
+        results.push_back(socket_address(host, port));
+        co_return results;
     }
 
-    bool await_ready() const noexcept {
-        if (!state_->results.empty()) {
-            return true;
+    // Try parsing as IPv6 literal
+    if (host.find(':') != std::string_view::npos) {
+        if (try_parse_ipv6_literal(host, port, results)) {
+            co_return results;
         }
+    }
 
-        if (!options_.use_cache) {
-            return false;
+    // Try parsing as IPv4 literal
+    if (try_parse_ipv4_literal(host, port, results)) {
+        co_return results;
+    }
+
+    // Check cache if enabled
+    resolve_cache_key key{std::string(host), port};
+    if (options.use_cache) {
+        resolve_cache* cache = options.cache ? options.cache : &default_resolve_cache();
+        if (cache->try_get(key, results)) {
+            co_return results;
         }
-
-        resolve_cache* cache = options_.cache ? options_.cache : &default_resolve_cache();
-        if (cache->try_get(key_, state_->results)) {
-            return true;
-        }
-
         cache->record_miss();
-        return false;
     }
 
-    template<typename Promise>
-    bool await_suspend(std::coroutine_handle<Promise> awaiter) {
-        state_->handle = awaiter;
-        state_->scheduler = runtime::scheduler::current();
-        state_->handle_address = awaiter.address();
+    // Perform blocking DNS resolution via spawn_blocking
+    std::string host_str(host);
+    auto dns_result = co_await elio::spawn_blocking([host_str, port]() {
+        struct resolve_result {
+            std::vector<socket_address> addresses;
+            int error = 0;
+        };
 
-        if constexpr (std::is_base_of_v<coro::promise_base, Promise>) {
-            state_->saved_affinity = awaiter.promise().affinity();
-            auto* worker = runtime::worker_thread::current();
-            if (worker) {
-                awaiter.promise().set_affinity(worker->worker_id());
+        resolve_result result;
+        struct addrinfo hints{};
+        struct addrinfo* ai_result = nullptr;
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+
+        std::string service = std::to_string(port);
+        int rc = getaddrinfo(host_str.c_str(), service.c_str(), &hints, &ai_result);
+        if (rc == 0 && ai_result) {
+            for (auto* current = ai_result; current != nullptr; current = current->ai_next) {
+                if (current->ai_family == AF_INET6) {
+                    auto* sa = reinterpret_cast<struct sockaddr_in6*>(current->ai_addr);
+                    result.addresses.push_back(socket_address(ipv6_address(*sa)));
+                } else if (current->ai_family == AF_INET) {
+                    auto* sa = reinterpret_cast<struct sockaddr_in*>(current->ai_addr);
+                    result.addresses.push_back(socket_address(ipv4_address(*sa)));
+                }
             }
+            freeaddrinfo(ai_result);
         }
 
-        auto host = host_;
-        auto key = key_;
-        auto options = options_;
-        auto state = state_;
-
-        std::thread([host = std::move(host), key = std::move(key), options, state]() mutable {
-            struct addrinfo hints{};
-            struct addrinfo* result = nullptr;
-            hints.ai_family = AF_UNSPEC;
-            hints.ai_socktype = SOCK_STREAM;
-
-            std::string service = std::to_string(key.port);
-            int rc = getaddrinfo(host.c_str(), service.c_str(), &hints, &result);
-            if (rc == 0 && result) {
-                for (auto* current = result; current != nullptr; current = current->ai_next) {
-                    if (current->ai_family == AF_INET6) {
-                        auto* sa = reinterpret_cast<struct sockaddr_in6*>(current->ai_addr);
-                        state->results.push_back(socket_address(ipv6_address(*sa)));
-                    } else if (current->ai_family == AF_INET) {
-                        auto* sa = reinterpret_cast<struct sockaddr_in*>(current->ai_addr);
-                        state->results.push_back(socket_address(ipv4_address(*sa)));
-                    }
-                }
-                freeaddrinfo(result);
-            }
-
-            if (state->results.empty()) {
-                state->error = (rc == EAI_SYSTEM) ? errno : EHOSTUNREACH;
-                if (options.use_cache) {
-                    resolve_cache* cache = options.cache ? options.cache : &default_resolve_cache();
-                    cache->store(key, {}, options.negative_ttl);
-                }
-            } else if (options.use_cache) {
-                resolve_cache* cache = options.cache ? options.cache : &default_resolve_cache();
-                cache->store(key, state->results, options.positive_ttl);
-            }
-
-            if (state->scheduler && state->scheduler->is_running()) {
-                state->scheduler->spawn(state->handle);
-            } else {
-                runtime::schedule_handle(state->handle);
-            }
-        }).detach();
-
-        return true;
-    }
-
-    std::vector<socket_address> await_resume() {
-        state_->restore_affinity();
-        if (state_->results.empty()) {
-            errno = state_->error;
+        if (result.addresses.empty()) {
+            result.error = (rc == EAI_SYSTEM) ? errno : EHOSTUNREACH;
         }
-        return state_->results;
+        return result;
+    });
+
+    // Update cache based on result
+    if (options.use_cache) {
+        resolve_cache* cache = options.cache ? options.cache : &default_resolve_cache();
+        if (dns_result.addresses.empty()) {
+            cache->store(key, {}, options.negative_ttl);
+        } else {
+            cache->store(key, dns_result.addresses, options.positive_ttl);
+        }
     }
 
-private:
-    std::string host_;
-    resolve_cache_key key_;
-    resolve_options options_;
-    std::shared_ptr<resolve_waiter_state> state_;
-};
+    // Set errno on failure
+    if (dns_result.addresses.empty()) {
+        errno = dns_result.error;
+    }
 
-inline auto resolve_all(std::string_view host,
-                        uint16_t port,
-                        resolve_options options = {}) {
-    return resolve_all_awaitable(host, port, options);
+    co_return dns_result.addresses;
 }
 
 inline coro::task<std::optional<socket_address>> resolve_hostname(std::string_view host,

@@ -45,7 +45,7 @@ coro::task<void> signal_handler_task() {
     } while(0)
 
 // Helper awaitable to get promise reference
-namespace detail {
+namespace debug_detail {
 struct get_promise {
     bool await_ready() const noexcept { return false; }
     
@@ -66,7 +66,7 @@ struct get_promise {
 // Level 3: Leaf coroutine that does some work
 coro::task<int> compute_value(int x) {
     // Set debug location
-    auto& p = co_await detail::get_promise{};
+    auto& p = co_await debug_detail::get_promise{};
     p.set_location(__FILE__, "compute_value", __LINE__);
     p.set_state(coro::coroutine_state::running);
     
@@ -79,7 +79,7 @@ coro::task<int> compute_value(int x) {
 
 // Level 2: Middle coroutine
 coro::task<int> process_data(int id) {
-    auto& p = co_await detail::get_promise{};
+    auto& p = co_await debug_detail::get_promise{};
     p.set_location(__FILE__, "process_data", __LINE__);
     p.set_state(coro::coroutine_state::running);
     
@@ -90,7 +90,7 @@ coro::task<int> process_data(int id) {
 
 // Level 1: Outer coroutine (worker)
 coro::task<void> worker_task(int worker_id) {
-    auto& p = co_await detail::get_promise{};
+    auto& p = co_await debug_detail::get_promise{};
     p.set_location(__FILE__, "worker_task", __LINE__);
     p.set_state(coro::coroutine_state::running);
     
@@ -107,7 +107,7 @@ coro::task<void> worker_task(int worker_id) {
 
 // Long-running task for debugging
 coro::task<void> long_running_task([[maybe_unused]] int id) {
-    auto& p = co_await detail::get_promise{};
+    auto& p = co_await debug_detail::get_promise{};
     p.set_location(__FILE__, "long_running_task", __LINE__);
     p.set_state(coro::coroutine_state::running);
     
@@ -141,19 +141,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
         std::cout << std::endl;
     }
     
-    // Spawn some worker tasks
-    std::vector<coro::task<void>> workers;
-    for (int i = 0; i < 4; ++i) {
-        workers.push_back(worker_task(i));
-    }
-    
-    // Spawn long-running tasks for debugging
-    std::vector<coro::task<void>> long_tasks;
-    for (int i = 0; i < 2; ++i) {
-        long_tasks.push_back(long_running_task(i));
-    }
-    
-    // Get scheduler and spawn tasks
+    // Get scheduler
     auto* sched = runtime::scheduler::current();
     if (!sched) {
         std::cerr << "Error: No scheduler" << std::endl;
@@ -161,17 +149,19 @@ coro::task<int> async_main(int argc, char* argv[]) {
     }
     
     // Spawn signal handler coroutine
-    auto sig_handler = signal_handler_task();
-    sched->spawn(sig_handler.release());
+    sched->go(signal_handler_task);
     
-    for (auto& w : workers) {
-        sched->spawn(w.release());
-    }
-    for (auto& t : long_tasks) {
-        sched->spawn(t.release());
+    // Spawn some worker tasks
+    for (int i = 0; i < 4; ++i) {
+        sched->go([i]() { return worker_task(i); });
     }
     
-    std::cout << "Spawned " << workers.size() + long_tasks.size() << " tasks" << std::endl;
+    // Spawn long-running tasks for debugging
+    for (int i = 0; i < 2; ++i) {
+        sched->go([i]() { return long_running_task(i); });
+    }
+    
+    std::cout << "Spawned " << 4 + 2 << " tasks" << std::endl;
     std::cout << std::endl;
     
     if (pause_mode) {
@@ -198,5 +188,5 @@ int main(int argc, char* argv[]) {
     sigs.block_all_threads();
     
     // Use elio::run() with the async_main coroutine
-    return elio::run(async_main(argc, argv));
+    return elio::run([&]() { return async_main(argc, argv); });
 }

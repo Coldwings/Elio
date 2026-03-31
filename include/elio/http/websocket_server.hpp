@@ -455,8 +455,9 @@ public:
             }
 
             // Spawn connection handler
-            auto handler = handle_connection(std::move(*stream_result));
-            sched->spawn(handler.release());
+            sched->go([this, s = std::move(*stream_result)]() mutable {
+                return handle_connection(std::move(s));
+            });
         }
     }
 
@@ -490,8 +491,9 @@ public:
             }
 
             // Spawn TLS connection handler
-            auto handler = handle_tls_connection(std::move(*stream_result), tls_ctx);
-            sched->spawn(handler.release());
+            sched->go([this, s = std::move(*stream_result), &tls_ctx]() mutable {
+                return handle_tls_connection(std::move(s), tls_ctx);
+            });
         }
     }
     

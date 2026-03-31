@@ -19,6 +19,10 @@ int main() {
 
     constexpr int N = 100000;
 
+    // NOTE: Tests 1-2 below use detail::task_access to directly measure
+    // coroutine frame allocation overhead. This is intentional for low-level
+    // performance analysis and requires manual handle management.
+
     // 1. Measure coroutine frame allocation (cold - first time)
     {
         std::vector<std::coroutine_handle<>> handles;
@@ -27,7 +31,7 @@ int main() {
         auto start = high_resolution_clock::now();
         for (int i = 0; i < N; ++i) {
             auto t = empty_task();
-            handles.push_back(t.release());
+            handles.push_back(coro::detail::task_access::release(t));
         }
         auto end = high_resolution_clock::now();
         auto ns = duration_cast<nanoseconds>(end - start).count();
@@ -46,7 +50,7 @@ int main() {
         auto start = high_resolution_clock::now();
         for (int i = 0; i < N; ++i) {
             auto t = empty_task();
-            handles.push_back(t.release());
+            handles.push_back(coro::detail::task_access::release(t));
         }
         auto end = high_resolution_clock::now();
         auto ns = duration_cast<nanoseconds>(end - start).count();
@@ -119,23 +123,14 @@ int main() {
         close(fd);
     }
 
-    // 7. Full spawn path (with running scheduler) - cold
+    // 7. Full spawn path (with running scheduler) - includes alloc + spawn
     {
         runtime::scheduler sched(4);
         sched.start();
 
-        std::vector<std::coroutine_handle<>> handles;
-        handles.reserve(N);
-
-        // Pre-create tasks
-        for (int i = 0; i < N; ++i) {
-            auto t = empty_task();
-            handles.push_back(t.release());
-        }
-
         auto start = high_resolution_clock::now();
-        for (auto h : handles) {
-            sched.spawn(h);
+        for (int i = 0; i < N; ++i) {
+            sched.go(empty_task);
         }
         auto end = high_resolution_clock::now();
 
@@ -145,12 +140,12 @@ int main() {
         }
 
         auto ns = duration_cast<nanoseconds>(end - start).count();
-        std::cout << "spawn() only (pre-alloc): " << (ns / N) << " ns/spawn" << std::endl;
+        std::cout << "sched.go() full path: " << (ns / N) << " ns/go" << std::endl;
 
         sched.shutdown();
     }
 
-    // 8. Measure idle worker overhead
+    // 8. Measure warmed-up worker overhead
     {
         runtime::scheduler sched(4);
         sched.start();
@@ -158,18 +153,9 @@ int main() {
         // Let workers warm up
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-        std::vector<std::coroutine_handle<>> handles;
-        handles.reserve(N);
-
-        // Pre-create tasks
-        for (int i = 0; i < N; ++i) {
-            auto t = empty_task();
-            handles.push_back(t.release());
-        }
-
         auto start = high_resolution_clock::now();
-        for (auto h : handles) {
-            sched.spawn(h);
+        for (int i = 0; i < N; ++i) {
+            sched.go(empty_task);
         }
         auto end = high_resolution_clock::now();
 
@@ -179,7 +165,7 @@ int main() {
         }
 
         auto ns = duration_cast<nanoseconds>(end - start).count();
-        std::cout << "spawn() only (workers idle): " << (ns / N) << " ns/spawn" << std::endl;
+        std::cout << "sched.go() (workers warmed): " << (ns / N) << " ns/go" << std::endl;
 
         sched.shutdown();
     }

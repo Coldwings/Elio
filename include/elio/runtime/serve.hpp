@@ -23,6 +23,7 @@
 
 #include <elio/coro/task.hpp>
 #include <elio/signal/signalfd.hpp>
+#include <elio/runtime/scheduler.hpp>
 #include <elio/log/macros.hpp>
 
 #include <csignal>
@@ -75,9 +76,9 @@ inline coro::task<signal::signal_info> wait_shutdown_signal(
 /// task to complete.
 ///
 /// @tparam Server Server type (must have stop() method)
-/// @tparam ListenTask The awaitable returned by server.listen()
+/// @tparam ListenFunc Callable that returns a listen coroutine task
 /// @param server Reference to the server (used to call stop())
-/// @param listen_task The listen coroutine task
+/// @param listen_func Function that returns the listen coroutine task
 /// @param signals Signals to wait for shutdown (defaults to SIGINT, SIGTERM)
 ///
 /// Example:
@@ -87,23 +88,31 @@ inline coro::task<signal::signal_info> wait_shutdown_signal(
 ///     r.get("/", handler);
 ///
 ///     http::server srv(r);
-///     co_await serve(srv, srv.listen(net::ipv4_address(8080)));
+///     co_await serve(srv, [&]() { return srv.listen(net::ipv4_address(8080)); });
 ///
 ///     co_return 0;
 /// }
 ///
 /// ELIO_ASYNC_MAIN(async_main)
 /// @endcode
-template<typename Server, typename ListenTask>
-coro::task<void> serve(Server& server, ListenTask listen_task,
+template<typename Server, typename ListenFunc>
+    requires std::invocable<ListenFunc>
+coro::task<void> serve(Server& server, ListenFunc listen_func,
                        std::initializer_list<int> signals = default_shutdown_signals)
 {
     // Set up signal handling
     signal::signal_set sigs(signals);
     signal::signal_fd sigfd(sigs);
 
-    // Spawn the listen task
-    auto listen_handle = std::move(listen_task).spawn();
+    // Get the scheduler
+    auto* sched = runtime::scheduler::current();
+    if (!sched) {
+        ELIO_LOG_ERROR("serve() must be called within a scheduler context");
+        co_return;
+    }
+
+    // Spawn the listen task as a joinable coroutine
+    auto listen_handle = sched->go_joinable(std::move(listen_func));
 
     // Wait for shutdown signal
     auto info = co_await sigfd.wait();
@@ -153,9 +162,9 @@ coro::task<void> serve(Server& server, ListenTask listen_task,
 /// When signal is received, stops all servers.
 ///
 /// @tparam Servers Variadic server types
-/// @tparam ListenTasks Variadic listen task types
+/// @tparam ListenFuncs Variadic listen function types
 /// @param servers Tuple of server references
-/// @param listen_tasks Tuple of listen tasks
+/// @param listen_funcs Tuple of listen functions (each returning a task)
 /// @param signals Signals to wait for shutdown
 ///
 /// Example:
@@ -167,26 +176,33 @@ coro::task<void> serve(Server& server, ListenTask listen_task,
 ///     co_await serve_all(
 ///         std::tie(http_srv, ws_srv),
 ///         std::make_tuple(
-///             http_srv.listen(addr1),
-///             ws_srv.listen(addr2)
+///             [&]() { return http_srv.listen(addr1); },
+///             [&]() { return ws_srv.listen(addr2); }
 ///         )
 ///     );
 /// }
 /// @endcode
-template<typename... Servers, typename... ListenTasks>
+template<typename... Servers, typename... ListenFuncs>
 coro::task<void> serve_all(std::tuple<Servers&...> servers,
-                           std::tuple<ListenTasks...> listen_tasks,
+                           std::tuple<ListenFuncs...> listen_funcs,
                            std::initializer_list<int> signals = default_shutdown_signals)
 {
     // Set up signal handling
     signal::signal_set sigs(signals);
     signal::signal_fd sigfd(sigs);
 
-    // Spawn all listen tasks
-    auto spawn_tasks = [](auto&&... tasks) {
-        return std::make_tuple(std::move(tasks).spawn()...);
+    // Get the scheduler
+    auto* sched = runtime::scheduler::current();
+    if (!sched) {
+        ELIO_LOG_ERROR("serve_all() must be called within a scheduler context");
+        co_return;
+    }
+
+    // Spawn all listen tasks as joinable coroutines
+    auto spawn_tasks = [sched](auto&&... funcs) {
+        return std::make_tuple(sched->go_joinable(std::move(funcs))...);
     };
-    auto handles = std::apply(spawn_tasks, std::move(listen_tasks));
+    auto handles = std::apply(spawn_tasks, std::move(listen_funcs));
 
     // Wait for shutdown signal
     auto info = co_await sigfd.wait();

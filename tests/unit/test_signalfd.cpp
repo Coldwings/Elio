@@ -14,6 +14,12 @@ using namespace elio::runtime;
 using namespace elio::io;
 using namespace std::chrono_literals;
 
+// Helper to spawn a task to scheduler using high-level API (fire-and-forget)
+template<typename F>
+void spawn_task(scheduler& sched, F&& f) {
+    sched.go(std::forward<F>(f));
+}
+
 TEST_CASE("signal_set basic operations", "[signal][signal_set]") {
     SECTION("default constructor creates empty set") {
         signal_set sigs;
@@ -212,8 +218,7 @@ TEST_CASE("signal_fd async wait", "[signal][signal_fd]") {
     sched.start();
     
     {
-        auto t = wait_task();
-        sched.spawn(t.release());
+        spawn_task(sched, wait_task);
     }
     
     // Give the coroutine time to start and enter wait
@@ -264,8 +269,7 @@ TEST_CASE("signal_fd multiple signals", "[signal][signal_fd]") {
     sched.start();
     
     {
-        auto t = wait_task();
-        sched.spawn(t.release());
+        spawn_task(sched, wait_task);
     }
     
     std::this_thread::sleep_for(50ms);
@@ -383,8 +387,7 @@ TEST_CASE("wait_signal convenience function", "[signal][wait_signal]") {
     sched.start();
     
     {
-        auto t = wait_task();
-        sched.spawn(t.release());
+        spawn_task(sched, wait_task);
     }
     
     std::this_thread::sleep_for(50ms);

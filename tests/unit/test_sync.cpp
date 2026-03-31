@@ -12,6 +12,12 @@ using namespace elio::sync;
 using namespace elio::coro;
 using namespace elio::runtime;
 
+// Helper to spawn a task to scheduler using high-level API (fire-and-forget)
+template<typename F>
+void spawn_task(scheduler& sched, F&& f) {
+    sched.go(std::forward<F>(f));
+}
+
 TEST_CASE("mutex basic operations", "[sync][mutex]") {
     mutex m;
     
@@ -35,7 +41,7 @@ TEST_CASE("mutex basic operations", "[sync][mutex]") {
 
 TEST_CASE("mutex with coroutines", "[sync][mutex][coro]") {
     mutex m;
-    int counter = 0;
+    std::atomic<int> counter{0};
     std::atomic<int> completed{0};
     
     scheduler sched(2);
@@ -43,19 +49,17 @@ TEST_CASE("mutex with coroutines", "[sync][mutex][coro]") {
     
     auto increment_task = [&]() -> task<void> {
         co_await m.lock();
-        int temp = counter;
-        std::this_thread::yield();  // Give other coroutines a chance
-        counter = temp + 1;
+        // Use fetch_add for atomic increment
+        counter.fetch_add(1, std::memory_order_relaxed);
         m.unlock();
-        completed++;
+        completed.fetch_add(1, std::memory_order_relaxed);
     };
     
-    // Create and spawn tasks - use release() to transfer ownership to scheduler
+    // Create and spawn tasks - use spawn_task helper to transfer ownership to scheduler
     // We track completion via the atomic counter
     constexpr int NUM_TASKS = 10;
     for (int i = 0; i < NUM_TASKS; ++i) {
-        auto t = increment_task();
-        sched.spawn(t.release());  // Transfer ownership - scheduler will manage lifetime
+        spawn_task(sched, increment_task);  // Transfer ownership - scheduler will manage lifetime
     }
     
     // Wait for completion
@@ -200,12 +204,10 @@ TEST_CASE("channel with coroutines", "[sync][channel][coro]") {
     scheduler sched(2);
     sched.start();
     
-    // Use release() to transfer ownership to scheduler
+    // Use spawn_task helper to transfer ownership to scheduler
     {
-        auto p = producer();
-        auto c = consumer();
-        sched.spawn(p.release());
-        sched.spawn(c.release());
+        spawn_task(sched, producer);
+        spawn_task(sched, consumer);
     }
     
     // Wait for completion
@@ -306,12 +308,10 @@ TEST_CASE("shared_mutex with coroutines", "[sync][shared_mutex][coro]") {
     
     // Spawn readers and writers
     for (int i = 0; i < NUM_READERS; ++i) {
-        auto t = reader_task();
-        sched.spawn(t.release());
+        spawn_task(sched, reader_task);
     }
     for (int i = 0; i < NUM_WRITERS; ++i) {
-        auto t = writer_task();
-        sched.spawn(t.release());
+        spawn_task(sched, writer_task);
     }
     
     // Wait for completion
@@ -398,8 +398,7 @@ TEST_CASE("spinlock with coroutines", "[sync][spinlock][coro]") {
 
     constexpr int NUM_TASKS = 10;
     for (int i = 0; i < NUM_TASKS; ++i) {
-        auto t = increment_task();
-        sched.spawn(t.release());
+        spawn_task(sched, increment_task);
     }
 
     for (int i = 0; i < 200 && completed < NUM_TASKS; ++i) {
@@ -456,7 +455,7 @@ TEST_CASE("condition_variable has_waiters", "[sync][condvar]") {
 TEST_CASE("condition_variable with mutex notify_one", "[sync][condvar][coro]") {
     mutex mtx;
     condition_variable cv;
-    bool ready = false;
+    std::atomic<bool> ready{false};
     std::atomic<int> completed{0};
 
     scheduler sched(2);
@@ -464,31 +463,29 @@ TEST_CASE("condition_variable with mutex notify_one", "[sync][condvar][coro]") {
 
     auto waiter = [&]() -> task<void> {
         co_await mtx.lock();
-        while (!ready) {
+        while (!ready.load(std::memory_order_acquire)) {
             co_await co_await cv.wait(mtx);
         }
         mtx.unlock();
-        completed++;
+        completed.fetch_add(1, std::memory_order_relaxed);
     };
 
     auto notifier = [&]() -> task<void> {
         co_await mtx.lock();
-        ready = true;
+        ready.store(true, std::memory_order_release);
         mtx.unlock();
         cv.notify_one();
-        completed++;
+        completed.fetch_add(1, std::memory_order_relaxed);
     };
 
     {
-        auto w = waiter();
-        sched.spawn(w.release());
+        spawn_task(sched, waiter);
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     {
-        auto n = notifier();
-        sched.spawn(n.release());
+        spawn_task(sched, notifier);
     }
 
     for (int i = 0; i < 200 && completed < 2; ++i) {
@@ -498,13 +495,13 @@ TEST_CASE("condition_variable with mutex notify_one", "[sync][condvar][coro]") {
     sched.shutdown();
 
     REQUIRE(completed == 2);
-    REQUIRE(ready);
+    REQUIRE(ready.load());
 }
 
 TEST_CASE("condition_variable with mutex notify_all", "[sync][condvar][coro]") {
     mutex mtx;
     condition_variable cv;
-    bool ready = false;
+    std::atomic<bool> ready{false};
     std::atomic<int> completed{0};
 
     scheduler sched(4);
@@ -514,30 +511,28 @@ TEST_CASE("condition_variable with mutex notify_all", "[sync][condvar][coro]") {
 
     auto waiter = [&]() -> task<void> {
         co_await mtx.lock();
-        while (!ready) {
+        while (!ready.load(std::memory_order_acquire)) {
             co_await co_await cv.wait(mtx);
         }
         mtx.unlock();
-        completed++;
+        completed.fetch_add(1, std::memory_order_relaxed);
     };
 
     for (int i = 0; i < NUM_WAITERS; ++i) {
-        auto w = waiter();
-        sched.spawn(w.release());
+        spawn_task(sched, waiter);
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     auto notifier = [&]() -> task<void> {
         co_await mtx.lock();
-        ready = true;
+        ready.store(true, std::memory_order_release);
         mtx.unlock();
         cv.notify_all();
         co_return;
     };
     {
-        auto n = notifier();
-        sched.spawn(n.release());
+        spawn_task(sched, notifier);
     }
 
     for (int i = 0; i < 300 && completed < NUM_WAITERS; ++i) {
@@ -552,7 +547,7 @@ TEST_CASE("condition_variable with mutex notify_all", "[sync][condvar][coro]") {
 TEST_CASE("condition_variable with spinlock", "[sync][condvar][coro]") {
     spinlock sl;
     condition_variable cv;
-    bool ready = false;
+    std::atomic<bool> ready{false};
     std::atomic<int> completed{0};
 
     scheduler sched(2);
@@ -560,32 +555,30 @@ TEST_CASE("condition_variable with spinlock", "[sync][condvar][coro]") {
 
     auto waiter = [&]() -> task<void> {
         sl.lock();
-        while (!ready) {
+        while (!ready.load(std::memory_order_acquire)) {
             co_await cv.wait(sl);
         }
         sl.unlock();
-        completed++;
+        completed.fetch_add(1, std::memory_order_relaxed);
     };
 
     auto notifier = [&]() -> task<void> {
         sl.lock();
-        ready = true;
+        ready.store(true, std::memory_order_release);
         sl.unlock();
         cv.notify_one();
-        completed++;
+        completed.fetch_add(1, std::memory_order_relaxed);
         co_return;
     };
 
     {
-        auto w = waiter();
-        sched.spawn(w.release());
+        spawn_task(sched, waiter);
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     {
-        auto n = notifier();
-        sched.spawn(n.release());
+        spawn_task(sched, notifier);
     }
 
     for (int i = 0; i < 200 && completed < 2; ++i) {
@@ -599,7 +592,7 @@ TEST_CASE("condition_variable with spinlock", "[sync][condvar][coro]") {
 
 TEST_CASE("condition_variable unlocked", "[sync][condvar][coro]") {
     condition_variable cv;
-    bool ready = false;
+    std::atomic<bool> ready{false};
     std::atomic<int> completed{0};
 
     // Single worker: all coroutines run on the same thread
@@ -607,29 +600,27 @@ TEST_CASE("condition_variable unlocked", "[sync][condvar][coro]") {
     sched.start();
 
     auto waiter = [&]() -> task<void> {
-        while (!ready) {
+        while (!ready.load(std::memory_order_acquire)) {
             co_await cv.wait_unlocked();
         }
-        completed++;
+        completed.fetch_add(1, std::memory_order_relaxed);
     };
 
     auto notifier = [&]() -> task<void> {
-        ready = true;
+        ready.store(true, std::memory_order_release);
         cv.notify_one();
-        completed++;
+        completed.fetch_add(1, std::memory_order_relaxed);
         co_return;
     };
 
     {
-        auto w = waiter();
-        sched.spawn(w.release());
+        spawn_task(sched, waiter);
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     {
-        auto n = notifier();
-        sched.spawn(n.release());
+        spawn_task(sched, notifier);
     }
 
     for (int i = 0; i < 200 && completed < 2; ++i) {
@@ -644,7 +635,7 @@ TEST_CASE("condition_variable unlocked", "[sync][condvar][coro]") {
 TEST_CASE("condition_variable notify_one wakes exactly one", "[sync][condvar][coro]") {
     mutex mtx;
     condition_variable cv;
-    int phase = 0;
+    std::atomic<int> phase{0};
     std::atomic<int> woken{0};
     std::atomic<int> completed{0};
 
@@ -655,17 +646,16 @@ TEST_CASE("condition_variable notify_one wakes exactly one", "[sync][condvar][co
 
     auto waiter = [&]() -> task<void> {
         co_await mtx.lock();
-        while (phase == 0) {
+        while (phase.load(std::memory_order_acquire) == 0) {
             co_await co_await cv.wait(mtx);
         }
-        woken++;
+        woken.fetch_add(1, std::memory_order_relaxed);
         mtx.unlock();
-        completed++;
+        completed.fetch_add(1, std::memory_order_relaxed);
     };
 
     for (int i = 0; i < NUM_WAITERS; ++i) {
-        auto w = waiter();
-        sched.spawn(w.release());
+        spawn_task(sched, waiter);
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -673,14 +663,13 @@ TEST_CASE("condition_variable notify_one wakes exactly one", "[sync][condvar][co
     // Set condition and notify exactly one
     auto notifier = [&]() -> task<void> {
         co_await mtx.lock();
-        phase = 1;
+        phase.store(1, std::memory_order_release);
         mtx.unlock();
         cv.notify_one();
         co_return;
     };
     {
-        auto n = notifier();
-        sched.spawn(n.release());
+        spawn_task(sched, notifier);
     }
 
     // Wait for exactly one to wake
@@ -749,13 +738,11 @@ TEST_CASE("condition_variable producer-consumer", "[sync][condvar][coro]") {
     };
 
     {
-        auto c = consumer();
-        sched.spawn(c.release());
+        spawn_task(sched, consumer);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     {
-        auto p = producer();
-        sched.spawn(p.release());
+        spawn_task(sched, producer);
     }
 
     for (int i = 0; i < 300 && completed < 2; ++i) {

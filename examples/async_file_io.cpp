@@ -270,8 +270,7 @@ int main(int argc, char* argv[]) {
             done = true;
         };
         
-        auto t = run();
-        sched.spawn(t.release());
+        sched.go(run);
     } else if (mode == "--read") {
         std::vector<std::string> files;
         for (int i = 2; i < argc; ++i) {
@@ -283,8 +282,7 @@ int main(int argc, char* argv[]) {
             done = true;
         };
         
-        auto t = run();
-        sched.spawn(t.release());
+        sched.go(run);
     } else if (argc >= 3) {
         // File copy mode
         std::string src = argv[1];
@@ -296,8 +294,7 @@ int main(int argc, char* argv[]) {
             done = true;
         };
         
-        auto t = run();
-        sched.spawn(t.release());
+        sched.go(run);
     } else {
         std::cerr << "Invalid arguments" << std::endl;
         return 1;

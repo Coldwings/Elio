@@ -182,6 +182,92 @@ coro::task<void> main_task() {
 }
 ```
 
+### `generator<T>`
+
+Async generator for producing a stream of values with full scheduler integration. Uses a producer-consumer model where the producer coroutine generates values asynchronously and the consumer retrieves them via `co_await next()`.
+
+```cpp
+template<typename T>
+class generator_producer {
+public:
+    using promise_type = /* implementation */;
+    // Return type for producer coroutines (use co_yield to produce values)
+};
+
+template<typename T>
+class generator {
+public:
+    using value_type = T;
+    using producer_type = generator_producer<T>;
+
+    generator();
+    explicit generator(producer_type producer);
+
+    generator(generator&& other) noexcept;
+    generator& operator=(generator&& other) noexcept;
+
+    // Non-copyable
+    generator(const generator&) = delete;
+    generator& operator=(const generator&) = delete;
+
+    /// Get the next value. Returns std::nullopt when finished.
+    auto next();  // Returns awaitable<std::optional<T>>
+
+    /// Check if generator is finished.
+    [[nodiscard]] bool finished() const noexcept;
+};
+```
+
+**Basic Usage:**
+```cpp
+// Producer: generates values using co_yield
+generator_producer<int> produce_values(int n) {
+    for (int i = 0; i < n; ++i) {
+        co_yield i;
+    }
+}
+
+// Consumer: retrieves values using co_await next()
+coro::task<void> consume() {
+    generator<int> gen(produce_values(5));
+    while (auto val = co_await gen.next()) {
+        std::cout << *val << "\n";  // 0, 1, 2, 3, 4
+    }
+}
+```
+
+**With Async Operations:**
+```cpp
+// Producer can use co_await for async I/O
+generator_producer<std::string> read_lines(tcp::socket& sock) {
+    while (sock.is_open()) {
+        auto line = co_await sock.read_line();
+        co_yield std::move(line);
+    }
+}
+
+coro::task<void> process(tcp::socket& sock) {
+    generator<std::string> lines(read_lines(sock));
+    while (auto line = co_await lines.next()) {
+        handle_line(*line);
+    }
+}
+```
+
+**Nested Generators:**
+```cpp
+generator_producer<int> inner(int n) {
+    for (int i = 0; i < n; ++i) co_yield i;
+}
+
+generator_producer<int> outer() {
+    generator<int> g1(inner(3));
+    while (auto v = co_await g1.next()) {
+        co_yield *v + 100;  // 100, 101, 102
+    }
+}
+```
+
 ### `cancel_token` and `cancel_source`
 
 Cooperative cancellation mechanism for async operations.

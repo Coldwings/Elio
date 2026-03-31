@@ -19,6 +19,7 @@
 #include "coro/frame.hpp"
 #include "coro/cancel_token.hpp"
 #include "coro/vthread_stack.hpp"
+#include "coro/generator.hpp"
 
 // Runtime scheduler
 #include "runtime/scheduler.hpp"

@@ -18,7 +18,7 @@ using namespace elio::time;
 // Basic generator tests
 // ============================================================================
 
-generator_producer<int> simple_producer() {
+generator<int> simple_producer() {
     co_yield 1;
     co_yield 2;
     co_yield 3;
@@ -32,7 +32,7 @@ TEST_CASE("generator basic usage", "[generator]") {
     std::vector<int> values;
     
     auto consumer = [&]() -> task<void> {
-        generator<int> gen(simple_producer());
+        auto gen = simple_producer();
         
         while (auto v = co_await gen.next()) {
             values.push_back(*v);
@@ -50,7 +50,7 @@ TEST_CASE("generator basic usage", "[generator]") {
     sched.shutdown();
 }
 
-generator_producer<int> empty_producer() {
+generator<int> empty_producer() {
     co_return;
 }
 
@@ -62,7 +62,7 @@ TEST_CASE("generator empty", "[generator]") {
     int count = 0;
     
     auto consumer = [&]() -> task<void> {
-        generator<int> gen(empty_producer());
+        auto gen = empty_producer();
         
         while (auto v = co_await gen.next()) {
             ++count;
@@ -84,7 +84,7 @@ TEST_CASE("generator empty", "[generator]") {
 // Async operations during yield
 // ============================================================================
 
-generator_producer<int> producer_with_delay() {
+generator<int> producer_with_delay() {
     for (int i = 0; i < 5; ++i) {
         co_await sleep_for(std::chrono::milliseconds(20));
         co_yield i;
@@ -101,7 +101,7 @@ TEST_CASE("generator with async delays", "[generator]") {
     auto start = std::chrono::steady_clock::now();
     
     auto consumer = [&]() -> task<void> {
-        generator<int> gen(producer_with_delay());
+        auto gen = producer_with_delay();
         
         while (auto v = co_await gen.next()) {
             values.push_back(*v);
@@ -128,7 +128,7 @@ TEST_CASE("generator with async delays", "[generator]") {
 // Fibonacci with generator
 // ============================================================================
 
-generator_producer<int> fibonacci(int n) {
+generator<int> fibonacci(int n) {
     int a = 0, b = 1;
     for (int i = 0; i < n; ++i) {
         co_yield a;
@@ -146,7 +146,7 @@ TEST_CASE("generator fibonacci", "[generator]") {
     std::vector<int> values;
     
     auto consumer = [&]() -> task<void> {
-        generator<int> gen(fibonacci(10));
+        auto gen = fibonacci(10);
         
         while (auto v = co_await gen.next()) {
             values.push_back(*v);
@@ -168,7 +168,7 @@ TEST_CASE("generator fibonacci", "[generator]") {
 // String type
 // ============================================================================
 
-generator_producer<std::string> string_producer() {
+generator<std::string> string_producer() {
     co_yield "hello";
     co_yield "async";
     co_yield "world";
@@ -182,7 +182,7 @@ TEST_CASE("generator with strings", "[generator]") {
     std::vector<std::string> values;
     
     auto consumer = [&]() -> task<void> {
-        generator<std::string> gen(string_producer());
+        auto gen = string_producer();
         
         while (auto v = co_await gen.next()) {
             values.push_back(*v);
@@ -204,7 +204,7 @@ TEST_CASE("generator with strings", "[generator]") {
 // Exception handling
 // ============================================================================
 
-generator_producer<int> throwing_producer() {
+generator<int> throwing_producer() {
     co_yield 1;
     co_yield 2;
     throw std::runtime_error("generator error");
@@ -219,7 +219,7 @@ TEST_CASE("generator throws exception", "[generator]") {
     std::vector<int> values;
     
     auto consumer = [&]() -> task<void> {
-        generator<int> gen(throwing_producer());
+        auto gen = throwing_producer();
         
         try {
             while (auto v = co_await gen.next()) {
@@ -251,7 +251,7 @@ TEST_CASE("generator single consumer", "[generator]") {
     std::atomic<int> total{0};
     
     auto consumer = [&]() -> task<void> {
-        generator<int> gen(simple_producer());
+        auto gen = simple_producer();
         
         while (auto v = co_await gen.next()) {
             total += *v;
@@ -271,7 +271,7 @@ TEST_CASE("generator single consumer", "[generator]") {
 // Producer consumer timing
 // ============================================================================
 
-generator_producer<int> slow_producer(int delay_ms) {
+generator<int> slow_producer(int delay_ms) {
     for (int i = 1; i <= 3; ++i) {
         co_await sleep_for(std::chrono::milliseconds(delay_ms));
         co_yield i;
@@ -287,7 +287,7 @@ TEST_CASE("generator producer consumer timing", "[generator]") {
     std::vector<std::chrono::steady_clock::time_point> timestamps;
     
     auto consumer = [&]() -> task<void> {
-        generator<int> gen(slow_producer(30));
+        auto gen = slow_producer(30);
         
         while (auto v = co_await gen.next()) {
             timestamps.push_back(std::chrono::steady_clock::now());
@@ -331,7 +331,7 @@ struct LargeValue {
     }
 };
 
-generator_producer<LargeValue> large_producer() {
+generator<LargeValue> large_producer() {
     co_yield LargeValue(1);
     co_yield LargeValue(2);
     co_yield LargeValue(3);
@@ -345,7 +345,7 @@ TEST_CASE("generator with large values", "[generator]") {
     std::vector<int> sums;
     
     auto consumer = [&]() -> task<void> {
-        generator<LargeValue> gen(large_producer());
+        auto gen = large_producer();
         
         while (auto v = co_await gen.next()) {
             sums.push_back(v->sum());
@@ -374,7 +374,7 @@ TEST_CASE("generator virtual stack allocation", "[generator][vstack]") {
     std::atomic<bool> completed{false};
     
     auto consumer = [&]() -> task<void> {
-        generator<int> gen(simple_producer());
+        auto gen = simple_producer();
         
         while (auto v = co_await gen.next()) {
             // Just consume values
@@ -395,15 +395,15 @@ TEST_CASE("generator virtual stack allocation", "[generator][vstack]") {
 // Nested generators
 // ============================================================================
 
-generator_producer<int> gen_nested_inner(int n) {
+generator<int> gen_nested_inner(int n) {
     for (int i = 0; i < n; ++i) {
         co_yield i;
     }
 }
 
-generator_producer<int> gen_nested_outer() {
-    generator<int> inner1(gen_nested_inner(3));
-    generator<int> inner2(gen_nested_inner(2));
+generator<int> gen_nested_outer() {
+    auto inner1 = gen_nested_inner(3);
+    auto inner2 = gen_nested_inner(2);
     
     while (auto v = co_await inner1.next()) {
         co_yield *v + 100;
@@ -422,7 +422,7 @@ TEST_CASE("generator nested", "[generator]") {
     std::vector<int> values;
     
     auto consumer = [&]() -> task<void> {
-        generator<int> gen(gen_nested_outer());
+        auto gen = gen_nested_outer();
         
         while (auto v = co_await gen.next()) {
             values.push_back(*v);
@@ -452,7 +452,7 @@ TEST_CASE("generator early termination", "[generator]") {
     std::vector<int> values;
     
     auto consumer = [&]() -> task<void> {
-        generator<int> gen(fibonacci(100));
+        auto gen = fibonacci(100);
         
         int count = 0;
         while (auto v = co_await gen.next()) {
@@ -476,7 +476,7 @@ TEST_CASE("generator early termination", "[generator]") {
 // Infinite generator (limited by consumer)
 // ============================================================================
 
-generator_producer<int> infinite_producer() {
+generator<int> infinite_producer() {
     int i = 0;
     while (true) {
         co_yield i++;
@@ -491,7 +491,7 @@ TEST_CASE("generator infinite limited by consumer", "[generator]") {
     std::vector<int> values;
     
     auto consumer = [&]() -> task<void> {
-        generator<int> gen(infinite_producer());
+        auto gen = infinite_producer();
         
         int count = 0;
         while (auto v = co_await gen.next()) {
@@ -512,10 +512,124 @@ TEST_CASE("generator infinite limited by consumer", "[generator]") {
 }
 
 // ============================================================================
+// ELIO_CO_FOR macro
+// ============================================================================
+
+TEST_CASE("generator ELIO_CO_FOR macro", "[generator]") {
+    scheduler sched(2);
+    sched.start();
+    
+    std::atomic<bool> completed{false};
+    std::vector<int> values;
+    
+    auto consumer = [&]() -> task<void> {
+        auto gen = simple_producer();
+        
+        ELIO_CO_FOR(v, gen) {
+            values.push_back(v);
+        }
+        completed.store(true);
+    };
+    
+    elio::go(consumer);
+    
+    std::this_thread::sleep_for(scaled_ms(200));
+    
+    REQUIRE(completed.load());
+    REQUIRE(values == std::vector<int>{1, 2, 3});
+    
+    sched.shutdown();
+}
+
+TEST_CASE("generator ELIO_CO_FOR with break", "[generator]") {
+    scheduler sched(2);
+    sched.start();
+    
+    std::atomic<bool> completed{false};
+    std::vector<int> values;
+    
+    auto consumer = [&]() -> task<void> {
+        auto gen = fibonacci(100);
+        
+        ELIO_CO_FOR(v, gen) {
+            values.push_back(v);
+            if (values.size() >= 5) break;
+        }
+        completed.store(true);
+    };
+    
+    elio::go(consumer);
+    
+    std::this_thread::sleep_for(scaled_ms(200));
+    
+    REQUIRE(completed.load());
+    REQUIRE(values == std::vector<int>{0, 1, 1, 2, 3});
+    
+    sched.shutdown();
+}
+
+// ============================================================================
+// for_each method
+// ============================================================================
+
+TEST_CASE("generator for_each", "[generator]") {
+    scheduler sched(2);
+    sched.start();
+    
+    std::atomic<bool> completed{false};
+    std::vector<int> values;
+    
+    auto consumer = [&]() -> task<void> {
+        auto gen = simple_producer();
+        
+        co_await gen.for_each([&](int v) {
+            values.push_back(v);
+        });
+        completed.store(true);
+    };
+    
+    elio::go(consumer);
+    
+    std::this_thread::sleep_for(scaled_ms(200));
+    
+    REQUIRE(completed.load());
+    REQUIRE(values == std::vector<int>{1, 2, 3});
+    
+    sched.shutdown();
+}
+
+TEST_CASE("generator for_each with early termination", "[generator]") {
+    scheduler sched(2);
+    sched.start();
+    
+    std::atomic<bool> completed{false};
+    std::vector<int> values;
+    
+    auto consumer = [&]() -> task<void> {
+        auto gen = fibonacci(100);
+        
+        co_await gen.for_each([&](int v) -> bool {
+            values.push_back(v);
+            return values.size() < 5;  // stop after 5 values
+        });
+        completed.store(true);
+    };
+    
+    elio::go(consumer);
+    
+    std::this_thread::sleep_for(scaled_ms(200));
+    
+    REQUIRE(completed.load());
+    REQUIRE(values == std::vector<int>{0, 1, 1, 2, 3});
+    
+    sched.shutdown();
+}
+
+// ============================================================================
 // Multiple yields in sequence
 // ============================================================================
 
-generator_producer<int> multi_yield_producer() {
+generator<int> multi_yield_producer() {
     co_yield 1;
     co_yield 2;
     co_yield 3;
@@ -536,7 +650,7 @@ TEST_CASE("generator many yields", "[generator]") {
     std::vector<int> values;
     
     auto consumer = [&]() -> task<void> {
-        generator<int> gen(multi_yield_producer());
+        auto gen = multi_yield_producer();
         
         while (auto v = co_await gen.next()) {
             values.push_back(*v);

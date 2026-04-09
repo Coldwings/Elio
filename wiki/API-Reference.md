@@ -184,25 +184,15 @@ coro::task<void> main_task() {
 
 ### `generator<T>`
 
-Async generator for producing a stream of values with full scheduler integration. Uses a producer-consumer model where the producer coroutine generates values asynchronously and the consumer retrieves them via `co_await next()`.
+Async generator for producing a stream of values via symmetric transfer. A single type serves as both the coroutine return type and the consumer interface — the producer coroutine uses `co_yield` to produce values, and the consumer retrieves them via `co_await gen.next()`.
 
 ```cpp
 template<typename T>
-class generator_producer {
-public:
-    using promise_type = /* implementation */;
-    // Return type for producer coroutines (use co_yield to produce values)
-};
-
-template<typename T>
 class generator {
 public:
-    using value_type = T;
-    using producer_type = generator_producer<T>;
+    using promise_type = /* implementation */;
 
     generator();
-    explicit generator(producer_type producer);
-
     generator(generator&& other) noexcept;
     generator& operator=(generator&& other) noexcept;
 
@@ -213,33 +203,61 @@ public:
     /// Get the next value. Returns std::nullopt when finished.
     auto next();  // Returns awaitable<std::optional<T>>
 
+    /// Iterate with a callback. If func returns bool, false = early break.
+    template<typename F>
+    auto for_each(F&& func);  // Returns awaitable<void>
+
     /// Check if generator is finished.
     [[nodiscard]] bool finished() const noexcept;
 };
+
+/// Range-for-like macro (zero overhead, supports break/continue)
+#define ELIO_CO_FOR(var, gen)  /* ... */
 ```
 
 **Basic Usage:**
 ```cpp
 // Producer: generates values using co_yield
-generator_producer<int> produce_values(int n) {
+generator<int> produce_values(int n) {
     for (int i = 0; i < n; ++i) {
         co_yield i;
     }
 }
 
-// Consumer: retrieves values using co_await next()
+// Consumer: three iteration styles
 coro::task<void> consume() {
-    generator<int> gen(produce_values(5));
+    // Style 1: while loop
+    auto gen = produce_values(5);
     while (auto val = co_await gen.next()) {
         std::cout << *val << "\n";  // 0, 1, 2, 3, 4
     }
+
+    // Style 2: ELIO_CO_FOR macro (range-for-like, supports break/continue)
+    auto gen2 = produce_values(10);
+    ELIO_CO_FOR(v, gen2) {
+        std::cout << v << "\n";
+        if (v >= 4) break;
+    }
+
+    // Style 3: for_each method (functional style)
+    auto gen3 = produce_values(5);
+    co_await gen3.for_each([](int v) {
+        std::cout << v << "\n";
+    });
+
+    // for_each with early termination (return false to break)
+    auto gen4 = produce_values(100);
+    co_await gen4.for_each([](int v) -> bool {
+        std::cout << v << "\n";
+        return v < 5;  // stop when v >= 5
+    });
 }
 ```
 
 **With Async Operations:**
 ```cpp
 // Producer can use co_await for async I/O
-generator_producer<std::string> read_lines(tcp::socket& sock) {
+generator<std::string> read_lines(tcp::socket& sock) {
     while (sock.is_open()) {
         auto line = co_await sock.read_line();
         co_yield std::move(line);
@@ -247,23 +265,23 @@ generator_producer<std::string> read_lines(tcp::socket& sock) {
 }
 
 coro::task<void> process(tcp::socket& sock) {
-    generator<std::string> lines(read_lines(sock));
-    while (auto line = co_await lines.next()) {
-        handle_line(*line);
+    auto lines = read_lines(sock);
+    ELIO_CO_FOR(line, lines) {
+        handle_line(line);
     }
 }
 ```
 
 **Nested Generators:**
 ```cpp
-generator_producer<int> inner(int n) {
+generator<int> inner(int n) {
     for (int i = 0; i < n; ++i) co_yield i;
 }
 
-generator_producer<int> outer() {
-    generator<int> g1(inner(3));
-    while (auto v = co_await g1.next()) {
-        co_yield *v + 100;  // 100, 101, 102
+generator<int> outer() {
+    auto g1 = inner(3);
+    ELIO_CO_FOR(v, g1) {
+        co_yield v + 100;  // 100, 101, 102
     }
 }
 ```

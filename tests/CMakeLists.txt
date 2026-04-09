@@ -23,6 +23,7 @@ set(TEST_SOURCES
     unit/test_rpc.cpp
     unit/test_signalfd.cpp
     unit/test_autoscaler.cpp
+    unit/test_generator.cpp
     integration/test_scheduler_integration.cpp
     integration/test_exception_propagation.cpp
     integration/test_parallel_tasks.cpp

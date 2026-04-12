@@ -687,6 +687,95 @@ void hash_example() {
 }
 ```
 
+## File I/O
+
+### Reading and Writing Files
+
+```cpp
+#include <elio/elio.hpp>
+#include <iostream>
+
+using namespace elio;
+
+coro::task<void> file_operations() {
+    // Read a file
+    auto content = co_await io::read_file("/etc/hostname");
+    if (content) {
+        std::cout << "Hostname: " << *content << std::endl;
+    }
+
+    // Write a file
+    bool ok = co_await io::write_file("/tmp/hello.txt", "Hello, Elio!\n");
+    if (ok) {
+        std::cout << "File written successfully" << std::endl;
+    }
+
+    // Append to a file
+    ok = co_await io::append_file("/tmp/hello.txt", "Appended line\n");
+
+    // Check file metadata
+    if (io::file_exists("/tmp/hello.txt")) {
+        auto size = io::file_size("/tmp/hello.txt");
+        std::cout << "File size: " << (size ? *size : 0) << " bytes" << std::endl;
+    }
+
+    // Read a directory
+    auto entries = io::read_dir("/tmp");
+    if (entries) {
+        for (const auto& entry : *entries) {
+            if (entry.is_file) {
+                std::cout << "[FILE] " << entry.name << std::endl;
+            } else if (entry.is_dir) {
+                std::cout << "[DIR]  " << entry.name << std::endl;
+            }
+        }
+    }
+}
+```
+
+### Batch I/O
+
+Read multiple file regions in a single syscall:
+
+```cpp
+coro::task<void> batch_read_example(int fd) {
+    char header[64] = {0};
+    char footer[64] = {0};
+    char middle[128] = {0};
+
+    std::array<io::batch_read_segment, 3> segments;
+    segments[0] = {0, header, 64};       // Read first 64 bytes
+    segments[1] = {1024, middle, 128};   // Read 128 bytes at offset 1024
+    segments[2] = {-1, footer, 64};      // Read from current position
+
+    auto results = co_await io::batch_read(fd, segments);
+
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i] > 0) {
+            std::cout << "Segment " << i << ": read " << results[i] << " bytes" << std::endl;
+        } else {
+            std::cerr << "Segment " << i << ": error " << -results[i] << std::endl;
+        }
+    }
+}
+```
+
+Write multiple file regions simultaneously:
+
+```cpp
+coro::task<void> batch_write_example(int fd) {
+    const char* part1 = "HEADER";
+    const char* part2 = "FOOTER";
+
+    std::array<io::batch_write_segment, 2> segments;
+    segments[0] = {0, part1, 6};      // Write at start
+    segments[1] = {1024, part2, 6};   // Write at offset 1024
+
+    auto results = co_await io::batch_write(fd, segments);
+    // Both writes happen concurrently in the kernel
+}
+```
+
 ## Building Examples
 
 All examples are built automatically with CMake:

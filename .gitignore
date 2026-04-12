@@ -37,3 +37,4 @@ benchmark
 .DS_Store
 .clangd
 __pycache__
+build-release/

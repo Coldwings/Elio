@@ -42,6 +42,7 @@
 #include "io/io_uring_backend.hpp"
 #include "io/epoll_backend.hpp"
 #include "io/io_awaitables.hpp"
+#include "io/file_helpers.hpp"
 
 // Networking
 #include "net/tcp.hpp"

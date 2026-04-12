@@ -9,6 +9,11 @@
 #include <span>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <unistd.h>
+#include <thread>
+#include <atomic>
+#include <memory>
+#include <vector>
 
 namespace elio::io {
 
@@ -539,6 +544,230 @@ inline auto async_poll_read(int fd) {
 /// Create an async poll awaitable for writing
 inline auto async_poll_write(int fd) {
     return async_poll_awaitable(fd, false);
+}
+
+/// Segment descriptor for batch read operations
+struct batch_read_segment {
+    int64_t offset;   ///< File offset (-1 for current position → uses pread with offset 0)
+    void* buffer;     ///< Destination buffer
+    size_t length;    ///< Bytes to read
+};
+
+/// Segment descriptor for batch write operations
+struct batch_write_segment {
+    int64_t offset;      ///< File offset (-1 for current position → uses pwrite with offset 0)
+    const void* buffer;  ///< Source data
+    size_t length;       ///< Bytes to write
+};
+
+/// Tracks completion of a batch I/O operation
+struct batch_state {
+    std::atomic<int> completed{0}; ///< Atomically incremented per completion
+    int total;                      ///< Total segments
+    std::vector<int> results;       ///< Per-segment results (bytes or -errno)
+
+    explicit batch_state(int n) : total(n), results(n) {}
+
+    bool all_done() const noexcept {
+        return completed.load(std::memory_order_acquire) >= total;
+    }
+};
+
+/// Awaitable for batch read operations
+/// Submits multiple pread operations in a single io_uring syscall.
+/// Falls back to sequential synchronous reads for epoll backend.
+class batch_read_awaitable : public io_awaitable_base {
+public:
+    batch_read_awaitable(int fd, std::span<const batch_read_segment> segments) noexcept
+        : io_awaitable_base(), fd_(fd), segments_(segments.begin(), segments.end()) {}
+
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+
+        if (segments_.empty()) {
+            batch_st_ = std::make_unique<batch_state>(0);
+            awaiter.resume();
+            return;
+        }
+
+        auto& ctx = current_io_context();
+
+#if ELIO_HAS_IO_URING
+        auto* backend = dynamic_cast<io_uring_backend*>(ctx.get_backend());
+        if (backend && backend->get_ring()) {
+            struct io_uring* ring = backend->get_ring();
+            batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
+
+            // Prepare all SQEs at once, using a unique tag per segment
+            for (size_t i = 0; i < segments_.size(); ++i) {
+                struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
+                if (!sqe) {
+                    batch_st_->results[i] = -EAGAIN;
+                    batch_st_->completed.fetch_add(1, std::memory_order_acq_rel);
+                    continue;
+                }
+                // Store segment index + batch pointer in user_data
+                // Use a simple scheme: encode index in lower bits of a combined value
+                auto* tagged = reinterpret_cast<void*>(
+                    (reinterpret_cast<uintptr_t>(batch_st_.get()) << 8) |
+                    (i & 0x7F) | 0x80);
+                io_uring_sqe_set_data(sqe, tagged);
+                auto off = static_cast<__u64>(
+                    segments_[i].offset >= 0 ? segments_[i].offset : 0);
+                io_uring_prep_read(sqe, fd_, segments_[i].buffer,
+                    static_cast<unsigned>(segments_[i].length), off);
+            }
+
+            // Single syscall submit
+            io_uring_submit(ring);
+
+            // Poll until all segments complete
+            while (!batch_st_->all_done()) {
+                struct io_uring_cqe* wcqe = nullptr;
+                int ret = io_uring_wait_cqe(ring, &wcqe);
+                if (ret != 0 || !wcqe) continue;
+                auto* ud = io_uring_cqe_get_data(wcqe);
+                auto val = reinterpret_cast<uintptr_t>(ud);
+                if (val & 0x80) {
+                    auto* st = reinterpret_cast<batch_state*>(val >> 8);
+                    if (st == batch_st_.get()) {
+                        int seg_idx = static_cast<int>(val & 0x7F);
+                        if (seg_idx < static_cast<int>(st->results.size())) {
+                            st->results[seg_idx] = wcqe->res;
+                        }
+                        st->completed.fetch_add(1, std::memory_order_acq_rel);
+                    }
+                }
+                io_uring_cqe_seen(ring, wcqe);
+            }
+            awaiter.resume();
+            return;
+        }
+#endif
+        // Fallback: sequential synchronous reads
+        batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
+        for (size_t i = 0; i < segments_.size(); ++i) {
+            auto off = segments_[i].offset >= 0 ? segments_[i].offset : 0;
+            batch_st_->results[i] = static_cast<int>(
+                pread(fd_, segments_[i].buffer, segments_[i].length, off));
+        }
+        awaiter.resume();
+    }
+
+    std::vector<int> await_resume() noexcept {
+        restore_affinity();
+        if (batch_st_) {
+            return std::move(batch_st_->results);
+        }
+        return {};
+    }
+
+private:
+    int fd_;
+    std::vector<batch_read_segment> segments_;
+    std::unique_ptr<batch_state> batch_st_;
+};
+
+/// Awaitable for batch write operations
+/// Submits multiple pwrite operations in a single io_uring syscall.
+/// Falls back to sequential synchronous writes for epoll backend.
+class batch_write_awaitable : public io_awaitable_base {
+public:
+    batch_write_awaitable(int fd, std::span<const batch_write_segment> segments) noexcept
+        : io_awaitable_base(), fd_(fd), segments_(segments.begin(), segments.end()) {}
+
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+
+        if (segments_.empty()) {
+            batch_st_ = std::make_unique<batch_state>(0);
+            awaiter.resume();
+            return;
+        }
+
+        auto& ctx = current_io_context();
+
+#if ELIO_HAS_IO_URING
+        auto* backend = dynamic_cast<io_uring_backend*>(ctx.get_backend());
+        if (backend && backend->get_ring()) {
+            struct io_uring* ring = backend->get_ring();
+            batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
+
+            for (size_t i = 0; i < segments_.size(); ++i) {
+                struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
+                if (!sqe) {
+                    batch_st_->results[i] = -EAGAIN;
+                    batch_st_->completed.fetch_add(1, std::memory_order_acq_rel);
+                    continue;
+                }
+                auto* tagged = reinterpret_cast<void*>(
+                    (reinterpret_cast<uintptr_t>(batch_st_.get()) << 8) |
+                    (i & 0x7F) | 0x80);
+                io_uring_sqe_set_data(sqe, tagged);
+                auto off = static_cast<__u64>(
+                    segments_[i].offset >= 0 ? segments_[i].offset : 0);
+                io_uring_prep_write(sqe, fd_, segments_[i].buffer,
+                    static_cast<unsigned>(segments_[i].length), off);
+            }
+
+            io_uring_submit(ring);
+
+            while (!batch_st_->all_done()) {
+                struct io_uring_cqe* wcqe = nullptr;
+                int ret = io_uring_wait_cqe(ring, &wcqe);
+                if (ret != 0 || !wcqe) continue;
+                auto* ud = io_uring_cqe_get_data(wcqe);
+                auto val = reinterpret_cast<uintptr_t>(ud);
+                if (val & 0x80) {
+                    auto* st = reinterpret_cast<batch_state*>(val >> 8);
+                    if (st == batch_st_.get()) {
+                        int seg_idx = static_cast<int>(val & 0x7F);
+                        if (seg_idx < static_cast<int>(st->results.size())) {
+                            st->results[seg_idx] = wcqe->res;
+                        }
+                        st->completed.fetch_add(1, std::memory_order_acq_rel);
+                    }
+                }
+                io_uring_cqe_seen(ring, wcqe);
+            }
+            awaiter.resume();
+            return;
+        }
+#endif
+        // Fallback: sequential synchronous writes
+        batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
+        for (size_t i = 0; i < segments_.size(); ++i) {
+            auto off = segments_[i].offset >= 0 ? segments_[i].offset : 0;
+            batch_st_->results[i] = static_cast<int>(
+                pwrite(fd_, segments_[i].buffer, segments_[i].length, off));
+        }
+        awaiter.resume();
+    }
+
+    std::vector<int> await_resume() noexcept {
+        restore_affinity();
+        if (batch_st_) {
+            return std::move(batch_st_->results);
+        }
+        return {};
+    }
+
+private:
+    int fd_;
+    std::vector<batch_write_segment> segments_;
+    std::unique_ptr<batch_state> batch_st_;
+};
+
+/// Batch read from file at multiple offsets in a single syscall (io_uring)
+inline auto batch_read(int fd, std::span<const batch_read_segment> segments) {
+    return batch_read_awaitable(fd, segments);
+}
+
+/// Batch write to file at multiple offsets in a single syscall (io_uring)
+inline auto batch_write(int fd, std::span<const batch_write_segment> segments) {
+    return batch_write_awaitable(fd, segments);
 }
 
 } // namespace elio::io

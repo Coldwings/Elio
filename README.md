@@ -17,6 +17,8 @@
 - **Synchronization Primitives**: mutex, semaphore, event, channel
 - **Timers**: sleep_for, sleep_until, yield
 - **I/O Backends**: io_uring (preferred) and epoll fallback
+- **Batch I/O**: Submit multiple file operations in a single syscall
+- **File Helpers**: High-level async read/write/append operations
 - **TCP Networking**: async client/server with connection management
 - **HTTP/1.1**: full client and server implementation
 - **HTTP/2**: client with multiplexed streams via nghttp2
@@ -165,6 +167,9 @@ elio::
 ├── io::                     // I/O backend
 │   ├── io_context           // Unified I/O interface
 │   ├── io_uring_backend     // io_uring implementation
+│   ├── io_awaitables        // Async I/O operations
+│   ├── batch_read/write     // Batch file I/O (multi-segment)
+│   ├── file_helpers         // High-level file operations
 │   └── epoll_backend        // epoll fallback
 │
 ├── net::                    // Networking
@@ -239,6 +244,7 @@ Explore the `examples/` directory for detailed examples:
 - **sse_server.cpp** - Server-Sent Events server
 - **sse_client.cpp** - SSE client example
 - **async_file_io.cpp** - Async file operations
+- **batch_file_io.cpp** - Batch read/write at multiple offsets
 - **debug_test.cpp** - Debugging tools demonstration
 - **benchmark.cpp** - Full performance measurements
 - **quick_benchmark.cpp** - Fast spawn/switch/yield benchmarks
@@ -474,6 +480,8 @@ See [Performance Tuning Guide](wiki/Performance-Tuning.md) for optimization tips
 - Synchronization primitives (mutex, semaphore, event, channel)
 - Timers (sleep_for, sleep_until, yield)
 - I/O backends (io_uring, epoll)
+- **Batch I/O** (multi-segment pread/pwrite in single syscall)
+- **File Helpers** (read_file, write_file, append_file, file_exists, file_size, read_dir)
 - TCP networking (client/server)
 - HTTP/1.1 (client/server)
 - HTTP/2 (client)

@@ -805,6 +805,105 @@ struct io_result {
 };
 ```
 
+### Async I/O Awaits
+
+```cpp
+// Read from fd
+auto result = co_await async_read(fd, buffer, length, offset);
+
+// Write to fd
+auto result = co_await async_write(fd, data, length, offset);
+
+// Scatter-gather read
+auto result = co_await async_readv(fd, iovecs, count);
+
+// Scatter-gather write
+auto result = co_await async_writev(fd, iovecs, count);
+
+// Recv/Send (sockets)
+auto result = co_await async_recv(fd, buffer, length, flags);
+auto result = co_await async_send(fd, buffer, length, flags);
+
+// Accept
+auto [client_fd, addr] = co_await async_accept(listen_fd, &addr, &addrlen);
+
+// Connect
+auto result = co_await async_connect(fd, addr, addrlen);
+
+// Close
+auto result = co_await async_close(fd);
+
+// Poll
+auto result = co_await async_poll_read(fd);
+auto result = co_await async_poll_write(fd);
+```
+
+### Batch I/O
+
+Submit multiple file operations in a single `io_uring_submit()` syscall.
+
+```cpp
+// Batch read: read multiple file regions at once
+struct batch_read_segment {
+    int64_t offset;   // File offset (-1 for current position)
+    void* buffer;     // Destination buffer
+    size_t length;    // Bytes to read
+};
+
+std::vector<batch_read_segment> segments = { ... };
+auto results = co_await batch_read(fd, segments);
+// results[i] > 0: bytes read; results[i] < 0: -errno
+
+// Batch write: write multiple file regions at once
+struct batch_write_segment {
+    int64_t offset;      // File offset (-1 for current position)
+    const void* buffer;  // Source data
+    size_t length;       // Bytes to write
+};
+
+std::vector<batch_write_segment> segments = { ... };
+auto results = co_await batch_write(fd, segments);
+```
+
+**How it works:**
+1. All SQEs are prepared in the io_uring submission queue
+2. Single `io_uring_submit()` syscall dispatches all operations
+3. Each completion is tracked via tagged `user_data` encoding
+4. Results are returned in a `std::vector<int>` matching segment order
+
+**Fallback:** When io_uring is unavailable (epoll backend), falls back to sequential synchronous `pread`/`pwrite`.
+
+### File Helpers
+
+High-level coroutine functions for common file operations:
+
+```cpp
+// Read entire file into a string
+std::optional<std::string> content = co_await read_file("/path/to/file.txt");
+
+// Write string to file (creates/truncates)
+bool ok = co_await write_file("/path/to/file.txt", "Hello, World!");
+
+// Append to file (creates if not exists)
+bool ok = co_await append_file("/path/to/log.txt", "New entry\n");
+
+// File metadata (synchronous, no coroutine needed)
+bool exists = file_exists("/path/to/file.txt");
+std::optional<int64_t> size = file_size("/path/to/file.txt");
+
+// Read directory
+std::optional<std::vector<dir_entry>> entries = read_dir("/path/to/dir");
+
+struct dir_entry {
+    std::string name;   // Filename
+    bool is_dir;        // Is directory
+    bool is_file;       // Is regular file
+    bool is_symlink;    // Is symbolic link
+};
+```
+
+**Chunking strategy:** Large files are read/written in 1MB chunks to avoid excessive single-request memory allocation.
+
 ---
 
 ## Signal Handling (`elio::signal`)

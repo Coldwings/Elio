@@ -378,6 +378,13 @@ public:
     /// Override to indicate this is an io_uring backend
     bool is_io_uring() const noexcept override { return true; }
 
+    /// Get direct access to the underlying io_uring ring.
+    /// Used by batch I/O operations to prepare multiple SQEs at once.
+    /// @return Pointer to the io_uring struct, or nullptr if not initialized
+    struct io_uring* get_ring() noexcept {
+        return &ring_;
+    }
+
     void notify() override {
         uint64_t val = 1;
         ssize_t ret = ::write(wake_fd_, &val, sizeof(val));

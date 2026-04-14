@@ -11,7 +11,7 @@
 #include <memory>
 
 namespace elio::runtime {
-class scheduler;  // Forward declaration
+class scheduler;
 scheduler* get_current_scheduler() noexcept;
 void schedule_handle(std::coroutine_handle<> handle) noexcept;
 }
@@ -35,19 +35,11 @@ struct final_awaiter {
         if (continuation) {
             return continuation;
         } else if (h.promise().detached_) {
-            // Detached task with no continuation - self-destruct
-            // IMPORTANT: If this coroutine owns its vstack, we must release ownership
-            // BEFORE destroying the coroutine frame, because the frame itself is allocated
-            // on the vstack. Destroying the frame triggers ~promise_base() which would
-            // delete the vstack, causing the frame (and its members) to become invalid
-            // while still being accessed.
             auto* vstack_to_delete = h.promise().release_vstack_ownership();
             h.destroy();
-            // Now safe to delete vstack - the coroutine frame is fully destroyed
             delete vstack_to_delete;
             return std::noop_coroutine();
         } else {
-            // Owned task with no continuation - stay suspended for owner to destroy
             return std::noop_coroutine();
         }
     }
@@ -64,23 +56,18 @@ struct task_access {
         }
         return std::exchange(t.handle_, nullptr);
     }
-    // Get handle without transferring ownership (for testing)
     template<typename TaskT>
     static auto handle(TaskT& t) noexcept {
         return t.handle_;
     }
 };
 
-/// Shared state for join_handle<T> - stores result and waiter
+/// Shared state for join_handle<T> — stores result and waiter
 template<typename T>
 struct join_state {
     std::optional<T> value_;
     std::exception_ptr exception_;
-    // waiter_/completed_ are the hot path: written by the coroutine producer
-    // (complete()) and the awaiting consumer (set_waiter()).  Aligning them
-    // to a new cache line separates them from value_/exception_ which may
-    // be large and written only once, preventing false sharing.
-    alignas(64) std::atomic<void*> waiter_{nullptr};  // Stores coroutine_handle address
+    alignas(64) std::atomic<void*> waiter_{nullptr};
     std::atomic<bool> completed_{false};
     
     void set_value(T&& value) {
@@ -106,14 +93,11 @@ struct join_state {
         return completed_.load(std::memory_order_acquire);
     }
     
-    // Returns true if waiter was stored (should suspend), false if already completed
     bool set_waiter(std::coroutine_handle<> h) noexcept {
         void* expected = nullptr;
         if (waiter_.compare_exchange_strong(expected, h.address(), 
                 std::memory_order_release, std::memory_order_acquire)) {
-            // Check again if completed (race condition)
             if (completed_.load(std::memory_order_acquire)) {
-                // Already completed, try to reclaim and resume
                 void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
                 if (addr) {
                     runtime::schedule_handle(std::coroutine_handle<>::from_address(addr));
@@ -122,7 +106,7 @@ struct join_state {
             }
             return true;
         }
-        return false;  // Already has a waiter (shouldn't happen with single await)
+        return false;
     }
     
     T get_value() {
@@ -133,11 +117,9 @@ struct join_state {
     }
 };
 
-/// Specialization for void
 template<>
 struct join_state<void> {
     std::exception_ptr exception_;
-    // Hot atomics on their own cache line (see join_state<T> comment above)
     alignas(64) std::atomic<void*> waiter_{nullptr};
     std::atomic<bool> completed_{false};
     
@@ -189,7 +171,9 @@ struct join_state<void> {
 } // namespace detail
 
 /// Join handle for awaiting spawned tasks
-/// Returned by task<T>::spawn(), allows co_await to get the result
+/// Uses shared_ptr internally so it is safely movable — moving transfers
+/// the shared_ptr ownership without invalidating the awaiting coroutine.
+/// The join_state survives moves because it lives on the heap.
 template<typename T>
 class join_handle {
 public:
@@ -203,29 +187,43 @@ public:
     join_handle& operator=(const join_handle&) = delete;
 
     [[nodiscard]] bool await_ready() const noexcept {
-        return state_->is_completed();
+        return state_ && state_->is_completed();
     }
 
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        // Keep a local copy of the shared_ptr to prevent use-after-free.
+        if (!state_) {
+            // Moved-from join_handle: nothing to await, resume immediately
+            runtime::schedule_handle(awaiter);
+            return false;
+        }
         auto state = state_;
         return state->set_waiter(awaiter);
     }
 
     T await_resume() {
+        if (!state_) {
+            if constexpr (!std::is_void_v<T>) {
+                return T{};
+            }
+            return;
+        }
         return state_->get_value();
     }
 
     /// Check if the spawned task has completed
     [[nodiscard]] bool is_ready() const noexcept {
-        return state_->is_completed();
+        return state_ && state_->is_completed();
+    }
+
+    /// Check if this handle is valid (not moved-from)
+    [[nodiscard]] bool valid() const noexcept {
+        return static_cast<bool>(state_);
     }
 
 private:
     std::shared_ptr<detail::join_state<T>> state_;
 };
 
-/// Specialization for void
 template<>
 class join_handle<void> {
 public:
@@ -239,22 +237,30 @@ public:
     join_handle& operator=(const join_handle&) = delete;
     
     [[nodiscard]] bool await_ready() const noexcept {
-        return state_->is_completed();
+        return state_ && state_->is_completed();
     }
 
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        // Keep a local copy of the shared_ptr to prevent use-after-free.
-        // See join_handle<T>::await_suspend for detailed explanation.
+        if (!state_) {
+            runtime::schedule_handle(awaiter);
+            return false;
+        }
         auto state = state_;
         return state->set_waiter(awaiter);
     }
 
     void await_resume() {
-        state_->get_value();
+        if (state_) {
+            state_->get_value();
+        }
     }
 
     [[nodiscard]] bool is_ready() const noexcept {
-        return state_->is_completed();
+        return state_ && state_->is_completed();
+    }
+
+    [[nodiscard]] bool valid() const noexcept {
+        return static_cast<bool>(state_);
     }
 
 private:
@@ -311,7 +317,6 @@ public:
 
     ~task() { if (handle_) handle_.destroy(); }
 
-    // co_await interface
     [[nodiscard]] bool await_ready() const noexcept { return false; }
     [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept {
         handle_.promise().continuation_ = awaiter;
@@ -321,6 +326,18 @@ public:
         auto& promise = handle_.promise();
         if (promise.exception()) std::rethrow_exception(promise.exception());
         return std::move(*promise.value_);
+    }
+
+    /// Spawn this task and return a join_handle to await its result.
+    /// After calling spawn(), this task is consumed (handle becomes null).
+    join_handle<T> spawn() && {
+        auto h = std::exchange(handle_, nullptr);
+        auto state = std::make_shared<detail::join_state<T>>();
+        h.promise().join_state_ = state;
+        h.promise().detached_ = true;
+        h.promise().detach_from_parent();
+        runtime::schedule_handle(h);
+        return join_handle<T>{std::move(state)};
     }
 
 private:
@@ -366,7 +383,6 @@ public:
 
     explicit task(handle_type h) noexcept : handle_(h) {}
 
-    // Non-copyable, non-movable
     task(const task&) = delete;
     task& operator=(const task&) = delete;
     task(task&&) = delete;
@@ -374,7 +390,6 @@ public:
 
     ~task() { if (handle_) handle_.destroy(); }
 
-    // co_await interface
     [[nodiscard]] bool await_ready() const noexcept { return false; }
     [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept {
         handle_.promise().continuation_ = awaiter;
@@ -383,6 +398,16 @@ public:
     void await_resume() {
         auto& promise = handle_.promise();
         if (promise.exception()) std::rethrow_exception(promise.exception());
+    }
+
+    join_handle<void> spawn() && {
+        auto h = std::exchange(handle_, nullptr);
+        auto state = std::make_shared<detail::join_state<void>>();
+        h.promise().join_state_ = state;
+        h.promise().detached_ = true;
+        h.promise().detach_from_parent();
+        runtime::schedule_handle(h);
+        return join_handle<void>{std::move(state)};
     }
 
 private:

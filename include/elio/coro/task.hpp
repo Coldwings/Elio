@@ -202,10 +202,7 @@ public:
 
     T await_resume() {
         if (!state_) {
-            if constexpr (!std::is_void_v<T>) {
-                return T{};
-            }
-            return;
+            return T{};
         }
         return state_->get_value();
     }

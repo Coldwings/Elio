@@ -339,33 +339,38 @@ public:
     void unlock_shared() {
         // Decrement reader count atomically
         uint64_t prev_state = state_.fetch_sub(1, std::memory_order_release);
-        uint64_t new_readers = (prev_state & READER_MASK) - 1;
+        uint64_t old_readers = prev_state & READER_MASK;
 
-        // Fast path: if there are still readers or no writer waiting, done
-        if (new_readers > 0 || !(prev_state & WRITER_WAITING)) {
+        // Fast path: if we weren't the last reader OR no writer waiting, done
+        // Note: we check using prev_state which is consistent with the decrement
+        if (old_readers != 1 || !(prev_state & WRITER_WAITING)) {
             return;
         }
 
-        // Slow path: might need to wake a writer
+        // Slow path: we were the last reader and a writer was waiting
+        // Must acquire internal_mutex_ to synchronize with other unlock_shared calls
         std::coroutine_handle<> to_resume;
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
 
-            // Double-check under lock
+            // Double-check under lock: verify no new readers acquired the lock
+            // and a writer is actually waiting
             uint64_t state = state_.load(std::memory_order_relaxed);
-            if ((state & READER_MASK) == 0 && !writer_waiters_.empty()) {
-                auto writer = writer_waiters_.front();
-                writer_waiters_.pop();
-                --pending_writers_;
-
-                // Clear WRITER_WAITING if no more pending writers, set WRITER_ACTIVE
-                uint64_t new_state = WRITER_ACTIVE;
-                if (pending_writers_ > 0) {
-                    new_state |= WRITER_WAITING;
-                }
-                state_.store(new_state, std::memory_order_release);
-                to_resume = writer;
+            if ((state & READER_MASK) > 0 || writer_waiters_.empty()) {
+                return;
             }
+
+            auto writer = writer_waiters_.front();
+            writer_waiters_.pop();
+            --pending_writers_;
+
+            // Clear WRITER_WAITING if no more pending writers, set WRITER_ACTIVE
+            uint64_t new_state = WRITER_ACTIVE;
+            if (pending_writers_ > 0) {
+                new_state |= WRITER_WAITING;
+            }
+            state_.store(new_state, std::memory_order_release);
+            to_resume = writer;
         }
 
         if (to_resume) {

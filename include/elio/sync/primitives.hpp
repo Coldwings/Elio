@@ -252,6 +252,7 @@ private:
 
 public:
     /// Shared lock awaitable (for readers)
+    /// Optimized with lock-free fast path for uncontended acquisition
     class lock_shared_awaitable {
     public:
         explicit lock_shared_awaitable(shared_mutex& m) : mutex_(m) {}
@@ -261,24 +262,30 @@ public:
         }
 
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+            // Lock-free fast path: attempt to increment reader count without mutex
+            // This avoids cache line bouncing on the internal_mutex_ in reader-heavy
+            // workloads where writers are rare.
+            uint64_t state = mutex_.state_.load(std::memory_order_relaxed);
+            while (!(state & WRITER_FLAGS)) {
+                // No writer active or waiting - try CAS to increment reader count
+                if (mutex_.state_.compare_exchange_weak(state, state + 1,
+                        std::memory_order_acquire, std::memory_order_relaxed)) {
+                    return false;  // Acquired lock-free, don't suspend
+                }
+                // CAS failed, state updated - loop continues with new state
+            }
+
+            // Slow path: writer present or CAS failed multiple times
+            // Fall back to mutex for proper waiter queue management
             std::lock_guard<std::mutex> guard(mutex_.internal_mutex_);
 
-            // Check state under lock and atomically acquire if possible
-            uint64_t state = mutex_.state_.load(std::memory_order_relaxed);
+            // Double-check under lock - state may have changed
+            state = mutex_.state_.load(std::memory_order_relaxed);
             if (!(state & WRITER_FLAGS)) {
-                // No writer active or waiting - try to acquire read lock atomically
+                // Try one more time under lock for fairness
                 if (mutex_.state_.compare_exchange_strong(state, state + 1,
                         std::memory_order_acquire, std::memory_order_relaxed)) {
                     return false;  // Acquired, don't suspend
-                }
-                // CAS failed, state was updated - need to re-check
-                // Re-check: if still no writer flags, CAS again
-                state = mutex_.state_.load(std::memory_order_relaxed);
-                if (!(state & WRITER_FLAGS)) {
-                    if (mutex_.state_.compare_exchange_strong(state, state + 1,
-                            std::memory_order_acquire, std::memory_order_relaxed)) {
-                        return false;  // Acquired on second try, don't suspend
-                    }
                 }
             }
 

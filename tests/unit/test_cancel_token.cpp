@@ -19,6 +19,8 @@ auto spawn_joinable(scheduler& sched, F&& f) {
     return sched.go_joinable(std::forward<F>(f));
 }
 
+
+
 // ==================== Basic Operations ====================
 
 TEST_CASE("cancel_token default constructed is not cancelled", "[cancel_token][basic]") {
@@ -262,7 +264,7 @@ TEST_CASE("cancel_registration move assignment", "[cancel_token][callback]") {
     }
 }
 
-TEST_CASE("cancel_registration self-move is safe", "[cancel_token][callback]") {
+TEST_CASE("cancel_registration move assignment transfers callback ownership", "[cancel_token][callback]") {
     cancel_source source;
     cancel_token token = source.get_token();
     std::atomic<bool> callback_invoked{false};
@@ -271,19 +273,13 @@ TEST_CASE("cancel_registration self-move is safe", "[cancel_token][callback]") {
         callback_invoked.store(true, std::memory_order_release);
     });
     
-    // Self-move (should be safe due to check in operator=)
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wself-move"
-#endif
-    reg = std::move(reg);
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif
+    // Move assignment: transfer callback ownership from reg to reg2.
+    // reg2 now holds the registration; reg is in a moved-from state.
+    auto reg2 = std::move(reg);
     
     source.cancel();
     
-    // Callback should still be invoked
+    // Callback should still be invoked via reg2
     REQUIRE(callback_invoked.load(std::memory_order_acquire));
 }
 

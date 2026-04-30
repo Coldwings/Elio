@@ -29,8 +29,10 @@ struct cancel_state {
         std::unique_lock<std::mutex> lock(mutex);
         if (cancelled.load(std::memory_order_relaxed)) {
             // Already cancelled, invoke callback outside lock
-            lock.unlock();
+            // Release the unique_lock to avoid double-unlock UB
+            lock.release();
             cb();
+            // Don't re-acquire - we're done
             return 0;
         }
         uint64_t id = next_id++;

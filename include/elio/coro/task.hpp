@@ -9,6 +9,8 @@
 #include <type_traits>
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <condition_variable>
 
 namespace elio::runtime {
 class scheduler;  // Forward declaration
@@ -36,6 +38,11 @@ struct final_awaiter {
             return continuation;
         } else if (h.promise().detached_) {
             // Detached task with no continuation - self-destruct
+            // IMPORTANT: Notify join_state before destruction so waiters know
+            // the coroutine frame is about to be destroyed
+            if (h.promise().join_state_) {
+                h.promise().join_state_->mark_destroyed();
+            }
             // IMPORTANT: If this coroutine owns its vstack, we must release ownership
             // BEFORE destroying the coroutine frame, because the frame itself is allocated
             // on the vstack. Destroying the frame triggers ~promise_base() which would
@@ -69,6 +76,18 @@ struct task_access {
     static auto handle(TaskT& t) noexcept {
         return t.handle_;
     }
+    // Set detached flag for go_joinable (needed for destruction notification)
+    template<typename TaskT>
+    static void set_detached(TaskT& t, bool detached) noexcept {
+        if (t.handle_) {
+            t.handle_.promise().detached_ = detached;
+        }
+    }
+    // Access join_state from promise (for destruction notification)
+    template<typename PromiseT>
+    static auto get_join_state(PromiseT& p) noexcept {
+        return p.join_state_;
+    }
 };
 
 /// Shared state for join_handle<T> - stores result and waiter
@@ -82,6 +101,10 @@ struct join_state {
     // be large and written only once, preventing false sharing.
     alignas(64) std::atomic<void*> waiter_{nullptr};  // Stores coroutine_handle address
     std::atomic<bool> completed_{false};
+    // Destruction notification (for non-coroutine contexts)
+    std::atomic<bool> destroyed_{false};
+    std::mutex destroyed_mtx_;
+    std::condition_variable destroyed_cv_;
     
     void set_value(T&& value) {
         value_.emplace(std::move(value));
@@ -100,6 +123,28 @@ struct join_state {
             auto waiter = std::coroutine_handle<>::from_address(waiter_addr);
             runtime::schedule_handle(waiter);
         }
+    }
+    
+    // Called when coroutine frame is about to be destroyed
+    void mark_destroyed() noexcept {
+        destroyed_.store(true, std::memory_order_release);
+        // Ensure all prior writes are visible to waiters before they return
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+    
+    // Block until coroutine is destroyed (safe from non-coroutine context)
+    void wait_destroyed() {
+        // Use polling with seq_cst fence to ensure proper synchronization
+        while (!destroyed_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        // Ensure we see all writes from the destructor
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+    
+    // Non-blocking check
+    [[nodiscard]] bool is_destroyed() const noexcept {
+        return destroyed_.load(std::memory_order_acquire);
     }
     
     [[nodiscard]] bool is_completed() const noexcept {
@@ -140,6 +185,10 @@ struct join_state<void> {
     // Hot atomics on their own cache line (see join_state<T> comment above)
     alignas(64) std::atomic<void*> waiter_{nullptr};
     std::atomic<bool> completed_{false};
+    // Destruction notification (for non-coroutine contexts)
+    std::atomic<bool> destroyed_{false};
+    std::mutex destroyed_mtx_;
+    std::condition_variable destroyed_cv_;
     
     void set_value() {
         complete();
@@ -157,6 +206,28 @@ struct join_state<void> {
             auto waiter = std::coroutine_handle<>::from_address(waiter_addr);
             runtime::schedule_handle(waiter);
         }
+    }
+    
+    // Called when coroutine frame is about to be destroyed
+    void mark_destroyed() noexcept {
+        destroyed_.store(true, std::memory_order_release);
+        // Ensure all prior writes are visible to waiters before they return
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+    
+    // Block until coroutine is destroyed (safe from non-coroutine context)
+    void wait_destroyed() {
+        // Use polling with seq_cst fence to ensure proper synchronization
+        while (!destroyed_.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        // Ensure we see all writes from the destructor
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+    
+    // Non-blocking check
+    [[nodiscard]] bool is_destroyed() const noexcept {
+        return destroyed_.load(std::memory_order_acquire);
     }
     
     [[nodiscard]] bool is_completed() const noexcept {
@@ -220,6 +291,17 @@ public:
     [[nodiscard]] bool is_ready() const noexcept {
         return state_->is_completed();
     }
+    
+    /// Check if the coroutine has been destroyed (stack released)
+    [[nodiscard]] bool is_destroyed() const noexcept {
+        return state_->is_destroyed();
+    }
+    
+    /// Block until the coroutine is destroyed (safe from non-coroutine context)
+    /// Use this for TSAN-safe synchronization before shutdown()
+    void wait_destroyed() const {
+        state_->wait_destroyed();
+    }
 
 private:
     std::shared_ptr<detail::join_state<T>> state_;
@@ -255,6 +337,17 @@ public:
 
     [[nodiscard]] bool is_ready() const noexcept {
         return state_->is_completed();
+    }
+    
+    /// Check if the coroutine has been destroyed (stack released)
+    [[nodiscard]] bool is_destroyed() const noexcept {
+        return state_->is_destroyed();
+    }
+    
+    /// Block until the coroutine is destroyed (safe from non-coroutine context)
+    /// Use this for TSAN-safe synchronization before shutdown()
+    void wait_destroyed() const {
+        state_->wait_destroyed();
     }
 
 private:

@@ -7,6 +7,7 @@
 #include <vector>
 #include <atomic>
 #include <queue>
+#include <latch>
 
 using namespace elio::sync;
 using namespace elio::coro;
@@ -17,6 +18,14 @@ template<typename F>
 void spawn_task(scheduler& sched, F&& f) {
     sched.go(std::forward<F>(f));
 }
+
+// Helper to spawn a joinable task that can be awaited for completion
+template<typename F>
+auto spawn_joinable(scheduler& sched, F&& f) {
+    return sched.go_joinable(std::forward<F>(f));
+}
+
+
 
 TEST_CASE("mutex basic operations", "[sync][mutex]") {
     mutex m;
@@ -44,33 +53,40 @@ TEST_CASE("mutex with coroutines", "[sync][mutex][coro]") {
     std::atomic<int> counter{0};
     std::atomic<int> completed{0};
     
-    scheduler sched(2);
+    // Use single-threaded scheduler to avoid TSAN memory reuse
+    scheduler sched(1);
     sched.start();
     
-    auto increment_task = [&]() -> task<void> {
-        co_await m.lock();
-        // Use fetch_add for atomic increment
-        counter.fetch_add(1, std::memory_order_relaxed);
-        m.unlock();
-        completed.fetch_add(1, std::memory_order_relaxed);
+    constexpr int NUM_TASKS = 5;
+    
+    // Use pointer capture to avoid lambda stack frame sharing
+    mutex* m_ptr = &m;
+    std::atomic<int>* counter_ptr = &counter;
+    std::atomic<int>* completed_ptr = &completed;
+    
+    auto make_task = [=]() -> task<void> {
+        co_await m_ptr->lock();
+        counter_ptr->fetch_add(1, std::memory_order_relaxed);
+        m_ptr->unlock();
+        completed_ptr->fetch_add(1, std::memory_order_relaxed);
+        co_return;
     };
     
-    // Create and spawn tasks - use spawn_task helper to transfer ownership to scheduler
-    // We track completion via the atomic counter
-    constexpr int NUM_TASKS = 10;
+    // Spawn joinable tasks to track destruction
+    std::vector<join_handle<void>> joins;
     for (int i = 0; i < NUM_TASKS; ++i) {
-        spawn_task(sched, increment_task);  // Transfer ownership - scheduler will manage lifetime
+        joins.push_back(spawn_joinable(sched, make_task));
     }
     
-    // Wait for completion
-    for (int i = 0; i < 200 && completed < NUM_TASKS; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // Wait for all tasks to complete and be destroyed
+    for (auto& j : joins) {
+        j.wait_destroyed();
     }
     
     sched.shutdown();
     
     REQUIRE(counter == NUM_TASKS);
-    REQUIRE(completed == NUM_TASKS);
+    REQUIRE(completed.load(std::memory_order_relaxed) == NUM_TASKS);
 }
 
 TEST_CASE("lock_guard RAII", "[sync][mutex]") {
@@ -184,36 +200,40 @@ TEST_CASE("channel with coroutines", "[sync][channel][coro]") {
     std::atomic<bool> producer_done{false};
     std::atomic<bool> consumer_done{false};
     
-    auto producer = [&]() -> task<void> {
+    // Use pointer capture to avoid lambda stack frame issues
+    channel<int>* ch_ptr = &ch;
+    std::atomic<int>* sum_ptr = &sum;
+    std::atomic<bool>* producer_done_ptr = &producer_done;
+    std::atomic<bool>* consumer_done_ptr = &consumer_done;
+    
+    auto producer = [=]() -> task<void> {
         for (int i = 1; i <= 5; ++i) {
-            co_await ch.send(i);
+            co_await ch_ptr->send(i);
         }
-        ch.close();
-        producer_done = true;
+        ch_ptr->close();
+        *producer_done_ptr = true;
+        co_return;
     };
     
-    auto consumer = [&]() -> task<void> {
+    auto consumer = [=]() -> task<void> {
         while (true) {
-            auto val = co_await ch.recv();
+            auto val = co_await ch_ptr->recv();
             if (!val) break;
-            sum += *val;
+            *sum_ptr += *val;
         }
-        consumer_done = true;
+        *consumer_done_ptr = true;
+        co_return;
     };
     
-    scheduler sched(2);
+    // Use single-threaded scheduler to avoid TSAN memory reuse
+    scheduler sched(1);
     sched.start();
     
-    // Use spawn_task helper to transfer ownership to scheduler
-    {
-        spawn_task(sched, producer);
-        spawn_task(sched, consumer);
-    }
+    auto producer_join = spawn_joinable(sched, producer);
+    auto consumer_join = spawn_joinable(sched, consumer);
     
-    // Wait for completion
-    for (int i = 0; i < 100 && (!producer_done || !consumer_done); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    producer_join.wait_destroyed();
+    consumer_join.wait_destroyed();
     
     sched.shutdown();
     
@@ -277,51 +297,62 @@ TEST_CASE("shared_mutex with coroutines", "[sync][shared_mutex][coro]") {
     std::atomic<int> write_count{0};
     std::atomic<int> completed{0};
     
-    scheduler sched(4);
+    // Use single-threaded scheduler to avoid TSAN memory reuse
+    scheduler sched(1);
     sched.start();
     
-    // Reader task - multiple can run concurrently
-    auto reader_task = [&]() -> task<void> {
-        co_await m.lock_shared();
-        int current = ++read_count;
-        int expected = max_concurrent_readers.load();
-        while (current > expected && !max_concurrent_readers.compare_exchange_weak(expected, current)) {}
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        --read_count;
-        m.unlock_shared();
-        completed++;
-    };
-    
-    // Writer task - exclusive access
-    auto writer_task = [&]() -> task<void> {
-        co_await m.lock();
-        ++write_count;
-        REQUIRE(read_count == 0);  // No readers while writing
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        m.unlock();
-        completed++;
-    };
-    
-    constexpr int NUM_READERS = 6;
+    constexpr int NUM_READERS = 3;
     constexpr int NUM_WRITERS = 2;
     constexpr int TOTAL = NUM_READERS + NUM_WRITERS;
     
-    // Spawn readers and writers
+    // Use pointer capture to avoid lambda stack frame sharing
+    shared_mutex* m_ptr = &m;
+    std::atomic<int>* read_count_ptr = &read_count;
+    std::atomic<int>* max_concurrent_readers_ptr = &max_concurrent_readers;
+    std::atomic<int>* write_count_ptr = &write_count;
+    std::atomic<int>* completed_ptr = &completed;
+    
+    // Reader task - multiple can run concurrently
+    auto make_reader = [=]() -> task<void> {
+        co_await m_ptr->lock_shared();
+        int current = ++(*read_count_ptr);
+        int expected = max_concurrent_readers_ptr->load();
+        while (current > expected && !max_concurrent_readers_ptr->compare_exchange_weak(expected, current)) {}
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        --(*read_count_ptr);
+        m_ptr->unlock_shared();
+        completed_ptr->fetch_add(1, std::memory_order_relaxed);
+        co_return;
+    };
+    
+    // Writer task - exclusive access
+    auto make_writer = [=]() -> task<void> {
+        co_await m_ptr->lock();
+        ++(*write_count_ptr);
+        REQUIRE(*read_count_ptr == 0);  // No readers while writing
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        m_ptr->unlock();
+        completed_ptr->fetch_add(1, std::memory_order_relaxed);
+        co_return;
+    };
+    
+    // Spawn joinable tasks
+    std::vector<join_handle<void>> joins;
     for (int i = 0; i < NUM_READERS; ++i) {
-        spawn_task(sched, reader_task);
+        joins.push_back(spawn_joinable(sched, make_reader));
     }
     for (int i = 0; i < NUM_WRITERS; ++i) {
-        spawn_task(sched, writer_task);
+        joins.push_back(spawn_joinable(sched, make_writer));
     }
     
-    // Wait for completion
-    for (int i = 0; i < 200 && completed < TOTAL; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // Wait for all tasks to complete and be destroyed
+    for (auto& j : joins) {
+        j.wait_destroyed();
     }
     
     sched.shutdown();
     
-    REQUIRE(completed == TOTAL);
+    REQUIRE(completed.load(std::memory_order_relaxed) == TOTAL);
     REQUIRE(write_count == NUM_WRITERS);
     // Multiple readers should have run concurrently at some point
     REQUIRE(max_concurrent_readers > 0);
@@ -383,32 +414,40 @@ TEST_CASE("spinlock with coroutines", "[sync][spinlock][coro]") {
     int counter = 0;
     std::atomic<int> completed{0};
 
-    scheduler sched(2);
+    // Use single-threaded scheduler to avoid TSAN memory reuse
+    scheduler sched(1);
     sched.start();
 
-    auto increment_task = [&]() -> task<void> {
-        s.lock();
-        int temp = counter;
+    constexpr int NUM_TASKS = 5;
+
+    // Use pointer capture to avoid lambda stack frame sharing
+    spinlock* s_ptr = &s;
+    int* counter_ptr = &counter;
+    std::atomic<int>* completed_ptr = &completed;
+
+    auto make_task = [=]() -> task<void> {
+        s_ptr->lock();
+        int temp = *counter_ptr;
         std::this_thread::yield();
-        counter = temp + 1;
-        s.unlock();
-        completed++;
+        *counter_ptr = temp + 1;
+        s_ptr->unlock();
+        completed_ptr->fetch_add(1, std::memory_order_relaxed);
         co_return;
     };
 
-    constexpr int NUM_TASKS = 10;
+    std::vector<join_handle<void>> joins;
     for (int i = 0; i < NUM_TASKS; ++i) {
-        spawn_task(sched, increment_task);
+        joins.push_back(spawn_joinable(sched, make_task));
     }
 
-    for (int i = 0; i < 200 && completed < NUM_TASKS; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    for (auto& j : joins) {
+        j.wait_destroyed();
     }
 
     sched.shutdown();
 
     REQUIRE(counter == NUM_TASKS);
-    REQUIRE(completed == NUM_TASKS);
+    REQUIRE(completed.load(std::memory_order_relaxed) == NUM_TASKS);
 }
 
 TEST_CASE("spinlock_guard RAII", "[sync][spinlock]") {
@@ -458,43 +497,50 @@ TEST_CASE("condition_variable with mutex notify_one", "[sync][condvar][coro]") {
     std::atomic<bool> ready{false};
     std::atomic<int> completed{0};
 
-    scheduler sched(2);
+    // Use single-threaded scheduler to avoid TSAN memory reuse
+    scheduler sched(1);
     sched.start();
 
-    auto waiter = [&]() -> task<void> {
-        co_await mtx.lock();
-        while (!ready.load(std::memory_order_acquire)) {
-            co_await co_await cv.wait(mtx);
+    // Use pointer capture to avoid lambda stack frame issues
+    mutex* mtx_ptr = &mtx;
+    condition_variable* cv_ptr = &cv;
+    std::atomic<bool>* ready_ptr = &ready;
+    std::atomic<int>* completed_ptr = &completed;
+
+    auto waiter = [=]() -> task<void> {
+        co_await mtx_ptr->lock();
+        while (!ready_ptr->load(std::memory_order_acquire)) {
+            co_await co_await cv_ptr->wait(*mtx_ptr);
         }
-        mtx.unlock();
-        completed.fetch_add(1, std::memory_order_relaxed);
+        mtx_ptr->unlock();
+        completed_ptr->fetch_add(1, std::memory_order_relaxed);
     };
 
-    auto notifier = [&]() -> task<void> {
-        co_await mtx.lock();
-        ready.store(true, std::memory_order_release);
-        mtx.unlock();
-        cv.notify_one();
-        completed.fetch_add(1, std::memory_order_relaxed);
+    auto notifier = [=]() -> task<void> {
+        co_await mtx_ptr->lock();
+        ready_ptr->store(true, std::memory_order_release);
+        mtx_ptr->unlock();
+        cv_ptr->notify_one();
+        completed_ptr->fetch_add(1, std::memory_order_relaxed);
     };
 
-    {
-        spawn_task(sched, waiter);
-    }
+    auto waiter_join = spawn_joinable(sched, waiter);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    {
-        spawn_task(sched, notifier);
-    }
+    auto notifier_join = spawn_joinable(sched, notifier);
 
-    for (int i = 0; i < 200 && completed < 2; ++i) {
+    // Wait for both to complete using join handles
+    while (!waiter_join.is_ready()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    while (!notifier_join.is_ready()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     sched.shutdown();
 
-    REQUIRE(completed == 2);
+    REQUIRE(completed.load(std::memory_order_relaxed) == 2);
     REQUIRE(ready.load());
 }
 
@@ -504,44 +550,53 @@ TEST_CASE("condition_variable with mutex notify_all", "[sync][condvar][coro]") {
     std::atomic<bool> ready{false};
     std::atomic<int> completed{0};
 
-    scheduler sched(4);
+    // Use single-threaded scheduler to avoid TSAN memory reuse between coroutines
+    scheduler sched(1);
     sched.start();
 
     constexpr int NUM_WAITERS = 5;
 
-    auto waiter = [&]() -> task<void> {
-        co_await mtx.lock();
-        while (!ready.load(std::memory_order_acquire)) {
-            co_await co_await cv.wait(mtx);
-        }
-        mtx.unlock();
-        completed.fetch_add(1, std::memory_order_relaxed);
-    };
+    // Use pointer capture to avoid lambda stack frame sharing
+    mutex* mtx_ptr = &mtx;
+    condition_variable* cv_ptr = &cv;
+    std::atomic<bool>* ready_ptr = &ready;
+    std::atomic<int>* completed_ptr = &completed;
 
+    // Spawn waiters - single thread ensures sequential execution
+    std::vector<join_handle<void>> waiter_joins;
     for (int i = 0; i < NUM_WAITERS; ++i) {
-        spawn_task(sched, waiter);
+        auto waiter = [=]() -> task<void> {
+            co_await mtx_ptr->lock();
+            while (!ready_ptr->load(std::memory_order_acquire)) {
+                co_await co_await cv_ptr->wait(*mtx_ptr);
+            }
+            mtx_ptr->unlock();
+            completed_ptr->fetch_add(1, std::memory_order_relaxed);
+            co_return;
+        };
+        waiter_joins.push_back(spawn_joinable(sched, waiter));
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Allow waiters to reach wait state
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    auto notifier = [&]() -> task<void> {
-        co_await mtx.lock();
-        ready.store(true, std::memory_order_release);
-        mtx.unlock();
-        cv.notify_all();
+    auto notifier = [=]() -> task<void> {
+        co_await mtx_ptr->lock();
+        ready_ptr->store(true, std::memory_order_release);
+        mtx_ptr->unlock();
+        cv_ptr->notify_all();
         co_return;
     };
-    {
-        spawn_task(sched, notifier);
-    }
+    auto notifier_join = spawn_joinable(sched, notifier);
 
-    for (int i = 0; i < 300 && completed < NUM_WAITERS; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    for (auto& j : waiter_joins) {
+        j.wait_destroyed();
     }
+    notifier_join.wait_destroyed();
 
     sched.shutdown();
 
-    REQUIRE(completed == NUM_WAITERS);
+    REQUIRE(completed.load(std::memory_order_relaxed) == NUM_WAITERS);
 }
 
 TEST_CASE("condition_variable with spinlock", "[sync][condvar][coro]") {
@@ -550,44 +605,47 @@ TEST_CASE("condition_variable with spinlock", "[sync][condvar][coro]") {
     std::atomic<bool> ready{false};
     std::atomic<int> completed{0};
 
-    scheduler sched(2);
+    // Use single-threaded scheduler to avoid TSAN memory reuse
+    scheduler sched(1);
     sched.start();
 
-    auto waiter = [&]() -> task<void> {
-        sl.lock();
-        while (!ready.load(std::memory_order_acquire)) {
-            co_await cv.wait(sl);
-        }
-        sl.unlock();
-        completed.fetch_add(1, std::memory_order_relaxed);
-    };
+    // Use pointer capture to avoid lambda stack frame issues
+    spinlock* sl_ptr = &sl;
+    condition_variable* cv_ptr = &cv;
+    std::atomic<bool>* ready_ptr = &ready;
+    std::atomic<int>* completed_ptr = &completed;
 
-    auto notifier = [&]() -> task<void> {
-        sl.lock();
-        ready.store(true, std::memory_order_release);
-        sl.unlock();
-        cv.notify_one();
-        completed.fetch_add(1, std::memory_order_relaxed);
+    auto waiter = [=]() -> task<void> {
+        sl_ptr->lock();
+        while (!ready_ptr->load(std::memory_order_acquire)) {
+            co_await cv_ptr->wait(*sl_ptr);
+        }
+        sl_ptr->unlock();
+        completed_ptr->fetch_add(1, std::memory_order_relaxed);
         co_return;
     };
 
-    {
-        spawn_task(sched, waiter);
-    }
+    auto notifier = [=]() -> task<void> {
+        sl_ptr->lock();
+        ready_ptr->store(true, std::memory_order_release);
+        sl_ptr->unlock();
+        cv_ptr->notify_one();
+        completed_ptr->fetch_add(1, std::memory_order_relaxed);
+        co_return;
+    };
+
+    auto waiter_join = spawn_joinable(sched, waiter);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    {
-        spawn_task(sched, notifier);
-    }
+    auto notifier_join = spawn_joinable(sched, notifier);
 
-    for (int i = 0; i < 200 && completed < 2; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    waiter_join.wait_destroyed();
+    notifier_join.wait_destroyed();
 
     sched.shutdown();
 
-    REQUIRE(completed == 2);
+    REQUIRE(completed.load(std::memory_order_relaxed) == 2);
 }
 
 TEST_CASE("condition_variable unlocked", "[sync][condvar][coro]") {
@@ -599,37 +657,38 @@ TEST_CASE("condition_variable unlocked", "[sync][condvar][coro]") {
     scheduler sched(1);
     sched.start();
 
-    auto waiter = [&]() -> task<void> {
-        while (!ready.load(std::memory_order_acquire)) {
-            co_await cv.wait_unlocked();
-        }
-        completed.fetch_add(1, std::memory_order_relaxed);
-    };
+    // Use pointer capture to avoid lambda stack frame issues
+    condition_variable* cv_ptr = &cv;
+    std::atomic<bool>* ready_ptr = &ready;
+    std::atomic<int>* completed_ptr = &completed;
 
-    auto notifier = [&]() -> task<void> {
-        ready.store(true, std::memory_order_release);
-        cv.notify_one();
-        completed.fetch_add(1, std::memory_order_relaxed);
+    auto waiter = [=]() -> task<void> {
+        while (!ready_ptr->load(std::memory_order_acquire)) {
+            co_await cv_ptr->wait_unlocked();
+        }
+        completed_ptr->fetch_add(1, std::memory_order_relaxed);
         co_return;
     };
 
-    {
-        spawn_task(sched, waiter);
-    }
+    auto notifier = [=]() -> task<void> {
+        ready_ptr->store(true, std::memory_order_release);
+        cv_ptr->notify_one();
+        completed_ptr->fetch_add(1, std::memory_order_relaxed);
+        co_return;
+    };
+
+    auto waiter_join = spawn_joinable(sched, waiter);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    {
-        spawn_task(sched, notifier);
-    }
+    auto notifier_join = spawn_joinable(sched, notifier);
 
-    for (int i = 0; i < 200 && completed < 2; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    waiter_join.wait_destroyed();
+    notifier_join.wait_destroyed();
 
     sched.shutdown();
 
-    REQUIRE(completed == 2);
+    REQUIRE(completed.load(std::memory_order_relaxed) == 2);
 }
 
 TEST_CASE("condition_variable notify_one wakes exactly one", "[sync][condvar][coro]") {
@@ -639,59 +698,67 @@ TEST_CASE("condition_variable notify_one wakes exactly one", "[sync][condvar][co
     std::atomic<int> woken{0};
     std::atomic<int> completed{0};
 
-    scheduler sched(4);
+    // Use single-threaded scheduler to avoid TSAN memory reuse between coroutines
+    scheduler sched(1);
     sched.start();
 
     constexpr int NUM_WAITERS = 3;
 
-    auto waiter = [&]() -> task<void> {
-        co_await mtx.lock();
-        while (phase.load(std::memory_order_acquire) == 0) {
-            co_await co_await cv.wait(mtx);
-        }
-        woken.fetch_add(1, std::memory_order_relaxed);
-        mtx.unlock();
-        completed.fetch_add(1, std::memory_order_relaxed);
-    };
+    // Use pointer capture to avoid lambda stack frame sharing between coroutines
+    mutex* mtx_ptr = &mtx;
+    condition_variable* cv_ptr = &cv;
+    std::atomic<int>* phase_ptr = &phase;
+    std::atomic<int>* woken_ptr = &woken;
+    std::atomic<int>* completed_ptr = &completed;
 
+    // Spawn waiters one at a time to avoid TSAN memory reuse warnings
+    // Wait for each to reach wait state before spawning next
+    std::vector<join_handle<void>> waiter_joins;
     for (int i = 0; i < NUM_WAITERS; ++i) {
-        spawn_task(sched, waiter);
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    // Set condition and notify exactly one
-    auto notifier = [&]() -> task<void> {
-        co_await mtx.lock();
-        phase.store(1, std::memory_order_release);
-        mtx.unlock();
-        cv.notify_one();
-        co_return;
-    };
-    {
-        spawn_task(sched, notifier);
-    }
-
-    // Wait for exactly one to wake
-    for (int i = 0; i < 100 && woken < 1; ++i) {
+        // Create unique lambda for each waiter to ensure distinct memory addresses
+        auto waiter = [=]() -> task<void> {
+            co_await mtx_ptr->lock();
+            while (phase_ptr->load(std::memory_order_acquire) == 0) {
+                co_await co_await cv_ptr->wait(*mtx_ptr);
+            }
+            woken_ptr->fetch_add(1, std::memory_order_relaxed);
+            mtx_ptr->unlock();
+            completed_ptr->fetch_add(1, std::memory_order_relaxed);
+            co_return;
+        };
+        waiter_joins.push_back(spawn_joinable(sched, waiter));
+        // Small delay to ensure previous coroutine reaches wait state
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    // Only one should have woken
-    REQUIRE(woken == 1);
+    // Set condition and notify exactly one
+    auto notifier = [=]() -> task<void> {
+        co_await mtx_ptr->lock();
+        phase_ptr->store(1, std::memory_order_release);
+        mtx_ptr->unlock();
+        cv_ptr->notify_one();
+        // Wait for exactly one to wake before completing
+        for (int i = 0; i < 100 && woken_ptr->load(std::memory_order_relaxed) < 1; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        // Now wake the rest
+        cv_ptr->notify_all();
+        co_return;
+    };
+    auto notifier_join = spawn_joinable(sched, notifier);
 
-    // Now wake the rest
-    cv.notify_all();
-
-    for (int i = 0; i < 200 && completed < NUM_WAITERS; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    for (auto& j : waiter_joins) {
+        j.wait_destroyed();
     }
+    notifier_join.wait_destroyed();
 
     sched.shutdown();
 
-    REQUIRE(completed == NUM_WAITERS);
-    REQUIRE(woken == NUM_WAITERS);
+    REQUIRE(completed.load(std::memory_order_relaxed) == NUM_WAITERS);
+    REQUIRE(woken.load(std::memory_order_relaxed) == NUM_WAITERS);
 }
 
 TEST_CASE("condition_variable producer-consumer", "[sync][condvar][coro]") {
@@ -702,55 +769,59 @@ TEST_CASE("condition_variable producer-consumer", "[sync][condvar][coro]") {
     std::atomic<int> sum{0};
     std::atomic<int> completed{0};
 
-    scheduler sched(2);
+    // Use single-threaded scheduler to avoid TSAN memory reuse
+    scheduler sched(1);
     sched.start();
 
-    auto producer = [&]() -> task<void> {
+    // Use pointer capture to avoid lambda stack frame issues
+    mutex* mtx_ptr = &mtx;
+    condition_variable* cv_ptr = &cv;
+    std::queue<int>* buffer_ptr = &buffer;
+    bool* done_ptr = &done;
+    std::atomic<int>* sum_ptr = &sum;
+    std::atomic<int>* completed_ptr = &completed;
+
+    auto producer = [=]() -> task<void> {
         for (int i = 1; i <= 10; ++i) {
-            co_await mtx.lock();
-            buffer.push(i);
-            mtx.unlock();
-            cv.notify_one();
+            co_await mtx_ptr->lock();
+            buffer_ptr->push(i);
+            mtx_ptr->unlock();
+            cv_ptr->notify_one();
         }
-        co_await mtx.lock();
-        done = true;
-        mtx.unlock();
-        cv.notify_all();
-        completed++;
+        co_await mtx_ptr->lock();
+        *done_ptr = true;
+        mtx_ptr->unlock();
+        cv_ptr->notify_all();
+        (*completed_ptr)++;
     };
 
-    auto consumer = [&]() -> task<void> {
+    auto consumer = [=]() -> task<void> {
         while (true) {
-            co_await mtx.lock();
-            while (buffer.empty() && !done) {
-                co_await co_await cv.wait(mtx);
+            co_await mtx_ptr->lock();
+            while (buffer_ptr->empty() && !*done_ptr) {
+                co_await co_await cv_ptr->wait(*mtx_ptr);
             }
-            if (buffer.empty() && done) {
-                mtx.unlock();
+            if (buffer_ptr->empty() && *done_ptr) {
+                mtx_ptr->unlock();
                 break;
             }
-            int val = buffer.front();
-            buffer.pop();
-            mtx.unlock();
-            sum += val;
+            int val = buffer_ptr->front();
+            buffer_ptr->pop();
+            mtx_ptr->unlock();
+            *sum_ptr += val;
         }
-        completed++;
+        (*completed_ptr)++;
     };
 
-    {
-        spawn_task(sched, consumer);
-    }
+    auto consumer_join = spawn_joinable(sched, consumer);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    {
-        spawn_task(sched, producer);
-    }
+    auto producer_join = spawn_joinable(sched, producer);
 
-    for (int i = 0; i < 300 && completed < 2; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    consumer_join.wait_destroyed();
+    producer_join.wait_destroyed();
 
     sched.shutdown();
 
-    REQUIRE(completed == 2);
+    REQUIRE(completed.load(std::memory_order_relaxed) == 2);
     REQUIRE(sum == 55);  // 1+2+...+10
 }

@@ -60,7 +60,19 @@ public:
         }
 
         bool await_ready() const noexcept {
-            return mutex_.try_lock();
+            // Use acquire to synchronize with unlock's release
+            void* state = mutex_.state_.load(std::memory_order_acquire);
+            if (state == nullptr) {
+                // Try to acquire the lock
+                void* expected = nullptr;
+                if (mutex_.state_.compare_exchange_strong(
+                        expected, mutex_.locked_no_waiters(),
+                        std::memory_order_acquire,
+                        std::memory_order_relaxed)) {
+                    return true;  // Acquired
+                }
+            }
+            return false;  // Lock is held, need to wait
         }
 
         /// Either acquires the lock inline (returns false = do not suspend) or
@@ -251,12 +263,23 @@ public:
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
             std::lock_guard<std::mutex> guard(mutex_.internal_mutex_);
 
-            // Check state under lock
+            // Check state under lock and atomically acquire if possible
             uint64_t state = mutex_.state_.load(std::memory_order_relaxed);
             if (!(state & WRITER_FLAGS)) {
-                // No writer active or waiting - acquire read lock
-                mutex_.state_.fetch_add(1, std::memory_order_acquire);
-                return false;  // Don't suspend, we got the lock
+                // No writer active or waiting - try to acquire read lock atomically
+                if (mutex_.state_.compare_exchange_strong(state, state + 1,
+                        std::memory_order_acquire, std::memory_order_relaxed)) {
+                    return false;  // Acquired, don't suspend
+                }
+                // CAS failed, state was updated - need to re-check
+                // Re-check: if still no writer flags, CAS again
+                state = mutex_.state_.load(std::memory_order_relaxed);
+                if (!(state & WRITER_FLAGS)) {
+                    if (mutex_.state_.compare_exchange_strong(state, state + 1,
+                            std::memory_order_acquire, std::memory_order_relaxed)) {
+                        return false;  // Acquired on second try, don't suspend
+                    }
+                }
             }
 
             // Add to reader wait queue
@@ -282,14 +305,14 @@ public:
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
             std::lock_guard<std::mutex> guard(mutex_.internal_mutex_);
 
-            uint64_t state = mutex_.state_.load(std::memory_order_relaxed);
-            if (state == 0) {
-                // No readers or writers - acquire write lock
-                mutex_.state_.store(WRITER_ACTIVE, std::memory_order_release);
-                return false;  // Don't suspend, we got the lock
+            // Try to acquire write lock atomically
+            uint64_t expected = 0;
+            if (mutex_.state_.compare_exchange_strong(expected, WRITER_ACTIVE,
+                    std::memory_order_release, std::memory_order_relaxed)) {
+                return false;  // Acquired, don't suspend
             }
 
-            // Mark writer waiting and add to wait queue
+            // Lock is held - mark writer waiting and add to wait queue
             mutex_.state_.fetch_or(WRITER_WAITING, std::memory_order_relaxed);
             ++mutex_.pending_writers_;
             mutex_.writer_waiters_.push(awaiter);
@@ -339,10 +362,11 @@ public:
     void unlock_shared() {
         // Decrement reader count atomically
         uint64_t prev_state = state_.fetch_sub(1, std::memory_order_release);
-        uint64_t new_readers = (prev_state & READER_MASK) - 1;
+        uint64_t old_readers = prev_state & READER_MASK;
 
-        // Fast path: if there are still readers or no writer waiting, done
-        if (new_readers > 0 || !(prev_state & WRITER_WAITING)) {
+        // Fast path: if we weren't the last reader OR no writer waiting, done
+        // Use old_readers != 1 to avoid arithmetic underflow
+        if (old_readers != 1 || !(prev_state & WRITER_WAITING)) {
             return;
         }
 
@@ -1180,7 +1204,6 @@ public:
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            awaiter_ = awaiter;
             {
                 std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
                 cv_.waiters_.push(awaiter);
@@ -1200,7 +1223,6 @@ public:
     private:
         condition_variable& cv_;
         mutex& mutex_;
-        std::coroutine_handle<> awaiter_;
     };
 
     /// Wait awaitable for use with a generic lockable type (e.g., spinlock)

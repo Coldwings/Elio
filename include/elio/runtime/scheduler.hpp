@@ -247,6 +247,7 @@ public:
         auto handle = coro::detail::task_access::release(wrapper);
         auto state = std::make_shared<coro::detail::join_state<T>>();
         handle.promise().join_state_ = state;
+        handle.promise().detached_ = true;  // Enable destruction notification
         handle.promise().set_vstack_owner(new_vstack);
         // Detach from current thread's frame chain before spawning to another thread
         // to avoid use-after-free when this thread creates another coroutine.

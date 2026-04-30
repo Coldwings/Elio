@@ -86,6 +86,17 @@ target_compile_options(elio_tests_tsan PRIVATE -fsanitize=thread -g -fno-omit-fr
 target_link_options(elio_tests_tsan PRIVATE -fsanitize=thread)
 target_compile_definitions(elio_tests_tsan PRIVATE ELIO_DEBUG)
 
+# Stress test executable for shared_mutex
+add_executable(stress_test_shared_mutex stress_test_shared_mutex.cpp)
+target_link_libraries(stress_test_shared_mutex PRIVATE elio)
+if(TARGET elio_tls)
+    target_link_libraries(stress_test_shared_mutex PRIVATE elio_tls)
+endif()
+if(TARGET nghttp2_static)
+    target_link_libraries(stress_test_shared_mutex PRIVATE nghttp2_static)
+endif()
+target_compile_definitions(stress_test_shared_mutex PRIVATE ELIO_DEBUG)
+
 # Register tests with CTest
 include(Catch)
 catch_discover_tests(elio_tests)

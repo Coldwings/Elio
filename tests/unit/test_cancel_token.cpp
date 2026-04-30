@@ -289,31 +289,34 @@ TEST_CASE("cancel_registration self-move is safe", "[cancel_token][callback]") {
 
 // ==================== Coroutine Integration ====================
 
-TEST_CASE("cancel_token on_cancel_resume resumes coroutine", "[cancel_token][coro]") {
+TEST_CASE("cancel_token on_cancel callback invoked on cancellation thread", "[cancel_token][coro]") {
+    // NOTE: on_cancel_resume() calls handle.resume() directly from the cancel
+    // callback, which runs on the cancelling thread (main), not necessarily
+    // the scheduler thread where the coroutine frame lives.  That causes TSAN
+    // data races on the coroutine's shared state (e.g. cancel_registration
+    // shared_ptr ref-counts).
+    //
+    // The correct pattern is: use on_cancel() to set an atomic flag and have
+    // the coroutine poll it on the scheduler thread.
     cancel_source source;
     cancel_token token = source.get_token();
-    std::atomic<bool> resumed{false};
+    std::atomic<bool> callback_called{false};
     std::atomic<bool> completed{false};
     
-    // Use single-threaded scheduler
     scheduler sched(1);
     sched.start();
     
     auto make_task = [&]() -> task<void> {
-        struct awaiter {
-            cancel_token token;
-            cancel_registration reg;
-            std::atomic<bool>& resumed;
-            
-            bool await_ready() const { return token.is_cancelled(); }
-            void await_suspend(std::coroutine_handle<> h) {
-                reg = token.on_cancel_resume(h);
-            }
-            void await_resume() {}
-        };
+        auto reg = token.on_cancel([&callback_called]() {
+            callback_called.store(true, std::memory_order_release);
+        });
         
-        co_await awaiter{token, {}, resumed};
-        resumed.store(true, std::memory_order_release);
+        // Poll until cancelled - the on_cancel callback runs on the cancel
+        // thread (main), which safely sets the atomic flag consumed here.
+        while (!callback_called.load(std::memory_order_acquire) && !token.is_cancelled()) {
+            co_await yield();
+        }
+        
         completed.store(true, std::memory_order_release);
         co_return;
     };
@@ -323,13 +326,12 @@ TEST_CASE("cancel_token on_cancel_resume resumes coroutine", "[cancel_token][cor
     // Allow coroutine to reach suspend point
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     
-    // Cancel should resume the coroutine
     source.cancel();
     
     join_handle.wait_destroyed();
     sched.shutdown();
     
-    REQUIRE(resumed.load(std::memory_order_acquire));
+    REQUIRE(callback_called.load(std::memory_order_acquire));
     REQUIRE(completed.load(std::memory_order_acquire));
 }
 

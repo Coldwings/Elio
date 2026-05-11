@@ -2,6 +2,9 @@
 
 #include "io_backend.hpp"
 #include <elio/log/macros.hpp>
+#include <elio/coro/vthread_stack.hpp>
+#include <elio/coro/promise_base.hpp>
+#include <elio/coro/frame.hpp>
 
 #if ELIO_HAS_IO_URING
 
@@ -474,7 +477,7 @@ private:
                 deferred_resumes->push_back({handle, result});
             } else {
                 last_result_ = result;
-                handle.resume();
+                safe_resume(handle);
             }
 
             // Mark as done
@@ -482,6 +485,19 @@ private:
         }
     }
     
+    /// Safely resume a coroutine handle with proper vthread_stack context
+    /// This ensures current_ is set to the coroutine's vstack before resume
+    /// and restored afterwards, preventing vthread_stack corruption.
+    static void safe_resume(std::coroutine_handle<> handle) {
+        auto* promise = coro::get_promise_base(handle.address());
+        auto* prev_vstack = coro::vthread_stack::current();
+        if (promise) {
+            coro::vthread_stack::set_current(promise->vstack());
+        }
+        handle.resume();
+        coro::vthread_stack::set_current(prev_vstack);
+    }
+
     /// Resume collected coroutine handles (call outside of lock)
     static void resume_deferred(std::vector<deferred_resume_entry>& entries) {
         for (auto& entry : entries) {
@@ -495,7 +511,7 @@ private:
             // so we just need to check if it's valid
             if (entry.handle) {
                 last_result_ = entry.result;
-                entry.handle.resume();
+                safe_resume(entry.handle);
             }
         }
     }

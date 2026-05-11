@@ -557,3 +557,81 @@ task<void> deep_test() {
 TEST_CASE("deep nested co_await chain", "[vthread_stack]") {
     elio::run(deep_test);
 }
+
+// ============================================================================
+// I/O completion vthread_stack context verification
+// This test verifies that I/O completion callbacks correctly restore
+// the vthread_stack context, preventing stack corruption.
+// See: https://github.com/Coldwings/Elio/issues/XXX
+// ============================================================================
+
+#include <elio/io/io_context.hpp>
+#include <elio/io/io_awaitables.hpp>
+#include <fcntl.h>
+#include <unistd.h>
+
+namespace {
+    task<void> io_vstack_test_helper(int fd, char* buffer, size_t size, std::atomic<bool>& done) {
+        // Get the current vstack before I/O
+        auto* vstack_before = vthread_stack::current();
+        REQUIRE(vstack_before != nullptr);
+
+        // Perform async read - this will suspend and resume via I/O completion
+        auto result = co_await elio::io::async_read(fd, buffer, size);
+        REQUIRE(result.success());
+
+        // After I/O completion, current_ should still be correct
+        auto* vstack_after = vthread_stack::current();
+        REQUIRE(vstack_after == vstack_before);
+
+        // Allocate and deallocate on the vstack to verify it's not corrupted
+        void* p1 = vstack_before->push(64);
+        REQUIRE(p1 != nullptr);
+        void* p2 = vstack_before->push(128);
+        REQUIRE(p2 != nullptr);
+
+        // Pop in reverse order - should not crash
+        vstack_before->pop(p2, 128);
+        vstack_before->pop(p1, 64);
+
+        done = true;
+    }
+}
+
+TEST_CASE("I/O completion preserves vthread_stack context", "[vthread_stack][io]") {
+    // Create a temp file with test data
+    char tmpfile[] = "/tmp/elio_vstack_test_XXXXXX";
+    int fd = mkstemp(tmpfile);
+    REQUIRE(fd >= 0);
+
+    const char* test_data = "Hello, vthread_stack I/O test!";
+    ssize_t written = write(fd, test_data, strlen(test_data));
+    REQUIRE(written == static_cast<ssize_t>(strlen(test_data)));
+
+    // Seek back to beginning
+    lseek(fd, 0, SEEK_SET);
+
+    // Make non-blocking
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+
+    char buffer[128] = {0};
+    std::atomic<bool> done{false};
+
+    scheduler sched(1);
+    sched.start();
+
+    sched.go([&]() { return io_vstack_test_helper(fd, buffer, sizeof(buffer) - 1, done); });
+
+    // Wait for completion
+    for (int i = 0; i < 200 && !done.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(done.load());
+    REQUIRE(std::string(buffer) == test_data);
+
+    close(fd);
+    unlink(tmpfile);
+}

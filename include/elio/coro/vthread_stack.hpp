@@ -126,11 +126,19 @@ public:
     }
 
 private:
-    struct segment {
+    static constexpr size_t ALIGNMENT = alignof(std::max_align_t);
+    static constexpr size_t DEFAULT_SEGMENT_SIZE = 16384;  // 16KB
+
+    // Ensure segment header size is a multiple of ALIGNMENT so that
+    // data() (which is this + 1) is also ALIGNMENT-aligned. Without this,
+    // coroutine frames allocated from vthread_stack can have misaligned
+    // addresses, causing SIGSEGV from SSE instructions (movaps) when
+    // the frame contains alignas(16) or higher objects.
+    struct alignas(ALIGNMENT) segment {
         segment* prev;
         size_t capacity;
         size_t used;
-        
+
         // Flexible array member workaround: compute data pointer from end of struct
         char* data() noexcept {
             return reinterpret_cast<char*>(this + 1);
@@ -139,10 +147,10 @@ private:
             return reinterpret_cast<const char*>(this + 1);
         }
     };
+    static_assert(sizeof(segment) % ALIGNMENT == 0,
+                  "sizeof(segment) must be a multiple of ALIGNMENT");
 
     segment* current_segment_ = nullptr;
-    static constexpr size_t DEFAULT_SEGMENT_SIZE = 16384;  // 16KB
-    static constexpr size_t ALIGNMENT = alignof(std::max_align_t);
 
     static constexpr size_t align_up(size_t n) noexcept {
         return (n + ALIGNMENT - 1) & ~(ALIGNMENT - 1);

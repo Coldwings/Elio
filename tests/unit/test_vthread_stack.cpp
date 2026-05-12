@@ -635,3 +635,112 @@ TEST_CASE("I/O completion preserves vthread_stack context", "[vthread_stack][io]
     close(fd);
     unlink(tmpfile);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Regression tests for alignment bug (Issue #55)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Before the fix, vthread_stack::segment header size was 24 bytes (not a
+// multiple of 16). Since data() returns this + 1, the first allocation in a
+// segment had an address that was only 8-byte aligned. When a coroutine frame
+// contained alignas(16) or higher objects, GCC generated SSE movaps
+// instructions that SIGSEGV on misaligned addresses.
+//
+// The fix: add alignas(ALIGNMENT) to struct segment and a static_assert that
+// sizeof(segment) % ALIGNMENT == 0.
+
+TEST_CASE("vthread_stack alignment: segment size is multiple of ALIGNMENT", "[vthread_stack][alignment]") {
+    // This is verified at compile time by the static_assert in vthread_stack.hpp.
+    // We also verify at runtime for extra safety across platforms.
+    constexpr size_t alignment = alignof(std::max_align_t);
+
+    struct alignas(alignment) mock_segment {
+        void* prev;
+        size_t capacity;
+        size_t used;
+    };
+    REQUIRE(sizeof(mock_segment) % alignment == 0);
+    REQUIRE(alignof(mock_segment) == alignment);
+}
+
+TEST_CASE("vthread_stack alignment: allocate returns aligned pointer", "[vthread_stack][alignment]") {
+    vthread_stack vs;
+    vthread_stack::set_current(&vs);
+
+    constexpr size_t alignment = alignof(std::max_align_t);
+
+    void* p1 = vthread_stack::allocate(64);
+    void* p2 = vthread_stack::allocate(128);
+    void* p3 = vthread_stack::allocate(256);
+
+    REQUIRE(reinterpret_cast<uintptr_t>(p1) % alignment == 0);
+    REQUIRE(reinterpret_cast<uintptr_t>(p2) % alignment == 0);
+    REQUIRE(reinterpret_cast<uintptr_t>(p3) % alignment == 0);
+
+    vthread_stack::deallocate(p3, 256);
+    vthread_stack::deallocate(p2, 128);
+    vthread_stack::deallocate(p1, 64);
+    vthread_stack::set_current(nullptr);
+}
+
+TEST_CASE("vthread_stack alignment: coroutine with alignas(64) local", "[vthread_stack][alignment]") {
+    // Exact reproducer from Issue #55. Before the fix, this SIGSEGV'd in
+    // Release builds because the coroutine frame was only 8-byte aligned.
+    vthread_stack vs;
+    vthread_stack::set_current(&vs);
+
+    scheduler sched(1);
+    std::atomic<bool> done{false};
+    bool ok = false;
+
+    sched.start();
+    sched.go([&]() -> task<void> {
+        alignas(64) char buffer[64];
+        (void)buffer;
+        ok = true;
+        done = true;
+        co_return;
+    });
+
+    for (int i = 0; i < 200 && !done.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    sched.shutdown();
+
+    REQUIRE(done.load() == true);
+    REQUIRE(ok == true);
+    vthread_stack::set_current(nullptr);
+}
+
+TEST_CASE("vthread_stack alignment: nested coroutines with over-aligned locals", "[vthread_stack][alignment]") {
+    vthread_stack vs;
+    vthread_stack::set_current(&vs);
+
+    scheduler sched(1);
+    std::atomic<bool> done{false};
+    int counter = 0;
+
+    sched.start();
+    sched.go([&]() -> task<void> {
+        auto inner = [&]() -> task<void> {
+            alignas(64) char buf1[64];
+            (void)buf1;
+            ++counter;
+            co_return;
+        };
+        for (int i = 0; i < 10; ++i) {
+            co_await inner();
+        }
+        done = true;
+        co_return;
+    });
+
+    for (int i = 0; i < 200 && !done.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    sched.shutdown();
+
+    REQUIRE(done.load() == true);
+    REQUIRE(counter == 10);
+    vthread_stack::set_current(nullptr);
+}

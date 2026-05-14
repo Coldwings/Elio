@@ -16,7 +16,6 @@
 #include <vector>
 #include <unordered_map>
 #include <memory>
-#include <regex>
 #include <optional>
 #include <atomic>
 
@@ -76,24 +75,70 @@ using handler_func = std::function<coro::task<response>(context&)>;
 /// Synchronous handler function type
 using sync_handler_func = std::function<response(context&)>;
 
+/// Path segment kind for route matching
+enum class segment_kind {
+    literal,    ///< Match exact text
+    param,      ///< Capture single non-empty path component into named parameter
+    wildcard,   ///< Match zero or more remaining components (only meaningful as last segment)
+};
+
+/// Compiled path segment
+struct route_segment {
+    segment_kind kind;
+    std::string value;  ///< literal text, or param name (without leading ':'); empty for wildcard
+};
+
 /// Route definition
 struct route {
     method http_method;
     std::string pattern;
-    std::regex regex;
-    std::vector<std::string> param_names;
+    std::vector<route_segment> segments;
+    std::vector<std::string> param_names;  ///< Kept for backwards compatibility / introspection
     handler_func handler;
-    
+
     /// Check if path matches and extract parameters
     bool match(std::string_view path, std::unordered_map<std::string, std::string>& params) const {
-        std::cmatch match;
-        if (std::regex_match(path.data(), path.data() + path.size(), match, regex)) {
-            for (size_t i = 0; i < param_names.size() && i + 1 < match.size(); ++i) {
-                params[param_names[i]] = match[i + 1].str();
+        // Tokenize `path` into components by splitting on '/'.
+        // For example, "/foo/bar" -> ["", "foo", "bar"], "/foo/" -> ["", "foo", ""].
+        // This makes trailing-slash handling consistent: components count differs from
+        // patterns without the trailing slash, so they will not collide.
+        std::vector<std::string_view> components;
+        components.reserve(8);
+        size_t start = 0;
+        for (size_t i = 0; i <= path.size(); ++i) {
+            if (i == path.size() || path[i] == '/') {
+                components.emplace_back(path.data() + start, i - start);
+                start = i + 1;
             }
-            return true;
         }
-        return false;
+
+        size_t si = 0;  // segment index
+        size_t ci = 0;  // component index
+        while (si < segments.size()) {
+            const auto& seg = segments[si];
+            if (seg.kind == segment_kind::wildcard) {
+                // Wildcard matches the remainder of the path (zero or more
+                // components). The slash before the wildcard in the pattern
+                // implies at least one trailing component must exist, mirroring
+                // regex "^.../.*$": "/foo" does NOT match "/foo/*" (no
+                // trailing slash), but "/foo/" matches because splitting
+                // "/foo/" -> ["", "foo", ""] gives an empty trailing component
+                // that the wildcard consumes (regex ".*" matches empty).
+                return ci < components.size();
+            }
+            if (ci >= components.size()) return false;
+            if (seg.kind == segment_kind::literal) {
+                if (components[ci] != seg.value) return false;
+            } else {
+                // param: must match a non-empty component (mirrors regex "([^/]+)").
+                if (components[ci].empty()) return false;
+                params[seg.value] = std::string(components[ci]);
+            }
+            ++si;
+            ++ci;
+        }
+        // No more segments to match — accept only if all path components consumed.
+        return ci == components.size();
     }
 };
 
@@ -101,53 +146,41 @@ struct route {
 class router {
 public:
     router() = default;
-    
+
     /// Add a route with async handler
     void add_route(method m, std::string_view pattern, handler_func handler) {
         route r;
         r.http_method = m;
         r.pattern = pattern;
         r.handler = std::move(handler);
-        
-        // Convert pattern to regex
-        // Patterns like "/users/:id" become "/users/([^/]+)"
-        std::string regex_str = "^";
-        std::string param_pattern;
-        bool in_param = false;
-        
-        for (size_t i = 0; i < pattern.size(); ++i) {
-            char c = pattern[i];
-            if (c == ':' && !in_param) {
-                in_param = true;
-                param_pattern.clear();
-            } else if (in_param && (c == '/' || i == pattern.size() - 1)) {
-                if (c != '/') param_pattern += c;
-                r.param_names.push_back(param_pattern);
-                regex_str += "([^/]+)";
-                if (c == '/') regex_str += '/';
-                in_param = false;
-            } else if (in_param) {
-                param_pattern += c;
-            } else if (c == '*') {
-                regex_str += ".*";
-            } else if (c == '.' || c == '+' || c == '?' || c == '(' || c == ')' ||
-                       c == '[' || c == ']' || c == '{' || c == '}' || c == '\\' ||
-                       c == '^' || c == '$' || c == '|') {
-                regex_str += '\\';
-                regex_str += c;
-            } else {
-                regex_str += c;
+
+        // Parse the pattern into a flat segment list. We split on '/' the same way
+        // match() splits the request path, so empty leading/trailing segments are
+        // preserved (this is what gives "/foo" vs "/foo/" their distinct identity).
+        // Within a component:
+        //   - ":name" => param segment (entire component must be ":name").
+        //   - "*"     => wildcard segment; consumes the rest of the path.
+        //   - anything else is treated as a literal (matched verbatim, no escaping).
+        size_t start = 0;
+        for (size_t i = 0; i <= pattern.size(); ++i) {
+            if (i == pattern.size() || pattern[i] == '/') {
+                std::string_view comp(pattern.data() + start, i - start);
+                route_segment seg;
+                if (!comp.empty() && comp.front() == ':') {
+                    seg.kind = segment_kind::param;
+                    seg.value.assign(comp.data() + 1, comp.size() - 1);
+                    r.param_names.push_back(seg.value);
+                } else if (comp == "*") {
+                    seg.kind = segment_kind::wildcard;
+                } else {
+                    seg.kind = segment_kind::literal;
+                    seg.value.assign(comp.data(), comp.size());
+                }
+                r.segments.push_back(std::move(seg));
+                start = i + 1;
             }
         }
-        
-        if (in_param) {
-            r.param_names.push_back(param_pattern);
-            regex_str += "([^/]+)";
-        }
-        
-        regex_str += "$";
-        r.regex = std::regex(regex_str);
-        
+
         routes_.push_back(std::move(r));
     }
     

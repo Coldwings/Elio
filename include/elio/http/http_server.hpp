@@ -291,6 +291,7 @@ public:
         ELIO_LOG_INFO("HTTP server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
+        listener_fd_ = listener.fd();
         running_ = true;
 
         while (running_) {
@@ -328,6 +329,7 @@ public:
         ELIO_LOG_INFO("HTTPS server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
+        listener_fd_ = listener.fd();
         running_ = true;
 
         while (running_) {
@@ -349,6 +351,10 @@ public:
     /// Stop the server
     void stop() {
         running_ = false;
+        if (listener_fd_ >= 0) {
+            ::shutdown(listener_fd_, SHUT_RDWR);
+            listener_fd_ = -1;
+        }
     }
     
     /// Check if server is running
@@ -515,6 +521,7 @@ private:
     handler_func not_found_handler_;
     std::function<response(const std::exception&)> error_handler_;
     std::atomic<bool> running_{false};
+    int listener_fd_ = -1;
 };
 
 /// Convenience function to create a simple HTTP server

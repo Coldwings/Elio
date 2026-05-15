@@ -11,11 +11,15 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <coroutine>
 #include <thread>
 #include <functional>
 
 namespace elio::runtime {
+
+class scheduler;
 
 namespace detail {
     // Type traits for task<T>
@@ -27,6 +31,20 @@ namespace detail {
     template<typename T> struct is_task<coro::task<T>> : std::true_type {};
     template<typename T> inline constexpr bool is_task_v = is_task<T>::value;
 
+    /// RAII guard registered at the top of every wrapper coroutine. The guard's
+    /// constructor increments the scheduler's tracked-task counter on first
+    /// resume of the wrapper body; the destructor decrements it on body exit
+    /// (normal or exceptional). If the wrapper is destroyed before its body
+    /// runs (e.g. handle.destroy() during shutdown), neither runs — the count
+    /// stays balanced.
+    struct task_lifecycle_guard {
+        scheduler* sched;
+        explicit task_lifecycle_guard(scheduler* s) noexcept;
+        ~task_lifecycle_guard() noexcept;
+        task_lifecycle_guard(const task_lifecycle_guard&) = delete;
+        task_lifecycle_guard& operator=(const task_lifecycle_guard&) = delete;
+    };
+
     /// Wrapper coroutine for fire-and-forget (go/go_to).
     /// Stores callable and args in its coroutine frame, ensuring lambda lifetime
     /// safety even when temporary lambdas are passed.
@@ -35,7 +53,8 @@ namespace detail {
     /// which remains valid because this wrapper's frame outlives the inner coroutine.
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && is_task_v<std::invoke_result_t<F, Args...>>)
-    coro::task<void> callable_wrapper_void(F f, Args... args) {
+    coro::task<void> callable_wrapper_void(scheduler* sched, F f, Args... args) {
+        task_lifecycle_guard guard{sched};
         co_await std::invoke(std::move(f), std::move(args)...);
     }
 
@@ -43,7 +62,8 @@ namespace detail {
     /// Same lifetime safety as callable_wrapper_void, but preserves return value.
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && is_task_v<std::invoke_result_t<F, Args...>>)
-    auto callable_wrapper(F f, Args... args) -> std::invoke_result_t<F, Args...> {
+    auto callable_wrapper(scheduler* sched, F f, Args... args) -> std::invoke_result_t<F, Args...> {
+        task_lifecycle_guard guard{sched};
         co_return co_await std::invoke(std::move(f), std::move(args)...);
     }
 } // namespace detail
@@ -76,7 +96,9 @@ public:
 
     ~scheduler() {
         if (running_.load(std::memory_order_relaxed)) {
-            shutdown();
+            // Destructor must not block — fall back to immediate shutdown.
+            // Users wanting drain-on-exit should call shutdown() explicitly.
+            shutdown_force();
         }
     }
 
@@ -98,30 +120,137 @@ public:
         current_scheduler_ = this;
     }
 
-    void shutdown() {
+    /// Graceful shutdown: wait for tasks spawned via go/go_to/go_joinable
+    /// (and elio::run()) to complete, including those suspended on I/O, then
+    /// stop workers. If the timeout elapses with tasks still in flight, the
+    /// remaining work is force-stopped (in-flight I/O may be orphaned).
+    ///
+    /// @param timeout Maximum wait. Default: wait forever.
+    /// @return true if all tracked tasks completed within the timeout.
+    /// @note Must NOT be called from a worker thread (would deadlock).
+    ///       If detected, falls back to shutdown_force() with a warning.
+    bool shutdown(std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) {
+        if (!running_.load(std::memory_order_acquire)) {
+            return true;
+        }
+
+        bool drained = wait_for_idle(timeout);
+        shutdown_force();
+        return drained;
+    }
+
+    /// Force shutdown: stop workers immediately. Tasks suspended on I/O will
+    /// be orphaned (their CQEs are lost, and their frames are destroyed via
+    /// drain_remaining_tasks). Use shutdown() for graceful drain.
+    void shutdown_force() {
         bool expected = true;
         if (!running_.compare_exchange_strong(expected, false)) {
             return;
         }
-        
+
         // First shutdown blocking pool (before stopping workers)
         if (blocking_pool_) {
             blocking_pool_->shutdown();
         }
-        
+
         // Then stop all workers (sets running_=false and joins threads)
         for (auto& worker : workers_) {
             worker->stop();
         }
-        
+
         // Now that ALL workers are stopped, drain remaining tasks
         // This is safe because no worker can steal from another at this point
         for (auto& worker : workers_) {
             worker->drain_remaining_tasks();
         }
-        
+
+        // Wake any threads still parked in wait_for_idle so they can observe
+        // the !running_ state and bail out promptly.
+        {
+            std::lock_guard<std::mutex> lock(idle_mutex_);
+            idle_cv_.notify_all();
+        }
+
         if (current_scheduler_ == this) {
             current_scheduler_ = nullptr;
+        }
+    }
+
+    /// Number of tracked tasks currently in flight: spawned but not yet
+    /// completed (running, suspended on I/O, sleeping, or queued). Tasks
+    /// spawned via raw spawn(handle) are NOT counted; pending I/O operations
+    /// from any source ARE counted, so a coroutine waiting on an io_uring
+    /// completion always shows up here.
+    [[nodiscard]] size_t active_tasks() const noexcept {
+        size_t total = active_tracked_.load(std::memory_order_acquire);
+        size_t n = num_threads_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < n && i < workers_.size(); ++i) {
+            total += workers_[i]->queue_size();
+            total += workers_[i]->io_context().pending_count();
+        }
+        return total;
+    }
+
+    /// Block until active_tasks() returns 0 or timeout expires. Workers
+    /// continue running normally during the wait.
+    ///
+    /// @param timeout Maximum wait. Default: wait forever.
+    /// @return true if drained, false on timeout.
+    /// @note Must NOT be called from a worker thread (would deadlock).
+    bool wait_for_idle(std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) {
+        if (worker_thread::current() != nullptr) [[unlikely]] {
+            ELIO_LOG_WARNING(
+                "wait_for_idle() called from a worker thread; returning false to avoid deadlock");
+            return active_tasks() == 0;
+        }
+
+        if (timeout <= std::chrono::milliseconds::zero()) {
+            return active_tasks() == 0;
+        }
+
+        const bool wait_forever = (timeout == std::chrono::milliseconds::max());
+        const auto deadline = wait_forever
+            ? std::chrono::steady_clock::time_point::max()
+            : std::chrono::steady_clock::now() + timeout;
+
+        // Periodic wake to re-evaluate queue/io counters (which don't notify
+        // the CV directly). The CV only fires on tracked-task transitions to
+        // zero; this poll catches everything else within a bounded window.
+        constexpr auto poll_interval = std::chrono::milliseconds(5);
+
+        waiters_.fetch_add(1, std::memory_order_acq_rel);
+        std::unique_lock<std::mutex> lock(idle_mutex_);
+        while (active_tasks() > 0 && running_.load(std::memory_order_acquire)) {
+            auto now = std::chrono::steady_clock::now();
+            if (!wait_forever && now >= deadline) break;
+
+            auto wait_for = poll_interval;
+            if (!wait_forever) {
+                auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - now);
+                if (remaining < wait_for) wait_for = remaining;
+            }
+            idle_cv_.wait_for(lock, wait_for);
+        }
+        waiters_.fetch_sub(1, std::memory_order_acq_rel);
+        return active_tasks() == 0;
+    }
+
+    /// Internal: increment tracked-task counter. Called by task_lifecycle_guard
+    /// at the top of every wrapper coroutine body.
+    void on_task_spawned() noexcept {
+        active_tracked_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    /// Internal: decrement tracked-task counter. Called by task_lifecycle_guard
+    /// when the wrapper body exits (normal or exceptional). Notifies waiters
+    /// when the counter transitions to zero.
+    void on_task_completed() noexcept {
+        if (active_tracked_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            if (waiters_.load(std::memory_order_acquire) > 0) {
+                std::lock_guard<std::mutex> lock(idle_mutex_);
+                idle_cv_.notify_all();
+            }
         }
     }
 
@@ -169,11 +298,11 @@ public:
         
         // Create wrapper coroutine - f and args are stored in wrapper's frame
         // This ensures lambda captures remain valid for the entire coroutine lifetime
-        auto wrapper = detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
-        
+        auto wrapper = detail::callable_wrapper_void(this, std::forward<F>(f), std::forward<Args>(args)...);
+
         // Restore previous vstack context
         coro::vthread_stack::set_current(old_vstack);
-        
+
         auto handle = coro::detail::task_access::release(wrapper);
         handle.promise().detached_ = true;
         handle.promise().set_vstack_owner(new_vstack);
@@ -195,14 +324,14 @@ public:
     void go_to(size_t worker_id, F&& f, Args&&... args) {
         // Create independent vthread_stack for spawned coroutine
         auto* new_vstack = new coro::vthread_stack();
-        
+
         // Save current vstack context and switch to new one
         auto* old_vstack = coro::vthread_stack::current();
         coro::vthread_stack::set_current(new_vstack);
-        
+
         // Create wrapper coroutine - f and args are stored in wrapper's frame
         // This ensures lambda captures remain valid for the entire coroutine lifetime
-        auto wrapper = detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
+        auto wrapper = detail::callable_wrapper_void(this, std::forward<F>(f), std::forward<Args>(args)...);
         
         // Restore previous vstack context
         coro::vthread_stack::set_current(old_vstack);
@@ -239,7 +368,7 @@ public:
         
         // Create wrapper coroutine - f and args are stored in wrapper's frame
         // This ensures lambda captures remain valid for the entire coroutine lifetime
-        auto wrapper = detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
+        auto wrapper = detail::callable_wrapper(this, std::forward<F>(f), std::forward<Args>(args)...);
         
         // Restore previous vstack context
         coro::vthread_stack::set_current(old_vstack);
@@ -445,8 +574,30 @@ private:
     // Blocking pool for spawn_blocking operations
     std::unique_ptr<blocking_pool> blocking_pool_;
 
+    // Tracked-task accounting for graceful shutdown / wait_for_idle.
+    // active_tracked_ is incremented by every wrapper coroutine on first
+    // resume and decremented when the wrapper's body exits. waiters_ is
+    // a hint so the on-completion path skips the CV mutex when no one is
+    // parked in wait_for_idle.
+    alignas(64) std::atomic<size_t> active_tracked_{0};
+    alignas(64) std::atomic<size_t> waiters_{0};
+    mutable std::mutex idle_mutex_;
+    mutable std::condition_variable idle_cv_;
+
     static inline thread_local scheduler* current_scheduler_ = nullptr;
 };
+
+namespace detail {
+
+inline task_lifecycle_guard::task_lifecycle_guard(scheduler* s) noexcept : sched(s) {
+    if (sched) sched->on_task_spawned();
+}
+
+inline task_lifecycle_guard::~task_lifecycle_guard() noexcept {
+    if (sched) sched->on_task_completed();
+}
+
+} // namespace detail
 
 } // namespace elio::runtime
 

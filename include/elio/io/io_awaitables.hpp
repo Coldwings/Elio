@@ -560,18 +560,70 @@ struct batch_write_segment {
     size_t length;       ///< Bytes to write
 };
 
-/// Tracks completion of a batch I/O operation
-struct batch_state {
-    std::atomic<int> completed{0}; ///< Atomically incremented per completion
-    int total;                      ///< Total segments
-    std::vector<int> results;       ///< Per-segment results (bytes or -errno)
+// ``batch_state`` and ``batch_completion`` are defined in
+// ``io_uring_backend.hpp`` (already included transitively via io_context.hpp)
+// so the io_uring backend can dispatch CQEs to per-segment trampolines
+// without any locks or maps.
 
-    explicit batch_state(int n) : total(n), results(n) {}
+namespace detail {
 
-    bool all_done() const noexcept {
-        return completed.load(std::memory_order_acquire) >= total;
+/// Submit a batch via io_uring without blocking the worker.
+/// Returns true on success (caller must NOT resume; the final CQE will
+/// resume the awaiter via the trampolines). Returns false if the io_uring
+/// backend is unavailable or every SQE allocation failed; the caller should
+/// then either fall back to sequential I/O or resume immediately.
+template<typename PrepFn>
+inline bool submit_batch_io_uring(io_uring_backend* backend,
+                                  batch_state& st,
+                                  std::coroutine_handle<> awaiter,
+                                  PrepFn&& prep_one) {
+    struct io_uring* ring = backend->get_ring();
+    if (!ring) {
+        return false;
     }
-};
+
+    const int total = st.total;
+    st.awaiter = awaiter;
+    st.awaiter_vstack = coro::vthread_stack::current();
+    st.trampolines.resize(total);
+
+    size_t in_flight = 0;
+    size_t failed = 0;
+    for (int i = 0; i < total; ++i) {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
+        if (!sqe) {
+            st.results[i] = -EAGAIN;
+            ++failed;
+            continue;
+        }
+        st.trampolines[i] = batch_completion{&st, static_cast<uint32_t>(i)};
+        io_uring_sqe_set_data(sqe, st.trampolines[i].tagged_user_data());
+        prep_one(sqe, i);
+        ++in_flight;
+    }
+
+    if (in_flight == 0) {
+        // Nothing made it onto the ring: no CQEs will fire, so the caller
+        // must resume the awaiter inline. Reset awaiter so a stray CQE
+        // (there should be none) cannot resume twice.
+        st.awaiter = {};
+        st.awaiter_vstack = nullptr;
+        st.completed.store(total, std::memory_order_release);
+        return false;
+    }
+
+    // Account for the failed SQEs first so the in-flight count is exactly
+    // what's needed to drive ``completed`` to ``total``.
+    if (failed) {
+        st.completed.fetch_add(static_cast<int>(failed), std::memory_order_acq_rel);
+    }
+
+    backend->register_pending(in_flight);
+    io_uring_submit(ring);
+    return true;
+}
+
+} // namespace detail
 
 /// Awaitable for batch read operations
 /// Submits multiple pread operations in a single io_uring syscall.
@@ -596,56 +648,27 @@ public:
 #if ELIO_HAS_IO_URING
         auto* backend = dynamic_cast<io_uring_backend*>(ctx.get_backend());
         if (backend && backend->get_ring()) {
-            struct io_uring* ring = backend->get_ring();
             batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
-
-            // Prepare all SQEs at once, using a unique tag per segment
-            for (size_t i = 0; i < segments_.size(); ++i) {
-                struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
-                if (!sqe) {
-                    batch_st_->results[i] = -EAGAIN;
-                    batch_st_->completed.fetch_add(1, std::memory_order_acq_rel);
-                    continue;
-                }
-                // Store segment index + batch pointer in user_data
-                // Use a simple scheme: encode index in lower bits of a combined value
-                auto* tagged = reinterpret_cast<void*>(
-                    (reinterpret_cast<uintptr_t>(batch_st_.get()) << 8) |
-                    (i & 0x7F) | 0x80);
-                io_uring_sqe_set_data(sqe, tagged);
-                auto off = static_cast<__u64>(
-                    segments_[i].offset >= 0 ? segments_[i].offset : 0);
-                io_uring_prep_read(sqe, fd_, segments_[i].buffer,
-                    static_cast<unsigned>(segments_[i].length), off);
+            const int n = batch_st_->total;
+            bool submitted = detail::submit_batch_io_uring(
+                backend, *batch_st_, awaiter,
+                [this, n](struct io_uring_sqe* sqe, int i) {
+                    auto off = static_cast<__u64>(
+                        segments_[i].offset >= 0 ? segments_[i].offset : 0);
+                    io_uring_prep_read(sqe, fd_, segments_[i].buffer,
+                        static_cast<unsigned>(segments_[i].length), off);
+                    (void)n;
+                });
+            if (!submitted) {
+                // No SQEs made it onto the ring: every result is already
+                // -EAGAIN. Resume inline.
+                awaiter.resume();
             }
-
-            // Single syscall submit
-            io_uring_submit(ring);
-
-            // Poll until all segments complete
-            while (!batch_st_->all_done()) {
-                struct io_uring_cqe* wcqe = nullptr;
-                int ret = io_uring_wait_cqe(ring, &wcqe);
-                if (ret != 0 || !wcqe) continue;
-                auto* ud = io_uring_cqe_get_data(wcqe);
-                auto val = reinterpret_cast<uintptr_t>(ud);
-                if (val & 0x80) {
-                    auto* st = reinterpret_cast<batch_state*>(val >> 8);
-                    if (st == batch_st_.get()) {
-                        int seg_idx = static_cast<int>(val & 0x7F);
-                        if (seg_idx < static_cast<int>(st->results.size())) {
-                            st->results[seg_idx] = wcqe->res;
-                        }
-                        st->completed.fetch_add(1, std::memory_order_acq_rel);
-                    }
-                }
-                io_uring_cqe_seen(ring, wcqe);
-            }
-            awaiter.resume();
+            // Otherwise the final CQE drives the resume via the backend.
             return;
         }
 #endif
-        // Fallback: sequential synchronous reads
+        // Fallback: sequential synchronous reads (no io_uring available).
         batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
         for (size_t i = 0; i < segments_.size(); ++i) {
             auto off = segments_[i].offset >= 0 ? segments_[i].offset : 0;
@@ -692,51 +715,22 @@ public:
 #if ELIO_HAS_IO_URING
         auto* backend = dynamic_cast<io_uring_backend*>(ctx.get_backend());
         if (backend && backend->get_ring()) {
-            struct io_uring* ring = backend->get_ring();
             batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
-
-            for (size_t i = 0; i < segments_.size(); ++i) {
-                struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
-                if (!sqe) {
-                    batch_st_->results[i] = -EAGAIN;
-                    batch_st_->completed.fetch_add(1, std::memory_order_acq_rel);
-                    continue;
-                }
-                auto* tagged = reinterpret_cast<void*>(
-                    (reinterpret_cast<uintptr_t>(batch_st_.get()) << 8) |
-                    (i & 0x7F) | 0x80);
-                io_uring_sqe_set_data(sqe, tagged);
-                auto off = static_cast<__u64>(
-                    segments_[i].offset >= 0 ? segments_[i].offset : 0);
-                io_uring_prep_write(sqe, fd_, segments_[i].buffer,
-                    static_cast<unsigned>(segments_[i].length), off);
+            bool submitted = detail::submit_batch_io_uring(
+                backend, *batch_st_, awaiter,
+                [this](struct io_uring_sqe* sqe, int i) {
+                    auto off = static_cast<__u64>(
+                        segments_[i].offset >= 0 ? segments_[i].offset : 0);
+                    io_uring_prep_write(sqe, fd_, segments_[i].buffer,
+                        static_cast<unsigned>(segments_[i].length), off);
+                });
+            if (!submitted) {
+                awaiter.resume();
             }
-
-            io_uring_submit(ring);
-
-            while (!batch_st_->all_done()) {
-                struct io_uring_cqe* wcqe = nullptr;
-                int ret = io_uring_wait_cqe(ring, &wcqe);
-                if (ret != 0 || !wcqe) continue;
-                auto* ud = io_uring_cqe_get_data(wcqe);
-                auto val = reinterpret_cast<uintptr_t>(ud);
-                if (val & 0x80) {
-                    auto* st = reinterpret_cast<batch_state*>(val >> 8);
-                    if (st == batch_st_.get()) {
-                        int seg_idx = static_cast<int>(val & 0x7F);
-                        if (seg_idx < static_cast<int>(st->results.size())) {
-                            st->results[seg_idx] = wcqe->res;
-                        }
-                        st->completed.fetch_add(1, std::memory_order_acq_rel);
-                    }
-                }
-                io_uring_cqe_seen(ring, wcqe);
-            }
-            awaiter.resume();
             return;
         }
 #endif
-        // Fallback: sequential synchronous writes
+        // Fallback: sequential synchronous writes.
         batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
         for (size_t i = 0; i < segments_.size(); ++i) {
             auto off = segments_[i].offset >= 0 ? segments_[i].offset : 0;

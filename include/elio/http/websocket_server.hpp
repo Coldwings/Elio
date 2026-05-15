@@ -29,6 +29,7 @@
 #include <atomic>
 #include <vector>
 #include <optional>
+#include <regex>
 
 namespace elio::http::websocket {
 

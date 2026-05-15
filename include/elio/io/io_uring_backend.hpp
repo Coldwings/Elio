@@ -6,6 +6,91 @@
 #include <elio/coro/promise_base.hpp>
 #include <elio/coro/frame.hpp>
 
+#include <atomic>
+#include <coroutine>
+#include <cstdint>
+#include <vector>
+
+namespace elio::io {
+
+// ---------------------------------------------------------------------------
+// io_uring user_data tagging scheme
+// ---------------------------------------------------------------------------
+//
+// Every SQE submitted via this backend stores a ``user_data`` value that the
+// kernel echoes back on the matching CQE. We use the low bit of that value as
+// a discriminator so the completion handler can dispatch without any extra
+// bookkeeping or locking:
+//
+//   * ``bit 0 == 0`` (the default for ``std::coroutine_handle::address()``,
+//     which is always at least pointer-aligned): the value is a coroutine
+//     handle address. ``process_completion`` resumes that coroutine.
+//
+//   * ``bit 0 == 1``: the value is a tagged pointer to a ``batch_completion``
+//     trampoline. Mask off the low bit to recover the pointer; the
+//     trampoline knows which segment of which ``batch_state`` it belongs to
+//     and is responsible for delivering the per-segment result and, on the
+//     last completion of the batch, resuming the awaiting coroutine.
+//
+// A few sentinel values do not follow either convention. They are never
+// dereferenced and are recognised by exact comparison:
+//
+//   * ``WAKE_SENTINEL`` (= 1): used by the eventfd poll SQE that wakes the
+//     ring on cross-thread ``notify()``. Note this also has bit 0 set, but is
+//     handled before the tag check.
+//   * ``nullptr``: used for cancel SQEs that do not need to resume anything.
+//
+// Coroutine handle addresses are guaranteed to be aligned (in practice
+// ``alignof(void*)``-aligned, certainly even), so they never collide with the
+// tagged form.
+// ---------------------------------------------------------------------------
+
+struct batch_state;
+
+/// Per-segment trampoline used as tagged user_data on batch SQEs.
+/// One ``batch_completion`` exists per segment; it lives inside the owning
+/// ``batch_state::trampolines`` vector so its lifetime covers every CQE.
+struct batch_completion {
+    batch_state* state = nullptr; ///< Back-pointer to the shared batch state
+    uint32_t segment_index = 0;   ///< Which results[i] this CQE updates
+
+    /// Encode this trampoline into a tagged user_data value (low bit = 1).
+    void* tagged_user_data() noexcept {
+        return reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(this) | uintptr_t{1});
+    }
+};
+
+/// Shared state for a batch I/O operation.
+/// Kept here so both the io_uring backend (which dispatches CQEs) and the
+/// batch awaitables in ``io_awaitables.hpp`` (which build trampolines) can
+/// see the layout without a forward-declaration dance. Used by both the
+/// io_uring path (per-CQE updates) and the epoll/synchronous fallback (which
+/// just fills ``results`` directly).
+///
+/// Lifetime: ``batch_state`` lives on the awaitable (as a member of
+/// ``batch_read_awaitable`` / ``batch_write_awaitable``), which itself lives
+/// on the awaiting coroutine's frame. Because we don't resume the awaiter
+/// until the last CQE arrives, the awaitable -- and therefore this state and
+/// every trampoline pointing at it -- is alive through to the final
+/// completion.
+struct batch_state {
+    std::atomic<int> completed{0};                 ///< Per-CQE counter
+    int total = 0;                                 ///< Total segments
+    std::vector<int> results;                      ///< Per-segment results (bytes or -errno)
+    std::vector<batch_completion> trampolines;     ///< One trampoline per segment (io_uring only)
+    std::coroutine_handle<> awaiter{};             ///< Resumed when completed == total
+    coro::vthread_stack* awaiter_vstack = nullptr; ///< Captured at suspend time
+
+    explicit batch_state(int n) : total(n), results(n) {}
+
+    bool all_done() const noexcept {
+        return completed.load(std::memory_order_acquire) >= total;
+    }
+};
+
+} // namespace elio::io
+
 #if ELIO_HAS_IO_URING
 
 #include <liburing.h>
@@ -17,40 +102,12 @@
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
-#include <atomic>
-#include <mutex>
-#include <unordered_map>
 #include <algorithm>
 #include <thread>
 
 namespace elio::io {
 
-/// Number of shards for resume tracking map to reduce lock contention.
-/// 64 shards accommodate up to ~64-core machines without measurable contention;
-/// must be a power of 2 for efficient bitwise modulo.
-static constexpr size_t kResumeTrackingShards = 64;
-
-/// Get the shard index for a given user_data pointer
-inline size_t get_resume_tracking_shard(const void* user_data) {
-    // Use pointer value to distribute across shards
-    // Mix bits to get better distribution
-    uintptr_t addr = reinterpret_cast<uintptr_t>(user_data);
-    return (addr ^ (addr >> 8) ^ (addr >> 16)) & (kResumeTrackingShards - 1);
-}
-
-/// Per-shard tracking data
-struct resume_tracking_shard {
-    std::unordered_map<void*, std::atomic<bool>> map;
-    std::mutex mutex;
-};
-
-/// Get the sharded resume tracking maps and mutexes
-/// Using sharding to reduce lock contention under high I/O load
-inline std::array<resume_tracking_shard, kResumeTrackingShards>&
-get_resume_tracking_shards() {
-    static std::array<resume_tracking_shard, kResumeTrackingShards> shards;
-    return shards;
-}
+class io_uring_backend;
 
 /// io_uring backend implementation
 /// 
@@ -388,6 +445,23 @@ public:
         return &ring_;
     }
 
+    /// Account for ``n`` SQEs that were prepared via ``get_ring()`` outside
+    /// the regular ``prepare()`` path (e.g. by the batch I/O awaitables).
+    /// Each registered op must produce exactly one CQE, which the backend
+    /// will then count as completed via ``process_completion``.
+    void register_pending(size_t n) noexcept {
+        if (n) {
+            pending_ops_.fetch_add(n, std::memory_order_relaxed);
+        }
+    }
+
+    /// Resume a coroutine handle while temporarily setting its
+    /// ``vthread_stack`` as current. Exposed for the batch trampoline to
+    /// reuse the same logic the backend uses internally.
+    static void resume_with_vstack(std::coroutine_handle<> handle) {
+        safe_resume(handle);
+    }
+
     void notify() override {
         uint64_t val = 1;
         ssize_t ret = ::write(wake_fd_, &val, sizeof(val));
@@ -415,7 +489,8 @@ private:
                            std::vector<deferred_resume_entry>* deferred_resumes = nullptr) {
         void* user_data = io_uring_cqe_get_data(cqe);
 
-        // Check for wake notification sentinel
+        // Check for wake notification sentinel (must be before any tag-bit check
+        // because WAKE_SENTINEL itself has bit 0 set).
         if (user_data == reinterpret_cast<void*>(WAKE_SENTINEL)) {
             drain_notify();
             submit_wake_poll();
@@ -429,9 +504,6 @@ private:
             return;
         }
 
-        // Store result
-        io_result result{cqe->res, cqe->flags};
-
         // Check for error conditions (negative res indicates error)
         if (cqe->res < 0) {
             ELIO_LOG_DEBUG("Completing operation with error: result={}, flags={}",
@@ -441,47 +513,59 @@ private:
                            cqe->res, cqe->flags);
         }
 
+        uintptr_t v = reinterpret_cast<uintptr_t>(user_data);
+        if (v & uintptr_t{1}) {
+            // Tagged pointer: batch_completion trampoline.
+            auto* tramp = reinterpret_cast<batch_completion*>(v & ~uintptr_t{1});
+            dispatch_batch_completion(tramp, cqe->res, deferred_resumes);
+            return;
+        }
+
+        // Plain coroutine handle: each prepare() sets a unique awaiter and
+        // io_uring guarantees one CQE per SQE, so resuming directly is safe.
         auto handle = std::coroutine_handle<>::from_address(user_data);
+        if (!handle) {
+            return;
+        }
 
-        if (handle) {
-            // Thread-safe check-and-resume using sharded atomic operations.
-            // Uses per-shard locking to reduce lock contention under high I/O load.
-            // Try to atomically claim this resume to prevent use-after-free.
-            // If another thread is already resuming this handle, skip.
+        io_result result{cqe->res, cqe->flags};
+        if (deferred_resumes) {
+            deferred_resumes->push_back({handle, result});
+        } else {
+            last_result_ = result;
+            safe_resume(handle);
+        }
+    }
 
-            // Get the shard for this user_data to reduce contention
-            size_t shard = get_resume_tracking_shard(user_data);
-            auto& shards = get_resume_tracking_shards();
-
-            std::lock_guard<std::mutex> lock(shards[shard].mutex);
-            auto& tracking_map = shards[shard].map;
-
-            // Get or create the atomic flag for this handle
-            auto it = tracking_map.find(user_data);
-            if (it == tracking_map.end()) {
-                // Insert new entry with false (not being resumed)
-                // Use try_emplace which handles atomic types better on some compilers
-                auto [new_it, inserted] = tracking_map.try_emplace(user_data, false);
-                it = new_it;
-            }
-
-            // Try to atomically claim the resume
-            bool expected = false;
-            if (!it->second.compare_exchange_strong(expected, true,
-                    std::memory_order_acq_rel, std::memory_order_acquire)) {
-                // Another thread already claimed this resume - skip
-                return;
-            }
-
-            if (deferred_resumes) {
-                deferred_resumes->push_back({handle, result});
-            } else {
-                last_result_ = result;
-                safe_resume(handle);
-            }
-
-            // Mark as done
-            it->second.store(false, std::memory_order_release);
+    /// Dispatch a batch CQE to its per-segment trampoline.
+    /// Writes the segment result, increments the completed counter, and on
+    /// the final segment resumes the awaiting coroutine (deferred if a
+    /// resume queue is provided so we don't resume inside CQE iteration).
+    static void dispatch_batch_completion(
+        batch_completion* tramp,
+        int32_t res,
+        std::vector<deferred_resume_entry>* deferred_resumes) {
+        if (!tramp || !tramp->state) {
+            return;
+        }
+        batch_state* st = tramp->state;
+        const uint32_t idx = tramp->segment_index;
+        if (idx < st->results.size()) {
+            st->results[idx] = res;
+        }
+        int prev = st->completed.fetch_add(1, std::memory_order_acq_rel);
+        if (prev + 1 != st->total) {
+            return;
+        }
+        // Final segment: resume the awaiter.
+        auto handle = st->awaiter;
+        if (!handle) {
+            return;
+        }
+        if (deferred_resumes) {
+            deferred_resumes->push_back({handle, io_result{0, 0}});
+        } else {
+            safe_resume(handle);
         }
     }
     

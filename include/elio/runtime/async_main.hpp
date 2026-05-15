@@ -21,6 +21,11 @@ struct run_config {
     size_t num_threads = 0;
     /// Blocking thread pool size (0 = fallback to std::thread per task)
     size_t blocking_threads = 4;
+    /// After async_main completes, how long to wait for tasks spawned via
+    /// go/go_to/go_joinable (and their pending I/O) to drain before forcing
+    /// shutdown. Default: wait forever. Set to 0ms to use the legacy
+    /// fast-exit behavior (shutdown_force, which may orphan in-flight I/O).
+    std::chrono::milliseconds shutdown_timeout = std::chrono::milliseconds::max();
 };
 
 namespace detail {
@@ -168,12 +173,20 @@ auto run(F&& f, const run_config& config = {})
         sched.spawn(handle);
     }
 
+    auto do_shutdown = [&] {
+        if (config.shutdown_timeout <= std::chrono::milliseconds::zero()) {
+            sched.shutdown_force();
+        } else {
+            sched.shutdown(config.shutdown_timeout);
+        }
+    };
+
     if constexpr (std::is_void_v<T>) {
         signal.wait();
-        sched.shutdown();
+        do_shutdown();
     } else {
         T result = signal.wait();
-        sched.shutdown();
+        do_shutdown();
         return result;
     }
 }

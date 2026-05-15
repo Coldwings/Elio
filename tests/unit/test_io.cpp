@@ -248,10 +248,11 @@ TEST_CASE("Cancel operation", "[io][epoll][cancel]") {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     
     // Note: cancel behavior depends on backend implementation
-    // Just verify we don't crash on shutdown with pending operation
-    
-    sched.shutdown();
-    
+    // Just verify we don't crash on shutdown with pending operation.
+    // Use shutdown_force() — the recv will never complete (no data sent),
+    // so graceful shutdown would block forever waiting for it.
+    sched.shutdown_force();
+
     close(sv[0]);
     close(sv[1]);
 }

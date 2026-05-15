@@ -49,8 +49,8 @@ public:
     
     /// Get/set body
     std::string_view body() const noexcept { return body_; }
-    void set_body(std::string_view b) { body_ = b; }
-    void set_body(std::string&& b) { body_ = std::move(b); }
+    void set_body(std::string_view b) { body_ = b; headers_.set_content_length(body_.size()); }
+    void set_body(std::string&& b) { body_ = std::move(b); headers_.set_content_length(body_.size()); }
     
     /// Get host header
     std::string_view host() const { return headers_.get("Host"); }

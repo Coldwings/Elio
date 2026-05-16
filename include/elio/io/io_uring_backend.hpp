@@ -319,7 +319,19 @@ public:
         int submitted = io_uring_submit(&ring_);
         if (submitted < 0) {
             ELIO_LOG_ERROR("io_uring_submit failed: {}", strerror(-submitted));
+            // Rollback pending_ops for the operations that failed to submit.
+            // Without this rollback, pending_ops_ stays elevated forever and
+            // has_pending() / poll() will spin or block indefinitely.
+            pending_ops_.fetch_sub(pending, std::memory_order_relaxed);
             return submitted;
+        }
+
+        // If we submitted fewer than prepared (shouldn't happen with
+        // io_uring_submit), rollback the excess.
+        if (static_cast<size_t>(submitted) < pending) {
+            size_t rollback = pending - static_cast<size_t>(submitted);
+            pending_ops_.fetch_sub(rollback, std::memory_order_relaxed);
+            ELIO_LOG_WARNING("io_uring_submit submitted {}/{} SQEs", submitted, pending);
         }
 
         ELIO_LOG_DEBUG("Submitted {} operations", submitted);
@@ -603,13 +615,22 @@ private:
     /// Submit a poll_add SQE to watch the wake eventfd
     void submit_wake_poll() {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-        if (sqe) {
-            io_uring_prep_poll_add(sqe, wake_fd_, POLLIN);
-            io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(WAKE_SENTINEL));
-            // Don't count this as a pending user operation
-        } else {
-            ELIO_LOG_WARNING("Failed to submit wake poll: SQ full");
+        if (!sqe) {
+            // SQ is full - flush and retry once. This ensures the wake
+            // poll is always installed, otherwise cross-thread notify()
+            // will be lost and workers can deadlock.
+            ELIO_LOG_WARNING("SQ full for wake poll, flushing and retrying");
+            io_uring_submit(&ring_);
+            sqe = io_uring_get_sqe(&ring_);
+            if (!sqe) {
+                ELIO_LOG_ERROR("Failed to submit wake poll: SQ still full after flush");
+                return;
+            }
         }
+        io_uring_prep_poll_add(sqe, wake_fd_, POLLIN);
+        io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(WAKE_SENTINEL));
+        // Don't count this as a pending user operation - submit immediately
+        io_uring_submit(&ring_);
     }
     
 public:

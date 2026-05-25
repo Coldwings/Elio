@@ -103,9 +103,22 @@ public:
             SSL_CTX_set_max_proto_version(ctx_, max_version);
         }
         
-        // Set default options
-        SSL_CTX_set_options(ctx_, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION);
-        
+        // Set default options. SSL_OP_NO_RENEGOTIATION mitigates the TLS 1.2
+        // renegotiation DoS by refusing peer-initiated renegotiations.
+        long options = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION;
+#ifdef SSL_OP_NO_RENEGOTIATION
+        options |= SSL_OP_NO_RENEGOTIATION;
+#endif
+        if (mode == tls_mode::server) {
+            // Servers should pick the cipher rather than honoring client order.
+            options |= SSL_OP_CIPHER_SERVER_PREFERENCE;
+        }
+        SSL_CTX_set_options(ctx_, options);
+
+        // Auto-retry transparent renegotiations so SSL_read/SSL_write don't
+        // surface them as spurious WANT_READ/WANT_WRITE.
+        SSL_CTX_set_mode(ctx_, SSL_MODE_AUTO_RETRY);
+
         // Enable session caching for performance
         SSL_CTX_set_session_cache_mode(ctx_, SSL_SESS_CACHE_BOTH);
         
@@ -127,16 +140,23 @@ public:
     
     // Movable
     tls_context(tls_context&& other) noexcept
-        : ctx_(other.ctx_), mode_(other.mode_) {
+        : ctx_(other.ctx_)
+        , mode_(other.mode_)
+        , alpn_protocols_(std::move(other.alpn_protocols_)) {
         other.ctx_ = nullptr;
+        // Re-register the ALPN selection callback so OpenSSL holds a pointer
+        // to *this* (the new owner) rather than the moved-from source.
+        rebind_alpn_callback();
     }
-    
+
     tls_context& operator=(tls_context&& other) noexcept {
         if (this != &other) {
             if (ctx_) SSL_CTX_free(ctx_);
             ctx_ = other.ctx_;
             mode_ = other.mode_;
+            alpn_protocols_ = std::move(other.alpn_protocols_);
             other.ctx_ = nullptr;
+            rebind_alpn_callback();
         }
         return *this;
     }
@@ -179,9 +199,14 @@ public:
     /// @param ca_file Path to CA certificate file (PEM)
     /// @param ca_path Path to directory containing CA certificates
     bool load_verify_locations(std::string_view ca_file = "", std::string_view ca_path = "") {
-        const char* file = ca_file.empty() ? nullptr : std::string(ca_file).c_str();
-        const char* path = ca_path.empty() ? nullptr : std::string(ca_path).c_str();
-        
+        // Persist std::string locals through the OpenSSL call: directly chaining
+        // std::string(ca_file).c_str() would leave `file`/`path` dangling because
+        // the temporary std::string is destroyed at the end of the full expression.
+        std::string file_buf{ca_file};
+        std::string path_buf{ca_path};
+        const char* file = ca_file.empty() ? nullptr : file_buf.c_str();
+        const char* path = ca_path.empty() ? nullptr : path_buf.c_str();
+
         if (SSL_CTX_load_verify_locations(ctx_, file, path) != 1) {
             ELIO_LOG_ERROR("Failed to load CA certificates: {}", get_ssl_error());
             return false;
@@ -328,6 +353,12 @@ public:
     }
     
 private:
+    void rebind_alpn_callback() noexcept {
+        if (ctx_ && mode_ == tls_mode::server && !alpn_protocols_.empty()) {
+            SSL_CTX_set_alpn_select_cb(ctx_, alpn_select_callback, this);
+        }
+    }
+
     static std::string get_ssl_error() {
         char buf[256];
         ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));

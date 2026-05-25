@@ -7,7 +7,7 @@
 #include <elio/coro/vthread_stack.hpp>
 #include <elio/coro/task.hpp>
 #include <type_traits>
-#include <vector>
+#include <array>
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -86,11 +86,13 @@ public:
         , blocking_pool_(std::make_unique<blocking_pool>(blocking_threads)) {
 
         size_t n = num_threads_.load(std::memory_order_relaxed);
-        // Pre-reserve to MAX_THREADS to prevent reallocation during runtime
-        // This ensures get_worker() is safe while set_thread_count() adds workers
-        workers_.reserve(MAX_THREADS);
+        // Fixed-size storage avoids the data race vector::push_back triggers
+        // when set_thread_count() grows the pool concurrently with hot-path
+        // readers (get_worker, schedule_round_robin, active_tasks, ...).
+        // Slots are populated in-place; the num_threads_ atomic publishes the
+        // visible range to readers via release/acquire.
         for (size_t i = 0; i < n; ++i) {
-            workers_.push_back(std::make_unique<worker_thread>(this, i, strategy));
+            workers_[i] = std::make_unique<worker_thread>(this, i, strategy);
         }
     }
 
@@ -164,15 +166,21 @@ public:
             return;
         }
 
-        // Stop all workers (sets running_=false and joins threads)
-        for (auto& worker : workers_) {
-            worker->stop();
+        // Stop all workers (sets running_=false and joins threads).
+        // Iterate the visible range; slots beyond num_threads_ are either
+        // unpopulated (nullptr) or correspond to workers already stopped by
+        // a prior shrink (whose tasks were redistributed at shrink time).
+        // Their unique_ptr destructors will run on scheduler destruction and
+        // call stop()/drain via ~worker_thread(), which is idempotent.
+        size_t n = num_threads_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < n; ++i) {
+            workers_[i]->stop();
         }
 
         // Now that ALL workers are stopped, drain remaining tasks
         // This is safe because no worker can steal from another at this point
-        for (auto& worker : workers_) {
-            worker->drain_remaining_tasks();
+        for (size_t i = 0; i < n; ++i) {
+            workers_[i]->drain_remaining_tasks();
         }
 
         // Wake any threads still parked in wait_for_idle so they can observe
@@ -195,7 +203,7 @@ public:
     [[nodiscard]] size_t active_tasks() const noexcept {
         size_t total = active_tracked_.load(std::memory_order_acquire);
         size_t n = num_threads_.load(std::memory_order_acquire);
-        for (size_t i = 0; i < n && i < workers_.size(); ++i) {
+        for (size_t i = 0; i < n; ++i) {
             total += workers_[i]->queue_size();
             total += workers_[i]->io_context().pending_count();
         }
@@ -421,7 +429,7 @@ public:
     [[nodiscard]] size_t pending_tasks() const noexcept {
         size_t n = num_threads_.load(std::memory_order_acquire);
         size_t total = 0;
-        for (size_t i = 0; i < n && i < workers_.size(); ++i) {
+        for (size_t i = 0; i < n; ++i) {
             total += workers_[i]->queue_size();
         }
         return total;
@@ -439,7 +447,9 @@ public:
             if (count <= old_count) return;
             
             for (size_t i = old_count; i < count; ++i) {
-                if (i < workers_.size()) {
+                if (workers_[i]) {
+                    // Slot already populated (either by ctor or a prior grow
+                    // that was later shrunk). Restart the worker in place.
                     if (running_.load(std::memory_order_relaxed)) {
                         workers_[i]->start();
                     }
@@ -448,9 +458,13 @@ public:
                     if (running_.load(std::memory_order_relaxed)) {
                         worker->start();
                     }
-                    workers_.push_back(std::move(worker));
+                    workers_[i] = std::move(worker);
                 }
             }
+            // Publish the new size AFTER all slot writes are visible. Hot-path
+            // readers (get_worker, do_spawn, active_tasks) gate on
+            // num_threads_.load(acquire); the release here pairs with their
+            // acquire to make the slot writes visible.
             num_threads_.store(count, std::memory_order_release);
         } else if (count < old_count) {
             // Lock to prevent spawns to workers being stopped
@@ -525,7 +539,7 @@ public:
     [[nodiscard]] size_t total_tasks_executed() const noexcept {
         size_t n = num_threads_.load(std::memory_order_acquire);
         size_t total = 0;
-        for (size_t i = 0; i < n && i < workers_.size(); ++i) {
+        for (size_t i = 0; i < n; ++i) {
             total += workers_[i]->tasks_executed();
         }
         return total;
@@ -533,7 +547,7 @@ public:
 
     [[nodiscard]] size_t worker_tasks_executed(size_t worker_id) const noexcept {
         size_t n = num_threads_.load(std::memory_order_acquire);
-        if (worker_id >= n || worker_id >= workers_.size()) return 0;
+        if (worker_id >= n) return 0;
         return workers_[worker_id]->tasks_executed();
     }
 
@@ -592,7 +606,16 @@ private:
         }
     }
 
-    std::vector<std::unique_ptr<worker_thread>> workers_;
+    // Fixed-size storage indexed up to MAX_THREADS. Slot occupancy is
+    // controlled by the num_threads_ atomic: writers populate workers_[i]
+    // before publishing the new size via num_threads_.store(release);
+    // readers gate on num_threads_.load(acquire), so the release/acquire
+    // pair makes the slot pointer visible. Using std::array (rather than
+    // std::vector + reserve) eliminates the implicit size-field write that
+    // vector::push_back performs even when no reallocation occurs — that
+    // write was the source of a TSAN race against lock-free hot-path
+    // readers (get_worker, schedule_round_robin, active_tasks, ...).
+    std::array<std::unique_ptr<worker_thread>, MAX_THREADS> workers_;
 
     // Frequently-read fields on their own cache line to avoid false sharing
     // with the spawn counter and the slow-path workers_mutex_.

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <chrono>
 #include <coroutine>
@@ -9,6 +10,46 @@
 #include <sys/socket.h>
 
 namespace elio::io {
+
+/// Owner-controlled op tag carried as ``user_data`` on submitted SQEs.
+///
+/// Lifetime / cancellation contract
+/// --------------------------------
+/// Each awaitable that submits an io_uring SQE allocates an ``op_state``
+/// (``std::unique_ptr``) and passes its address through ``io_request::state``.
+/// The backend tags that pointer (low bit 1 set, see io_uring_backend.hpp)
+/// when storing it as the SQE's ``user_data`` so the completion handler can
+/// distinguish it from a raw coroutine handle or a batch trampoline.
+///
+/// The kernel guarantees exactly one CQE per SQE. The lifecycle has three
+/// phases tracked by the ``phase`` atomic:
+///
+///   * ``pending`` (0): SQE is in flight, awaitable still owns the state.
+///   * ``completed`` (1): the CQE arrived first. ``process_completion``
+///     stamps ``result``/``flags``, resumes ``handle``, and the awaitable's
+///     ``unique_ptr`` frees the state on destruction.
+///   * ``orphaned`` (2): the awaitable was destroyed before the CQE arrived
+///     (e.g. forced ``coroutine_handle::destroy()`` or vthread teardown). The
+///     destructor releases ownership; ``process_completion`` sees the
+///     orphaned phase, deletes the state, and skips the resume — preventing
+///     the use-after-free on a freed coroutine frame.
+///
+/// CAS pending->completed (in process_completion) and CAS pending->orphaned
+/// (in awaitable destructor) serialize the transfer of ownership between
+/// the awaitable and the backend so neither side can free or resume after
+/// the other has taken over.
+struct op_state {
+    enum : uint8_t {
+        phase_pending = 0,
+        phase_completed = 1,
+        phase_orphaned = 2,
+    };
+
+    std::coroutine_handle<> handle{};
+    std::atomic<uint8_t> phase{phase_pending};
+    int32_t result = 0;
+    uint32_t flags = 0;
+};
 
 /// I/O operation types
 enum class io_op : uint8_t {
@@ -55,6 +96,12 @@ struct io_request {
     int64_t offset;                     ///< File offset (-1 for current position)
     std::coroutine_handle<> awaiter;    ///< Coroutine to resume on completion
     void* user_data;                    ///< User data for tracking
+    /// Optional owner-controlled op tag. When non-null, io_uring_backend
+    /// tags this pointer and uses it as the SQE's ``user_data`` instead of
+    /// the raw awaiter handle, so a CQE arriving after the awaitable was
+    /// destroyed is detected and dropped instead of resuming a freed frame.
+    /// See ``op_state`` above.
+    op_state* state = nullptr;
 
     // For vectored I/O
     ::iovec* iovecs;

@@ -18,34 +18,45 @@ namespace elio::io {
 // ---------------------------------------------------------------------------
 //
 // Every SQE submitted via this backend stores a ``user_data`` value that the
-// kernel echoes back on the matching CQE. We use the low bit of that value as
-// a discriminator so the completion handler can dispatch without any extra
-// bookkeeping or locking:
+// kernel echoes back on the matching CQE. The low two bits of that value are
+// used as a discriminator so the completion handler can dispatch without any
+// extra bookkeeping or locking. Because every dispatched pointer is at least
+// 4-byte aligned, those bits are free to repurpose.
 //
-//   * ``bit 0 == 0`` (the default for ``std::coroutine_handle::address()``,
-//     which is always at least pointer-aligned): the value is a coroutine
-//     handle address. ``process_completion`` resumes that coroutine.
+//   * ``bit 0 == 1``: tagged pointer to a ``batch_completion`` trampoline.
+//     Mask off bit 0 to recover the pointer. Each trampoline knows which
+//     segment of which ``batch_state`` it belongs to and is responsible for
+//     delivering the per-segment result and, on the last completion of the
+//     batch, resuming the awaiting coroutine.
 //
-//   * ``bit 0 == 1``: the value is a tagged pointer to a ``batch_completion``
-//     trampoline. Mask off the low bit to recover the pointer; the
-//     trampoline knows which segment of which ``batch_state`` it belongs to
-//     and is responsible for delivering the per-segment result and, on the
-//     last completion of the batch, resuming the awaiting coroutine.
+//   * ``bit 1 == 1`` (with bit 0 clear): tagged pointer to an ``op_state``
+//     allocated and owned by the issuing awaitable. Mask off bit 1 to
+//     recover the pointer. The completion handler atomically transitions
+//     the op_state from ``pending`` to either ``completed`` (it won the
+//     race; resume the handle) or detects ``orphaned`` (the awaitable was
+//     destroyed first; just delete the state). This guards against
+//     resuming a freed coroutine frame after forced cancellation /
+//     vthread teardown.
+//
+//   * ``bit 0 == 0`` and ``bit 1 == 0``: legacy raw coroutine handle. Used
+//     by callers (e.g. timer, net, signal) that have not yet migrated to
+//     ``op_state``. ``process_completion`` resumes the handle directly.
 //
 // A few sentinel values do not follow either convention. They are never
 // dereferenced and are recognised by exact comparison:
 //
 //   * ``WAKE_SENTINEL`` (= 1): used by the eventfd poll SQE that wakes the
-//     ring on cross-thread ``notify()``. Note this also has bit 0 set, but is
-//     handled before the tag check.
+//     ring on cross-thread ``notify()``. Note this also has bit 0 set, but
+//     is handled before the tag check.
 //   * ``nullptr``: used for cancel SQEs that do not need to resume anything.
-//
-// Coroutine handle addresses are guaranteed to be aligned (in practice
-// ``alignof(void*)``-aligned, certainly even), so they never collide with the
-// tagged form.
 // ---------------------------------------------------------------------------
 
 struct batch_state;
+
+/// Tag bits used in ``user_data`` (see scheme docs above).
+inline constexpr uintptr_t USER_DATA_BATCH_TAG = 1;       ///< bit 0
+inline constexpr uintptr_t USER_DATA_OP_STATE_TAG = 2;    ///< bit 1
+inline constexpr uintptr_t USER_DATA_TAG_MASK = 3;        ///< bits 0..1
 
 /// Per-segment trampoline used as tagged user_data on batch SQEs.
 /// One ``batch_completion`` exists per segment; it lives inside the owning
@@ -57,9 +68,17 @@ struct batch_completion {
     /// Encode this trampoline into a tagged user_data value (low bit = 1).
     void* tagged_user_data() noexcept {
         return reinterpret_cast<void*>(
-            reinterpret_cast<uintptr_t>(this) | uintptr_t{1});
+            reinterpret_cast<uintptr_t>(this) | USER_DATA_BATCH_TAG);
     }
 };
+
+/// Encode an ``op_state*`` into a tagged user_data value (bit 1 = 1).
+/// op_state is heap-allocated so it has at least 4-byte alignment, leaving
+/// bits 0..1 free.
+inline void* tagged_op_state_user_data(op_state* st) noexcept {
+    return reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(st) | USER_DATA_OP_STATE_TAG);
+}
 
 /// Shared state for a batch I/O operation.
 /// Kept here so both the io_uring backend (which dispatches CQEs) and the
@@ -205,12 +224,25 @@ public:
     bool prepare(const io_request& req) override {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (!sqe) {
-            ELIO_LOG_WARNING("io_uring SQ full, cannot prepare operation");
-            return false;
+            // SQ full: try to drain by submitting whatever is queued, then
+            // retry once. This avoids spurious -EAGAIN at the awaitable layer
+            // when the SQ is just busy and a flush is enough.
+            ELIO_LOG_DEBUG("io_uring SQ full, flushing and retrying");
+            (void)io_uring_submit(&ring_);
+            sqe = io_uring_get_sqe(&ring_);
+            if (!sqe) {
+                ELIO_LOG_WARNING("io_uring SQ still full after flush");
+                return false;
+            }
         }
-        
-        // Encode the awaiter handle as user_data
-        io_uring_sqe_set_data(sqe, req.awaiter.address());
+
+        // Encode user_data: prefer op_state tagged pointer (UAF-safe path),
+        // fall back to raw coroutine handle for legacy callers.
+        if (req.state) {
+            io_uring_sqe_set_data(sqe, tagged_op_state_user_data(req.state));
+        } else {
+            io_uring_sqe_set_data(sqe, req.awaiter.address());
+        }
         
         switch (req.op) {
             case io_op::read:
@@ -420,19 +452,33 @@ public:
     }
     
     /// Cancel a pending operation
+    /// @param user_data The exact ``user_data`` value the original SQE was
+    ///                  submitted with. For the legacy (raw handle) path
+    ///                  this is ``coroutine_handle::address()``; for the
+    ///                  ``op_state`` path the awaitable must pass the
+    ///                  tagged value via ``tagged_op_state_user_data``.
     bool cancel(void* user_data) override {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (!sqe) {
-            return false;
+            // Try a flush + retry, mirroring prepare(). A cancel that
+            // can't be queued is silently dropped (caller will likely
+            // observe normal completion or be torn down).
+            (void)io_uring_submit(&ring_);
+            sqe = io_uring_get_sqe(&ring_);
+            if (!sqe) {
+                return false;
+            }
         }
-        
+
         io_uring_prep_cancel(sqe, user_data, 0);
         io_uring_sqe_set_data(sqe, nullptr);  // No awaiter for cancel itself
-        
+
         pending_ops_.fetch_add(1, std::memory_order_relaxed);
-        
-        // Submit immediately - cancel must be acted upon right away
-        io_uring_submit(&ring_);
+
+        // Stage only — the next poll() auto-submits. Cancellation latency
+        // is bounded by the poll loop's wakeup, which happens within
+        // microseconds on a busy worker. Skipping the immediate submit
+        // saves a syscall on every cancel.
         return true;
     }
     
@@ -526,21 +572,64 @@ private:
         }
 
         uintptr_t v = reinterpret_cast<uintptr_t>(user_data);
-        if (v & uintptr_t{1}) {
+        if (v & USER_DATA_BATCH_TAG) {
             // Tagged pointer: batch_completion trampoline.
-            auto* tramp = reinterpret_cast<batch_completion*>(v & ~uintptr_t{1});
+            auto* tramp = reinterpret_cast<batch_completion*>(v & ~USER_DATA_BATCH_TAG);
             dispatch_batch_completion(tramp, cqe->res, deferred_resumes);
             return;
         }
+        if (v & USER_DATA_OP_STATE_TAG) {
+            // Tagged pointer: owner-controlled op_state (UAF-safe path).
+            auto* st = reinterpret_cast<op_state*>(v & ~USER_DATA_OP_STATE_TAG);
+            dispatch_op_state(st, cqe->res, cqe->flags, deferred_resumes);
+            return;
+        }
 
-        // Plain coroutine handle: each prepare() sets a unique awaiter and
-        // io_uring guarantees one CQE per SQE, so resuming directly is safe.
+        // Plain coroutine handle (legacy path): each prepare() sets a unique
+        // awaiter and io_uring guarantees one CQE per SQE, so resuming
+        // directly is safe — provided the awaiter frame is still alive.
         auto handle = std::coroutine_handle<>::from_address(user_data);
         if (!handle) {
             return;
         }
 
         io_result result{cqe->res, cqe->flags};
+        if (deferred_resumes) {
+            deferred_resumes->push_back({handle, result});
+        } else {
+            last_result_ = result;
+            safe_resume(handle);
+        }
+    }
+
+    /// Dispatch a CQE matched to an awaitable-owned ``op_state``.
+    /// CAS pending->completed: we won; stamp result/flags and resume.
+    /// CAS fails because phase is orphaned: the awaitable was destroyed
+    /// before this CQE arrived; just delete the storage and skip resume.
+    static void dispatch_op_state(
+        op_state* st,
+        int32_t res,
+        uint32_t flags,
+        std::vector<deferred_resume_entry>* deferred_resumes) {
+        if (!st) {
+            return;
+        }
+        uint8_t expected = op_state::phase_pending;
+        if (!st->phase.compare_exchange_strong(
+                expected, op_state::phase_completed,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            // expected was phase_orphaned: awaitable already torn down.
+            // The destructor released ownership to us; free it.
+            delete st;
+            return;
+        }
+        st->result = res;
+        st->flags = flags;
+        auto handle = st->handle;
+        if (!handle) {
+            return;
+        }
+        io_result result{res, flags};
         if (deferred_resumes) {
             deferred_resumes->push_back({handle, result});
         } else {

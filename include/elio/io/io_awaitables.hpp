@@ -28,26 +28,68 @@ inline io_context& current_io_context() noexcept {
 }
 
 /// Base class for I/O awaitables
-/// Provides common functionality for all async I/O operations
+/// Provides common functionality for all async I/O operations.
+///
+/// Owns the ``op_state`` tag passed through ``io_request::state`` so that a
+/// CQE arriving after the awaitable's frame has been freed (forced cancel /
+/// vthread teardown) is dropped instead of resuming a dangling handle. See
+/// the contract in io_backend.hpp.
 class io_awaitable_base {
 public:
     io_awaitable_base() noexcept = default;
-    
+
+    // Non-copyable, non-movable: op_state holds a pointer to the awaitable's
+    // own coroutine handle and is referenced by an in-flight SQE. Copying or
+    // moving would invalidate that pointer.
+    io_awaitable_base(const io_awaitable_base&) = delete;
+    io_awaitable_base& operator=(const io_awaitable_base&) = delete;
+    io_awaitable_base(io_awaitable_base&&) = delete;
+    io_awaitable_base& operator=(io_awaitable_base&&) = delete;
+
+    ~io_awaitable_base() {
+        if (!op_state_) {
+            return;
+        }
+        // op_state_ is still owned: either the SQE was never submitted (in
+        // which case it has phase_pending and no CQE will arrive — we just
+        // free via unique_ptr below) OR the SQE is in flight and the CQE
+        // hasn't been processed yet. The latter case is the UAF-prone one:
+        // the awaitable's coroutine frame is being torn down while the
+        // kernel still has a reference. CAS pending->orphaned to release
+        // ownership; the eventual CQE will see phase_orphaned and delete.
+        uint8_t expected = op_state::phase_pending;
+        if (op_state_->phase.compare_exchange_strong(
+                expected, op_state::phase_orphaned,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            // We won. The CQE handler will free the storage — release the
+            // unique_ptr so we don't double-free. If the SQE was never
+            // submitted (e.g. SQ-full path that already reset op_state_)
+            // we never reach here.
+            (void)op_state_.release();
+            return;
+        }
+        // CAS failed: phase was already phase_completed. The CQE handler
+        // wrote result/flags and queued our resume; unique_ptr cleans up.
+    }
+
     /// Never ready immediately - always suspend
     bool await_ready() const noexcept {
         return false;
     }
-    
+
     /// Get the result of the I/O operation
     io_result result() const noexcept {
         return result_;
     }
-    
+
 protected:
     io_result result_{};
     size_t saved_affinity_ = coro::NO_AFFINITY;
     void* handle_address_ = nullptr;
-    
+    /// Owned op_state for the in-flight SQE. Nullable: lazily allocated by
+    /// ``setup_op_state`` and reset on prepare-failure paths.
+    std::unique_ptr<op_state> op_state_;
+
     /// Save current affinity and bind to current worker
     template<typename Promise>
     void bind_to_worker(std::coroutine_handle<Promise> handle) {
@@ -60,7 +102,32 @@ protected:
             }
         }
     }
-    
+
+    /// Allocate the op_state and return a pointer suitable for
+    /// ``io_request::state``. Stores the awaiter handle in op_state for
+    /// the completion handler to resume.
+    op_state* setup_op_state(std::coroutine_handle<> awaiter) {
+        op_state_ = std::make_unique<op_state>();
+        op_state_->handle = awaiter;
+        return op_state_.get();
+    }
+
+    /// Drop op_state ownership without orphaning (used on prepare-failure
+    /// paths where no SQE was submitted, so no CQE will arrive).
+    void clear_op_state() noexcept {
+        op_state_.reset();
+    }
+
+    /// Read the io_result deposited by the completion handler. Falls back
+    /// to ``result_`` (set inline by EAGAIN/error paths) when there is no
+    /// op_state, e.g. after ``clear_op_state``.
+    io_result read_result_from_op_state() const noexcept {
+        if (op_state_) {
+            return io_result{op_state_->result, op_state_->flags};
+        }
+        return result_;
+    }
+
     /// Restore previous affinity (called from await_resume)
     void restore_affinity() {
         if (handle_address_) {
@@ -91,7 +158,7 @@ public:
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
         bind_to_worker(awaiter);
         auto& ctx = current_io_context();
-        
+
         io_request req{};
         req.op = io_op::read;
         req.fd = fd_;
@@ -99,21 +166,24 @@ public:
         req.length = length_;
         req.offset = offset_;
         req.awaiter = awaiter;
-        
+        req.state = setup_op_state(awaiter);
+
         if (!ctx.prepare(req)) {
+            clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx.submit();
+        // No explicit submit: poll() auto-submits at the top of its loop,
+        // saving one syscall per op while still keeping latency bounded.
     }
-    
+
     io_result await_resume() noexcept {
-        result_ = io_context::get_last_result();
+        result_ = read_result_from_op_state();
         restore_affinity();
         return result_;
     }
-    
+
 private:
     int fd_;
     void* buffer_;
@@ -136,7 +206,7 @@ public:
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
         bind_to_worker(awaiter);
         auto& ctx = current_io_context();
-        
+
         io_request req{};
         req.op = io_op::write;
         req.fd = fd_;
@@ -144,21 +214,22 @@ public:
         req.length = length_;
         req.offset = offset_;
         req.awaiter = awaiter;
-        
+        req.state = setup_op_state(awaiter);
+
         if (!ctx.prepare(req)) {
+            clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx.submit();
     }
-    
+
     io_result await_resume() noexcept {
-        result_ = io_context::get_last_result();
+        result_ = read_result_from_op_state();
         restore_affinity();
         return result_;
     }
-    
+
 private:
     int fd_;
     const void* buffer_;
@@ -181,7 +252,7 @@ public:
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
         bind_to_worker(awaiter);
         auto& ctx = current_io_context();
-        
+
         io_request req{};
         req.op = io_op::recv;
         req.fd = fd_;
@@ -189,21 +260,22 @@ public:
         req.length = length_;
         req.socket_flags = flags_;
         req.awaiter = awaiter;
-        
+        req.state = setup_op_state(awaiter);
+
         if (!ctx.prepare(req)) {
+            clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx.submit();
     }
-    
+
     io_result await_resume() noexcept {
-        result_ = io_context::get_last_result();
+        result_ = read_result_from_op_state();
         restore_affinity();
         return result_;
     }
-    
+
 private:
     int fd_;
     void* buffer_;
@@ -226,7 +298,7 @@ public:
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
         bind_to_worker(awaiter);
         auto& ctx = current_io_context();
-        
+
         io_request req{};
         req.op = io_op::send;
         req.fd = fd_;
@@ -234,21 +306,22 @@ public:
         req.length = length_;
         req.socket_flags = flags_;
         req.awaiter = awaiter;
-        
+        req.state = setup_op_state(awaiter);
+
         if (!ctx.prepare(req)) {
+            clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx.submit();
     }
-    
+
     io_result await_resume() noexcept {
-        result_ = io_context::get_last_result();
+        result_ = read_result_from_op_state();
         restore_affinity();
         return result_;
     }
-    
+
 private:
     int fd_;
     const void* buffer_;
@@ -273,7 +346,7 @@ public:
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
         bind_to_worker(awaiter);
         auto& ctx = current_io_context();
-        
+
         io_request req{};
         req.op = io_op::accept;
         req.fd = listen_fd_;
@@ -281,26 +354,27 @@ public:
         req.addrlen = addrlen_;
         req.socket_flags = flags_;
         req.awaiter = awaiter;
-        
+        req.state = setup_op_state(awaiter);
+
         if (!ctx.prepare(req)) {
+            clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx.submit();
     }
-    
+
     io_result await_resume() noexcept {
-        result_ = io_context::get_last_result();
+        result_ = read_result_from_op_state();
         restore_affinity();
         return result_;
     }
-    
+
     /// Convenience: get the accepted fd directly
     int accepted_fd() const noexcept {
         return result_.success() ? result_.result : -1;
     }
-    
+
 private:
     int listen_fd_;
     struct sockaddr* addr_;
@@ -323,28 +397,29 @@ public:
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
         bind_to_worker(awaiter);
         auto& ctx = current_io_context();
-        
+
         io_request req{};
         req.op = io_op::connect;
         req.fd = fd_;
         req.addr = const_cast<struct sockaddr*>(addr_);
         req.addrlen = &addrlen_;
         req.awaiter = awaiter;
-        
+        req.state = setup_op_state(awaiter);
+
         if (!ctx.prepare(req)) {
+            clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx.submit();
     }
-    
+
     io_result await_resume() noexcept {
-        result_ = io_context::get_last_result();
+        result_ = read_result_from_op_state();
         restore_affinity();
         return result_;
     }
-    
+
 private:
     int fd_;
     const struct sockaddr* addr_;
@@ -362,26 +437,27 @@ public:
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
         bind_to_worker(awaiter);
         auto& ctx = current_io_context();
-        
+
         io_request req{};
         req.op = io_op::close;
         req.fd = fd_;
         req.awaiter = awaiter;
-        
+        req.state = setup_op_state(awaiter);
+
         if (!ctx.prepare(req)) {
+            clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx.submit();
     }
-    
+
     io_result await_resume() noexcept {
-        result_ = io_context::get_last_result();
+        result_ = read_result_from_op_state();
         restore_affinity();
         return result_;
     }
-    
+
 private:
     int fd_;
 };
@@ -400,28 +476,29 @@ public:
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
         bind_to_worker(awaiter);
         auto& ctx = current_io_context();
-        
+
         io_request req{};
         req.op = io_op::writev;
         req.fd = fd_;
         req.iovecs = iovecs_;
         req.iovec_count = iovec_count_;
         req.awaiter = awaiter;
-        
+        req.state = setup_op_state(awaiter);
+
         if (!ctx.prepare(req)) {
+            clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx.submit();
     }
-    
+
     io_result await_resume() noexcept {
-        result_ = io_context::get_last_result();
+        result_ = read_result_from_op_state();
         restore_affinity();
         return result_;
     }
-    
+
 private:
     int fd_;
     struct iovec* iovecs_;
@@ -440,26 +517,27 @@ public:
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
         bind_to_worker(awaiter);
         auto& ctx = current_io_context();
-        
+
         io_request req{};
         req.op = for_read_ ? io_op::poll_read : io_op::poll_write;
         req.fd = fd_;
         req.awaiter = awaiter;
-        
+        req.state = setup_op_state(awaiter);
+
         if (!ctx.prepare(req)) {
+            clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx.submit();
     }
-    
+
     io_result await_resume() noexcept {
-        result_ = io_context::get_last_result();
+        result_ = read_result_from_op_state();
         restore_affinity();
         return result_;
     }
-    
+
 private:
     int fd_;
     bool for_read_;
@@ -646,7 +724,12 @@ public:
         auto& ctx = current_io_context();
 
 #if ELIO_HAS_IO_URING
-        auto* backend = dynamic_cast<io_uring_backend*>(ctx.get_backend());
+        // Fast path: skip RTTI/dynamic_cast — io_context already exposes
+        // an is_io_uring() check, and we know the backend hierarchy
+        // statically here.
+        auto* backend = ctx.is_io_uring()
+            ? static_cast<io_uring_backend*>(ctx.get_backend())
+            : nullptr;
         if (backend && backend->get_ring()) {
             batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
             const int n = batch_st_->total;
@@ -713,7 +796,12 @@ public:
         auto& ctx = current_io_context();
 
 #if ELIO_HAS_IO_URING
-        auto* backend = dynamic_cast<io_uring_backend*>(ctx.get_backend());
+        // Fast path: skip RTTI/dynamic_cast — io_context already exposes
+        // an is_io_uring() check, and we know the backend hierarchy
+        // statically here.
+        auto* backend = ctx.is_io_uring()
+            ? static_cast<io_uring_backend*>(ctx.get_backend())
+            : nullptr;
         if (backend && backend->get_ring()) {
             batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
             bool submitted = detail::submit_batch_io_uring(

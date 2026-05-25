@@ -10,6 +10,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+#include <chrono>
 #include <string>
 #include <string_view>
 #include <memory>
@@ -26,6 +27,14 @@ enum class handshake_result {
 };
 
 /// TLS stream wrapping a TCP connection with SSL/TLS encryption
+///
+/// **Thread safety:** like the underlying ``SSL*``, a ``tls_stream`` is **not**
+/// safe for concurrent use from multiple coroutines/threads. Issuing
+/// ``read``/``write``/``shutdown`` on the same instance from different
+/// coroutines simultaneously is undefined behavior — OpenSSL does not protect
+/// SSL state against concurrent operations. Callers that need concurrent
+/// writes must serialize them externally (for example with a ``sync::mutex``,
+/// as done in the WebSocket layer's ``send_mutex_``).
 class tls_stream {
 public:
     /// Create a TLS stream from an existing TCP stream
@@ -54,7 +63,18 @@ public:
     /// Destructor
     ~tls_stream() {
         if (ssl_) {
-            // Don't call SSL_shutdown in destructor - it may block
+            // If the user forgot to ``co_await stream.shutdown()``, at least
+            // queue our close_notify alert so the peer can distinguish a
+            // clean close from a MITM truncation. The underlying fd is
+            // non-blocking, so a single ``SSL_shutdown`` call is bounded:
+            // it serializes the alert and tries to write it; if the kernel
+            // buffer is full we accept the loss rather than block here.
+            // We never wait for the peer's close_notify in the destructor,
+            // since that would require async I/O.
+            if (handshake_complete_ && !shutdown_sent_) {
+                ERR_clear_error();
+                (void)SSL_shutdown(ssl_);
+            }
             SSL_free(ssl_);
         }
     }
@@ -68,18 +88,30 @@ public:
         : tcp_(std::move(other.tcp_))
         , ssl_(other.ssl_)
         , mode_(other.mode_)
-        , handshake_complete_(other.handshake_complete_) {
+        , handshake_complete_(other.handshake_complete_)
+        , shutdown_sent_(other.shutdown_sent_) {
         other.ssl_ = nullptr;
+        other.handshake_complete_ = false;
+        other.shutdown_sent_ = false;
     }
-    
+
     tls_stream& operator=(tls_stream&& other) noexcept {
         if (this != &other) {
-            if (ssl_) SSL_free(ssl_);
+            if (ssl_) {
+                if (handshake_complete_ && !shutdown_sent_) {
+                    ERR_clear_error();
+                    (void)SSL_shutdown(ssl_);
+                }
+                SSL_free(ssl_);
+            }
             tcp_ = std::move(other.tcp_);
             ssl_ = other.ssl_;
             mode_ = other.mode_;
             handshake_complete_ = other.handshake_complete_;
+            shutdown_sent_ = other.shutdown_sent_;
             other.ssl_ = nullptr;
+            other.handshake_complete_ = false;
+            other.shutdown_sent_ = false;
         }
         return *this;
     }
@@ -230,38 +262,97 @@ public:
         return write(data.data(), data.size());
     }
     
-    /// Perform TLS shutdown
-    coro::task<void> shutdown() {
+    /// Perform TLS shutdown.
+    ///
+    /// Splits the handshake into two phases:
+    ///   1. Send our ``close_notify`` (loop on WANT_WRITE).
+    ///   2. Wait for the peer's ``close_notify`` (loop on WANT_READ).
+    ///
+    /// A wall-clock budget bounds the wait so a misbehaving peer cannot stall
+    /// the caller indefinitely. The default budget of 2 seconds matches the
+    /// guidance in TLS implementations; pass a longer duration if needed.
+    coro::task<void> shutdown(std::chrono::milliseconds timeout =
+                                  std::chrono::milliseconds(2000)) {
         if (!ssl_ || !handshake_complete_) {
             co_return;
         }
-        
-        // Try shutdown (may need to retry)
-        for (int i = 0; i < 2; ++i) {
+
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        auto remaining = [&]() {
+            return std::chrono::steady_clock::now() < deadline;
+        };
+
+        // Phase 1: emit our close_notify. ``SSL_shutdown`` returning 0 means
+        // our alert has been queued/sent (peer's not yet observed); 1 means
+        // both sides have already exchanged close_notify. WANT_WRITE means
+        // the underlying socket can't accept more data right now — poll and
+        // retry. WANT_READ at this stage is unusual but possible when there
+        // is still inbound data buffered to drain.
+        while (remaining()) {
             ERR_clear_error();
             int ret = SSL_shutdown(ssl_);
-            
+            if (ret >= 0) {
+                shutdown_sent_ = true;
+                if (ret == 1) {
+                    handshake_complete_ = false;
+                    co_return;
+                }
+                break;  // ret == 0: our close_notify is out, fall through to phase 2
+            }
+            int err = SSL_get_error(ssl_, ret);
+            if (err == SSL_ERROR_WANT_WRITE) {
+                auto poll = co_await tcp_.poll_write();
+                if (poll.result < 0) {
+                    handshake_complete_ = false;
+                    co_return;
+                }
+            } else if (err == SSL_ERROR_WANT_READ) {
+                auto poll = co_await tcp_.poll_read();
+                if (poll.result < 0) {
+                    handshake_complete_ = false;
+                    co_return;
+                }
+            } else {
+                // Hard error — abandon shutdown.
+                handshake_complete_ = false;
+                co_return;
+            }
+        }
+
+        if (!shutdown_sent_) {
+            // Timed out before our alert went out.
+            handshake_complete_ = false;
+            co_return;
+        }
+
+        // Phase 2: wait for peer's close_notify. Each non-progress loop
+        // iteration must consume time from the wall-clock budget so a
+        // chatty peer that keeps producing WANT_READ/WANT_WRITE cycles
+        // can't keep us here forever.
+        while (remaining()) {
+            ERR_clear_error();
+            int ret = SSL_shutdown(ssl_);
             if (ret == 1) {
-                // Shutdown complete
                 break;
             }
-            
             if (ret == 0) {
-                // Need to call again
+                // Our close_notify is out, peer's hasn't arrived yet.
+                auto poll = co_await tcp_.poll_read();
+                if (poll.result < 0) break;
                 continue;
             }
-            
             int err = SSL_get_error(ssl_, ret);
             if (err == SSL_ERROR_WANT_READ) {
-                co_await tcp_.poll_read();
+                auto poll = co_await tcp_.poll_read();
+                if (poll.result < 0) break;
             } else if (err == SSL_ERROR_WANT_WRITE) {
-                co_await tcp_.poll_write();
+                auto poll = co_await tcp_.poll_write();
+                if (poll.result < 0) break;
             } else {
-                // Error or done
                 break;
             }
         }
-        
+
         handshake_complete_ = false;
     }
     
@@ -329,6 +420,7 @@ private:
     SSL* ssl_ = nullptr;
     tls_mode mode_ = tls_mode::client;
     bool handshake_complete_ = false;
+    bool shutdown_sent_ = false;  ///< True once our close_notify has been queued.
     std::string hostname_;  // Store hostname for SNI and verification
 };
 

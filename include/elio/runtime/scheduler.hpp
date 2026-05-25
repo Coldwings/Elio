@@ -143,17 +143,28 @@ public:
     /// be orphaned (their CQEs are lost, and their frames are destroyed via
     /// drain_remaining_tasks). Use shutdown() for graceful drain.
     void shutdown_force() {
+        // Drain the blocking pool BEFORE flipping running_=false. Pool tasks
+        // finishing here resume their callers via the spawn_blocking awaitable;
+        // that path checks scheduler::is_running() to decide whether to route
+        // through scheduler::spawn() (correct) or fall back to caller.resume()
+        // on the pool thread (broken — leaves the coroutine without a worker /
+        // io_context context, breaking subsequent co_awaits). Doing the drain
+        // first keeps running_=true while pool tasks finish, so all resumes
+        // land on a real worker.
+        //
+        // blocking_pool::shutdown() is idempotent, so this is safe even on
+        // repeated calls or when shutdown_force() is invoked from contexts
+        // where the CAS below will lose.
+        if (blocking_pool_) {
+            blocking_pool_->shutdown();
+        }
+
         bool expected = true;
         if (!running_.compare_exchange_strong(expected, false)) {
             return;
         }
 
-        // First shutdown blocking pool (before stopping workers)
-        if (blocking_pool_) {
-            blocking_pool_->shutdown();
-        }
-
-        // Then stop all workers (sets running_=false and joins threads)
+        // Stop all workers (sets running_=false and joins threads)
         for (auto& worker : workers_) {
             worker->stop();
         }
@@ -446,18 +457,45 @@ public:
             std::unique_lock<std::mutex> lock(workers_mutex_);
             old_count = num_threads_.load(std::memory_order_relaxed);
             if (count >= old_count) return;
-            
+
             // Update count first so new spawns go to remaining workers
             num_threads_.store(count, std::memory_order_release);
-            
+
             // Unlock before stopping workers (stop() joins which can be slow)
             lock.unlock();
-            
+
+            // Wait for the doomed workers' I/O contexts to drain before stopping
+            // them. If a worker is stopped while it has pending I/O (e.g. a
+            // coroutine suspended on co_await recv()), the io_context is no
+            // longer polled and those coroutines never resume — silent leak.
+            //
+            // The doomed workers are still running here, so they continue to
+            // poll their own io_contexts and resume coroutines normally; the
+            // resumed coroutines re-enter the scheduler via spawn(), which now
+            // routes them to the still-active workers (num_threads_ already
+            // reflects the new lower count). We just have to wait for that to
+            // reach steady state. A bounded timeout protects against pathologic
+            // cases where pending I/O never resolves.
+            constexpr auto io_drain_timeout = std::chrono::seconds(5);
+            constexpr auto poll_interval = std::chrono::milliseconds(1);
+            auto deadline = std::chrono::steady_clock::now() + io_drain_timeout;
+            while (std::chrono::steady_clock::now() < deadline) {
+                bool all_drained = true;
+                for (size_t i = count; i < old_count; ++i) {
+                    if (workers_[i]->io_context().pending_count() > 0) {
+                        all_drained = false;
+                        break;
+                    }
+                }
+                if (all_drained) break;
+                std::this_thread::sleep_for(poll_interval);
+            }
+
             // Stop the workers that are being removed
             for (size_t i = count; i < old_count; ++i) {
                 workers_[i]->stop();
             }
-            
+
             // Redistribute remaining tasks to active workers
             for (size_t i = count; i < old_count; ++i) {
                 workers_[i]->redistribute_tasks(this);
@@ -702,11 +740,18 @@ inline void worker_thread::run() {
     // remaining tasks until both local queue and inbox are empty.
     // This ensures shutdown() returns only when all submitted tasks have
     // fully completed (including coroutine cleanup and lambda destruction).
+    //
+    // Note: pop() (steal-style CAS path) — NOT pop_local(false). Other
+    // workers may still be inside try_steal()->steal_task() against this
+    // worker's deque because they haven't yet observed our running_=false.
+    // Chase-Lev requires either single-threaded owner pop OR concurrent
+    // steal+pop synchronized via the seq_cst fence inside pop(); the
+    // single-thread fast path of pop_local() races with those stealers.
     while (true) {
         drain_inbox();
-        void* addr = queue_->pop_local(false);  // No concurrent stealers, workers are stopping
+        void* addr = queue_->pop();
         if (!addr) break;
-        
+
         auto handle = std::coroutine_handle<>::from_address(addr);
         if (handle && !handle.done()) {
             needs_sync_ = true;  // Conservatively ensure memory visibility for drained tasks

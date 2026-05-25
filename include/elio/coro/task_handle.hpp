@@ -71,41 +71,55 @@ struct task_state {
     std::optional<T> value_;
     failure failure_;
     std::exception_ptr exception_;
-    
+
     // Waiter management
     std::atomic<void*> waiter_{nullptr};
     std::mutex mutex_;
-    
+    // Used by blocking wait()/wait_for() in non-coroutine contexts.
+    std::condition_variable cv_;
+
     // Cancel control
     std::atomic<bool> cancel_requested_{false};
-    
+
     void set_value(T&& val) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        value_.emplace(std::move(val));
-        status_.store(task_status::completed, std::memory_order_release);
-        notify_waiter();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            value_.emplace(std::move(val));
+            status_.store(task_status::completed, std::memory_order_release);
+            notify_waiter();
+        }
+        cv_.notify_all();
     }
-    
+
     void set_failure(failure f) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        failure_ = std::move(f);
-        status_.store(task_status::logic_failed, std::memory_order_release);
-        notify_waiter();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            failure_ = std::move(f);
+            status_.store(task_status::logic_failed, std::memory_order_release);
+            notify_waiter();
+        }
+        cv_.notify_all();
     }
-    
+
     void set_exception(std::exception_ptr ex) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        exception_ = ex;
-        status_.store(task_status::exception, std::memory_order_release);
-        notify_waiter();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            exception_ = ex;
+            status_.store(task_status::exception, std::memory_order_release);
+            notify_waiter();
+        }
+        cv_.notify_all();
     }
-    
+
     void set_cancelled() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        status_.store(task_status::cancelled, std::memory_order_release);
-        notify_waiter();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            status_.store(task_status::cancelled, std::memory_order_release);
+            notify_waiter();
+        }
+        cv_.notify_all();
     }
-    
+
     void notify_waiter() {
         void* waiter_addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
         if (waiter_addr) {
@@ -113,7 +127,7 @@ struct task_state {
             runtime::schedule_handle(waiter);
         }
     }
-    
+
     [[nodiscard]] bool is_done() const noexcept {
         auto s = status_.load(std::memory_order_acquire);
         return s == task_status::completed ||
@@ -121,7 +135,8 @@ struct task_state {
                s == task_status::exception ||
                s == task_status::cancelled;
     }
-    
+
+    // Returns true if waiter was stored (should suspend), false if caller must resume locally.
     bool set_waiter(std::coroutine_handle<> h) noexcept {
         // Fast path: check if already done before trying to set waiter
         // This avoids the race of setting a waiter on an already-completed task
@@ -133,25 +148,31 @@ struct task_state {
         void* expected = nullptr;
         if (waiter_.compare_exchange_strong(expected, h.address(),
                 std::memory_order_release, std::memory_order_acquire)) {
-            // Double-check if task completed between our initial check and CAS
-            // If so, we need to notify the waiter we just set
+            // Race: completion may have happened between is_done() and CAS.
             if (is_done()) {
+                // Try to reclaim the waiter slot before notify_waiter() does.
                 void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
                 if (addr) {
-                    runtime::schedule_handle(std::coroutine_handle<>::from_address(addr));
+                    // We won the race: notify_waiter() did not take the waiter,
+                    // so it will not schedule us. Resume locally; do NOT schedule
+                    // here (that would double-resume the coroutine).
+                    return false;
                 }
-                return false;
+                // We lost the race: notify_waiter() already grabbed the waiter
+                // and scheduled (or is about to schedule) it on a worker. Suspend
+                // so the scheduler resumes us exactly once.
+                return true;
             }
             return true;
         }
         // Another waiter already set (shouldn't happen with single await)
         return false;
     }
-    
+
     void request_cancel() {
         cancel_requested_.store(true, std::memory_order_release);
     }
-    
+
     [[nodiscard]] bool is_cancellation_requested() const noexcept {
         return cancel_requested_.load(std::memory_order_acquire);
     }
@@ -165,34 +186,48 @@ struct task_state<void> {
     std::exception_ptr exception_;
     std::atomic<void*> waiter_{nullptr};
     std::mutex mutex_;
+    // Used by blocking wait()/wait_for() in non-coroutine contexts.
+    std::condition_variable cv_;
     std::atomic<bool> cancel_requested_{false};
-    
+
     void set_value() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        status_.store(task_status::completed, std::memory_order_release);
-        notify_waiter();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            status_.store(task_status::completed, std::memory_order_release);
+            notify_waiter();
+        }
+        cv_.notify_all();
     }
-    
+
     void set_failure(failure f) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        failure_ = std::move(f);
-        status_.store(task_status::logic_failed, std::memory_order_release);
-        notify_waiter();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            failure_ = std::move(f);
+            status_.store(task_status::logic_failed, std::memory_order_release);
+            notify_waiter();
+        }
+        cv_.notify_all();
     }
-    
+
     void set_exception(std::exception_ptr ex) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        exception_ = ex;
-        status_.store(task_status::exception, std::memory_order_release);
-        notify_waiter();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            exception_ = ex;
+            status_.store(task_status::exception, std::memory_order_release);
+            notify_waiter();
+        }
+        cv_.notify_all();
     }
-    
+
     void set_cancelled() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        status_.store(task_status::cancelled, std::memory_order_release);
-        notify_waiter();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            status_.store(task_status::cancelled, std::memory_order_release);
+            notify_waiter();
+        }
+        cv_.notify_all();
     }
-    
+
     void notify_waiter() {
         void* waiter_addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
         if (waiter_addr) {
@@ -200,7 +235,7 @@ struct task_state<void> {
             runtime::schedule_handle(waiter);
         }
     }
-    
+
     [[nodiscard]] bool is_done() const noexcept {
         auto s = status_.load(std::memory_order_acquire);
         return s == task_status::completed ||
@@ -208,7 +243,8 @@ struct task_state<void> {
                s == task_status::exception ||
                s == task_status::cancelled;
     }
-    
+
+    // Returns true if waiter was stored (should suspend), false if caller must resume locally.
     bool set_waiter(std::coroutine_handle<> h) noexcept {
         // Fast path: check if already done before trying to set waiter
         // This avoids the race of setting a waiter on an already-completed task
@@ -220,25 +256,31 @@ struct task_state<void> {
         void* expected = nullptr;
         if (waiter_.compare_exchange_strong(expected, h.address(),
                 std::memory_order_release, std::memory_order_acquire)) {
-            // Double-check if task completed between our initial check and CAS
-            // If so, we need to notify the waiter we just set
+            // Race: completion may have happened between is_done() and CAS.
             if (is_done()) {
+                // Try to reclaim the waiter slot before notify_waiter() does.
                 void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
                 if (addr) {
-                    runtime::schedule_handle(std::coroutine_handle<>::from_address(addr));
+                    // We won the race: notify_waiter() did not take the waiter,
+                    // so it will not schedule us. Resume locally; do NOT schedule
+                    // here (that would double-resume the coroutine).
+                    return false;
                 }
-                return false;
+                // We lost the race: notify_waiter() already grabbed the waiter
+                // and scheduled (or is about to schedule) it on a worker. Suspend
+                // so the scheduler resumes us exactly once.
+                return true;
             }
             return true;
         }
         // Another waiter already set (shouldn't happen with single await)
         return false;
     }
-    
+
     void request_cancel() {
         cancel_requested_.store(true, std::memory_order_release);
     }
-    
+
     [[nodiscard]] bool is_cancellation_requested() const noexcept {
         return cancel_requested_.load(std::memory_order_acquire);
     }
@@ -600,44 +642,32 @@ public:
     // ===== Synchronous wait =====
     task_status wait() {
         if (!state_) return task_status::exception;
-        
+
         std::unique_lock<std::mutex> lock(state_->mutex_);
-        while (!state_->is_done()) {
-            lock.unlock();
-            std::this_thread::yield();
-            lock.lock();
-        }
+        state_->cv_.wait(lock, [&] { return state_->is_done(); });
         return status();
     }
-    
+
     template<typename Rep, typename Period>
     task_status wait_for(std::chrono::duration<Rep, Period> timeout) {
         if (!state_) return task_status::exception;
-        
-        auto deadline = std::chrono::steady_clock::now() + timeout;
+
         std::unique_lock<std::mutex> lock(state_->mutex_);
-        while (!state_->is_done()) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                return status();  // May still be pending
-            }
-            lock.unlock();
-            std::this_thread::yield();
-            lock.lock();
-        }
+        state_->cv_.wait_for(lock, timeout, [&] { return state_->is_done(); });
         return status();
     }
-    
+
     // ===== Cancel control =====
     void request_cancel() {
         if (!state_) return;
         state_->request_cancel();
     }
-    
+
     [[nodiscard]] bool is_cancellation_requested() const noexcept {
         if (!state_) return false;
         return state_->is_cancellation_requested();
     }
-    
+
     // ===== Coroutine await (returns task_result, no exception thrown) =====
     auto operator co_await() const {
         struct awaiter {
@@ -797,44 +827,32 @@ public:
     // ===== Synchronous wait =====
     task_status wait() {
         if (!state_) return task_status::exception;
-        
+
         std::unique_lock<std::mutex> lock(state_->mutex_);
-        while (!state_->is_done()) {
-            lock.unlock();
-            std::this_thread::yield();
-            lock.lock();
-        }
+        state_->cv_.wait(lock, [&] { return state_->is_done(); });
         return status();
     }
-    
+
     template<typename Rep, typename Period>
     task_status wait_for(std::chrono::duration<Rep, Period> timeout) {
         if (!state_) return task_status::exception;
-        
-        auto deadline = std::chrono::steady_clock::now() + timeout;
+
         std::unique_lock<std::mutex> lock(state_->mutex_);
-        while (!state_->is_done()) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                return status();
-            }
-            lock.unlock();
-            std::this_thread::yield();
-            lock.lock();
-        }
+        state_->cv_.wait_for(lock, timeout, [&] { return state_->is_done(); });
         return status();
     }
-    
+
     // ===== Cancel control =====
     void request_cancel() {
         if (!state_) return;
         state_->request_cancel();
     }
-    
+
     [[nodiscard]] bool is_cancellation_requested() const noexcept {
         if (!state_) return false;
         return state_->is_cancellation_requested();
     }
-    
+
     // ===== Coroutine await (returns task_result, no exception thrown) =====
     auto operator co_await() const {
         struct awaiter {

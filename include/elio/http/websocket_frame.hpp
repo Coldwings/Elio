@@ -362,15 +362,33 @@ struct message {
     bool complete = false;      ///< Message is complete
 };
 
+/// Endpoint role used for direction-dependent frame validation.
+/// RFC 6455 §5.1 requires server endpoints to reject unmasked client frames
+/// and client endpoints to reject masked server frames.
+enum class endpoint_role {
+    unspecified,  ///< No mask-direction enforcement (e.g. for unit tests on raw frames)
+    server,       ///< Endpoint is acting as a server: incoming frames must be masked
+    client,       ///< Endpoint is acting as a client: incoming frames must NOT be masked
+};
+
 /// WebSocket frame parser with message assembly
 class frame_parser {
 public:
     frame_parser() = default;
-    
+
     /// Set maximum message size (0 = unlimited)
     void set_max_message_size(size_t max_size) {
         max_message_size_ = max_size;
     }
+
+    /// Set the local endpoint role so the parser can enforce RFC 6455 §5.1
+    /// mask-direction rules on incoming frames.
+    void set_role(endpoint_role role) { role_ = role; }
+
+    /// Get the close code associated with the most recent error (defaults to
+    /// protocol_error when has_error()).  Useful for emitting an RFC-compliant
+    /// close frame before tearing down the connection.
+    close_code error_close_code() const noexcept { return error_close_code_; }
     
     /// Parse incoming data
     /// @param data Input data
@@ -421,6 +439,7 @@ public:
         control_frames_.clear();
         has_error_ = false;
         error_msg_.clear();
+        error_close_code_ = close_code::protocol_error;
     }
     
 private:
@@ -434,17 +453,34 @@ private:
             if (result.error) {
                 has_error_ = true;
                 error_msg_ = result.error_msg;
+                error_close_code_ = close_code::protocol_error;
                 return -1;
             }
-            
+
             if (!result.complete) {
                 // Need more data
                 break;
             }
-            
+
             if (buffer_.size() < result.frame_size) {
                 // Need more payload data
                 break;
+            }
+
+            // RFC 6455 §5.1: enforce mask direction once we know our role.
+            // Servers MUST tear down a connection that delivers an unmasked
+            // client frame; clients MUST tear down on a masked server frame.
+            if (role_ == endpoint_role::server && !header.masked) {
+                has_error_ = true;
+                error_msg_ = "Unmasked frame received from client";
+                error_close_code_ = close_code::protocol_error;
+                return -1;
+            }
+            if (role_ == endpoint_role::client && header.masked) {
+                has_error_ = true;
+                error_msg_ = "Masked frame received from server";
+                error_close_code_ = close_code::protocol_error;
+                return -1;
             }
             
             // Extract payload
@@ -470,6 +506,7 @@ private:
                     if (!current_message_.data.empty() && !current_message_.complete) {
                         has_error_ = true;
                         error_msg_ = "New message started before previous completed";
+                        error_close_code_ = close_code::protocol_error;
                         return -1;
                     }
                     current_message_ = message{};
@@ -477,10 +514,11 @@ private:
                 }
                 
                 // Check message size limit
-                if (max_message_size_ > 0 && 
+                if (max_message_size_ > 0 &&
                     current_message_.data.size() + payload.size() > max_message_size_) {
                     has_error_ = true;
                     error_msg_ = "Message exceeds maximum size";
+                    error_close_code_ = close_code::too_large;
                     return -1;
                 }
                 
@@ -508,6 +546,8 @@ private:
     size_t max_message_size_ = 0;
     bool has_error_ = false;
     std::string error_msg_;
+    close_code error_close_code_ = close_code::protocol_error;
+    endpoint_role role_ = endpoint_role::unspecified;
 };
 
 /// Parse close frame payload to extract code and reason

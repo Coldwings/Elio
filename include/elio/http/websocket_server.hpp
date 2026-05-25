@@ -19,6 +19,7 @@
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/sync/primitives.hpp>
 #include <elio/log/macros.hpp>
 
 #include <string>
@@ -29,7 +30,6 @@
 #include <atomic>
 #include <vector>
 #include <optional>
-#include <regex>
 
 namespace elio::http::websocket {
 
@@ -60,26 +60,40 @@ struct server_config {
     bool enable_logging = true;                   ///< Log connections
 };
 
-/// WebSocket connection wrapper
+/// WebSocket connection wrapper.
+///
+/// Concurrency model:
+///   - The receive loop (`receive()` / `handle_control_frame`) is **single-reader** —
+///     only one coroutine should be awaiting `receive()` on a given connection at a
+///     time.  Reads from the underlying stream are not serialized.
+///   - Sends (`send_text`, `send_binary`, `send_ping`, `send_pong`, `close`, and the
+///     auto-pong / close-response paths inside the receive loop) are serialized by
+///     a per-connection coroutine mutex so that frames from concurrent senders never
+///     interleave at the byte level.
 class ws_connection {
 public:
     /// Stream type variant
     using stream_type = std::variant<std::monostate, net::tcp_stream*, tls::tls_stream*>;
-    
+
     /// Create from TCP stream (non-owning pointer)
     explicit ws_connection(net::tcp_stream* tcp)
-        : stream_(tcp), is_server_(true) {}
-    
+        : stream_(tcp), is_server_(true) {
+        parser_.set_role(endpoint_role::server);
+    }
+
     /// Create from TLS stream (non-owning pointer)
     explicit ws_connection(tls::tls_stream* tls)
-        : stream_(tls), is_server_(true) {}
-    
+        : stream_(tls), is_server_(true) {
+        parser_.set_role(endpoint_role::server);
+    }
+
     /// Destructor
     ~ws_connection() = default;
-    
-    // Move only
-    ws_connection(ws_connection&&) = default;
-    ws_connection& operator=(ws_connection&&) = default;
+
+    // Non-movable: holds a per-connection sync::mutex which is non-movable, and
+    // the connection is always used by reference inside the request handler.
+    ws_connection(ws_connection&&) = delete;
+    ws_connection& operator=(ws_connection&&) = delete;
     ws_connection(const ws_connection&) = delete;
     ws_connection& operator=(const ws_connection&) = delete;
     
@@ -152,7 +166,7 @@ public:
             if (parser_.has_message()) {
                 co_return parser_.get_message();
             }
-            
+
             // Process control frames
             while (parser_.has_control_frame()) {
                 auto control_frame = parser_.get_control_frame();
@@ -161,17 +175,19 @@ public:
                 }
                 co_await handle_control_frame(control_frame->first, control_frame->second);
             }
-            
-            // Check for errors
+
+            // Check for errors (RFC 6455 §5.1: emit a close frame before
+            // tearing down on protocol violations like an unmasked client
+            // frame, oversized message, etc.).
             if (parser_.has_error()) {
                 ELIO_LOG_ERROR("WebSocket parse error: {}", parser_.error());
-                state_ = connection_state::closed;
+                co_await fail_connection(parser_.error_close_code());
                 co_return std::nullopt;
             }
-            
+
             // Read more data
             auto result = co_await read(buffer_.data(), buffer_.size());
-            
+
             if (result.result <= 0) {
                 if (result.result == 0) {
                     ELIO_LOG_DEBUG("WebSocket connection closed by peer");
@@ -181,19 +197,19 @@ public:
                 state_ = connection_state::closed;
                 co_return std::nullopt;
             }
-            
+
             int parsed = parser_.parse(
                 reinterpret_cast<const uint8_t*>(buffer_.data()),
                 static_cast<size_t>(result.result)
             );
-            
+
             if (parsed < 0) {
                 ELIO_LOG_ERROR("WebSocket parse error: {}", parser_.error());
-                state_ = connection_state::closed;
+                co_await fail_connection(parser_.error_close_code());
                 co_return std::nullopt;
             }
         }
-        
+
         co_return std::nullopt;
     }
     
@@ -207,10 +223,18 @@ public:
     void set_max_message_size(size_t max_size) {
         parser_.set_max_message_size(max_size);
     }
-    
+
     /// Set read buffer size
     void set_buffer_size(size_t size) {
         buffer_.resize(size);
+    }
+
+    /// Hand the parser any bytes that arrived in the same TCP segment as the
+    /// HTTP upgrade request (pipelined first frame).  Must be called before
+    /// the receive loop starts.  No-op if the buffer is empty.
+    void seed_pipelined_bytes(std::string_view bytes) {
+        if (bytes.empty()) return;
+        parser_.parse(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
     }
 
 private:
@@ -232,7 +256,15 @@ private:
         co_return io::io_result{-ENOTCONN, 0};
     }
     
+    /// Serialize an entire frame onto the wire.  The per-connection send mutex
+    /// guarantees that frames produced by concurrent senders never interleave
+    /// at the byte level; the receive loop also funnels its auto-pong /
+    /// close-response writes through here, so it competes for the same lock
+    /// (and therefore must NOT be called recursively from a write path that
+    /// already holds the lock).
     coro::task<bool> send_raw(const std::vector<uint8_t>& data) {
+        co_await send_mutex_.lock();
+        sync::lock_guard send_guard(send_mutex_);
         size_t sent = 0;
         while (sent < data.size()) {
             auto result = co_await write(data.data() + sent, data.size() - sent);
@@ -243,7 +275,18 @@ private:
         }
         co_return true;
     }
-    
+
+    /// Emit a close frame with the given code and tear the connection down.
+    /// Used when the parser detects a protocol violation.
+    coro::task<void> fail_connection(close_code code) {
+        if (state_ == connection_state::open) {
+            state_ = connection_state::closing;
+            auto frame = encode_close_frame(code, "", !is_server_);
+            co_await send_raw(frame);
+        }
+        state_ = connection_state::closed;
+    }
+
     coro::task<void> handle_control_frame(opcode op, const std::string& payload) {
         switch (op) {
             case opcode::ping:
@@ -282,6 +325,7 @@ private:
     std::string subprotocol_;
     frame_parser parser_;
     std::vector<char> buffer_ = std::vector<char>(8192);
+    sync::mutex send_mutex_;  ///< Serializes frame writes; see class comment.
 };
 
 /// WebSocket upgrade handler result
@@ -357,64 +401,110 @@ inline response build_upgrade_response(std::string_view key,
 /// WebSocket handler function type
 using ws_handler_func = std::function<coro::task<void>(ws_connection&)>;
 
-/// WebSocket route for the HTTP router
+/// WebSocket route for the HTTP router.  Uses the same compiled segment
+/// representation as http::route to avoid the ReDoS surface and per-request
+/// std::regex_match cost that the HTTP router shed in commit bc511be.
 struct ws_route {
     std::string pattern;
-    std::regex regex;
+    std::vector<route_segment> segments;
+    std::vector<std::string> param_names;  ///< For introspection / future use
     ws_handler_func handler;
     server_config config;
+
+    /// Match `path` against the compiled segments, populating `params` with
+    /// any captured `:name` components.  Mirrors http::route::match exactly.
+    bool match(std::string_view path,
+               std::unordered_map<std::string, std::string>& params) const {
+        std::vector<std::string_view> components;
+        components.reserve(8);
+        size_t start = 0;
+        for (size_t i = 0; i <= path.size(); ++i) {
+            if (i == path.size() || path[i] == '/') {
+                components.emplace_back(path.data() + start, i - start);
+                start = i + 1;
+            }
+        }
+
+        size_t si = 0;
+        size_t ci = 0;
+        while (si < segments.size()) {
+            const auto& seg = segments[si];
+            if (seg.kind == segment_kind::wildcard) {
+                return ci < components.size();
+            }
+            if (ci >= components.size()) return false;
+            if (seg.kind == segment_kind::literal) {
+                if (components[ci] != seg.value) return false;
+            } else {
+                if (components[ci].empty()) return false;
+                params[seg.value] = std::string(components[ci]);
+            }
+            ++si;
+            ++ci;
+        }
+        return ci == components.size();
+    }
 };
 
 /// Extended HTTP router with WebSocket support
 class ws_router : public router {
 public:
     ws_router() = default;
-    
-    /// Add a WebSocket route
+
+    /// Add a WebSocket route.  Pattern grammar matches the HTTP router:
+    ///   - `:name` captures one path component
+    ///   - trailing `*` matches the rest of the path
+    ///   - anything else is a literal component
     void websocket(std::string_view pattern, ws_handler_func handler,
                    server_config config = {}) {
         ws_route route;
         route.pattern = pattern;
         route.handler = std::move(handler);
         route.config = config;
-        
-        // Convert pattern to regex (same as HTTP routes)
-        std::string regex_str = "^";
-        for (char c : pattern) {
-            if (c == '*') {
-                regex_str += ".*";
-            } else if (c == '.' || c == '+' || c == '?' || c == '(' || c == ')' ||
-                       c == '[' || c == ']' || c == '{' || c == '}' || c == '\\' ||
-                       c == '^' || c == '$' || c == '|') {
-                regex_str += '\\';
-                regex_str += c;
-            } else {
-                regex_str += c;
+
+        // Compile the pattern into a flat segment list, splitting on '/'
+        // identically to ws_route::match() so empty leading/trailing
+        // components round-trip correctly.
+        size_t start = 0;
+        for (size_t i = 0; i <= pattern.size(); ++i) {
+            if (i == pattern.size() || pattern[i] == '/') {
+                std::string_view comp(pattern.data() + start, i - start);
+                route_segment seg;
+                if (!comp.empty() && comp.front() == ':') {
+                    seg.kind = segment_kind::param;
+                    seg.value.assign(comp.data() + 1, comp.size() - 1);
+                    route.param_names.push_back(seg.value);
+                } else if (comp == "*") {
+                    seg.kind = segment_kind::wildcard;
+                } else {
+                    seg.kind = segment_kind::literal;
+                    seg.value.assign(comp.data(), comp.size());
+                }
+                route.segments.push_back(std::move(seg));
+                start = i + 1;
             }
         }
-        regex_str += "$";
-        route.regex = std::regex(regex_str);
-        
+
         ws_routes_.push_back(std::move(route));
     }
-    
+
     /// Find matching WebSocket route
     const ws_route* find_ws_route(std::string_view path) const {
+        std::unordered_map<std::string, std::string> params;
         for (const auto& route : ws_routes_) {
-            std::cmatch match;
-            if (std::regex_match(path.data(), path.data() + path.size(), 
-                                match, route.regex)) {
+            params.clear();
+            if (route.match(path, params)) {
                 return &route;
             }
         }
         return nullptr;
     }
-    
+
     /// Check if path matches a WebSocket route
     bool is_websocket_path(std::string_view path) const {
         return find_ws_route(path) != nullptr;
     }
-    
+
 private:
     std::vector<ws_route> ws_routes_;
 };
@@ -582,20 +672,27 @@ private:
                 co_return;
             }
             
+            // Capture any bytes that arrived in the same TCP segment as the
+            // upgrade request before we let the request_parser go out of
+            // scope — they belong to the first WebSocket frame and must not
+            // be discarded.
+            std::string pipelined = parser.take_remaining();
+
             // Send upgrade response
             auto ws_key = req.header("Sec-WebSocket-Key");
             auto resp = build_upgrade_response(ws_key, upgrade.accepted_protocol);
             co_await send_response(stream, resp);
-            
+
             if (http_config_.enable_logging) {
                 ELIO_LOG_INFO("WebSocket upgrade: {} from {}", req.path(), client_addr);
             }
-            
+
             // Create WebSocket connection and run handler
             ws_connection conn(&stream);
             conn.set_open(upgrade.accepted_protocol);
             conn.set_max_message_size(ws_route->config.max_message_size);
             conn.set_buffer_size(ws_route->config.read_buffer_size);
+            conn.seed_pipelined_bytes(pipelined);
             
             try {
                 co_await ws_route->handler(conn);

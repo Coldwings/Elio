@@ -19,6 +19,7 @@
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/coro/cancel_token.hpp>
+#include <elio/sync/primitives.hpp>
 #include <elio/log/macros.hpp>
 
 #include <string>
@@ -49,18 +50,24 @@ public:
     /// Create WebSocket client with configuration
     explicit ws_client(client_config config)
         : config_(config)
-        , tls_ctx_(tls::tls_mode::client) {
+        , tls_ctx_(tls::tls_mode::client)
+        , send_mutex_(std::make_unique<sync::mutex>()) {
         // Setup TLS context using shared utility
         http::init_client_tls_context(tls_ctx_, config_.verify_certificate);
 
         parser_.set_max_message_size(config_.max_message_size);
+        // Client endpoint: incoming server frames must not be masked
+        // (RFC 6455 §5.1).
+        parser_.set_role(endpoint_role::client);
         buffer_.resize(config_.read_buffer_size);
     }
-    
+
     /// Destructor
     ~ws_client() = default;
-    
-    // Move only
+
+    // Move only.  send_mutex_ is held via unique_ptr so ws_client remains
+    // movable (ws_connect returns std::optional<ws_client>) while still
+    // providing stable per-connection mutex addresses for waiters.
     ws_client(ws_client&&) = default;
     ws_client& operator=(ws_client&&) = default;
     ws_client(const ws_client&) = delete;
@@ -167,12 +174,12 @@ private:
             if (token.is_cancelled()) {
                 co_return std::nullopt;
             }
-            
+
             // Check for already-parsed messages
             if (parser_.has_message()) {
                 co_return parser_.get_message();
             }
-            
+
             // Process control frames
             while (parser_.has_control_frame()) {
                 auto control_frame = parser_.get_control_frame();
@@ -181,17 +188,19 @@ private:
                 }
                 co_await handle_control_frame(control_frame->first, control_frame->second);
             }
-            
-            // Check for errors
+
+            // Check for errors (e.g. masked frame from server, or message
+            // too large): RFC 6455 §5.1 requires emitting a close frame
+            // with the appropriate code before tearing down.
             if (parser_.has_error()) {
                 ELIO_LOG_ERROR("WebSocket parse error: {}", parser_.error());
-                state_ = connection_state::closed;
+                co_await fail_connection(parser_.error_close_code());
                 co_return std::nullopt;
             }
-            
+
             // Read more data
             auto result = co_await read(buffer_.data(), buffer_.size());
-            
+
             if (result.result <= 0) {
                 if (result.result == 0) {
                     ELIO_LOG_DEBUG("WebSocket connection closed by server");
@@ -201,19 +210,19 @@ private:
                 state_ = connection_state::closed;
                 co_return std::nullopt;
             }
-            
+
             int parsed = parser_.parse(
                 reinterpret_cast<const uint8_t*>(buffer_.data()),
                 static_cast<size_t>(result.result)
             );
-            
+
             if (parsed < 0) {
                 ELIO_LOG_ERROR("WebSocket parse error: {}", parser_.error());
-                state_ = connection_state::closed;
+                co_await fail_connection(parser_.error_close_code());
                 co_return std::nullopt;
             }
         }
-        
+
         co_return std::nullopt;
     }
     
@@ -379,59 +388,70 @@ private:
             co_return false;
         }
         
-        // Read response
-        std::string response_data;
-        response_data.reserve(1024);
-        
-        while (true) {
+        // Read and incrementally parse the upgrade response.  We feed bytes
+        // straight into a response_parser so that anything pipelined behind
+        // the headers (a server-pushed first frame in the same TCP segment,
+        // uncommon but legal) can be reclaimed via take_remaining() and
+        // handed off to the WebSocket frame parser instead of being
+        // discarded.
+        response_parser parser;
+        size_t total_read = 0;
+        while (!parser.is_complete() && !parser.has_error()) {
             auto read_result = co_await read(buffer_.data(), buffer_.size());
             if (read_result.result <= 0) {
                 ELIO_LOG_ERROR("Failed to read WebSocket handshake response");
                 co_return false;
             }
-            
-            response_data.append(buffer_.data(), static_cast<size_t>(read_result.result));
-            
-            // Check if we have complete headers
-            if (response_data.find("\r\n\r\n") != std::string::npos) {
-                break;
+
+            auto [pres, consumed] = parser.parse(
+                std::string_view(buffer_.data(), static_cast<size_t>(read_result.result)));
+            (void)consumed;
+
+            if (pres == parse_result::error) {
+                ELIO_LOG_ERROR("Failed to parse WebSocket handshake response");
+                co_return false;
             }
-            
-            if (response_data.size() > 8192) {
+
+            total_read += static_cast<size_t>(read_result.result);
+            if (total_read > 8192 && !parser.is_complete()) {
                 ELIO_LOG_ERROR("WebSocket handshake response too large");
                 co_return false;
             }
         }
-        
-        // Parse response
-        response_parser parser;
-        auto [result, consumed] = parser.parse(response_data);
-        
-        if (result == parse_result::error) {
+
+        if (parser.has_error()) {
             ELIO_LOG_ERROR("Failed to parse WebSocket handshake response");
             co_return false;
         }
-        
+
         // Check status code
         if (parser.get_status() != status::switching_protocols) {
-            ELIO_LOG_ERROR("WebSocket handshake failed: {}", 
+            ELIO_LOG_ERROR("WebSocket handshake failed: {}",
                           static_cast<int>(parser.get_status()));
             co_return false;
         }
-        
+
         // Verify Sec-WebSocket-Accept
         auto accept = parser.get_headers().get("Sec-WebSocket-Accept");
         if (!verify_websocket_accept(accept, ws_key_)) {
             ELIO_LOG_ERROR("Invalid Sec-WebSocket-Accept header");
             co_return false;
         }
-        
+
         // Get negotiated protocol
         auto protocol = parser.get_headers().get("Sec-WebSocket-Protocol");
         if (!protocol.empty()) {
             subprotocol_ = protocol;
         }
-        
+
+        // Recover any bytes the server pipelined behind the 101 response so
+        // the very first WebSocket frame is recognized.
+        std::string pipelined = parser.take_remaining();
+        if (!pipelined.empty()) {
+            parser_.parse(reinterpret_cast<const uint8_t*>(pipelined.data()),
+                          pipelined.size());
+        }
+
         ELIO_LOG_DEBUG("WebSocket handshake successful");
         co_return true;
     }
@@ -444,7 +464,15 @@ private:
         co_return co_await stream_.write(buf, len);
     }
     
+    /// Serialize an entire frame onto the wire under a per-connection mutex
+    /// so that two coroutines calling send_text/send_binary/etc concurrently
+    /// cannot byte-interleave their frames.  The receive loop's auto-pong /
+    /// close-response paths also funnel through here and contend for the
+    /// same lock, so this MUST NOT be invoked recursively from a write
+    /// path that already holds the lock.
     coro::task<bool> send_raw(const std::vector<uint8_t>& data) {
+        co_await send_mutex_->lock();
+        sync::lock_guard send_guard(*send_mutex_);
         size_t sent = 0;
         while (sent < data.size()) {
             auto result = co_await write(data.data() + sent, data.size() - sent);
@@ -455,7 +483,17 @@ private:
         }
         co_return true;
     }
-    
+
+    /// Emit a close frame with the given code and tear the connection down.
+    coro::task<void> fail_connection(close_code code) {
+        if (state_ == connection_state::open) {
+            state_ = connection_state::closing;
+            auto frame = encode_close_frame(code, "", true);
+            co_await send_raw(frame);
+        }
+        state_ = connection_state::closed;
+    }
+
     coro::task<void> handle_control_frame(opcode op, const std::string& payload) {
         switch (op) {
             case opcode::ping:
@@ -503,6 +541,7 @@ private:
     connection_state state_ = connection_state::connecting;
     frame_parser parser_;
     std::vector<char> buffer_;
+    std::unique_ptr<sync::mutex> send_mutex_;  ///< Serializes frame writes.
 };
 
 /// Convenience function for one-off WebSocket connection

@@ -142,10 +142,21 @@ public:
     
     /// Check if request is complete
     bool is_complete() const noexcept { return state_ == parse_state::complete; }
-    
+
     /// Check if there's an error
     bool has_error() const noexcept { return state_ == parse_state::error; }
-    
+
+    /// Move out any unconsumed bytes still sitting in the parser's internal
+    /// buffer.  Used after a protocol upgrade (e.g. HTTP -> WebSocket) so that
+    /// bytes pipelined behind the upgrade request can be handed to the next
+    /// protocol's parser instead of being silently discarded.
+    /// After this call the internal buffer is empty.
+    std::string take_remaining() {
+        std::string out = std::move(buffer_);
+        buffer_.clear();
+        return out;
+    }
+
 private:
     bool parse_request_line() {
         auto line_end = buffer_.find("\r\n");
@@ -474,10 +485,20 @@ public:
     
     /// Check if response is complete
     bool is_complete() const noexcept { return state_ == parse_state::complete; }
-    
+
     /// Check if there's an error
     bool has_error() const noexcept { return state_ == parse_state::error; }
-    
+
+    /// Move out any unconsumed bytes still sitting in the parser's internal
+    /// buffer.  Used after a protocol upgrade (e.g. WebSocket client receiving
+    /// the 101 response with a piggybacked frame in the same TCP segment).
+    /// After this call the internal buffer is empty.
+    std::string take_remaining() {
+        std::string out = std::move(buffer_);
+        buffer_.clear();
+        return out;
+    }
+
 private:
     bool parse_status_line() {
         auto line_end = buffer_.find("\r\n");

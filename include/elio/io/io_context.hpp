@@ -142,38 +142,61 @@ public:
         return epoll_backend::get_last_result();
     }
     
-    /// Run the event loop until stopped
-    /// @param stop_flag Atomic flag to signal stop
+    /// Run the event loop until stopped.
+    ///
+    /// Each iteration parks in ``poll(-1)`` (block until a completion or a
+    /// cross-thread ``notify()`` arrives), then re-reads @p stop_flag. There
+    /// is no idle sleep and no polling timeout cap — the eventfd-based wake
+    /// path (``notify()``) is responsible for unblocking the loop.
+    ///
+    /// **Stop contract**: callers MUST both store ``true`` into @p stop_flag
+    /// AND call ``notify()`` (or use ``stop(stop_flag)`` which does both)
+    /// so the parked ``poll(-1)`` wakes promptly. A bare flag store will
+    /// not be observed until the next unrelated I/O completion.
+    ///
+    /// @param stop_flag Atomic flag to signal stop.
     void run(std::atomic<bool>& stop_flag) {
         while (!stop_flag.load(std::memory_order_relaxed)) {
-            if (has_pending()) {
-                poll(std::chrono::milliseconds(10));
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
+            poll(std::chrono::milliseconds(-1));
         }
     }
-    
-    /// Run the event loop for a specific duration
+
+    /// Stop a loop spinning in ``run(stop_flag)`` — flips the flag and
+    /// wakes the parked ``poll(-1)``. Safe to call from any thread.
+    void stop(std::atomic<bool>& stop_flag) {
+        stop_flag.store(true, std::memory_order_release);
+        notify();
+    }
+
+    /// Run the event loop for a specific duration.
+    ///
+    /// Blocks in ``poll(remaining)`` until the deadline elapses or no
+    /// operations are pending. The backend's ``poll`` natively handles
+    /// arbitrarily long timeouts (io_uring kernel timespec / epoll
+    /// timeout_ms), so no per-iteration cap is needed.
     void run_for(std::chrono::milliseconds duration) {
         auto end_time = std::chrono::steady_clock::now() + duration;
         while (std::chrono::steady_clock::now() < end_time) {
-            if (has_pending()) {
-                auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    end_time - std::chrono::steady_clock::now());
-                if (remaining.count() > 0) {
-                    poll(std::min(remaining, std::chrono::milliseconds(10)));
-                }
-            } else {
-                break;  // No pending operations
+            if (!has_pending()) {
+                break;  // No pending operations — nothing to wait on.
             }
+            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                end_time - std::chrono::steady_clock::now());
+            if (remaining.count() <= 0) {
+                break;
+            }
+            poll(remaining);
         }
     }
-    
-    /// Run until all pending operations complete
+
+    /// Run until all pending operations complete.
+    ///
+    /// Each ``poll(-1)`` returns when at least one CQE is processed, which
+    /// strictly decreases ``pending_count()``. The loop therefore makes
+    /// monotonic progress and terminates when the queue drains.
     void run_until_complete() {
         while (has_pending()) {
-            poll(std::chrono::milliseconds(10));
+            poll(std::chrono::milliseconds(-1));
         }
     }
     

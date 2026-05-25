@@ -214,12 +214,10 @@ private:
     /// Read a frame, enforcing config_.frame_read_timeout. The watchdog
     /// shutdown(2)s the socket so any pending recv returns EOF/error.
     ///
-    /// Concurrency note: the watchdog uses a polled "abort" flag rather
-    /// than the cancel_token machinery in time::sleep_for. Cancelling a
-    /// timer mid-await_suspend can race with the cancel callback (see the
-    /// destroy() at timer.hpp:151), which surfaces as a use-after-free in
-    /// the worker. Polling avoids that path entirely; the worst case is
-    /// the watchdog sleeps up to `poll_interval` past frame arrival.
+    /// The watchdog blocks in a single cancellable sleep_for(timeout, token);
+    /// when the frame arrives early the main path cancels the source and the
+    /// watchdog returns immediately. cancellable_sleep_awaitable owns its
+    /// cancel state via shared_ptr (PR #81), so this is race-free.
     coro::task<std::optional<std::pair<frame_header, message_buffer>>>
     read_frame_with_deadline() {
         if (config_.frame_read_timeout.count() <= 0) {
@@ -233,37 +231,31 @@ private:
             co_return co_await read_frame_bounded(stream_, config_.max_message_size);
         }
 
-        auto frame_done = std::make_shared<std::atomic<bool>>(false);
         auto timed_out = std::make_shared<std::atomic<bool>>(false);
         int fd = stream_.fd();
         auto timeout = config_.frame_read_timeout;
+        coro::cancel_source watchdog_cancel;
+        auto wd_token = watchdog_cancel.get_token();
 
         auto watchdog = sched->go_joinable(
-            [fd, frame_done, timed_out, timeout]() -> coro::task<void> {
-                using clock = std::chrono::steady_clock;
-                auto deadline = clock::now() + timeout;
-                // Poll in small steps so the watchdog notices early frame
-                // completion without relying on cancel_token plumbing.
-                constexpr auto poll_interval = std::chrono::milliseconds(50);
-                while (!frame_done->load(std::memory_order_acquire)) {
-                    auto now = clock::now();
-                    if (now >= deadline) {
-                        timed_out->store(true, std::memory_order_release);
-                        if (fd >= 0) {
-                            ::shutdown(fd, SHUT_RDWR);
-                        }
-                        co_return;
+            [fd, timed_out, timeout, wd_token]() -> coro::task<void> {
+                auto result = co_await elio::time::sleep_for(timeout, wd_token);
+                if (result == coro::cancel_result::completed) {
+                    // Sleep ran to completion without being cancelled —
+                    // the frame did not arrive in time.
+                    timed_out->store(true, std::memory_order_release);
+                    if (fd >= 0) {
+                        ::shutdown(fd, SHUT_RDWR);
                     }
-                    auto step = std::min<std::chrono::steady_clock::duration>(
-                        poll_interval, deadline - now);
-                    co_await elio::time::sleep_for(step);
                 }
                 co_return;
             });
 
         auto frame = co_await read_frame_bounded(stream_, config_.max_message_size);
 
-        frame_done->store(true, std::memory_order_release);
+        // Wake the watchdog so it returns immediately instead of sleeping
+        // out the rest of the deadline.
+        watchdog_cancel.cancel();
         co_await watchdog;
 
         if (timed_out->load(std::memory_order_acquire)) {

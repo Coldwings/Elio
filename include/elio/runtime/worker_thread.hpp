@@ -166,12 +166,6 @@ public:
         return addr ? std::coroutine_handle<>::from_address(addr) : nullptr;
     }
 
-    /// Steal multiple tasks at once for better throughput
-    template<size_t N>
-    size_t steal_batch(std::array<void*, N>& output) noexcept {
-        return queue_->steal_batch(output);
-    }
-
     [[nodiscard]] bool is_running() const noexcept {
         return running_.load(std::memory_order_acquire);
     }

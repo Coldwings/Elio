@@ -601,27 +601,89 @@ TEST_CASE("generator for_each", "[generator]") {
 TEST_CASE("generator for_each with early termination", "[generator]") {
     scheduler sched(2);
     sched.start();
-    
+
     std::atomic<bool> completed{false};
     std::vector<int> values;
-    
+
     auto consumer = [&]() -> task<void> {
         auto gen = fibonacci(100);
-        
+
         co_await gen.for_each([&](int v) -> bool {
             values.push_back(v);
             return values.size() < 5;  // stop after 5 values
         });
         completed.store(true);
     };
-    
+
     elio::go(consumer);
-    
+
     std::this_thread::sleep_for(scaled_ms(200));
-    
+
     REQUIRE(completed.load());
     REQUIRE(values == std::vector<int>{0, 1, 1, 2, 3});
-    
+
+    sched.shutdown();
+}
+
+// Regression: the rvalue for_each overload must move the generator into the
+// returned awaitable's coroutine frame.  Otherwise, storing the awaitable in
+// a local first and awaiting it later would dereference the destroyed
+// temporary that produced it (UAF — caught by ASAN).
+TEST_CASE("generator for_each rvalue chaining outlives temporary", "[generator]") {
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> completed{false};
+    std::vector<int> values;
+
+    auto consumer = [&]() -> task<void> {
+        // The temporary returned by simple_producer() is destroyed at the
+        // end of this full-expression.  The fix moves it into `fet`'s
+        // coroutine frame so the subsequent co_await is well-defined.
+        auto fet = simple_producer().for_each([&](int v) {
+            values.push_back(v);
+        });
+
+        co_await fet;
+        completed.store(true);
+    };
+
+    elio::go(consumer);
+
+    std::this_thread::sleep_for(scaled_ms(200));
+
+    REQUIRE(completed.load());
+    REQUIRE(values == std::vector<int>{1, 2, 3});
+
+    sched.shutdown();
+}
+
+// Regression: explicit std::move on an lvalue generator must also reach the
+// rvalue overload and move the generator into the awaitable's frame.
+TEST_CASE("generator for_each std::move transfers ownership", "[generator]") {
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> completed{false};
+    std::vector<int> values;
+
+    auto consumer = [&]() -> task<void> {
+        auto gen = simple_producer();
+        auto fet = std::move(gen).for_each([&](int v) {
+            values.push_back(v);
+        });
+        // gen has been moved-from; the awaitable owns the generator now.
+        co_await fet;
+        completed.store(true);
+    };
+
+    elio::go(consumer);
+
+    std::this_thread::sleep_for(scaled_ms(200));
+
+    REQUIRE(completed.load());
+    REQUIRE(values == std::vector<int>{1, 2, 3});
+
     sched.shutdown();
 }
 

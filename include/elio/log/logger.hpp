@@ -4,6 +4,7 @@
 #include <fmt/format.h>
 #include <fmt/chrono.h>
 #include <atomic>
+#include <cstdio>
 #include <mutex>
 #include <chrono>
 
@@ -66,29 +67,53 @@ public:
             return;
         }
 
-        // Format the message
-        auto msg = fmt::format(fmt_str, std::forward<Args>(args)...);
-        
         // Get current time
         auto now = std::chrono::system_clock::now();
         auto time = std::chrono::system_clock::to_time_t(now);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now.time_since_epoch()) % 1000;
 
-        // Thread-safe output
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        // Format: [TIMESTAMP] [LEVEL] [file:line] message
-        fmt::print(stderr, 
-            "{}[{:%Y-%m-%d %H:%M:%S}.{:03d}] [{}] [{}:{}] {}\033[0m\n",
-            level_to_color(lvl),
-            fmt::localtime(time),
-            ms.count(),
-            level_to_string(lvl),
-            file,
-            line,
-            msg
-        );
+        // Format into a thread-local buffer OUTSIDE the global lock so that
+        // formatting (which can be expensive) runs concurrently across threads.
+        // Each thread reuses its own buffer to avoid malloc churn.
+        thread_local fmt::memory_buffer buf;
+        buf.clear();
+        try {
+            // Format: [TIMESTAMP] [LEVEL] [file:line] message<RESET>\n
+            // The user message is formatted directly into the buffer instead of
+            // being materialized as an intermediate std::string.
+            fmt::format_to(std::back_inserter(buf),
+                "{}[{:%Y-%m-%d %H:%M:%S}.{:03d}] [{}] [{}:{}] ",
+                level_to_color(lvl),
+                fmt::localtime(time),
+                ms.count(),
+                level_to_string(lvl),
+                file,
+                line);
+            fmt::format_to(std::back_inserter(buf), fmt_str, std::forward<Args>(args)...);
+            fmt::format_to(std::back_inserter(buf), "\033[0m\n");
+        } catch (...) {
+            // If formatting throws (e.g. invalid argument at runtime), make sure
+            // we don't leave a partially-formatted line lying around for the next
+            // call, and don't pin a now-grown allocation either.
+            buf = fmt::memory_buffer{};
+            throw;
+        }
+
+        // Lock only around the write syscall so the global mutex is held for
+        // the shortest possible window. lock_guard guarantees release even if
+        // fwrite somehow throws.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::fwrite(buf.data(), 1, buf.size(), stderr);
+        }
+
+        // Cap the thread-local buffer so a single huge log line doesn't pin a
+        // large allocation forever. fmt::memory_buffer has no shrink_to_fit, so
+        // assign a fresh empty buffer when we cross the threshold.
+        if (buf.capacity() > kBufferShrinkThreshold) {
+            buf = fmt::memory_buffer{};
+        }
     }
 
 private:
@@ -97,6 +122,10 @@ private:
     
     logger(const logger&) = delete;
     logger& operator=(const logger&) = delete;
+
+    /// Threshold above which the thread-local format buffer is reset to avoid
+    /// keeping a large allocation alive after an unusually long log line.
+    static constexpr std::size_t kBufferShrinkThreshold = 64 * 1024;
 
     std::atomic<level> min_level_;
     std::mutex mutex_;  // Protect concurrent writes to stderr

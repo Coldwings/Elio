@@ -5,8 +5,6 @@
 #include <cstddef>
 #include <vector>
 #include <mutex>
-#include <array>
-#include <algorithm>
 
 namespace elio::runtime {
 
@@ -179,12 +177,25 @@ public:
 
     /// Steal an element (thieves only) - lock-free
     [[nodiscard]] T* steal() noexcept {
+        // Mark this thief as active before touching the buffer so the owner
+        // can detect quiescence and reclaim retired buffers safely. The
+        // increment is relaxed; the seq_cst fence below is what gives this
+        // store global visibility for the Dekker-style check in resize().
+        active_thieves_.fetch_add(1, std::memory_order_relaxed);
+
         size_t t = top_.load(std::memory_order_acquire);
         // seq_cst fence is REQUIRED here for correctness with pop()
-        // It ensures we see the latest bottom value after any concurrent pop
+        // It ensures we see the latest bottom value after any concurrent pop.
+        // It also pairs with the seq_cst fence in resize(): if resize()
+        // observes active_thieves_ == 0 after its fence, this thief either
+        // hasn't reached this point yet (and will see the new buffer below)
+        // or has already decremented (release) — synchronized-with the owner's
+        // acquire load, so all buffer accesses are sequenced-before the
+        // owner's reclaim.
         std::atomic_thread_fence(std::memory_order_seq_cst);
         size_t b = bottom_.load(std::memory_order_acquire);
 
+        T* result = nullptr;
         if (t < b) {
             circular_buffer* buf = buffer_.load(std::memory_order_acquire);
             T* item = buf->load(t);
@@ -193,52 +204,14 @@ public:
             if (top_.compare_exchange_strong(t, t + 1,
                                               std::memory_order_acq_rel,
                                               std::memory_order_relaxed)) {
-                return item;
+                result = item;
             }
         }
-        return nullptr;
-    }
 
-    /// Steal up to N elements atomically (thieves only) - lock-free
-    ///
-    /// Uses a single CAS on top_ to claim min(size/2, N, 1) slots at once,
-    /// which dramatically reduces CAS overhead compared to N individual steal()
-    /// calls when many items are available.
-    ///
-    /// Safety: the CAS atomically reserves the range [t, t+batch); the owner
-    /// pops from the bottom (indices ≥ new bottom_), so there is no overlap
-    /// as long as batch ≤ available = b − t, which is enforced below.
-    ///
-    /// Returns the number of items stored in output[0..N-1].
-    template<size_t N>
-    size_t steal_batch(std::array<T*, N>& output) noexcept {
-        size_t t = top_.load(std::memory_order_acquire);
-        // seq_cst fence: required for correctness with pop() (same as steal())
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        size_t b = bottom_.load(std::memory_order_acquire);
-
-        if (t >= b) return 0;  // empty
-
-        size_t available = b - t;
-        // Steal at most half the queue (work-stealing heuristic), at least 1
-        size_t batch = std::min(std::max(available / 2, size_t{1}), N);
-
-        // Atomically claim [t, t+batch) by advancing top_
-        if (!top_.compare_exchange_strong(t, t + batch,
-                std::memory_order_acq_rel, std::memory_order_relaxed)) {
-            return 0;  // Lost race with another thief or owner
-        }
-
-        // We exclusively own slots [t, t+batch). Load items from the buffer.
-        // buffer_.load(acquire) ensures we see any resize that happened before
-        // our CAS; old buffers are kept alive in old_buffers_ so this is safe
-        // even if a resize happened concurrently.
-        circular_buffer* buf = buffer_.load(std::memory_order_acquire);
-        for (size_t i = 0; i < batch; ++i) {
-            output[i] = buf->load(t + i);
-        }
-
-        return batch;
+        // Release: any prior buffer load is sequenced-before this decrement,
+        // which synchronizes-with the owner's acquire load in resize().
+        active_thieves_.fetch_sub(1, std::memory_order_release);
+        return result;
     }
 
     [[nodiscard]] size_t size() const noexcept {
@@ -256,19 +229,38 @@ private:
         auto new_buf = old_buf->grow(top, bottom, old_buf->capacity() * 2);
         circular_buffer* raw_ptr = new_buf.release();
         buffer_.store(raw_ptr, std::memory_order_release);
-        
-        {
-            std::lock_guard<std::mutex> lock(old_buffers_mutex_);
-            old_buffers_.push_back(old_buf);
+
+        // Dekker fence pairing with the seq_cst fence in steal(). If we then
+        // observe active_thieves_ == 0, no thief is currently dereferencing
+        // any retired buffer:
+        //   - any thief whose increment is sequenced-before our load saw
+        //     count > 0 here, so we won't reclaim;
+        //   - any thief whose increment is sequenced-after our load observes
+        //     the new buffer pointer (because their buffer_.load(acquire) is
+        //     sequenced-after their own seq_cst fence which is after ours).
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+
+        std::lock_guard<std::mutex> lock(old_buffers_mutex_);
+        old_buffers_.push_back(old_buf);
+        if (active_thieves_.load(std::memory_order_acquire) == 0) {
+            // Acquire synchronizes-with the release decrement in steal(),
+            // so every prior thief's buffer access happens-before this delete.
+            for (auto* buf : old_buffers_) {
+                delete buf;
+            }
+            old_buffers_.clear();
         }
-        
+
         return raw_ptr;
     }
 
     alignas(64) std::atomic<size_t> top_;
     alignas(64) std::atomic<size_t> bottom_;
     alignas(64) std::atomic<circular_buffer*> buffer_;
-    
+    // Counter of thieves currently inside steal(). Owner uses this to decide
+    // when retired buffers can be freed without UB.
+    alignas(64) std::atomic<size_t> active_thieves_{0};
+
     mutable std::mutex old_buffers_mutex_;
     std::vector<circular_buffer*> old_buffers_;
 };

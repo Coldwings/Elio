@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <coroutine>
+#include <functional>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -20,15 +21,23 @@ namespace elio::time {
 namespace detail {
 
 /// Submit `work` to the scheduler's blocking pool, falling back to a
-/// detached std::thread if no pool is available. Used by the timer
-/// SQ-full fallback paths so we never block a worker thread for the
-/// full sleep duration.
+/// detached std::thread if no pool is available or the pool has already
+/// shut down. Used by the timer SQ-full fallback paths so we never block
+/// a worker thread for the full sleep duration.
 template <typename F>
 inline void submit_blocking(F&& work) {
     auto* sched = runtime::get_current_scheduler();
     if (sched && sched->is_running()) {
         if (auto* pool = sched->get_blocking_pool()) {
-            pool->submit(std::forward<F>(work));
+            // Materialize as std::function so we can fall through if the
+            // pool rejects the submit (post-shutdown). blocking_pool::submit
+            // returns false WITHOUT moving from `task` in the rejection
+            // path, so reusing `task` here is safe.
+            std::function<void()> task{std::forward<F>(work)};
+            if (pool->submit(std::move(task))) {
+                return;
+            }
+            std::thread(std::move(task)).detach();
             return;
         }
     }

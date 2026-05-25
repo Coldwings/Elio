@@ -6,18 +6,23 @@
 #include <elio/net/tcp.hpp>
 #include <elio/tls/tls_stream.hpp>
 #include <elio/io/io_context.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/time/timer.hpp>
 #include <elio/log/macros.hpp>
 
-#include <string>
-#include <string_view>
+#include <sys/socket.h>
+
+#include <atomic>
+#include <chrono>
 #include <functional>
-#include <vector>
-#include <unordered_map>
 #include <memory>
 #include <optional>
-#include <atomic>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
 
 namespace elio::http {
 
@@ -406,50 +411,123 @@ private:
     /// Handle HTTP requests on a stream (templated for TCP/TLS)
     template<typename Stream>
     coro::task<void> handle_requests(Stream& stream, const std::string& client_addr) {
+        auto* sched = runtime::scheduler::current();
         std::vector<char> buffer(config_.read_buffer_size);
         request_parser parser;
         size_t request_count = 0;
-        
+
         while (running_ && request_count < config_.max_keep_alive_requests) {
             parser.reset();
-            
-            // Read and parse request
+
+            // Slow-loris watchdog: each request is allowed at most
+            // keep_alive_timeout to fully arrive. The watchdog sleeps for
+            // that duration, then ::shutdown(2)s the socket, which forces
+            // any pending recv to return EOF/error so we can exit. We must
+            // own a join_handle and await it before this scope ends so that
+            // the watchdog's `fd` capture cannot outlive the stream.
+            auto timed_out = std::make_shared<std::atomic<bool>>(false);
+            auto cancel_src = std::make_shared<coro::cancel_source>();
+            int fd = stream.fd();
+            auto timeout = config_.keep_alive_timeout;
+            std::optional<coro::join_handle<void>> watchdog;
+            if (sched && timeout.count() > 0) {
+                watchdog.emplace(sched->go_joinable(
+                    [fd, timed_out, cancel_src, timeout]() -> coro::task<void> {
+                        auto r = co_await elio::time::sleep_for(
+                            timeout, cancel_src->get_token());
+                        if (r == coro::cancel_result::completed) {
+                            timed_out->store(true, std::memory_order_release);
+                            ::shutdown(fd, SHUT_RDWR);
+                        }
+                        co_return;
+                    }));
+            }
+
+            // Helper that drains the watchdog so the captured fd cannot
+            // outlive `stream`. Safe to call multiple times.
+            auto stop_watchdog = [&]() -> coro::task<void> {
+                if (watchdog) {
+                    cancel_src->cancel();
+                    co_await *watchdog;
+                    watchdog.reset();
+                }
+                co_return;
+            };
+
+            // Read and parse request, enforcing max_request_size on every
+            // accumulation step so a peer cannot stream gigabytes through
+            // the parser before we notice.
+            bool sent_response = false;
+            bool early_exit = false;
             while (!parser.is_complete() && !parser.has_error()) {
                 auto result = co_await stream.read(buffer.data(), buffer.size());
-                
-                if (result.result <= 0) {
-                    // Connection closed or error
-                    co_return;
+
+                if (timed_out->load(std::memory_order_acquire)) {
+                    early_exit = true;
+                    break;
                 }
-                
-                auto [parse_result, consumed] = parser.parse(
-                    std::string_view(buffer.data(), result.result));
-                
-                if (parse_result == parse_result::error) {
-                    // Send bad request response
-                    auto resp = response::bad_request(parser.error_message());
+                if (result.result <= 0) {
+                    early_exit = true;
+                    break;
+                }
+
+                size_t incoming = static_cast<size_t>(result.result);
+                if (parser.bytes_buffered() + incoming > config_.max_request_size) {
+                    co_await stop_watchdog();
+                    auto resp = response(status::payload_too_large, "Payload Too Large");
+                    resp.set_header("Connection", "close");
                     co_await send_response(stream, resp);
                     co_return;
                 }
+
+                auto [pres, consumed] = parser.parse(
+                    std::string_view(buffer.data(), incoming));
+
+                // Once the parser has finished headers we know any declared
+                // Content-Length. Reject early so we never even allocate the
+                // body string for a multi-GB POST.
+                if (auto declared = parser.declared_content_length();
+                    declared && *declared > config_.max_request_size) {
+                    co_await stop_watchdog();
+                    auto resp = response(status::payload_too_large, "Payload Too Large");
+                    resp.set_header("Connection", "close");
+                    co_await send_response(stream, resp);
+                    co_return;
+                }
+
+                if (pres == parse_result::error) {
+                    co_await stop_watchdog();
+                    auto resp = response::bad_request(parser.error_message());
+                    resp.set_header("Connection", "close");
+                    co_await send_response(stream, resp);
+                    sent_response = true;
+                    co_return;
+                }
             }
-            
-            if (parser.has_error()) {
+
+            // Always drain the watchdog before continuing — its captured fd
+            // refers to `stream`, which must remain alive until it returns.
+            co_await stop_watchdog();
+
+            if (timed_out->load(std::memory_order_acquire) || early_exit ||
+                parser.has_error()) {
+                (void)sent_response;
                 co_return;
             }
-            
+
             // Create request and context
             auto req = request::from_parser(parser);
             context ctx(std::move(req), client_addr);
-            
+
             // Log request
             if (config_.enable_logging) {
-                ELIO_LOG_INFO("{} {} {} from {}", 
+                ELIO_LOG_INFO("{} {} {} from {}",
                             method_to_string(ctx.req().get_method()),
                             ctx.req().path(),
                             ctx.req().version(),
                             client_addr);
             }
-            
+
             // Route request
             response resp;
             try {
@@ -462,20 +540,20 @@ private:
                     resp = response::internal_error();
                 }
             }
-            
+
             // Check keep-alive
             bool keep_alive = parser.get_headers().keep_alive(parser.version());
             if (!keep_alive) {
                 resp.set_header("Connection", "close");
             }
-            
+
             // Send response
             co_await send_response(stream, resp);
-            
+
             if (!keep_alive) {
                 break;
             }
-            
+
             ++request_count;
         }
     }

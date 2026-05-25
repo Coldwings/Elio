@@ -553,6 +553,150 @@ TEST_CASE("HTTP request serialization", "[http][message]") {
     }
 }
 
+// Security regression tests --------------------------------------------------
+
+TEST_CASE("HTTP request parser rejects CL+TE smuggling", "[http][parser][security]") {
+    request_parser parser;
+    std::string request =
+        "POST / HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Content-Length: 5\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "0\r\n\r\n";
+
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::error);
+    REQUIRE(parser.has_error());
+}
+
+TEST_CASE("HTTP request parser rejects duplicate Content-Length conflict",
+          "[http][parser][security]") {
+    request_parser parser;
+    std::string request =
+        "POST / HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Content-Length: 5\r\n"
+        "Content-Length: 6\r\n"
+        "\r\n"
+        "abcde";
+
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::error);
+}
+
+TEST_CASE("HTTP request parser accepts duplicate Content-Length when matching",
+          "[http][parser][security]") {
+    request_parser parser;
+    std::string request =
+        "POST / HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Content-Length: 5\r\n"
+        "Content-Length:  5  \r\n"  // OWS-equivalent value, allowed
+        "\r\n"
+        "abcde";
+
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::complete);
+    REQUIRE(parser.body() == "abcde");
+}
+
+TEST_CASE("HTTP request parser rejects unsupported Transfer-Encoding without chunked",
+          "[http][parser][security]") {
+    request_parser parser;
+    std::string request =
+        "POST / HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Transfer-Encoding: gzip\r\n"  // no trailing "chunked"
+        "\r\n";
+
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::error);
+}
+
+TEST_CASE("HTTP request parser rejects negative or trailing-garbage Content-Length",
+          "[http][parser][security]") {
+    SECTION("Negative") {
+        request_parser parser;
+        auto [r, _] = parser.parse(
+            "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: -1\r\n\r\n");
+        REQUIRE(r == parse_result::error);
+    }
+    SECTION("Trailing garbage") {
+        request_parser parser;
+        auto [r, _] = parser.parse(
+            "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5x\r\n\r\nhello");
+        REQUIRE(r == parse_result::error);
+    }
+}
+
+TEST_CASE("HTTP chunked detection requires final coding to be chunked",
+          "[http][headers][security]") {
+    headers h1;
+    h1.set("Transfer-Encoding", "x-chunked");  // similar substring, not real chunked
+    REQUIRE_FALSE(h1.is_chunked());
+
+    headers h2;
+    h2.set("Transfer-Encoding", "gzip, chunked");
+    REQUIRE(h2.is_chunked());
+
+    headers h3;
+    h3.set("Transfer-Encoding", "chunked, gzip");  // chunked is NOT final
+    REQUIRE_FALSE(h3.is_chunked());
+
+    headers h4;
+    h4.set("Transfer-Encoding", "  ChUnKeD  ");  // case + OWS
+    REQUIRE(h4.is_chunked());
+}
+
+TEST_CASE("HTTP headers reject CR/LF/NUL in values (CRLF injection)",
+          "[http][headers][security]") {
+    headers h;
+    REQUIRE_THROWS_AS(h.set("Location", "/next\r\nX-Evil: yes"),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(h.set("Location", "/next\nfoo"), std::invalid_argument);
+    REQUIRE_THROWS_AS(h.set("X", std::string("\0", 1)), std::invalid_argument);
+    // OK to set a clean value
+    REQUIRE_NOTHROW(h.set("Location", "/next"));
+}
+
+TEST_CASE("HTTP headers reject malformed names", "[http][headers][security]") {
+    headers h;
+    REQUIRE_THROWS_AS(h.set("", "v"), std::invalid_argument);
+    REQUIRE_THROWS_AS(h.set("Bad Name", "v"), std::invalid_argument);  // space in name
+    REQUIRE_THROWS_AS(h.set("Bad:Name", "v"), std::invalid_argument);
+    REQUIRE_NOTHROW(h.set("X-OK", "v"));
+}
+
+TEST_CASE("HTTP chunk size overflow is rejected", "[http][parser][security]") {
+    request_parser parser;
+    // 17 hex digits of 'f' would overflow a 64-bit size_t (16 hex digits = 64 bits).
+    std::string request =
+        "POST / HTTP/1.1\r\n"
+        "Host: a\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "fffffffffffffffff\r\n"
+        "x";
+
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::error);
+}
+
+TEST_CASE("HTTP chunk size beyond max is rejected", "[http][parser][security]") {
+    request_parser parser;
+    // 0x7fffffff = 2 GiB > kMaxChunkSize (1 GiB)
+    std::string request =
+        "POST / HTTP/1.1\r\n"
+        "Host: a\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "7fffffff\r\n";
+
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::error);
+}
+
 TEST_CASE("HTTP request from parser roundtrip", "[http][message]") {
     std::string original =
         "POST /api/test HTTP/1.1\r\n"

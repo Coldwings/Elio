@@ -132,31 +132,45 @@ public:
 
     /// Release the mutex
     void unlock() noexcept {
-        void* state = state_.load(std::memory_order_relaxed);
+        void* state = state_.load(std::memory_order_acquire);
 
-        if (state == locked_no_waiters()) {
-            // Fast path: no waiters — just release
-            if (state_.compare_exchange_strong(
-                    state, nullptr,
+        // Pop the current head (or release the lock if there are no waiters)
+        // via CAS so a concurrent await_suspend pushing onto the head cannot be
+        // silently overwritten by an unconditional store.  This preserves LIFO
+        // order: a pusher that wins the race becomes the new head and is
+        // observed on the next iteration.
+        while (true) {
+            if (state == locked_no_waiters()) {
+                if (state_.compare_exchange_weak(
+                        state, nullptr,
+                        std::memory_order_release,
+                        std::memory_order_acquire)) {
+                    return;
+                }
+                // CAS failed: a waiter pushed itself; state was reloaded.
+                continue;
+            }
+
+            auto* head = static_cast<lock_awaitable*>(state);
+            auto* next = head->next_.load(std::memory_order_acquire);
+            void* next_state = (next == nullptr)
+                                   ? locked_no_waiters()
+                                   : static_cast<void*>(next);
+            if (state_.compare_exchange_weak(
+                    state, next_state,
                     std::memory_order_release,
-                    std::memory_order_relaxed)) {
+                    std::memory_order_acquire)) {
+                // Schedule the waiter — it now holds the lock.
+                // Read handle_ before schedule_handle: once scheduled the
+                // awaitable's coroutine frame may be destroyed concurrently.
+                auto handle_addr = head->handle_.load(std::memory_order_acquire);
+                runtime::schedule_handle(
+                    std::coroutine_handle<>::from_address(handle_addr));
                 return;
             }
-            // A waiter pushed itself between our load and CAS; reload
-            state = state_.load(std::memory_order_acquire);
+            // CAS failed: a new waiter pushed onto the head between our load
+            // and CAS.  state has been refreshed to the new head — retry.
         }
-
-        // Pop head waiter and transfer lock ownership to it (LIFO)
-        auto* head = static_cast<lock_awaitable*>(state);
-        auto* next = head->next_.load(std::memory_order_acquire);
-        void* next_state = (next == nullptr)
-                               ? locked_no_waiters()
-                               : static_cast<void*>(next);
-        state_.store(next_state, std::memory_order_release);
-
-        // Schedule the waiter — it now holds the lock
-        auto handle_addr = head->handle_.load(std::memory_order_acquire);
-        runtime::schedule_handle(std::coroutine_handle<>::from_address(handle_addr));
     }
 
     /// Check if mutex is currently locked
@@ -315,12 +329,28 @@ public:
             // Try to acquire write lock atomically
             uint64_t expected = 0;
             if (mutex_.state_.compare_exchange_strong(expected, WRITER_ACTIVE,
-                    std::memory_order_release, std::memory_order_relaxed)) {
+                    std::memory_order_acquire, std::memory_order_relaxed)) {
                 return false;  // Acquired, don't suspend
             }
 
-            // Lock is held - mark writer waiting and add to wait queue
-            mutex_.state_.fetch_or(WRITER_WAITING, std::memory_order_relaxed);
+            // Lock is held — publish WRITER_WAITING so future readers/writers
+            // observe contention. A reader's lock-free unlock_shared could have
+            // dropped the count to 0 between our failing CAS above and now,
+            // leaving the lock effectively free without anyone scheduled to
+            // wake us.  Re-attempt the acquire from the WRITER_WAITING state
+            // before enqueuing to close that window.
+            mutex_.state_.fetch_or(WRITER_WAITING, std::memory_order_acq_rel);
+
+            expected = WRITER_WAITING;
+            uint64_t claim_state = WRITER_ACTIVE;
+            if (mutex_.pending_writers_ > 0) {
+                claim_state |= WRITER_WAITING;
+            }
+            if (mutex_.state_.compare_exchange_strong(expected, claim_state,
+                    std::memory_order_acquire, std::memory_order_relaxed)) {
+                return false;  // Acquired — lock was just released
+            }
+
             ++mutex_.pending_writers_;
             mutex_.writer_waiters_.push(awaiter);
             return true;  // Suspend
@@ -773,124 +803,182 @@ public:
     public:
         send_awaitable(channel& ch, T value)
             : channel_(ch), value_(std::move(value)) {}
-        
-        bool await_ready() const noexcept {
+
+        // Note: non-const so we can commit the operation under the channel
+        // lock and avoid a TOCTOU window between await_ready and await_resume.
+        bool await_ready() noexcept {
             std::lock_guard<std::mutex> guard(channel_.mutex_);
-            return channel_.closed_ || 
-                   channel_.capacity_ == 0 || 
-                   channel_.queue_.size() < channel_.capacity_;
+
+            if (channel_.closed_) {
+                // Don't suspend; await_resume reports failure.
+                return true;
+            }
+
+            if (channel_.capacity_ == 0 ||
+                channel_.queue_.size() < channel_.capacity_) {
+                // Commit the send while still holding the lock.  Doing this
+                // here (rather than in await_resume) prevents another sender
+                // from filling the queue between unlock and resume, which
+                // previously could push past capacity.
+                channel_.queue_.push(std::move(value_));
+                committed_ = true;
+
+                if (!channel_.recv_waiters_.empty()) {
+                    to_wake_ = channel_.recv_waiters_.front();
+                    channel_.recv_waiters_.pop();
+                }
+                return true;
+            }
+
+            return false;
         }
-        
+
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
             std::lock_guard<std::mutex> guard(channel_.mutex_);
-            
+
             if (channel_.closed_) {
-                return false;  // Channel closed, don't suspend
+                return false;  // Don't suspend; await_resume returns false
             }
-            
-            if (channel_.capacity_ == 0 || 
+
+            if (channel_.capacity_ == 0 ||
                 channel_.queue_.size() < channel_.capacity_) {
-                return false;  // Space available
+                // Space appeared between await_ready and now — commit.
+                channel_.queue_.push(std::move(value_));
+                committed_ = true;
+
+                if (!channel_.recv_waiters_.empty()) {
+                    to_wake_ = channel_.recv_waiters_.front();
+                    channel_.recv_waiters_.pop();
+                }
+                return false;
             }
-            
+
             // Wait for space
             channel_.send_waiters_.push({awaiter, std::move(value_)});
             value_moved_ = true;
             return true;
         }
-        
+
         bool await_resume() {
-            std::coroutine_handle<> to_wake;
-            bool result;
-            
-            {
-                std::lock_guard<std::mutex> guard(channel_.mutex_);
-                
-                if (channel_.closed_) {
-                    return false;  // Failed to send
-                }
-                
-                if (!value_moved_) {
-                    // We weren't suspended, add value now
-                    channel_.queue_.push(std::move(value_));
-                    
-                    // Wake a receiver if any
-                    if (!channel_.recv_waiters_.empty()) {
-                        to_wake = channel_.recv_waiters_.front();
-                        channel_.recv_waiters_.pop();
-                    }
-                }
-                
-                result = true;
+            if (to_wake_) {
+                runtime::schedule_handle(to_wake_);
+                to_wake_ = nullptr;
             }
-            
-            // Re-schedule outside the lock
-            if (to_wake) {
-                runtime::schedule_handle(to_wake);
+
+            if (committed_) {
+                // Value was committed under the lock; the send succeeded.
+                return true;
             }
-            
-            return result;
+
+            // We were either suspended on send_waiters_ (woken by a recv that
+            // took the value, or by close()), or short-circuited because the
+            // channel was closed at await_ready / await_suspend time.
+            std::lock_guard<std::mutex> guard(channel_.mutex_);
+            if (channel_.closed_) {
+                return false;
+            }
+            return value_moved_;
         }
-        
+
     private:
         channel& channel_;
         T value_;
-        bool value_moved_ = false;
+        bool committed_ = false;       // value pushed to queue under the lock
+        bool value_moved_ = false;     // value moved into send_waiters_
+        std::coroutine_handle<> to_wake_;
     };
-    
+
     /// Receive awaitable
     class recv_awaitable {
     public:
         explicit recv_awaitable(channel& ch) : channel_(ch) {}
-        
-        bool await_ready() const noexcept {
+
+        // Note: non-const so we can commit the recv (capture the value) under
+        // the channel lock and avoid a TOCTOU window where another receiver
+        // drains the queue between await_ready and await_resume — which would
+        // otherwise produce a spurious nullopt that callers misinterpret as
+        // "channel closed".
+        bool await_ready() noexcept {
             std::lock_guard<std::mutex> guard(channel_.mutex_);
-            return !channel_.queue_.empty() || channel_.closed_;
+            return try_take_locked();
         }
-        
+
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
             std::lock_guard<std::mutex> guard(channel_.mutex_);
-            
-            if (!channel_.queue_.empty() || channel_.closed_) {
-                return false;
+
+            if (try_take_locked()) {
+                return false;  // Don't suspend; value captured
             }
-            
+
             channel_.recv_waiters_.push(awaiter);
             return true;
         }
-        
+
         std::optional<T> await_resume() {
-            std::coroutine_handle<> to_wake;
+            if (to_wake_) {
+                runtime::schedule_handle(to_wake_);
+                to_wake_ = nullptr;
+            }
+
+            if (taken_.has_value()) {
+                return std::move(taken_);
+            }
+
+            // We suspended on recv_waiters_ and were woken either by a sender
+            // delivering a value (in which case the queue now has it) or by
+            // close().  Re-check under the lock.
             std::optional<T> result;
-            
             {
                 std::lock_guard<std::mutex> guard(channel_.mutex_);
-                
-                // Check if there's a blocked sender
-                if (!channel_.send_waiters_.empty()) {
-                    auto& [waiter, value] = channel_.send_waiters_.front();
-                    channel_.queue_.push(std::move(value));
-                    to_wake = waiter;
-                    channel_.send_waiters_.pop();
-                }
-                
                 if (!channel_.queue_.empty()) {
                     result = std::move(channel_.queue_.front());
                     channel_.queue_.pop();
                 }
-                // else: Channel closed and empty - return nullopt
             }
-            
-            // Re-schedule outside the lock
-            if (to_wake) {
-                runtime::schedule_handle(to_wake);
-            }
-            
             return result;
         }
-        
+
     private:
+        // Returns true if the recv is committed (taken_ filled or channel
+        // closed and empty so we can return nullopt without suspending).
+        // Caller must hold channel_.mutex_.
+        bool try_take_locked() noexcept {
+            if (!channel_.queue_.empty()) {
+                taken_ = std::move(channel_.queue_.front());
+                channel_.queue_.pop();
+
+                // Queue had space freed — pull a blocked sender's value in.
+                if (!channel_.send_waiters_.empty()) {
+                    auto& [waiter, value] = channel_.send_waiters_.front();
+                    channel_.queue_.push(std::move(value));
+                    to_wake_ = waiter;
+                    channel_.send_waiters_.pop();
+                }
+                return true;
+            }
+
+            // Queue empty: a sender may still be queued (e.g. capacity_==0
+            // rendezvous variant if it ever exists; defensive for general
+            // safety even when queue/sender invariants might race).
+            if (!channel_.send_waiters_.empty()) {
+                auto& [waiter, value] = channel_.send_waiters_.front();
+                taken_ = std::move(value);
+                to_wake_ = waiter;
+                channel_.send_waiters_.pop();
+                return true;
+            }
+
+            if (channel_.closed_) {
+                // Empty + closed: don't suspend; await_resume returns nullopt.
+                return true;
+            }
+
+            return false;
+        }
+
         channel& channel_;
+        std::optional<T> taken_;
+        std::coroutine_handle<> to_wake_;
     };
     
     /// Send a value to the channel

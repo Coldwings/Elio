@@ -4,6 +4,7 @@
 #include "blocking_pool.hpp"
 #include <coroutine>
 #include <exception>
+#include <functional>
 #include <optional>
 #include <thread>
 #include <type_traits>
@@ -40,7 +41,12 @@ public:
         // Capture scheduler pointer to ensure we resume on the right scheduler,
         // not directly on the blocking pool thread.
         auto* sched = runtime::get_current_scheduler();
-        auto work = [state, caller, sched, f = std::move(func_)]() mutable {
+        // Materialize as std::function up front so a rejected submit() leaves
+        // an intact, still-callable object we can hand to a detached thread.
+        // (Passing a lambda directly would move-construct a temporary
+        // std::function for submit's parameter even on the rejection path,
+        // moving-from our captures.)
+        std::function<void()> work = [state, caller, sched, f = std::move(func_)]() mutable {
             try {
                 if constexpr (std::is_void_v<T>) {
                     f();
@@ -60,11 +66,16 @@ public:
             }
         };
 
-        // Try blocking pool first, fallback to detached thread
+        // Try blocking pool first, fallback to detached thread.
+        // submit() may refuse if the pool is already shutting down (e.g.
+        // scheduler shutdown is in progress on another thread); on rejection
+        // it leaves `work` untouched so we can still run it on a detached
+        // thread and resume the awaiter instead of hanging forever.
         if (sched && sched->is_running()) {
             if (auto* pool = sched->get_blocking_pool()) {
-                pool->submit(std::move(work));
-                return;
+                if (pool->submit(std::move(work))) {
+                    return;
+                }
             }
         }
         std::thread(std::move(work)).detach();

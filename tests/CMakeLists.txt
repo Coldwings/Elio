@@ -16,6 +16,7 @@ set(TEST_SOURCES
     unit/test_chase_lev_deque.cpp
     unit/test_scheduler.cpp
     unit/test_scheduler_shutdown.cpp
+    unit/test_blocking_pool.cpp
     unit/test_affinity.cpp
     unit/test_io.cpp
     unit/test_batch_io.cpp

@@ -1,15 +1,21 @@
 #pragma once
 
 /// @file rpc_buffer.hpp
-/// @brief Zero-copy buffer management for RPC serialization
+/// @brief Buffer management for RPC serialization
 ///
 /// This module provides efficient buffer management for serializing and
-/// deserializing RPC messages without memory copies. It supports:
+/// deserializing RPC messages. It supports:
 /// - Discontinuous buffers via iovec chains
-/// - In-place deserialization with views
-/// - Little-endian wire format (host order assumed)
+/// - In-place deserialization with views (zero-copy reads)
+/// - Little-endian wire format on every host (explicit byteswap on BE)
 /// - Variable-length data (strings, arrays, blobs)
-/// - Buffer references for zero-copy iovec fields
+/// - Buffer references for "no extra allocation" sends. NOTE: the bytes
+///   referenced by a `buffer_ref` are still memcpy'd into the outgoing
+///   wire buffer by the current writer. True zero-copy / iovec-tail send
+///   is a separate (planned) feature; see iovec_buffer for scatter-gather
+///   construction.
+
+#include "rpc_endian.hpp"
 
 #include <elio/hash/crc32.hpp>
 
@@ -152,7 +158,9 @@ public:
         pos_ += n;
     }
     
-    /// Read a fixed-size value (little-endian, no conversion needed)
+    /// Read a fixed-size value as little-endian.
+    /// On LE hosts this compiles to a plain memcpy; on BE hosts the bytes
+    /// are byteswapped to host order before being returned.
     template<typename T>
     requires std::is_trivially_copyable_v<T>
     T read() {
@@ -160,23 +168,31 @@ public:
             throw serialization_error("read past end of buffer");
         }
         T value;
-        std::memcpy(&value, data_ + pos_, sizeof(T));
+        if constexpr (std::is_arithmetic_v<T> || std::is_enum_v<T>) {
+            value = endian::read_le<T>(data_ + pos_);
+        } else {
+            std::memcpy(&value, data_ + pos_, sizeof(T));
+        }
         pos_ += sizeof(T);
         return value;
     }
-    
-    /// Read into a value (little-endian, no conversion needed)
+
+    /// Read into a value as little-endian.
     template<typename T>
     requires std::is_trivially_copyable_v<T>
     void read_into(T& value) {
         if (pos_ + sizeof(T) > size_) {
             throw serialization_error("read past end of buffer");
         }
-        std::memcpy(&value, data_ + pos_, sizeof(T));
+        if constexpr (std::is_arithmetic_v<T> || std::is_enum_v<T>) {
+            value = endian::read_le<T>(data_ + pos_);
+        } else {
+            std::memcpy(&value, data_ + pos_, sizeof(T));
+        }
         pos_ += sizeof(T);
     }
-    
-    /// Peek at a value without advancing position
+
+    /// Peek at a value without advancing position (little-endian decoded).
     template<typename T>
     requires std::is_trivially_copyable_v<T>
     T peek() const {
@@ -184,7 +200,11 @@ public:
             throw serialization_error("peek past end of buffer");
         }
         T value;
-        std::memcpy(&value, data_ + pos_, sizeof(T));
+        if constexpr (std::is_arithmetic_v<T> || std::is_enum_v<T>) {
+            value = endian::read_le<T>(data_ + pos_);
+        } else {
+            std::memcpy(&value, data_ + pos_, sizeof(T));
+        }
         return value;
     }
     
@@ -201,18 +221,20 @@ public:
     /// Read a length-prefixed string view (zero-copy)
     std::string_view read_string() {
         uint32_t len = read<uint32_t>();
-        if (pos_ + len > size_) {
+        // Bound the length against the buffer BEFORE arithmetic so a
+        // malicious peer cannot trigger overflow in `pos_ + len`.
+        if (len > size_ - pos_) {
             throw serialization_error("string length exceeds buffer");
         }
         std::string_view result(reinterpret_cast<const char*>(data_ + pos_), len);
         pos_ += len;
         return result;
     }
-    
+
     /// Read a length-prefixed byte array as span (zero-copy)
     std::span<const uint8_t> read_blob() {
         uint32_t len = read<uint32_t>();
-        if (pos_ + len > size_) {
+        if (len > size_ - pos_) {
             throw serialization_error("blob length exceeds buffer");
         }
         std::span<const uint8_t> result(data_ + pos_, len);
@@ -285,13 +307,19 @@ public:
         return {const_cast<uint8_t*>(data_.data()), data_.size()};
     }
     
-    /// Write a fixed-size value (little-endian, no conversion)
+    /// Write a fixed-size value as little-endian.
+    /// Compiles to a plain memcpy on LE hosts; on BE hosts the bytes are
+    /// byteswapped before being stored.
     template<typename T>
     requires std::is_trivially_copyable_v<T>
     void write(T value) {
         size_t old_size = data_.size();
         data_.resize(old_size + sizeof(T));
-        std::memcpy(data_.data() + old_size, &value, sizeof(T));
+        if constexpr (std::is_arithmetic_v<T> || std::is_enum_v<T>) {
+            endian::write_le(data_.data() + old_size, value);
+        } else {
+            std::memcpy(data_.data() + old_size, &value, sizeof(T));
+        }
     }
     
     /// Write raw bytes
@@ -314,7 +342,7 @@ public:
         write(static_cast<uint32_t>(str.size()));
         write_bytes(str.data(), str.size());
     }
-    
+
     /// Write a length-prefixed blob
     void write_blob(std::span<const uint8_t> blob) {
         if (blob.size() > UINT32_MAX) {
@@ -323,27 +351,33 @@ public:
         write(static_cast<uint32_t>(blob.size()));
         write_bytes(blob.data(), blob.size());
     }
-    
+
     /// Write array size prefix
     void write_array_size(uint32_t count) {
         write(count);
     }
-    
+
     /// Reserve space and return offset (for back-patching headers)
     size_t reserve_space(size_t n) {
         size_t offset = data_.size();
         data_.resize(offset + n);
         return offset;
     }
-    
-    /// Write at a specific offset (for back-patching)
+
+    /// Write at a specific offset (for back-patching).
+    /// Performs little-endian conversion for arithmetic / enum types so the
+    /// patched value matches the wire format used by `write`.
     template<typename T>
     requires std::is_trivially_copyable_v<T>
     void write_at(size_t offset, T value) {
         if (offset + sizeof(T) > data_.size()) {
             throw serialization_error("write_at past end of buffer");
         }
-        std::memcpy(data_.data() + offset, &value, sizeof(T));
+        if constexpr (std::is_arithmetic_v<T> || std::is_enum_v<T>) {
+            endian::write_le(data_.data() + offset, value);
+        } else {
+            std::memcpy(data_.data() + offset, &value, sizeof(T));
+        }
     }
     
     /// Get buffer view for reading what was written

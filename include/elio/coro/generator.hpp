@@ -290,6 +290,18 @@ public:
     /// If func returns bool, returning false stops iteration (early break).
     /// If func returns void, iterates until the generator is exhausted.
     ///
+    /// Lifetime: the rvalue overload moves the generator into the returned
+    /// awaitable's coroutine frame, so chaining patterns such as
+    ///
+    ///     auto fet = make_gen().for_each(fn);
+    ///     co_await fet;
+    ///
+    /// are safe even though the temporary returned by `make_gen()` is
+    /// destroyed at the end of the full-expression.  The lvalue overload
+    /// takes the generator by reference; callers must keep the generator
+    /// alive at least until the awaitable completes (use
+    /// `std::move(gen).for_each(...)` to transfer ownership instead).
+    ///
     /// Usage:
     ///     co_await gen.for_each([](int v) {
     ///         std::cout << v << "\n";
@@ -301,7 +313,27 @@ public:
     ///         return v < 5;  // stop when v >= 5
     ///     });
     template<typename F>
-    auto for_each(F&& func) {
+    auto for_each(F&& func) && {
+        // Move the generator into the coroutine frame so the awaitable can
+        // outlive the rvalue source (e.g. a temporary from a chained call).
+        auto loop = [](generator gen, std::decay_t<F> f) -> detail::for_each_task {
+            while (auto val = co_await gen.next()) {
+                using R = decltype(f(std::move(*val)));
+                if constexpr (std::is_same_v<R, bool>) {
+                    if (!f(std::move(*val))) break;
+                } else {
+                    f(std::move(*val));
+                }
+            }
+        };
+        return loop(std::move(*this), std::forward<F>(func));
+    }
+
+    template<typename F>
+    auto for_each(F&& func) & {
+        // Lvalue: caller retains ownership; the awaitable holds a reference
+        // and the generator must outlive it (typical when both live in the
+        // same enclosing coroutine frame).
         auto loop = [](generator& gen, std::decay_t<F> f) -> detail::for_each_task {
             while (auto val = co_await gen.next()) {
                 using R = decltype(f(std::move(*val)));

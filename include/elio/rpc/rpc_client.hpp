@@ -241,6 +241,48 @@ public:
     }
     
 private:
+    /// RAII helper that erases a pending request from its shard map on
+    /// destruction. This guarantees the entry is removed even if the
+    /// caller's coroutine is cancelled / destroyed mid-await — without it,
+    /// the shard kept a dangling shared_ptr forever (Fix 4).
+    struct pending_eraser {
+        rpc_client* self = nullptr;
+        uint32_t request_id = 0;
+        bool active = false;
+
+        pending_eraser() = default;
+        pending_eraser(rpc_client* s, uint32_t id) : self(s), request_id(id), active(true) {}
+        pending_eraser(const pending_eraser&) = delete;
+        pending_eraser& operator=(const pending_eraser&) = delete;
+        pending_eraser(pending_eraser&& other) noexcept
+            : self(other.self), request_id(other.request_id), active(other.active) {
+            other.active = false;
+        }
+        pending_eraser& operator=(pending_eraser&& other) noexcept {
+            if (this != &other) {
+                erase_now();
+                self = other.self;
+                request_id = other.request_id;
+                active = other.active;
+                other.active = false;
+            }
+            return *this;
+        }
+        ~pending_eraser() { erase_now(); }
+
+        void erase_now() noexcept {
+            if (!active || !self) return;
+            active = false;
+            try {
+                auto& shard = self->pending_shard_for(request_id);
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                shard.requests.erase(request_id);
+            } catch (...) {
+                // Erase from a noexcept context must not propagate.
+            }
+        }
+    };
+
     /// Internal implementation of call with cancellation support
     template<typename Method, typename Rep, typename Period>
     coro::task<rpc_result<typename Method::response_type>> call_impl(
@@ -249,26 +291,31 @@ private:
         coro::cancel_token token)
     {
         using Response = typename Method::response_type;
-        
+
         // Check if already cancelled
         if (token.is_cancelled()) {
             co_return rpc_result<Response>(rpc_error::cancelled);
         }
-        
+
         if (!is_connected()) {
             co_return rpc_result<Response>(rpc_error::connection_closed);
         }
-        
+
         // Generate request ID and create pending request
         uint32_t request_id = id_generator_.next();
         auto pending = std::make_shared<pending_request>();
-        
+
         {
             auto& shard = pending_shard_for(request_id);
             std::lock_guard<std::mutex> lock(shard.mutex);
             shard.requests[request_id] = pending;
         }
-        
+
+        // From here on, the shard entry is guaranteed to be cleaned up no
+        // matter how this coroutine exits (normal return, exception, or
+        // caller-driven destruction while awaiting completion_event).
+        pending_eraser eraser(this, request_id);
+
         // Register cancellation callback
         auto cancel_registration = token.on_cancel([this, pending, request_id]() {
             if (pending->try_complete()) {
@@ -276,25 +323,22 @@ private:
                 pending->completion_event.set();
             }
         });
-        
+
         // Build and send request
         auto timeout_ms = static_cast<uint32_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count());
         auto request_frame = build_request(request_id, Method::id, request, timeout_ms);
-        
+
         {
             co_await send_mutex_.lock();
             sync::lock_guard send_guard(send_mutex_);
-            
+
             bool sent = co_await write_frame(stream_, request_frame.first, request_frame.second);
             if (!sent) {
-                auto& shard = pending_shard_for(request_id);
-                std::lock_guard<std::mutex> lock(shard.mutex);
-                shard.requests.erase(request_id);
                 co_return rpc_result<Response>(rpc_error::connection_closed);
             }
         }
-        
+
         // Wait for response with timeout
         // Spawn timeout watcher
         auto* sched = runtime::scheduler::current();
@@ -307,7 +351,7 @@ private:
                     -> coro::task<void>
                 {
                     auto result = co_await time::sleep_for(ms, tok);
-                    
+
                     // Only timeout if sleep completed normally (not cancelled)
                     if (result == coro::cancel_result::completed && pending->try_complete()) {
                         pending->timed_out = true;
@@ -317,25 +361,20 @@ private:
                 }(ms, p, std::move(tok));
             });
         }
-        
+
         // Wait for completion (either response, timeout, or cancellation)
         co_await pending->completion_event.wait();
-        
+
         // Unregister cancellation callback
         cancel_registration.unregister();
-        
-        // Remove from pending
-        {
-            auto& shard = pending_shard_for(request_id);
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            shard.requests.erase(request_id);
-        }
-        
+
+        // eraser's destructor removes the shard entry below.
+
         // Check result
         if (pending->error != rpc_error::success) {
             co_return rpc_result<Response>(pending->error);
         }
-        
+
         // Parse response
         try {
             if (pending->response_header.type == message_type::error) {
@@ -343,7 +382,7 @@ private:
                 auto err = parse_error(view);
                 co_return rpc_result<Response>(err.code);
             }
-            
+
             buffer_view view = pending->response_data.view();
             Response response = parse_response<Response>(view);
             co_return rpc_result<Response>(std::move(response));
@@ -375,36 +414,36 @@ public:
         if (!is_connected()) {
             co_return false;
         }
-        
+
         uint32_t ping_id = id_generator_.next();
         auto pending = std::make_shared<pending_request>();
-        
+
         {
             auto& shard = pending_shard_for(ping_id);
             std::lock_guard<std::mutex> lock(shard.mutex);
             shard.requests[ping_id] = pending;
         }
-        
+
+        // Guaranteed cleanup of the shard entry on every exit path.
+        pending_eraser eraser(this, ping_id);
+
         // Send ping
         auto header = build_ping(ping_id);
         {
             co_await send_mutex_.lock();
             sync::lock_guard send_guard(send_mutex_);
-            
+
             buffer_writer empty;
             bool sent = co_await write_frame(stream_, header, empty);
             if (!sent) {
-                auto& shard = pending_shard_for(ping_id);
-                std::lock_guard<std::mutex> lock(shard.mutex);
-                shard.requests.erase(ping_id);
                 co_return false;
             }
         }
-        
+
         // Setup timeout
         auto* sched = runtime::scheduler::current();
         if (sched) {
-            sched->go([ms = timeout, p = pending]() { 
+            sched->go([ms = timeout, p = pending]() {
                 return [](std::chrono::milliseconds ms, std::shared_ptr<pending_request> p)
                     -> coro::task<void> {
                     co_await time::sleep_for(ms);
@@ -415,16 +454,10 @@ public:
                 }(ms, p);
             });
         }
-        
+
         // Wait for pong
         co_await pending->completion_event.wait();
-        
-        {
-            auto& shard = pending_shard_for(ping_id);
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            shard.requests.erase(ping_id);
-        }
-        
+
         co_return !pending->timed_out;
     }
     

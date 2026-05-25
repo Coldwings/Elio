@@ -71,17 +71,45 @@ private:
         }
     }
 
-    // Default overload handler - scale up when overloaded
+    // Compute proportional scale-up step.
+    // Returns 0 when no scaling is needed, otherwise a positive step bounded by headroom.
+    // Roughly: step = ceil(pending / overload_threshold) - 1, with a minimum of 1 when
+    // we are already above overload_threshold, capped by (max_workers - num_workers).
+    size_t compute_scale_up_step(size_t pending, size_t num_workers) const noexcept {
+        if (pending <= config_.overload_threshold) return 0;
+        if (num_workers >= config_.max_workers) return 0;
+        const size_t overload = (config_.overload_threshold == 0) ? 1 : config_.overload_threshold;
+        // ceil(pending / overload)
+        size_t target_ratio = (pending + overload - 1) / overload;
+        // -1 because the existing num_workers already cover one "overload" worth of work
+        size_t step = (target_ratio > 1) ? (target_ratio - 1) : 1;
+        // Always make at least 1 step of progress while overloaded
+        if (step == 0) step = 1;
+        const size_t headroom = config_.max_workers - num_workers;
+        if (step > headroom) step = headroom;
+        return step;
+    }
+
+    // Scale-down hysteresis: require pending strictly below half of idle_threshold
+    // (computed without integer division so idle_threshold==1 still has a sensible
+    // boundary). This prevents flapping when pending hovers near idle_threshold.
+    bool below_idle_with_hysteresis(size_t pending) const noexcept {
+        // pending < idle_threshold / 2  <=>  pending * 2 < idle_threshold
+        return pending * 2 < config_.idle_threshold;
+    }
+
+    // Default overload handler - scale up when overloaded (proportional).
     void handle_default_overload(size_t pending, size_t num_workers) {
-        if (pending > config_.overload_threshold && num_workers < config_.max_workers) {
-            scheduler_->set_thread_count(num_workers + 1);
+        const size_t step = compute_scale_up_step(pending, num_workers);
+        if (step > 0) {
+            scheduler_->set_thread_count(num_workers + step);
         }
     }
 
-    // Default idle handler - scale down when idle
+    // Default idle handler - scale down when idle (with hysteresis).
     void handle_default_idle(size_t pending, size_t num_workers,
                             auto now, auto& last_idle_time) {
-        if (pending < config_.idle_threshold && num_workers > config_.min_workers) {
+        if (below_idle_with_hysteresis(pending) && num_workers > config_.min_workers) {
             auto idle_duration = now - last_idle_time;
             if (idle_duration > config_.idle_delay) {
                 scheduler_->set_thread_count(num_workers - 1);
@@ -94,14 +122,18 @@ private:
     void handle_trigger(on_overload<Actions...>, size_t pending, size_t num_workers,
                        auto now, auto& last_idle_time) {
         (void)num_workers;
+        (void)now;
         (void)last_idle_time;
 
         if (pending > config_.overload_threshold) {
-            // Try to scale up
             size_t current = scheduler_->num_threads();
-            if (current < config_.max_workers) {
-                bool success = scheduler_->set_thread_count(current + 1);
-                // Execute actions
+            const size_t step = compute_scale_up_step(pending, current);
+            if (step > 0) {
+                // scheduler::set_thread_count returns void, so derive success by
+                // comparing thread count before and after the call.
+                scheduler_->set_thread_count(current + step);
+                size_t after = scheduler_->num_threads();
+                bool success = (after > current);
                 if constexpr (sizeof...(Actions) > 0) {
                     execute_overload_actions<Actions...>(success, pending);
                 }
@@ -115,13 +147,16 @@ private:
                        auto now, auto& last_idle_time) {
         (void)num_workers;
 
-        if (pending < config_.idle_threshold) {
+        if (below_idle_with_hysteresis(pending)) {
             auto idle_duration = now - last_idle_time;
             if (idle_duration > config_.idle_delay) {
-                // Try to scale down
                 size_t current = scheduler_->num_threads();
                 if (current > config_.min_workers) {
-                    bool success = scheduler_->set_thread_count(current - 1);
+                    // scheduler::set_thread_count returns void, derive success
+                    // by checking the thread count actually decreased.
+                    scheduler_->set_thread_count(current - 1);
+                    size_t after = scheduler_->num_threads();
+                    bool success = (after < current);
                     if constexpr (sizeof...(Actions) > 0) {
                         auto idle_secs = std::chrono::duration_cast<std::chrono::seconds>(idle_duration);
                         execute_idle_actions<Actions...>(success, pending, idle_secs);

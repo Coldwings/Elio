@@ -104,19 +104,26 @@ public:
 
         // Try fast path: push to lock-free inbox
         if (inbox_->push(handle.address())) [[likely]] {
-            // Lazy wake: only wake if worker is idle (waiting for work)
-            // This avoids unnecessary wake syscalls when worker is busy
-            // Use relaxed load - occasional extra wake is fine, we optimize for the common case
-            if (idle_.load(std::memory_order_relaxed)) {
-                wake();
-            }
+            // Always wake on cross-thread submit. The eventfd dedupes via its
+            // counter — calling wake() on a busy worker just bumps the counter
+            // and is consumed in the next poll cycle. The previous "lazy wake"
+            // load on idle_ raced with the worker's relaxed idle_=false store,
+            // missing wakes and producing 10 ms tail latency on weak hardware.
+            wake();
             return;
         }
 
         // Slow path: inbox full, retry with exponential back-off
-        // Keep retrying - inbox will eventually have space as worker drains it
+        // Bounded so a stalled / shutting-down worker can't make us spin forever.
         int backoff = 1;
-        while (true) {
+        constexpr int max_total_retries = 1024;
+        for (int total = 0; total < max_total_retries; ++total) {
+            // Bail out promptly if the worker is being shut down — otherwise
+            // an external producer keeps spinning while the inbox stays full.
+            if (!running_.load(std::memory_order_acquire)) {
+                handle.destroy();
+                return;
+            }
             for (int i = 0; i < backoff; ++i) {
                 #if defined(__x86_64__) || defined(_M_X64)
                 __builtin_ia32_pause();
@@ -125,15 +132,17 @@ public:
                 #endif
             }
             if (inbox_->push(handle.address())) {
-                // Lazy wake: only wake if worker is idle
-                if (idle_.load(std::memory_order_relaxed)) {
-                    wake();
-                }
+                wake();
                 return;
             }
             backoff = std::min(backoff * 2, 1024);
             std::this_thread::yield();
         }
+
+        // Last resort after the retry ceiling — destroy the handle rather
+        // than spinning indefinitely. In practice this branch is unreachable
+        // under correct workloads (inbox drains as the worker runs).
+        handle.destroy();
     }
     
     /// Schedule a task from owner thread - pushes directly to local deque

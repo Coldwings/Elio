@@ -155,10 +155,17 @@ public:
         return pthread_sigmask(SIG_SETMASK, &mask_, old_mask) == 0;
     }
     
-    /// Block signals for all threads (process-wide)
-    /// This should be called early in main() before spawning threads
+    /// Sets the signal mask of the CURRENT thread.
+    /// Call this once at the very beginning of main(), before any threads
+    /// are spawned, so that all subsequent threads inherit the masked set.
+    ///
+    /// @note pthread_sigmask only affects the calling thread; the name of
+    /// this method reflects the typical Linux pattern of masking early
+    /// (before any threads exist) so that children inherit the mask.
+    /// POSIX leaves sigprocmask undefined in multi-threaded programs, so
+    /// pthread_sigmask is used unconditionally here.
     bool block_all_threads() const noexcept {
-        return sigprocmask(SIG_BLOCK, &mask_, nullptr) == 0;
+        return pthread_sigmask(SIG_BLOCK, &mask_, nullptr) == 0;
     }
 
 private:

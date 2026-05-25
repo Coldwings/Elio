@@ -2,6 +2,7 @@
 #include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/async_main.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/sync/primitives.hpp>
 #include <elio/time/timer.hpp>
 
 #include <atomic>
@@ -31,6 +32,14 @@ task<void> mark_after_sleep_counter(std::chrono::milliseconds dur, std::atomic<i
 task<void> increment_only(std::atomic<int>* counter) {
     counter->fetch_add(1, std::memory_order_acq_rel);
     co_return;
+}
+
+// Suspends on an event until the test releases it. Used by tests that need a
+// task to remain "in-flight and tracked" for an arbitrary, observer-controlled
+// window (replaces timing-fragile sleep-based gates).
+task<void> wait_on_event(elio::sync::event* gate, std::atomic<int>* counter) {
+    co_await gate->wait();
+    counter->fetch_add(1, std::memory_order_acq_rel);
 }
 
 } // namespace
@@ -127,17 +136,26 @@ TEST_CASE("active_tasks counts in-flight tracked tasks",
 
     REQUIRE(sched.active_tasks() == 0);
 
+    // Use a manual-reset event as the in-flight gate instead of a timed sleep.
+    // The wrapped task suspends on `gate.wait()` until the test signals it,
+    // so the "in-flight tracked" window is bounded by us, not by a wall clock —
+    // eliminating the flake where a 100ms sleep_for could complete before the
+    // polling loop observed active_tasks() >= 1 under load / scaled timing.
+    elio::sync::event gate;
     std::atomic<int> done{0};
-    sched.go(mark_after_sleep_counter, scaled_ms(100), &done);
+    sched.go(wait_on_event, &gate, &done);
 
-    // Poll until the wrapper body has run its first instruction
-    // (which is when the counter increments).
-    auto deadline = std::chrono::steady_clock::now() + scaled_ms(500);
+    // Poll until the wrapper body has started and registered itself in
+    // active_tracked_. Generous deadline (the gate keeps the task in-flight).
+    auto deadline = std::chrono::steady_clock::now() + scaled_sec(5);
     while (sched.active_tasks() == 0 &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     REQUIRE(sched.active_tasks() >= 1);
+
+    // Release the task and let it complete.
+    gate.set();
 
     REQUIRE(sched.wait_for_idle(scaled_ms(2000)));
     REQUIRE(done.load() == 1);

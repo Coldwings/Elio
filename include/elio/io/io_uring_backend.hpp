@@ -49,6 +49,38 @@ namespace elio::io {
 //     ring on cross-thread ``notify()``. Note this also has bit 0 set, but
 //     is handled before the tag check.
 //   * ``nullptr``: used for cancel SQEs that do not need to resume anything.
+//
+// ---------------------------------------------------------------------------
+// pending_ops_ accounting invariant
+// ---------------------------------------------------------------------------
+//
+// Every SQE submitted via this backend gets exactly one ``pending_ops_``
+// increment on the way in and exactly one matching decrement when its CQE is
+// processed. There is exactly one exception: the wake-eventfd poll SQE
+// (``WAKE_SENTINEL``) is never counted on either side — it is purely
+// internal plumbing and ``process_completion`` returns early before touching
+// ``pending_ops_``.
+//
+// Cancel SQEs are slightly subtle but deliberately balanced: ``cancel()``
+// adds one (line where ``pending_ops_.fetch_add(1)`` lives) and the
+// completion of that cancel SQE arrives with ``user_data == nullptr``,
+// hits the regular ``fetch_sub(1)`` in ``process_completion``, then bails
+// out without resuming an awaiter. So pending_ops_ transiently rises by one
+// per cancel and then falls back. ``run_until_complete()`` consequently
+// waits for cancel CQEs as well as the original op's -ECANCELED CQE, which
+// is fine — both arrive promptly.
+//
+// Why not just skip counting the cancel SQE? Because the ``submit()``
+// rollback path (introduced in PR #58 to recover from io_uring_submit
+// failures) rolls back ``io_uring_sq_ready()`` from ``pending_ops_``, which
+// includes every staged SQE. Excluding cancels there would either cause an
+// unsigned underflow on submit failure or require a parallel "internal SQE"
+// counter, both of which add complexity to an error path. The
+// every-SQE-counted scheme keeps the rollback math trivial.
+//
+// Net effect: ``pending_count()`` reports user ops in flight plus any
+// in-flight cancel SQEs. Once a cancel completes, the count returns to
+// exactly the number of user ops in flight.
 // ---------------------------------------------------------------------------
 
 struct batch_state;
@@ -473,6 +505,11 @@ public:
         io_uring_prep_cancel(sqe, user_data, 0);
         io_uring_sqe_set_data(sqe, nullptr);  // No awaiter for cancel itself
 
+        // Count the cancel SQE itself in pending_ops_ so the submit()
+        // rollback path can use io_uring_sq_ready() without an extra
+        // "internal SQE" counter (see invariant block at top of file).
+        // The matching CQE arrives with nullptr user_data and is decremented
+        // back out by process_completion, restoring the count.
         pending_ops_.fetch_add(1, std::memory_order_relaxed);
 
         // Stage only — the next poll() auto-submits. Cancellation latency
@@ -547,18 +584,24 @@ private:
                            std::vector<deferred_resume_entry>* deferred_resumes = nullptr) {
         void* user_data = io_uring_cqe_get_data(cqe);
 
-        // Check for wake notification sentinel (must be before any tag-bit check
-        // because WAKE_SENTINEL itself has bit 0 set).
+        // Wake notification: never counted in pending_ops_ (see the invariant
+        // block at the top of this file). Must be checked before any tag-bit
+        // check because WAKE_SENTINEL itself has bit 0 set.
         if (user_data == reinterpret_cast<void*>(WAKE_SENTINEL)) {
             drain_notify();
             submit_wake_poll();
             return;
         }
 
+        // Every other CQE pairs 1:1 with an SQE that incremented pending_ops_
+        // (real user ops via prepare()/register_pending(), and cancel SQEs
+        // via cancel()). Decrement here once, then dispatch.
         pending_ops_.fetch_sub(1, std::memory_order_relaxed);
 
         if (!user_data) {
-            // Cancel operation or internal operation, no awaiter to resume
+            // Cancel SQE completion: no awaiter to resume. The matching
+            // user op's CQE arrives separately with -ECANCELED through one
+            // of the dispatch paths below.
             return;
         }
 

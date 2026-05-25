@@ -45,8 +45,14 @@
 ///
 /// ## Features
 ///
-/// - **Zero-copy serialization**: Binary format with direct memory access
-/// - **Out-of-order calls**: Responses matched by request ID
+/// - **Zero-copy reads**: `buffer_view` parses fields in place without
+///   allocating; `buffer_ref` lets handlers reference payload bytes
+///   directly. NOTE: on the *send* path `buffer_ref` is currently still
+///   memcpy'd into the outgoing buffer — it's a "no extra allocation"
+///   shortcut, not true zero-copy. Real iovec-tail send is planned.
+/// - **Out-of-order calls**: Responses matched by request ID; the server
+///   dispatches each request to a separate coroutine so a slow handler
+///   does not block subsequent requests on the same connection.
 /// - **Per-call timeouts**: Individual timeout per RPC call
 /// - **Nested types**: Support for complex nested structures
 /// - **Variable-length data**: Strings, arrays, maps, and optionals
@@ -57,7 +63,8 @@
 /// All messages use a binary wire format with:
 /// - 18-byte frame header (magic, request_id, type, flags, method_id, length)
 /// - Variable-length payload
-/// - Little-endian byte order (host order)
+/// - Every multi-byte field is little-endian on the wire (`rpc_endian.hpp`
+///   handles host conversion so big-endian peers interoperate correctly).
 
 #include "rpc_buffer.hpp"
 #include "rpc_types.hpp"

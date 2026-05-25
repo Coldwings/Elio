@@ -24,18 +24,52 @@
 #include "rpc_protocol.hpp"
 
 #include <elio/coro/task.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/net/tcp.hpp>
 #include <elio/net/uds.hpp>
 #include <elio/sync/primitives.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/time/timer.hpp>
 #include <elio/log/macros.hpp>
 
-#include <memory>
-#include <unordered_map>
-#include <functional>
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <sys/socket.h>
+#include <unordered_map>
 
 namespace elio::rpc {
+
+// ============================================================================
+// Server configuration
+// ============================================================================
+
+/// Configuration for an RPC server. All limits are enforced per-connection
+/// except where noted. The defaults are tuned to mitigate the "slow loris"
+/// class of attacks (peer trickling bytes to consume sockets indefinitely)
+/// without affecting well-behaved clients.
+struct rpc_server_config {
+    /// Maximum number of concurrent client sessions accepted by serve().
+    /// New connections beyond this limit are accepted-then-closed (so the
+    /// kernel doesn't keep the SYN backlog full) until existing sessions
+    /// finish. 0 means "unlimited" (legacy behaviour, NOT recommended).
+    size_t max_sessions = 1024;
+
+    /// Per-frame read deadline. If a peer takes longer than this to send a
+    /// complete frame (header + payload + optional checksum), the session
+    /// is torn down. 0s disables the deadline (NOT recommended).
+    std::chrono::seconds frame_read_timeout{30};
+
+    /// Maximum payload bytes (header excluded) accepted per frame. Defaults
+    /// to the protocol-wide max (16 MiB). Set to a smaller value when you
+    /// know your application's largest expected message — reducing this is
+    /// the most effective defence against memory-exhaustion DoS.
+    uint32_t max_message_size = elio::rpc::max_message_size;
+};
 
 // ============================================================================
 // RPC Context
@@ -81,38 +115,52 @@ using raw_handler_t = std::function<coro::task<handler_result>(
 // RPC Session
 // ============================================================================
 
-/// A single client session on the server
+/// A single client session on the server.
+///
+/// Concurrency model: the read loop streams in one frame at a time and
+/// dispatches each request via `runtime::scheduler::current()->go(...)` so
+/// out-of-order completion is possible (matching what the client promises).
+/// Writes are serialised by `send_mutex_` so concurrent handlers cannot
+/// interleave bytes on the wire.
+///
+/// Lifetime: the session keeps itself alive via shared_from_this() while
+/// any dispatched handler is in flight; the run loop's enable_shared_from_this
+/// pin is dropped only after every handler has completed.
 template<typename Stream>
 class rpc_session : public std::enable_shared_from_this<rpc_session<Stream>> {
 public:
     using ptr = std::shared_ptr<rpc_session>;
-    
-    /// Create a new session
+    using handler_map = std::unordered_map<method_id_t, raw_handler_t>;
+
+    /// Create a new session. The handler map is snapshot by value so a
+    /// later call to register_method on the server cannot race with the
+    /// session's reads.
     static ptr create(Stream stream,
-                      const std::unordered_map<method_id_t, raw_handler_t>& handlers)
+                      std::shared_ptr<const handler_map> handlers,
+                      rpc_server_config config = {})
     {
-        return ptr(new rpc_session(std::move(stream), handlers));
+        return ptr(new rpc_session(std::move(stream), std::move(handlers), config));
     }
-    
-    /// Run the session (process requests until disconnect)
+
+    /// Run the session (process requests until disconnect).
     coro::task<void> run() {
         auto self = this->shared_from_this();
         ELIO_LOG_DEBUG("RPC session started");
-        
+
         while (stream_.is_valid() && !closed_.load(std::memory_order_acquire)) {
-            auto frame = co_await read_frame(stream_);
+            auto frame = co_await read_frame_with_deadline();
             if (!frame) {
                 ELIO_LOG_DEBUG("RPC session: connection closed");
                 break;
             }
-            
+
             auto& [header, payload] = *frame;
-            
+
             switch (header.type) {
                 case message_type::request:
-                    co_await handle_request(header, std::move(payload));
+                    dispatch_request(header, std::move(payload));
                     break;
-                    
+
                 case message_type::ping: {
                     auto pong = build_pong(header.request_id);
                     buffer_writer empty;
@@ -121,81 +169,181 @@ public:
                     co_await write_frame(stream_, pong, empty);
                     break;
                 }
-                    
+
                 case message_type::cancel:
                     // TODO: Support request cancellation
                     ELIO_LOG_DEBUG("RPC session: received cancel for request {}",
-                                  header.request_id);
+                                   header.request_id);
                     break;
-                    
+
                 default:
                     ELIO_LOG_WARNING("RPC session: unexpected message type {}",
-                                    static_cast<int>(header.type));
+                                     static_cast<int>(header.type));
                     break;
             }
         }
-        
+
         closed_.store(true, std::memory_order_release);
         ELIO_LOG_DEBUG("RPC session ended");
     }
-    
-    /// Close the session
+
+    /// Close the session. Forces the read loop out of any pending recv.
     void close() {
-        closed_.store(true, std::memory_order_release);
+        if (!closed_.exchange(true, std::memory_order_acq_rel)) {
+            // Force any pending recv to return so the run loop wakes up.
+            int fd = stream_.fd();
+            if (fd >= 0) {
+                ::shutdown(fd, SHUT_RDWR);
+            }
+        }
     }
-    
+
     /// Check if session is closed
     bool is_closed() const noexcept {
         return closed_.load(std::memory_order_acquire);
     }
-    
+
 private:
     rpc_session(Stream stream,
-                const std::unordered_map<method_id_t, raw_handler_t>& handlers)
+                std::shared_ptr<const handler_map> handlers,
+                rpc_server_config config)
         : stream_(std::move(stream))
-        , handlers_(handlers) {}
-    
-    /// Handle an incoming request
+        , handlers_(std::move(handlers))
+        , config_(config) {}
+
+    /// Read a frame, enforcing config_.frame_read_timeout. The watchdog
+    /// shutdown(2)s the socket so any pending recv returns EOF/error.
+    ///
+    /// Concurrency note: the watchdog uses a polled "abort" flag rather
+    /// than the cancel_token machinery in time::sleep_for. Cancelling a
+    /// timer mid-await_suspend can race with the cancel callback (see the
+    /// destroy() at timer.hpp:151), which surfaces as a use-after-free in
+    /// the worker. Polling avoids that path entirely; the worst case is
+    /// the watchdog sleeps up to `poll_interval` past frame arrival.
+    coro::task<std::optional<std::pair<frame_header, message_buffer>>>
+    read_frame_with_deadline() {
+        if (config_.frame_read_timeout.count() <= 0) {
+            // No deadline configured.
+            co_return co_await read_frame_bounded(stream_, config_.max_message_size);
+        }
+
+        auto* sched = runtime::scheduler::current();
+        if (!sched) {
+            // Cannot spawn a watchdog without a scheduler; degrade gracefully.
+            co_return co_await read_frame_bounded(stream_, config_.max_message_size);
+        }
+
+        auto frame_done = std::make_shared<std::atomic<bool>>(false);
+        auto timed_out = std::make_shared<std::atomic<bool>>(false);
+        int fd = stream_.fd();
+        auto timeout = config_.frame_read_timeout;
+
+        auto watchdog = sched->go_joinable(
+            [fd, frame_done, timed_out, timeout]() -> coro::task<void> {
+                using clock = std::chrono::steady_clock;
+                auto deadline = clock::now() + timeout;
+                // Poll in small steps so the watchdog notices early frame
+                // completion without relying on cancel_token plumbing.
+                constexpr auto poll_interval = std::chrono::milliseconds(50);
+                while (!frame_done->load(std::memory_order_acquire)) {
+                    auto now = clock::now();
+                    if (now >= deadline) {
+                        timed_out->store(true, std::memory_order_release);
+                        if (fd >= 0) {
+                            ::shutdown(fd, SHUT_RDWR);
+                        }
+                        co_return;
+                    }
+                    auto step = std::min<std::chrono::steady_clock::duration>(
+                        poll_interval, deadline - now);
+                    co_await elio::time::sleep_for(step);
+                }
+                co_return;
+            });
+
+        auto frame = co_await read_frame_bounded(stream_, config_.max_message_size);
+
+        frame_done->store(true, std::memory_order_release);
+        co_await watchdog;
+
+        if (timed_out->load(std::memory_order_acquire)) {
+            ELIO_LOG_WARNING("RPC session: frame read timed out after {}s",
+                             timeout.count());
+            co_return std::nullopt;
+        }
+        co_return frame;
+    }
+
+    /// Dispatch a request handler to the scheduler so the read loop can
+    /// continue receiving the next frame (out-of-order completion).
+    void dispatch_request(frame_header header, message_buffer payload) {
+        auto* sched = runtime::scheduler::current();
+        if (!sched) {
+            ELIO_LOG_ERROR("RPC session: no current scheduler; dropping request {}",
+                           header.request_id);
+            return;
+        }
+        auto self = this->shared_from_this();
+        sched->go([self, hdr = header, pl = std::move(payload)]() mutable
+                      -> coro::task<void> {
+            co_await self->handle_request(hdr, std::move(pl));
+        });
+    }
+
+    /// Handle an incoming request (runs concurrently with the read loop).
     coro::task<void> handle_request(const frame_header& header, message_buffer payload) {
         // Find handler
-        auto it = handlers_.find(header.method_id);
-        if (it == handlers_.end()) {
+        auto it = handlers_->find(header.method_id);
+        if (it == handlers_->end()) {
             ELIO_LOG_WARNING("RPC session: method {} not found", header.method_id);
             auto error_frame = build_error_response(
-                header.request_id, 
+                header.request_id,
                 rpc_error::method_not_found,
                 "Method not found"
             );
             co_await send_response(error_frame.first, error_frame.second);
             co_return;
         }
-        
+
         // Build context
         rpc_context ctx;
         ctx.request_id = header.request_id;
         ctx.method_id = header.method_id;
-        
-        // Parse timeout if present
-        buffer_view view = payload.view();
-        if (has_flag(header.flags, message_flags::has_timeout)) {
-            ctx.timeout_ms = view.read<uint32_t>();
-        }
-        
+
         // Call handler and capture result or error
         bool handler_success = false;
         buffer_writer response_payload;
         cleanup_callback_t cleanup_cb;
         rpc_error error_code = rpc_error::success;
         std::string error_message;
-        
+
         try {
-            auto result = co_await it->second(ctx, view);
-            handler_success = result.success;
-            response_payload = std::move(result.payload);
-            cleanup_cb = std::move(result.cleanup);
-            if (!handler_success) {
-                error_code = rpc_error::internal_error;
-                error_message = "Handler failed";
+            // Parse timeout flag inside the try block: a malformed
+            // has_timeout flag with payload_length < 4 must surface as
+            // rpc_error::invalid_message instead of tearing the session
+            // down (it would otherwise escape this coroutine via an
+            // uncaught serialization_error).
+            buffer_view view = payload.view();
+            bool malformed_timeout = false;
+            if (has_flag(header.flags, message_flags::has_timeout)) {
+                if (view.remaining() < sizeof(uint32_t)) {
+                    error_code = rpc_error::invalid_message;
+                    error_message = "has_timeout flag set but payload too short";
+                    malformed_timeout = true;
+                } else {
+                    ctx.timeout_ms = view.read<uint32_t>();
+                }
+            }
+
+            if (!malformed_timeout) {
+                auto result = co_await it->second(ctx, view);
+                handler_success = result.success;
+                response_payload = std::move(result.payload);
+                cleanup_cb = std::move(result.cleanup);
+                if (!handler_success) {
+                    error_code = rpc_error::internal_error;
+                    error_message = "Handler failed";
+                }
             }
         } catch (const serialization_error& e) {
             ELIO_LOG_ERROR("RPC session: serialization error: {}", e.what());
@@ -206,7 +354,7 @@ private:
             error_code = rpc_error::internal_error;
             error_message = e.what();
         }
-        
+
         // Send response (outside exception handlers)
         if (handler_success) {
             frame_header resp_header;
@@ -215,7 +363,7 @@ private:
             resp_header.flags = message_flags::none;
             resp_header.method_id = 0;
             resp_header.payload_length = static_cast<uint32_t>(response_payload.size());
-            
+
             co_await send_response(resp_header, response_payload);
         } else {
             auto error_frame = build_error_response(
@@ -225,7 +373,7 @@ private:
             );
             co_await send_response(error_frame.first, error_frame.second);
         }
-        
+
         // Invoke cleanup callback after response is sent
         if (cleanup_cb) {
             try {
@@ -235,18 +383,22 @@ private:
             }
         }
     }
-    
-    /// Send a response frame
-    coro::task<void> send_response(const frame_header& header, 
-                                    const buffer_writer& payload) 
+
+    /// Send a response frame; serialised against other concurrent handlers
+    /// on the same connection by `send_mutex_`.
+    coro::task<void> send_response(const frame_header& header,
+                                    const buffer_writer& payload)
     {
         co_await send_mutex_.lock();
         sync::lock_guard guard(send_mutex_);
         co_await write_frame(stream_, header, payload);
     }
-    
+
     Stream stream_;
-    const std::unordered_map<method_id_t, raw_handler_t>& handlers_;
+    /// Snapshot of the server's handler map captured at session creation.
+    /// Guarantees the read loop never observes a torn map (Fix 5).
+    std::shared_ptr<const handler_map> handlers_;
+    rpc_server_config config_;
     std::atomic<bool> closed_{false};
     sync::mutex send_mutex_;
 };
@@ -255,31 +407,50 @@ private:
 // RPC Server
 // ============================================================================
 
-/// RPC server that accepts connections and handles requests
+/// RPC server that accepts connections and handles requests.
+///
+/// Lifecycle:
+///   1. Construct with optional rpc_server_config.
+///   2. Call register_method<...>() any number of times BEFORE serve().
+///   3. Call serve() (or handle_client()) to begin accepting connections.
+///      At this moment the handler map is "frozen": further calls to
+///      register_method() will throw std::logic_error.
+///
+/// This freeze model (Fix 5) guarantees that a session's `handlers_` view
+/// is immutable for its entire lifetime, eliminating the data race that
+/// existed when sessions held a `const unordered_map&` to a map the server
+/// kept mutating.
 template<typename Stream>
 class rpc_server {
 public:
     using stream_type = Stream;
     using session_type = rpc_session<Stream>;
     using session_ptr = typename session_type::ptr;
-    
+    using handler_map = typename session_type::handler_map;
+
     rpc_server() = default;
+    explicit rpc_server(rpc_server_config config) : config_(config) {}
     ~rpc_server() = default;
-    
+
     // Non-copyable, non-movable
     rpc_server(const rpc_server&) = delete;
     rpc_server& operator=(const rpc_server&) = delete;
     rpc_server(rpc_server&&) = delete;
     rpc_server& operator=(rpc_server&&) = delete;
+
+    /// Read-only access to the configuration.
+    const rpc_server_config& config() const noexcept { return config_; }
     
     /// Register a method handler
     /// @tparam Method The method descriptor type
     /// @tparam Handler A callable returning task<Response>
+    /// @throws std::invalid_argument if Method::id was already registered
+    /// @throws std::logic_error if called after serve() has started
     template<typename Method, typename Handler>
     void register_method(Handler handler) {
         using Request = typename Method::request_type;
         using Response = typename Method::response_type;
-        
+
         raw_handler_t raw_handler = [h = std::move(handler)](
             [[maybe_unused]] const rpc_context& ctx,
             buffer_view payload
@@ -287,28 +458,30 @@ public:
             // Deserialize request
             Request request;
             deserialize(payload, request);
-            
+
             // Call handler
             Response response = co_await h(request);
-            
+
             // Serialize response
             buffer_writer response_data;
             serialize(response_data, response);
-            
+
             co_return handler_result{true, std::move(response_data), nullptr};
         };
-        
-        handlers_[Method::id] = std::move(raw_handler);
+
+        insert_handler(Method::id, std::move(raw_handler));
     }
-    
+
     /// Register a method handler with context
     /// @tparam Method The method descriptor type
     /// @tparam Handler A callable taking (ctx, request) and returning task<Response>
+    /// @throws std::invalid_argument if Method::id was already registered
+    /// @throws std::logic_error if called after serve() has started
     template<typename Method, typename Handler>
     void register_method_with_context(Handler handler) {
         using Request = typename Method::request_type;
         using Response = typename Method::response_type;
-        
+
         raw_handler_t raw_handler = [h = std::move(handler)](
             const rpc_context& ctx,
             buffer_view payload
@@ -316,26 +489,28 @@ public:
             // Deserialize request
             Request request;
             deserialize(payload, request);
-            
+
             // Call handler with context
             Response response = co_await h(ctx, request);
-            
+
             // Serialize response
             buffer_writer response_data;
             serialize(response_data, response);
-            
+
             co_return handler_result{true, std::move(response_data), nullptr};
         };
-        
-        handlers_[Method::id] = std::move(raw_handler);
+
+        insert_handler(Method::id, std::move(raw_handler));
     }
-    
+
     /// Register a synchronous method handler (doesn't need co_await)
+    /// @throws std::invalid_argument if Method::id was already registered
+    /// @throws std::logic_error if called after serve() has started
     template<typename Method, typename Handler>
     void register_sync_method(Handler handler) {
         using Request = typename Method::request_type;
         using Response = typename Method::response_type;
-        
+
         raw_handler_t raw_handler = [h = std::move(handler)](
             [[maybe_unused]] const rpc_context& ctx,
             buffer_view payload
@@ -343,18 +518,18 @@ public:
             // Deserialize request
             Request request;
             deserialize(payload, request);
-            
+
             // Call synchronous handler
             Response response = h(request);
-            
+
             // Serialize response
             buffer_writer response_data;
             serialize(response_data, response);
-            
+
             co_return handler_result{true, std::move(response_data), nullptr};
         };
-        
-        handlers_[Method::id] = std::move(raw_handler);
+
+        insert_handler(Method::id, std::move(raw_handler));
     }
     
     /// Register a method handler with cleanup callback support
@@ -362,10 +537,12 @@ public:
     /// The cleanup callback is invoked after the response is successfully sent
     /// @tparam Method The method descriptor type
     /// @tparam Handler A callable returning task<std::pair<Response, cleanup_callback_t>>
+    /// @throws std::invalid_argument if Method::id was already registered
+    /// @throws std::logic_error if called after serve() has started
     template<typename Method, typename Handler>
     void register_method_with_cleanup(Handler handler) {
         using Request = typename Method::request_type;
-        
+
         raw_handler_t raw_handler = [h = std::move(handler)](
             [[maybe_unused]] const rpc_context& ctx,
             buffer_view payload
@@ -373,28 +550,30 @@ public:
             // Deserialize request
             Request request;
             deserialize(payload, request);
-            
+
             // Call handler - returns (response, cleanup_callback)
             auto [response, cleanup] = co_await h(request);
-            
+
             // Serialize response
             buffer_writer response_data;
             serialize(response_data, response);
-            
+
             co_return handler_result{true, std::move(response_data), std::move(cleanup)};
         };
-        
-        handlers_[Method::id] = std::move(raw_handler);
+
+        insert_handler(Method::id, std::move(raw_handler));
     }
-    
+
     /// Register a method handler with context and cleanup callback support
     /// Handler should return std::pair<Response, cleanup_callback_t>
     /// @tparam Method The method descriptor type
     /// @tparam Handler A callable taking (ctx, request) and returning task<std::pair<Response, cleanup_callback_t>>
+    /// @throws std::invalid_argument if Method::id was already registered
+    /// @throws std::logic_error if called after serve() has started
     template<typename Method, typename Handler>
     void register_method_with_context_and_cleanup(Handler handler) {
         using Request = typename Method::request_type;
-        
+
         raw_handler_t raw_handler = [h = std::move(handler)](
             const rpc_context& ctx,
             buffer_view payload
@@ -402,28 +581,29 @@ public:
             // Deserialize request
             Request request;
             deserialize(payload, request);
-            
+
             // Call handler with context - returns (response, cleanup_callback)
             auto [response, cleanup] = co_await h(ctx, request);
-            
+
             // Serialize response
             buffer_writer response_data;
             serialize(response_data, response);
-            
+
             co_return handler_result{true, std::move(response_data), std::move(cleanup)};
         };
-        
-        handlers_[Method::id] = std::move(raw_handler);
+
+        insert_handler(Method::id, std::move(raw_handler));
     }
     
     /// Serve connections from a TCP listener
     coro::task<void> serve(net::tcp_listener& listener)
     requires std::is_same_v<Stream, net::tcp_stream>
     {
+        freeze_handlers();
         ELIO_LOG_INFO("RPC server starting on {}",
                      listener.local_address().to_string());
         running_.store(true, std::memory_order_release);
-        
+
         while (running_.load(std::memory_order_acquire)) {
             auto stream = co_await listener.accept();
             if (!stream) {
@@ -432,34 +612,48 @@ public:
                 }
                 continue;
             }
-            
+
+            // Backpressure: reject new sessions when at the configured cap.
+            // We accept then immediately drop so the kernel's listen backlog
+            // doesn't fill up.
+            if (!try_reserve_session_slot()) {
+                ELIO_LOG_WARNING(
+                    "RPC server: max_sessions={} reached, rejecting new connection",
+                    config_.max_sessions);
+                continue;  // stream dtor closes the socket
+            }
+
             // Create and start session
-            auto session = session_type::create(std::move(*stream), handlers_);
-            
+            auto session = session_type::create(std::move(*stream),
+                                                 frozen_handlers_, config_);
+
             // Track session
             {
                 std::lock_guard<std::mutex> lock(sessions_mutex_);
                 sessions_.push_back(session);
             }
-            
+
             // Spawn session handler
             auto* sched = runtime::scheduler::current();
             if (sched) {
                 sched->go([this, s = session]() { return run_session(s); });
+            } else {
+                release_session_slot();
             }
         }
-        
+
         ELIO_LOG_INFO("RPC server stopped");
     }
-    
+
     /// Serve connections from a UDS listener
     coro::task<void> serve(net::uds_listener& listener)
     requires std::is_same_v<Stream, net::uds_stream>
     {
+        freeze_handlers();
         ELIO_LOG_INFO("RPC server starting on {}",
                      listener.local_address().to_string());
         running_.store(true, std::memory_order_release);
-        
+
         while (running_.load(std::memory_order_acquire)) {
             auto stream = co_await listener.accept();
             if (!stream) {
@@ -468,37 +662,55 @@ public:
                 }
                 continue;
             }
-            
+
+            if (!try_reserve_session_slot()) {
+                ELIO_LOG_WARNING(
+                    "RPC server: max_sessions={} reached, rejecting new connection",
+                    config_.max_sessions);
+                continue;
+            }
+
             // Create and start session
-            auto session = session_type::create(std::move(*stream), handlers_);
-            
+            auto session = session_type::create(std::move(*stream),
+                                                 frozen_handlers_, config_);
+
             // Track session
             {
                 std::lock_guard<std::mutex> lock(sessions_mutex_);
                 sessions_.push_back(session);
             }
-            
+
             // Spawn session handler
             auto* sched = runtime::scheduler::current();
             if (sched) {
                 sched->go([this, s = session]() { return run_session(s); });
+            } else {
+                release_session_slot();
             }
         }
-        
+
         ELIO_LOG_INFO("RPC server stopped");
     }
-    
+
     /// Handle a single client stream (useful for testing or custom accept logic)
     coro::task<void> handle_client(Stream stream) {
-        auto session = session_type::create(std::move(stream), handlers_);
-        
+        freeze_handlers();
+        if (!try_reserve_session_slot()) {
+            ELIO_LOG_WARNING(
+                "RPC server: max_sessions={} reached, dropping client",
+                config_.max_sessions);
+            co_return;  // stream dtor closes the socket
+        }
+        auto session = session_type::create(std::move(stream),
+                                             frozen_handlers_, config_);
+
         {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
             sessions_.push_back(session);
         }
-        
+
         co_await session->run();
-        
+
         // Remove from active sessions
         {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
@@ -508,6 +720,7 @@ public:
                 sessions_.end()
             );
         }
+        release_session_slot();
     }
     
     /// Stop the server
@@ -533,10 +746,57 @@ public:
     }
     
 private:
+    /// Insert a handler entry, rejecting duplicates and post-serve writes.
+    /// (Fixes 5 and 8.)
+    void insert_handler(method_id_t id, raw_handler_t handler) {
+        if (handlers_frozen_.load(std::memory_order_acquire)) {
+            throw std::logic_error(
+                "rpc_server: register_method called after serve() has started");
+        }
+        auto [it, inserted] = handlers_.emplace(id, std::move(handler));
+        (void)it;
+        if (!inserted) {
+            throw std::invalid_argument(
+                "rpc_server: duplicate method id");
+        }
+    }
+
+    /// Snapshot the handler map so sessions hold an immutable view.
+    /// Idempotent: subsequent calls are no-ops. Thread-safe: concurrent
+    /// callers (e.g. parallel handle_client() entries) all see the same
+    /// snapshot once published.
+    void freeze_handlers() {
+        std::call_once(freeze_once_, [this]() {
+            frozen_handlers_ = std::make_shared<const handler_map>(handlers_);
+            handlers_frozen_.store(true, std::memory_order_release);
+        });
+    }
+
+    /// Reserve a session slot if max_sessions has not been reached.
+    /// max_sessions == 0 means unlimited.
+    bool try_reserve_session_slot() noexcept {
+        if (config_.max_sessions == 0) {
+            active_sessions_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        size_t cur = active_sessions_.load(std::memory_order_relaxed);
+        while (cur < config_.max_sessions) {
+            if (active_sessions_.compare_exchange_weak(
+                    cur, cur + 1, std::memory_order_acq_rel)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void release_session_slot() noexcept {
+        active_sessions_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
     /// Run a session and clean up when done
     coro::task<void> run_session(session_ptr session) {
         co_await session->run();
-        
+
         // Remove from active sessions
         {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
@@ -546,11 +806,17 @@ private:
                 sessions_.end()
             );
         }
+        release_session_slot();
     }
-    
-    std::unordered_map<method_id_t, raw_handler_t> handlers_;
+
+    rpc_server_config config_{};
+    handler_map handlers_;
+    std::atomic<bool> handlers_frozen_{false};
+    std::once_flag freeze_once_;
+    std::shared_ptr<const handler_map> frozen_handlers_;
     std::atomic<bool> running_{false};
-    
+    std::atomic<size_t> active_sessions_{0};
+
     mutable std::mutex sessions_mutex_;
     std::vector<session_ptr> sessions_;
 };

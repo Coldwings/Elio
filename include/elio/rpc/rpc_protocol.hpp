@@ -9,7 +9,8 @@
 /// - Optional CRC32 checksum for message integrity
 /// - Stream-based framing for TCP/UDS sockets
 ///
-/// Wire Format (all little-endian):
+/// Wire Format (every multi-byte field is little-endian on the wire,
+/// regardless of host byte order — see rpc_endian.hpp):
 /// +----------+----------+-------+--------+------------+---------+
 /// | magic(4) | req_id(4)| type(1)| flags(1)| method(4) | len(4)  |
 /// +----------+----------+-------+--------+------------+---------+
@@ -22,6 +23,7 @@
 /// Checksum trailer: 4 bytes (optional)
 
 #include "rpc_buffer.hpp"
+#include "rpc_endian.hpp"
 #include "rpc_types.hpp"
 
 #include <elio/coro/task.hpp>
@@ -120,19 +122,19 @@ struct frame_header {
         writer.write(payload_length);
     }
     
-    /// Serialize header to byte array
+    /// Serialize header to byte array (little-endian on every host).
     std::array<uint8_t, frame_header_size> to_bytes() const {
         std::array<uint8_t, frame_header_size> bytes;
         uint8_t* p = bytes.data();
-        std::memcpy(p, &magic, 4); p += 4;
-        std::memcpy(p, &request_id, 4); p += 4;
+        endian::write_le<uint32_t>(p, magic); p += 4;
+        endian::write_le<uint32_t>(p, request_id); p += 4;
         *p++ = static_cast<uint8_t>(type);
         *p++ = static_cast<uint8_t>(flags);
-        std::memcpy(p, &method_id, 4); p += 4;
-        std::memcpy(p, &payload_length, 4);
+        endian::write_le<uint32_t>(p, method_id); p += 4;
+        endian::write_le<uint32_t>(p, payload_length);
         return bytes;
     }
-    
+
     /// Deserialize header from buffer view
     static frame_header deserialize(buffer_view& reader) {
         frame_header h;
@@ -144,17 +146,17 @@ struct frame_header {
         h.payload_length = reader.read<uint32_t>();
         return h;
     }
-    
-    /// Deserialize from byte array
+
+    /// Deserialize from byte array (assumes little-endian on the wire).
     static frame_header from_bytes(const uint8_t* data) {
         frame_header h;
         const uint8_t* p = data;
-        std::memcpy(&h.magic, p, 4); p += 4;
-        std::memcpy(&h.request_id, p, 4); p += 4;
+        h.magic = endian::read_le<uint32_t>(p); p += 4;
+        h.request_id = endian::read_le<uint32_t>(p); p += 4;
         h.type = static_cast<message_type>(*p++);
         h.flags = static_cast<message_flags>(*p++);
-        std::memcpy(&h.method_id, p, 4); p += 4;
-        std::memcpy(&h.payload_length, p, 4);
+        h.method_id = endian::read_le<uint32_t>(p); p += 4;
+        h.payload_length = endian::read_le<uint32_t>(p);
         return h;
     }
 };
@@ -277,26 +279,39 @@ coro::task<io::io_result> writev_exact(Stream& stream, struct iovec* iovecs, siz
     co_return io::io_result{static_cast<int32_t>(total_length), 0};
 }
 
-/// Read a complete frame from stream
-/// If the frame has the has_checksum flag set, verifies the CRC32 checksum
+/// Read a complete frame from the stream, capping the payload at
+/// `max_payload`. The cap is checked BEFORE allocating the receive buffer
+/// (so a peer cannot trick us into a large allocation), and the underlying
+/// connection is closed (caller-side) when the cap is exceeded.
+///
+/// If the frame has the has_checksum flag set, verifies the CRC32 checksum.
 template<rpc_stream Stream>
-coro::task<std::optional<std::pair<frame_header, message_buffer>>> 
-read_frame(Stream& stream) {
+coro::task<std::optional<std::pair<frame_header, message_buffer>>>
+read_frame_bounded(Stream& stream, uint32_t max_payload) {
     // Read header
     std::array<uint8_t, frame_header_size> header_buf;
     auto result = co_await read_exact(stream, header_buf.data(), frame_header_size);
     if (result.result <= 0) {
         co_return std::nullopt;
     }
-    
+
     // Parse header
     frame_header header = frame_header::from_bytes(header_buf.data());
     if (!header.is_valid()) {
-        ELIO_LOG_ERROR("Invalid frame header: magic={:08x}, len={}", 
+        ELIO_LOG_ERROR("Invalid frame header: magic={:08x}, len={}",
                       header.magic, header.payload_length);
         co_return std::nullopt;
     }
-    
+
+    // Enforce per-frame payload cap BEFORE allocating, so an attacker
+    // sending a 16 MiB header field cannot pre-allocate that much buffer
+    // even when the configured cap is much smaller.
+    if (header.payload_length > max_payload) {
+        ELIO_LOG_ERROR("Frame payload too large: len={} > cap={}",
+                       header.payload_length, max_payload);
+        co_return std::nullopt;
+    }
+
     // Read payload
     message_buffer payload(header.payload_length);
     if (header.payload_length > 0) {
@@ -305,74 +320,82 @@ read_frame(Stream& stream) {
             co_return std::nullopt;
         }
     }
-    
-    // Verify checksum if present
+
+    // Verify checksum if present (LE on the wire)
     if (has_flag(header.flags, message_flags::has_checksum)) {
-        // Read checksum trailer
-        uint32_t received_checksum = 0;
-        result = co_await read_exact(stream, &received_checksum, checksum_size);
+        std::array<uint8_t, checksum_size> chk_bytes{};
+        result = co_await read_exact(stream, chk_bytes.data(), checksum_size);
         if (result.result <= 0) {
             co_return std::nullopt;
         }
-        
+        uint32_t received_checksum = endian::read_le<uint32_t>(chk_bytes.data());
+
         // Compute checksum over header + payload
         uint32_t crc = hash::crc32_update(header_buf.data(), frame_header_size, 0xFFFFFFFF);
         if (header.payload_length > 0) {
             crc = hash::crc32_update(payload.data(), header.payload_length, crc);
         }
         uint32_t computed = hash::crc32_finalize(crc);
-        
+
         if (computed != received_checksum) {
             ELIO_LOG_ERROR("Frame checksum mismatch: expected={:08x}, received={:08x}",
                           computed, received_checksum);
             co_return std::nullopt;
         }
     }
-    
+
     co_return std::make_pair(header, std::move(payload));
+}
+
+/// Read a complete frame using the protocol-wide max payload cap.
+/// Prefer `read_frame_bounded` with an application-specific cap.
+template<rpc_stream Stream>
+coro::task<std::optional<std::pair<frame_header, message_buffer>>>
+read_frame(Stream& stream) {
+    return read_frame_bounded(stream, static_cast<uint32_t>(max_message_size));
 }
 
 /// Write a frame to stream using scatter-gather I/O for atomicity
 /// If the header has the has_checksum flag set, appends CRC32 checksum
 template<rpc_stream Stream>
-coro::task<bool> write_frame(Stream& stream, const frame_header& header, 
+coro::task<bool> write_frame(Stream& stream, const frame_header& header,
                               const buffer_writer& payload) {
     // Prepare header bytes
     auto header_bytes = header.to_bytes();
-    
+
     // Compute checksum if needed (must be done before building iovecs)
-    uint32_t checksum = 0;
+    std::array<uint8_t, checksum_size> checksum_bytes{};
     if (has_flag(header.flags, message_flags::has_checksum)) {
         uint32_t crc = hash::crc32_update(header_bytes.data(), frame_header_size, 0xFFFFFFFF);
         if (payload.size() > 0) {
             crc = hash::crc32_update(payload.data(), payload.size(), crc);
         }
-        checksum = hash::crc32_finalize(crc);
+        endian::write_le<uint32_t>(checksum_bytes.data(), hash::crc32_finalize(crc));
     }
-    
+
     // Build iovec array for atomic write
     struct iovec iovecs[3];
     size_t iov_count = 0;
-    
+
     // Header
     iovecs[iov_count].iov_base = header_bytes.data();
     iovecs[iov_count].iov_len = frame_header_size;
     ++iov_count;
-    
+
     // Payload
     if (payload.size() > 0) {
         iovecs[iov_count].iov_base = const_cast<uint8_t*>(payload.data());
         iovecs[iov_count].iov_len = payload.size();
         ++iov_count;
     }
-    
+
     // Checksum
     if (has_flag(header.flags, message_flags::has_checksum)) {
-        iovecs[iov_count].iov_base = &checksum;
+        iovecs[iov_count].iov_base = checksum_bytes.data();
         iovecs[iov_count].iov_len = checksum_size;
         ++iov_count;
     }
-    
+
     // Write all data atomically using scatter-gather I/O
     auto result = co_await writev_exact(stream, iovecs, iov_count);
     co_return result.result > 0;
@@ -385,40 +408,40 @@ coro::task<bool> write_frame(Stream& stream, const frame_header& header,
                               const void* payload_data, size_t payload_size) {
     // Prepare header bytes
     auto header_bytes = header.to_bytes();
-    
+
     // Compute checksum if needed
-    uint32_t checksum = 0;
+    std::array<uint8_t, checksum_size> checksum_bytes{};
     if (has_flag(header.flags, message_flags::has_checksum)) {
         uint32_t crc = hash::crc32_update(header_bytes.data(), frame_header_size, 0xFFFFFFFF);
         if (payload_size > 0) {
             crc = hash::crc32_update(payload_data, payload_size, crc);
         }
-        checksum = hash::crc32_finalize(crc);
+        endian::write_le<uint32_t>(checksum_bytes.data(), hash::crc32_finalize(crc));
     }
-    
+
     // Build iovec array for atomic write
     struct iovec iovecs[3];
     size_t iov_count = 0;
-    
+
     // Header
     iovecs[iov_count].iov_base = header_bytes.data();
     iovecs[iov_count].iov_len = frame_header_size;
     ++iov_count;
-    
+
     // Payload
     if (payload_size > 0) {
         iovecs[iov_count].iov_base = const_cast<void*>(payload_data);
         iovecs[iov_count].iov_len = payload_size;
         ++iov_count;
     }
-    
+
     // Checksum
     if (has_flag(header.flags, message_flags::has_checksum)) {
-        iovecs[iov_count].iov_base = &checksum;
+        iovecs[iov_count].iov_base = checksum_bytes.data();
         iovecs[iov_count].iov_len = checksum_size;
         ++iov_count;
     }
-    
+
     // Write all data atomically using scatter-gather I/O
     auto result = co_await writev_exact(stream, iovecs, iov_count);
     co_return result.result > 0;

@@ -152,6 +152,68 @@ struct map_types<std::unordered_map<K, V, H, E, A>> {
 };
 
 // ============================================================================
+// Wire-size lower bounds (used to bound attacker-controlled count fields)
+// ============================================================================
+
+/// Minimum number of bytes any value of T occupies on the wire.
+/// Used to validate length-prefixed counts before allocating containers.
+/// Defaults to 1 (every type consumes at least 1 byte except for empty
+/// aggregates, which we cap separately by the global hard cap).
+template<typename T>
+struct min_wire_size : std::integral_constant<size_t, 1> {};
+
+template<typename T>
+requires is_primitive_v<T>
+struct min_wire_size<T> : std::integral_constant<size_t, sizeof(T)> {};
+
+template<>
+struct min_wire_size<std::string> : std::integral_constant<size_t, 4> {}; // length prefix
+
+template<>
+struct min_wire_size<std::string_view> : std::integral_constant<size_t, 4> {};
+
+template<typename T, typename A>
+struct min_wire_size<std::vector<T, A>> : std::integral_constant<size_t, 4> {};
+
+template<typename T, size_t N>
+struct min_wire_size<std::array<T, N>>
+    : std::integral_constant<size_t, N * min_wire_size<T>::value> {};
+
+template<typename K, typename V, typename C, typename A>
+struct min_wire_size<std::map<K, V, C, A>> : std::integral_constant<size_t, 4> {};
+
+template<typename K, typename V, typename H, typename E, typename A>
+struct min_wire_size<std::unordered_map<K, V, H, E, A>>
+    : std::integral_constant<size_t, 4> {};
+
+template<typename T>
+struct min_wire_size<std::optional<T>> : std::integral_constant<size_t, 1> {};
+
+template<typename T>
+inline constexpr size_t min_wire_size_v = min_wire_size<T>::value;
+
+/// Hard upper bound on container element counts. Even when the wire offers
+/// many bytes (e.g. nested empty aggregates), we never allocate more than
+/// this many container slots from a single deserialize call. Mirrors the
+/// per-frame cap so a single message cannot trigger arbitrary RAM use.
+inline constexpr size_t max_container_count = max_message_size;
+
+/// Validate a wire-supplied count against the bytes left in the buffer.
+/// Throws if the count would require more elements than the buffer could
+/// possibly contain, or exceeds the global hard cap.
+template<size_t MinElemSize>
+inline void check_container_count(uint32_t count, size_t remaining) {
+    if (count > max_container_count) {
+        throw serialization_error("container count exceeds max_container_count");
+    }
+    if constexpr (MinElemSize > 0) {
+        if (static_cast<size_t>(count) > remaining / MinElemSize) {
+            throw serialization_error("container count exceeds remaining buffer");
+        }
+    }
+}
+
+// ============================================================================
 // RPC struct field introspection
 // ============================================================================
 
@@ -265,6 +327,9 @@ void serialize_impl(buffer_writer& writer, const std::vector<T, A>& vec) {
 template<typename T, typename A>
 void deserialize_impl(buffer_view& reader, std::vector<T, A>& vec) {
     uint32_t count = reader.read_array_size();
+    // Bound count against attacker-controlled DoS: a malicious peer could
+    // send count=0xFFFFFFFF to force a 4G * sizeof(T) allocation.
+    check_container_count<min_wire_size_v<T>>(count, reader.remaining());
     vec.clear();
     vec.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
@@ -308,8 +373,11 @@ requires is_map_type_v<Map>
 void deserialize_impl(buffer_view& reader, Map& map) {
     using K = typename map_types<Map>::key_type;
     using V = typename map_types<Map>::value_type;
-    
+
     uint32_t count = reader.read_array_size();
+    // A malicious count would force unbounded hash-bucket / node allocation.
+    constexpr size_t pair_min = min_wire_size_v<K> + min_wire_size_v<V>;
+    check_container_count<pair_min>(count, reader.remaining());
     map.clear();
     for (uint32_t i = 0; i < count; ++i) {
         K key;

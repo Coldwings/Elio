@@ -272,15 +272,45 @@ public:
 
     /// Register a coroutine handle to be resumed when cancelled.
     ///
-    /// The cancel callback may run on any thread (typically whichever thread
-    /// invoked cancel_source::cancel()). Resuming the coroutine directly from
-    /// that thread does not restore vthread_stack::current() / the promise
-    /// frame chain, ignores worker affinity, and races on handle.done().
-    /// Route the resume through runtime::schedule_handle, which dispatches
-    /// onto the worker that owns (or will own) the coroutine and re-establishes
-    /// the per-vthread context before resuming.
+    /// **Deprecated.** This API is unsafe when ``handle`` is concurrently
+    /// suspended on an ``io::io_awaitable_base`` subclass (recv/send/accept/
+    /// connect/timeout/poll/read/write/close/...). Each io awaitable owns an
+    /// ``op_state`` whose phase atomic is shared with an in-flight SQE. If
+    /// cancellation fires while the SQE is still pending, two paths race to
+    /// resume the same coroutine:
+    ///
+    ///   1. ``on_cancel_resume`` schedules the handle on a worker. The worker
+    ///      resumes the coroutine; the io awaitable's destructor attempts to
+    ///      CAS the op_state phase from ``pending`` to ``orphaned``.
+    ///   2. The kernel CQE arrives concurrently. ``dispatch_op_state`` CASes
+    ///      ``pending`` → ``completed`` (winning before the destructor runs)
+    ///      and schedules the same handle a second time, resuming an
+    ///      already-destroyed frame.
+    ///
+    /// The correct pattern is to give the io awaitable its own ``cancel_token``
+    /// at construction (see ``time::sleep_for(duration, token)`` /
+    /// ``cancellable_sleep_awaitable``). That implementation registers
+    /// ``on_cancel`` on the token and, from the cancel callback, schedules a
+    /// fire-and-forget coroutine onto the awaiter's worker that submits an
+    /// ``IORING_OP_ASYNC_CANCEL`` SQE via ``io_context::cancel``. The kernel
+    /// then delivers exactly one terminal CQE, and the existing op_state
+    /// CAS resolves the cancel-vs-completion race correctly.
+    ///
+    /// For non-io use cases, prefer ``on_cancel(callable)`` and have the
+    /// coroutine poll an ``event`` / atomic flag, or wake via ``channel`` /
+    /// ``condition_variable``.
+    ///
+    /// The implementation is retained (and routes through
+    /// ``runtime::schedule_handle`` so that vthread_stack / promise context is
+    /// restored before resume) for callers who can prove their handle is
+    /// **not** suspended on an io awaitable. Otherwise this is a footgun.
     /// @param handle Coroutine to resume on cancellation
     /// @return Registration handle
+    [[deprecated(
+        "Unsafe with handles suspended on io_awaitables (double-resume race "
+        "with op_state CAS). Pass a cancel_token to the awaitable instead "
+        "(see time::sleep_for(d, token) / cancellable_sleep_awaitable), or "
+        "use on_cancel(callable) with an event/atomic flag.")]]
     [[nodiscard]] registration on_cancel_resume(std::coroutine_handle<> handle) const {
         return on_cancel([handle]() {
             if (handle && !handle.done()) {

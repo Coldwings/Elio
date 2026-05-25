@@ -244,6 +244,67 @@ TEST_CASE("sha256 reset", "[hash][sha256]") {
 }
 
 // ============================================================================
+// Hardware vs software dispatch parity (force_software_hash)
+// ============================================================================
+
+namespace {
+
+struct force_sw_guard {
+    bool prev;
+    force_sw_guard() noexcept : prev(get_force_software_hash()) {
+        set_force_software_hash(true);
+    }
+    ~force_sw_guard() { set_force_software_hash(prev); }
+};
+
+template <class HashFn>
+void check_parity(HashFn fn, const std::string& msg) {
+    auto hw_digest = fn(msg);
+    {
+        force_sw_guard guard;
+        auto sw_digest = fn(msg);
+        REQUIRE(sw_digest == hw_digest);
+    }
+}
+
+} // namespace
+
+TEST_CASE("sha1 hw/sw parity", "[hash][sha1][parity]") {
+    auto fn = [](const std::string& s) { return sha1(s); };
+
+    check_parity(fn, "");
+    check_parity(fn, "abc");
+    check_parity(fn, "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+    check_parity(fn, std::string(1000, 'a'));
+    // Multi-block (>1024 bytes) so the block loop runs many iterations
+    check_parity(fn, std::string(8192, 'x'));
+
+    // FIPS 180-4 long-message vector: SHA1("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu")
+    const std::string fips_long =
+        "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn"
+        "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+    check_parity(fn, fips_long);
+    REQUIRE(sha1_hex(fips_long) == "a49b2446a02c645bf419f995b67091253a04a259");
+}
+
+TEST_CASE("sha256 hw/sw parity", "[hash][sha256][parity]") {
+    auto fn = [](const std::string& s) { return sha256(s); };
+
+    check_parity(fn, "");
+    check_parity(fn, "abc");
+    check_parity(fn, "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+    check_parity(fn, std::string(1000, 'a'));
+    check_parity(fn, std::string(8192, 'x'));
+
+    // FIPS 180-4 long-message vector for SHA-256
+    const std::string fips_long =
+        "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn"
+        "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+    check_parity(fn, fips_long);
+    REQUIRE(sha256_hex(fips_long) == "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1");
+}
+
+// ============================================================================
 // Utility function tests
 // ============================================================================
 

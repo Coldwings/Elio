@@ -3,6 +3,7 @@
 /// @file cpu_features.hpp
 /// @brief CPU feature detection for hardware-accelerated hash functions
 
+#include <atomic>
 #include <cstdint>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -104,13 +105,65 @@ inline bool has_sha_ni() noexcept {
 #endif
 }
 
-/// Check if ARM SHA instructions are available
-inline bool has_arm_sha() noexcept {
+/// Check if ARM SHA1 instructions are available
+inline bool has_arm_sha1() noexcept {
 #ifdef ELIO_HASH_ARM64
-    return cpu_features::get().arm_sha1 && cpu_features::get().arm_sha2;
+    return cpu_features::get().arm_sha1;
 #else
     return false;
 #endif
+}
+
+/// Check if ARM SHA2 (SHA-256) instructions are available
+inline bool has_arm_sha2() noexcept {
+#ifdef ELIO_HASH_ARM64
+    return cpu_features::get().arm_sha2;
+#else
+    return false;
+#endif
+}
+
+/// Check if both ARM SHA1+SHA2 instructions are available
+inline bool has_arm_sha() noexcept {
+    return has_arm_sha1() && has_arm_sha2();
+}
+
+namespace detail {
+
+/// Process-wide override that forces hash implementations onto their
+/// software paths, even when hardware acceleration is available. Used by
+/// unit tests to exercise both code paths in CI on hardware-capable hosts.
+inline std::atomic<bool>& force_software_hash_flag() noexcept {
+    static std::atomic<bool> flag{false};
+    return flag;
+}
+
+} // namespace detail
+
+/// Test/debug knob: when true, SHA-1/SHA-256 hash implementations skip the
+/// hardware fast path and run their pure-software variants. Default false.
+inline void set_force_software_hash(bool v) noexcept {
+    detail::force_software_hash_flag().store(v, std::memory_order_relaxed);
+}
+
+inline bool get_force_software_hash() noexcept {
+    return detail::force_software_hash_flag().load(std::memory_order_relaxed);
+}
+
+/// Returns true when SHA-NI hardware acceleration should be used: both
+/// available and not overridden by `set_force_software_hash`.
+inline bool use_sha_ni() noexcept {
+    return has_sha_ni() && !get_force_software_hash();
+}
+
+/// Returns true when ARM SHA-1 hardware acceleration should be used.
+inline bool use_arm_sha1() noexcept {
+    return has_arm_sha1() && !get_force_software_hash();
+}
+
+/// Returns true when ARM SHA-256 hardware acceleration should be used.
+inline bool use_arm_sha2() noexcept {
+    return has_arm_sha2() && !get_force_software_hash();
 }
 
 } // namespace elio::hash

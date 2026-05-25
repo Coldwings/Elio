@@ -87,6 +87,10 @@ public:
 
     ~vthread_stack() {
         free_segments();
+        if (spare_ != nullptr) {
+            ::operator delete(spare_);
+            spare_ = nullptr;
+        }
     }
 
     vthread_stack(const vthread_stack&) = delete;
@@ -117,11 +121,21 @@ public:
 
         current_segment_->used -= aligned_size;
 
-        // If current segment is empty and has a previous segment, free current segment and backtrack
+        // If current segment is empty and has a previous segment, retire it
+        // and backtrack. To avoid heap thrash on workloads where each task fills
+        // exactly one segment (e.g. tight spawn loops of short coroutines), we
+        // cache a single freed segment in spare_ for reuse by allocate_segment.
+        // One slot is sufficient: the spawn-loop pattern only ever needs a
+        // segment immediately replaced, never several at once. Holding more
+        // would risk pinning peak memory long after a burst.
         if (current_segment_->used == 0 && current_segment_->prev != nullptr) {
             segment* old = current_segment_;
             current_segment_ = current_segment_->prev;
-            ::operator delete(old);
+            if (spare_ == nullptr) {
+                spare_ = old;
+            } else {
+                ::operator delete(old);
+            }
         }
     }
 
@@ -151,12 +165,28 @@ private:
                   "sizeof(segment) must be a multiple of ALIGNMENT");
 
     segment* current_segment_ = nullptr;
+    // Cache for one freed segment to skip alloc/free churn on spawn loops.
+    // Only populated by pop(); consumed by allocate_segment(). Cleared on dtor.
+    segment* spare_ = nullptr;
 
     static constexpr size_t align_up(size_t n) noexcept {
         return (n + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
     }
 
     void allocate_segment(size_t min_payload) {
+        // Reuse the cached spare if it's large enough. The segment header was
+        // allocated with the same ALIGNMENT-aware layout originally, so data()
+        // remains correctly aligned (commit afc3ee1 invariant). Resetting used=0
+        // brings it back to the same start state as a fresh allocation.
+        if (spare_ != nullptr && spare_->capacity >= min_payload) {
+            segment* seg = spare_;
+            spare_ = nullptr;
+            seg->prev = current_segment_;
+            seg->used = 0;
+            // capacity is preserved; no other bookkeeping to reset
+            current_segment_ = seg;
+            return;
+        }
         size_t payload = min_payload > DEFAULT_SEGMENT_SIZE ? min_payload : DEFAULT_SEGMENT_SIZE;
         void* mem = ::operator new(sizeof(segment) + payload);
         segment* seg = static_cast<segment*>(mem);

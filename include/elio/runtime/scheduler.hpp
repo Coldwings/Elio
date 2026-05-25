@@ -410,16 +410,30 @@ public:
             handle.destroy();
             return;
         }
-        
+
         // Detach from current thread's frame chain before spawning to another thread
         // to avoid use-after-free when this thread creates another coroutine.
         auto* promise = coro::get_promise_base(handle.address());
         if (promise) {
             promise->detach_from_parent();
         }
-        
+
         size_t n = num_threads_.load(std::memory_order_acquire);
-        workers_[worker_id % n]->schedule(handle);
+        if (n == 0) [[unlikely]] {
+            handle.destroy();
+            return;
+        }
+        size_t idx = worker_id % n;
+        // Verify the chosen slot is still running. After a shrink the worker at
+        // this index may have been stopped (or be in the process of being
+        // stopped) — pushing into its inbox would orphan the task. Fall through
+        // to do_spawn() so the round-robin path picks a worker that is still
+        // accepting work.
+        if (workers_[idx] && workers_[idx]->is_running()) {
+            workers_[idx]->schedule(handle);
+            return;
+        }
+        do_spawn(handle);
     }
 
     [[nodiscard]] size_t num_threads() const noexcept {
@@ -467,16 +481,29 @@ public:
             // acquire to make the slot writes visible.
             num_threads_.store(count, std::memory_order_release);
         } else if (count < old_count) {
-            // Lock to prevent spawns to workers being stopped
-            std::unique_lock<std::mutex> lock(workers_mutex_);
+            // Hold the lock across the entire shrink — including I/O drain,
+            // stop(), and redistribute_tasks(). This serializes shrink against
+            // a concurrent grow: without it, a grow that runs in the window
+            // between the num_threads_ store and the stop() calls would
+            // observe doomed workers as still "running" (because stop() hasn't
+            // run yet) and republish num_threads_ to a value that re-exposes
+            // them — only for shrink to then stop them, leaving slots inside
+            // the visible range backed by stopped workers and routing new
+            // spawns into stopped inboxes.
+            //
+            // stop() joins the worker thread which can take a few ticks, but
+            // bounded by the worker's poll timeout and any in-flight task.
+            // Correctness wins over throughput here: set_thread_count is a
+            // slow-path control operation, not a hot path.
+            //
+            // Note: must NOT be called from a worker thread — joining the
+            // current thread would deadlock. Same caveat as before this fix.
+            std::lock_guard<std::mutex> lock(workers_mutex_);
             old_count = num_threads_.load(std::memory_order_relaxed);
             if (count >= old_count) return;
 
-            // Update count first so new spawns go to remaining workers
+            // Update count first so new spawns go to remaining workers.
             num_threads_.store(count, std::memory_order_release);
-
-            // Unlock before stopping workers (stop() joins which can be slow)
-            lock.unlock();
 
             // Wait for the doomed workers' I/O contexts to drain before stopping
             // them. If a worker is stopped while it has pending I/O (e.g. a

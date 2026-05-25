@@ -319,12 +319,20 @@ public:
     
 private:
     static nghttp2_nv make_nv(std::string_view name, std::string_view value) {
+        // NOTE: do NOT pass NGHTTP2_NV_FLAG_NO_COPY_NAME/VALUE here. nghttp2 does
+        // not serialize HEADERS into its output buffer until a later
+        // nghttp2_session_mem_send() call (driven from process()), so the
+        // pointed-at storage would have to outlive that call. submit_request()
+        // builds nv values in a local std::vector<std::string>, which is
+        // destroyed on return, so NO_COPY would dangle and leak arbitrary
+        // memory into the HPACK output. Letting nghttp2 copy is the safe
+        // default; the cost is one extra allocation per header.
         return {
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(name.data())),
             const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(value.data())),
             name.size(),
             value.size(),
-            NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE
+            NGHTTP2_NV_FLAG_NONE
         };
     }
     

@@ -1,6 +1,11 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/hash/hash.hpp>
 
+#include <cstring>
+#include <span>
+#include <string>
+#include <vector>
+
 using namespace elio::hash;
 
 // ============================================================================
@@ -51,13 +56,44 @@ TEST_CASE("crc32_iovec", "[hash][crc32]") {
 TEST_CASE("crc32 incremental", "[hash][crc32]") {
     // Test incremental CRC computation
     const char* data = "123456789";
-    
+
     uint32_t crc = 0xFFFFFFFF;
     crc = crc32_update(data, 5, crc);      // "12345"
     crc = crc32_update(data + 5, 4, crc);  // "6789"
     uint32_t result = crc32_finalize(crc);
-    
+
     REQUIRE(result == 0xCBF43926);
+}
+
+// ============================================================================
+// CRC32C tests (Castagnoli polynomial)
+// ============================================================================
+
+TEST_CASE("crc32c basic", "[hash][crc32c]") {
+    SECTION("empty buffer") {
+        REQUIRE(crc32c(nullptr, 0) == 0);
+    }
+
+    SECTION("standard test vector \"123456789\"") {
+        // Castagnoli reference value
+        const char* data = "123456789";
+        REQUIRE(crc32c(data, 9) == 0xE3069283);
+    }
+
+    SECTION("longer string crosses 8-byte boundary") {
+        const char* data = "abcdefghijklmnopqrstuvwxyz0123456789";
+        REQUIRE(crc32c(data, std::strlen(data)) == 0xFE84208C);
+    }
+
+    SECTION("single byte 'a'") {
+        uint8_t byte = 'a';
+        REQUIRE(crc32c(&byte, 1) == 0xC1D04330);
+    }
+
+    SECTION("span overload") {
+        std::vector<uint8_t> v = {'1','2','3','4','5','6','7','8','9'};
+        REQUIRE(crc32c(std::span<const uint8_t>(v)) == 0xE3069283);
+    }
 }
 
 // ============================================================================

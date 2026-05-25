@@ -27,7 +27,7 @@ namespace elio::io {
 /// Used as a fallback when io_uring is not available
 /// 
 /// Features:
-/// - Edge-triggered mode for efficiency
+/// - Level-triggered mode (one op per fired event is safe; deregister-on-empty bounds wakeups)
 /// - Scales well with many file descriptors
 /// - Compatible with older Linux kernels
 class epoll_backend : public io_backend {
@@ -124,8 +124,12 @@ public:
         op.req = req;
         op.awaiter = req.awaiter;
         
-        // For epoll, we need to determine what events to watch for
-        uint32_t events = EPOLLET;  // Edge-triggered
+        // For epoll, we need to determine what events to watch for.
+        // Use level-triggered mode: each completion executes exactly one syscall
+        // and does not drain to EAGAIN, which would stall the next op under EPOLLET.
+        // Spurious wakeups are bounded because we EPOLL_CTL_DEL the fd as soon as
+        // its pending_ops queue becomes empty (see end of poll() and cancel()).
+        uint32_t events = 0;
         
         switch (req.op) {
             case io_op::read:

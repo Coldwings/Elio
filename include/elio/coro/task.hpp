@@ -127,49 +127,55 @@ struct join_state {
     
     // Called when coroutine frame is about to be destroyed
     void mark_destroyed() noexcept {
-        destroyed_.store(true, std::memory_order_release);
-        // Ensure all prior writes are visible to waiters before they return
-        std::atomic_thread_fence(std::memory_order_seq_cst);
+        {
+            std::lock_guard<std::mutex> lock(destroyed_mtx_);
+            destroyed_.store(true, std::memory_order_release);
+        }
+        destroyed_cv_.notify_all();
     }
-    
+
     // Block until coroutine is destroyed (safe from non-coroutine context)
     void wait_destroyed() {
-        // Use polling with seq_cst fence to ensure proper synchronization
-        while (!destroyed_.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        // Ensure we see all writes from the destructor
-        std::atomic_thread_fence(std::memory_order_seq_cst);
+        std::unique_lock<std::mutex> lock(destroyed_mtx_);
+        destroyed_cv_.wait(lock, [&] {
+            return destroyed_.load(std::memory_order_acquire);
+        });
     }
-    
+
     // Non-blocking check
     [[nodiscard]] bool is_destroyed() const noexcept {
         return destroyed_.load(std::memory_order_acquire);
     }
-    
+
     [[nodiscard]] bool is_completed() const noexcept {
         return completed_.load(std::memory_order_acquire);
     }
-    
-    // Returns true if waiter was stored (should suspend), false if already completed
+
+    // Returns true if waiter was stored (should suspend), false if caller must resume locally.
     bool set_waiter(std::coroutine_handle<> h) noexcept {
         void* expected = nullptr;
-        if (waiter_.compare_exchange_strong(expected, h.address(), 
+        if (waiter_.compare_exchange_strong(expected, h.address(),
                 std::memory_order_release, std::memory_order_acquire)) {
-            // Check again if completed (race condition)
+            // Race: complete() may have run between our check and CAS. Detect it.
             if (completed_.load(std::memory_order_acquire)) {
-                // Already completed, try to reclaim and resume
+                // Try to reclaim our waiter slot before complete() takes it.
                 void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
                 if (addr) {
-                    runtime::schedule_handle(std::coroutine_handle<>::from_address(addr));
+                    // We won the race: complete() did not take the waiter, so it
+                    // will not schedule us. Resume locally by returning false; do
+                    // NOT schedule the handle here (that would double-resume).
+                    return false;
                 }
-                return false;
+                // We lost the race: complete() already took the waiter and has
+                // scheduled (or is about to schedule) it on a worker. Suspend so
+                // the scheduler resumes us exactly once.
+                return true;
             }
             return true;
         }
         return false;  // Already has a waiter (shouldn't happen with single await)
     }
-    
+
     T get_value() {
         if (exception_) {
             std::rethrow_exception(exception_);
@@ -210,46 +216,55 @@ struct join_state<void> {
     
     // Called when coroutine frame is about to be destroyed
     void mark_destroyed() noexcept {
-        destroyed_.store(true, std::memory_order_release);
-        // Ensure all prior writes are visible to waiters before they return
-        std::atomic_thread_fence(std::memory_order_seq_cst);
+        {
+            std::lock_guard<std::mutex> lock(destroyed_mtx_);
+            destroyed_.store(true, std::memory_order_release);
+        }
+        destroyed_cv_.notify_all();
     }
-    
+
     // Block until coroutine is destroyed (safe from non-coroutine context)
     void wait_destroyed() {
-        // Use polling with seq_cst fence to ensure proper synchronization
-        while (!destroyed_.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        // Ensure we see all writes from the destructor
-        std::atomic_thread_fence(std::memory_order_seq_cst);
+        std::unique_lock<std::mutex> lock(destroyed_mtx_);
+        destroyed_cv_.wait(lock, [&] {
+            return destroyed_.load(std::memory_order_acquire);
+        });
     }
-    
+
     // Non-blocking check
     [[nodiscard]] bool is_destroyed() const noexcept {
         return destroyed_.load(std::memory_order_acquire);
     }
-    
+
     [[nodiscard]] bool is_completed() const noexcept {
         return completed_.load(std::memory_order_acquire);
     }
-    
+
+    // Returns true if waiter was stored (should suspend), false if caller must resume locally.
     bool set_waiter(std::coroutine_handle<> h) noexcept {
         void* expected = nullptr;
         if (waiter_.compare_exchange_strong(expected, h.address(),
                 std::memory_order_release, std::memory_order_acquire)) {
+            // Race: complete() may have run between our check and CAS. Detect it.
             if (completed_.load(std::memory_order_acquire)) {
+                // Try to reclaim our waiter slot before complete() takes it.
                 void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
                 if (addr) {
-                    runtime::schedule_handle(std::coroutine_handle<>::from_address(addr));
+                    // We won the race: complete() did not take the waiter, so it
+                    // will not schedule us. Resume locally by returning false; do
+                    // NOT schedule the handle here (that would double-resume).
+                    return false;
                 }
-                return false;
+                // We lost the race: complete() already took the waiter and has
+                // scheduled (or is about to schedule) it on a worker. Suspend so
+                // the scheduler resumes us exactly once.
+                return true;
             }
             return true;
         }
         return false;
     }
-    
+
     void get_value() {
         if (exception_) {
             std::rethrow_exception(exception_);

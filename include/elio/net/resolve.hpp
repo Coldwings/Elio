@@ -10,7 +10,9 @@
 
 #include <atomic>
 #include <array>
+#include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -47,13 +49,15 @@ struct resolve_cache_stats {
 struct resolve_cache_entry {
     std::vector<socket_address> addresses;
     std::chrono::steady_clock::time_point expires_at{};
+    std::optional<int> last_errno;
 };
 
 class resolve_cache {
 public:
     static constexpr size_t shard_count = 16;
 
-    bool try_get(const resolve_cache_key& key, std::vector<socket_address>& out) {
+    bool try_get(const resolve_cache_key& key, std::vector<socket_address>& out,
+                 std::optional<int>* cached_errno = nullptr) {
         auto& shard = shard_for(key);
         std::lock_guard<std::mutex> lock(shard.mutex);
         prune_expired_locked(shard.entries, std::chrono::steady_clock::now());
@@ -64,18 +68,23 @@ public:
         }
 
         out = it->second.addresses;
+        if (cached_errno != nullptr) {
+            *cached_errno = it->second.last_errno;
+        }
         cache_hits_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
     void store(const resolve_cache_key& key,
                std::vector<socket_address> addresses,
-               std::chrono::seconds ttl) {
+               std::chrono::seconds ttl,
+               std::optional<int> last_err = std::nullopt) {
         auto& shard = shard_for(key);
         std::lock_guard<std::mutex> lock(shard.mutex);
         resolve_cache_entry entry;
         entry.addresses = std::move(addresses);
         entry.expires_at = std::chrono::steady_clock::now() + ttl;
+        entry.last_errno = last_err;
         shard.entries[key] = std::move(entry);
         cache_stores_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -206,7 +215,25 @@ inline bool try_parse_ipv6_literal(std::string_view host, uint16_t port,
     if (scope_pos != std::string::npos) {
         std::string scope_name = ip_str.substr(scope_pos + 1);
         ip_str = ip_str.substr(0, scope_pos);
-        scope_id = if_nametoindex(scope_name.c_str());
+        if (scope_name.empty()) {
+            errno = EINVAL;
+            return false;
+        }
+
+        // Try numeric zone-id first (e.g. "fe80::1%2"); if_nametoindex does
+        // not fall through to numeric IDs, so a digit-only zone would
+        // otherwise silently become scope_id=0.
+        char* end = nullptr;
+        unsigned long parsed_zone = std::strtoul(scope_name.c_str(), &end, 10);
+        if (end != nullptr && end != scope_name.c_str() && *end == '\0') {
+            scope_id = static_cast<uint32_t>(parsed_zone);
+        } else {
+            scope_id = if_nametoindex(scope_name.c_str());
+            if (scope_id == 0) {
+                errno = EINVAL;
+                return false;
+            }
+        }
     }
 
     struct in6_addr addr{};
@@ -251,7 +278,14 @@ inline coro::task<std::vector<socket_address>> resolve_all(
     resolve_cache_key key{std::string(host), port};
     if (options.use_cache) {
         resolve_cache* cache = options.cache ? options.cache : &default_resolve_cache();
-        if (cache->try_get(key, results)) {
+        std::optional<int> cached_err;
+        if (cache->try_get(key, results, &cached_err)) {
+            // Negative-cache hit: surface the errno captured at the original
+            // failure so callers can distinguish failure modes from arbitrary
+            // stale errno on this thread.
+            if (results.empty()) {
+                errno = cached_err.value_or(EHOSTUNREACH);
+            }
             co_return results;
         }
         cache->record_miss();
@@ -296,7 +330,7 @@ inline coro::task<std::vector<socket_address>> resolve_all(
     if (options.use_cache) {
         resolve_cache* cache = options.cache ? options.cache : &default_resolve_cache();
         if (dns_result.addresses.empty()) {
-            cache->store(key, {}, options.negative_ttl);
+            cache->store(key, {}, options.negative_ttl, dns_result.error);
         } else {
             cache->store(key, dns_result.addresses, options.positive_ttl);
         }

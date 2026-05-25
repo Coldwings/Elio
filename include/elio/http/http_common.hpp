@@ -8,8 +8,58 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <stdexcept>
 
 namespace elio::http {
+
+namespace detail {
+
+/// Returns true if `c` is a "tchar" per RFC 7230 §3.2.6 (the set of byte
+/// values allowed in HTTP token productions, including header field names).
+inline constexpr bool is_tchar(unsigned char c) noexcept {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' ||
+           c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
+           c == '`' || c == '|' || c == '~';
+}
+
+/// Validate an HTTP header field-name: must be a non-empty token (1*tchar)
+/// per RFC 7230 §3.2. Whitespace, CR, LF, NUL and any non-tchar byte are rejected.
+inline bool is_valid_header_name(std::string_view name) noexcept {
+    if (name.empty()) return false;
+    for (unsigned char c : name) {
+        if (!is_tchar(c)) return false;
+    }
+    return true;
+}
+
+/// Validate an HTTP header field-value: rejects CR, LF and NUL which are the
+/// bytes responsible for header/body smuggling and request-splitting attacks.
+inline bool is_valid_header_value(std::string_view value) noexcept {
+    for (char c : value) {
+        if (c == '\r' || c == '\n' || c == '\0') return false;
+    }
+    return true;
+}
+
+/// Trim leading and trailing OWS (space / horizontal-tab) per RFC 7230.
+inline std::string_view trim_ows(std::string_view s) noexcept {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.remove_suffix(1);
+    return s;
+}
+
+/// Case-insensitive equality compare for two ASCII strings.
+inline bool ascii_iequals(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) return false;
+    }
+    return true;
+}
+
+} // namespace detail
 
 /// HTTP methods
 enum class method {
@@ -231,15 +281,43 @@ public:
     
     headers() = default;
     
-    /// Set a header (overwrites existing)
+    /// Set a header (overwrites existing).
+    /// Throws std::invalid_argument when the name is not an RFC 7230 token or
+    /// the value contains CR/LF/NUL — those bytes enable header/body smuggling
+    /// and CRLF injection (e.g. via reflected request data).
     void set(std::string_view name, std::string_view value) {
+        if (!detail::is_valid_header_name(name)) {
+            throw std::invalid_argument("elio::http::headers: invalid header name");
+        }
+        if (!detail::is_valid_header_value(value)) {
+            throw std::invalid_argument("elio::http::headers: header value contains CR/LF/NUL");
+        }
         headers_[std::string(name)] = std::string(value);
     }
-    
-    /// Add a header (appends with comma if exists)
+
+    /// Add a header (appends with comma if exists). Validates name/value the
+    /// same way as set(). Per RFC 7230 §3.3.2, a duplicate Content-Length is
+    /// only acceptable if it carries the byte-equal value (after trimming
+    /// OWS); a conflicting duplicate must be rejected to prevent CL/CL
+    /// request smuggling.
     void add(std::string_view name, std::string_view value) {
+        if (!detail::is_valid_header_name(name)) {
+            throw std::invalid_argument("elio::http::headers: invalid header name");
+        }
+        if (!detail::is_valid_header_value(value)) {
+            throw std::invalid_argument("elio::http::headers: header value contains CR/LF/NUL");
+        }
         auto it = headers_.find(std::string(name));
         if (it != headers_.end()) {
+            if (detail::ascii_iequals(name, "Content-Length")) {
+                auto existing = detail::trim_ows(it->second);
+                auto incoming = detail::trim_ows(value);
+                if (existing != incoming) {
+                    throw std::invalid_argument(
+                        "elio::http::headers: conflicting Content-Length values");
+                }
+                return;  // matching duplicate: silently drop
+            }
             it->second += ", ";
             it->second += value;
         } else {
@@ -266,14 +344,23 @@ public:
         headers_.erase(std::string(name));
     }
     
-    /// Get Content-Length header value
+    /// Get Content-Length header value.
+    /// Returns std::nullopt if the header is missing, empty, signed, or
+    /// contains anything other than digits after trimming OWS — accepting
+    /// trailing garbage (or a "+"/"-" prefix) here would let an attacker
+    /// fool the parser into reading an attacker-controlled number of body
+    /// bytes (CL/CL or CL/TE smuggling).
     std::optional<size_t> content_length() const {
-        auto val = get("Content-Length");
+        auto val = detail::trim_ows(get("Content-Length"));
         if (val.empty()) return std::nullopt;
+        // std::from_chars on size_t already rejects '-'; explicitly reject '+'
+        // so the value is exactly *DIGIT.
+        if (val.front() == '+' || val.front() == '-') return std::nullopt;
         size_t len = 0;
         auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), len);
-        if (ec == std::errc{}) return len;
-        return std::nullopt;
+        if (ec != std::errc{}) return std::nullopt;
+        if (ptr != val.data() + val.size()) return std::nullopt;
+        return len;
     }
     
     /// Set Content-Length header
@@ -291,10 +378,20 @@ public:
         set("Content-Type", type);
     }
     
-    /// Check if Transfer-Encoding is chunked
+    /// Check if Transfer-Encoding indicates chunked framing per RFC 7230 §3.3.1.
+    /// A naive substring search would let "x-chunked", "chunkedfoo", or
+    /// "gzip, chunked, identity" all flip the decision — the first two
+    /// shouldn't, and the last one is invalid because chunked must be the
+    /// final transfer-coding. We split on commas, trim OWS, and require the
+    /// final token to be exactly "chunked" (case-insensitive).
     bool is_chunked() const {
         auto te = get("Transfer-Encoding");
-        return te.find("chunked") != std::string_view::npos;
+        if (te.empty()) return false;
+        auto last_comma = te.rfind(',');
+        std::string_view last = (last_comma == std::string_view::npos)
+            ? te
+            : te.substr(last_comma + 1);
+        return detail::ascii_iequals(detail::trim_ows(last), "chunked");
     }
     
     /// Check if connection should be kept alive

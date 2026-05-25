@@ -2,12 +2,20 @@
 
 #include <elio/http/http_common.hpp>
 
+#include <climits>
+#include <cstdint>
+#include <cstring>
+#include <optional>
 #include <string>
 #include <string_view>
-#include <optional>
-#include <cstring>
 
 namespace elio::http {
+
+/// Hard upper bound on a single chunk's declared size (1 GiB). Independent of
+/// any per-server max_request_size, this is a safety net to keep
+/// request_parser self-contained and to bound the integer arithmetic in
+/// parse_chunk_size against pathological inputs.
+inline constexpr size_t kMaxChunkSize = static_cast<size_t>(1) << 30;
 
 /// HTTP parser state
 enum class parse_state {
@@ -57,10 +65,10 @@ public:
     std::pair<parse_result, size_t> parse(std::string_view data) {
         size_t consumed = 0;
         buffer_ += data;
-        
+
         while (!buffer_.empty() && state_ != parse_state::complete && state_ != parse_state::error) {
             size_t before = buffer_.size();
-            
+
             switch (state_) {
                 case parse_state::request_line:
                     if (!parse_request_line()) {
@@ -70,7 +78,7 @@ public:
                         return {parse_result::need_more, consumed};
                     }
                     break;
-                    
+
                 case parse_state::headers:
                     if (!parse_headers()) {
                         if (state_ == parse_state::error) {
@@ -79,45 +87,54 @@ public:
                         return {parse_result::need_more, consumed};
                     }
                     break;
-                    
+
                 case parse_state::body:
                     if (!parse_body()) {
                         return {parse_result::need_more, consumed};
                     }
                     break;
-                    
+
                 case parse_state::chunk_size:
                     if (!parse_chunk_size()) {
                         return {parse_result::need_more, consumed};
                     }
                     break;
-                    
+
                 case parse_state::chunk_data:
                     if (!parse_chunk_data()) {
                         return {parse_result::need_more, consumed};
                     }
                     break;
-                    
+
                 case parse_state::chunk_trailer:
                     if (!parse_chunk_trailer()) {
                         return {parse_result::need_more, consumed};
                     }
                     break;
-                    
+
                 default:
                     break;
             }
-            
+
             consumed += before - buffer_.size();
         }
-        
+
+        // The chunked sub-parsers signal failure by transitioning to
+        // parse_state::error and returning true (so the outer loop drops
+        // out cleanly). Surface that as parse_result::error to callers —
+        // without this check a malformed chunk-size would be reported as
+        // "need more data", letting an attacker stall the parser instead
+        // of triggering a 400.
+        if (state_ == parse_state::error) {
+            return {parse_result::error, consumed};
+        }
         if (state_ == parse_state::complete) {
             return {parse_result::complete, consumed};
         }
-        
+
         return {parse_result::need_more, consumed};
     }
-    
+
     /// Get parsed method
     method get_method() const noexcept { return method_; }
     
@@ -155,6 +172,27 @@ public:
         std::string out = std::move(buffer_);
         buffer_.clear();
         return out;
+    }
+
+    /// Bytes currently held by the parser (un-consumed buffered input plus
+    /// any body bytes already extracted into body_). The HTTP server uses
+    /// this to enforce server_config::max_request_size after every read.
+    size_t bytes_buffered() const noexcept {
+        return buffer_.size() + body_.size();
+    }
+
+    /// Returns the parsed Content-Length once headers are done parsing.
+    /// Returns std::nullopt while still consuming the request line/headers
+    /// or when the request uses chunked transfer encoding.
+    std::optional<size_t> declared_content_length() const noexcept {
+        if (chunked_) return std::nullopt;
+        switch (state_) {
+            case parse_state::body:
+            case parse_state::complete:
+                return content_length_;
+            default:
+                return std::nullopt;
+        }
     }
 
 private:
@@ -218,51 +256,92 @@ private:
             if (line_end == std::string::npos) {
                 return false;
             }
-            
+
             if (line_end == 0) {
                 // Empty line - end of headers
                 buffer_.erase(0, 2);
-                
-                // Check for body
-                if (auto len = headers_.content_length()) {
+
+                // RFC 7230 §3.3.3 rule 3: a request that carries both
+                // Transfer-Encoding and Content-Length is ambiguous and the
+                // canonical request-smuggling vector. Reject as 400 — never
+                // pick one over the other.
+                bool has_te = headers_.contains("Transfer-Encoding");
+                bool has_cl = headers_.contains("Content-Length");
+                if (has_te && has_cl) {
+                    set_error("Both Transfer-Encoding and Content-Length present (RFC 7230 §3.3.3)");
+                    return false;
+                }
+
+                // Transfer-Encoding takes precedence over (a missing)
+                // Content-Length per RFC 7230 §3.3.3. Check chunked FIRST
+                // so a malformed/extension-only TE doesn't silently fall
+                // through to "no body".
+                if (has_te) {
+                    if (!headers_.is_chunked()) {
+                        // We do not implement other transfer codings; per
+                        // RFC 7230 §3.3.1, an unrecognized coding without a
+                        // final "chunked" must be rejected.
+                        set_error("Unsupported Transfer-Encoding (chunked must be final)");
+                        return false;
+                    }
+                    chunked_ = true;
+                    state_ = parse_state::chunk_size;
+                } else if (has_cl) {
+                    auto len = headers_.content_length();
+                    if (!len) {
+                        // Header present but unparseable / signed / trailing
+                        // garbage — refuse rather than guess.
+                        set_error("Invalid Content-Length");
+                        return false;
+                    }
                     content_length_ = *len;
                     if (content_length_ > 0) {
                         state_ = parse_state::body;
                     } else {
                         state_ = parse_state::complete;
                     }
-                } else if (headers_.is_chunked()) {
-                    chunked_ = true;
-                    state_ = parse_state::chunk_size;
                 } else {
                     // No body
                     state_ = parse_state::complete;
                 }
                 return true;
             }
-            
+
             std::string_view line(buffer_.data(), line_end);
-            
+
             // Parse header
             auto colon = line.find(':');
             if (colon == std::string_view::npos) {
                 set_error("Invalid header line");
                 return false;
             }
-            
+
             auto name = line.substr(0, colon);
-            auto value = line.substr(colon + 1);
-            
-            // Trim leading whitespace from value
-            while (!value.empty() && (value[0] == ' ' || value[0] == '\t')) {
-                value = value.substr(1);
+            auto value = detail::trim_ows(line.substr(colon + 1));
+
+            // Validate name BEFORE calling headers_.set() (which throws on
+            // bad input) so we report parser errors uniformly via set_error.
+            // RFC 7230 §3.2.4: no whitespace is allowed between field-name
+            // and ':' — the validator rejects names with embedded spaces.
+            if (!detail::is_valid_header_name(name)) {
+                set_error("Invalid header name");
+                return false;
             }
-            
-            // Trim trailing whitespace from value
-            while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
-                value = value.substr(0, value.size() - 1);
+            if (!detail::is_valid_header_value(value)) {
+                set_error("Invalid header value");
+                return false;
             }
-            
+
+            // Detect duplicate Content-Length with conflicting values BEFORE
+            // headers_.set() overwrites the prior value — RFC 7230 §3.3.2.
+            if (detail::ascii_iequals(name, "Content-Length")) {
+                auto existing = headers_.get("Content-Length");
+                if (!existing.empty() && detail::trim_ows(existing) != value) {
+                    set_error("Conflicting Content-Length headers");
+                    return false;
+                }
+            }
+
             headers_.set(name, value);
             buffer_.erase(0, line_end + 2);
         }
@@ -289,73 +368,96 @@ private:
         if (line_end == std::string::npos) {
             return false;
         }
-        
+
         std::string_view line(buffer_.data(), line_end);
-        
-        // Parse hex chunk size
+
+        // Parse hex chunk size with overflow protection. Without the
+        // (SIZE_MAX - d) / 16 guard, a malicious peer can send a chunk
+        // header like "ffffffffffffffff..." that wraps chunk_size_ to a
+        // small value (or zero), letting them either truncate the framed
+        // body or trick parse_chunk_data() into appending an attacker-chosen
+        // count of bytes. We additionally clamp by kMaxChunkSize so a single
+        // chunk cannot OOM the process.
         chunk_size_ = 0;
+        bool any_digit = false;
         for (char c : line) {
+            size_t d;
             if (c >= '0' && c <= '9') {
-                chunk_size_ = chunk_size_ * 16 + (c - '0');
+                d = static_cast<size_t>(c - '0');
             } else if (c >= 'a' && c <= 'f') {
-                chunk_size_ = chunk_size_ * 16 + (c - 'a' + 10);
+                d = static_cast<size_t>(c - 'a' + 10);
             } else if (c >= 'A' && c <= 'F') {
-                chunk_size_ = chunk_size_ * 16 + (c - 'A' + 10);
-            } else if (c == ';') {
-                // Chunk extension - ignore
+                d = static_cast<size_t>(c - 'A' + 10);
+            } else if (c == ';' || c == ' ' || c == '\t') {
+                // Chunk extension or trailing OWS - rest is ignored.
                 break;
             } else {
-                break;
+                set_error("Invalid character in chunk size");
+                return true;
             }
+            if (chunk_size_ > (SIZE_MAX - d) / 16) {
+                set_error("Chunk size overflow");
+                return true;
+            }
+            chunk_size_ = chunk_size_ * 16 + d;
+            any_digit = true;
         }
-        
+        if (!any_digit) {
+            set_error("Empty chunk size");
+            return true;
+        }
+        if (chunk_size_ > kMaxChunkSize) {
+            set_error("Chunk size exceeds maximum");
+            return true;
+        }
+
         buffer_.erase(0, line_end + 2);
-        
+
         if (chunk_size_ == 0) {
             state_ = parse_state::chunk_trailer;
         } else {
             state_ = parse_state::chunk_data;
         }
-        
+
         return true;
     }
-    
+
     bool parse_chunk_data() {
         if (buffer_.size() < chunk_size_ + 2) {  // +2 for trailing CRLF
             return false;
         }
-        
+
         body_.append(buffer_.data(), chunk_size_);
         buffer_.erase(0, chunk_size_ + 2);  // Skip chunk data and CRLF
-        
+
         state_ = parse_state::chunk_size;
         return true;
     }
-    
+
     bool parse_chunk_trailer() {
         // Parse trailer headers (usually empty)
         auto line_end = buffer_.find("\r\n");
         if (line_end == std::string::npos) {
             return false;
         }
-        
+
         if (line_end == 0) {
             // Empty line - end of chunked body
             buffer_.erase(0, 2);
             state_ = parse_state::complete;
             return true;
         }
-        
+
         // Skip trailer header
         buffer_.erase(0, line_end + 2);
         return true;
     }
-    
+
     void set_error(std::string_view msg) {
         state_ = parse_state::error;
         error_message_ = msg;
     }
-    
+
     parse_state state_ = parse_state::request_line;
     method method_ = method::GET;
     std::string path_;
@@ -450,14 +552,19 @@ public:
             
             consumed += before - buffer_.size();
         }
-        
+
+        // Mirror request_parser: surface error-state from the chunked
+        // sub-parsers as parse_result::error.
+        if (state_ == parse_state::error) {
+            return {parse_result::error, consumed};
+        }
         if (state_ == parse_state::complete) {
             return {parse_result::complete, consumed};
         }
-        
+
         return {parse_result::need_more, consumed};
     }
-    
+
     /// Get parsed status
     status get_status() const noexcept { return status_; }
     
@@ -551,49 +658,76 @@ private:
             if (line_end == std::string::npos) {
                 return false;
             }
-            
+
             if (line_end == 0) {
                 // Empty line - end of headers
                 buffer_.erase(0, 2);
-                
-                // Check for body
-                if (auto len = headers_.content_length()) {
+
+                // Same RFC 7230 §3.3.3 rule applies to responses: a server
+                // returning both Transfer-Encoding and Content-Length is
+                // suspect — silently picking one enables response smuggling
+                // through downstream proxies.
+                bool has_te = headers_.contains("Transfer-Encoding");
+                bool has_cl = headers_.contains("Content-Length");
+                if (has_te && has_cl) {
+                    set_error("Both Transfer-Encoding and Content-Length present");
+                    return false;
+                }
+
+                if (has_te) {
+                    if (!headers_.is_chunked()) {
+                        set_error("Unsupported Transfer-Encoding (chunked must be final)");
+                        return false;
+                    }
+                    chunked_ = true;
+                    state_ = parse_state::chunk_size;
+                } else if (has_cl) {
+                    auto len = headers_.content_length();
+                    if (!len) {
+                        set_error("Invalid Content-Length");
+                        return false;
+                    }
                     content_length_ = *len;
                     if (content_length_ > 0) {
                         state_ = parse_state::body;
                     } else {
                         state_ = parse_state::complete;
                     }
-                } else if (headers_.is_chunked()) {
-                    chunked_ = true;
-                    state_ = parse_state::chunk_size;
                 } else {
                     // No body or connection close
                     state_ = parse_state::complete;
                 }
                 return true;
             }
-            
+
             std::string_view line(buffer_.data(), line_end);
-            
+
             // Parse header
             auto colon = line.find(':');
             if (colon == std::string_view::npos) {
                 set_error("Invalid header line");
                 return false;
             }
-            
+
             auto name = line.substr(0, colon);
-            auto value = line.substr(colon + 1);
-            
-            // Trim whitespace
-            while (!value.empty() && (value[0] == ' ' || value[0] == '\t')) {
-                value = value.substr(1);
+            auto value = detail::trim_ows(line.substr(colon + 1));
+
+            if (!detail::is_valid_header_name(name)) {
+                set_error("Invalid header name");
+                return false;
             }
-            while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
-                value = value.substr(0, value.size() - 1);
+            if (!detail::is_valid_header_value(value)) {
+                set_error("Invalid header value");
+                return false;
             }
-            
+            if (detail::ascii_iequals(name, "Content-Length")) {
+                auto existing = headers_.get("Content-Length");
+                if (!existing.empty() && detail::trim_ows(existing) != value) {
+                    set_error("Conflicting Content-Length headers");
+                    return false;
+                }
+            }
+
             headers_.set(name, value);
             buffer_.erase(0, line_end + 2);
         }
@@ -620,41 +754,62 @@ private:
         if (line_end == std::string::npos) {
             return false;
         }
-        
+
         std::string_view line(buffer_.data(), line_end);
-        
+
+        // See request_parser::parse_chunk_size for the full rationale on
+        // the overflow guard and kMaxChunkSize clamp.
         chunk_size_ = 0;
+        bool any_digit = false;
         for (char c : line) {
+            size_t d;
             if (c >= '0' && c <= '9') {
-                chunk_size_ = chunk_size_ * 16 + (c - '0');
+                d = static_cast<size_t>(c - '0');
             } else if (c >= 'a' && c <= 'f') {
-                chunk_size_ = chunk_size_ * 16 + (c - 'a' + 10);
+                d = static_cast<size_t>(c - 'a' + 10);
             } else if (c >= 'A' && c <= 'F') {
-                chunk_size_ = chunk_size_ * 16 + (c - 'A' + 10);
-            } else {
+                d = static_cast<size_t>(c - 'A' + 10);
+            } else if (c == ';' || c == ' ' || c == '\t') {
                 break;
+            } else {
+                set_error("Invalid character in chunk size");
+                return true;
             }
+            if (chunk_size_ > (SIZE_MAX - d) / 16) {
+                set_error("Chunk size overflow");
+                return true;
+            }
+            chunk_size_ = chunk_size_ * 16 + d;
+            any_digit = true;
         }
-        
+        if (!any_digit) {
+            set_error("Empty chunk size");
+            return true;
+        }
+        if (chunk_size_ > kMaxChunkSize) {
+            set_error("Chunk size exceeds maximum");
+            return true;
+        }
+
         buffer_.erase(0, line_end + 2);
-        
+
         if (chunk_size_ == 0) {
             state_ = parse_state::chunk_trailer;
         } else {
             state_ = parse_state::chunk_data;
         }
-        
+
         return true;
     }
-    
+
     bool parse_chunk_data() {
         if (buffer_.size() < chunk_size_ + 2) {
             return false;
         }
-        
+
         body_.append(buffer_.data(), chunk_size_);
         buffer_.erase(0, chunk_size_ + 2);
-        
+
         state_ = parse_state::chunk_size;
         return true;
     }

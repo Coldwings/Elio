@@ -432,25 +432,38 @@ private:
     static int on_header_callback(nghttp2_session*, const nghttp2_frame* frame,
                                    const uint8_t* name, size_t namelen,
                                    const uint8_t* value, size_t valuelen,
-                                   uint8_t, void* user_data) {
+                                   uint8_t, void* user_data) noexcept {
         auto* self = static_cast<h2_session*>(user_data);
-        
+
         if (frame->hd.type == NGHTTP2_HEADERS) {
             auto* stream = self->get_stream(frame->hd.stream_id);
             if (stream) {
                 std::string_view name_sv(reinterpret_cast<const char*>(name), namelen);
                 std::string_view value_sv(reinterpret_cast<const char*>(value), valuelen);
-                
+
                 if (name_sv == ":status") {
                     int status_code = 0;
-                    auto [ptr, ec] = std::from_chars(value_sv.data(), 
-                                                      value_sv.data() + value_sv.size(), 
+                    auto [ptr, ec] = std::from_chars(value_sv.data(),
+                                                      value_sv.data() + value_sv.size(),
                                                       status_code);
                     if (ec == std::errc{}) {
                         stream->response_status = static_cast<status>(status_code);
                     }
                 } else if (!name_sv.starts_with(":")) {
-                    stream->response_headers.set(name_sv, value_sv);
+                    // headers::set() validates name/value and throws
+                    // std::invalid_argument on RFC 7230 token violations or
+                    // CR/LF/NUL in the value. We are inside a C callback
+                    // invoked from nghttp2_session_mem_recv() — letting an
+                    // exception unwind across the C frames is undefined
+                    // behavior and would corrupt nghttp2 internal state. Catch
+                    // it and surface the protocol error so nghttp2 resets the
+                    // offending stream (RST_STREAM) instead of silently
+                    // dropping the header.
+                    try {
+                        stream->response_headers.set(name_sv, value_sv);
+                    } catch (...) {
+                        return NGHTTP2_ERR_CALLBACK_FAILURE;
+                    }
                 }
             }
         }

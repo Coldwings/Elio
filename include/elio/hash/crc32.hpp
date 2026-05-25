@@ -13,6 +13,7 @@
 
 #include "cpu_features.hpp"
 
+#include <bit>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -86,41 +87,115 @@ struct crc32_tables {
 
 inline constexpr crc32_tables crc32_slice_tables{};
 
-// Software CRC32 using slicing-by-8
-inline uint32_t crc32_sw(const uint8_t* data, size_t length, uint32_t crc) noexcept {
-    const auto& t = crc32_slice_tables.t;
-    
-    // Process unaligned head bytes
-    while (length > 0 && (reinterpret_cast<uintptr_t>(data) & 7)) {
-        crc = t[0][(crc ^ *data++) & 0xFF] ^ (crc >> 8);
-        --length;
+// Slicing-by-8 tables for CRC32C (Castagnoli polynomial 0x82F63B78)
+struct crc32c_tables {
+    uint32_t t[8][256];
+
+    constexpr crc32c_tables() : t{} {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t crc = i;
+            for (int j = 0; j < 8; ++j) {
+                crc = (crc >> 1) ^ ((crc & 1) ? 0x82F63B78 : 0);
+            }
+            t[0][i] = crc;
+        }
+
+        for (uint32_t i = 0; i < 256; ++i) {
+            t[1][i] = (t[0][i] >> 8) ^ t[0][t[0][i] & 0xFF];
+            t[2][i] = (t[1][i] >> 8) ^ t[0][t[1][i] & 0xFF];
+            t[3][i] = (t[2][i] >> 8) ^ t[0][t[2][i] & 0xFF];
+            t[4][i] = (t[3][i] >> 8) ^ t[0][t[3][i] & 0xFF];
+            t[5][i] = (t[4][i] >> 8) ^ t[0][t[4][i] & 0xFF];
+            t[6][i] = (t[5][i] >> 8) ^ t[0][t[5][i] & 0xFF];
+            t[7][i] = (t[6][i] >> 8) ^ t[0][t[6][i] & 0xFF];
+        }
     }
-    
-    // Process 8 bytes at a time (slicing-by-8)
-    while (length >= 8) {
-        uint32_t lo, hi;
-        std::memcpy(&lo, data, 4);
-        std::memcpy(&hi, data + 4, 4);
-        crc ^= lo;
-        
-        crc = t[7][crc & 0xFF] ^
-              t[6][(crc >> 8) & 0xFF] ^
-              t[5][(crc >> 16) & 0xFF] ^
-              t[4][(crc >> 24)] ^
-              t[3][hi & 0xFF] ^
-              t[2][(hi >> 8) & 0xFF] ^
-              t[1][(hi >> 16) & 0xFF] ^
-              t[0][(hi >> 24)];
-        
-        data += 8;
-        length -= 8;
+};
+
+inline constexpr crc32c_tables crc32c_slice_tables{};
+
+// Software CRC32C using slicing-by-8 (mirrors crc32_sw); same little-endian
+// gate applies to the wide fast path.
+inline uint32_t crc32c_sw(const uint8_t* data, size_t length, uint32_t crc) noexcept {
+    const auto& t = crc32c_slice_tables.t;
+
+    if constexpr (std::endian::native == std::endian::little) {
+        while (length > 0 && (reinterpret_cast<uintptr_t>(data) & 7)) {
+            crc = t[0][(crc ^ *data++) & 0xFF] ^ (crc >> 8);
+            --length;
+        }
+
+        while (length >= 8) {
+            uint32_t lo, hi;
+            std::memcpy(&lo, data, 4);
+            std::memcpy(&hi, data + 4, 4);
+            crc ^= lo;
+
+            crc = t[7][crc & 0xFF] ^
+                  t[6][(crc >> 8) & 0xFF] ^
+                  t[5][(crc >> 16) & 0xFF] ^
+                  t[4][(crc >> 24)] ^
+                  t[3][hi & 0xFF] ^
+                  t[2][(hi >> 8) & 0xFF] ^
+                  t[1][(hi >> 16) & 0xFF] ^
+                  t[0][(hi >> 24)];
+
+            data += 8;
+            length -= 8;
+        }
     }
-    
-    // Process remaining bytes
+
     while (length--) {
         crc = t[0][(crc ^ *data++) & 0xFF] ^ (crc >> 8);
     }
-    
+
+    return crc;
+}
+
+// Software CRC32 using slicing-by-8
+//
+// The slicing-by-8 inner loop loads two little-endian 32-bit words per
+// iteration and indexes the lookup tables by the LSB-first bytes. That is
+// only correct when the host is little-endian: on big-endian targets the
+// memcpy'd word would have data[0] in the MSB and produce a wrong CRC.
+// We gate the fast path on `std::endian::native == std::endian::little`
+// and fall through to the byte-at-a-time path on big-endian platforms.
+inline uint32_t crc32_sw(const uint8_t* data, size_t length, uint32_t crc) noexcept {
+    const auto& t = crc32_slice_tables.t;
+
+    if constexpr (std::endian::native == std::endian::little) {
+        // Process unaligned head bytes
+        while (length > 0 && (reinterpret_cast<uintptr_t>(data) & 7)) {
+            crc = t[0][(crc ^ *data++) & 0xFF] ^ (crc >> 8);
+            --length;
+        }
+
+        // Process 8 bytes at a time (slicing-by-8)
+        while (length >= 8) {
+            uint32_t lo, hi;
+            std::memcpy(&lo, data, 4);
+            std::memcpy(&hi, data + 4, 4);
+            crc ^= lo;
+
+            crc = t[7][crc & 0xFF] ^
+                  t[6][(crc >> 8) & 0xFF] ^
+                  t[5][(crc >> 16) & 0xFF] ^
+                  t[4][(crc >> 24)] ^
+                  t[3][hi & 0xFF] ^
+                  t[2][(hi >> 8) & 0xFF] ^
+                  t[1][(hi >> 16) & 0xFF] ^
+                  t[0][(hi >> 24)];
+
+            data += 8;
+            length -= 8;
+        }
+    }
+
+    // Process remaining bytes (also the only path on big-endian targets)
+    while (length--) {
+        crc = t[0][(crc ^ *data++) & 0xFF] ^ (crc >> 8);
+    }
+
     return crc;
 }
 
@@ -241,25 +316,35 @@ inline uint32_t crc32c_hw_arm64(const uint8_t* data, size_t length, uint32_t crc
 
 /// Compute CRC32 checksum of a buffer (IEEE polynomial)
 /// Uses hardware acceleration on ARM64, slicing-by-8 on other platforms
+///
 /// @param data Pointer to data buffer
 /// @param length Length of data in bytes
-/// @param crc Initial CRC value (default 0xFFFFFFFF for new computation)
+/// @param seed  Internal CRC initializer (defaults to 0xFFFFFFFF, the
+///              standard initial register state). This is **not** a chain
+///              state: the function unconditionally finalizes the result by
+///              XOR'ing with 0xFFFFFFFF before returning, so feeding a
+///              previous return value back in produces an incorrect digest.
+///              For chained / streaming computation use `crc32_update` to
+///              accumulate state and `crc32_finalize` to produce the digest.
 /// @return Final CRC32 checksum
-inline uint32_t crc32(const void* data, size_t length, uint32_t crc = 0xFFFFFFFF) noexcept {
-    if (length == 0) return crc ^ 0xFFFFFFFF;
-    
+inline uint32_t crc32(const void* data, size_t length, uint32_t seed = 0xFFFFFFFF) noexcept {
+    if (length == 0) return seed ^ 0xFFFFFFFF;
+
 #ifdef ELIO_CRC32_HW_ARM64
     if (has_hw_crc32()) {
-        return detail::crc32_hw_arm64(static_cast<const uint8_t*>(data), length, crc) ^ 0xFFFFFFFF;
+        return detail::crc32_hw_arm64(static_cast<const uint8_t*>(data), length, seed) ^ 0xFFFFFFFF;
     }
 #endif
-    
-    return detail::crc32_sw(static_cast<const uint8_t*>(data), length, crc) ^ 0xFFFFFFFF;
+
+    return detail::crc32_sw(static_cast<const uint8_t*>(data), length, seed) ^ 0xFFFFFFFF;
 }
 
 /// Compute CRC32 checksum of a span
-inline uint32_t crc32(std::span<const uint8_t> data, uint32_t crc = 0xFFFFFFFF) noexcept {
-    return crc32(data.data(), data.size(), crc);
+/// @param seed See `crc32(const void*, size_t, uint32_t)` — initializer only,
+///             not a chain state. Use `crc32_update`/`crc32_finalize` for
+///             streaming computation.
+inline uint32_t crc32(std::span<const uint8_t> data, uint32_t seed = 0xFFFFFFFF) noexcept {
+    return crc32(data.data(), data.size(), seed);
 }
 
 /// Compute CRC32 checksum over multiple iovec buffers (scatter-gather)
@@ -305,12 +390,16 @@ inline uint32_t crc32_finalize(uint32_t crc) noexcept {
 
 /// Compute CRC32C checksum (Castagnoli polynomial)
 /// Uses hardware acceleration on x86 with SSE4.2 or ARM64, falls back to software
+///
 /// @param data Pointer to data buffer
 /// @param length Length of data in bytes
-/// @param crc Initial CRC value (default 0xFFFFFFFF)
+/// @param seed Internal CRC initializer (defaults to 0xFFFFFFFF). Like
+///             `crc32`, this is **not** a chain state: the result is
+///             finalized via XOR with 0xFFFFFFFF before returning.
 /// @return Final CRC32C checksum
-inline uint32_t crc32c(const void* data, size_t length, uint32_t crc = 0xFFFFFFFF) noexcept {
-    if (length == 0) return crc ^ 0xFFFFFFFF;
+inline uint32_t crc32c(const void* data, size_t length, uint32_t seed = 0xFFFFFFFF) noexcept {
+    if (length == 0) return seed ^ 0xFFFFFFFF;
+    uint32_t crc = seed;
     
 #ifdef ELIO_CRC32_HW_X86
     if (has_hw_crc32()) {
@@ -323,32 +412,16 @@ inline uint32_t crc32c(const void* data, size_t length, uint32_t crc = 0xFFFFFFF
         return detail::crc32c_hw_arm64(static_cast<const uint8_t*>(data), length, crc) ^ 0xFFFFFFFF;
     }
 #endif
-    
-    // Software fallback for CRC32C (Castagnoli polynomial)
-    // Using slicing-by-4 with Castagnoli tables
-    static const auto make_crc32c_table = []() {
-        std::array<uint32_t, 256> table{};
-        for (uint32_t i = 0; i < 256; ++i) {
-            uint32_t c = i;
-            for (int j = 0; j < 8; ++j) {
-                c = (c >> 1) ^ ((c & 1) ? 0x82F63B78 : 0);
-            }
-            table[i] = c;
-        }
-        return table;
-    };
-    static const auto crc32c_table = make_crc32c_table();
-    
-    const uint8_t* bytes = static_cast<const uint8_t*>(data);
-    for (size_t i = 0; i < length; ++i) {
-        crc = crc32c_table[(crc ^ bytes[i]) & 0xFF] ^ (crc >> 8);
-    }
-    return crc ^ 0xFFFFFFFF;
+
+    // Software fallback for CRC32C (Castagnoli polynomial), slicing-by-8.
+    return detail::crc32c_sw(static_cast<const uint8_t*>(data), length, crc) ^ 0xFFFFFFFF;
 }
 
 /// Compute CRC32C checksum of a span
-inline uint32_t crc32c(std::span<const uint8_t> data, uint32_t crc = 0xFFFFFFFF) noexcept {
-    return crc32c(data.data(), data.size(), crc);
+/// @param seed See `crc32c(const void*, size_t, uint32_t)` — initializer
+///             only, not a chain state.
+inline uint32_t crc32c(std::span<const uint8_t> data, uint32_t seed = 0xFFFFFFFF) noexcept {
+    return crc32c(data.data(), data.size(), seed);
 }
 
 /// Check if hardware CRC32C is available

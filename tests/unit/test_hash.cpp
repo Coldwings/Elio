@@ -1,6 +1,11 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/hash/hash.hpp>
 
+#include <cstring>
+#include <span>
+#include <string>
+#include <vector>
+
 using namespace elio::hash;
 
 // ============================================================================
@@ -51,13 +56,44 @@ TEST_CASE("crc32_iovec", "[hash][crc32]") {
 TEST_CASE("crc32 incremental", "[hash][crc32]") {
     // Test incremental CRC computation
     const char* data = "123456789";
-    
+
     uint32_t crc = 0xFFFFFFFF;
     crc = crc32_update(data, 5, crc);      // "12345"
     crc = crc32_update(data + 5, 4, crc);  // "6789"
     uint32_t result = crc32_finalize(crc);
-    
+
     REQUIRE(result == 0xCBF43926);
+}
+
+// ============================================================================
+// CRC32C tests (Castagnoli polynomial)
+// ============================================================================
+
+TEST_CASE("crc32c basic", "[hash][crc32c]") {
+    SECTION("empty buffer") {
+        REQUIRE(crc32c(nullptr, 0) == 0);
+    }
+
+    SECTION("standard test vector \"123456789\"") {
+        // Castagnoli reference value
+        const char* data = "123456789";
+        REQUIRE(crc32c(data, 9) == 0xE3069283);
+    }
+
+    SECTION("longer string crosses 8-byte boundary") {
+        const char* data = "abcdefghijklmnopqrstuvwxyz0123456789";
+        REQUIRE(crc32c(data, std::strlen(data)) == 0xFE84208C);
+    }
+
+    SECTION("single byte 'a'") {
+        uint8_t byte = 'a';
+        REQUIRE(crc32c(&byte, 1) == 0xC1D04330);
+    }
+
+    SECTION("span overload") {
+        std::vector<uint8_t> v = {'1','2','3','4','5','6','7','8','9'};
+        REQUIRE(crc32c(std::span<const uint8_t>(v)) == 0xE3069283);
+    }
 }
 
 // ============================================================================
@@ -205,6 +241,67 @@ TEST_CASE("sha256 reset", "[hash][sha256]") {
     auto digest2 = ctx.finalize();
     
     REQUIRE(digest1 == digest2);
+}
+
+// ============================================================================
+// Hardware vs software dispatch parity (force_software_hash)
+// ============================================================================
+
+namespace {
+
+struct force_sw_guard {
+    bool prev;
+    force_sw_guard() noexcept : prev(get_force_software_hash()) {
+        set_force_software_hash(true);
+    }
+    ~force_sw_guard() { set_force_software_hash(prev); }
+};
+
+template <class HashFn>
+void check_parity(HashFn fn, const std::string& msg) {
+    auto hw_digest = fn(msg);
+    {
+        force_sw_guard guard;
+        auto sw_digest = fn(msg);
+        REQUIRE(sw_digest == hw_digest);
+    }
+}
+
+} // namespace
+
+TEST_CASE("sha1 hw/sw parity", "[hash][sha1][parity]") {
+    auto fn = [](const std::string& s) { return sha1(s); };
+
+    check_parity(fn, "");
+    check_parity(fn, "abc");
+    check_parity(fn, "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+    check_parity(fn, std::string(1000, 'a'));
+    // Multi-block (>1024 bytes) so the block loop runs many iterations
+    check_parity(fn, std::string(8192, 'x'));
+
+    // FIPS 180-4 long-message vector: SHA1("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu")
+    const std::string fips_long =
+        "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn"
+        "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+    check_parity(fn, fips_long);
+    REQUIRE(sha1_hex(fips_long) == "a49b2446a02c645bf419f995b67091253a04a259");
+}
+
+TEST_CASE("sha256 hw/sw parity", "[hash][sha256][parity]") {
+    auto fn = [](const std::string& s) { return sha256(s); };
+
+    check_parity(fn, "");
+    check_parity(fn, "abc");
+    check_parity(fn, "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq");
+    check_parity(fn, std::string(1000, 'a'));
+    check_parity(fn, std::string(8192, 'x'));
+
+    // FIPS 180-4 long-message vector for SHA-256
+    const std::string fips_long =
+        "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn"
+        "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+    check_parity(fn, fips_long);
+    REQUIRE(sha256_hex(fips_long) == "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1");
 }
 
 // ============================================================================

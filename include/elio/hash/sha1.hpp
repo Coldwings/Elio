@@ -7,9 +7,17 @@
 /// - Loop unrolling for better instruction-level parallelism
 /// - Aligned memory access optimization
 /// - Efficient message schedule computation
+/// - Optional hardware acceleration on x86 (SHA-NI) and ARMv8 (SHA1 ext)
+///
+/// The hardware fast path is selected at runtime via `cpu_features` and
+/// produces digests bit-for-bit identical to the software path. Use
+/// `set_force_software_hash(true)` from `<elio/hash/cpu_features.hpp>` to
+/// pin all hashing onto the software path (e.g. for unit-test parity).
 ///
 /// Note: SHA-1 is considered weak for cryptographic purposes.
 /// Use SHA-256 or stronger for security-sensitive applications.
+
+#include "cpu_features.hpp"
 
 #include <array>
 #include <cstdint>
@@ -18,6 +26,14 @@
 #include <span>
 #include <string>
 #include <string_view>
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define ELIO_SHA1_HAVE_ARM_DISPATCH 1
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#define ELIO_SHA1_HAVE_X86_DISPATCH 1
+#endif
 
 namespace elio::hash {
 
@@ -191,8 +207,24 @@ private:
         b = rotl(b, 30)
     
     void process_block(const uint8_t* block) noexcept {
+#ifdef ELIO_SHA1_HAVE_ARM_DISPATCH
+        if (use_arm_sha1()) {
+            process_block_arm(block);
+            return;
+        }
+#endif
+#ifdef ELIO_SHA1_HAVE_X86_DISPATCH
+        if (use_sha_ni()) {
+            process_block_sha_ni(block);
+            return;
+        }
+#endif
+        process_block_sw(block);
+    }
+
+    void process_block_sw(const uint8_t* block) noexcept {
         uint32_t w[80];
-        
+
         // Load block into w[0..15] (big-endian)
         for (int i = 0; i < 16; ++i) {
             w[i] = load_be32(block + i * 4);
@@ -263,17 +295,386 @@ private:
         state_[3] += d;
         state_[4] += e;
     }
-    
+
     #undef SHA1_ROUND0
     #undef SHA1_ROUND1
     #undef SHA1_ROUND2
     #undef SHA1_ROUND3
-    
+
+#ifdef ELIO_SHA1_HAVE_ARM_DISPATCH
+    void process_block_arm(const uint8_t* block) noexcept;
+#endif
+#ifdef ELIO_SHA1_HAVE_X86_DISPATCH
+    void process_block_sha_ni(const uint8_t* block) noexcept;
+#endif
+
     alignas(16) uint32_t state_[5];
     uint64_t count_;
     alignas(16) uint8_t buffer_[sha1_block_size];
     size_t buffer_len_;
 };
+
+// ============================================================================
+// Hardware-accelerated block processors (out-of-class definitions)
+// ============================================================================
+
+#ifdef ELIO_SHA1_HAVE_ARM_DISPATCH
+#pragma GCC push_options
+#pragma GCC target("+crypto")
+#include <arm_neon.h>
+
+inline void sha1_context::process_block_arm(const uint8_t* block) noexcept {
+    // Reference pattern: ARMv8 Crypto Extension SHA-1 message schedule via
+    // vsha1su0/vsha1su1, round application via vsha1c/p/m and vsha1h.
+    uint32x4_t ABCD = vld1q_u32(state_);
+    uint32_t E0 = state_[4];
+    uint32_t E1;
+
+    uint32x4_t MSG0 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block + 0)));
+    uint32x4_t MSG1 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block + 16)));
+    uint32x4_t MSG2 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block + 32)));
+    uint32x4_t MSG3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block + 48)));
+
+    uint32x4_t ABCD_SAVED = ABCD;
+    uint32_t E0_SAVED = E0;
+
+    const uint32x4_t K0 = vdupq_n_u32(0x5A827999);
+    const uint32x4_t K1 = vdupq_n_u32(0x6ED9EBA1);
+    const uint32x4_t K2 = vdupq_n_u32(0x8F1BBCDC);
+    const uint32x4_t K3 = vdupq_n_u32(0xCA62C1D6);
+
+    uint32x4_t TMP0 = vaddq_u32(MSG0, K0);
+    uint32x4_t TMP1 = vaddq_u32(MSG1, K0);
+
+    // Rounds 0-3
+    E1 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1cq_u32(ABCD, E0, TMP0);
+    TMP0 = vaddq_u32(MSG2, K0);
+    MSG0 = vsha1su0q_u32(MSG0, MSG1, MSG2);
+
+    // Rounds 4-7
+    E0 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1cq_u32(ABCD, E1, TMP1);
+    TMP1 = vaddq_u32(MSG3, K0);
+    MSG0 = vsha1su1q_u32(MSG0, MSG3);
+    MSG1 = vsha1su0q_u32(MSG1, MSG2, MSG3);
+
+    // Rounds 8-11
+    E1 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1cq_u32(ABCD, E0, TMP0);
+    TMP0 = vaddq_u32(MSG0, K0);
+    MSG1 = vsha1su1q_u32(MSG1, MSG0);
+    MSG2 = vsha1su0q_u32(MSG2, MSG3, MSG0);
+
+    // Rounds 12-15
+    E0 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1cq_u32(ABCD, E1, TMP1);
+    TMP1 = vaddq_u32(MSG1, K1);
+    MSG2 = vsha1su1q_u32(MSG2, MSG1);
+    MSG3 = vsha1su0q_u32(MSG3, MSG0, MSG1);
+
+    // Rounds 16-19
+    E1 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1cq_u32(ABCD, E0, TMP0);
+    TMP0 = vaddq_u32(MSG2, K1);
+    MSG3 = vsha1su1q_u32(MSG3, MSG2);
+    MSG0 = vsha1su0q_u32(MSG0, MSG1, MSG2);
+
+    // Rounds 20-23
+    E0 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1pq_u32(ABCD, E1, TMP1);
+    TMP1 = vaddq_u32(MSG3, K1);
+    MSG0 = vsha1su1q_u32(MSG0, MSG3);
+    MSG1 = vsha1su0q_u32(MSG1, MSG2, MSG3);
+
+    // Rounds 24-27
+    E1 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1pq_u32(ABCD, E0, TMP0);
+    TMP0 = vaddq_u32(MSG0, K1);
+    MSG1 = vsha1su1q_u32(MSG1, MSG0);
+    MSG2 = vsha1su0q_u32(MSG2, MSG3, MSG0);
+
+    // Rounds 28-31
+    E0 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1pq_u32(ABCD, E1, TMP1);
+    TMP1 = vaddq_u32(MSG1, K1);
+    MSG2 = vsha1su1q_u32(MSG2, MSG1);
+    MSG3 = vsha1su0q_u32(MSG3, MSG0, MSG1);
+
+    // Rounds 32-35
+    E1 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1pq_u32(ABCD, E0, TMP0);
+    TMP0 = vaddq_u32(MSG2, K2);
+    MSG3 = vsha1su1q_u32(MSG3, MSG2);
+    MSG0 = vsha1su0q_u32(MSG0, MSG1, MSG2);
+
+    // Rounds 36-39
+    E0 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1pq_u32(ABCD, E1, TMP1);
+    TMP1 = vaddq_u32(MSG3, K2);
+    MSG0 = vsha1su1q_u32(MSG0, MSG3);
+    MSG1 = vsha1su0q_u32(MSG1, MSG2, MSG3);
+
+    // Rounds 40-43
+    E1 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1mq_u32(ABCD, E0, TMP0);
+    TMP0 = vaddq_u32(MSG0, K2);
+    MSG1 = vsha1su1q_u32(MSG1, MSG0);
+    MSG2 = vsha1su0q_u32(MSG2, MSG3, MSG0);
+
+    // Rounds 44-47
+    E0 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1mq_u32(ABCD, E1, TMP1);
+    TMP1 = vaddq_u32(MSG1, K2);
+    MSG2 = vsha1su1q_u32(MSG2, MSG1);
+    MSG3 = vsha1su0q_u32(MSG3, MSG0, MSG1);
+
+    // Rounds 48-51
+    E1 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1mq_u32(ABCD, E0, TMP0);
+    TMP0 = vaddq_u32(MSG2, K2);
+    MSG3 = vsha1su1q_u32(MSG3, MSG2);
+    MSG0 = vsha1su0q_u32(MSG0, MSG1, MSG2);
+
+    // Rounds 52-55
+    E0 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1mq_u32(ABCD, E1, TMP1);
+    TMP1 = vaddq_u32(MSG3, K3);
+    MSG0 = vsha1su1q_u32(MSG0, MSG3);
+    MSG1 = vsha1su0q_u32(MSG1, MSG2, MSG3);
+
+    // Rounds 56-59
+    E1 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1mq_u32(ABCD, E0, TMP0);
+    TMP0 = vaddq_u32(MSG0, K3);
+    MSG1 = vsha1su1q_u32(MSG1, MSG0);
+    MSG2 = vsha1su0q_u32(MSG2, MSG3, MSG0);
+
+    // Rounds 60-63
+    E0 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1pq_u32(ABCD, E1, TMP1);
+    TMP1 = vaddq_u32(MSG1, K3);
+    MSG2 = vsha1su1q_u32(MSG2, MSG1);
+    MSG3 = vsha1su0q_u32(MSG3, MSG0, MSG1);
+
+    // Rounds 64-67
+    E1 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1pq_u32(ABCD, E0, TMP0);
+    TMP0 = vaddq_u32(MSG2, K3);
+    MSG3 = vsha1su1q_u32(MSG3, MSG2);
+    MSG0 = vsha1su0q_u32(MSG0, MSG1, MSG2);
+
+    // Rounds 68-71
+    E0 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1pq_u32(ABCD, E1, TMP1);
+    TMP1 = vaddq_u32(MSG3, K3);
+    MSG0 = vsha1su1q_u32(MSG0, MSG3);
+
+    // Rounds 72-75
+    E1 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1pq_u32(ABCD, E0, TMP0);
+
+    // Rounds 76-79
+    E0 = vsha1h_u32(vgetq_lane_u32(ABCD, 0));
+    ABCD = vsha1pq_u32(ABCD, E1, TMP1);
+
+    // Add to running state
+    E0 += E0_SAVED;
+    ABCD = vaddq_u32(ABCD_SAVED, ABCD);
+
+    vst1q_u32(state_, ABCD);
+    state_[4] = E0;
+}
+
+#pragma GCC pop_options
+#endif // ELIO_SHA1_HAVE_ARM_DISPATCH
+
+#ifdef ELIO_SHA1_HAVE_X86_DISPATCH
+#pragma GCC push_options
+#pragma GCC target("sha,sse4.2,ssse3")
+#include <immintrin.h>
+
+inline void sha1_context::process_block_sha_ni(const uint8_t* block) noexcept {
+    // Reference pattern: Intel SHA Extensions Implementation White Paper.
+    // The state vector ABCD is loaded reversed (sha1rnds4 expects this
+    // ordering), and E starts in the high lane.
+    const __m128i MASK = _mm_set_epi64x(
+        static_cast<long long>(0x0001020304050607ULL),
+        static_cast<long long>(0x08090a0b0c0d0e0fULL));
+
+    __m128i ABCD = _mm_loadu_si128(reinterpret_cast<const __m128i*>(state_));
+    __m128i E0 = _mm_set_epi32(static_cast<int>(state_[4]), 0, 0, 0);
+    ABCD = _mm_shuffle_epi32(ABCD, 0x1B);  // reverse lanes: D C B A
+
+    __m128i ABCD_SAVE = ABCD;
+    __m128i E0_SAVE = E0;
+
+    __m128i MSG0 = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 0)), MASK);
+    __m128i MSG1 = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 16)), MASK);
+    __m128i MSG2 = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 32)), MASK);
+    __m128i MSG3 = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 48)), MASK);
+    __m128i E1;
+
+    // Rounds 0-3
+    E0 = _mm_add_epi32(E0, MSG0);
+    E1 = ABCD;
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
+
+    // Rounds 4-7
+    E1 = _mm_sha1nexte_epu32(E1, MSG1);
+    E0 = ABCD;
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 0);
+    MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
+
+    // Rounds 8-11
+    E0 = _mm_sha1nexte_epu32(E0, MSG2);
+    E1 = ABCD;
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
+    MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+    MSG0 = _mm_xor_si128(MSG0, MSG2);
+
+    // Rounds 12-15
+    E1 = _mm_sha1nexte_epu32(E1, MSG3);
+    E0 = ABCD;
+    MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 0);
+    MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
+    MSG1 = _mm_xor_si128(MSG1, MSG3);
+
+    // Rounds 16-19
+    E0 = _mm_sha1nexte_epu32(E0, MSG0);
+    E1 = ABCD;
+    MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
+    MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
+    MSG2 = _mm_xor_si128(MSG2, MSG0);
+
+    // Rounds 20-23
+    E1 = _mm_sha1nexte_epu32(E1, MSG1);
+    E0 = ABCD;
+    MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 1);
+    MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
+    MSG3 = _mm_xor_si128(MSG3, MSG1);
+
+    // Rounds 24-27
+    E0 = _mm_sha1nexte_epu32(E0, MSG2);
+    E1 = ABCD;
+    MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 1);
+    MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+    MSG0 = _mm_xor_si128(MSG0, MSG2);
+
+    // Rounds 28-31
+    E1 = _mm_sha1nexte_epu32(E1, MSG3);
+    E0 = ABCD;
+    MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 1);
+    MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
+    MSG1 = _mm_xor_si128(MSG1, MSG3);
+
+    // Rounds 32-35
+    E0 = _mm_sha1nexte_epu32(E0, MSG0);
+    E1 = ABCD;
+    MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 1);
+    MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
+    MSG2 = _mm_xor_si128(MSG2, MSG0);
+
+    // Rounds 36-39
+    E1 = _mm_sha1nexte_epu32(E1, MSG1);
+    E0 = ABCD;
+    MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 1);
+    MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
+    MSG3 = _mm_xor_si128(MSG3, MSG1);
+
+    // Rounds 40-43
+    E0 = _mm_sha1nexte_epu32(E0, MSG2);
+    E1 = ABCD;
+    MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 2);
+    MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+    MSG0 = _mm_xor_si128(MSG0, MSG2);
+
+    // Rounds 44-47
+    E1 = _mm_sha1nexte_epu32(E1, MSG3);
+    E0 = ABCD;
+    MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 2);
+    MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
+    MSG1 = _mm_xor_si128(MSG1, MSG3);
+
+    // Rounds 48-51
+    E0 = _mm_sha1nexte_epu32(E0, MSG0);
+    E1 = ABCD;
+    MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 2);
+    MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
+    MSG2 = _mm_xor_si128(MSG2, MSG0);
+
+    // Rounds 52-55
+    E1 = _mm_sha1nexte_epu32(E1, MSG1);
+    E0 = ABCD;
+    MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 2);
+    MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
+    MSG3 = _mm_xor_si128(MSG3, MSG1);
+
+    // Rounds 56-59
+    E0 = _mm_sha1nexte_epu32(E0, MSG2);
+    E1 = ABCD;
+    MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 2);
+    MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+    MSG0 = _mm_xor_si128(MSG0, MSG2);
+
+    // Rounds 60-63
+    E1 = _mm_sha1nexte_epu32(E1, MSG3);
+    E0 = ABCD;
+    MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
+    MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
+    MSG1 = _mm_xor_si128(MSG1, MSG3);
+
+    // Rounds 64-67
+    E0 = _mm_sha1nexte_epu32(E0, MSG0);
+    E1 = ABCD;
+    MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 3);
+    MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
+    MSG2 = _mm_xor_si128(MSG2, MSG0);
+
+    // Rounds 68-71
+    E1 = _mm_sha1nexte_epu32(E1, MSG1);
+    E0 = ABCD;
+    MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
+    MSG3 = _mm_xor_si128(MSG3, MSG1);
+
+    // Rounds 72-75
+    E0 = _mm_sha1nexte_epu32(E0, MSG2);
+    E1 = ABCD;
+    MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 3);
+
+    // Rounds 76-79
+    E1 = _mm_sha1nexte_epu32(E1, MSG3);
+    E0 = ABCD;
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
+
+    // Add saved state
+    E0 = _mm_sha1nexte_epu32(E0, E0_SAVE);
+    ABCD = _mm_add_epi32(ABCD, ABCD_SAVE);
+
+    // Restore the state lane order and store
+    ABCD = _mm_shuffle_epi32(ABCD, 0x1B);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(state_), ABCD);
+    state_[4] = static_cast<uint32_t>(_mm_extract_epi32(E0, 3));
+}
+
+#pragma GCC pop_options
+#endif // ELIO_SHA1_HAVE_X86_DISPATCH
 
 // ============================================================================
 // Convenience functions

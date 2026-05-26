@@ -227,134 +227,193 @@ def read_atomic_value(process, addr, size=8):
 
 
 def iterate_chase_lev_deque(process, queue_addr, ptr_size):
-    """Iterate over entries in a Chase-Lev deque."""
+    """Iterate over entries in a Chase-Lev deque.
+
+    chase_lev_deque has ``alignas(64)`` on top_, bottom_, and buffer_, so they
+    sit on consecutive 64-byte cache lines (offsets 0, 64, 128). buffer_ is an
+    ``atomic<circular_buffer*>``; the circular_buffer object itself starts with
+    capacity_, mask_, then a ``unique_ptr<atomic<T*>[]>`` payload.
+    """
     try:
-        # Chase-Lev deque layout (approximate):
-        # - top_ (atomic<size_t>)
-        # - bottom_ (atomic<size_t>)
-        # - buffer_ (struct with buffer_ pointer and capacity_)
-        
         top = read_uint64(process, queue_addr)
-        bottom = read_uint64(process, queue_addr + 8)
-        
-        # buffer_ offset depends on atomics size, typically 16
-        buffer_struct_addr = queue_addr + 16
-        buffer_ptr = read_pointer(process, buffer_struct_addr)
-        capacity = read_uint64(process, buffer_struct_addr + ptr_size)
-        
-        if top is None or bottom is None or buffer_ptr == 0 or capacity == 0:
+        bottom = read_uint64(process, queue_addr + 64)
+        buffer_ptr = read_pointer(process, queue_addr + 128)
+
+        if top is None or bottom is None or buffer_ptr == 0:
             return
-        
+
+        # circular_buffer layout (chase_lev_deque.hpp): capacity_, mask_,
+        # then a unique_ptr<atomic<T*>[]> whose held pointer is the slot
+        # array. Both members are size_t.
+        capacity = read_uint64(process, buffer_ptr)
+        slots_ptr = read_pointer(process, buffer_ptr + 2 * 8)
+
+        if not capacity or slots_ptr == 0:
+            return
+
         for i in range(top, bottom):
             try:
                 idx = i % capacity
-                entry_addr = buffer_ptr + idx * ptr_size
+                entry_addr = slots_ptr + idx * ptr_size
                 entry = read_pointer(process, entry_addr)
                 if entry and entry != 0:
                     yield entry
-            except:
+            except Exception:
                 pass
-    except:
+    except Exception:
         pass
 
 
-def iterate_mpsc_queue(process, inbox_addr, ptr_size):
-    """Iterate over entries in MPSC queue (best effort)."""
+# NOTE: MPSC inbox traversal is omitted on purpose; see iterate_worker_tasks.
+
+# ---------------------------------------------------------------------------
+# Known limitation: I/O-suspended coroutines are NOT enumerated.
+#
+# Coroutines awaiting an io_uring SQE are not in any worker's run-queue. Their
+# coroutine handle is reachable only through ``op_state``s referenced by
+# tagged ``user_data`` values inside the kernel-side io_uring CQ ring (see
+# include/elio/io/io_uring_backend.hpp). The backend keeps a count
+# (``pending_ops_``) but no walkable container of in-flight op_states, so
+# iterating them from a debugger requires walking io_uring's mmap'd CQ ring
+# — kernel-version-dependent and out of scope for this script. Production
+# stacks dominated by I/O suspension will therefore report few or no tasks
+# from ``elio list``; check ``elio workers`` for queue counts and combine
+# with native ``thread backtrace all`` for full coverage.
+# ---------------------------------------------------------------------------
+
+
+def iterate_worker_tasks(process, worker_addr, ptr_size, target=None):
+    """Iterate over all tasks in a worker's queues.
+
+    worker_thread holds ``queue_`` (Chase-Lev deque) and ``inbox_`` (MPSC) as
+    ``unique_ptr``s, so we read the held pointer at the field offset and then
+    walk the heap-allocated container.
+    """
     try:
-        # MPSC queue structure varies, try common patterns
-        head = read_uint64(process, inbox_addr)
-        tail = read_uint64(process, inbox_addr + 8)
-        buffer_ptr = read_pointer(process, inbox_addr + 16)
-        capacity = read_uint64(process, inbox_addr + 16 + ptr_size)
-        
-        if head is None or tail is None or buffer_ptr == 0 or capacity == 0:
-            return
-        
-        count = (tail - head) % capacity
-        for i in range(count):
-            try:
-                idx = (head + i) % capacity
-                entry_addr = buffer_ptr + idx * ptr_size
-                entry = read_pointer(process, entry_addr)
-                if entry and entry != 0:
-                    yield entry
-            except:
-                pass
-    except:
+        # worker_thread layout (worker_thread.hpp:226+):
+        #   scheduler_ (ptr) -> 0
+        #   worker_id_ (size_t) -> 8
+        #   queue_ (unique_ptr<chase_lev_deque<void>>) -> 16
+        #   inbox_ (unique_ptr<mpsc_queue<void>>)      -> 24
+        queue_offset = ptr_size + ptr_size  # after scheduler_ + worker_id_
+        if target is not None:
+            queue_offset = _resolve_field_offset(
+                target, "elio::runtime::worker_thread", "queue_", queue_offset)
+
+        queue_ptr = read_pointer(process, worker_addr + queue_offset)
+        if queue_ptr != 0:
+            for addr in iterate_chase_lev_deque(process, queue_ptr, ptr_size):
+                yield addr
+
+        # inbox_ traversal is intentionally omitted: ``mpsc_queue`` uses an
+        # array-of-slots layout with embedded sequence counters that is not
+        # safe to walk lock-free from a debugger. Tasks visible there are
+        # transient hand-offs to the worker; the deque view is sufficient
+        # for an interactive snapshot.
+    except Exception:
         pass
 
 
-def iterate_worker_tasks(process, worker_addr, ptr_size):
-    """Iterate over all tasks in a worker's queues."""
+# scheduler::MAX_THREADS — kept in sync with include/elio/runtime/scheduler.hpp.
+# Used as both a hard upper bound on the worker walk and as the inline size of
+# the std::array<unique_ptr<worker_thread>, MAX_THREADS> ``workers_`` member.
+SCHEDULER_MAX_THREADS = 256
+
+
+def _get_field_offset(sbtype, field_name):
+    """Find a field's byte offset on an SBType, or None if absent/invalid."""
+    if not sbtype or not sbtype.IsValid():
+        return None
     try:
-        # Worker layout depends on implementation
-        # Try to find queue_ and inbox_ members
-        # This is a best-effort approach based on typical layouts
-        
-        # Assume queue_ is at some offset after worker_id_ and other fields
-        # We'll try multiple offsets
-        
-        for queue_offset in [8, 16, 24, 32, 40, 48]:
-            queue_addr = worker_addr + queue_offset
-            found_tasks = False
-            for addr in iterate_chase_lev_deque(process, queue_addr, ptr_size):
-                found_tasks = True
-                yield addr
-            if found_tasks:
-                break
-        
-        # Try inbox_ at various offsets after queue_
-        for inbox_offset in [64, 72, 80, 88, 96, 128, 256]:
-            inbox_addr = worker_addr + inbox_offset
-            for addr in iterate_mpsc_queue(process, inbox_addr, ptr_size):
-                yield addr
-    except:
+        for i in range(sbtype.GetNumberOfFields()):
+            f = sbtype.GetFieldAtIndex(i)
+            if f.GetName() == field_name:
+                return f.GetOffsetInBytes()
+    except Exception:
         pass
+    return None
+
+
+def _resolve_field_offset(target, type_name, field_name, fallback):
+    """Look up a field offset via the debugger's type system, with fallback.
+
+    Falling back to a hard-coded offset matters for stripped binaries / partial
+    debug info where the type lookup returns invalid. The fallbacks track the
+    layout documented in scheduler.hpp / worker_thread.hpp.
+    """
+    try:
+        t = target.FindFirstType(type_name)
+        off = _get_field_offset(t, field_name)
+        if off is not None:
+            return off
+    except Exception:
+        pass
+    return fallback
 
 
 def iterate_all_tasks(target, process):
-    """Iterate over all tasks across all workers."""
+    """Iterate over all tasks across all workers.
+
+    Layout invariants (see include/elio/runtime/scheduler.hpp):
+      * ``workers_`` is ``std::array<std::unique_ptr<worker_thread>, MAX_THREADS>``
+        stored inline in the scheduler — NOT a heap-allocated vector. Slot ``i``
+        holds the unique_ptr's pointee directly at ``&workers_ + i * ptr_size``.
+      * ``num_threads_`` is an ``alignas(64) std::atomic<size_t>`` that lives
+        immediately after ``workers_``. Readers must clamp ``i`` to
+        ``min(num_threads_, MAX_THREADS)`` to stay inside the array.
+
+    Prior to PR #72 ``workers_`` was a heap-allocated vector and the walker
+    chased ``vector::_M_start`` as a pointer. With std::array storage that
+    offset now points into worker_thread #0's body, producing garbage worker
+    pointers and segfaulting the inferior — hence the rewrite.
+    """
     sched_addr = get_scheduler(target, process)
     if sched_addr is None:
         return
-    
+
     ptr_size = process.GetAddressByteSize()
-    
-    try:
-        # Scheduler layout (approximate):
-        # Various fields, then:
-        # - num_threads_ (atomic<size_t>)
-        # - workers_ (unique_ptr<worker_thread>[] or vector)
-        
-        # Try to find num_threads_ and workers_ at various offsets
-        # This is implementation-dependent
-        
-        for num_threads_offset in [0, 8, 16, 24, 32, 40, 48]:
-            num_threads = read_uint64(process, sched_addr + num_threads_offset)
-            if num_threads and 0 < num_threads <= 256:
-                # Likely found num_threads, workers_ should be nearby
-                workers_offset = num_threads_offset + 8
-                workers_ptr = read_pointer(process, sched_addr + workers_offset)
-                
-                if workers_ptr != 0:
-                    for i in range(num_threads):
-                        try:
-                            worker_ptr_addr = workers_ptr + i * ptr_size
-                            worker_ptr = read_pointer(process, worker_ptr_addr)
-                            
-                            if worker_ptr == 0:
-                                continue
-                            
-                            # Read worker_id_ (usually first field)
-                            worker_id = read_uint32(process, worker_ptr)
-                            
-                            for task_addr in iterate_worker_tasks(process, worker_ptr, ptr_size):
-                                yield task_addr, worker_id
-                        except:
-                            pass
-                    return
-    except:
-        pass
+
+    # Default fallbacks track scheduler.hpp:645+ (post-PR #72 layout):
+    #   workers_       at offset 0 (no earlier members; no vtable)
+    #   num_threads_   alignas(64) right after the std::array storage
+    default_workers_offset = 0
+    default_num_threads_offset = ((SCHEDULER_MAX_THREADS * ptr_size) + 63) & ~63
+
+    workers_offset = _resolve_field_offset(
+        target, "elio::runtime::scheduler", "workers_", default_workers_offset)
+    num_threads_offset = _resolve_field_offset(
+        target, "elio::runtime::scheduler", "num_threads_", default_num_threads_offset)
+
+    num_threads = read_uint64(process, sched_addr + num_threads_offset)
+    if num_threads is None or num_threads == 0:
+        return
+    if num_threads > SCHEDULER_MAX_THREADS:
+        num_threads = SCHEDULER_MAX_THREADS
+
+    workers_base = sched_addr + workers_offset
+
+    # worker_thread layout (worker_thread.hpp):
+    #   scheduler_  (ptr,    8 bytes) at offset 0
+    #   worker_id_  (size_t, 8 bytes) at offset 8
+    worker_id_offset = _resolve_field_offset(
+        target, "elio::runtime::worker_thread", "worker_id_", ptr_size)
+
+    for i in range(num_threads):
+        try:
+            # Each std::array slot is a unique_ptr<worker_thread>. Both
+            # libstdc++ and libc++ store the held pointer as the first (and
+            # only) word, so reading ptr_size bytes recovers worker_ptr.
+            slot_addr = workers_base + i * ptr_size
+            worker_ptr = read_pointer(process, slot_addr)
+            if worker_ptr == 0:
+                continue
+
+            worker_id = read_uint64(process, worker_ptr + worker_id_offset)
+
+            for task_addr in iterate_worker_tasks(process, worker_ptr, ptr_size, target):
+                yield task_addr, worker_id
+        except Exception:
+            continue
 
 
 def get_all_frames(target, process):

@@ -858,6 +858,9 @@ TEST_CASE("buffer_ref type traits", "[rpc][buffer_ref]") {
 #include <elio/time/timer.hpp>
 #include <thread>
 #include <atomic>
+#include <chrono>
+#include <future>
+#include <utility>
 
 TEST_CASE("oversized vector count is rejected", "[rpc][security]") {
     // Wire layout for vector<int32_t>: <count:u32><n * int32>.
@@ -1233,11 +1236,29 @@ TEST_CASE("server out-of-order dispatch does not head-of-line block",
     // on a forced-close path.
     cfg.frame_read_timeout = std::chrono::seconds(1);
     auto server = std::make_shared<rpc_server<tcp_stream>>(cfg);
-    server->register_method<DelayMethod>([](const DelayReq& r)
-                                             -> coro::task<DelayResp> {
-        co_await elio::time::sleep_for(std::chrono::milliseconds(r.ms));
-        co_return DelayResp{r.ms};
-    });
+
+    // Server-side concurrency probe: deterministic in-flight counter
+    // observed by every handler entry/exit. If the read loop dispatches
+    // requests concurrently, max_in_flight will reach >= 2 (and ideally 3)
+    // even on slow CI runners. This replaces the previous wall-clock
+    // assertion which was flaky on arm64-Debug + ASAN where the shared
+    // GitHub runner can stretch a 150ms sleep into hundreds of ms of
+    // overhead, blurring the concurrent-vs-sequential gap.
+    std::atomic<int> in_flight{0};
+    std::atomic<int> max_in_flight{0};
+    server->register_method<DelayMethod>(
+        [&in_flight, &max_in_flight](const DelayReq& r) -> coro::task<DelayResp> {
+            int now = in_flight.fetch_add(1, std::memory_order_acq_rel) + 1;
+            int prev = max_in_flight.load(std::memory_order_relaxed);
+            while (prev < now &&
+                   !max_in_flight.compare_exchange_weak(prev, now,
+                                                       std::memory_order_acq_rel)) {
+                // retry
+            }
+            co_await elio::time::sleep_for(std::chrono::milliseconds(r.ms));
+            in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            co_return DelayResp{r.ms};
+        });
 
     scheduler sched(4);
     sched.start();
@@ -1250,26 +1271,25 @@ TEST_CASE("server out-of-order dispatch does not head-of-line block",
         co_await server->handle_client(std::move(*s));
     });
 
-    std::atomic<int64_t> total_elapsed_ms{0};
-    std::atomic<int> done{0};
+    // Cross-thread synchronization: the test main thread waits on this
+    // promise instead of spinning on a 5-second wall-clock budget. The
+    // budget here (60s) only bounds pathological hangs.
+    std::promise<void> client_done_promise;
+    auto client_done = client_done_promise.get_future();
     std::atomic<int> ok_count{0};
 
-    sched.go([&]() -> coro::task<void> {
+    sched.go([&, p = std::move(client_done_promise)]() mutable -> coro::task<void> {
         auto client_opt = co_await tcp_rpc_client::connect("::1", port);
         REQUIRE(client_opt.has_value());
         auto client = *client_opt;
 
-        // Spawn 3 calls concurrently. Sequential execution would take
-        // ~150*3=450ms; concurrent ~150ms. Anything <300ms confirms the
-        // read loop did not serialise them.
-        auto t0 = std::chrono::steady_clock::now();
-
         auto* current_sched = elio::runtime::scheduler::current();
         REQUIRE(current_sched != nullptr);
-        // Short per-call timeout (vs. 30s default) so the spawned timer
-        // tasks complete on their own before shutdown, avoiding orphaned
-        // I/O during sched.shutdown().
-        auto call_timeout = std::chrono::milliseconds(800);
+
+        // Per-call timeout that comfortably accommodates arm64-Debug+ASAN
+        // CI runners where 150ms sleep + frame round-trip can take hundreds
+        // of ms. Still well below the 30s default so a real hang surfaces.
+        auto call_timeout = std::chrono::seconds(5);
         auto h1 = current_sched->go_joinable(
             [c = client, call_timeout]() -> coro::task<int> {
                 auto r = co_await c->call<DelayMethod>(DelayReq{150}, call_timeout);
@@ -1293,25 +1313,23 @@ TEST_CASE("server out-of-order dispatch does not head-of-line block",
         if (v2 == 150) ok_count.fetch_add(1);
         if (v3 == 150) ok_count.fetch_add(1);
 
-        auto t1 = std::chrono::steady_clock::now();
-        total_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               t1 - t0).count();
-        done = 1;
+        p.set_value();
     });
 
-    for (int i = 0; i < 500 && !done.load(); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    REQUIRE(done.load() == 1);
+    // 60s upper bound only catches pathological hangs; healthy runs
+    // resolve in well under a second on developer machines and a few
+    // seconds on the slowest CI runner.
+    auto status = client_done.wait_for(std::chrono::seconds(60));
+    REQUIRE(status == std::future_status::ready);
     REQUIRE(ok_count.load() == 3);
-    // Allow generous slack for CI noise.
-    REQUIRE(total_elapsed_ms.load() < 400);
+    // Deterministic concurrency check: server saw at least 2 handlers in
+    // flight simultaneously (with the test's 3 parallel calls and 150ms
+    // sleeps, max_in_flight should reach 3 in practice; >= 2 is enough
+    // to rule out head-of-line blocking).
+    REQUIRE(max_in_flight.load() >= 2);
 
-    // The functional assertions are already validated. Drain with a tight
-    // timeout — if any task is stuck, we force-stop. This keeps the test
-    // bounded regardless of how the receive_loop / session shutdown races
-    // resolve.
+    // Drain naturally so any in-flight dispatched handler completes
+    // before the scheduler tears down its workers — keeps ASAN clean.
     server->stop();
-    sched.shutdown(std::chrono::seconds(3));
+    sched.shutdown(std::chrono::seconds(30));
 }

@@ -293,15 +293,21 @@ private:
     
     /// Internal receive implementation
     coro::task<std::optional<event>> receive_impl(coro::cancel_token token) {
-        // Use passed token or stored token
-        auto& active_token = token.is_cancelled() ? token_ : token;
-        
+        // Observe BOTH tokens at every loop point.  Either the parameter
+        // token (per-receive cancellation) or the connect-time token must be
+        // able to break out of the loop; the previous `auto& active_token =
+        // token.is_cancelled() ? token_ : token;` selected exactly the wrong
+        // one and silently dropped the connect-time token's cancellation.
+        auto cancelled = [&] {
+            return token.is_cancelled() || token_.is_cancelled();
+        };
+
         while (state_ == client_state::connected) {
             // Check for cancellation
-            if (active_token.is_cancelled()) {
+            if (cancelled()) {
                 co_return std::nullopt;
             }
-            
+
             // Check for already-parsed events
             if (parser_.has_event()) {
                 auto evt = parser_.get_event();
@@ -310,23 +316,23 @@ private:
                 }
                 co_return evt;
             }
-            
+
             // Read more data
             auto result = co_await read(buffer_.data(), buffer_.size());
-            
+
             if (result.result <= 0) {
                 if (result.result == 0) {
                     ELIO_LOG_DEBUG("SSE connection closed by server");
                 } else {
                     ELIO_LOG_ERROR("SSE read error: {}", strerror(-result.result));
                 }
-                
+
                 // Check cancellation before reconnect
-                if (active_token.is_cancelled()) {
+                if (cancelled()) {
                     state_ = client_state::disconnected;
                     co_return std::nullopt;
                 }
-                
+
                 // Handle reconnection
                 if (config_.auto_reconnect && state_ != client_state::closed) {
                     state_ = client_state::reconnecting;
@@ -335,15 +341,15 @@ private:
                         continue;
                     }
                 }
-                
+
                 state_ = client_state::disconnected;
                 co_return std::nullopt;
             }
-            
-            parser_.parse(std::string_view(buffer_.data(), 
+
+            parser_.parse(std::string_view(buffer_.data(),
                                            static_cast<size_t>(result.result)));
         }
-        
+
         co_return std::nullopt;
     }
 
@@ -397,10 +403,20 @@ private:
             co_return false;
         }
         
-        // Read response headers
+        // Read response headers.
+        //
+        // SSE responses MUST be parsed headers-only.  Some misbehaving
+        // proxies wrap an SSE stream in a `Content-Length: N` or
+        // `Transfer-Encoding: chunked` envelope; if we let the generic
+        // `response_parser` consume the stream, it eats real SSE event
+        // bytes as the HTTP "body" and the first events vanish into
+        // `parser.take_body()` — `response_data.substr(consumed)` would
+        // then drop the bytes we just lost.  Instead, delimit the header
+        // block manually with `\r\n\r\n` and feed every byte after the
+        // delimiter directly to the SSE event parser.
         std::string response_data;
         response_data.reserve(1024);
-        
+
         while (true) {
             auto read_result = co_await read(buffer_.data(), buffer_.size());
             if (read_result.result <= 0) {
@@ -408,43 +424,56 @@ private:
                 state_ = client_state::disconnected;
                 co_return false;
             }
-            
+
             response_data.append(buffer_.data(), static_cast<size_t>(read_result.result));
-            
+
             auto header_end = response_data.find("\r\n\r\n");
             if (header_end != std::string::npos) {
-                // Parse response
+                size_t header_block_size = header_end + 4;
+
+                // Parse only the header block (status line + headers + CRLF
+                // CRLF terminator).  If the server advertises a body via
+                // Content-Length / Transfer-Encoding we deliberately ignore
+                // it — feeding only the header section keeps response_parser
+                // from consuming any SSE event bytes.  The parser will
+                // typically return need_more (it expected a body), but
+                // status_ and headers_ are already populated by then.
                 response_parser parser;
-                auto [result, consumed] = parser.parse(response_data);
-                
+                auto [result, consumed] = parser.parse(
+                    std::string_view(response_data).substr(0, header_block_size));
+                (void)consumed;
+
                 if (result == parse_result::error) {
-                    ELIO_LOG_ERROR("Failed to parse SSE response");
+                    ELIO_LOG_ERROR("Failed to parse SSE response: {}",
+                                   parser.error_message());
                     state_ = client_state::disconnected;
                     co_return false;
                 }
-                
+
                 // Check status code
                 if (parser.get_status() != status::ok) {
-                    ELIO_LOG_ERROR("SSE request failed: {}", 
+                    ELIO_LOG_ERROR("SSE request failed: {}",
                                   static_cast<int>(parser.get_status()));
                     state_ = client_state::disconnected;
                     co_return false;
                 }
-                
+
                 // Check content type
                 auto content_type = parser.get_headers().get("Content-Type");
                 if (content_type.find("text/event-stream") == std::string_view::npos) {
                     ELIO_LOG_WARNING("Unexpected Content-Type: {}", content_type);
                 }
-                
-                // Feed any remaining data to the event parser
-                if (consumed < response_data.size()) {
-                    parser_.parse(response_data.substr(consumed));
+
+                // Anything past the header delimiter is SSE event data,
+                // regardless of what the server claimed about the body.
+                if (header_block_size < response_data.size()) {
+                    parser_.parse(std::string_view(response_data)
+                                      .substr(header_block_size));
                 }
-                
+
                 break;
             }
-            
+
             if (response_data.size() > 8192) {
                 ELIO_LOG_ERROR("SSE response headers too large");
                 state_ = client_state::disconnected;

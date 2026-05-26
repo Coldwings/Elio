@@ -244,21 +244,49 @@ def walk_virtual_stack(handle_addr):
 
 
 def iterate_chase_lev_deque(queue):
-    """Iterate over entries in a Chase-Lev deque."""
+    """Iterate over entries in a Chase-Lev deque (gdb.Value of the deque).
+
+    Layout (chase_lev_deque.hpp):
+      * top_, bottom_, buffer_ are each ``alignas(64) std::atomic<...>``
+        on their own cache line. We read them via gdb's atomic accessor.
+      * buffer_ holds a ``circular_buffer*``. The pointee starts with
+        ``capacity_`` (size_t), ``mask_`` (size_t), then a
+        ``unique_ptr<atomic<T*>[]>`` whose held pointer is the slot array.
+
+    Walking the slot array via raw memory reads keeps us ABI-agnostic across
+    libstdc++ and libc++ unique_ptr layouts.
+    """
     try:
         top = read_atomic(queue["top_"])
         bottom = read_atomic(queue["bottom_"])
-        buffer = queue["buffer_"]["buffer_"]
-        capacity = int(queue["buffer_"]["capacity_"])
-        
-        if top is None or bottom is None:
+        if top is None or bottom is None or top >= bottom:
             return
-        
+
+        buf_ptr_val = read_atomic(queue["buffer_"])
+        if not buf_ptr_val:
+            return
+
+        ptr_size = gdb.lookup_type("void").pointer().sizeof
+        inferior = gdb.selected_inferior()
+
+        # circular_buffer: capacity_(size_t) at offset 0;
+        # buffer_ (unique_ptr held ptr) at offset 2*sizeof(size_t).
+        cap_bytes = inferior.read_memory(buf_ptr_val, 8)
+        capacity = int.from_bytes(bytes(cap_bytes), 'little')
+        if capacity == 0:
+            return
+
+        slots_bytes = inferior.read_memory(buf_ptr_val + 2 * 8, ptr_size)
+        slots_addr = int.from_bytes(bytes(slots_bytes), 'little')
+        if slots_addr == 0:
+            return
+
         for i in range(top, bottom):
             try:
                 idx = i % capacity
-                entry = read_atomic(buffer[idx])
-                if entry and entry != 0:
+                raw = inferior.read_memory(slots_addr + idx * ptr_size, ptr_size)
+                entry = int.from_bytes(bytes(raw), 'little')
+                if entry:
                     yield entry
             except:
                 pass
@@ -266,73 +294,120 @@ def iterate_chase_lev_deque(queue):
         pass
 
 
-def iterate_mpsc_queue(inbox):
-    """Iterate over entries in MPSC queue (best effort)."""
-    try:
-        # MPSC queue structure varies, try common patterns
-        head = read_atomic(inbox["head_"])
-        tail = read_atomic(inbox["tail_"])
-        buffer = inbox["buffer_"]
-        capacity = int(inbox["capacity_"])
-        
-        if head is None or tail is None:
-            return
-        
-        count = (tail - head) % capacity
-        for i in range(count):
-            try:
-                idx = (head + i) % capacity
-                entry_addr = read_atomic(buffer[idx])
-                if entry_addr and entry_addr != 0:
-                    yield entry_addr
-            except:
-                pass
-    except:
-        pass
-
-
 def iterate_worker_tasks(worker):
-    """Iterate over all tasks in a worker's queues."""
+    """Iterate over all tasks in a worker's run queue.
+
+    The MPSC inbox is intentionally not walked: its array-of-slots layout
+    with embedded sequence counters is not safe to traverse lock-free from
+    a debugger.
+    """
     try:
-        # Iterate Chase-Lev deque
-        queue = worker["queue_"]
-        for addr in iterate_chase_lev_deque(queue):
-            yield addr
-        
-        # Iterate MPSC inbox
-        inbox = worker["inbox_"]
-        for addr in iterate_mpsc_queue(inbox):
+        # queue_ is unique_ptr<chase_lev_deque<void>>; .get() yields the deque
+        # pointer. Use parse_and_eval to remain ABI-agnostic.
+        queue_ptr = gdb.parse_and_eval(f"(({worker.type}*)({int(worker.address)}))->queue_.get()")
+        if int(queue_ptr) == 0:
+            return
+        for addr in iterate_chase_lev_deque(queue_ptr.dereference()):
             yield addr
     except:
         pass
+
+
+def _array_get(arr_value, i):
+    """Index into a std::array gdb.Value, handling libstdc++/libc++ ABIs.
+
+    libstdc++ stores the data in ``_M_elems``; libc++ uses ``__elems_``. As of
+    GDB 10+ pretty-printers expose ``__getitem__`` for std::array, but that's
+    not universal — fall back to the ABI-specific member.
+    """
+    # Direct indexing first: works for raw arrays/pointers and for std::array
+    # when a Python __getitem__ override is in scope.
+    try:
+        return arr_value[i]
+    except Exception:
+        pass
+    for member in ("_M_elems", "__elems_"):
+        try:
+            return arr_value[member][i]
+        except Exception:
+            continue
+    raise RuntimeError("std::array indexing failed (unknown stdlib ABI)")
 
 
 def iterate_all_tasks(scheduler):
-    """Iterate over all tasks across all workers."""
+    """Iterate over all tasks across all workers.
+
+    PR #72 changed ``workers_`` from ``std::vector<std::unique_ptr<worker_thread>>``
+    to ``std::array<std::unique_ptr<worker_thread>, MAX_THREADS>``. The std::array
+    holds storage inline; we index into it via the libstdc++/libc++ helper above
+    and clamp the upper bound by ``min(num_threads_, MAX_THREADS=256)`` to stay
+    within the array.
+    """
     if scheduler is None:
         return
-    
+
     try:
         num_threads = read_atomic(scheduler["num_threads_"])
-        workers = scheduler["workers_"]
-        
-        if num_threads is None:
+        if num_threads is None or num_threads == 0:
             return
-        
+        # Clamp to the std::array's static capacity (scheduler::MAX_THREADS).
+        if num_threads > 256:
+            num_threads = 256
+
+        workers = scheduler["workers_"]
+
+        # unique_ptr<worker_thread>::get() is the stable accessor regardless
+        # of whether libstdc++/libc++ exposes children() or __getitem__ for
+        # the array. parse_and_eval lets us call it directly.
+        sched_addr = int(scheduler.address)
         for i in range(num_threads):
             try:
-                worker_ptr = workers[i]
+                worker_ptr = gdb.parse_and_eval(
+                    f"((elio::runtime::scheduler*)({sched_addr}))->workers_[{i}].get()"
+                )
                 if int(worker_ptr) == 0:
                     continue
                 worker = worker_ptr.dereference()
                 worker_id = int(worker["worker_id_"])
-                
+
                 for task_addr in iterate_worker_tasks(worker):
                     yield task_addr, worker_id
             except:
-                pass
+                # Fallback path when parse_and_eval can't materialize
+                # workers_[i] (e.g. stripped binary): try _array_get directly.
+                try:
+                    slot = _array_get(workers, i)
+                    # slot is unique_ptr<worker_thread>; pull the held ptr
+                    # through .get() if available, otherwise skip.
+                    worker_ptr = gdb.parse_and_eval(
+                        f"((std::unique_ptr<elio::runtime::worker_thread>*)({int(slot.address)}))->get()"
+                    )
+                    if int(worker_ptr) == 0:
+                        continue
+                    worker = worker_ptr.dereference()
+                    worker_id = int(worker["worker_id_"])
+                    for task_addr in iterate_worker_tasks(worker):
+                        yield task_addr, worker_id
+                except:
+                    pass
     except:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Known limitation: I/O-suspended coroutines are NOT enumerated.
+#
+# A coroutine awaiting an io_uring SQE is not in any worker's run queue. Its
+# handle is reachable only through ``op_state`` objects referenced by tagged
+# ``user_data`` values inside the kernel-side io_uring CQ ring (see
+# include/elio/io/io_uring_backend.hpp). The backend tracks a count
+# (``pending_ops_``) but does not maintain a walkable container of in-flight
+# op_states, so iterating them from a debugger would require walking
+# io_uring's mmap'd CQ ring — kernel-version-dependent and out of scope.
+# Stacks dominated by I/O suspension will therefore report few or no tasks
+# via ``elio list``; combine with native ``thread apply all bt`` for
+# coverage.
+# ---------------------------------------------------------------------------
 
 
 class ElioCommand(gdb.Command):
@@ -486,21 +561,25 @@ class ElioWorkersCommand(gdb.Command):
             print(f"{'Worker':<8} {'Status':<12} {'Queue Size':<12} {'Tasks Executed'}")
             print("-" * 60)
             
-            workers = scheduler["workers_"]
-            for i in range(num_threads):
+            sched_addr = int(scheduler.address)
+            # Clamp to scheduler::MAX_THREADS: workers_ is std::array<...,256>.
+            walk_n = min(int(num_threads), 256)
+            for i in range(walk_n):
                 try:
-                    worker_ptr = workers[i]
+                    worker_ptr = gdb.parse_and_eval(
+                        f"((elio::runtime::scheduler*)({sched_addr}))->workers_[{i}].get()"
+                    )
                     if int(worker_ptr) == 0:
                         continue
                     worker = worker_ptr.dereference()
                     is_running = read_atomic(worker["running_"])
                     tasks_exec = read_atomic(worker["tasks_executed_"])
-                    
+
                     # Count queue size
                     queue_count = 0
                     for _ in iterate_worker_tasks(worker):
                         queue_count += 1
-                    
+
                     status = "running" if is_running else "stopped"
                     print(f"{i:<8} {status:<12} {queue_count:<12} {tasks_exec}")
                 except:
@@ -599,17 +678,21 @@ class ElioStatsCommand(gdb.Command):
             
             total_queued = 0
             total_executed = 0
-            workers = scheduler["workers_"]
-            for i in range(num_threads):
+            sched_addr = int(scheduler.address)
+            # Clamp to scheduler::MAX_THREADS: workers_ is std::array<...,256>.
+            walk_n = min(int(num_threads), 256)
+            for i in range(walk_n):
                 try:
-                    worker_ptr = workers[i]
+                    worker_ptr = gdb.parse_and_eval(
+                        f"((elio::runtime::scheduler*)({sched_addr}))->workers_[{i}].get()"
+                    )
                     if int(worker_ptr) == 0:
                         continue
                     worker = worker_ptr.dereference()
                     tasks_exec = read_atomic(worker["tasks_executed_"])
                     if tasks_exec:
                         total_executed += tasks_exec
-                    
+
                     for _ in iterate_worker_tasks(worker):
                         total_queued += 1
                 except:

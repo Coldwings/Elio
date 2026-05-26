@@ -376,14 +376,14 @@ public:
         -> coro::join_handle<detail::task_value_t<std::invoke_result_t<F, Args...>>>
     {
         using T = detail::task_value_t<std::invoke_result_t<F, Args...>>;
-        
+
         // Create independent vthread_stack for spawned coroutine
         auto* new_vstack = new coro::vthread_stack();
-        
+
         // Save current vstack context and switch to new one
         auto* old_vstack = coro::vthread_stack::current();
         coro::vthread_stack::set_current(new_vstack);
-        
+
         // Create wrapper coroutine - f and args are stored in wrapper's frame
         // This ensures lambda captures remain valid for the entire coroutine lifetime
         auto wrapper = detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
@@ -402,6 +402,51 @@ public:
         // See the comment in go() for why we track here, not in the body.
         mark_tracked_(handle.promise());
         do_spawn(handle);
+        return coro::join_handle<T>(std::move(state));
+    }
+
+    /// High-level API: spawn + join, pinned to a specific worker.
+    /// @param worker_id  Target worker index. Affinity is set on the spawned
+    ///                   vthread so it cannot be stolen to a different worker;
+    ///                   any I/O the body issues (e.g. sleep_for, recv) is
+    ///                   bound to that worker's io_context.
+    /// @param f  Callable that returns a task<T>
+    /// @param args  Arguments to forward to the callable
+    /// @return join_handle<T> that can be awaited to get the result
+    ///
+    /// Use this when the spawned task and its caller must share fate with
+    /// respect to thread-pool resizing — for example, a watchdog whose I/O
+    /// must be drained alongside the read loop it guards. With round-robin
+    /// `go_joinable`, autoscaler shrink can strand the watchdog on a
+    /// stopped worker while the caller still awaits its join handle.
+    template<typename F, typename... Args>
+        requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
+    auto go_joinable_to(size_t worker_id, F&& f, Args&&... args)
+        -> coro::join_handle<detail::task_value_t<std::invoke_result_t<F, Args...>>>
+    {
+        using T = detail::task_value_t<std::invoke_result_t<F, Args...>>;
+
+        auto* new_vstack = new coro::vthread_stack();
+        auto* old_vstack = coro::vthread_stack::current();
+        coro::vthread_stack::set_current(new_vstack);
+
+        auto wrapper = detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
+
+        coro::vthread_stack::set_current(old_vstack);
+
+        auto handle = coro::detail::task_access::release(wrapper);
+        auto state = std::make_shared<coro::detail::join_state<T>>();
+        handle.promise().join_state_ = state;
+        handle.promise().detached_ = true;
+        handle.promise().set_vstack_owner(new_vstack);
+        // Pin to the requested worker so subsequent steals re-route back to
+        // it. spawn_to() handles the initial dispatch and falls back to
+        // round-robin if the worker is no longer accepting work.
+        handle.promise().set_affinity(worker_id);
+        handle.promise().detach_from_parent();
+        // See the comment in go() for why we track here, not in the body.
+        mark_tracked_(handle.promise());
+        spawn_to(worker_id, handle);
         return coro::join_handle<T>(std::move(state));
     }
 

@@ -5,6 +5,7 @@
 #include <elio/coro/vthread_stack.hpp>
 #include <atomic>
 #include <condition_variable>
+#include <csignal>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -29,6 +30,32 @@ struct run_config {
 };
 
 namespace detail {
+
+/// Install ``SIG_IGN`` for ``SIGPIPE`` exactly once per process.
+///
+/// Elio writes to sockets from many places (raw ``tcp_stream::write``, OpenSSL's
+/// ``SSL_shutdown`` close_notify, ``send_file`` retries, slow-loris watchdog
+/// teardown, ...). Any of those can race with the peer closing its end and
+/// produce ``EPIPE``; on libc/OpenSSL builds that don't pass ``MSG_NOSIGNAL``
+/// (older OpenSSL <1.1.1, musl, custom builds), that ``EPIPE`` arrives as a
+/// ``SIGPIPE`` signal, terminating the process by default. The standard Linux
+/// idiom for network-server programs is to ignore ``SIGPIPE`` globally and
+/// rely on ``EPIPE`` return values to detect the condition, which Elio's
+/// awaitables already report through ``io_result``.
+///
+/// Note: this is a process-wide effect. If the embedding application needs
+/// ``SIGPIPE`` for some other reason, it should restore the previous handler
+/// after ``elio::run`` returns.
+inline void ignore_sigpipe_once() {
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        struct sigaction sa{};
+        sa.sa_handler = SIG_IGN;
+        sa.sa_flags = SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        ::sigaction(SIGPIPE, &sa, nullptr);
+    });
+}
 
 /// Type alias using definitions from scheduler.hpp
 template<typename T> using task_value_t = typename task_value<T>::type;
@@ -142,6 +169,11 @@ auto run(F&& f, const run_config& config = {})
 {
     using T = detail::task_value_t<std::invoke_result_t<F>>;
     detail::completion_signal<T> signal;
+
+    // Mask SIGPIPE process-wide so writes to half-closed sockets surface as
+    // EPIPE return values rather than terminating the process. See
+    // detail::ignore_sigpipe_once for the full rationale.
+    detail::ignore_sigpipe_once();
 
     size_t threads = config.num_threads;
     if (threads == 0) {

@@ -28,12 +28,34 @@
 
 #include <csignal>
 #include <initializer_list>
+#include <mutex>
 #include <type_traits>
 
 namespace elio {
 
 /// Default shutdown signals
 inline constexpr std::initializer_list<int> default_shutdown_signals = {SIGINT, SIGTERM};
+
+namespace detail {
+
+/// Install ``SIG_IGN`` for ``SIGPIPE`` exactly once per process. See the
+/// matching helper in ``runtime/async_main.hpp`` for the full rationale —
+/// this duplicate exists so users that wire ``serve()`` into a custom
+/// scheduler (without going through ``elio::run`` / ``ELIO_ASYNC_MAIN``)
+/// still get the protection. ``sigaction`` is idempotent, so running the
+/// install twice is harmless.
+inline void ignore_sigpipe_in_serve_once() {
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        struct sigaction sa{};
+        sa.sa_handler = SIG_IGN;
+        sa.sa_flags = SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        ::sigaction(SIGPIPE, &sa, nullptr);
+    });
+}
+
+} // namespace detail
 
 /// Wait for shutdown signals (SIGINT or SIGTERM)
 ///
@@ -100,6 +122,10 @@ template<typename Server, typename ListenFunc>
 coro::task<void> serve(Server& server, ListenFunc listen_func,
                        std::initializer_list<int> signals = default_shutdown_signals)
 {
+    // Mask SIGPIPE so writes on half-closed sockets surface as EPIPE
+    // io_results rather than terminating the process.
+    detail::ignore_sigpipe_in_serve_once();
+
     // Set up signal handling
     signal::signal_set sigs(signals);
     signal::signal_fd sigfd(sigs);
@@ -187,6 +213,10 @@ coro::task<void> serve_all(std::tuple<Servers&...> servers,
                            std::tuple<ListenFuncs...> listen_funcs,
                            std::initializer_list<int> signals = default_shutdown_signals)
 {
+    // Mask SIGPIPE so writes on half-closed sockets surface as EPIPE
+    // io_results rather than terminating the process.
+    detail::ignore_sigpipe_in_serve_once();
+
     // Set up signal handling
     signal::signal_set sigs(signals);
     signal::signal_fd sigfd(sigs);

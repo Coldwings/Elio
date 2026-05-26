@@ -10,6 +10,9 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+#include <sys/socket.h>
+
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <string_view>
@@ -71,34 +74,48 @@ public:
             // buffer is full we accept the loss rather than block here.
             // We never wait for the peer's close_notify in the destructor,
             // since that would require async I/O.
-            if (handshake_complete_ && !shutdown_sent_) {
+            //
+            // Skip SSL_shutdown when the underlying socket is already known
+            // to be unusable. SSL_shutdown's BIO writes via send(2); on a
+            // half-closed socket that produces EPIPE and, on OpenSSL builds
+            // that don't set MSG_NOSIGNAL (older OpenSSL, musl, etc.),
+            // delivers SIGPIPE to the process. We avoid the write entirely
+            // when (a) somebody else (e.g. a slow-loris watchdog) called
+            // ``shutdown_socket()`` / ``mark_externally_shut_down()`` on us,
+            // or (b) the kernel reports a pending socket error.
+            if (handshake_complete_ && !shutdown_sent_ &&
+                !is_socket_closed_or_dead()) {
                 ERR_clear_error();
                 (void)SSL_shutdown(ssl_);
             }
             SSL_free(ssl_);
         }
     }
-    
+
     // Non-copyable
     tls_stream(const tls_stream&) = delete;
     tls_stream& operator=(const tls_stream&) = delete;
-    
+
     // Movable
     tls_stream(tls_stream&& other) noexcept
         : tcp_(std::move(other.tcp_))
         , ssl_(other.ssl_)
         , mode_(other.mode_)
         , handshake_complete_(other.handshake_complete_)
-        , shutdown_sent_(other.shutdown_sent_) {
+        , shutdown_sent_(other.shutdown_sent_)
+        , externally_shut_down_(
+              other.externally_shut_down_.load(std::memory_order_acquire)) {
         other.ssl_ = nullptr;
         other.handshake_complete_ = false;
         other.shutdown_sent_ = false;
+        other.externally_shut_down_.store(false, std::memory_order_release);
     }
 
     tls_stream& operator=(tls_stream&& other) noexcept {
         if (this != &other) {
             if (ssl_) {
-                if (handshake_complete_ && !shutdown_sent_) {
+                if (handshake_complete_ && !shutdown_sent_ &&
+                    !is_socket_closed_or_dead()) {
                     ERR_clear_error();
                     (void)SSL_shutdown(ssl_);
                 }
@@ -109,9 +126,13 @@ public:
             mode_ = other.mode_;
             handshake_complete_ = other.handshake_complete_;
             shutdown_sent_ = other.shutdown_sent_;
+            externally_shut_down_.store(
+                other.externally_shut_down_.load(std::memory_order_acquire),
+                std::memory_order_release);
             other.ssl_ = nullptr;
             other.handshake_complete_ = false;
             other.shutdown_sent_ = false;
+            other.externally_shut_down_.store(false, std::memory_order_release);
         }
         return *this;
     }
@@ -379,12 +400,38 @@ public:
     
     /// Get underlying file descriptor
     int fd() const noexcept { return tcp_.fd(); }
-    
+
     /// Get underlying TCP stream (const)
     const net::tcp_stream& tcp() const noexcept { return tcp_; }
-    
+
     /// Check if handshake is complete
     bool is_handshake_complete() const noexcept { return handshake_complete_; }
+
+    /// Mark this stream as having had its socket shut down externally
+    /// (e.g. by a slow-loris watchdog running on a different thread).
+    ///
+    /// After this call the destructor will skip ``SSL_shutdown`` because the
+    /// underlying socket can no longer accept the close_notify write; on
+    /// OpenSSL versions / libc builds that don't set ``MSG_NOSIGNAL`` the
+    /// write would deliver SIGPIPE to the process.
+    ///
+    /// This method only flips a flag and is safe to call from any thread;
+    /// it must, however, happen-before the destructor runs (typically by
+    /// joining the watchdog coroutine before letting the stream go out of
+    /// scope).
+    void mark_externally_shut_down() noexcept {
+        externally_shut_down_.store(true, std::memory_order_release);
+    }
+
+    /// Convenience: kernel-side ``::shutdown(fd, SHUT_RDWR)`` plus
+    /// ``mark_externally_shut_down()``. Intended for watchdog code that
+    /// needs to interrupt a pending recv on a different thread.
+    void shutdown_socket() noexcept {
+        mark_externally_shut_down();
+        if (int fd = tcp_.fd(); fd >= 0) {
+            ::shutdown(fd, SHUT_RDWR);
+        }
+    }
     
     /// Get peer certificate (if any)
     X509* peer_certificate() const {
@@ -397,6 +444,28 @@ public:
     }
     
 private:
+    /// Cheap probe that returns true when the underlying socket is either
+    /// already known (via the externally_shut_down_ flag) to be unusable,
+    /// or when the kernel reports a pending error such as ECONNRESET/EPIPE.
+    /// Used by the destructor to decide whether SSL_shutdown's close_notify
+    /// write would be wasted (and potentially fatal via SIGPIPE).
+    bool is_socket_closed_or_dead() const noexcept {
+        if (externally_shut_down_.load(std::memory_order_acquire)) {
+            return true;
+        }
+        int fd = tcp_.fd();
+        if (fd < 0) {
+            return true;
+        }
+        int sock_err = 0;
+        socklen_t len = sizeof(sock_err);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &sock_err, &len) == 0
+            && sock_err != 0) {
+            return true;
+        }
+        return false;
+    }
+
     static std::string get_ssl_error_string(int err) {
         switch (err) {
             case SSL_ERROR_NONE: return "none";
@@ -421,6 +490,11 @@ private:
     tls_mode mode_ = tls_mode::client;
     bool handshake_complete_ = false;
     bool shutdown_sent_ = false;  ///< True once our close_notify has been queued.
+    /// Set by ``mark_externally_shut_down()`` / ``shutdown_socket()`` when a
+    /// foreign actor (typically a watchdog on another thread) has already
+    /// shut down the underlying TCP socket. The destructor reads this to
+    /// avoid an SSL_shutdown() that would write to a half-closed socket.
+    std::atomic<bool> externally_shut_down_{false};
     std::string hostname_;  // Store hostname for SNI and verification
 };
 

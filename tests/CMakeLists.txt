@@ -8,6 +8,7 @@ endif()
 
 set(TEST_SOURCES
     test_main.cpp
+    test_watchdog.cpp
     unit/test_logger.cpp
     unit/test_virtual_stack.cpp
     unit/test_vthread_stack.cpp

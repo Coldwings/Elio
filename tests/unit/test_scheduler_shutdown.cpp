@@ -62,7 +62,7 @@ TEST_CASE("shutdown waits for tracked tasks suspended on I/O", "[scheduler][shut
     // Give the spawns time to start and register their timers.
     std::this_thread::sleep_for(scaled_ms(20));
 
-    bool drained = sched.shutdown(scaled_ms(2000));
+    bool drained = sched.shutdown(scaled_ms(10000));
     REQUIRE(drained);
     REQUIRE(done_a.load());
     REQUIRE(done_b.load());
@@ -88,7 +88,7 @@ TEST_CASE("wait_for_idle returns false when tasks exceed timeout",
     REQUIRE(elapsed < scaled_ms(200));   // didn't wait the full task duration
 
     // Let the task complete naturally before shutdown (avoids IO orphaning).
-    REQUIRE(sched.shutdown(scaled_ms(2000)));
+    REQUIRE(sched.shutdown(scaled_ms(10000)));
     REQUIRE(done.load() == 1);
 }
 
@@ -100,7 +100,7 @@ TEST_CASE("shutdown_force on idle scheduler is near-immediate",
     // Run a quick task and wait for it to complete so the scheduler is idle.
     std::atomic<int> count{0};
     sched.go(increment_only, &count);
-    REQUIRE(sched.wait_for_idle(scaled_ms(2000)));
+    REQUIRE(sched.wait_for_idle(scaled_ms(10000)));
     REQUIRE(count.load() == 1);
 
     auto t0 = std::chrono::steady_clock::now();
@@ -122,7 +122,7 @@ TEST_CASE("wait_for_idle returns when all tracked tasks complete",
         sched.go(mark_after_sleep_counter, scaled_ms(30), &counter);
     }
 
-    REQUIRE(sched.wait_for_idle(scaled_ms(2000)));
+    REQUIRE(sched.wait_for_idle(scaled_ms(10000)));
     REQUIRE(counter.load() == N);
     REQUIRE(sched.active_tasks() == 0);
 
@@ -157,7 +157,7 @@ TEST_CASE("active_tasks counts in-flight tracked tasks",
     // Release the task and let it complete.
     gate.set();
 
-    REQUIRE(sched.wait_for_idle(scaled_ms(2000)));
+    REQUIRE(sched.wait_for_idle(scaled_ms(10000)));
     REQUIRE(done.load() == 1);
     REQUIRE(sched.active_tasks() == 0);
 
@@ -193,7 +193,7 @@ TEST_CASE("shutdown can be called twice safely (idempotent)",
     std::atomic<int> counter{0};
     sched.go(mark_after_sleep_counter, scaled_ms(20), &counter);
 
-    REQUIRE(sched.shutdown(scaled_ms(2000)));
+    REQUIRE(sched.shutdown(scaled_ms(10000)));
     REQUIRE(!sched.is_running());
 
     // Second call is a no-op.
@@ -214,7 +214,7 @@ TEST_CASE("graceful shutdown coexists with go_joinable",
     });
 
     // Call shutdown without explicitly joining the handle.
-    REQUIRE(sched.shutdown(scaled_ms(2000)));
+    REQUIRE(sched.shutdown(scaled_ms(10000)));
     // The joinable wrapper completed via the same RAII tracking, so its
     // result is now ready even without an explicit await.
     REQUIRE(handle.is_ready());

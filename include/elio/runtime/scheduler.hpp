@@ -252,7 +252,45 @@ public:
             idle_cv_.wait_for(lock, wait_for);
         }
         waiters_.fetch_sub(1, std::memory_order_acq_rel);
-        return active_tasks() == 0;
+        const bool drained = (active_tasks() == 0);
+
+        // Diagnostic log on timeout. wait_for_idle's three sub-counters
+        // are updated lock-free, so when it times out we want a per-counter
+        // breakdown to localize *which* counter is stuck (active_tracked_,
+        // a worker's queue+inbox, or an io_context's pending_ops_). Without
+        // this, a CI flake reports only "wait_for_idle returned false" with
+        // no actionable detail.
+        //
+        // Only log when the caller's timeout was generous (>= 1 s) so that
+        // intentionally-short waits used as "is the scheduler busy?" probes
+        // (e.g. wait_for_idle(20ms) in tests that *expect* false) don't
+        // spam the log. Real shutdown / drain calls almost always use
+        // multi-second budgets, so this filter targets diagnostic output
+        // at exactly the cases we care about.
+        constexpr auto kDiagnosticThreshold = std::chrono::seconds(1);
+        if (!drained && timeout >= kDiagnosticThreshold) [[unlikely]] {
+            log_idle_breakdown_("wait_for_idle timed out");
+        }
+        return drained;
+    }
+
+    /// Internal: log a per-counter breakdown of active_tasks(). Used by
+    /// wait_for_idle on timeout to make the next CI flake actionable
+    /// instead of opaque. noexcept so it's safe from any caller.
+    void log_idle_breakdown_(const char* reason) const noexcept {
+        size_t tracked = active_tracked_.load(std::memory_order_acquire);
+        size_t n = num_threads_.load(std::memory_order_acquire);
+        ELIO_LOG_WARNING("{}: active_tracked={} num_workers={}", reason, tracked, n);
+        for (size_t i = 0; i < n; ++i) {
+            size_t qs = workers_[i]->queue_size();
+            size_t pc = workers_[i]->io_context().pending_count();
+            if (qs != 0 || pc != 0) {
+                ELIO_LOG_WARNING(
+                    "  worker[{}]: queue+inbox={} io_pending={} running={}",
+                    i, qs, pc,
+                    workers_[i]->is_running() ? "yes" : "no");
+            }
+        }
     }
 
     /// Internal: increment tracked-task counter. Called by task_lifecycle_guard
@@ -270,6 +308,25 @@ public:
                 std::lock_guard<std::mutex> lock(idle_mutex_);
                 idle_cv_.notify_all();
             }
+        }
+    }
+
+    /// Internal: called by ``worker_thread::poll_io_when_idle`` immediately
+    /// before the worker blocks waiting for I/O. This is the moment a worker
+    /// has drained its local queue + inbox; combined with the io_context's
+    /// own pending_count, this is the right edge for wait_for_idle to
+    /// re-check active_tasks(). Without this notify, wait_for_idle's only
+    /// reactive wake comes from on_task_completed() — leaving a window
+    /// where a task already finished, ready_count went 1→0, but the
+    /// transition happened in a worker that hadn't yet announced itself
+    /// idle. The 5 ms polling loop in wait_for_idle masks this in steady
+    /// state, but on Debug + slow CI runners that masking can stretch and
+    /// surface as spurious wait_for_idle timeouts. This converts that
+    /// edge into an explicit happens-before.
+    void on_worker_became_idle() noexcept {
+        if (waiters_.load(std::memory_order_acquire) > 0) [[unlikely]] {
+            std::lock_guard<std::mutex> lock(idle_mutex_);
+            idle_cv_.notify_all();
         }
     }
 
@@ -945,6 +1002,12 @@ inline void worker_thread::poll_io_when_idle() {
 
     // Mark as idle before any blocking - enables lazy wake optimization
     idle_.store(true, std::memory_order_release);
+
+    // Tell the scheduler: we have drained local queue + inbox. Combined
+    // with our io_context's pending_count, this is the right moment for
+    // wait_for_idle to re-check active_tasks(). See the doc on
+    // scheduler::on_worker_became_idle for the race this closes.
+    scheduler_->on_worker_became_idle();
 
     // Optional spinning phase (if configured via wait_strategy)
     if (strategy_.spin_iterations > 0) {

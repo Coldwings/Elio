@@ -421,23 +421,29 @@ private:
 
             // Slow-loris watchdog: each request is allowed at most
             // keep_alive_timeout to fully arrive. The watchdog sleeps for
-            // that duration, then ::shutdown(2)s the socket, which forces
-            // any pending recv to return EOF/error so we can exit. We must
-            // own a join_handle and await it before this scope ends so that
-            // the watchdog's `fd` capture cannot outlive the stream.
+            // that duration, then shuts down the socket via the stream's
+            // ``shutdown_socket()`` method, which forces any pending recv
+            // to return EOF/error so we can exit. Going through the stream
+            // (rather than ::shutdown(fd, ...) on a captured fd) lets a
+            // tls_stream record that its socket is dead, so its destructor
+            // can skip SSL_shutdown — that close_notify write would
+            // otherwise risk SIGPIPE on OpenSSL builds without
+            // MSG_NOSIGNAL. We must own a join_handle and await it before
+            // this scope ends so the watchdog's stream pointer cannot
+            // outlive the stream.
             auto timed_out = std::make_shared<std::atomic<bool>>(false);
             auto cancel_src = std::make_shared<coro::cancel_source>();
-            int fd = stream.fd();
+            auto* stream_ptr = &stream;
             auto timeout = config_.keep_alive_timeout;
             std::optional<coro::join_handle<void>> watchdog;
             if (sched && timeout.count() > 0) {
                 watchdog.emplace(sched->go_joinable(
-                    [fd, timed_out, cancel_src, timeout]() -> coro::task<void> {
+                    [stream_ptr, timed_out, cancel_src, timeout]() -> coro::task<void> {
                         auto r = co_await elio::time::sleep_for(
                             timeout, cancel_src->get_token());
                         if (r == coro::cancel_result::completed) {
                             timed_out->store(true, std::memory_order_release);
-                            ::shutdown(fd, SHUT_RDWR);
+                            stream_ptr->shutdown_socket();
                         }
                         co_return;
                     }));

@@ -191,10 +191,12 @@ public:
     void close() {
         if (!closed_.exchange(true, std::memory_order_acq_rel)) {
             // Force any pending recv to return so the run loop wakes up.
-            int fd = stream_.fd();
-            if (fd >= 0) {
-                ::shutdown(fd, SHUT_RDWR);
-            }
+            // Going through the stream's ``shutdown_socket()`` (instead of
+            // ::shutdown on a raw fd) lets a tls_stream record that its
+            // socket is dead so its destructor can skip the close_notify
+            // write that risks SIGPIPE on OpenSSL builds without
+            // MSG_NOSIGNAL.
+            stream_.shutdown_socket();
         }
     }
 
@@ -232,21 +234,23 @@ private:
         }
 
         auto timed_out = std::make_shared<std::atomic<bool>>(false);
-        int fd = stream_.fd();
+        auto* stream_ptr = &stream_;
         auto timeout = config_.frame_read_timeout;
         coro::cancel_source watchdog_cancel;
         auto wd_token = watchdog_cancel.get_token();
 
         auto watchdog = sched->go_joinable(
-            [fd, timed_out, timeout, wd_token]() -> coro::task<void> {
+            [stream_ptr, timed_out, timeout, wd_token]() -> coro::task<void> {
                 auto result = co_await elio::time::sleep_for(timeout, wd_token);
                 if (result == coro::cancel_result::completed) {
                     // Sleep ran to completion without being cancelled —
-                    // the frame did not arrive in time.
+                    // the frame did not arrive in time. Going through the
+                    // stream's ``shutdown_socket()`` lets a tls_stream
+                    // record that its socket is dead so its destructor
+                    // can skip the close_notify write that risks SIGPIPE
+                    // on OpenSSL builds without MSG_NOSIGNAL.
                     timed_out->store(true, std::memory_order_release);
-                    if (fd >= 0) {
-                        ::shutdown(fd, SHUT_RDWR);
-                    }
+                    stream_ptr->shutdown_socket();
                 }
                 co_return;
             });

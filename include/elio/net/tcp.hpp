@@ -348,7 +348,19 @@ public:
         fd_ = -1;
         return io::async_close(fd);
     }
-    
+
+    /// Shut down the underlying socket synchronously (kernel-side ::shutdown(2)).
+    ///
+    /// Safe to call from a different thread than the one driving the stream:
+    /// shutdown(2) is thread-safe at the kernel level and is the standard way
+    /// to interrupt a pending recv/send on another thread (e.g. a slow-loris
+    /// watchdog). The fd is *not* closed; the destructor still owns it.
+    void shutdown_socket() noexcept {
+        if (fd_ >= 0) {
+            ::shutdown(fd_, SHUT_RDWR);
+        }
+    }
+
     /// Set TCP_NODELAY option
     bool set_no_delay(bool enable) {
         int flag = enable ? 1 : 0;

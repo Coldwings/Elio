@@ -697,6 +697,93 @@ TEST_CASE("HTTP chunk size beyond max is rejected", "[http][parser][security]") 
     REQUIRE(result == parse_result::error);
 }
 
+// Mirror of the request-side hardening tests on the response parser. These
+// guard against a regression where a hostile *server* — typically reachable
+// through a proxy — exploits the same RFC 7230 §3.3.3 ambiguity to smuggle
+// a follow-on response into a keep-alive connection.
+TEST_CASE("HTTP response parser rejects CL+TE smuggling",
+          "[http][parser][security]") {
+    response_parser parser;
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "0\r\n\r\n";
+
+    auto [result, _] = parser.parse(response);
+    REQUIRE(result == parse_result::error);
+    REQUIRE(parser.has_error());
+}
+
+TEST_CASE("HTTP response parser rejects chunk size overflow",
+          "[http][parser][security]") {
+    response_parser parser;
+    // 17 hex 'f' digits would overflow size_t (16 hex digits = 64 bits).
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "fffffffffffffffff\r\n"
+        "x";
+
+    auto [result, _] = parser.parse(response);
+    REQUIRE(result == parse_result::error);
+}
+
+TEST_CASE("HTTP response parser rejects chunk size beyond max",
+          "[http][parser][security]") {
+    response_parser parser;
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "7fffffff\r\n";  // 2 GiB > kMaxChunkSize (1 GiB)
+
+    auto [result, _] = parser.parse(response);
+    REQUIRE(result == parse_result::error);
+}
+
+TEST_CASE("HTTP response parser bytes_remaining flags pipelined trailers",
+          "[http][parser][security]") {
+    // After is_complete() is true, any bytes still in the parser's buffer
+    // are pipelined data the server pushed past the response. The HTTP
+    // client uses bytes_remaining() to refuse to return such a connection
+    // to the keep-alive pool (response-splitting prevention).
+    response_parser parser;
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n"
+        "hello"
+        // smuggled bytes left over after the framed response:
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+    auto [result, _] = parser.parse(response);
+    REQUIRE(result == parse_result::complete);
+    REQUIRE(parser.is_complete());
+    REQUIRE(parser.body() == "hello");
+    REQUIRE(parser.bytes_remaining() > 0);
+}
+
+TEST_CASE("HTTP response parser bytes_buffered tracks parser footprint",
+          "[http][parser][security]") {
+    // The HTTP client reads in chunks and after each parse() call inspects
+    // bytes_buffered() to enforce client_config::max_response_size. This
+    // guards the accessor's contract: it must include both already-extracted
+    // body and any bytes still queued in the parser's input buffer.
+    response_parser parser;
+    auto [r1, _1] = parser.parse(
+        "HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n");
+    REQUIRE(r1 == parse_result::need_more);
+    REQUIRE(parser.bytes_buffered() == 0);
+
+    std::string body_chunk(512, 'x');
+    auto [r2, _2] = parser.parse(body_chunk);
+    REQUIRE(r2 == parse_result::need_more);
+    REQUIRE(parser.bytes_buffered() == 512);
+}
+
 TEST_CASE("HTTP request from parser roundtrip", "[http][message]") {
     std::string original =
         "POST /api/test HTTP/1.1\r\n"

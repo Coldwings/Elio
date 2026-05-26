@@ -39,6 +39,14 @@ list(APPEND TEST_SOURCES
     unit/test_http_parser.cpp
 )
 
+# HTTP client integration tests need TLS (the client links against the
+# unified TLS-aware net::stream type even for plain HTTP requests).
+if(TARGET elio_tls)
+    list(APPEND TEST_SOURCES
+        unit/test_http_client.cpp
+    )
+endif()
+
 # Add HTTP/2 tests if nghttp2 is available
 if(TARGET nghttp2_static)
     list(APPEND TEST_SOURCES

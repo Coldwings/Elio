@@ -606,6 +606,24 @@ public:
         return out;
     }
 
+    /// Bytes currently held by the parser (un-consumed buffered input plus
+    /// any body bytes already extracted into body_). The HTTP client uses this
+    /// to enforce client_config::max_response_size after every read so a
+    /// hostile server cannot OOM the client by streaming a huge body.
+    size_t bytes_buffered() const noexcept {
+        return buffer_.size() + body_.size();
+    }
+
+    /// Bytes still sitting in the parser's input buffer that were NOT consumed
+    /// by the parsed message. After is_complete() is true, a non-zero value
+    /// means the server pipelined extra bytes after the response (e.g. a
+    /// response-splitting payload). The HTTP client uses this to refuse to
+    /// return such a connection to the keep-alive pool: those bytes would
+    /// otherwise be misread as the head of the next response.
+    size_t bytes_remaining() const noexcept {
+        return buffer_.size();
+    }
+
 private:
     bool parse_status_line() {
         auto line_end = buffer_.find("\r\n");

@@ -228,6 +228,16 @@ private:
 };
 
 /// TCP stream for connected sockets
+///
+/// **Thread safety:** a ``tcp_stream`` is **not** safe for arbitrary
+/// concurrent use. The supported pattern is one reader and one writer in
+/// distinct coroutines (mirroring the kernel's full-duplex socket semantics):
+/// concurrent ``read``/``poll_read`` from coroutine A and concurrent
+/// ``write``/``writev``/``poll_write`` from coroutine B is well-defined.
+/// Issuing two concurrent reads, two concurrent writes, or a read alongside
+/// a ``close``/``shutdown`` on the same instance is undefined behaviour
+/// unless externally serialised. The same contract applies to
+/// ``tcp_listener::accept``: only one coroutine may be accepting at a time.
 class tcp_stream {
 public:
     /// Construct from file descriptor
@@ -361,6 +371,18 @@ public:
         }
     }
 
+    /// Half-close one direction of the connection without releasing the fd.
+    /// @param how One of ``SHUT_RD``, ``SHUT_WR``, ``SHUT_RDWR``.
+    /// @return true on success, false on error (check ``errno``).
+    /// Mirrors the contract on ``tls::tls_stream::shutdown()`` for symmetry.
+    bool shutdown(int how) noexcept {
+        if (fd_ < 0) {
+            errno = EBADF;
+            return false;
+        }
+        return ::shutdown(fd_, how) == 0;
+    }
+
     /// Set TCP_NODELAY option
     bool set_no_delay(bool enable) {
         int flag = enable ? 1 : 0;
@@ -374,13 +396,18 @@ public:
     }
     
 private:
+    /// Release the fd. Prefers ``IORING_OP_CLOSE`` when called from a worker
+    /// running on an io_uring backend, so the kernel can drain any in-flight
+    /// SQEs on the same fd before the fd table entry is freed for reuse.
+    /// Falls back to ``::close`` otherwise (epoll backend or non-worker
+    /// teardown), where the SQE-vs-fd-reuse race cannot occur.
     void close_sync() {
         if (fd_ >= 0) {
-            ::close(fd_);
+            io::close_fd_for_destructor(fd_);
             fd_ = -1;
         }
     }
-    
+
     int fd_ = -1;
     std::optional<socket_address> peer_addr_;
 };
@@ -597,12 +624,12 @@ private:
     
     void close_sync() {
         if (fd_ >= 0) {
-            ::close(fd_);
+            io::close_fd_for_destructor(fd_);
             fd_ = -1;
             ELIO_LOG_INFO("TCP listener closed");
         }
     }
-    
+
     int fd_ = -1;
     socket_address local_addr_;
     tcp_options opts_;

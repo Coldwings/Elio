@@ -110,6 +110,16 @@ struct unix_address {
 };
 
 /// Unix Domain Socket stream for connected sockets
+///
+/// **Thread safety:** a ``uds_stream`` is **not** safe for arbitrary
+/// concurrent use. The supported pattern is one reader and one writer in
+/// distinct coroutines (matching socket full-duplex semantics): concurrent
+/// ``read``/``poll_read`` and concurrent ``write``/``writev``/``poll_write``
+/// in different coroutines is well-defined. Issuing two concurrent reads,
+/// two concurrent writes, or a read alongside a ``close`` on the same
+/// instance is undefined behaviour unless externally serialised. The same
+/// contract applies to ``uds_listener::accept``: only one coroutine may be
+/// accepting at a time.
 class uds_stream {
 public:
     /// Construct from file descriptor
@@ -232,6 +242,17 @@ public:
         }
     }
 
+    /// Half-close one direction of the connection without releasing the fd.
+    /// @param how One of ``SHUT_RD``, ``SHUT_WR``, ``SHUT_RDWR``.
+    /// @return true on success, false on error (check ``errno``).
+    bool shutdown(int how) noexcept {
+        if (fd_ < 0) {
+            errno = EBADF;
+            return false;
+        }
+        return ::shutdown(fd_, how) == 0;
+    }
+
     /// Set SO_RCVBUF option
     bool set_recv_buffer(int size) {
         return setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) == 0;
@@ -249,13 +270,16 @@ public:
     }
     
 private:
+    /// Release the fd. Prefers ``IORING_OP_CLOSE`` when called from a worker
+    /// running on an io_uring backend, so the kernel can drain any in-flight
+    /// SQEs on the same fd before the fd table entry is freed for reuse.
     void close_sync() {
         if (fd_ >= 0) {
-            ::close(fd_);
+            io::close_fd_for_destructor(fd_);
             fd_ = -1;
         }
     }
-    
+
     int fd_ = -1;
     unix_address peer_addr_;
 };
@@ -427,14 +451,16 @@ private:
     
     void close_sync() {
         if (fd_ >= 0) {
-            ::close(fd_);
+            io::close_fd_for_destructor(fd_);
             fd_ = -1;
-            
-            // Unlink socket file (only for filesystem sockets)
+
+            // Unlink socket file (only for filesystem sockets). The unlink
+            // is a path operation, independent of the fd lifecycle, so it
+            // remains synchronous regardless of which close path we took.
             if (!local_addr_.is_abstract() && !local_addr_.path.empty()) {
                 ::unlink(local_addr_.path.c_str());
             }
-            
+
             ELIO_LOG_INFO("UDS listener closed");
         }
     }

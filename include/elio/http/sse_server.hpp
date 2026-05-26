@@ -15,8 +15,12 @@
 #include <elio/tls/tls_stream.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/coro/cancel_token.hpp>
+#include <elio/sync/primitives.hpp>
+#include <elio/time/timer.hpp>
 #include <elio/log/macros.hpp>
 
+#include <chrono>
 #include <string>
 #include <string_view>
 #include <functional>
@@ -109,25 +113,34 @@ enum class connection_state {
 };
 
 /// SSE event stream connection
+///
+/// Concurrency model:
+///   - Concurrent producers may call `send`/`send_data`/`send_event`/
+///     `send_comment`/`send_retry` from independent coroutines (e.g. an
+///     application loop plus a heartbeat task spawned via `run_heartbeat`).
+///     A per-connection coroutine mutex serializes the underlying byte
+///     writes inside `send_raw` so that the multi-line `event:`/`data:`/
+///     `\n\n` framing of one event is never interleaved with another.
 class sse_connection {
 public:
     /// Stream type variant
     using stream_type = std::variant<std::monostate, net::tcp_stream*, tls::tls_stream*>;
-    
+
     /// Create from TCP stream (non-owning pointer)
     explicit sse_connection(net::tcp_stream* tcp)
         : stream_(tcp) {}
-    
+
     /// Create from TLS stream (non-owning pointer)
     explicit sse_connection(tls::tls_stream* tls)
         : stream_(tls) {}
-    
+
     /// Destructor
     ~sse_connection() = default;
-    
-    // Move only
-    sse_connection(sse_connection&&) = default;
-    sse_connection& operator=(sse_connection&&) = default;
+
+    // Non-movable: holds a per-connection sync::mutex which is non-movable.
+    // The connection is always used by reference inside the SSE handler.
+    sse_connection(sse_connection&&) = delete;
+    sse_connection& operator=(sse_connection&&) = delete;
     sse_connection(const sse_connection&) = delete;
     sse_connection& operator=(const sse_connection&) = delete;
     
@@ -190,18 +203,59 @@ public:
     void close() {
         state_ = connection_state::closed;
     }
-    
+
     /// Mark connection as active (after sending headers)
     void set_active() {
         state_ = connection_state::active;
     }
 
+    /// Heartbeat / keep-alive loop.
+    ///
+    /// Periodically writes a SSE comment line (`": <comment>\n\n"`).  Many
+    /// SSE clients and intermediaries expect a steady stream of bytes to
+    /// detect a half-open connection; without a heartbeat a long idle period
+    /// looks identical to a stuck server.
+    ///
+    /// Spawn this alongside the producer loop, e.g.
+    /// ```cpp
+    /// conn.run_heartbeat(std::chrono::seconds(30), token).go();
+    /// ```
+    /// The loop exits when the connection is no longer active, when the
+    /// optional cancellation token fires, or when `interval == 0`.
+    coro::task<void> run_heartbeat(
+        std::chrono::milliseconds interval = std::chrono::seconds(30),
+        coro::cancel_token token = {},
+        std::string_view comment = "ping") {
+        if (interval.count() <= 0) {
+            co_return;
+        }
+        while (state_ == connection_state::active) {
+            auto sleep_result = co_await elio::time::sleep_for(interval, token);
+            if (sleep_result == coro::cancel_result::cancelled) {
+                co_return;
+            }
+            if (state_ != connection_state::active) {
+                co_return;
+            }
+            if (!co_await send_comment(comment)) {
+                co_return;
+            }
+        }
+    }
+
 private:
+    /// Serialize an entire SSE frame onto the wire.  The per-connection send
+    /// mutex guarantees that frames produced by concurrent senders never
+    /// interleave at the byte level — without it a heartbeat coroutine and a
+    /// data-producer coroutine could splice their `event:`/`data:`/`\n\n`
+    /// lines and corrupt the stream.
     coro::task<bool> send_raw(std::string_view data) {
+        co_await send_mutex_.lock();
+        sync::lock_guard send_guard(send_mutex_);
         size_t sent = 0;
         while (sent < data.size()) {
             io::io_result result;
-            
+
             if (std::holds_alternative<net::tcp_stream*>(stream_)) {
                 result = co_await std::get<net::tcp_stream*>(stream_)->write(
                     data.data() + sent, data.size() - sent);
@@ -211,7 +265,7 @@ private:
             } else {
                 co_return false;
             }
-            
+
             if (result.result <= 0) {
                 state_ = connection_state::closed;
                 co_return false;
@@ -220,10 +274,11 @@ private:
         }
         co_return true;
     }
-    
+
     stream_type stream_;
     connection_state state_ = connection_state::active;
     std::string last_event_id_;
+    sync::mutex send_mutex_;  ///< Serializes frame writes; see send_raw().
 };
 
 /// Build SSE response headers

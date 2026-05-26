@@ -451,11 +451,24 @@ private:
 
             // Helper that drains the watchdog so the captured fd cannot
             // outlive `stream`. Safe to call multiple times.
+            //
+            // We explicitly take ownership of the join_handle before
+            // awaiting it: ``co_await *watchdog`` is an lvalue await,
+            // and ``join_handle`` is intentionally non-copyable, so on
+            // some compilers/STDs the lvalue form makes the compiler
+            // instantiate the deleted copy ctor while materializing
+            // the awaitable. Moving it into a local + ``co_await
+            // std::move(wd)`` is the portable, intent-clear form
+            // ("one-shot consumption — the handle is gone after
+            // this point"). The optional reset happens before the
+            // await; subsequent calls to stop_watchdog see no value
+            // and skip.
             auto stop_watchdog = [&]() -> coro::task<void> {
                 if (watchdog) {
                     cancel_src->cancel();
-                    co_await *watchdog;
+                    auto wd = std::move(*watchdog);
                     watchdog.reset();
+                    co_await std::move(wd);
                 }
                 co_return;
             };

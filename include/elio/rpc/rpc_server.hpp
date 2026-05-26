@@ -289,9 +289,13 @@ private:
         auto frame = co_await read_frame_bounded(stream_, config_.max_message_size);
 
         // Wake the watchdog so it returns immediately instead of sleeping
-        // out the rest of the deadline.
+        // out the rest of the deadline. Move the join_handle into the
+        // await: ``co_await watchdog`` (lvalue) can make some compilers
+        // instantiate join_handle's deleted copy ctor while
+        // materializing the awaitable. The owning rvalue form is the
+        // portable, intent-clear one.
         watchdog_cancel.cancel();
-        co_await watchdog;
+        co_await std::move(watchdog);
 
         // Prefer the arrived frame even when the watchdog raced ahead and
         // already set timed_out. The contract is delivery-by-deadline; the

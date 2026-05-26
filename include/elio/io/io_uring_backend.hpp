@@ -483,6 +483,45 @@ public:
         return pending_ops_.load(std::memory_order_relaxed);
     }
     
+    /// Submit a fire-and-forget ``IORING_OP_CLOSE`` for ``fd``.
+    ///
+    /// Use this from non-coroutine destructors that cannot ``co_await`` a
+    /// regular ``async_close`` awaitable. The kernel orders ``IORING_OP_CLOSE``
+    /// after every earlier-submitted SQE on the same fd that is in flight on
+    /// this ring, so a concurrent in-flight ``recv``/``send``/``poll`` cannot
+    /// end up operating on a recycled fd.
+    ///
+    /// The CQE arrives with ``user_data == nullptr`` and is silently consumed
+    /// by ``process_completion``; the matching ``pending_ops_`` increment we
+    /// add here is symmetrically decremented there, preserving the every-SQE-
+    /// counted invariant documented at the top of this file.
+    ///
+    /// @return true if the SQE was queued; false if both the initial
+    ///         ``io_uring_get_sqe`` and the post-flush retry returned null.
+    ///         On false the caller should fall back to ``::close``.
+    /// @note Must be called from the thread that owns this io_uring (the
+    ///       worker thread). io_uring SQE production is not thread-safe.
+    bool submit_close_async(int fd) noexcept {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+        if (!sqe) {
+            (void)io_uring_submit(&ring_);
+            sqe = io_uring_get_sqe(&ring_);
+            if (!sqe) {
+                return false;
+            }
+        }
+        io_uring_prep_close(sqe, fd);
+        // Fire-and-forget: nullptr user_data lands in process_completion's
+        // "no awaiter to resume" branch (same path as cancel SQE completions).
+        io_uring_sqe_set_data(sqe, nullptr);
+        pending_ops_.fetch_add(1, std::memory_order_relaxed);
+        // Submit immediately: the caller (a destructor) does not poll on its
+        // own. Other workers will eventually drain the CQE; if no one ever
+        // does, ``io_uring_queue_exit`` cleans up at backend teardown.
+        (void)io_uring_submit(&ring_);
+        return true;
+    }
+
     /// Cancel a pending operation
     /// @param user_data The exact ``user_data`` value the original SQE was
     ///                  submitted with. For the legacy (raw handle) path

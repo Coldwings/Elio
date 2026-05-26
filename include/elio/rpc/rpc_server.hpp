@@ -29,6 +29,7 @@
 #include <elio/net/uds.hpp>
 #include <elio/sync/primitives.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/runtime/worker_thread.hpp>
 #include <elio/time/timer.hpp>
 #include <elio/log/macros.hpp>
 
@@ -220,6 +221,26 @@ private:
     /// when the frame arrives early the main path cancels the source and the
     /// watchdog returns immediately. cancellable_sleep_awaitable owns its
     /// cancel state via shared_ptr (PR #81), so this is race-free.
+    ///
+    /// Worker affinity: the watchdog is pinned to the same worker as the
+    /// read loop via go_joinable_to(). The read loop itself is pinned by
+    /// I/O affinity (each recv re-binds the vthread to the worker whose
+    /// io_context owns the completion). Without this pin, autoscaler shrink
+    /// can stop the worker hosting the watchdog while its sleep timer is
+    /// still pending — the io_context is no longer polled, the watchdog
+    /// never resumes, and the read loop hangs forever on `co_await *watchdog`.
+    /// scheduler::set_thread_count's I/O drain has a 5 s bound while
+    /// frame_read_timeout defaults to 30 s, so the leak is reachable in
+    /// practice. Pinning makes shrink-time draining a shared-fate operation:
+    /// either both the read loop and watchdog drain, or neither does (and
+    /// the connection is correctly torn down at scheduler shutdown).
+    ///
+    /// Frame-vs-watchdog race: if the timer CQE fires microseconds before
+    /// read_frame_bounded returns a complete frame, both `frame` and
+    /// `timed_out` end up set. The contract is "must arrive by deadline" —
+    /// the frame did, so we deliver it. ::shutdown() has already happened
+    /// inside the watchdog, so the next read_frame_with_deadline call will
+    /// fail naturally; that's the right behavior for one-shot delivery.
     coro::task<std::optional<std::pair<frame_header, message_buffer>>>
     read_frame_with_deadline() {
         if (config_.frame_read_timeout.count() <= 0) {
@@ -239,21 +260,31 @@ private:
         coro::cancel_source watchdog_cancel;
         auto wd_token = watchdog_cancel.get_token();
 
-        auto watchdog = sched->go_joinable(
-            [stream_ptr, timed_out, timeout, wd_token]() -> coro::task<void> {
-                auto result = co_await elio::time::sleep_for(timeout, wd_token);
-                if (result == coro::cancel_result::completed) {
-                    // Sleep ran to completion without being cancelled —
-                    // the frame did not arrive in time. Going through the
-                    // stream's ``shutdown_socket()`` lets a tls_stream
-                    // record that its socket is dead so its destructor
-                    // can skip the close_notify write that risks SIGPIPE
-                    // on OpenSSL builds without MSG_NOSIGNAL.
-                    timed_out->store(true, std::memory_order_release);
-                    stream_ptr->shutdown_socket();
-                }
-                co_return;
-            });
+        // Pin the watchdog to the same worker as the read loop so it cannot
+        // be independently shrunk by the autoscaler — otherwise a doomed
+        // worker can have an in-flight timeout SQE pending while its
+        // io_context stops being polled, leaving us hung on
+        // ``co_await *watchdog``.
+        auto* current_worker = runtime::worker_thread::current();
+        auto watchdog_body = [stream_ptr, timed_out, timeout, wd_token]()
+                                 -> coro::task<void> {
+            auto result = co_await elio::time::sleep_for(timeout, wd_token);
+            if (result == coro::cancel_result::completed) {
+                // Sleep ran to completion without being cancelled —
+                // the frame did not arrive in time. Going through the
+                // stream's ``shutdown_socket()`` (rather than raw
+                // ``::shutdown(fd, ...)``) lets a tls_stream record that
+                // its socket is dead so its destructor can skip the
+                // close_notify write that risks SIGPIPE on OpenSSL
+                // builds without MSG_NOSIGNAL.
+                timed_out->store(true, std::memory_order_release);
+                stream_ptr->shutdown_socket();
+            }
+            co_return;
+        };
+        auto watchdog = current_worker
+            ? sched->go_joinable_to(current_worker->worker_id(), watchdog_body)
+            : sched->go_joinable(watchdog_body);
 
         auto frame = co_await read_frame_bounded(stream_, config_.max_message_size);
 
@@ -262,12 +293,18 @@ private:
         watchdog_cancel.cancel();
         co_await watchdog;
 
+        // Prefer the arrived frame even when the watchdog raced ahead and
+        // already set timed_out. The contract is delivery-by-deadline; the
+        // frame met it. If the watchdog also issued ::shutdown() the socket
+        // is dead — but this frame is still complete and worth processing.
+        if (frame) {
+            co_return frame;
+        }
         if (timed_out->load(std::memory_order_acquire)) {
             ELIO_LOG_WARNING("RPC session: frame read timed out after {}s",
                              timeout.count());
-            co_return std::nullopt;
         }
-        co_return frame;
+        co_return std::nullopt;
     }
 
     /// Dispatch a request handler to the scheduler so the read loop can

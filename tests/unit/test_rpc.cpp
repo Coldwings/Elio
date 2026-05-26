@@ -1065,6 +1065,101 @@ TEST_CASE("rpc_session frame_read_timeout fires on slow-loris peer",
     REQUIRE(server_done);
 }
 
+TEST_CASE("frame arriving near deadline is delivered, not discarded as timeout",
+          "[rpc][security][slow_loris]") {
+    // Regression test for the watchdog-vs-frame race: when the timer CQE
+    // fires microseconds before read_frame_bounded returns a complete frame,
+    // both `frame` and `timed_out` end up set. Pre-fix code dropped such
+    // frames; the contract is "must arrive by deadline" — and the frame did.
+    //
+    // frame_read_timeout is seconds-resolution, so we use a 1s deadline and
+    // send the frame ~50 ms before it. The actual race window we care about
+    // (timer-CQE-vs-recv-completion) is microseconds wide regardless of the
+    // overall deadline, so iterating multiple times exercises the same race
+    // path. With the fix the handler is invoked on every iteration; without
+    // it the handler is occasionally skipped under timing jitter.
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    rpc_server_config cfg;
+    cfg.frame_read_timeout = std::chrono::seconds(1);
+    cfg.max_message_size = 1024;
+    rpc_server<tcp_stream> server(cfg);
+
+    using Method = ELIO_RPC_METHOD(202, TestRequest, TestResponse);
+    std::atomic<int> handler_calls{0};
+    server.register_method<Method>([&handler_calls](const TestRequest& req)
+                                       -> coro::task<TestResponse> {
+        handler_calls.fetch_add(1, std::memory_order_relaxed);
+        co_return TestResponse{std::to_string(req.value)};
+    });
+
+    scheduler sched(2);
+    sched.start();
+
+    constexpr int iterations = 5;
+    std::atomic<int> server_done{0};
+
+    sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
+        for (int i = 0; i < iterations; ++i) {
+            auto stream = co_await lst.accept();
+            if (!stream) co_return;
+            // handle_client returns after the connection closes (the client
+            // sends one frame then drops the socket; the next read will hit
+            // EOF or the watchdog will trip — either way the loop exits).
+            co_await server.handle_client(std::move(*stream));
+            server_done.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    sched.go([&]() -> coro::task<void> {
+        for (int i = 0; i < iterations; ++i) {
+            auto client = co_await tcp_connect(ipv6_address("::1", port));
+            REQUIRE(client.has_value());
+
+            // Sleep until ~50 ms before the server-side deadline, then send
+            // a complete request frame in two back-to-back writes (header
+            // then payload). The exact arrival time is jittery at this
+            // resolution — sometimes well before, sometimes very close to,
+            // the watchdog firing — which is exactly the race window we want
+            // to exercise.
+            co_await elio::time::sleep_for(std::chrono::milliseconds(950));
+
+            TestRequest req{i};
+            auto frame_pair = elio::rpc::build_request<TestRequest>(
+                static_cast<uint32_t>(i + 1), 202, req);
+            auto hbytes = frame_pair.first.to_bytes();
+            co_await client->write(hbytes.data(), hbytes.size());
+            if (frame_pair.second.size() > 0) {
+                co_await client->write(frame_pair.second.data(),
+                                       frame_pair.second.size());
+            }
+
+            // Wait briefly so the server processes the request before we
+            // tear down the socket. Then close — the next server-side read
+            // will hit EOF or the watchdog (whichever first) and the
+            // handle_client coroutine returns.
+            co_await elio::time::sleep_for(std::chrono::milliseconds(200));
+        }
+    });
+
+    for (int i = 0; i < 1500 &&
+                    server_done.load(std::memory_order_relaxed) < iterations;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(server_done.load() == iterations);
+    REQUIRE(handler_calls.load() == iterations);
+}
+
 TEST_CASE("server max_sessions enforces backpressure",
           "[rpc][security]") {
     using namespace elio::net;

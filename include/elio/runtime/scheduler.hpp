@@ -31,30 +31,24 @@ namespace detail {
     template<typename T> struct is_task<coro::task<T>> : std::true_type {};
     template<typename T> inline constexpr bool is_task_v = is_task<T>::value;
 
-    /// RAII guard registered at the top of every wrapper coroutine. The guard's
-    /// constructor increments the scheduler's tracked-task counter on first
-    /// resume of the wrapper body; the destructor decrements it on body exit
-    /// (normal or exceptional). If the wrapper is destroyed before its body
-    /// runs (e.g. handle.destroy() during shutdown), neither runs — the count
-    /// stays balanced.
-    struct task_lifecycle_guard {
-        scheduler* sched;
-        explicit task_lifecycle_guard(scheduler* s) noexcept;
-        ~task_lifecycle_guard() noexcept;
-        task_lifecycle_guard(const task_lifecycle_guard&) = delete;
-        task_lifecycle_guard& operator=(const task_lifecycle_guard&) = delete;
-    };
-
     /// Wrapper coroutine for fire-and-forget (go/go_to).
     /// Stores callable and args in its coroutine frame, ensuring lambda lifetime
     /// safety even when temporary lambdas are passed.
     ///
-    /// The inner coroutine's frame holds a reference to the lambda (via this pointer),
-    /// which remains valid because this wrapper's frame outlives the inner coroutine.
+    /// Tracked-task accounting is NOT done in a body-local guard here. Doing
+    /// so would leave a window where the wrapper had been pushed to a worker
+    /// inbox (post-spawn) but not yet resumed (pre-body-ctor) — during that
+    /// window active_tracked_=0 and the inbox briefly drops to 0 between the
+    /// worker's pop and its handle.resume(), which makes wait_for_idle
+    /// race-prone (it can observe active_tasks()==0 and return drained=true
+    /// while the task is genuinely still in flight). Instead, the +1 is
+    /// done at the ``sched.go`` call site (before do_spawn) and the -1 is
+    /// done in promise_base::~promise_base via the on_spawn_completion_
+    /// callback, which fires whenever the frame is destroyed regardless of
+    /// whether the body ever ran.
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && is_task_v<std::invoke_result_t<F, Args...>>)
-    coro::task<void> callable_wrapper_void(scheduler* sched, F f, Args... args) {
-        task_lifecycle_guard guard{sched};
+    coro::task<void> callable_wrapper_void(F f, Args... args) {
         co_await std::invoke(std::move(f), std::move(args)...);
     }
 
@@ -62,8 +56,7 @@ namespace detail {
     /// Same lifetime safety as callable_wrapper_void, but preserves return value.
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && is_task_v<std::invoke_result_t<F, Args...>>)
-    auto callable_wrapper(scheduler* sched, F f, Args... args) -> std::invoke_result_t<F, Args...> {
-        task_lifecycle_guard guard{sched};
+    auto callable_wrapper(F f, Args... args) -> std::invoke_result_t<F, Args...> {
         co_return co_await std::invoke(std::move(f), std::move(args)...);
     }
 } // namespace detail
@@ -317,7 +310,7 @@ public:
         
         // Create wrapper coroutine - f and args are stored in wrapper's frame
         // This ensures lambda captures remain valid for the entire coroutine lifetime
-        auto wrapper = detail::callable_wrapper_void(this, std::forward<F>(f), std::forward<Args>(args)...);
+        auto wrapper = detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
 
         // Restore previous vstack context
         coro::vthread_stack::set_current(old_vstack);
@@ -328,6 +321,10 @@ public:
         // Detach from current thread's frame chain before spawning to another thread
         // to avoid use-after-free when this thread creates another coroutine.
         handle.promise().detach_from_parent();
+        // Mark tracked at spawn time, BEFORE do_spawn. Pairs with the
+        // promise destructor's on_spawn_completion_ callback for a
+        // balanced -1, regardless of whether the body ever resumes.
+        mark_tracked_(handle.promise());
         do_spawn(handle);
     }
 
@@ -350,17 +347,19 @@ public:
 
         // Create wrapper coroutine - f and args are stored in wrapper's frame
         // This ensures lambda captures remain valid for the entire coroutine lifetime
-        auto wrapper = detail::callable_wrapper_void(this, std::forward<F>(f), std::forward<Args>(args)...);
-        
+        auto wrapper = detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
+
         // Restore previous vstack context
         coro::vthread_stack::set_current(old_vstack);
-        
+
         auto handle = coro::detail::task_access::release(wrapper);
         handle.promise().detached_ = true;
         handle.promise().set_vstack_owner(new_vstack);
         // Detach from current thread's frame chain before spawning to another thread
         // to avoid use-after-free when this thread creates another coroutine.
         handle.promise().detach_from_parent();
+        // See the comment in go() for why we track here, not in the body.
+        mark_tracked_(handle.promise());
         spawn_to(worker_id, handle);
     }
 
@@ -387,11 +386,11 @@ public:
         
         // Create wrapper coroutine - f and args are stored in wrapper's frame
         // This ensures lambda captures remain valid for the entire coroutine lifetime
-        auto wrapper = detail::callable_wrapper(this, std::forward<F>(f), std::forward<Args>(args)...);
-        
+        auto wrapper = detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
+
         // Restore previous vstack context
         coro::vthread_stack::set_current(old_vstack);
-        
+
         auto handle = coro::detail::task_access::release(wrapper);
         auto state = std::make_shared<coro::detail::join_state<T>>();
         handle.promise().join_state_ = state;
@@ -400,6 +399,8 @@ public:
         // Detach from current thread's frame chain before spawning to another thread
         // to avoid use-after-free when this thread creates another coroutine.
         handle.promise().detach_from_parent();
+        // See the comment in go() for why we track here, not in the body.
+        mark_tracked_(handle.promise());
         do_spawn(handle);
         return coro::join_handle<T>(std::move(state));
     }
@@ -589,6 +590,23 @@ public:
     }
 
 private:
+    /// Pair an ``on_task_spawned()`` increment with a deferred decrement
+    /// installed on the wrapper coroutine's promise. The decrement fires
+    /// from ``promise_base::~promise_base`` whenever the frame is freed —
+    /// normal completion, forced ``handle.destroy()`` mid-flight, or
+    /// drain during shutdown — so the counter is balanced on every path.
+    /// Must be called while the wrapper handle is still live and before
+    /// ``do_spawn`` (or any branch that may destroy the handle).
+    /// noexcept on every line so there is no throw-between-+1-and-callback
+    /// window.
+    void mark_tracked_(coro::promise_base& p) noexcept {
+        on_task_spawned();
+        p.on_spawn_completion_data_ = this;
+        p.on_spawn_completion_ = +[](void* self) noexcept {
+            static_cast<scheduler*>(self)->on_task_completed();
+        };
+    }
+
     void do_spawn(std::coroutine_handle<> handle) {
         // Release fence ensures all writes to the coroutine frame (including
         // captured lambda state) are visible to the worker that will run this task
@@ -674,18 +692,6 @@ private:
 
     static inline thread_local scheduler* current_scheduler_ = nullptr;
 };
-
-namespace detail {
-
-inline task_lifecycle_guard::task_lifecycle_guard(scheduler* s) noexcept : sched(s) {
-    if (sched) sched->on_task_spawned();
-}
-
-inline task_lifecycle_guard::~task_lifecycle_guard() noexcept {
-    if (sched) sched->on_task_completed();
-}
-
-} // namespace detail
 
 } // namespace elio::runtime
 

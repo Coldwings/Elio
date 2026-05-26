@@ -102,7 +102,32 @@ public:
         current_frame_ = this;
     }
 
+    /// Optional callback invoked from the promise destructor to notify a
+    /// scheduler that a tracked task is going away. Set by
+    /// ``scheduler::go``/``go_to``/``go_joinable`` immediately after the
+    /// matching ``on_task_spawned()`` call; cleared on no-op promises
+    /// (e.g. tasks ``co_await``-ed inline by user code).
+    ///
+    /// Living in the promise (not in a body-local guard) is the key:
+    /// the promise is constructed when the coroutine *frame* is allocated
+    /// (i.e. at ``sched.go``-time, before the wrapper body has had a
+    /// chance to run) and destructed when the frame is freed — including
+    /// the corner case where ``handle.destroy()`` runs on a handle whose
+    /// body never executed (e.g. drained out of an inbox during shutdown).
+    /// A body-local guard misses both endpoints in that corner case.
+    using spawn_completion_fn = void (*)(void*) noexcept;
+    spawn_completion_fn on_spawn_completion_ = nullptr;
+    void* on_spawn_completion_data_ = nullptr;
+
     ~promise_base() noexcept {
+        // Invoke spawn-completion callback first. This is the universal
+        // -1 for active_tracked_ paired with the +1 the scheduler did at
+        // ``go``-time. It runs whether the body completed normally, was
+        // cancelled, or the handle was force-destroyed before resuming.
+        if (on_spawn_completion_) {
+            on_spawn_completion_(on_spawn_completion_data_);
+        }
+
         current_frame_ = parent_;
         if (owns_vstack_) {
             // Clear current_ before deleting vstack. When operator delete later

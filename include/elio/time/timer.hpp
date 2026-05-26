@@ -21,26 +21,57 @@ namespace elio::time {
 namespace detail {
 
 /// Submit `work` to the scheduler's blocking pool, falling back to a
-/// detached std::thread if no pool is available or the pool has already
-/// shut down. Used by the timer SQ-full fallback paths so we never block
-/// a worker thread for the full sleep duration.
+/// detached std::thread when there is no scheduler (e.g. unit tests).
+/// Used by the timer SQ-full fallback paths so we never block a worker
+/// thread for the full sleep duration.
+///
+/// During scheduler shutdown the work is silently dropped. Callers pass a
+/// lambda that captures a raw ``runtime::scheduler*`` and the awaiter's
+/// ``coroutine_handle``; running that on a detached thread once shutdown
+/// is in progress is unsafe two ways:
+///
+///   * the scheduler may be destroyed between the submit and the resume
+///     so ``sched->is_running()`` / ``sched->spawn(awaiter)`` reads a
+///     dangling pointer;
+///   * even while the scheduler is alive but ``is_running() == false``,
+///     ``resume_via_scheduler`` falls through to ``handle.resume()`` on
+///     the detached thread — which has no ``worker_thread::current()``,
+///     no ``current_io_context()`` and no ``vthread_stack``, so every
+///     subsequent ``co_await`` on the resumed coroutine is a UAF.
+///
+/// Dropping the work during shutdown is safe because the awaiter is
+/// suspended inside a worker queue and will be reaped by
+/// ``drain_remaining_tasks``. ``blocking_pool::submit`` rejection is the
+/// authoritative signal that shutdown is in progress (the pool is shut
+/// down before ``running_`` is flipped, see ``scheduler::shutdown_force``).
 template <typename F>
 inline void submit_blocking(F&& work) {
     auto* sched = runtime::get_current_scheduler();
-    if (sched && sched->is_running()) {
-        if (auto* pool = sched->get_blocking_pool()) {
-            // Materialize as std::function so we can fall through if the
-            // pool rejects the submit (post-shutdown). blocking_pool::submit
-            // returns false WITHOUT moving from `task` in the rejection
-            // path, so reusing `task` here is safe.
+    if (sched) {
+        auto* pool = sched->get_blocking_pool();
+        if (pool && sched->is_running()) {
             std::function<void()> task{std::forward<F>(work)};
             if (pool->submit(std::move(task))) {
                 return;
             }
-            std::thread(std::move(task)).detach();
+            // Pool rejection => scheduler is tearing down. Drop the work;
+            // see the doc comment above for why a detached-thread fallback
+            // here would UAF the awaiter / scheduler.
             return;
         }
+        if (!sched->is_running()) {
+            // Scheduler already shut down: same UAF concerns as the pool
+            // rejection branch. Drop.
+            return;
+        }
+        // Scheduler exists, is running, but exposes no pool: fall through
+        // to the standalone detached-thread path.
     }
+    // Standalone use (no scheduler) or scheduler-running-without-pool:
+    // detached thread is safe because the work captures either a null
+    // ``sched`` (resume falls through to direct ``handle.resume()`` with
+    // no scheduler context to dangle) or a scheduler that stays alive
+    // past the resume.
     std::thread(std::forward<F>(work)).detach();
 }
 
@@ -62,8 +93,16 @@ inline void resume_via_scheduler(std::coroutine_handle<> handle,
 }  // namespace detail
 
 /// Awaitable for sleeping/delaying execution
-/// Uses the I/O backend's timeout mechanism for efficient waiting
-class sleep_awaitable {
+/// Uses the I/O backend's timeout mechanism for efficient waiting.
+///
+/// Inherits from ``io::io_awaitable_base`` so the SQE carries a tagged
+/// ``op_state`` pointer rather than the raw coroutine handle as user_data.
+/// If the awaitable's frame is destroyed before the timeout CQE arrives
+/// (e.g. parent task forced down on scheduler shutdown), the base
+/// destructor CASes the op_state from ``pending`` to ``orphaned`` and the
+/// completion handler drops the late CQE instead of resuming a dangling
+/// handle. See the contract in ``include/elio/io/io_backend.hpp``.
+class sleep_awaitable : public io::io_awaitable_base {
 public:
     /// Construct a sleep awaitable
     /// @param duration Duration to sleep
@@ -94,6 +133,9 @@ public:
         req.op = io::io_op::timeout;
         req.length = static_cast<size_t>(duration_ns_);
         req.awaiter = awaiter;
+        // Owner-controlled op_state: tags the SQE so a CQE arriving after
+        // teardown is dropped instead of resuming a freed coroutine frame.
+        req.state = setup_op_state(awaiter);
 #ifdef __linux__
         // Provide our local timespec for io_uring backend (runtime check)
         // epoll backend ignores this field
@@ -101,11 +143,13 @@ public:
 #endif
 
         if (!ctx->prepare(req)) {
-            // SQ full / submit failed. Route the sleep to the blocking pool
-            // so we don't block this worker thread for the full duration —
-            // that would halt every other coroutine on this worker and
-            // violate the "coroutines must not block worker threads"
-            // invariant.
+            // SQ full / submit failed: no SQE went out, so no CQE will
+            // arrive. Drop the op_state (no orphan needed) and route the
+            // sleep to the blocking pool so we don't block this worker
+            // thread for the full duration — that would halt every other
+            // coroutine on this worker and violate the "coroutines must
+            // not block worker threads" invariant.
+            clear_op_state();
             ELIO_LOG_WARNING("sleep_awaitable: failed to prepare timeout, routing fallback through blocking pool");
             auto* sched = runtime::get_current_scheduler();
             const int64_t duration = duration_ns_;
@@ -119,8 +163,9 @@ public:
         ctx->submit();
     }
 
-    void await_resume() const noexcept {
-        // Nothing to return
+    void await_resume() noexcept {
+        // Nothing to return; op_state lifetime is handled by the base
+        // destructor (deletes via unique_ptr in the completed phase).
     }
 
 private:
@@ -132,8 +177,14 @@ private:
 };
 
 /// Awaitable for cancellable sleep operations
-/// Returns cancel_result indicating if sleep completed or was cancelled
-class cancellable_sleep_awaitable {
+/// Returns cancel_result indicating if sleep completed or was cancelled.
+///
+/// Inherits from ``io::io_awaitable_base`` for the same UAF protection as
+/// ``sleep_awaitable`` — a CQE arriving after teardown finds an orphaned
+/// op_state and is dropped. The cancel callback path additionally uses
+/// the tagged op_state pointer as the cancel SQE's user_data so it
+/// matches the original timer SQE.
+class cancellable_sleep_awaitable : public io::io_awaitable_base {
 public:
     using cancel_result = coro::cancel_result;
 
@@ -185,6 +236,10 @@ public:
         state->ctx = ctx;
         state->awaiter = awaiter;
         state->worker = runtime::worker_thread::current();
+        // ``op`` is set below once setup_op_state succeeds. The cancel
+        // executor uses it as the SQE-matching key (tagged user_data) so
+        // it cancels the right entry even though the SQE no longer keys
+        // off the raw coroutine handle.
         state_ = state;
 
         // Register cancellation callback. The lambda captures only the
@@ -221,6 +276,12 @@ public:
         req.op = io::io_op::timeout;
         req.length = static_cast<size_t>(duration_ns_);
         req.awaiter = awaiter;
+        // Owner-controlled op_state: same UAF protection as
+        // sleep_awaitable. The pointer is stashed in shared_state so the
+        // cancel executor can pass the matching tagged user_data to
+        // io_context::cancel().
+        req.state = setup_op_state(awaiter);
+        state->op = req.state;
 #ifdef __linux__
         // Provide our local timespec for io_uring backend (runtime check)
         // epoll backend ignores this field
@@ -232,9 +293,12 @@ public:
             return;
         }
 
-        // SQ full / submit failed. Drop the cancel registration and route
-        // the sleep through the blocking pool — blocking the worker for
+        // SQ full / submit failed: no SQE went out, drop the op_state
+        // (no CQE will arrive) and route through the blocking pool.
+        // We also drop the cancel registration — blocking the worker for
         // the full duration would freeze every other coroutine on it.
+        clear_op_state();
+        state->op = nullptr;
         cancel_registration_.unregister();
         ELIO_LOG_WARNING("cancellable_sleep: failed to prepare timeout, routing fallback through blocking pool");
 
@@ -286,10 +350,18 @@ private:
     /// lambda, and the cancel executor coroutine. shared_ptr keeps it
     /// alive past the awaitable's destruction so cross-thread cancel
     /// paths cannot UAF.
+    ///
+    /// ``op`` is the awaitable's owned op_state pointer. The cancel
+    /// executor uses ``tagged_op_state_user_data(op)`` as the SQE key
+    /// when issuing the cancel — that matches what the timer SQE was
+    /// submitted with. The pointer is only ever used as a key, never
+    /// dereferenced through the cancel path, so its eventual deletion by
+    /// the backend (after orphan + CQE) is benign.
     struct shared_state {
         io::io_context* ctx = nullptr;
         std::coroutine_handle<> awaiter;
         runtime::worker_thread* worker = nullptr;
+        io::op_state* op = nullptr;
         std::atomic<bool> resumed{false};
         std::atomic<bool> cancelled{false};
     };
@@ -314,15 +386,17 @@ private:
     static cancel_executor make_cancel_executor(std::shared_ptr<shared_state> state) {
         // Atomically claim the resume slot. If `resumed` was already true,
         // the natural completion path has resumed (or is resuming) the
-        // awaiter; touching state->ctx with state->awaiter.address() is
-        // still memory-safe (the addresses are just opaque keys to the
-        // ring) but we'd risk cancelling a freshly-reused SQE keyed off
-        // the same handle address. Bail early.
+        // awaiter and we'd risk cancelling a freshly-reused SQE keyed off
+        // the same op_state pointer. Bail early.
         if (state->resumed.exchange(true, std::memory_order_acq_rel)) {
             co_return;
         }
-        if (state->ctx) {
-            state->ctx->cancel(state->awaiter.address());
+        if (state->ctx && state->op) {
+            // Match the tagged user_data the timer SQE was submitted
+            // with. ``state->op`` is an opaque key here — never
+            // dereferenced — so it stays sound even if the backend has
+            // already freed the op_state via the orphan/CQE handshake.
+            state->ctx->cancel(io::tagged_op_state_user_data(state->op));
         }
         co_return;
     }

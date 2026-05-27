@@ -37,12 +37,14 @@
 /// the full design plan and stage breakdown.
 
 #include <elio/rdma/types.hpp>
+#include <elio/rdma/op_state.hpp>
+#include <elio/rdma/completion.hpp>
 #include <elio/rdma/backend_traits.hpp>
 
 namespace elio::rdma {
 
 /// Module version string, bumped per stage so downstream code can
 /// feature-detect during this incremental rollout.
-inline constexpr const char* module_version = "0.0.1-S0";
+inline constexpr const char* module_version = "0.0.2-S1";
 
 }  // namespace elio::rdma

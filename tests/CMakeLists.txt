@@ -63,6 +63,16 @@ if(TARGET elio_tls)
     )
 endif()
 
+# RDMA abstraction tests (only when ELIO_ENABLE_RDMA=ON).
+# Header-only; no extra libraries required for the dispatcher / op_state
+# slice — the mock backend (S3+) and any real ibverbs backend are
+# user-side, never built into elio_tests.
+if(TARGET elio_rdma)
+    list(APPEND TEST_SOURCES
+        unit/test_rdma_dispatcher.cpp
+    )
+endif()
+
 # Standard test executable
 add_executable(elio_tests ${TEST_SOURCES})
 target_link_libraries(elio_tests PRIVATE elio Catch2::Catch2WithMain)

@@ -40,11 +40,12 @@
 #include <elio/rdma/op_state.hpp>
 #include <elio/rdma/completion.hpp>
 #include <elio/rdma/backend_traits.hpp>
+#include <elio/rdma/connection.hpp>
 
 namespace elio::rdma {
 
 /// Module version string, bumped per stage so downstream code can
 /// feature-detect during this incremental rollout.
-inline constexpr const char* module_version = "0.0.2-S1";
+inline constexpr const char* module_version = "0.0.3-S2";
 
 }  // namespace elio::rdma

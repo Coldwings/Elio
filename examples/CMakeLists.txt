@@ -135,3 +135,10 @@ if(TARGET elio_http)
     target_link_libraries(sse_client PRIVATE elio_http)
     target_link_options(sse_client PRIVATE ${STATIC_LINK_FLAGS})
 endif()
+
+# RDMA mock-backend pingpong (requires elio_rdma).
+if(TARGET elio_rdma)
+    add_executable(rdma_pingpong_mock rdma_pingpong_mock.cpp)
+    target_link_libraries(rdma_pingpong_mock PRIVATE elio_rdma)
+    target_link_options(rdma_pingpong_mock PRIVATE ${STATIC_LINK_FLAGS})
+endif()

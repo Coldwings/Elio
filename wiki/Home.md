@@ -74,6 +74,7 @@ Elio is built around a few key technical decisions:
 - [[Batch IO and File Helpers]] - Batch I/O operations and file utilities
 - [[RPC Framework]] - High-performance RPC with zero-copy serialization
 - [[Hash Functions]] - CRC32, SHA-1, and SHA-256
+- [[RDMA Guide]] - Optional RDMA-Core abstraction (header-only, bring-your-own-backend)
 - [[Performance Tuning]] - Optimization and benchmarking
 - [[Debugging]] - GDB/LLDB extensions and elio-pstack
 - [[Examples]] - Code examples and use cases

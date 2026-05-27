@@ -78,6 +78,7 @@ if(TARGET elio_rdma)
         unit/test_rdma_srq.cpp
         unit/test_rdma_memory_region.cpp
         unit/test_rdma_cq_pump.cpp
+        unit/test_rdma_imm.cpp
     )
 endif()
 

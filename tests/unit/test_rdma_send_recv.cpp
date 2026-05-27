@@ -51,6 +51,7 @@ struct mock_state {
     sge              last_send_sge{};
     sge              last_recv_sge{};
     send_flags       last_send_flags{};
+    std::uint32_t    last_send_imm = 0;
     void*            last_qp = nullptr;
 };
 
@@ -58,12 +59,14 @@ struct mock_static_backend {
     static inline mock_state* state = nullptr;
 
     static int post_send(void* qp, std::span<const sge> sges,
-                         send_flags flags, wr_id id) noexcept {
+                         send_flags flags, std::uint32_t imm_data,
+                         wr_id id) noexcept {
         if (state) {
             state->sends.fetch_add(1);
             state->last_send_id    = id;
             state->last_send_sge   = sges.empty() ? sge{} : sges.front();
             state->last_send_flags = flags;
+            state->last_send_imm   = imm_data;
             state->last_qp         = qp;
             return state->send_rc;
         }
@@ -81,7 +84,8 @@ struct mock_static_backend {
         return 0;
     }
     static int post_rdma_write(void*, std::span<const sge>,
-                               remote_buffer, send_flags, wr_id) noexcept {
+                               remote_buffer, send_flags,
+                               std::uint32_t, wr_id) noexcept {
         return 0;
     }
     static int post_rdma_read(void*, std::span<const sge>,
@@ -103,11 +107,13 @@ struct mock_poly_backend : polymorphic_backend {
     mock_state state;
 
     int post_send(void* qp, std::span<const sge> sges,
-                  send_flags flags, wr_id id) noexcept override {
+                  send_flags flags, std::uint32_t imm_data,
+                  wr_id id) noexcept override {
         state.sends.fetch_add(1);
         state.last_send_id    = id;
         state.last_send_sge   = sges.empty() ? sge{} : sges.front();
         state.last_send_flags = flags;
+        state.last_send_imm   = imm_data;
         state.last_qp         = qp;
         return state.send_rc;
     }
@@ -120,7 +126,8 @@ struct mock_poly_backend : polymorphic_backend {
         return state.recv_rc;
     }
     int post_rdma_write(void*, std::span<const sge>,
-                        remote_buffer, send_flags, wr_id) noexcept override {
+                        remote_buffer, send_flags,
+                        std::uint32_t, wr_id) noexcept override {
         return 0;
     }
     int post_rdma_read(void*, std::span<const sge>,

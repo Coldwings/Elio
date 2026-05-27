@@ -54,12 +54,15 @@ struct mr_static_backend {
     // backend_traits surface (unused by these tests but required to
     // satisfy backend_with_mr).
     static int post_send(void*, std::span<const sge>,
-                         send_flags, wr_id) noexcept { return 0; }
+                         send_flags, std::uint32_t, wr_id) noexcept {
+        return 0;
+    }
     static int post_recv(void*, std::span<const sge>, wr_id) noexcept {
         return 0;
     }
     static int post_rdma_write(void*, std::span<const sge>,
-                               remote_buffer, send_flags, wr_id) noexcept {
+                               remote_buffer, send_flags,
+                               std::uint32_t, wr_id) noexcept {
         return 0;
     }
     static int post_rdma_read(void*, std::span<const sge>,
@@ -104,12 +107,15 @@ struct mr_poly_backend : polymorphic_backend {
     mr_state state;
 
     int post_send(void*, std::span<const sge>,
-                  send_flags, wr_id) noexcept override { return 0; }
+                  send_flags, std::uint32_t, wr_id) noexcept override {
+        return 0;
+    }
     int post_recv(void*, std::span<const sge>, wr_id) noexcept override {
         return 0;
     }
     int post_rdma_write(void*, std::span<const sge>,
-                        remote_buffer, send_flags, wr_id) noexcept override {
+                        remote_buffer, send_flags,
+                        std::uint32_t, wr_id) noexcept override {
         return 0;
     }
     int post_rdma_read(void*, std::span<const sge>,
@@ -299,12 +305,15 @@ TEST_CASE("memory_region<polymorphic_backend>: subclass without "
           "[rdma][mr][polymorphic][default]") {
     struct no_mr_backend : polymorphic_backend {
         int post_send(void*, std::span<const sge>,
-                      send_flags, wr_id) noexcept override { return 0; }
+                      send_flags, std::uint32_t, wr_id) noexcept override {
+            return 0;
+        }
         int post_recv(void*, std::span<const sge>, wr_id) noexcept override {
             return 0;
         }
         int post_rdma_write(void*, std::span<const sge>,
-                            remote_buffer, send_flags, wr_id) noexcept override {
+                            remote_buffer, send_flags,
+                            std::uint32_t, wr_id) noexcept override {
             return 0;
         }
         int post_rdma_read(void*, std::span<const sge>,

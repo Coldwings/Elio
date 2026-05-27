@@ -50,7 +50,8 @@ struct sge_static_backend {
         state->last_sges.assign(sges.begin(), sges.end());
     }
     static int post_send(void* qp, std::span<const sge> sges,
-                         send_flags flags, wr_id id) noexcept {
+                         send_flags flags, std::uint32_t,
+                         wr_id id) noexcept {
         record_(qp, sges, id);
         if (state) state->last_flags = flags;
         return 0;
@@ -62,7 +63,7 @@ struct sge_static_backend {
     }
     static int post_rdma_write(void* qp, std::span<const sge> sges,
                                remote_buffer rb, send_flags flags,
-                               wr_id id) noexcept {
+                               std::uint32_t, wr_id id) noexcept {
         record_(qp, sges, id);
         if (state) {
             state->last_remote = rb;
@@ -90,7 +91,8 @@ struct state_guard {
 struct sge_poly_backend : polymorphic_backend {
     sge_state state;
     int post_send(void* qp, std::span<const sge> sges,
-                  send_flags flags, wr_id id) noexcept override {
+                  send_flags flags, std::uint32_t,
+                  wr_id id) noexcept override {
         state.posts.fetch_add(1);
         state.last_qp = qp;
         state.last_id = id;
@@ -108,7 +110,7 @@ struct sge_poly_backend : polymorphic_backend {
     }
     int post_rdma_write(void* qp, std::span<const sge> sges,
                         remote_buffer rb, send_flags flags,
-                        wr_id id) noexcept override {
+                        std::uint32_t, wr_id id) noexcept override {
         state.posts.fetch_add(1);
         state.last_qp = qp;
         state.last_id = id;

@@ -53,7 +53,7 @@ struct static_test_backend {
     static inline call_counts* counts = nullptr;
 
     static int post_send(void*, std::span<const sge>,
-                         send_flags, wr_id) noexcept {
+                         send_flags, std::uint32_t, wr_id) noexcept {
         if (counts) counts->sends.fetch_add(1);
         return 0;
     }
@@ -63,7 +63,8 @@ struct static_test_backend {
         return 0;
     }
     static int post_rdma_write(void*, std::span<const sge>,
-                               remote_buffer, send_flags, wr_id) noexcept {
+                               remote_buffer, send_flags,
+                               std::uint32_t, wr_id) noexcept {
         if (counts) counts->writes.fetch_add(1);
         return 0;
     }
@@ -77,10 +78,11 @@ struct static_test_backend {
 // Same surface plus the MR extension hooks.
 struct static_test_backend_with_mr {
     static int post_send(void*, std::span<const sge>,
-                         send_flags, wr_id) noexcept { return 0; }
+                         send_flags, std::uint32_t, wr_id) noexcept { return 0; }
     static int post_recv(void*, std::span<const sge>, wr_id) noexcept { return 0; }
     static int post_rdma_write(void*, std::span<const sge>,
-                               remote_buffer, send_flags, wr_id) noexcept { return 0; }
+                               remote_buffer, send_flags,
+                               std::uint32_t, wr_id) noexcept { return 0; }
     static int post_rdma_read(void*, std::span<const sge>,
                               remote_buffer, wr_id) noexcept { return 0; }
     static void* register_mr(void*, void*, std::size_t, int) noexcept {
@@ -94,9 +96,10 @@ struct static_test_backend_with_mr {
 // A type missing post_recv: must NOT satisfy backend_traits.
 struct broken_backend {
     static int post_send(void*, std::span<const sge>,
-                         send_flags, wr_id) noexcept { return 0; }
+                         send_flags, std::uint32_t, wr_id) noexcept { return 0; }
     static int post_rdma_write(void*, std::span<const sge>,
-                               remote_buffer, send_flags, wr_id) noexcept { return 0; }
+                               remote_buffer, send_flags,
+                               std::uint32_t, wr_id) noexcept { return 0; }
     static int post_rdma_read(void*, std::span<const sge>,
                               remote_buffer, wr_id) noexcept { return 0; }
     // post_recv intentionally omitted.
@@ -109,7 +112,7 @@ struct mock_polymorphic : polymorphic_backend {
     call_counts counts;
 
     int post_send(void*, std::span<const sge>,
-                  send_flags, wr_id) noexcept override {
+                  send_flags, std::uint32_t, wr_id) noexcept override {
         counts.sends.fetch_add(1);
         return 0;
     }
@@ -118,7 +121,8 @@ struct mock_polymorphic : polymorphic_backend {
         return 0;
     }
     int post_rdma_write(void*, std::span<const sge>,
-                        remote_buffer, send_flags, wr_id) noexcept override {
+                        remote_buffer, send_flags,
+                        std::uint32_t, wr_id) noexcept override {
         counts.writes.fetch_add(1);
         return 0;
     }
@@ -157,9 +161,9 @@ TEST_CASE("polymorphic_backend dispatches through the vtable",
     remote_buffer rb{};
     auto sges = std::span<const sge>(&s, 1);
 
-    REQUIRE(base.post_send(nullptr, sges, {}, 0) == 0);
+    REQUIRE(base.post_send(nullptr, sges, {}, 0u, 0) == 0);
     REQUIRE(base.post_recv(nullptr, sges, 0) == 0);
-    REQUIRE(base.post_rdma_write(nullptr, sges, rb, {}, 0) == 0);
+    REQUIRE(base.post_rdma_write(nullptr, sges, rb, {}, 0u, 0) == 0);
     REQUIRE(base.post_rdma_read(nullptr, sges, rb, 0) == 0);
     REQUIRE(base.post_srq_recv(nullptr, sges, 0) == 0);
 
@@ -173,9 +177,11 @@ TEST_CASE("polymorphic_backend dispatches through the vtable",
 TEST_CASE("polymorphic_backend default optional methods report not-supported",
           "[rdma][backend][polymorphic]") {
     struct minimal_poly : polymorphic_backend {
-        int post_send(void*, std::span<const sge>, send_flags, wr_id) noexcept override { return 0; }
+        int post_send(void*, std::span<const sge>, send_flags,
+                      std::uint32_t, wr_id) noexcept override { return 0; }
         int post_recv(void*, std::span<const sge>, wr_id) noexcept override { return 0; }
-        int post_rdma_write(void*, std::span<const sge>, remote_buffer, send_flags, wr_id) noexcept override { return 0; }
+        int post_rdma_write(void*, std::span<const sge>, remote_buffer,
+                            send_flags, std::uint32_t, wr_id) noexcept override { return 0; }
         int post_rdma_read(void*, std::span<const sge>, remote_buffer, wr_id) noexcept override { return 0; }
     };
 
@@ -202,9 +208,9 @@ TEST_CASE("polymorphic_traits_adapter forwards to the vtable",
     remote_buffer rb{};
     auto sges = std::span<const sge>(&s, 1);
 
-    REQUIRE(adapter.post_send(nullptr, sges, {}, 0) == 0);
+    REQUIRE(adapter.post_send(nullptr, sges, {}, 0u, 0) == 0);
     REQUIRE(adapter.post_recv(nullptr, sges, 0) == 0);
-    REQUIRE(adapter.post_rdma_write(nullptr, sges, rb, {}, 0) == 0);
+    REQUIRE(adapter.post_rdma_write(nullptr, sges, rb, {}, 0u, 0) == 0);
     REQUIRE(adapter.post_rdma_read(nullptr, sges, rb, 0) == 0);
 
     REQUIRE(impl.counts.sends.load() == 1);

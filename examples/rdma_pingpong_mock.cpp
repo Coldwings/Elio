@@ -85,7 +85,8 @@ void wake(int fd) noexcept {
 // peer's queue.
 struct mock_backend {
     static int post_send(void* qp_ptr, std::span<const sge> sges,
-                         send_flags /*flags*/, wr_id id) noexcept {
+                         send_flags /*flags*/, std::uint32_t /*imm*/,
+                         wr_id id) noexcept {
         auto* q = static_cast<mock_qp*>(qp_ptr);
         mock_qp::pending_send msg;
         msg.id = id;
@@ -165,7 +166,8 @@ struct mock_backend {
     // The mock doesn't implement one-sided ops or MR / SRQ in this
     // example — those would need extra plumbing.
     static int post_rdma_write(void*, std::span<const sge>,
-                               remote_buffer, send_flags, wr_id) noexcept {
+                               remote_buffer, send_flags,
+                               std::uint32_t, wr_id) noexcept {
         return -95;  // -ENOTSUP
     }
     static int post_rdma_read(void*, std::span<const sge>,

@@ -51,7 +51,8 @@ struct inline_static_backend {
     static inline inline_state* state = nullptr;
 
     static int post_send(void*, std::span<const sge>,
-                         send_flags flags, wr_id id) noexcept {
+                         send_flags flags, std::uint32_t,
+                         wr_id id) noexcept {
         if (state) {
             state->sends.fetch_add(1);
             state->last_id    = id;
@@ -64,7 +65,7 @@ struct inline_static_backend {
     }
     static int post_rdma_write(void*, std::span<const sge>,
                                remote_buffer, send_flags flags,
-                               wr_id id) noexcept {
+                               std::uint32_t, wr_id id) noexcept {
         if (state) {
             state->writes.fetch_add(1);
             state->last_id    = id;

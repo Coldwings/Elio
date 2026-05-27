@@ -52,6 +52,6 @@ namespace elio::rdma {
 
 /// Module version string, bumped per stage so downstream code can
 /// feature-detect during this incremental rollout.
-inline constexpr const char* module_version = "0.0.11-S8";
+inline constexpr const char* module_version = "0.0.12-S11";
 
 }  // namespace elio::rdma

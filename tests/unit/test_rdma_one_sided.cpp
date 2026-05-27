@@ -46,6 +46,7 @@ struct one_sided_state {
     remote_buffer    last_write_remote{};
     remote_buffer    last_read_remote{};
     send_flags       last_write_flags{};
+    std::uint32_t    last_write_imm = 0;
     void*            last_qp = nullptr;
 };
 
@@ -53,19 +54,22 @@ struct one_sided_static_backend {
     static inline one_sided_state* state = nullptr;
 
     static int post_send(void*, std::span<const sge>,
-                         send_flags, wr_id) noexcept { return 0; }
+                         send_flags, std::uint32_t, wr_id) noexcept {
+        return 0;
+    }
     static int post_recv(void*, std::span<const sge>, wr_id) noexcept {
         return 0;
     }
     static int post_rdma_write(void* qp, std::span<const sge> sges,
                                remote_buffer rb, send_flags flags,
-                               wr_id id) noexcept {
+                               std::uint32_t imm_data, wr_id id) noexcept {
         if (state) {
             state->writes.fetch_add(1);
             state->last_write_id     = id;
             state->last_write_sge    = sges.empty() ? sge{} : sges.front();
             state->last_write_remote = rb;
             state->last_write_flags  = flags;
+            state->last_write_imm    = imm_data;
             state->last_qp           = qp;
             return state->write_rc;
         }
@@ -98,18 +102,21 @@ struct one_sided_poly_backend : polymorphic_backend {
     one_sided_state state;
 
     int post_send(void*, std::span<const sge>,
-                  send_flags, wr_id) noexcept override { return 0; }
+                  send_flags, std::uint32_t, wr_id) noexcept override {
+        return 0;
+    }
     int post_recv(void*, std::span<const sge>, wr_id) noexcept override {
         return 0;
     }
     int post_rdma_write(void* qp, std::span<const sge> sges,
                         remote_buffer rb, send_flags flags,
-                        wr_id id) noexcept override {
+                        std::uint32_t imm_data, wr_id id) noexcept override {
         state.writes.fetch_add(1);
         state.last_write_id     = id;
         state.last_write_sge    = sges.empty() ? sge{} : sges.front();
         state.last_write_remote = rb;
         state.last_write_flags  = flags;
+        state.last_write_imm    = imm_data;
         state.last_qp           = qp;
         return state.write_rc;
     }

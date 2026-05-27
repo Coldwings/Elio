@@ -13,6 +13,8 @@
 
 #include <infiniband/verbs.h>
 
+#include <endian.h>
+
 #include <cerrno>
 #include <cstring>
 #include <span>
@@ -28,6 +30,7 @@ struct ibverbs_backend {
     static int post_send(void* qp_ptr,
                          std::span<const elio::rdma::sge> sges,
                          elio::rdma::send_flags flags,
+                         std::uint32_t imm_data,
                          elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
         std::vector<ibv_sge> raw;
@@ -43,7 +46,10 @@ struct ibverbs_backend {
         wr.wr_id      = id;
         wr.sg_list    = raw.empty() ? nullptr : raw.data();
         wr.num_sge    = static_cast<int>(raw.size());
-        wr.opcode     = IBV_WR_SEND;
+        wr.opcode     = flags.with_imm ? IBV_WR_SEND_WITH_IMM : IBV_WR_SEND;
+        if (flags.with_imm) {
+            wr.imm_data = ::htobe32(imm_data);
+        }
         wr.send_flags = make_send_flags_(flags);
         ibv_send_wr* bad = nullptr;
         const int rc = ::ibv_post_send(qp, &wr, &bad);
@@ -76,6 +82,7 @@ struct ibverbs_backend {
                                std::span<const elio::rdma::sge> sges,
                                elio::rdma::remote_buffer rb,
                                elio::rdma::send_flags flags,
+                               std::uint32_t imm_data,
                                elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
         std::vector<ibv_sge> raw;
@@ -91,7 +98,11 @@ struct ibverbs_backend {
         wr.wr_id              = id;
         wr.sg_list            = raw.empty() ? nullptr : raw.data();
         wr.num_sge            = static_cast<int>(raw.size());
-        wr.opcode             = IBV_WR_RDMA_WRITE;
+        wr.opcode             = flags.with_imm
+            ? IBV_WR_RDMA_WRITE_WITH_IMM : IBV_WR_RDMA_WRITE;
+        if (flags.with_imm) {
+            wr.imm_data = ::htobe32(imm_data);
+        }
         wr.send_flags         = make_send_flags_(flags);
         wr.wr.rdma.remote_addr = rb.addr;
         wr.wr.rdma.rkey        = rb.rkey;

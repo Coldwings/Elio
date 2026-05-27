@@ -51,12 +51,15 @@ struct srq_static_backend {
     static inline srq_state* state = nullptr;
 
     static int post_send(void*, std::span<const sge>,
-                         send_flags, wr_id) noexcept { return 0; }
+                         send_flags, std::uint32_t, wr_id) noexcept {
+        return 0;
+    }
     static int post_recv(void*, std::span<const sge>, wr_id) noexcept {
         return 0;
     }
     static int post_rdma_write(void*, std::span<const sge>,
-                               remote_buffer, send_flags, wr_id) noexcept {
+                               remote_buffer, send_flags,
+                               std::uint32_t, wr_id) noexcept {
         return 0;
     }
     static int post_rdma_read(void*, std::span<const sge>,
@@ -89,12 +92,15 @@ struct srq_poly_backend : polymorphic_backend {
     srq_state state;
 
     int post_send(void*, std::span<const sge>,
-                  send_flags, wr_id) noexcept override { return 0; }
+                  send_flags, std::uint32_t, wr_id) noexcept override {
+        return 0;
+    }
     int post_recv(void*, std::span<const sge>, wr_id) noexcept override {
         return 0;
     }
     int post_rdma_write(void*, std::span<const sge>,
-                        remote_buffer, send_flags, wr_id) noexcept override {
+                        remote_buffer, send_flags,
+                        std::uint32_t, wr_id) noexcept override {
         return 0;
     }
     int post_rdma_read(void*, std::span<const sge>,
@@ -115,12 +121,15 @@ struct srq_poly_backend : polymorphic_backend {
 // post_srq_recv — should yield wr_flush_error via the -ENOTSUP path.
 struct poly_no_srq : polymorphic_backend {
     int post_send(void*, std::span<const sge>,
-                  send_flags, wr_id) noexcept override { return 0; }
+                  send_flags, std::uint32_t, wr_id) noexcept override {
+        return 0;
+    }
     int post_recv(void*, std::span<const sge>, wr_id) noexcept override {
         return 0;
     }
     int post_rdma_write(void*, std::span<const sge>,
-                        remote_buffer, send_flags, wr_id) noexcept override {
+                        remote_buffer, send_flags,
+                        std::uint32_t, wr_id) noexcept override {
         return 0;
     }
     int post_rdma_read(void*, std::span<const sge>,

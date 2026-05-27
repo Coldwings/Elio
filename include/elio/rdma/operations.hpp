@@ -54,9 +54,10 @@ struct backend_invoker {
     static int post_send(void* qp,
                          std::span<const sge> sges,
                          send_flags flags,
+                         std::uint32_t imm_data,
                          wr_id id,
                          [[maybe_unused]] Backend* backend) noexcept {
-        return Backend::post_send(qp, sges, flags, id);
+        return Backend::post_send(qp, sges, flags, imm_data, id);
     }
     static int post_recv(void* qp,
                          std::span<const sge> sges,
@@ -68,9 +69,10 @@ struct backend_invoker {
                                std::span<const sge> sges,
                                remote_buffer rb,
                                send_flags flags,
+                               std::uint32_t imm_data,
                                wr_id id,
                                [[maybe_unused]] Backend* backend) noexcept {
-        return Backend::post_rdma_write(qp, sges, rb, flags, id);
+        return Backend::post_rdma_write(qp, sges, rb, flags, imm_data, id);
     }
     static int post_rdma_read(void* qp,
                               std::span<const sge> sges,
@@ -94,9 +96,10 @@ struct backend_invoker<polymorphic_backend> {
     static int post_send(void* qp,
                          std::span<const sge> sges,
                          send_flags flags,
+                         std::uint32_t imm_data,
                          wr_id id,
                          polymorphic_backend* backend) noexcept {
-        return backend->post_send(qp, sges, flags, id);
+        return backend->post_send(qp, sges, flags, imm_data, id);
     }
     static int post_recv(void* qp,
                          std::span<const sge> sges,
@@ -108,9 +111,10 @@ struct backend_invoker<polymorphic_backend> {
                                std::span<const sge> sges,
                                remote_buffer rb,
                                send_flags flags,
+                               std::uint32_t imm_data,
                                wr_id id,
                                polymorphic_backend* backend) noexcept {
-        return backend->post_rdma_write(qp, sges, rb, flags, id);
+        return backend->post_rdma_write(qp, sges, rb, flags, imm_data, id);
     }
     static int post_rdma_read(void* qp,
                               std::span<const sge> sges,
@@ -280,17 +284,19 @@ public:
                    Backend* backend_or_null,
                    buffer_view buf,
                    send_flags flags,
-                   std::size_t max_inline = 0) noexcept
+                   std::size_t max_inline = 0,
+                   std::uint32_t imm_data = 0) noexcept
         : sge_holder(buf), qp_(qp), backend_(backend_or_null),
-          flags_(flags), max_inline_(max_inline) {}
+          flags_(flags), max_inline_(max_inline), imm_data_(imm_data) {}
 
     send_awaitable(void* qp,
                    Backend* backend_or_null,
                    std::span<const sge> sges,
                    send_flags flags,
-                   std::size_t max_inline = 0) noexcept
+                   std::size_t max_inline = 0,
+                   std::uint32_t imm_data = 0) noexcept
         : sge_holder(sges), qp_(qp), backend_(backend_or_null),
-          flags_(flags), max_inline_(max_inline) {}
+          flags_(flags), max_inline_(max_inline), imm_data_(imm_data) {}
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
         const auto id = arm_(h);
@@ -302,15 +308,16 @@ public:
                 static_cast<std::uint32_t>(total_bytes_()));
         }
         const int rc = backend_invoker<Backend>::post_send(
-            qp_, effective_sges_(), flags_, id, backend_);
+            qp_, effective_sges_(), flags_, imm_data_, id, backend_);
         return finalize_post_(rc);
     }
 
 private:
-    void*       qp_;
-    Backend*    backend_;
-    send_flags  flags_;
-    std::size_t max_inline_;
+    void*         qp_;
+    Backend*      backend_;
+    send_flags    flags_;
+    std::size_t   max_inline_;
+    std::uint32_t imm_data_;
 };
 
 /// RECV awaiter. Constructible from a single `buffer_view` or a
@@ -355,18 +362,22 @@ public:
                          buffer_view local,
                          remote_buffer remote,
                          send_flags flags,
-                         std::size_t max_inline = 0) noexcept
+                         std::size_t max_inline = 0,
+                         std::uint32_t imm_data = 0) noexcept
         : sge_holder(local), qp_(qp), backend_(backend_or_null),
-          remote_(remote), flags_(flags), max_inline_(max_inline) {}
+          remote_(remote), flags_(flags), max_inline_(max_inline),
+          imm_data_(imm_data) {}
 
     rdma_write_awaitable(void* qp,
                          Backend* backend_or_null,
                          std::span<const sge> locals,
                          remote_buffer remote,
                          send_flags flags,
-                         std::size_t max_inline = 0) noexcept
+                         std::size_t max_inline = 0,
+                         std::uint32_t imm_data = 0) noexcept
         : sge_holder(locals), qp_(qp), backend_(backend_or_null),
-          remote_(remote), flags_(flags), max_inline_(max_inline) {}
+          remote_(remote), flags_(flags), max_inline_(max_inline),
+          imm_data_(imm_data) {}
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
         const auto id = arm_(h);
@@ -376,7 +387,7 @@ public:
                 static_cast<std::uint32_t>(total_bytes_()));
         }
         const int rc = backend_invoker<Backend>::post_rdma_write(
-            qp_, effective_sges_(), remote_, flags_, id, backend_);
+            qp_, effective_sges_(), remote_, flags_, imm_data_, id, backend_);
         return finalize_post_(rc);
     }
 
@@ -386,6 +397,7 @@ private:
     remote_buffer remote_;
     send_flags    flags_;
     std::size_t   max_inline_;
+    std::uint32_t imm_data_;
 };
 
 /// One-sided RDMA READ awaiter. Pulls remote bytes into the local

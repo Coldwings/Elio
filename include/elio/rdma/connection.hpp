@@ -90,6 +90,12 @@ public:
         send(buffer_view buf, send_flags flags = {}) noexcept;
     [[nodiscard]] detail::send_awaitable<Backend>
         send(std::span<const sge> sges, send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::send_awaitable<Backend>
+        send_with_imm(buffer_view buf, std::uint32_t imm_data,
+                      send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::send_awaitable<Backend>
+        send_with_imm(std::span<const sge> sges, std::uint32_t imm_data,
+                      send_flags flags = {}) noexcept;
     [[nodiscard]] detail::recv_awaitable<Backend>
         recv(buffer_view buf) noexcept;
     [[nodiscard]] detail::recv_awaitable<Backend>
@@ -100,6 +106,15 @@ public:
     [[nodiscard]] detail::rdma_write_awaitable<Backend>
         rdma_write(std::span<const sge> locals, remote_buffer remote,
                    send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::rdma_write_awaitable<Backend>
+        rdma_write_with_imm(buffer_view local, remote_buffer remote,
+                            std::uint32_t imm_data,
+                            send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::rdma_write_awaitable<Backend>
+        rdma_write_with_imm(std::span<const sge> locals,
+                            remote_buffer remote,
+                            std::uint32_t imm_data,
+                            send_flags flags = {}) noexcept;
     [[nodiscard]] detail::rdma_read_awaitable<Backend>
         rdma_read(buffer_view local, remote_buffer remote) noexcept;
     [[nodiscard]] detail::rdma_read_awaitable<Backend>
@@ -143,11 +158,18 @@ public:
     // after operations.hpp is included. Dispatch goes through the
     // polymorphic backend's virtual methods. Each operation has the
     // same single-buffer / multi-SGE overload pair as the primary
-    // template (S5a).
+    // template (S5a). The *_with_imm variants set send_flags::with_imm
+    // and carry imm_data through to the backend (S11).
     [[nodiscard]] detail::send_awaitable<polymorphic_backend>
         send(buffer_view buf, send_flags flags = {}) noexcept;
     [[nodiscard]] detail::send_awaitable<polymorphic_backend>
         send(std::span<const sge> sges, send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::send_awaitable<polymorphic_backend>
+        send_with_imm(buffer_view buf, std::uint32_t imm_data,
+                      send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::send_awaitable<polymorphic_backend>
+        send_with_imm(std::span<const sge> sges, std::uint32_t imm_data,
+                      send_flags flags = {}) noexcept;
     [[nodiscard]] detail::recv_awaitable<polymorphic_backend>
         recv(buffer_view buf) noexcept;
     [[nodiscard]] detail::recv_awaitable<polymorphic_backend>
@@ -158,6 +180,15 @@ public:
     [[nodiscard]] detail::rdma_write_awaitable<polymorphic_backend>
         rdma_write(std::span<const sge> locals, remote_buffer remote,
                    send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::rdma_write_awaitable<polymorphic_backend>
+        rdma_write_with_imm(buffer_view local, remote_buffer remote,
+                            std::uint32_t imm_data,
+                            send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::rdma_write_awaitable<polymorphic_backend>
+        rdma_write_with_imm(std::span<const sge> locals,
+                            remote_buffer remote,
+                            std::uint32_t imm_data,
+                            send_flags flags = {}) noexcept;
     [[nodiscard]] detail::rdma_read_awaitable<polymorphic_backend>
         rdma_read(buffer_view local, remote_buffer remote) noexcept;
     [[nodiscard]] detail::rdma_read_awaitable<polymorphic_backend>
@@ -204,6 +235,33 @@ connection<Backend>::send(std::span<const sge> sges,
 }
 
 template <typename Backend>
+inline detail::send_awaitable<Backend>
+connection<Backend>::send_with_imm(buffer_view buf, std::uint32_t imm_data,
+                                   send_flags flags) noexcept {
+    static_assert(backend_traits<Backend>,
+                  "Backend must satisfy elio::rdma::backend_traits");
+    flags.with_imm = true;
+    return detail::send_awaitable<Backend>(qp_, /*backend=*/nullptr,
+                                           buf, flags,
+                                           config_.max_inline_data,
+                                           imm_data);
+}
+
+template <typename Backend>
+inline detail::send_awaitable<Backend>
+connection<Backend>::send_with_imm(std::span<const sge> sges,
+                                   std::uint32_t imm_data,
+                                   send_flags flags) noexcept {
+    static_assert(backend_traits<Backend>,
+                  "Backend must satisfy elio::rdma::backend_traits");
+    flags.with_imm = true;
+    return detail::send_awaitable<Backend>(qp_, /*backend=*/nullptr,
+                                           sges, flags,
+                                           config_.max_inline_data,
+                                           imm_data);
+}
+
+template <typename Backend>
 inline detail::recv_awaitable<Backend>
 connection<Backend>::recv(buffer_view buf) noexcept {
     static_assert(backend_traits<Backend>,
@@ -243,6 +301,34 @@ connection<Backend>::rdma_write(std::span<const sge> locals,
 }
 
 template <typename Backend>
+inline detail::rdma_write_awaitable<Backend>
+connection<Backend>::rdma_write_with_imm(buffer_view local,
+                                         remote_buffer remote,
+                                         std::uint32_t imm_data,
+                                         send_flags flags) noexcept {
+    static_assert(backend_traits<Backend>,
+                  "Backend must satisfy elio::rdma::backend_traits");
+    flags.with_imm = true;
+    return detail::rdma_write_awaitable<Backend>(
+        qp_, /*backend=*/nullptr, local, remote, flags,
+        config_.max_inline_data, imm_data);
+}
+
+template <typename Backend>
+inline detail::rdma_write_awaitable<Backend>
+connection<Backend>::rdma_write_with_imm(std::span<const sge> locals,
+                                         remote_buffer remote,
+                                         std::uint32_t imm_data,
+                                         send_flags flags) noexcept {
+    static_assert(backend_traits<Backend>,
+                  "Backend must satisfy elio::rdma::backend_traits");
+    flags.with_imm = true;
+    return detail::rdma_write_awaitable<Backend>(
+        qp_, /*backend=*/nullptr, locals, remote, flags,
+        config_.max_inline_data, imm_data);
+}
+
+template <typename Backend>
 inline detail::rdma_read_awaitable<Backend>
 connection<Backend>::rdma_read(buffer_view local,
                                remote_buffer remote) noexcept {
@@ -276,6 +362,24 @@ connection<polymorphic_backend>::send(std::span<const sge> sges,
         qp_, backend_, sges, flags, config_.max_inline_data);
 }
 
+inline detail::send_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::send_with_imm(buffer_view buf,
+                                               std::uint32_t imm_data,
+                                               send_flags flags) noexcept {
+    flags.with_imm = true;
+    return detail::send_awaitable<polymorphic_backend>(
+        qp_, backend_, buf, flags, config_.max_inline_data, imm_data);
+}
+
+inline detail::send_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::send_with_imm(std::span<const sge> sges,
+                                               std::uint32_t imm_data,
+                                               send_flags flags) noexcept {
+    flags.with_imm = true;
+    return detail::send_awaitable<polymorphic_backend>(
+        qp_, backend_, sges, flags, config_.max_inline_data, imm_data);
+}
+
 inline detail::recv_awaitable<polymorphic_backend>
 connection<polymorphic_backend>::recv(buffer_view buf) noexcept {
     return detail::recv_awaitable<polymorphic_backend>(
@@ -304,6 +408,26 @@ connection<polymorphic_backend>::rdma_write(std::span<const sge> locals,
     return detail::rdma_write_awaitable<polymorphic_backend>(
         qp_, backend_, locals, remote, flags,
         config_.max_inline_data);
+}
+
+inline detail::rdma_write_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::rdma_write_with_imm(
+    buffer_view local, remote_buffer remote,
+    std::uint32_t imm_data, send_flags flags) noexcept {
+    flags.with_imm = true;
+    return detail::rdma_write_awaitable<polymorphic_backend>(
+        qp_, backend_, local, remote, flags,
+        config_.max_inline_data, imm_data);
+}
+
+inline detail::rdma_write_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::rdma_write_with_imm(
+    std::span<const sge> locals, remote_buffer remote,
+    std::uint32_t imm_data, send_flags flags) noexcept {
+    flags.with_imm = true;
+    return detail::rdma_write_awaitable<polymorphic_backend>(
+        qp_, backend_, locals, remote, flags,
+        config_.max_inline_data, imm_data);
 }
 
 inline detail::rdma_read_awaitable<polymorphic_backend>

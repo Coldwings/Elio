@@ -50,10 +50,12 @@ concept backend_traits = requires(void* qp,
                                   std::span<const sge> sges,
                                   remote_buffer rb,
                                   send_flags flags,
+                                  std::uint32_t imm_data,
                                   wr_id id) {
-    { B::post_send(qp, sges, flags, id) } noexcept -> std::same_as<int>;
+    { B::post_send(qp, sges, flags, imm_data, id) } noexcept
+        -> std::same_as<int>;
     { B::post_recv(qp, sges, id) } noexcept -> std::same_as<int>;
-    { B::post_rdma_write(qp, sges, rb, flags, id) } noexcept
+    { B::post_rdma_write(qp, sges, rb, flags, imm_data, id) } noexcept
         -> std::same_as<int>;
     { B::post_rdma_read(qp, sges, rb, id) } noexcept
         -> std::same_as<int>;
@@ -107,10 +109,13 @@ struct polymorphic_backend {
     polymorphic_backend(polymorphic_backend&&) = delete;
     polymorphic_backend& operator=(polymorphic_backend&&) = delete;
 
-    // Data path: required.
+    // Data path: required. The `imm_data` parameter is meaningful
+    // only when `flags.with_imm` is set; backends should ignore it
+    // otherwise and select the non-IMM opcode.
     virtual int post_send(void* qp,
                           std::span<const sge> sges,
                           send_flags flags,
+                          std::uint32_t imm_data,
                           wr_id id) noexcept = 0;
     virtual int post_recv(void* qp,
                           std::span<const sge> sges,
@@ -119,6 +124,7 @@ struct polymorphic_backend {
                                 std::span<const sge> sges,
                                 remote_buffer rb,
                                 send_flags flags,
+                                std::uint32_t imm_data,
                                 wr_id id) noexcept = 0;
     virtual int post_rdma_read(void* qp,
                                std::span<const sge> sges,
@@ -156,8 +162,9 @@ struct polymorphic_traits_adapter {
     polymorphic_backend* impl = nullptr;
 
     int post_send(void* qp, std::span<const sge> sges,
-                  send_flags flags, wr_id id) const noexcept {
-        return impl->post_send(qp, sges, flags, id);
+                  send_flags flags, std::uint32_t imm_data,
+                  wr_id id) const noexcept {
+        return impl->post_send(qp, sges, flags, imm_data, id);
     }
     int post_recv(void* qp, std::span<const sge> sges,
                   wr_id id) const noexcept {
@@ -165,8 +172,8 @@ struct polymorphic_traits_adapter {
     }
     int post_rdma_write(void* qp, std::span<const sge> sges,
                         remote_buffer rb, send_flags flags,
-                        wr_id id) const noexcept {
-        return impl->post_rdma_write(qp, sges, rb, flags, id);
+                        std::uint32_t imm_data, wr_id id) const noexcept {
+        return impl->post_rdma_write(qp, sges, rb, flags, imm_data, id);
     }
     int post_rdma_read(void* qp, std::span<const sge> sges,
                        remote_buffer rb, wr_id id) const noexcept {

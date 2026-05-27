@@ -112,11 +112,18 @@ struct wc_result {
 /// `inline_send`  — request inline send (S5b); valid only when
 ///                  payload <= connection's max_inline_data.
 /// `fence`        — execute after all prior WRs (IBV_SEND_FENCE).
+/// `with_imm`     — request SEND_WITH_IMM or RDMA_WRITE_WITH_IMM
+///                  (S11). Backend uses the imm_data parameter passed
+///                  alongside flags. Awaitable's convenience methods
+///                  `connection::send_with_imm` /
+///                  `connection::rdma_write_with_imm` set this bit
+///                  automatically.
 struct send_flags {
     bool signaled    : 1 = true;
     bool solicited   : 1 = false;
     bool inline_send : 1 = false;
     bool fence       : 1 = false;
+    bool with_imm    : 1 = false;
 
     [[nodiscard]] constexpr static send_flags none() noexcept {
         return send_flags{.signaled = false};

@@ -142,3 +142,10 @@ if(TARGET elio_rdma)
     target_link_libraries(rdma_pingpong_mock PRIVATE elio_rdma)
     target_link_options(rdma_pingpong_mock PRIVATE ${STATIC_LINK_FLAGS})
 endif()
+
+# RDMA req/resp using endpoint + IMM (needs both ibverbs + CM helpers).
+if(TARGET elio_rdma_ibverbs AND TARGET elio_rdma_cm)
+    add_executable(rdma_req_resp_ibverbs rdma_req_resp_ibverbs.cpp)
+    target_link_libraries(rdma_req_resp_ibverbs PRIVATE elio_rdma_ibverbs)
+    target_link_options(rdma_req_resp_ibverbs PRIVATE ${STATIC_LINK_FLAGS})
+endif()

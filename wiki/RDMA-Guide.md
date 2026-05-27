@@ -124,6 +124,33 @@ Backends that want SRQ support add `static int post_srq_recv(...)`;
 the `backend_with_srq` concept gates the API. The polymorphic
 backend has a default that returns `-ENOTSUP`.
 
+### SEND / RDMA WRITE with IMM
+
+When the peer needs an in-band 32-bit signal alongside the payload
+(or, as in the typical OOB-completion pattern, when an RDMA_WRITE
+finishes and the writer needs to tell the reader "go look at your
+buffer"), use the `*_with_imm` variants:
+
+```cpp
+// Client side: post recv for the OOB notify first.
+auto notify_awaiter = conn.recv(notify_mr.view());
+
+// ...peer does an RDMA_WRITE...
+
+// Then peer SENDs a zero-length frame with imm = payload size.
+co_await conn.send_with_imm(notify_mr.view(0, 0), payload_len);
+
+// Notify side observes the imm in wc_result.imm_data.
+auto wc = co_await notify_awaiter;
+auto written = wc.imm_data;
+```
+
+`rdma_write_with_imm` is the same shape; the IMM lands on the
+peer's RECV CQE on whatever QP it has bound for the WRITE target.
+`send_flags::with_imm` is set automatically by these methods; you
+can still pass an explicit `send_flags` value to mix in `solicited`
+/ `fence` / etc.
+
 ### Inline send
 
 `send_flags::inline_send` requests inline payload staging. The
@@ -219,6 +246,62 @@ The awaiter and the dispatcher race for ownership of a per-WR
 Exactly one party frees the heap node; the coroutine is resumed at
 most once. This is the same UAF-safe pattern PR #69 introduced for
 io_uring.
+
+## The high-level `endpoint` wrapper (libibverbs path)
+
+If you're using libibverbs anyway and don't want to wire up PD / CQ
+/ comp_channel / QP yourself, enable both
+`-DELIO_ENABLE_RDMA_IBVERBS=ON` and `-DELIO_ENABLE_RDMA_CM=ON` and
+use `elio::rdma_ibverbs::endpoint`:
+
+```cpp
+#include <elio/rdma_ibverbs/rdma_ibverbs.hpp>
+
+elio::rdma_cm::event_channel cm_ch;
+auto ep = co_await elio::rdma_ibverbs::connect(
+    cm_ch, dst_addr, sizeof(*dst_addr),
+    elio::rdma_ibverbs::endpoint_config{
+        .max_send_wr = 8, .max_recv_wr = 8});
+ep.start_cq_pump(sched);
+
+auto mr = ep.register_buffer(buf, len, IBV_ACCESS_LOCAL_WRITE);
+auto wc = co_await ep.conn().send(mr.view());
+```
+
+`endpoint` bundles:
+* `ibv_pd` (allocated against the cm_id's verbs context),
+* `ibv_comp_channel` + armed `ibv_cq`,
+* `rdma_create_qp` against the cm_id,
+* a `dispatcher` + `connection<ibverbs_backend>` over that QP,
+* a `cq_pump` coroutine started on demand via `start_cq_pump`,
+* `register_buffer(...)` returning `memory_region<ibverbs_backend>`
+  bound to the endpoint's PD.
+
+Server side uses `acceptor`:
+
+```cpp
+elio::rdma_ibverbs::acceptor ac{cm_ch, bind_addr, len};
+auto ep = co_await ac.accept();    // accepts ONE connection
+ep.start_cq_pump(sched);
+// ... data path identical to client
+```
+
+For full control over QP attributes, set
+`endpoint_config::custom_qp_init_attr` to a pre-populated struct;
+the wrapper hands it to `rdma_create_qp` unchanged (it will still
+fill `send_cq` / `recv_cq` if you left them null).
+
+**Shutdown contract**: the destructor cancels the cq_pump, destroys
+the QP first (its flush CQEs wake the pump), waits up to 1s for
+the pump to observe the cancel, then tears down CQ / comp_channel /
+PD. If the pump doesn't exit in time (custom drain that blocks
+indefinitely) the verbs resources are intentionally leaked rather
+than risk a use-after-free.
+
+Worked example: `examples/rdma_req_resp_ibverbs.cpp` runs a
+client / server in one process — client SEND request → server
+RDMA_WRITE response → server SEND_WITH_IMM "done" — using
+`endpoint` + `acceptor` + `send_with_imm`.
 
 ## Connection bootstrap (librdmacm)
 

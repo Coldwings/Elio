@@ -60,13 +60,23 @@ concept backend_traits = requires(void* qp,
 };
 
 /// Optional extension: backend supports memory-region registration.
-/// `memory_region<B>` (S6) requires this.
+/// `memory_region<B>` (S6) requires this. The four members map 1:1 to
+/// the underlying ibverbs surface:
+///   * `register_mr(pd, addr, len, access) -> void*` — allocates the
+///     MR; backend chooses the representation (typically `ibv_mr*`).
+///   * `dereg_mr(void*)` — releases the MR.
+///   * `lkey_of(void*) -> uint32_t` — local key, used in SGEs the
+///     local side posts.
+///   * `rkey_of(void*) -> uint32_t` — remote key, advertised to the
+///     peer for one-sided RDMA WRITE / READ targets.
 template <typename B>
 concept backend_with_mr = backend_traits<B> &&
     requires(void* pd, void* addr, std::size_t length, int access, void* mr) {
         { B::register_mr(pd, addr, length, access) } noexcept
             -> std::convertible_to<void*>;
         { B::dereg_mr(mr) } noexcept;
+        { B::lkey_of(mr) } noexcept -> std::convertible_to<std::uint32_t>;
+        { B::rkey_of(mr) } noexcept -> std::convertible_to<std::uint32_t>;
     };
 
 /// Optional extension: backend supports shared receive queues.
@@ -116,12 +126,18 @@ struct polymorphic_backend {
                                wr_id id) noexcept = 0;
 
     // Optional: MR management. Default = "not supported".
+    //
+    // `register_mr` returning nullptr is the sentinel for backends
+    // that don't support MRs; `lkey_of` / `rkey_of` return 0 by
+    // default so memory_region's accessors don't UB on a null MR.
     virtual void* register_mr(void* /*pd*/, void* /*addr*/,
                               std::size_t /*length*/,
                               int /*access*/) noexcept {
         return nullptr;
     }
     virtual void dereg_mr(void* /*mr*/) noexcept {}
+    virtual std::uint32_t lkey_of(void* /*mr*/) noexcept { return 0; }
+    virtual std::uint32_t rkey_of(void* /*mr*/) noexcept { return 0; }
 
     // Optional: SRQ. Default = "not supported" (-ENOTSUP).
     virtual int post_srq_recv(void* /*srq*/,

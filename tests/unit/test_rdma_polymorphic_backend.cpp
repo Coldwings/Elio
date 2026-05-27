@@ -87,6 +87,8 @@ struct static_test_backend_with_mr {
         return reinterpret_cast<void*>(static_cast<std::uintptr_t>(0xDEAD));
     }
     static void dereg_mr(void*) noexcept {}
+    static std::uint32_t lkey_of(void*) noexcept { return 0xAAAA; }
+    static std::uint32_t rkey_of(void*) noexcept { return 0xBBBB; }
 };
 
 // A type missing post_recv: must NOT satisfy backend_traits.
@@ -181,9 +183,12 @@ TEST_CASE("polymorphic_backend default optional methods report not-supported",
     polymorphic_backend& base = impl;
 
     // Default register_mr returns nullptr (not-supported sentinel),
-    // dereg_mr is a no-op, post_srq_recv returns -ENOTSUP (-95).
+    // dereg_mr is a no-op, lkey_of / rkey_of return 0 on any input,
+    // post_srq_recv returns -ENOTSUP (-95).
     REQUIRE(base.register_mr(nullptr, nullptr, 0, 0) == nullptr);
     base.dereg_mr(nullptr);  // must not crash
+    REQUIRE(base.lkey_of(nullptr) == 0u);
+    REQUIRE(base.rkey_of(nullptr) == 0u);
     sge s{};
     REQUIRE(base.post_srq_recv(nullptr, std::span<const sge>(&s, 1), 0) == -95);
 }

@@ -188,6 +188,24 @@ protected:
         return false;  // do NOT suspend
     }
 
+    /// Synthesise a precondition failure (no WR was posted), e.g. the
+    /// inline-send size check rejecting an oversized payload. Same
+    /// rationale as finalize_post_(rc != 0): no party will ever
+    /// deliver a CQE, so the unique_ptr in op_awaiter_base must own
+    /// the free.
+    [[nodiscard]] bool fail_pre_post_(wc_status status,
+                                      std::uint32_t hint = 0) noexcept {
+        op_->result = wc_result{
+            .status   = status,
+            .byte_len = 0,
+            .imm_data = hint,
+            .wc_flags = 0,
+        };
+        op_->phase.store(op_phase::completed,
+                         std::memory_order_release);
+        return false;  // do NOT suspend
+    }
+
 private:
     std::unique_ptr<op_state> op_;
 };
@@ -212,6 +230,16 @@ protected:
             : external_sges_;
     }
 
+    /// Total bytes across the resolved SGE list. Used by S5b's inline
+    /// send precondition check.
+    [[nodiscard]] std::size_t total_bytes_() const noexcept {
+        std::size_t total = 0;
+        for (const auto& s : effective_sges_()) {
+            total += s.length;
+        }
+        return total;
+    }
+
 private:
     sge                  inline_sge_;
     std::span<const sge> external_sges_;
@@ -220,34 +248,52 @@ private:
 
 /// SEND awaiter. Constructible from a single `buffer_view` (inline
 /// SGE) or an `std::span<const sge>` (multi-segment WR).
+///
+/// S5b: when `flags.inline_send` is set, the awaiter validates the
+/// total SGE bytes against `max_inline` (typically the owning
+/// connection's `connection_config::max_inline_data`). If the payload
+/// exceeds the limit the awaiter rejects the WR with `local_length_
+/// error` BEFORE calling the backend — fail-fast saves a round-trip
+/// to the backend's own check and gives users a clear precondition
+/// failure.
 template <typename Backend>
 class send_awaitable : public op_awaiter_base, public sge_holder {
 public:
     send_awaitable(void* qp,
                    Backend* backend_or_null,
                    buffer_view buf,
-                   send_flags flags) noexcept
+                   send_flags flags,
+                   std::size_t max_inline = 0) noexcept
         : sge_holder(buf), qp_(qp), backend_(backend_or_null),
-          flags_(flags) {}
+          flags_(flags), max_inline_(max_inline) {}
 
     send_awaitable(void* qp,
                    Backend* backend_or_null,
                    std::span<const sge> sges,
-                   send_flags flags) noexcept
+                   send_flags flags,
+                   std::size_t max_inline = 0) noexcept
         : sge_holder(sges), qp_(qp), backend_(backend_or_null),
-          flags_(flags) {}
+          flags_(flags), max_inline_(max_inline) {}
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
         const auto id = arm_(h);
+        if (flags_.inline_send && total_bytes_() > max_inline_) {
+            // Pass the offending byte count back via imm_data so the
+            // caller can log it without re-walking the SGE list.
+            return fail_pre_post_(
+                wc_status::local_length_error,
+                static_cast<std::uint32_t>(total_bytes_()));
+        }
         const int rc = backend_invoker<Backend>::post_send(
             qp_, effective_sges_(), flags_, id, backend_);
         return finalize_post_(rc);
     }
 
 private:
-    void*      qp_;
-    Backend*   backend_;
-    send_flags flags_;
+    void*       qp_;
+    Backend*    backend_;
+    send_flags  flags_;
+    std::size_t max_inline_;
 };
 
 /// RECV awaiter. Constructible from a single `buffer_view` or a
@@ -281,6 +327,9 @@ private:
 /// or scatter list) to a remote buffer; no receive is consumed on the
 /// peer side, but the local CQE still surfaces wr_flush_error /
 /// remote_access_error / retry_exceeded on the usual failure modes.
+///
+/// Inline RDMA WRITE is supported with the same fail-fast precondition
+/// as `send_awaitable` (see S5b).
 template <typename Backend>
 class rdma_write_awaitable : public op_awaiter_base, public sge_holder {
 public:
@@ -288,20 +337,27 @@ public:
                          Backend* backend_or_null,
                          buffer_view local,
                          remote_buffer remote,
-                         send_flags flags) noexcept
+                         send_flags flags,
+                         std::size_t max_inline = 0) noexcept
         : sge_holder(local), qp_(qp), backend_(backend_or_null),
-          remote_(remote), flags_(flags) {}
+          remote_(remote), flags_(flags), max_inline_(max_inline) {}
 
     rdma_write_awaitable(void* qp,
                          Backend* backend_or_null,
                          std::span<const sge> locals,
                          remote_buffer remote,
-                         send_flags flags) noexcept
+                         send_flags flags,
+                         std::size_t max_inline = 0) noexcept
         : sge_holder(locals), qp_(qp), backend_(backend_or_null),
-          remote_(remote), flags_(flags) {}
+          remote_(remote), flags_(flags), max_inline_(max_inline) {}
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
         const auto id = arm_(h);
+        if (flags_.inline_send && total_bytes_() > max_inline_) {
+            return fail_pre_post_(
+                wc_status::local_length_error,
+                static_cast<std::uint32_t>(total_bytes_()));
+        }
         const int rc = backend_invoker<Backend>::post_rdma_write(
             qp_, effective_sges_(), remote_, flags_, id, backend_);
         return finalize_post_(rc);
@@ -312,6 +368,7 @@ private:
     Backend*      backend_;
     remote_buffer remote_;
     send_flags    flags_;
+    std::size_t   max_inline_;
 };
 
 /// One-sided RDMA READ awaiter. Pulls remote bytes into the local

@@ -188,7 +188,8 @@ connection<Backend>::send(buffer_view buf, send_flags flags) noexcept {
     static_assert(backend_traits<Backend>,
                   "Backend must satisfy elio::rdma::backend_traits");
     return detail::send_awaitable<Backend>(qp_, /*backend=*/nullptr,
-                                           buf, flags);
+                                           buf, flags,
+                                           config_.max_inline_data);
 }
 
 template <typename Backend>
@@ -198,7 +199,8 @@ connection<Backend>::send(std::span<const sge> sges,
     static_assert(backend_traits<Backend>,
                   "Backend must satisfy elio::rdma::backend_traits");
     return detail::send_awaitable<Backend>(qp_, /*backend=*/nullptr,
-                                           sges, flags);
+                                           sges, flags,
+                                           config_.max_inline_data);
 }
 
 template <typename Backend>
@@ -224,7 +226,8 @@ connection<Backend>::rdma_write(buffer_view local, remote_buffer remote,
     static_assert(backend_traits<Backend>,
                   "Backend must satisfy elio::rdma::backend_traits");
     return detail::rdma_write_awaitable<Backend>(
-        qp_, /*backend=*/nullptr, local, remote, flags);
+        qp_, /*backend=*/nullptr, local, remote, flags,
+        config_.max_inline_data);
 }
 
 template <typename Backend>
@@ -235,7 +238,8 @@ connection<Backend>::rdma_write(std::span<const sge> locals,
     static_assert(backend_traits<Backend>,
                   "Backend must satisfy elio::rdma::backend_traits");
     return detail::rdma_write_awaitable<Backend>(
-        qp_, /*backend=*/nullptr, locals, remote, flags);
+        qp_, /*backend=*/nullptr, locals, remote, flags,
+        config_.max_inline_data);
 }
 
 template <typename Backend>
@@ -262,14 +266,14 @@ inline detail::send_awaitable<polymorphic_backend>
 connection<polymorphic_backend>::send(buffer_view buf,
                                       send_flags flags) noexcept {
     return detail::send_awaitable<polymorphic_backend>(
-        qp_, backend_, buf, flags);
+        qp_, backend_, buf, flags, config_.max_inline_data);
 }
 
 inline detail::send_awaitable<polymorphic_backend>
 connection<polymorphic_backend>::send(std::span<const sge> sges,
                                       send_flags flags) noexcept {
     return detail::send_awaitable<polymorphic_backend>(
-        qp_, backend_, sges, flags);
+        qp_, backend_, sges, flags, config_.max_inline_data);
 }
 
 inline detail::recv_awaitable<polymorphic_backend>
@@ -289,7 +293,8 @@ connection<polymorphic_backend>::rdma_write(buffer_view local,
                                             remote_buffer remote,
                                             send_flags flags) noexcept {
     return detail::rdma_write_awaitable<polymorphic_backend>(
-        qp_, backend_, local, remote, flags);
+        qp_, backend_, local, remote, flags,
+        config_.max_inline_data);
 }
 
 inline detail::rdma_write_awaitable<polymorphic_backend>
@@ -297,7 +302,8 @@ connection<polymorphic_backend>::rdma_write(std::span<const sge> locals,
                                             remote_buffer remote,
                                             send_flags flags) noexcept {
     return detail::rdma_write_awaitable<polymorphic_backend>(
-        qp_, backend_, locals, remote, flags);
+        qp_, backend_, locals, remote, flags,
+        config_.max_inline_data);
 }
 
 inline detail::rdma_read_awaitable<polymorphic_backend>

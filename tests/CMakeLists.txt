@@ -74,6 +74,7 @@ if(TARGET elio_rdma)
         unit/test_rdma_send_recv.cpp
         unit/test_rdma_one_sided.cpp
         unit/test_rdma_sge.cpp
+        unit/test_rdma_inline.cpp
     )
 endif()
 

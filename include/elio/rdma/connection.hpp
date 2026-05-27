@@ -39,12 +39,14 @@ struct connection_config {
 
 namespace detail {
 
-// Awaiter types are declared in operations.hpp (S3+). Forward-declare
-// here so member-function signatures can name them.
-template <typename Backend> struct send_awaitable;
-template <typename Backend> struct recv_awaitable;
-template <typename Backend> struct rdma_write_awaitable;
-template <typename Backend> struct rdma_read_awaitable;
+// Awaiter types are defined in operations.hpp (S3+). Forward-declare
+// here so member-function signatures can name them; operations.hpp is
+// included at the bottom of this header so inline method bodies can
+// instantiate them.
+template <typename Backend> class send_awaitable;
+template <typename Backend> class recv_awaitable;
+template <typename Backend> class rdma_write_awaitable;
+template <typename Backend> class rdma_read_awaitable;
 
 }  // namespace detail
 
@@ -78,19 +80,14 @@ public:
         return config_;
     }
 
-    // Data-path member functions land in S3 / S4. Declarations only —
-    // attempting to call these at S2 produces a clean "incomplete
-    // type" error rather than a confusing template instantiation
-    // failure. Each will be defined as a function returning the
-    // corresponding awaitable type from operations.hpp.
-
-    // detail::send_awaitable<Backend>      send(buffer_view buf, send_flags flags = {}) noexcept;
-    // detail::recv_awaitable<Backend>      recv(buffer_view buf) noexcept;
-    // detail::rdma_write_awaitable<Backend> rdma_write(buffer_view local,
-    //                                                  remote_buffer remote,
-    //                                                  send_flags flags = {}) noexcept;
-    // detail::rdma_read_awaitable<Backend>  rdma_read(buffer_view local,
-    //                                                 remote_buffer remote) noexcept;
+    // Data-path member functions. Bodies are defined inline at the
+    // bottom of this header, after operations.hpp has been included
+    // (the awaiter types are incomplete here). S4 will add rdma_write
+    // and rdma_read with the same pattern.
+    [[nodiscard]] detail::send_awaitable<Backend>
+        send(buffer_view buf, send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::recv_awaitable<Backend>
+        recv(buffer_view buf) noexcept;
 
 private:
     void*              qp_         = nullptr;
@@ -125,11 +122,60 @@ public:
         return config_;
     }
 
+    // Data-path member functions. Bodies are inline below this class
+    // after operations.hpp is included. Dispatch goes through the
+    // polymorphic backend's virtual methods.
+    [[nodiscard]] detail::send_awaitable<polymorphic_backend>
+        send(buffer_view buf, send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::recv_awaitable<polymorphic_backend>
+        recv(buffer_view buf) noexcept;
+
 private:
     void*                qp_         = nullptr;
     polymorphic_backend* backend_    = nullptr;
     dispatcher*          dispatcher_ = nullptr;
     connection_config    config_{};
 };
+
+}  // namespace elio::rdma
+
+// Pull in the awaiter definitions so the inline method bodies below
+// can construct them. operations.hpp does NOT include connection.hpp
+// (only forward-declares connection<>), so this is safe.
+#include <elio/rdma/operations.hpp>
+
+namespace elio::rdma {
+
+// Out-of-line definitions for connection<Backend>::send / recv. Kept
+// inline so the whole module stays header-only.
+template <typename Backend>
+inline detail::send_awaitable<Backend>
+connection<Backend>::send(buffer_view buf, send_flags flags) noexcept {
+    static_assert(backend_traits<Backend>,
+                  "Backend must satisfy elio::rdma::backend_traits");
+    return detail::send_awaitable<Backend>(qp_, /*backend=*/nullptr,
+                                           buf, flags);
+}
+
+template <typename Backend>
+inline detail::recv_awaitable<Backend>
+connection<Backend>::recv(buffer_view buf) noexcept {
+    static_assert(backend_traits<Backend>,
+                  "Backend must satisfy elio::rdma::backend_traits");
+    return detail::recv_awaitable<Backend>(qp_, /*backend=*/nullptr, buf);
+}
+
+inline detail::send_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::send(buffer_view buf,
+                                      send_flags flags) noexcept {
+    return detail::send_awaitable<polymorphic_backend>(
+        qp_, backend_, buf, flags);
+}
+
+inline detail::recv_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::recv(buffer_view buf) noexcept {
+    return detail::recv_awaitable<polymorphic_backend>(
+        qp_, backend_, buf);
+}
 
 }  // namespace elio::rdma

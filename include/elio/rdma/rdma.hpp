@@ -24,12 +24,11 @@
 ///
 /// ## Stage status
 ///
-/// This umbrella currently re-exports only the type and traits stubs from
-/// stage S0 (skeleton). Subsequent stages will add:
-///   * S1: op_state (UAF-safe completion routing) + dispatcher
-///   * S2: backend_traits concept + polymorphic_backend
-///   * S3-S4: send/recv/rdma_write/rdma_read awaitables
-///   * S5: SGE, inline send, SRQ
+/// Through S3 the umbrella re-exports: types, op_state, dispatcher,
+/// backend_traits, polymorphic_backend, connection, and the SEND / RECV
+/// awaiters (`operations.hpp`). Pending stages:
+///   * S4: rdma_write / rdma_read awaiters
+///   * S5: multi-SGE, inline send, SRQ
 ///   * S6: memory_region<Backend> RAII
 ///   * S7: cq_pump coroutine (io_context binding)
 ///
@@ -40,12 +39,13 @@
 #include <elio/rdma/op_state.hpp>
 #include <elio/rdma/completion.hpp>
 #include <elio/rdma/backend_traits.hpp>
+#include <elio/rdma/operations.hpp>
 #include <elio/rdma/connection.hpp>
 
 namespace elio::rdma {
 
 /// Module version string, bumped per stage so downstream code can
 /// feature-detect during this incremental rollout.
-inline constexpr const char* module_version = "0.0.3-S2";
+inline constexpr const char* module_version = "0.0.4-S3";
 
 }  // namespace elio::rdma

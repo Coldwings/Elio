@@ -71,6 +71,7 @@ if(TARGET elio_rdma)
     list(APPEND TEST_SOURCES
         unit/test_rdma_dispatcher.cpp
         unit/test_rdma_polymorphic_backend.cpp
+        unit/test_rdma_send_recv.cpp
     )
 endif()
 

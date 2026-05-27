@@ -79,6 +79,14 @@ struct backend_invoker {
                               [[maybe_unused]] Backend* backend) noexcept {
         return Backend::post_rdma_read(qp, sges, rb, id);
     }
+    // Only valid if Backend satisfies backend_with_srq<>. Constrained
+    // at the call site by srq_recv_awaitable (S5c).
+    static int post_srq_recv(void* srq_ptr,
+                             std::span<const sge> sges,
+                             wr_id id,
+                             [[maybe_unused]] Backend* backend) noexcept {
+        return Backend::post_srq_recv(srq_ptr, sges, id);
+    }
 };
 
 template <>
@@ -110,6 +118,15 @@ struct backend_invoker<polymorphic_backend> {
                               wr_id id,
                               polymorphic_backend* backend) noexcept {
         return backend->post_rdma_read(qp, sges, rb, id);
+    }
+    static int post_srq_recv(void* srq_ptr,
+                             std::span<const sge> sges,
+                             wr_id id,
+                             polymorphic_backend* backend) noexcept {
+        // polymorphic_backend's default returns -ENOTSUP for backends
+        // that don't override; the awaiter surfaces that as a flush
+        // error to the caller (same pattern as any other negative rc).
+        return backend->post_srq_recv(srq_ptr, sges, id);
     }
 };
 
@@ -402,6 +419,35 @@ private:
     void*         qp_;
     Backend*      backend_;
     remote_buffer remote_;
+};
+
+/// SRQ RECV awaiter (S5c). Posts to a shared receive queue rather
+/// than a per-QP RQ. Completion arrives via whichever CQ the QP
+/// consuming the WR is bound to; the dispatcher routes by op_state
+/// pointer so the actual delivery path is identical to per-QP recv.
+template <typename Backend>
+class srq_recv_awaitable : public op_awaiter_base, public sge_holder {
+public:
+    srq_recv_awaitable(void* srq_ptr,
+                       Backend* backend_or_null,
+                       buffer_view buf) noexcept
+        : sge_holder(buf), srq_(srq_ptr), backend_(backend_or_null) {}
+
+    srq_recv_awaitable(void* srq_ptr,
+                       Backend* backend_or_null,
+                       std::span<const sge> sges) noexcept
+        : sge_holder(sges), srq_(srq_ptr), backend_(backend_or_null) {}
+
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+        const auto id = arm_(h);
+        const int rc = backend_invoker<Backend>::post_srq_recv(
+            srq_, effective_sges_(), id, backend_);
+        return finalize_post_(rc);
+    }
+
+private:
+    void*    srq_;
+    Backend* backend_;
 };
 
 }  // namespace elio::rdma::detail

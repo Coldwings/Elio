@@ -151,6 +151,26 @@ catch_discover_tests(elio_tests)
 catch_discover_tests(elio_tests_asan)
 catch_discover_tests(elio_tests_tsan)
 
+# Optional libibverbs-backed RDMA integration test (S10). The binary
+# is separate so linking libibverbs is opt-in and devices without
+# rxe simply skip the test rather than failing the build. Discovered
+# here so that `include(Catch)` from earlier in this file is in
+# scope.
+if(ELIO_ENABLE_RDMA_IBVERBS_TESTS AND TARGET elio_rdma)
+    add_executable(elio_rdma_integration_tests
+        test_main.cpp
+        integration_rdma/test_rdma_rxe_loopback.cpp
+    )
+    target_link_libraries(elio_rdma_integration_tests PRIVATE
+        elio_rdma Catch2::Catch2WithMain ${ELIO_IBVERBS_LIB})
+    if(ELIO_IBVERBS_INC)
+        target_include_directories(elio_rdma_integration_tests PRIVATE
+            ${ELIO_IBVERBS_INC})
+    endif()
+    target_compile_definitions(elio_rdma_integration_tests PRIVATE ELIO_DEBUG)
+    catch_discover_tests(elio_rdma_integration_tests)
+endif()
+
 # Add custom targets for convenience
 add_custom_target(test_all
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure

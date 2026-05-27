@@ -18,6 +18,7 @@ option(ELIO_ENABLE_HTTP "Enable HTTP client/server support (requires TLS)" ${ELI
 option(ELIO_ENABLE_HTTP2 "Enable HTTP/2 support (requires nghttp2)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_RDMA "Enable RDMA-Core abstraction layer (header-only; user supplies ibverbs backend)" OFF)
 option(ELIO_ENABLE_RDMA_CM "Enable optional librdmacm-backed CM helper (requires librdmacm)" OFF)
+option(ELIO_ENABLE_RDMA_IBVERBS_TESTS "Build the libibverbs-backed RDMA integration test (requires libibverbs + rxe at runtime)" OFF)
 option(ELIO_ENABLE_DEVELOPER_WARNINGS "Enable strict warning flags for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_WARNINGS_AS_ERRORS "Treat warnings as errors for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_DEBUG_METADATA "Enable coroutine debug metadata" ON)
@@ -193,6 +194,44 @@ endif()
 # the user opts in by setting ELIO_ENABLE_RDMA_CM=ON. We try
 # pkg-config first, then fall back to find_library so packages that
 # ship librdmacm without a .pc file still work.
+# Optional libibverbs lookup, gated by ELIO_ENABLE_RDMA_IBVERBS_TESTS
+# (the verbs backend itself stays under tests/integration). Same
+# detection pattern as librdmacm: pkg-config first, find_library
+# fallback.
+set(_IBVERBS_LIB "")
+if(ELIO_ENABLE_RDMA_IBVERBS_TESTS)
+    if(NOT TARGET elio_rdma)
+        message(FATAL_ERROR
+            "ELIO_ENABLE_RDMA_IBVERBS_TESTS=ON requires ELIO_ENABLE_RDMA=ON")
+    endif()
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(IBVERBS QUIET libibverbs)
+        if(IBVERBS_FOUND)
+            set(_IBVERBS_LIB "${IBVERBS_LIBRARIES}")
+            set(_IBVERBS_INC "${IBVERBS_INCLUDE_DIRS}")
+        endif()
+    endif()
+    if(NOT _IBVERBS_LIB)
+        find_library(_IBVERBS_LIB_FALLBACK ibverbs)
+        find_path(_IBVERBS_INC_FALLBACK infiniband/verbs.h)
+        if(_IBVERBS_LIB_FALLBACK AND _IBVERBS_INC_FALLBACK)
+            set(_IBVERBS_LIB "${_IBVERBS_LIB_FALLBACK}")
+            set(_IBVERBS_INC "${_IBVERBS_INC_FALLBACK}")
+        endif()
+    endif()
+    if(NOT _IBVERBS_LIB)
+        message(FATAL_ERROR
+            "ELIO_ENABLE_RDMA_IBVERBS_TESTS=ON but libibverbs was not found.")
+    endif()
+    set(ELIO_IBVERBS_LIB "${_IBVERBS_LIB}" CACHE INTERNAL
+        "libibverbs link spec for RDMA integration tests")
+    set(ELIO_IBVERBS_INC "${_IBVERBS_INC}" CACHE INTERNAL
+        "libibverbs include dir for RDMA integration tests")
+    message(STATUS "RDMA ibverbs integration tests enabled "
+                   "(linking ${_IBVERBS_LIB})")
+endif()
+
 if(ELIO_ENABLE_RDMA_CM)
     if(NOT TARGET elio_rdma)
         message(FATAL_ERROR

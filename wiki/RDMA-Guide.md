@@ -264,6 +264,43 @@ It demonstrates: `connection<Backend>`, paired send/recv,
 two-task coroutine pattern (echo on one side, request/reply on the
 other).
 
+## Integration testing on Soft-RoCE (rxe)
+
+The default test binary (`elio_tests`) runs every `[rdma]` test
+purely against mock backends and needs no hardware. End-to-end
+validation against a real verbs stack lives in a separate binary
+gated behind `ELIO_ENABLE_RDMA_IBVERBS_TESTS=ON`. Build it like:
+
+```bash
+cmake -B build -DELIO_ENABLE_RDMA=ON -DELIO_ENABLE_RDMA_IBVERBS_TESTS=ON
+cmake --build build --target elio_rdma_integration_tests
+./build/tests/elio_rdma_integration_tests "[rdma_integration]"
+```
+
+The test gracefully `SKIP`s when no usable RDMA device is present —
+that's the OrbStack case (kernel exposes rxe metadata but userspace
+`uverbs` returns `EPERM`), and any non-RDMA Linux box behaves the
+same way.
+
+To make the test actually run, set up Soft-RoCE locally on a stock
+Linux host (kernel module is `rdma_rxe`, in-tree since 4.8):
+
+```bash
+sudo modprobe rdma_rxe
+sudo rdma link add rxe0 type rxe netdev <your-nic>      # e.g. eth0
+# /dev/infiniband/uverbs0 should appear automatically. If udev didn't
+# create the cdev for some reason, mknod it manually:
+#   sudo mknod /dev/infiniband/uverbs0 c 231 192
+ibv_devinfo                                              # sanity check
+```
+
+The integration test exercises the full Elio data path against rxe:
+two RC QPs in-process, brought up to RTS via direct attribute
+exchange (no CM), a registered MR per side, one SEND from QP_A
+matched by a posted RECV on QP_B, dispatched through
+`elio::rdma::connection<ibverbs_backend>` (a real `ibv_post_send` /
+`ibv_post_recv` shim that lives under `tests/integration_rdma/`).
+
 ## Out of scope (deferred)
 
 * ATOMIC operations (compare-and-swap, fetch-and-add).

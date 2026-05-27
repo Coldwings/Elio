@@ -24,6 +24,7 @@
 #include <elio/rdma/types.hpp>
 
 #include <cstddef>
+#include <span>
 
 namespace elio::rdma {
 
@@ -82,16 +83,28 @@ public:
 
     // Data-path member functions. Bodies are defined inline at the
     // bottom of this header, after operations.hpp has been included
-    // (the awaiter types are incomplete here).
+    // (the awaiter types are incomplete here). Each operation has a
+    // single-`buffer_view` convenience overload and an `std::span<const
+    // sge>` overload for multi-segment scatter / gather (S5a).
     [[nodiscard]] detail::send_awaitable<Backend>
         send(buffer_view buf, send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::send_awaitable<Backend>
+        send(std::span<const sge> sges, send_flags flags = {}) noexcept;
     [[nodiscard]] detail::recv_awaitable<Backend>
         recv(buffer_view buf) noexcept;
+    [[nodiscard]] detail::recv_awaitable<Backend>
+        recv(std::span<const sge> sges) noexcept;
     [[nodiscard]] detail::rdma_write_awaitable<Backend>
         rdma_write(buffer_view local, remote_buffer remote,
                    send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::rdma_write_awaitable<Backend>
+        rdma_write(std::span<const sge> locals, remote_buffer remote,
+                   send_flags flags = {}) noexcept;
     [[nodiscard]] detail::rdma_read_awaitable<Backend>
         rdma_read(buffer_view local, remote_buffer remote) noexcept;
+    [[nodiscard]] detail::rdma_read_awaitable<Backend>
+        rdma_read(std::span<const sge> locals,
+                  remote_buffer remote) noexcept;
 
 private:
     void*              qp_         = nullptr;
@@ -128,16 +141,28 @@ public:
 
     // Data-path member functions. Bodies are inline below this class
     // after operations.hpp is included. Dispatch goes through the
-    // polymorphic backend's virtual methods.
+    // polymorphic backend's virtual methods. Each operation has the
+    // same single-buffer / multi-SGE overload pair as the primary
+    // template (S5a).
     [[nodiscard]] detail::send_awaitable<polymorphic_backend>
         send(buffer_view buf, send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::send_awaitable<polymorphic_backend>
+        send(std::span<const sge> sges, send_flags flags = {}) noexcept;
     [[nodiscard]] detail::recv_awaitable<polymorphic_backend>
         recv(buffer_view buf) noexcept;
+    [[nodiscard]] detail::recv_awaitable<polymorphic_backend>
+        recv(std::span<const sge> sges) noexcept;
     [[nodiscard]] detail::rdma_write_awaitable<polymorphic_backend>
         rdma_write(buffer_view local, remote_buffer remote,
                    send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::rdma_write_awaitable<polymorphic_backend>
+        rdma_write(std::span<const sge> locals, remote_buffer remote,
+                   send_flags flags = {}) noexcept;
     [[nodiscard]] detail::rdma_read_awaitable<polymorphic_backend>
         rdma_read(buffer_view local, remote_buffer remote) noexcept;
+    [[nodiscard]] detail::rdma_read_awaitable<polymorphic_backend>
+        rdma_read(std::span<const sge> locals,
+                  remote_buffer remote) noexcept;
 
 private:
     void*                qp_         = nullptr;
@@ -167,11 +192,29 @@ connection<Backend>::send(buffer_view buf, send_flags flags) noexcept {
 }
 
 template <typename Backend>
+inline detail::send_awaitable<Backend>
+connection<Backend>::send(std::span<const sge> sges,
+                          send_flags flags) noexcept {
+    static_assert(backend_traits<Backend>,
+                  "Backend must satisfy elio::rdma::backend_traits");
+    return detail::send_awaitable<Backend>(qp_, /*backend=*/nullptr,
+                                           sges, flags);
+}
+
+template <typename Backend>
 inline detail::recv_awaitable<Backend>
 connection<Backend>::recv(buffer_view buf) noexcept {
     static_assert(backend_traits<Backend>,
                   "Backend must satisfy elio::rdma::backend_traits");
     return detail::recv_awaitable<Backend>(qp_, /*backend=*/nullptr, buf);
+}
+
+template <typename Backend>
+inline detail::recv_awaitable<Backend>
+connection<Backend>::recv(std::span<const sge> sges) noexcept {
+    static_assert(backend_traits<Backend>,
+                  "Backend must satisfy elio::rdma::backend_traits");
+    return detail::recv_awaitable<Backend>(qp_, /*backend=*/nullptr, sges);
 }
 
 template <typename Backend>
@@ -185,6 +228,17 @@ connection<Backend>::rdma_write(buffer_view local, remote_buffer remote,
 }
 
 template <typename Backend>
+inline detail::rdma_write_awaitable<Backend>
+connection<Backend>::rdma_write(std::span<const sge> locals,
+                                remote_buffer remote,
+                                send_flags flags) noexcept {
+    static_assert(backend_traits<Backend>,
+                  "Backend must satisfy elio::rdma::backend_traits");
+    return detail::rdma_write_awaitable<Backend>(
+        qp_, /*backend=*/nullptr, locals, remote, flags);
+}
+
+template <typename Backend>
 inline detail::rdma_read_awaitable<Backend>
 connection<Backend>::rdma_read(buffer_view local,
                                remote_buffer remote) noexcept {
@@ -194,6 +248,16 @@ connection<Backend>::rdma_read(buffer_view local,
         qp_, /*backend=*/nullptr, local, remote);
 }
 
+template <typename Backend>
+inline detail::rdma_read_awaitable<Backend>
+connection<Backend>::rdma_read(std::span<const sge> locals,
+                               remote_buffer remote) noexcept {
+    static_assert(backend_traits<Backend>,
+                  "Backend must satisfy elio::rdma::backend_traits");
+    return detail::rdma_read_awaitable<Backend>(
+        qp_, /*backend=*/nullptr, locals, remote);
+}
+
 inline detail::send_awaitable<polymorphic_backend>
 connection<polymorphic_backend>::send(buffer_view buf,
                                       send_flags flags) noexcept {
@@ -201,10 +265,23 @@ connection<polymorphic_backend>::send(buffer_view buf,
         qp_, backend_, buf, flags);
 }
 
+inline detail::send_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::send(std::span<const sge> sges,
+                                      send_flags flags) noexcept {
+    return detail::send_awaitable<polymorphic_backend>(
+        qp_, backend_, sges, flags);
+}
+
 inline detail::recv_awaitable<polymorphic_backend>
 connection<polymorphic_backend>::recv(buffer_view buf) noexcept {
     return detail::recv_awaitable<polymorphic_backend>(
         qp_, backend_, buf);
+}
+
+inline detail::recv_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::recv(std::span<const sge> sges) noexcept {
+    return detail::recv_awaitable<polymorphic_backend>(
+        qp_, backend_, sges);
 }
 
 inline detail::rdma_write_awaitable<polymorphic_backend>
@@ -215,11 +292,26 @@ connection<polymorphic_backend>::rdma_write(buffer_view local,
         qp_, backend_, local, remote, flags);
 }
 
+inline detail::rdma_write_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::rdma_write(std::span<const sge> locals,
+                                            remote_buffer remote,
+                                            send_flags flags) noexcept {
+    return detail::rdma_write_awaitable<polymorphic_backend>(
+        qp_, backend_, locals, remote, flags);
+}
+
 inline detail::rdma_read_awaitable<polymorphic_backend>
 connection<polymorphic_backend>::rdma_read(buffer_view local,
                                            remote_buffer remote) noexcept {
     return detail::rdma_read_awaitable<polymorphic_backend>(
         qp_, backend_, local, remote);
+}
+
+inline detail::rdma_read_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::rdma_read(std::span<const sge> locals,
+                                           remote_buffer remote) noexcept {
+    return detail::rdma_read_awaitable<polymorphic_backend>(
+        qp_, backend_, locals, remote);
 }
 
 }  // namespace elio::rdma

@@ -3,9 +3,11 @@
 /// @file operations.hpp
 /// @brief Data-path awaiters (send / recv / rdma_write / rdma_read).
 ///
-/// Stage S3 lands `send_awaitable` and `recv_awaitable`.
-/// Stage S4 will add `rdma_write_awaitable` and `rdma_read_awaitable`
-/// with the same pattern.
+/// Stage S3 landed the SEND / RECV awaiters; S4 added one-sided
+/// WRITE / READ. S5a turned every awaiter into a multi-SGE-capable
+/// shape: each accepts either a single `buffer_view` (built into one
+/// inline SGE) or an arbitrary `std::span<const sge>` (a scatter list
+/// the caller owns).
 ///
 /// Each awaiter is parameterised on the backend type. Two backend
 /// styles are supported via the `backend_invoker<B>` trait below:
@@ -21,6 +23,15 @@
 /// suspended. The op_state ↔ dispatcher race (see op_state.hpp +
 /// completion.hpp) decides which side frees the node on the final
 /// transition.
+///
+/// Multi-SGE lifetime: when an awaiter is constructed from a
+/// `std::span<const sge>`, the underlying SGE array must outlive the
+/// `co_await` expression. In practice the awaiter is a temporary
+/// inside the caller's coroutine frame and the SGE array typically
+/// lives in the same frame; the span is only dereferenced inside
+/// `await_suspend` (i.e. while the caller is still in scope), so this
+/// is the same lifetime requirement as the underlying buffer
+/// payloads.
 
 #include <elio/rdma/backend_traits.hpp>
 #include <elio/rdma/completion.hpp>
@@ -181,113 +192,158 @@ private:
     std::unique_ptr<op_state> op_;
 };
 
-/// SEND awaiter. Single SGE (S5a will add multi-SGE overload).
+/// Tiny mixin that all four awaiters share: dual storage for either a
+/// single inline SGE (built from a `buffer_view`) or a caller-owned
+/// SGE span. `effective_sges_()` resolves to one or the other at the
+/// point the WR is posted. Built inside `await_suspend`, never
+/// stored; safe under awaiter moves.
+class sge_holder {
+public:
+    explicit sge_holder(buffer_view buf) noexcept
+        : inline_sge_(sge::from(buf)), external_sges_(),
+          using_inline_(true) {}
+    explicit sge_holder(std::span<const sge> sges) noexcept
+        : inline_sge_{}, external_sges_(sges), using_inline_(false) {}
+
+protected:
+    [[nodiscard]] std::span<const sge> effective_sges_() const noexcept {
+        return using_inline_
+            ? std::span<const sge>(&inline_sge_, 1)
+            : external_sges_;
+    }
+
+private:
+    sge                  inline_sge_;
+    std::span<const sge> external_sges_;
+    bool                 using_inline_;
+};
+
+/// SEND awaiter. Constructible from a single `buffer_view` (inline
+/// SGE) or an `std::span<const sge>` (multi-segment WR).
 template <typename Backend>
-class send_awaitable : public op_awaiter_base {
+class send_awaitable : public op_awaiter_base, public sge_holder {
 public:
     send_awaitable(void* qp,
                    Backend* backend_or_null,
                    buffer_view buf,
                    send_flags flags) noexcept
-        : qp_(qp), backend_(backend_or_null), buf_(buf), flags_(flags) {}
+        : sge_holder(buf), qp_(qp), backend_(backend_or_null),
+          flags_(flags) {}
+
+    send_awaitable(void* qp,
+                   Backend* backend_or_null,
+                   std::span<const sge> sges,
+                   send_flags flags) noexcept
+        : sge_holder(sges), qp_(qp), backend_(backend_or_null),
+          flags_(flags) {}
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
-        const auto sge_val = sge::from(buf_);
-        auto sges = std::span<const sge>(&sge_val, 1);
         const auto id = arm_(h);
         const int rc = backend_invoker<Backend>::post_send(
-            qp_, sges, flags_, id, backend_);
+            qp_, effective_sges_(), flags_, id, backend_);
         return finalize_post_(rc);
     }
 
 private:
-    void*       qp_;
-    Backend*    backend_;
-    buffer_view buf_;
-    send_flags  flags_;
+    void*      qp_;
+    Backend*   backend_;
+    send_flags flags_;
 };
 
-/// RECV awaiter. Single SGE for now.
+/// RECV awaiter. Constructible from a single `buffer_view` or a
+/// scatter list.
 template <typename Backend>
-class recv_awaitable : public op_awaiter_base {
+class recv_awaitable : public op_awaiter_base, public sge_holder {
 public:
     recv_awaitable(void* qp,
                    Backend* backend_or_null,
                    buffer_view buf) noexcept
-        : qp_(qp), backend_(backend_or_null), buf_(buf) {}
+        : sge_holder(buf), qp_(qp), backend_(backend_or_null) {}
+
+    recv_awaitable(void* qp,
+                   Backend* backend_or_null,
+                   std::span<const sge> sges) noexcept
+        : sge_holder(sges), qp_(qp), backend_(backend_or_null) {}
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
-        const auto sge_val = sge::from(buf_);
-        auto sges = std::span<const sge>(&sge_val, 1);
         const auto id = arm_(h);
         const int rc = backend_invoker<Backend>::post_recv(
-            qp_, sges, id, backend_);
+            qp_, effective_sges_(), id, backend_);
         return finalize_post_(rc);
     }
 
 private:
-    void*       qp_;
-    Backend*    backend_;
-    buffer_view buf_;
+    void*    qp_;
+    Backend* backend_;
 };
 
-/// One-sided RDMA WRITE awaiter. Pushes local payload to a remote
-/// buffer; no receive is consumed on the peer side, but the local
-/// CQE still surfaces wr_flush_error / remote_access_error /
-/// retry_exceeded on the usual failure modes.
+/// One-sided RDMA WRITE awaiter. Pushes local payload (single buffer
+/// or scatter list) to a remote buffer; no receive is consumed on the
+/// peer side, but the local CQE still surfaces wr_flush_error /
+/// remote_access_error / retry_exceeded on the usual failure modes.
 template <typename Backend>
-class rdma_write_awaitable : public op_awaiter_base {
+class rdma_write_awaitable : public op_awaiter_base, public sge_holder {
 public:
     rdma_write_awaitable(void* qp,
                          Backend* backend_or_null,
                          buffer_view local,
                          remote_buffer remote,
                          send_flags flags) noexcept
-        : qp_(qp), backend_(backend_or_null),
-          local_(local), remote_(remote), flags_(flags) {}
+        : sge_holder(local), qp_(qp), backend_(backend_or_null),
+          remote_(remote), flags_(flags) {}
+
+    rdma_write_awaitable(void* qp,
+                         Backend* backend_or_null,
+                         std::span<const sge> locals,
+                         remote_buffer remote,
+                         send_flags flags) noexcept
+        : sge_holder(locals), qp_(qp), backend_(backend_or_null),
+          remote_(remote), flags_(flags) {}
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
-        const auto sge_val = sge::from(local_);
-        auto sges = std::span<const sge>(&sge_val, 1);
         const auto id = arm_(h);
         const int rc = backend_invoker<Backend>::post_rdma_write(
-            qp_, sges, remote_, flags_, id, backend_);
+            qp_, effective_sges_(), remote_, flags_, id, backend_);
         return finalize_post_(rc);
     }
 
 private:
     void*         qp_;
     Backend*      backend_;
-    buffer_view   local_;
     remote_buffer remote_;
     send_flags    flags_;
 };
 
 /// One-sided RDMA READ awaiter. Pulls remote bytes into the local
-/// buffer; on success wc_result.byte_len reports the bytes received.
+/// buffer (single or scatter list); on success wc_result.byte_len
+/// reports the bytes received.
 template <typename Backend>
-class rdma_read_awaitable : public op_awaiter_base {
+class rdma_read_awaitable : public op_awaiter_base, public sge_holder {
 public:
     rdma_read_awaitable(void* qp,
                         Backend* backend_or_null,
                         buffer_view local,
                         remote_buffer remote) noexcept
-        : qp_(qp), backend_(backend_or_null),
-          local_(local), remote_(remote) {}
+        : sge_holder(local), qp_(qp), backend_(backend_or_null),
+          remote_(remote) {}
+
+    rdma_read_awaitable(void* qp,
+                        Backend* backend_or_null,
+                        std::span<const sge> locals,
+                        remote_buffer remote) noexcept
+        : sge_holder(locals), qp_(qp), backend_(backend_or_null),
+          remote_(remote) {}
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
-        const auto sge_val = sge::from(local_);
-        auto sges = std::span<const sge>(&sge_val, 1);
         const auto id = arm_(h);
         const int rc = backend_invoker<Backend>::post_rdma_read(
-            qp_, sges, remote_, id, backend_);
+            qp_, effective_sges_(), remote_, id, backend_);
         return finalize_post_(rc);
     }
 
 private:
     void*         qp_;
     Backend*      backend_;
-    buffer_view   local_;
     remote_buffer remote_;
 };
 

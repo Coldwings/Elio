@@ -72,6 +72,7 @@ if(TARGET elio_rdma)
         unit/test_rdma_dispatcher.cpp
         unit/test_rdma_polymorphic_backend.cpp
         unit/test_rdma_send_recv.cpp
+        unit/test_rdma_one_sided.cpp
     )
 endif()
 

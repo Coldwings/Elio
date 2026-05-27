@@ -82,12 +82,16 @@ public:
 
     // Data-path member functions. Bodies are defined inline at the
     // bottom of this header, after operations.hpp has been included
-    // (the awaiter types are incomplete here). S4 will add rdma_write
-    // and rdma_read with the same pattern.
+    // (the awaiter types are incomplete here).
     [[nodiscard]] detail::send_awaitable<Backend>
         send(buffer_view buf, send_flags flags = {}) noexcept;
     [[nodiscard]] detail::recv_awaitable<Backend>
         recv(buffer_view buf) noexcept;
+    [[nodiscard]] detail::rdma_write_awaitable<Backend>
+        rdma_write(buffer_view local, remote_buffer remote,
+                   send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::rdma_read_awaitable<Backend>
+        rdma_read(buffer_view local, remote_buffer remote) noexcept;
 
 private:
     void*              qp_         = nullptr;
@@ -129,6 +133,11 @@ public:
         send(buffer_view buf, send_flags flags = {}) noexcept;
     [[nodiscard]] detail::recv_awaitable<polymorphic_backend>
         recv(buffer_view buf) noexcept;
+    [[nodiscard]] detail::rdma_write_awaitable<polymorphic_backend>
+        rdma_write(buffer_view local, remote_buffer remote,
+                   send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::rdma_read_awaitable<polymorphic_backend>
+        rdma_read(buffer_view local, remote_buffer remote) noexcept;
 
 private:
     void*                qp_         = nullptr;
@@ -165,6 +174,26 @@ connection<Backend>::recv(buffer_view buf) noexcept {
     return detail::recv_awaitable<Backend>(qp_, /*backend=*/nullptr, buf);
 }
 
+template <typename Backend>
+inline detail::rdma_write_awaitable<Backend>
+connection<Backend>::rdma_write(buffer_view local, remote_buffer remote,
+                                send_flags flags) noexcept {
+    static_assert(backend_traits<Backend>,
+                  "Backend must satisfy elio::rdma::backend_traits");
+    return detail::rdma_write_awaitable<Backend>(
+        qp_, /*backend=*/nullptr, local, remote, flags);
+}
+
+template <typename Backend>
+inline detail::rdma_read_awaitable<Backend>
+connection<Backend>::rdma_read(buffer_view local,
+                               remote_buffer remote) noexcept {
+    static_assert(backend_traits<Backend>,
+                  "Backend must satisfy elio::rdma::backend_traits");
+    return detail::rdma_read_awaitable<Backend>(
+        qp_, /*backend=*/nullptr, local, remote);
+}
+
 inline detail::send_awaitable<polymorphic_backend>
 connection<polymorphic_backend>::send(buffer_view buf,
                                       send_flags flags) noexcept {
@@ -176,6 +205,21 @@ inline detail::recv_awaitable<polymorphic_backend>
 connection<polymorphic_backend>::recv(buffer_view buf) noexcept {
     return detail::recv_awaitable<polymorphic_backend>(
         qp_, backend_, buf);
+}
+
+inline detail::rdma_write_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::rdma_write(buffer_view local,
+                                            remote_buffer remote,
+                                            send_flags flags) noexcept {
+    return detail::rdma_write_awaitable<polymorphic_backend>(
+        qp_, backend_, local, remote, flags);
+}
+
+inline detail::rdma_read_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::rdma_read(buffer_view local,
+                                           remote_buffer remote) noexcept {
+    return detail::rdma_read_awaitable<polymorphic_backend>(
+        qp_, backend_, local, remote);
 }
 
 }  // namespace elio::rdma

@@ -231,4 +231,64 @@ private:
     buffer_view buf_;
 };
 
+/// One-sided RDMA WRITE awaiter. Pushes local payload to a remote
+/// buffer; no receive is consumed on the peer side, but the local
+/// CQE still surfaces wr_flush_error / remote_access_error /
+/// retry_exceeded on the usual failure modes.
+template <typename Backend>
+class rdma_write_awaitable : public op_awaiter_base {
+public:
+    rdma_write_awaitable(void* qp,
+                         Backend* backend_or_null,
+                         buffer_view local,
+                         remote_buffer remote,
+                         send_flags flags) noexcept
+        : qp_(qp), backend_(backend_or_null),
+          local_(local), remote_(remote), flags_(flags) {}
+
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+        const auto sge_val = sge::from(local_);
+        auto sges = std::span<const sge>(&sge_val, 1);
+        const auto id = arm_(h);
+        const int rc = backend_invoker<Backend>::post_rdma_write(
+            qp_, sges, remote_, flags_, id, backend_);
+        return finalize_post_(rc);
+    }
+
+private:
+    void*         qp_;
+    Backend*      backend_;
+    buffer_view   local_;
+    remote_buffer remote_;
+    send_flags    flags_;
+};
+
+/// One-sided RDMA READ awaiter. Pulls remote bytes into the local
+/// buffer; on success wc_result.byte_len reports the bytes received.
+template <typename Backend>
+class rdma_read_awaitable : public op_awaiter_base {
+public:
+    rdma_read_awaitable(void* qp,
+                        Backend* backend_or_null,
+                        buffer_view local,
+                        remote_buffer remote) noexcept
+        : qp_(qp), backend_(backend_or_null),
+          local_(local), remote_(remote) {}
+
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+        const auto sge_val = sge::from(local_);
+        auto sges = std::span<const sge>(&sge_val, 1);
+        const auto id = arm_(h);
+        const int rc = backend_invoker<Backend>::post_rdma_read(
+            qp_, sges, remote_, id, backend_);
+        return finalize_post_(rc);
+    }
+
+private:
+    void*         qp_;
+    Backend*      backend_;
+    buffer_view   local_;
+    remote_buffer remote_;
+};
+
 }  // namespace elio::rdma::detail

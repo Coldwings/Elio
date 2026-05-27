@@ -246,6 +246,11 @@ if(ELIO_ENABLE_RDMA_IBVERBS)
     endif()
     target_link_libraries(elio_rdma_ibverbs INTERFACE elio_rdma ${ELIO_IBVERBS_LIB})
     target_compile_definitions(elio_rdma_ibverbs INTERFACE ELIO_HAS_RDMA_IBVERBS=1)
+    # If the CM helper is also enabled, the endpoint wrapper becomes
+    # active and needs to pull in librdmacm transitively.
+    if(TARGET elio_rdma_cm)
+        target_link_libraries(elio_rdma_ibverbs INTERFACE elio_rdma_cm)
+    endif()
     message(STATUS "RDMA ibverbs module enabled (linking ${ELIO_IBVERBS_LIB})")
 endif()
 if(ELIO_ENABLE_RDMA_IBVERBS_TESTS)

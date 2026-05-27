@@ -26,11 +26,11 @@
 ///     touching libibverbs directly.
 
 #include <elio/rdma_ibverbs/cq_drain.hpp>
+#include <elio/rdma_ibverbs/endpoint.hpp>
 #include <elio/rdma_ibverbs/ibverbs_backend.hpp>
-// endpoint.hpp added in S13.
 
 namespace elio::rdma_ibverbs {
 
-inline constexpr const char* module_version = "0.0.13-S12";
+inline constexpr const char* module_version = "0.0.14-S13";
 
 }  // namespace elio::rdma_ibverbs

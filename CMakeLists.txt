@@ -18,6 +18,7 @@ option(ELIO_ENABLE_HTTP "Enable HTTP client/server support (requires TLS)" ${ELI
 option(ELIO_ENABLE_HTTP2 "Enable HTTP/2 support (requires nghttp2)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_RDMA "Enable RDMA-Core abstraction layer (header-only; user supplies ibverbs backend)" OFF)
 option(ELIO_ENABLE_RDMA_CM "Enable optional librdmacm-backed CM helper (requires librdmacm)" OFF)
+option(ELIO_ENABLE_RDMA_IBVERBS "Enable optional libibverbs backend + cq_drain helper + endpoint wrapper (requires libibverbs)" OFF)
 option(ELIO_ENABLE_RDMA_IBVERBS_TESTS "Build the libibverbs-backed RDMA integration test (requires libibverbs + rxe at runtime)" OFF)
 option(ELIO_ENABLE_DEVELOPER_WARNINGS "Enable strict warning flags for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_WARNINGS_AS_ERRORS "Treat warnings as errors for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
@@ -194,15 +195,17 @@ endif()
 # the user opts in by setting ELIO_ENABLE_RDMA_CM=ON. We try
 # pkg-config first, then fall back to find_library so packages that
 # ship librdmacm without a .pc file still work.
-# Optional libibverbs lookup, gated by ELIO_ENABLE_RDMA_IBVERBS_TESTS
-# (the verbs backend itself stays under tests/integration). Same
-# detection pattern as librdmacm: pkg-config first, find_library
-# fallback.
+# Optional libibverbs lookup, shared by ELIO_ENABLE_RDMA_IBVERBS
+# (the public backend / cq_drain / endpoint module) and
+# ELIO_ENABLE_RDMA_IBVERBS_TESTS (the integration test binary).
+# Same detection pattern as librdmacm: pkg-config first,
+# find_library fallback.
 set(_IBVERBS_LIB "")
-if(ELIO_ENABLE_RDMA_IBVERBS_TESTS)
+set(_IBVERBS_INC "")
+if(ELIO_ENABLE_RDMA_IBVERBS OR ELIO_ENABLE_RDMA_IBVERBS_TESTS)
     if(NOT TARGET elio_rdma)
         message(FATAL_ERROR
-            "ELIO_ENABLE_RDMA_IBVERBS_TESTS=ON requires ELIO_ENABLE_RDMA=ON")
+            "ELIO_ENABLE_RDMA_IBVERBS / _TESTS=ON requires ELIO_ENABLE_RDMA=ON")
     endif()
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
@@ -222,14 +225,32 @@ if(ELIO_ENABLE_RDMA_IBVERBS_TESTS)
     endif()
     if(NOT _IBVERBS_LIB)
         message(FATAL_ERROR
-            "ELIO_ENABLE_RDMA_IBVERBS_TESTS=ON but libibverbs was not found.")
+            "ELIO_ENABLE_RDMA_IBVERBS / _TESTS=ON but libibverbs was not found.")
     endif()
     set(ELIO_IBVERBS_LIB "${_IBVERBS_LIB}" CACHE INTERNAL
-        "libibverbs link spec for RDMA integration tests")
+        "libibverbs link spec")
     set(ELIO_IBVERBS_INC "${_IBVERBS_INC}" CACHE INTERNAL
-        "libibverbs include dir for RDMA integration tests")
+        "libibverbs include dir")
+endif()
+
+# elio_rdma_ibverbs INTERFACE target: public libibverbs-backed
+# backend + cq_drain helper + endpoint wrapper (S12-S13).
+if(ELIO_ENABLE_RDMA_IBVERBS)
+    add_library(elio_rdma_ibverbs INTERFACE)
+    target_include_directories(elio_rdma_ibverbs INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+    if(ELIO_IBVERBS_INC)
+        target_include_directories(elio_rdma_ibverbs INTERFACE ${ELIO_IBVERBS_INC})
+    endif()
+    target_link_libraries(elio_rdma_ibverbs INTERFACE elio_rdma ${ELIO_IBVERBS_LIB})
+    target_compile_definitions(elio_rdma_ibverbs INTERFACE ELIO_HAS_RDMA_IBVERBS=1)
+    message(STATUS "RDMA ibverbs module enabled (linking ${ELIO_IBVERBS_LIB})")
+endif()
+if(ELIO_ENABLE_RDMA_IBVERBS_TESTS)
     message(STATUS "RDMA ibverbs integration tests enabled "
-                   "(linking ${_IBVERBS_LIB})")
+                   "(linking ${ELIO_IBVERBS_LIB})")
 endif()
 
 if(ELIO_ENABLE_RDMA_CM)
@@ -303,6 +324,9 @@ if(TARGET elio_rdma)
 endif()
 if(TARGET elio_rdma_cm)
     list(APPEND ELIO_EXPORT_TARGETS elio_rdma_cm)
+endif()
+if(TARGET elio_rdma_ibverbs)
+    list(APPEND ELIO_EXPORT_TARGETS elio_rdma_ibverbs)
 endif()
 
 set(ELIO_PACKAGE_NEEDS_OPENSSL OFF)

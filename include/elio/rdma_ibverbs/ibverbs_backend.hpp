@@ -1,13 +1,13 @@
 #pragma once
 
 /// @file ibverbs_backend.hpp
-/// @brief Thin static-traits backend that forwards to libibverbs.
-///        Used only by the optional rxe integration test (S10).
+/// @brief Public reference backend that forwards to libibverbs.
 ///
-/// This is NOT shipped as part of the public Elio API — the
-/// abstraction's whole point is that the user supplies their own
-/// backend. This file exists so the integration test can exercise a
-/// real verbs stack end-to-end with a known-good implementation.
+/// Lives under the optional `elio_rdma_ibverbs` target. Satisfies
+/// `elio::rdma::backend_traits` and `backend_with_mr`; users who
+/// don't want to roll their own backend can `using my_backend =
+/// elio::rdma_ibverbs::ibverbs_backend;` and be done. Composes
+/// naturally with `elio::rdma_ibverbs::endpoint` (S13).
 
 #include <elio/rdma/types.hpp>
 
@@ -20,7 +20,7 @@
 #include <span>
 #include <vector>
 
-namespace elio_rdma_test {
+namespace elio::rdma_ibverbs {
 
 /// Static-traits backend over libibverbs. Each post_* helper takes
 /// the QP / SRQ pointer the user wrapped into the connection /
@@ -166,35 +166,6 @@ private:
     }
 };
 
-/// Map an `ibv_wc_status` onto Elio's normalised `wc_status`. The
-/// integration test uses this to translate the raw CQE into a
-/// `dispatcher::deliver(...)` call.
-inline elio::rdma::wc_status translate_status(ibv_wc_status s) noexcept {
-    using S = elio::rdma::wc_status;
-    switch (s) {
-        case IBV_WC_SUCCESS:               return S::success;
-        case IBV_WC_LOC_LEN_ERR:           return S::local_length_error;
-        case IBV_WC_LOC_QP_OP_ERR:         return S::local_qp_error;
-        case IBV_WC_LOC_EEC_OP_ERR:        return S::local_eec_error;
-        case IBV_WC_LOC_PROT_ERR:          return S::local_protection_error;
-        case IBV_WC_WR_FLUSH_ERR:          return S::wr_flush_error;
-        case IBV_WC_MW_BIND_ERR:           return S::memory_window_bind_error;
-        case IBV_WC_BAD_RESP_ERR:          return S::bad_response;
-        case IBV_WC_LOC_ACCESS_ERR:        return S::local_access_error;
-        case IBV_WC_REM_INV_REQ_ERR:       return S::remote_invalid_request;
-        case IBV_WC_REM_ACCESS_ERR:        return S::remote_access_error;
-        case IBV_WC_REM_OP_ERR:            return S::remote_op_error;
-        case IBV_WC_RETRY_EXC_ERR:         return S::retry_exceeded;
-        case IBV_WC_RNR_RETRY_EXC_ERR:     return S::rnr_retry_exceeded;
-        case IBV_WC_LOC_RDD_VIOL_ERR:      return S::local_rdd_violation;
-        case IBV_WC_REM_INV_RD_REQ_ERR:    return S::remote_invalid_rd_request;
-        case IBV_WC_REM_ABORT_ERR:         return S::remote_aborted;
-        case IBV_WC_INV_EECN_ERR:          return S::invalid_eecn;
-        case IBV_WC_INV_EEC_STATE_ERR:     return S::invalid_eec_state;
-        case IBV_WC_FATAL_ERR:             return S::fatal;
-        case IBV_WC_RESP_TIMEOUT_ERR:      return S::response_timeout;
-        default:                           return S::general;
-    }
-}
+// `translate_status` lives in cq_drain.hpp now.
 
-}  // namespace elio_rdma_test
+}  // namespace elio::rdma_ibverbs

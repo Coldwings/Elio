@@ -23,8 +23,7 @@
 
 #include <elio/elio.hpp>
 #include <elio/rdma/rdma.hpp>
-
-#include "ibverbs_backend.hpp"
+#include <elio/rdma_ibverbs/rdma_ibverbs.hpp>
 
 #include <infiniband/verbs.h>
 
@@ -34,8 +33,8 @@
 #include <thread>
 #include <vector>
 
-using elio_rdma_test::ibverbs_backend;
-using elio_rdma_test::translate_status;
+using elio::rdma_ibverbs::ibverbs_backend;
+using elio::rdma_ibverbs::translate_status;
 using elio::coro::cancel_source;
 using elio::coro::task;
 using elio::rdma::buffer_view;

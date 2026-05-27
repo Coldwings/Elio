@@ -16,6 +16,7 @@ option(ELIO_BUILD_EXAMPLES "Build Elio examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_TLS "Enable TLS support (requires OpenSSL)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_HTTP "Enable HTTP client/server support (requires TLS)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_HTTP2 "Enable HTTP/2 support (requires nghttp2)" ${ELIO_IS_TOP_LEVEL})
+option(ELIO_ENABLE_RDMA "Enable RDMA-Core abstraction layer (header-only; user supplies ibverbs backend)" OFF)
 option(ELIO_ENABLE_DEVELOPER_WARNINGS "Enable strict warning flags for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_WARNINGS_AS_ERRORS "Treat warnings as errors for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_DEBUG_METADATA "Enable coroutine debug metadata" ON)
@@ -157,6 +158,31 @@ elseif(NOT ELIO_ENABLE_HTTP)
     message(STATUS "HTTP support disabled (ELIO_ENABLE_HTTP=OFF)")
 endif()
 
+# RDMA-Core abstraction (header-only, optional)
+#
+# Elio's RDMA layer is a thin protocol-agnostic abstraction over RDMA-Core
+# verbs. It does NOT depend on libibverbs or librdmacm itself — users plug
+# in their own backend (via template traits or the polymorphic_backend
+# pure-virtual class) and link those libraries themselves. This keeps
+# Elio header-only and lets consumers choose between libibverbs, a mock
+# backend (for tests), or any other implementation that satisfies the
+# elio::rdma::backend_traits concept.
+#
+# A separate elio_rdma_cm target (Stage 8) will provide an optional
+# librdmacm-backed connection helper; it is not built by this option.
+if(ELIO_ENABLE_RDMA)
+    add_library(elio_rdma INTERFACE)
+    target_include_directories(elio_rdma INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_link_libraries(elio_rdma INTERFACE elio)
+    target_compile_definitions(elio_rdma INTERFACE ELIO_HAS_RDMA=1)
+    message(STATUS "RDMA core abstraction enabled (header-only; bring your own ibverbs backend)")
+else()
+    message(STATUS "RDMA support disabled (ELIO_ENABLE_RDMA=OFF)")
+endif()
+
 # Testing
 if(ELIO_BUILD_TESTS)
     enable_testing()
@@ -180,6 +206,9 @@ if(TARGET elio_http)
 endif()
 if(TARGET elio_http2)
     list(APPEND ELIO_EXPORT_TARGETS elio_http2)
+endif()
+if(TARGET elio_rdma)
+    list(APPEND ELIO_EXPORT_TARGETS elio_rdma)
 endif()
 
 set(ELIO_PACKAGE_NEEDS_OPENSSL OFF)

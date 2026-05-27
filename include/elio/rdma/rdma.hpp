@@ -24,16 +24,16 @@
 ///
 /// ## Stage status
 ///
-/// Through S7 the umbrella re-exports: types, op_state, dispatcher,
+/// Through S8 the umbrella re-exports: types, op_state, dispatcher,
 /// backend_traits (incl. the extended `backend_with_mr` requiring
 /// `lkey_of` / `rkey_of`), polymorphic_backend, connection, all four
 /// data-path awaiters (SEND / RECV / RDMA_WRITE / RDMA_READ), the
 /// multi-SGE / inline-send extensions, the shared receive queue
 /// abstraction (`srq.hpp`), the `memory_region<Backend>` RAII
-/// wrapper (`memory_region.hpp`), and the default `cq_pump` coroutine
-/// that binds a completion-channel fd to an `io_context`
-/// (`cq_pump.hpp`). Pending stages:
-///   * S8: optional librdmacm adapter (`elio_rdma_cm` CMake target)
+/// wrapper (`memory_region.hpp`), and the default `cq_pump`
+/// coroutine that binds a completion-channel fd to an `io_context`
+/// (`cq_pump.hpp`). The optional librdmacm-backed CM helper lives
+/// in a separate `elio_rdma_cm` CMake target (`<elio/rdma_cm/*>`).
 ///
 /// See spec/rdma-support-plan.md (feature/rdma-support local branch) for
 /// the full design plan and stage breakdown.
@@ -52,6 +52,6 @@ namespace elio::rdma {
 
 /// Module version string, bumped per stage so downstream code can
 /// feature-detect during this incremental rollout.
-inline constexpr const char* module_version = "0.0.10-S7";
+inline constexpr const char* module_version = "0.0.11-S8";
 
 }  // namespace elio::rdma

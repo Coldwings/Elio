@@ -17,6 +17,7 @@ option(ELIO_ENABLE_TLS "Enable TLS support (requires OpenSSL)" ${ELIO_IS_TOP_LEV
 option(ELIO_ENABLE_HTTP "Enable HTTP client/server support (requires TLS)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_HTTP2 "Enable HTTP/2 support (requires nghttp2)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_RDMA "Enable RDMA-Core abstraction layer (header-only; user supplies ibverbs backend)" OFF)
+option(ELIO_ENABLE_RDMA_CM "Enable optional librdmacm-backed CM helper (requires librdmacm)" OFF)
 option(ELIO_ENABLE_DEVELOPER_WARNINGS "Enable strict warning flags for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_WARNINGS_AS_ERRORS "Treat warnings as errors for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_DEBUG_METADATA "Enable coroutine debug metadata" ON)
@@ -183,6 +184,57 @@ else()
     message(STATUS "RDMA support disabled (ELIO_ENABLE_RDMA=OFF)")
 endif()
 
+# Optional librdmacm-backed CM helper (Stage 8).
+#
+# Adds the elio_rdma_cm INTERFACE target that links librdmacm and
+# exposes a TCP-style listen / connect surface that hands an
+# established ibv_qp* back to elio::rdma::connection for the data
+# path. Unlike elio_rdma itself, this DOES link a system library —
+# the user opts in by setting ELIO_ENABLE_RDMA_CM=ON. We try
+# pkg-config first, then fall back to find_library so packages that
+# ship librdmacm without a .pc file still work.
+if(ELIO_ENABLE_RDMA_CM)
+    if(NOT TARGET elio_rdma)
+        message(FATAL_ERROR
+            "ELIO_ENABLE_RDMA_CM=ON requires ELIO_ENABLE_RDMA=ON")
+    endif()
+    find_package(PkgConfig QUIET)
+    set(_RDMACM_LIB "")
+    set(_RDMACM_INC "")
+    if(PkgConfig_FOUND)
+        pkg_check_modules(RDMACM QUIET librdmacm)
+        if(RDMACM_FOUND)
+            set(_RDMACM_LIB "${RDMACM_LIBRARIES}")
+            set(_RDMACM_INC "${RDMACM_INCLUDE_DIRS}")
+        endif()
+    endif()
+    if(NOT _RDMACM_LIB)
+        find_library(_RDMACM_LIB_FALLBACK rdmacm)
+        find_path(_RDMACM_INC_FALLBACK rdma/rdma_cma.h)
+        if(_RDMACM_LIB_FALLBACK AND _RDMACM_INC_FALLBACK)
+            set(_RDMACM_LIB "${_RDMACM_LIB_FALLBACK}")
+            set(_RDMACM_INC "${_RDMACM_INC_FALLBACK}")
+        endif()
+    endif()
+    if(NOT _RDMACM_LIB)
+        message(FATAL_ERROR
+            "ELIO_ENABLE_RDMA_CM=ON but librdmacm was not found "
+            "(checked pkg-config librdmacm and find_library(rdmacm)). "
+            "Install librdmacm-dev or set CMAKE_PREFIX_PATH.")
+    endif()
+    add_library(elio_rdma_cm INTERFACE)
+    target_include_directories(elio_rdma_cm INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+    if(_RDMACM_INC)
+        target_include_directories(elio_rdma_cm INTERFACE ${_RDMACM_INC})
+    endif()
+    target_link_libraries(elio_rdma_cm INTERFACE elio_rdma ${_RDMACM_LIB})
+    target_compile_definitions(elio_rdma_cm INTERFACE ELIO_HAS_RDMA_CM=1)
+    message(STATUS "RDMA CM helper enabled (linking ${_RDMACM_LIB})")
+endif()
+
 # Testing
 if(ELIO_BUILD_TESTS)
     enable_testing()
@@ -209,6 +261,9 @@ if(TARGET elio_http2)
 endif()
 if(TARGET elio_rdma)
     list(APPEND ELIO_EXPORT_TARGETS elio_rdma)
+endif()
+if(TARGET elio_rdma_cm)
+    list(APPEND ELIO_EXPORT_TARGETS elio_rdma_cm)
 endif()
 
 set(ELIO_PACKAGE_NEEDS_OPENSSL OFF)

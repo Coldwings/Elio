@@ -69,10 +69,12 @@ public:
 private:
     void destroy_() noexcept {
         if (id_) {
-            // rdma_destroy_id requires the QP to be destroyed first
-            // (via rdma_destroy_qp). If the caller used endpoint,
-            // the QP is already gone; otherwise the caller must
-            // rdma_destroy_qp before the cm_id goes out of scope.
+            // rdma_destroy_id requires the QP to be destroyed first.
+            // Defensively tear down any attached QP so callers who
+            // forget (or who never created one) are safe either way.
+            if (id_->qp) {
+                ::rdma_destroy_qp(id_);
+            }
             (void)::rdma_destroy_id(id_);
             id_ = nullptr;
         }

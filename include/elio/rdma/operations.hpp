@@ -223,6 +223,11 @@ protected:
     /// Returns the wr_id to pass into the backend's post_* function.
     [[nodiscard]] wr_id arm_(std::coroutine_handle<> h) noexcept {
         op_->handle = h;
+        // Release-store so that a deliver() on another thread (which
+        // does acq_rel CAS on phase) formally acquires the handle write.
+        // No-op on TSO (x86); single dmb on ARM.
+        op_->phase.store(detail::op_phase::pending,
+                         std::memory_order_release);
         return dispatcher::make_wr_id(op_.get());
     }
 

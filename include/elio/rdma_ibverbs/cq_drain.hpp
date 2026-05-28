@@ -27,6 +27,8 @@
 #include <endian.h>
 #include <infiniband/verbs.h>
 
+#include <cassert>
+
 namespace elio::rdma_ibverbs {
 
 /// Map an `ibv_wc_status` onto Elio's normalised `wc_status`.
@@ -71,12 +73,15 @@ translate_status(ibv_wc_status s) noexcept {
         if (::ibv_get_cq_event(channel, &ev_cq, &ev_ctx) != 0) {
             return;  // EAGAIN-ish; just bail and let cq_pump re-poll
         }
+        assert(ev_cq == cq && "CQ event from unexpected CQ");
         ::ibv_ack_cq_events(ev_cq, 1);
-        (void)::ibv_req_notify_cq(cq, 0);
+        (void)::ibv_req_notify_cq(ev_cq, 0);
         ibv_wc wc{};
         while (::ibv_poll_cq(cq, 1, &wc) > 0) {
+            const std::uint32_t imm = (wc.wc_flags & IBV_WC_WITH_IMM)
+                ? be32toh(wc.imm_data) : 0;
             disp.deliver(wc.wr_id, translate_status(wc.status),
-                         wc.byte_len, be32toh(wc.imm_data), wc.wc_flags);
+                         wc.byte_len, imm, wc.wc_flags);
         }
     };
 }

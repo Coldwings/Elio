@@ -58,6 +58,9 @@ enum class op_phase : std::uint8_t {
 /// + a wc_result) so per-op allocator pressure stays low; if S3 profiling
 /// shows it matters we can layer a pool on top in a follow-up PR.
 struct op_state {
+    static_assert(std::atomic<op_phase>::is_always_lock_free,
+                  "op_phase must be lock-free for the CAS-based lifecycle race");
+
     std::atomic<op_phase> phase{op_phase::pending};
     std::coroutine_handle<> handle{};
     wc_result result{};

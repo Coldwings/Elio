@@ -25,6 +25,7 @@
 #include <elio/rdma/types.hpp>
 #include <elio/runtime/scheduler.hpp>
 
+#include <cassert>
 #include <cstdint>
 
 namespace elio::rdma {
@@ -46,6 +47,8 @@ public:
     /// completion routing; alignment guarantees of `op_state` (≥ 8 byte)
     /// keep that bit available.
     [[nodiscard]] static wr_id make_wr_id(detail::op_state* op) noexcept {
+        static_assert(alignof(detail::op_state) >= 2,
+                      "op_state must be >= 2-byte aligned for wr_id low-bit tagging");
         return static_cast<wr_id>(reinterpret_cast<std::uintptr_t>(op));
     }
 
@@ -105,7 +108,10 @@ public:
 
         // The awaiter destructor already CASed pending → orphaned.
         // No coroutine to resume; we own the heap node now and must
-        // free it.
+        // free it. Assert the expected phase to catch duplicate CQEs
+        // (deliver called twice for the same wr_id) in debug builds.
+        assert(expected == detail::op_phase::orphaned &&
+               "deliver() on non-pending op_state (duplicate CQE?)");
         delete op;
     }
 

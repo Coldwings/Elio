@@ -82,7 +82,7 @@ concept cq_drain_callable = requires(Drain d, dispatcher& disp) {
 /// @param drain  User-supplied drain callable.
 /// @param token  Optional cancel_token; if cancelled the loop exits
 ///               after the current poll returns.
-template <typename Drain>
+template <detail::cq_drain_callable Drain>
 [[nodiscard]] inline coro::task<void> cq_pump(int fd,
                                               dispatcher& disp,
                                               Drain drain,
@@ -103,6 +103,12 @@ template <typename Drain>
         }
 
         drain(disp);
+
+        // POLLHUP / graceful close: result == 0 means the fd was closed.
+        // drain() was called one final time above; now exit the loop.
+        if (result.result == 0) {
+            break;
+        }
     }
 }
 

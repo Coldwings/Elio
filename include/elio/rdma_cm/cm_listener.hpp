@@ -27,8 +27,10 @@
 #include <sys/socket.h>
 
 #include <cerrno>
+#include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace elio::rdma_cm {
 
@@ -44,30 +46,44 @@ public:
         rdma_cm_id* raw = nullptr;
         if (::rdma_create_id(ch.native(), &raw, /*context=*/nullptr,
                              port_space) != 0) {
+            const int e = errno;
             throw std::runtime_error(
                 std::string("rdma_create_id failed: ")
-                + std::strerror(errno));
+                + std::strerror(e));
         }
         listen_id_ = cm_id{raw};
 
         (void)addr_len;  // librdmacm reads the family from the sockaddr
         if (::rdma_bind_addr(listen_id_.native(),
                              const_cast<struct sockaddr*>(addr)) != 0) {
+            const int e = errno;
             throw std::runtime_error(
                 std::string("rdma_bind_addr failed: ")
-                + std::strerror(errno));
+                + std::strerror(e));
         }
         if (::rdma_listen(listen_id_.native(), backlog) != 0) {
+            const int e = errno;
             throw std::runtime_error(
                 std::string("rdma_listen failed: ")
-                + std::strerror(errno));
+                + std::strerror(e));
         }
     }
 
     cm_listener(const cm_listener&) = delete;
     cm_listener& operator=(const cm_listener&) = delete;
-    cm_listener(cm_listener&&) noexcept = default;
-    cm_listener& operator=(cm_listener&&) noexcept = default;
+
+    cm_listener(cm_listener&& other) noexcept
+        : channel_(std::exchange(other.channel_, nullptr)),
+          listen_id_(std::move(other.listen_id_)) {}
+
+    cm_listener& operator=(cm_listener&& other) noexcept {
+        if (this != &other) {
+            listen_id_ = std::move(other.listen_id_);
+            channel_   = std::exchange(other.channel_, nullptr);
+        }
+        return *this;
+    }
+
     ~cm_listener() = default;
 
     [[nodiscard]] rdma_cm_id* native() const noexcept {

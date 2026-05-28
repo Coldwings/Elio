@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -39,9 +40,10 @@ public:
     event_channel()
         : channel_(::rdma_create_event_channel()) {
         if (!channel_) {
+            const int e = errno;
             throw std::runtime_error(
                 std::string("rdma_create_event_channel failed: ")
-                + std::strerror(errno));
+                + std::strerror(e));
         }
         // Non-blocking so rdma_get_cm_event returns EAGAIN instead of
         // blocking the worker. Errors here are non-fatal; we still

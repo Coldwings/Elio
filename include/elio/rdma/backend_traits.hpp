@@ -106,11 +106,12 @@ concept backend_with_atomic = backend_traits<B> &&
              remote_buffer rb,
              std::uint64_t compare,
              std::uint64_t swap,
+             std::uint64_t add,
              send_flags flags,
              wr_id id) {
         { B::post_atomic_cas(qp, sges, rb, compare, swap, flags, id) }
             noexcept -> std::same_as<int>;
-        { B::post_atomic_fetch_add(qp, sges, rb, compare, flags, id) }
+        { B::post_atomic_fetch_add(qp, sges, rb, add, flags, id) }
             noexcept -> std::same_as<int>;
     };
 
@@ -201,11 +202,13 @@ struct polymorphic_backend {
     }
 };
 
-/// A trivial wrapper that lets `polymorphic_backend*` satisfy the
-/// `backend_traits` static-dispatch surface by forwarding to virtual
-/// calls. `connection<polymorphic_backend>` (S3+) uses a specialisation
-/// instead of this adapter — the adapter is provided mainly for
-/// uniformity in generic test fixtures.
+/// A trivial wrapper that forwards instance calls to the polymorphic
+/// vtable. NOTE: this is NOT a static-traits backend — its methods
+/// are non-static, so it does NOT satisfy `backend_traits<>`.
+/// `connection<polymorphic_backend>` (S3+) uses a template specialisation
+/// instead. The adapter is provided for convenience in generic test
+/// fixtures that call `.post_send(...)` through an object rather than
+/// through a concept-constrained template.
 struct polymorphic_traits_adapter {
     polymorphic_backend* impl = nullptr;
 

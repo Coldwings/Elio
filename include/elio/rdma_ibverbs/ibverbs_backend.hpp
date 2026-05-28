@@ -15,10 +15,11 @@
 
 #include <endian.h>
 
+#include <array>
+#include <cassert>
 #include <cerrno>
 #include <cstring>
 #include <span>
-#include <vector>
 
 namespace elio::rdma_ibverbs {
 
@@ -27,25 +28,19 @@ namespace elio::rdma_ibverbs {
 /// memory_region / srq object as `void*`. The same cast convention
 /// the spec recommends for production user backends.
 struct ibverbs_backend {
+    static constexpr std::size_t kMaxSge = 16;
+
     static int post_send(void* qp_ptr,
                          std::span<const elio::rdma::sge> sges,
                          elio::rdma::send_flags flags,
                          std::uint32_t imm_data,
                          elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
-        std::vector<ibv_sge> raw;
-        raw.reserve(sges.size());
-        for (const auto& s : sges) {
-            raw.push_back(ibv_sge{
-                .addr   = reinterpret_cast<std::uint64_t>(s.addr),
-                .length = s.length,
-                .lkey   = s.lkey,
-            });
-        }
+        auto [raw, n] = convert_sges_(sges);
         ibv_send_wr wr{};
         wr.wr_id      = id;
-        wr.sg_list    = raw.empty() ? nullptr : raw.data();
-        wr.num_sge    = static_cast<int>(raw.size());
+        wr.sg_list    = n > 0 ? raw.data() : nullptr;
+        wr.num_sge    = static_cast<int>(n);
         wr.opcode     = flags.with_imm ? IBV_WR_SEND_WITH_IMM : IBV_WR_SEND;
         if (flags.with_imm) {
             wr.imm_data = ::htobe32(imm_data);
@@ -60,19 +55,11 @@ struct ibverbs_backend {
                          std::span<const elio::rdma::sge> sges,
                          elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
-        std::vector<ibv_sge> raw;
-        raw.reserve(sges.size());
-        for (const auto& s : sges) {
-            raw.push_back(ibv_sge{
-                .addr   = reinterpret_cast<std::uint64_t>(s.addr),
-                .length = s.length,
-                .lkey   = s.lkey,
-            });
-        }
+        auto [raw, n] = convert_sges_(sges);
         ibv_recv_wr wr{};
         wr.wr_id   = id;
-        wr.sg_list = raw.empty() ? nullptr : raw.data();
-        wr.num_sge = static_cast<int>(raw.size());
+        wr.sg_list = n > 0 ? raw.data() : nullptr;
+        wr.num_sge = static_cast<int>(n);
         ibv_recv_wr* bad = nullptr;
         const int rc = ::ibv_post_recv(qp, &wr, &bad);
         return rc == 0 ? 0 : -rc;
@@ -85,19 +72,11 @@ struct ibverbs_backend {
                                std::uint32_t imm_data,
                                elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
-        std::vector<ibv_sge> raw;
-        raw.reserve(sges.size());
-        for (const auto& s : sges) {
-            raw.push_back(ibv_sge{
-                .addr   = reinterpret_cast<std::uint64_t>(s.addr),
-                .length = s.length,
-                .lkey   = s.lkey,
-            });
-        }
+        auto [raw, n] = convert_sges_(sges);
         ibv_send_wr wr{};
         wr.wr_id              = id;
-        wr.sg_list            = raw.empty() ? nullptr : raw.data();
-        wr.num_sge            = static_cast<int>(raw.size());
+        wr.sg_list            = n > 0 ? raw.data() : nullptr;
+        wr.num_sge            = static_cast<int>(n);
         wr.opcode             = flags.with_imm
             ? IBV_WR_RDMA_WRITE_WITH_IMM : IBV_WR_RDMA_WRITE;
         if (flags.with_imm) {
@@ -116,19 +95,11 @@ struct ibverbs_backend {
                               elio::rdma::remote_buffer rb,
                               elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
-        std::vector<ibv_sge> raw;
-        raw.reserve(sges.size());
-        for (const auto& s : sges) {
-            raw.push_back(ibv_sge{
-                .addr   = reinterpret_cast<std::uint64_t>(s.addr),
-                .length = s.length,
-                .lkey   = s.lkey,
-            });
-        }
+        auto [raw, n] = convert_sges_(sges);
         ibv_send_wr wr{};
         wr.wr_id               = id;
-        wr.sg_list             = raw.empty() ? nullptr : raw.data();
-        wr.num_sge             = static_cast<int>(raw.size());
+        wr.sg_list             = n > 0 ? raw.data() : nullptr;
+        wr.num_sge             = static_cast<int>(n);
         wr.opcode              = IBV_WR_RDMA_READ;
         wr.send_flags          = IBV_SEND_SIGNALED;
         wr.wr.rdma.remote_addr = rb.addr;
@@ -155,10 +126,6 @@ struct ibverbs_backend {
         return mr_ptr ? static_cast<ibv_mr*>(mr_ptr)->rkey : 0;
     }
 
-    // ATOMIC (S15). ibverbs delivers the OLD remote value into the
-    // local SGE as 8 raw bytes big-endian on the wire; users wanting
-    // a host-endian view should go through `atomic_result::
-    // old_value_host()` rather than reading the buffer directly.
     static int post_atomic_cas(void* qp_ptr,
                                std::span<const elio::rdma::sge> sges,
                                elio::rdma::remote_buffer rb,
@@ -167,19 +134,11 @@ struct ibverbs_backend {
                                elio::rdma::send_flags flags,
                                elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
-        std::vector<ibv_sge> raw;
-        raw.reserve(sges.size());
-        for (const auto& s : sges) {
-            raw.push_back(ibv_sge{
-                .addr   = reinterpret_cast<std::uint64_t>(s.addr),
-                .length = s.length,
-                .lkey   = s.lkey,
-            });
-        }
+        auto [raw, n] = convert_sges_(sges);
         ibv_send_wr wr{};
         wr.wr_id              = id;
-        wr.sg_list            = raw.empty() ? nullptr : raw.data();
-        wr.num_sge            = static_cast<int>(raw.size());
+        wr.sg_list            = n > 0 ? raw.data() : nullptr;
+        wr.num_sge            = static_cast<int>(n);
         wr.opcode             = IBV_WR_ATOMIC_CMP_AND_SWP;
         wr.send_flags         = make_send_flags_(flags);
         wr.wr.atomic.remote_addr = rb.addr;
@@ -197,30 +156,41 @@ struct ibverbs_backend {
                                      elio::rdma::send_flags flags,
                                      elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
-        std::vector<ibv_sge> raw;
-        raw.reserve(sges.size());
-        for (const auto& s : sges) {
-            raw.push_back(ibv_sge{
-                .addr   = reinterpret_cast<std::uint64_t>(s.addr),
-                .length = s.length,
-                .lkey   = s.lkey,
-            });
-        }
+        auto [raw, n] = convert_sges_(sges);
         ibv_send_wr wr{};
         wr.wr_id              = id;
-        wr.sg_list            = raw.empty() ? nullptr : raw.data();
-        wr.num_sge            = static_cast<int>(raw.size());
+        wr.sg_list            = n > 0 ? raw.data() : nullptr;
+        wr.num_sge            = static_cast<int>(n);
         wr.opcode             = IBV_WR_ATOMIC_FETCH_AND_ADD;
         wr.send_flags         = make_send_flags_(flags);
         wr.wr.atomic.remote_addr = rb.addr;
         wr.wr.atomic.rkey        = rb.rkey;
-        wr.wr.atomic.compare_add = add;   // FAA reuses the compare_add slot
+        wr.wr.atomic.compare_add = add;
         ibv_send_wr* bad = nullptr;
         const int rc = ::ibv_post_send(qp, &wr, &bad);
         return rc == 0 ? 0 : -rc;
     }
 
 private:
+    struct sge_buf {
+        std::array<ibv_sge, kMaxSge> data{};
+        std::size_t count = 0;
+    };
+    static sge_buf convert_sges_(std::span<const elio::rdma::sge> sges) noexcept {
+        sge_buf buf;
+        buf.count = sges.size() < kMaxSge ? sges.size() : kMaxSge;
+        assert(sges.size() <= kMaxSge &&
+               "SGE count exceeds ibverbs_backend::kMaxSge");
+        for (std::size_t i = 0; i < buf.count; ++i) {
+            buf.data[i] = ibv_sge{
+                .addr   = reinterpret_cast<std::uint64_t>(sges[i].addr),
+                .length = sges[i].length,
+                .lkey   = sges[i].lkey,
+            };
+        }
+        return buf;
+    }
+
     static unsigned int make_send_flags_(elio::rdma::send_flags f) noexcept {
         unsigned int out = 0;
         if (f.signaled)    out |= IBV_SEND_SIGNALED;

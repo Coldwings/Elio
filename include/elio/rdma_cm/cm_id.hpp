@@ -69,9 +69,10 @@ public:
 private:
     void destroy_() noexcept {
         if (id_) {
-            // rdma_destroy_id closes the QP if one is attached;
-            // applications that need finer control should release()
-            // first.
+            // rdma_destroy_id requires the QP to be destroyed first
+            // (via rdma_destroy_qp). If the caller used endpoint,
+            // the QP is already gone; otherwise the caller must
+            // rdma_destroy_qp before the cm_id goes out of scope.
             (void)::rdma_destroy_id(id_);
             id_ = nullptr;
         }

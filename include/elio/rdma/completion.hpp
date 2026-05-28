@@ -90,23 +90,16 @@ public:
         if (we_won) {
             // We own the race. Fill the result, hand the coroutine off
             // to the scheduler (or resume inline if no scheduler is
-            // current). Then free the heap node — the awaiter's
-            // unique_ptr was .release()d the moment it observed our
-            // CAS through its own `try_orphan()` returning false.
+            // current). We do NOT free `op` here — the awaiter still
+            // holds a `unique_ptr<op_state>` and is responsible for the
+            // free after it has consumed `op->result` via await_resume.
+            //
+            // When the awaiter's destructor eventually runs, try_orphan
+            // observes `completed` and returns false, so the unique_ptr
+            // retains ownership and frees `op` normally.
             op->result = wc_result{status, byte_len, imm_data, wc_flags};
             auto handle = op->handle;
-            // schedule_handle handles the null / done() / no-scheduler
-            // edge cases; we don't second-guess it here.
             runtime::schedule_handle(handle);
-            // The awaiter is still responsible for `delete op` after
-            // it has consumed `op->result`. Doing it here would race
-            // with the resumed coroutine reading those fields.
-            //
-            // Concretely: awaiters hold `unique_ptr<op_state>` and CAS
-            // pending → orphaned in their destructor. If we (deliver)
-            // win the race first, the awaiter's destructor will observe
-            // `completed`, NOT call .release(), and the unique_ptr will
-            // free `op` on awaiter destruction.
             return;
         }
 

@@ -24,6 +24,7 @@
 #include <elio/rdma/completion.hpp>
 #include <elio/rdma/types.hpp>
 
+#include <endian.h>
 #include <infiniband/verbs.h>
 
 namespace elio::rdma_ibverbs {
@@ -75,7 +76,7 @@ translate_status(ibv_wc_status s) noexcept {
         ibv_wc wc{};
         while (::ibv_poll_cq(cq, 1, &wc) > 0) {
             disp.deliver(wc.wr_id, translate_status(wc.status),
-                         wc.byte_len, wc.imm_data, wc.wc_flags);
+                         wc.byte_len, be32toh(wc.imm_data), wc.wc_flags);
         }
     };
 }

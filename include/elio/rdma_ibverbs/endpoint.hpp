@@ -145,9 +145,17 @@ public:
 
     endpoint& operator=(endpoint&& other) noexcept {
         if (this != &other) {
-            // Tear down our resources before adopting other's.
-            this->~endpoint();
-            ::new (this) endpoint(std::move(other));
+            endpoint tmp(std::move(*this));
+            id_          = std::move(other.id_);
+            config_      = other.config_;
+            pd_          = std::exchange(other.pd_, nullptr);
+            comp_ch_     = std::exchange(other.comp_ch_, nullptr);
+            cq_          = std::exchange(other.cq_, nullptr);
+            qp_          = std::exchange(other.qp_, nullptr);
+            disp_        = std::move(other.disp_);
+            conn_        = std::move(other.conn_);
+            pump_cancel_ = std::move(other.pump_cancel_);
+            pump_state_  = std::move(other.pump_state_);
         }
         return *this;
     }
@@ -157,16 +165,19 @@ public:
             pump_cancel_.cancel();
         }
         // Destroying QP first generates flush CQEs that wake the pump
-        // and unblock its async_poll_read.
+        // and unblock its async_poll_read. Use rdma_destroy_qp (not
+        // ibv_destroy_qp) so the cm_id's internal qp pointer is nulled;
+        // otherwise rdma_destroy_id would double-free it.
         if (qp_) {
-            ::ibv_destroy_qp(qp_);
+            ::rdma_destroy_qp(id_.native());
             qp_ = nullptr;
         }
         // Wait briefly for the pump to observe the cancel and exit.
         // If it doesn't (custom drain that blocks indefinitely, or no
         // flush CQEs because the QP had no posted WRs), we leak the
-        // remaining verbs resources rather than risk a UAF when
-        // ibv_destroy_cq runs against a still-polling drain.
+        // remaining verbs resources AND the dispatcher rather than
+        // risk a UAF when ibv_destroy_cq or ~dispatcher runs while the
+        // pump coroutine is still referencing them.
         bool pump_clean = true;
         if (pump_state_) {
             auto deadline = std::chrono::steady_clock::now()
@@ -181,6 +192,8 @@ public:
             if (cq_) ::ibv_destroy_cq(cq_);
             if (comp_ch_) ::ibv_destroy_comp_channel(comp_ch_);
             if (pd_) ::ibv_dealloc_pd(pd_);
+        } else {
+            (void)disp_.release();
         }
         // cm_id RAII handles itself.
     }
@@ -299,7 +312,10 @@ private:
     }
 
     void destroy_resources_() noexcept {
-        if (qp_)      { ::ibv_destroy_qp(qp_); qp_ = nullptr; }
+        if (qp_) {
+            ::rdma_destroy_qp(id_.native());
+            qp_ = nullptr;
+        }
         if (cq_)      { ::ibv_destroy_cq(cq_); cq_ = nullptr; }
         if (comp_ch_) { ::ibv_destroy_comp_channel(comp_ch_); comp_ch_ = nullptr; }
         if (pd_)      { ::ibv_dealloc_pd(pd_); pd_ = nullptr; }

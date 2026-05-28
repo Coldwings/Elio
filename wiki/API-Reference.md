@@ -19,6 +19,9 @@ This page provides a reference for Elio's public API.
 | `elio::log` | Logging |
 | `elio::hash` | Hash and checksum functions |
 | `elio::rpc` | RPC framework |
+| `elio::rdma` | RDMA verbs abstraction (core, header-only, `ELIO_ENABLE_RDMA`) |
+| `elio::rdma_cm` | RDMA Connection Manager helpers (`ELIO_ENABLE_RDMA_CM`) |
+| `elio::rdma_ibverbs` | Reference libibverbs backend + endpoint (`ELIO_ENABLE_RDMA_IBVERBS`) |
 
 ---
 

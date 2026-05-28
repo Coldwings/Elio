@@ -31,6 +31,7 @@
 #include <elio/rdma/backend_traits.hpp>
 #include <elio/rdma/types.hpp>
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -104,6 +105,8 @@ public:
 
     /// `remote_buffer` describing the entire MR for peer one-sided ops.
     [[nodiscard]] remote_buffer remote() const noexcept {
+        assert(length_ <= std::uint32_t(-1) &&
+               "MR length exceeds uint32_t range for remote_buffer");
         return remote_buffer{
             .addr = reinterpret_cast<std::uint64_t>(addr_),
             .length = static_cast<std::uint32_t>(length_),
@@ -114,6 +117,8 @@ public:
     /// Sub-range `remote_buffer`.
     [[nodiscard]] remote_buffer remote(std::size_t offset,
                                        std::size_t sub_length) const noexcept {
+        assert(sub_length <= std::uint32_t(-1) &&
+               "sub_length exceeds uint32_t range for remote_buffer");
         return remote_buffer{
             .addr = reinterpret_cast<std::uint64_t>(addr_) + offset,
             .length = static_cast<std::uint32_t>(sub_length),
@@ -143,23 +148,18 @@ public:
     memory_region& operator=(const memory_region&) = delete;
 
     memory_region(memory_region&& other) noexcept
-        : backend_(other.backend_), mr_(other.mr_),
-          addr_(other.addr_), length_(other.length_) {
-        other.mr_     = nullptr;
-        other.addr_   = nullptr;
-        other.length_ = 0;
-    }
+        : backend_(std::exchange(other.backend_, nullptr)),
+          mr_(std::exchange(other.mr_, nullptr)),
+          addr_(std::exchange(other.addr_, nullptr)),
+          length_(std::exchange(other.length_, 0)) {}
 
     memory_region& operator=(memory_region&& other) noexcept {
         if (this != &other) {
             if (mr_ && backend_) backend_->dereg_mr(mr_);
-            backend_ = other.backend_;
-            mr_      = other.mr_;
-            addr_    = other.addr_;
-            length_  = other.length_;
-            other.mr_     = nullptr;
-            other.addr_   = nullptr;
-            other.length_ = 0;
+            backend_ = std::exchange(other.backend_, nullptr);
+            mr_      = std::exchange(other.mr_, nullptr);
+            addr_    = std::exchange(other.addr_, nullptr);
+            length_  = std::exchange(other.length_, 0);
         }
         return *this;
     }
@@ -190,6 +190,8 @@ public:
     }
 
     [[nodiscard]] remote_buffer remote() const noexcept {
+        assert(length_ <= std::uint32_t(-1) &&
+               "MR length exceeds uint32_t range for remote_buffer");
         return remote_buffer{
             .addr = reinterpret_cast<std::uint64_t>(addr_),
             .length = static_cast<std::uint32_t>(length_),
@@ -198,6 +200,8 @@ public:
     }
     [[nodiscard]] remote_buffer remote(std::size_t offset,
                                        std::size_t sub_length) const noexcept {
+        assert(sub_length <= std::uint32_t(-1) &&
+               "sub_length exceeds uint32_t range for remote_buffer");
         return remote_buffer{
             .addr = reinterpret_cast<std::uint64_t>(addr_) + offset,
             .length = static_cast<std::uint32_t>(sub_length),

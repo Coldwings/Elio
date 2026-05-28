@@ -24,6 +24,7 @@
 #include <elio/rdma/types.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <span>
 
 namespace elio::rdma {

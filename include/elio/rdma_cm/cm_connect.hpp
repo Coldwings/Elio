@@ -49,20 +49,6 @@ struct cm_status {
     [[nodiscard]] bool ok() const noexcept { return status == 0; }
 };
 
-namespace detail {
-
-inline cm_status pump_until_(event_channel& ch,
-                             coro::cancel_token token,
-                             rdma_cm_event_type expected,
-                             coro::task<cm_status>& /*self*/) noexcept {
-    // Placeholder — the real pump is inline in resolve(); kept here
-    // as a marker for future refactoring.
-    (void)ch; (void)token; (void)expected;
-    return cm_status{ECANCELED};
-}
-
-}  // namespace detail
-
 /// Step 1+2+3: create a cm_id and resolve the destination address +
 /// route. Returns the cm_id on success; populates `out_status` with
 /// the underlying errno on failure (the returned cm_id is then null).

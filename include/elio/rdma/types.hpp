@@ -8,6 +8,7 @@
 /// these structs are normalised, backend-agnostic mirrors that the user's
 /// backend translates to/from real ibverbs structures.
 
+#include <cassert>
 #include <cstddef>
 #include <cstring>
 #include <cstdint>
@@ -40,7 +41,9 @@ struct sge {
     std::uint32_t lkey = 0;
 
     /// Convenience: build an sge from a buffer_view.
-    [[nodiscard]] static constexpr sge from(buffer_view v) noexcept {
+    [[nodiscard]] static sge from(buffer_view v) noexcept {
+        assert(v.length <= std::uint32_t(-1) &&
+               "buffer_view::length exceeds uint32_t range for sge");
         return sge{v.addr, static_cast<std::uint32_t>(v.length), v.lkey};
     }
 };
@@ -118,7 +121,7 @@ struct atomic_result {
     wc_result   wc{};
     buffer_view local{};
 
-    [[nodiscard]] bool ok() const noexcept { return wc.ok(); }
+    [[nodiscard]] constexpr bool ok() const noexcept { return wc.ok(); }
 
     [[nodiscard]] std::uint64_t old_value_host() const noexcept {
         std::uint64_t be = 0;

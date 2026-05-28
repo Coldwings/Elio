@@ -177,8 +177,6 @@ private:
                                 s.map.erase(it);
                             }
                             s.reclaim_unlink(cur);
-                        } else {
-                            break;
                         }
 
                         cur = next;
@@ -186,22 +184,30 @@ private:
                 }
 
                 // Sweep TTL-expired entries with active borrows (not in reclaim list)
-                if (default_ttl_ns > 0) {
-                    std::lock_guard lock(s.mutex);
-                    std::vector<Key> evict_keys;
-                    for (auto& [k, e] : s.map) {
-                        auto entry_ttl_ns2 = e->ttl_.count() > 0
-                            ? std::chrono::duration_cast<std::chrono::nanoseconds>(e->ttl_).count()
-                            : default_ttl_ns;
-                        if (entry_ttl_ns2 > 0 &&
-                            (now_ns - e->created_at_ns_ >= entry_ttl_ns2)) {
-                            e->force_evict_.store(true, std::memory_order_release);
-                            s.reclaim_unlink(e.get());
-                            evict_keys.push_back(k);
+                {
+                    std::vector<std::shared_ptr<entry>> ttl_destroy;
+
+                    {
+                        std::lock_guard lock(s.mutex);
+                        std::vector<Key> evict_keys;
+                        for (auto& [k, e] : s.map) {
+                            auto entry_ttl_ns2 = e->ttl_.count() > 0
+                                ? std::chrono::duration_cast<std::chrono::nanoseconds>(e->ttl_).count()
+                                : default_ttl_ns;
+                            if (entry_ttl_ns2 > 0 &&
+                                (now_ns - e->created_at_ns_ >= entry_ttl_ns2)) {
+                                e->force_evict_.store(true, std::memory_order_release);
+                                s.reclaim_unlink(e.get());
+                                evict_keys.push_back(k);
+                            }
                         }
-                    }
-                    for (auto& k : evict_keys) {
-                        s.map.erase(k);
+                        for (auto& k : evict_keys) {
+                            auto it = s.map.find(k);
+                            if (it != s.map.end()) {
+                                ttl_destroy.push_back(std::move(it->second));
+                                s.map.erase(it);
+                            }
+                        }
                     }
                 }
             }
@@ -210,6 +216,8 @@ private:
         void enqueue_for_reclaim(entry* e) {
             auto& s = shards_[e->shard_index_];
             std::lock_guard lock(s.mutex);
+            auto it = s.map.find(e->key_);
+            if (it == s.map.end() || it->second.get() != e) return;
             if (e->refcount_.load(std::memory_order_acquire) > 0) return;
             if (e->in_reclaim_list) return;
             if (e->force_evict_.load(std::memory_order_acquire)) return;
@@ -237,14 +245,19 @@ private:
         }
 
         bool await_suspend(std::coroutine_handle<> h) noexcept {
+            auto* refcount = &entry_.refcount_;
+            auto* waiter = &entry_.release_waiter_;
+
             void* expected = nullptr;
-            if (!entry_.release_waiter_.compare_exchange_strong(
+            if (!waiter->compare_exchange_strong(
                     expected, h.address(),
                     std::memory_order_release, std::memory_order_relaxed)) {
                 return false;
             }
-            if (entry_.refcount_.load(std::memory_order_acquire) == 1) {
-                void* addr = entry_.release_waiter_.exchange(
+            // After CAS, another thread may resume our coroutine and destroy
+            // the awaitable on the frame. Only access stack-local pointers.
+            if (refcount->load(std::memory_order_acquire) == 1) {
+                void* addr = waiter->exchange(
                     nullptr, std::memory_order_acq_rel);
                 if (addr) {
                     return false;
@@ -387,14 +400,18 @@ public:
     }
 
     void evict(const Key& key) {
-        auto& s = state_->shard_for(key);
-        std::lock_guard lock(s.mutex);
-        auto it = s.map.find(key);
-        if (it != s.map.end()) {
-            auto& e = it->second;
-            e->force_evict_.store(true, std::memory_order_release);
-            s.reclaim_unlink(e.get());
-            s.map.erase(it);
+        std::shared_ptr<entry> evicted;
+        {
+            auto& s = state_->shard_for(key);
+            std::lock_guard lock(s.mutex);
+            auto it = s.map.find(key);
+            if (it != s.map.end()) {
+                auto& e = it->second;
+                e->force_evict_.store(true, std::memory_order_release);
+                s.reclaim_unlink(e.get());
+                evicted = std::move(it->second);
+                s.map.erase(it);
+            }
         }
     }
 
@@ -436,9 +453,10 @@ private:
     }
 
     void ensure_sweep_running() {
-        if (state_->sweep_started_.exchange(true, std::memory_order_acq_rel)) return;
+        if (state_->sweep_started_.load(std::memory_order_acquire)) return;
         auto* sched = runtime::get_current_scheduler();
         if (!sched) return;
+        if (state_->sweep_started_.exchange(true, std::memory_order_acq_rel)) return;
 
         auto* new_vstack = new coro::vthread_stack();
         auto* old_vstack = coro::vthread_stack::current();

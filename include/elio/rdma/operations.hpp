@@ -89,6 +89,28 @@ struct backend_invoker {
                              [[maybe_unused]] Backend* backend) noexcept {
         return Backend::post_srq_recv(srq_ptr, sges, id);
     }
+    // Only valid if Backend satisfies backend_with_atomic<>;
+    // constrained at the call site by rdma_cas_awaitable /
+    // rdma_faa_awaitable.
+    static int post_atomic_cas(void* qp,
+                               std::span<const sge> sges,
+                               remote_buffer rb,
+                               std::uint64_t compare,
+                               std::uint64_t swap,
+                               send_flags flags,
+                               wr_id id,
+                               [[maybe_unused]] Backend* backend) noexcept {
+        return Backend::post_atomic_cas(qp, sges, rb, compare, swap, flags, id);
+    }
+    static int post_atomic_fetch_add(void* qp,
+                                     std::span<const sge> sges,
+                                     remote_buffer rb,
+                                     std::uint64_t add,
+                                     send_flags flags,
+                                     wr_id id,
+                                     [[maybe_unused]] Backend* backend) noexcept {
+        return Backend::post_atomic_fetch_add(qp, sges, rb, add, flags, id);
+    }
 };
 
 template <>
@@ -131,6 +153,25 @@ struct backend_invoker<polymorphic_backend> {
         // that don't override; the awaiter surfaces that as a flush
         // error to the caller (same pattern as any other negative rc).
         return backend->post_srq_recv(srq_ptr, sges, id);
+    }
+    static int post_atomic_cas(void* qp,
+                               std::span<const sge> sges,
+                               remote_buffer rb,
+                               std::uint64_t compare,
+                               std::uint64_t swap,
+                               send_flags flags,
+                               wr_id id,
+                               polymorphic_backend* backend) noexcept {
+        return backend->post_atomic_cas(qp, sges, rb, compare, swap, flags, id);
+    }
+    static int post_atomic_fetch_add(void* qp,
+                                     std::span<const sge> sges,
+                                     remote_buffer rb,
+                                     std::uint64_t add,
+                                     send_flags flags,
+                                     wr_id id,
+                                     polymorphic_backend* backend) noexcept {
+        return backend->post_atomic_fetch_add(qp, sges, rb, add, flags, id);
     }
 };
 
@@ -431,6 +472,91 @@ private:
     void*         qp_;
     Backend*      backend_;
     remote_buffer remote_;
+};
+
+/// 8-byte ATOMIC compare-and-swap awaiter (S15). Single SGE; the
+/// local buffer must be 8 bytes (where the OLD remote value lands).
+/// `await_resume` returns `atomic_result` which wraps the standard
+/// `wc_result` plus convenience accessors over the local buffer.
+template <typename Backend>
+class rdma_cas_awaitable : public op_awaiter_base {
+public:
+    rdma_cas_awaitable(void* qp,
+                       Backend* backend_or_null,
+                       buffer_view local,
+                       remote_buffer remote,
+                       std::uint64_t compare,
+                       std::uint64_t swap,
+                       send_flags flags) noexcept
+        : qp_(qp), backend_(backend_or_null),
+          local_(local), remote_(remote),
+          compare_(compare), swap_(swap), flags_(flags) {}
+
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+        const auto sge_val = sge::from(local_);
+        auto sges = std::span<const sge>(&sge_val, 1);
+        const auto id = arm_(h);
+        const int rc = backend_invoker<Backend>::post_atomic_cas(
+            qp_, sges, remote_, compare_, swap_, flags_, id, backend_);
+        return finalize_post_(rc);
+    }
+
+    [[nodiscard]] atomic_result await_resume() noexcept {
+        return atomic_result{
+            .wc    = op_awaiter_base::await_resume(),
+            .local = local_,
+        };
+    }
+
+private:
+    void*         qp_;
+    Backend*      backend_;
+    buffer_view   local_;
+    remote_buffer remote_;
+    std::uint64_t compare_;
+    std::uint64_t swap_;
+    send_flags    flags_;
+};
+
+/// 8-byte ATOMIC fetch-and-add awaiter (S15). Same shape as CAS;
+/// the `add` value is added atomically at the remote, the OLD value
+/// is delivered to the local buffer.
+template <typename Backend>
+class rdma_faa_awaitable : public op_awaiter_base {
+public:
+    rdma_faa_awaitable(void* qp,
+                       Backend* backend_or_null,
+                       buffer_view local,
+                       remote_buffer remote,
+                       std::uint64_t add,
+                       send_flags flags) noexcept
+        : qp_(qp), backend_(backend_or_null),
+          local_(local), remote_(remote),
+          add_(add), flags_(flags) {}
+
+    [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+        const auto sge_val = sge::from(local_);
+        auto sges = std::span<const sge>(&sge_val, 1);
+        const auto id = arm_(h);
+        const int rc = backend_invoker<Backend>::post_atomic_fetch_add(
+            qp_, sges, remote_, add_, flags_, id, backend_);
+        return finalize_post_(rc);
+    }
+
+    [[nodiscard]] atomic_result await_resume() noexcept {
+        return atomic_result{
+            .wc    = op_awaiter_base::await_resume(),
+            .local = local_,
+        };
+    }
+
+private:
+    void*         qp_;
+    Backend*      backend_;
+    buffer_view   local_;
+    remote_buffer remote_;
+    std::uint64_t add_;
+    send_flags    flags_;
 };
 
 /// SRQ RECV awaiter (S5c). Posts to a shared receive queue rather

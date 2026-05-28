@@ -199,6 +199,22 @@ public:
             pd_, addr, length, access};
     }
 
+    /// Atomic CAS / FAA shortcuts that forward to the underlying
+    /// connection (S15). The local buffer must be 8 bytes and the
+    /// remote address must be 8-byte aligned.
+    [[nodiscard]] auto cas(elio::rdma::buffer_view local,
+                           elio::rdma::remote_buffer remote,
+                           std::uint64_t compare, std::uint64_t swap,
+                           elio::rdma::send_flags flags = {}) noexcept {
+        return conn_->cas(local, remote, compare, swap, flags);
+    }
+    [[nodiscard]] auto fetch_add(elio::rdma::buffer_view local,
+                                 elio::rdma::remote_buffer remote,
+                                 std::uint64_t add,
+                                 elio::rdma::send_flags flags = {}) noexcept {
+        return conn_->fetch_add(local, remote, add, flags);
+    }
+
     /// Spawn the cq_pump on the given scheduler. Idempotent: a
     /// second call is a no-op.
     void start_cq_pump(elio::runtime::scheduler& sched) {

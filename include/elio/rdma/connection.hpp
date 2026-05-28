@@ -48,6 +48,8 @@ template <typename Backend> class send_awaitable;
 template <typename Backend> class recv_awaitable;
 template <typename Backend> class rdma_write_awaitable;
 template <typename Backend> class rdma_read_awaitable;
+template <typename Backend> class rdma_cas_awaitable;
+template <typename Backend> class rdma_faa_awaitable;
 
 }  // namespace detail
 
@@ -120,6 +122,20 @@ public:
     [[nodiscard]] detail::rdma_read_awaitable<Backend>
         rdma_read(std::span<const sge> locals,
                   remote_buffer remote) noexcept;
+
+    // 8-byte ATOMIC ops (S15). Single buffer_view only — ibverbs
+    // atomic WRs require exactly one 8-byte SGE. Backends must
+    // satisfy backend_with_atomic<Backend>; the static_assert fires
+    // at the call site so unsupported backends still let users
+    // construct connection<> for non-atomic paths.
+    [[nodiscard]] detail::rdma_cas_awaitable<Backend>
+        cas(buffer_view local, remote_buffer remote,
+            std::uint64_t compare, std::uint64_t swap,
+            send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::rdma_faa_awaitable<Backend>
+        fetch_add(buffer_view local, remote_buffer remote,
+                  std::uint64_t add,
+                  send_flags flags = {}) noexcept;
 
 private:
     void*              qp_         = nullptr;
@@ -194,6 +210,18 @@ public:
     [[nodiscard]] detail::rdma_read_awaitable<polymorphic_backend>
         rdma_read(std::span<const sge> locals,
                   remote_buffer remote) noexcept;
+
+    // 8-byte ATOMIC ops (S15). Backends without an
+    // post_atomic_* override get the polymorphic_backend default
+    // (-ENOTSUP) surfaced as wr_flush_error on the awaiter.
+    [[nodiscard]] detail::rdma_cas_awaitable<polymorphic_backend>
+        cas(buffer_view local, remote_buffer remote,
+            std::uint64_t compare, std::uint64_t swap,
+            send_flags flags = {}) noexcept;
+    [[nodiscard]] detail::rdma_faa_awaitable<polymorphic_backend>
+        fetch_add(buffer_view local, remote_buffer remote,
+                  std::uint64_t add,
+                  send_flags flags = {}) noexcept;
 
 private:
     void*                qp_         = nullptr;
@@ -442,6 +470,52 @@ connection<polymorphic_backend>::rdma_read(std::span<const sge> locals,
                                            remote_buffer remote) noexcept {
     return detail::rdma_read_awaitable<polymorphic_backend>(
         qp_, backend_, locals, remote);
+}
+
+// --- ATOMIC: connection<Backend> ---
+
+template <typename Backend>
+inline detail::rdma_cas_awaitable<Backend>
+connection<Backend>::cas(buffer_view local, remote_buffer remote,
+                         std::uint64_t compare, std::uint64_t swap,
+                         send_flags flags) noexcept {
+    static_assert(backend_with_atomic<Backend>,
+                  "Backend must satisfy elio::rdma::backend_with_atomic "
+                  "to use connection::cas (provide static post_atomic_cas).");
+    return detail::rdma_cas_awaitable<Backend>(
+        qp_, /*backend=*/nullptr, local, remote, compare, swap, flags);
+}
+
+template <typename Backend>
+inline detail::rdma_faa_awaitable<Backend>
+connection<Backend>::fetch_add(buffer_view local, remote_buffer remote,
+                               std::uint64_t add,
+                               send_flags flags) noexcept {
+    static_assert(backend_with_atomic<Backend>,
+                  "Backend must satisfy elio::rdma::backend_with_atomic "
+                  "to use connection::fetch_add (provide static "
+                  "post_atomic_fetch_add).");
+    return detail::rdma_faa_awaitable<Backend>(
+        qp_, /*backend=*/nullptr, local, remote, add, flags);
+}
+
+// --- ATOMIC: connection<polymorphic_backend> ---
+
+inline detail::rdma_cas_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::cas(buffer_view local, remote_buffer remote,
+                                     std::uint64_t compare, std::uint64_t swap,
+                                     send_flags flags) noexcept {
+    return detail::rdma_cas_awaitable<polymorphic_backend>(
+        qp_, backend_, local, remote, compare, swap, flags);
+}
+
+inline detail::rdma_faa_awaitable<polymorphic_backend>
+connection<polymorphic_backend>::fetch_add(buffer_view local,
+                                           remote_buffer remote,
+                                           std::uint64_t add,
+                                           send_flags flags) noexcept {
+    return detail::rdma_faa_awaitable<polymorphic_backend>(
+        qp_, backend_, local, remote, add, flags);
 }
 
 }  // namespace elio::rdma

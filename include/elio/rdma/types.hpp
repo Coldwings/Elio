@@ -9,7 +9,9 @@
 /// backend translates to/from real ibverbs structures.
 
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
+#include <endian.h>
 
 namespace elio::rdma {
 
@@ -98,6 +100,40 @@ struct wc_result {
 
     [[nodiscard]] constexpr bool ok() const noexcept {
         return is_success(status);
+    }
+};
+
+/// Result returned by atomic awaiters (S15: CAS / FAA). Wraps the
+/// standard `wc_result` and carries the local buffer pointer so
+/// callers don't have to thread it through manually to read the old
+/// value the remote held BEFORE the atomic completed.
+///
+/// IB ATOMIC operations deliver the old value as 8 raw bytes
+/// big-endian on the wire. `old_value_host()` does the `be64toh`
+/// conversion; `old_value_raw()` returns the raw 8 bytes verbatim
+/// (useful for backends with custom endianness such as mlx5's
+/// `IBV_EXP_ATOMIC_HCA_REPLY_BE`, where the wire format isn't
+/// strictly IB-canonical big-endian).
+struct atomic_result {
+    wc_result   wc{};
+    buffer_view local{};
+
+    [[nodiscard]] bool ok() const noexcept { return wc.ok(); }
+
+    [[nodiscard]] std::uint64_t old_value_host() const noexcept {
+        std::uint64_t be = 0;
+        if (local.addr && local.length >= sizeof(be)) {
+            std::memcpy(&be, local.addr, sizeof(be));
+        }
+        return be64toh(be);
+    }
+
+    [[nodiscard]] std::uint64_t old_value_raw() const noexcept {
+        std::uint64_t raw = 0;
+        if (local.addr && local.length >= sizeof(raw)) {
+            std::memcpy(&raw, local.addr, sizeof(raw));
+        }
+        return raw;
     }
 };
 

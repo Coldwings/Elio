@@ -151,6 +151,53 @@ peer's RECV CQE on whatever QP it has bound for the WRITE target.
 can still pass an explicit `send_flags` value to mix in `solicited`
 / `fence` / etc.
 
+### 8-byte ATOMIC ops (CAS / FAA)
+
+Two hardware-atomic operations against a remote 8-byte location:
+
+```cpp
+// compare-and-swap: if remote == compare, write swap. The OLD remote
+// value lands in `local` (8 raw big-endian bytes).
+auto r = co_await conn.cas(local_mr.view(), remote,
+                           /*compare=*/expected, /*swap=*/desired);
+if (r.ok() && r.old_value_host() == expected) {
+    // CAS succeeded — remote now holds `desired`.
+}
+
+// fetch-and-add: atomically remote += add; OLD remote value lands in local.
+auto r = co_await conn.fetch_add(local_mr.view(), remote, /*add=*/1);
+auto previous = r.old_value_host();
+```
+
+Returned by `atomic_result`:
+
+```cpp
+struct atomic_result {
+    wc_result   wc;     // standard CQE fields
+    buffer_view local;  // where the old 8 bytes landed
+    bool ok() const noexcept;
+    std::uint64_t old_value_host() const noexcept;  // be64toh of the buffer
+    std::uint64_t old_value_raw()  const noexcept;  // raw 8 bytes (be wire fmt)
+};
+```
+
+IB delivers the old value big-endian. `old_value_host()` does the
+conversion; `old_value_raw()` returns the raw bytes verbatim for
+backends that don't follow the canonical byte order (mlx5's
+`IBV_EXP_ATOMIC_HCA_REPLY_BE`, vendor-specific reply ordering).
+
+Constraints (enforced by ibverbs, not by Elio):
+- Local SGE must point at exactly 8 bytes.
+- Remote `addr` must be 8-byte aligned.
+- Only valid on RC QPs; UD has no atomics.
+
+Backend opt-in: implement the static `post_atomic_cas` /
+`post_atomic_fetch_add` methods to satisfy the
+`backend_with_atomic<Backend>` concept (compile-time gate at the
+call site of `cas` / `fetch_add`). For `polymorphic_backend`,
+override the two virtuals; not overriding them is fine — calls
+yield `wr_flush_error` with `imm_data = 95` (ENOTSUP).
+
 ### Inline send
 
 `send_flags::inline_send` requests inline payload staging. The
@@ -386,7 +433,6 @@ matched by a posted RECV on QP_B, dispatched through
 
 ## Out of scope (deferred)
 
-* ATOMIC operations (compare-and-swap, fetch-and-add).
 * XRC / Reliable Datagram QPs.
 * RoCEv2 GID helpers / VLAN tagging.
 * `mlx5` direct-verbs fast path.

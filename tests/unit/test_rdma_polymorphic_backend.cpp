@@ -190,13 +190,19 @@ TEST_CASE("polymorphic_backend default optional methods report not-supported",
 
     // Default register_mr returns nullptr (not-supported sentinel),
     // dereg_mr is a no-op, lkey_of / rkey_of return 0 on any input,
-    // post_srq_recv returns -ENOTSUP (-95).
+    // post_srq_recv / post_atomic_* return -ENOTSUP (-95).
     REQUIRE(base.register_mr(nullptr, nullptr, 0, 0) == nullptr);
     base.dereg_mr(nullptr);  // must not crash
     REQUIRE(base.lkey_of(nullptr) == 0u);
     REQUIRE(base.rkey_of(nullptr) == 0u);
     sge s{};
     REQUIRE(base.post_srq_recv(nullptr, std::span<const sge>(&s, 1), 0) == -95);
+    elio::rdma::remote_buffer rb{};
+    REQUIRE(base.post_atomic_cas(nullptr, std::span<const sge>(&s, 1),
+                                 rb, /*compare=*/0, /*swap=*/0,
+                                 {}, 0) == -95);
+    REQUIRE(base.post_atomic_fetch_add(nullptr, std::span<const sge>(&s, 1),
+                                       rb, /*add=*/0, {}, 0) == -95);
 }
 
 TEST_CASE("polymorphic_traits_adapter forwards to the vtable",

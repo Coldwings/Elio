@@ -88,6 +88,32 @@ concept backend_with_srq = backend_traits<B> &&
         { B::post_srq_recv(srq, sges, id) } noexcept -> std::same_as<int>;
     };
 
+/// Optional extension: backend supports 8-byte atomic operations
+/// (CAS, FAA). Available on RC transports for hardware that
+/// implements `IBV_WR_ATOMIC_CMP_AND_SWP` /
+/// `IBV_WR_ATOMIC_FETCH_AND_ADD`. The local SGE must point at an
+/// 8-byte buffer where the OLD remote value is delivered; the
+/// remote address must be 8-byte aligned.
+///
+///   * `post_atomic_cas(qp, sges, remote, compare, swap, flags, id)`
+///   * `post_atomic_fetch_add(qp, sges, remote, add, flags, id)`
+///
+/// Both return 0 on submission success or a negative errno.
+template <typename B>
+concept backend_with_atomic = backend_traits<B> &&
+    requires(void* qp,
+             std::span<const sge> sges,
+             remote_buffer rb,
+             std::uint64_t compare,
+             std::uint64_t swap,
+             send_flags flags,
+             wr_id id) {
+        { B::post_atomic_cas(qp, sges, rb, compare, swap, flags, id) }
+            noexcept -> std::same_as<int>;
+        { B::post_atomic_fetch_add(qp, sges, rb, compare, flags, id) }
+            noexcept -> std::same_as<int>;
+    };
+
 /// Runtime-replaceable backend. Users derive from this and pass an
 /// instance (typically a long-lived singleton) to
 /// `connection<polymorphic_backend>` constructors.
@@ -150,6 +176,28 @@ struct polymorphic_backend {
                               std::span<const sge> /*sges*/,
                               wr_id /*id*/) noexcept {
         return -95;  // -ENOTSUP. <errno.h> avoided to keep this header light.
+    }
+
+    // Optional: 8-byte ATOMIC ops. Defaults return -ENOTSUP so
+    // subclasses that don't support atomics (UD QPs, hardware
+    // without atomic acceleration) get a clean wr_flush_error back
+    // to the caller through the awaiter's standard failure path.
+    virtual int post_atomic_cas(void* /*qp*/,
+                                std::span<const sge> /*sges*/,
+                                remote_buffer /*rb*/,
+                                std::uint64_t /*compare*/,
+                                std::uint64_t /*swap*/,
+                                send_flags /*flags*/,
+                                wr_id /*id*/) noexcept {
+        return -95;  // -ENOTSUP
+    }
+    virtual int post_atomic_fetch_add(void* /*qp*/,
+                                      std::span<const sge> /*sges*/,
+                                      remote_buffer /*rb*/,
+                                      std::uint64_t /*add*/,
+                                      send_flags /*flags*/,
+                                      wr_id /*id*/) noexcept {
+        return -95;  // -ENOTSUP
     }
 };
 

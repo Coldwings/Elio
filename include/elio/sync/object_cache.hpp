@@ -38,7 +38,9 @@ inline size_t round_up_power_of_two(size_t v) noexcept {
     v |= v >> 4;
     v |= v >> 8;
     v |= v >> 16;
-    v |= v >> 32;
+    if constexpr (sizeof(size_t) > 4) {
+        v |= v >> 32;
+    }
     return v + 1;
 }
 
@@ -238,15 +240,19 @@ private:
 
     class release_awaitable {
     public:
-        explicit release_awaitable(entry& e) noexcept : entry_(e) {}
+        explicit release_awaitable(std::shared_ptr<entry> e) noexcept
+            : entry_sp_(std::move(e)) {}
 
         bool await_ready() const noexcept {
-            return entry_.refcount_.load(std::memory_order_acquire) == 1;
+            return entry_sp_->refcount_.load(std::memory_order_acquire) == 1;
         }
 
         bool await_suspend(std::coroutine_handle<> h) noexcept {
-            auto* refcount = &entry_.refcount_;
-            auto* waiter = &entry_.release_waiter_;
+            // Pin entry alive on our stack — after CAS another thread may
+            // resume our coroutine and drop the borrow's shared_ptr.
+            auto pin = entry_sp_;
+            auto* refcount = &pin->refcount_;
+            auto* waiter = &pin->release_waiter_;
 
             void* expected = nullptr;
             if (!waiter->compare_exchange_strong(
@@ -254,8 +260,6 @@ private:
                     std::memory_order_release, std::memory_order_relaxed)) {
                 return false;
             }
-            // After CAS, another thread may resume our coroutine and destroy
-            // the awaitable on the frame. Only access stack-local pointers.
             if (refcount->load(std::memory_order_acquire) == 1) {
                 void* addr = waiter->exchange(
                     nullptr, std::memory_order_acq_rel);
@@ -270,7 +274,7 @@ private:
         void await_resume() const noexcept {}
 
     private:
-        entry& entry_;
+        std::shared_ptr<entry> entry_sp_;
     };
 
 public:
@@ -323,15 +327,17 @@ public:
         coro::task<std::unique_ptr<Value>> release() {
             if (!entry_) co_return nullptr;
 
+            bool already = entry_->release_requested_.exchange(
+                true, std::memory_order_acq_rel);
+            if (already) co_return nullptr;
+
             auto state = internals_.lock();
             if (state) {
                 state->remove_from_index(entry_.get());
             }
 
-            entry_->release_requested_.store(true, std::memory_order_release);
-
             if (entry_->refcount_.load(std::memory_order_acquire) > 1) {
-                co_await release_awaitable(*entry_);
+                co_await release_awaitable(entry_);
             }
 
             auto value = std::move(entry_->value_);
@@ -481,81 +487,90 @@ private:
         ensure_sweep_running();
 
         auto& s = state_->shard_for(key);
-        std::shared_ptr<entry> e;
-        bool i_am_constructor = false;
 
-        {
-            std::lock_guard lock(s.mutex);
-            auto it = s.map.find(key);
+        for (;;) {
+            std::shared_ptr<entry> e;
+            bool i_am_constructor = false;
+            std::shared_ptr<entry> stale;
 
-            if (it != s.map.end()) {
-                e = it->second;
-                auto st = e->state_.load(std::memory_order_acquire);
-
-                if (st == entry::state::ready) {
-                    if (!is_ttl_expired(e.get())) {
-                        e->refcount_.fetch_add(1, std::memory_order_relaxed);
-                        s.reclaim_unlink(e.get());
-                        co_return borrow(std::move(e), state_);
-                    }
-                    e->force_evict_.store(true, std::memory_order_release);
-                    s.reclaim_unlink(e.get());
-                    s.map.erase(it);
-                    e.reset();
-                } else if (st == entry::state::failed) {
-                    s.map.erase(it);
-                    e.reset();
-                }
-                // state::constructing: e is set, will wait below
-            }
-
-            if (!e) {
-                e = std::make_shared<entry>();
-                e->key_ = key;
-                e->shard_index_ = static_cast<size_t>(&s - state_->shards_.get());
-                e->ttl_ = ttl;
-                s.map[key] = e;
-                i_am_constructor = true;
-            }
-        }
-
-        if (!i_am_constructor) {
-            co_await e->ready_event_.wait();
-
-            auto st = e->state_.load(std::memory_order_acquire);
-            if (st == entry::state::ready) {
-                {
-                    std::lock_guard lock(s.mutex);
-                    e->refcount_.fetch_add(1, std::memory_order_relaxed);
-                    s.reclaim_unlink(e.get());
-                }
-                co_return borrow(std::move(e), state_);
-            }
-            if (e->error_) {
-                std::rethrow_exception(e->error_);
-            }
-            throw std::runtime_error("object_cache: construction failed");
-        }
-
-        try {
-            auto value = co_await std::forward<Ctor>(ctor)();
-            e->value_ = std::make_unique<Value>(std::move(value));
-            e->refcount_.fetch_add(1, std::memory_order_relaxed);
-            e->state_.store(entry::state::ready, std::memory_order_release);
-            e->ready_event_.set();
-            co_return borrow(std::move(e), state_);
-        } catch (...) {
-            e->error_ = std::current_exception();
-            e->state_.store(entry::state::failed, std::memory_order_release);
-            e->ready_event_.set();
             {
                 std::lock_guard lock(s.mutex);
                 auto it = s.map.find(key);
-                if (it != s.map.end() && it->second == e) {
-                    s.map.erase(it);
+
+                if (it != s.map.end()) {
+                    e = it->second;
+                    auto st = e->state_.load(std::memory_order_acquire);
+
+                    if (st == entry::state::ready) {
+                        if (!is_ttl_expired(e.get())) {
+                            e->refcount_.fetch_add(1, std::memory_order_relaxed);
+                            s.reclaim_unlink(e.get());
+                            co_return borrow(std::move(e), state_);
+                        }
+                        e->force_evict_.store(true, std::memory_order_release);
+                        s.reclaim_unlink(e.get());
+                        stale = std::move(it->second);
+                        s.map.erase(it);
+                        e.reset();
+                    } else if (st == entry::state::failed) {
+                        stale = std::move(it->second);
+                        s.map.erase(it);
+                        e.reset();
+                    }
+                }
+
+                if (!e) {
+                    e = std::make_shared<entry>();
+                    e->key_ = key;
+                    e->shard_index_ = static_cast<size_t>(&s - state_->shards_.get());
+                    e->ttl_ = ttl;
+                    s.map[key] = e;
+                    i_am_constructor = true;
                 }
             }
-            throw;
+
+            if (!i_am_constructor) {
+                co_await e->ready_event_.wait();
+
+                auto st = e->state_.load(std::memory_order_acquire);
+                if (st == entry::state::ready) {
+                    {
+                        std::lock_guard lock(s.mutex);
+                        auto it = s.map.find(key);
+                        if (it == s.map.end() || it->second.get() != e.get()) {
+                            continue;
+                        }
+                        e->refcount_.fetch_add(1, std::memory_order_relaxed);
+                        s.reclaim_unlink(e.get());
+                    }
+                    co_return borrow(std::move(e), state_);
+                }
+                if (e->error_) {
+                    std::rethrow_exception(e->error_);
+                }
+                throw std::runtime_error("object_cache: construction failed");
+            }
+
+            try {
+                auto value = co_await std::forward<Ctor>(ctor)();
+                e->value_ = std::make_unique<Value>(std::move(value));
+                e->refcount_.fetch_add(1, std::memory_order_relaxed);
+                e->state_.store(entry::state::ready, std::memory_order_release);
+                e->ready_event_.set();
+                co_return borrow(std::move(e), state_);
+            } catch (...) {
+                e->error_ = std::current_exception();
+                e->state_.store(entry::state::failed, std::memory_order_release);
+                e->ready_event_.set();
+                {
+                    std::lock_guard lock(s.mutex);
+                    auto it = s.map.find(key);
+                    if (it != s.map.end() && it->second == e) {
+                        s.map.erase(it);
+                    }
+                }
+                throw;
+            }
         }
     }
 

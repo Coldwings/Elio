@@ -20,6 +20,7 @@ option(ELIO_ENABLE_RDMA "Enable RDMA-Core abstraction layer (header-only; user s
 option(ELIO_ENABLE_RDMA_CM "Enable optional librdmacm-backed CM helper (requires librdmacm)" OFF)
 option(ELIO_ENABLE_RDMA_IBVERBS "Enable optional libibverbs backend + cq_drain helper + endpoint wrapper (requires libibverbs)" OFF)
 option(ELIO_ENABLE_RDMA_IBVERBS_TESTS "Build the libibverbs-backed RDMA integration test (requires libibverbs + rxe at runtime)" OFF)
+option(ELIO_ENABLE_RDMA_CUDA "Enable CUDA GPUDirect RDMA helpers (requires CUDA Toolkit + elio_rdma_ibverbs)" OFF)
 option(ELIO_ENABLE_DEVELOPER_WARNINGS "Enable strict warning flags for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_WARNINGS_AS_ERRORS "Treat warnings as errors for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_DEBUG_METADATA "Enable coroutine debug metadata" ON)
@@ -256,6 +257,23 @@ endif()
 if(ELIO_ENABLE_RDMA_IBVERBS_TESTS)
     message(STATUS "RDMA ibverbs integration tests enabled "
                    "(linking ${ELIO_IBVERBS_LIB})")
+endif()
+
+if(ELIO_ENABLE_RDMA_CUDA)
+    if(NOT TARGET elio_rdma_ibverbs)
+        message(FATAL_ERROR
+            "ELIO_ENABLE_RDMA_CUDA=ON requires ELIO_ENABLE_RDMA_IBVERBS=ON")
+    endif()
+    find_package(CUDAToolkit REQUIRED)
+    add_library(elio_rdma_cuda INTERFACE)
+    target_include_directories(elio_rdma_cuda INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_link_libraries(elio_rdma_cuda INTERFACE
+        elio_rdma_ibverbs CUDA::cudart)
+    target_compile_definitions(elio_rdma_cuda INTERFACE ELIO_HAS_RDMA_CUDA=1)
+    message(STATUS "RDMA CUDA GPUDirect helpers enabled")
 endif()
 
 if(ELIO_ENABLE_RDMA_CM)

@@ -64,7 +64,10 @@ public:
     // already returned from its wait loop without picking up the new task).
     // After shutdown() returns, submit() will reject all further submissions.
     void shutdown() {
-        if (stopped_.exchange(true, std::memory_order_acq_rel)) return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopped_.exchange(true, std::memory_order_release)) return;
+        }
         cv_.notify_all();
         for (auto& t : threads_) {
             if (t.joinable()) t.join();

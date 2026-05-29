@@ -54,6 +54,7 @@
 
 // Synchronization primitives
 #include "sync/primitives.hpp"
+#include "sync/object_cache.hpp"
 
 // Logging
 #include "log/logger.hpp"

@@ -864,8 +864,68 @@ The autoscaler supports:
 - **Actions**: `scale_up`, `scale_down`, `log`, `null`
 - **Combinators**: `on_success`, `on_failure`
 
+## RDMA Ping-Pong (Mock Backend)
+
+A single-process SEND/RECV ping-pong using a mock backend — no RDMA hardware required. Demonstrates `connection`, `dispatcher`, `cq_pump`, and `wc_result`. See [`examples/rdma_pingpong_mock.cpp`](../examples/rdma_pingpong_mock.cpp).
+
+```cpp
+// Abridged — see full source for mock_backend and mock_qp wiring.
+#include <elio/elio.hpp>
+#include <elio/rdma/rdma.hpp>
+
+using elio::rdma::connection;
+using elio::rdma::buffer_view;
+
+// A side: send "ping N", await echoed reply.
+elio::coro::task<void> ping_side(connection<mock_backend>& conn) {
+    std::vector<char> tx(128), rx(128);
+    for (int i = 0; i < 16; ++i) {
+        auto recv_aw = conn.recv(buffer_view{rx.data(), rx.size(), 0});
+        std::string msg = "ping " + std::to_string(i);
+        std::memcpy(tx.data(), msg.data(), msg.size());
+        co_await conn.send(buffer_view{tx.data(), msg.size(), 0});
+        auto wc = co_await recv_aw;
+        // wc.byte_len tells us how much was echoed
+    }
+}
+```
+
+Build: `cmake -B build -DELIO_ENABLE_RDMA=ON && cmake --build build --target rdma_pingpong_mock`
+
+## RDMA Request/Response (ibverbs + CM)
+
+Client sends a request via SEND, server writes the response with RDMA WRITE and signals completion with SEND_WITH_IMM. Uses `endpoint`, `acceptor`, `connect` from `elio::rdma_ibverbs`. Requires a working uverbs ABI (Soft-RoCE / real HCA). See [`examples/rdma_req_resp_ibverbs.cpp`](../examples/rdma_req_resp_ibverbs.cpp).
+
+```cpp
+// Abridged client side — see full source for the server.
+#include <elio/rdma/rdma.hpp>
+#include <elio/rdma_cm/rdma_cm.hpp>
+#include <elio/rdma_ibverbs/rdma_ibverbs.hpp>
+
+elio::coro::task<void> client(elio::runtime::scheduler& sched) {
+    elio::rdma_cm::event_channel cm_ch;
+    auto ep = co_await elio::rdma_ibverbs::connect(
+        cm_ch, dst_addr, sizeof(*dst_addr),
+        {.max_send_wr = 4, .max_recv_wr = 4});
+    ep.start_cq_pump(sched);
+
+    auto req_mr  = ep.register_buffer(req_buf, sizeof(req_buf), IBV_ACCESS_LOCAL_WRITE);
+    auto resp_mr = ep.register_buffer(resp_buf, sizeof(resp_buf),
+                                      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+
+    // Post recv for OOB notify BEFORE sending the request.
+    auto notify_aw = ep.conn().recv(notify_mr.view());
+    co_await ep.conn().send(req_mr.view(0, sizeof(request_header)));
+    auto wc = co_await notify_aw;
+    // wc.imm_data carries the response length
+}
+```
+
+Build: `cmake -B build -DELIO_ENABLE_RDMA=ON -DELIO_ENABLE_RDMA_CM=ON -DELIO_ENABLE_RDMA_IBVERBS=ON && cmake --build build --target rdma_req_resp_ibverbs`
+
 ## See Also
 
+- [[RDMA-Guide]] - Full RDMA abstraction layer guide
 - [[Signal-Handling]] - Detailed guide on signal handling with signalfd
 - [[RPC-Framework]] - RPC system documentation
 - [[Hash-Functions]] - Hash function documentation

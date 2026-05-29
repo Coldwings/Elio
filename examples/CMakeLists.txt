@@ -135,3 +135,21 @@ if(TARGET elio_http)
     target_link_libraries(sse_client PRIVATE elio_http)
     target_link_options(sse_client PRIVATE ${STATIC_LINK_FLAGS})
 endif()
+
+# RDMA mock-backend pingpong (requires elio_rdma).
+if(TARGET elio_rdma)
+    add_executable(rdma_pingpong_mock rdma_pingpong_mock.cpp)
+    target_link_libraries(rdma_pingpong_mock PRIVATE elio_rdma)
+    target_link_options(rdma_pingpong_mock PRIVATE ${STATIC_LINK_FLAGS})
+endif()
+
+# RDMA req/resp using endpoint + IMM (needs both ibverbs + CM helpers).
+if(TARGET elio_rdma_ibverbs AND TARGET elio_rdma_cm)
+    add_executable(rdma_req_resp_ibverbs rdma_req_resp_ibverbs.cpp)
+    target_link_libraries(rdma_req_resp_ibverbs PRIVATE elio_rdma_ibverbs)
+    target_link_options(rdma_req_resp_ibverbs PRIVATE ${STATIC_LINK_FLAGS})
+
+    add_executable(rdma_perf rdma_perf.cpp)
+    target_link_libraries(rdma_perf PRIVATE elio_rdma_ibverbs)
+    target_link_options(rdma_perf PRIVATE ${STATIC_LINK_FLAGS})
+endif()

@@ -64,6 +64,41 @@ if(TARGET elio_tls)
     )
 endif()
 
+# RDMA abstraction tests (only when ELIO_ENABLE_RDMA=ON).
+# Header-only; no extra libraries required for the dispatcher / op_state
+# slice — the mock backend (S3+) and any real ibverbs backend are
+# user-side, never built into elio_tests.
+if(TARGET elio_rdma)
+    list(APPEND TEST_SOURCES
+        unit/test_rdma_dispatcher.cpp
+        unit/test_rdma_polymorphic_backend.cpp
+        unit/test_rdma_send_recv.cpp
+        unit/test_rdma_one_sided.cpp
+        unit/test_rdma_sge.cpp
+        unit/test_rdma_inline.cpp
+        unit/test_rdma_srq.cpp
+        unit/test_rdma_memory_region.cpp
+        unit/test_rdma_cq_pump.cpp
+        unit/test_rdma_imm.cpp
+        unit/test_rdma_atomic.cpp
+    )
+endif()
+
+# elio_rdma_cm tests (S8). Requires librdmacm at compile + link.
+if(TARGET elio_rdma_cm)
+    list(APPEND TEST_SOURCES
+        unit/test_rdma_cm.cpp
+    )
+endif()
+
+# elio_rdma_ibverbs endpoint smoke tests (S13). Requires libibverbs
+# at compile + link.
+if(TARGET elio_rdma_ibverbs)
+    list(APPEND TEST_SOURCES
+        unit/test_rdma_ibverbs_endpoint.cpp
+    )
+endif()
+
 # Standard test executable
 add_executable(elio_tests ${TEST_SOURCES})
 target_link_libraries(elio_tests PRIVATE elio Catch2::Catch2WithMain)
@@ -72,6 +107,12 @@ if(TARGET elio_tls)
 endif()
 if(TARGET nghttp2_static)
     target_link_libraries(elio_tests PRIVATE nghttp2_static)
+endif()
+if(TARGET elio_rdma_cm)
+    target_link_libraries(elio_tests PRIVATE elio_rdma_cm)
+endif()
+if(TARGET elio_rdma_ibverbs)
+    target_link_libraries(elio_tests PRIVATE elio_rdma_ibverbs)
 endif()
 target_compile_definitions(elio_tests PRIVATE ELIO_DEBUG)
 
@@ -83,6 +124,12 @@ if(TARGET elio_tls)
 endif()
 if(TARGET nghttp2_static)
     target_link_libraries(elio_tests_asan PRIVATE nghttp2_static)
+endif()
+if(TARGET elio_rdma_cm)
+    target_link_libraries(elio_tests_asan PRIVATE elio_rdma_cm)
+endif()
+if(TARGET elio_rdma_ibverbs)
+    target_link_libraries(elio_tests_asan PRIVATE elio_rdma_ibverbs)
 endif()
 target_compile_options(elio_tests_asan PRIVATE -fsanitize=address -g -fno-omit-frame-pointer)
 target_link_options(elio_tests_asan PRIVATE -fsanitize=address)
@@ -96,6 +143,12 @@ if(TARGET elio_tls)
 endif()
 if(TARGET nghttp2_static)
     target_link_libraries(elio_tests_tsan PRIVATE nghttp2_static)
+endif()
+if(TARGET elio_rdma_cm)
+    target_link_libraries(elio_tests_tsan PRIVATE elio_rdma_cm)
+endif()
+if(TARGET elio_rdma_ibverbs)
+    target_link_libraries(elio_tests_tsan PRIVATE elio_rdma_ibverbs)
 endif()
 target_compile_options(elio_tests_tsan PRIVATE -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan)
 target_link_options(elio_tests_tsan PRIVATE -fsanitize=thread)
@@ -117,6 +170,25 @@ include(Catch)
 catch_discover_tests(elio_tests)
 catch_discover_tests(elio_tests_asan)
 catch_discover_tests(elio_tests_tsan)
+
+# Optional libibverbs-backed RDMA integration test (S10). The binary
+# is separate so linking libibverbs is opt-in and devices without
+# rxe simply skip the test rather than failing the build. Discovered
+# here so that `include(Catch)` from earlier in this file is in
+# scope.
+if(ELIO_ENABLE_RDMA_IBVERBS_TESTS AND TARGET elio_rdma_ibverbs)
+    add_executable(elio_rdma_integration_tests
+        test_main.cpp
+        integration_rdma/test_rdma_rxe_loopback.cpp
+    )
+    target_link_libraries(elio_rdma_integration_tests PRIVATE
+        elio_rdma_ibverbs Catch2::Catch2WithMain)
+    target_compile_definitions(elio_rdma_integration_tests PRIVATE ELIO_DEBUG)
+    catch_discover_tests(elio_rdma_integration_tests)
+elseif(ELIO_ENABLE_RDMA_IBVERBS_TESTS)
+    message(FATAL_ERROR
+        "ELIO_ENABLE_RDMA_IBVERBS_TESTS=ON requires ELIO_ENABLE_RDMA_IBVERBS=ON")
+endif()
 
 # Add custom targets for convenience
 add_custom_target(test_all

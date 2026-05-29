@@ -16,6 +16,10 @@ option(ELIO_BUILD_EXAMPLES "Build Elio examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_TLS "Enable TLS support (requires OpenSSL)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_HTTP "Enable HTTP client/server support (requires TLS)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_HTTP2 "Enable HTTP/2 support (requires nghttp2)" ${ELIO_IS_TOP_LEVEL})
+option(ELIO_ENABLE_RDMA "Enable RDMA-Core abstraction layer (header-only; user supplies ibverbs backend)" OFF)
+option(ELIO_ENABLE_RDMA_CM "Enable optional librdmacm-backed CM helper (requires librdmacm)" OFF)
+option(ELIO_ENABLE_RDMA_IBVERBS "Enable optional libibverbs backend + cq_drain helper + endpoint wrapper (requires libibverbs)" OFF)
+option(ELIO_ENABLE_RDMA_IBVERBS_TESTS "Build the libibverbs-backed RDMA integration test (requires libibverbs + rxe at runtime)" OFF)
 option(ELIO_ENABLE_DEVELOPER_WARNINGS "Enable strict warning flags for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_WARNINGS_AS_ERRORS "Treat warnings as errors for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_DEBUG_METADATA "Enable coroutine debug metadata" ON)
@@ -157,6 +161,145 @@ elseif(NOT ELIO_ENABLE_HTTP)
     message(STATUS "HTTP support disabled (ELIO_ENABLE_HTTP=OFF)")
 endif()
 
+# RDMA-Core abstraction (header-only, optional)
+#
+# Elio's RDMA layer is a thin protocol-agnostic abstraction over RDMA-Core
+# verbs. It does NOT depend on libibverbs or librdmacm itself — users plug
+# in their own backend (via template traits or the polymorphic_backend
+# pure-virtual class) and link those libraries themselves. This keeps
+# Elio header-only and lets consumers choose between libibverbs, a mock
+# backend (for tests), or any other implementation that satisfies the
+# elio::rdma::backend_traits concept.
+#
+# A separate elio_rdma_cm target (Stage 8) will provide an optional
+# librdmacm-backed connection helper; it is not built by this option.
+if(ELIO_ENABLE_RDMA)
+    add_library(elio_rdma INTERFACE)
+    target_include_directories(elio_rdma INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_link_libraries(elio_rdma INTERFACE elio)
+    target_compile_definitions(elio_rdma INTERFACE ELIO_HAS_RDMA=1)
+    message(STATUS "RDMA core abstraction enabled (header-only; bring your own ibverbs backend)")
+else()
+    message(STATUS "RDMA support disabled (ELIO_ENABLE_RDMA=OFF)")
+endif()
+
+# Optional librdmacm-backed CM helper (Stage 8).
+#
+# Adds the elio_rdma_cm INTERFACE target that links librdmacm and
+# exposes a TCP-style listen / connect surface that hands an
+# established ibv_qp* back to elio::rdma::connection for the data
+# path. Unlike elio_rdma itself, this DOES link a system library —
+# the user opts in by setting ELIO_ENABLE_RDMA_CM=ON. We try
+# pkg-config first, then fall back to find_library so packages that
+# ship librdmacm without a .pc file still work.
+# Optional libibverbs lookup, shared by ELIO_ENABLE_RDMA_IBVERBS
+# (the public backend / cq_drain / endpoint module) and
+# ELIO_ENABLE_RDMA_IBVERBS_TESTS (the integration test binary).
+# Same detection pattern as librdmacm: pkg-config first,
+# find_library fallback.
+set(_IBVERBS_LIB "")
+set(_IBVERBS_INC "")
+if(ELIO_ENABLE_RDMA_IBVERBS OR ELIO_ENABLE_RDMA_IBVERBS_TESTS)
+    if(NOT TARGET elio_rdma)
+        message(FATAL_ERROR
+            "ELIO_ENABLE_RDMA_IBVERBS / _TESTS=ON requires ELIO_ENABLE_RDMA=ON")
+    endif()
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(IBVERBS QUIET libibverbs)
+        if(IBVERBS_FOUND)
+            set(_IBVERBS_LIB "${IBVERBS_LIBRARIES}")
+            set(_IBVERBS_INC "${IBVERBS_INCLUDE_DIRS}")
+        endif()
+    endif()
+    if(NOT _IBVERBS_LIB)
+        find_library(_IBVERBS_LIB_FALLBACK ibverbs)
+        find_path(_IBVERBS_INC_FALLBACK infiniband/verbs.h)
+        if(_IBVERBS_LIB_FALLBACK AND _IBVERBS_INC_FALLBACK)
+            set(_IBVERBS_LIB "${_IBVERBS_LIB_FALLBACK}")
+            set(_IBVERBS_INC "${_IBVERBS_INC_FALLBACK}")
+        endif()
+    endif()
+    if(NOT _IBVERBS_LIB)
+        message(FATAL_ERROR
+            "ELIO_ENABLE_RDMA_IBVERBS / _TESTS=ON but libibverbs was not found.")
+    endif()
+    set(ELIO_IBVERBS_LIB "${_IBVERBS_LIB}" CACHE INTERNAL
+        "libibverbs link spec")
+    set(ELIO_IBVERBS_INC "${_IBVERBS_INC}" CACHE INTERNAL
+        "libibverbs include dir")
+endif()
+
+# elio_rdma_ibverbs INTERFACE target: public libibverbs-backed
+# backend + cq_drain helper + endpoint wrapper (S12-S13).
+if(ELIO_ENABLE_RDMA_IBVERBS)
+    add_library(elio_rdma_ibverbs INTERFACE)
+    target_include_directories(elio_rdma_ibverbs INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+    if(ELIO_IBVERBS_INC)
+        target_include_directories(elio_rdma_ibverbs INTERFACE ${ELIO_IBVERBS_INC})
+    endif()
+    target_link_libraries(elio_rdma_ibverbs INTERFACE elio_rdma ${ELIO_IBVERBS_LIB})
+    target_compile_definitions(elio_rdma_ibverbs INTERFACE ELIO_HAS_RDMA_IBVERBS=1)
+    # If the CM helper is also enabled, the endpoint wrapper becomes
+    # active and needs to pull in librdmacm transitively.
+    if(TARGET elio_rdma_cm)
+        target_link_libraries(elio_rdma_ibverbs INTERFACE elio_rdma_cm)
+    endif()
+    message(STATUS "RDMA ibverbs module enabled (linking ${ELIO_IBVERBS_LIB})")
+endif()
+if(ELIO_ENABLE_RDMA_IBVERBS_TESTS)
+    message(STATUS "RDMA ibverbs integration tests enabled "
+                   "(linking ${ELIO_IBVERBS_LIB})")
+endif()
+
+if(ELIO_ENABLE_RDMA_CM)
+    if(NOT TARGET elio_rdma)
+        message(FATAL_ERROR
+            "ELIO_ENABLE_RDMA_CM=ON requires ELIO_ENABLE_RDMA=ON")
+    endif()
+    find_package(PkgConfig QUIET)
+    set(_RDMACM_LIB "")
+    set(_RDMACM_INC "")
+    if(PkgConfig_FOUND)
+        pkg_check_modules(RDMACM QUIET librdmacm)
+        if(RDMACM_FOUND)
+            set(_RDMACM_LIB "${RDMACM_LIBRARIES}")
+            set(_RDMACM_INC "${RDMACM_INCLUDE_DIRS}")
+        endif()
+    endif()
+    if(NOT _RDMACM_LIB)
+        find_library(_RDMACM_LIB_FALLBACK rdmacm)
+        find_path(_RDMACM_INC_FALLBACK rdma/rdma_cma.h)
+        if(_RDMACM_LIB_FALLBACK AND _RDMACM_INC_FALLBACK)
+            set(_RDMACM_LIB "${_RDMACM_LIB_FALLBACK}")
+            set(_RDMACM_INC "${_RDMACM_INC_FALLBACK}")
+        endif()
+    endif()
+    if(NOT _RDMACM_LIB)
+        message(FATAL_ERROR
+            "ELIO_ENABLE_RDMA_CM=ON but librdmacm was not found "
+            "(checked pkg-config librdmacm and find_library(rdmacm)). "
+            "Install librdmacm-dev or set CMAKE_PREFIX_PATH.")
+    endif()
+    add_library(elio_rdma_cm INTERFACE)
+    target_include_directories(elio_rdma_cm INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+    if(_RDMACM_INC)
+        target_include_directories(elio_rdma_cm INTERFACE ${_RDMACM_INC})
+    endif()
+    target_link_libraries(elio_rdma_cm INTERFACE elio_rdma ${_RDMACM_LIB})
+    target_compile_definitions(elio_rdma_cm INTERFACE ELIO_HAS_RDMA_CM=1)
+    message(STATUS "RDMA CM helper enabled (linking ${_RDMACM_LIB})")
+endif()
+
 # Testing
 if(ELIO_BUILD_TESTS)
     enable_testing()
@@ -180,6 +323,15 @@ if(TARGET elio_http)
 endif()
 if(TARGET elio_http2)
     list(APPEND ELIO_EXPORT_TARGETS elio_http2)
+endif()
+if(TARGET elio_rdma)
+    list(APPEND ELIO_EXPORT_TARGETS elio_rdma)
+endif()
+if(TARGET elio_rdma_cm)
+    list(APPEND ELIO_EXPORT_TARGETS elio_rdma_cm)
+endif()
+if(TARGET elio_rdma_ibverbs)
+    list(APPEND ELIO_EXPORT_TARGETS elio_rdma_ibverbs)
 endif()
 
 set(ELIO_PACKAGE_NEEDS_OPENSSL OFF)

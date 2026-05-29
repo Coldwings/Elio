@@ -193,6 +193,10 @@ private:
                         std::lock_guard lock(s.mutex);
                         std::vector<Key> evict_keys;
                         for (auto& [k, e] : s.map) {
+                            if (e->state_.load(std::memory_order_acquire)
+                                != entry::state::ready) {
+                                continue;
+                            }
                             auto entry_ttl_ns2 = e->ttl_.count() > 0
                                 ? std::chrono::duration_cast<std::chrono::nanoseconds>(e->ttl_).count()
                                 : default_ttl_ns;

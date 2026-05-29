@@ -69,6 +69,10 @@ namespace elio::rdma_ibverbs { /* endpoint API not available */ }
 #include <thread>
 #include <utility>
 
+#if defined(ELIO_HAS_RDMA_CUDA) && ELIO_HAS_RDMA_CUDA
+#include <elio/rdma_cuda/gpu_memory_region.hpp>
+#endif
+
 namespace elio::rdma_ibverbs {
 
 /// Per-endpoint creation knobs. Most users only touch the cap fields.
@@ -253,6 +257,13 @@ public:
     void stop_cq_pump() noexcept {
         if (pump_state_) pump_cancel_.cancel();
     }
+
+#if defined(ELIO_HAS_RDMA_CUDA) && ELIO_HAS_RDMA_CUDA
+    [[nodiscard]] elio::rdma_cuda::gpu_memory_region
+    register_gpu_buffer(std::size_t size, int access) {
+        return elio::rdma_cuda::gpu_memory_region{pd_, size, access};
+    }
+#endif
 
     /// Raw resource accessors for users who need to dip into the
     /// underlying ibverbs / rdma_cm surface.

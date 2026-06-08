@@ -8,6 +8,7 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <variant>
 
 #include "task.hpp"
 #include "../runtime/spawn.hpp"

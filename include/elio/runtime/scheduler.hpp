@@ -15,7 +15,9 @@
 #include <chrono>
 #include <coroutine>
 #include <thread>
+#include <algorithm>
 #include <functional>
+#include <vector>
 
 namespace elio::runtime {
 
@@ -176,6 +178,16 @@ public:
             workers_[i]->drain_remaining_tasks();
         }
 
+        // Stop and join any draining workers left from prior shrink operations.
+        {
+            std::lock_guard<std::mutex> lock(workers_mutex_);
+            for (auto& [w, t] : draining_workers_) {
+                w->stop();
+                if (t.joinable()) t.join();
+            }
+            draining_workers_.clear();
+        }
+
         // Wake any threads still parked in wait_for_idle so they can observe
         // the !running_ state and bail out promptly.
         {
@@ -293,161 +305,38 @@ public:
     }
 
     /// High-level API: fire-and-forget, spawn to this scheduler
-    /// @param f  Callable that returns a task<T>
-    /// @param args  Arguments to forward to the callable
-    ///
-    /// Note: f and args are safely stored in a wrapper coroutine's frame,
-    /// so temporary lambdas with captures are safe to use.
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
     void go(F&& f, Args&&... args) {
-        // Create independent vthread_stack for spawned coroutine
-        auto* new_vstack = new coro::vthread_stack();
-        
-        // Save current vstack context and switch to new one
-        auto* old_vstack = coro::vthread_stack::current();
-        coro::vthread_stack::set_current(new_vstack);
-        
-        // Create wrapper coroutine - f and args are stored in wrapper's frame
-        // This ensures lambda captures remain valid for the entire coroutine lifetime
-        auto wrapper = detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
-
-        // Restore previous vstack context
-        coro::vthread_stack::set_current(old_vstack);
-
-        auto handle = coro::detail::task_access::release(wrapper);
-        handle.promise().detached_ = true;
-        handle.promise().set_vstack_owner(new_vstack);
-        // Detach from current thread's frame chain before spawning to another thread
-        // to avoid use-after-free when this thread creates another coroutine.
-        handle.promise().detach_from_parent();
-        // Mark tracked at spawn time, BEFORE do_spawn. Pairs with the
-        // promise destructor's on_spawn_completion_ callback for a
-        // balanced -1, regardless of whether the body ever resumes.
-        mark_tracked_(handle.promise());
-        do_spawn(handle);
+        do_go_<false, false>(0, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
     /// High-level API: fire-and-forget, spawn to specific worker
-    /// @param worker_id  Target worker index
-    /// @param f  Callable that returns a task<T>
-    /// @param args  Arguments to forward to the callable
-    ///
-    /// Note: f and args are safely stored in a wrapper coroutine's frame,
-    /// so temporary lambdas with captures are safe to use.
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
     void go_to(size_t worker_id, F&& f, Args&&... args) {
-        // Create independent vthread_stack for spawned coroutine
-        auto* new_vstack = new coro::vthread_stack();
-
-        // Save current vstack context and switch to new one
-        auto* old_vstack = coro::vthread_stack::current();
-        coro::vthread_stack::set_current(new_vstack);
-
-        // Create wrapper coroutine - f and args are stored in wrapper's frame
-        // This ensures lambda captures remain valid for the entire coroutine lifetime
-        auto wrapper = detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
-
-        // Restore previous vstack context
-        coro::vthread_stack::set_current(old_vstack);
-
-        auto handle = coro::detail::task_access::release(wrapper);
-        handle.promise().detached_ = true;
-        handle.promise().set_vstack_owner(new_vstack);
-        // Detach from current thread's frame chain before spawning to another thread
-        // to avoid use-after-free when this thread creates another coroutine.
-        handle.promise().detach_from_parent();
-        // See the comment in go() for why we track here, not in the body.
-        mark_tracked_(handle.promise());
-        spawn_to(worker_id, handle);
+        do_go_<false, true>(worker_id, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
     /// High-level API: spawn + join, spawn to this scheduler
-    /// @param f  Callable that returns a task<T>
-    /// @param args  Arguments to forward to the callable
-    /// @return join_handle<T> that can be awaited to get the result
-    ///
-    /// Note: f and args are safely stored in a wrapper coroutine's frame,
-    /// so temporary lambdas with captures are safe to use.
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
     auto go_joinable(F&& f, Args&&... args)
         -> coro::join_handle<detail::task_value_t<std::invoke_result_t<F, Args...>>>
     {
-        using T = detail::task_value_t<std::invoke_result_t<F, Args...>>;
-
-        // Create independent vthread_stack for spawned coroutine
-        auto* new_vstack = new coro::vthread_stack();
-
-        // Save current vstack context and switch to new one
-        auto* old_vstack = coro::vthread_stack::current();
-        coro::vthread_stack::set_current(new_vstack);
-
-        // Create wrapper coroutine - f and args are stored in wrapper's frame
-        // This ensures lambda captures remain valid for the entire coroutine lifetime
-        auto wrapper = detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
-
-        // Restore previous vstack context
-        coro::vthread_stack::set_current(old_vstack);
-
-        auto handle = coro::detail::task_access::release(wrapper);
-        auto state = std::make_shared<coro::detail::join_state<T>>();
-        handle.promise().join_state_ = state;
-        handle.promise().detached_ = true;  // Enable destruction notification
-        handle.promise().set_vstack_owner(new_vstack);
-        // Detach from current thread's frame chain before spawning to another thread
-        // to avoid use-after-free when this thread creates another coroutine.
-        handle.promise().detach_from_parent();
-        // See the comment in go() for why we track here, not in the body.
-        mark_tracked_(handle.promise());
-        do_spawn(handle);
-        return coro::join_handle<T>(std::move(state));
+        return do_go_<true, false>(0, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
     /// High-level API: spawn + join, pinned to a specific worker.
-    /// @param worker_id  Target worker index. Affinity is set on the spawned
-    ///                   vthread so it cannot be stolen to a different worker;
-    ///                   any I/O the body issues (e.g. sleep_for, recv) is
-    ///                   bound to that worker's io_context.
-    /// @param f  Callable that returns a task<T>
-    /// @param args  Arguments to forward to the callable
-    /// @return join_handle<T> that can be awaited to get the result
-    ///
-    /// Use this when the spawned task and its caller must share fate with
-    /// respect to thread-pool resizing — for example, a watchdog whose I/O
-    /// must be drained alongside the read loop it guards. With round-robin
-    /// `go_joinable`, autoscaler shrink can strand the watchdog on a
-    /// stopped worker while the caller still awaits its join handle.
+    /// Affinity is set so the task cannot be stolen; I/O is bound to that
+    /// worker's io_context. Use when spawned task and caller must share fate
+    /// w.r.t. thread-pool resizing.
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
     auto go_joinable_to(size_t worker_id, F&& f, Args&&... args)
         -> coro::join_handle<detail::task_value_t<std::invoke_result_t<F, Args...>>>
     {
-        using T = detail::task_value_t<std::invoke_result_t<F, Args...>>;
-
-        auto* new_vstack = new coro::vthread_stack();
-        auto* old_vstack = coro::vthread_stack::current();
-        coro::vthread_stack::set_current(new_vstack);
-
-        auto wrapper = detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
-
-        coro::vthread_stack::set_current(old_vstack);
-
-        auto handle = coro::detail::task_access::release(wrapper);
-        auto state = std::make_shared<coro::detail::join_state<T>>();
-        handle.promise().join_state_ = state;
-        handle.promise().detached_ = true;
-        handle.promise().set_vstack_owner(new_vstack);
-        // Pin to the requested worker so subsequent steals re-route back to
-        // it. spawn_to() handles the initial dispatch and falls back to
-        // round-robin if the worker is no longer accepting work.
-        handle.promise().set_affinity(worker_id);
-        handle.promise().detach_from_parent();
-        // See the comment in go() for why we track here, not in the body.
-        mark_tracked_(handle.promise());
-        spawn_to(worker_id, handle);
-        return coro::join_handle<T>(std::move(state));
+        return do_go_<true, true>(worker_id, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle) {
@@ -555,14 +444,6 @@ public:
             // them. If a worker is stopped while it has pending I/O (e.g. a
             // coroutine suspended on co_await recv()), the io_context is no
             // longer polled and those coroutines never resume — silent leak.
-            //
-            // The doomed workers are still running here, so they continue to
-            // poll their own io_contexts and resume coroutines normally; the
-            // resumed coroutines re-enter the scheduler via spawn(), which now
-            // routes them to the still-active workers (num_threads_ already
-            // reflects the new lower count). We just have to wait for that to
-            // reach steady state. A bounded timeout protects against pathologic
-            // cases where pending I/O never resolves.
             constexpr auto io_drain_timeout = std::chrono::seconds(5);
             constexpr auto poll_interval = std::chrono::milliseconds(1);
             auto deadline = std::chrono::steady_clock::now() + io_drain_timeout;
@@ -578,14 +459,22 @@ public:
                 std::this_thread::sleep_for(poll_interval);
             }
 
-            // Stop the workers that are being removed
-            for (size_t i = count; i < old_count; ++i) {
-                workers_[i]->stop();
-            }
+            // Join any previously-draining workers that have finished.
+            reap_draining_workers_();
 
-            // Redistribute remaining tasks to active workers
             for (size_t i = count; i < old_count; ++i) {
-                workers_[i]->redistribute_tasks(this);
+                if (workers_[i]->io_context().pending_count() == 0) {
+                    // Fully drained — stop immediately.
+                    workers_[i]->stop();
+                    workers_[i]->redistribute_tasks(this);
+                } else {
+                    // Still has pending I/O — enter draining mode. The worker
+                    // continues polling its io_context and self-exits when
+                    // pending_count() reaches 0.
+                    workers_[i]->enter_draining_mode();
+                    std::thread t = workers_[i]->detach_thread();
+                    draining_workers_.emplace_back(std::move(workers_[i]), std::move(t));
+                }
             }
         }
     }
@@ -650,6 +539,67 @@ private:
         p.on_spawn_completion_ = +[](void* self) noexcept {
             static_cast<scheduler*>(self)->on_task_completed();
         };
+    }
+
+    template<bool Joinable, bool Pinned, typename F, typename... Args>
+    auto do_go_(size_t worker_id, F&& f, Args&&... args) {
+        using ResultTask = std::invoke_result_t<F, Args...>;
+        using T = detail::task_value_t<ResultTask>;
+
+        auto* new_vstack = new coro::vthread_stack();
+        auto* old_vstack = coro::vthread_stack::current();
+        coro::vthread_stack::set_current(new_vstack);
+
+        auto wrapper = [&] {
+            if constexpr (Joinable) {
+                return detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
+            } else {
+                return detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
+            }
+        }();
+
+        coro::vthread_stack::set_current(old_vstack);
+
+        auto handle = coro::detail::task_access::release(wrapper);
+        handle.promise().detached_ = true;
+        handle.promise().set_vstack_owner(new_vstack);
+        if constexpr (Pinned) {
+            handle.promise().set_affinity(worker_id);
+        }
+        handle.promise().detach_from_parent();
+
+        if constexpr (Joinable) {
+            auto state = std::make_shared<coro::detail::join_state<T>>();
+            handle.promise().join_state_ = state;
+            mark_tracked_(handle.promise());
+            if constexpr (Pinned) {
+                spawn_to(worker_id, handle);
+            } else {
+                do_spawn(handle);
+            }
+            return coro::join_handle<T>(std::move(state));
+        } else {
+            mark_tracked_(handle.promise());
+            if constexpr (Pinned) {
+                spawn_to(worker_id, handle);
+            } else {
+                do_spawn(handle);
+            }
+        }
+    }
+
+    void reap_draining_workers_() noexcept {
+        draining_workers_.erase(
+            std::remove_if(draining_workers_.begin(), draining_workers_.end(),
+                [](auto& entry) {
+                    auto& [w, t] = entry;
+                    if (!w->is_running()) {
+                        if (t.joinable()) t.join();
+                        return true;
+                    }
+                    return false;
+                }),
+            draining_workers_.end());
     }
 
     void do_spawn(std::coroutine_handle<> handle) {
@@ -735,6 +685,10 @@ private:
     mutable std::mutex idle_mutex_;
     mutable std::condition_variable idle_cv_;
 
+    // Workers that are draining pending I/O after a shrink operation.
+    // Protected by workers_mutex_.
+    std::vector<std::pair<std::unique_ptr<worker_thread>, std::thread>> draining_workers_;
+
     static inline thread_local scheduler* current_scheduler_ = nullptr;
 };
 
@@ -748,13 +702,25 @@ inline scheduler* get_current_scheduler() noexcept {
 
 inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
     if (!handle) return;
-    
+
     auto* sched = scheduler::current();
     if (sched && sched->is_running()) {
         sched->spawn(handle);
     } else {
-        // No scheduler - run synchronously. Task self-destructs via final_suspend.
-        if (!handle.done()) handle.resume();
+        static thread_local std::vector<std::coroutine_handle<>> trampoline_queue;
+        static thread_local bool trampoline_running = false;
+
+        trampoline_queue.push_back(handle);
+
+        if (!trampoline_running) {
+            trampoline_running = true;
+            struct trampoline_guard { ~trampoline_guard() { trampoline_running = false; } } guard;
+            while (!trampoline_queue.empty()) {
+                auto h = trampoline_queue.back();
+                trampoline_queue.pop_back();
+                if (!h.done()) h.resume();
+            }
+        }
     }
 }
 
@@ -821,15 +787,28 @@ inline void worker_thread::run() {
     // Set the current scheduler and worker for this thread
     scheduler::current_scheduler_ = scheduler_;
     current_worker_ = this;
-    
+
     while (running_.load(std::memory_order_relaxed)) {
+        if (draining_.load(std::memory_order_relaxed)) [[unlikely]] {
+            // Draining mode: only poll I/O, no new tasks or stealing.
+            // Redistribute any queued tasks, then wait for pending I/O to complete.
+            redistribute_tasks(scheduler_);
+            if (io_context_->pending_count() == 0 ||
+                std::chrono::steady_clock::now() >= draining_deadline_) {
+                running_.store(false, std::memory_order_release);
+                break;
+            }
+            io_context_->poll(std::chrono::milliseconds(50));
+            continue;
+        }
+
         if (scheduler_->is_paused()) [[unlikely]] {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        
+
         auto handle = get_next_task();
-        
+
         if (handle) {
             run_task(handle);
         } else {

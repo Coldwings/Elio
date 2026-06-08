@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <latch>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -18,16 +19,14 @@ public:
     explicit blocking_pool(size_t num_threads)
         : num_threads_(num_threads) {
         threads_.reserve(num_threads);
-        std::atomic<size_t> ready{0};
+        std::latch ready(static_cast<std::ptrdiff_t>(num_threads));
         for (size_t i = 0; i < num_threads; ++i) {
             threads_.emplace_back([this, &ready] {
-                ready.fetch_add(1, std::memory_order_release);
+                ready.count_down();
                 worker_loop();
             });
         }
-        while (ready.load(std::memory_order_acquire) < num_threads) {
-            std::this_thread::yield();
-        }
+        ready.wait();
     }
 
     ~blocking_pool() {

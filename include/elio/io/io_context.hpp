@@ -21,106 +21,120 @@ public:
         io_uring,     ///< Use io_uring (Linux 5.1+)
         epoll         ///< Use epoll (fallback)
     };
-    
+
     /// Constructor with auto-detection
-    /// Detects io_uring availability and falls back to epoll
     io_context() : io_context(backend_type::auto_detect) {}
-    
+
     /// Constructor with explicit backend selection
     explicit io_context(backend_type type) {
         switch (type) {
             case backend_type::auto_detect:
 #if ELIO_HAS_IO_URING
-                if (io_uring_backend::is_available()) {
-                    try {
-                        backend_ = std::make_unique<io_uring_backend>();
-                        backend_type_ = backend_type::io_uring;
-                        ELIO_LOG_INFO("io_context using io_uring backend (auto-detected)");
-                        return;
-                    } catch (const std::exception& e) {
-                        ELIO_LOG_WARNING("io_uring init failed: {}, falling back to epoll", e.what());
-                    }
-                }
-#endif
-                backend_ = std::make_unique<epoll_backend>();
+                ELIO_LOG_INFO("io_context using io_uring backend (auto-detected)");
+                backend_type_ = backend_type::io_uring;
+                return;
+#else
+                epoll_backend_ = std::make_unique<epoll_backend>();
                 backend_type_ = backend_type::epoll;
                 ELIO_LOG_INFO("io_context using epoll backend");
                 break;
-                
+#endif
+
             case backend_type::io_uring:
 #if ELIO_HAS_IO_URING
-                backend_ = std::make_unique<io_uring_backend>();
                 backend_type_ = backend_type::io_uring;
                 ELIO_LOG_INFO("io_context using io_uring backend (explicit)");
 #else
                 throw std::runtime_error("io_uring backend not available (not compiled with liburing)");
 #endif
                 break;
-                
+
             case backend_type::epoll:
-                backend_ = std::make_unique<epoll_backend>();
+#if ELIO_HAS_IO_URING
+                // io_uring direct-hold mode: epoll is unavailable, use io_uring instead.
+                backend_type_ = backend_type::io_uring;
+                ELIO_LOG_INFO("io_context using io_uring backend (epoll requested but unavailable)");
+#else
+                epoll_backend_ = std::make_unique<epoll_backend>();
                 backend_type_ = backend_type::epoll;
                 ELIO_LOG_INFO("io_context using epoll backend (explicit)");
+#endif
                 break;
         }
     }
-    
-    /// Destructor
+
     ~io_context() = default;
-    
-    // Non-copyable, movable
+
     io_context(const io_context&) = delete;
     io_context& operator=(const io_context&) = delete;
+#if ELIO_HAS_IO_URING
+    io_context(io_context&&) = delete;
+    io_context& operator=(io_context&&) = delete;
+#else
     io_context(io_context&&) = default;
     io_context& operator=(io_context&&) = default;
-    
-    /// Prepare an I/O operation
-    /// @param req The I/O request to prepare
-    /// @return true if prepared successfully
+#endif
+
     bool prepare(const io_request& req) {
-        return backend_->prepare(req);
-    }
-    
-    /// Submit all prepared operations
-    /// @return Number of operations submitted
-    int submit() {
-        return backend_->submit();
-    }
-    
-    /// Poll for completed I/O operations
-    /// @param timeout Maximum time to wait
-    /// @return Number of completions processed
-    int poll(std::chrono::milliseconds timeout = std::chrono::milliseconds(0)) {
-        return backend_->poll(timeout);
-    }
-    
-    /// Check if there are pending I/O operations
-    bool has_pending() const noexcept {
-        return backend_->has_pending();
-    }
-    
-    /// Get number of pending operations
-    size_t pending_count() const noexcept {
-        return backend_->pending_count();
-    }
-    
-    /// Cancel a pending operation
-    bool cancel(void* user_data) {
-        return backend_->cancel(user_data);
+#if ELIO_HAS_IO_URING
+        return uring_backend_.prepare(req);
+#else
+        return epoll_backend_->prepare(req);
+#endif
     }
 
-    /// Wake up a thread blocked in poll()
-    /// Called from external threads to interrupt blocking I/O wait
-    void notify() {
-        backend_->notify();
+    int submit() {
+#if ELIO_HAS_IO_URING
+        return uring_backend_.submit();
+#else
+        return epoll_backend_->submit();
+#endif
     }
-    
-    /// Get the active backend type
+
+    int poll(std::chrono::milliseconds timeout = std::chrono::milliseconds(0)) {
+#if ELIO_HAS_IO_URING
+        return uring_backend_.poll(timeout);
+#else
+        return epoll_backend_->poll(timeout);
+#endif
+    }
+
+    bool has_pending() const noexcept {
+#if ELIO_HAS_IO_URING
+        return uring_backend_.has_pending();
+#else
+        return epoll_backend_->has_pending();
+#endif
+    }
+
+    size_t pending_count() const noexcept {
+#if ELIO_HAS_IO_URING
+        return uring_backend_.pending_count();
+#else
+        return epoll_backend_->pending_count();
+#endif
+    }
+
+    bool cancel(void* user_data) {
+#if ELIO_HAS_IO_URING
+        return uring_backend_.cancel(user_data);
+#else
+        return epoll_backend_->cancel(user_data);
+#endif
+    }
+
+    void notify() {
+#if ELIO_HAS_IO_URING
+        uring_backend_.notify();
+#else
+        epoll_backend_->notify();
+#endif
+    }
+
     backend_type get_backend_type() const noexcept {
         return backend_type_;
     }
-    
-    /// Get backend type as string
+
     const char* get_backend_name() const noexcept {
         switch (backend_type_) {
             case backend_type::io_uring: return "io_uring";
@@ -128,97 +142,69 @@ public:
             default: return "unknown";
         }
     }
-    
-    /// Get the last I/O result (thread-local)
+
     static io_result get_last_result() noexcept {
 #if ELIO_HAS_IO_URING
-        // Check which backend produced the result
-        // For now, check io_uring first since it's preferred
-        auto result = io_uring_backend::get_last_result();
-        if (result.result != 0 || result.flags != 0) {
-            return result;
-        }
-#endif
+        return io_uring_backend::get_last_result();
+#else
         return epoll_backend::get_last_result();
+#endif
     }
-    
-    /// Run the event loop until stopped.
-    ///
-    /// Each iteration parks in ``poll(-1)`` (block until a completion or a
-    /// cross-thread ``notify()`` arrives), then re-reads @p stop_flag. There
-    /// is no idle sleep and no polling timeout cap — the eventfd-based wake
-    /// path (``notify()``) is responsible for unblocking the loop.
-    ///
-    /// **Stop contract**: callers MUST both store ``true`` into @p stop_flag
-    /// AND call ``notify()`` (or use ``stop(stop_flag)`` which does both)
-    /// so the parked ``poll(-1)`` wakes promptly. A bare flag store will
-    /// not be observed until the next unrelated I/O completion.
-    ///
-    /// @param stop_flag Atomic flag to signal stop.
+
     void run(std::atomic<bool>& stop_flag) {
         while (!stop_flag.load(std::memory_order_relaxed)) {
             poll(std::chrono::milliseconds(-1));
         }
     }
 
-    /// Stop a loop spinning in ``run(stop_flag)`` — flips the flag and
-    /// wakes the parked ``poll(-1)``. Safe to call from any thread.
     void stop(std::atomic<bool>& stop_flag) {
         stop_flag.store(true, std::memory_order_release);
         notify();
     }
 
-    /// Run the event loop for a specific duration.
-    ///
-    /// Blocks in ``poll(remaining)`` until the deadline elapses or no
-    /// operations are pending. The backend's ``poll`` natively handles
-    /// arbitrarily long timeouts (io_uring kernel timespec / epoll
-    /// timeout_ms), so no per-iteration cap is needed.
     void run_for(std::chrono::milliseconds duration) {
         auto end_time = std::chrono::steady_clock::now() + duration;
         while (std::chrono::steady_clock::now() < end_time) {
-            if (!has_pending()) {
-                break;  // No pending operations — nothing to wait on.
-            }
+            if (!has_pending()) break;
             auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                 end_time - std::chrono::steady_clock::now());
-            if (remaining.count() <= 0) {
-                break;
-            }
+            if (remaining.count() <= 0) break;
             poll(remaining);
         }
     }
 
-    /// Run until all pending operations complete.
-    ///
-    /// Each ``poll(-1)`` returns when at least one CQE is processed, which
-    /// strictly decreases ``pending_count()``. The loop therefore makes
-    /// monotonic progress and terminates when the queue drains.
     void run_until_complete() {
         while (has_pending()) {
             poll(std::chrono::milliseconds(-1));
         }
     }
-    
-    /// Get the underlying backend (for advanced use)
+
     io_backend* get_backend() noexcept {
-        return backend_.get();
+#if ELIO_HAS_IO_URING
+        return &uring_backend_;
+#else
+        return epoll_backend_.get();
+#endif
     }
 
-    /// Check if the current backend is io_uring
-    /// @return true if using io_uring backend
     bool is_io_uring() const noexcept {
-        return backend_ && backend_->is_io_uring();
+#if ELIO_HAS_IO_URING
+        return true;
+#else
+        return false;
+#endif
     }
 
 private:
-    std::unique_ptr<io_backend> backend_;   ///< Active I/O backend
-    backend_type backend_type_;              ///< Current backend type
+#if ELIO_HAS_IO_URING
+    io_uring_backend uring_backend_;
+#else
+    std::unique_ptr<io_backend> epoll_backend_;
+#endif
+    backend_type backend_type_;
 };
 
 /// Global default io_context for convenience
-/// Created lazily on first use using Meyer's singleton pattern.
-/// The destructor is safe to call during static destruction.
 inline io_context& default_io_context() {
     static io_context instance;
     return instance;

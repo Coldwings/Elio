@@ -167,7 +167,7 @@ class io_uring_backend;
 /// - Submission queue batching
 /// - Zero-copy operations (when available)
 /// - Efficient completion handling
-class io_uring_backend : public io_backend {
+class io_uring_backend final : public io_backend {
 public:
     /// Configuration options
     struct config {
@@ -828,7 +828,7 @@ private:
 namespace elio::io {
 
 /// Stub implementation when io_uring is not available
-class io_uring_backend : public io_backend {
+class io_uring_backend final : public io_backend {
 public:
     io_uring_backend() {
         throw std::runtime_error("io_uring not available on this system");

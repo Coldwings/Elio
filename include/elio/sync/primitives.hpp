@@ -1,6 +1,7 @@
 #pragma once
 
 #include <elio/log/macros.hpp>
+#include <elio/coro/task.hpp>
 #include <elio/runtime/wait_strategy.hpp>
 #include <coroutine>
 #include <atomic>
@@ -1288,12 +1289,10 @@ public:
     condition_variable(condition_variable&&) = delete;
     condition_variable& operator=(condition_variable&&) = delete;
 
-    /// Wait awaitable for use with elio::sync::mutex
-    /// Atomically releases the mutex and suspends the coroutine.
-    /// Re-acquires the mutex before resuming.
-    class wait_awaitable_mutex {
+    /// Internal awaitable: suspends until notified, does NOT re-lock.
+    class wait_suspend_awaitable {
     public:
-        wait_awaitable_mutex(condition_variable& cv, mutex& m)
+        wait_suspend_awaitable(condition_variable& cv, mutex& m)
             : cv_(cv), mutex_(m) {}
 
         bool await_ready() const noexcept { return false; }
@@ -1303,17 +1302,11 @@ public:
                 std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
                 cv_.waiters_.push(awaiter);
             }
-            // Release the user's mutex after enqueuing
-            // This ensures no signal is lost between unlock and suspend
             mutex_.unlock();
             return true;
         }
 
-        // Re-acquire the mutex upon resume by returning a lock awaitable
-        // The caller must co_await this result
-        auto await_resume() {
-            return mutex_.lock();
-        }
+        void await_resume() const noexcept {}
 
     private:
         condition_variable& cv_;
@@ -1373,14 +1366,16 @@ public:
 
     /// Wait with elio::sync::mutex
     /// The mutex must be locked before calling wait().
+    /// Atomically releases the mutex, suspends until notified, then re-acquires.
     /// Usage:
     ///   co_await mtx.lock();
     ///   while (!condition) {
-    ///       co_await co_await cv.wait(mtx);  // double co_await: outer suspends, inner re-locks
+    ///       co_await cv.wait(mtx);
     ///   }
     ///   mtx.unlock();
-    auto wait(mutex& m) {
-        return wait_awaitable_mutex(*this, m);
+    coro::task<void> wait(mutex& m) {
+        co_await wait_suspend_awaitable(*this, m);
+        co_await m.lock();
     }
 
     /// Wait with a generic lockable (e.g., spinlock)

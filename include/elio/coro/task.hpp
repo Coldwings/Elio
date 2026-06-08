@@ -90,121 +90,13 @@ struct task_access {
     }
 };
 
-/// Shared state for join_handle<T> - stores result and waiter
-template<typename T>
-struct join_state {
-    std::optional<T> value_;
-    std::exception_ptr exception_;
-    // waiter_/completed_ are the hot path: written by the coroutine producer
-    // (complete()) and the awaiting consumer (set_waiter()).  Aligning them
-    // to a new cache line separates them from value_/exception_ which may
-    // be large and written only once, preventing false sharing.
-    alignas(64) std::atomic<void*> waiter_{nullptr};  // Stores coroutine_handle address
-    std::atomic<bool> completed_{false};
-    // Destruction notification (for non-coroutine contexts)
-    std::atomic<bool> destroyed_{false};
-    std::mutex destroyed_mtx_;
-    std::condition_variable destroyed_cv_;
-    
-    void set_value(T&& value) {
-        value_.emplace(std::move(value));
-        complete();
-    }
-    
-    void set_exception(std::exception_ptr ex) {
-        exception_ = ex;
-        complete();
-    }
-    
-    void complete() {
-        completed_.store(true, std::memory_order_release);
-        void* waiter_addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-        if (waiter_addr) {
-            auto waiter = std::coroutine_handle<>::from_address(waiter_addr);
-            runtime::schedule_handle(waiter);
-        }
-    }
-    
-    // Called when coroutine frame is about to be destroyed
-    void mark_destroyed() noexcept {
-        {
-            std::lock_guard<std::mutex> lock(destroyed_mtx_);
-            destroyed_.store(true, std::memory_order_release);
-        }
-        destroyed_cv_.notify_all();
-    }
-
-    // Block until coroutine is destroyed (safe from non-coroutine context)
-    void wait_destroyed() {
-        std::unique_lock<std::mutex> lock(destroyed_mtx_);
-        destroyed_cv_.wait(lock, [&] {
-            return destroyed_.load(std::memory_order_acquire);
-        });
-    }
-
-    // Non-blocking check
-    [[nodiscard]] bool is_destroyed() const noexcept {
-        return destroyed_.load(std::memory_order_acquire);
-    }
-
-    [[nodiscard]] bool is_completed() const noexcept {
-        return completed_.load(std::memory_order_acquire);
-    }
-
-    // Returns true if waiter was stored (should suspend), false if caller must resume locally.
-    bool set_waiter(std::coroutine_handle<> h) noexcept {
-        void* expected = nullptr;
-        if (waiter_.compare_exchange_strong(expected, h.address(),
-                std::memory_order_release, std::memory_order_acquire)) {
-            // Race: complete() may have run between our check and CAS. Detect it.
-            if (completed_.load(std::memory_order_acquire)) {
-                // Try to reclaim our waiter slot before complete() takes it.
-                void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-                if (addr) {
-                    // We won the race: complete() did not take the waiter, so it
-                    // will not schedule us. Resume locally by returning false; do
-                    // NOT schedule the handle here (that would double-resume).
-                    return false;
-                }
-                // We lost the race: complete() already took the waiter and has
-                // scheduled (or is about to schedule) it on a worker. Suspend so
-                // the scheduler resumes us exactly once.
-                return true;
-            }
-            return true;
-        }
-        return false;  // Already has a waiter (shouldn't happen with single await)
-    }
-
-    T get_value() {
-        if (exception_) {
-            std::rethrow_exception(exception_);
-        }
-        return std::move(*value_);
-    }
-};
-
-/// Specialization for void
-template<>
-struct join_state<void> {
-    std::exception_ptr exception_;
-    // Hot atomics on their own cache line (see join_state<T> comment above)
+struct join_state_base {
     alignas(64) std::atomic<void*> waiter_{nullptr};
     std::atomic<bool> completed_{false};
-    // Destruction notification (for non-coroutine contexts)
     std::atomic<bool> destroyed_{false};
     std::mutex destroyed_mtx_;
     std::condition_variable destroyed_cv_;
-    
-    void set_value() {
-        complete();
-    }
-    
-    void set_exception(std::exception_ptr ex) {
-        exception_ = ex;
-        complete();
-    }
-    
+
     void complete() {
         completed_.store(true, std::memory_order_release);
         void* waiter_addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
@@ -213,8 +105,7 @@ struct join_state<void> {
             runtime::schedule_handle(waiter);
         }
     }
-    
-    // Called when coroutine frame is about to be destroyed
+
     void mark_destroyed() noexcept {
         {
             std::lock_guard<std::mutex> lock(destroyed_mtx_);
@@ -223,7 +114,6 @@ struct join_state<void> {
         destroyed_cv_.notify_all();
     }
 
-    // Block until coroutine is destroyed (safe from non-coroutine context)
     void wait_destroyed() {
         std::unique_lock<std::mutex> lock(destroyed_mtx_);
         destroyed_cv_.wait(lock, [&] {
@@ -231,7 +121,6 @@ struct join_state<void> {
         });
     }
 
-    // Non-blocking check
     [[nodiscard]] bool is_destroyed() const noexcept {
         return destroyed_.load(std::memory_order_acquire);
     }
@@ -240,35 +129,55 @@ struct join_state<void> {
         return completed_.load(std::memory_order_acquire);
     }
 
-    // Returns true if waiter was stored (should suspend), false if caller must resume locally.
     bool set_waiter(std::coroutine_handle<> h) noexcept {
         void* expected = nullptr;
         if (waiter_.compare_exchange_strong(expected, h.address(),
                 std::memory_order_release, std::memory_order_acquire)) {
-            // Race: complete() may have run between our check and CAS. Detect it.
             if (completed_.load(std::memory_order_acquire)) {
-                // Try to reclaim our waiter slot before complete() takes it.
                 void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-                if (addr) {
-                    // We won the race: complete() did not take the waiter, so it
-                    // will not schedule us. Resume locally by returning false; do
-                    // NOT schedule the handle here (that would double-resume).
-                    return false;
-                }
-                // We lost the race: complete() already took the waiter and has
-                // scheduled (or is about to schedule) it on a worker. Suspend so
-                // the scheduler resumes us exactly once.
+                if (addr) return false;
                 return true;
             }
             return true;
         }
         return false;
     }
+};
+
+template<typename T>
+struct join_state : join_state_base {
+    std::optional<T> value_;
+    std::exception_ptr exception_;
+
+    void set_value(T&& value) {
+        value_.emplace(std::move(value));
+        complete();
+    }
+
+    void set_exception(std::exception_ptr ex) {
+        exception_ = ex;
+        complete();
+    }
+
+    T get_value() {
+        if (exception_) std::rethrow_exception(exception_);
+        return std::move(*value_);
+    }
+};
+
+template<>
+struct join_state<void> : join_state_base {
+    std::exception_ptr exception_;
+
+    void set_value() { complete(); }
+
+    void set_exception(std::exception_ptr ex) {
+        exception_ = ex;
+        complete();
+    }
 
     void get_value() {
-        if (exception_) {
-            std::rethrow_exception(exception_);
-        }
+        if (exception_) std::rethrow_exception(exception_);
     }
 };
 

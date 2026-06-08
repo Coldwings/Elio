@@ -18,8 +18,15 @@ public:
     explicit blocking_pool(size_t num_threads)
         : num_threads_(num_threads) {
         threads_.reserve(num_threads);
+        std::atomic<size_t> ready{0};
         for (size_t i = 0; i < num_threads; ++i) {
-            threads_.emplace_back([this] { worker_loop(); });
+            threads_.emplace_back([this, &ready] {
+                ready.fetch_add(1, std::memory_order_release);
+                worker_loop();
+            });
+        }
+        while (ready.load(std::memory_order_acquire) < num_threads) {
+            std::this_thread::yield();
         }
     }
 

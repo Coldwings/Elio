@@ -1,10 +1,14 @@
 #pragma once
 
+#include <cstdlib>
 #include <functional>
+#include <memory>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 #include "../coro/task.hpp"
 #include "../coro/vthread_stack.hpp"
+#include "../log/macros.hpp"
 #include "scheduler.hpp"
 
 namespace elio {
@@ -38,9 +42,10 @@ void go(F&& f, Args&&... args) {
     auto* sched = runtime::scheduler::current();
     if (sched && sched->is_running()) {
         sched->go(std::forward<F>(f), std::forward<Args>(args)...);
+        return;
     }
-    // No running scheduler: task is not scheduled (programming error)
-    // The caller should ensure a scheduler is running before calling elio::go()
+    ELIO_LOG_ERROR("elio::go() called without a running scheduler — aborting");
+    std::abort();
 }
 
 /// Spawn a coroutine and return a join_handle to await its result.
@@ -64,9 +69,12 @@ auto spawn(F&& f, Args&&... args)
     if (sched && sched->is_running()) {
         return sched->go_joinable(std::forward<F>(f), std::forward<Args>(args)...);
     }
-    // No running scheduler: return empty join_handle (programming error)
     using T = detail::task_value_t<std::invoke_result_t<F, Args...>>;
-    return coro::join_handle<T>{nullptr};
+    auto state = std::make_shared<coro::detail::join_state<T>>();
+    state->set_exception(std::make_exception_ptr(
+        std::logic_error("elio::spawn() called without a running scheduler")));
+    state->mark_destroyed();
+    return coro::join_handle<T>{std::move(state)};
 }
 
 } // namespace elio

@@ -16,6 +16,7 @@
 
 #include <variant>
 #include <chrono>
+#include <type_traits>
 
 namespace elio::net {
 
@@ -30,11 +31,11 @@ public:
 
     /// Create from a plain TCP stream
     explicit stream(tcp_stream tcp)
-        : stream_(std::move(tcp)), secure_(false) {}
+        : stream_(std::move(tcp)) {}
 
     /// Create from a TLS stream
     explicit stream(tls::tls_stream tls)
-        : stream_(std::move(tls)), secure_(true) {}
+        : stream_(std::move(tls)) {}
 
     // Move only
     stream(stream&&) = default;
@@ -48,30 +49,24 @@ public:
     }
 
     /// Check if this is a secure (TLS) connection
-    bool is_secure() const noexcept { return secure_; }
+    bool is_secure() const noexcept { return is_tls(); }
 
     /// Read data from the stream
-    /// @param buffer Buffer to read into
-    /// @param length Maximum bytes to read
-    /// @return io_result with bytes read or error
     coro::task<io::io_result> read(void* buffer, size_t length) {
-        if (std::holds_alternative<tcp_stream>(stream_)) {
-            co_return co_await std::get<tcp_stream>(stream_).read(buffer, length);
-        } else if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_return co_await std::get<tls::tls_stream>(stream_).read(buffer, length);
+        if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
+            co_return co_await tcp->read(buffer, length);
+        } else if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+            co_return co_await tls->read(buffer, length);
         }
         co_return io::io_result{-ENOTCONN, 0};
     }
 
     /// Write data to the stream
-    /// @param buffer Data to write
-    /// @param length Number of bytes to write
-    /// @return io_result with bytes written or error
     coro::task<io::io_result> write(const void* buffer, size_t length) {
-        if (std::holds_alternative<tcp_stream>(stream_)) {
-            co_return co_await std::get<tcp_stream>(stream_).write(buffer, length);
-        } else if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_return co_await std::get<tls::tls_stream>(stream_).write(buffer, length);
+        if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
+            co_return co_await tcp->write(buffer, length);
+        } else if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+            co_return co_await tls->write(buffer, length);
         }
         co_return io::io_result{-ENOTCONN, 0};
     }
@@ -105,8 +100,8 @@ public:
 
     /// Close/shutdown the stream
     coro::task<void> close() {
-        if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            co_await std::get<tls::tls_stream>(stream_).shutdown();
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+            co_await tls->shutdown();
         }
         stream_ = std::monostate{};
     }
@@ -129,12 +124,13 @@ public:
 
     /// Get underlying file descriptor (-1 if not connected)
     int fd() const noexcept {
-        if (std::holds_alternative<tcp_stream>(stream_)) {
-            return std::get<tcp_stream>(stream_).fd();
-        } else if (std::holds_alternative<tls::tls_stream>(stream_)) {
-            return std::get<tls::tls_stream>(stream_).fd();
-        }
-        return -1;
+        return std::visit([](const auto& s) -> int {
+            if constexpr (std::is_same_v<std::decay_t<decltype(s)>, std::monostate>) {
+                return -1;
+            } else {
+                return s.fd();
+            }
+        }, stream_);
     }
 
     /// Access underlying TCP stream (throws if not TCP or disconnected)
@@ -167,7 +163,6 @@ public:
 
 private:
     variant_type stream_;
-    bool secure_ = false;
     std::chrono::steady_clock::time_point last_use_ = std::chrono::steady_clock::now();
 };
 

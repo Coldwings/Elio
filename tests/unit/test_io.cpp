@@ -32,8 +32,13 @@ TEST_CASE("io_context creation", "[io][context]") {
     
     SECTION("explicit epoll backend") {
         io_context ctx(io_context::backend_type::epoll);
+#if ELIO_HAS_IO_URING
+        // io_uring direct-hold mode: epoll request silently uses io_uring
+        REQUIRE(ctx.get_backend_type() == io_context::backend_type::io_uring);
+#else
         REQUIRE(ctx.get_backend_type() == io_context::backend_type::epoll);
         REQUIRE(std::string(ctx.get_backend_name()) == "epoll");
+#endif
     }
     
     SECTION("no pending operations initially") {

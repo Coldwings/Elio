@@ -170,6 +170,20 @@ public:
         return running_.load(std::memory_order_acquire);
     }
 
+    [[nodiscard]] bool is_draining() const noexcept {
+        return draining_.load(std::memory_order_acquire);
+    }
+
+    void enter_draining_mode() noexcept {
+        draining_deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        draining_.store(true, std::memory_order_release);
+        wake();
+    }
+
+    std::thread detach_thread() noexcept {
+        return std::move(thread_);
+    }
+
     /// Check if worker is idle (waiting for work)
     [[nodiscard]] bool is_idle() const noexcept {
         return idle_.load(std::memory_order_relaxed);
@@ -229,6 +243,8 @@ private:
     std::unique_ptr<mpsc_queue<void>> inbox_;           // External submissions (MPSC)
     std::thread thread_;
     std::atomic<bool> running_;
+    std::atomic<bool> draining_{false};
+    std::chrono::steady_clock::time_point draining_deadline_{};
     std::atomic<size_t> tasks_executed_;
     std::atomic<bool> idle_{false};    // True when worker is waiting for work (for lazy wake)
     std::atomic<std::chrono::steady_clock::time_point> last_task_time_{std::chrono::steady_clock::now()};

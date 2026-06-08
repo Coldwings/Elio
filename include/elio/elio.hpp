@@ -20,6 +20,10 @@
 #include "coro/cancel_token.hpp"
 #include "coro/vthread_stack.hpp"
 #include "coro/generator.hpp"
+#include "coro/when_all.hpp"
+#ifdef ELIO_EXPERIMENTAL
+#include "coro/when_any.hpp"
+#endif
 
 // Runtime scheduler
 #include "runtime/scheduler.hpp"

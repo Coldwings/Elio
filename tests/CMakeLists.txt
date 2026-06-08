@@ -30,6 +30,7 @@ set(TEST_SOURCES
     unit/test_autoscaler.cpp
     unit/test_generator.cpp
     unit/test_object_cache.cpp
+    unit/test_combinators.cpp
     integration/test_scheduler_integration.cpp
     integration/test_exception_propagation.cpp
     integration/test_parallel_tasks.cpp

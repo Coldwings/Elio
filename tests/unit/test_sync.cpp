@@ -510,7 +510,7 @@ TEST_CASE("condition_variable with mutex notify_one", "[sync][condvar][coro]") {
     auto waiter = [=]() -> task<void> {
         co_await mtx_ptr->lock();
         while (!ready_ptr->load(std::memory_order_acquire)) {
-            co_await co_await cv_ptr->wait(*mtx_ptr);
+            co_await cv_ptr->wait(*mtx_ptr);
         }
         mtx_ptr->unlock();
         completed_ptr->fetch_add(1, std::memory_order_relaxed);
@@ -568,7 +568,7 @@ TEST_CASE("condition_variable with mutex notify_all", "[sync][condvar][coro]") {
         auto waiter = [=]() -> task<void> {
             co_await mtx_ptr->lock();
             while (!ready_ptr->load(std::memory_order_acquire)) {
-                co_await co_await cv_ptr->wait(*mtx_ptr);
+                co_await cv_ptr->wait(*mtx_ptr);
             }
             mtx_ptr->unlock();
             completed_ptr->fetch_add(1, std::memory_order_relaxed);
@@ -719,7 +719,7 @@ TEST_CASE("condition_variable notify_one wakes exactly one", "[sync][condvar][co
         auto waiter = [=]() -> task<void> {
             co_await mtx_ptr->lock();
             while (phase_ptr->load(std::memory_order_acquire) == 0) {
-                co_await co_await cv_ptr->wait(*mtx_ptr);
+                co_await cv_ptr->wait(*mtx_ptr);
             }
             woken_ptr->fetch_add(1, std::memory_order_relaxed);
             mtx_ptr->unlock();
@@ -799,7 +799,7 @@ TEST_CASE("condition_variable producer-consumer", "[sync][condvar][coro]") {
         while (true) {
             co_await mtx_ptr->lock();
             while (buffer_ptr->empty() && !*done_ptr) {
-                co_await co_await cv_ptr->wait(*mtx_ptr);
+                co_await cv_ptr->wait(*mtx_ptr);
             }
             if (buffer_ptr->empty() && *done_ptr) {
                 mtx_ptr->unlock();

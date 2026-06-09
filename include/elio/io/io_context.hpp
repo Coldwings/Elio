@@ -75,61 +75,33 @@ public:
     io_context& operator=(io_context&&) = default;
 #endif
 
-    bool prepare(const io_request& req) {
+    auto& backend() noexcept {
 #if ELIO_HAS_IO_URING
-        return uring_backend_.prepare(req);
+        return uring_backend_;
 #else
-        return epoll_backend_->prepare(req);
+        return *epoll_backend_;
 #endif
     }
 
-    int submit() {
+    const auto& backend() const noexcept {
 #if ELIO_HAS_IO_URING
-        return uring_backend_.submit();
+        return uring_backend_;
 #else
-        return epoll_backend_->submit();
+        return *epoll_backend_;
 #endif
     }
+
+    bool prepare(const io_request& req) { return backend().prepare(req); }
+    int submit() { return backend().submit(); }
 
     int poll(std::chrono::milliseconds timeout = std::chrono::milliseconds(0)) {
-#if ELIO_HAS_IO_URING
-        return uring_backend_.poll(timeout);
-#else
-        return epoll_backend_->poll(timeout);
-#endif
+        return backend().poll(timeout);
     }
 
-    bool has_pending() const noexcept {
-#if ELIO_HAS_IO_URING
-        return uring_backend_.has_pending();
-#else
-        return epoll_backend_->has_pending();
-#endif
-    }
-
-    size_t pending_count() const noexcept {
-#if ELIO_HAS_IO_URING
-        return uring_backend_.pending_count();
-#else
-        return epoll_backend_->pending_count();
-#endif
-    }
-
-    bool cancel(void* user_data) {
-#if ELIO_HAS_IO_URING
-        return uring_backend_.cancel(user_data);
-#else
-        return epoll_backend_->cancel(user_data);
-#endif
-    }
-
-    void notify() {
-#if ELIO_HAS_IO_URING
-        uring_backend_.notify();
-#else
-        epoll_backend_->notify();
-#endif
-    }
+    bool has_pending() const noexcept { return backend().has_pending(); }
+    size_t pending_count() const noexcept { return backend().pending_count(); }
+    bool cancel(void* user_data) { return backend().cancel(user_data); }
+    void notify() { backend().notify(); }
 
     backend_type get_backend_type() const noexcept {
         return backend_type_;
@@ -179,13 +151,7 @@ public:
         }
     }
 
-    io_backend* get_backend() noexcept {
-#if ELIO_HAS_IO_URING
-        return &uring_backend_;
-#else
-        return epoll_backend_.get();
-#endif
-    }
+    io_backend* get_backend() noexcept { return &backend(); }
 
     bool is_io_uring() const noexcept {
 #if ELIO_HAS_IO_URING

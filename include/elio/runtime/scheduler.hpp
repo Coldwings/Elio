@@ -557,7 +557,8 @@ private:
         using ResultTask = std::invoke_result_t<F, Args...>;
         using T = detail::task_value_t<ResultTask>;
 
-        auto* new_vstack = new coro::vthread_stack();
+        auto vstack_owner = std::make_unique<coro::vthread_stack>();
+        auto* new_vstack = vstack_owner.get();
         auto* old_vstack = coro::vthread_stack::current();
         coro::vthread_stack::set_current(new_vstack);
 
@@ -573,7 +574,7 @@ private:
 
         auto handle = coro::detail::task_access::release(wrapper);
         handle.promise().detached_ = true;
-        handle.promise().set_vstack_owner(new_vstack);
+        handle.promise().set_vstack_owner(vstack_owner.release());
         if constexpr (Pinned) {
             handle.promise().set_affinity(worker_id);
         }

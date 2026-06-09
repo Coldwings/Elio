@@ -10,7 +10,7 @@
 #include <utility>
 #include <variant>
 
-#include "task.hpp"
+#include "traits.hpp"
 #include "../runtime/spawn.hpp"
 
 namespace elio {

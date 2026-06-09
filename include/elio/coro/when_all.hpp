@@ -11,6 +11,7 @@
 #include <variant>
 
 #include "traits.hpp"
+#include "cancel_token.hpp"
 #include "../log/macros.hpp"
 #include "../runtime/spawn.hpp"
 
@@ -35,6 +36,7 @@ struct when_all_state {
     std::tuple<std::optional<when_all_slot_t<callable_result_t<Fs>>>...> values_;
     std::exception_ptr first_exception_;
     std::atomic<bool> has_exception_{false};
+    coro::cancel_source cancel_source_;
 
     explicit when_all_state(size_t count) : remaining_(count) {}
 
@@ -53,6 +55,7 @@ struct when_all_state {
         if (has_exception_.compare_exchange_strong(expected, true,
                 std::memory_order_acq_rel)) {
             first_exception_ = std::move(ex);
+            cancel_source_.cancel();
         } else {
             ELIO_LOG_WARNING("when_all: discarding subsequent exception "
                              "(only the first is propagated)");
@@ -74,9 +77,14 @@ struct when_all_awaitable {
 
     template<size_t... Is>
     void spawn_all(std::index_sequence<Is...>) {
-        (elio::go([state = this->state_,
+        auto token = state_->cancel_source_.get_token();
+        (elio::go([state = this->state_, token,
                    f = std::move(std::get<Is>(callables_))]() mutable
                       -> coro::task<void> {
+            if (token.is_cancelled()) {
+                state->complete_one();
+                co_return;
+            }
             using T = callable_result_t<std::tuple_element_t<Is, std::tuple<Fs...>>>;
             try {
                 if constexpr (std::is_void_v<T>) {

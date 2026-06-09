@@ -255,10 +255,15 @@ private:
     std::atomic<bool> running_;
     std::atomic<bool> draining_{false};
     std::chrono::steady_clock::time_point draining_deadline_{};
-    std::atomic<size_t> tasks_executed_;
+    // Hot-write fields (owner thread writes per task) — isolated cache line
+    alignas(64) std::atomic<size_t> tasks_executed_;
     std::atomic<size_t> steals_executed_{0};
-    std::atomic<bool> idle_{false};    // True when worker is waiting for work (for lazy wake)
-    std::atomic<std::chrono::steady_clock::time_point> last_task_time_{std::chrono::steady_clock::now()};
+
+    // Idle flag (owner writes, other threads read) — isolated cache line
+    alignas(64) std::atomic<bool> idle_{false};
+
+    // Slow-update fields — isolated cache line
+    alignas(64) std::atomic<std::chrono::steady_clock::time_point> last_task_time_{std::chrono::steady_clock::now()};
     bool needs_sync_ = false;          // Whether current task needs memory synchronization
     wait_strategy strategy_;           // Configurable wait strategy
     std::unique_ptr<io::io_context> io_context_;  // Per-worker io_context

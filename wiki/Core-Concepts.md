@@ -181,6 +181,28 @@ coro::task<void> parallel_example() {
 }
 ```
 
+#### Pinned Spawn with `elio::go_to()`
+
+Use `elio::go_to()` to spawn a task pinned to a specific worker thread. The task is placed directly on the target worker's queue with affinity set — it cannot be stolen by other workers.
+
+```cpp
+coro::task<void> connection_handler(int fd) {
+    // This entire task runs on the designated worker
+    co_return;
+}
+
+coro::task<void> accept_loop() {
+    int worker = 0;
+    while (auto fd = co_await accept(...)) {
+        // Round-robin connections across workers
+        elio::go_to(worker % num_workers, connection_handler, fd);
+        ++worker;
+    }
+}
+```
+
+This is useful when you need cache locality or want to partition work across workers at spawn time, without the brief migration window that `go()` + `set_affinity()` would have.
+
 #### Checking Completion
 
 You can check if a spawned task is done without blocking:

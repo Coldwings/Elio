@@ -99,6 +99,31 @@ coro::task<void> main_task() {
 }
 ```
 
+#### `elio::go_to()` - Pinned Fire-and-Forget
+
+Spawn a coroutine pinned to a specific worker thread. The task's affinity is set so it cannot be stolen by other workers; if a steal occurs, the task is bounced back to the target worker.
+
+```cpp
+template<typename F, typename... Args>
+void go_to(size_t worker_id, F&& f, Args&&... args);
+```
+
+**Example:**
+```cpp
+coro::task<void> io_handler(int fd) {
+    // Handle I/O on this specific worker
+    co_return;
+}
+
+coro::task<void> main_task() {
+    // Pin the handler to worker 0 for cache locality
+    elio::go_to(0, io_handler, fd);
+    co_return;
+}
+```
+
+> **Note:** `go_to()` differs from spawning with `go()` + `co_await set_affinity()`. With `go_to()`, the task is pinned *from the start* — it is placed directly on the target worker's queue and marked as non-stealable before it ever runs. With `go()` + `set_affinity()`, the task may briefly run on any worker before migrating.
+
 #### `elio::spawn()` - Joinable
 
 Spawn a coroutine and return a `join_handle` to await the result later.

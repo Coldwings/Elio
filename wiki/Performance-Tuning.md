@@ -250,6 +250,23 @@ coro::task<void> pinned_work() {
 
 `set_affinity` is an awaitable. When called with `migrate=true` (the default), the coroutine is immediately rescheduled on the target worker. With `migrate=false`, the affinity is recorded but migration is deferred until the next scheduling point. `clear_affinity` removes the binding so the task can be freely stolen by any worker again.
 
+#### Spawn-time Pinning with `go_to()`
+
+When you know the target worker at spawn time, `go_to()` is more efficient than `go()` + `set_affinity()`:
+
+```cpp
+// Preferred: pinned from the start, no migration window
+elio::go_to(2, cache_sensitive_work);
+
+// Alternative: task may briefly run on another worker before migrating
+elio::go([]{
+    co_await elio::set_affinity(2);
+    // ...
+});
+```
+
+`go_to()` places the task directly on the target worker's queue with the `Pinned` flag set, so the task is never stolen. This avoids the brief scheduling window where the task could execute on the wrong worker before `set_affinity` takes effect.
+
 ## I/O Backend Selection
 
 ### io_uring vs epoll

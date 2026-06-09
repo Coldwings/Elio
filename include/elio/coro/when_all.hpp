@@ -11,6 +11,7 @@
 #include <variant>
 
 #include "traits.hpp"
+#include "../log/macros.hpp"
 #include "../runtime/spawn.hpp"
 
 namespace elio {
@@ -52,6 +53,9 @@ struct when_all_state {
         if (has_exception_.compare_exchange_strong(expected, true,
                 std::memory_order_acq_rel)) {
             first_exception_ = std::move(ex);
+        } else {
+            ELIO_LOG_WARNING("when_all: discarding subsequent exception "
+                             "(only the first is propagated)");
         }
     }
 };

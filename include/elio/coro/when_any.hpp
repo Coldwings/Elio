@@ -13,7 +13,7 @@
 #include <utility>
 #include <variant>
 
-#include "task.hpp"
+#include "traits.hpp"
 #include "when_all.hpp"
 #include "cancel_token.hpp"
 #include "../runtime/spawn.hpp"

@@ -57,8 +57,7 @@ inline void ignore_sigpipe_once() {
     });
 }
 
-/// Type alias using definitions from scheduler.hpp
-template<typename T> using task_value_t = typename task_value<T>::type;
+using elio::detail::task_value_t;
 
 /// Completion signal for async_main
 template<typename T>

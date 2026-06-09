@@ -6,6 +6,7 @@
 #include <elio/coro/frame.hpp>
 #include <elio/coro/vthread_stack.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/coro/traits.hpp>
 #include <type_traits>
 #include <array>
 #include <memory>
@@ -24,14 +25,9 @@ namespace elio::runtime {
 class scheduler;
 
 namespace detail {
-    // Type traits for task<T>
-    template<typename T> struct task_value;
-    template<typename T> struct task_value<coro::task<T>> { using type = T; };
-    template<typename T> using task_value_t = typename task_value<T>::type;
-
-    template<typename T> struct is_task : std::false_type {};
-    template<typename T> struct is_task<coro::task<T>> : std::true_type {};
-    template<typename T> inline constexpr bool is_task_v = is_task<T>::value;
+    using elio::detail::task_value_t;
+    using elio::detail::is_task;
+    using elio::detail::is_task_v;
 
     /// Wrapper coroutine for fire-and-forget (go/go_to).
     /// Stores callable and args in its coroutine frame, ensuring lambda lifetime

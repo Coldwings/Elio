@@ -55,6 +55,7 @@ public:
         , thread_(std::move(other.thread_))
         , running_(other.running_.load(std::memory_order_relaxed))
         , tasks_executed_(other.tasks_executed_.load(std::memory_order_relaxed))
+        , steals_executed_(other.steals_executed_.load(std::memory_order_relaxed))
         , idle_(other.idle_.load(std::memory_order_relaxed))
         , last_task_time_(other.last_task_time_.load(std::memory_order_relaxed))
         , needs_sync_(other.needs_sync_)
@@ -76,6 +77,7 @@ public:
             thread_ = std::move(other.thread_);
             running_.store(other.running_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             tasks_executed_.store(other.tasks_executed_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            steals_executed_.store(other.steals_executed_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             idle_.store(other.idle_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             last_task_time_.store(other.last_task_time_.load(std::memory_order_relaxed), std::memory_order_relaxed);
             needs_sync_ = other.needs_sync_;
@@ -157,6 +159,10 @@ public:
 
     [[nodiscard]] size_t tasks_executed() const noexcept {
         return tasks_executed_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] size_t steals_executed() const noexcept {
+        return steals_executed_.load(std::memory_order_relaxed);
     }
 
     [[nodiscard]] size_t queue_size() const noexcept {
@@ -250,6 +256,7 @@ private:
     std::atomic<bool> draining_{false};
     std::chrono::steady_clock::time_point draining_deadline_{};
     std::atomic<size_t> tasks_executed_;
+    std::atomic<size_t> steals_executed_{0};
     std::atomic<bool> idle_{false};    // True when worker is waiting for work (for lazy wake)
     std::atomic<std::chrono::steady_clock::time_point> last_task_time_{std::chrono::steady_clock::now()};
     bool needs_sync_ = false;          // Whether current task needs memory synchronization

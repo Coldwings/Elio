@@ -123,16 +123,14 @@ TEST_CASE("Parallel tasks with dependencies", "[parallel]") {
     sched.shutdown();
 }
 
-TEST_CASE("Work stealing under heavy load", "[parallel]") {
+TEST_CASE("Parallel execution distributes work", "[parallel]") {
     scheduler sched(4);
     sched.start();
-    
+
     const int num_tasks = 200;
     std::atomic<int> completed{0};
-    std::atomic<size_t> total_steals{0};
-    
+
     auto task_func = [&]() -> task<void> {
-        // Medium work
         for (int i = 0; i < 5000; ++i) {
             volatile int x = i * i;
             (void)x;
@@ -140,20 +138,22 @@ TEST_CASE("Work stealing under heavy load", "[parallel]") {
         completed.fetch_add(1);
         co_return;
     };
-    
-    // Spawn all tasks quickly
+
     for (int i = 0; i < num_tasks; ++i) {
         sched.go(task_func);
     }
-    
+
     std::this_thread::sleep_for(scaled_ms(1500));
-    
+
     REQUIRE(completed.load() == num_tasks);
-    
-    // Verify work was distributed
-    size_t total_executed = sched.total_tasks_executed();
-    REQUIRE(total_executed >= num_tasks);
-    
+
+    // Verify multiple workers participated
+    size_t workers_active = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        if (sched.worker_tasks_executed(i) > 0) ++workers_active;
+    }
+    REQUIRE(workers_active >= 2);
+
     sched.shutdown();
 }
 

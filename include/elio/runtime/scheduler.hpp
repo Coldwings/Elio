@@ -509,6 +509,21 @@ public:
         return workers_[worker_id]->tasks_executed();
     }
 
+    [[nodiscard]] size_t total_steals_executed() const noexcept {
+        size_t n = num_threads_.load(std::memory_order_acquire);
+        size_t total = 0;
+        for (size_t i = 0; i < n; ++i) {
+            total += workers_[i]->steals_executed();
+        }
+        return total;
+    }
+
+    [[nodiscard]] size_t worker_steals_executed(size_t worker_id) const noexcept {
+        size_t n = num_threads_.load(std::memory_order_acquire);
+        if (worker_id >= n) return 0;
+        return workers_[worker_id]->steals_executed();
+    }
+
     /// Get the wait strategy used by this scheduler
     [[nodiscard]] const wait_strategy& get_wait_strategy() const noexcept {
         return wait_strategy_;
@@ -944,7 +959,7 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
             size_t affinity = coro::get_affinity(handle.address());
             
             if (affinity == coro::NO_AFFINITY || affinity == worker_id_) {
-                // No affinity or affinity matches this worker - we can run it
+                steals_executed_.fetch_add(1, std::memory_order_relaxed);
                 return handle;
             }
             
@@ -952,11 +967,11 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
             if (affinity < num_workers) {
                 scheduler_->spawn_to(affinity, handle);
             } else {
-                // Invalid affinity (worker doesn't exist) - clear and run locally
                 auto* promise = coro::get_promise_base(handle.address());
                 if (promise) {
                     promise->clear_affinity();
                 }
+                steals_executed_.fetch_add(1, std::memory_order_relaxed);
                 return handle;
             }
             

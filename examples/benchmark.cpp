@@ -290,74 +290,79 @@ void benchmark_yield() {
 }
 
 // Time-based work stealing benchmark
+// Strategy: start with 1 worker, queue all tasks there (unpinned via go()),
+// then expand to 4 workers — new workers must steal from worker 0.
 void benchmark_work_stealing() {
     const int batch_size = 1000;
+    const size_t num_workers = 4;
     std::vector<double> throughput_samples;
-    std::vector<size_t> total_per_worker(4, 0);
+    std::vector<size_t> total_per_worker(num_workers, 0);
+    std::vector<size_t> total_steals_per_worker(num_workers, 0);
     size_t total_tasks = 0;
-    
-    std::cout << "  Running for at least " << duration_cast<seconds>(MIN_BENCH_DURATION).count() 
-              << " seconds with 4 workers..." << std::endl;
-    
+    size_t total_steals = 0;
+
+    std::cout << "  Running for at least " << duration_cast<seconds>(MIN_BENCH_DURATION).count()
+              << " seconds with " << num_workers << " workers..." << std::endl;
+
     auto bench_start = high_resolution_clock::now();
-    
+
     while (duration_cast<seconds>(high_resolution_clock::now() - bench_start) < MIN_BENCH_DURATION) {
-        runtime::scheduler sched(4);
+        runtime::scheduler sched(1);
         sched.start();
-        
+
         std::atomic<int> completed(0);
 
-        // Record initial per-worker task counts
-        std::vector<size_t> initial_counts(4);
-        for (size_t i = 0; i < 4; ++i) {
-            initial_counts[i] = sched.worker_tasks_executed(i);
+        // Queue all tasks to the single worker (unpinned, no affinity)
+        for (int i = 0; i < batch_size; ++i) {
+            sched.go(work_stealing_task, &completed);
         }
 
         auto batch_start = high_resolution_clock::now();
 
-        // Spawn ALL tasks to worker 0 to test work stealing
-        for (int i = 0; i < batch_size; ++i) {
-            sched.go_to(0, work_stealing_task, &completed);
-        }
+        // Expand to num_workers — new workers steal from worker 0's deque
+        sched.set_thread_count(num_workers);
 
         while (completed.load(std::memory_order_relaxed) < batch_size) {
             std::this_thread::sleep_for(microseconds(1));
         }
-        
+
         auto batch_end = high_resolution_clock::now();
         auto batch_us = duration_cast<microseconds>(batch_end - batch_start).count();
-        
+
         double throughput = (batch_us > 0) ? (batch_size * 1000000.0) / batch_us : 0;
         throughput_samples.push_back(throughput);
         total_tasks += batch_size;
-        
-        // Accumulate per-worker counts
-        for (size_t i = 0; i < 4; ++i) {
-            total_per_worker[i] += sched.worker_tasks_executed(i) - initial_counts[i];
+
+        for (size_t i = 0; i < num_workers; ++i) {
+            total_per_worker[i] += sched.worker_tasks_executed(i);
+            total_steals_per_worker[i] += sched.worker_steals_executed(i);
         }
-        
+        total_steals += sched.total_steals_executed();
+
         sched.shutdown();
     }
-    
+
     auto bench_end = high_resolution_clock::now();
     auto total_sec = duration_cast<milliseconds>(bench_end - bench_start).count() / 1000.0;
-    
+
     auto stats = bench_stats::compute(throughput_samples);
-    
+
     std::cout << std::endl;
     std::cout << "Work Stealing Performance Results:" << std::endl;
     std::cout << "  Duration:           " << std::fixed << std::setprecision(2) << total_sec << " seconds" << std::endl;
     std::cout << "  Total tasks:        " << total_tasks << std::endl;
+    std::cout << "  Total steals:       " << total_steals << std::endl;
     std::cout << "  Batches:            " << throughput_samples.size() << std::endl;
     std::cout << "  Avg throughput:     " << std::fixed << std::setprecision(0) << stats.avg << " tasks/sec" << std::endl;
     std::cout << "  Min throughput:     " << std::fixed << std::setprecision(0) << stats.min << " tasks/sec" << std::endl;
     std::cout << "  Max throughput:     " << std::fixed << std::setprecision(0) << stats.max << " tasks/sec" << std::endl;
     std::cout << "  StdDev:             " << std::fixed << std::setprecision(0) << stats.stddev << " tasks/sec" << std::endl;
-    std::cout << "  Per-worker totals (all spawned to worker 0):" << std::endl;
-    for (size_t i = 0; i < 4; ++i) {
+    std::cout << "  Per-worker totals (queued to worker 0, then expanded):" << std::endl;
+    for (size_t i = 0; i < num_workers; ++i) {
         double pct = (total_tasks > 0) ? (100.0 * total_per_worker[i] / total_tasks) : 0;
-        std::cout << "    Worker " << i << ": " << total_per_worker[i] 
-                  << " tasks (" << std::fixed << std::setprecision(1) << pct << "%)" << std::endl;
+        std::cout << "    Worker " << i << ": " << total_per_worker[i]
+                  << " tasks (" << std::fixed << std::setprecision(1) << pct << "%)"
+                  << ", " << total_steals_per_worker[i] << " steals" << std::endl;
     }
     std::cout << std::endl;
 }

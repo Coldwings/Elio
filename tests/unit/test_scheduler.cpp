@@ -22,16 +22,6 @@ task<void> increment_counter_task(std::atomic<int>* counter) {
     co_return;
 }
 
-task<void> work_stealing_task(std::atomic<int>* counter) {
-    // Simulate some work
-    for (int i = 0; i < 1000; ++i) {
-        volatile int x = i * i;
-        (void)x;
-    }
-    counter->fetch_add(1);
-    co_return;
-}
-
 task<void> empty_task() {
     co_return;
 }
@@ -114,26 +104,45 @@ TEST_CASE("Scheduler spawn multiple coroutines", "[scheduler]") {
 }
 
 TEST_CASE("Scheduler work stealing occurs", "[scheduler]") {
-    scheduler sched(4);
-    sched.start();
-    
-    const int num_tasks = 200;
+    const int num_tasks = 500;
     std::atomic<int> completed{0};
-    
-    // Spawn many tasks quickly using parameter passing
+
+    auto heavy_task = [](std::atomic<int>* ctr) -> task<void> {
+        volatile int sum = 0;
+        for (int j = 0; j < 50000; ++j) {
+            sum = sum + j * j;
+        }
+        (void)sum;
+        ctr->fetch_add(1);
+        co_return;
+    };
+
+    // Start with 1 worker so all tasks queue on worker 0
+    scheduler sched(1);
+    sched.start();
+
     for (int i = 0; i < num_tasks; ++i) {
-        sched.go(work_stealing_task, &completed);
+        sched.go(heavy_task, &completed);
     }
-    
-    // Wait for all to complete
-    std::this_thread::sleep_for(scaled_ms(1000));
-    
+
+    // Expand to 4 workers — new workers must steal from worker 0's deque
+    sched.set_thread_count(4);
+
+    auto start = std::chrono::steady_clock::now();
+    while (completed.load() < num_tasks) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (std::chrono::steady_clock::now() - start > scaled_sec(30)) break;
+    }
+
     REQUIRE(completed.load() == num_tasks);
-    
-    // Check that multiple workers executed tasks (indicating work stealing)
-    size_t total_executed = sched.total_tasks_executed();
-    REQUIRE(total_executed >= num_tasks);
-    
+    REQUIRE(sched.total_steals_executed() > 0);
+
+    size_t workers_active = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        if (sched.worker_tasks_executed(i) > 0) ++workers_active;
+    }
+    REQUIRE(workers_active >= 2);
+
     sched.shutdown();
 }
 

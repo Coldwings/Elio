@@ -5,6 +5,7 @@
 #include "wait_strategy.hpp"
 #include <elio/coro/promise_base.hpp>
 #include <elio/io/io_context.hpp>
+#include <elio/log/macros.hpp>
 #include <coroutine>
 #include <thread>
 #include <atomic>
@@ -121,6 +122,9 @@ public:
             // Bail out promptly if the worker is being shut down — otherwise
             // an external producer keeps spinning while the inbox stays full.
             if (!running_.load(std::memory_order_acquire)) {
+                ELIO_LOG_WARNING("worker {} schedule(): destroying handle "
+                                "— worker shut down during inbox retry",
+                                worker_id_);
                 handle.destroy();
                 return;
             }
@@ -139,9 +143,9 @@ public:
             std::this_thread::yield();
         }
 
-        // Last resort after the retry ceiling — destroy the handle rather
-        // than spinning indefinitely. In practice this branch is unreachable
-        // under correct workloads (inbox drains as the worker runs).
+        ELIO_LOG_WARNING("worker {} schedule(): destroying handle after {} "
+                        "inbox retries exhausted — possible task loss",
+                        worker_id_, max_total_retries);
         handle.destroy();
     }
     

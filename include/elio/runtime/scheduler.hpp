@@ -307,7 +307,9 @@ public:
         do_go_<false, false>(0, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
-    /// High-level API: fire-and-forget, spawn to specific worker
+    /// High-level API: fire-and-forget, pinned to a specific worker.
+    /// Affinity is set so the task cannot be stolen by other workers;
+    /// if stolen it will be bounced back to the target worker.
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
     void go_to(size_t worker_id, F&& f, Args&&... args) {
@@ -728,7 +730,9 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
             struct trampoline_guard {
                 std::vector<std::coroutine_handle<>>& q;
                 ~trampoline_guard() {
-                    for (auto h : q) h.destroy();
+                    for (auto h : q) {
+                        if (!h.done()) h.destroy();
+                    }
                     q.clear();
                     trampoline_running = false;
                 }

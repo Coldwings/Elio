@@ -124,9 +124,9 @@ public:
             // Bail out promptly if the worker is being shut down — otherwise
             // an external producer keeps spinning while the inbox stays full.
             if (!running_.load(std::memory_order_acquire)) {
-                ELIO_LOG_WARNING("worker {} schedule(): destroying handle "
-                                "— worker shut down during inbox retry",
-                                worker_id_);
+                ELIO_LOG_ERROR("worker {} schedule(): destroying handle "
+                              "— worker shut down during inbox retry",
+                              worker_id_);
                 handle.destroy();
                 return;
             }
@@ -145,9 +145,9 @@ public:
             std::this_thread::yield();
         }
 
-        ELIO_LOG_WARNING("worker {} schedule(): destroying handle after {} "
-                        "inbox retries exhausted — possible task loss",
-                        worker_id_, max_total_retries);
+        ELIO_LOG_ERROR("worker {} schedule(): destroying handle after {} "
+                      "inbox retries exhausted — possible task loss",
+                      worker_id_, max_total_retries);
         handle.destroy();
     }
     

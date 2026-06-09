@@ -46,50 +46,8 @@ public:
 
     worker_thread(const worker_thread&) = delete;
     worker_thread& operator=(const worker_thread&) = delete;
-
-    worker_thread(worker_thread&& other) noexcept
-        : scheduler_(other.scheduler_)
-        , worker_id_(other.worker_id_)
-        , queue_(std::move(other.queue_))
-        , inbox_(std::move(other.inbox_))
-        , thread_(std::move(other.thread_))
-        , running_(other.running_.load(std::memory_order_relaxed))
-        , tasks_executed_(other.tasks_executed_.load(std::memory_order_relaxed))
-        , steals_executed_(other.steals_executed_.load(std::memory_order_relaxed))
-        , idle_(other.idle_.load(std::memory_order_relaxed))
-        , last_task_time_(other.last_task_time_.load(std::memory_order_relaxed))
-        , needs_sync_(other.needs_sync_)
-        , strategy_(std::move(other.strategy_))
-        , io_context_(std::move(other.io_context_)) {
-        // Reset other's pointers to empty states to prevent double-free
-        other.queue_ = std::make_unique<chase_lev_deque<void>>();
-        other.inbox_ = std::make_unique<mpsc_queue<void>>();
-    }
-
-    worker_thread& operator=(worker_thread&& other) noexcept {
-        if (this != &other) {
-            stop();
-
-            scheduler_ = other.scheduler_;
-            worker_id_ = other.worker_id_;
-            queue_ = std::move(other.queue_);
-            inbox_ = std::move(other.inbox_);
-            thread_ = std::move(other.thread_);
-            running_.store(other.running_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            tasks_executed_.store(other.tasks_executed_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            steals_executed_.store(other.steals_executed_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            idle_.store(other.idle_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            last_task_time_.store(other.last_task_time_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            needs_sync_ = other.needs_sync_;
-            strategy_ = std::move(other.strategy_);
-            io_context_ = std::move(other.io_context_);
-
-            // Reset other's pointers to empty states to prevent double-free
-            other.queue_ = std::make_unique<chase_lev_deque<void>>();
-            other.inbox_ = std::make_unique<mpsc_queue<void>>();
-        }
-        return *this;
-    }
+    worker_thread(worker_thread&&) = delete;
+    worker_thread& operator=(worker_thread&&) = delete;
 
     void start();
     void stop();

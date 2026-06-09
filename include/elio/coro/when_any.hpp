@@ -33,25 +33,13 @@ struct when_any_state {
     size_t winner_index_{0};
     coro::cancel_source cancel_source_;
 
-    template<size_t I, typename T>
-    void resolve(T&& value) {
+    template<size_t I, typename... Args>
+    void resolve(Args&&... args) {
         bool expected = false;
         if (resolved_.compare_exchange_strong(expected, true,
                 std::memory_order_acq_rel)) {
             winner_index_ = I;
-            result_.template emplace<I>(std::forward<T>(value));
-            cancel_source_.cancel();
-            resume_waiter();
-        }
-    }
-
-    template<size_t I>
-    void resolve_void() {
-        bool expected = false;
-        if (resolved_.compare_exchange_strong(expected, true,
-                std::memory_order_acq_rel)) {
-            winner_index_ = I;
-            result_.template emplace<I>(std::monostate{});
+            result_.template emplace<I>(std::forward<Args>(args)...);
             cancel_source_.cancel();
             resume_waiter();
         }
@@ -99,7 +87,7 @@ struct when_any_awaitable {
             try {
                 if constexpr (std::is_void_v<T>) {
                     co_await f();
-                    state->template resolve_void<Is>();
+                    state->template resolve<Is>(std::monostate{});
                 } else {
                     auto val = co_await f();
                     state->template resolve<Is>(std::move(val));

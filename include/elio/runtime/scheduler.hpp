@@ -710,7 +710,14 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
 
         if (!trampoline_running) {
             trampoline_running = true;
-            struct trampoline_guard { ~trampoline_guard() { trampoline_running = false; } } guard;
+            struct trampoline_guard {
+                std::vector<std::coroutine_handle<>>& q;
+                ~trampoline_guard() {
+                    for (auto h : q) h.destroy();
+                    q.clear();
+                    trampoline_running = false;
+                }
+            } guard{trampoline_queue};
             while (!trampoline_queue.empty()) {
                 auto h = trampoline_queue.back();
                 trampoline_queue.pop_back();

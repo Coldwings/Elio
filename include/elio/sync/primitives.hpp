@@ -1173,7 +1173,7 @@ private:
 
                     if (!warned && iterations >= warn_threshold) {
                         warned = true;
-                        ELIO_LOG_WARNING(
+                        ELIO_LOG_INFO(
                             "spinlock: high contention ({} iterations), "
                             "consider using elio::sync::mutex instead",
                             iterations);

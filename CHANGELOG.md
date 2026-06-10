@@ -27,6 +27,14 @@ stabilization since the 0.3.0 internal milestone.
 
 ### Added
 
+- **`when_any` stabilized** — removed `ELIO_EXPERIMENTAL` gate. Callables may
+  now optionally accept a `cancel_token` parameter for cooperative cancellation
+  when another callable wins. Homogeneous return types are unwrapped
+  automatically (`pair<size_t, T>` instead of `pair<size_t, variant<T,T,...>>`).
+  (#129)
+- **`with_timeout` combinator** — `co_await with_timeout(duration, callable)`
+  returns `timeout_result<T>` with `timed_out` flag and optional value. Supports
+  cancel_token propagation for cooperative cancellation on timeout. (#134)
 - `elio::go_to(worker_id, f, args...)` free function and `ELIO_GO_TO` macro for
   fire-and-forget task spawning pinned to a specific worker. (#124)
 - Unified `ELIO_ASYNC_MAIN(func)` macro that auto-detects all four async-main
@@ -53,6 +61,10 @@ stabilization since the 0.3.0 internal milestone.
   correctly adds `n - k`. (#123)
 - **vthread_stack**: `assert()` in `pop()` replaced with `__builtin_trap()` so
   invariant checks remain active in release builds. (#120)
+- **spinlock slow path**: removed `std::this_thread::sleep_for()` which could
+  block worker threads. High-contention warning logged at DEBUG level after lock
+  acquisition. Class documentation clarifies spinlock is thread-blocking and not
+  coroutine-aware. (#131)
 - Sync primitives: all types (`semaphore`, `event`, `channel`, `mutex`,
   `shared_mutex`, `condition_variable`, `spinlock`) now have explicit
   copy + move `= delete` for consistency. (#126, #121)
@@ -63,6 +75,9 @@ stabilization since the 0.3.0 internal milestone.
 - Runtime: `workers_` grow race and active_tasks shutdown. (#72)
 - Runtime: `blocking_pool` shutdown refusal, arm64 hang fix. (#83, #104)
 - Runtime: task tracking from spawn-time, not body-resume-time. (#98)
+- I/O: io_uring default `queue_depth` reduced from `512 * nproc` to flat 256,
+  clamped to [64, 4096]. Fixes `ENOMEM` on arm64 runners with low
+  `RLIMIT_MEMLOCK`. (#133)
 - I/O: io_uring CQE use-after-free and per-op syscall reduction. (#69)
 - I/O: io_uring deadlock in `submit_wake_poll`. (#58)
 - I/O: epoll switched from edge-triggered to level-triggered. (#61)
@@ -100,6 +115,8 @@ stabilization since the 0.3.0 internal milestone.
 - Chase-Lev deque: dropped unused `steal_batch`, reclaim old buffers. (#66)
 - Worker thread: deleted unused move semantics. (#119)
 - Coro: `when_any` resolve/resolve_void merged into single template. (#112)
+- Sync: `shared_mutex::unlock_shared` correctness documented — `WRITER_WAITING`
+  flag prevents reader sneak-in during the unlock window. (#132)
 - Tools: gdb/lldb scripts updated for `std::array` workers and `op_state`. (#89)
 - Build: improved portability, package export, CI consumer check. (#33)
 
@@ -108,8 +125,6 @@ stabilization since the 0.3.0 internal milestone.
 - TSAN sync primitive tests currently run with single-threaded scheduler to work
   around coroutine-frame-reuse false positives. Multi-threaded TSAN coverage
   will be restored in a future release with targeted suppressions.
-- `when_any` remains experimental (cooperative cancellation cannot interrupt
-  in-flight I/O; gated by `ELIO_EXPERIMENTAL`).
 
 ## [0.3.0] - 2026-02-03
 

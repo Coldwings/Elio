@@ -143,23 +143,26 @@ perf(runtime): add alignas(64) to worker_thread hot fields
 ### Branch Strategy
 
 - **`main`** — development mainline. Always builds and passes tests.
-- **`release/vX.Y`** — created from a tag when a release is cut. Used for
-  backporting bug fixes to older minor versions.
+- **`release/X.Y`** — long-lived branch for a minor version series (e.g.,
+  `release/0.4` covers all 0.4.x releases). Created from the initial `vX.Y.0`
+  tag. Patch releases (vX.Y.1, vX.Y.2, …) are tagged on this branch.
 - **Feature branches** — short-lived branches for individual changes, merged
   to `main` via PR.
 
 ### Release Process
 
 1. All changes land on `main` first.
-2. A release branch `release/vX.Y` is created from the release tag.
-3. Bug fixes are cherry-picked from `main` to the release branch manually.
+2. When cutting a new minor version, tag `vX.Y.0` on `main` and create a
+   `release/X.Y` branch from that tag.
+3. Bug fixes for a released version are cherry-picked from `main` to the
+   `release/X.Y` branch, then tagged as `vX.Y.Z` on that branch.
 4. The project aims to maintain the last two minor versions.
 
 ### Backporting
 
 Backporting is currently done manually via `git cherry-pick`. When cherry-picking
-a fix to a release branch, open a PR targeting the release branch so that CI
-validates the change.
+a fix to a release branch, open a PR targeting the `release/X.Y` branch so that
+CI validates the change.
 
 ## Reporting Issues
 

@@ -3,8 +3,10 @@
 #include <elio/coro/frame.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/spawn.hpp>
+#include <elio/runtime/affinity.hpp>
 #include <string>
 #include <atomic>
+#include <chrono>
 #include "../test_main.cpp"  // For scaled timeouts
 
 using namespace elio::coro;
@@ -260,6 +262,94 @@ TEST_CASE("elio::go() spawns fire-and-forget task with value", "[task][spawn]") 
     
     REQUIRE(result.load() == 42);
     
+    sched.shutdown();
+}
+
+TEST_CASE("elio::go_to() pins task to specific worker", "[task][spawn][affinity]") {
+    scheduler sched(4);
+    sched.start();
+
+    const size_t target = 2;
+    std::atomic<bool> executed{false};
+    std::atomic<size_t> observed_worker{NO_AFFINITY};
+
+    auto coro = [&]() -> task<void> {
+        observed_worker.store(elio::current_worker_id());
+        executed.store(true);
+        co_return;
+    };
+
+    elio::go_to(target, coro);
+
+    auto start = std::chrono::steady_clock::now();
+    while (!executed.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (std::chrono::steady_clock::now() - start > scaled_sec(5)) break;
+    }
+
+    REQUIRE(executed.load());
+    REQUIRE(observed_worker.load() == target);
+
+    sched.shutdown();
+}
+
+TEST_CASE("elio::go_to() with arguments", "[task][spawn][affinity]") {
+    scheduler sched(4);
+    sched.start();
+
+    const size_t target = 1;
+    std::atomic<bool> executed{false};
+    std::atomic<size_t> observed_worker{NO_AFFINITY};
+    std::atomic<int> sum{0};
+
+    auto coro = [](std::atomic<bool>* done, std::atomic<size_t>* worker,
+                   std::atomic<int>* result, int a, int b) -> task<void> {
+        worker->store(elio::current_worker_id());
+        result->store(a + b);
+        done->store(true);
+        co_return;
+    };
+
+    elio::go_to(target, coro, &executed, &observed_worker, &sum, 10, 32);
+
+    auto start = std::chrono::steady_clock::now();
+    while (!executed.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (std::chrono::steady_clock::now() - start > scaled_sec(5)) break;
+    }
+
+    REQUIRE(executed.load());
+    REQUIRE(observed_worker.load() == target);
+    REQUIRE(sum.load() == 42);
+
+    sched.shutdown();
+}
+
+TEST_CASE("ELIO_GO_TO macro pins task to worker", "[task][spawn][affinity]") {
+    scheduler sched(4);
+    sched.start();
+
+    const size_t target = 3;
+    std::atomic<bool> executed{false};
+    std::atomic<size_t> observed_worker{NO_AFFINITY};
+
+    auto work = [&]() -> task<void> {
+        observed_worker.store(elio::current_worker_id());
+        executed.store(true);
+        co_return;
+    };
+
+    ELIO_GO_TO(target, work());
+
+    auto start = std::chrono::steady_clock::now();
+    while (!executed.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (std::chrono::steady_clock::now() - start > scaled_sec(5)) break;
+    }
+
+    REQUIRE(executed.load());
+    REQUIRE(observed_worker.load() == target);
+
     sched.shutdown();
 }
 

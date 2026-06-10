@@ -171,15 +171,11 @@ class io_uring_backend final : public io_backend {
 public:
     /// Configuration options
     struct config {
-        /// SQ/CQ depth: defaults to 512 * num_hw_threads, clamped to [1024, 32768].
-        /// A larger ring reduces SQE exhaustion under high concurrency without
-        /// wasting memory on small machines.
-        uint32_t queue_depth = []() -> uint32_t {
-            unsigned hw = std::thread::hardware_concurrency();
-            if (hw == 0) hw = 4;  // conservative default if detection fails
-            auto d = static_cast<uint32_t>(hw) * 512u;
-            return std::clamp(d, 1024u, 32768u);
-        }();
+        /// SQ/CQ ring depth (per worker).  256 comfortably handles hundreds
+        /// of concurrent connections; if the SQ fills up the backend flushes
+        /// and retries, so a smaller ring only costs an extra submit syscall.
+        /// Override via config{.queue_depth = N} for extreme workloads.
+        uint32_t queue_depth = 256;
         uint32_t flags = 0;             ///< io_uring_setup flags
         bool sq_poll = false;           ///< Enable SQ polling (requires privileges)
     };

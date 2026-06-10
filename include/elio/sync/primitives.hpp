@@ -773,30 +773,9 @@ public:
     channel(const channel&) = delete;
     channel& operator=(const channel&) = delete;
 
-    // Movable
-    channel(channel&& other) noexcept
-        : capacity_(other.capacity_)
-        , closed_(other.closed_)
-        , queue_(std::move(other.queue_))
-        , recv_waiters_(std::move(other.recv_waiters_))
-        , send_waiters_(std::move(other.send_waiters_)) {
-        other.capacity_ = 0;
-        other.closed_ = true;
-    }
-
-    channel& operator=(channel&& other) noexcept(false) {
-        if (this != &other) {
-            close();
-            capacity_ = other.capacity_;
-            closed_ = other.closed_;
-            queue_ = std::move(other.queue_);
-            recv_waiters_ = std::move(other.recv_waiters_);
-            send_waiters_ = std::move(other.send_waiters_);
-            other.capacity_ = 0;
-            other.closed_ = true;
-        }
-        return *this;
-    }
+    // Non-movable (concurrent send/recv would race with move)
+    channel(channel&&) = delete;
+    channel& operator=(channel&&) = delete;
     
     /// Send awaitable
     class send_awaitable {

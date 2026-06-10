@@ -1,12 +1,8 @@
 #pragma once
 
-// EXPERIMENTAL: when_any's cancellation semantics are not yet fully validated.
-// Define ELIO_EXPERIMENTAL to include this header via elio.hpp, or include it directly.
-
 #include <atomic>
 #include <coroutine>
 #include <exception>
-#include <functional>
 #include <memory>
 #include <tuple>
 #include <type_traits>
@@ -22,9 +18,33 @@ namespace elio {
 
 namespace detail {
 
+template<typename F, bool = std::invocable<F, coro::cancel_token>>
+struct when_any_result;
+
+template<typename F>
+struct when_any_result<F, true> {
+    using type = task_value_t<std::invoke_result_t<F, coro::cancel_token>>;
+};
+
+template<typename F>
+struct when_any_result<F, false> {
+    using type = task_value_t<std::invoke_result_t<F>>;
+};
+
+template<typename F>
+using when_any_result_t = typename when_any_result<F>::type;
+
+template<typename F>
+concept when_any_callable =
+    (std::invocable<F> && is_task_v<std::invoke_result_t<F>>) ||
+    (std::invocable<F, coro::cancel_token> && is_task_v<std::invoke_result_t<F, coro::cancel_token>>);
+
+template<typename First, typename... Rest>
+inline constexpr bool all_same_v = (std::is_same_v<First, Rest> && ...);
+
 template<typename... Fs>
 struct when_any_state {
-    using result_type = std::variant<when_all_slot_t<callable_result_t<Fs>>...>;
+    using result_type = std::variant<when_all_slot_t<when_any_result_t<Fs>>...>;
 
     std::atomic<bool> resolved_{false};
     std::atomic<void*> waiter_{nullptr};
@@ -83,11 +103,19 @@ struct when_any_awaitable {
                    f = std::move(std::get<Is>(callables_))]() mutable
                       -> coro::task<void> {
             if (token.is_cancelled()) co_return;
-            using T = callable_result_t<std::tuple_element_t<Is, std::tuple<Fs...>>>;
+            using F = std::tuple_element_t<Is, std::tuple<Fs...>>;
+            using T = when_any_result_t<F>;
             try {
                 if constexpr (std::is_void_v<T>) {
-                    co_await f();
+                    if constexpr (std::invocable<F, coro::cancel_token>) {
+                        co_await f(token);
+                    } else {
+                        co_await f();
+                    }
                     state->template resolve<Is>(std::monostate{});
+                } else if constexpr (std::invocable<F, coro::cancel_token>) {
+                    auto val = co_await f(token);
+                    state->template resolve<Is>(std::move(val));
                 } else {
                     auto val = co_await f();
                     state->template resolve<Is>(std::move(val));
@@ -116,23 +144,35 @@ struct when_any_awaitable {
         if (state_->exception_) {
             std::rethrow_exception(state_->exception_);
         }
-        return std::pair{state_->winner_index_, std::move(state_->result_)};
+        if constexpr (all_same_v<when_all_slot_t<when_any_result_t<Fs>>...>) {
+            using common_t = when_all_slot_t<when_any_result_t<
+                std::tuple_element_t<0, std::tuple<Fs...>>>>;
+            return std::pair{state_->winner_index_,
+                std::visit([](auto&& v) -> common_t {
+                    return std::forward<decltype(v)>(v);
+                }, std::move(state_->result_))};
+        } else {
+            return std::pair{state_->winner_index_, std::move(state_->result_)};
+        }
     }
 };
 
 } // namespace detail
 
 /// Await multiple callables concurrently, resuming when the first one completes.
-/// Each callable must return a task<T>. Returns {index, variant<results...>}.
-/// Remaining tasks are signalled via cancel_token (cooperative cancellation).
+/// Each callable must return a task<T>. Callables may optionally accept a
+/// cancel_token parameter for cooperative cancellation when another wins.
+///
+/// When all callables return the same type, result is that type directly;
+/// otherwise it is std::variant<results...>.
 ///
 /// Usage:
-///   auto [idx, result] = co_await elio::when_any(
-///       []() -> task<int> { co_return 1; },
-///       []() -> task<int> { co_await sleep_for(10s); co_return 2; }
+///   auto [idx, value] = co_await elio::when_any(
+///       [](cancel_token tok) -> task<int> { co_return co_await fetch(key, tok); },
+///       []() -> task<int> { co_await sleep_for(10s); co_return -1; }
 ///   );
 template<typename... Fs>
-    requires ((std::invocable<Fs> && detail::is_task_v<std::invoke_result_t<Fs>>) && ...)
+    requires (detail::when_any_callable<Fs> && ...)
 auto when_any(Fs... fs) {
     return detail::when_any_awaitable<Fs...>(std::move(fs)...);
 }

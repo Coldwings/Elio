@@ -493,13 +493,8 @@ See [Performance Tuning Guide](wiki/Performance-Tuning.md) for optimization tips
 
 ## Contributing
 
-Contributions are welcome! Please:
-1. Follow C++20 best practices
-2. Write tests for new features
-3. Ensure ASAN tests pass
-4. Ensure CI passes
-5. Document public APIs
-6. Follow existing code style
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on
+development setup, code style, testing requirements, and the pull request workflow.
 
 ## License
 

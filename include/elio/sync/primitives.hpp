@@ -760,8 +760,14 @@ private:
 template<typename T>
 class channel {
 public:
-    /// Create a channel with the given capacity
-    /// @param capacity Maximum number of items (0 = unbounded)
+    /// Create a channel with the given capacity.
+    /// @param capacity Maximum number of items that can be buffered.
+    ///   - capacity > 0: bounded channel with back-pressure when full
+    ///   - capacity == 0: unbounded channel (no back-pressure, may grow
+    ///     indefinitely)
+    /// @note Unlike Go's `make(chan T)` / `make(chan T, 0)` which creates a
+    ///   synchronous (rendezvous) channel, Elio's `channel(0)` is *unbounded*.
+    ///   For bounded channels, always specify a positive capacity.
     explicit channel(size_t capacity = 0)
         : capacity_(capacity), closed_(false) {}
 

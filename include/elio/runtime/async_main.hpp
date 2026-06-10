@@ -244,6 +244,37 @@ auto run(F&& f, Arg0&& arg0, Args&&... args)
     return run(run_config{}, std::forward<F>(f), std::forward<Arg0>(arg0), std::forward<Args>(args)...);
 }
 
+namespace detail {
+
+/// Dispatch helper for ELIO_ASYNC_MAIN -- detects the callable's arity and
+/// return type at compile time so a single macro covers all four combinations
+/// of (argc, argv) vs no-args and task<int> vs task<void>.
+template<typename F>
+int async_main_dispatch(F&& func, int argc, char* argv[]) {
+    if constexpr (std::is_invocable_v<F, int, char**>) {
+        // func(argc, argv)
+        using result_t = task_value_t<std::invoke_result_t<F, int, char**>>;
+        if constexpr (std::is_void_v<result_t>) {
+            run(std::forward<F>(func), argc, argv);
+            return 0;
+        } else {
+            return run(std::forward<F>(func), argc, argv);
+        }
+    } else {
+        // func() -- no args
+        (void)argc; (void)argv;
+        using result_t = task_value_t<std::invoke_result_t<F>>;
+        if constexpr (std::is_void_v<result_t>) {
+            run(std::forward<F>(func));
+            return 0;
+        } else {
+            return run(std::forward<F>(func));
+        }
+    }
+}
+
+} // namespace detail
+
 } // namespace elio::runtime
 
 namespace elio {
@@ -256,11 +287,15 @@ using runtime::run_config;
 
 } // namespace elio
 
-/// Macro to define main() that runs an async_main coroutine with argc/argv
-/// 
-/// The async_main function should have signature:
-///   coro::task<int> async_main(int argc, char* argv[])
-/// 
+/// Unified macro to define main() that runs an async_main coroutine.
+///
+/// The callable's signature is detected at compile time. All four combinations
+/// are supported:
+///   - coro::task<int>  async_main(int argc, char* argv[])
+///   - coro::task<void> async_main(int argc, char* argv[])
+///   - coro::task<int>  async_main()
+///   - coro::task<void> async_main()
+///
 /// Usage:
 /// @code
 /// elio::coro::task<int> async_main(int argc, char* argv[]) {
@@ -268,42 +303,32 @@ using runtime::run_config;
 ///         std::cerr << "Usage: " << argv[0] << " <arg>\n";
 ///         co_return 1;
 ///     }
-///     // Your async code here
 ///     co_return 0;
 /// }
-/// 
+///
 /// ELIO_ASYNC_MAIN(async_main)
 /// @endcode
 #define ELIO_ASYNC_MAIN(async_main_func) \
     int main(int argc, char* argv[]) { \
-        return elio::run(async_main_func, argc, argv); \
+        return elio::runtime::detail::async_main_dispatch( \
+            async_main_func, argc, argv); \
     }
 
-/// Macro for async_main that returns void (exits with 0)
-/// 
-/// The async_main function should have signature:
-///   coro::task<void> async_main(int argc, char* argv[])
+// -------------------------------------------------------------------
+// Deprecated aliases — prefer ELIO_ASYNC_MAIN for all new code.
+// -------------------------------------------------------------------
+
+/// @deprecated Use ELIO_ASYNC_MAIN instead (it auto-detects void return).
 #define ELIO_ASYNC_MAIN_VOID(async_main_func) \
-    int main(int argc, char* argv[]) { \
-        elio::run(async_main_func, argc, argv); \
-        return 0; \
-    }
+    _Pragma("GCC warning \"ELIO_ASYNC_MAIN_VOID is deprecated; use ELIO_ASYNC_MAIN instead\"") \
+    ELIO_ASYNC_MAIN(async_main_func)
 
-/// Macro for async_main without arguments
-/// 
-/// The async_main function should have signature:
-///   coro::task<int> async_main()
+/// @deprecated Use ELIO_ASYNC_MAIN instead (it auto-detects no-arg callables).
 #define ELIO_ASYNC_MAIN_NOARGS(async_main_func) \
-    int main() { \
-        return elio::run(async_main_func); \
-    }
+    _Pragma("GCC warning \"ELIO_ASYNC_MAIN_NOARGS is deprecated; use ELIO_ASYNC_MAIN instead\"") \
+    ELIO_ASYNC_MAIN(async_main_func)
 
-/// Macro for async_main without arguments, returning void
-/// 
-/// The async_main function should have signature:
-///   coro::task<void> async_main()
+/// @deprecated Use ELIO_ASYNC_MAIN instead (it auto-detects both).
 #define ELIO_ASYNC_MAIN_VOID_NOARGS(async_main_func) \
-    int main() { \
-        elio::run(async_main_func); \
-        return 0; \
-    }
+    _Pragma("GCC warning \"ELIO_ASYNC_MAIN_VOID_NOARGS is deprecated; use ELIO_ASYNC_MAIN instead\"") \
+    ELIO_ASYNC_MAIN(async_main_func)

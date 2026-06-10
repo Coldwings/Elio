@@ -124,16 +124,7 @@ struct when_all_awaitable {
 private:
     template<size_t... Is>
     auto extract_values(std::index_sequence<Is...>) {
-        if constexpr (sizeof...(Fs) == 1) {
-            using T = callable_result_t<std::tuple_element_t<0, std::tuple<Fs...>>>;
-            if constexpr (std::is_void_v<T>) {
-                return;
-            } else {
-                return std::move(*std::get<0>(state_->values_));
-            }
-        } else {
-            return std::tuple{std::move(*std::get<Is>(state_->values_))...};
-        }
+        return std::tuple{std::move(*std::get<Is>(state_->values_))...};
     }
 };
 

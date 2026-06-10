@@ -1100,13 +1100,14 @@ private:
     bool closed_;
 };
 
-/// Coroutine-aware spinlock
-/// Uses atomic CAS with cpu_relax() for low-latency locking.
-/// Suitable for short critical sections where contention is low.
-/// Unlike std::mutex-based elio::sync::mutex, this avoids OS-level synchronization
-/// entirely, trading CPU cycles for lower latency.
+/// Thread-blocking spinlock — NOT coroutine-aware.
+/// Spins on atomic CAS with cpu_relax(), then yields to the OS scheduler.
+/// This blocks the entire worker thread, starving all coroutines on it.
 ///
-/// For coroutine suspension under contention, use elio::sync::mutex instead.
+/// Use ONLY for very short critical sections (a few instructions) where
+/// contention is rare and no co_await occurs while the lock is held.
+/// For anything else, use elio::sync::mutex which suspends the coroutine
+/// instead of blocking the thread.
 /// This spinlock is designed for scenarios where the lock is held very briefly
 /// and the overhead of thread/coroutine suspension would exceed the spin time.
 class spinlock {

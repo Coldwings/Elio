@@ -1,4 +1,3 @@
-#define ELIO_EXPERIMENTAL
 #include <catch2/catch_test_macros.hpp>
 #include <elio/elio.hpp>
 #include <elio/coro/when_all.hpp>
@@ -6,6 +5,7 @@
 #include <elio/time/timer.hpp>
 #include <atomic>
 #include <stdexcept>
+#include <string>
 #include "../test_main.cpp"
 
 using namespace elio;
@@ -114,7 +114,7 @@ TEST_CASE("when_all single task", "[sync][combinators]") {
 
 TEST_CASE("when_any returns first completer", "[sync][combinators]") {
     auto test = []() -> task<void> {
-        auto [idx, result] = co_await when_any(
+        auto [idx, value] = co_await when_any(
             []() -> task<int> {
                 co_await time::sleep_for(std::chrono::milliseconds(1));
                 co_return 1;
@@ -125,7 +125,7 @@ TEST_CASE("when_any returns first completer", "[sync][combinators]") {
             }
         );
         REQUIRE(idx == 0);
-        REQUIRE(std::get<0>(result) == 1);
+        REQUIRE(value == 1);
     };
 
     runtime::scheduler sched(2);
@@ -135,7 +135,7 @@ TEST_CASE("when_any returns first completer", "[sync][combinators]") {
 
 TEST_CASE("when_any second finishes first", "[sync][combinators]") {
     auto test = []() -> task<void> {
-        auto [idx, result] = co_await when_any(
+        auto [idx, value] = co_await when_any(
             []() -> task<int> {
                 co_await time::sleep_for(std::chrono::milliseconds(500));
                 co_return 1;
@@ -146,7 +146,7 @@ TEST_CASE("when_any second finishes first", "[sync][combinators]") {
             }
         );
         REQUIRE(idx == 1);
-        REQUIRE(std::get<1>(result) == 2);
+        REQUIRE(value == 2);
     };
 
     runtime::scheduler sched(2);
@@ -174,6 +174,119 @@ TEST_CASE("when_any propagates exception from winner", "[sync][combinators]") {
             REQUIRE(std::string(e.what()) == "test error");
         }
         REQUIRE(caught);
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("when_any with cancel_token propagation", "[sync][combinators]") {
+    std::atomic<bool> was_cancelled{false};
+
+    auto test = [&]() -> task<void> {
+        auto [idx, value] = co_await when_any(
+            []() -> task<int> {
+                co_await time::sleep_for(std::chrono::milliseconds(1));
+                co_return 42;
+            },
+            [&](coro::cancel_token tok) -> task<int> {
+                auto r = co_await time::sleep_for(
+                    std::chrono::milliseconds(500), tok);
+                if (r == coro::cancel_result::cancelled) {
+                    was_cancelled.store(true, std::memory_order_relaxed);
+                }
+                co_return -1;
+            }
+        );
+        REQUIRE(idx == 0);
+        REQUIRE(value == 42);
+        co_await time::sleep_for(std::chrono::milliseconds(50));
+        REQUIRE(was_cancelled.load(std::memory_order_relaxed));
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("when_any with void tasks", "[sync][combinators]") {
+    std::atomic<int> winner{-1};
+
+    auto test = [&]() -> task<void> {
+        auto [idx, mono] = co_await when_any(
+            [&]() -> task<void> {
+                co_await time::sleep_for(std::chrono::milliseconds(1));
+                winner.store(0, std::memory_order_relaxed);
+            },
+            [&]() -> task<void> {
+                co_await time::sleep_for(std::chrono::milliseconds(500));
+                winner.store(1, std::memory_order_relaxed);
+            }
+        );
+        REQUIRE(idx == 0);
+        static_assert(std::is_same_v<decltype(mono), std::monostate>);
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("when_any single task", "[sync][combinators]") {
+    auto test = []() -> task<void> {
+        auto [idx, value] = co_await when_any(
+            []() -> task<int> { co_return 99; }
+        );
+        REQUIRE(idx == 0);
+        REQUIRE(value == 99);
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("when_any with heterogeneous types", "[sync][combinators]") {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+    auto test = []() -> task<void> {
+        auto [idx, result] = co_await when_any(
+            []() -> task<int> {
+                co_await time::sleep_for(std::chrono::milliseconds(1));
+                co_return 42;
+            },
+            []() -> task<std::string> {
+                co_await time::sleep_for(std::chrono::milliseconds(500));
+                co_return std::string("hello");
+            }
+        );
+        REQUIRE(idx == 0);
+        REQUIRE(std::get<0>(result) == 42);
+    };
+#pragma GCC diagnostic pop
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("when_any loser exception is silent", "[sync][combinators]") {
+    auto test = []() -> task<void> {
+        auto [idx, value] = co_await when_any(
+            []() -> task<int> {
+                co_await time::sleep_for(std::chrono::milliseconds(1));
+                co_return 42;
+            },
+            []() -> task<int> {
+                co_await time::sleep_for(std::chrono::milliseconds(50));
+                throw std::runtime_error("loser exception");
+                co_return 0;
+            }
+        );
+        REQUIRE(idx == 0);
+        REQUIRE(value == 42);
+        co_await time::sleep_for(std::chrono::milliseconds(200));
     };
 
     runtime::scheduler sched(2);

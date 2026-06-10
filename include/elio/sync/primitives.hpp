@@ -10,7 +10,6 @@
 #include <optional>
 #include <vector>
 #include <thread>
-#include <chrono>
 
 namespace elio::runtime {
 class scheduler;  // Forward declaration
@@ -1153,13 +1152,11 @@ public:
 
 private:
     void lock_slow() noexcept {
-        // Exponential backoff parameters
-        constexpr int spin_threshold = 8;    // spins before yielding
-        constexpr int yield_threshold = 64;  // iterations before sleeping
-        constexpr auto max_sleep = std::chrono::microseconds{512};
+        constexpr int spin_threshold = 8;
+        constexpr int warn_threshold = 1024;
 
         int iterations = 0;
-        auto sleep_duration = std::chrono::microseconds{1};
+        bool warned = false;
 
         for (;;) {
             // TTAS: spin on read first (avoids cache-line bouncing from CAS)
@@ -1167,29 +1164,26 @@ private:
                 ++iterations;
 
                 if (iterations < spin_threshold) {
-                    // Initial spinning phase - burn CPU cycles
                     runtime::cpu_relax();
-                } else if (iterations < yield_threshold) {
-                    // Yield phase - allow other threads to run
-                    std::this_thread::yield();
                 } else {
-                    // Sleep phase - exponential backoff sleep
-                    std::this_thread::sleep_for(sleep_duration);
-                    sleep_duration = std::min(sleep_duration * 2, max_sleep);
+                    // Yield to the OS scheduler — never sleep, which would
+                    // block a worker thread and starve all coroutines on it.
+                    std::this_thread::yield();
+
+                    if (!warned && iterations >= warn_threshold) {
+                        warned = true;
+                        ELIO_LOG_WARNING(
+                            "spinlock: high contention ({} iterations), "
+                            "consider using elio::sync::mutex instead",
+                            iterations);
+                    }
                 }
             }
 
-            // Try to acquire
             bool expected = false;
             if (locked_.compare_exchange_weak(expected, true,
                     std::memory_order_acquire, std::memory_order_relaxed)) {
                 return;
-            }
-
-            // Reset iterations on CAS failure to give the lock holder
-            // a chance to release the lock
-            if (iterations >= yield_threshold) {
-                sleep_duration = std::chrono::microseconds{1};
             }
         }
     }

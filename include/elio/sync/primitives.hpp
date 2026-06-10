@@ -657,9 +657,8 @@ public:
                 waiters_.pop();
             }
 
-            // Always add the full release count to count_
-            // (waiters that were woken will consume permits when they run)
-            count_ += count;
+            // Only add permits not consumed by woken waiters
+            count_ += (count - to_wake);
         }
 
         // Re-schedule waiters through the scheduler

@@ -128,6 +128,90 @@ TEST_CASE("semaphore basic operations", "[sync][semaphore]") {
     }
 }
 
+TEST_CASE("semaphore release does not leak permits when waking waiters", "[sync][semaphore][coro]") {
+    semaphore sem(2);
+    std::atomic<int> acquired_count{0};
+    event gate;           // signals the 2 initial acquirers to release
+    event waiter_gate;    // signals blocked acquirers to release
+
+    semaphore* sem_ptr = &sem;
+    std::atomic<int>* acquired_count_ptr = &acquired_count;
+    event* gate_ptr = &gate;
+    event* waiter_gate_ptr = &waiter_gate;
+
+    // Use single-threaded scheduler to avoid TSAN memory reuse
+    scheduler sched(1);
+    sched.start();
+
+    // Phase 1: two tasks acquire, consuming both permits (count_ -> 0)
+    auto initial_acquirer = [=]() -> task<void> {
+        co_await sem_ptr->acquire();
+        acquired_count_ptr->fetch_add(1, std::memory_order_relaxed);
+        // Hold the permit until gate is set
+        co_await gate_ptr->wait();
+        sem_ptr->release();
+        co_return;
+    };
+
+    auto j1 = spawn_joinable(sched, initial_acquirer);
+    auto j2 = spawn_joinable(sched, initial_acquirer);
+
+    // Give time for both to acquire
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    REQUIRE(acquired_count.load(std::memory_order_relaxed) == 2);
+    REQUIRE(sem.count() == 0);
+
+    // Phase 2: two more tasks try to acquire — they will block
+    std::atomic<int> waiter_acquired{0};
+    std::atomic<int>* waiter_acquired_ptr = &waiter_acquired;
+
+    auto blocked_acquirer = [=]() -> task<void> {
+        co_await sem_ptr->acquire();  // will block — no permits available
+        waiter_acquired_ptr->fetch_add(1, std::memory_order_relaxed);
+        // Hold the permit — do NOT release immediately, so we can observe count
+        co_await waiter_gate_ptr->wait();
+        sem_ptr->release();
+        co_return;
+    };
+
+    auto j3 = spawn_joinable(sched, blocked_acquirer);
+    auto j4 = spawn_joinable(sched, blocked_acquirer);
+
+    // Give time for both to enqueue as waiters
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    REQUIRE(waiter_acquired.load(std::memory_order_relaxed) == 0);
+
+    // Phase 3: release(1) — should wake exactly 1 waiter, leaving count_==0
+    sem.release(1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    REQUIRE(waiter_acquired.load(std::memory_order_relaxed) == 1);
+
+    // KEY CHECK: With the bug, count_ would be 1 (phantom permit).
+    // After the fix, count_ should be 0 — the woken waiter consumed the permit.
+    REQUIRE_FALSE(sem.try_acquire());  // no phantom permit should exist
+    REQUIRE(sem.count() == 0);
+
+    // Phase 4: release(1) to unblock the last waiter
+    sem.release(1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    REQUIRE(waiter_acquired.load(std::memory_order_relaxed) == 2);
+    REQUIRE_FALSE(sem.try_acquire());  // still no phantom permits
+    REQUIRE(sem.count() == 0);
+
+    // Cleanup: let all tasks finish
+    waiter_gate.set();
+    gate.set();
+
+    j1.wait_destroyed();
+    j2.wait_destroyed();
+    j3.wait_destroyed();
+    j4.wait_destroyed();
+
+    sched.shutdown();
+}
+
 TEST_CASE("event basic operations", "[sync][event]") {
     event e;
     

@@ -99,7 +99,7 @@ TEST_CASE("when_all propagates first exception", "[sync][combinators]") {
 
 TEST_CASE("when_all single task", "[sync][combinators]") {
     auto test = []() -> task<void> {
-        auto result = co_await when_all(
+        auto [result] = co_await when_all(
             []() -> task<int> { co_return 42; }
         );
         REQUIRE(result == 42);

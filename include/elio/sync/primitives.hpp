@@ -10,7 +10,6 @@
 #include <optional>
 #include <vector>
 #include <thread>
-#include <chrono>
 
 namespace elio::runtime {
 class scheduler;  // Forward declaration
@@ -1109,13 +1108,14 @@ private:
     bool closed_;
 };
 
-/// Coroutine-aware spinlock
-/// Uses atomic CAS with cpu_relax() for low-latency locking.
-/// Suitable for short critical sections where contention is low.
-/// Unlike std::mutex-based elio::sync::mutex, this avoids OS-level synchronization
-/// entirely, trading CPU cycles for lower latency.
+/// Thread-blocking spinlock — NOT coroutine-aware.
+/// Spins on atomic CAS with cpu_relax(), then yields to the OS scheduler.
+/// This blocks the entire worker thread, starving all coroutines on it.
 ///
-/// For coroutine suspension under contention, use elio::sync::mutex instead.
+/// Use ONLY for very short critical sections (a few instructions) where
+/// contention is rare and no co_await occurs while the lock is held.
+/// For anything else, use elio::sync::mutex which suspends the coroutine
+/// instead of blocking the thread.
 /// This spinlock is designed for scenarios where the lock is held very briefly
 /// and the overhead of thread/coroutine suspension would exceed the spin time.
 class spinlock {
@@ -1161,43 +1161,31 @@ public:
 
 private:
     void lock_slow() noexcept {
-        // Exponential backoff parameters
-        constexpr int spin_threshold = 8;    // spins before yielding
-        constexpr int yield_threshold = 64;  // iterations before sleeping
-        constexpr auto max_sleep = std::chrono::microseconds{512};
+        constexpr int spin_threshold = 8;
+        constexpr int warn_threshold = 1024;
 
         int iterations = 0;
-        auto sleep_duration = std::chrono::microseconds{1};
 
         for (;;) {
-            // TTAS: spin on read first (avoids cache-line bouncing from CAS)
             while (locked_.load(std::memory_order_relaxed)) {
                 ++iterations;
-
                 if (iterations < spin_threshold) {
-                    // Initial spinning phase - burn CPU cycles
                     runtime::cpu_relax();
-                } else if (iterations < yield_threshold) {
-                    // Yield phase - allow other threads to run
-                    std::this_thread::yield();
                 } else {
-                    // Sleep phase - exponential backoff sleep
-                    std::this_thread::sleep_for(sleep_duration);
-                    sleep_duration = std::min(sleep_duration * 2, max_sleep);
+                    std::this_thread::yield();
                 }
             }
 
-            // Try to acquire
             bool expected = false;
             if (locked_.compare_exchange_weak(expected, true,
                     std::memory_order_acquire, std::memory_order_relaxed)) {
+                if (iterations >= warn_threshold) {
+                    ELIO_LOG_DEBUG(
+                        "spinlock: high contention ({} iterations), "
+                        "consider using elio::sync::mutex instead",
+                        iterations);
+                }
                 return;
-            }
-
-            // Reset iterations on CAS failure to give the lock holder
-            // a chance to release the lock
-            if (iterations >= yield_threshold) {
-                sleep_duration = std::chrono::microseconds{1};
             }
         }
     }

@@ -37,6 +37,30 @@ void go(F&& f, Args&&... args) {
     std::abort();
 }
 
+/// Fire-and-forget: spawn a coroutine pinned to a specific worker.
+/// The task is bound to the given worker and cannot be stolen by others.
+///
+/// @tparam F  Callable type that returns a task<T>
+/// @tparam Args  Argument types
+/// @param worker_id  Target worker index
+/// @param f  Callable to invoke (must return a task)
+/// @param args  Arguments to forward to the callable
+///
+/// Example:
+///   elio::go_to(0, async_work);
+///   elio::go_to(1, async_work_with_args, 1, 2, 3);
+template<typename F, typename... Args>
+    requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
+void go_to(size_t worker_id, F&& f, Args&&... args) {
+    auto* sched = runtime::scheduler::current();
+    if (sched && sched->is_running()) {
+        sched->go_to(worker_id, std::forward<F>(f), std::forward<Args>(args)...);
+        return;
+    }
+    ELIO_LOG_ERROR("elio::go_to() called without a running scheduler — aborting");
+    std::abort();
+}
+
 /// Spawn a coroutine and return a join_handle to await its result.
 /// The coroutine runs concurrently and the result can be retrieved via co_await.
 ///
@@ -74,6 +98,10 @@ auto spawn(F&& f, Args&&... args)
 /// Fire-and-forget macro for inline coroutine expressions
 /// Usage: ELIO_GO(some_async_operation())
 #define ELIO_GO(...)    elio::go([&]() { return __VA_ARGS__; })
+
+/// Fire-and-forget macro for inline coroutine expressions pinned to a worker
+/// Usage: ELIO_GO_TO(0, some_async_operation())
+#define ELIO_GO_TO(worker_id, ...)    elio::go_to(worker_id, [&]() { return __VA_ARGS__; })
 
 /// Spawn macro for inline coroutine expressions, returns join_handle
 /// Usage: auto h = ELIO_SPAWN(compute_async()); auto result = co_await h;

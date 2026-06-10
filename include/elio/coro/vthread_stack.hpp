@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <new>
-#include <cassert>
+
 #include <functional>
 
 // Sanitizer detection for vthread_stack
@@ -114,10 +114,9 @@ public:
     void pop([[maybe_unused]] void* ptr, size_t size) noexcept {
         size_t aligned_size = align_up(size);
 
-        assert(current_segment_ != nullptr && "pop called with no segment");
-        assert(current_segment_->used >= aligned_size && "pop size exceeds used");
-        assert(ptr == current_segment_->data() + current_segment_->used - aligned_size &&
-               "pop ptr does not match expected position");
+        if (!current_segment_) [[unlikely]] __builtin_trap();
+        if (current_segment_->used < aligned_size) [[unlikely]] __builtin_trap();
+        if (ptr != current_segment_->data() + current_segment_->used - aligned_size) [[unlikely]] __builtin_trap();
 
         current_segment_->used -= aligned_size;
 

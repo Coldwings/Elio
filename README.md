@@ -1,6 +1,6 @@
 # Elio Coroutine Library
 
-**Elio** is a modern, production-ready C++20 coroutine library for high-performance asynchronous programming on Linux. It provides stackless coroutines with virtual stack tracking, a multi-threaded work-stealing scheduler, and a foundation for efficient I/O operations.
+**Elio** is a modern, high-performance C++20 coroutine library for asynchronous programming on Linux, approaching stable release. It provides stackless coroutines with virtual stack tracking, a multi-threaded work-stealing scheduler, and a foundation for efficient I/O operations.
 
 [![CI](https://github.com/Coldwings/Elio/actions/workflows/ci.yml/badge.svg)](https://github.com/Coldwings/Elio/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
@@ -523,4 +523,4 @@ For questions, issues, or feature requests, please open an issue on the reposito
 
 ---
 
-**Status**: Feature Complete | **Version**: 0.3.0 | **Date**: 2026-02-03
+**Status**: Approaching Stable | **Version**: 0.4.0 | **Date**: 2026-06-10

@@ -22,6 +22,7 @@
 #include "coro/generator.hpp"
 #include "coro/when_all.hpp"
 #include "coro/when_any.hpp"
+#include "coro/with_timeout.hpp"
 
 // Runtime scheduler
 #include "runtime/scheduler.hpp"

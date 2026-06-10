@@ -2,6 +2,7 @@
 #include <elio/elio.hpp>
 #include <elio/coro/when_all.hpp>
 #include <elio/coro/when_any.hpp>
+#include <elio/coro/with_timeout.hpp>
 #include <elio/time/timer.hpp>
 #include <atomic>
 #include <stdexcept>
@@ -287,6 +288,132 @@ TEST_CASE("when_any loser exception is silent", "[sync][combinators]") {
         REQUIRE(idx == 0);
         REQUIRE(value == 42);
         co_await time::sleep_for(std::chrono::milliseconds(200));
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+// --- with_timeout tests ---
+
+TEST_CASE("with_timeout task completes before timeout", "[sync][combinators]") {
+    auto test = []() -> task<void> {
+        auto result = co_await with_timeout(
+            std::chrono::milliseconds(500),
+            []() -> task<int> {
+                co_await time::sleep_for(std::chrono::milliseconds(1));
+                co_return 42;
+            }
+        );
+        REQUIRE(static_cast<bool>(result));
+        REQUIRE(!result.timed_out);
+        REQUIRE(*result == 42);
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("with_timeout task exceeds timeout", "[sync][combinators]") {
+    auto test = []() -> task<void> {
+        auto result = co_await with_timeout(
+            std::chrono::milliseconds(1),
+            [](coro::cancel_token tok) -> task<int> {
+                co_await time::sleep_for(std::chrono::milliseconds(500), tok);
+                co_return 42;
+            }
+        );
+        REQUIRE(!static_cast<bool>(result));
+        REQUIRE(result.timed_out);
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("with_timeout with cancel_token propagation", "[sync][combinators]") {
+    std::atomic<bool> was_cancelled{false};
+
+    auto test = [&]() -> task<void> {
+        auto result = co_await with_timeout(
+            std::chrono::milliseconds(1),
+            [&](coro::cancel_token tok) -> task<int> {
+                auto r = co_await time::sleep_for(
+                    std::chrono::milliseconds(500), tok);
+                if (r == coro::cancel_result::cancelled) {
+                    was_cancelled.store(true, std::memory_order_relaxed);
+                }
+                co_return -1;
+            }
+        );
+        REQUIRE(result.timed_out);
+        co_await time::sleep_for(std::chrono::milliseconds(50));
+        REQUIRE(was_cancelled.load(std::memory_order_relaxed));
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("with_timeout with void task", "[sync][combinators]") {
+    std::atomic<bool> completed{false};
+
+    auto test = [&]() -> task<void> {
+        auto result = co_await with_timeout(
+            std::chrono::milliseconds(500),
+            [&]() -> task<void> {
+                co_await time::sleep_for(std::chrono::milliseconds(1));
+                completed.store(true, std::memory_order_relaxed);
+            }
+        );
+        REQUIRE(static_cast<bool>(result));
+        REQUIRE(!result.timed_out);
+        REQUIRE(completed.load(std::memory_order_relaxed));
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("with_timeout with zero duration", "[sync][combinators]") {
+    auto test = []() -> task<void> {
+        auto result = co_await with_timeout(
+            std::chrono::milliseconds(0),
+            [](coro::cancel_token tok) -> task<int> {
+                co_await time::sleep_for(std::chrono::milliseconds(100), tok);
+                co_return 42;
+            }
+        );
+        REQUIRE(result.timed_out);
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("with_timeout task throws exception", "[sync][combinators]") {
+    auto test = []() -> task<void> {
+        bool caught = false;
+        try {
+            co_await with_timeout(
+                std::chrono::milliseconds(500),
+                []() -> task<int> {
+                    co_await time::sleep_for(std::chrono::milliseconds(1));
+                    throw std::runtime_error("task error");
+                    co_return 0;
+                }
+            );
+        } catch (const std::runtime_error& e) {
+            caught = true;
+            REQUIRE(std::string(e.what()) == "task error");
+        }
+        REQUIRE(caught);
     };
 
     runtime::scheduler sched(2);

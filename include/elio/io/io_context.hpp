@@ -67,13 +67,8 @@ public:
 
     io_context(const io_context&) = delete;
     io_context& operator=(const io_context&) = delete;
-#if ELIO_HAS_IO_URING
     io_context(io_context&&) = delete;
     io_context& operator=(io_context&&) = delete;
-#else
-    io_context(io_context&&) = default;
-    io_context& operator=(io_context&&) = default;
-#endif
 
     auto& backend() noexcept {
 #if ELIO_HAS_IO_URING

@@ -397,6 +397,14 @@ public:
     }
 
     /// Release shared (read) lock
+    ///
+    /// No new reader can sneak in via the lock-free fast path between our
+    /// fetch_sub and the slow-path mutex acquisition below: WRITER_WAITING
+    /// is already set in state_, and try_lock_shared()/lock_shared_awaitable
+    /// both check WRITER_FLAGS before the CAS, so they fail immediately.
+    /// The writer's own re-acquire CAS (after its fetch_or of WRITER_WAITING)
+    /// closes any remaining window where all readers have exited but no one
+    /// has woken the writer.
     void unlock_shared() {
         // Decrement reader count atomically
         uint64_t prev_state = state_.fetch_sub(1, std::memory_order_release);

@@ -1157,33 +1157,26 @@ private:
         constexpr int warn_threshold = 1024;
 
         int iterations = 0;
-        bool warned = false;
 
         for (;;) {
-            // TTAS: spin on read first (avoids cache-line bouncing from CAS)
             while (locked_.load(std::memory_order_relaxed)) {
                 ++iterations;
-
                 if (iterations < spin_threshold) {
                     runtime::cpu_relax();
                 } else {
-                    // Yield to the OS scheduler — never sleep, which would
-                    // block a worker thread and starve all coroutines on it.
                     std::this_thread::yield();
-
-                    if (!warned && iterations >= warn_threshold) {
-                        warned = true;
-                        ELIO_LOG_INFO(
-                            "spinlock: high contention ({} iterations), "
-                            "consider using elio::sync::mutex instead",
-                            iterations);
-                    }
                 }
             }
 
             bool expected = false;
             if (locked_.compare_exchange_weak(expected, true,
                     std::memory_order_acquire, std::memory_order_relaxed)) {
+                if (iterations >= warn_threshold) {
+                    ELIO_LOG_DEBUG(
+                        "spinlock: high contention ({} iterations), "
+                        "consider using elio::sync::mutex instead",
+                        iterations);
+                }
                 return;
             }
         }

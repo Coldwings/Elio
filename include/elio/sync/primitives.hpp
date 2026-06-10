@@ -598,6 +598,8 @@ public:
     // Non-copyable, non-movable
     semaphore(const semaphore&) = delete;
     semaphore& operator=(const semaphore&) = delete;
+    semaphore(semaphore&&) = delete;
+    semaphore& operator=(semaphore&&) = delete;
     
     /// Acquire awaitable
     class acquire_awaitable {
@@ -688,6 +690,8 @@ public:
     // Non-copyable, non-movable
     event(const event&) = delete;
     event& operator=(const event&) = delete;
+    event(event&&) = delete;
+    event& operator=(event&&) = delete;
     
     /// Wait awaitable
     class wait_awaitable {

@@ -171,10 +171,10 @@ class io_uring_backend final : public io_backend {
 public:
     /// Configuration options
     struct config {
-        /// SQ/CQ ring depth (per worker).  256 comfortably handles hundreds
-        /// of concurrent connections; if the SQ fills up the backend flushes
-        /// and retries, so a smaller ring only costs an extra submit syscall.
-        /// Override via config{.queue_depth = N} for extreme workloads.
+        /// SQ/CQ ring depth (per worker), clamped to [64, 4096].
+        /// 256 comfortably handles hundreds of concurrent connections;
+        /// if the SQ fills up the backend flushes and retries, so a
+        /// smaller ring only costs an extra submit syscall.
         uint32_t queue_depth = 256;
         uint32_t flags = 0;             ///< io_uring_setup flags
         bool sq_poll = false;           ///< Enable SQ polling (requires privileges)
@@ -184,18 +184,20 @@ public:
     io_uring_backend() : io_uring_backend(config{}) {}
     
     /// Constructor with custom configuration
-    explicit io_uring_backend(const config& cfg) 
+    explicit io_uring_backend(const config& cfg)
         : pending_ops_(0) {
-        
+
+        const uint32_t depth = std::clamp(cfg.queue_depth, 64u, 4096u);
+
         struct io_uring_params params = {};
         params.flags = cfg.flags;
-        
+
         if (cfg.sq_poll) {
             params.flags |= IORING_SETUP_SQPOLL;
             params.sq_thread_idle = 2000;  // 2 second idle timeout
         }
-        
-        int ret = io_uring_queue_init_params(cfg.queue_depth, &ring_, &params);
+
+        int ret = io_uring_queue_init_params(depth, &ring_, &params);
         if (ret < 0) {
             throw std::runtime_error(
                 std::string("io_uring_queue_init failed: ") + strerror(-ret)
@@ -203,7 +205,7 @@ public:
         }
         
         ELIO_LOG_INFO("io_uring_backend initialized (queue_depth={}, flags=0x{:x})",
-                      cfg.queue_depth, params.flags);
+                      depth, params.flags);
 
         // Create eventfd for cross-thread wake notifications
         wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);

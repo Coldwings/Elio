@@ -17,6 +17,21 @@
 #endif
 #endif
 
+// TSAN annotations for coroutine frame reuse
+// These tell TSAN that memory allocated by one coroutine and freed by another
+// has a proper happens-before relationship, avoiding false positives.
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+extern "C" {
+void __tsan_acquire(void* addr);
+void __tsan_release(void* addr);
+}
+#define ELIO_TSAN_ACQUIRE(addr) __tsan_acquire(addr)
+#define ELIO_TSAN_RELEASE(addr) __tsan_release(addr)
+#else
+#define ELIO_TSAN_ACQUIRE(addr) ((void)0)
+#define ELIO_TSAN_RELEASE(addr) ((void)0)
+#endif
+
 namespace elio::coro {
 
 /// Segmented bump-pointer stack allocator for vthread coroutine frames.
@@ -34,10 +49,13 @@ public:
     // Static interface — for promise_type::operator new/delete
 #ifdef ELIO_SANITIZER_ACTIVE
     static void* allocate(size_t size) {
-        return ::operator new(size);
+        void* ptr = ::operator new(size);
+        ELIO_TSAN_RELEASE(ptr);  // Mark allocation as happening-after any previous deallocation
+        return ptr;
     }
 
     static void deallocate(void* ptr, [[maybe_unused]] size_t size) noexcept {
+        ELIO_TSAN_RELEASE(ptr);  // Mark deallocation as happening-before any subsequent allocation
         ::operator delete(ptr);
     }
 #else

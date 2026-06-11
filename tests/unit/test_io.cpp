@@ -2,6 +2,7 @@
 #include <elio/io/io_context.hpp>
 #include <elio/io/io_awaitables.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/net/resolve.hpp>
 
@@ -1509,3 +1510,253 @@ TEST_CASE("resolve_options ttl controls cache expiry", "[tcp][dns][cache][config
     REQUIRE(stats.cache_misses >= 2);
     REQUIRE(stats.cache_hits == 0);
 }
+
+// ============================================================================
+// Cancellable I/O tests
+// ============================================================================
+
+TEST_CASE("Cancellable recv completes normally", "[io][cancel]") {
+    int sv[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+    const char* msg = "cancel test data";
+    ssize_t sent = send(sv[0], msg, strlen(msg), 0);
+    REQUIRE(sent == static_cast<ssize_t>(strlen(msg)));
+
+    char buffer[64] = {0};
+    std::atomic<bool> completed{false};
+    cancellable_io_result recv_result{};
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+
+    auto recv_coro = [&]() -> task<void> {
+        auto result = co_await async_recv(sv[1], buffer, sizeof(buffer) - 1, 0,
+                                          source.get_token());
+        recv_result = result;
+        completed = true;
+        co_return;
+    };
+
+    sched.go(recv_coro);
+
+    for (int i = 0; i < 100 && !completed; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(completed);
+    REQUIRE(recv_result.success());
+    REQUIRE_FALSE(recv_result.was_cancelled());
+    REQUIRE(recv_result.bytes_transferred() == static_cast<int>(strlen(msg)));
+    REQUIRE(std::string(buffer) == msg);
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+TEST_CASE("Cancellable recv already cancelled", "[io][cancel]") {
+    int sv[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+    char buffer[64] = {0};
+    std::atomic<bool> completed{false};
+    cancellable_io_result recv_result{};
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+    source.cancel();
+
+    auto recv_coro = [&]() -> task<void> {
+        auto result = co_await async_recv(sv[1], buffer, sizeof(buffer) - 1, 0,
+                                          source.get_token());
+        recv_result = result;
+        completed = true;
+        co_return;
+    };
+
+    sched.go(recv_coro);
+
+    for (int i = 0; i < 100 && !completed; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(completed);
+    REQUIRE(recv_result.was_cancelled());
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+TEST_CASE("Cancellable recv cancelled during wait", "[io][cancel]") {
+    int sv[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+    char buffer[64] = {0};
+    std::atomic<bool> started{false};
+    std::atomic<bool> completed{false};
+    cancellable_io_result recv_result{};
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+
+    auto recv_coro = [&]() -> task<void> {
+        started = true;
+        auto result = co_await async_recv(sv[1], buffer, sizeof(buffer) - 1, 0,
+                                          source.get_token());
+        recv_result = result;
+        completed = true;
+        co_return;
+    };
+
+    sched.go(recv_coro);
+
+    for (int i = 0; i < 100 && !started; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    source.cancel();
+
+    for (int i = 0; i < 200 && !completed; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(completed);
+    REQUIRE(recv_result.was_cancelled());
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+TEST_CASE("Cancellable send completes normally", "[io][cancel]") {
+    int sv[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+    const char* msg = "cancel send test";
+    std::atomic<bool> completed{false};
+    cancellable_io_result send_result{};
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+
+    auto send_coro = [&]() -> task<void> {
+        auto result = co_await async_send(sv[0], msg, strlen(msg), 0,
+                                          source.get_token());
+        send_result = result;
+        completed = true;
+        co_return;
+    };
+
+    sched.go(send_coro);
+
+    for (int i = 0; i < 100 && !completed; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(completed);
+    REQUIRE(send_result.success());
+    REQUIRE_FALSE(send_result.was_cancelled());
+    REQUIRE(send_result.bytes_transferred() == static_cast<int>(strlen(msg)));
+
+    char buffer[64] = {0};
+    ssize_t received = recv(sv[1], buffer, sizeof(buffer) - 1, 0);
+    REQUIRE(received == static_cast<ssize_t>(strlen(msg)));
+    REQUIRE(std::string(buffer) == msg);
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+TEST_CASE("Cancellable send already cancelled", "[io][cancel]") {
+    int sv[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+    const char* msg = "should not send";
+    std::atomic<bool> completed{false};
+    cancellable_io_result send_result{};
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+    source.cancel();
+
+    auto send_coro = [&]() -> task<void> {
+        auto result = co_await async_send(sv[0], msg, strlen(msg), 0,
+                                          source.get_token());
+        send_result = result;
+        completed = true;
+        co_return;
+    };
+
+    sched.go(send_coro);
+
+    for (int i = 0; i < 100 && !completed; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(completed);
+    REQUIRE(send_result.was_cancelled());
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
+TEST_CASE("Cancellable connect already cancelled", "[io][cancel]") {
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    REQUIRE(fd >= 0);
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(12345);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+    std::atomic<bool> completed{false};
+    cancellable_io_result connect_result{};
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+    source.cancel();
+
+    auto connect_coro = [&]() -> task<void> {
+        auto result = co_await async_connect(fd,
+            reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr),
+            source.get_token());
+        connect_result = result;
+        completed = true;
+    };
+
+    sched.go(connect_coro);
+
+    for (int i = 0; i < 100 && !completed; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(completed);
+    REQUIRE(connect_result.was_cancelled());
+
+    close(fd);
+}
+

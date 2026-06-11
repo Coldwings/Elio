@@ -4,6 +4,7 @@
 #include <elio/log/macros.hpp>
 #include <elio/coro/promise_base.hpp>
 #include <elio/coro/frame.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/runtime/worker_thread.hpp>
 #include <coroutine>
 #include <span>
@@ -884,6 +885,397 @@ inline auto batch_read(int fd, std::span<const batch_read_segment> segments) {
 /// Batch write to file at multiple offsets in a single syscall (io_uring)
 inline auto batch_write(int fd, std::span<const batch_write_segment> segments) {
     return batch_write_awaitable(fd, segments);
+}
+
+// ============================================================================
+// Cancellable I/O awaitables
+// ============================================================================
+
+namespace detail {
+
+/// Shared state for cancellable I/O operations.
+/// Follows the same pattern as cancellable_sleep_awaitable::shared_state.
+struct io_cancel_state {
+    io_context* ctx = nullptr;
+    std::coroutine_handle<> awaiter;
+    runtime::worker_thread* worker = nullptr;
+    op_state* op = nullptr;
+    std::atomic<bool> resumed{false};
+    std::atomic<bool> cancelled{false};
+};
+
+/// Fire-and-forget coroutine that executes io_context::cancel() on the worker
+/// that owns the ring. Self-destroys via suspend_never on final_suspend.
+struct io_cancel_executor {
+    struct promise_type {
+        io_cancel_executor get_return_object() {
+            return {std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_always initial_suspend() noexcept { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_void() noexcept {}
+        void unhandled_exception() noexcept {}
+    };
+    std::coroutine_handle<promise_type> handle;
+};
+
+inline io_cancel_executor make_io_cancel_executor(
+    std::shared_ptr<io_cancel_state> state) {
+    if (state->resumed.exchange(true, std::memory_order_acq_rel)) {
+        co_return;
+    }
+    if (state->ctx && state->op) {
+#if ELIO_HAS_IO_URING
+        if (state->ctx->is_io_uring()) {
+            state->ctx->cancel(tagged_op_state_user_data(state->op));
+        } else {
+            ELIO_LOG_WARNING(
+                "cancellable I/O: epoll backend does not support async cancel "
+                "(fd reuse race risk); cancel_token is no-op");
+        }
+#else
+        ELIO_LOG_WARNING(
+            "cancellable I/O: epoll backend does not support async cancel "
+            "(fd reuse race risk); cancel_token is no-op");
+#endif
+    }
+    co_return;
+}
+
+}  // namespace detail
+
+/// Result of a cancellable I/O operation
+struct cancellable_io_result {
+    io_result io;
+    coro::cancel_result cancel;
+
+    bool success() const noexcept { return io.success(); }
+    bool was_cancelled() const noexcept {
+        return cancel == coro::cancel_result::cancelled;
+    }
+    int bytes_transferred() const noexcept { return io.bytes_transferred(); }
+    int error_code() const noexcept { return io.error_code(); }
+};
+
+/// Awaitable for cancellable async recv operations
+class cancellable_async_recv_awaitable : public io_awaitable_base {
+public:
+    cancellable_async_recv_awaitable(int fd, void* buffer, size_t length,
+                                      int flags, coro::cancel_token token) noexcept
+        : io_awaitable_base()
+        , fd_(fd)
+        , buffer_(buffer)
+        , length_(length)
+        , flags_(flags)
+        , token_(std::move(token)) {}
+
+    bool await_ready() const noexcept {
+        return token_.is_cancelled();
+    }
+
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        if (token_.is_cancelled()) {
+            already_cancelled_before_setup_ = true;
+            awaiter.resume();
+            return;
+        }
+
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+
+        // Allocate shared state for cancel callback
+        auto state = std::make_shared<detail::io_cancel_state>();
+        state->ctx = &ctx;
+        state->awaiter = awaiter;
+        state->worker = runtime::worker_thread::current();
+        state_ = state;
+
+        // Register cancel callback
+        cancel_registration_ = token_.on_cancel([state]() {
+            state->cancelled.store(true, std::memory_order_release);
+            if (!state->worker) {
+                return;
+            }
+            auto exec = detail::make_io_cancel_executor(state);
+            state->worker->schedule(exec.handle);
+        });
+
+        // Check again after registration
+        if (token_.is_cancelled()) {
+            cancel_registration_.unregister();
+            state->resumed.store(true, std::memory_order_release);
+            awaiter.resume();
+            return;
+        }
+
+        io_request req{};
+        req.op = io_op::recv;
+        req.fd = fd_;
+        req.buffer = buffer_;
+        req.length = length_;
+        req.socket_flags = flags_;
+        req.awaiter = awaiter;
+        req.state = setup_op_state(awaiter);
+        state->op = req.state;
+
+        if (!ctx.prepare(req)) {
+            clear_op_state();
+            state->op = nullptr;
+            cancel_registration_.unregister();
+            result_ = io_result{-EAGAIN, 0};
+            awaiter.resume();
+            return;
+        }
+    }
+
+    cancellable_io_result await_resume() noexcept {
+        cancel_registration_.unregister();
+        bool was_cancelled = already_cancelled_before_setup_;
+        if (state_) {
+            state_->resumed.store(true, std::memory_order_release);
+            was_cancelled = was_cancelled ||
+                            state_->cancelled.load(std::memory_order_acquire);
+        }
+        result_ = read_result_from_op_state();
+        restore_affinity();
+        return cancellable_io_result{
+            result_,
+            (was_cancelled || token_.is_cancelled())
+                ? coro::cancel_result::cancelled
+                : coro::cancel_result::completed
+        };
+    }
+
+private:
+    int fd_;
+    void* buffer_;
+    size_t length_;
+    int flags_;
+    coro::cancel_token token_;
+    coro::cancel_token::registration cancel_registration_;
+    std::shared_ptr<detail::io_cancel_state> state_;
+    bool already_cancelled_before_setup_ = false;
+};
+
+/// Awaitable for cancellable async send operations
+class cancellable_async_send_awaitable : public io_awaitable_base {
+public:
+    cancellable_async_send_awaitable(int fd, const void* buffer,
+                                      size_t length, int flags,
+                                      coro::cancel_token token) noexcept
+        : io_awaitable_base()
+        , fd_(fd)
+        , buffer_(buffer)
+        , length_(length)
+        , flags_(flags)
+        , token_(std::move(token)) {}
+
+    bool await_ready() const noexcept {
+        return token_.is_cancelled();
+    }
+
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        if (token_.is_cancelled()) {
+            already_cancelled_before_setup_ = true;
+            awaiter.resume();
+            return;
+        }
+
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+
+        auto state = std::make_shared<detail::io_cancel_state>();
+        state->ctx = &ctx;
+        state->awaiter = awaiter;
+        state->worker = runtime::worker_thread::current();
+        state_ = state;
+
+        cancel_registration_ = token_.on_cancel([state]() {
+            state->cancelled.store(true, std::memory_order_release);
+            if (!state->worker) {
+                return;
+            }
+            auto exec = detail::make_io_cancel_executor(state);
+            state->worker->schedule(exec.handle);
+        });
+
+        if (token_.is_cancelled()) {
+            cancel_registration_.unregister();
+            state->resumed.store(true, std::memory_order_release);
+            awaiter.resume();
+            return;
+        }
+
+        io_request req{};
+        req.op = io_op::send;
+        req.fd = fd_;
+        req.buffer = const_cast<void*>(buffer_);
+        req.length = length_;
+        req.socket_flags = flags_;
+        req.awaiter = awaiter;
+        req.state = setup_op_state(awaiter);
+        state->op = req.state;
+
+        if (!ctx.prepare(req)) {
+            clear_op_state();
+            state->op = nullptr;
+            cancel_registration_.unregister();
+            result_ = io_result{-EAGAIN, 0};
+            awaiter.resume();
+            return;
+        }
+    }
+
+    cancellable_io_result await_resume() noexcept {
+        cancel_registration_.unregister();
+        bool was_cancelled = already_cancelled_before_setup_;
+        if (state_) {
+            state_->resumed.store(true, std::memory_order_release);
+            was_cancelled = was_cancelled ||
+                            state_->cancelled.load(std::memory_order_acquire);
+        }
+        result_ = read_result_from_op_state();
+        restore_affinity();
+        return cancellable_io_result{
+            result_,
+            (was_cancelled || token_.is_cancelled())
+                ? coro::cancel_result::cancelled
+                : coro::cancel_result::completed
+        };
+    }
+
+private:
+    int fd_;
+    const void* buffer_;
+    size_t length_;
+    int flags_;
+    coro::cancel_token token_;
+    coro::cancel_token::registration cancel_registration_;
+    std::shared_ptr<detail::io_cancel_state> state_;
+    bool already_cancelled_before_setup_ = false;
+};
+
+/// Awaitable for cancellable async connect operations
+class cancellable_async_connect_awaitable : public io_awaitable_base {
+public:
+    cancellable_async_connect_awaitable(int fd,
+                                         const struct sockaddr* addr,
+                                         socklen_t addrlen,
+                                         coro::cancel_token token) noexcept
+        : io_awaitable_base()
+        , fd_(fd)
+        , addr_(addr)
+        , addrlen_(addrlen)
+        , token_(std::move(token)) {}
+
+    bool await_ready() const noexcept {
+        return token_.is_cancelled();
+    }
+
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        if (token_.is_cancelled()) {
+            already_cancelled_before_setup_ = true;
+            awaiter.resume();
+            return;
+        }
+
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+
+        auto state = std::make_shared<detail::io_cancel_state>();
+        state->ctx = &ctx;
+        state->awaiter = awaiter;
+        state->worker = runtime::worker_thread::current();
+        state_ = state;
+
+        cancel_registration_ = token_.on_cancel([state]() {
+            state->cancelled.store(true, std::memory_order_release);
+            if (!state->worker) {
+                return;
+            }
+            auto exec = detail::make_io_cancel_executor(state);
+            state->worker->schedule(exec.handle);
+        });
+
+        if (token_.is_cancelled()) {
+            cancel_registration_.unregister();
+            state->resumed.store(true, std::memory_order_release);
+            awaiter.resume();
+            return;
+        }
+
+        io_request req{};
+        req.op = io_op::connect;
+        req.fd = fd_;
+        req.addr = const_cast<struct sockaddr*>(addr_);
+        req.addrlen = &addrlen_;
+        req.awaiter = awaiter;
+        req.state = setup_op_state(awaiter);
+        state->op = req.state;
+
+        if (!ctx.prepare(req)) {
+            clear_op_state();
+            state->op = nullptr;
+            cancel_registration_.unregister();
+            result_ = io_result{-EAGAIN, 0};
+            awaiter.resume();
+            return;
+        }
+    }
+
+    cancellable_io_result await_resume() noexcept {
+        cancel_registration_.unregister();
+        bool was_cancelled = already_cancelled_before_setup_;
+        if (state_) {
+            state_->resumed.store(true, std::memory_order_release);
+            was_cancelled = was_cancelled ||
+                            state_->cancelled.load(std::memory_order_acquire);
+        }
+        result_ = read_result_from_op_state();
+        restore_affinity();
+        return cancellable_io_result{
+            result_,
+            (was_cancelled || token_.is_cancelled())
+                ? coro::cancel_result::cancelled
+                : coro::cancel_result::completed
+        };
+    }
+
+private:
+    int fd_;
+    const struct sockaddr* addr_;
+    socklen_t addrlen_;
+    coro::cancel_token token_;
+    coro::cancel_token::registration cancel_registration_;
+    std::shared_ptr<detail::io_cancel_state> state_;
+    bool already_cancelled_before_setup_ = false;
+};
+
+/// Factory functions for cancellable I/O operations
+
+/// Create a cancellable async recv awaitable
+inline auto async_recv(int fd, void* buffer, size_t length,
+                       int flags, coro::cancel_token token) {
+    return cancellable_async_recv_awaitable(fd, buffer, length, flags,
+                                             std::move(token));
+}
+
+/// Create a cancellable async send awaitable
+inline auto async_send(int fd, const void* buffer,
+                       size_t length, int flags, coro::cancel_token token) {
+    return cancellable_async_send_awaitable(fd, buffer, length, flags,
+                                             std::move(token));
+}
+
+/// Create a cancellable async connect awaitable
+inline auto async_connect(int fd,
+                          const struct sockaddr* addr, socklen_t addrlen,
+                          coro::cancel_token token) {
+    return cancellable_async_connect_awaitable(fd, addr, addrlen,
+                                                std::move(token));
 }
 
 } // namespace elio::io

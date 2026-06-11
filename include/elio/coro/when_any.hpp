@@ -12,6 +12,8 @@
 #include "traits.hpp"
 #include "when_all.hpp"
 #include "cancel_token.hpp"
+#include "../log/macros.hpp"
+#include "../runtime/scheduler.hpp"
 #include "../runtime/spawn.hpp"
 
 namespace elio {
@@ -72,6 +74,21 @@ struct when_any_state {
             exception_ = std::move(ex);
             cancel_source_.cancel();
             resume_waiter();
+        } else {
+            // Loser exception: winner already resolved, report via scheduler
+            auto* sched = runtime::get_current_scheduler();
+            if (sched) {
+                sched->report_unhandled_exception(std::move(ex));
+            } else {
+                // No scheduler context — log directly
+                try {
+                    std::rethrow_exception(ex);
+                } catch (const std::exception& e) {
+                    ELIO_LOG_ERROR("when_any loser exception (no scheduler): {}", e.what());
+                } catch (...) {
+                    ELIO_LOG_ERROR("when_any loser exception (no scheduler): <unknown>");
+                }
+            }
         }
     }
 

@@ -272,7 +272,7 @@ TEST_CASE("when_any with heterogeneous types", "[sync][combinators]") {
     sched.shutdown();
 }
 
-TEST_CASE("when_any loser exception is silent", "[sync][combinators]") {
+TEST_CASE("when_any loser exception is logged", "[sync][combinators]") {
     auto test = []() -> task<void> {
         auto [idx, value] = co_await when_any(
             []() -> task<int> {
@@ -288,6 +288,71 @@ TEST_CASE("when_any loser exception is silent", "[sync][combinators]") {
         REQUIRE(idx == 0);
         REQUIRE(value == 42);
         co_await time::sleep_for(std::chrono::milliseconds(200));
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("when_any loser exception triggers handler", "[sync][combinators]") {
+    std::atomic<bool> handler_called{false};
+    std::string handler_message;
+
+    auto test = [&]() -> task<void> {
+        auto [idx, value] = co_await when_any(
+            []() -> task<int> {
+                co_await time::sleep_for(std::chrono::milliseconds(1));
+                co_return 42;
+            },
+            []() -> task<int> {
+                co_await time::sleep_for(std::chrono::milliseconds(50));
+                throw std::runtime_error("loser exception for handler");
+                co_return 0;
+            }
+        );
+        REQUIRE(idx == 0);
+        REQUIRE(value == 42);
+        co_await time::sleep_for(std::chrono::milliseconds(200));
+    };
+
+    runtime::scheduler sched(2);
+    sched.start();
+    sched.set_unhandled_exception_handler([&](std::exception_ptr ex) {
+        handler_called = true;
+        try {
+            std::rethrow_exception(ex);
+        } catch (const std::exception& e) {
+            handler_message = e.what();
+        }
+    });
+    sched.go(test);
+    sched.shutdown();
+
+    REQUIRE(handler_called.load());
+    REQUIRE(handler_message == "loser exception for handler");
+}
+
+TEST_CASE("when_any winner exception propagates", "[sync][combinators]") {
+    auto test = []() -> task<void> {
+        bool caught = false;
+        try {
+            co_await when_any(
+                []() -> task<int> {
+                    co_await time::sleep_for(std::chrono::milliseconds(1));
+                    throw std::runtime_error("winner exception");
+                    co_return 0;
+                },
+                []() -> task<int> {
+                    co_await time::sleep_for(std::chrono::milliseconds(500));
+                    co_return 42;
+                }
+            );
+        } catch (const std::runtime_error& e) {
+            caught = true;
+            REQUIRE(std::string(e.what()) == "winner exception");
+        }
+        REQUIRE(caught);
     };
 
     runtime::scheduler sched(2);

@@ -16,6 +16,10 @@ namespace elio::runtime {
 class scheduler;  // Forward declaration
 scheduler* get_current_scheduler() noexcept;
 void schedule_handle(std::coroutine_handle<> handle) noexcept;
+/// Report an unhandled exception from a detached (go/go_to) task.
+/// Routes through the scheduler's exception handler if set, otherwise logs ERROR.
+/// Defined in scheduler.hpp.
+void report_detached_exception(std::exception_ptr ex) noexcept;
 }
 
 namespace elio::coro {
@@ -42,6 +46,11 @@ struct final_awaiter {
             // the coroutine frame is about to be destroyed
             if (h.promise().join_state_) {
                 h.promise().join_state_->mark_destroyed();
+            }
+            // If this detached task threw an unhandled exception, report it
+            // via the scheduler's exception handler (or default log ERROR).
+            if (auto ex = h.promise().exception()) {
+                runtime::report_detached_exception(std::move(ex));
             }
             // IMPORTANT: If this coroutine owns its vstack, we must release ownership
             // BEFORE destroying the coroutine frame, because the frame itself is allocated

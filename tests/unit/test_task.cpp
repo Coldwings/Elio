@@ -539,19 +539,86 @@ TEST_CASE("elio::go() works with scheduler context", "[scheduler][spawn]") {
 TEST_CASE("elio::go() works with task<int>", "[scheduler][spawn]") {
     scheduler sched(2);
     sched.start();
-    
+
     std::atomic<int> result{0};
-    
+
     auto coro = [&]() -> task<int> {
         result.store(99);
         co_return 99;
     };
-    
+
     elio::go(coro);
-    
+
     std::this_thread::sleep_for(scaled_ms(100));
-    
+
     REQUIRE(result.load() == 99);
-    
+
     sched.shutdown();
+}
+
+// --- go() exception handler tests ---
+
+TEST_CASE("go() task throws — handler is called", "[task][spawn][exception]") {
+    std::atomic<bool> handler_called{false};
+    std::string handler_message;
+
+    scheduler sched(2);
+    sched.start();
+    sched.set_unhandled_exception_handler([&](std::exception_ptr ex) {
+        handler_called.store(true, std::memory_order_release);
+        try {
+            std::rethrow_exception(ex);
+        } catch (const std::exception& e) {
+            handler_message = e.what();
+        }
+    });
+
+    elio::go([]() -> task<void> {
+        throw std::runtime_error("go task exception");
+        co_return;
+    });
+
+    // Wait for the detached task to complete and handler to fire
+    std::this_thread::sleep_for(scaled_ms(100));
+    sched.shutdown();
+
+    REQUIRE(handler_called.load(std::memory_order_acquire));
+    REQUIRE(handler_message == "go task exception");
+}
+
+TEST_CASE("go() task throws — default log when no handler set", "[task][spawn][exception]") {
+    scheduler sched(2);
+    sched.start();
+    // No handler set — should log ERROR, not crash
+
+    elio::go([]() -> task<void> {
+        throw std::runtime_error("go unhandled exception");
+        co_return;
+    });
+
+    std::this_thread::sleep_for(scaled_ms(100));
+    sched.shutdown();
+    // Test passes if no crash — default behavior is log ERROR
+}
+
+TEST_CASE("go() task completes normally — no handler called", "[task][spawn][exception]") {
+    std::atomic<bool> handler_called{false};
+
+    scheduler sched(2);
+    sched.start();
+    sched.set_unhandled_exception_handler([&](std::exception_ptr) {
+        handler_called.store(true, std::memory_order_release);
+    });
+
+    std::atomic<bool> task_ran{false};
+    elio::go([&]() -> task<void> {
+        task_ran.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    std::this_thread::sleep_for(scaled_ms(100));
+    sched.shutdown();
+
+    REQUIRE(task_ran.load(std::memory_order_acquire));
+    REQUIRE_FALSE(handler_called.load(std::memory_order_acquire));
 }

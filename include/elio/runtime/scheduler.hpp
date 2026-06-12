@@ -93,6 +93,8 @@ public:
             // Users wanting drain-on-exit should call shutdown() explicitly.
             shutdown_force();
         }
+        // Clean up exception handler
+        delete unhandled_exception_handler_.exchange(nullptr, std::memory_order_acq_rel);
     }
 
     scheduler(const scheduler&) = delete;
@@ -536,6 +538,56 @@ public:
         return blocking_pool_.get();
     }
 
+    /// Exception handler type for unhandled exceptions in detached tasks
+    /// and when_any loser exceptions.
+    using unhandled_exception_handler = std::function<void(std::exception_ptr)>;
+
+    /// Set the per-scheduler unhandled exception handler.
+    /// Called when:
+    /// - A detached task (go/go_to) throws and the exception is not observed
+    /// - A when_any loser throws after the winner has already resolved
+    ///
+    /// Default behavior (no handler set): log ERROR with exception info.
+    /// When handler is set: invoke handler instead of logging.
+    ///
+    /// Thread-safe: handler pointer is atomic. Can be set from any thread.
+    void set_unhandled_exception_handler(unhandled_exception_handler handler) {
+        auto* new_handler = handler
+            ? new unhandled_exception_handler(std::move(handler))
+            : nullptr;
+        auto* old_handler = unhandled_exception_handler_.exchange(
+            new_handler, std::memory_order_acq_rel);
+        delete old_handler;
+    }
+
+    /// Get the current unhandled exception handler (may be nullptr).
+    [[nodiscard]] const unhandled_exception_handler* get_unhandled_exception_handler() const noexcept {
+        return unhandled_exception_handler_.load(std::memory_order_acquire);
+    }
+
+    /// Report an unhandled exception. If handler is set, invoke it.
+    /// Otherwise log ERROR.
+    void report_unhandled_exception(std::exception_ptr ex) noexcept {
+        if (!ex) return;
+        auto* handler = unhandled_exception_handler_.load(std::memory_order_acquire);
+        if (handler) {
+            try {
+                (*handler)(std::move(ex));
+            } catch (...) {
+                // Handler itself threw — log both
+                ELIO_LOG_ERROR("unhandled exception handler threw; original exception dropped");
+            }
+        } else {
+            try {
+                std::rethrow_exception(ex);
+            } catch (const std::exception& e) {
+                ELIO_LOG_ERROR("unhandled exception in detached task or when_any loser: {}", e.what());
+            } catch (...) {
+                ELIO_LOG_ERROR("unhandled exception in detached task or when_any loser: <unknown>");
+            }
+        }
+    }
+
 private:
     /// Pair an ``on_task_spawned()`` increment with a deferred decrement
     /// installed on the wrapper coroutine's promise. The decrement fires
@@ -702,6 +754,11 @@ private:
     // Workers that are draining pending I/O after a shrink operation.
     // Protected by workers_mutex_.
     std::vector<std::pair<std::unique_ptr<worker_thread>, std::thread>> draining_workers_;
+
+    // Per-scheduler unhandled exception handler. Nullptr means default behavior
+    // (log ERROR). Owned via raw pointer + atomic for lock-free reads on hot path.
+    // Set/delete via set_unhandled_exception_handler().
+    std::atomic<unhandled_exception_handler*> unhandled_exception_handler_{nullptr};
 
     static inline thread_local scheduler* current_scheduler_ = nullptr;
 };

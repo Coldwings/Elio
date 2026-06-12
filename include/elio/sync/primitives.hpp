@@ -1357,6 +1357,12 @@ public:
     ///       co_await cv.wait(mtx);
     ///   }
     ///   mtx.unlock();
+    ///
+    /// Note: This returns a task<void> because re-acquiring the mutex requires
+    /// an async operation (co_await m.lock()). The template version for generic
+    /// lockable types (e.g., spinlock) returns an awaitable directly because
+    /// those locks use synchronous lock() calls. Both versions require a single
+    /// co_await at the call site.
     coro::task<void> wait(mutex& m) {
         co_await wait_suspend_awaitable(*this, m);
         co_await m.lock();

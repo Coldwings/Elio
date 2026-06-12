@@ -804,6 +804,23 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
     }
 }
 
+inline void report_detached_exception(std::exception_ptr ex) noexcept {
+    if (!ex) return;
+    auto* sched = scheduler::current();
+    if (sched) {
+        sched->report_unhandled_exception(std::move(ex));
+    } else {
+        // No scheduler context — log directly
+        try {
+            std::rethrow_exception(ex);
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR("unhandled exception in detached (go) task: {}", e.what());
+        } catch (...) {
+            ELIO_LOG_ERROR("unhandled exception in detached (go) task: <unknown>");
+        }
+    }
+}
+
 inline void worker_thread::start() {
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true)) return;

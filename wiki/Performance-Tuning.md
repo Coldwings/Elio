@@ -396,11 +396,14 @@ coro::task<void> writer() {
 Choose appropriate channel type:
 
 ```cpp
+// Rendezvous channel: synchronous hand-off, no buffering (default)
+sync::channel<int> ch;       // or equivalently: sync::channel<int> ch(0);
+
 // Bounded channel: back-pressure, bounded memory
-sync::channel<int> ch(100);
+sync::channel<int> bch(100);
 
 // Unbounded channel: faster but can grow indefinitely
-sync::unbounded_channel<int> uch;
+auto uch = sync::channel<int>::unbounded();
 
 // SPSC queue: single producer/consumer (fastest)
 runtime::spsc_queue<int> spsc(1000);

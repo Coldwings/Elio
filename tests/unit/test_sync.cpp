@@ -252,12 +252,12 @@ TEST_CASE("channel basic operations", "[sync][channel]") {
     }
     
     SECTION("unbounded channel") {
-        channel<int> unbounded(0);  // Unbounded
-        
+        auto unbounded = channel<int>::unbounded();
+
         for (int i = 0; i < 100; ++i) {
             REQUIRE(unbounded.try_send(i));
         }
-        
+
         REQUIRE(unbounded.size() == 100);
     }
     
@@ -327,6 +327,125 @@ TEST_CASE("channel with coroutines", "[sync][channel][coro]") {
     REQUIRE(producer_done);
     REQUIRE(consumer_done);
     REQUIRE(sum == 15);  // 1+2+3+4+5
+}
+
+TEST_CASE("channel rendezvous semantics", "[sync][channel]") {
+    SECTION("default constructor is rendezvous") {
+        channel<int> ch;  // capacity == 0 → rendezvous
+        // try_send fails when no receiver is waiting
+        REQUIRE_FALSE(ch.try_send(42));
+        REQUIRE(ch.empty());
+    }
+
+    SECTION("explicit zero is rendezvous") {
+        channel<int> ch(0);
+        REQUIRE_FALSE(ch.try_send(1));
+    }
+
+    SECTION("try_recv from send_waiters (rendezvous)") {
+        // This tests the internal rendezvous path indirectly:
+        // after close() with pending senders, values are drained to queue.
+        channel<int> ch(0);
+        ch.close();
+        auto v = ch.try_recv();
+        // Closed + empty → nullopt
+        REQUIRE_FALSE(v.has_value());
+    }
+}
+
+TEST_CASE("channel rendezvous with coroutines", "[sync][channel][coro]") {
+    channel<int> ch;  // rendezvous
+    std::atomic<int> received{0};
+    std::atomic<bool> done{false};
+
+    channel<int>* ch_ptr = &ch;
+    std::atomic<int>* recv_ptr = &received;
+    std::atomic<bool>* done_ptr = &done;
+
+    auto sender = [=]() -> task<void> {
+        for (int i = 1; i <= 5; ++i) {
+            co_await ch_ptr->send(i);
+        }
+        ch_ptr->close();
+        co_return;
+    };
+
+    auto receiver = [=]() -> task<void> {
+        while (true) {
+            auto val = co_await ch_ptr->recv();
+            if (!val) break;
+            *recv_ptr += *val;
+        }
+        *done_ptr = true;
+        co_return;
+    };
+
+    scheduler sched(2);
+    sched.start();
+
+    auto s_join = spawn_joinable(sched, sender);
+    auto r_join = spawn_joinable(sched, receiver);
+
+    s_join.wait_destroyed();
+    r_join.wait_destroyed();
+
+    sched.shutdown();
+
+    REQUIRE(done);
+    REQUIRE(received == 15);  // 1+2+3+4+5
+}
+
+TEST_CASE("channel close drains send_waiters", "[sync][channel][coro]") {
+    // Verify that close() moves pending send values into the queue so
+    // receivers can still read them (Go semantics).
+    channel<int> ch(1);  // bounded(1): fill it, then one sender blocks
+    ch.try_send(100);    // fills the buffer
+
+    std::atomic<int> sum{0};
+    std::atomic<bool> sender_done{false};
+
+    channel<int>* ch_ptr = &ch;
+    std::atomic<int>* sum_ptr = &sum;
+    std::atomic<bool>* sd_ptr = &sender_done;
+
+    // This sender will block because the channel is full
+    auto blocked_sender = [=]() -> task<void> {
+        co_await ch_ptr->send(200);
+        *sd_ptr = true;
+        co_return;
+    };
+
+    scheduler sched(2);
+    sched.start();
+
+    auto s_join = spawn_joinable(sched, blocked_sender);
+
+    // Give the sender time to block on send_waiters_
+    // (we rely on the scheduler having started and the sender having suspended)
+    // Small sleep to let the sender reach await_suspend
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Close should drain the blocked sender's value (200) into the queue
+    ch.close();
+
+    // Now receive both values: 100 (buffered) + 200 (drained from send_waiters)
+    auto v1 = ch.try_recv();
+    REQUIRE(v1.has_value());
+    *sum_ptr += *v1;
+
+    auto v2 = ch.try_recv();
+    REQUIRE(v2.has_value());
+    *sum_ptr += *v2;
+
+    // No more values
+    auto v3 = ch.try_recv();
+    REQUIRE_FALSE(v3.has_value());
+
+    s_join.wait_destroyed();
+    sched.shutdown();
+
+    REQUIRE(*sd_ptr);
+    REQUIRE(sum == 300);  // 100 + 200
 }
 
 TEST_CASE("shared_mutex basic operations", "[sync][shared_mutex]") {

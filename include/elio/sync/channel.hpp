@@ -2,6 +2,7 @@
 
 #include <coroutine>
 #include <atomic>
+#include <limits>
 #include <mutex>
 #include <queue>
 #include <vector>
@@ -17,14 +18,18 @@ class channel {
 public:
     /// Create a channel with the given capacity.
     /// @param capacity Maximum number of items that can be buffered.
+    ///   - capacity == 0: rendezvous (synchronous) channel — send blocks until
+    ///     a receiver is ready (Go-style `make(chan T)`)
     ///   - capacity > 0: bounded channel with back-pressure when full
-    ///   - capacity == 0: unbounded channel (no back-pressure, may grow
-    ///     indefinitely)
-    /// @note Unlike Go's `make(chan T)` / `make(chan T, 0)` which creates a
-    ///   synchronous (rendezvous) channel, Elio's `channel(0)` is *unbounded*.
-    ///   For bounded channels, always specify a positive capacity.
+    /// @note For an unbounded channel (no back-pressure), use
+    ///   `channel<T>::unbounded()`.
     explicit channel(size_t capacity = 0)
         : capacity_(capacity), closed_(false) {}
+
+    /// Create an unbounded channel (no back-pressure, may grow indefinitely).
+    static channel unbounded() {
+        return channel(std::numeric_limits<size_t>::max());
+    }
 
     ~channel() {
         close();
@@ -54,8 +59,25 @@ public:
                 return true;
             }
 
-            if (channel_.capacity_ == 0 ||
-                channel_.queue_.size() < channel_.capacity_) {
+            if (channel_.capacity_ == 0) {
+                // Rendezvous: hand off directly to a waiting receiver.
+                if (!channel_.recv_waiters_.empty()) {
+                    // A receiver is already waiting — push value into the queue
+                    // so try_take_locked / await_resume can pick it up, then
+                    // wake the receiver.
+                    channel_.queue_.push(std::move(value_));
+                    committed_ = true;
+
+                    to_wake_ = channel_.recv_waiters_.front();
+                    channel_.recv_waiters_.pop();
+                    return true;
+                }
+                // No receiver ready — must suspend.
+                return false;
+            }
+
+            // Bounded channel (capacity_ > 0)
+            if (channel_.queue_.size() < channel_.capacity_) {
                 // Commit the send while still holding the lock.  Doing this
                 // here (rather than in await_resume) prevents another sender
                 // from filling the queue between unlock and resume, which
@@ -80,8 +102,25 @@ public:
                 return false;  // Don't suspend; await_resume returns false
             }
 
-            if (channel_.capacity_ == 0 ||
-                channel_.queue_.size() < channel_.capacity_) {
+            if (channel_.capacity_ == 0) {
+                // Rendezvous: check again for a receiver that arrived between
+                // await_ready and now.
+                if (!channel_.recv_waiters_.empty()) {
+                    channel_.queue_.push(std::move(value_));
+                    committed_ = true;
+
+                    to_wake_ = channel_.recv_waiters_.front();
+                    channel_.recv_waiters_.pop();
+                    return false;  // Don't suspend; value delivered
+                }
+                // No receiver — park on send_waiters_.
+                channel_.send_waiters_.push({awaiter, std::move(value_)});
+                value_moved_ = true;
+                return true;
+            }
+
+            // Bounded channel (capacity_ > 0)
+            if (channel_.queue_.size() < channel_.capacity_) {
                 // Space appeared between await_ready and now — commit.
                 channel_.queue_.push(std::move(value_));
                 committed_ = true;
@@ -197,9 +236,9 @@ public:
                 return true;
             }
 
-            // Queue empty: a sender may still be queued (e.g. capacity_==0
-            // rendezvous variant if it ever exists; defensive for general
-            // safety even when queue/sender invariants might race).
+            // Queue empty: check for a sender waiting on a rendezvous channel
+            // (capacity_==0) or a sender whose value hasn't been pulled into
+            // the queue yet.
             if (!channel_.send_waiters_.empty()) {
                 auto& [waiter, value] = channel_.send_waiters_.front();
                 taken_ = std::move(value);
@@ -237,15 +276,24 @@ public:
                 return false;
             }
 
-            if (capacity_ > 0 && queue_.size() >= capacity_) {
-                return false;
-            }
-
-            queue_.push(std::move(value));
-
-            if (!recv_waiters_.empty()) {
+            if (capacity_ == 0) {
+                // Rendezvous: only succeeds if a receiver is already waiting.
+                if (recv_waiters_.empty()) {
+                    return false;
+                }
+                queue_.push(std::move(value));
                 to_wake = recv_waiters_.front();
                 recv_waiters_.pop();
+            } else {
+                // Bounded channel
+                if (queue_.size() >= capacity_) {
+                    return false;
+                }
+                queue_.push(std::move(value));
+                if (!recv_waiters_.empty()) {
+                    to_wake = recv_waiters_.front();
+                    recv_waiters_.pop();
+                }
             }
         }
 
@@ -270,19 +318,25 @@ public:
         {
             std::lock_guard<std::mutex> guard(mutex_);
 
-            if (queue_.empty()) {
-                return std::nullopt;
-            }
+            if (!queue_.empty()) {
+                result = std::move(queue_.front());
+                queue_.pop();
 
-            result = std::move(queue_.front());
-            queue_.pop();
-
-            // Wake a sender if any
-            if (!send_waiters_.empty()) {
+                // Queue had space freed — pull a blocked sender's value in.
+                if (!send_waiters_.empty()) {
+                    auto& [waiter, send_value] = send_waiters_.front();
+                    queue_.push(std::move(send_value));
+                    to_wake = waiter;
+                    send_waiters_.pop();
+                }
+            } else if (!send_waiters_.empty()) {
+                // Rendezvous path: no queued items but a sender is waiting.
                 auto& [waiter, send_value] = send_waiters_.front();
-                queue_.push(std::move(send_value));
+                result = std::move(send_value);
                 to_wake = waiter;
                 send_waiters_.pop();
+            } else {
+                return std::nullopt;
             }
         }
 
@@ -307,15 +361,22 @@ public:
 
             closed_ = true;
 
-            // Wake all waiters
+            // Drain pending send values into the queue so receivers can still
+            // read them after close (Go semantics: close flushes in-flight
+            // sends).  Senders' await_resume will return false because
+            // value_moved_ is set but committed_ is not — they learn the send
+            // did not complete normally.
+            while (!send_waiters_.empty()) {
+                auto& [waiter, value] = send_waiters_.front();
+                queue_.push(std::move(value));
+                to_resume.push_back(waiter);
+                send_waiters_.pop();
+            }
+
+            // Wake all recv waiters
             while (!recv_waiters_.empty()) {
                 to_resume.push_back(recv_waiters_.front());
                 recv_waiters_.pop();
-            }
-
-            while (!send_waiters_.empty()) {
-                to_resume.push_back(send_waiters_.front().first);
-                send_waiters_.pop();
             }
         }
 

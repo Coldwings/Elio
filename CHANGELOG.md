@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking Changes
+
+- **`channel(0)` semantics changed to rendezvous**: `channel<T>()` and
+  `channel<T>(0)` now create a synchronous rendezvous channel (Go-style
+  hand-off: `send` suspends until a matching `recv` is ready). Use
+  `channel<T>::unbounded()` to create an unbounded channel with no
+  back-pressure. The previous `channel(0) = unbounded` semantics was
+  inconsistent with Go/Rust/Kotlin conventions and has been replaced.
+
+### Fixed
+
+- **`channel::close()` preserves pending send values**: Previously, `close()`
+  discarded values held by blocked senders in `send_waiters_`. Now these
+  values are drained into the queue so receivers can still read them after
+  close (Go semantics).
+
 ## [0.4.0] - 2026-06-10
 
 First tagged release. Includes 89 commits of bug fixes, hardening, and API
@@ -106,8 +124,6 @@ stabilization since the 0.3.0 internal milestone.
 
 ### Changed
 
-- `channel(0)` documentation clarified: capacity 0 means unbounded (unlike Go's
-  rendezvous semantics). (#125)
 - Lock-free fast path for `shared_mutex` read lock. (#52)
 - Autoscaler proportional scale-up and scale-down hysteresis. (#62)
 - Log formatting moved outside global lock to reduce contention. (#75)

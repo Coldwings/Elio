@@ -429,10 +429,17 @@ coro::task<void> signaler() {
 
 ### Channel
 
-`channel<T>` provides a bounded, multi-producer multi-consumer queue for passing values between coroutines:
+`channel<T>` provides a multi-producer multi-consumer queue for passing values between coroutines. By default, `channel<T>` creates a **rendezvous** (synchronous) channel where `send` blocks until a matching `recv` is ready:
 
 ```cpp
-sync::channel<int> ch(16);  // Bounded capacity of 16
+// Rendezvous channel (default): sender waits for receiver
+sync::channel<int> ch;
+
+// Bounded channel: buffers up to 16 items before back-pressure
+sync::channel<int> bch(16);
+
+// Unbounded channel: no back-pressure, may grow indefinitely
+auto uch = sync::channel<int>::unbounded();
 
 coro::task<void> producer() {
     co_await ch.send(42);
@@ -440,7 +447,7 @@ coro::task<void> producer() {
 }
 
 coro::task<void> consumer() {
-    auto value = co_await ch.receive();
+    auto value = co_await ch.recv();
     // value == 42
     co_return;
 }

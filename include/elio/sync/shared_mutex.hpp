@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <coroutine>
 #include <atomic>
 #include <mutex>
@@ -218,7 +219,14 @@ public:
 
     /// Release exclusive (write) lock
     void unlock() {
-        std::vector<std::coroutine_handle<>> to_resume;
+        // Stack-allocated small buffer to avoid heap allocation in the common
+        // case.  The writer path always resumes exactly one handle; the reader
+        // path typically resumes a handful.  Only when reader waiters exceed
+        // the inline capacity do we fall back to a heap-allocated vector.
+        static constexpr size_t kInlineCapacity = 8;
+        std::array<std::coroutine_handle<>, kInlineCapacity> inline_buf;
+        size_t inline_count = 0;
+        std::vector<std::coroutine_handle<>> overflow;
 
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
@@ -235,13 +243,21 @@ public:
                     new_state |= WRITER_WAITING;
                 }
                 state_.store(new_state, std::memory_order_release);
-                to_resume.push_back(writer);
+
+                // Writer path: always exactly one handle — fits in inline buffer
+                inline_buf[0] = writer;
+                inline_count = 1;
             } else {
                 // Wake all waiting readers
                 size_t reader_count = reader_waiters_.size();
                 while (!reader_waiters_.empty()) {
-                    to_resume.push_back(reader_waiters_.front());
+                    auto h = reader_waiters_.front();
                     reader_waiters_.pop();
+                    if (inline_count < kInlineCapacity) {
+                        inline_buf[inline_count++] = h;
+                    } else {
+                        overflow.push_back(h);
+                    }
                 }
                 // Set reader count, preserve WRITER_WAITING if there are pending writers
                 uint64_t new_state = reader_count;
@@ -252,7 +268,10 @@ public:
             }
         }
 
-        for (auto& h : to_resume) {
+        for (size_t i = 0; i < inline_count; ++i) {
+            runtime::schedule_handle(inline_buf[i]);
+        }
+        for (auto& h : overflow) {
             runtime::schedule_handle(h);
         }
     }

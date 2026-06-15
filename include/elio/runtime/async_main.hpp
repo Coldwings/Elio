@@ -313,22 +313,3 @@ using runtime::run_config;
         return elio::runtime::detail::async_main_dispatch( \
             async_main_func, argc, argv); \
     }
-
-// -------------------------------------------------------------------
-// Deprecated aliases — prefer ELIO_ASYNC_MAIN for all new code.
-// -------------------------------------------------------------------
-
-/// @deprecated Use ELIO_ASYNC_MAIN instead (it auto-detects void return).
-#define ELIO_ASYNC_MAIN_VOID(async_main_func) \
-    _Pragma("GCC warning \"ELIO_ASYNC_MAIN_VOID is deprecated; use ELIO_ASYNC_MAIN instead\"") \
-    ELIO_ASYNC_MAIN(async_main_func)
-
-/// @deprecated Use ELIO_ASYNC_MAIN instead (it auto-detects no-arg callables).
-#define ELIO_ASYNC_MAIN_NOARGS(async_main_func) \
-    _Pragma("GCC warning \"ELIO_ASYNC_MAIN_NOARGS is deprecated; use ELIO_ASYNC_MAIN instead\"") \
-    ELIO_ASYNC_MAIN(async_main_func)
-
-/// @deprecated Use ELIO_ASYNC_MAIN instead (it auto-detects both).
-#define ELIO_ASYNC_MAIN_VOID_NOARGS(async_main_func) \
-    _Pragma("GCC warning \"ELIO_ASYNC_MAIN_VOID_NOARGS is deprecated; use ELIO_ASYNC_MAIN instead\"") \
-    ELIO_ASYNC_MAIN(async_main_func)

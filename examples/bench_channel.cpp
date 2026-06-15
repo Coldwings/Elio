@@ -44,9 +44,11 @@ struct bench_stats {
     }
 };
 
-void print_stats(const char* name, const bench_stats& stats, const char* unit) {
+void print_stats(const char* name, const bench_stats& stats, size_t ops, const char* unit) {
+    double avg_per_op = stats.avg / ops;
     std::cout << std::setw(35) << std::left << name
-              << std::setw(10) << std::right << std::fixed << std::setprecision(2) << stats.avg << " "
+              << std::setw(12) << std::right << std::fixed << std::setprecision(2) << stats.avg << " "
+              << std::setw(10) << avg_per_op << " "
               << std::setw(10) << stats.min << " "
               << std::setw(10) << stats.max << " "
               << std::setw(10) << stats.stddev << " "
@@ -60,12 +62,13 @@ void print_stats(const char* name, const bench_stats& stats, const char* unit) {
 void bench_sync_throughput() {
     std::cout << "\n=== Synchronous try_send/try_recv Throughput ===\n";
     std::cout << std::setw(35) << std::left << "Scenario"
-              << std::setw(10) << std::right << "Avg (us)"
+              << std::setw(12) << std::right << "Total (us)"
+              << std::setw(10) << "Avg/op"
               << std::setw(10) << "Min (us)"
               << std::setw(10) << "Max (us)"
               << std::setw(10) << "StdDev"
               << " Unit\n";
-    std::cout << std::string(85, '-') << "\n";
+    std::cout << std::string(97, '-') << "\n";
 
     constexpr size_t OPS = 100'000;
     constexpr size_t ITERATIONS = 5;
@@ -85,7 +88,7 @@ void bench_sync_throughput() {
             auto t1 = steady_clock::now();
             times.push_back(duration<double, std::micro>(t1 - t0).count());
         }
-        print_stats("bounded(1)", bench_stats::compute(times), "us");
+        print_stats("bounded(1)", bench_stats::compute(times), OPS, "us");
     }
 
     // Bounded(64)
@@ -103,7 +106,7 @@ void bench_sync_throughput() {
             auto t1 = steady_clock::now();
             times.push_back(duration<double, std::micro>(t1 - t0).count());
         }
-        print_stats("bounded(64)", bench_stats::compute(times), "us");
+        print_stats("bounded(64)", bench_stats::compute(times), OPS, "us");
     }
 
     // Unbounded
@@ -121,7 +124,7 @@ void bench_sync_throughput() {
             auto t1 = steady_clock::now();
             times.push_back(duration<double, std::micro>(t1 - t0).count());
         }
-        print_stats("unbounded", bench_stats::compute(times), "us");
+        print_stats("unbounded", bench_stats::compute(times), OPS, "us");
     }
 }
 
@@ -174,12 +177,13 @@ void bench_spsc_throughput() {
     std::cout << "  - No parallelism to hide contention in SPSC pattern\n";
     std::cout << "  See channel.hpp for implementation details.\n";
     std::cout << std::setw(35) << std::left << "Scenario"
-              << std::setw(10) << std::right << "Avg (us)"
+              << std::setw(12) << std::right << "Total (us)"
+              << std::setw(10) << "Avg/op"
               << std::setw(10) << "Min (us)"
               << std::setw(10) << "Max (us)"
               << std::setw(10) << "StdDev"
               << " Unit\n";
-    std::cout << std::string(85, '-') << "\n";
+    std::cout << std::string(97, '-') << "\n";
 
     constexpr size_t OPS = 50'000;
     constexpr size_t ITERATIONS = 5;
@@ -189,7 +193,7 @@ void bench_spsc_throughput() {
         for (size_t iter = 0; iter < ITERATIONS; ++iter) {
             times.push_back(bench_spsc_coroutine(capacity, OPS));
         }
-        print_stats(name, bench_stats::compute(times), "us");
+        print_stats(name, bench_stats::compute(times), OPS, "us");
     };
 
     run_bench("rendezvous (cap=0)", 0);
@@ -265,21 +269,23 @@ double bench_mpmc_coroutine(size_t capacity) {
 void bench_mpmc_throughput() {
     std::cout << "\n=== MPMC Coroutine Throughput (4 producers, 4 consumers) ===\n";
     std::cout << std::setw(35) << std::left << "Scenario"
-              << std::setw(10) << std::right << "Avg (us)"
+              << std::setw(12) << std::right << "Total (us)"
+              << std::setw(10) << "Avg/op"
               << std::setw(10) << "Min (us)"
               << std::setw(10) << "Max (us)"
               << std::setw(10) << "StdDev"
               << " Unit\n";
-    std::cout << std::string(85, '-') << "\n";
+    std::cout << std::string(97, '-') << "\n";
 
     constexpr size_t ITERATIONS = 5;
+    constexpr size_t TOTAL_OPS = 4 * 12'500;  // 4 producers * 12,500 ops each
 
     auto run_bench = [&](const char* name, size_t capacity) {
         std::vector<double> times;
         for (size_t iter = 0; iter < ITERATIONS; ++iter) {
             times.push_back(bench_mpmc_coroutine(capacity));
         }
-        print_stats(name, bench_stats::compute(times), "us");
+        print_stats(name, bench_stats::compute(times), TOTAL_OPS, "us");
     };
 
     run_bench("rendezvous (cap=0)", 0);
@@ -356,14 +362,16 @@ double bench_scalability(size_t num_pairs) {
 void bench_contention_scalability() {
     std::cout << "\n=== Contention Scalability (bounded(64) channel) ===\n";
     std::cout << std::setw(35) << std::left << "Scenario"
-              << std::setw(10) << std::right << "Avg (us)"
+              << std::setw(12) << std::right << "Total (us)"
+              << std::setw(10) << "Avg/op"
               << std::setw(10) << "Min (us)"
               << std::setw(10) << "Max (us)"
               << std::setw(10) << "StdDev"
               << " Unit\n";
-    std::cout << std::string(85, '-') << "\n";
+    std::cout << std::string(97, '-') << "\n";
 
     constexpr size_t ITERATIONS = 5;
+    constexpr size_t TOTAL_OPS = 100'000;
 
     auto run_bench = [&](size_t num_pairs) {
         std::vector<double> times;
@@ -372,7 +380,7 @@ void bench_contention_scalability() {
         }
         char name[32];
         snprintf(name, sizeof(name), "%zu pairs", num_pairs);
-        print_stats(name, bench_stats::compute(times), "us");
+        print_stats(name, bench_stats::compute(times), TOTAL_OPS, "us");
     };
 
     run_bench(1);

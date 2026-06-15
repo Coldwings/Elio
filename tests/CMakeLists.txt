@@ -191,6 +191,21 @@ elseif(ELIO_ENABLE_RDMA_IBVERBS_TESTS)
         "ELIO_ENABLE_RDMA_IBVERBS_TESTS=ON requires ELIO_ENABLE_RDMA_IBVERBS=ON")
 endif()
 
+# Benchmark executable (not included in ASAN/TSAN builds)
+add_executable(elio_benchmarks
+    test_main.cpp
+    bench/bench_channel.cpp
+)
+target_link_libraries(elio_benchmarks PRIVATE elio Catch2::Catch2WithMain)
+if(TARGET elio_tls)
+    target_link_libraries(elio_benchmarks PRIVATE elio_tls)
+endif()
+if(TARGET nghttp2_static)
+    target_link_libraries(elio_benchmarks PRIVATE nghttp2_static)
+endif()
+target_compile_definitions(elio_benchmarks PRIVATE ELIO_DEBUG)
+catch_discover_tests(elio_benchmarks)
+
 # Add custom targets for convenience
 add_custom_target(test_all
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure

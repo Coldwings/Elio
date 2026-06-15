@@ -1,6 +1,7 @@
 #include <elio/sync/channel.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/log/macros.hpp>
 #include <iostream>
 #include <iomanip>
 #include <atomic>
@@ -166,6 +167,12 @@ double bench_spsc_coroutine(size_t capacity, size_t ops) {
 
 void bench_spsc_throughput() {
     std::cout << "\n=== SPSC Coroutine Throughput (1 producer, 1 consumer) ===\n";
+    std::cout << "NOTE: Low performance for rendezvous/bounded(1) is expected due to:\n";
+    std::cout << "  - Coarse-grained mutex on every operation (send/recv both acquire same lock)\n";
+    std::cout << "  - Rendezvous requires 3 mutex acquisitions per message + context switch\n";
+    std::cout << "  - std::queue operations happen under lock\n";
+    std::cout << "  - No parallelism to hide contention in SPSC pattern\n";
+    std::cout << "  See channel.hpp for implementation details.\n";
     std::cout << std::setw(35) << std::left << "Scenario"
               << std::setw(10) << std::right << "Avg (us)"
               << std::setw(10) << "Min (us)"
@@ -379,6 +386,9 @@ void bench_contention_scalability() {
 // ---------------------------------------------------------------------------
 
 int main() {
+    // Suppress verbose logs during benchmark
+    elio::log::logger::instance().set_level(elio::log::level::error);
+
     std::cout << "=== Elio Channel Benchmark Suite ===\n";
     std::cout << "Measuring channel performance across different modes and contention levels.\n";
 

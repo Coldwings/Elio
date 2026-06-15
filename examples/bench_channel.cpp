@@ -155,10 +155,11 @@ double bench_spsc_coroutine(size_t capacity, size_t ops) {
     scheduler sched(2);
     sched.start();
 
+    auto t0 = steady_clock::now();
+
     auto p = sched.go_joinable(producer, ops);
     auto c = sched.go_joinable(consumer, ops);
 
-    auto t0 = steady_clock::now();
     p.wait_destroyed();
     c.wait_destroyed();
     auto t1 = steady_clock::now();
@@ -239,6 +240,8 @@ double bench_mpmc_coroutine(size_t capacity) {
     std::vector<join_handle<void>> joins;
     joins.reserve(NUM_P + NUM_C);
 
+    auto t0 = steady_clock::now();
+
     for (size_t i = 0; i < NUM_P; ++i) {
         joins.push_back(sched.go_joinable(producer, OPS_PER_P));
     }
@@ -251,8 +254,6 @@ double bench_mpmc_coroutine(size_t capacity) {
         joins[i].wait_destroyed();
     }
     ch.close();
-
-    auto t0 = steady_clock::now();
 
     // Wait for consumers to drain
     for (size_t i = NUM_P; i < joins.size(); ++i) {
@@ -332,14 +333,14 @@ double bench_scalability(size_t num_pairs) {
     std::vector<join_handle<void>> joins;
     joins.reserve(num_pairs * 2);
 
+    auto t0 = steady_clock::now();
+
     for (size_t i = 0; i < num_pairs; ++i) {
         joins.push_back(sched.go_joinable(producer, ops_per_producer));
     }
     for (size_t i = 0; i < num_pairs; ++i) {
         joins.push_back(sched.go_joinable(consumer_fn, size_t{0}));
     }
-
-    auto t0 = steady_clock::now();
 
     // Wait for producers
     for (size_t i = 0; i < num_pairs; ++i) {

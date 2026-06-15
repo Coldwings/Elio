@@ -58,6 +58,10 @@ add_executable(scalability_test scalability_test.cpp)
 target_link_libraries(scalability_test PRIVATE elio)
 target_link_options(scalability_test PRIVATE ${STATIC_LINK_FLAGS})
 
+add_executable(bench_channel bench_channel.cpp)
+target_link_libraries(bench_channel PRIVATE elio)
+target_link_options(bench_channel PRIVATE ${STATIC_LINK_FLAGS})
+
 # Signal handling example
 add_executable(signal_handling signal_handling.cpp)
 target_link_libraries(signal_handling PRIVATE elio)

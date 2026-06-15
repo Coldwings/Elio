@@ -62,9 +62,13 @@ jobs:
       env:
         TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
 
-    - name: Run benchmark 
+    - name: Run benchmark
       if: matrix.build_type == 'Release'
       run: ./build/examples/benchmark
+
+    - name: Run channel benchmark
+      if: matrix.build_type == 'Release'
+      run: ./build/examples/bench_channel
 
   package-consumer-check:
     runs-on: ubuntu-24.04

@@ -37,11 +37,6 @@ set(TEST_SOURCES
     integration/test_dynamic_threads.cpp
 )
 
-# Benchmark sources (excluded from ASAN/TSAN builds due to timing sensitivity)
-set(BENCH_SOURCES
-    bench/bench_channel.cpp
-)
-
 # Add HTTP tests (no TLS dependency for parser tests)
 list(APPEND TEST_SOURCES
     unit/test_http_parser.cpp
@@ -106,7 +101,7 @@ if(TARGET elio_rdma_ibverbs)
 endif()
 
 # Standard test executable
-add_executable(elio_tests ${TEST_SOURCES} ${BENCH_SOURCES})
+add_executable(elio_tests ${TEST_SOURCES})
 target_link_libraries(elio_tests PRIVATE elio Catch2::Catch2WithMain)
 if(TARGET elio_tls)
     target_link_libraries(elio_tests PRIVATE elio_tls)

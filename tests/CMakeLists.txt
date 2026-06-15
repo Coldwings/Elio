@@ -37,6 +37,11 @@ set(TEST_SOURCES
     integration/test_dynamic_threads.cpp
 )
 
+# Benchmark sources (excluded from ASAN/TSAN builds due to timing sensitivity)
+set(BENCH_SOURCES
+    bench/bench_channel.cpp
+)
+
 # Add HTTP tests (no TLS dependency for parser tests)
 list(APPEND TEST_SOURCES
     unit/test_http_parser.cpp
@@ -101,7 +106,7 @@ if(TARGET elio_rdma_ibverbs)
 endif()
 
 # Standard test executable
-add_executable(elio_tests ${TEST_SOURCES})
+add_executable(elio_tests ${TEST_SOURCES} ${BENCH_SOURCES})
 target_link_libraries(elio_tests PRIVATE elio Catch2::Catch2WithMain)
 if(TARGET elio_tls)
     target_link_libraries(elio_tests PRIVATE elio_tls)
@@ -190,21 +195,6 @@ elseif(ELIO_ENABLE_RDMA_IBVERBS_TESTS)
     message(FATAL_ERROR
         "ELIO_ENABLE_RDMA_IBVERBS_TESTS=ON requires ELIO_ENABLE_RDMA_IBVERBS=ON")
 endif()
-
-# Benchmark executable (not included in ASAN/TSAN builds)
-add_executable(elio_benchmarks
-    test_main.cpp
-    bench/bench_channel.cpp
-)
-target_link_libraries(elio_benchmarks PRIVATE elio Catch2::Catch2WithMain)
-if(TARGET elio_tls)
-    target_link_libraries(elio_benchmarks PRIVATE elio_tls)
-endif()
-if(TARGET nghttp2_static)
-    target_link_libraries(elio_benchmarks PRIVATE nghttp2_static)
-endif()
-target_compile_definitions(elio_benchmarks PRIVATE ELIO_DEBUG)
-catch_discover_tests(elio_benchmarks)
 
 # Add custom targets for convenience
 add_custom_target(test_all

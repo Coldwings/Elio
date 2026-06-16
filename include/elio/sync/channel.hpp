@@ -82,40 +82,55 @@ public:
             }
 
             // Ring is full, need to wait
-            // Add to send_waiters_ queue with the value
-            {
-                std::lock_guard<std::mutex> guard(mutex_);
-                if (closed_) {
-                    co_return false;
-                }
-            }
-
             // Create awaitable for suspension (lock NOT held — critical for
             // coroutine correctness: we must not hold a mutex across co_await)
             struct send_awaitable {
                 channel& ch_;
                 T value_;
-                bool value_moved_ = false;
+                bool pushed_ = false;
 
                 bool await_ready() const noexcept { return false; }
 
                 bool await_suspend(std::coroutine_handle<> h) noexcept {
                     std::lock_guard<std::mutex> guard(ch_.mutex_);
+
+                    // Double-check: closed, ring space, or waiting receivers
                     if (ch_.closed_) {
-                        return false;  // Don't suspend, resume and return false
+                        return false;
                     }
+
+                    // Check if ring has space now (consumer may have popped)
+                    if (ch_.ring_->size() < ch_.capacity_) {
+                        if (ch_.ring_->try_push(std::move(value_))) {
+                            pushed_ = true;
+                            ch_.items_available_.release();
+                            // Wake a waiting receiver if any
+                            std::coroutine_handle<> receiver;
+                            if (!ch_.recv_waiters_.empty()) {
+                                receiver = ch_.recv_waiters_.front();
+                                ch_.recv_waiters_.pop();
+                            }
+                            if (receiver) {
+                                elio::runtime::schedule_handle(receiver);
+                            }
+                            return false;  // Don't suspend, we pushed successfully
+                        }
+                    }
+
+                    // Still full, add to send_waiters_
                     ch_.send_waiters_.push({h, std::move(value_)});
-                    value_moved_ = true;
                     return true;
                 }
 
-                void await_resume() noexcept {}
+                bool await_resume() const noexcept { return pushed_; }
             };
 
             send_awaitable awaitable{*this, std::move(value)};
-            co_await awaitable;
+            bool pushed = co_await awaitable;
 
-            // Value was moved to send_waiters_, check if it was successfully sent
+            if (pushed) {
+                co_return true;
+            }
             co_return !closed_.load(std::memory_order_acquire);
         }
 
@@ -125,7 +140,6 @@ public:
                 co_return false;
             }
             queue_.push(std::move(value));
-            items_available_.release();
             // Wake a waiting receiver if any
             std::coroutine_handle<> receiver;
             if (!recv_waiters_.empty()) {
@@ -144,7 +158,6 @@ public:
             co_return false;
         }
         queue_.push(std::move(value));
-        items_available_.release();
         // Wake a waiting receiver if any
         std::coroutine_handle<> receiver;
         if (!recv_waiters_.empty()) {
@@ -179,7 +192,9 @@ public:
             std::lock_guard<std::mutex> guard(mutex_);
             if (!recv_waiters_.empty()) {
                 queue_.push(std::move(value));
-                items_available_.release();
+                std::coroutine_handle<> receiver = recv_waiters_.front();
+                recv_waiters_.pop();
+                elio::runtime::schedule_handle(receiver);
                 return true;
             }
             return false;
@@ -191,7 +206,15 @@ public:
             return false;
         }
         queue_.push(std::move(value));
-        items_available_.release();
+        // Wake a waiting receiver if any
+        std::coroutine_handle<> receiver;
+        if (!recv_waiters_.empty()) {
+            receiver = recv_waiters_.front();
+            recv_waiters_.pop();
+        }
+        if (receiver) {
+            elio::runtime::schedule_handle(receiver);
+        }
         return true;
     }
 
@@ -265,7 +288,7 @@ public:
             }
         }
 
-        // Unbounded or rendezvous: use queue
+        // Unbounded or rendezvous: use queue with explicit waiters
         while (true) {
             {
                 std::lock_guard<std::mutex> guard(mutex_);
@@ -279,8 +302,23 @@ public:
                 }
             }
 
-            // Wait for item
-            co_await items_available_.acquire();
+            // Wait for item or close
+            struct recv_suspend_awaitable {
+                channel& ch_;
+                bool await_ready() const noexcept { return false; }
+                bool await_suspend(std::coroutine_handle<> h) noexcept {
+                    std::lock_guard<std::mutex> guard(ch_.mutex_);
+                    // Double-check: item available or closed?
+                    if (!ch_.queue_.empty() || ch_.closed_.load(std::memory_order_acquire)) {
+                        return false;  // Don't suspend, retry immediately
+                    }
+                    ch_.recv_waiters_.push(h);
+                    return true;
+                }
+                void await_resume() noexcept {}
+            };
+
+            co_await recv_suspend_awaitable{*this};
         }
     }
 
@@ -328,7 +366,6 @@ public:
         }
         auto result = std::move(queue_.front());
         queue_.pop();
-        items_available_.try_acquire();  // Decrement count (should succeed)
         return result;
     }
 
@@ -341,7 +378,6 @@ public:
 
         std::vector<std::coroutine_handle<>> senders_to_wake;
         std::vector<std::coroutine_handle<>> receivers_to_wake;
-        size_t queue_size = 0;
 
         {
             std::lock_guard<std::mutex> guard(mutex_);
@@ -364,20 +400,11 @@ public:
                 }
             }
 
-            queue_size = queue_.size();
-
             // Collect all waiting receivers
             while (!recv_waiters_.empty()) {
                 receivers_to_wake.push_back(recv_waiters_.front());
                 recv_waiters_.pop();
             }
-        }
-
-        // Update items_available_ count OUTSIDE the channel lock.
-        // release() calls schedule_handle which may resume coroutines via
-        // trampoline; those coroutines can call recv() which needs mutex_.
-        while (items_available_.count() < static_cast<int>(queue_size)) {
-            items_available_.release();
         }
 
         // Wake up all blocked senders and receivers after releasing lock

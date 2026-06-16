@@ -2,7 +2,6 @@
 #include <elio/sync/channel.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/runtime/scheduler.hpp>
-#include <iostream>
 #include <chrono>
 #include <thread>
 
@@ -20,30 +19,22 @@ TEST_CASE("close wakes blocked sender", "[sync][channel][coro]") {
     std::atomic<bool>* sd_ptr = &sender_done;
 
     auto blocked_sender = [=]() -> task<void> {
-        std::cout << "Sender: about to send" << std::endl;
-        bool result = co_await ch_ptr->send(200);
-        std::cout << "Sender: send returned " << result << std::endl;
+        co_await ch_ptr->send(200);
         *sd_ptr = true;
-        std::cout << "Sender: done" << std::endl;
         co_return;
     };
 
     scheduler sched(2);
     sched.start();
 
-    std::cout << "Main: spawning sender" << std::endl;
     auto s_join = sched.go_joinable(blocked_sender);
 
-    std::cout << "Main: sleeping 50ms" << std::endl;
+    // Give the sender time to block on send_waiters_
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    std::cout << "Main: calling close()" << std::endl;
     ch.close();
-    std::cout << "Main: close() returned" << std::endl;
 
-    std::cout << "Main: waiting for sender" << std::endl;
     s_join.wait_destroyed();
-    std::cout << "Main: sender done" << std::endl;
 
     sched.shutdown();
 

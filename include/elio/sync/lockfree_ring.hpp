@@ -45,7 +45,7 @@ class LockfreeMPMCRing {
 
 public:
     explicit LockfreeMPMCRing(size_t capacity)
-        : capacity_(next_power_of_2(capacity))
+        : capacity_(next_power_of_2(std::max<size_t>(capacity, 2)))
         , mask_(capacity_ - 1)
         , slots_(new Slot[capacity_])
     {

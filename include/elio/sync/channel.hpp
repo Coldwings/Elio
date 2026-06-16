@@ -8,7 +8,11 @@
 #include <vector>
 #include <optional>
 #include <utility>
+#include <memory>
+#include "lockfree_ring.hpp"
 #include "../runtime/scheduler.hpp"
+#include "semaphore.hpp"
+#include "mutex.hpp"
 
 namespace elio::sync {
 
@@ -24,7 +28,15 @@ public:
     /// @note For an unbounded channel (no back-pressure), use
     ///   `channel<T>::unbounded()`.
     explicit channel(size_t capacity = 0)
-        : capacity_(capacity), closed_(false) {}
+        : capacity_(capacity)
+        , closed_(false)
+        , items_available_(0)
+        , space_available_(capacity == 0 ? 0 : (capacity == std::numeric_limits<size_t>::max() ? 0 : capacity))
+    {
+        if (is_bounded()) {
+            ring_ = std::make_unique<LockfreeMPMCRing<T>>(capacity);
+        }
+    }
 
     /// Create an unbounded channel (no back-pressure, may grow indefinitely).
     static channel unbounded() {
@@ -43,374 +55,367 @@ public:
     channel(channel&&) = delete;
     channel& operator=(channel&&) = delete;
 
-    /// Send awaitable
-    class send_awaitable {
-    public:
-        send_awaitable(channel& ch, T value)
-            : channel_(ch), value_(std::move(value)) {}
+    /// Send a value to the channel
+    auto send(T value) -> coro::task<bool> {
+        if (closed_.load(std::memory_order_acquire)) {
+            co_return false;
+        }
 
-        // Note: non-const so we can commit the operation under the channel
-        // lock and avoid a TOCTOU window between await_ready and await_resume.
-        bool await_ready() noexcept {
-            std::lock_guard<std::mutex> guard(channel_.mutex_);
-
-            if (channel_.closed_) {
-                // Don't suspend; await_resume reports failure.
-                return true;
+        if (is_bounded()) {
+            // Try fast path: lockfree push
+            if (ring_->try_push(std::move(value))) {
+                // Signal item available
+                items_available_.release();
+                // Wake a waiting receiver if any
+                std::lock_guard<std::mutex> guard(mutex_);
+                if (!recv_waiters_.empty()) {
+                    auto receiver = recv_waiters_.front();
+                    recv_waiters_.pop();
+                    receiver.resume();
+                }
+                co_return true;
             }
 
-            if (channel_.capacity_ == 0) {
-                // Rendezvous: hand off directly to a waiting receiver.
-                if (!channel_.recv_waiters_.empty()) {
-                    // A receiver is already waiting — push value into the queue
-                    // so try_take_locked / await_resume can pick it up, then
-                    // wake the receiver.
-                    channel_.queue_.push(std::move(value_));
-                    committed_ = true;
+            // Ring is full, need to wait
+            // Add to send_waiters_ queue with the value
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (closed_) {
+                co_return false;
+            }
 
-                    to_wake_ = channel_.recv_waiters_.front();
-                    channel_.recv_waiters_.pop();
+            // Create awaitable for suspension
+            struct send_awaitable {
+                channel& ch_;
+                T value_;
+                bool value_moved_ = false;
+
+                bool await_ready() const noexcept { return false; }
+
+                bool await_suspend(std::coroutine_handle<> h) noexcept {
+                    ch_.send_waiters_.push({h, std::move(value_)});
+                    value_moved_ = true;
                     return true;
                 }
-                // No receiver ready — must suspend.
-                return false;
-            }
 
-            // Bounded channel (capacity_ > 0)
-            if (channel_.queue_.size() < channel_.capacity_) {
-                // Commit the send while still holding the lock.  Doing this
-                // here (rather than in await_resume) prevents another sender
-                // from filling the queue between unlock and resume, which
-                // previously could push past capacity.
-                channel_.queue_.push(std::move(value_));
-                committed_ = true;
+                void await_resume() noexcept {}
+            };
 
-                if (!channel_.recv_waiters_.empty()) {
-                    to_wake_ = channel_.recv_waiters_.front();
-                    channel_.recv_waiters_.pop();
-                }
-                return true;
-            }
+            send_awaitable awaitable{*this, std::move(value)};
+            co_await awaitable;
 
-            return false;
+            // Value was moved to send_waiters_, check if it was successfully sent
+            co_return !closed_.load(std::memory_order_acquire);
         }
 
-        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            std::lock_guard<std::mutex> guard(channel_.mutex_);
-
-            if (channel_.closed_) {
-                return false;  // Don't suspend; await_resume returns false
+        if (is_unbounded()) {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (closed_) {
+                co_return false;
             }
-
-            if (channel_.capacity_ == 0) {
-                // Rendezvous: check again for a receiver that arrived between
-                // await_ready and now.
-                if (!channel_.recv_waiters_.empty()) {
-                    channel_.queue_.push(std::move(value_));
-                    committed_ = true;
-
-                    to_wake_ = channel_.recv_waiters_.front();
-                    channel_.recv_waiters_.pop();
-                    return false;  // Don't suspend; value delivered
-                }
-                // No receiver — park on send_waiters_.
-                channel_.send_waiters_.push({awaiter, std::move(value_)});
-                value_moved_ = true;
-                return true;
+            queue_.push(std::move(value));
+            items_available_.release();
+            // Wake a waiting receiver if any
+            if (!recv_waiters_.empty()) {
+                auto receiver = recv_waiters_.front();
+                recv_waiters_.pop();
+                receiver.resume();
             }
-
-            // Bounded channel (capacity_ > 0)
-            if (channel_.queue_.size() < channel_.capacity_) {
-                // Space appeared between await_ready and now — commit.
-                channel_.queue_.push(std::move(value_));
-                committed_ = true;
-
-                if (!channel_.recv_waiters_.empty()) {
-                    to_wake_ = channel_.recv_waiters_.front();
-                    channel_.recv_waiters_.pop();
-                }
-                return false;
-            }
-
-            // Wait for space
-            channel_.send_waiters_.push({awaiter, std::move(value_)});
-            value_moved_ = true;
-            return true;
+            co_return true;
         }
 
-        bool await_resume() {
-            if (to_wake_) {
-                runtime::schedule_handle(to_wake_);
-                to_wake_ = nullptr;
-            }
-
-            if (committed_) {
-                // Value was committed under the lock; the send succeeded.
-                return true;
-            }
-
-            // We were either suspended on send_waiters_ (woken by a recv that
-            // took the value, or by close()), or short-circuited because the
-            // channel was closed at await_ready / await_suspend time.
-            std::lock_guard<std::mutex> guard(channel_.mutex_);
-            if (channel_.closed_) {
-                return false;
-            }
-            return value_moved_;
+        // Rendezvous
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (closed_) {
+            co_return false;
         }
-
-    private:
-        channel& channel_;
-        T value_;
-        bool committed_ = false;       // value pushed to queue under the lock
-        bool value_moved_ = false;     // value moved into send_waiters_
-        std::coroutine_handle<> to_wake_;
-    };
-
-    /// Receive awaitable
-    class recv_awaitable {
-    public:
-        explicit recv_awaitable(channel& ch) : channel_(ch) {}
-
-        // Note: non-const so we can commit the recv (capture the value) under
-        // the channel lock and avoid a TOCTOU window where another receiver
-        // drains the queue between await_ready and await_resume — which would
-        // otherwise produce a spurious nullopt that callers misinterpret as
-        // "channel closed".
-        bool await_ready() noexcept {
-            std::lock_guard<std::mutex> guard(channel_.mutex_);
-            return try_take_locked();
+        queue_.push(std::move(value));
+        items_available_.release();
+        // Wake a waiting receiver if any
+        if (!recv_waiters_.empty()) {
+            auto receiver = recv_waiters_.front();
+            recv_waiters_.pop();
+            receiver.resume();
         }
-
-        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            std::lock_guard<std::mutex> guard(channel_.mutex_);
-
-            if (try_take_locked()) {
-                return false;  // Don't suspend; value captured
-            }
-
-            channel_.recv_waiters_.push(awaiter);
-            return true;
-        }
-
-        std::optional<T> await_resume() {
-            if (to_wake_) {
-                runtime::schedule_handle(to_wake_);
-                to_wake_ = nullptr;
-            }
-
-            if (taken_.has_value()) {
-                return std::move(taken_);
-            }
-
-            // We suspended on recv_waiters_ and were woken either by a sender
-            // delivering a value (in which case the queue now has it) or by
-            // close().  Re-check under the lock.
-            std::optional<T> result;
-            {
-                std::lock_guard<std::mutex> guard(channel_.mutex_);
-                if (!channel_.queue_.empty()) {
-                    result = std::move(channel_.queue_.front());
-                    channel_.queue_.pop();
-                }
-            }
-            return result;
-        }
-
-    private:
-        // Returns true if the recv is committed (taken_ filled or channel
-        // closed and empty so we can return nullopt without suspending).
-        // Caller must hold channel_.mutex_.
-        bool try_take_locked() noexcept {
-            if (!channel_.queue_.empty()) {
-                taken_ = std::move(channel_.queue_.front());
-                channel_.queue_.pop();
-
-                // Queue had space freed — pull a blocked sender's value in.
-                if (!channel_.send_waiters_.empty()) {
-                    auto& [waiter, value] = channel_.send_waiters_.front();
-                    channel_.queue_.push(std::move(value));
-                    to_wake_ = waiter;
-                    channel_.send_waiters_.pop();
-                }
-                return true;
-            }
-
-            // Queue empty: check for a sender waiting on a rendezvous channel
-            // (capacity_==0) or a sender whose value hasn't been pulled into
-            // the queue yet.
-            if (!channel_.send_waiters_.empty()) {
-                auto& [waiter, value] = channel_.send_waiters_.front();
-                taken_ = std::move(value);
-                to_wake_ = waiter;
-                channel_.send_waiters_.pop();
-                return true;
-            }
-
-            if (channel_.closed_) {
-                // Empty + closed: don't suspend; await_resume returns nullopt.
-                return true;
-            }
-
-            return false;
-        }
-
-        channel& channel_;
-        std::optional<T> taken_;
-        std::coroutine_handle<> to_wake_;
-    };
-
-    /// Send a value to the channel
-    auto send(T value) {
-        return send_awaitable(*this, std::move(value));
+        co_return true;
     }
 
     /// Try to send without waiting
     bool try_send(T value) {
-        std::coroutine_handle<> to_wake;
+        if (closed_.load(std::memory_order_acquire)) {
+            return false;
+        }
 
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-
-            if (closed_) {
+        if (is_bounded()) {
+            // Check if ring is full
+            if (ring_->size() >= capacity_) {
                 return false;
             }
-
-            if (capacity_ == 0) {
-                // Rendezvous: only succeeds if a receiver is already waiting.
-                if (recv_waiters_.empty()) {
-                    return false;
-                }
-                queue_.push(std::move(value));
-                to_wake = recv_waiters_.front();
-                recv_waiters_.pop();
-            } else {
-                // Bounded channel
-                if (queue_.size() >= capacity_) {
-                    return false;
-                }
-                queue_.push(std::move(value));
-                if (!recv_waiters_.empty()) {
-                    to_wake = recv_waiters_.front();
-                    recv_waiters_.pop();
-                }
+            if (ring_->try_push(std::move(value))) {
+                items_available_.release();
+                return true;
             }
+            // Ring is full, try_send fails (no blocking)
+            return false;
         }
 
-        // Re-schedule outside the lock
-        if (to_wake) {
-            runtime::schedule_handle(to_wake);
+        if (is_rendezvous()) {
+            // Rendezvous: only succeeds if a receiver is already waiting
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (!recv_waiters_.empty()) {
+                queue_.push(std::move(value));
+                items_available_.release();
+                return true;
+            }
+            return false;
         }
 
+        // Unbounded
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (closed_) {
+            return false;
+        }
+        queue_.push(std::move(value));
+        items_available_.release();
         return true;
     }
 
     /// Receive a value from the channel
-    auto recv() {
-        return recv_awaitable(*this);
+    coro::task<std::optional<T>> recv() {
+        if (is_bounded()) {
+            // Try fast path: lockfree pop from ring
+            auto val = ring_->try_pop();
+            if (val.has_value()) {
+                // Signal space available and wake a blocked sender
+                std::lock_guard<std::mutex> guard(mutex_);
+                if (!send_waiters_.empty()) {
+                    auto& [awaiter, send_value] = send_waiters_.front();
+                    if (ring_->try_push(std::move(send_value))) {
+                        awaiter.resume();
+                        send_waiters_.pop();
+                    }
+                }
+                co_return val;
+            }
+
+            // Ring is empty, need to wait
+            std::optional<T> result;
+
+            // Create awaitable for suspension
+            struct recv_awaitable {
+                channel& ch_;
+                std::optional<T>& result_;
+
+                bool await_ready() const noexcept {
+                    // Check if there's a value available
+                    return !ch_.ring_->empty();
+                }
+
+                bool await_suspend(std::coroutine_handle<> h) noexcept {
+                    std::lock_guard<std::mutex> guard(ch_.mutex_);
+                    // Check again if there's a value (may have been sent while we were waiting for lock)
+                    auto val = ch_.ring_->try_pop();
+                    if (val.has_value()) {
+                        // Value available, don't suspend
+                        result_ = std::move(val);
+                        // Wake a blocked sender if any
+                        if (!ch_.send_waiters_.empty()) {
+                            auto& [awaiter, send_value] = ch_.send_waiters_.front();
+                            if (ch_.ring_->try_push(std::move(send_value))) {
+                                awaiter.resume();
+                                ch_.send_waiters_.pop();
+                            }
+                        }
+                        return false;  // Don't suspend
+                    }
+                    // No value, add to waiters and suspend
+                    ch_.recv_waiters_.push(h);
+                    return true;
+                }
+
+                void await_resume() noexcept {}
+            };
+
+            recv_awaitable awaitable{*this, result};
+            co_await awaitable;
+
+            if (result.has_value()) {
+                co_return result;
+            }
+
+            // Woken up, try to get value from ring
+            val = ring_->try_pop();
+            if (val.has_value()) {
+                // Wake a blocked sender if any
+                std::lock_guard<std::mutex> guard(mutex_);
+                if (!send_waiters_.empty()) {
+                    auto& [awaiter, send_value] = send_waiters_.front();
+                    if (ring_->try_push(std::move(send_value))) {
+                        awaiter.resume();
+                        send_waiters_.pop();
+                    }
+                }
+                co_return val;
+            }
+
+            // Ring is empty, check if closed and has values in queue
+            if (closed_.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> guard(mutex_);
+                if (!queue_.empty()) {
+                    auto result = std::move(queue_.front());
+                    queue_.pop();
+                    co_return result;
+                }
+            }
+
+            // Still empty (channel closed)
+            co_return std::nullopt;
+        }
+
+        // Unbounded or rendezvous: use queue
+        while (true) {
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                if (!queue_.empty()) {
+                    auto result = std::move(queue_.front());
+                    queue_.pop();
+                    co_return result;
+                }
+                if (closed_.load(std::memory_order_acquire)) {
+                    co_return std::nullopt;
+                }
+            }
+
+            // Wait for item
+            co_await items_available_.acquire();
+        }
     }
 
     /// Try to receive without waiting
     std::optional<T> try_recv() {
-        std::coroutine_handle<> to_wake;
-        std::optional<T> result;
-
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-
-            if (!queue_.empty()) {
-                result = std::move(queue_.front());
-                queue_.pop();
-
-                // Queue had space freed — pull a blocked sender's value in.
+        if (is_bounded()) {
+            // Try lockfree pop from ring first
+            auto val = ring_->try_pop();
+            if (val.has_value()) {
+                // Signal space available and wake a blocked sender
+                std::lock_guard<std::mutex> guard(mutex_);
                 if (!send_waiters_.empty()) {
-                    auto& [waiter, send_value] = send_waiters_.front();
-                    queue_.push(std::move(send_value));
-                    to_wake = waiter;
-                    send_waiters_.pop();
+                    auto& [awaiter, send_value] = send_waiters_.front();
+                    if (ring_->try_push(std::move(send_value))) {
+                        awaiter.resume();
+                        send_waiters_.pop();
+                    }
                 }
-            } else if (!send_waiters_.empty()) {
-                // Rendezvous path: no queued items but a sender is waiting.
-                auto& [waiter, send_value] = send_waiters_.front();
-                result = std::move(send_value);
-                to_wake = waiter;
-                send_waiters_.pop();
-            } else {
-                return std::nullopt;
+                return val;
             }
+
+            // Ring is empty, check if closed and has values in queue
+            if (closed_.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> guard(mutex_);
+                if (!queue_.empty()) {
+                    auto result = std::move(queue_.front());
+                    queue_.pop();
+                    return result;
+                }
+            }
+
+            // Ring is empty
+            return std::nullopt;
         }
 
-        // Re-schedule outside the lock
-        if (to_wake) {
-            runtime::schedule_handle(to_wake);
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (queue_.empty()) {
+            return std::nullopt;
         }
-
+        auto result = std::move(queue_.front());
+        queue_.pop();
+        items_available_.try_acquire();  // Decrement count (should succeed)
         return result;
     }
 
     /// Close the channel
     void close() {
-        std::vector<std::coroutine_handle<>> to_resume;
+        bool expected = false;
+        if (!closed_.compare_exchange_strong(expected, true)) {
+            return;
+        }
 
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
+        std::lock_guard<std::mutex> guard(mutex_);
 
-            if (closed_) {
-                return;
+        // For bounded channels, drain any remaining values from the ring
+        // and from send_waiters_ into the queue (Go semantics)
+        if (is_bounded()) {
+            // Drain ring
+            while (true) {
+                auto val = ring_->try_pop();
+                if (!val.has_value()) break;
+                queue_.push(std::move(*val));
             }
-
-            closed_ = true;
-
-            // Drain pending send values into the queue so receivers can still
-            // read them after close (Go semantics: close flushes in-flight
-            // sends).  Senders' await_resume will return false because
-            // value_moved_ is set but committed_ is not — they learn the send
-            // did not complete normally.
+            // Drain send_waiters_
             while (!send_waiters_.empty()) {
-                auto& [waiter, value] = send_waiters_.front();
+                auto& [awaiter, value] = send_waiters_.front();
                 queue_.push(std::move(value));
-                to_resume.push_back(waiter);
+                awaiter.resume();  // Wake up blocked sender
                 send_waiters_.pop();
-            }
-
-            // Wake all recv waiters
-            while (!recv_waiters_.empty()) {
-                to_resume.push_back(recv_waiters_.front());
-                recv_waiters_.pop();
             }
         }
 
-        // Re-schedule all waiters through the scheduler
-        for (auto& h : to_resume) {
-            runtime::schedule_handle(h);
+        // Update items_available_ count to reflect queue size
+        // (for closed channels, we use queue instead of semaphore)
+        while (items_available_.count() < static_cast<int>(queue_.size())) {
+            items_available_.release();
         }
     }
 
     /// Check if channel is closed
     bool is_closed() const noexcept {
-        std::lock_guard<std::mutex> guard(mutex_);
-        return closed_;
+        return closed_.load(std::memory_order_acquire);
     }
 
     /// Get current queue size
     size_t size() const noexcept {
+        if (is_bounded()) {
+            return ring_->size();
+        }
         std::lock_guard<std::mutex> guard(mutex_);
         return queue_.size();
     }
 
     /// Check if channel is empty
     bool empty() const noexcept {
+        if (is_bounded()) {
+            return ring_->empty();
+        }
         std::lock_guard<std::mutex> guard(mutex_);
         return queue_.empty();
     }
 
+    /// Get items_available semaphore count (for debugging)
+    int items_available_count() const noexcept {
+        return items_available_.count();
+    }
+
 private:
+    bool is_bounded() const noexcept {
+        return capacity_ > 0 && capacity_ != std::numeric_limits<size_t>::max();
+    }
+
+    bool is_unbounded() const noexcept {
+        return capacity_ == std::numeric_limits<size_t>::max();
+    }
+
+    bool is_rendezvous() const noexcept {
+        return capacity_ == 0;
+    }
+
     mutable std::mutex mutex_;
-    std::queue<T> queue_;
-    std::queue<std::coroutine_handle<>> recv_waiters_;
-    std::queue<std::pair<std::coroutine_handle<>, T>> send_waiters_;
+    std::unique_ptr<LockfreeMPMCRing<T>> ring_;  // Only for bounded channels
+    std::queue<T> queue_;  // Only for unbounded and rendezvous channels
+    std::queue<std::coroutine_handle<>> recv_waiters_;  // Blocked receivers
+    std::queue<std::pair<std::coroutine_handle<>, T>> send_waiters_;  // Blocked senders with their values
     size_t capacity_;
-    bool closed_;
+    std::atomic<bool> closed_;
+    semaphore items_available_;  // Tracks available items
+    semaphore space_available_;  // Tracks available space (bounded only)
 };
 
 } // namespace elio::sync

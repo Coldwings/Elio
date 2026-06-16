@@ -22,6 +22,9 @@ set(TEST_SOURCES
     unit/test_io.cpp
     unit/test_batch_io.cpp
     unit/test_sync.cpp
+    unit/test_channel_debug.cpp
+    unit/test_channel_close.cpp
+    unit/test_close_wake.cpp
     unit/test_cancel_token.cpp
     unit/test_timer.cpp
     unit/test_hash.cpp

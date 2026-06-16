@@ -251,9 +251,14 @@ public:
                 return;
             }
             // Schedule the actual io_context::cancel() on the worker that
-            // owns the ring. schedule() uses a lock-free MPSC inbox so this
-            // is safe from any thread.
+            // owns the ring. We set affinity to prevent stealing — this
+            // task accesses worker-local io_context and must run on the
+            // correct worker.
             auto exec = make_cancel_executor(state);
+            if (auto* promise = coro::get_promise_base(exec.handle.address())) {
+                promise->set_affinity(state->worker->worker_id());
+                promise->detach_from_parent();
+            }
             state->worker->schedule(exec.handle);
         });
 
@@ -370,15 +375,20 @@ private:
     /// the worker that owns the ring. Self-destroys via suspend_never on
     /// final_suspend. Captures shared_ptr<shared_state> by value so it
     /// holds an independent ref to the state.
+    ///
+    /// NOTE: promise_type MUST inherit coro::promise_base to enable the
+    /// affinity mechanism. Without it, try_steal() sees NO_AFFINITY and
+    /// allows stealing this task to other workers, which then access the
+    /// wrong io_context's io_uring ring — causing data races (TSAN warning
+    /// in CI run 27592314235).
     struct cancel_executor {
-        struct promise_type {
+        struct promise_type : public coro::promise_base {
             cancel_executor get_return_object() {
                 return {std::coroutine_handle<promise_type>::from_promise(*this)};
             }
             std::suspend_always initial_suspend() noexcept { return {}; }
             std::suspend_never final_suspend() noexcept { return {}; }
             void return_void() noexcept {}
-            void unhandled_exception() noexcept {}
         };
         std::coroutine_handle<promise_type> handle;
     };

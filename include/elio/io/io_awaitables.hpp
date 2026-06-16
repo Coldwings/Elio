@@ -906,15 +906,19 @@ struct io_cancel_state {
 
 /// Fire-and-forget coroutine that executes io_context::cancel() on the worker
 /// that owns the ring. Self-destroys via suspend_never on final_suspend.
+///
+/// NOTE: promise_type MUST inherit coro::promise_base to enable the affinity
+/// mechanism. Without it, try_steal() sees NO_AFFINITY and allows stealing
+/// this task to other workers, which then access the wrong io_context's
+/// io_uring ring — causing data races.
 struct io_cancel_executor {
-    struct promise_type {
+    struct promise_type : public coro::promise_base {
         io_cancel_executor get_return_object() {
             return {std::coroutine_handle<promise_type>::from_promise(*this)};
         }
         std::suspend_always initial_suspend() noexcept { return {}; }
         std::suspend_never final_suspend() noexcept { return {}; }
         void return_void() noexcept {}
-        void unhandled_exception() noexcept {}
     };
     std::coroutine_handle<promise_type> handle;
 };
@@ -998,6 +1002,10 @@ public:
                 return;
             }
             auto exec = detail::make_io_cancel_executor(state);
+            if (auto* promise = coro::get_promise_base(exec.handle.address())) {
+                promise->set_affinity(state->worker->worker_id());
+                promise->detach_from_parent();
+            }
             state->worker->schedule(exec.handle);
         });
 
@@ -1098,6 +1106,10 @@ public:
                 return;
             }
             auto exec = detail::make_io_cancel_executor(state);
+            if (auto* promise = coro::get_promise_base(exec.handle.address())) {
+                promise->set_affinity(state->worker->worker_id());
+                promise->detach_from_parent();
+            }
             state->worker->schedule(exec.handle);
         });
 
@@ -1197,6 +1209,10 @@ public:
                 return;
             }
             auto exec = detail::make_io_cancel_executor(state);
+            if (auto* promise = coro::get_promise_base(exec.handle.address())) {
+                promise->set_affinity(state->worker->worker_id());
+                promise->detach_from_parent();
+            }
             state->worker->schedule(exec.handle);
         });
 

@@ -300,7 +300,7 @@ private:
             case opcode::close: {
                 auto close_info = parse_close_payload(payload);
                 auto code = close_info.first;
-                auto& reason = close_info.second;
+                [[maybe_unused]] auto& reason = close_info.second;
                 ELIO_LOG_DEBUG("WebSocket close received: {} {}",
                               static_cast<uint16_t>(code), reason);
 

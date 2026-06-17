@@ -790,7 +790,7 @@ public:
         bind_to_worker(awaiter);
 
         if (segments_.empty()) {
-            batch_st_ = std::make_unique<batch_state>(0);
+            // No segments, no need to allocate batch_state
             awaiter.resume();
             return;
         }
@@ -872,7 +872,7 @@ public:
         bind_to_worker(awaiter);
 
         if (segments_.empty()) {
-            batch_st_ = std::make_unique<batch_state>(0);
+            // No segments, no need to allocate batch_state
             awaiter.resume();
             return;
         }

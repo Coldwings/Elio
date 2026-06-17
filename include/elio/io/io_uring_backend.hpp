@@ -128,6 +128,7 @@ inline void* tagged_op_state_user_data(op_state* st) noexcept {
 struct batch_state {
     static constexpr uint8_t phase_pending = 0;
     static constexpr uint8_t phase_orphaned = 1;
+    static constexpr uint8_t phase_completed = 2;
 
     std::atomic<int> completed{0};                 ///< Per-CQE counter
     int total = 0;                                 ///< Total segments
@@ -771,6 +772,8 @@ private:
             delete st;
             return;
         }
+        // Mark as completed so the destructor's CAS fails and unique_ptr cleans up
+        st->phase.store(batch_state::phase_completed, std::memory_order_release);
         auto handle = st->awaiter;
         if (!handle) {
             return;

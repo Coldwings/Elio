@@ -14,6 +14,7 @@
 #include <string_view>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <filesystem>
 
 namespace elio::net {
@@ -40,29 +41,52 @@ struct unix_address {
     explicit unix_address(const struct sockaddr_un& sa) {
         if (sa.sun_path[0] == '\0') {
             // Abstract socket (Linux-specific)
-            // The actual name starts at sun_path[1]
-            path = std::string(sa.sun_path, sizeof(sa.sun_path));
+            // The actual name starts at sun_path[1]. Trim trailing null bytes
+            // since the caller may not have provided the exact sockaddr length.
+            size_t len = sizeof(sa.sun_path);
+            while (len > 1 && sa.sun_path[len - 1] == '\0') {
+                --len;
+            }
+            path = std::string(sa.sun_path, len);
+        } else {
+            path = sa.sun_path;
+        }
+    }
+
+    /// Construct from sockaddr_un with explicit length (preferred for abstract sockets)
+    unix_address(const struct sockaddr_un& sa, socklen_t sa_len) {
+        if (sa.sun_path[0] == '\0') {
+            // Abstract socket: use the exact length from the kernel
+            size_t name_len = sa_len - offsetof(struct sockaddr_un, sun_path);
+            if (name_len > sizeof(sa.sun_path)) {
+                name_len = sizeof(sa.sun_path);
+            }
+            path = std::string(sa.sun_path, name_len);
         } else {
             path = sa.sun_path;
         }
     }
     
     /// Convert to sockaddr_un
+    /// @throws std::invalid_argument if the path exceeds sun_path capacity
     struct sockaddr_un to_sockaddr() const {
         struct sockaddr_un sa{};
         sa.sun_family = AF_UNIX;
-        
-        if (path.size() >= sizeof(sa.sun_path)) {
-            ELIO_LOG_ERROR("Unix socket path too long: {} (max {})", 
-                          path.size(), sizeof(sa.sun_path) - 1);
-            // Truncate to fit
-            std::memcpy(sa.sun_path, path.data(), sizeof(sa.sun_path) - 1);
-            sa.sun_path[sizeof(sa.sun_path) - 1] = '\0';
-        } else {
-            std::memcpy(sa.sun_path, path.data(), path.size());
+
+        // For abstract sockets (path[0] == '\0'), the full path.size() bytes
+        // must fit in sun_path. For filesystem sockets, we need room for a
+        // null terminator.
+        size_t max_len = is_abstract() ? sizeof(sa.sun_path) : sizeof(sa.sun_path) - 1;
+        if (path.size() > max_len) {
+            throw std::invalid_argument(
+                "unix_address: path too long (" + std::to_string(path.size()) +
+                " bytes, max " + std::to_string(max_len) + ")");
+        }
+        std::memcpy(sa.sun_path, path.data(), path.size());
+        if (!is_abstract()) {
             sa.sun_path[path.size()] = '\0';
         }
-        
+
         return sa;
     }
     
@@ -316,7 +340,10 @@ public:
         
         // Unlink existing socket file if requested (only for filesystem sockets)
         if (opts.unlink_on_bind && !addr.is_abstract() && !addr.path.empty()) {
-            ::unlink(addr.path.c_str());
+            if (::unlink(addr.path.c_str()) != 0 && errno != ENOENT) {
+                ELIO_LOG_WARNING("Failed to unlink existing socket path '{}': {} (errno={})",
+                              addr.path, strerror(errno), errno);
+            }
         }
         
         // Bind
@@ -381,16 +408,17 @@ public:
     const unix_address& local_address() const noexcept { return local_addr_; }
     
     /// Accept a connection awaitable
-    class accept_awaitable {
+    class accept_awaitable : public io::io_awaitable_base {
     public:
         accept_awaitable(uds_listener& listener)
-            : listener_(listener) {}
-        
-        bool await_ready() const noexcept { return false; }
-        
-        void await_suspend(std::coroutine_handle<> awaiter) {
+            : io::io_awaitable_base()
+            , listener_(listener) {}
+
+        template<typename Promise>
+        void await_suspend(std::coroutine_handle<Promise> awaiter) {
+            bind_to_worker(awaiter);
             auto& ctx = io::current_io_context();
-            
+
             io::io_request req{};
             req.op = io::io_op::accept;
             req.fd = listener_.fd_;
@@ -398,41 +426,42 @@ public:
             req.addrlen = &peer_addr_len_;
             req.socket_flags = SOCK_NONBLOCK | SOCK_CLOEXEC;
             req.awaiter = awaiter;
-            
+            req.state = setup_op_state(awaiter);
+
             if (!ctx.prepare(req)) {
+                clear_op_state();
                 result_ = io::io_result{-EAGAIN, 0};
                 awaiter.resume();
                 return;
             }
-            ctx.submit();
         }
-        
+
         std::optional<uds_stream> await_resume() {
-            result_ = io::io_context::get_last_result();
-            
+            result_ = read_result_from_op_state();
+            restore_affinity();
+
             if (!result_.success()) {
                 errno = result_.error_code();
                 return std::nullopt;
             }
-            
+
             int client_fd = result_.result;
             uds_stream stream(client_fd);
-            
+
             // Set peer address if available
             if (peer_addr_len_ > offsetof(struct sockaddr_un, sun_path)) {
                 stream.set_peer_address(unix_address(peer_addr_));
             }
-            
+
             ELIO_LOG_DEBUG("Accepted UDS connection");
-            
+
             return stream;
         }
-        
+
     private:
         uds_listener& listener_;
         struct sockaddr_un peer_addr_{};
         socklen_t peer_addr_len_ = sizeof(peer_addr_);
-        io::io_result result_{};
     };
     
     /// Accept a new connection

@@ -102,11 +102,14 @@ public:
                 // No waiters, just release
                 state_.store(nullptr, std::memory_order_release);
             } else {
-                // Wake the next waiter
+                // Wake the next waiter — use a sentinel locked marker instead
+                // of the waiter's address to avoid dangling pointers if the
+                // woken coroutine is destroyed before resuming (e.g., during
+                // scheduler shutdown). The waiter knows it owns the lock by
+                // virtue of being woken from the queue.
                 waiter_to_wake = waiters_.front();
                 waiters_.pop();
-                // Transfer ownership to the waiter
-                state_.store(waiter_to_wake.address(), std::memory_order_release);
+                state_.store(reinterpret_cast<void*>(1), std::memory_order_release);
             }
         }
 

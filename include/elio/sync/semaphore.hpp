@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <coroutine>
 #include <atomic>
 #include <mutex>
@@ -14,7 +15,9 @@ namespace elio::sync {
 class semaphore {
 public:
     explicit semaphore(int initial_count = 0)
-        : count_(initial_count) {}
+        : count_(initial_count) {
+        assert(initial_count >= 0 && "semaphore initial count must be non-negative");
+    }
 
     ~semaphore() = default;
 
@@ -68,6 +71,8 @@ public:
 
     /// Release (increment) the semaphore
     void release(int count = 1) {
+        assert(count > 0 && "semaphore release count must be positive");
+
         std::vector<std::coroutine_handle<>> to_resume;
 
         {
@@ -83,7 +88,9 @@ public:
             }
 
             // Only add permits not consumed by woken waiters
-            count_ += (count - to_wake);
+            const int remaining = count - to_wake;
+            assert(count_ <= INT_MAX - remaining && "semaphore count overflow");
+            count_ += remaining;
         }
 
         // Re-schedule waiters through the scheduler

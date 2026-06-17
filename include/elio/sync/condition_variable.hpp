@@ -33,7 +33,8 @@ concept lockable = requires(Lock& l) {
 ///   are guaranteed to run on the same worker thread
 ///
 /// Supports both notify_one() and notify_all() semantics.
-/// The predicate-based wait variants provide spurious-wakeup protection.
+/// Callers must use a while(!pred) { co_await cv.wait(m); } loop for
+/// spurious-wakeup protection.
 class condition_variable {
 public:
     condition_variable() = default;
@@ -54,11 +55,12 @@ public:
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            {
-                std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
-                cv_.waiters_.push(awaiter);
-            }
+            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+            // Unlock user mutex BEFORE enqueueing to ensure atomicity:
+            // either the waiter is visible to notifiers, or the user mutex
+            // is still held (serializing with notifier's state changes).
             mutex_.unlock();
+            cv_.waiters_.push(awaiter);
             return true;
         }
 
@@ -81,12 +83,12 @@ public:
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            {
-                std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
-                cv_.waiters_.push(awaiter);
-            }
-            // Release the user's lock after enqueuing
+            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+            // Unlock user lock BEFORE enqueueing to ensure atomicity:
+            // either the waiter is visible to notifiers, or the user lock
+            // is still held (serializing with notifier's state changes).
             lock_.unlock();
+            cv_.waiters_.push(awaiter);
             return true;
         }
 

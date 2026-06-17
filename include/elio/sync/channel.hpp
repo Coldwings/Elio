@@ -11,7 +11,6 @@
 #include <memory>
 #include "lockfree_ring.hpp"
 #include "../runtime/scheduler.hpp"
-#include "semaphore.hpp"
 
 namespace elio::sync {
 
@@ -29,8 +28,6 @@ public:
     explicit channel(size_t capacity = 0)
         : capacity_(capacity)
         , closed_(false)
-        , items_available_(0)
-        , space_available_(capacity == 0 ? 0 : (capacity == std::numeric_limits<size_t>::max() ? 0 : capacity))
     {
         if (is_bounded()) {
             ring_ = std::make_unique<LockfreeMPMCRing<T>>(capacity);
@@ -62,23 +59,34 @@ public:
 
         if (is_bounded()) {
             // Try fast path: lockfree push (only if under user-requested capacity)
-            if (ring_->size() < capacity_ && ring_->try_push(std::move(value))) {
-                // Signal item available
-                items_available_.release();
-                // Wake a waiting receiver if any
+            // Note: we must check closed_ under lock to avoid racing with close()
+            if (ring_->size() < capacity_) {
+                // Check closed_ and push under lock to prevent post-close sends
                 std::coroutine_handle<> receiver;
+                bool pushed = false;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
-                    if (!recv_waiters_.empty()) {
-                        receiver = recv_waiters_.front();
-                        recv_waiters_.pop();
+                    if (!closed_) {
+                        if (ring_->try_push(std::move(value))) {
+                            pushed = true;
+                            // Wake a waiting receiver if any
+                            if (!recv_waiters_.empty()) {
+                                receiver = recv_waiters_.front();
+                                recv_waiters_.pop();
+                            }
+                        }
                     }
                 }
-                if (receiver) {
-                    // Resume receiver through scheduler
-                    elio::runtime::schedule_handle(receiver);
+                if (pushed) {
+                    if (receiver) {
+                        elio::runtime::schedule_handle(receiver);
+                    }
+                    co_return true;
                 }
-                co_return true;
+                if (closed_.load(std::memory_order_acquire)) {
+                    co_return false;
+                }
+                // Push failed due to contention, fall through to slow path
             }
 
             // Ring is full, need to wait
@@ -103,7 +111,6 @@ public:
                     if (ch_.ring_->size() < ch_.capacity_) {
                         if (ch_.ring_->try_push(std::move(value_))) {
                             pushed_ = true;
-                            ch_.items_available_.release();
                             // Wake a waiting receiver if any
                             std::coroutine_handle<> receiver;
                             if (!ch_.recv_waiters_.empty()) {
@@ -152,22 +159,48 @@ public:
             co_return true;
         }
 
-        // Rendezvous
-        std::lock_guard<std::mutex> guard(mutex_);
-        if (closed_) {
-            co_return false;
+        // Rendezvous: must suspend if no receiver is waiting
+        {
+            struct rendezvous_send_awaitable {
+                channel& ch_;
+                T value_;
+                bool handed_off_ = false;
+
+                bool await_ready() const noexcept { return false; }
+
+                bool await_suspend(std::coroutine_handle<> h) noexcept {
+                    std::lock_guard<std::mutex> guard(ch_.mutex_);
+
+                    if (ch_.closed_) {
+                        return false;
+                    }
+
+                    // If a receiver is waiting, hand off directly
+                    if (!ch_.recv_waiters_.empty()) {
+                        // Push to queue_ for the receiver to pick up
+                        ch_.queue_.push(std::move(value_));
+                        handed_off_ = true;
+                        auto receiver = ch_.recv_waiters_.front();
+                        ch_.recv_waiters_.pop();
+                        elio::runtime::schedule_handle(receiver);
+                        return false;  // Don't suspend
+                    }
+
+                    // No receiver waiting — suspend on send_waiters_
+                    ch_.send_waiters_.push({h, std::move(value_)});
+                    return true;
+                }
+
+                bool await_resume() const noexcept { return handed_off_; }
+            };
+
+            rendezvous_send_awaitable awaitable{*this, std::move(value)};
+            bool result = co_await awaitable;
+            if (result) {
+                co_return true;
+            }
+            co_return !closed_.load(std::memory_order_acquire);
         }
-        queue_.push(std::move(value));
-        // Wake a waiting receiver if any
-        std::coroutine_handle<> receiver;
-        if (!recv_waiters_.empty()) {
-            receiver = recv_waiters_.front();
-            recv_waiters_.pop();
-        }
-        if (receiver) {
-            elio::runtime::schedule_handle(receiver);
-        }
-        co_return true;
     }
 
     /// Try to send without waiting
@@ -177,11 +210,23 @@ public:
         }
 
         if (is_bounded()) {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (closed_) {
+                return false;
+            }
             if (ring_->size() >= capacity_) {
                 return false;
             }
             if (ring_->try_push(std::move(value))) {
-                items_available_.release();
+                // Wake a waiting receiver if any
+                std::coroutine_handle<> receiver;
+                if (!recv_waiters_.empty()) {
+                    receiver = recv_waiters_.front();
+                    recv_waiters_.pop();
+                }
+                if (receiver) {
+                    elio::runtime::schedule_handle(receiver);
+                }
                 return true;
             }
             return false;
@@ -190,6 +235,9 @@ public:
         if (is_rendezvous()) {
             // Rendezvous: only succeeds if a receiver is already waiting
             std::lock_guard<std::mutex> guard(mutex_);
+            if (closed_) {
+                return false;
+            }
             if (!recv_waiters_.empty()) {
                 queue_.push(std::move(value));
                 std::coroutine_handle<> receiver = recv_waiters_.front();
@@ -231,7 +279,18 @@ public:
                         std::lock_guard<std::mutex> guard(mutex_);
                         if (!send_waiters_.empty()) {
                             auto& [awaiter, send_value] = send_waiters_.front();
-                            if (ring_->try_push(std::move(send_value))) {
+                            // Only transfer if we can guarantee the push will succeed.
+                            // We just popped, so there should be space. But another
+                            // producer could fill it concurrently. If try_push fails,
+                            // wake the sender anyway so it can retry properly.
+                            if (ring_->try_push(send_value)) {
+                                sender = awaiter;
+                                send_waiters_.pop();
+                            } else {
+                                // Can't transfer — wake sender to retry through
+                                // normal send_awaitable path. Do NOT move from
+                                // send_value since try_push takes by value and
+                                // would leave it in a moved-from state.
                                 sender = awaiter;
                                 send_waiters_.pop();
                             }
@@ -292,9 +351,18 @@ public:
         while (true) {
             {
                 std::lock_guard<std::mutex> guard(mutex_);
+                // For rendezvous channels, also check send_waiters_ for direct handoff
                 if (!queue_.empty()) {
                     auto result = std::move(queue_.front());
                     queue_.pop();
+                    co_return result;
+                }
+                if (is_rendezvous() && !send_waiters_.empty()) {
+                    auto& [awaiter, send_value] = send_waiters_.front();
+                    auto result = std::optional<T>(std::move(send_value));
+                    auto sender = awaiter;
+                    send_waiters_.pop();
+                    elio::runtime::schedule_handle(sender);
                     co_return result;
                 }
                 if (closed_.load(std::memory_order_acquire)) {
@@ -308,9 +376,12 @@ public:
                 bool await_ready() const noexcept { return false; }
                 bool await_suspend(std::coroutine_handle<> h) noexcept {
                     std::lock_guard<std::mutex> guard(ch_.mutex_);
-                    // Double-check: item available or closed?
+                    // Double-check: item available, sender waiting (rendezvous), or closed?
                     if (!ch_.queue_.empty() || ch_.closed_.load(std::memory_order_acquire)) {
                         return false;  // Don't suspend, retry immediately
+                    }
+                    if (ch_.is_rendezvous() && !ch_.send_waiters_.empty()) {
+                        return false;  // Sender waiting for rendezvous
                     }
                     ch_.recv_waiters_.push(h);
                     return true;
@@ -328,13 +399,17 @@ public:
             // Try lockfree pop from ring first
             auto val = ring_->try_pop();
             if (val.has_value()) {
-                // Signal space available and wake a blocked sender
+                // Wake a blocked sender if any
                 std::coroutine_handle<> sender;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
                     if (!send_waiters_.empty()) {
                         auto& [awaiter, send_value] = send_waiters_.front();
-                        if (ring_->try_push(std::move(send_value))) {
+                        if (ring_->try_push(send_value)) {
+                            sender = awaiter;
+                            send_waiters_.pop();
+                        } else {
+                            // Can't transfer — wake sender to retry
                             sender = awaiter;
                             send_waiters_.pop();
                         }
@@ -361,7 +436,16 @@ public:
         }
 
         std::lock_guard<std::mutex> guard(mutex_);
+        // For rendezvous, check send_waiters_ too
         if (queue_.empty()) {
+            if (is_rendezvous() && !send_waiters_.empty()) {
+                auto& [awaiter, send_value] = send_waiters_.front();
+                auto result = std::optional<T>(std::move(send_value));
+                auto sender = awaiter;
+                send_waiters_.pop();
+                elio::runtime::schedule_handle(sender);
+                return result;
+            }
             return std::nullopt;
         }
         auto result = std::move(queue_.front());
@@ -392,6 +476,16 @@ public:
                     queue_.push(std::move(*val));
                 }
                 // Drain send_waiters_
+                while (!send_waiters_.empty()) {
+                    auto& [awaiter, value] = send_waiters_.front();
+                    queue_.push(std::move(value));
+                    senders_to_wake.push_back(awaiter);
+                    send_waiters_.pop();
+                }
+            }
+
+            // For rendezvous channels, drain send_waiters_ into queue_
+            if (is_rendezvous()) {
                 while (!send_waiters_.empty()) {
                     auto& [awaiter, value] = send_waiters_.front();
                     queue_.push(std::move(value));
@@ -439,11 +533,6 @@ public:
         return queue_.empty();
     }
 
-    /// Get items_available semaphore count (for debugging)
-    int items_available_count() const noexcept {
-        return items_available_.count();
-    }
-
 private:
     bool is_bounded() const noexcept {
         return capacity_ > 0 && capacity_ != std::numeric_limits<size_t>::max();
@@ -464,8 +553,6 @@ private:
     std::queue<std::pair<std::coroutine_handle<>, T>> send_waiters_;  // Blocked senders with their values
     size_t capacity_;
     std::atomic<bool> closed_;
-    semaphore items_available_;  // Tracks available items
-    semaphore space_available_;  // Tracks available space (bounded only)
 };
 
 } // namespace elio::sync

@@ -4,7 +4,7 @@ Elio's RPC framework provides high-performance remote procedure calls over TCP a
 
 ## Features
 
-- **Zero-copy serialization**: Binary format with direct memory access where possible
+- **Zero-copy deserialization**: Binary format with direct memory access for reads; buffer_ref avoids extra allocations on the send path (data is still copied into the wire buffer)
 - **Out-of-order calls**: Multiple concurrent requests with response correlation by request ID
 - **Per-call timeouts**: Individual timeout per RPC call
 - **Nested types**: Support for complex nested structures
@@ -23,7 +23,7 @@ The RPC framework uses a custom binary wire format to maintain zero external dep
 
 ### Why zero-copy with buffer_ref
 
-Large payloads such as file contents or binary data can be sent without copying into a serialization buffer. The `buffer_ref` type holds a pointer and size, referencing memory that lives elsewhere (e.g., an mmap'd file or a pre-allocated buffer). Combined with `iovec_buffer`, this enables scatter-gather writes that combine the header and payload in a single `writev()` syscall, avoiding intermediate copies and reducing memory allocations on the send path.
+Large payloads such as file contents or binary data can be referenced without an extra allocation. Note: on the send path the data is currently still copied into the wire buffer; true zero-copy iovec-tail send is planned. The `buffer_ref` type holds a pointer and size, referencing memory that lives elsewhere (e.g., an mmap'd file or a pre-allocated buffer). Combined with `iovec_buffer`, this enables scatter-gather writes that combine the header and payload in a single `writev()` syscall, reducing memory allocations on the send path.
 
 ### Why cleanup callbacks
 
@@ -72,10 +72,8 @@ using namespace elio;
 using namespace elio::rpc;
 
 coro::task<void> run_server(uint16_t port) {
-    auto& ctx = io::default_io_context();
-    
     // Create listener
-    auto listener = net::tcp_listener::bind(net::ipv4_address(port), ctx);
+    auto listener = net::tcp_listener::bind(net::ipv4_address(port));
     if (!listener) {
         ELIO_LOG_ERROR("Failed to bind");
         co_return;
@@ -102,10 +100,8 @@ coro::task<void> run_server(uint16_t port) {
 
 ```cpp
 coro::task<void> run_client(const char* host, uint16_t port) {
-    auto& ctx = io::default_io_context();
-    
     // Connect to server
-    auto client = co_await tcp_rpc_client::connect(ctx, host, port);
+    auto client = co_await tcp_rpc_client::connect(host, port);
     if (!client) {
         ELIO_LOG_ERROR("Failed to connect");
         co_return;
@@ -437,7 +433,7 @@ Enable CRC32 checksums for message integrity verification:
 GetUserRequest req{42};
 auto [header, payload] = build_request(
     request_id, GetUser::id, req,
-    std::chrono::milliseconds(5000),  // timeout
+    5000,  // timeout in milliseconds
     true  // enable_checksum
 );
 
@@ -473,14 +469,14 @@ if (!alive) {
 ```cpp
 // Server
 auto listener = net::uds_listener::bind(
-    net::unix_address("/tmp/my_service.sock"), ctx);
+    net::unix_address("/tmp/my_service.sock"));
 uds_rpc_server server;
 // ... register methods
 co_await server.serve(*listener);
 
 // Client
 auto client = co_await uds_rpc_client::connect(
-    ctx, "/tmp/my_service.sock");
+    "/tmp/my_service.sock");
 ```
 
 ### Abstract Sockets (Linux)
@@ -488,7 +484,7 @@ auto client = co_await uds_rpc_client::connect(
 ```cpp
 // No filesystem path - automatically cleaned up
 auto addr = net::unix_address::abstract("my_service");
-auto listener = net::uds_listener::bind(addr, ctx);
+auto listener = net::uds_listener::bind(addr);
 ```
 
 ## Performance Considerations

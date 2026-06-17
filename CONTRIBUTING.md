@@ -73,7 +73,7 @@ and are not propagated to downstream consumers.
   non-obvious (a hidden constraint, a workaround, surprising behavior).
   Do not explain *what* the code does — let well-named identifiers do that.
 - **No blocking on worker threads** — route long blocking calls through
-  `runtime::spawn_blocking` or `runtime::blocking_pool`.
+  `elio::spawn_blocking` or `runtime::blocking_pool`.
 
 ## Testing
 
@@ -97,8 +97,8 @@ cmake --build build --target test_tsan
 
 Frequently used tags: `[scheduler]`, `[task]`, `[sync]`, `[channel]`, `[event]`,
 `[condvar]`, `[cancel_token]`, `[autoscaler]`, `[chase_lev_deque]`,
-`[generator]`, `[batch][file_helpers]`, `[http_parser]`, `[http2]`,
-`[websocket]`, `[sse]`, `[rpc]`, `[signalfd]`, `[hash]`, `[integration]`.
+`[generator]`, `[batch][file_helpers]`, `[http][parser]`, `[http2]`,
+`[websocket]`, `[sse]`, `[rpc]`, `[signal]`, `[hash]`, `[integration]`.
 
 ### Test Requirements
 

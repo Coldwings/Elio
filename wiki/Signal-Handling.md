@@ -98,7 +98,7 @@ Async-friendly signalfd wrapper.
 signal_fd sigfd(sigs);
 
 // Don't auto-block (caller manages signal mask)
-signal_fd sigfd(sigs, false);
+signal_fd sigfd(sigs, io::current_io_context(), false);
 
 // Check validity
 if (sigfd.valid()) { /* ... */ }
@@ -226,7 +226,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
     http::server srv(r);
 
     // serve() waits for SIGINT/SIGTERM and calls srv.stop() automatically
-    co_await elio::serve(srv, srv.listen(addr));
+    co_await elio::serve(srv, [&]() { return srv.listen(addr); });
 
     co_return 0;
 }
@@ -281,9 +281,8 @@ See `examples/signal_handling.cpp` for a complete example showing:
 Build and run:
 
 ```bash
-cd build
-make signal_handling
-./signal_handling
+cmake --build build --target signal_handling
+./build/examples/signal_handling
 
 # In another terminal:
 kill -USR1 <pid>  # Print status

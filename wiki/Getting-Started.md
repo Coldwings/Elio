@@ -64,7 +64,7 @@ target_link_libraries(your_target PRIVATE elio)
 
 #### Optional Features
 
-Elio has three optional feature flags, each controlled by a CMake option:
+Elio has several optional feature flags, each controlled by a CMake option. The primary feature flags are:
 
 | CMake option | Dependency | What it enables |
 |---|---|---|
@@ -79,6 +79,8 @@ cmake -B build -DELIO_ENABLE_TLS=ON -DELIO_ENABLE_HTTP=ON -DELIO_ENABLE_HTTP2=ON
 ```
 
 When `ELIO_ENABLE_HTTP2` is set, nghttp2 is fetched automatically via CMake's `FetchContent` if it is not already installed on the system. OpenSSL and liburing must be installed separately (see Prerequisites above).
+
+Additional options include RDMA support (`ELIO_ENABLE_RDMA`, `ELIO_ENABLE_RDMA_CM`, `ELIO_ENABLE_RDMA_IBVERBS`), build controls (`ELIO_BUILD_TESTS`, `ELIO_BUILD_EXAMPLES`), developer warnings (`ELIO_ENABLE_DEVELOPER_WARNINGS`, `ELIO_WARNINGS_AS_ERRORS`), and debug metadata (`ELIO_ENABLE_DEBUG_METADATA`). See CLAUDE.md for the full list.
 
 ## Your First Program
 
@@ -134,7 +136,7 @@ For more control, use `elio::run()` directly:
 
 ```cpp
 int main(int argc, char* argv[]) {
-    return elio::run(async_main(argc, argv));
+    return elio::run(async_main, argc, argv);
 }
 ```
 
@@ -145,18 +147,15 @@ int main(int argc, char* argv[]) {
     elio::run_config config;
     config.num_threads = 4;  // Use 4 worker threads
     
-    return elio::run(async_main(argc, argv), config);
+    return elio::run(config, async_main, argc, argv);
 }
 ```
 
 ### Macros Reference
 
-| Macro | async_main signature | Description |
+| Macro | Supported signatures | Description |
 |-------|---------------------|-------------|
-| `ELIO_ASYNC_MAIN` | `task<int>(int, char**)` | With args, returns exit code |
-| `ELIO_ASYNC_MAIN_VOID` | `task<void>(int, char**)` | With args, always exits 0 |
-| `ELIO_ASYNC_MAIN_NOARGS` | `task<int>()` | No args, returns exit code |
-| `ELIO_ASYNC_MAIN_VOID_NOARGS` | `task<void>()` | No args, always exits 0 |
+| `ELIO_ASYNC_MAIN` | `task<int>(int, char**)`, `task<void>(int, char**)`, `task<int>()`, `task<void>()` | Unified entry point macro; detects signature at compile time |
 
 ## Design Philosophy
 
@@ -168,7 +167,7 @@ Elio ships as a header-only library. Coroutine-heavy code is inherently template
 
 ### C++20 coroutines
 
-C++20 stackless coroutines give us suspension and resumption without allocating a full thread stack per concurrent operation. The compiler manages coroutine frame layout and lifetime, which means the optimizer can see through `co_await` boundaries. When you are not using coroutines, you pay nothing -- no background threads, no hidden allocations. The trade-off is that C++20 coroutine support requires a reasonably modern compiler (GCC 12+, Clang 14+), but that is a reasonable baseline in 2024.
+C++20 stackless coroutines give us suspension and resumption without allocating a full thread stack per concurrent operation. The compiler manages coroutine frame layout and lifetime, which means the optimizer can see through `co_await` boundaries. When you are not using coroutines, you pay nothing -- no background threads, no hidden allocations. The trade-off is that C++20 coroutine support requires a reasonably modern compiler (GCC 12+, Clang 15+), but that is a reasonable baseline in 2024.
 
 ### Linux-only
 
@@ -206,9 +205,15 @@ include/elio/
 │   ├── task.hpp          # task<T>
 │   ├── promise_base.hpp  # Virtual stack base
 │   ├── frame.hpp         # Stack introspection
-│   ├── frame_allocator.hpp # Frame memory pool
+│   ├── generator.hpp     # Async generator
 │   ├── cancel_token.hpp  # Cooperative cancellation
-│   └── awaitable_base.hpp # Awaitable interface
+│   ├── awaitable_base.hpp # Awaitable interface
+│   ├── task_handle.hpp   # Task handle utilities
+│   ├── traits.hpp        # Type traits for coroutines
+│   ├── vthread_stack.hpp # Segmented bump allocator
+│   ├── when_all.hpp      # Wait for all tasks
+│   ├── when_any.hpp      # Wait for any task
+│   └── with_timeout.hpp  # Timeout wrapper
 ├── runtime/              # Scheduler and threading
 │   ├── scheduler.hpp     # Work-stealing scheduler
 │   ├── worker_thread.hpp # Worker implementation
@@ -217,7 +222,14 @@ include/elio/
 │   ├── wait_strategy.hpp # Idle wait policies
 │   ├── affinity.hpp      # Thread affinity
 │   ├── async_main.hpp    # Entry point macros
-│   └── serve.hpp         # Server lifecycle
+│   ├── serve.hpp         # Server lifecycle
+│   ├── autoscaler.hpp    # Dynamic thread scaling
+│   ├── autoscaler_actions.hpp # Scale up/down actions
+│   ├── autoscaler_config.hpp  # Autoscaler configuration
+│   ├── autoscaler_triggers.hpp # Overload/idle triggers
+│   ├── blocking_pool.hpp # Blocking thread pool
+│   ├── spawn.hpp         # go() and spawn() free functions
+│   └── spawn_blocking.hpp # Spawn blocking operations
 ├── io/                   # I/O backends
 │   ├── io_context.hpp
 │   ├── io_backend.hpp
@@ -227,7 +239,16 @@ include/elio/
 │   ├── tcp.hpp
 │   └── uds.hpp
 ├── sync/                 # Synchronization
-│   └── primitives.hpp    # mutex, shared_mutex, semaphore, event, channel
+│   ├── primitives.hpp    # Convenience umbrella header
+│   ├── mutex.hpp
+│   ├── shared_mutex.hpp
+│   ├── semaphore.hpp
+│   ├── event.hpp
+│   ├── channel.hpp
+│   ├── condition_variable.hpp
+│   ├── spinlock.hpp
+│   ├── lockfree_ring.hpp
+│   └── object_cache.hpp
 ├── time/                 # Timers
 │   └── timer.hpp
 ├── signal/               # Signal handling

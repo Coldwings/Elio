@@ -10,7 +10,7 @@
 - **Multi-threaded Scheduler**: Work-stealing scheduler with per-worker I/O contexts
 - **Async I/O Backends**: io_uring (preferred) and epoll fallback
 - **Signal Handling**: Coroutine-friendly signal handling via signalfd
-- **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel
+- **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel, spinlock, condition_variable
 - **Timers**: sleep_for, sleep_until, yield with cancellation support
 - **TCP Networking**: Async TCP client/server with connection management
 - **HTTP/1.1**: Full HTTP client and server implementation
@@ -44,8 +44,7 @@ int main() {
     runtime::scheduler sched(4);
     sched.start();
     
-    auto t = hello();
-    sched.spawn(t.release());
+    sched.go(hello);
     
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     sched.shutdown();

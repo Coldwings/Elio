@@ -62,8 +62,7 @@ coro::task<void> server(uint16_t port) {
         auto stream = co_await listener->accept();
         if (!stream) continue;
 
-        auto handler = handle_client(std::move(*stream));
-        sched->spawn(handler.release());
+        sched->go(handle_client, std::move(*stream));
     }
 }
 ```
@@ -72,8 +71,13 @@ coro::task<void> server(uint16_t port) {
 
 ```cpp
 coro::task<void> client(const std::string& host, uint16_t port) {
-    // Connect to server (hostname is resolved automatically)
-    auto stream = co_await tcp_connect(ipv4_address(host, port));
+    // Connect to server (use numeric IP or resolve hostname first)
+    auto addrs = co_await net::resolve_all(host, port);
+    if (addrs.empty()) {
+        ELIO_LOG_ERROR("DNS resolution failed for {}", host);
+        co_return;
+    }
+    auto stream = co_await tcp_connect(addrs[0]);
     if (!stream) {
         ELIO_LOG_ERROR("Connect failed: {}", strerror(errno));
         co_return;
@@ -101,18 +105,18 @@ Elio provides three address types for TCP networking: `ipv4_address`, `ipv6_addr
 // IPv4 address with port
 ipv4_address addr1(8080);                    // 0.0.0.0:8080
 ipv4_address addr2("192.168.1.1", 8080);     // 192.168.1.1:8080
-ipv4_address addr3("example.com", 80);       // DNS resolved
+ipv4_address addr3("192.168.1.1", 80);       // Numeric IP only; use net::resolve_all() for hostnames
 
 // IPv6 address with port
 ipv6_address addr4(8080);                    // [::]:8080
 ipv6_address addr5("::1", 8080);             // [::1]:8080
 ipv6_address addr6("fe80::1%eth0", 8080);   // Link-local with scope ID
-ipv6_address addr7("example.com", 443);      // DNS resolved (AAAA)
+ipv6_address addr7("2001:db8::1", 443);      // Numeric IPv6 only; use net::resolve_all() for hostnames
 
 // Generic socket_address (variant of ipv4_address | ipv6_address)
 socket_address sa1(ipv4_address(8080));              // From IPv4
 socket_address sa2(ipv6_address("::1", 8080));       // From IPv6
-socket_address sa3("example.com", 443);              // Auto-detects v4/v6
+socket_address sa3("192.168.1.1", 443);              // Numeric IP only; use net::resolve_all() for hostnames
 
 // Inspect address type
 if (sa3.is_v6()) {
@@ -198,8 +202,7 @@ coro::task<void> server(const unix_address& addr) {
         auto stream = co_await listener->accept();
         if (!stream) continue;
 
-        auto handler = handle_client(std::move(*stream));
-        sched->spawn(handler.release());
+        sched->go(handle_client, std::move(*stream));
     }
 }
 ```
@@ -344,8 +347,10 @@ coro::task<void> advanced_client() {
 
 using namespace elio::http;
 
-coro::task<void> handle_request(request& req, response& resp) {
-    if (req.method() == method::GET && req.path() == "/") {
+coro::task<response> handle_request(context& ctx) {
+    auto& req = ctx.req();
+    response resp;
+    if (req.get_method() == method::GET && req.path() == "/") {
         resp.set_status(status::ok);
         resp.set_header("Content-Type", "text/html");
         resp.set_body("<h1>Hello from Elio!</h1>");
@@ -357,7 +362,7 @@ coro::task<void> handle_request(request& req, response& resp) {
         resp.set_status(status::not_found);
         resp.set_body("Not Found");
     }
-    co_return;
+    co_return resp;
 }
 
 coro::task<void> run_server(uint16_t port) {
@@ -463,9 +468,9 @@ using namespace elio::tls;
 
 coro::task<void> secure_connection() {
     // Create TLS context
-    tls_context tls_ctx(tls_method::client);
+    tls_context tls_ctx(tls_mode::client);
     tls_ctx.use_default_verify_paths();
-    tls_ctx.set_verify_mode(true);
+    tls_ctx.set_verify_mode(verify_mode::peer);
 
     // Connect TCP
     auto tcp = co_await tcp_connect(ipv4_address("example.com", 443));
@@ -501,9 +506,9 @@ coro::task<void> secure_connection() {
 ```cpp
 coro::task<void> tls_server(uint16_t port) {
     // Create TLS context with certificate
-    tls_context tls_ctx(tls_method::server);
-    tls_ctx.use_certificate_file("server.crt");
-    tls_ctx.use_private_key_file("server.key");
+    tls_context tls_ctx(tls_mode::server);
+    tls_ctx.load_certificate("server.crt");
+    tls_ctx.load_private_key("server.key");
 
     auto listener = tcp_listener::bind(ipv4_address(port));
     if (!listener) co_return;

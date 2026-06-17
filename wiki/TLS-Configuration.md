@@ -269,9 +269,8 @@ coro::task<void> inspect_connection() {
 
 ```cpp
 http::client_config config;
-config.verify_certificate = true;  // Enable verification
 
-http::client client(ctx, config);
+http::client client(config);
 
 // Access and customize TLS context
 auto& tls_ctx = client.tls_context();
@@ -283,7 +282,7 @@ auto resp = co_await client.get("https://example.com/");
 ### HTTP/2 Client TLS Configuration
 
 ```cpp
-h2_client client(ctx);
+h2_client client;
 
 // Configure TLS for HTTP/2
 auto& tls_ctx = client.tls_context();

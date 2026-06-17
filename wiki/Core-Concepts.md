@@ -73,7 +73,7 @@ coro::task<void> async_main(int argc, char* argv[]) {
     co_return;
 }
 
-ELIO_ASYNC_MAIN_VOID(async_main)
+ELIO_ASYNC_MAIN(async_main)  // Same macro handles void return type
 ```
 
 For simple programs without command line arguments:
@@ -83,8 +83,10 @@ coro::task<int> async_main() {
     co_return 0;
 }
 
-ELIO_ASYNC_MAIN_NOARGS(async_main)
+ELIO_ASYNC_MAIN(async_main)  // Same macro handles no-argument signature
 ```
+
+> **Note:** `ELIO_ASYNC_MAIN` uses compile-time dispatch to detect the callable's arity and return type, supporting all four combinations: `task<int>(argc,argv)`, `task<void>(argc,argv)`, `task<int>()`, `task<void>()`.
 
 ### Using elio::run()
 
@@ -93,7 +95,7 @@ For more control, use `elio::run()` directly:
 ```cpp
 int main(int argc, char* argv[]) {
     // Run with default thread count (hardware concurrency)
-    return elio::run(async_main(argc, argv));
+    return elio::run(async_main, argc, argv);
 }
 
 // Or use run_config for full control
@@ -101,7 +103,7 @@ int main(int argc, char* argv[]) {
     elio::run_config config;
     config.num_threads = 4;  // 4 worker threads
     
-    return elio::run(async_main(argc, argv), config);
+    return elio::run(config, async_main, argc, argv);
 }
 ```
 
@@ -118,8 +120,8 @@ runtime::scheduler sched(4);
 // Start the scheduler
 sched.start();
 
-// Spawn tasks (new simplified API)
-sched.spawn(my_coroutine());
+// Spawn tasks (pass callable, not invoked task)
+sched.go(my_coroutine);
 
 // Shutdown when done
 sched.shutdown();
@@ -296,21 +298,13 @@ Each `promise_base` also carries debug metadata:
 - **`debug_location_`**: Source file, function name, and line number.
 - **`debug_state_`**: Current state (created, running, suspended, completed, failed).
 
-## Frame Allocator
+## Coroutine Frame Allocation
 
-Coroutine frames are heap-allocated by default. In workloads that create and destroy many short-lived coroutines, this can cause significant allocator contention across threads.
-
-`frame_allocator` is a thread-local free-list pool that handles small coroutine frames (up to 256 bytes, with up to 1024 pooled slots). When a coroutine frame is allocated, the allocator checks the thread-local pool first. When freed, the frame is returned to the pool instead of the global heap.
-
-### Cross-thread returns
-
-Work-stealing means a coroutine may be allocated on thread A but destroyed on thread B. The frame allocator handles this with an MPSC (multi-producer, single-consumer) return queue per pool. When a frame is freed on a different thread than the one that allocated it, the frame is pushed onto the source pool's MPSC queue. The owning thread reclaims these returns in batches during subsequent allocations.
-
-Each allocated block carries a hidden header that records its source pool ID, so the deallocator knows which pool to return it to.
+Coroutine frames are heap-allocated by default using `::operator new/delete`. When the optional `vthread_stack` allocator is enabled (gated by `ELIO_ENABLE_VTHREAD_STACK`), each vthread maintains its own segmented bump-pointer stack allocator. Coroutine frames are allocated in LIFO order within segments. When a segment is exhausted, a new segment is allocated and linked.
 
 ### Sanitizer compatibility
 
-Under AddressSanitizer or ThreadSanitizer, the pool is bypassed entirely -- all allocations go directly through `::operator new` and `::operator delete`. This ensures that sanitizers can accurately detect leaks, use-after-free, and data races without being confused by the pooling layer.
+Under AddressSanitizer or ThreadSanitizer, the custom allocator is bypassed entirely -- all allocations go directly through `::operator new` and `::operator delete`. This ensures that sanitizers can accurately detect leaks, use-after-free, and data races without being confused by the pooling layer. The sanitizer fallback is automatic via `ELIO_SANITIZER_ACTIVE` preprocessor detection.
 
 ## I/O Context
 
@@ -319,7 +313,7 @@ The I/O context manages async I/O operations. Each worker thread has its own I/O
 ### Accessing the Current Context
 
 ```cpp
-#include <elio/io/io_context.hpp>
+#include <elio/io/io_awaitables.hpp>
 
 // Get the current thread's I/O context (from within a coroutine)
 auto& ctx = io::current_io_context();
@@ -359,10 +353,10 @@ auto stream = co_await listener.accept();
 #include <elio/time/timer.hpp>
 
 // Sleep for a duration
-co_await time::sleep(io_ctx, std::chrono::seconds(1));
+co_await time::sleep_for(std::chrono::seconds(1));
 
 // Sleep until a time point
-co_await time::sleep_until(io_ctx, deadline);
+co_await time::sleep_until(deadline);
 ```
 
 ## Synchronization Primitives
@@ -377,8 +371,9 @@ Elio provides coroutine-aware synchronization primitives.
 sync::mutex mtx;
 
 coro::task<void> critical_section() {
-    auto lock = co_await mtx.lock();
+    co_await mtx.lock();
     // Protected code here
+    mtx.unlock();
     co_return;
 }
 ```
@@ -510,8 +505,8 @@ bool ready = false;
 coro::task<void> waiter() {
     co_await mtx.lock();
     while (!ready) {
-        // Double co_await: outer suspends for signal, inner re-acquires mutex
-        co_await co_await cv.wait(mtx);
+        // Single co_await: wait() returns task<void>
+        co_await cv.wait(mtx);
     }
     mtx.unlock();
     co_return;
@@ -644,7 +639,7 @@ coro::task<void> custom_operation(coro::cancel_token token) {
 
 ## Error Handling
 
-Elio uses `std::optional` for error handling in I/O operations. On failure, functions return `std::nullopt` and set `errno`:
+Elio uses `io_result` for I/O operation results. `io_result` contains an `int32_t result` field (bytes transferred or negative errno) and a `uint32_t flags` field. Use `result.success()` to check for errors, `result.bytes_transferred()` for byte count, and `result.error_code()` for the errno value. Factory methods like `tcp_listener::bind()` use `std::optional`.
 
 ```cpp
 coro::task<void> handle_errors() {
@@ -665,7 +660,7 @@ coro::task<void> handle_errors() {
 For factory methods like `tcp_listener::bind()`, check for `std::nullopt` and use `errno` to get the error code:
 
 ```cpp
-auto listener = tcp_listener::bind(ipv4_address(port), ctx);
+auto listener = tcp_listener::bind(ipv4_address(port));
 if (!listener) {
     ELIO_LOG_ERROR("Bind failed: {}", strerror(errno));
     co_return;

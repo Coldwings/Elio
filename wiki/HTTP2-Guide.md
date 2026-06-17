@@ -73,14 +73,15 @@ struct h2_client_config {
     std::chrono::seconds connect_timeout{10};
     std::chrono::seconds read_timeout{30};
     size_t max_concurrent_streams = 100;
-    size_t initial_window_size = 65535;
-    bool verify_certificate = true;
+    uint32_t initial_window_size = 65535;
     std::string user_agent = "elio-http2/1.0";
+    bool enable_push = false;  // Server push (rarely needed)
+    net::resolve_options resolve_options = net::default_cached_resolve_options();
+    bool rotate_resolved_addresses = true;
 };
 
 // Usage
 h2_client_config config;
-config.verify_certificate = false;  // For testing only!
 config.max_concurrent_streams = 50;
 
 h2_client client(config);
@@ -95,11 +96,11 @@ h2_client client;
 auto& tls_ctx = client.tls_context();
 
 // Use custom CA certificate
-tls_ctx.load_verify_file("/path/to/ca-bundle.crt");
+tls_ctx.load_verify_locations("/path/to/ca-bundle.crt");
 
 // Use client certificate (for mutual TLS)
-tls_ctx.use_certificate_file("/path/to/client.crt");
-tls_ctx.use_private_key_file("/path/to/client.key");
+tls_ctx.load_certificate("/path/to/client.crt");
+tls_ctx.load_private_key("/path/to/client.key");
 ```
 
 ## Concurrent Requests
@@ -128,7 +129,7 @@ coro::task<void> parallel_requests() {
 
 ```cpp
 coro::task<void> handle_response() {
-    h2_client client(ctx);
+    h2_client client;
 
     auto resp = co_await client.get("https://example.com/api/data");
 
@@ -147,11 +148,11 @@ coro::task<void> handle_response() {
     auto content_type = resp->header("Content-Type");
     auto cache_control = resp->header("Cache-Control");
 
-    // Get body
-    std::string body = resp->body();
+    // Get body (returns string_view)
+    std::string_view body = resp->body();
 
-    // Or take ownership (avoids copy)
-    std::string body_moved = resp->take_body();
+    // If you need an owned copy:
+    std::string body_owned(resp->body());
 }
 ```
 
@@ -159,7 +160,7 @@ coro::task<void> handle_response() {
 
 ```cpp
 coro::task<void> error_handling() {
-    h2_client client(ctx);
+    h2_client client;
 
     auto resp = co_await client.get("https://example.com/");
 
@@ -192,19 +193,14 @@ coro::task<void> error_handling() {
 
 ```cpp
 coro::task<void> cancellable_request() {
-    h2_client client(ctx);
-    coro::cancel_source cancel_source;
+    h2_client client;
 
-    // Start cancellable request
-    auto request_task = client.get("https://slow-api.example.com/",
-                                    cancel_source.token());
+    // Note: h2_client does not currently support per-request cancellation
+    // via cancel_token. Use task-level cancellation instead.
+    auto resp = co_await client.get("https://slow-api.example.com/");
 
-    // In another coroutine or after timeout
-    cancel_source.cancel();
-
-    auto resp = co_await request_task;
-    if (!resp && errno == ECANCELED) {
-        std::cout << "Request was cancelled" << std::endl;
+    if (!resp) {
+        std::cout << "Request failed" << std::endl;
     }
 }
 ```
@@ -215,7 +211,7 @@ The h2_client maintains a connection pool internally:
 
 ```cpp
 coro::task<void> connection_lifecycle() {
-    h2_client client(ctx);
+    h2_client client;
 
     // First request establishes connection
     co_await client.get("https://api.example.com/ping");
@@ -261,9 +257,9 @@ Enable debug logging to see HTTP/2 frame details:
 
 ```cpp
 // Set log level before creating client
-elio::log::set_level(elio::log::level::debug);
+elio::log::logger::instance().set_level(elio::log::level::debug);
 
-h2_client client(ctx);
+h2_client client;
 auto resp = co_await client.get("https://example.com/");
 
 // Output shows frame exchanges:

@@ -65,22 +65,29 @@ public:
         std::string key = make_key(host, port, secure);
         auto& shard = shard_for(key);
 
-        // Try to get an existing connection
+        // Try to get an existing connection.  Extract it under the lock
+        // into a local variable, then release the lock BEFORE any
+        // suspension point (co_return) so we never hold a std::mutex
+        // across a coroutine suspension.
+        std::optional<connection> conn;
         {
             std::lock_guard<std::mutex> lock(shard.mutex);
             auto it = shard.pools.find(key);
             if (it != shard.pools.end() && !it->second.empty()) {
-                auto conn = std::move(it->second.front());
+                auto candidate = std::move(it->second.front());
                 it->second.pop_front();
 
                 // Check if connection is still valid (not too old)
-                auto age = std::chrono::steady_clock::now() - conn.last_use();
+                auto age = std::chrono::steady_clock::now() - candidate.last_use();
                 if (age < config_.pool_idle_timeout) {
-                    conn.touch();
-                    co_return std::move(conn);
+                    candidate.touch();
+                    conn = std::move(candidate);
                 }
                 // Connection too old, let it close
             }
+        }
+        if (conn.has_value()) {
+            co_return std::move(*conn);
         }
 
         // Create new connection using client_connect utility
@@ -367,6 +374,11 @@ private:
             sched != nullptr && config_.read_timeout.count() > 0;
         const auto io_deadline = config_.read_timeout;
 
+        // Compute an absolute deadline for the entire response so that a
+        // slowloris-style server cannot reset the timer on every byte.
+        const auto response_deadline =
+            std::chrono::steady_clock::now() + io_deadline;
+
         // ---- write the request, optionally bounded by read_timeout -------
         // We re-use read_timeout for the send phase: send_timeout is not
         // currently configurable, but a stalled write to a malicious server
@@ -414,9 +426,21 @@ private:
             io::io_result read_result{};
             std::shared_ptr<std::atomic<bool>> read_timed_out;
             if (deadline_enforced) {
+                // Use remaining time from the absolute response deadline
+                // rather than a fresh per-read timeout.  This prevents a
+                // slowloris-style server from keeping the connection alive
+                // indefinitely by trickling data just before each per-read
+                // deadline expires.
+                auto remaining = response_deadline - std::chrono::steady_clock::now();
+                if (remaining.count() <= 0) {
+                    ELIO_LOG_ERROR("Total response timeout exceeded for {}:{}",
+                                   target.host, target.effective_port());
+                    errno = ETIMEDOUT;
+                    co_return std::nullopt;
+                }
                 read_timed_out = std::make_shared<std::atomic<bool>>(false);
                 coro::cancel_source ws_cancel;
-                auto watchdog = arm_io_watchdog(sched, conn.fd(), io_deadline,
+                auto watchdog = arm_io_watchdog(sched, conn.fd(), remaining,
                                                 ws_cancel.get_token(),
                                                 read_timed_out);
                 read_result = co_await conn.read(buffer.data(), buffer.size());
@@ -521,6 +545,13 @@ private:
                 }
                 
                 if (redirect_url) {
+                    // Reject HTTPS -> HTTP downgrades to prevent SSL stripping
+                    if (target.is_secure() && !redirect_url->is_secure()) {
+                        ELIO_LOG_WARNING("Rejecting insecure redirect from HTTPS to HTTP: {}",
+                                         location);
+                        co_return resp;
+                    }
+
                     // Change method to GET for 303 or POST->GET for 301/302
                     method redirect_method = req.get_method();
                     if (resp.get_status() == status::see_other ||

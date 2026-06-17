@@ -228,7 +228,20 @@ private:
         }
         
         auto uri = line.substr(path_start, space2 - path_start);
-        
+
+        // Reject NUL bytes and bare control characters (0x01-0x1F, 0x7F)
+        // in the request-target.  These can cause log injection, path
+        // traversal in downstream consumers, or protocol confusion when
+        // proxying.  Space (0x20) is already excluded by the delimiter
+        // search above.
+        for (char c : uri) {
+            auto uc = static_cast<unsigned char>(c);
+            if (uc == 0x00 || (uc >= 0x01 && uc <= 0x1F) || uc == 0x7F) {
+                set_error("Invalid character in request-target");
+                return false;
+            }
+        }
+
         // Split path and query
         auto query_pos = uri.find('?');
         if (query_pos != std::string_view::npos) {
@@ -425,6 +438,12 @@ private:
     bool parse_chunk_data() {
         if (buffer_.size() < chunk_size_ + 2) {  // +2 for trailing CRLF
             return false;
+        }
+
+        // Validate trailing CRLF per RFC 7230 §4.1
+        if (buffer_[chunk_size_] != '\r' || buffer_[chunk_size_ + 1] != '\n') {
+            set_error("Missing CRLF after chunk data");
+            return true;
         }
 
         body_.append(buffer_.data(), chunk_size_);
@@ -823,6 +842,12 @@ private:
     bool parse_chunk_data() {
         if (buffer_.size() < chunk_size_ + 2) {
             return false;
+        }
+
+        // Validate trailing CRLF per RFC 7230 §4.1
+        if (buffer_[chunk_size_] != '\r' || buffer_[chunk_size_ + 1] != '\n') {
+            set_error("Missing CRLF after chunk data");
+            return true;
         }
 
         body_.append(buffer_.data(), chunk_size_);

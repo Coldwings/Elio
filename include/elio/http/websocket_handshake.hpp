@@ -9,8 +9,8 @@
 #include <string>
 #include <string_view>
 #include <array>
-#include <random>
 #include <algorithm>
+#include <sys/random.h>
 
 #include <openssl/sha.h>
 #include <openssl/evp.h>
@@ -81,15 +81,21 @@ inline std::string base64_decode(std::string_view encoded) {
     return result;
 }
 
-/// Generate a random 16-byte Sec-WebSocket-Key (base64 encoded)
+/// Generate a random 16-byte Sec-WebSocket-Key (base64 encoded).
+/// Uses getrandom(2) for cryptographic randomness per RFC 6455 §5.3.
 inline std::string generate_websocket_key() {
-    static thread_local std::mt19937 rng(std::random_device{}());
-    
-    std::array<uint8_t, 16> key;
-    for (auto& byte : key) {
-        byte = static_cast<uint8_t>(rng());
+    std::array<uint8_t, 16> key{};
+    ssize_t n = ::getrandom(key.data(), key.size(), 0);
+    if (n < static_cast<ssize_t>(key.size())) {
+        // Fallback: should never happen on Linux 3.17+
+        FILE* f = fopen("/dev/urandom", "rb");
+        if (f) {
+            auto rd = fread(key.data(), 1, key.size(), f);
+            (void)rd;
+            fclose(f);
+        }
     }
-    
+
     return base64_encode(key.data(), key.size());
 }
 

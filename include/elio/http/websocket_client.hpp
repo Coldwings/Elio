@@ -509,13 +509,17 @@ private:
                 auto close_info = parse_close_payload(payload);
                 auto code = close_info.first;
                 auto& reason = close_info.second;
-                ELIO_LOG_DEBUG("WebSocket close received: {} {}", 
+                ELIO_LOG_DEBUG("WebSocket close received: {} {}",
                               static_cast<uint16_t>(code), reason);
-                
+
                 if (state_ == connection_state::open) {
-                    // Send close response
+                    // Send close response.  RFC 6455 §7.4.1 forbids sending
+                    // no_status (1005) on the wire; map it to normal (1000).
                     state_ = connection_state::closing;
-                    auto frame = encode_close_frame(code, reason, true);
+                    auto resp_code = (code == close_code::no_status)
+                                         ? close_code::normal
+                                         : code;
+                    auto frame = encode_close_frame(resp_code, "", true);
                     co_await send_raw(frame);
                 }
                 state_ = connection_state::closed;

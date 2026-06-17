@@ -301,13 +301,17 @@ private:
                 auto close_info = parse_close_payload(payload);
                 auto code = close_info.first;
                 auto& reason = close_info.second;
-                ELIO_LOG_DEBUG("WebSocket close received: {} {}", 
+                ELIO_LOG_DEBUG("WebSocket close received: {} {}",
                               static_cast<uint16_t>(code), reason);
-                
+
                 if (state_ == connection_state::open) {
-                    // Send close response
+                    // Send close response.  RFC 6455 §7.4.1 forbids sending
+                    // no_status (1005) on the wire; map it to normal (1000).
                     state_ = connection_state::closing;
-                    auto frame = encode_close_frame(code, reason, !is_server_);
+                    auto resp_code = (code == close_code::no_status)
+                                         ? close_code::normal
+                                         : code;
+                    auto frame = encode_close_frame(resp_code, "", !is_server_);
                     co_await send_raw(frame);
                 }
                 state_ = connection_state::closed;
@@ -553,6 +557,8 @@ public:
     }
 
     /// Start listening with TLS (HTTPS/WSS)
+    /// @note The caller must ensure `tls_ctx` outlives all spawned connection
+    ///       handlers.  See http::server::listen_tls for details.
     coro::task<void> listen_tls(const net::socket_address& addr, tls::tls_context& tls_ctx,
                                 const net::tcp_options& opts = {}) {
         auto* sched = runtime::scheduler::current();
@@ -572,6 +578,9 @@ public:
         auto& listener = *listener_result;
         running_ = true;
 
+        // Capture by pointer — see doc comment above for lifetime requirement.
+        auto* tls_ctx_ptr = &tls_ctx;
+
         while (running_) {
             auto stream_result = co_await listener.accept();
             if (!stream_result) {
@@ -582,8 +591,8 @@ public:
             }
 
             // Spawn TLS connection handler
-            sched->go([this, s = std::move(*stream_result), &tls_ctx]() mutable {
-                return handle_tls_connection(std::move(s), tls_ctx);
+            sched->go([this, s = std::move(*stream_result), tls_ctx_ptr]() mutable {
+                return handle_tls_connection(std::move(s), *tls_ctx_ptr);
             });
         }
     }

@@ -109,22 +109,27 @@ private:
             }
             
             if (line.empty()) {
-                // Empty line = dispatch event
-                if (!current_event_.data.empty() || !current_event_.type.empty()) {
+                // Empty line = dispatch event.  Per the SSE spec (HTML Living
+                // Standard §9.2.6), an event is dispatched ONLY when the
+                // data buffer is non-empty.  Events carrying only `event:`
+                // (no data) reset state without producing a user-visible
+                // event.
+                if (!current_event_.data.empty()) {
                     // Remove trailing newline from data
-                    if (!current_event_.data.empty() && current_event_.data.back() == '\n') {
+                    if (current_event_.data.back() == '\n') {
                         current_event_.data.pop_back();
                     }
-                    
+
                     // Update last event ID
                     if (!current_event_.id.empty()) {
                         last_event_id_ = current_event_.id;
                     }
-                    
+
                     events_.push_back(std::move(current_event_));
-                    current_event_ = event{};
                     ++events_found;
                 }
+                // Always reset state on blank line (spec requirement)
+                current_event_ = event{};
                 continue;
             }
             
@@ -163,19 +168,25 @@ private:
                     current_event_.id = value;
                 }
             } else if (field == "retry") {
-                // Parse retry as integer
-                int retry = 0;
+                // Parse retry as integer with overflow protection.
+                // Clamp to a sane maximum (24 hours = 86400000 ms) to prevent
+                // unreasonably long reconnect intervals.
+                int64_t retry = 0;
                 bool valid = true;
                 for (char c : value) {
                     if (c >= '0' && c <= '9') {
                         retry = retry * 10 + (c - '0');
+                        if (retry > 86400000LL) {
+                            retry = 86400000LL;
+                            break;
+                        }
                     } else {
                         valid = false;
                         break;
                     }
                 }
                 if (valid && !value.empty()) {
-                    retry_ms_ = retry;
+                    retry_ms_ = static_cast<int>(retry);
                 }
             }
             // Ignore unknown fields
@@ -482,6 +493,9 @@ private:
         }
         
         state_ = client_state::connected;
+        // Reset backoff on successful connection so the next disconnect
+        // starts from the server-advertised or configured default.
+        current_retry_ms_ = 0;
         ELIO_LOG_DEBUG("SSE connected to {}{}", url_.host, url_.path);
         co_return true;
     }
@@ -492,11 +506,17 @@ private:
 
         // Close current connection
         co_await stream_.close();
-        
-        // Get retry interval
-        int retry_ms = parser_.retry_ms();
+
+        // Use the persisted backoff value if available, otherwise start from
+        // the server-advertised or configured default.  This ensures
+        // exponential backoff survives across reconnection cycles (flapping).
+        int retry_ms = current_retry_ms_;
         if (retry_ms <= 0) {
-            retry_ms = config_.default_retry_ms;
+            retry_ms = parser_.retry_ms();
+            if (retry_ms <= 0) {
+                retry_ms = config_.default_retry_ms;
+            }
+            current_retry_ms_ = retry_ms;
         }
         
         size_t attempts = 0;
@@ -536,7 +556,8 @@ private:
             state_ = client_state::reconnecting;
             
             // Increase retry interval (exponential backoff, max 1 minute)
-            retry_ms = std::min(retry_ms * 2, 60000);
+            current_retry_ms_ = std::min(current_retry_ms_ * 2, 60000);
+            retry_ms = current_retry_ms_;
         }
         
         co_return false;
@@ -560,6 +581,7 @@ private:
     client_state state_ = client_state::disconnected;
     event_parser parser_;
     std::vector<char> buffer_;
+    int current_retry_ms_ = 0;  ///< Persisted backoff value across reconnection cycles
 };
 
 /// Convenience function for one-off SSE connection

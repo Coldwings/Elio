@@ -394,18 +394,26 @@ public:
         return detail::ascii_iequals(detail::trim_ows(last), "chunked");
     }
     
-    /// Check if connection should be kept alive
+    /// Check if connection should be kept alive.
+    /// Per RFC 7230 §6.1, Connection is a comma-separated list of tokens;
+    /// we split on commas, trim OWS, and compare each token exactly
+    /// (case-insensitive) against "close" and "keep-alive".
     bool keep_alive(std::string_view http_version = "1.1") const {
         auto conn = get("Connection");
         if (!conn.empty()) {
-            // Case-insensitive check
-            std::string lower;
-            lower.reserve(conn.size());
-            for (char c : conn) {
-                lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            // Walk the comma-separated token list
+            size_t pos = 0;
+            while (pos < conn.size()) {
+                auto comma = conn.find(',', pos);
+                std::string_view token = (comma == std::string_view::npos)
+                    ? conn.substr(pos)
+                    : conn.substr(pos, comma - pos);
+                token = detail::trim_ows(token);
+                if (detail::ascii_iequals(token, "close")) return false;
+                if (detail::ascii_iequals(token, "keep-alive")) return true;
+                if (comma == std::string_view::npos) break;
+                pos = comma + 1;
             }
-            if (lower.find("close") != std::string::npos) return false;
-            if (lower.find("keep-alive") != std::string::npos) return true;
         }
         // Default: HTTP/1.1 keeps alive, HTTP/1.0 closes
         return http_version == "1.1" || http_version == "HTTP/1.1";

@@ -109,7 +109,9 @@ TEST_CASE("Scheduler work stealing occurs", "[scheduler]") {
 
     auto heavy_task = [](std::atomic<int>* ctr) -> task<void> {
         volatile int sum = 0;
-        for (int j = 0; j < 50000; ++j) {
+        // Heavier workload to ensure tasks remain in queue long enough
+        // for stealing to occur, even in optimized Release builds
+        for (int j = 0; j < 200000; ++j) {
             sum = sum + j * j;
         }
         (void)sum;
@@ -127,6 +129,9 @@ TEST_CASE("Scheduler work stealing occurs", "[scheduler]") {
 
     // Expand to 4 workers — new workers must steal from worker 0's deque
     sched.set_thread_count(4);
+
+    // Give new workers time to start and attempt stealing
+    std::this_thread::sleep_for(scaled_ms(50));
 
     auto start = std::chrono::steady_clock::now();
     while (completed.load() < num_tasks) {
@@ -154,6 +159,9 @@ TEST_CASE("Scheduler dynamic thread pool growth", "[scheduler]") {
     
     // Increase threads
     sched.set_thread_count(4);
+
+    // Give new workers time to start and attempt stealing
+    std::this_thread::sleep_for(scaled_ms(50));
     REQUIRE(sched.num_threads() == 4);
     
     // Spawn some tasks

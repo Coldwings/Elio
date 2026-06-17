@@ -11,15 +11,15 @@
 ///
 /// Wire Format (every multi-byte field is little-endian on the wire,
 /// regardless of host byte order — see rpc_endian.hpp):
-/// +----------+----------+-------+--------+------------+---------+
-/// | magic(4) | req_id(4)| type(1)| flags(1)| method(4) | len(4)  |
-/// +----------+----------+-------+--------+------------+---------+
+/// +----------+----------+-------+--------+------------+---------+------+
+/// | magic(4) | req_id(4)| type(1)| flags(1)| method(4) | len(4)  | ver  |
+/// +----------+----------+-------+--------+------------+---------+------+
 /// | payload (len bytes)                                         |
 /// +-------------------------------------------------------------+
 /// | checksum(4) - optional, present if has_checksum flag set    |
 /// +-------------------------------------------------------------+
 ///
-/// Total header size: 18 bytes
+/// Total header size: 19 bytes
 /// Checksum trailer: 4 bytes (optional)
 
 #include "rpc_buffer.hpp"
@@ -47,8 +47,8 @@ constexpr uint32_t protocol_magic = 0x454C494F; // "ELIO" in ASCII
 /// Protocol version
 constexpr uint8_t protocol_version = 1;
 
-/// Frame header size
-constexpr size_t frame_header_size = 18;
+/// Frame header size (includes version byte)
+constexpr size_t frame_header_size = 19;
 
 /// Checksum trailer size
 constexpr size_t checksum_size = 4;
@@ -105,13 +105,15 @@ struct frame_header {
     message_flags flags = message_flags::none;
     method_id_t method_id = 0;        ///< Method being called (for requests)
     uint32_t payload_length = 0;      ///< Length of payload in bytes
-    
+    uint8_t version = protocol_version; ///< Protocol version
+
     /// Validate header
     bool is_valid() const noexcept {
-        return magic == protocol_magic && 
+        return magic == protocol_magic &&
+               version == protocol_version &&
                payload_length <= max_message_size;
     }
-    
+
     /// Serialize header to buffer
     void serialize(buffer_writer& writer) const {
         writer.write(magic);
@@ -120,8 +122,9 @@ struct frame_header {
         writer.write(static_cast<uint8_t>(flags));
         writer.write(method_id);
         writer.write(payload_length);
+        writer.write(version);
     }
-    
+
     /// Serialize header to byte array (little-endian on every host).
     std::array<uint8_t, frame_header_size> to_bytes() const {
         std::array<uint8_t, frame_header_size> bytes;
@@ -131,7 +134,8 @@ struct frame_header {
         *p++ = static_cast<uint8_t>(type);
         *p++ = static_cast<uint8_t>(flags);
         endian::write_le<uint32_t>(p, method_id); p += 4;
-        endian::write_le<uint32_t>(p, payload_length);
+        endian::write_le<uint32_t>(p, payload_length); p += 4;
+        *p++ = version;
         return bytes;
     }
 
@@ -144,6 +148,7 @@ struct frame_header {
         h.flags = static_cast<message_flags>(reader.read<uint8_t>());
         h.method_id = reader.read<method_id_t>();
         h.payload_length = reader.read<uint32_t>();
+        h.version = reader.read<uint8_t>();
         return h;
     }
 
@@ -156,12 +161,13 @@ struct frame_header {
         h.type = static_cast<message_type>(*p++);
         h.flags = static_cast<message_flags>(*p++);
         h.method_id = endian::read_le<uint32_t>(p); p += 4;
-        h.payload_length = endian::read_le<uint32_t>(p);
+        h.payload_length = endian::read_le<uint32_t>(p); p += 4;
+        h.version = *p++;
         return h;
     }
 };
 
-static_assert(frame_header_size == 18, "Header size mismatch");
+static_assert(frame_header_size == 19, "Header size mismatch");
 
 // ============================================================================
 // Error response payload

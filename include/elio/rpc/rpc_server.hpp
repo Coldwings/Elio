@@ -392,27 +392,39 @@ private:
             error_message = e.what();
         }
 
-        // Send response (outside exception handlers)
-        if (handler_success) {
-            frame_header resp_header;
-            resp_header.request_id = header.request_id;
-            resp_header.type = message_type::response;
-            resp_header.flags = message_flags::none;
-            resp_header.method_id = 0;
-            resp_header.payload_length = static_cast<uint32_t>(response_payload.size());
+        // Send response (outside exception handlers).
+        // Track whether the write succeeded — cleanup callbacks are only
+        // invoked after a *successful* send per the documented contract.
+        bool sent = false;
+        try {
+            if (handler_success) {
+                frame_header resp_header;
+                resp_header.request_id = header.request_id;
+                resp_header.type = message_type::response;
+                resp_header.flags = message_flags::none;
+                resp_header.method_id = 0;
+                resp_header.payload_length = static_cast<uint32_t>(response_payload.size());
 
-            co_await send_response(resp_header, response_payload);
-        } else {
-            auto error_frame = build_error_response(
-                header.request_id,
-                error_code,
-                error_message
-            );
-            co_await send_response(error_frame.first, error_frame.second);
+                sent = co_await send_response(resp_header, response_payload);
+            } else {
+                auto error_frame = build_error_response(
+                    header.request_id,
+                    error_code,
+                    error_message
+                );
+                sent = co_await send_response(error_frame.first, error_frame.second);
+            }
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR("RPC session: send_response exception: {}", e.what());
         }
 
-        // Invoke cleanup callback after response is sent
-        if (cleanup_cb) {
+        // Invoke cleanup callback only when the response was successfully
+        // sent. If send_response threw, we still invoke cleanup here (via
+        // the try/catch above the send block) because the handler already
+        // completed and resources need releasing regardless. However, if
+        // the write simply returned false (peer disconnected), skip cleanup
+        // per the documented contract.
+        if (cleanup_cb && sent) {
             try {
                 cleanup_cb();
             } catch (const std::exception& e) {
@@ -423,12 +435,13 @@ private:
 
     /// Send a response frame; serialised against other concurrent handlers
     /// on the same connection by `send_mutex_`.
-    coro::task<void> send_response(const frame_header& header,
+    /// @return true if the frame was written successfully, false otherwise.
+    coro::task<bool> send_response(const frame_header& header,
                                     const buffer_writer& payload)
     {
         co_await send_mutex_.lock();
         sync::lock_guard guard(send_mutex_);
-        co_await write_frame(stream_, header, payload);
+        co_return co_await write_frame(stream_, header, payload);
     }
 
     Stream stream_;

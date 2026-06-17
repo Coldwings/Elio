@@ -39,30 +39,29 @@ namespace detail {
 ///     no ``current_io_context()`` and no ``vthread_stack``, so every
 ///     subsequent ``co_await`` on the resumed coroutine is a UAF.
 ///
-/// Dropping the work during shutdown is safe because the awaiter is
-/// suspended inside a worker queue and will be reaped by
-/// ``drain_remaining_tasks``. ``blocking_pool::submit`` rejection is the
-/// authoritative signal that shutdown is in progress (the pool is shut
-/// down before ``running_`` is flipped, see ``scheduler::shutdown_force``).
+/// Returns true if the work was accepted (by the blocking pool or a
+/// detached thread). Returns false if the scheduler is shutting down
+/// and the work was dropped — the caller MUST resume or destroy the
+/// awaiter to avoid leaking the coroutine frame.
 template <typename F>
-inline void submit_blocking(F&& work) {
+inline bool submit_blocking(F&& work) {
     auto* sched = runtime::get_current_scheduler();
     if (sched) {
         auto* pool = sched->get_blocking_pool();
         if (pool && sched->is_running()) {
             std::function<void()> task{std::forward<F>(work)};
             if (pool->submit(std::move(task))) {
-                return;
+                return true;
             }
             // Pool rejection => scheduler is tearing down. Drop the work;
             // see the doc comment above for why a detached-thread fallback
             // here would UAF the awaiter / scheduler.
-            return;
+            return false;
         }
         if (!sched->is_running()) {
             // Scheduler already shut down: same UAF concerns as the pool
             // rejection branch. Drop.
-            return;
+            return false;
         }
         // Scheduler exists, is running, but exposes no pool: fall through
         // to the standalone detached-thread path.
@@ -73,6 +72,7 @@ inline void submit_blocking(F&& work) {
     // no scheduler context to dangle) or a scheduler that stays alive
     // past the resume.
     std::thread(std::forward<F>(work)).detach();
+    return true;
 }
 
 /// Resume a coroutine handle on the right scheduler context. Used from
@@ -153,10 +153,16 @@ public:
             ELIO_LOG_WARNING("sleep_awaitable: failed to prepare timeout, routing fallback through blocking pool");
             auto* sched = runtime::get_current_scheduler();
             const int64_t duration = duration_ns_;
-            detail::submit_blocking([awaiter, sched, duration]() {
+            if (!detail::submit_blocking([awaiter, sched, duration]() {
                 std::this_thread::sleep_for(std::chrono::nanoseconds(duration));
                 detail::resume_via_scheduler(awaiter, sched);
-            });
+            })) {
+                // Scheduler shutting down: work was dropped. Destroy the
+                // awaiter handle to prevent coroutine frame leak.
+                if (awaiter && !awaiter.done()) {
+                    awaiter.destroy();
+                }
+            }
             return;
         }
 
@@ -311,7 +317,7 @@ public:
         const int64_t duration = duration_ns_;
         coro::cancel_token token_copy = token_;
 
-        detail::submit_blocking(
+        if (!detail::submit_blocking(
             [awaiter, sched, duration, token = std::move(token_copy), state]() mutable {
                 const auto end_time = std::chrono::steady_clock::now() +
                                       std::chrono::nanoseconds(duration);
@@ -326,7 +332,16 @@ public:
                 // no-op before touching ctx / awaiter.
                 state->resumed.store(true, std::memory_order_release);
                 detail::resume_via_scheduler(awaiter, sched);
-            });
+            })) {
+            // Scheduler shutting down: work was dropped. Destroy the
+            // awaiter handle to prevent coroutine frame leak. The
+            // coroutine was already popped from the worker deque and
+            // suspended via await_suspend returning void, so
+            // drain_remaining_tasks will NOT find it.
+            if (awaiter && !awaiter.done()) {
+                awaiter.destroy();
+            }
+        }
     }
 
     cancel_result await_resume() noexcept {

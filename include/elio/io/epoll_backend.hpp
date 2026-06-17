@@ -156,12 +156,19 @@ public:
             case io_op::timeout: {
                 // Use timer queue for timeout operations
                 int64_t timeout_ns = static_cast<int64_t>(req.length);
-                auto deadline = std::chrono::steady_clock::now() + 
+                auto deadline = std::chrono::steady_clock::now() +
                                 std::chrono::nanoseconds(timeout_ns);
-                
-                timer_queue_.push(timer_entry{deadline, req.awaiter});
+
+                // cancel_key must match what the awaitable passes to
+                // io_context::cancel(). For op_state-aware awaitables this
+                // is tagged_op_state_user_data(req.state); for legacy
+                // awaitables it is the raw coroutine handle address.
+                void* ckey = req.state
+                    ? tagged_op_state_user_data(req.state)
+                    : req.awaiter.address();
+                timer_queue_.push(timer_entry{deadline, req.awaiter, ckey});
                 pending_count_++;
-                
+
                 ELIO_LOG_DEBUG("Prepared timeout: {}ns", timeout_ns);
                 return true;
             }
@@ -194,9 +201,17 @@ public:
                 }
             }
             
-            if (ret < 0 && errno != EEXIST) {
-                ELIO_LOG_WARNING("epoll_ctl failed for fd {}: {}", 
-                                 req.fd, strerror(errno));
+            if (ret < 0) {
+                if (errno == EEXIST) {
+                    // fd is already registered (e.g. from a prior ADD that
+                    // succeeded but whose state was lost). Treat as
+                    // registered so subsequent prepare() calls use
+                    // EPOLL_CTL_MOD instead of retrying ADD forever.
+                    state.registered = true;
+                } else {
+                    ELIO_LOG_WARNING("epoll_ctl failed for fd {}: {}",
+                                     req.fd, strerror(errno));
+                }
             }
         }
         
@@ -211,22 +226,34 @@ public:
     /// This just executes any synchronous operations
     int submit() override {
         int submitted = 0;
-        
+
         // Execute synchronous operations (like close)
         for (auto& [fd, state] : fd_states_) {
             auto it = state.pending_ops.begin();
             while (it != state.pending_ops.end()) {
                 if (it->synchronous) {
+                    bool is_close = (it->req.op == io_op::close);
                     execute_sync_op(*it);
                     it = state.pending_ops.erase(it);
                     pending_count_--;
                     submitted++;
+                    if (is_close) {
+                        // After closing an fd, reset the fd_state so that
+                        // if the fd number is reused, prepare() will issue
+                        // EPOLL_CTL_ADD instead of EPOLL_CTL_MOD on a stale
+                        // entry. Also deregister from epoll if still tracked.
+                        if (state.registered) {
+                            epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                        }
+                        state.registered = false;
+                        state.events = 0;
+                    }
                 } else {
                     ++it;
                 }
             }
         }
-        
+
         ELIO_LOG_DEBUG("Submitted {} synchronous operations", submitted);
         return submitted;
     }
@@ -306,38 +333,58 @@ public:
             }
             
             fd_state& state = it->second;
-                
-                // Process pending operations for this fd
+
+                // Process pending operations for this fd.
+                // Level-triggered epoll will re-fire as long as the fd is
+                // ready, so we consume at most ONE read-direction op and
+                // ONE write-direction op per poll cycle. This prevents a
+                // non-blocking syscall that returns EAGAIN from consuming
+                // (and failing) every queued op of the same direction.
+                bool consumed_read = false;
+                bool consumed_write = false;
                 auto op_it = state.pending_ops.begin();
                 while (op_it != state.pending_ops.end()) {
-                    bool ready = false;
-                    
+                    bool is_read_dir = false;
+                    bool is_write_dir = false;
+
                     switch (op_it->req.op) {
                         case io_op::read:
                         case io_op::readv:
                         case io_op::recv:
                         case io_op::accept:
                         case io_op::poll_read:
-                            ready = (revents & (EPOLLIN | EPOLLHUP | EPOLLERR)) != 0;
+                            is_read_dir = true;
                             break;
-                            
+
                         case io_op::write:
                         case io_op::writev:
                         case io_op::send:
                         case io_op::connect:
                         case io_op::poll_write:
-                            ready = (revents & (EPOLLOUT | EPOLLHUP | EPOLLERR)) != 0;
+                            is_write_dir = true;
                             break;
-                            
+
                         default:
-                            break;
+                            ++op_it;
+                            continue;
                     }
-                    
+
+                    bool ready = false;
+                    if (is_read_dir && !consumed_read &&
+                        (revents & (EPOLLIN | EPOLLHUP | EPOLLERR))) {
+                        ready = true;
+                    } else if (is_write_dir && !consumed_write &&
+                               (revents & (EPOLLOUT | EPOLLHUP | EPOLLERR))) {
+                        ready = true;
+                    }
+
                     if (ready) {
                         execute_async_op(*op_it, revents, &deferred_resumes);
                         op_it = state.pending_ops.erase(op_it);
                         pending_count_--;
                         completions++;
+                        if (is_read_dir) consumed_read = true;
+                        if (is_write_dir) consumed_write = true;
                     } else {
                         ++op_it;
                     }
@@ -409,7 +456,8 @@ public:
             while (!timer_queue_.empty()) {
                 auto entry = timer_queue_.top();
                 timer_queue_.pop();
-                if (entry.awaiter.address() == user_data) {
+                // Match against cancel_key (tagged op_state or awaiter address)
+                if (entry.cancel_key == user_data) {
                     if (entry.awaiter && !entry.awaiter.done()) {
                         to_resume = {entry.awaiter, io_result{-ECANCELED, 0}};
                         found_entry = true;
@@ -480,7 +528,8 @@ private:
     struct timer_entry {
         std::chrono::steady_clock::time_point deadline;
         std::coroutine_handle<> awaiter;
-        
+        void* cancel_key = nullptr;  ///< Key for cancel matching (tagged op_state or awaiter address)
+
         /// Comparison for min-heap (earliest deadline first)
         bool operator>(const timer_entry& other) const {
             return deadline > other.deadline;

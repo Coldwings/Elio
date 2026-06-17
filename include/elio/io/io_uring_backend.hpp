@@ -119,19 +119,23 @@ inline void* tagged_op_state_user_data(op_state* st) noexcept {
 /// io_uring path (per-CQE updates) and the epoll/synchronous fallback (which
 /// just fills ``results`` directly).
 ///
-/// Lifetime: ``batch_state`` lives on the awaitable (as a member of
-/// ``batch_read_awaitable`` / ``batch_write_awaitable``), which itself lives
-/// on the awaiting coroutine's frame. Because we don't resume the awaiter
-/// until the last CQE arrives, the awaitable -- and therefore this state and
-/// every trampoline pointing at it -- is alive through to the final
-/// completion.
+/// Lifetime: ``batch_state`` is heap-allocated (via unique_ptr) on the
+/// awaitable. An orphan protocol analogous to ``op_state`` protects against
+/// UAF when the awaiting coroutine is destroyed while SQEs are in flight:
+/// the destructor CAS's ``phase`` from ``phase_pending`` to ``phase_orphaned``,
+/// releasing ownership. The final CQE handler sees ``phase_orphaned`` and
+/// deletes the state instead of resuming a dangling awaiter.
 struct batch_state {
+    static constexpr uint8_t phase_pending = 0;
+    static constexpr uint8_t phase_orphaned = 1;
+
     std::atomic<int> completed{0};                 ///< Per-CQE counter
     int total = 0;                                 ///< Total segments
     std::vector<int> results;                      ///< Per-segment results (bytes or -errno)
     std::vector<batch_completion> trampolines;     ///< One trampoline per segment (io_uring only)
     std::coroutine_handle<> awaiter{};             ///< Resumed when completed == total
     coro::vthread_stack* awaiter_vstack = nullptr; ///< Captured at suspend time
+    std::atomic<uint8_t> phase{phase_pending};     ///< Orphan protocol phase
 
     explicit batch_state(int n) : total(n), results(n) {}
 
@@ -405,7 +409,14 @@ public:
         // Auto-submit any pending operations before polling
         // This enables batching: multiple prepares followed by one submit
         if (io_uring_sq_ready(&ring_) > 0) {
-            io_uring_submit(&ring_);
+            int ret = io_uring_submit(&ring_);
+            if (ret < 0) {
+                // Log but do NOT rollback pending_ops_: poll() will retry
+                // on the next iteration and a rollback here would cause
+                // underflow when the retried SQEs succeed and their CQEs
+                // decrement pending_ops_.
+                ELIO_LOG_ERROR("io_uring_submit in poll() failed: {}", strerror(-ret));
+            }
         }
 
         struct io_uring_cqe* cqe = nullptr;
@@ -587,6 +598,13 @@ public:
         }
     }
 
+    /// Rollback pending_ops_ for SQEs that failed to submit.
+    void unregister_pending(size_t n) noexcept {
+        if (n) {
+            pending_ops_.fetch_sub(n, std::memory_order_relaxed);
+        }
+    }
+
     /// Resume a coroutine handle while temporarily setting its
     /// ``vthread_stack`` as current. Exposed for the batch trampoline to
     /// reuse the same logic the backend uses internally.
@@ -722,6 +740,8 @@ private:
     /// Writes the segment result, increments the completed counter, and on
     /// the final segment resumes the awaiting coroutine (deferred if a
     /// resume queue is provided so we don't resume inside CQE iteration).
+    /// If the awaitable has been destroyed (phase == phase_orphaned), the
+    /// final CQE frees the batch_state instead of resuming.
     static void dispatch_batch_completion(
         batch_completion* tramp,
         int32_t res,
@@ -730,15 +750,27 @@ private:
             return;
         }
         batch_state* st = tramp->state;
+
+        // Check orphan protocol: if the awaitable was destroyed while
+        // SQEs were in flight, only write results (the vector is still
+        // alive since we own it now) but do NOT resume the awaiter.
+        bool orphaned = st->phase.load(std::memory_order_acquire)
+                        == batch_state::phase_orphaned;
+
         const uint32_t idx = tramp->segment_index;
-        if (idx < st->results.size()) {
+        if (!orphaned && idx < st->results.size()) {
             st->results[idx] = res;
         }
         int prev = st->completed.fetch_add(1, std::memory_order_acq_rel);
         if (prev + 1 != st->total) {
             return;
         }
-        // Final segment: resume the awaiter.
+        // Final segment.
+        if (orphaned) {
+            // Awaitable already torn down — free the state ourselves.
+            delete st;
+            return;
+        }
         auto handle = st->awaiter;
         if (!handle) {
             return;

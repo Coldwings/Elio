@@ -732,7 +732,29 @@ inline bool submit_batch_io_uring(io_uring_backend* backend,
     }
 
     backend->register_pending(in_flight);
-    io_uring_submit(ring);
+    int submitted = io_uring_submit(ring);
+    if (submitted < 0) {
+        // Submit failed entirely: rollback pending_ops_ and mark all
+        // in-flight segments as failed so the awaiter resumes promptly.
+        ELIO_LOG_ERROR("submit_batch_io_uring: io_uring_submit failed: {}",
+                       strerror(-submitted));
+        backend->unregister_pending(in_flight);
+        st.completed.fetch_add(static_cast<int>(in_flight), std::memory_order_acq_rel);
+        for (size_t i = 0; i < static_cast<size_t>(st.total); ++i) {
+            if (st.results[i] == 0) {
+                st.results[i] = submitted;  // propagate the error
+            }
+        }
+        return false;
+    }
+    if (static_cast<size_t>(submitted) < in_flight) {
+        // Partial submit: rollback the excess and mark un-submitted segments.
+        size_t excess = in_flight - static_cast<size_t>(submitted);
+        backend->unregister_pending(excess);
+        st.completed.fetch_add(static_cast<int>(excess), std::memory_order_acq_rel);
+        ELIO_LOG_WARNING("submit_batch_io_uring: submitted {}/{} SQEs",
+                         submitted, in_flight);
+    }
     return true;
 }
 
@@ -745,6 +767,23 @@ class batch_read_awaitable : public io_awaitable_base {
 public:
     batch_read_awaitable(int fd, std::span<const batch_read_segment> segments) noexcept
         : io_awaitable_base(), fd_(fd), segments_(segments.begin(), segments.end()) {}
+
+    ~batch_read_awaitable() {
+        if (!batch_st_) return;
+        // Orphan protocol: if SQEs are still in flight when the awaitable
+        // is destroyed (forced cancel, vthread teardown), CAS phase to
+        // orphaned so dispatch_batch_completion frees the state instead
+        // of resuming a dangling awaiter.
+        uint8_t expected = batch_state::phase_pending;
+        if (batch_st_->phase.compare_exchange_strong(
+                expected, batch_state::phase_orphaned,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            // We won the CAS: CQE handler will delete. Release ownership.
+            (void)batch_st_.release();
+        }
+        // If CAS failed, phase was already completed or something else —
+        // unique_ptr cleans up normally.
+    }
 
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
@@ -817,6 +856,16 @@ class batch_write_awaitable : public io_awaitable_base {
 public:
     batch_write_awaitable(int fd, std::span<const batch_write_segment> segments) noexcept
         : io_awaitable_base(), fd_(fd), segments_(segments.begin(), segments.end()) {}
+
+    ~batch_write_awaitable() {
+        if (!batch_st_) return;
+        uint8_t expected = batch_state::phase_pending;
+        if (batch_st_->phase.compare_exchange_strong(
+                expected, batch_state::phase_orphaned,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            (void)batch_st_.release();
+        }
+    }
 
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
@@ -981,6 +1030,7 @@ public:
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
         if (token_.is_cancelled()) {
             already_cancelled_before_setup_ = true;
+            result_ = io_result{-ECANCELED, 0};
             awaiter.resume();
             return;
         }
@@ -1013,6 +1063,7 @@ public:
         if (token_.is_cancelled()) {
             cancel_registration_.unregister();
             state->resumed.store(true, std::memory_order_release);
+            result_ = io_result{-ECANCELED, 0};
             awaiter.resume();
             return;
         }
@@ -1026,6 +1077,13 @@ public:
         req.awaiter = awaiter;
         req.state = setup_op_state(awaiter);
         state->op = req.state;
+
+        // Post-registration race: cancel may have fired between on_cancel()
+        // and setting state->op above. Re-check and submit async cancel
+        // inline so the kernel op is actually aborted.
+        if (state->cancelled.load(std::memory_order_acquire)) {
+            ctx.cancel(tagged_op_state_user_data(req.state));
+        }
 
         if (!ctx.prepare(req)) {
             clear_op_state();
@@ -1046,6 +1104,12 @@ public:
                             state_->cancelled.load(std::memory_order_acquire);
         }
         result_ = read_result_from_op_state();
+        // Ensure cancelled results carry a distinguishable error code so
+        // callers checking success() before was_cancelled() don't confuse
+        // cancellation with a legitimate zero-byte read.
+        if (was_cancelled && result_.result == 0) {
+            result_ = io_result{-ECANCELED, 0};
+        }
         restore_affinity();
         return cancellable_io_result{
             result_,
@@ -1087,6 +1151,7 @@ public:
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
         if (token_.is_cancelled()) {
             already_cancelled_before_setup_ = true;
+            result_ = io_result{-ECANCELED, 0};
             awaiter.resume();
             return;
         }
@@ -1116,6 +1181,7 @@ public:
         if (token_.is_cancelled()) {
             cancel_registration_.unregister();
             state->resumed.store(true, std::memory_order_release);
+            result_ = io_result{-ECANCELED, 0};
             awaiter.resume();
             return;
         }
@@ -1129,6 +1195,13 @@ public:
         req.awaiter = awaiter;
         req.state = setup_op_state(awaiter);
         state->op = req.state;
+
+        // Post-registration race: cancel may have fired between on_cancel()
+        // and setting state->op above. Re-check and submit async cancel
+        // inline so the kernel op is actually aborted.
+        if (state->cancelled.load(std::memory_order_acquire)) {
+            ctx.cancel(tagged_op_state_user_data(req.state));
+        }
 
         if (!ctx.prepare(req)) {
             clear_op_state();
@@ -1149,6 +1222,9 @@ public:
                             state_->cancelled.load(std::memory_order_acquire);
         }
         result_ = read_result_from_op_state();
+        if (was_cancelled && result_.result == 0) {
+            result_ = io_result{-ECANCELED, 0};
+        }
         restore_affinity();
         return cancellable_io_result{
             result_,
@@ -1190,6 +1266,7 @@ public:
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
         if (token_.is_cancelled()) {
             already_cancelled_before_setup_ = true;
+            result_ = io_result{-ECANCELED, 0};
             awaiter.resume();
             return;
         }
@@ -1219,6 +1296,7 @@ public:
         if (token_.is_cancelled()) {
             cancel_registration_.unregister();
             state->resumed.store(true, std::memory_order_release);
+            result_ = io_result{-ECANCELED, 0};
             awaiter.resume();
             return;
         }
@@ -1231,6 +1309,13 @@ public:
         req.awaiter = awaiter;
         req.state = setup_op_state(awaiter);
         state->op = req.state;
+
+        // Post-registration race: cancel may have fired between on_cancel()
+        // and setting state->op above. Re-check and submit async cancel
+        // inline so the kernel op is actually aborted.
+        if (state->cancelled.load(std::memory_order_acquire)) {
+            ctx.cancel(tagged_op_state_user_data(req.state));
+        }
 
         if (!ctx.prepare(req)) {
             clear_op_state();
@@ -1251,6 +1336,9 @@ public:
                             state_->cancelled.load(std::memory_order_acquire);
         }
         result_ = read_result_from_op_state();
+        if (was_cancelled && result_.result == 0) {
+            result_ = io_result{-ECANCELED, 0};
+        }
         restore_affinity();
         return cancellable_io_result{
             result_,

@@ -12,8 +12,8 @@
 #include <string_view>
 #include <vector>
 #include <optional>
-#include <random>
 #include <array>
+#include <sys/random.h>
 
 namespace elio::http::websocket {
 
@@ -211,17 +211,23 @@ inline void apply_mask(uint8_t* data, size_t len, const uint8_t* mask_key, size_
     }
 }
 
-/// Generate a random 4-byte masking key
+/// Generate a random 4-byte masking key using a CSPRNG.
+/// RFC 6455 §5.3 requires masking keys to be derived from a strong source
+/// of entropy and to be unpredictable.
 inline std::array<uint8_t, 4> generate_mask_key() {
-    static thread_local std::mt19937 rng(std::random_device{}());
-    std::uniform_int_distribution<uint32_t> dist;
-    uint32_t key = dist(rng);
-    return {
-        static_cast<uint8_t>(key >> 24),
-        static_cast<uint8_t>(key >> 16),
-        static_cast<uint8_t>(key >> 8),
-        static_cast<uint8_t>(key)
-    };
+    std::array<uint8_t, 4> key{};
+    ssize_t n = ::getrandom(key.data(), key.size(), 0);
+    if (n < static_cast<ssize_t>(key.size())) {
+        // Fallback: should never happen on Linux 3.17+ with valid args
+        // Use /dev/urandom as last resort
+        FILE* f = fopen("/dev/urandom", "rb");
+        if (f) {
+            auto rd = fread(key.data(), 1, key.size(), f);
+            (void)rd;
+            fclose(f);
+        }
+    }
+    return key;
 }
 
 /// Encode a WebSocket frame
@@ -511,8 +517,19 @@ private:
                     }
                     current_message_ = message{};
                     current_message_.type = header.op;
+                    has_initial_frame_ = true;
+                } else {
+                    // Continuation frame: RFC 6455 §5.4 requires a preceding
+                    // initial text/binary frame.  If none exists, this is a
+                    // protocol error.
+                    if (!has_initial_frame_) {
+                        has_error_ = true;
+                        error_msg_ = "Continuation frame without initial frame";
+                        error_close_code_ = close_code::protocol_error;
+                        return -1;
+                    }
                 }
-                
+
                 // Check message size limit
                 if (max_message_size_ > 0 &&
                     current_message_.data.size() + payload.size() > max_message_size_) {
@@ -521,13 +538,14 @@ private:
                     error_close_code_ = close_code::too_large;
                     return -1;
                 }
-                
+
                 current_message_.data.append(payload);
-                
+
                 if (header.fin) {
                     current_message_.complete = true;
                     messages_.push_back(std::move(current_message_));
                     current_message_ = message{};
+                    has_initial_frame_ = false;
                 }
             }
             
@@ -545,23 +563,78 @@ private:
     std::vector<std::pair<opcode, std::string>> control_frames_;
     size_t max_message_size_ = 0;
     bool has_error_ = false;
+    bool has_initial_frame_ = false;  ///< Tracks whether a non-continuation frame started the current message
     std::string error_msg_;
     close_code error_close_code_ = close_code::protocol_error;
     endpoint_role role_ = endpoint_role::unspecified;
 };
 
-/// Parse close frame payload to extract code and reason
+/// Validate a close code per RFC 6455 §7.4.1.
+/// Returns true if the code is valid for use in a close frame.
+inline bool is_valid_close_code(uint16_t code) {
+    // Defined codes: 1000-1003, 1007-1011
+    if (code >= 1000 && code <= 1003) return true;
+    if (code >= 1007 && code <= 1011) return true;
+    // Reserved for libraries/frameworks/applications: 3000-4999
+    if (code >= 3000 && code <= 4999) return true;
+    // Everything else (0-999, 1004, 1005-1006, 1015, 1016-2999, 5000+) is invalid
+    return false;
+}
+
+/// Simple UTF-8 validation.  Returns true if the string is valid UTF-8.
+inline bool is_valid_utf8(std::string_view s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        auto c = static_cast<uint8_t>(s[i]);
+        size_t len = 0;
+        if (c <= 0x7F) { len = 1; }
+        else if ((c & 0xE0) == 0xC0) { len = 2; }
+        else if ((c & 0xF0) == 0xE0) { len = 3; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; }
+        else { return false; }
+        if (len == 0 || i + len > s.size()) return false;
+        // Check continuation bytes
+        for (size_t j = 1; j < len; ++j) {
+            if ((static_cast<uint8_t>(s[i + j]) & 0xC0) != 0x80) return false;
+        }
+        // Reject overlong encodings
+        if (len == 2 && c < 0xC2) return false;
+        if (len == 3) {
+            if (c == 0xE0 && static_cast<uint8_t>(s[i+1]) < 0xA0) return false;
+        }
+        if (len == 4) {
+            if (c == 0xF0 && static_cast<uint8_t>(s[i+1]) < 0x90) return false;
+            if (c == 0xF4 && static_cast<uint8_t>(s[i+1]) > 0x8F) return false;
+            if (c > 0xF4) return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
+/// Parse close frame payload to extract code and reason.
+/// Validates the close code per RFC 6455 §7.4.1 and the reason per §7.1.6.
+/// Returns protocol_error for invalid codes or non-UTF-8 reasons.
 inline std::pair<close_code, std::string> parse_close_payload(std::string_view payload) {
     if (payload.size() < 2) {
         return {close_code::no_status, ""};
     }
-    
-    uint16_t code = (static_cast<uint8_t>(payload[0]) << 8) | 
+
+    uint16_t code = (static_cast<uint8_t>(payload[0]) << 8) |
                     static_cast<uint8_t>(payload[1]);
-    
+
+    // Validate close code per RFC 6455 §7.4.1
+    if (!is_valid_close_code(code)) {
+        return {close_code::protocol_error, ""};
+    }
+
     std::string reason;
     if (payload.size() > 2) {
         reason = std::string(payload.substr(2));
+        // Validate UTF-8 per RFC 6455 §7.1.6
+        if (!is_valid_utf8(reason)) {
+            return {close_code::protocol_error, ""};
+        }
     }
     
     return {static_cast<close_code>(code), reason};

@@ -145,10 +145,10 @@ public:
     sse_connection& operator=(const sse_connection&) = delete;
     
     /// Get connection state
-    connection_state state() const noexcept { return state_; }
-    
+    connection_state state() const noexcept { return state_.load(std::memory_order_acquire); }
+
     /// Check if connection is active
-    bool is_active() const noexcept { return state_ == connection_state::active; }
+    bool is_active() const noexcept { return state_.load(std::memory_order_acquire) == connection_state::active; }
     
     /// Get last event ID requested by client
     std::string_view last_event_id() const noexcept { return last_event_id_; }
@@ -158,7 +158,7 @@ public:
     
     /// Send an event
     coro::task<bool> send(const event& evt) {
-        if (state_ != connection_state::active) {
+        if (state_.load(std::memory_order_acquire) != connection_state::active) {
             co_return false;
         }
         
@@ -178,7 +178,7 @@ public:
     
     /// Send a comment (for keep-alive)
     coro::task<bool> send_comment(std::string_view comment = "") {
-        if (state_ != connection_state::active) {
+        if (state_.load(std::memory_order_acquire) != connection_state::active) {
             co_return false;
         }
         
@@ -191,7 +191,7 @@ public:
     
     /// Send retry interval
     coro::task<bool> send_retry(int retry_ms) {
-        if (state_ != connection_state::active) {
+        if (state_.load(std::memory_order_acquire) != connection_state::active) {
             co_return false;
         }
         
@@ -201,12 +201,12 @@ public:
     
     /// Close the connection
     void close() {
-        state_ = connection_state::closed;
+        state_.store(connection_state::closed, std::memory_order_release);
     }
 
     /// Mark connection as active (after sending headers)
     void set_active() {
-        state_ = connection_state::active;
+        state_.store(connection_state::active, std::memory_order_release);
     }
 
     /// Heartbeat / keep-alive loop.
@@ -229,12 +229,12 @@ public:
         if (interval.count() <= 0) {
             co_return;
         }
-        while (state_ == connection_state::active) {
+        while (state_.load(std::memory_order_acquire) == connection_state::active) {
             auto sleep_result = co_await elio::time::sleep_for(interval, token);
             if (sleep_result == coro::cancel_result::cancelled) {
                 co_return;
             }
-            if (state_ != connection_state::active) {
+            if (state_.load(std::memory_order_acquire) != connection_state::active) {
                 co_return;
             }
             if (!co_await send_comment(comment)) {
@@ -267,7 +267,7 @@ private:
             }
 
             if (result.result <= 0) {
-                state_ = connection_state::closed;
+                state_.store(connection_state::closed, std::memory_order_release);
                 co_return false;
             }
             sent += static_cast<size_t>(result.result);
@@ -276,7 +276,7 @@ private:
     }
 
     stream_type stream_;
-    connection_state state_ = connection_state::active;
+    std::atomic<connection_state> state_{connection_state::active};
     std::string last_event_id_;
     sync::mutex send_mutex_;  ///< Serializes frame writes; see send_raw().
 };

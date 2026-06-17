@@ -308,14 +308,19 @@ public:
                 continue;
             }
 
-            // Spawn connection handler
+            // Spawn connection handler (tracked for graceful shutdown)
+            active_connections_.fetch_add(1, std::memory_order_relaxed);
             sched->go([this, s = std::move(*stream_result)]() mutable {
-                return handle_connection(std::move(s));
+                return handle_connection_guarded(std::move(s));
             });
         }
     }
 
     /// Start listening with TLS (HTTPS)
+    /// @note The caller must ensure `tls_ctx` outlives all spawned connection
+    ///       handlers.  In practice this means `tls_ctx` should be stored as a
+    ///       member or otherwise kept alive until after `stop()` returns and
+    ///       all in-flight handlers have completed.
     coro::task<void> listen_tls(const net::socket_address& addr,
                                 tls::tls_context& tls_ctx,
                                 const net::tcp_options& opts = {}) {
@@ -337,6 +342,12 @@ public:
         listener_fd_ = listener.fd();
         running_ = true;
 
+        // Capture tls_ctx by pointer rather than by reference so that the
+        // lambda does not silently dangle when listen_tls's coroutine frame
+        // is destroyed.  The pointed-to tls_context MUST outlive all spawned
+        // handlers — this is documented above.
+        auto* tls_ctx_ptr = &tls_ctx;
+
         while (running_) {
             auto stream_result = co_await listener.accept();
             if (!stream_result) {
@@ -346,13 +357,14 @@ public:
                 continue;
             }
 
-            // Create TLS stream and spawn handler
-            sched->go([this, s = std::move(*stream_result), &tls_ctx]() mutable {
-                return handle_tls_connection(std::move(s), tls_ctx);
+            // Track in-flight connections for graceful shutdown
+            active_connections_.fetch_add(1, std::memory_order_relaxed);
+            sched->go([this, s = std::move(*stream_result), tls_ctx_ptr]() mutable {
+                return handle_tls_connection_guarded(std::move(s), *tls_ctx_ptr);
             });
         }
     }
-    
+
     /// Stop the server
     void stop() {
         running_ = false;
@@ -361,11 +373,30 @@ public:
             listener_fd_ = -1;
         }
     }
-    
+
     /// Check if server is running
     bool is_running() const noexcept { return running_; }
-    
+
+    /// Return the number of in-flight connection handlers.  Callers that
+    /// destroy the server after stop() should wait until this returns 0
+    /// to avoid use-after-free on router_, config_, etc.
+    size_t active_connections() const noexcept {
+        return active_connections_.load(std::memory_order_acquire);
+    }
+
 private:
+    /// Guard wrapper that decrements the active-connection counter on exit.
+    coro::task<void> handle_connection_guarded(net::tcp_stream stream) {
+        co_await handle_connection(std::move(stream));
+        active_connections_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    /// Guard wrapper for TLS connections.
+    coro::task<void> handle_tls_connection_guarded(net::tcp_stream tcp, tls::tls_context& tls_ctx) {
+        co_await handle_tls_connection(std::move(tcp), tls_ctx);
+        active_connections_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
     /// Handle a plain HTTP connection
     coro::task<void> handle_connection(net::tcp_stream stream) {
         auto peer = stream.peer_address();
@@ -554,22 +585,40 @@ private:
             } catch (const std::exception& e) {
                 ELIO_LOG_ERROR("Handler exception: {}", e.what());
                 if (error_handler_) {
-                    resp = error_handler_(e);
+                    try {
+                        resp = error_handler_(e);
+                    } catch (...) {
+                        ELIO_LOG_ERROR("Error handler itself threw; falling back to 500");
+                        resp = response::internal_error();
+                    }
                 } else {
                     resp = response::internal_error();
                 }
             }
 
-            // Check keep-alive
+            // Check keep-alive: honour both the request AND the response
+            // Connection headers, plus the server-side max-requests limit.
             bool keep_alive = parser.get_headers().keep_alive(parser.version());
+            if (keep_alive) {
+                keep_alive = resp.get_headers().keep_alive(parser.version());
+            }
+            // If this is the last allowed request, signal close so the
+            // client does not pipeline into a connection we are about to
+            // abandon (RFC 7230 §6.6).
+            if (keep_alive && request_count + 1 >= config_.max_keep_alive_requests) {
+                keep_alive = false;
+            }
+            if (!running_) {
+                keep_alive = false;
+            }
             if (!keep_alive) {
                 resp.set_header("Connection", "close");
             }
 
             // Send response
-            co_await send_response(stream, resp);
+            bool send_ok = co_await send_response(stream, resp);
 
-            if (!keep_alive) {
+            if (!send_ok || !keep_alive) {
                 break;
             }
 
@@ -598,19 +647,24 @@ private:
         co_return response::not_found();
     }
     
-    /// Send HTTP response
+    /// Send HTTP response.  Returns true if the entire response was written
+    /// successfully, false on write failure (truncated / broken stream).
     template<typename Stream>
-    coro::task<void> send_response(Stream& stream, const response& resp) {
+    coro::task<bool> send_response(Stream& stream, const response& resp) {
         auto data = resp.serialize();
-        
+
         size_t sent = 0;
         while (sent < data.size()) {
             auto result = co_await stream.write(data.data() + sent, data.size() - sent);
             if (result.result <= 0) {
-                break;
+                ELIO_LOG_ERROR("Failed to send HTTP response: {}",
+                               result.result == 0 ? "connection closed"
+                                                  : strerror(-result.result));
+                co_return false;
             }
             sent += result.result;
         }
+        co_return true;
     }
     
     router router_;
@@ -618,6 +672,7 @@ private:
     handler_func not_found_handler_;
     std::function<response(const std::exception&)> error_handler_;
     std::atomic<bool> running_{false};
+    std::atomic<size_t> active_connections_{0};  ///< In-flight connection handlers
     int listener_fd_ = -1;
 };
 

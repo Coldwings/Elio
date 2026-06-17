@@ -440,23 +440,30 @@ public:
             }
         }
 
-        // Setup timeout
+        // Setup timeout with cancellation support so the watcher exits
+        // promptly when ping completes or is destroyed (mirrors call_impl).
+        coro::cancel_source ping_cancel;
         auto* sched = runtime::scheduler::current();
         if (sched) {
-            sched->go([ms = timeout, p = pending]() {
-                return [](std::chrono::milliseconds ms, std::shared_ptr<pending_request> p)
+            sched->go([ms = timeout, p = pending, tok = ping_cancel.get_token()]() {
+                return [](std::chrono::milliseconds ms,
+                          std::shared_ptr<pending_request> p,
+                          coro::cancel_token tok)
                     -> coro::task<void> {
-                    co_await time::sleep_for(ms);
-                    if (p->try_complete()) {
+                    auto result = co_await time::sleep_for(ms, tok);
+                    if (result == coro::cancel_result::completed && p->try_complete()) {
                         p->timed_out = true;
                         p->completion_event.set();
                     }
-                }(ms, p);
+                }(ms, p, std::move(tok));
             });
         }
 
         // Wait for pong
         co_await pending->completion_event.wait();
+
+        // Cancel the timeout watcher so it doesn't linger after completion.
+        ping_cancel.cancel();
 
         co_return !pending->timed_out;
     }
@@ -474,35 +481,47 @@ private:
         auto self = this->shared_from_this();
         auto* sched = runtime::scheduler::current();
         if (sched) {
-            sched->go([s = self]() { return receive_loop(s); });
+            // Capture a weak_ptr so the receive loop does not keep the
+            // client alive when all external owners have dropped their
+            // references.  Without this, dropping the shared_ptr returned
+            // by connect() would leak the stream fd and coroutine frame
+            // forever because the receive loop's strong ref prevents
+            // destruction (and therefore close()).
+            std::weak_ptr<rpc_client> weak_self = self;
+            sched->go([w = std::move(weak_self)]() { return receive_loop(w); });
         }
     }
-    
+
     /// Background task that receives and dispatches responses
-    static coro::task<void> receive_loop(ptr self) {
+    static coro::task<void> receive_loop(std::weak_ptr<rpc_client> weak_self) {
         ELIO_LOG_DEBUG("RPC client receive loop started");
-        
-        while (self->is_connected()) {
+
+        while (true) {
+            auto self = weak_self.lock();
+            if (!self || !self->is_connected()) {
+                break;
+            }
+
             auto frame = co_await read_frame(self->stream_);
             if (!frame) {
                 ELIO_LOG_DEBUG("RPC client receive loop: connection closed");
                 self->close();
                 break;
             }
-            
+
             auto& [header, payload] = *frame;
-            
+
             // Handle different message types
             switch (header.type) {
                 case message_type::response:
                 case message_type::error:
                     self->handle_response(header, std::move(payload));
                     break;
-                    
+
                 case message_type::pong:
                     self->handle_pong(header.request_id);
                     break;
-                    
+
                 case message_type::ping: {
                     // Respond with pong
                     auto pong = build_pong(header.request_id);
@@ -512,14 +531,14 @@ private:
                     co_await write_frame(self->stream_, pong, empty);
                     break;
                 }
-                    
+
                 default:
                     ELIO_LOG_WARNING("RPC client: unexpected message type {}",
                                     static_cast<int>(header.type));
                     break;
             }
         }
-        
+
         ELIO_LOG_DEBUG("RPC client receive loop ended");
     }
     

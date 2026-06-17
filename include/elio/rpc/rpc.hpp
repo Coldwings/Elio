@@ -61,7 +61,7 @@
 /// ## Wire Format
 ///
 /// All messages use a binary wire format with:
-/// - 18-byte frame header (magic, request_id, type, flags, method_id, length)
+/// - 19-byte frame header (magic, request_id, type, flags, method_id, length, version)
 /// - Variable-length payload
 /// - Every multi-byte field is little-endian on the wire (`rpc_endian.hpp`
 ///   handles host conversion so big-endian peers interoperate correctly).

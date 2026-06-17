@@ -56,6 +56,8 @@ public:
             // workloads where writers are rare.
             uint64_t state = mtx_.state_.load(std::memory_order_relaxed);
             while (!(state & WRITER_FLAGS)) {
+                // Overflow guard: if reader count is at max, fall through to slow path
+                if ((state & READER_MASK) == READER_MASK) break;
                 // No writer active or waiting - try CAS to increment reader count
                 if (mtx_.state_.compare_exchange_weak(state, state + 1,
                         std::memory_order_acquire, std::memory_order_relaxed)) {
@@ -70,7 +72,7 @@ public:
 
             // Double-check under lock - state may have changed
             state = mtx_.state_.load(std::memory_order_relaxed);
-            if (!(state & WRITER_FLAGS)) {
+            if (!(state & WRITER_FLAGS) && (state & READER_MASK) != READER_MASK) {
                 // Try one more time under lock for fairness
                 if (mtx_.state_.compare_exchange_strong(state, state + 1,
                         std::memory_order_acquire, std::memory_order_relaxed)) {
@@ -154,6 +156,8 @@ public:
 
         // Fast path: if no writer active/waiting, try to increment reader count
         while (!(state & WRITER_FLAGS)) {
+            // Overflow guard: if reader count is at max, fail instead of corrupting state
+            if ((state & READER_MASK) == READER_MASK) return false;
             if (state_.compare_exchange_weak(state, state + 1,
                     std::memory_order_acquire, std::memory_order_relaxed)) {
                 return true;

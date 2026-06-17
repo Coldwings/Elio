@@ -372,8 +372,8 @@ public:
         do_spawn(handle);
     }
 
-    [[nodiscard]] size_t num_threads() const noexcept {
-        return num_threads_.load(std::memory_order_relaxed);
+    [[nodiscard]] size_t num_threads(std::memory_order order = std::memory_order_relaxed) const noexcept {
+        return num_threads_.load(order);
     }
 
     [[nodiscard]] size_t pending_tasks() const noexcept {
@@ -386,6 +386,16 @@ public:
     }
 
     void set_thread_count(size_t count) {
+        // Guard against calling from a worker thread. The shrink path joins
+        // worker threads while holding workers_mutex_; if the joined worker's
+        // current task calls set_thread_count() re-entrantly, it would deadlock
+        // trying to acquire the same non-recursive mutex.
+        if (worker_thread::current() != nullptr) [[unlikely]] {
+            ELIO_LOG_WARNING(
+                "set_thread_count() called from a worker thread; ignoring to avoid deadlock");
+            return;
+        }
+
         if (count == 0) count = 1;
         if (count > MAX_THREADS) count = MAX_THREADS;
         
@@ -956,17 +966,16 @@ inline void worker_thread::run() {
 }
 
 inline std::coroutine_handle<> worker_thread::get_next_task() noexcept {
-    // Check single-worker mode dynamically (thread count can change at runtime)
-    // Pass allow_concurrent_steals=true to pop_local() so it can fall back to
-    // pop() if there might be concurrent stealers. This avoids the TOCTOU race
-    // where another thread could be added between check and use.
-    bool single_worker = (scheduler_->num_threads() == 1);
+    // Always pass allow_concurrent_steals=true to pop_local(). The thread count
+    // can change at runtime via set_thread_count(), and any TOCTOU window between
+    // a num_threads() check and the pop_local() call could let a newly-started
+    // worker begin stealing while we use the unsafe fast path (no seq_cst fence).
+    // The cost of always using the safe pop() path is one seq_cst fence per task,
+    // which is negligible compared to coroutine resume overhead.
+    constexpr bool allow_concurrent_steals = true;
 
     // Fast path: pop from local deque first
-    // In single-worker mode, use pop_local() to skip seq_cst fence
-    // Pass !single_worker as allow_concurrent_steals - pop_local() will fall back
-    // to pop() if there could be concurrent stealers
-    void* addr = queue_->pop_local(!single_worker);
+    void* addr = queue_->pop_local(allow_concurrent_steals);
     if (addr) {
         needs_sync_ = false;  // Local task, no sync needed
         return std::coroutine_handle<>::from_address(addr);
@@ -976,13 +985,16 @@ inline std::coroutine_handle<> worker_thread::get_next_task() noexcept {
     drain_inbox();
 
     // Try local deque again after draining inbox
-    addr = queue_->pop_local(!single_worker);
+    addr = queue_->pop_local(allow_concurrent_steals);
     if (addr) {
         needs_sync_ = true;  // Came from inbox, needs sync
         return std::coroutine_handle<>::from_address(addr);
     }
-    
-    // Nothing local, try stealing from other workers (skip in single-worker mode)
+
+    // Nothing local, try stealing from other workers.
+    // Use acquire ordering to synchronize with set_thread_count()'s release
+    // store, ensuring we see newly-added workers before deciding to skip steal.
+    bool single_worker = (scheduler_->num_threads(std::memory_order_acquire) == 1);
     if (!single_worker) {
         auto handle = try_steal();
         if (handle) {

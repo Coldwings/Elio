@@ -481,16 +481,17 @@ public:
     const socket_address& local_address() const noexcept { return local_addr_; }
     
     /// Accept a connection awaitable
-    class accept_awaitable {
+    class accept_awaitable : public io::io_awaitable_base {
     public:
         accept_awaitable(tcp_listener& listener)
-            : listener_(listener) {}
-        
-        bool await_ready() const noexcept { return false; }
-        
-        void await_suspend(std::coroutine_handle<> awaiter) {
+            : io::io_awaitable_base()
+            , listener_(listener) {}
+
+        template<typename Promise>
+        void await_suspend(std::coroutine_handle<Promise> awaiter) {
+            bind_to_worker(awaiter);
             auto& ctx = io::current_io_context();
-            
+
             io::io_request req{};
             req.op = io::io_op::accept;
             req.fd = listener_.fd_;
@@ -498,17 +499,19 @@ public:
             req.addrlen = &peer_addr_len_;
             req.socket_flags = SOCK_NONBLOCK | SOCK_CLOEXEC;
             req.awaiter = awaiter;
-            
+            req.state = setup_op_state(awaiter);
+
             if (!ctx.prepare(req)) {
+                clear_op_state();
                 result_ = io::io_result{-EAGAIN, 0};
                 awaiter.resume();
                 return;
             }
-            ctx.submit();
         }
-        
+
         std::optional<tcp_stream> await_resume() {
-            result_ = io::io_context::get_last_result();
+            result_ = read_result_from_op_state();
+            restore_affinity();
 
             if (!result_.success()) {
                 errno = result_.error_code();
@@ -517,7 +520,7 @@ public:
 
             int client_fd = result_.result;
             tcp_stream stream(client_fd);
-            
+
             // Apply TCP options
             if (listener_.opts_.no_delay) {
                 stream.set_no_delay(true);
@@ -525,21 +528,20 @@ public:
             if (listener_.opts_.keep_alive) {
                 stream.set_keep_alive(true);
             }
-            
+
             // Set peer address
             socket_address peer(peer_addr_);
             stream.set_peer_address(peer);
-            
+
             ELIO_LOG_DEBUG("Accepted connection from {}", peer.to_string());
-            
+
             return stream;
         }
-        
+
     private:
         tcp_listener& listener_;
         struct sockaddr_storage peer_addr_{};
         socklen_t peer_addr_len_ = sizeof(peer_addr_);
-        io::io_result result_{};
     };
     
     /// Accept a new connection
@@ -638,10 +640,23 @@ private:
 /// Connect to a remote TCP server
 class tcp_connect_awaitable {
 public:
-    tcp_connect_awaitable(const socket_address& addr, 
+    tcp_connect_awaitable(const socket_address& addr,
                           const tcp_options& opts = {})
         : addr_(addr), opts_(opts) {}
-    
+
+    ~tcp_connect_awaitable() {
+        if (fd_ >= 0) {
+            io::close_fd_for_destructor(fd_);
+            fd_ = -1;
+        }
+    }
+
+    // Non-copyable, non-movable: holds an fd tied to this awaitable's lifetime
+    tcp_connect_awaitable(const tcp_connect_awaitable&) = delete;
+    tcp_connect_awaitable& operator=(const tcp_connect_awaitable&) = delete;
+    tcp_connect_awaitable(tcp_connect_awaitable&&) = delete;
+    tcp_connect_awaitable& operator=(tcp_connect_awaitable&&) = delete;
+
     bool await_ready() const noexcept { return false; }
     
     bool await_suspend(std::coroutine_handle<> awaiter) {

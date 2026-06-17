@@ -173,16 +173,16 @@ private:
 };
 
 /// Awaitable for reading from signalfd
-class signal_wait_awaitable {
+class signal_wait_awaitable : public io::io_awaitable_base {
 public:
     signal_wait_awaitable(io::io_context& ctx, int fd) noexcept
-        : ctx_(ctx), fd_(fd) {}
-    
-    bool await_ready() const noexcept {
-        return false;
-    }
-    
-    void await_suspend(std::coroutine_handle<> awaiter) {
+        : io::io_awaitable_base()
+        , ctx_(ctx), fd_(fd) {}
+
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+
         io::io_request req{};
         req.op = io::io_op::read;
         req.fd = fd_;
@@ -190,28 +190,29 @@ public:
         req.length = sizeof(siginfo_);
         req.offset = -1;
         req.awaiter = awaiter;
-        
+        req.state = setup_op_state(awaiter);
+
         if (!ctx_.prepare(req)) {
+            clear_op_state();
             result_ = io::io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
         }
-        ctx_.submit();
     }
-    
+
     std::optional<signal_info> await_resume() {
-        result_ = io::io_context::get_last_result();
+        result_ = read_result_from_op_state();
+        restore_affinity();
         if (result_.result == static_cast<int>(sizeof(signalfd_siginfo))) {
             return signal_info(siginfo_);
         }
         return std::nullopt;
     }
-    
+
 private:
     io::io_context& ctx_;
     int fd_;
     signalfd_siginfo siginfo_{};
-    io::io_result result_{};
 };
 
 /// Async signal file descriptor
@@ -224,10 +225,10 @@ public:
     /// @param ctx Optional I/O context (defaults to the current worker's context)
     /// @param auto_block If true (default), automatically block the signals
     /// @throws std::system_error if signalfd creation fails
-    explicit signal_fd(const signal_set& signals, 
+    explicit signal_fd(const signal_set& signals,
                        io::io_context& ctx = io::current_io_context(),
                        bool auto_block = true)
-        : ctx_(ctx)
+        : ctx_(&ctx)
         , signals_(signals)
         , old_mask_saved_(false) {
         
@@ -257,7 +258,11 @@ public:
     /// Destructor - closes the fd and optionally restores signal mask
     ~signal_fd() {
         if (fd_ >= 0) {
-            ::close(fd_);
+            // Use close_fd_for_destructor to let io_uring drain any in-flight
+            // SQEs on this fd before the fd table entry is freed for reuse.
+            // Combined with the op_state orphan protocol in
+            // signal_wait_awaitable, this ensures late CQEs are safely dropped.
+            io::close_fd_for_destructor(fd_);
             ELIO_LOG_DEBUG("signal_fd closed fd={}", fd_);
         }
         // Note: We don't restore the old mask by default in destructor
@@ -271,18 +276,18 @@ public:
     
     // Movable
     signal_fd(signal_fd&& other) noexcept
-        : ctx_(other.ctx_)
+        : ctx_(std::exchange(other.ctx_, nullptr))
         , fd_(std::exchange(other.fd_, -1))
         , signals_(std::move(other.signals_))
         , old_mask_(other.old_mask_)
         , old_mask_saved_(std::exchange(other.old_mask_saved_, false)) {}
-    
+
     signal_fd& operator=(signal_fd&& other) noexcept {
         if (this != &other) {
             if (fd_ >= 0) {
                 ::close(fd_);
             }
-            // Note: ctx_ is a reference, cannot be reassigned
+            ctx_ = std::exchange(other.ctx_, nullptr);
             fd_ = std::exchange(other.fd_, -1);
             signals_ = std::move(other.signals_);
             old_mask_ = other.old_mask_;
@@ -304,7 +309,7 @@ public:
     /// Wait for a signal asynchronously
     /// @return Awaitable that yields signal_info when a signal is received
     auto wait() {
-        return signal_wait_awaitable(ctx_, fd_);
+        return signal_wait_awaitable(*ctx_, fd_);
     }
     
     /// Read a signal synchronously (non-blocking)
@@ -324,16 +329,27 @@ public:
     /// @return true on success
     bool update(const signal_set& new_signals, bool block = true) {
         if (block) {
+            // Block any new signals that weren't in the old set
             if (!new_signals.block()) {
                 return false;
             }
+            // Unblock signals that were in the old set but not in the new set
+            // so they revert to default disposition instead of staying blocked.
+            for (int sig = 1; sig < NSIG; ++sig) {
+                if (signals_.contains(sig) && !new_signals.contains(sig)) {
+                    sigset_t unblock_mask;
+                    sigemptyset(&unblock_mask);
+                    sigaddset(&unblock_mask, sig);
+                    pthread_sigmask(SIG_UNBLOCK, &unblock_mask, nullptr);
+                }
+            }
         }
-        
+
         int result = signalfd(fd_, &new_signals.mask(), 0);
         if (result < 0) {
             return false;
         }
-        
+
         signals_ = new_signals;
         return true;
     }
@@ -350,13 +366,13 @@ public:
     /// Close the signalfd explicitly
     void close() {
         if (fd_ >= 0) {
-            ::close(fd_);
+            io::close_fd_for_destructor(fd_);
             fd_ = -1;
         }
     }
 
 private:
-    io::io_context& ctx_;
+    io::io_context* ctx_;
     int fd_ = -1;
     signal_set signals_;
     sigset_t old_mask_{};

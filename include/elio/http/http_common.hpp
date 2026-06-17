@@ -248,14 +248,28 @@ inline constexpr std::string_view status_reason(status s) noexcept {
     }
 }
 
-/// Case-insensitive string comparison for headers
+/// Case-insensitive hash for headers using FNV-1a.
+/// The previous polynomial hash (hash * 31 + c) was vulnerable to HashDoS
+/// collision attacks. FNV-1a provides significantly better avalanche
+/// properties while remaining fast for short strings typical of HTTP headers.
 struct case_insensitive_hash {
     size_t operator()(std::string_view s) const noexcept {
-        size_t hash = 0;
-        for (char c : s) {
-            hash = hash * 31 + static_cast<size_t>(std::tolower(static_cast<unsigned char>(c)));
+        // FNV-1a parameters for 64-bit / 32-bit
+        if constexpr (sizeof(size_t) == 8) {
+            size_t hash = 14695981039346656037ULL;  // FNV offset basis
+            for (char c : s) {
+                hash ^= static_cast<size_t>(std::tolower(static_cast<unsigned char>(c)));
+                hash *= 1099511628211ULL;          // FNV prime
+            }
+            return hash;
+        } else {
+            size_t hash = 2166136261U;             // FNV offset basis
+            for (char c : s) {
+                hash ^= static_cast<size_t>(std::tolower(static_cast<unsigned char>(c)));
+                hash *= 16777619U;                 // FNV prime
+            }
+            return hash;
         }
-        return hash;
     }
 };
 

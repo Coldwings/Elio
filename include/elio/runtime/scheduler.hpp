@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <coroutine>
+#include <csignal>
 #include <thread>
 #include <algorithm>
 #include <functional>
@@ -881,6 +882,19 @@ inline void worker_thread::drain_inbox() noexcept {
 }
 
 inline void worker_thread::run() {
+    // Block common signals on this worker thread so they are delivered via
+    // signalfd rather than invoking the default disposition (which may
+    // terminate the process).  Threads inherit the signal mask of their
+    // parent, but the main thread may not have blocked these before
+    // spawning workers.  Blocking here is idempotent and safe.
+    {
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGINT);
+        sigaddset(&mask, SIGTERM);
+        pthread_sigmask(SIG_BLOCK, &mask, nullptr);
+    }
+
     // Set the current scheduler and worker for this thread
     scheduler::current_scheduler_ = scheduler_;
     current_worker_ = this;

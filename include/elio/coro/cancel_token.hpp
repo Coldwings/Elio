@@ -214,7 +214,6 @@ public:
     }
 
 private:
-    template<typename> friend class basic_cancel_token;
     friend class cancel_token;
 
     cancel_registration(std::shared_ptr<detail::cancel_state> state, uint64_t id)
@@ -260,6 +259,14 @@ public:
 
     /// Register a callback to be invoked when cancellation is requested.
     /// The callback will be invoked immediately if already cancelled.
+    ///
+    /// **Concurrency note:** If the token is already cancelled, the callback
+    /// is invoked synchronously in the calling thread. This invocation may
+    /// overlap with callbacks still being dispatched by a concurrent
+    /// `cancel()` call on another thread. Callbacks must not assume mutual
+    /// exclusion with other cancel callbacks; use external synchronization
+    /// if shared mutable state is accessed.
+    ///
     /// @param callback Function to call on cancellation
     /// @return Registration handle (callback unregisters when handle is destroyed)
     template<typename F>

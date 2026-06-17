@@ -300,6 +300,15 @@ public:
         bool detached_ = false;
         std::shared_ptr<detail::join_state<T>> join_state_;
 
+        // Safety net: if the coroutine frame is destroyed without going
+        // through final_awaiter (e.g., force-destroy during shutdown drain),
+        // notify join_state so wait_destroyed() does not deadlock.
+        ~promise_type() {
+            if (join_state_) {
+                join_state_->mark_destroyed();
+            }
+        }
+
         void* operator new(size_t size) {
             return vthread_stack::allocate(size);
         }
@@ -316,7 +325,13 @@ public:
         template<typename U>
         void return_value(U&& value) {
             value_.emplace(std::forward<U>(value));
-            if (join_state_) join_state_->set_value(std::move(*value_));
+            if (join_state_) {
+                try {
+                    join_state_->set_value(std::move(*value_));
+                } catch (...) {
+                    join_state_->set_exception(std::current_exception());
+                }
+            }
         }
 
         void unhandled_exception() noexcept {
@@ -364,6 +379,15 @@ public:
         std::coroutine_handle<> continuation_;
         bool detached_ = false;
         std::shared_ptr<detail::join_state<void>> join_state_;
+
+        // Safety net: if the coroutine frame is destroyed without going
+        // through final_awaiter (e.g., force-destroy during shutdown drain),
+        // notify join_state so wait_destroyed() does not deadlock.
+        ~promise_type() {
+            if (join_state_) {
+                join_state_->mark_destroyed();
+            }
+        }
 
         void* operator new(size_t size) {
             return vthread_stack::allocate(size);

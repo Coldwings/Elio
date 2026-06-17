@@ -221,7 +221,11 @@ public:
         void return_void() noexcept {}
 
         void unhandled_exception() noexcept {
-            promise_base::unhandled_exception();
+            // Generator detaches from the parent frame chain at initial_suspend
+            // and manages its own exception propagation via this member.
+            // Do NOT call promise_base::unhandled_exception() — that would
+            // store a redundant copy in promise_base::exception_ which is
+            // never read by generator consumer code.
             exception_ = std::current_exception();
         }
     };

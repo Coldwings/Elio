@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <chrono>
 #include <optional>
 #include <type_traits>
@@ -19,9 +20,9 @@ struct timeout_result {
     std::optional<T> value;
 
     explicit operator bool() const noexcept { return !timed_out; }
-    T& operator*() & { return *value; }
-    const T& operator*() const& { return *value; }
-    T&& operator*() && { return std::move(*value); }
+    T& operator*() & { assert(value.has_value() && "dereferencing timed-out result"); return *value; }
+    const T& operator*() const& { assert(value.has_value() && "dereferencing timed-out result"); return *value; }
+    T&& operator*() && { assert(value.has_value() && "dereferencing timed-out result"); return std::move(*value); }
 };
 
 template<>

@@ -150,10 +150,15 @@ struct when_any_awaitable {
 
         spawn_all(std::index_sequence_for<Fs...>{});
 
-        if (state_->resolved_.load(std::memory_order_acquire)) {
-            void* addr = state_->waiter_.exchange(nullptr, std::memory_order_acq_rel);
-            if (addr) return false;
-        }
+        // Always suspend and rely on resume_waiter() -> schedule_handle()
+        // for resumption.  schedule_handle() provides sufficient internal
+        // synchronization (mutex/atomic in the scheduler's mpsc_queue) to
+        // establish happens-before between the winner's data writes
+        // (winner_index_, result_) and the waiter's await_resume reads.
+        // An inline fast-path (returning false when resolved_ is already
+        // true) would lack this synchronization: the waiter's acquire load
+        // on resolved_ only synchronizes with writes BEFORE the CAS release
+        // in resolve(), not the subsequent data stores.
         return true;
     }
 

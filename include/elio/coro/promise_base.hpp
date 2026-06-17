@@ -128,7 +128,14 @@ public:
             on_spawn_completion_(on_spawn_completion_data_);
         }
 
-        current_frame_ = parent_;
+        // Only restore current_frame_ if this frame is actually the current
+        // frame on this thread.  For detached coroutines destroyed on a
+        // foreign thread (e.g., during shutdown drain or failed spawn),
+        // unconditionally setting current_frame_ = parent_ (nullptr after
+        // detach) would clobber an unrelated active frame chain.
+        if (current_frame_ == this) {
+            current_frame_ = parent_;
+        }
         if (owns_vstack_) {
             // Clear current_ before deleting vstack. When operator delete later
             // calls tagged_dealloc() -> vthread_stack::deallocate(), it will find

@@ -140,39 +140,16 @@ public:
         return nullptr;
     }
     
-    /// Pop without seq_cst fence - ONLY use when there are no concurrent stealers
-    /// This is safe in single-worker mode where no other thread can steal
+    /// Pop from local deque with proper synchronization.
     ///
-    /// WARNING: This function has a TOCTOU (time-of-check-time-of-use) race condition
-    /// when used with a separate num_threads() check. Another thread could be added
-    /// between the check and this call, causing concurrent steal() operations to
-    /// race with this pop_local().
-    ///
-    /// Use the `allow_concurrent_steals` parameter to ensure safety:
-    /// - When `allow_concurrent_steals == false`: assumes single-worker, uses fast path
-    /// - When `allow_concurrent_steals == true`: falls back to pop() for safety
-    [[nodiscard]] T* pop_local(bool allow_concurrent_steals = false) noexcept {
-        // If concurrent steals are possible, fall back to the safe pop() method
-        // which uses seq_cst fence for proper synchronization
-        if (allow_concurrent_steals) {
-            return pop();
-        }
-
-        size_t b = bottom_.load(std::memory_order_relaxed);
-        if (b == 0) return nullptr;
-        
-        circular_buffer* buf = buffer_.load(std::memory_order_relaxed);
-        b = b - 1;
-        bottom_.store(b, std::memory_order_relaxed);
-        
-        size_t t = top_.load(std::memory_order_relaxed);
-        if (t <= b) {
-            return buf->load(b);
-        }
-        
-        // Queue was empty
-        bottom_.store(b + 1, std::memory_order_relaxed);
-        return nullptr;
+    /// The `allow_concurrent_steals` parameter is accepted for API compatibility
+    /// but ignored: this method always uses the safe pop() path with seq_cst
+    /// fence. The previous "fast path" (no fence) was unsafe because the thread
+    /// count can change at runtime via set_thread_count(), creating a TOCTOU
+    /// window where a newly-started worker could steal concurrently while the
+    /// owner uses the unfenced path — leading to double-consume.
+    [[nodiscard]] T* pop_local(bool /*allow_concurrent_steals*/ = false) noexcept {
+        return pop();
     }
 
     /// Steal an element (thieves only) - lock-free

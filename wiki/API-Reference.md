@@ -345,7 +345,9 @@ public:
     [[nodiscard]] registration on_cancel(F&& callback) const;
     
     // Register a coroutine to resume on cancellation
-    [[nodiscard]] registration on_cancel_resume(std::coroutine_handle<> h) const;
+    // Deprecated: Unsafe with handles suspended on io_awaitables.
+    // Pass a cancel_token to the awaitable instead.
+    [[deprecated]] [[nodiscard]] registration on_cancel_resume(std::coroutine_handle<> h) const;
 };
 
 /// Source for creating cancel tokens and triggering cancellation
@@ -466,8 +468,8 @@ public:
 runtime::scheduler sched(4);
 sched.start();
 
-// Spawn tasks directly
-sched.spawn(my_coroutine());  // Accepts task directly
+// Spawn tasks directly (pass callable, not invoked task)
+sched.go(my_coroutine);
 
 sched.shutdown();
 ```
@@ -542,6 +544,8 @@ Configuration for running async tasks.
 ```cpp
 struct run_config {
     size_t num_threads = 0;           // 0 = hardware concurrency
+    size_t blocking_threads = 4;      // Blocking thread pool size
+    std::chrono::milliseconds shutdown_timeout = std::chrono::milliseconds::max();
 };
 ```
 
@@ -550,13 +554,17 @@ struct run_config {
 Run a coroutine to completion.
 
 ```cpp
-// Run task with configuration
-template<typename T>
-T run(coro::task<T> task, const run_config& config = {});
+// Run callable returning task with configuration
+template<typename F>
+auto run(F&& f, const run_config& config = {}) -> task_value_t<invoke_result_t<F>>;
 
-// Run task with specified thread count
-template<typename T>
-T run(coro::task<T> task, size_t num_threads);
+// Run callable with arguments and config first
+template<typename F, typename... Args>
+auto run(const run_config& config, F&& f, Args&&... args) -> task_value_t<invoke_result_t<F, Args...>>;
+
+// Run callable with arguments (no config)
+template<typename F, typename Arg0, typename... Args>
+auto run(F&& f, Arg0&& arg0, Args&&... args) -> task_value_t<invoke_result_t<F, Arg0, Args...>>;
 ```
 
 **Example:**
@@ -566,27 +574,27 @@ coro::task<int> async_main(int argc, char* argv[]) {
 }
 
 int main(int argc, char* argv[]) {
-    return elio::run(async_main(argc, argv));
+    return elio::run(async_main, argc, argv);
 }
 
 // With configuration
 int main(int argc, char* argv[]) {
     elio::run_config config;
     config.num_threads = 4;
-    return elio::run(async_main(argc, argv), config);
+    return elio::run(config, async_main, argc, argv);
 }
 ```
 
-### `ELIO_ASYNC_MAIN` Macros
+### `ELIO_ASYNC_MAIN` Macro
 
-Macros to define main() that runs an async_main coroutine.
+A single `ELIO_ASYNC_MAIN(func)` macro handles all four signature combinations via compile-time dispatch:
 
-| Macro | async_main signature | Description |
-|-------|---------------------|-------------|
-| `ELIO_ASYNC_MAIN` | `task<int>(int, char**)` | With args, returns exit code |
-| `ELIO_ASYNC_MAIN_VOID` | `task<void>(int, char**)` | With args, always exits 0 |
-| `ELIO_ASYNC_MAIN_NOARGS` | `task<int>()` | No args, returns exit code |
-| `ELIO_ASYNC_MAIN_VOID_NOARGS` | `task<void>()` | No args, always exits 0 |
+| Supported signature | Description |
+|---------------------|-------------|
+| `task<int>(int, char**)` | With args, returns exit code |
+| `task<void>(int, char**)` | With args, always exits 0 |
+| `task<int>()` | No args, returns exit code |
+| `task<void>()` | No args, always exits 0 |
 
 **Example:**
 ```cpp
@@ -612,13 +620,14 @@ Run a server until a shutdown signal is received.
 
 ```cpp
 // Serve a single server with graceful shutdown
-template<typename Server, typename ListenTask>
-coro::task<void> serve(Server& server, ListenTask listen_task,
+template<typename Server, typename ListenFunc>
+    requires std::invocable<ListenFunc>
+coro::task<void> serve(Server& server, ListenFunc listen_func,
                        std::initializer_list<int> signals = {SIGINT, SIGTERM});
 ```
 
 The function:
-1. Spawns the listen task in the background
+1. Spawns the listen function in the background
 2. Waits for a shutdown signal (SIGINT or SIGTERM by default)
 3. Calls `server.stop()` when signal is received
 4. Waits for the listen task to complete
@@ -632,7 +641,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
     http::server srv(r);
 
     // serve() handles everything: listen, wait for Ctrl+C, stop cleanly
-    co_await elio::serve(srv, srv.listen(addr));
+    co_await elio::serve(srv, [&]() { return srv.listen(addr); });
 
     co_return 0;
 }
@@ -645,9 +654,9 @@ ELIO_ASYNC_MAIN(async_main)
 Run multiple servers until shutdown.
 
 ```cpp
-template<typename... Servers, typename... ListenTasks>
+template<typename... Servers, typename... ListenFuncs>
 coro::task<void> serve_all(std::tuple<Servers&...> servers,
-                           std::tuple<ListenTasks...> listen_tasks,
+                           std::tuple<ListenFuncs...> listen_funcs,
                            std::initializer_list<int> signals = {SIGINT, SIGTERM});
 ```
 
@@ -660,8 +669,8 @@ coro::task<void> run_servers() {
     co_await elio::serve_all(
         std::tie(http_srv, ws_srv),
         std::make_tuple(
-            http_srv.listen(http_addr),
-            ws_srv.listen(ws_addr)
+            [&]() { return http_srv.listen(http_addr); },
+            [&]() { return ws_srv.listen(ws_addr); }
         )
     );
 }
@@ -1071,8 +1080,7 @@ int main() {
     runtime::scheduler sched(4);
     sched.start();
     
-    auto sig_handler = signal_handler_task();
-    sched.spawn(sig_handler.release());
+    sched.go(signal_handler_task);
     
     // ... spawn other tasks ...
     
@@ -1093,17 +1101,13 @@ int main() {
 IPv4 address with port.
 
 ```cpp
-class ipv4_address {
-public:
-    // Bind to all interfaces on port
-    explicit ipv4_address(uint16_t port);
+struct ipv4_address {
+    uint32_t addr = INADDR_ANY;
+    uint16_t port = 0;
     
-    // Specific IP and port (IP can be hostname)
-    ipv4_address(const std::string& ip, uint16_t port);
-    
-    // Get components
-    uint32_t ip() const noexcept;
-    uint16_t port() const noexcept;
+    ipv4_address() = default;
+    explicit ipv4_address(uint16_t p);
+    ipv4_address(std::string_view ip, uint16_t p);
     
     // String representation
     std::string to_string() const;
@@ -1130,7 +1134,7 @@ public:
     int fd() const noexcept;
     
     // Get local address
-    std::optional<ipv4_address> local_address() const;
+    const socket_address& local_address() const noexcept;
 };
 ```
 
@@ -1163,9 +1167,6 @@ public:
     
     // Get peer address
     std::optional<ipv4_address> peer_address() const;
-    
-    // Get local address
-    std::optional<ipv4_address> local_address() const;
 };
 
 // Connect to address (awaitable, returns std::optional<tcp_stream>)
@@ -1208,11 +1209,13 @@ public:
 ### `client_config`
 
 ```cpp
-struct client_config {
-    std::string user_agent = "elio-http-client/1.0";
+struct client_config : base_client_config {
+    size_t max_redirects = 5;
     bool follow_redirects = true;
-    int max_redirects = 10;
-    std::chrono::seconds timeout{30};
+    size_t max_connections_per_host = 6;
+    std::chrono::seconds pool_idle_timeout{60};
+    size_t max_response_size = 16 * 1024 * 1024;
+    // Inherited: connect_timeout{10}, read_timeout{30}, user_agent
 };
 ```
 
@@ -1223,16 +1226,16 @@ HTTP request message.
 ```cpp
 class request {
 public:
-    request(method m, const std::string& path);
+    request(method m, std::string_view path);
     
     void set_host(const std::string& host);
     void set_header(const std::string& name, const std::string& value);
     void set_body(const std::string& body);
     
-    method method() const;
+    method get_method() const noexcept;
     const std::string& path() const;
-    std::string header(const std::string& name) const;
-    const std::string& body() const;
+    std::string_view header(std::string_view name) const;
+    std::string_view body() const noexcept;
 };
 ```
 
@@ -1246,9 +1249,9 @@ public:
     int status_code() const;
     status get_status() const;
     
-    std::string header(const std::string& name) const;
+    std::string_view header(std::string_view name) const;
     std::string content_type() const;
-    const std::string& body() const;
+    std::string_view body() const noexcept;
     
     void set_status(status s);
     void set_header(const std::string& name, const std::string& value);
@@ -1260,7 +1263,7 @@ public:
 
 ```cpp
 enum class method {
-    GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS
+    GET, HEAD, POST, PUT, DELETE_, CONNECT, OPTIONS, TRACE, PATCH
 };
 
 enum class status {
@@ -1387,21 +1390,21 @@ TLS configuration context.
 ```cpp
 class tls_context {
 public:
-    explicit tls_context(tls_method method);
+    explicit tls_context(tls_mode mode, tls_version version = tls_version::tls_1_2_or_higher);
     
     // Load certificate and key
-    bool use_certificate_file(const std::string& path);
-    bool use_private_key_file(const std::string& path);
+    bool load_certificate(std::string_view path);
+    bool load_private_key(std::string_view path);
     
     // Certificate verification
     bool use_default_verify_paths();
-    void set_verify_mode(bool verify);
+    void set_verify_mode(verify_mode mode);
     
     // ALPN protocol negotiation
-    void set_alpn_protocols(const std::vector<std::string>& protocols);
+    bool set_alpn_protocols(std::string_view protocols);
 };
 
-enum class tls_method {
+enum class tls_mode {
     client,
     server
 };
@@ -1574,9 +1577,8 @@ class condition_variable {
 public:
     condition_variable();
 
-    // Wait with elio::sync::mutex (requires double co_await)
-    // Returns a lock awaitable that re-acquires the mutex
-    /* awaitable<lock_awaitable> */ wait(mutex& m);
+    /// Wait with elio::sync::mutex (single co_await)
+    coro::task<void> wait(mutex& m);
 
     // Wait with a generic lockable (e.g., spinlock)
     // Re-acquires the lock synchronously before resuming
@@ -1597,7 +1599,7 @@ public:
 };
 ```
 
-**Usage with mutex (double co_await):**
+**Usage with mutex (single co_await):**
 ```cpp
 sync::mutex mtx;
 sync::condition_variable cv;
@@ -1606,7 +1608,7 @@ bool ready = false;
 coro::task<void> waiter() {
     co_await mtx.lock();
     while (!ready) {
-        co_await co_await cv.wait(mtx);  // double co_await required
+        co_await cv.wait(mtx);  // single co_await
     }
     mtx.unlock();
 }
@@ -1632,6 +1634,60 @@ coro::task<void> waiter() {
     }
     sl.unlock();
 }
+```
+
+### `event`
+
+One-shot signaling primitive. One or more coroutines wait for the event to be set.
+
+```cpp
+class event {
+public:
+    event();
+
+    // Wait for the event to be set (awaitable)
+    /* awaitable */ wait();
+
+    // Set the event (wakes all waiters)
+    void set();
+
+    // Check if the event is set
+    bool is_set() const noexcept;
+
+    // Reset the event
+    void reset();
+};
+```
+
+### `channel<T>`
+
+Multi-producer multi-consumer channel for passing values between coroutines. Supports rendezvous (synchronous), bounded, and unbounded modes.
+
+```cpp
+template<typename T>
+class channel {
+public:
+    // Create a rendezvous channel (default, capacity 0)
+    channel();
+
+    // Create a bounded channel with specified capacity
+    explicit channel(size_t capacity);
+
+    // Create an unbounded channel
+    static channel unbounded();
+
+    // Send a value (awaitable, blocks if full for bounded channels)
+    /* awaitable */ send(T value);
+
+    // Receive a value (awaitable, blocks if empty)
+    /* awaitable<std::optional<T>> */ recv();
+
+    // Close the channel
+    void close();
+
+    // Check if closed
+    bool is_closed() const noexcept;
+};
 ```
 
 ### `semaphore`

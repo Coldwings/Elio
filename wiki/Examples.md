@@ -410,7 +410,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
     r.post("/api/echo", echo_handler);
 
     server srv(r);
-    co_await elio::serve(srv, srv.listen(net::ipv4_address(8080)));
+    co_await elio::serve(srv, [&]() { return srv.listen(net::ipv4_address(8080)); });
 
     co_return 0;
 }
@@ -580,9 +580,10 @@ int g_counter = 0;
 
 coro::task<void> increment(int id) {
     for (int i = 0; i < 100; ++i) {
-        auto lock = co_await g_mutex.lock();
+        co_await g_mutex.lock();
         ++g_counter;
         ELIO_LOG_DEBUG("Task {} incremented to {}", id, g_counter);
+        g_mutex.unlock();
     }
 }
 
@@ -661,6 +662,7 @@ Using CRC32 and SHA-256 hash functions:
 ```cpp
 #include <elio/hash/sha256.hpp>
 #include <elio/hash/crc32.hpp>
+#include <elio/hash/hash.hpp>
 
 using namespace elio::hash;
 
@@ -844,7 +846,7 @@ int main() {
     // Submit workload...
     std::atomic<int> completed{0};
     for (int i = 0; i < 1000; ++i) {
-        sched.spawn(workload_task(completed).release());
+        sched.go(workload_task, std::ref(completed));
     }
 
     // Monitor autoscaler behavior

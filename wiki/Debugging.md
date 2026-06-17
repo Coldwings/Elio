@@ -25,7 +25,7 @@ The thread-local `current_frame_` tracks which frame is currently executing. Whe
 
 ### Frame Validation
 
-Each `promise_base` contains a `frame_magic_` field set to `0x454C494F46524D45` (the ASCII string "ELIOFRMR"). The debugger tools check this magic value when traversing memory to distinguish valid Elio coroutine frames from arbitrary data. This is especially important during coredump analysis, where the debugger walks raw memory without type information.
+Each `promise_base` contains a `frame_magic_` field set to `0x454C494F46524D45` (the ASCII string "ELIOFRME"). The debugger tools check this magic value when traversing memory to distinguish valid Elio coroutine frames from arbitrary data. This is especially important during coredump analysis, where the debugger walks raw memory without type information.
 
 ### Debug Metadata
 
@@ -33,10 +33,10 @@ Every frame carries the following debug metadata with no additional allocation:
 
 | Field | Description |
 |-------|-------------|
-| `id_` | Unique monotonic identifier assigned at creation |
-| `state_` | Current state: created, running, suspended, completed, or failed |
-| `worker_id_` | Index of the worker thread the frame is assigned to (or -1 if unassigned) |
-| `file_`, `function_`, `line_` | Source location captured via `std::source_location` or manual `set_location()` |
+| `debug_id_` | Unique monotonic identifier assigned at creation |
+| `debug_state_` | Current state: created, running, suspended, completed, or failed |
+| `debug_worker_id_` | Index of the worker thread the frame is assigned to (or 0xFFFFFFFF if unassigned) |
+| `debug_location_` | Source location struct (type `debug_location`) with members `file`, `function`, `line`, set via manual `set_location()` |
 | `parent_` | Pointer to the calling frame's promise, forming the virtual stack chain |
 | `frame_magic_` | Magic number for frame integrity validation |
 

@@ -14,7 +14,7 @@
 - **Work-Stealing Scheduler** with lock-free Chase-Lev deques
 - **Dynamic Thread Pool** with runtime adjustment
 - **Autoscaler** for automatic worker thread scaling under load
-- **Synchronization Primitives**: mutex, semaphore, event, channel
+- **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel, spinlock, condition_variable
 - **Timers**: sleep_for, sleep_until, yield
 - **I/O Backends**: io_uring (preferred) and epoll fallback
 - **Batch I/O**: Submit multiple file operations in a single syscall
@@ -122,8 +122,8 @@ int main() {
     runtime::scheduler sched(4);
     sched.start();
     
-    // Spawn the main task (simplified API)
-    sched.spawn(main_task());
+    // Spawn the main task (pass callable, not invoked task)
+    sched.go(main_task);
     
     // Wait for completion
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -155,9 +155,12 @@ elio::
 │
 ├── sync::                   // Synchronization primitives
 │   ├── mutex                // Async mutex
+│   ├── shared_mutex         // Reader-writer mutex
 │   ├── semaphore            // Counting semaphore
 │   ├── event                // One-shot event
-│   └── channel<T>           // MPSC channel
+│   ├── channel<T>           // MPMC channel
+│   ├── spinlock             // Busy-wait lock
+│   └── condition_variable   // Async condition variable
 │
 ├── time::                   // Timer utilities
 │   ├── sleep_for            // Duration-based sleep
@@ -244,7 +247,6 @@ Explore the `examples/` directory for detailed examples:
 - **sse_server.cpp** - Server-Sent Events server
 - **sse_client.cpp** - SSE client example
 - **async_file_io.cpp** - Async file operations
-- **batch_file_io.cpp** - Batch read/write at multiple offsets
 - **debug_test.cpp** - Debugging tools demonstration
 - **benchmark.cpp** - Full performance measurements
 - **quick_benchmark.cpp** - Fast spawn/switch/yield benchmarks
@@ -313,8 +315,9 @@ elio::coro::task<int> compute() {
 elio::runtime::scheduler sched(num_threads);
 sched.start();
 
-// Spawn coroutines (accepts task<T> directly)
-sched.spawn(my_coroutine());
+// Spawn coroutines (pass callable, not invoked task)
+sched.go(my_coroutine);  // fire-and-forget
+// Or for joinable: auto handle = sched.go_joinable(my_coroutine);
 
 // Dynamic thread adjustment
 sched.set_thread_count(8);

@@ -57,8 +57,7 @@ int main() {
     runtime::scheduler sched(4);
     sched.start();
     
-    auto task = srv.listen(net::ipv4_address(8080));
-    sched.spawn(task.release());
+    sched.go([&srv]() -> coro::task<void> { co_await srv.listen(net::ipv4_address(8080)); });
     
     // Run until stopped...
     sched.shutdown();
@@ -139,11 +138,10 @@ For secure connections, use `wss://` URLs and configure TLS:
 ```cpp
 // Server with TLS
 auto tls_ctx = tls::tls_context::make_server("cert.pem", "key.pem");
-auto task = srv.listen_tls(net::ipv4_address(8443), 
-                          io::default_io_context(), sched, tls_ctx);
+auto task = srv.listen_tls(net::ipv4_address(8443), tls_ctx);
 
 // Client with TLS
-ws_client client(ctx);
+ws_client client;
 client.tls_context().use_default_verify_paths();
 co_await client.connect("wss://example.com/ws");
 ```
@@ -205,7 +203,7 @@ coro::task<void> listen_events() {
     config.auto_reconnect = true;
     config.default_retry_ms = 3000;
     
-    sse_client client(ctx, config);
+    sse_client client(config);
     
     // Connect
     if (!co_await client.connect("http://localhost:8080/events")) {

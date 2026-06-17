@@ -199,9 +199,9 @@ std::string hex2 = elio::hash::to_hex(data, length);
 
 ## Implementation Notes
 
-**CRC32** uses hardware acceleration when available. On x86/x86-64, this means the PCLMULQDQ instruction and SSE4.2 CRC32 instruction; on ARM64, it uses the ACLE CRC intrinsics. When hardware support is not detected at runtime, the implementation falls back to a slicing-by-8 lookup table approach. In addition to the standard IEEE polynomial, the library also provides CRC32C (Castagnoli polynomial) via the `crc32c()` function. Hardware availability for CRC32C can be checked with `crc32c_hw_available()`.
+**CRC32** uses hardware acceleration when available. On x86/x86-64, this means the SSE4.2 CRC32 instruction; on ARM64, it uses the ACLE CRC intrinsics. When hardware support is not detected at runtime, the implementation falls back to a slicing-by-8 lookup table approach. In addition to the standard IEEE polynomial, the library also provides CRC32C (Castagnoli polynomial) via the `crc32c()` function. Hardware availability for CRC32C can be checked with `crc32c_hw_available()`.
 
-**SHA-1 and SHA-256** are pure C++ implementations with no external dependencies. They do not rely on OpenSSL or any other cryptographic library. SHA-1 is included primarily for WebSocket handshakes (RFC 6455 requires it), while SHA-256 is suitable for data integrity verification and content addressing.
+**SHA-1 and SHA-256** include optional hardware acceleration via SHA-NI (x86) and ARM Crypto Extensions (ARM64), selected at runtime. They do not rely on OpenSSL or any other cryptographic library. SHA-1 is included primarily for WebSocket handshakes (RFC 6455 requires it), while SHA-256 is suitable for data integrity verification and content addressing.
 
 ## Performance Considerations
 

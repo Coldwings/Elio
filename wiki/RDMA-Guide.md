@@ -38,6 +38,7 @@ concept works:
 struct my_backend {
     static int post_send(void* qp, std::span<const elio::rdma::sge> sges,
                          elio::rdma::send_flags flags,
+                         std::uint32_t imm_data,
                          elio::rdma::wr_id id) noexcept {
         // ... call ibv_post_send on (ibv_qp*)qp ...
     }
@@ -46,6 +47,7 @@ struct my_backend {
     static int post_rdma_write(void* qp, std::span<const elio::rdma::sge> sges,
                                elio::rdma::remote_buffer rb,
                                elio::rdma::send_flags flags,
+                               std::uint32_t imm_data,
                                elio::rdma::wr_id id) noexcept { /* ... */ }
     static int post_rdma_read(void* qp, std::span<const elio::rdma::sge> sges,
                               elio::rdma::remote_buffer rb,
@@ -68,9 +70,13 @@ switching at runtime or to mix multiple backends in one process:
 ```cpp
 struct my_poly_backend : elio::rdma::polymorphic_backend {
     int post_send(void* qp, std::span<const elio::rdma::sge>,
-                  elio::rdma::send_flags, elio::rdma::wr_id) noexcept override;
+                  elio::rdma::send_flags, std::uint32_t,
+                  elio::rdma::wr_id) noexcept override;
     int post_recv(...) override;
-    int post_rdma_write(...) override;
+    int post_rdma_write(void* qp, std::span<const elio::rdma::sge>,
+                        elio::rdma::remote_buffer,
+                        elio::rdma::send_flags, std::uint32_t,
+                        elio::rdma::wr_id) noexcept override;
     int post_rdma_read(...) override;
     // Optional: override post_srq_recv, register_mr, dereg_mr,
     // lkey_of, rkey_of. Defaults return -ENOTSUP / nullptr / 0.

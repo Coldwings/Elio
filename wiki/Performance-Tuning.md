@@ -47,25 +47,24 @@ Scaling efficiency depends on workload characteristics. Tasks with more computat
 
 ### Wake-up Mechanism
 
-Elio uses an **eventfd embedded in each worker's I/O backend** (epoll/io_uring) for cross-thread notifications. This provides a single unified wait point — both I/O completions and task wake-ups unblock the same `poll()` call, eliminating the latency gap that exists with separate wait mechanisms. Combined with **Lazy Wake optimization**, which avoids unnecessary syscalls when workers are busy, this minimizes scheduling overhead.
+Elio uses an **eventfd embedded in each worker's I/O backend** (epoll/io_uring) for cross-thread notifications. This provides a single unified wait point — both I/O completions and task wake-ups unblock the same `poll()` call, eliminating the latency gap that exists with separate wait mechanisms. The eventfd counter deduplicates wakes, making unconditional wake safe and minimizing scheduling overhead.
 
 ## Built-in Optimizations
 
-### Lazy Wake
+### Unconditional Wake
 
-Workers track their idle state. Task submissions only trigger wake syscalls when the target worker is actually sleeping:
+Workers track their idle state. Task submissions always trigger wake syscalls on cross-thread submit; the eventfd counter deduplicates, making unconditional wake safe:
 
 ```cpp
 // In worker_thread::schedule()
-if (inbox_.push(handle.address())) {
-    // Only wake if worker is idle (sleeping)
-    if (idle_.load(std::memory_order_relaxed)) {
-        wake();  // eventfd write → interrupts I/O poll
-    }
+if (inbox_->push(handle.address())) {
+    // Always wake on cross-thread submit. The eventfd dedupes via its
+    // counter — calling wake() on a busy worker just bumps the counter.
+    wake();
 }
 ```
 
-This eliminates unnecessary syscalls when workers are busy processing tasks.
+The previous lazy wake optimization was removed due to a race condition that caused 10ms tail latency on weak hardware.
 
 ### Unified Wake Mechanism
 
@@ -75,9 +74,9 @@ This unified design has two key benefits:
 
 1. **Single wait point.** A worker blocked on I/O poll is immediately woken by a cross-thread task submission. There is no separate condition variable or futex that could introduce a latency gap between "I/O ready" and "task ready" paths.
 
-2. **No redundant syscalls.** Combined with Lazy Wake, an eventfd write is only issued when the target worker is actually idle. If the worker is busy executing tasks or processing I/O completions, the submitter skips the write entirely. The submitted task is picked up when the worker next drains its inbox.
+2. **Safe unconditional wake.** The eventfd counter deduplicates wakes — calling `wake()` on a busy worker just bumps the counter, which is consumed on the next poll return. This eliminates the race condition that existed with the previous lazy wake optimization.
 
-The result is that cross-thread scheduling latency equals one `eventfd_write` plus one `epoll_wait`/`io_uring_enter` return — typically under 5 microseconds — while avoiding any syscall overhead when the worker is already active.
+The result is that cross-thread scheduling latency equals one `eventfd_write` plus one `epoll_wait`/`io_uring_enter` return — typically under 5 microseconds.
 
 ### Wait Strategy
 
@@ -146,11 +145,12 @@ Debug IDs for coroutines are only allocated when actually accessed, reducing cre
 
 ```cpp
 // debug_id_ initialized to 0, allocated on first id() call
-uint64_t id() const noexcept {
-    if (debug_id_.load(std::memory_order_relaxed) == 0) {
-        debug_id_.store(id_allocator::allocate(), std::memory_order_relaxed);
+// Only available when ELIO_ENABLE_DEBUG_METADATA is enabled
+uint64_t id() noexcept {
+    if (debug_id_ == 0) {
+        debug_id_ = id_allocator::allocate();
     }
-    return debug_id_.load(std::memory_order_relaxed);
+    return debug_id_;
 }
 ```
 
@@ -307,19 +307,13 @@ For best io_uring performance:
 
 ## Memory Management
 
-### Coroutine Frame Allocator
+### Coroutine Frame Allocation
 
-Elio uses a thread-local pool allocator for coroutine frames:
+By default, coroutine frames are allocated using `::operator new/delete`. When the optional `vthread_stack` allocator is enabled (gated by `ELIO_ENABLE_VTHREAD_STACK`), each vthread maintains a segmented bump-pointer stack allocator for coroutine frames. Under sanitizers, all allocations automatically fall back to `::operator new/delete`.
 
 ```cpp
-// Configured in frame_allocator.hpp
-static constexpr size_t MAX_FRAME_SIZE = 256;  // Max pooled size
-static constexpr size_t POOL_SIZE = 1024;       // Pool capacity
-
-// Statistics (if enabled)
-auto stats = coro::frame_allocator::get_stats();
-std::cout << "Allocations: " << stats.allocations << std::endl;
-std::cout << "Pool hits: " << stats.pool_hits << std::endl;
+// Enable vthread_stack allocator (optional)
+// cmake -DELIО_ENABLE_VTHREAD_STACK=ON ..
 ```
 
 ### Avoiding Allocations
@@ -417,10 +411,10 @@ HTTP client uses connection pooling by default:
 
 ```cpp
 http::client_config config;
-config.max_connections_per_host = 10;  // Pool size per host
+config.max_connections_per_host = 10;
 config.pool_idle_timeout = std::chrono::seconds(60);
 
-http::client client(ctx, config);
+http::client client(config);  // No io_context parameter
 ```
 
 ### Buffer Sizes
@@ -442,11 +436,12 @@ Configure TCP options for performance:
 ```cpp
 // Enable TCP_NODELAY for latency-sensitive applications
 net::tcp_stream stream = /* ... */;
-stream.set_nodelay(true);
+stream.set_no_delay(true);  // Note: underscore in method name
 
-// Adjust send/receive buffers
-stream.set_send_buffer_size(65536);
-stream.set_recv_buffer_size(65536);
+// Buffer sizes are set via tcp_options at connection time, not on the stream
+net::tcp_options opts;
+opts.recv_buffer = 65536;
+opts.send_buffer = 65536;
 ```
 
 ## Profiling and Monitoring
@@ -471,10 +466,10 @@ Debug logging has overhead; disable in production:
 
 ```cpp
 // Set at compile time
-// cmake -DELIO_DEBUG=OFF ..
+// cmake -DELIО_ENABLE_DEBUG_METADATA=OFF ..
 
 // Or at runtime
-elio::log::set_level(elio::log::level::warning);
+elio::log::logger::instance().set_level(elio::log::level::warning);
 ```
 
 ### Coroutine Stack Tracing
@@ -483,9 +478,12 @@ Use virtual stack for debugging without significant overhead:
 
 ```cpp
 // Enable in debug builds only
-#ifdef ELIO_DEBUG
-    auto* frame = coro::current_frame();
-    print_stack_trace(frame);
+#ifdef ELIO_ENABLE_DEBUG_METADATA
+    auto* frame = coro::promise_base::current_frame();
+    auto stack = coro::dump_virtual_stack();
+    for (const auto& entry : stack) {
+        fmt::print("{}\n", entry);
+    }
 #endif
 ```
 
@@ -498,7 +496,7 @@ Use virtual stack for debugging without significant overhead:
 for (int i = 0; i < 1000; i++) {
     elio::go(warmup_task);
 }
-sched.sync();
+sched.wait_for_idle();
 
 // Now measure
 auto start = std::chrono::steady_clock::now();
@@ -578,23 +576,22 @@ cmake --build .
 Elio includes several benchmark tools:
 
 ```bash
-cd build
-cmake --build .
+cmake --build build
 
 # Quick benchmark - measures spawn, context switch, yield
-./quick_benchmark
+./build/examples/quick_benchmark
 
 # Microbenchmarks - individual operation timing
-./microbench
+./build/examples/microbench
 
 # I/O benchmark - file read throughput
-./io_benchmark
+./build/examples/io_benchmark
 
 # Full benchmark suite
-./benchmark
+./build/examples/benchmark
 
 # Scalability test - multi-thread scaling
-./scalability_test
+./build/examples/scalability_test
 ```
 
 ### Interpreting Results

@@ -265,7 +265,13 @@ public:
     }
 
     void await_resume() {
-        state_->get_value();
+        // Keep join_state alive during get_value() execution.
+        // get_value() may rethrow an exception, and the catch block needs
+        // to access the exception object. If join_handle is destroyed before
+        // the catch block completes, join_state would be destroyed, potentially
+        // causing the exception object to be freed while still being accessed.
+        auto state = state_;
+        state->get_value();
     }
 
     [[nodiscard]] bool is_ready() const noexcept {

@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-06-18
+
+Focus: **correctness infrastructure and internal quality**. TSAN coverage
+restoration, exception observability, real I/O cancellation, modularization of
+the sync subsystem, and comprehensive bug fixes (74 bugs across all subsystems).
 
 ### Breaking Changes
 
@@ -13,15 +17,189 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `channel<T>(0)` now create a synchronous rendezvous channel (Go-style
   hand-off: `send` suspends until a matching `recv` is ready). Use
   `channel<T>::unbounded()` to create an unbounded channel with no
-  back-pressure. The previous `channel(0) = unbounded` semantics was
-  inconsistent with Go/Rust/Kotlin conventions and has been replaced.
+  back-pressure. (#141)
+- **Deprecated async main macros removed**: `ELIO_ASYNC_MAIN_VOID`,
+  `ELIO_ASYNC_MAIN_NOARGS`, and `ELIO_ASYNC_MAIN_VOID_NOARGS` have been
+  deleted. Use the unified `ELIO_ASYNC_MAIN(func)` macro which auto-detects
+  all four signatures (args/no-args x int/void). (#143)
+
+### Added
+
+- **`sync/primitives.hpp` modularization**: Split into individual headers
+  (`sync/mutex.hpp`, `sync/shared_mutex.hpp`, `sync/semaphore.hpp`,
+  `sync/event.hpp`, `sync/channel.hpp`, `sync/condition_variable.hpp`,
+  `sync/spinlock.hpp`). The umbrella `primitives.hpp` is retained for
+  backward compatibility. (#140)
+- **Per-scheduler exception handler**: `scheduler::set_unhandled_exception_handler()`
+  allows routing unhandled exceptions from detached tasks (`go()`) and
+  `when_any` losers through a custom callback. When no handler is set,
+  exceptions are logged at ERROR level. (#136, #139)
+- **I/O awaitable `cancel_token` support**: `recv()`, `send()`, and
+  `connect()` now accept an optional `cancel_token` parameter. Cancellation
+  issues `IORING_OP_ASYNC_CANCEL` on io_uring backend. (#135)
+- **Channel benchmark harness**: `examples/bench_channel.cpp` provides
+  performance baselines for SPSC/MPMC throughput, contention scalability,
+  and bounded vs unbounded vs rendezvous comparisons. (#144)
+
+### Changed
+
+- **TSAN multi-threaded coverage restored**: 10 sync primitive tests in
+  `test_sync.cpp` now run with multi-threaded schedulers instead of
+  single-threaded. Coroutine frame reuse false positives resolved via
+  `__tsan_acquire`/`__tsan_release` annotations. (#137)
+- **`condition_variable::wait` design clarified**: Both `wait(mutex&)` and
+  `wait(Lock&)` overloads intentionally use different patterns. Documented
+  as intentional design choice with rationale. (#138)
 
 ### Fixed
 
-- **`channel::close()` preserves pending send values**: Previously, `close()`
-  discarded values held by blocked senders in `send_waiters_`. Now these
-  values are drained into the queue so receivers can still read them after
-  close (Go semantics).
+#### Sync Primitives (10 bugs, #150, #161)
+
+- **channel rendezvous deadlock**: `send()` slow path did not suspend when
+  no receiver was waiting.
+- **channel bounded recv sender starvation**: When `try_push()` failed after
+  popping from ring, sender remained in `send_waiters_` without wakeup.
+- **channel bounded send closed race**: Fast path did not re-check `closed_`
+  under lock.
+- **channel close deadlock**: `items_available_.release()` called while
+  holding mutex.
+- **channel recv data loss**: `await_ready()` returning true skipped value
+  extraction.
+- **channel send slow path deadlock**: `unique_lock<std::mutex>` held
+  across `co_await`.
+- **LockfreeMPMCRing capacity=1 overflow**: Vyukov algorithm cannot handle
+  single slot. Fixed by enforcing minimum capacity of 2.
+- **condition_variable atomicity violation**: User mutex unlock occurred
+  after enqueue.
+- **mutex unlock dangling pointer**: Waiter address transfer could reference
+  freed coroutine frame.
+- **semaphore/shared_mutex count overflow**: Added overflow guards.
+- **channel sender wakeup data loss**: When receiver pops and tries to wake
+  a blocked sender, if `try_push` fails due to concurrent fill, the sender's
+  value was lost. Fixed by only popping sender when transfer succeeds.
+
+#### Coroutine Infrastructure (9 bugs, #149, #157, #162)
+
+- **join_handle exception propagation data race**: `await_resume()` could
+  destroy `join_state` while catch block accessed exception. Fixed by
+  holding `shared_ptr` copy during `get_value()`.
+- **cancel_token concurrent callback semantics**: Documented that callbacks
+  may execute concurrently.
+- **when_any winner selection race**: Removed unsafe fast path.
+- **task promise destructor safety net**: Added `~promise_type()` that calls
+  `mark_destroyed()`.
+- **with_timeout result access guards**: Added assertions.
+- **task return_value exception routing**: Wrapped in try-catch.
+- **generator exception handling**: Removed redundant call.
+- **promise_base frame chain clobbering**: Guarded restoration.
+- **join_handle<T>::await_resume() TSAN race**: Same fix as void variant.
+
+#### Runtime and Scheduler (9 bugs, #153, #155)
+
+- **Chase-Lev TOCTOU race**: `get_next_task()` read `num_threads()` with
+  relaxed ordering.
+- **Chase-Lev pop_local missing fence**: Unsafe fast path removed.
+- **autoscaler start/stop TOCTOU**: Non-atomic check-then-act replaced with
+  CAS.
+- **autoscaler config data race**: Protected with mutex.
+- **scheduler set_thread_count deadlock**: Added runtime guard.
+- **autoscaler success detection race**: Removed racy re-read.
+- **mpsc_queue documentation**: Corrected "wait-free" → "lock-free".
+- **work stealing test flakiness**: Increased task workload and added delay.
+- **worker_thread steal decision synchronization**: Added acquire ordering.
+
+#### I/O Subsystem (10 bugs, #154)
+
+- **batch_read_awaitable UAF**: Added orphan protocol with atomic phase CAS.
+- **batch I/O submit error handling**: Added rollback on failure.
+- **cancellable I/O early cancel success**: Set `result_ = {-ECANCELED, 0}`.
+- **epoll multi-pending-op consumption**: Only consume one op per event.
+- **epoll EEXIST state**: Set `registered = true` on EEXIST.
+- **epoll timer cancel key mismatch**: Added `cancel_key` field.
+- **io_uring poll error logging**: Log submit errors.
+- **epoll fd_state reset**: Reset after close.
+- **cancellable I/O post-registration cancel**: Re-check and submit cancel.
+- **timer submit_blocking rejection**: Destroy handle on rejection.
+
+#### Network and Signal Handling (13 bugs, #151)
+
+- **TCP/UDS accept_awaitable UAF**: Made inherit `io_awaitable_base`.
+- **signal_wait_awaitable UAF**: Inherit `io_awaitable_base`.
+- **signal masking incomplete**: Block at `worker_thread::run()` entry.
+- **TCP connect_awaitable fd leak**: Added destructor.
+- **UDS abstract socket address**: Added length-aware overload.
+- **signal update() unblock**: Unblock removed signals.
+- **UDS to_sockaddr truncation**: Throw on truncation.
+- **signal ctx_ move semantics**: Changed to pointer.
+- **hash HashDoS vulnerability**: Replaced with FNV-1a.
+- **signal destructor SQE draining**: Use `close_fd_for_destructor`.
+- **UDS unlink_on_bind warning**: Log on unexpected failures.
+- **TCP listener close race**: Added op_state support.
+- **UDS close/accept coordination**: Resolved by orphan protocol.
+
+#### HTTP and WebSocket (19 bugs, #152)
+
+- **HTTP server TLS capture**: Capture `shared_ptr<tls_context>`.
+- **HTTP server send_response error handling**: Return bool.
+- **HTTP server active connection tracking**: Added atomic counter.
+- **HTTP server keep-alive logic**: Fixed edge cases.
+- **HTTP server error handler safety**: Added null checks.
+- **HTTP client pool mutex-across-suspension**: Extract before suspension.
+- **HTTP client absolute response deadline**: Added enforcement.
+- **HTTP client HTTPS→HTTP redirect**: Reject downgrades.
+- **HTTP parser chunk CRLF validation**: Added for both parsers.
+- **HTTP parser URI control character rejection**: Reject control chars.
+- **HTTP common keep_alive parsing**: Token-based parsing.
+- **WebSocket continuation frame validation**: Reject without initial frame.
+- **WebSocket close code validation**: Reject reserved values.
+- **WebSocket UTF-8 validation**: Validate text payloads.
+- **WebSocket CSPRNG**: Use CSPRNG for mask keys.
+- **WebSocket handshake CSPRNG**: Use CSPRNG for Sec-WebSocket-Key.
+- **WebSocket server TLS capture**: Same as HTTP server.
+- **WebSocket close response codes**: Map no_status to normal.
+- **SSE server atomic state**: Changed to `std::atomic`.
+- **SSE client retry overflow**: Added protection.
+- **SSE client event dispatch**: Spec-compliant.
+- **SSE client persistent backoff**: Persistent across reconnections.
+
+#### RPC (5 bugs, #148)
+
+- **RPC protocol version field**: Added and validated.
+- **RPC client receive_loop leak**: Changed to `weak_ptr`.
+- **RPC client ping timeout**: Added cancellation support.
+- **RPC server cleanup callback leak**: Wrapped in try-catch.
+- **RPC server send_response return**: Check write_frame return.
+
+### Documentation
+
+- **Wiki and README synchronization**: Automated audit found and fixed 106
+  documentation mismatches across 17 files. (#156)
+
+### Performance
+
+- **Bounded channel lock-free fast path**: `channel::send()` and
+  `channel::recv()` now use `LockfreeMPMCRing` for bounded channels,
+  eliminating mutex contention on hot path. (#146)
+
+### Internal
+
+- **`shared_mutex::unlock` optimization**: Eliminated vector allocation in
+  writer path. (#145)
+- **TSAN cancel executor affinity**: Set affinity on cancel executors to
+  prevent cross-worker stealing. (#147)
+
+### Testing
+
+- **Multi-threaded TSAN coverage**: Restored for sync primitive tests. (#137)
+- **Work stealing test stabilization**: Fixed flakiness in Release builds. (#155)
+
+### Verification
+
+All quality gates passed:
+- ✅ 475 unit tests, 2771 assertions
+- ✅ ASAN clean
+- ✅ TSAN clean (including arm64-Debug)
+- ✅ CI: 5/5 checks pass (x64/arm64 x Debug/Release + package-consumer)
 
 ## [0.4.0] - 2026-06-10
 

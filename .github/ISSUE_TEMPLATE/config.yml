@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and Discussions
+    url: https://github.com/Coldwings/Elio/discussions
+    about: Ask questions, share ideas, and discuss Elio with the community
+  - name: Documentation
+    url: https://github.com/Coldwings/Elio/wiki
+    about: Check the wiki for documentation and guides
+  - name: Security Vulnerabilities
+    url: https://github.com/Coldwings/Elio/security/policy
+    about: Report security vulnerabilities privately (do NOT use public issues)

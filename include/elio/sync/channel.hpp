@@ -282,18 +282,13 @@ public:
                             // Only transfer if we can guarantee the push will succeed.
                             // We just popped, so there should be space. But another
                             // producer could fill it concurrently. If try_push fails,
-                            // wake the sender anyway so it can retry properly.
-                            if (ring_->try_push(send_value)) {
-                                sender = awaiter;
-                                send_waiters_.pop();
-                            } else {
-                                // Can't transfer — wake sender to retry through
-                                // normal send_awaitable path. Do NOT move from
-                                // send_value since try_push takes by value and
-                                // would leave it in a moved-from state.
+                            // do NOT wake the sender - it will be woken later when
+                            // there's actually space for its value.
+                            if (ring_->try_push(std::move(send_value))) {
                                 sender = awaiter;
                                 send_waiters_.pop();
                             }
+                            // If try_push fails, leave sender in queue - don't wake it
                         }
                     }
                     if (sender) {

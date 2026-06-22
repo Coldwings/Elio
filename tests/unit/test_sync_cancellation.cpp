@@ -77,9 +77,9 @@ TEST_CASE("condition_variable: destroying waiter does not crash on notify()", "[
     cv.notify_all();  // Must NOT crash
 }
 
-TEST_CASE("channel: destroying recv waiter does not crash on close()", "[sync][channel][cancellation]") {
-    // Use a rendezvous channel (capacity 0) so recv always suspends
-    channel<int> ch(0);
+TEST_CASE("channel: destroying recv waiter does not crash on send()", "[sync][channel][cancellation]") {
+    // Use a buffered channel (capacity 1) so send can complete without a receiver
+    channel<int> ch(1);
 
     auto waiter_task = [&]() -> task<std::optional<int>> {
         co_return co_await ch.recv();
@@ -90,7 +90,12 @@ TEST_CASE("channel: destroying recv waiter does not crash on close()", "[sync][c
     h.resume();  // Suspends on ch.recv()
 
     h.destroy();
-    ch.close();  // Must NOT crash
+
+    // send() must NOT crash — the destroyed recv waiter was unlinked from the queue
+    auto send_task = ch.send(42);
+    auto sh = elio::coro::detail::task_access::release(send_task);
+    sh.resume();  // Runs send to completion (fast path into ring buffer)
+    // Coroutine self-destructs in final_awaiter (detached), so no manual destroy needed
 }
 
 TEST_CASE("channel: destroying send waiter does not crash on close()", "[sync][channel][cancellation]") {
@@ -121,18 +126,30 @@ TEST_CASE("event: multiple waiters, destroy one, set wakes remaining", "[sync][e
         woken.fetch_add(1);
     };
 
-    // Spawn 3 waiters
-    auto j1 = sched.go_joinable(make_waiter);
-    auto j2 = sched.go_joinable(make_waiter);
-    auto j3 = sched.go_joinable(make_waiter);
+    // Create 3 waiter tasks and suspend them on the event
+    auto t1 = make_waiter();
+    auto t2 = make_waiter();
+    auto t3 = make_waiter();
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    auto h1 = elio::coro::detail::task_access::release(t1);
+    auto h2 = elio::coro::detail::task_access::release(t2);
+    auto h3 = elio::coro::detail::task_access::release(t3);
 
-    // Set should wake all 3
+    h1.resume();  // Suspends on e.wait()
+    h2.resume();  // Suspends on e.wait()
+    h3.resume();  // Suspends on e.wait()
+
+    // Destroy one waiter — must unlink from the event's waiter list
+    h2.destroy();
+
+    // Set should wake only the remaining 2
     e.set();
+
+    // Give the scheduler time to run the woken coroutines
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     sched.shutdown();
 
-    // All 3 should have been woken
-    REQUIRE(woken.load() == 3);
+    // Only 2 should have been woken (the destroyed one doesn't count)
+    REQUIRE(woken.load() == 2);
 }

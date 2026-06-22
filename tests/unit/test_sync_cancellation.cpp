@@ -145,9 +145,6 @@ TEST_CASE("event: multiple waiters, destroy one, set wakes remaining", "[sync][e
     // Set should wake only the remaining 2
     e.set();
 
-    // Give the scheduler time to run the woken coroutines
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
     sched.shutdown();
 
     // Only 2 should have been woken (the destroyed one doesn't count)

@@ -766,8 +766,14 @@ private:
         if (prev + 1 != st->total) {
             return;
         }
-        // Final segment.
-        if (orphaned) {
+        // Final segment: re-read phase with acquire to synchronize with
+        // destructor's acq_rel CAS. The destructor may have CAS'd phase
+        // to orphaned between our initial check (line 758) and the
+        // fetch_add above. Using the stale 'orphaned' variable would
+        // cause us to skip the delete and overwrite orphaned with
+        // completed, leading to memory leak and use-after-free.
+        uint8_t final_phase = st->phase.load(std::memory_order_acquire);
+        if (final_phase == batch_state::phase_orphaned) {
             // Awaitable already torn down — free the state ourselves.
             delete st;
             return;

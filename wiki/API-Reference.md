@@ -1440,6 +1440,12 @@ public:
 
 ## Synchronization (`elio::sync`)
 
+### Cancellation Safety
+
+All coroutine-aware synchronization primitives (`mutex`, `event`, `semaphore`, `condition_variable`, `channel`) are **cancellation-safe**. Waiting coroutines are tracked via an intrusive linked list embedded in the coroutine frame. If a waiter is destroyed (cancellation, timeout, forced termination) before being woken, it automatically unlinks itself from the primitive's waiter list — preventing use-after-free when the primitive later calls its wake function.
+
+No manual cleanup is required. Destroying a waiting coroutine is always safe.
+
 ### `mutex`
 
 Coroutine-aware mutex.

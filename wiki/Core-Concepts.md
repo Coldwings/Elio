@@ -478,6 +478,29 @@ coro::task<void> quick_update() {
 
 Use `spinlock_guard` for RAII-style locking:
 
+### Cancellation Safety
+
+All coroutine-aware synchronization primitives (`event`, `mutex`, `semaphore`, `condition_variable`, `channel`) are **cancellation-safe**: if a waiting coroutine is destroyed (due to cancellation, timeout, or forced termination) before it is woken, it is automatically unlinked from the primitive's internal waiter list. The primitive can then safely call its wake function (`set()`, `unlock()`, `release()`, `notify_one()`, `send()`, etc.) without risk of use-after-free.
+
+This is implemented via an intrusive linked list: each waiter node is embedded in the coroutine frame and registers itself with the primitive on suspension. If the coroutine is destroyed before being woken, the waiter's destructor acquires the primitive's mutex and removes itself from the list — ensuring the primitive never holds a dangling handle.
+
+```cpp
+sync::event evt;
+
+// This is safe even if the waiter is cancelled/destroyed:
+coro::task<void> waiter_with_timeout() {
+    auto result = co_await time::with_timeout(evt.wait(), 5s);
+    if (result == cancel_result::cancelled) {
+        co_return;  // Waiter destroyed — event::set() remains safe
+    }
+}
+```
+
+**Key guarantees:**
+- Destroying a waiting coroutine does not invalidate the primitive's waiter list
+- Calling `set()`/`unlock()`/`release()`/`notify_one()`/`notify_all()` after a waiter is destroyed is safe — the destroyed waiter is simply skipped
+- No manual cleanup is required — unlinking happens automatically in the waiter's destructor
+
 ```cpp
 sync::spinlock sl;
 

@@ -2,14 +2,23 @@
 
 #include <coroutine>
 #include <atomic>
+#include <mutex>
+#include <cassert>
+#include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
 
 namespace elio::sync {
 
 class mutex {
 public:
+    // Forward declaration for intrusive_list
+    class lock_awaitable;
+
     mutex() = default;
-    ~mutex() = default;
+
+    ~mutex() {
+        assert(waiters_.empty() && "mutex destroyed with pending waiters");
+    }
 
     // Non-copyable, non-movable
     mutex(const mutex&) = delete;
@@ -17,17 +26,25 @@ public:
     mutex(mutex&&) = delete;
     mutex& operator=(mutex&&) = delete;
 
-    /// Lock awaitable - suspends the coroutine until the lock is acquired
-    class lock_awaitable {
+    /// Lock awaitable — inherits intrusive_list_node for safe unlinking
+    class lock_awaitable : public detail::intrusive_list_node<lock_awaitable> {
     public:
         explicit lock_awaitable(mutex& m) : mtx_(m) {}
+
+        ~lock_awaitable() {
+            // ALWAYS acquire internal_mutex_ to prevent race with unlock()
+            std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+            if (this->is_linked()) {
+                mtx_.waiters_.remove(this);
+            }
+        }
 
         bool await_ready() const noexcept {
             return mtx_.try_lock();
         }
 
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            // Try to acquire the lock
+            // Try to acquire the lock (fast path)
             void* expected = nullptr;
             if (mtx_.state_.compare_exchange_strong(
                     expected, awaiter.address(),
@@ -47,7 +64,8 @@ public:
             }
 
             // Add to wait queue
-            mtx_.waiters_.push(awaiter);
+            handle_ = awaiter;
+            mtx_.waiters_.push_back(this);
             return true; // Suspend
         }
 
@@ -55,9 +73,12 @@ public:
 
     private:
         mutex& mtx_;
+        std::coroutine_handle<> handle_;
+
+        friend class mutex;
     };
 
-    /// Unlock awaitable - releases the lock and wakes one waiter if any
+    /// Unlock awaitable — releases the lock and wakes one waiter if any
     class unlock_awaitable {
     public:
         explicit unlock_awaitable(mutex& m) : mtx_(m) {}
@@ -93,28 +114,18 @@ public:
 
     /// Unlock the mutex and wake one waiter if any
     void unlock() noexcept {
-        std::coroutine_handle<> waiter_to_wake = nullptr;
+        std::lock_guard<std::mutex> guard(internal_mutex_);
 
-        {
-            std::lock_guard<std::mutex> guard(internal_mutex_);
+        if (waiters_.empty()) {
+            // No waiters, just release
+            state_.store(nullptr, std::memory_order_release);
+        } else {
+            // Transfer lock to next waiter using sentinel marker
+            state_.store(reinterpret_cast<void*>(1), std::memory_order_release);
 
-            if (waiters_.empty()) {
-                // No waiters, just release
-                state_.store(nullptr, std::memory_order_release);
-            } else {
-                // Wake the next waiter — use a sentinel locked marker instead
-                // of the waiter's address to avoid dangling pointers if the
-                // woken coroutine is destroyed before resuming (e.g., during
-                // scheduler shutdown). The waiter knows it owns the lock by
-                // virtue of being woken from the queue.
-                waiter_to_wake = waiters_.front();
-                waiters_.pop();
-                state_.store(reinterpret_cast<void*>(1), std::memory_order_release);
-            }
-        }
-
-        if (waiter_to_wake) {
-            runtime::schedule_handle(waiter_to_wake);
+            // Schedule WHILE holding mutex to prevent frame destruction
+            auto* waiter = waiters_.pop_front();
+            runtime::schedule_handle(waiter->handle_);
         }
     }
 
@@ -126,7 +137,7 @@ public:
 private:
     std::atomic<void*> state_{nullptr};
     mutable std::mutex internal_mutex_;
-    std::queue<std::coroutine_handle<>> waiters_;
+    detail::intrusive_list<lock_awaitable> waiters_;
 };
 
 /// RAII lock guard for mutex (synchronous)

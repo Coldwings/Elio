@@ -73,7 +73,8 @@ public:
     }
 
     /// Reset the event
-    void reset() {
+    void reset() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
         signaled_.store(false, std::memory_order_release);
     }
 

@@ -179,7 +179,6 @@ public:
 
         // Bounded or rendezvous: try fast path, then suspend
         if (is_bounded() && ring_->size() < capacity_) {
-            std::coroutine_handle<> receiver_handle;
             bool pushed = false;
             {
                 std::lock_guard<std::mutex> guard(mutex_);
@@ -188,15 +187,12 @@ public:
                         pushed = true;
                         if (!recv_waiters_.empty()) {
                             auto* receiver = recv_waiters_.pop_front();
-                            receiver_handle = receiver->handle_;
+                            elio::runtime::schedule_handle(receiver->handle_);
                         }
                     }
                 }
             }
             if (pushed) {
-                if (receiver_handle) {
-                    elio::runtime::schedule_handle(receiver_handle);
-                }
                 co_return true;
             }
             if (closed_.load(std::memory_order_acquire)) {
@@ -263,19 +259,15 @@ public:
             while (true) {
                 auto val = ring_->try_pop();
                 if (val.has_value()) {
-                    std::coroutine_handle<> sender_handle;
                     {
                         std::lock_guard<std::mutex> guard(mutex_);
                         if (!send_waiters_.empty()) {
                             auto* sender = send_waiters_.front();
                             if (ring_->try_push(sender->value_)) {
-                                sender_handle = sender->handle_;
+                                elio::runtime::schedule_handle(sender->handle_);
                                 send_waiters_.pop_front();
                             }
                         }
-                    }
-                    if (sender_handle) {
-                        elio::runtime::schedule_handle(sender_handle);
                     }
                     co_return val;
                 }
@@ -333,19 +325,15 @@ public:
         if (is_bounded()) {
             auto val = ring_->try_pop();
             if (val.has_value()) {
-                std::coroutine_handle<> sender_handle;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
                     if (!send_waiters_.empty()) {
                         auto* sender = send_waiters_.front();
                         if (ring_->try_push(sender->value_)) {
-                            sender_handle = sender->handle_;
+                            elio::runtime::schedule_handle(sender->handle_);
                             send_waiters_.pop_front();
                         }
                     }
-                }
-                if (sender_handle) {
-                    elio::runtime::schedule_handle(sender_handle);
                 }
                 return val;
             }

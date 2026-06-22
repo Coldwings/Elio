@@ -233,21 +233,18 @@ public:
             while (it != state.pending_ops.end()) {
                 if (it->synchronous) {
                     bool is_close = (it->req.op == io_op::close);
+                    // Deregister from epoll BEFORE closing the fd to prevent
+                    // a race where another thread reuses the fd number between
+                    // close() and EPOLL_CTL_DEL, causing stale registrations.
+                    if (is_close && state.registered) {
+                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                        state.registered = false;
+                        state.events = 0;
+                    }
                     execute_sync_op(*it);
                     it = state.pending_ops.erase(it);
                     pending_count_--;
                     submitted++;
-                    if (is_close) {
-                        // After closing an fd, reset the fd_state so that
-                        // if the fd number is reused, prepare() will issue
-                        // EPOLL_CTL_ADD instead of EPOLL_CTL_MOD on a stale
-                        // entry. Also deregister from epoll if still tracked.
-                        if (state.registered) {
-                            epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                        }
-                        state.registered = false;
-                        state.events = 0;
-                    }
                 } else {
                     ++it;
                 }
@@ -272,7 +269,7 @@ public:
             if (earliest <= now) {
                 timeout_ms = 0;  // Timer already expired
             } else {
-                auto timer_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+                auto timer_timeout = std::chrono::ceil<std::chrono::milliseconds>(
                     earliest - now).count();
                 if (timeout_ms < 0 || timer_timeout < timeout_ms) {
                     timeout_ms = static_cast<int>(timer_timeout);

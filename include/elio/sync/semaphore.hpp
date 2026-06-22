@@ -4,9 +4,8 @@
 #include <coroutine>
 #include <atomic>
 #include <mutex>
-#include <queue>
-#include <vector>
 #include <algorithm>
+#include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
 
 namespace elio::sync {
@@ -14,12 +13,17 @@ namespace elio::sync {
 /// Coroutine-aware semaphore
 class semaphore {
 public:
+    // Forward declaration for intrusive_list
+    class acquire_awaitable;
+
     explicit semaphore(int initial_count = 0)
         : count_(initial_count) {
         assert(initial_count >= 0 && "semaphore initial count must be non-negative");
     }
 
-    ~semaphore() = default;
+    ~semaphore() {
+        assert(waiters_.empty() && "semaphore destroyed with pending waiters");
+    }
 
     // Non-copyable, non-movable
     semaphore(const semaphore&) = delete;
@@ -27,10 +31,18 @@ public:
     semaphore(semaphore&&) = delete;
     semaphore& operator=(semaphore&&) = delete;
 
-    /// Acquire awaitable
-    class acquire_awaitable {
+    /// Acquire awaitable — inherits intrusive_list_node for safe unlinking
+    class acquire_awaitable : public detail::intrusive_list_node<acquire_awaitable> {
     public:
         explicit acquire_awaitable(semaphore& s) : sem_(s) {}
+
+        ~acquire_awaitable() {
+            // ALWAYS acquire mutex to prevent race with release()
+            std::lock_guard<std::mutex> guard(sem_.mutex_);
+            if (this->is_linked()) {
+                sem_.waiters_.remove(this);
+            }
+        }
 
         bool await_ready() const noexcept {
             return sem_.try_acquire();
@@ -44,7 +56,8 @@ public:
                 return false;  // Don't suspend
             }
 
-            sem_.waiters_.push(awaiter);
+            handle_ = awaiter;
+            sem_.waiters_.push_back(this);
             return true;  // Suspend
         }
 
@@ -52,6 +65,9 @@ public:
 
     private:
         semaphore& sem_;
+        std::coroutine_handle<> handle_;
+
+        friend class semaphore;
     };
 
     /// Acquire (decrement) the semaphore
@@ -73,30 +89,21 @@ public:
     void release(int count = 1) {
         assert(count > 0 && "semaphore release count must be positive");
 
-        std::vector<std::coroutine_handle<>> to_resume;
+        std::lock_guard<std::mutex> guard(mutex_);
 
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
+        // Calculate how many waiters to wake (up to 'count')
+        const int to_wake = std::min(count, static_cast<int>(waiters_.size()));
 
-            // Calculate how many waiters to wake (up to 'count')
-            const int to_wake = std::min(count, static_cast<int>(waiters_.size()));
-
-            // Wake up the calculated number of waiters
-            for (int i = 0; i < to_wake; ++i) {
-                to_resume.push_back(waiters_.front());
-                waiters_.pop();
-            }
-
-            // Only add permits not consumed by woken waiters
-            const int remaining = count - to_wake;
-            assert(count_ <= INT_MAX - remaining && "semaphore count overflow");
-            count_ += remaining;
+        // Schedule waiters WHILE holding mutex
+        for (int i = 0; i < to_wake; ++i) {
+            auto* waiter = waiters_.pop_front();
+            runtime::schedule_handle(waiter->handle_);
         }
 
-        // Re-schedule waiters through the scheduler
-        for (auto& h : to_resume) {
-            runtime::schedule_handle(h);
-        }
+        // Only add permits not consumed by woken waiters
+        const int remaining = count - to_wake;
+        assert(count_ <= INT_MAX - remaining && "semaphore count overflow");
+        count_ += remaining;
     }
 
     /// Get current count
@@ -108,7 +115,7 @@ public:
 private:
     mutable std::mutex mutex_;
     int count_;
-    std::queue<std::coroutine_handle<>> waiters_;
+    detail::intrusive_list<acquire_awaitable> waiters_;
 };
 
 } // namespace elio::sync

@@ -66,7 +66,11 @@ public:
                 bool pushed = false;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
-                    if (!closed_) {
+                    // Re-check capacity under lock: concurrent producers may have
+                    // filled the ring between the outer check and lock acquisition.
+                    // Without this, the ring can exceed the user-requested capacity
+                    // (up to next_power_of_2(capacity)) violating the backpressure contract.
+                    if (!closed_ && ring_->size() < capacity_) {
                         if (ring_->try_push(std::move(value))) {
                             pushed = true;
                             // Wake a waiting receiver if any

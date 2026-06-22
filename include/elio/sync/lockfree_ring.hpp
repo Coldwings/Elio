@@ -60,7 +60,7 @@ public:
     LockfreeMPMCRing(const LockfreeMPMCRing&) = delete;
     LockfreeMPMCRing& operator=(const LockfreeMPMCRing&) = delete;
 
-    /// Try to push a value into the ring
+    /// Try to push a value into the ring (lvalue reference)
     /// @param value The value to push (only moved on success)
     /// @return true if successful, false if ring is full
     bool try_push(T& value) noexcept {
@@ -90,6 +90,15 @@ public:
                 head = head_.load(std::memory_order_relaxed);
             }
         }
+    }
+
+    /// Try to push a value into the ring (rvalue reference overload)
+    /// @param value The value to push (rvalue)
+    /// @return true if successful, false if ring is full
+    /// @note This overload binds rvalue ref but only moves on successful push,
+    ///       preserving the moved-from-on-failure fix from the lvalue version.
+    bool try_push(T&& value) noexcept {
+        return try_push(value);  // Forward to lvalue version
     }
 
     /// Try to pop a value from the ring

@@ -67,7 +67,7 @@ public:
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
                     if (!closed_) {
-                        if (ring_->try_push(std::move(value))) {
+                        if (ring_->try_push(value)) {
                             pushed = true;
                             // Wake a waiting receiver if any
                             if (!recv_waiters_.empty()) {
@@ -109,7 +109,7 @@ public:
 
                     // Check if ring has space now (consumer may have popped)
                     if (ch_.ring_->size() < ch_.capacity_) {
-                        if (ch_.ring_->try_push(std::move(value_))) {
+                        if (ch_.ring_->try_push(value_)) {
                             pushed_ = true;
                             // Wake a waiting receiver if any
                             std::coroutine_handle<> receiver;
@@ -217,7 +217,7 @@ public:
             if (ring_->size() >= capacity_) {
                 return false;
             }
-            if (ring_->try_push(std::move(value))) {
+            if (ring_->try_push(value)) {
                 // Wake a waiting receiver if any
                 std::coroutine_handle<> receiver;
                 if (!recv_waiters_.empty()) {
@@ -284,7 +284,7 @@ public:
                             // producer could fill it concurrently. If try_push fails,
                             // leave the sender in the queue to be woken later when
                             // there's actually space for its value.
-                            if (ring_->try_push(std::move(send_value))) {
+                            if (ring_->try_push(send_value)) {
                                 sender = awaiter;
                                 send_waiters_.pop();
                             }

@@ -61,8 +61,9 @@ public:
     LockfreeMPMCRing& operator=(const LockfreeMPMCRing&) = delete;
 
     /// Try to push a value into the ring
+    /// @param value The value to push (only moved on success)
     /// @return true if successful, false if ring is full
-    bool try_push(T value) noexcept {
+    bool try_push(T& value) noexcept {
         uint64_t head = head_.load(std::memory_order_relaxed);
 
         while (true) {

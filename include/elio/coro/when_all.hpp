@@ -115,14 +115,14 @@ struct when_all_awaitable {
     }
 
     auto await_resume() {
-        // Extract values BEFORE rethrowing so that if extract_values itself
-        // throws (e.g. moving a value type throws), we don't silently discard
-        // that exception in favour of first_exception_.
-        auto result = extract_values(std::index_sequence_for<Fs...>{});
+        // Check for exceptions BEFORE extracting values. If any sub-task threw,
+        // its corresponding values_ slot is disengaged (std::nullopt), and
+        // extracting would dereference a disengaged optional → UB.
         if (state_->first_exception_) {
             std::rethrow_exception(state_->first_exception_);
         }
-        return result;
+        // Only extract values if all tasks completed successfully
+        return extract_values(std::index_sequence_for<Fs...>{});
     }
 
 private:

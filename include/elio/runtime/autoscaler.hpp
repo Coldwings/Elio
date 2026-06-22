@@ -39,7 +39,10 @@ public:
         }
     }
 
-    const autoscaler_config& config() const { return config_; }
+    autoscaler_config config() const {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        return config_;
+    }
     void update_config(const autoscaler_config& config) {
         std::lock_guard<std::mutex> lock(config_mutex_);
         config_ = config;

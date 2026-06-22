@@ -115,10 +115,14 @@ struct when_all_awaitable {
     }
 
     auto await_resume() {
+        // Extract values BEFORE rethrowing so that if extract_values itself
+        // throws (e.g. moving a value type throws), we don't silently discard
+        // that exception in favour of first_exception_.
+        auto result = extract_values(std::index_sequence_for<Fs...>{});
         if (state_->first_exception_) {
             std::rethrow_exception(state_->first_exception_);
         }
-        return extract_values(std::index_sequence_for<Fs...>{});
+        return result;
     }
 
 private:

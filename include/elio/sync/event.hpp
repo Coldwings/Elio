@@ -3,7 +3,6 @@
 #include <coroutine>
 #include <atomic>
 #include <mutex>
-#include <vector>
 #include <cassert>
 #include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"

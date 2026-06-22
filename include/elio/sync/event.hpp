@@ -3,8 +3,9 @@
 #include <coroutine>
 #include <atomic>
 #include <mutex>
-#include <queue>
 #include <vector>
+#include <cassert>
+#include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
 
 namespace elio::sync {
@@ -12,8 +13,14 @@ namespace elio::sync {
 /// Coroutine-aware event (manual reset)
 class event {
 public:
+    // Forward declaration for intrusive_list
+    class wait_awaitable;
+
     event() = default;
-    ~event() = default;
+
+    ~event() {
+        assert(waiters_.empty() && "event destroyed with pending waiters");
+    }
 
     // Non-copyable, non-movable
     event(const event&) = delete;
@@ -21,10 +28,21 @@ public:
     event(event&&) = delete;
     event& operator=(event&&) = delete;
 
-    /// Wait awaitable
-    class wait_awaitable {
+    /// Wait awaitable — inherits intrusive_list_node for safe unlinking
+    class wait_awaitable : public detail::intrusive_list_node<wait_awaitable> {
     public:
         explicit wait_awaitable(event& e) : evt_(e) {}
+
+        ~wait_awaitable() {
+            // ALWAYS acquire mutex to prevent race with set().
+            // If set() already popped us and is scheduling, holding the
+            // mutex ensures the coroutine frame won't be destroyed until
+            // schedule_handle() completes.
+            std::lock_guard<std::mutex> guard(evt_.mutex_);
+            if (this->is_linked()) {
+                evt_.waiters_.remove(this);
+            }
+        }
 
         bool await_ready() const noexcept {
             return evt_.signaled_.load(std::memory_order_acquire);
@@ -37,7 +55,8 @@ public:
                 return false;  // Already signaled
             }
 
-            evt_.waiters_.push(awaiter);
+            handle_ = awaiter;
+            evt_.waiters_.push_back(this);
             return true;
         }
 
@@ -45,6 +64,9 @@ public:
 
     private:
         event& evt_;
+        std::coroutine_handle<> handle_;
+
+        friend class event;
     };
 
     /// Wait for the event to be signaled
@@ -54,27 +76,21 @@ public:
 
     /// Signal the event (wake all waiters)
     void set() {
-        std::vector<std::coroutine_handle<>> to_resume;
+        std::lock_guard<std::mutex> guard(mutex_);
+        signaled_.store(true, std::memory_order_release);
 
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-            signaled_.store(true, std::memory_order_release);
-
-            while (!waiters_.empty()) {
-                to_resume.push_back(waiters_.front());
-                waiters_.pop();
-            }
-        }
-
-        // Re-schedule waiters through the scheduler
-        for (auto& h : to_resume) {
-            runtime::schedule_handle(h);
+        // Schedule all waiters WHILE holding mutex.
+        // This prevents the coroutine frame from being destroyed
+        // during scheduling (the destructor blocks on this mutex).
+        while (!waiters_.empty()) {
+            auto* waiter = waiters_.pop_front();
+            runtime::schedule_handle(waiter->handle_);
         }
     }
 
     /// Reset the event
-    void reset() noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
+    void reset() {
+        std::lock_guard<std::mutex> guard(mutex_);
         signaled_.store(false, std::memory_order_release);
     }
 
@@ -86,7 +102,7 @@ public:
 private:
     std::mutex mutex_;
     std::atomic<bool> signaled_{false};
-    std::queue<std::coroutine_handle<>> waiters_;
+    detail::intrusive_list<wait_awaitable> waiters_;
 };
 
 } // namespace elio::sync

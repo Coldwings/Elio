@@ -227,6 +227,10 @@ public:
     int submit() override {
         int submitted = 0;
 
+        // Collect handles to resume after processing all operations
+        // (avoids iterator invalidation if resumed coroutine calls prepare())
+        std::vector<deferred_resume_entry> deferred_resumes;
+
         // Execute synchronous operations (like close)
         for (auto& [fd, state] : fd_states_) {
             auto it = state.pending_ops.begin();
@@ -241,7 +245,7 @@ public:
                         state.registered = false;
                         state.events = 0;
                     }
-                    execute_sync_op(*it);
+                    execute_sync_op(*it, &deferred_resumes);
                     it = state.pending_ops.erase(it);
                     pending_count_--;
                     submitted++;
@@ -250,6 +254,9 @@ public:
                 }
             }
         }
+
+        // Resume coroutines after iteration is complete
+        resume_deferred(deferred_resumes);
 
         ELIO_LOG_DEBUG("Submitted {} synchronous operations", submitted);
         return submitted;
@@ -544,9 +551,10 @@ private:
                                                std::vector<timer_entry>,
                                                std::greater<timer_entry>>;
     
-    void execute_sync_op(pending_operation& op) {
+    void execute_sync_op(pending_operation& op,
+                         std::vector<deferred_resume_entry>* deferred_resumes = nullptr) {
         int result = 0;
-        
+
         switch (op.req.op) {
             case io_op::close:
                 result = ::close(op.req.fd);
@@ -554,16 +562,21 @@ private:
                     result = -errno;
                 }
                 break;
-                
+
             default:
                 result = -ENOTSUP;
                 break;
         }
-        
-        last_result_ = io_result{result, 0};
-        
+
+        io_result res{result, 0};
+
         if (op.awaiter && !op.awaiter.done()) {
-            op.awaiter.resume();
+            if (deferred_resumes) {
+                deferred_resumes->push_back({op.awaiter, res});
+            } else {
+                last_result_ = res;
+                op.awaiter.resume();
+            }
         }
     }
     

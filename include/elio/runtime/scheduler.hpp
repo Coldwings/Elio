@@ -910,7 +910,7 @@ inline void worker_thread::run() {
     current_worker_ = this;
 
     while (running_.load(std::memory_order_relaxed)) {
-        if (draining_.load(std::memory_order_relaxed)) [[unlikely]] {
+        if (draining_.load(std::memory_order_acquire)) [[unlikely]] {
             // Draining mode: only poll I/O, no new tasks or stealing.
             // Redistribute any queued tasks, then wait for pending I/O to complete.
             redistribute_tasks(scheduler_);

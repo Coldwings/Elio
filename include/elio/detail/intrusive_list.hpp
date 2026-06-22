@@ -27,26 +27,8 @@ public:
     // Non-copyable, non-movable
     intrusive_list_node(const intrusive_list_node&) = delete;
     intrusive_list_node& operator=(const intrusive_list_node&) = delete;
-    intrusive_list_node(intrusive_list_node&& other) noexcept
-        : prev_(other.prev_), next_(other.next_), in_list_(other.in_list_) {
-        // Move constructor transfers linkage state but does NOT update
-        // neighboring node pointers — caller must handle list fixup.
-        other.prev_ = nullptr;
-        other.next_ = nullptr;
-        other.in_list_ = false;
-    }
-    intrusive_list_node& operator=(intrusive_list_node&& other) noexcept {
-        if (this != &other) {
-            assert(!in_list_ && "Cannot move-assign to a linked node");
-            prev_ = other.prev_;
-            next_ = other.next_;
-            in_list_ = other.in_list_;
-            other.prev_ = nullptr;
-            other.next_ = nullptr;
-            other.in_list_ = false;
-        }
-        return *this;
-    }
+    intrusive_list_node(intrusive_list_node&&) = delete;
+    intrusive_list_node& operator=(intrusive_list_node&&) = delete;
 
     /// Check if this node is currently linked in a list
     bool is_linked() const noexcept { return in_list_; }

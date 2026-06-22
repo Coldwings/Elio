@@ -55,12 +55,10 @@ public:
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
-            // Unlock user mutex BEFORE enqueueing to ensure atomicity:
-            // either the waiter is visible to notifiers, or the user mutex
-            // is still held (serializing with notifier's state changes).
-            mutex_.unlock();
+            std::unique_lock<std::mutex> lock(cv_.internal_mutex_);
             cv_.waiters_.push(awaiter);
+            lock.unlock();
+            mutex_.unlock();
             return true;
         }
 
@@ -83,12 +81,10 @@ public:
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
-            // Unlock user lock BEFORE enqueueing to ensure atomicity:
-            // either the waiter is visible to notifiers, or the user lock
-            // is still held (serializing with notifier's state changes).
-            lock_.unlock();
+            std::unique_lock<std::mutex> lock(cv_.internal_mutex_);
             cv_.waiters_.push(awaiter);
+            lock.unlock();
+            lock_.unlock();
             return true;
         }
 

@@ -227,32 +227,36 @@ public:
     int submit() override {
         int submitted = 0;
 
+        // Collect handles to resume after processing all operations
+        // (avoids iterator invalidation if resumed coroutine calls prepare())
+        std::vector<deferred_resume_entry> deferred_resumes;
+
         // Execute synchronous operations (like close)
         for (auto& [fd, state] : fd_states_) {
             auto it = state.pending_ops.begin();
             while (it != state.pending_ops.end()) {
                 if (it->synchronous) {
                     bool is_close = (it->req.op == io_op::close);
-                    execute_sync_op(*it);
-                    it = state.pending_ops.erase(it);
-                    pending_count_--;
-                    submitted++;
-                    if (is_close) {
-                        // After closing an fd, reset the fd_state so that
-                        // if the fd number is reused, prepare() will issue
-                        // EPOLL_CTL_ADD instead of EPOLL_CTL_MOD on a stale
-                        // entry. Also deregister from epoll if still tracked.
-                        if (state.registered) {
-                            epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                        }
+                    // Deregister from epoll BEFORE closing the fd to prevent
+                    // a race where another thread reuses the fd number between
+                    // close() and EPOLL_CTL_DEL, causing stale registrations.
+                    if (is_close && state.registered) {
+                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
                         state.registered = false;
                         state.events = 0;
                     }
+                    execute_sync_op(*it, &deferred_resumes);
+                    it = state.pending_ops.erase(it);
+                    pending_count_--;
+                    submitted++;
                 } else {
                     ++it;
                 }
             }
         }
+
+        // Resume coroutines after iteration is complete
+        resume_deferred(deferred_resumes);
 
         ELIO_LOG_DEBUG("Submitted {} synchronous operations", submitted);
         return submitted;
@@ -272,7 +276,7 @@ public:
             if (earliest <= now) {
                 timeout_ms = 0;  // Timer already expired
             } else {
-                auto timer_timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+                auto timer_timeout = std::chrono::ceil<std::chrono::milliseconds>(
                     earliest - now).count();
                 if (timeout_ms < 0 || timer_timeout < timeout_ms) {
                     timeout_ms = static_cast<int>(timer_timeout);
@@ -412,12 +416,12 @@ public:
     bool has_pending() const noexcept override {
         return pending_count_ > 0;
     }
-    
+
     /// Get the number of pending operations
     size_t pending_count() const noexcept override {
-        return pending_count_;
+        return pending_count_.load(std::memory_order_relaxed);
     }
-    
+
     /// Cancel a pending operation
     bool cancel(void* user_data) override {
         deferred_resume_entry to_resume{};
@@ -547,9 +551,10 @@ private:
                                                std::vector<timer_entry>,
                                                std::greater<timer_entry>>;
     
-    void execute_sync_op(pending_operation& op) {
+    void execute_sync_op(pending_operation& op,
+                         std::vector<deferred_resume_entry>* deferred_resumes = nullptr) {
         int result = 0;
-        
+
         switch (op.req.op) {
             case io_op::close:
                 result = ::close(op.req.fd);
@@ -557,16 +562,21 @@ private:
                     result = -errno;
                 }
                 break;
-                
+
             default:
                 result = -ENOTSUP;
                 break;
         }
-        
-        last_result_ = io_result{result, 0};
-        
+
+        io_result res{result, 0};
+
         if (op.awaiter && !op.awaiter.done()) {
-            op.awaiter.resume();
+            if (deferred_resumes) {
+                deferred_resumes->push_back({op.awaiter, res});
+            } else {
+                last_result_ = res;
+                op.awaiter.resume();
+            }
         }
     }
     
@@ -716,7 +726,7 @@ private:
     std::vector<struct epoll_event> events_;              ///< Event buffer for epoll_wait
     std::unordered_map<int, fd_state> fd_states_;         ///< Per-fd state
     timer_queue_t timer_queue_;                           ///< Timer queue for timeouts
-    size_t pending_count_ = 0;                            ///< Number of pending operations
+    std::atomic<size_t> pending_count_{0};                ///< Number of pending operations (atomic for cross-thread reads)
     int wake_fd_ = -1;  ///< eventfd for cross-thread wake-up
 
     static inline thread_local io_result last_result_{};

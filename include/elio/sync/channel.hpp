@@ -66,7 +66,11 @@ public:
                 bool pushed = false;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
-                    if (!closed_) {
+                    // Re-check capacity under lock: concurrent producers may have
+                    // filled the ring between the outer check and lock acquisition.
+                    // Without this, the ring can exceed the user-requested capacity
+                    // (up to next_power_of_2(capacity)) violating the backpressure contract.
+                    if (!closed_ && ring_->size() < capacity_) {
                         if (ring_->try_push(value)) {
                             pushed = true;
                             // Wake a waiting receiver if any
@@ -399,11 +403,12 @@ public:
                     std::lock_guard<std::mutex> guard(mutex_);
                     if (!send_waiters_.empty()) {
                         auto& [awaiter, send_value] = send_waiters_.front();
+                        // Only transfer if we can guarantee the push will succeed.
+                        // We just popped, so there should be space. But another
+                        // producer could fill it concurrently. If try_push fails,
+                        // leave the sender in the queue to be woken later when
+                        // there's actually space for its value.
                         if (ring_->try_push(send_value)) {
-                            sender = awaiter;
-                            send_waiters_.pop();
-                        } else {
-                            // Can't transfer — wake sender to retry
                             sender = awaiter;
                             send_waiters_.pop();
                         }

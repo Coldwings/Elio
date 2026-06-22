@@ -44,7 +44,11 @@ struct for_each_task {
                 [[nodiscard]] bool await_ready() const noexcept { return false; }
                 [[nodiscard]] std::coroutine_handle<> await_suspend(
                     std::coroutine_handle<promise_type> h) noexcept {
-                    return h.promise().consumer_;
+                    auto consumer = h.promise().consumer_;
+                    if (consumer) {
+                        return consumer;
+                    }
+                    return std::noop_coroutine();
                 }
                 void await_resume() const noexcept {}
             };

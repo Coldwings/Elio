@@ -771,8 +771,18 @@ private:
             delete st;
             return;
         }
-        // Mark as completed so the destructor's CAS fails and unique_ptr cleans up
-        st->phase.store(batch_state::phase_completed, std::memory_order_release);
+        // Mark as completed so the destructor's CAS fails and unique_ptr cleans up.
+        // Use CAS instead of unconditional store to handle the race where destructor
+        // CAS's to orphaned between our load above and this store.
+        uint8_t expected = batch_state::phase_pending;
+        if (!st->phase.compare_exchange_strong(
+                expected, batch_state::phase_completed,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            // CAS failed: destructor CAS'd to orphaned after our load.
+            // Destructor has released ownership, so we must delete.
+            delete st;
+            return;
+        }
         auto handle = st->awaiter;
         if (!handle) {
             return;

@@ -752,22 +752,21 @@ private:
         }
         batch_state* st = tramp->state;
 
-        // Check orphan protocol: if the awaitable was destroyed while
-        // SQEs were in flight, only write results (the vector is still
-        // alive since we own it now) but do NOT resume the awaiter.
-        bool orphaned = st->phase.load(std::memory_order_acquire)
-                        == batch_state::phase_orphaned;
-
         const uint32_t idx = tramp->segment_index;
-        if (!orphaned && idx < st->results.size()) {
+        // Write result if not orphaned yet (check will be re-validated at final segment)
+        if (st->phase.load(std::memory_order_acquire) != batch_state::phase_orphaned
+            && idx < st->results.size()) {
             st->results[idx] = res;
         }
         int prev = st->completed.fetch_add(1, std::memory_order_acq_rel);
         if (prev + 1 != st->total) {
             return;
         }
-        // Final segment.
-        if (orphaned) {
+        // Final segment — re-read phase to get the authoritative orphaned status.
+        // The destructor may have CAS'd phase to orphaned between our initial check
+        // and the fetch_add above.
+        uint8_t phase = st->phase.load(std::memory_order_acquire);
+        if (phase == batch_state::phase_orphaned) {
             // Awaitable already torn down — free the state ourselves.
             delete st;
             return;

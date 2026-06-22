@@ -7,7 +7,31 @@ on:
     branches: [ main, develop, 'release/**' ]
 
 jobs:
+  # Detect which files changed to conditionally run expensive CI jobs
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Check for code changes
+      uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          code:
+            - 'include/**'
+            - 'tests/**'
+            - 'examples/**'
+            - 'CMakeLists.txt'
+            - '*.cmake'
+            - 'cmake/**'
+
   build-and-test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -71,6 +95,8 @@ jobs:
       run: ./build/examples/bench_channel
 
   package-consumer-check:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     name: package-consumer-check
 

@@ -115,9 +115,13 @@ struct when_all_awaitable {
     }
 
     auto await_resume() {
+        // Check for exceptions BEFORE extracting values. If any sub-task threw,
+        // its corresponding values_ slot is disengaged (std::nullopt), and
+        // extracting would dereference a disengaged optional → UB.
         if (state_->first_exception_) {
             std::rethrow_exception(state_->first_exception_);
         }
+        // Only extract values if all tasks completed successfully
         return extract_values(std::index_sequence_for<Fs...>{});
     }
 

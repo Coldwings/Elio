@@ -416,12 +416,12 @@ public:
     bool has_pending() const noexcept override {
         return pending_count_ > 0;
     }
-    
+
     /// Get the number of pending operations
     size_t pending_count() const noexcept override {
-        return pending_count_;
+        return pending_count_.load(std::memory_order_relaxed);
     }
-    
+
     /// Cancel a pending operation
     bool cancel(void* user_data) override {
         deferred_resume_entry to_resume{};
@@ -726,7 +726,7 @@ private:
     std::vector<struct epoll_event> events_;              ///< Event buffer for epoll_wait
     std::unordered_map<int, fd_state> fd_states_;         ///< Per-fd state
     timer_queue_t timer_queue_;                           ///< Timer queue for timeouts
-    size_t pending_count_ = 0;                            ///< Number of pending operations
+    std::atomic<size_t> pending_count_{0};                ///< Number of pending operations (atomic for cross-thread reads)
     int wake_fd_ = -1;  ///< eventfd for cross-thread wake-up
 
     static inline thread_local io_result last_result_{};

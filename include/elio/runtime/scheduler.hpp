@@ -381,6 +381,7 @@ public:
         size_t total = 0;
         for (size_t i = 0; i < n; ++i) {
             total += workers_[i]->queue_size();
+            total += workers_[i]->io_context().pending_count();
         }
         return total;
     }

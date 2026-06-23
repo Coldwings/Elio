@@ -478,9 +478,22 @@ coro::task<void> quick_update() {
 
 Use `spinlock_guard` for RAII-style locking:
 
+```cpp
+sync::spinlock sl;
+
+coro::task<void> safe_update() {
+    sync::spinlock_guard guard(sl);  // Locks on construction
+    // Critical section
+    co_return;
+    // Automatically unlocked on destruction
+}
+```
+
+**When to use spinlock vs mutex:** Use `spinlock` when the critical section is very short (a few assignments or pointer swaps) and contention is low. Use `mutex` when the critical section might suspend (e.g., performing I/O) or when contention is high — `mutex` suspends the coroutine instead of busy-waiting, allowing other coroutines to run.
+
 ### Cancellation Safety
 
-All coroutine-aware synchronization primitives (`event`, `mutex`, `semaphore`, `condition_variable`, `channel`) are **cancellation-safe**: if a waiting coroutine is destroyed (due to cancellation, timeout, or forced termination) before it is woken, it is automatically unlinked from the primitive's internal waiter list. The primitive can then safely call its wake function (`set()`, `unlock()`, `release()`, `notify_one()`, `send()`, etc.) without risk of use-after-free.
+All coroutine-aware synchronization primitives (`event`, `mutex`, `semaphore`, `condition_variable`, `channel`, `shared_mutex`) are **cancellation-safe**: if a waiting coroutine is destroyed (due to cancellation, timeout, or forced termination) before it is woken, it is automatically unlinked from the primitive's internal waiter list. The primitive can then safely call its wake function (`set()`, `unlock()`, `release()`, `notify_one()`, `send()`, etc.) without risk of use-after-free.
 
 This is implemented via an intrusive linked list: each waiter node is embedded in the coroutine frame and registers itself with the primitive on suspension. If the coroutine is destroyed before being woken, the waiter's destructor acquires the primitive's mutex and removes itself from the list — ensuring the primitive never holds a dangling handle.
 
@@ -502,19 +515,6 @@ coro::task<void> waiter_with_timeout() {
 - Destroying a waiting coroutine does not invalidate the primitive's waiter list
 - Calling `set()`/`unlock()`/`release()`/`notify_one()`/`notify_all()` after a waiter is destroyed is safe — the destroyed waiter is simply skipped
 - No manual cleanup is required — unlinking happens automatically in the waiter's destructor
-
-```cpp
-sync::spinlock sl;
-
-coro::task<void> safe_update() {
-    sync::spinlock_guard guard(sl);  // Locks on construction
-    // Critical section
-    co_return;
-    // Automatically unlocked on destruction
-}
-```
-
-**When to use spinlock vs mutex:** Use `spinlock` when the critical section is very short (a few assignments or pointer swaps) and contention is low. Use `mutex` when the critical section might suspend (e.g., performing I/O) or when contention is high — `mutex` suspends the coroutine instead of busy-waiting, allowing other coroutines to run.
 
 ### Condition Variable
 

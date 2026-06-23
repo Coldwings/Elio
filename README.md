@@ -14,7 +14,7 @@
 - **Work-Stealing Scheduler** with lock-free Chase-Lev deques
 - **Dynamic Thread Pool** with runtime adjustment
 - **Autoscaler** for automatic worker thread scaling under load
-- **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel, spinlock, condition_variable — mutex, semaphore, event, channel, and condition_variable are cancellation-safe via intrusive waiter tracking
+- **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel, spinlock, condition_variable — all coroutine-aware primitives (mutex, shared_mutex, semaphore, event, channel, condition_variable) are cancellation-safe via intrusive waiter tracking
 - **Timers**: sleep_for, sleep_until, yield
 - **I/O Backends**: io_uring (preferred) and epoll fallback
 - **Batch I/O**: Submit multiple file operations in a single syscall

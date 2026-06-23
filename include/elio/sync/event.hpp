@@ -38,10 +38,10 @@ public:
             // so no wake function could hold a reference to us.
             if (!suspended_) return;
 
-            // Slow path: acquire mutex to prevent race with set().
-            // If set() already popped us and is scheduling, holding the
-            // mutex ensures the coroutine frame won't be destroyed until
-            // schedule_handle() completes.
+            // Slow path: acquire mutex to serialize access to the waiter list.
+            // Either we unlink before set() pops us, or set() has already
+            // popped us (so is_linked() is false here). This ensures we don't
+            // race with set()'s collect-then-schedule pattern.
             std::lock_guard<std::mutex> guard(evt_.mutex_);
             if (this->is_linked()) {
                 evt_.waiters_.remove(this);

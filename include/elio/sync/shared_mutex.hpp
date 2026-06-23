@@ -121,6 +121,14 @@ public:
             std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
             if (this->is_linked()) {
                 mtx_.writer_waiters_.remove(this);
+                // Reverse the bookkeeping from await_suspend: decrement pending_writers_
+                // and clear WRITER_WAITING if no more pending writers
+                --mtx_.pending_writers_;
+                if (mtx_.pending_writers_ == 0) {
+                    // No more pending writers, clear WRITER_WAITING bit
+                    // Use fetch_and to clear the bit while preserving other bits
+                    mtx_.state_.fetch_and(~WRITER_WAITING, std::memory_order_release);
+                }
             }
         }
 

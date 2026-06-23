@@ -32,7 +32,11 @@ public:
         explicit lock_awaitable(mutex& m) : mtx_(m) {}
 
         ~lock_awaitable() {
-            // ALWAYS acquire internal_mutex_ to prevent race with unlock()
+            // Fast path: if we never suspended, we were never enqueued,
+            // so no wake function could hold a reference to us.
+            if (!suspended_) return;
+
+            // Slow path: acquire internal_mutex_ to prevent race with unlock()
             std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
             if (this->is_linked()) {
                 mtx_.waiters_.remove(this);
@@ -66,6 +70,7 @@ public:
             // Add to wait queue
             handle_ = awaiter;
             mtx_.waiters_.push_back(this);
+            suspended_ = true;  // Mark as enqueued
             return true; // Suspend
         }
 
@@ -74,6 +79,7 @@ public:
     private:
         mutex& mtx_;
         std::coroutine_handle<> handle_;
+        bool suspended_ = false;  // True if enqueued in waiters_
 
         friend class mutex;
     };

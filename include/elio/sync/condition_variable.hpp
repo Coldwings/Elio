@@ -46,6 +46,7 @@ public:
     class cv_waiter_base : public elio::detail::intrusive_list_node<cv_waiter_base> {
     public:
         std::coroutine_handle<> handle_;
+        bool suspended_ = false;  // True if enqueued in waiters_
     protected:
         cv_waiter_base() = default;
     };
@@ -69,7 +70,11 @@ public:
             : cv_(cv), mutex_(m) {}
 
         ~wait_suspend_awaitable() {
-            // ALWAYS acquire internal_mutex_ to prevent race with notify
+            // Fast path: if we never suspended, we were never enqueued,
+            // so no wake function could hold a reference to us.
+            if (!this->suspended_) return;
+
+            // Slow path: acquire internal_mutex_ to prevent race with notify
             std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
             if (this->is_linked()) {
                 cv_.waiters_.remove(this);
@@ -84,6 +89,7 @@ public:
             mutex_.unlock();
             this->handle_ = awaiter;
             cv_.waiters_.push_back(this);
+            this->suspended_ = true;  // Mark as enqueued
             return true;
         }
 
@@ -102,6 +108,10 @@ public:
             : cv_(cv), lock_(lock) {}
 
         ~wait_awaitable_lock() {
+            // Fast path: if we never suspended, we were never enqueued
+            if (!this->suspended_) return;
+
+            // Slow path: acquire internal_mutex_ to prevent race with notify
             std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
             if (this->is_linked()) {
                 cv_.waiters_.remove(this);
@@ -115,6 +125,7 @@ public:
             lock_.unlock();
             this->handle_ = awaiter;
             cv_.waiters_.push_back(this);
+            this->suspended_ = true;  // Mark as enqueued
             return true;
         }
 
@@ -133,6 +144,10 @@ public:
         explicit wait_awaitable_unlocked(condition_variable& cv) : cv_(cv) {}
 
         ~wait_awaitable_unlocked() {
+            // Fast path: if we never suspended, we were never enqueued
+            if (!this->suspended_) return;
+
+            // Slow path: acquire internal_mutex_ to prevent race with notify
             std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
             if (this->is_linked()) {
                 cv_.waiters_.remove(this);
@@ -145,6 +160,7 @@ public:
             std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
             this->handle_ = awaiter;
             cv_.waiters_.push_back(this);
+            this->suspended_ = true;  // Mark as enqueued
             return true;
         }
 

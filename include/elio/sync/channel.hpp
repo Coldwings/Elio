@@ -65,6 +65,10 @@ public:
         send_awaitable(channel& ch, T value) : ch_(ch), value_(std::move(value)) {}
 
         ~send_awaitable() {
+            // Fast path: if we never suspended, we were never enqueued
+            if (!suspended_) return;
+
+            // Slow path: acquire mutex to prevent race with close/recv
             std::lock_guard<std::mutex> guard(ch_.mutex_);
             if (this->is_linked()) {
                 ch_.send_waiters_.remove(this);
@@ -109,6 +113,7 @@ public:
                     // Cannot send now — suspend
                     handle_ = h;
                     ch_.send_waiters_.push_back(this);
+                    suspended_ = true;  // Mark as enqueued
                 }
             }
 
@@ -127,6 +132,7 @@ public:
         T value_;
         std::coroutine_handle<> handle_;
         bool success_ = false;
+        bool suspended_ = false;  // True if enqueued in send_waiters_
 
         friend class channel;
     };
@@ -137,6 +143,10 @@ public:
         explicit recv_awaitable(channel& ch) : ch_(ch) {}
 
         ~recv_awaitable() {
+            // Fast path: if we never suspended, we were never enqueued
+            if (!suspended_) return;
+
+            // Slow path: acquire mutex to prevent race with close/send
             std::lock_guard<std::mutex> guard(ch_.mutex_);
             if (this->is_linked()) {
                 ch_.recv_waiters_.remove(this);
@@ -164,6 +174,7 @@ public:
 
             handle_ = h;
             ch_.recv_waiters_.push_back(this);
+            suspended_ = true;  // Mark as enqueued
             return true;
         }
 
@@ -172,6 +183,7 @@ public:
     private:
         channel& ch_;
         std::coroutine_handle<> handle_;
+        bool suspended_ = false;  // True if enqueued in recv_waiters_
 
         friend class channel;
     };

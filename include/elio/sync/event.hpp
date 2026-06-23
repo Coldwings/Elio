@@ -34,7 +34,11 @@ public:
         explicit wait_awaitable(event& e) : evt_(e) {}
 
         ~wait_awaitable() {
-            // ALWAYS acquire mutex to prevent race with set().
+            // Fast path: if we never suspended, we were never enqueued,
+            // so no wake function could hold a reference to us.
+            if (!suspended_) return;
+
+            // Slow path: acquire mutex to prevent race with set().
             // If set() already popped us and is scheduling, holding the
             // mutex ensures the coroutine frame won't be destroyed until
             // schedule_handle() completes.
@@ -57,6 +61,7 @@ public:
 
             handle_ = awaiter;
             evt_.waiters_.push_back(this);
+            suspended_ = true;  // Mark as enqueued
             return true;
         }
 
@@ -65,6 +70,7 @@ public:
     private:
         event& evt_;
         std::coroutine_handle<> handle_;
+        bool suspended_ = false;  // True if enqueued in waiters_
 
         friend class event;
     };

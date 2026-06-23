@@ -38,7 +38,11 @@ public:
         explicit acquire_awaitable(semaphore& s) : sem_(s) {}
 
         ~acquire_awaitable() {
-            // ALWAYS acquire mutex to prevent race with release()
+            // Fast path: if we never suspended, we were never enqueued,
+            // so no wake function could hold a reference to us.
+            if (!suspended_) return;
+
+            // Slow path: acquire mutex to prevent race with release()
             std::lock_guard<std::mutex> guard(sem_.mutex_);
             if (this->is_linked()) {
                 sem_.waiters_.remove(this);
@@ -59,6 +63,7 @@ public:
 
             handle_ = awaiter;
             sem_.waiters_.push_back(this);
+            suspended_ = true;  // Mark as enqueued
             return true;  // Suspend
         }
 
@@ -67,6 +72,7 @@ public:
     private:
         semaphore& sem_;
         std::coroutine_handle<> handle_;
+        bool suspended_ = false;  // True if enqueued in waiters_
 
         friend class semaphore;
     };

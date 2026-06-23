@@ -27,7 +27,7 @@ public:
     mutex& operator=(mutex&&) = delete;
 
     /// Lock awaitable — inherits intrusive_list_node for safe unlinking
-    class lock_awaitable : public detail::intrusive_list_node<lock_awaitable> {
+    class lock_awaitable : public elio::detail::intrusive_list_node<lock_awaitable> {
     public:
         explicit lock_awaitable(mutex& m) : mtx_(m) {}
 
@@ -146,7 +146,7 @@ public:
 private:
     std::atomic<void*> state_{nullptr};
     mutable std::mutex internal_mutex_;
-    detail::intrusive_list<lock_awaitable> waiters_;
+    elio::detail::intrusive_list<lock_awaitable> waiters_;
 };
 
 /// RAII lock guard for mutex (synchronous)

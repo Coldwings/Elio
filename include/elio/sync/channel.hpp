@@ -25,6 +25,13 @@ public:
     class recv_awaitable;
 
     /// Create a channel with the given capacity.
+    ///
+    /// @param capacity Maximum number of items that can be buffered.
+    ///   - capacity == 0: rendezvous (synchronous) channel — send blocks until
+    ///     a receiver is ready (Go-style `make(chan T)`)
+    ///   - capacity > 0: bounded channel with back-pressure when full
+    /// @note For an unbounded channel (no back-pressure), use
+    ///   `channel<T>::unbounded()`.
     explicit channel(size_t capacity = 0)
         : capacity_(capacity)
         , closed_(false)
@@ -53,7 +60,7 @@ public:
 
     /// Send awaitable — handles both bounded and rendezvous channels.
     /// Stores handle + value. Inherits intrusive_list_node for safe unlinking.
-    class send_awaitable : public detail::intrusive_list_node<send_awaitable> {
+    class send_awaitable : public elio::detail::intrusive_list_node<send_awaitable> {
     public:
         send_awaitable(channel& ch, T value) : ch_(ch), value_(std::move(value)) {}
 
@@ -125,7 +132,7 @@ public:
     };
 
     /// Recv awaitable — handles bounded, unbounded, and rendezvous channels.
-    class recv_awaitable : public detail::intrusive_list_node<recv_awaitable> {
+    class recv_awaitable : public elio::detail::intrusive_list_node<recv_awaitable> {
     public:
         explicit recv_awaitable(channel& ch) : ch_(ch) {}
 
@@ -516,8 +523,8 @@ private:
     mutable std::mutex mutex_;
     std::unique_ptr<LockfreeMPMCRing<T>> ring_;
     std::queue<T> queue_;
-    detail::intrusive_list<recv_awaitable> recv_waiters_;
-    detail::intrusive_list<send_awaitable> send_waiters_;
+    elio::detail::intrusive_list<recv_awaitable> recv_waiters_;
+    elio::detail::intrusive_list<send_awaitable> send_waiters_;
     size_t capacity_;
     std::atomic<bool> closed_;
 };

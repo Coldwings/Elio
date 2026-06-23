@@ -33,7 +33,7 @@ public:
     semaphore& operator=(semaphore&&) = delete;
 
     /// Acquire awaitable — inherits intrusive_list_node for safe unlinking
-    class acquire_awaitable : public detail::intrusive_list_node<acquire_awaitable> {
+    class acquire_awaitable : public elio::detail::intrusive_list_node<acquire_awaitable> {
     public:
         explicit acquire_awaitable(semaphore& s) : sem_(s) {}
 
@@ -125,7 +125,7 @@ public:
 private:
     mutable std::mutex mutex_;
     int count_;
-    detail::intrusive_list<acquire_awaitable> waiters_;
+    elio::detail::intrusive_list<acquire_awaitable> waiters_;
 };
 
 } // namespace elio::sync

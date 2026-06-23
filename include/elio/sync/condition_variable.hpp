@@ -24,6 +24,21 @@ concept lockable = requires(Lock& l) {
 } // namespace detail
 
 /// Coroutine-aware condition variable
+///
+/// Suspends the coroutine instead of blocking the thread.
+/// Supports three modes of use:
+/// - With elio::sync::mutex (coroutine-aware async re-lock)
+/// - With elio::sync::spinlock or any lockable type (synchronous re-lock)
+/// - Without any lock (wait_unlocked) for single-worker scenarios
+///
+/// IMPORTANT: Always use a predicate loop to protect against spurious wakeups:
+/// @code
+/// co_await mtx.lock();
+/// while (!condition) {
+///     co_await cv.wait(mtx);
+/// }
+/// mtx.unlock();
+/// @endcode
 class condition_variable {
 public:
     /// Common base for all cv waiter types.
@@ -140,6 +155,18 @@ public:
     };
 
     /// Wait with elio::sync::mutex
+    ///
+    /// Atomically releases the mutex and suspends the coroutine.
+    /// When notified, re-acquires the mutex before returning.
+    ///
+    /// Usage:
+    /// @code
+    /// co_await mtx.lock();
+    /// while (!condition) {
+    ///     co_await cv.wait(mtx);
+    /// }
+    /// mtx.unlock();
+    /// @endcode
     coro::task<void> wait(mutex& m) {
         co_await wait_suspend_awaitable(*this, m);
         co_await m.lock();

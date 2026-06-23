@@ -29,7 +29,7 @@ public:
     event& operator=(event&&) = delete;
 
     /// Wait awaitable — inherits intrusive_list_node for safe unlinking
-    class wait_awaitable : public detail::intrusive_list_node<wait_awaitable> {
+    class wait_awaitable : public elio::detail::intrusive_list_node<wait_awaitable> {
     public:
         explicit wait_awaitable(event& e) : evt_(e) {}
 
@@ -109,7 +109,7 @@ public:
 private:
     std::mutex mutex_;
     std::atomic<bool> signaled_{false};
-    detail::intrusive_list<wait_awaitable> waiters_;
+    elio::detail::intrusive_list<wait_awaitable> waiters_;
 };
 
 } // namespace elio::sync

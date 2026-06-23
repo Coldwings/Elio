@@ -524,4 +524,4 @@ For questions, issues, or feature requests, please open an issue on the reposito
 
 ---
 
-**Status**: Approaching Stable | **Version**: 0.5.0 | **Date**: 2026-06-18
+**Status**: Approaching Stable | **Version**: 0.5.1 | **Date**: 2026-06-23

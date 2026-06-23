@@ -5,6 +5,106 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-06-23
+
+Focus: **concurrency safety hardening**. Comprehensive audit and fixes for
+use-after-free vulnerabilities, race conditions, and lifetime management issues
+across all synchronization primitives. Added intrusive list infrastructure for
+O(1) safe waiter unlinking.
+
+### Added
+
+- **Intrusive list for waiter lifetime tracking**: New `detail::intrusive_list<T>`
+  infrastructure enabling O(1) safe unlinking of waiters on coroutine destruction.
+  Each waitable primitive now uses `intrusive_list_node` inheritance, allowing
+  waiters to remove themselves from queues in destructors without use-after-free.
+  Includes comprehensive cancellation safety tests (246 lines, 10 test cases).
+  (#193)
+
+### Fixed
+
+#### Critical Concurrency Bugs (4 bugs, #176)
+
+- **channel use-after-free**: `try_recv()` could schedule dangling coroutine handle
+  after waiter destruction. Fixed by checking `is_linked()` before scheduling.
+- **epoll iterator invalidation**: `submit()` could invalidate `fd_states_` iterators
+  when processing multiple file descriptors. Fixed by using index-based iteration.
+- **io_uring batch TOCTOU**: Race between batch completion and awaitable destruction.
+  Fixed by adding `orphaned` flag and checking before scheduling.
+- **scheduler draining deadline**: `draining_deadline_` could be read with relaxed
+  ordering after being written with release ordering. Fixed by using acquire ordering.
+
+#### Synchronization Primitives (8 bugs, #181, #187, #193)
+
+- **event reset race**: `reset()` could race with `set()` due to missing mutex.
+  Fixed by holding mutex during reset.
+- **shared_mutex ordering**: Reader/writer wake ordering could violate fairness.
+  Fixed by ensuring writers are woken before readers.
+- **condition_variable timing**: `notify_one()` could miss waiters due to timing.
+  Fixed by checking waiter count before and after notification.
+- **channel capacity enforcement**: Bounded channel could exceed capacity due to
+  race between `size()` check and `try_push()`. Fixed by re-checking capacity
+  under lock. (#187)
+- **channel try_push moved-from**: `try_push()` taking rvalue reference could leave
+  value in moved-from state on failure. Fixed by taking lvalue reference and
+  adding rvalue overload that preserves original value.
+- **channel send fast path**: Bounded channel could exceed capacity when concurrent
+  senders both pass unlocked size check. Fixed by re-checking capacity under lock.
+- **All sync primitives use-after-free**: Comprehensive fix across all primitives
+  (mutex, shared_mutex, semaphore, event, channel, condition_variable) using
+  intrusive list for safe waiter lifetime tracking. (#193)
+- **API compatibility**: Added rvalue overload for `try_push()` to preserve
+  existing API compatibility while fixing moved-from bug.
+
+#### Coroutine Combinators (2 bugs, #186)
+
+- **when_all await_resume ordering**: Exception could be thrown before value
+  extraction, causing value loss. Fixed by extracting values before rethrowing.
+- **generator null guard**: Missing null check in generator destructor. Fixed by
+  adding null guard.
+
+#### Runtime and Scheduler (2 bugs, #188)
+
+- **autoscaler task counting**: `task_count()` could race with task spawn/destroy.
+  Fixed by using atomic operations.
+- **autoscaler config race**: Config update could race with config read. Fixed by
+  using mutex protection.
+
+#### I/O Subsystem (2 bugs, #189)
+
+- **epoll timer truncation**: Timer deadline could be truncated incorrectly.
+  Fixed by using proper rounding.
+- **epoll close ordering**: `close()` could race with pending operations.
+  Fixed by ensuring operations complete before closing file descriptor.
+
+### Changed
+
+- **CI dependencies**: Bumped `actions/checkout` from 4 to 7 (#174),
+  `dorny/paths-filter` from 3 to 4 (#173)
+- **Dependabot configuration**: Added GitHub Actions updates to dependabot.yml
+
+### Documentation
+
+- **Cancellation safety**: Added comprehensive documentation for cancellation safety
+  guarantees across all synchronization primitives in wiki and API reference
+- **GitHub community files**: Added CONTRIBUTING.md, CODE_OF_CONDUCT.md,
+  SECURITY.md, and FUNDING.yml for better community governance
+
+### Testing
+
+- **Intrusive list unit tests**: 171 lines of comprehensive tests covering all
+  intrusive list operations (push, pop, remove, splice, etc.)
+- **Cancellation safety tests**: 246 lines of tests verifying safe waiter
+  unlinking on coroutine destruction for all sync primitives
+
+### Verification
+
+All quality gates passed:
+- ✅ 495 unit tests, 2820 assertions (up from 475 tests, 2771 assertions in 0.5.0)
+- ✅ ASAN clean
+- ✅ TSAN clean
+- ✅ CI: 5/5 checks pass (x64/arm64 x Debug/Release + package-consumer)
+
 ## [0.5.0] - 2026-06-18
 
 Focus: **correctness infrastructure and internal quality**. TSAN coverage

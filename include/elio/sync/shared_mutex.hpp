@@ -135,8 +135,6 @@ public:
                         // to prevent lost wakeups (they were blocked by WRITER_WAITING)
                         uint64_t state = mtx_.state_.load(std::memory_order_relaxed);
                         if (!(state & WRITER_ACTIVE) && !mtx_.reader_waiters_.empty()) {
-                            // Extract current reader count from state
-                            uint64_t current_readers = state & READER_MASK;
                             size_t parked_count = mtx_.reader_waiters_.size();
 
                             while (!mtx_.reader_waiters_.empty()) {
@@ -144,9 +142,12 @@ public:
                                 readers_to_wake.push_back(reader->handle_);
                             }
 
-                            // Update state: add parked readers to existing reader count
-                            uint64_t new_state = current_readers + parked_count;
-                            mtx_.state_.store(new_state, std::memory_order_release);
+                            // Update state: atomically add parked readers count.
+                            // Use fetch_add instead of store to avoid race with
+                            // lock-free readers who may increment state_ between
+                            // our load and this update (WRITER_WAITING is cleared,
+                            // so lock-free fast path is enabled).
+                            mtx_.state_.fetch_add(parked_count, std::memory_order_release);
                         }
                     }
                 }

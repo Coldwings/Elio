@@ -118,17 +118,42 @@ public:
             if (!suspended_) return;
 
             // Slow path: acquire internal_mutex_ to prevent race with unlock
-            std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
-            if (this->is_linked()) {
-                mtx_.writer_waiters_.remove(this);
-                // Reverse the bookkeeping from await_suspend: decrement pending_writers_
-                // and clear WRITER_WAITING if no more pending writers
-                --mtx_.pending_writers_;
-                if (mtx_.pending_writers_ == 0) {
-                    // No more pending writers, clear WRITER_WAITING bit
-                    // Use fetch_and to clear the bit while preserving other bits
-                    mtx_.state_.fetch_and(~WRITER_WAITING, std::memory_order_release);
+            std::vector<std::coroutine_handle<>> readers_to_wake;
+            {
+                std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+                if (this->is_linked()) {
+                    mtx_.writer_waiters_.remove(this);
+                    // Reverse the bookkeeping from await_suspend: decrement pending_writers_
+                    // and clear WRITER_WAITING if no more pending writers
+                    --mtx_.pending_writers_;
+                    if (mtx_.pending_writers_ == 0) {
+                        // No more pending writers, clear WRITER_WAITING bit
+                        // Use fetch_and to clear the bit while preserving other bits
+                        mtx_.state_.fetch_and(~WRITER_WAITING, std::memory_order_release);
+
+                        // If no writer is active and there are parked readers, wake them
+                        // to prevent lost wakeups (they were blocked by WRITER_WAITING)
+                        uint64_t state = mtx_.state_.load(std::memory_order_relaxed);
+                        if (!(state & WRITER_ACTIVE) && !mtx_.reader_waiters_.empty()) {
+                            // Extract current reader count from state
+                            uint64_t current_readers = state & READER_MASK;
+                            size_t parked_count = mtx_.reader_waiters_.size();
+
+                            while (!mtx_.reader_waiters_.empty()) {
+                                auto* reader = mtx_.reader_waiters_.pop_front();
+                                readers_to_wake.push_back(reader->handle_);
+                            }
+
+                            // Update state: add parked readers to existing reader count
+                            uint64_t new_state = current_readers + parked_count;
+                            mtx_.state_.store(new_state, std::memory_order_release);
+                        }
+                    }
                 }
+            }
+            // Schedule readers outside the lock
+            for (auto h : readers_to_wake) {
+                runtime::schedule_handle(h);
             }
         }
 

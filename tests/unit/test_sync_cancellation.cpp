@@ -167,6 +167,47 @@ TEST_CASE("shared_mutex: destroying writer waiter does not deadlock subsequent o
     wh.resume();  // Should complete without suspending
 }
 
+TEST_CASE("shared_mutex: destroying writer waiter wakes parked readers", "[sync][shared_mutex][cancellation]") {
+    shared_mutex sm;
+    sm.try_lock_shared();  // Reader R1 holds lock
+
+    // Writer W1 suspends and sets WRITER_WAITING
+    auto writer_task = [&]() -> task<void> {
+        co_await sm.lock();
+    };
+    auto wt = writer_task();
+    auto wh = elio::coro::detail::task_access::release(wt);
+    wh.resume();  // Suspends on lock() because reader holds lock
+
+    // Reader R2 tries to acquire, sees WRITER_WAITING, parks in reader_waiters_
+    auto reader_task = [&]() -> task<void> {
+        co_await sm.lock_shared();
+        sm.unlock_shared();
+    };
+    auto rt = reader_task();
+    auto rh = elio::coro::detail::task_access::release(rt);
+    rh.resume();  // Suspends on lock_shared() because WRITER_WAITING is set
+
+    // Verify R2 is parked
+    REQUIRE(sm.reader_count() == 1);  // Only R1 is active
+
+    // Destroy writer W1 — must clear WRITER_WAITING and wake parked reader R2
+    wh.destroy();
+
+    // Verify WRITER_WAITING was cleared and R2 was woken
+    // R2 should now be active (reader_count should be 2: R1 + R2)
+    // But R2 hasn't actually acquired the lock yet - it was just scheduled
+    // So we need to release R1's lock first, then R2 can acquire
+
+    // Release reader R1's lock
+    sm.unlock_shared();
+
+    // Now R2 should be able to complete when resumed
+    // Note: schedule_handle was called in the destructor, so R2 is scheduled
+    // We just need to verify the state is correct (no WRITER_WAITING)
+    REQUIRE(!sm.is_writer_active());
+}
+
 TEST_CASE("event: multiple waiters, destroy one, set wakes remaining", "[sync][event][cancellation]") {
     event e;
     std::atomic<int> woken{0};

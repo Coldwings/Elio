@@ -22,6 +22,8 @@ set(TEST_SOURCES
     unit/test_io.cpp
     unit/test_batch_io.cpp
     unit/test_sync.cpp
+    unit/test_intrusive_list.cpp
+    unit/test_sync_cancellation.cpp
     unit/test_channel_debug.cpp
     unit/test_channel_close.cpp
     unit/test_close_wake.cpp

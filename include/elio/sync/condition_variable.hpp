@@ -3,16 +3,16 @@
 #include <coroutine>
 #include <atomic>
 #include <mutex>
-#include <queue>
 #include <vector>
 #include <concepts>
+#include <cassert>
+#include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
 #include "mutex.hpp"
 
 namespace elio::sync {
 
-/// Lock concept for condition_variable - any type with lock()/unlock()
-/// that can be used with the condition_variable
+/// Lock concept for condition_variable
 namespace detail {
 
 template<typename Lock>
@@ -24,21 +24,38 @@ concept lockable = requires(Lock& l) {
 } // namespace detail
 
 /// Coroutine-aware condition variable
+///
 /// Suspends the coroutine instead of blocking the thread.
+/// Supports three modes of use:
+/// - With elio::sync::mutex (coroutine-aware async re-lock)
+/// - With elio::sync::spinlock or any lockable type (synchronous re-lock)
+/// - Without any lock (wait_unlocked) for single-worker scenarios
 ///
-/// Can be used with:
-/// - elio::sync::mutex (via co_await cv.wait(mutex))
-/// - elio::sync::spinlock (via co_await cv.wait(spinlock))
-/// - No lock at all (via co_await cv.wait_unlocked()) when all participants
-///   are guaranteed to run on the same worker thread
-///
-/// Supports both notify_one() and notify_all() semantics.
-/// Callers must use a while(!pred) { co_await cv.wait(m); } loop for
-/// spurious-wakeup protection.
+/// IMPORTANT: Always use a predicate loop to protect against spurious wakeups:
+/// @code
+/// co_await mtx.lock();
+/// while (!condition) {
+///     co_await cv.wait(mtx);
+/// }
+/// mtx.unlock();
+/// @endcode
 class condition_variable {
 public:
+    /// Common base for all cv waiter types.
+    /// Inherits intrusive_list_node so all awaiter types can share one list.
+    class cv_waiter_base : public elio::detail::intrusive_list_node<cv_waiter_base> {
+    public:
+        std::coroutine_handle<> handle_;
+        bool suspended_ = false;  // True if enqueued in waiters_
+    protected:
+        cv_waiter_base() = default;
+    };
+
     condition_variable() = default;
-    ~condition_variable() = default;
+
+    ~condition_variable() {
+        assert(waiters_.empty() && "condition_variable destroyed with pending waiters");
+    }
 
     // Non-copyable, non-movable
     condition_variable(const condition_variable&) = delete;
@@ -47,17 +64,35 @@ public:
     condition_variable& operator=(condition_variable&&) = delete;
 
     /// Internal awaitable: suspends until notified, does NOT re-lock.
-    class wait_suspend_awaitable {
+    class wait_suspend_awaitable : public cv_waiter_base {
     public:
         wait_suspend_awaitable(condition_variable& cv, mutex& m)
             : cv_(cv), mutex_(m) {}
 
+        ~wait_suspend_awaitable() {
+            // Fast path: if we never suspended, we were never enqueued,
+            // so no wake function could hold a reference to us.
+            if (!this->suspended_) return;
+
+            // Slow path: acquire internal_mutex_ to prevent race with notify
+            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+            if (this->is_linked()) {
+                cv_.waiters_.remove(this);
+            }
+        }
+
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            std::unique_lock<std::mutex> lock(cv_.internal_mutex_);
-            cv_.waiters_.push(awaiter);
-            lock.unlock();
+            {
+                std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+                this->handle_ = awaiter;
+                cv_.waiters_.push_back(this);
+                this->suspended_ = true;  // Mark as enqueued
+            }
+            // Release cv lock BEFORE unlocking user mutex to avoid self-deadlock
+            // on trampoline path: if mutex_.unlock() schedules a waiter that
+            // immediately calls cv.wait(), it needs to acquire cv_.internal_mutex_.
             mutex_.unlock();
             return true;
         }
@@ -70,26 +105,40 @@ public:
     };
 
     /// Wait awaitable for use with a generic lockable type (e.g., spinlock)
-    /// Atomically releases the lock and suspends the coroutine.
-    /// Re-acquires the lock before resuming.
     template<detail::lockable Lock>
-    class wait_awaitable_lock {
+    class wait_awaitable_lock : public cv_waiter_base {
     public:
         wait_awaitable_lock(condition_variable& cv, Lock& lock)
             : cv_(cv), lock_(lock) {}
 
+        ~wait_awaitable_lock() {
+            // Fast path: if we never suspended, we were never enqueued
+            if (!this->suspended_) return;
+
+            // Slow path: acquire internal_mutex_ to prevent race with notify
+            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+            if (this->is_linked()) {
+                cv_.waiters_.remove(this);
+            }
+        }
+
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            std::unique_lock<std::mutex> lock(cv_.internal_mutex_);
-            cv_.waiters_.push(awaiter);
-            lock.unlock();
+            {
+                std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+                this->handle_ = awaiter;
+                cv_.waiters_.push_back(this);
+                this->suspended_ = true;  // Mark as enqueued
+            }
+            // Release cv lock BEFORE unlocking user lock to avoid self-deadlock
+            // on trampoline path: if lock_.unlock() schedules a waiter that
+            // immediately calls cv.wait(), it needs to acquire cv_.internal_mutex_.
             lock_.unlock();
             return true;
         }
 
         void await_resume() {
-            // Re-acquire the lock synchronously (spinlock)
             lock_.lock();
         }
 
@@ -99,16 +148,28 @@ public:
     };
 
     /// Wait awaitable without any external lock
-    /// Use only when all participants are guaranteed to run on the same worker thread.
-    class wait_awaitable_unlocked {
+    class wait_awaitable_unlocked : public cv_waiter_base {
     public:
         explicit wait_awaitable_unlocked(condition_variable& cv) : cv_(cv) {}
+
+        ~wait_awaitable_unlocked() {
+            // Fast path: if we never suspended, we were never enqueued
+            if (!this->suspended_) return;
+
+            // Slow path: acquire internal_mutex_ to prevent race with notify
+            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+            if (this->is_linked()) {
+                cv_.waiters_.remove(this);
+            }
+        }
 
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
             std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
-            cv_.waiters_.push(awaiter);
+            this->handle_ = awaiter;
+            cv_.waiters_.push_back(this);
+            this->suspended_ = true;  // Mark as enqueued
             return true;
         }
 
@@ -119,70 +180,62 @@ public:
     };
 
     /// Wait with elio::sync::mutex
-    /// The mutex must be locked before calling wait().
-    /// Atomically releases the mutex, suspends until notified, then re-acquires.
-    /// Usage:
-    ///   co_await mtx.lock();
-    ///   while (!condition) {
-    ///       co_await cv.wait(mtx);
-    ///   }
-    ///   mtx.unlock();
     ///
-    /// Note: This returns a task<void> because re-acquiring the mutex requires
-    /// an async operation (co_await m.lock()). The template version for generic
-    /// lockable types (e.g., spinlock) returns an awaitable directly because
-    /// those locks use synchronous lock() calls. Both versions require a single
-    /// co_await at the call site.
+    /// Atomically releases the mutex and suspends the coroutine.
+    /// When notified, re-acquires the mutex before returning.
+    ///
+    /// Usage:
+    /// @code
+    /// co_await mtx.lock();
+    /// while (!condition) {
+    ///     co_await cv.wait(mtx);
+    /// }
+    /// mtx.unlock();
+    /// @endcode
     coro::task<void> wait(mutex& m) {
         co_await wait_suspend_awaitable(*this, m);
         co_await m.lock();
     }
 
     /// Wait with a generic lockable (e.g., spinlock)
-    /// The lock must be held before calling wait().
-    /// Usage:
-    ///   sl.lock();
-    ///   while (!condition) {
-    ///       co_await cv.wait(sl);
-    ///   }
-    ///   sl.unlock();
     template<detail::lockable Lock>
     auto wait(Lock& lock) {
         return wait_awaitable_lock<Lock>(*this, lock);
     }
 
     /// Wait without external lock (single-worker only)
-    /// Usage:
-    ///   while (!condition) {
-    ///       co_await cv.wait_unlocked();
-    ///   }
     auto wait_unlocked() {
         return wait_awaitable_unlocked(*this);
     }
 
     /// Wake one waiting coroutine
     void notify_one() {
-        std::coroutine_handle<> to_resume;
+        std::coroutine_handle<> to_schedule = nullptr;
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
             if (waiters_.empty()) return;
-            to_resume = waiters_.front();
-            waiters_.pop();
+
+            auto* waiter = waiters_.pop_front();
+            to_schedule = waiter->handle_;
         }
-        runtime::schedule_handle(to_resume);
+        // Schedule outside lock to avoid deadlock if schedule_handle()
+        // resumes inline (trampoline path) and destructor re-acquires mutex.
+        runtime::schedule_handle(to_schedule);
     }
 
     /// Wake all waiting coroutines
     void notify_all() {
-        std::vector<std::coroutine_handle<>> to_resume;
+        std::vector<std::coroutine_handle<>> to_schedule;
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
             while (!waiters_.empty()) {
-                to_resume.push_back(waiters_.front());
-                waiters_.pop();
+                auto* waiter = waiters_.pop_front();
+                to_schedule.push_back(waiter->handle_);
             }
         }
-        for (auto& h : to_resume) {
+        // Schedule outside lock to avoid deadlock if schedule_handle()
+        // resumes inline (trampoline path) and destructor re-acquires mutex.
+        for (auto h : to_schedule) {
             runtime::schedule_handle(h);
         }
     }
@@ -195,7 +248,7 @@ public:
 
 private:
     mutable std::mutex internal_mutex_;
-    std::queue<std::coroutine_handle<>> waiters_;
+    elio::detail::intrusive_list<cv_waiter_base> waiters_;
 };
 
 } // namespace elio::sync

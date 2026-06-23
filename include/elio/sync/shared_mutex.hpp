@@ -4,8 +4,8 @@
 #include <coroutine>
 #include <atomic>
 #include <mutex>
-#include <queue>
 #include <vector>
+#include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
 
 namespace elio::sync {
@@ -42,9 +42,20 @@ private:
 public:
     /// Shared lock awaitable (for readers)
     /// Optimized with lock-free fast path for uncontended acquisition
-    class lock_shared_awaitable {
+    class lock_shared_awaitable : public elio::detail::intrusive_list_node<lock_shared_awaitable> {
     public:
         explicit lock_shared_awaitable(shared_mutex& m) : mtx_(m) {}
+
+        ~lock_shared_awaitable() {
+            // Fast path: if we never suspended, we were never enqueued
+            if (!suspended_) return;
+
+            // Slow path: acquire internal_mutex_ to prevent race with unlock
+            std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+            if (this->is_linked()) {
+                mtx_.reader_waiters_.remove(this);
+            }
+        }
 
         bool await_ready() const noexcept {
             return mtx_.try_lock_shared();
@@ -81,7 +92,9 @@ public:
             }
 
             // Add to reader wait queue
-            mtx_.reader_waiters_.push(awaiter);
+            handle_ = awaiter;
+            suspended_ = true;
+            mtx_.reader_waiters_.push_back(this);
             return true;  // Suspend
         }
 
@@ -89,12 +102,61 @@ public:
 
     private:
         shared_mutex& mtx_;
+        std::coroutine_handle<> handle_;
+        bool suspended_ = false;
+
+        friend class shared_mutex;
     };
 
     /// Exclusive lock awaitable (for writers)
-    class lock_awaitable {
+    class lock_awaitable : public elio::detail::intrusive_list_node<lock_awaitable> {
     public:
         explicit lock_awaitable(shared_mutex& m) : mtx_(m) {}
+
+        ~lock_awaitable() {
+            // Fast path: if we never suspended, we were never enqueued
+            if (!suspended_) return;
+
+            // Slow path: acquire internal_mutex_ to prevent race with unlock
+            std::vector<std::coroutine_handle<>> readers_to_wake;
+            {
+                std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+                if (this->is_linked()) {
+                    mtx_.writer_waiters_.remove(this);
+                    // Reverse the bookkeeping from await_suspend: decrement pending_writers_
+                    // and clear WRITER_WAITING if no more pending writers
+                    --mtx_.pending_writers_;
+                    if (mtx_.pending_writers_ == 0) {
+                        // No more pending writers, clear WRITER_WAITING bit
+                        // Use fetch_and to clear the bit while preserving other bits
+                        mtx_.state_.fetch_and(~WRITER_WAITING, std::memory_order_release);
+
+                        // If no writer is active and there are parked readers, wake them
+                        // to prevent lost wakeups (they were blocked by WRITER_WAITING)
+                        uint64_t state = mtx_.state_.load(std::memory_order_relaxed);
+                        if (!(state & WRITER_ACTIVE) && !mtx_.reader_waiters_.empty()) {
+                            size_t parked_count = mtx_.reader_waiters_.size();
+
+                            while (!mtx_.reader_waiters_.empty()) {
+                                auto* reader = mtx_.reader_waiters_.pop_front();
+                                readers_to_wake.push_back(reader->handle_);
+                            }
+
+                            // Update state: atomically add parked readers count.
+                            // Use fetch_add instead of store to avoid race with
+                            // lock-free readers who may increment state_ between
+                            // our load and this update (WRITER_WAITING is cleared,
+                            // so lock-free fast path is enabled).
+                            mtx_.state_.fetch_add(parked_count, std::memory_order_release);
+                        }
+                    }
+                }
+            }
+            // Schedule readers outside the lock
+            for (auto h : readers_to_wake) {
+                runtime::schedule_handle(h);
+            }
+        }
 
         bool await_ready() const noexcept {
             return mtx_.try_lock();
@@ -129,7 +191,9 @@ public:
             }
 
             ++mtx_.pending_writers_;
-            mtx_.writer_waiters_.push(awaiter);
+            handle_ = awaiter;
+            suspended_ = true;
+            mtx_.writer_waiters_.push_back(this);
             return true;  // Suspend
         }
 
@@ -137,6 +201,10 @@ public:
 
     private:
         shared_mutex& mtx_;
+        std::coroutine_handle<> handle_;
+        bool suspended_ = false;
+
+        friend class shared_mutex;
     };
 
     /// Acquire shared (read) lock
@@ -202,8 +270,7 @@ public:
             // Double-check under lock
             uint64_t state = state_.load(std::memory_order_relaxed);
             if ((state & READER_MASK) == 0 && !writer_waiters_.empty()) {
-                auto writer = writer_waiters_.front();
-                writer_waiters_.pop();
+                auto* writer = writer_waiters_.pop_front();
                 --pending_writers_;
 
                 // Clear WRITER_WAITING if no more pending writers, set WRITER_ACTIVE
@@ -212,7 +279,7 @@ public:
                     new_state |= WRITER_WAITING;
                 }
                 state_.store(new_state, std::memory_order_release);
-                to_resume = writer;
+                to_resume = writer->handle_;
             }
         }
 
@@ -237,8 +304,7 @@ public:
 
             // Prefer writers over readers to prevent writer starvation
             if (!writer_waiters_.empty()) {
-                auto writer = writer_waiters_.front();
-                writer_waiters_.pop();
+                auto* writer = writer_waiters_.pop_front();
                 --pending_writers_;
 
                 // Keep WRITER_ACTIVE, update WRITER_WAITING based on remaining writers
@@ -249,18 +315,17 @@ public:
                 state_.store(new_state, std::memory_order_release);
 
                 // Writer path: always exactly one handle — fits in inline buffer
-                inline_buf[0] = writer;
+                inline_buf[0] = writer->handle_;
                 inline_count = 1;
             } else {
                 // Wake all waiting readers
                 size_t reader_count = reader_waiters_.size();
                 while (!reader_waiters_.empty()) {
-                    auto h = reader_waiters_.front();
-                    reader_waiters_.pop();
+                    auto* reader = reader_waiters_.pop_front();
                     if (inline_count < kInlineCapacity) {
-                        inline_buf[inline_count++] = h;
+                        inline_buf[inline_count++] = reader->handle_;
                     } else {
-                        overflow.push_back(h);
+                        overflow.push_back(reader->handle_);
                     }
                 }
                 // Set reader count, preserve WRITER_WAITING if there are pending writers
@@ -299,8 +364,8 @@ private:
     // slow-path fields: only accessed under internal_mutex_
     alignas(64) mutable std::mutex internal_mutex_;
     size_t pending_writers_ = 0;       // Count of pending writers (for WRITER_WAITING flag management)
-    std::queue<std::coroutine_handle<>> reader_waiters_;
-    std::queue<std::coroutine_handle<>> writer_waiters_;
+    elio::detail::intrusive_list<lock_shared_awaitable> reader_waiters_;
+    elio::detail::intrusive_list<lock_awaitable> writer_waiters_;
 };
 
 /// RAII shared lock guard for shared_mutex (reader lock)

@@ -3,8 +3,9 @@
 #include <coroutine>
 #include <atomic>
 #include <mutex>
-#include <queue>
 #include <vector>
+#include <cassert>
+#include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
 
 namespace elio::sync {
@@ -12,8 +13,14 @@ namespace elio::sync {
 /// Coroutine-aware event (manual reset)
 class event {
 public:
+    // Forward declaration for intrusive_list
+    class wait_awaitable;
+
     event() = default;
-    ~event() = default;
+
+    ~event() {
+        assert(waiters_.empty() && "event destroyed with pending waiters");
+    }
 
     // Non-copyable, non-movable
     event(const event&) = delete;
@@ -21,10 +28,25 @@ public:
     event(event&&) = delete;
     event& operator=(event&&) = delete;
 
-    /// Wait awaitable
-    class wait_awaitable {
+    /// Wait awaitable — inherits intrusive_list_node for safe unlinking
+    class wait_awaitable : public elio::detail::intrusive_list_node<wait_awaitable> {
     public:
         explicit wait_awaitable(event& e) : evt_(e) {}
+
+        ~wait_awaitable() {
+            // Fast path: if we never suspended, we were never enqueued,
+            // so no wake function could hold a reference to us.
+            if (!suspended_) return;
+
+            // Slow path: acquire mutex to serialize access to the waiter list.
+            // Either we unlink before set() pops us, or set() has already
+            // popped us (so is_linked() is false here). This ensures we don't
+            // race with set()'s collect-then-schedule pattern.
+            std::lock_guard<std::mutex> guard(evt_.mutex_);
+            if (this->is_linked()) {
+                evt_.waiters_.remove(this);
+            }
+        }
 
         bool await_ready() const noexcept {
             return evt_.signaled_.load(std::memory_order_acquire);
@@ -37,7 +59,9 @@ public:
                 return false;  // Already signaled
             }
 
-            evt_.waiters_.push(awaiter);
+            handle_ = awaiter;
+            evt_.waiters_.push_back(this);
+            suspended_ = true;  // Mark as enqueued
             return true;
         }
 
@@ -45,6 +69,10 @@ public:
 
     private:
         event& evt_;
+        std::coroutine_handle<> handle_;
+        bool suspended_ = false;  // True if enqueued in waiters_
+
+        friend class event;
     };
 
     /// Wait for the event to be signaled
@@ -54,27 +82,28 @@ public:
 
     /// Signal the event (wake all waiters)
     void set() {
-        std::vector<std::coroutine_handle<>> to_resume;
-
+        std::vector<std::coroutine_handle<>> to_schedule;
         {
             std::lock_guard<std::mutex> guard(mutex_);
             signaled_.store(true, std::memory_order_release);
 
+            // Collect handles and pop from list under lock.
+            // Popping marks nodes as unlinked, so destructors won't try to remove them.
             while (!waiters_.empty()) {
-                to_resume.push_back(waiters_.front());
-                waiters_.pop();
+                auto* waiter = waiters_.pop_front();
+                to_schedule.push_back(waiter->handle_);
             }
         }
-
-        // Re-schedule waiters through the scheduler
-        for (auto& h : to_resume) {
+        // Schedule outside lock to avoid deadlock if schedule_handle()
+        // resumes inline (trampoline path) and destructor re-acquires mutex.
+        for (auto h : to_schedule) {
             runtime::schedule_handle(h);
         }
     }
 
     /// Reset the event
     void reset() noexcept {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> guard(mutex_);
         signaled_.store(false, std::memory_order_release);
     }
 
@@ -86,7 +115,7 @@ public:
 private:
     std::mutex mutex_;
     std::atomic<bool> signaled_{false};
-    std::queue<std::coroutine_handle<>> waiters_;
+    elio::detail::intrusive_list<wait_awaitable> waiters_;
 };
 
 } // namespace elio::sync

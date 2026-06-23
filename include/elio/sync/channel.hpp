@@ -5,6 +5,7 @@
 #include <limits>
 #include <mutex>
 #include <queue>
+#include <vector>
 #include <optional>
 #include <utility>
 #include <memory>
@@ -66,39 +67,50 @@ public:
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> h) noexcept {
-            std::lock_guard<std::mutex> guard(ch_.mutex_);
+            std::coroutine_handle<> to_schedule = nullptr;
+            bool should_suspend = true;
 
-            if (ch_.closed_) {
-                return false;
-            }
+            {
+                std::lock_guard<std::mutex> guard(ch_.mutex_);
 
-            if (ch_.is_rendezvous()) {
-                // Rendezvous: direct handoff to a waiting receiver
-                if (!ch_.recv_waiters_.empty()) {
-                    ch_.queue_.push(std::move(value_));
-                    success_ = true;
-                    auto* receiver = ch_.recv_waiters_.pop_front();
-                    elio::runtime::schedule_handle(receiver->handle_);
-                    return false;
-                }
-            } else {
-                // Bounded: try to push into ring
-                if (ch_.ring_->size() < ch_.capacity_) {
-                    if (ch_.ring_->try_push(value_)) {
+                if (ch_.closed_) {
+                    should_suspend = false;
+                } else if (ch_.is_rendezvous()) {
+                    // Rendezvous: direct handoff to a waiting receiver
+                    if (!ch_.recv_waiters_.empty()) {
+                        ch_.queue_.push(std::move(value_));
                         success_ = true;
-                        if (!ch_.recv_waiters_.empty()) {
-                            auto* receiver = ch_.recv_waiters_.pop_front();
-                            elio::runtime::schedule_handle(receiver->handle_);
+                        auto* receiver = ch_.recv_waiters_.pop_front();
+                        to_schedule = receiver->handle_;
+                        should_suspend = false;
+                    }
+                } else {
+                    // Bounded: try to push into ring
+                    if (ch_.ring_->size() < ch_.capacity_) {
+                        if (ch_.ring_->try_push(value_)) {
+                            success_ = true;
+                            if (!ch_.recv_waiters_.empty()) {
+                                auto* receiver = ch_.recv_waiters_.pop_front();
+                                to_schedule = receiver->handle_;
+                            }
+                            should_suspend = false;
                         }
-                        return false;
                     }
                 }
+
+                if (should_suspend) {
+                    // Cannot send now — suspend
+                    handle_ = h;
+                    ch_.send_waiters_.push_back(this);
+                }
             }
 
-            // Cannot send now — suspend
-            handle_ = h;
-            ch_.send_waiters_.push_back(this);
-            return true;
+            // Schedule outside lock to avoid deadlock
+            if (to_schedule) {
+                elio::runtime::schedule_handle(to_schedule);
+            }
+
+            return should_suspend;
         }
 
         bool await_resume() const noexcept { return success_; }
@@ -164,14 +176,20 @@ public:
         }
 
         if (is_unbounded()) {
-            std::lock_guard<std::mutex> guard(mutex_);
-            if (closed_) {
-                co_return false;
+            std::coroutine_handle<> receiver_handle = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                if (closed_) {
+                    co_return false;
+                }
+                queue_.push(std::move(value));
+                if (!recv_waiters_.empty()) {
+                    auto* receiver = recv_waiters_.pop_front();
+                    receiver_handle = receiver->handle_;
+                }
             }
-            queue_.push(std::move(value));
-            if (!recv_waiters_.empty()) {
-                auto* receiver = recv_waiters_.pop_front();
-                elio::runtime::schedule_handle(receiver->handle_);
+            if (receiver_handle) {
+                elio::runtime::schedule_handle(receiver_handle);
             }
             co_return true;
         }
@@ -179,6 +197,7 @@ public:
         // Bounded or rendezvous: try fast path, then suspend
         if (is_bounded() && ring_->size() < capacity_) {
             bool pushed = false;
+            std::coroutine_handle<> receiver_handle = nullptr;
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 if (!closed_) {
@@ -186,10 +205,13 @@ public:
                         pushed = true;
                         if (!recv_waiters_.empty()) {
                             auto* receiver = recv_waiters_.pop_front();
-                            elio::runtime::schedule_handle(receiver->handle_);
+                            receiver_handle = receiver->handle_;
                         }
                     }
                 }
+            }
+            if (receiver_handle) {
+                elio::runtime::schedule_handle(receiver_handle);
             }
             if (pushed) {
                 co_return true;
@@ -216,38 +238,56 @@ public:
         }
 
         if (is_bounded()) {
-            std::lock_guard<std::mutex> guard(mutex_);
-            if (closed_) return false;
-            if (ring_->size() >= capacity_) return false;
-            if (ring_->try_push(value)) {
-                if (!recv_waiters_.empty()) {
-                    auto* receiver = recv_waiters_.pop_front();
-                    elio::runtime::schedule_handle(receiver->handle_);
+            std::coroutine_handle<> receiver_handle = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                if (closed_) return false;
+                if (ring_->size() >= capacity_) return false;
+                if (ring_->try_push(value)) {
+                    if (!recv_waiters_.empty()) {
+                        auto* receiver = recv_waiters_.pop_front();
+                        receiver_handle = receiver->handle_;
+                    }
+                } else {
+                    return false;
                 }
-                return true;
             }
-            return false;
+            if (receiver_handle) {
+                elio::runtime::schedule_handle(receiver_handle);
+            }
+            return true;
         }
 
         if (is_rendezvous()) {
-            std::lock_guard<std::mutex> guard(mutex_);
-            if (closed_) return false;
-            if (!recv_waiters_.empty()) {
-                queue_.push(std::move(value));
-                auto* receiver = recv_waiters_.pop_front();
-                elio::runtime::schedule_handle(receiver->handle_);
-                return true;
+            std::coroutine_handle<> receiver_handle = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                if (closed_) return false;
+                if (!recv_waiters_.empty()) {
+                    queue_.push(std::move(value));
+                    auto* receiver = recv_waiters_.pop_front();
+                    receiver_handle = receiver->handle_;
+                } else {
+                    return false;
+                }
             }
-            return false;
+            elio::runtime::schedule_handle(receiver_handle);
+            return true;
         }
 
         // Unbounded
-        std::lock_guard<std::mutex> guard(mutex_);
-        if (closed_) return false;
-        queue_.push(std::move(value));
-        if (!recv_waiters_.empty()) {
-            auto* receiver = recv_waiters_.pop_front();
-            elio::runtime::schedule_handle(receiver->handle_);
+        std::coroutine_handle<> receiver_handle = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (closed_) return false;
+            queue_.push(std::move(value));
+            if (!recv_waiters_.empty()) {
+                auto* receiver = recv_waiters_.pop_front();
+                receiver_handle = receiver->handle_;
+            }
+        }
+        if (receiver_handle) {
+            elio::runtime::schedule_handle(receiver_handle);
         }
         return true;
     }
@@ -258,35 +298,46 @@ public:
             while (true) {
                 auto val = ring_->try_pop();
                 if (val.has_value()) {
+                    std::coroutine_handle<> sender_handle = nullptr;
                     {
                         std::lock_guard<std::mutex> guard(mutex_);
                         if (!send_waiters_.empty()) {
                             auto* sender = send_waiters_.front();
                             if (ring_->try_push(sender->value_)) {
-                                elio::runtime::schedule_handle(sender->handle_);
+                                sender_handle = sender->handle_;
                                 send_waiters_.pop_front();
                             }
                         }
                     }
+                    if (sender_handle) {
+                        elio::runtime::schedule_handle(sender_handle);
+                    }
                     co_return val;
                 }
 
+                std::coroutine_handle<> sender_handle = nullptr;
+                std::optional<T> result;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
                     if (!send_waiters_.empty()) {
                         auto* sender = send_waiters_.pop_front();
-                        auto result = std::optional<T>(std::move(sender->value_));
-                        elio::runtime::schedule_handle(sender->handle_);
-                        co_return result;
-                    }
-                    if (closed_.load(std::memory_order_acquire)) {
+                        result = std::optional<T>(std::move(sender->value_));
+                        sender_handle = sender->handle_;
+                    } else if (closed_.load(std::memory_order_acquire)) {
                         if (!queue_.empty()) {
-                            auto result = std::move(queue_.front());
+                            result = std::move(queue_.front());
                             queue_.pop();
-                            co_return result;
+                        } else {
+                            result = std::nullopt;
                         }
-                        co_return std::nullopt;
                     }
+                }
+
+                if (result.has_value() || (closed_.load(std::memory_order_acquire) && !result.has_value())) {
+                    if (sender_handle) {
+                        elio::runtime::schedule_handle(sender_handle);
+                    }
+                    co_return result;
                 }
 
                 recv_awaitable awaitable{*this};
@@ -296,26 +347,33 @@ public:
 
         // Unbounded or rendezvous
         while (true) {
+            std::coroutine_handle<> sender_handle = nullptr;
+            std::optional<T> result;
+            bool should_wait = false;
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 if (!queue_.empty()) {
-                    auto result = std::move(queue_.front());
+                    result = std::move(queue_.front());
                     queue_.pop();
-                    co_return result;
-                }
-                if (is_rendezvous() && !send_waiters_.empty()) {
+                } else if (is_rendezvous() && !send_waiters_.empty()) {
                     auto* sender = send_waiters_.pop_front();
-                    auto result = std::optional<T>(std::move(sender->value_));
-                    elio::runtime::schedule_handle(sender->handle_);
-                    co_return result;
-                }
-                if (closed_.load(std::memory_order_acquire)) {
-                    co_return std::nullopt;
+                    result = std::optional<T>(std::move(sender->value_));
+                    sender_handle = sender->handle_;
+                } else if (closed_.load(std::memory_order_acquire)) {
+                    result = std::nullopt;
+                } else {
+                    should_wait = true;
                 }
             }
-
-            recv_awaitable awaitable{*this};
-            co_await awaitable;
+            if (should_wait) {
+                recv_awaitable awaitable{*this};
+                co_await awaitable;
+                continue;
+            }
+            if (sender_handle) {
+                elio::runtime::schedule_handle(sender_handle);
+            }
+            co_return result;
         }
     }
 
@@ -324,15 +382,19 @@ public:
         if (is_bounded()) {
             auto val = ring_->try_pop();
             if (val.has_value()) {
+                std::coroutine_handle<> sender_handle = nullptr;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
                     if (!send_waiters_.empty()) {
                         auto* sender = send_waiters_.front();
                         if (ring_->try_push(sender->value_)) {
-                            elio::runtime::schedule_handle(sender->handle_);
+                            sender_handle = sender->handle_;
                             send_waiters_.pop_front();
                         }
                     }
+                }
+                if (sender_handle) {
+                    elio::runtime::schedule_handle(sender_handle);
                 }
                 return val;
             }
@@ -348,18 +410,26 @@ public:
             return std::nullopt;
         }
 
-        std::lock_guard<std::mutex> guard(mutex_);
-        if (queue_.empty()) {
-            if (is_rendezvous() && !send_waiters_.empty()) {
-                auto* sender = send_waiters_.pop_front();
-                auto result = std::optional<T>(std::move(sender->value_));
-                elio::runtime::schedule_handle(sender->handle_);
-                return result;
+        std::coroutine_handle<> sender_handle = nullptr;
+        std::optional<T> result;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (queue_.empty()) {
+                if (is_rendezvous() && !send_waiters_.empty()) {
+                    auto* sender = send_waiters_.pop_front();
+                    result = std::optional<T>(std::move(sender->value_));
+                    sender_handle = sender->handle_;
+                } else {
+                    return std::nullopt;
+                }
+            } else {
+                result = std::move(queue_.front());
+                queue_.pop();
             }
-            return std::nullopt;
         }
-        auto result = std::move(queue_.front());
-        queue_.pop();
+        if (sender_handle) {
+            elio::runtime::schedule_handle(sender_handle);
+        }
         return result;
     }
 
@@ -370,35 +440,43 @@ public:
             return;
         }
 
-        std::lock_guard<std::mutex> guard(mutex_);
+        std::vector<std::coroutine_handle<>> to_schedule;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
 
-        // Drain ring and send_waiters_ into queue_ for bounded channels
-        if (is_bounded()) {
-            while (true) {
-                auto val = ring_->try_pop();
-                if (!val.has_value()) break;
-                queue_.push(std::move(*val));
+            // Drain ring and send_waiters_ into queue_ for bounded channels
+            if (is_bounded()) {
+                while (true) {
+                    auto val = ring_->try_pop();
+                    if (!val.has_value()) break;
+                    queue_.push(std::move(*val));
+                }
+                while (!send_waiters_.empty()) {
+                    auto* sender = send_waiters_.pop_front();
+                    queue_.push(std::move(sender->value_));
+                    to_schedule.push_back(sender->handle_);
+                }
             }
-            while (!send_waiters_.empty()) {
-                auto* sender = send_waiters_.pop_front();
-                queue_.push(std::move(sender->value_));
-                elio::runtime::schedule_handle(sender->handle_);
+
+            // Drain rendezvous send_waiters_
+            if (is_rendezvous()) {
+                while (!send_waiters_.empty()) {
+                    auto* sender = send_waiters_.pop_front();
+                    queue_.push(std::move(sender->value_));
+                    to_schedule.push_back(sender->handle_);
+                }
+            }
+
+            // Wake all waiting receivers
+            while (!recv_waiters_.empty()) {
+                auto* receiver = recv_waiters_.pop_front();
+                to_schedule.push_back(receiver->handle_);
             }
         }
 
-        // Drain rendezvous send_waiters_
-        if (is_rendezvous()) {
-            while (!send_waiters_.empty()) {
-                auto* sender = send_waiters_.pop_front();
-                queue_.push(std::move(sender->value_));
-                elio::runtime::schedule_handle(sender->handle_);
-            }
-        }
-
-        // Wake all waiting receivers
-        while (!recv_waiters_.empty()) {
-            auto* receiver = recv_waiters_.pop_front();
-            elio::runtime::schedule_handle(receiver->handle_);
+        // Schedule outside lock to avoid deadlock
+        for (auto h : to_schedule) {
+            elio::runtime::schedule_handle(h);
         }
     }
 

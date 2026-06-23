@@ -114,18 +114,27 @@ public:
 
     /// Unlock the mutex and wake one waiter if any
     void unlock() noexcept {
-        std::lock_guard<std::mutex> guard(internal_mutex_);
+        std::coroutine_handle<> to_schedule = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(internal_mutex_);
 
-        if (waiters_.empty()) {
-            // No waiters, just release
-            state_.store(nullptr, std::memory_order_release);
-        } else {
-            // Transfer lock to next waiter using sentinel marker
-            state_.store(reinterpret_cast<void*>(1), std::memory_order_release);
+            if (waiters_.empty()) {
+                // No waiters, just release
+                state_.store(nullptr, std::memory_order_release);
+            } else {
+                // Transfer lock to next waiter using sentinel marker
+                state_.store(reinterpret_cast<void*>(1), std::memory_order_release);
 
-            // Schedule WHILE holding mutex to prevent frame destruction
-            auto* waiter = waiters_.pop_front();
-            runtime::schedule_handle(waiter->handle_);
+                // Collect handle and pop from list under lock.
+                // Popping marks node as unlinked, so destructor won't try to remove it.
+                auto* waiter = waiters_.pop_front();
+                to_schedule = waiter->handle_;
+            }
+        }
+        // Schedule outside lock to avoid deadlock if schedule_handle()
+        // resumes inline (trampoline path) and destructor re-acquires mutex.
+        if (to_schedule) {
+            runtime::schedule_handle(to_schedule);
         }
     }
 

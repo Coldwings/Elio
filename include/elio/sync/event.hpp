@@ -3,6 +3,7 @@
 #include <coroutine>
 #include <atomic>
 #include <mutex>
+#include <vector>
 #include <cassert>
 #include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
@@ -75,15 +76,22 @@ public:
 
     /// Signal the event (wake all waiters)
     void set() {
-        std::lock_guard<std::mutex> guard(mutex_);
-        signaled_.store(true, std::memory_order_release);
+        std::vector<std::coroutine_handle<>> to_schedule;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            signaled_.store(true, std::memory_order_release);
 
-        // Schedule all waiters WHILE holding mutex.
-        // This prevents the coroutine frame from being destroyed
-        // during scheduling (the destructor blocks on this mutex).
-        while (!waiters_.empty()) {
-            auto* waiter = waiters_.pop_front();
-            runtime::schedule_handle(waiter->handle_);
+            // Collect handles and pop from list under lock.
+            // Popping marks nodes as unlinked, so destructors won't try to remove them.
+            while (!waiters_.empty()) {
+                auto* waiter = waiters_.pop_front();
+                to_schedule.push_back(waiter->handle_);
+            }
+        }
+        // Schedule outside lock to avoid deadlock if schedule_handle()
+        // resumes inline (trampoline path) and destructor re-acquires mutex.
+        for (auto h : to_schedule) {
+            runtime::schedule_handle(h);
         }
     }
 

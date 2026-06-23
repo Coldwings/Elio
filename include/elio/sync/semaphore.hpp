@@ -4,6 +4,7 @@
 #include <coroutine>
 #include <atomic>
 #include <mutex>
+#include <vector>
 #include <algorithm>
 #include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
@@ -89,21 +90,30 @@ public:
     void release(int count = 1) {
         assert(count > 0 && "semaphore release count must be positive");
 
-        std::lock_guard<std::mutex> guard(mutex_);
+        std::vector<std::coroutine_handle<>> to_schedule;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
 
-        // Calculate how many waiters to wake (up to 'count')
-        const int to_wake = std::min(count, static_cast<int>(waiters_.size()));
+            // Calculate how many waiters to wake (up to 'count')
+            const int to_wake = std::min(count, static_cast<int>(waiters_.size()));
 
-        // Schedule waiters WHILE holding mutex
-        for (int i = 0; i < to_wake; ++i) {
-            auto* waiter = waiters_.pop_front();
-            runtime::schedule_handle(waiter->handle_);
+            // Collect handles and pop from list under lock.
+            // Popping marks nodes as unlinked, so destructors won't try to remove them.
+            for (int i = 0; i < to_wake; ++i) {
+                auto* waiter = waiters_.pop_front();
+                to_schedule.push_back(waiter->handle_);
+            }
+
+            // Only add permits not consumed by woken waiters
+            const int remaining = count - to_wake;
+            assert(count_ <= INT_MAX - remaining && "semaphore count overflow");
+            count_ += remaining;
         }
-
-        // Only add permits not consumed by woken waiters
-        const int remaining = count - to_wake;
-        assert(count_ <= INT_MAX - remaining && "semaphore count overflow");
-        count_ += remaining;
+        // Schedule outside lock to avoid deadlock if schedule_handle()
+        // resumes inline (trampoline path) and destructor re-acquires mutex.
+        for (auto h : to_schedule) {
+            runtime::schedule_handle(h);
+        }
     }
 
     /// Get current count

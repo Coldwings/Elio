@@ -3,6 +3,7 @@
 #include <coroutine>
 #include <atomic>
 #include <mutex>
+#include <vector>
 #include <concepts>
 #include <cassert>
 #include "../detail/intrusive_list.hpp"
@@ -157,20 +158,33 @@ public:
 
     /// Wake one waiting coroutine
     void notify_one() {
-        std::lock_guard<std::mutex> guard(internal_mutex_);
-        if (waiters_.empty()) return;
+        std::coroutine_handle<> to_schedule = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(internal_mutex_);
+            if (waiters_.empty()) return;
 
-        auto* waiter = waiters_.pop_front();
-        // Schedule WHILE holding mutex
-        runtime::schedule_handle(waiter->handle_);
+            auto* waiter = waiters_.pop_front();
+            to_schedule = waiter->handle_;
+        }
+        // Schedule outside lock to avoid deadlock if schedule_handle()
+        // resumes inline (trampoline path) and destructor re-acquires mutex.
+        runtime::schedule_handle(to_schedule);
     }
 
     /// Wake all waiting coroutines
     void notify_all() {
-        std::lock_guard<std::mutex> guard(internal_mutex_);
-        while (!waiters_.empty()) {
-            auto* waiter = waiters_.pop_front();
-            runtime::schedule_handle(waiter->handle_);
+        std::vector<std::coroutine_handle<>> to_schedule;
+        {
+            std::lock_guard<std::mutex> guard(internal_mutex_);
+            while (!waiters_.empty()) {
+                auto* waiter = waiters_.pop_front();
+                to_schedule.push_back(waiter->handle_);
+            }
+        }
+        // Schedule outside lock to avoid deadlock if schedule_handle()
+        // resumes inline (trampoline path) and destructor re-acquires mutex.
+        for (auto h : to_schedule) {
+            runtime::schedule_handle(h);
         }
     }
 

@@ -123,6 +123,9 @@ TEST_CASE("intrusive_list: contains", "[intrusive_list]") {
     REQUIRE(list.contains(&a));
     REQUIRE(list.contains(&b));
     REQUIRE_FALSE(list.contains(&c));
+
+    // Clean up before nodes go out of scope
+    list.clear();
 }
 
 TEST_CASE("intrusive_list: clear unlinks all nodes", "[intrusive_list]") {

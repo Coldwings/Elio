@@ -487,10 +487,12 @@ This is implemented via an intrusive linked list: each waiter node is embedded i
 ```cpp
 sync::event evt;
 
-// This is safe even if the waiter is cancelled/destroyed:
+// This is safe even if the waiter times out and is destroyed:
 coro::task<void> waiter_with_timeout() {
-    auto result = co_await time::with_timeout(evt.wait(), 5s);
-    if (result == cancel_result::cancelled) {
+    auto result = co_await with_timeout(5s, [](cancel_token tok) -> task<void> {
+        co_await evt.wait();
+    });
+    if (!result) {  // timed out
         co_return;  // Waiter destroyed — event::set() remains safe
     }
 }

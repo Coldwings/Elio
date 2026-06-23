@@ -158,7 +158,7 @@ elio::
 │
 ├── sync::                   // Synchronization primitives
 │   ├── mutex                // Async mutex (cancellation-safe)
-│   ├── shared_mutex         // Reader-writer mutex
+│   ├── shared_mutex         // Reader-writer mutex (cancellation-safe)
 │   ├── semaphore            // Counting semaphore (cancellation-safe)
 │   ├── event                // One-shot event (cancellation-safe)
 │   ├── channel<T>           // MPMC channel (cancellation-safe)

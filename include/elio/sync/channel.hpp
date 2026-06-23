@@ -219,7 +219,7 @@ public:
             std::coroutine_handle<> receiver_handle = nullptr;
             {
                 std::lock_guard<std::mutex> guard(mutex_);
-                if (!closed_) {
+                if (!closed_ && ring_->size() < capacity_) {
                     if (ring_->try_push(value)) {
                         pushed = true;
                         if (!recv_waiters_.empty()) {
@@ -501,10 +501,12 @@ public:
         }
     }
 
+    /// Check if channel is closed
     bool is_closed() const noexcept {
         return closed_.load(std::memory_order_acquire);
     }
 
+    /// Get current queue size
     size_t size() const noexcept {
         if (is_bounded()) {
             return ring_->size();
@@ -513,6 +515,7 @@ public:
         return queue_.size();
     }
 
+    /// Check if channel is empty
     bool empty() const noexcept {
         if (is_bounded()) {
             return ring_->empty();

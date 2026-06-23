@@ -114,6 +114,59 @@ TEST_CASE("channel: destroying send waiter does not crash on close()", "[sync][c
     ch.close();  // Must NOT crash
 }
 
+TEST_CASE("shared_mutex: destroying reader waiter does not crash on unlock()", "[sync][shared_mutex][cancellation]") {
+    shared_mutex sm;
+    sm.try_lock();  // Writer holds lock, so readers will suspend
+
+    auto waiter_task = [&]() -> task<void> {
+        co_await sm.lock_shared();
+    };
+
+    auto t = waiter_task();
+    auto h = elio::coro::detail::task_access::release(t);
+    h.resume();  // Suspends on lock_shared() because writer holds lock
+
+    h.destroy();  // Destroy suspended reader — must unlink from reader_waiters_
+
+    sm.unlock();  // Writer unlock — must NOT crash when scanning reader_waiters_
+}
+
+TEST_CASE("shared_mutex: destroying writer waiter does not deadlock subsequent operations", "[sync][shared_mutex][cancellation]") {
+    shared_mutex sm;
+    sm.try_lock_shared();  // Reader holds lock, so writer will suspend and set WRITER_WAITING
+
+    auto waiter_task = [&]() -> task<void> {
+        co_await sm.lock();
+    };
+
+    auto t = waiter_task();
+    auto h = elio::coro::detail::task_access::release(t);
+    h.resume();  // Suspends on lock() because reader holds lock
+
+    h.destroy();  // Destroy suspended writer — must decrement pending_writers_ and clear WRITER_WAITING
+
+    // Verify subsequent operations work (not deadlocked):
+    // 1. A new reader should be able to acquire (WRITER_WAITING was cleared)
+    sm.unlock_shared();  // Release the reader lock
+
+    auto reader_task = [&]() -> task<void> {
+        co_await sm.lock_shared();
+        sm.unlock_shared();
+    };
+    auto rt = reader_task();
+    auto rh = elio::coro::detail::task_access::release(rt);
+    rh.resume();  // Should complete without suspending (no writer active/waiting)
+
+    // 2. A new writer should be able to acquire (no readers active)
+    auto writer_task = [&]() -> task<void> {
+        co_await sm.lock();
+        sm.unlock();
+    };
+    auto wt = writer_task();
+    auto wh = elio::coro::detail::task_access::release(wt);
+    wh.resume();  // Should complete without suspending
+}
+
 TEST_CASE("event: multiple waiters, destroy one, set wakes remaining", "[sync][event][cancellation]") {
     event e;
     std::atomic<int> woken{0};

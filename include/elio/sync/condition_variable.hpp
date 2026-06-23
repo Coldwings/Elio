@@ -84,12 +84,16 @@ public:
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
-            // Unlock user mutex BEFORE enqueueing to ensure atomicity
+            {
+                std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+                this->handle_ = awaiter;
+                cv_.waiters_.push_back(this);
+                this->suspended_ = true;  // Mark as enqueued
+            }
+            // Release cv lock BEFORE unlocking user mutex to avoid self-deadlock
+            // on trampoline path: if mutex_.unlock() schedules a waiter that
+            // immediately calls cv.wait(), it needs to acquire cv_.internal_mutex_.
             mutex_.unlock();
-            this->handle_ = awaiter;
-            cv_.waiters_.push_back(this);
-            this->suspended_ = true;  // Mark as enqueued
             return true;
         }
 
@@ -121,11 +125,16 @@ public:
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+            {
+                std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+                this->handle_ = awaiter;
+                cv_.waiters_.push_back(this);
+                this->suspended_ = true;  // Mark as enqueued
+            }
+            // Release cv lock BEFORE unlocking user lock to avoid self-deadlock
+            // on trampoline path: if lock_.unlock() schedules a waiter that
+            // immediately calls cv.wait(), it needs to acquire cv_.internal_mutex_.
             lock_.unlock();
-            this->handle_ = awaiter;
-            cv_.waiters_.push_back(this);
-            this->suspended_ = true;  // Mark as enqueued
             return true;
         }
 

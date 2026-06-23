@@ -336,6 +336,7 @@ public:
 
                 std::coroutine_handle<> sender_handle = nullptr;
                 std::optional<T> result;
+                bool should_wait = false;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
                     if (!send_waiters_.empty()) {
@@ -349,18 +350,19 @@ public:
                         } else {
                             result = std::nullopt;
                         }
+                    } else {
+                        should_wait = true;
                     }
                 }
-
-                if (result.has_value() || (closed_.load(std::memory_order_acquire) && !result.has_value())) {
-                    if (sender_handle) {
-                        elio::runtime::schedule_handle(sender_handle);
-                    }
-                    co_return result;
+                if (sender_handle) {
+                    elio::runtime::schedule_handle(sender_handle);
                 }
-
-                recv_awaitable awaitable{*this};
-                co_await awaitable;
+                if (should_wait) {
+                    recv_awaitable awaitable{*this};
+                    co_await awaitable;
+                    continue;
+                }
+                co_return result;
             }
         }
 

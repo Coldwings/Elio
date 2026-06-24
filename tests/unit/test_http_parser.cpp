@@ -866,3 +866,100 @@ TEST_CASE("HTTP response from parser roundtrip", "[http][message]") {
     REQUIRE(resp.body() == body);
     REQUIRE(resp.header("Content-Type") == "text/html");
 }
+
+TEST_CASE("HTTP request parser rejects too many headers", "[http][parser][security]") {
+    // Build a request with more than the default limit of 100 headers.
+    std::string request = "GET / HTTP/1.1\r\nHost: a\r\n";
+    for (int i = 0; i < 100; ++i) {
+        request += "X-H-" + std::to_string(i) + ": v\r\n";
+    }
+    request += "\r\n";
+
+    request_parser parser;
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::error);
+    REQUIRE(parser.has_error());
+}
+
+TEST_CASE("HTTP request parser rejects too many headers with duplicate names",
+          "[http][parser][security]") {
+    // Repeating one header name keeps headers_.size() == 1, but header_count_
+    // increments per line, so the dedicated counter must fire here.
+    std::string request = "GET / HTTP/1.1\r\nHost: a\r\n";
+    for (int i = 0; i < 100; ++i) {
+        request += "X-Dup: v\r\n";
+    }
+    request += "\r\n";
+
+    request_parser parser;
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::error);
+    REQUIRE(parser.has_error());
+}
+
+TEST_CASE("HTTP request parser accepts exactly max_headers headers",
+          "[http][parser][security]") {
+    // Exactly 100 unique headers (Host + 99 X-H-*) must be accepted.
+    std::string request = "GET / HTTP/1.1\r\nHost: a\r\n";
+    for (int i = 0; i < 99; ++i) {
+        request += "X-H-" + std::to_string(i) + ": v\r\n";
+    }
+    request += "\r\n";
+
+    request_parser parser;
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::complete);
+}
+
+TEST_CASE("HTTP request parser rejects oversized header line",
+          "[http][parser][security]") {
+    // A header value of 8193 bytes exceeds the default 8192-byte limit.
+    std::string long_value(8193, 'x');
+    std::string request =
+        "GET / HTTP/1.1\r\nHost: a\r\nX-Big: " + long_value + "\r\n\r\n";
+
+    request_parser parser;
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::error);
+    REQUIRE(parser.has_error());
+}
+
+TEST_CASE("HTTP request parser accepts header line exactly at max_header_size",
+          "[http][parser][security]") {
+    // A header line of exactly 8192 bytes (name + ": " + value) must be
+    // accepted. "X: " is 3 bytes, so the value should be 8192 - 3 = 8189.
+    std::string value(8189, 'x');
+    std::string request =
+        "GET / HTTP/1.1\r\nHost: a\r\nX: " + value + "\r\n\r\n";
+
+    request_parser parser;
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::complete);
+}
+
+TEST_CASE("HTTP response parser rejects too many headers with duplicate names",
+          "[http][parser][security]") {
+    // Same bypass-via-duplicate-name test for the response-side parser.
+    std::string response = "HTTP/1.1 200 OK\r\n";
+    for (int i = 0; i < 101; ++i) {
+        response += "X-Dup: v\r\n";
+    }
+    response += "\r\n";
+
+    response_parser parser;
+    auto [result, _] = parser.parse(response);
+    REQUIRE(result == parse_result::error);
+    REQUIRE(parser.has_error());
+}
+
+TEST_CASE("HTTP response parser rejects oversized header line",
+          "[http][parser][security]") {
+    std::string long_value(8193, 'x');
+    std::string response =
+        "HTTP/1.1 200 OK\r\nX-Big: " + long_value + "\r\n\r\n";
+
+    response_parser parser;
+    auto [result, _] = parser.parse(response);
+    REQUIRE(result == parse_result::error);
+    REQUIRE(parser.has_error());
+}

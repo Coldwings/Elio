@@ -1,10 +1,17 @@
 #include <catch2/catch_test_macros.hpp>
+#include <elio/http/http2_client.hpp>
 #include <elio/http/http2_session.hpp>
 
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 using namespace elio::http;
+
+static_assert(std::is_move_constructible_v<h2_session>);
+static_assert(std::is_move_assignable_v<h2_session>);
+static_assert(std::is_move_constructible_v<h2_client>);
+static_assert(std::is_move_assignable_v<h2_client>);
 
 TEST_CASE("HTTP/2 error codes", "[http2]") {
     SECTION("Error code values match nghttp2") {

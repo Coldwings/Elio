@@ -62,10 +62,11 @@ public:
         : stream_(&stream) {
         nghttp2_session_callbacks* callbacks;
         nghttp2_session_callbacks_new(&callbacks);
-        
+
         // Setup callbacks
-        nghttp2_session_callbacks_set_send_callback(callbacks, send_callback);
-        nghttp2_session_callbacks_set_recv_callback(callbacks, recv_callback);
+        // NOTE: send_callback and recv_callback are NOT registered because
+        // we use nghttp2_session_mem_send/mem_recv which manage their own
+        // I/O buffers directly.
         nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, on_frame_recv_callback);
         nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, on_data_chunk_recv_callback);
         nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, on_stream_close_callback);
@@ -91,33 +92,30 @@ public:
         }
     }
     
-    // Non-copyable, movable
+    // Non-copyable, movable.
     h2_session(const h2_session&) = delete;
     h2_session& operator=(const h2_session&) = delete;
     h2_session(h2_session&& other) noexcept
         : session_(other.session_)
         , stream_(other.stream_)
         , streams_(std::move(other.streams_))
-        , pending_bodies_(std::move(other.pending_bodies_))
-        , send_buffer_(std::move(other.send_buffer_))
-        , recv_buffer_(std::move(other.recv_buffer_)) {
+        , pending_bodies_(std::move(other.pending_bodies_)) {
         other.session_ = nullptr;
         other.stream_ = nullptr;
-        // Update user data pointer
         if (session_) {
             nghttp2_session_set_user_data(session_, this);
         }
     }
-    
+
     h2_session& operator=(h2_session&& other) noexcept {
         if (this != &other) {
-            if (session_) nghttp2_session_del(session_);
+            if (session_) {
+                nghttp2_session_del(session_);
+            }
             session_ = other.session_;
             stream_ = other.stream_;
             streams_ = std::move(other.streams_);
             pending_bodies_ = std::move(other.pending_bodies_);
-            send_buffer_ = std::move(other.send_buffer_);
-            recv_buffer_ = std::move(other.recv_buffer_);
             other.session_ = nullptr;
             other.stream_ = nullptr;
             if (session_) {
@@ -337,26 +335,6 @@ private:
     }
     
     // nghttp2 callbacks
-    static ssize_t send_callback(nghttp2_session*, const uint8_t* data,
-                                  size_t length, int, void* user_data) {
-        auto* self = static_cast<h2_session*>(user_data);
-        self->send_buffer_.insert(self->send_buffer_.end(), data, data + length);
-        return static_cast<ssize_t>(length);
-    }
-    
-    static ssize_t recv_callback(nghttp2_session*, uint8_t* buf,
-                                  size_t length, int, void* user_data) {
-        auto* self = static_cast<h2_session*>(user_data);
-        if (self->recv_buffer_.empty()) {
-            return NGHTTP2_ERR_WOULDBLOCK;
-        }
-        size_t to_copy = std::min(length, self->recv_buffer_.size());
-        std::memcpy(buf, self->recv_buffer_.data(), to_copy);
-        self->recv_buffer_.erase(self->recv_buffer_.begin(), 
-                                  self->recv_buffer_.begin() + to_copy);
-        return static_cast<ssize_t>(to_copy);
-    }
-    
     static int on_frame_recv_callback(nghttp2_session*, const nghttp2_frame* frame,
                                        void* user_data) {
         auto* self = static_cast<h2_session*>(user_data);
@@ -469,13 +447,11 @@ private:
         }
         return 0;
     }
-    
+
     nghttp2_session* session_ = nullptr;
     tls::tls_stream* stream_ = nullptr;
     std::unordered_map<int32_t, h2_stream> streams_;
     std::unordered_map<int32_t, std::shared_ptr<std::string>> pending_bodies_;
-    std::vector<uint8_t> send_buffer_;
-    std::vector<uint8_t> recv_buffer_;
 };
 
 } // namespace elio::http

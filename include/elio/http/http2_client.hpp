@@ -95,13 +95,19 @@ public:
     /// Create HTTP/2 client with configuration
     explicit h2_client(h2_client_config config)
         : config_(config)
-        , tls_ctx_(tls::tls_mode::client) {
+        , tls_ctx_(tls::tls_mode::client)
+        , rotation_state_(std::make_unique<rotation_state>()) {
         // Setup TLS context for HTTP/2
         tls_ctx_.use_default_verify_paths();
         tls_ctx_.set_verify_mode(tls::verify_mode::peer);
         // Set ALPN for HTTP/2 (h2 is the HTTP/2 over TLS identifier)
         tls_ctx_.set_alpn_protocols("h2");
     }
+
+    h2_client(h2_client&&) noexcept = default;
+    h2_client& operator=(h2_client&&) noexcept = default;
+    h2_client(const h2_client&) = delete;
+    h2_client& operator=(const h2_client&) = delete;
     
     /// Perform HTTP/2 GET request
     coro::task<std::optional<response>> get(std::string_view url_str) {
@@ -148,13 +154,17 @@ public:
             ELIO_LOG_ERROR("Failed to submit HTTP/2 request");
             co_return std::nullopt;
         }
-        
+
         auto resp = co_await conn->session()->wait_for_stream(stream_id);
-        conn->touch();
-        
-        // Return connection to pool
-        return_connection(target.host, target.effective_port(), std::move(*conn));
-        
+
+        // Only return connection to pool if the request succeeded.
+        // Errored connections may have corrupted nghttp2 internal state
+        // and should not be reused.
+        if (resp) {
+            conn->touch();
+            return_connection(target.host, target.effective_port(), std::move(*conn));
+        }
+
         co_return resp;
     }
     
@@ -209,10 +219,8 @@ private:
 
         size_t offset = 0;
         if (config_.rotate_resolved_addresses) {
-            static std::mutex rotation_mutex;
-            static std::unordered_map<std::string, size_t> rotation_cursor;
-            std::lock_guard<std::mutex> lock(rotation_mutex);
-            size_t& cursor = rotation_cursor[key];
+            std::lock_guard<std::mutex> lock(rotation_state_->mutex);
+            size_t& cursor = rotation_state_->cursor[key];
             offset = cursor % addresses.size();
             cursor = (cursor + 1) % addresses.size();
         }
@@ -264,10 +272,16 @@ private:
         std::string key = host + ":" + std::to_string(port);
         connections_[key] = std::move(conn);
     }
-    
+
+    struct rotation_state {
+        std::mutex mutex;
+        std::unordered_map<std::string, size_t> cursor;
+    };
+
     h2_client_config config_;
     tls::tls_context tls_ctx_;
     std::unordered_map<std::string, h2_connection> connections_;
+    std::unique_ptr<rotation_state> rotation_state_;
 };
 
 /// Convenience function for one-off HTTP/2 GET request

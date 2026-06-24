@@ -132,11 +132,12 @@ public:
     void run_for(std::chrono::milliseconds duration) {
         auto end_time = std::chrono::steady_clock::now() + duration;
         while (std::chrono::steady_clock::now() < end_time) {
-            if (!has_pending()) break;
             auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                 end_time - std::chrono::steady_clock::now());
             if (remaining.count() <= 0) break;
             poll(remaining);
+            // Check has_pending() AFTER poll() to avoid missing ready CQEs
+            if (!has_pending()) break;
         }
     }
 

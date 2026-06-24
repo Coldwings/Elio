@@ -282,36 +282,38 @@ public:
         switch (req.op) {
             case io_op::read:
                 if (req.offset >= 0) {
-                    io_uring_prep_read(sqe, req.fd, req.buffer, 
-                                       static_cast<unsigned>(req.length), 
+                    io_uring_prep_read(sqe, req.fd, req.buffer,
+                                       static_cast<unsigned>(req.length),
                                        static_cast<__u64>(req.offset));
                 } else {
-                    io_uring_prep_read(sqe, req.fd, req.buffer, 
-                                       static_cast<unsigned>(req.length), 0);
+                    // offset < 0 means use current file position
+                    io_uring_prep_read(sqe, req.fd, req.buffer,
+                                       static_cast<unsigned>(req.length), -1);
                 }
                 break;
                 
             case io_op::write:
                 if (req.offset >= 0) {
-                    io_uring_prep_write(sqe, req.fd, req.buffer, 
-                                        static_cast<unsigned>(req.length), 
+                    io_uring_prep_write(sqe, req.fd, req.buffer,
+                                        static_cast<unsigned>(req.length),
                                         static_cast<__u64>(req.offset));
                 } else {
-                    io_uring_prep_write(sqe, req.fd, req.buffer, 
-                                        static_cast<unsigned>(req.length), 0);
+                    // offset < 0 means use current file position (honors O_APPEND)
+                    io_uring_prep_write(sqe, req.fd, req.buffer,
+                                        static_cast<unsigned>(req.length), -1);
                 }
                 break;
                 
             case io_op::readv:
-                io_uring_prep_readv(sqe, req.fd, req.iovecs, 
+                io_uring_prep_readv(sqe, req.fd, req.iovecs,
                                     static_cast<unsigned>(req.iovec_count),
-                                    static_cast<__u64>(req.offset >= 0 ? req.offset : 0));
+                                    static_cast<__u64>(req.offset >= 0 ? req.offset : -1));
                 break;
-                
+
             case io_op::writev:
-                io_uring_prep_writev(sqe, req.fd, req.iovecs, 
+                io_uring_prep_writev(sqe, req.fd, req.iovecs,
                                      static_cast<unsigned>(req.iovec_count),
-                                     static_cast<__u64>(req.offset >= 0 ? req.offset : 0));
+                                     static_cast<__u64>(req.offset >= 0 ? req.offset : -1));
                 break;
                 
             case io_op::accept:

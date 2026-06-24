@@ -279,7 +279,61 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
         auto evt = parser.get_event();
         REQUIRE(evt->data == "Hello");
     }
-    
+
+    SECTION("CR-only line endings") {
+        event_parser parser;
+
+        parser.parse("data: Hello\r\r");
+
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt->data == "Hello");
+    }
+
+    SECTION("mixed CR and CRLF line endings") {
+        event_parser parser;
+
+        parser.parse("event: update\rdata: World\r\n\r\n");
+
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt->type == "update");
+        REQUIRE(evt->data == "World");
+    }
+
+    SECTION("CR at buffer boundary followed by LF") {
+        event_parser parser;
+
+        // Feed in two chunks: first ends with \r, second starts with \n
+        parser.parse("data: Hello\r");
+        // \r at end of buffer — parser must wait, so no event yet
+        REQUIRE_FALSE(parser.has_event());
+
+        parser.parse("\n\r\n");
+        // Now the \r\n terminator plus the empty \r\n dispatch the event
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt->data == "Hello");
+    }
+
+    SECTION("CR at buffer boundary followed by non-LF") {
+        event_parser parser;
+
+        // Feed in two chunks: first ends with \r, second starts with a regular char
+        parser.parse("data: Hello\r");
+        REQUIRE_FALSE(parser.has_event());
+
+        // The next chunk starts with 'd', not '\n', so the lone \r is the line terminator
+        parser.parse("data: World\r\r");
+        REQUIRE(parser.has_event());
+        auto evt1 = parser.get_event();
+        REQUIRE(evt1->data == "Hello");
+
+        REQUIRE(parser.has_event());
+        auto evt2 = parser.get_event();
+        REQUIRE(evt2->data == "World");
+    }
+
     SECTION("reject id with null character") {
         event_parser parser;
         

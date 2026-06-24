@@ -148,13 +148,17 @@ public:
             ELIO_LOG_ERROR("Failed to submit HTTP/2 request");
             co_return std::nullopt;
         }
-        
+
         auto resp = co_await conn->session()->wait_for_stream(stream_id);
-        conn->touch();
-        
-        // Return connection to pool
-        return_connection(target.host, target.effective_port(), std::move(*conn));
-        
+
+        // Only return connection to pool if the request succeeded.
+        // Errored connections may have corrupted nghttp2 internal state
+        // and should not be reused.
+        if (resp) {
+            conn->touch();
+            return_connection(target.host, target.effective_port(), std::move(*conn));
+        }
+
         co_return resp;
     }
     
@@ -209,10 +213,8 @@ private:
 
         size_t offset = 0;
         if (config_.rotate_resolved_addresses) {
-            static std::mutex rotation_mutex;
-            static std::unordered_map<std::string, size_t> rotation_cursor;
-            std::lock_guard<std::mutex> lock(rotation_mutex);
-            size_t& cursor = rotation_cursor[key];
+            std::lock_guard<std::mutex> lock(rotation_mutex_);
+            size_t& cursor = rotation_cursor_[key];
             offset = cursor % addresses.size();
             cursor = (cursor + 1) % addresses.size();
         }
@@ -268,6 +270,10 @@ private:
     h2_client_config config_;
     tls::tls_context tls_ctx_;
     std::unordered_map<std::string, h2_connection> connections_;
+
+    // Per-instance rotation state for DNS address rotation
+    std::mutex rotation_mutex_;
+    std::unordered_map<std::string, size_t> rotation_cursor_;
 };
 
 /// Convenience function for one-off HTTP/2 GET request

@@ -646,18 +646,28 @@ private:
         request_parser parser;
         parser.set_max_headers(http_config_.max_headers);
         parser.set_max_header_size(http_config_.max_header_size);
-        
+
         // Read HTTP request
         while (!parser.is_complete() && !parser.has_error()) {
             auto result = co_await stream.read(buffer.data(), buffer.size());
-            
+
             if (result.result <= 0) {
                 co_return;
             }
-            
+
+            // Enforce max_request_size to prevent DoS via large upgrade requests
+            size_t incoming = static_cast<size_t>(result.result);
+            if (parser.bytes_buffered() + incoming > http_config_.max_request_size) {
+                ELIO_LOG_WARNING("WebSocket upgrade request exceeds max_request_size");
+                auto resp = response(status::payload_too_large, "Payload Too Large");
+                resp.set_header("Connection", "close");
+                co_await send_response(stream, resp);
+                co_return;
+            }
+
             auto [parse_result, consumed] = parser.parse(
                 std::string_view(buffer.data(), result.result));
-            
+
             if (parse_result == parse_result::error) {
                 co_return;
             }

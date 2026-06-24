@@ -392,6 +392,37 @@ enum class endpoint_role {
     client,       ///< Endpoint is acting as a client: incoming frames must NOT be masked
 };
 
+/// Simple UTF-8 validation.  Returns true if the string is valid UTF-8.
+inline bool is_valid_utf8(std::string_view s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        auto c = static_cast<uint8_t>(s[i]);
+        size_t len = 0;
+        if (c <= 0x7F) { len = 1; }
+        else if ((c & 0xE0) == 0xC0) { len = 2; }
+        else if ((c & 0xF0) == 0xE0) { len = 3; }
+        else if ((c & 0xF8) == 0xF0) { len = 4; }
+        else { return false; }
+        if (len == 0 || i + len > s.size()) return false;
+        // Check continuation bytes
+        for (size_t j = 1; j < len; ++j) {
+            if ((static_cast<uint8_t>(s[i + j]) & 0xC0) != 0x80) return false;
+        }
+        // Reject overlong encodings
+        if (len == 2 && c < 0xC2) return false;
+        if (len == 3) {
+            if (c == 0xE0 && static_cast<uint8_t>(s[i+1]) < 0xA0) return false;
+        }
+        if (len == 4) {
+            if (c == 0xF0 && static_cast<uint8_t>(s[i+1]) < 0x90) return false;
+            if (c == 0xF4 && static_cast<uint8_t>(s[i+1]) > 0x8F) return false;
+            if (c > 0xF4) return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
 /// WebSocket frame parser with message assembly
 class frame_parser {
 public:
@@ -557,6 +588,16 @@ private:
                 current_message_.data.append(payload);
 
                 if (header.fin) {
+                    // RFC 6455 §8.1: text messages MUST be valid UTF-8.
+                    // Validate before delivering to application.
+                    if (current_message_.type == opcode::text) {
+                        if (!is_valid_utf8(current_message_.data)) {
+                            has_error_ = true;
+                            error_msg_ = "Text message contains invalid UTF-8";
+                            error_close_code_ = close_code::invalid_data;
+                            return -1;
+                        }
+                    }
                     current_message_.complete = true;
                     messages_.push_back(std::move(current_message_));
                     current_message_ = message{};
@@ -595,37 +636,6 @@ inline bool is_valid_close_code(uint16_t code) {
     if (code >= 3000 && code <= 4999) return true;
     // Everything else (0-999, 1004, 1005-1006, 1015, 1016-2999, 5000+) is invalid
     return false;
-}
-
-/// Simple UTF-8 validation.  Returns true if the string is valid UTF-8.
-inline bool is_valid_utf8(std::string_view s) {
-    size_t i = 0;
-    while (i < s.size()) {
-        auto c = static_cast<uint8_t>(s[i]);
-        size_t len = 0;
-        if (c <= 0x7F) { len = 1; }
-        else if ((c & 0xE0) == 0xC0) { len = 2; }
-        else if ((c & 0xF0) == 0xE0) { len = 3; }
-        else if ((c & 0xF8) == 0xF0) { len = 4; }
-        else { return false; }
-        if (len == 0 || i + len > s.size()) return false;
-        // Check continuation bytes
-        for (size_t j = 1; j < len; ++j) {
-            if ((static_cast<uint8_t>(s[i + j]) & 0xC0) != 0x80) return false;
-        }
-        // Reject overlong encodings
-        if (len == 2 && c < 0xC2) return false;
-        if (len == 3) {
-            if (c == 0xE0 && static_cast<uint8_t>(s[i+1]) < 0xA0) return false;
-        }
-        if (len == 4) {
-            if (c == 0xF0 && static_cast<uint8_t>(s[i+1]) < 0x90) return false;
-            if (c == 0xF4 && static_cast<uint8_t>(s[i+1]) > 0x8F) return false;
-            if (c > 0xF4) return false;
-        }
-        i += len;
-    }
-    return true;
 }
 
 /// Parse close frame payload to extract code and reason.

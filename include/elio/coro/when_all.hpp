@@ -107,10 +107,14 @@ struct when_all_awaitable {
 
         spawn_all(std::index_sequence_for<Fs...>{});
 
-        if (state_->remaining_.load(std::memory_order_acquire) == 0) {
-            void* addr = state_->waiter_.exchange(nullptr, std::memory_order_acq_rel);
-            if (addr) return false;
-        }
+        // Always suspend and rely on complete_one() -> schedule_handle()
+        // for resumption.  schedule_handle() provides sufficient internal
+        // synchronization (mutex/atomic in the scheduler's mpsc_queue) to
+        // establish happens-before between sub-task data writes and the
+        // waiter's await_resume reads.  An inline fast-path (returning
+        // false when remaining_ is already 0) would lack this synchronization:
+        // the waiter's acquire load on remaining_ only synchronizes with
+        // the decrement, not the subsequent data stores in complete_one().
         return true;
     }
 

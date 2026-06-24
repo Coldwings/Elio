@@ -626,6 +626,7 @@ private:
         auto vstack_owner = std::make_unique<coro::vthread_stack>();
         auto* new_vstack = vstack_owner.get();
         auto* old_vstack = coro::vthread_stack::current();
+        auto* old_frame = coro::promise_base::current_frame();
         coro::vthread_stack::set_current(new_vstack);
 
         auto wrapper = [&] {
@@ -645,6 +646,12 @@ private:
             handle.promise().set_affinity(worker_id);
         }
         handle.promise().detach_from_parent();
+        // Restore caller's frame chain. detach_from_parent() sets current_frame_
+        // to nullptr to avoid UAF when parent_ was spawned to another thread,
+        // but in do_go_ the parent is the caller on the same thread and is safe.
+        // Without this restore, the caller's subsequent coroutines would have
+        // nullptr as parent_, breaking the virtual stack chain.
+        coro::promise_base::set_current_frame(old_frame);
 
         if constexpr (Joinable) {
             auto state = std::make_shared<coro::detail::join_state<T>>();

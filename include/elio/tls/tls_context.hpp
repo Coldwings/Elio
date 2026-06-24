@@ -142,11 +142,13 @@ public:
     tls_context(tls_context&& other) noexcept
         : ctx_(other.ctx_)
         , mode_(other.mode_)
-        , alpn_protocols_(std::move(other.alpn_protocols_)) {
+        , alpn_protocols_(std::move(other.alpn_protocols_))
+        , key_password_(std::move(other.key_password_)) {
         other.ctx_ = nullptr;
-        // Re-register the ALPN selection callback so OpenSSL holds a pointer
-        // to *this* (the new owner) rather than the moved-from source.
+        // Re-register callbacks so OpenSSL holds pointers to *this* (the new
+        // owner) rather than the moved-from source.
         rebind_alpn_callback();
+        rebind_passwd_userdata();
     }
 
     tls_context& operator=(tls_context&& other) noexcept {
@@ -155,8 +157,10 @@ public:
             ctx_ = other.ctx_;
             mode_ = other.mode_;
             alpn_protocols_ = std::move(other.alpn_protocols_);
+            key_password_ = std::move(other.key_password_);
             other.ctx_ = nullptr;
             rebind_alpn_callback();
+            rebind_passwd_userdata();
         }
         return *this;
     }
@@ -177,7 +181,10 @@ public:
     /// @param password Optional password for encrypted key
     bool load_private_key(std::string_view key_file, std::string_view password = "") {
         if (!password.empty()) {
-            SSL_CTX_set_default_passwd_cb_userdata(ctx_, const_cast<char*>(password.data()));
+            // Own the password string so the userdata pointer remains valid
+            // for the lifetime of this context (and across moves).
+            key_password_ = std::string(password);
+            SSL_CTX_set_default_passwd_cb_userdata(ctx_, key_password_.data());
         }
         
         if (SSL_CTX_use_PrivateKey_file(ctx_, std::string(key_file).c_str(), SSL_FILETYPE_PEM) != 1) {
@@ -359,6 +366,12 @@ private:
         }
     }
 
+    void rebind_passwd_userdata() noexcept {
+        if (ctx_ && !key_password_.empty()) {
+            SSL_CTX_set_default_passwd_cb_userdata(ctx_, key_password_.data());
+        }
+    }
+
     static std::string get_ssl_error() {
         char buf[256];
         ERR_error_string_n(ERR_get_error(), buf, sizeof(buf));
@@ -382,6 +395,7 @@ private:
     SSL_CTX* ctx_ = nullptr;
     tls_mode mode_;
     std::string alpn_protocols_;
+    std::string key_password_;
 };
 
 } // namespace elio::tls

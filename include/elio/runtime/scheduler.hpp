@@ -800,8 +800,20 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
             struct trampoline_guard {
                 std::vector<std::coroutine_handle<>>& q;
                 ~trampoline_guard() {
+                    // Only destroy completed coroutines.  Live (suspended)
+                    // handles are intentionally leaked: there is no scheduler
+                    // to adopt them, and destroying them here would UAF any
+                    // awaitables holding raw coroutine_handle references.
+                    size_t leaked = 0;
                     for (auto h : q) {
-                        if (!h.done()) h.destroy();
+                        if (h.done()) {
+                            h.destroy();
+                        } else {
+                            ++leaked;
+                        }
+                    }
+                    if (leaked > 0) {
+                        ELIO_LOG_WARNING("trampoline: {} live coroutine(s) leaked (no scheduler available)", leaked);
                     }
                     q.clear();
                     trampoline_running = false;

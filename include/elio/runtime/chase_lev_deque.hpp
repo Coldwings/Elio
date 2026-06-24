@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <vector>
 #include <mutex>
+#include <thread>
 
 namespace elio::runtime {
 
@@ -71,6 +72,14 @@ public:
     }
 
     ~chase_lev_deque() {
+        // Wait for any in-flight thieves to finish before freeing buffers.
+        // steal() increments active_thieves_ before loading buffer_ and
+        // decrements (release) after reading from it.  We spin-wait here
+        // with acquire ordering so that all thief buffer accesses are
+        // sequenced-before we delete.
+        while (active_thieves_.load(std::memory_order_acquire) != 0) {
+            std::this_thread::yield();
+        }
         delete buffer_.load(std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(old_buffers_mutex_);
         for (auto* buf : old_buffers_) {

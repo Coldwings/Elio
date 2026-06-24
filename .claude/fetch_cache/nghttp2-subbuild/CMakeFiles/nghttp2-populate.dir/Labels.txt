@@ -1,0 +1,14 @@
+# Target labels
+ nghttp2-populate
+# Source files and their labels
+/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-subbuild/CMakeFiles/nghttp2-populate
+/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-subbuild/CMakeFiles/nghttp2-populate.rule
+/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-subbuild/CMakeFiles/nghttp2-populate-complete.rule
+/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-subbuild/nghttp2-populate-prefix/src/nghttp2-populate-stamp/nghttp2-populate-build.rule
+/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-subbuild/nghttp2-populate-prefix/src/nghttp2-populate-stamp/nghttp2-populate-configure.rule
+/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-subbuild/nghttp2-populate-prefix/src/nghttp2-populate-stamp/nghttp2-populate-download.rule
+/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-subbuild/nghttp2-populate-prefix/src/nghttp2-populate-stamp/nghttp2-populate-install.rule
+/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-subbuild/nghttp2-populate-prefix/src/nghttp2-populate-stamp/nghttp2-populate-mkdir.rule
+/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-subbuild/nghttp2-populate-prefix/src/nghttp2-populate-stamp/nghttp2-populate-patch.rule
+/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-subbuild/nghttp2-populate-prefix/src/nghttp2-populate-stamp/nghttp2-populate-test.rule
+/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-subbuild/nghttp2-populate-prefix/src/nghttp2-populate-stamp/nghttp2-populate-update.rule

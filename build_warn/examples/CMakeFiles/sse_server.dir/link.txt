@@ -1,0 +1,1 @@
+/usr/bin/c++ -O2 -g -DNDEBUG -static-libgcc -static-libstdc++ -Wl,--dependency-file=CMakeFiles/sse_server.dir/link.d CMakeFiles/sse_server.dir/sse_server.cpp.o -o sse_server  ../_deps/fmt-build/libfmt.a -lpthread -luring /usr/lib/aarch64-linux-gnu/libssl.so /usr/lib/aarch64-linux-gnu/libcrypto.so

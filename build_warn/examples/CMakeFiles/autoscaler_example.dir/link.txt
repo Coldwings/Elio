@@ -1,0 +1,1 @@
+/usr/bin/c++ -O2 -g -DNDEBUG -static-libgcc -static-libstdc++ -Wl,--dependency-file=CMakeFiles/autoscaler_example.dir/link.d CMakeFiles/autoscaler_example.dir/autoscaler_example.cpp.o -o autoscaler_example  ../_deps/fmt-build/libfmt.a -lpthread -luring

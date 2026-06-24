@@ -638,11 +638,12 @@ private:
 };
 
 /// Connect to a remote TCP server
-class tcp_connect_awaitable {
+class tcp_connect_awaitable : public io::io_awaitable_base {
 public:
     tcp_connect_awaitable(const socket_address& addr,
                           const tcp_options& opts = {})
-        : addr_(addr), opts_(opts) {}
+        : io::io_awaitable_base()
+        , addr_(addr), opts_(opts) {}
 
     ~tcp_connect_awaitable() {
         if (fd_ >= 0) {
@@ -658,24 +659,27 @@ public:
     tcp_connect_awaitable& operator=(tcp_connect_awaitable&&) = delete;
 
     bool await_ready() const noexcept { return false; }
-    
-    bool await_suspend(std::coroutine_handle<> awaiter) {
+
+    template<typename Promise>
+    bool await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+
         // Create socket with appropriate address family
         fd_ = socket(addr_.family(), SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd_ < 0) {
             result_ = io::io_result{-errno, 0};
             return false;  // Don't suspend, resume immediately
         }
-        
+
         // Apply options
         if (opts_.no_delay) {
             int flag = 1;
             setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
         }
-        
+
         // Get sockaddr
         socklen_t sa_len = addr_.to_sockaddr(sa_);
-        
+
         int ret = ::connect(fd_, reinterpret_cast<struct sockaddr*>(&sa_), sa_len);
         if (ret == 0) {
             // Connected immediately (rare for TCP, but possible)
@@ -683,7 +687,7 @@ public:
             result_ = io::io_result{0, 0};
             return false;  // Don't suspend, resume immediately
         }
-        
+
         if (errno != EINPROGRESS) {
             // Connection failed
             result_ = io::io_result{-errno, 0};
@@ -691,32 +695,36 @@ public:
             fd_ = -1;
             return false;  // Don't suspend, resume immediately
         }
-        
+
         // Connection in progress, wait for socket to become writable
         connect_in_progress_ = true;
         auto& ctx = io::current_io_context();
-        
+
         io::io_request req{};
         req.op = io::io_op::poll_write;
         req.fd = fd_;
         req.addr = reinterpret_cast<struct sockaddr*>(&sa_);
         req.addrlen = &sa_len_;
         req.awaiter = awaiter;
-        
+        req.state = setup_op_state(awaiter);
+
         if (!ctx.prepare(req)) {
+            clear_op_state();
             ::close(fd_);
             fd_ = -1;
             result_ = io::io_result{-EAGAIN, 0};
             return false;  // Don't suspend, resume immediately
         }
-        ctx.submit();
-        return true;  // Suspend, will be resumed by epoll
+        // No explicit submit: poll() auto-submits at the top of its loop
+        return true;  // Suspend, will be resumed by completion handler
     }
     
     std::optional<tcp_stream> await_resume() {
-        // Async path completion result comes from io_context.
+        restore_affinity();
+
+        // Async path completion result comes from op_state.
         if (connect_in_progress_ && fd_ >= 0) {
-            result_ = io::io_context::get_last_result();
+            result_ = read_result_from_op_state();
         }
 
         // For non-blocking connect, writability means completion, not success.
@@ -730,7 +738,7 @@ public:
                 result_ = io::io_result{-so_error, 0};
             }
         }
-        
+
         if (!result_.success()) {
             if (fd_ >= 0) {
                 ::close(fd_);
@@ -738,13 +746,13 @@ public:
             errno = result_.error_code();
             return std::nullopt;
         }
-        
+
         tcp_stream stream(fd_);
         fd_ = -1;  // Transfer ownership
         stream.set_peer_address(addr_);
-        
+
         ELIO_LOG_DEBUG("Connected to {}", addr_.to_string());
-        
+
         return stream;
     }
     
@@ -755,7 +763,6 @@ private:
     socklen_t sa_len_ = sizeof(sa_);
     int fd_ = -1;
     bool connect_in_progress_ = false;
-    io::io_result result_{};
 };
 
 /// Connect to a remote TCP server (IPv4)

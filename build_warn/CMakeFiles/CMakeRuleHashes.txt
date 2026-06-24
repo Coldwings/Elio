@@ -1,0 +1,5 @@
+# Hashes of file build rules.
+a89a77dfdaef8647b437bb487fdc7feb _deps/nghttp2-build/CMakeFiles/check
+fa7a894e6b0706462b29fe9ba5486d27 tests/CMakeFiles/test_all
+1b7770173d16b35e04a7a14c5e031d30 tests/CMakeFiles/test_asan
+9bf76dbecf143f04b6ae5d5ebb988a75 tests/CMakeFiles/test_tsan

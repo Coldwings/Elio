@@ -1,0 +1,1 @@
+/usr/bin/c++ -O2 -g -DNDEBUG -static-libgcc -static-libstdc++ -Wl,--dependency-file=CMakeFiles/http2_client.dir/link.d CMakeFiles/http2_client.dir/http2_client.cpp.o -o http2_client  ../_deps/fmt-build/libfmt.a -lpthread -luring /usr/lib/aarch64-linux-gnu/libssl.so /usr/lib/aarch64-linux-gnu/libcrypto.so ../_deps/nghttp2-build/lib/libnghttp2.a

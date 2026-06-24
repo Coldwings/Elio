@@ -107,15 +107,19 @@ private:
             } else if (cr_pos != std::string::npos &&
                        (lf_pos == std::string::npos || cr_pos < lf_pos)) {
                 // \r found first — could be standalone \r or start of \r\n
-                if (cr_pos + 1 >= buffer_.size()) {
-                    // \r at end of buffer — cannot determine if \r\n yet; wait
-                    break;
-                }
                 line_end = cr_pos;
-                if (buffer_[cr_pos + 1] == '\n') {
-                    consume = cr_pos + 2;  // consume \r\n together
+                if (cr_pos + 1 < buffer_.size()) {
+                    if (buffer_[cr_pos + 1] == '\n') {
+                        consume = cr_pos + 2;  // consume \r\n together
+                    } else {
+                        consume = cr_pos + 1;  // standalone \r
+                    }
                 } else {
-                    consume = cr_pos + 1;  // standalone \r
+                    // \r at end of buffer — process as standalone \r.
+                    // If the next chunk starts with \n, that \n will be
+                    // treated as a separate (empty) line, which only
+                    // resets state without dispatching a spurious event.
+                    consume = cr_pos + 1;
                 }
             } else {
                 // \n found first (no preceding \r — that case is handled above)

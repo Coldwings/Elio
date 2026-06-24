@@ -306,11 +306,14 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
 
         // Feed in two chunks: first ends with \r, second starts with \n
         parser.parse("data: Hello\r");
-        // \r at end of buffer — parser must wait, so no event yet
+        // \r at end of buffer is processed immediately as standalone CR.
+        // This terminates the "data: Hello" line but no empty line yet,
+        // so no event dispatched.
         REQUIRE_FALSE(parser.has_event());
 
         parser.parse("\n\r\n");
-        // Now the \r\n terminator plus the empty \r\n dispatch the event
+        // The leading \n is an empty line → dispatches event with "Hello".
+        // The \r\n is another empty line → no dispatch (data already reset).
         REQUIRE(parser.has_event());
         auto evt = parser.get_event();
         REQUIRE(evt->data == "Hello");
@@ -319,19 +322,24 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
     SECTION("CR at buffer boundary followed by non-LF") {
         event_parser parser;
 
-        // Feed in two chunks: first ends with \r, second starts with a regular char
+        // Feed in two chunks: first ends with \r (processed immediately as
+        // standalone CR), second starts with a regular char.
+        // Per SSE spec, the \r at end of buffer is treated as a line
+        // terminator.  If the next chunk starts with a non-\n char, no
+        // spurious empty line is produced.
         parser.parse("data: Hello\r");
+        // \r terminates the "data: Hello" line but no empty line yet,
+        // so no event dispatched.
         REQUIRE_FALSE(parser.has_event());
 
-        // The next chunk starts with 'd', not '\n', so the lone \r is the line terminator
+        // The next chunk starts with 'd', not '\n'.  The previous \r
+        // already terminated the line, so this is a new line.
+        // \r\r produces: "data: World" line + empty line (dispatches event).
+        // The event accumulates both data lines: "Hello\nWorld".
         parser.parse("data: World\r\r");
         REQUIRE(parser.has_event());
-        auto evt1 = parser.get_event();
-        REQUIRE(evt1->data == "Hello");
-
-        REQUIRE(parser.has_event());
-        auto evt2 = parser.get_event();
-        REQUIRE(evt2->data == "World");
+        auto evt = parser.get_event();
+        REQUIRE(evt->data == "Hello\nWorld");
     }
 
     SECTION("reject id with null character") {

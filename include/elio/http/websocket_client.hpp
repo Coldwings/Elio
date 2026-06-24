@@ -248,6 +248,7 @@ private:
         if (port == 0) {
             port = secure_ ? 443 : 80;
         }
+        port_ = port;
         
         ELIO_LOG_DEBUG("Connecting to WebSocket server {}:{}{}", host_, port, path_);
         

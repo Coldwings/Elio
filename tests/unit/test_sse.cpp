@@ -279,7 +279,69 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
         auto evt = parser.get_event();
         REQUIRE(evt->data == "Hello");
     }
-    
+
+    SECTION("CR-only line endings") {
+        event_parser parser;
+
+        parser.parse("data: Hello\r\r");
+
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt->data == "Hello");
+    }
+
+    SECTION("mixed CR and CRLF line endings") {
+        event_parser parser;
+
+        parser.parse("event: update\rdata: World\r\n\r\n");
+
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt->type == "update");
+        REQUIRE(evt->data == "World");
+    }
+
+    SECTION("CR at buffer boundary followed by LF") {
+        event_parser parser;
+
+        // Feed in two chunks: first ends with \r, second starts with \n
+        parser.parse("data: Hello\r");
+        // \r at end of buffer is processed immediately as standalone CR.
+        // This terminates the "data: Hello" line but no empty line yet,
+        // so no event dispatched.
+        REQUIRE_FALSE(parser.has_event());
+
+        parser.parse("\n\r\n");
+        // The leading \n is an empty line → dispatches event with "Hello".
+        // The \r\n is another empty line → no dispatch (data already reset).
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt->data == "Hello");
+    }
+
+    SECTION("CR at buffer boundary followed by non-LF") {
+        event_parser parser;
+
+        // Feed in two chunks: first ends with \r (processed immediately as
+        // standalone CR), second starts with a regular char.
+        // Per SSE spec, the \r at end of buffer is treated as a line
+        // terminator.  If the next chunk starts with a non-\n char, no
+        // spurious empty line is produced.
+        parser.parse("data: Hello\r");
+        // \r terminates the "data: Hello" line but no empty line yet,
+        // so no event dispatched.
+        REQUIRE_FALSE(parser.has_event());
+
+        // The next chunk starts with 'd', not '\n'.  The previous \r
+        // already terminated the line, so this is a new line.
+        // \r\r produces: "data: World" line + empty line (dispatches event).
+        // The event accumulates both data lines: "Hello\nWorld".
+        parser.parse("data: World\r\r");
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt->data == "Hello\nWorld");
+    }
+
     SECTION("reject id with null character") {
         event_parser parser;
         

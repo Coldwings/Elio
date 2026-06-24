@@ -42,6 +42,62 @@ TEST_CASE("WebSocket close codes", "[websocket][frame]") {
     REQUIRE(close_reason(close_code::too_large) == "Message too big");
 }
 
+TEST_CASE("WebSocket reserved close codes remapped on encode", "[websocket][frame]") {
+    // RFC 6455 §7.4.1: 1005/1006/1015 MUST NOT appear on the wire; they must
+    // be replaced with protocol_error (1002).
+    auto wire_code = [](close_code c) -> uint16_t {
+        auto frame = encode_close_frame(c, "", false);
+        return (static_cast<uint16_t>(static_cast<uint8_t>(frame[2])) << 8) |
+               static_cast<uint8_t>(frame[3]);
+    };
+
+    SECTION("no_status (1005) maps to protocol_error (1002)") {
+        REQUIRE(wire_code(close_code::no_status) == 1002);
+    }
+
+    SECTION("abnormal (1006) maps to protocol_error (1002)") {
+        REQUIRE(wire_code(close_code::abnormal) == 1002);
+    }
+
+    SECTION("raw 1015 maps to protocol_error (1002)") {
+        REQUIRE(wire_code(static_cast<close_code>(1015)) == 1002);
+    }
+
+    SECTION("normal (1000) is unchanged") {
+        REQUIRE(wire_code(close_code::normal) == 1000);
+    }
+}
+
+TEST_CASE("WebSocket is_valid_close_code", "[websocket][frame]") {
+    // Defined codes that must be accepted
+    REQUIRE(is_valid_close_code(1000));  // normal
+    REQUIRE(is_valid_close_code(1001));  // going_away
+    REQUIRE(is_valid_close_code(1002));  // protocol_error
+    REQUIRE(is_valid_close_code(1003));  // unsupported
+    REQUIRE(is_valid_close_code(1007));  // invalid_data
+    REQUIRE(is_valid_close_code(1008));  // policy_violation
+    REQUIRE(is_valid_close_code(1009));  // too_large
+    REQUIRE(is_valid_close_code(1010));  // extension_required
+    REQUIRE(is_valid_close_code(1011));  // unexpected
+    // RFC 6455 §7.4.1 registered codes 1012-1014
+    REQUIRE(is_valid_close_code(1012));  // Service Restart
+    REQUIRE(is_valid_close_code(1013));  // Try Again Later
+    REQUIRE(is_valid_close_code(1014));  // Bad Gateway
+    // Library/application range
+    REQUIRE(is_valid_close_code(3000));
+    REQUIRE(is_valid_close_code(4999));
+
+    // Codes that must be rejected
+    REQUIRE_FALSE(is_valid_close_code(0));
+    REQUIRE_FALSE(is_valid_close_code(999));
+    REQUIRE_FALSE(is_valid_close_code(1004));  // reserved
+    REQUIRE_FALSE(is_valid_close_code(1005));  // no_status (internal)
+    REQUIRE_FALSE(is_valid_close_code(1006));  // abnormal (internal)
+    REQUIRE_FALSE(is_valid_close_code(1015));  // TLS (internal)
+    REQUIRE_FALSE(is_valid_close_code(2999));
+    REQUIRE_FALSE(is_valid_close_code(5000));
+}
+
 TEST_CASE("WebSocket frame encoding", "[websocket][frame]") {
     SECTION("encode simple text frame (unmasked)") {
         auto frame = encode_text_frame("Hello", false);

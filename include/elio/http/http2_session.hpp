@@ -360,7 +360,7 @@ private:
         return 0;
     }
     
-    static int on_data_chunk_recv_callback(nghttp2_session* session, uint8_t,
+    static int on_data_chunk_recv_callback(nghttp2_session*, uint8_t,
                                             int32_t stream_id, const uint8_t* data,
                                             size_t len, void* user_data) {
         auto* self = static_cast<h2_session*>(user_data);

@@ -92,22 +92,40 @@ public:
 private:
     size_t process_buffer() {
         size_t events_found = 0;
-        
+
         while (true) {
-            // Find line ending
-            auto line_end = buffer_.find('\n');
-            if (line_end == std::string::npos) {
-                break;
+            // SSE spec (HTML Living Standard §9.2.6): lines may be terminated
+            // by \n, \r\n, or \r alone.  Find the earliest line terminator.
+            auto lf_pos = buffer_.find('\n');
+            auto cr_pos = buffer_.find('\r');
+
+            size_t line_end = std::string::npos;
+            size_t consume = 0;  // bytes to erase including terminator
+
+            if (lf_pos == std::string::npos && cr_pos == std::string::npos) {
+                break;  // no line terminator found
+            } else if (cr_pos != std::string::npos &&
+                       (lf_pos == std::string::npos || cr_pos < lf_pos)) {
+                // \r found first — could be standalone \r or start of \r\n
+                if (cr_pos + 1 >= buffer_.size()) {
+                    // \r at end of buffer — cannot determine if \r\n yet; wait
+                    break;
+                }
+                line_end = cr_pos;
+                if (buffer_[cr_pos + 1] == '\n') {
+                    consume = cr_pos + 2;  // consume \r\n together
+                } else {
+                    consume = cr_pos + 1;  // standalone \r
+                }
+            } else {
+                // \n found first (no preceding \r — that case is handled above)
+                line_end = lf_pos;
+                consume = lf_pos + 1;
             }
-            
+
             std::string line = buffer_.substr(0, line_end);
-            buffer_.erase(0, line_end + 1);
-            
-            // Remove trailing CR if present
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-            
+            buffer_.erase(0, consume);
+
             if (line.empty()) {
                 // Empty line = dispatch event.  Per the SSE spec (HTML Living
                 // Standard §9.2.6), an event is dispatched ONLY when the
@@ -556,7 +574,9 @@ private:
             state_ = client_state::reconnecting;
             
             // Increase retry interval (exponential backoff, max 1 minute)
-            current_retry_ms_ = std::min(current_retry_ms_ * 2, 60000);
+            // Cap before multiplying to prevent signed integer overflow (UB).
+            current_retry_ms_ = std::min(current_retry_ms_, 30000) * 2;
+            current_retry_ms_ = std::min(current_retry_ms_, 60000);
             retry_ms = current_retry_ms_;
         }
         

@@ -13,6 +13,7 @@
 #include <vector>
 #include <optional>
 #include <array>
+#include <stdexcept>
 #include <sys/random.h>
 
 namespace elio::http::websocket {
@@ -223,8 +224,12 @@ inline std::array<uint8_t, 4> generate_mask_key() {
         FILE* f = fopen("/dev/urandom", "rb");
         if (f) {
             auto rd = fread(key.data(), 1, key.size(), f);
-            (void)rd;
             fclose(f);
+            if (rd != key.size()) {
+                throw std::runtime_error("websocket: failed to read masking key from /dev/urandom");
+            }
+        } else {
+            throw std::runtime_error("websocket: no entropy source available for masking key");
         }
     }
     return key;
@@ -321,23 +326,33 @@ inline std::vector<uint8_t> encode_binary_frame(std::string_view data, bool mask
     return encode_frame(header, data);
 }
 
-/// Encode a close frame
-inline std::vector<uint8_t> encode_close_frame(close_code code = close_code::normal, 
-                                                std::string_view reason = "", 
+/// Encode a close frame.
+/// RFC 6455 §7.4.1: codes 1005, 1006, and 1015 MUST NOT be sent on the wire.
+/// They are silently mapped to protocol_error if provided.
+inline std::vector<uint8_t> encode_close_frame(close_code code = close_code::normal,
+                                                std::string_view reason = "",
                                                 bool mask = false) {
+    uint16_t raw = static_cast<uint16_t>(code);
+    // RFC 6455 §7.4.1: 1005 (no_status), 1006 (abnormal), 1015 (TLS handshake)
+    // are reserved and MUST NOT be sent in a close frame.
+    if (raw == 1005 || raw == 1006 || raw == 1015) {
+        code = close_code::protocol_error;
+    }
+
     frame_header header;
     header.op = opcode::close;
     header.fin = true;
     header.masked = mask;
     if (mask) header.mask_key = generate_mask_key();
-    
+
     std::string payload;
-    payload.push_back(static_cast<char>(static_cast<uint16_t>(code) >> 8));
-    payload.push_back(static_cast<char>(static_cast<uint16_t>(code)));
+    uint16_t wire_code = static_cast<uint16_t>(code);
+    payload.push_back(static_cast<char>(wire_code >> 8));
+    payload.push_back(static_cast<char>(wire_code));
     if (!reason.empty()) {
         payload.append(reason);
     }
-    
+
     return encode_frame(header, payload);
 }
 
@@ -572,9 +587,10 @@ private:
 /// Validate a close code per RFC 6455 §7.4.1.
 /// Returns true if the code is valid for use in a close frame.
 inline bool is_valid_close_code(uint16_t code) {
-    // Defined codes: 1000-1003, 1007-1011
+    // Defined codes: 1000-1003, 1007-1014
+    // (1012=Service Restart, 1013=Try Again Later, 1014=Bad Gateway — RFC 6455 §7.4.1)
     if (code >= 1000 && code <= 1003) return true;
-    if (code >= 1007 && code <= 1011) return true;
+    if (code >= 1007 && code <= 1014) return true;
     // Reserved for libraries/frameworks/applications: 3000-4999
     if (code >= 3000 && code <= 4999) return true;
     // Everything else (0-999, 1004, 1005-1006, 1015, 1016-2999, 5000+) is invalid

@@ -285,7 +285,7 @@ public:
     signal_fd& operator=(signal_fd&& other) noexcept {
         if (this != &other) {
             if (fd_ >= 0) {
-                ::close(fd_);
+                io::close_fd_for_destructor(fd_);
             }
             ctx_ = std::exchange(other.ctx_, nullptr);
             fd_ = std::exchange(other.fd_, -1);

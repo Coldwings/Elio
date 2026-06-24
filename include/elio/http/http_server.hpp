@@ -259,6 +259,10 @@ struct server_config {
     std::chrono::seconds keep_alive_timeout{30};  ///< Keep-alive timeout
     size_t max_keep_alive_requests = 100;         ///< Max requests per connection
     bool enable_logging = true;                   ///< Log requests
+
+    // DoS protection limits
+    size_t max_headers = 100;                     ///< Max number of request headers
+    size_t max_header_size = 8192;                ///< Max size of a single header line (bytes)
 };
 
 /// HTTP server
@@ -445,6 +449,8 @@ private:
         auto* sched = runtime::scheduler::current();
         std::vector<char> buffer(config_.read_buffer_size);
         request_parser parser;
+        parser.set_max_headers(config_.max_headers);
+        parser.set_max_header_size(config_.max_header_size);
         size_t request_count = 0;
 
         while (running_ && request_count < config_.max_keep_alive_requests) {

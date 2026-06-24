@@ -52,6 +52,10 @@ struct base_client_config {
     bool verify_certificate = true;               ///< Verify TLS certificates
     net::resolve_options resolve_options = net::default_cached_resolve_options();  ///< DNS resolve/cache behavior
     bool rotate_resolved_addresses = true;        ///< Rotate start index across resolved addresses
+
+    // DoS protection limits
+    size_t max_headers = 100;                     ///< Max number of response headers
+    size_t max_header_size = 8192;                ///< Max size of a single header line (bytes)
 };
 
 /// Initialize a TLS context for client use with default settings

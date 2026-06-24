@@ -644,6 +644,8 @@ private:
     coro::task<void> handle_request(Stream& stream, const std::string& client_addr) {
         std::vector<char> buffer(http_config_.read_buffer_size);
         request_parser parser;
+        parser.set_max_headers(http_config_.max_headers);
+        parser.set_max_header_size(http_config_.max_header_size);
         
         // Read HTTP request
         while (!parser.is_complete() && !parser.has_error()) {

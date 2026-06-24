@@ -415,6 +415,8 @@ private:
         // Read and parse response
         std::vector<char> buffer(config_.read_buffer_size);
         response_parser parser;
+        parser.set_max_headers(config_.max_headers);
+        parser.set_max_header_size(config_.max_header_size);
 
         while (!parser.is_complete() && !parser.has_error()) {
             // Check cancellation before read

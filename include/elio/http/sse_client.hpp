@@ -450,6 +450,8 @@ private:
                 // typically return need_more (it expected a body), but
                 // status_ and headers_ are already populated by then.
                 response_parser parser;
+                parser.set_max_headers(config_.max_headers);
+                parser.set_max_header_size(config_.max_header_size);
                 auto [result, consumed] = parser.parse(
                     std::string_view(response_data).substr(0, header_block_size));
                 (void)consumed;

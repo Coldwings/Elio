@@ -42,7 +42,13 @@ enum class parse_result {
 class request_parser {
 public:
     request_parser() = default;
-    
+
+    /// Set maximum number of headers allowed (default: 100)
+    void set_max_headers(size_t max) noexcept { max_headers_ = max; }
+
+    /// Set maximum size of a single header line in bytes (default: 8192)
+    void set_max_header_size(size_t max) noexcept { max_header_size_ = max; }
+
     /// Reset parser state
     void reset() {
         state_ = parse_state::request_line;
@@ -57,8 +63,9 @@ public:
         chunked_ = false;
         chunk_size_ = 0;
         error_message_.clear();
+        header_count_ = 0;
     }
-    
+
     /// Parse incoming data
     /// @param data Data to parse
     /// @return Parse result and number of bytes consumed
@@ -322,6 +329,12 @@ private:
 
             std::string_view line(buffer_.data(), line_end);
 
+            // DoS protection: enforce per-line length limit
+            if (line_end > max_header_size_) {
+                set_error("Header line too long");
+                return false;
+            }
+
             // Parse header
             auto colon = line.find(':');
             if (colon == std::string_view::npos) {
@@ -355,27 +368,36 @@ private:
                 }
             }
 
+            // DoS protection: enforce header count limit. Uses a dedicated
+            // counter rather than headers_.size() because the underlying map
+            // overwrites duplicate names, so size() only counts unique keys.
+            if (header_count_ >= max_headers_) {
+                set_error("Too many headers");
+                return false;
+            }
+
+            ++header_count_;
             headers_.set(name, value);
             buffer_.erase(0, line_end + 2);
         }
     }
-    
+
     bool parse_body() {
         size_t remaining = content_length_ - body_received_;
         size_t available = std::min(remaining, buffer_.size());
-        
+
         body_.append(buffer_.data(), available);
         buffer_.erase(0, available);
         body_received_ += available;
-        
+
         if (body_received_ >= content_length_) {
             state_ = parse_state::complete;
             return true;
         }
-        
+
         return false;
     }
-    
+
     bool parse_chunk_size() {
         auto line_end = buffer_.find("\r\n");
         if (line_end == std::string::npos) {
@@ -490,13 +512,24 @@ private:
     bool chunked_ = false;
     size_t chunk_size_ = 0;
     std::string error_message_;
+
+    // DoS protection limits
+    size_t max_headers_ = 100;
+    size_t max_header_size_ = 8192;
+    size_t header_count_ = 0;
 };
 
 /// HTTP response parser
 class response_parser {
 public:
     response_parser() = default;
-    
+
+    /// Set maximum number of headers allowed (default: 100)
+    void set_max_headers(size_t max) noexcept { max_headers_ = max; }
+
+    /// Set maximum size of a single header line in bytes (default: 8192)
+    void set_max_header_size(size_t max) noexcept { max_header_size_ = max; }
+
     /// Reset parser state
     void reset() {
         state_ = parse_state::status_line;
@@ -510,8 +543,9 @@ public:
         chunked_ = false;
         chunk_size_ = 0;
         error_message_.clear();
+        header_count_ = 0;
     }
-    
+
     /// Parse incoming data
     /// @param data Data to parse
     /// @return Parse result and number of bytes consumed
@@ -739,6 +773,12 @@ private:
 
             std::string_view line(buffer_.data(), line_end);
 
+            // DoS protection: enforce per-line length limit
+            if (line_end > max_header_size_) {
+                set_error("Header line too long");
+                return false;
+            }
+
             // Parse header
             auto colon = line.find(':');
             if (colon == std::string_view::npos) {
@@ -765,15 +805,24 @@ private:
                 }
             }
 
+            // DoS protection: enforce header count limit. Uses a dedicated
+            // counter rather than headers_.size() because the underlying map
+            // overwrites duplicate names, so size() only counts unique keys.
+            if (header_count_ >= max_headers_) {
+                set_error("Too many headers");
+                return false;
+            }
+
+            ++header_count_;
             headers_.set(name, value);
             buffer_.erase(0, line_end + 2);
         }
     }
-    
+
     bool parse_body() {
         size_t remaining = content_length_ - body_received_;
         size_t available = std::min(remaining, buffer_.size());
-        
+
         body_.append(buffer_.data(), available);
         buffer_.erase(0, available);
         body_received_ += available;
@@ -890,6 +939,11 @@ private:
     bool chunked_ = false;
     size_t chunk_size_ = 0;
     std::string error_message_;
+
+    // DoS protection limits
+    size_t max_headers_ = 100;
+    size_t max_header_size_ = 8192;
+    size_t header_count_ = 0;
 };
 
 } // namespace elio::http

@@ -395,6 +395,8 @@ private:
         // handed off to the WebSocket frame parser instead of being
         // discarded.
         response_parser parser;
+        parser.set_max_headers(config_.max_headers);
+        parser.set_max_header_size(config_.max_header_size);
         size_t total_read = 0;
         while (!parser.is_complete() && !parser.has_error()) {
             auto read_result = co_await read(buffer_.data(), buffer_.size());

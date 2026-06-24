@@ -500,22 +500,33 @@ private:
 };
 
 /// Connect to a Unix Domain Socket server
-class uds_connect_awaitable {
+class uds_connect_awaitable : public io::io_awaitable_base {
 public:
     uds_connect_awaitable(const unix_address& addr,
                           const uds_options& opts = {})
-        : addr_(addr), opts_(opts) {}
-    
+        : io::io_awaitable_base()
+        , addr_(addr), opts_(opts) {}
+
+    ~uds_connect_awaitable() {
+        if (fd_ >= 0) {
+            io::close_fd_for_destructor(fd_);
+            fd_ = -1;
+        }
+    }
+
     bool await_ready() const noexcept { return false; }
-    
-    bool await_suspend(std::coroutine_handle<> awaiter) {
+
+    template<typename Promise>
+    bool await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+
         // Create socket
         fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd_ < 0) {
             result_ = io::io_result{-errno, 0};
             return false;  // Don't suspend, resume immediately
         }
-        
+
         // Apply buffer options if specified
         if (opts_.recv_buffer > 0) {
             setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &opts_.recv_buffer, sizeof(opts_.recv_buffer));
@@ -523,11 +534,11 @@ public:
         if (opts_.send_buffer > 0) {
             setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &opts_.send_buffer, sizeof(opts_.send_buffer));
         }
-        
+
         // Initiate non-blocking connect
         sa_ = addr_.to_sockaddr();
         sa_len_ = addr_.sockaddr_len();
-        
+
         int ret = ::connect(fd_, reinterpret_cast<struct sockaddr*>(&sa_), sa_len_);
         if (ret == 0) {
             // Connected immediately (common for UDS)
@@ -535,7 +546,7 @@ public:
             result_ = io::io_result{0, 0};
             return false;  // Don't suspend, resume immediately
         }
-        
+
         if (errno != EINPROGRESS) {
             // Connection failed
             result_ = io::io_result{-errno, 0};
@@ -543,32 +554,36 @@ public:
             fd_ = -1;
             return false;  // Don't suspend, resume immediately
         }
-        
+
         // Connection in progress, wait for socket to become writable
         connect_in_progress_ = true;
         auto& ctx = io::current_io_context();
-        
+
         io::io_request req{};
         req.op = io::io_op::poll_write;
         req.fd = fd_;
         req.addr = reinterpret_cast<struct sockaddr*>(&sa_);
         req.addrlen = &sa_len_;
         req.awaiter = awaiter;
-        
+        req.state = setup_op_state(awaiter);
+
         if (!ctx.prepare(req)) {
+            clear_op_state();
             ::close(fd_);
             fd_ = -1;
             result_ = io::io_result{-EAGAIN, 0};
             return false;  // Don't suspend, resume immediately
         }
-        ctx.submit();
-        return true;  // Suspend, will be resumed by epoll
+        // No explicit submit: poll() auto-submits at the top of its loop
+        return true;  // Suspend, will be resumed by completion handler
     }
     
     std::optional<uds_stream> await_resume() {
-        // Async path completion result comes from io_context.
+        restore_affinity();
+
+        // Async path completion result comes from op_state.
         if (connect_in_progress_ && fd_ >= 0) {
-            result_ = io::io_context::get_last_result();
+            result_ = read_result_from_op_state();
         }
 
         // For non-blocking connect, writability means completion, not success.
@@ -582,21 +597,22 @@ public:
                 result_ = io::io_result{-so_error, 0};
             }
         }
-        
+
         if (!result_.success()) {
             if (fd_ >= 0) {
                 ::close(fd_);
+                fd_ = -1;
             }
             errno = result_.error_code();
             return std::nullopt;
         }
-        
+
         uds_stream stream(fd_);
         fd_ = -1;  // Transfer ownership
         stream.set_peer_address(addr_);
-        
+
         ELIO_LOG_DEBUG("Connected to {}", addr_.to_string());
-        
+
         return stream;
     }
     
@@ -607,7 +623,6 @@ private:
     socklen_t sa_len_ = 0;
     int fd_ = -1;
     bool connect_in_progress_ = false;
-    io::io_result result_{};
 };
 
 /// Connect to a Unix Domain Socket server

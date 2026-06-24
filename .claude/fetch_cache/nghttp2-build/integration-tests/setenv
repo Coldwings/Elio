@@ -1,0 +1,14 @@
+#!/bin/sh -e
+
+libdir="/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-build/lib"
+if [ -d "$libdir/.libs" ]; then
+    libdir="$libdir/.libs"
+fi
+
+export CGO_CFLAGS="-I/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-src/lib/includes -I/home/ray.dr/Git/Elio/.claude/fetch_cache/nghttp2-build/lib/includes "
+export CGO_CPPFLAGS=""
+export CGO_LDFLAGS="-L$libdir "
+export LD_LIBRARY_PATH="$libdir"
+export DYLD_LIBRARY_PATH="$libdir"
+export GODEBUG=cgocheck=0
+"$@"

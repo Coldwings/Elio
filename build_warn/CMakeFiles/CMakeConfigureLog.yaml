@@ -1,0 +1,1539 @@
+
+---
+events:
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineSystem.cmake:205 (message)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      The system is: Linux - 7.0.5-orbstack-00330-ge3df4e19b0a0-dirty - aarch64
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCXXCompiler.cmake:126 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      Compiling the CXX compiler identification source file "CMakeCXXCompilerId.cpp" succeeded.
+      Compiler: /usr/bin/c++ 
+      Build flags: 
+      Id flags:  
+      
+      The output was:
+      0
+      
+      
+      Compilation of the CXX compiler identification source "CMakeCXXCompilerId.cpp" produced "a.out"
+      
+      The CXX compiler identification is GNU, found in:
+        /home/ray.dr/Git/Elio/build_warn/CMakeFiles/3.31.6/CompilerIdCXX/a.out
+      
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCompilerABI.cmake:74 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:2 (project)"
+    checks:
+      - "Detecting CXX compiler ABI info"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-DI1qIx"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-DI1qIx"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_CXX_SCAN_FOR_MODULES: "OFF"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "CMAKE_CXX_ABI_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-DI1qIx'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_38375/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_38375.dir/build.make CMakeFiles/cmTC_38375.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-DI1qIx'
+        Building CXX object CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o
+        /usr/bin/c++   -v -o CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o -c /usr/share/cmake-3.31/Modules/CMakeCXXCompilerABI.cpp
+        Using built-in specs.
+        COLLECT_GCC=/usr/bin/c++
+        OFFLOAD_TARGET_NAMES=nvptx-none
+        OFFLOAD_TARGET_DEFAULT=1
+        Target: aarch64-linux-gnu
+        Configured with: ../src/configure -v --with-pkgversion='Ubuntu 15-20250404-0ubuntu1' --with-bugurl=file:///usr/share/doc/gcc-15/README.Bugs --enable-languages=c,ada,c++,go,d,fortran,objc,obj-c++,m2,rust,cobol,algol68 --prefix=/usr --with-gcc-major-version-only --program-suffix=-15 --program-prefix=aarch64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/libexec --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-bootstrap --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-libstdcxx-backtrace --enable-gnu-unique-object --disable-libquadmath --disable-libquadmath-support --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --enable-fix-cortex-a53-843419 --disable-werror --enable-offload-targets=nvptx-none=/build/gcc-15-xDE5Sv/gcc-15-15-20250404/debian/tmp-nvptx/usr --enable-offload-defaulted --without-cuda-driver --enable-checking=release --build=aarch64-linux-gnu --host=aarch64-linux-gnu --target=aarch64-linux-gnu --with-build-config=bootstrap-lto-lean --enable-link-serialization=4
+        Thread model: posix
+        Supported LTO compression algorithms: zlib zstd
+        gcc version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be] (Ubuntu 15-20250404-0ubuntu1) 
+        COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o' '-c' '-shared-libgcc' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'CMakeFiles/cmTC_38375.dir/'
+         /usr/libexec/gcc/aarch64-linux-gnu/15/cc1plus -quiet -v -imultiarch aarch64-linux-gnu -D_GNU_SOURCE /usr/share/cmake-3.31/Modules/CMakeCXXCompilerABI.cpp -quiet -dumpdir CMakeFiles/cmTC_38375.dir/ -dumpbase CMakeCXXCompilerABI.cpp.cpp -dumpbase-ext .cpp -mlittle-endian -mabi=lp64 -version -fasynchronous-unwind-tables -fstack-protector-strong -Wformat -Wformat-security -fstack-clash-protection -o /tmp/ccKFdui4.s
+        GNU C++17 (Ubuntu 15-20250404-0ubuntu1) version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be] (aarch64-linux-gnu)
+        	compiled by GNU C version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be], GMP version 6.3.0, MPFR version 4.2.2, MPC version 1.3.1, isl version isl-0.27-GMP
+        
+        GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072
+        ignoring duplicate directory "/usr/include/aarch64-linux-gnu/c++/15"
+        ignoring nonexistent directory "/usr/local/include/aarch64-linux-gnu"
+        ignoring nonexistent directory "/usr/lib/gcc/aarch64-linux-gnu/15/include-fixed/aarch64-linux-gnu"
+        ignoring nonexistent directory "/usr/lib/gcc/aarch64-linux-gnu/15/include-fixed"
+        ignoring nonexistent directory "/usr/lib/gcc/aarch64-linux-gnu/15/../../../../aarch64-linux-gnu/include"
+        #include "..." search starts here:
+        #include <...> search starts here:
+         /usr/include/c++/15
+         /usr/include/aarch64-linux-gnu/c++/15
+         /usr/include/c++/15/backward
+         /usr/lib/gcc/aarch64-linux-gnu/15/include
+         /usr/local/include
+         /usr/include/aarch64-linux-gnu
+         /usr/include
+        End of search list.
+        Compiler executable checksum: ad92be005c758612989aabc4e1c42dc5
+        COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o' '-c' '-shared-libgcc' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'CMakeFiles/cmTC_38375.dir/'
+         as -v -EL -mabi=lp64 -o CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o /tmp/ccKFdui4.s
+        GNU assembler version 2.44 (aarch64-linux-gnu) using BFD version (GNU Binutils for Ubuntu) 2.44
+        COMPILER_PATH=/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/
+        LIBRARY_PATH=/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib/:/lib/aarch64-linux-gnu/:/lib/../lib/:/usr/lib/aarch64-linux-gnu/:/usr/lib/../lib/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../:/lib/:/usr/lib/
+        COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o' '-c' '-shared-libgcc' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.'
+        Linking CXX executable cmTC_38375
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_38375.dir/link.txt --verbose=1
+        Using built-in specs.
+        COLLECT_GCC=/usr/bin/c++
+        COLLECT_LTO_WRAPPER=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper
+        OFFLOAD_TARGET_NAMES=nvptx-none
+        OFFLOAD_TARGET_DEFAULT=1
+        Target: aarch64-linux-gnu
+        Configured with: ../src/configure -v --with-pkgversion='Ubuntu 15-20250404-0ubuntu1' --with-bugurl=file:///usr/share/doc/gcc-15/README.Bugs --enable-languages=c,ada,c++,go,d,fortran,objc,obj-c++,m2,rust,cobol,algol68 --prefix=/usr --with-gcc-major-version-only --program-suffix=-15 --program-prefix=aarch64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/libexec --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-bootstrap --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-libstdcxx-backtrace --enable-gnu-unique-object --disable-libquadmath --disable-libquadmath-support --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --enable-fix-cortex-a53-843419 --disable-werror --enable-offload-targets=nvptx-none=/build/gcc-15-xDE5Sv/gcc-15-15-20250404/debian/tmp-nvptx/usr --enable-offload-defaulted --without-cuda-driver --enable-checking=release --build=aarch64-linux-gnu --host=aarch64-linux-gnu --target=aarch64-linux-gnu --with-build-config=bootstrap-lto-lean --enable-link-serialization=4
+        Thread model: posix
+        Supported LTO compression algorithms: zlib zstd
+        gcc version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be] (Ubuntu 15-20250404-0ubuntu1) 
+        COMPILER_PATH=/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/
+        LIBRARY_PATH=/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib/:/lib/aarch64-linux-gnu/:/lib/../lib/:/usr/lib/aarch64-linux-gnu/:/usr/lib/../lib/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../:/lib/:/usr/lib/
+        COLLECT_GCC_OPTIONS='-v' '-o' 'cmTC_38375' '-foffload-options=-l_GCC_stdc++' '-foffload-options=-l_GCC_m' '-shared-libgcc' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'cmTC_38375.'
+         /usr/libexec/gcc/aarch64-linux-gnu/15/collect2 -plugin /usr/libexec/gcc/aarch64-linux-gnu/15/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper -plugin-opt=-fresolution=/tmp/ccEzQd80.res -plugin-opt=-pass-through=-lgcc_s -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc_s -plugin-opt=-pass-through=-lgcc --build-id --eh-frame-hdr --hash-style=gnu --as-needed -dynamic-linker /lib/ld-linux-aarch64.so.1 -X -EL -maarch64linux --fix-cortex-a53-843419 -pie -z now -z relro -o cmTC_38375 /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o /usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o -L/usr/lib/gcc/aarch64-linux-gnu/15 -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib -L/lib/aarch64-linux-gnu -L/lib/../lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib/../lib -L/usr/lib/gcc/aarch64-linux-gnu/15/../../.. -L/lib -L/usr/lib -v CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o -lstdc++ -lm -lgcc_s -lgcc -lc -lgcc_s -lgcc /usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o
+        collect2 version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be]
+        /usr/bin/ld -plugin /usr/libexec/gcc/aarch64-linux-gnu/15/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper -plugin-opt=-fresolution=/tmp/ccEzQd80.res -plugin-opt=-pass-through=-lgcc_s -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc_s -plugin-opt=-pass-through=-lgcc --build-id --eh-frame-hdr --hash-style=gnu --as-needed -dynamic-linker /lib/ld-linux-aarch64.so.1 -X -EL -maarch64linux --fix-cortex-a53-843419 -pie -z now -z relro -o cmTC_38375 /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o /usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o -L/usr/lib/gcc/aarch64-linux-gnu/15 -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib -L/lib/aarch64-linux-gnu -L/lib/../lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib/../lib -L/usr/lib/gcc/aarch64-linux-gnu/15/../../.. -L/lib -L/usr/lib -v CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o -lstdc++ -lm -lgcc_s -lgcc -lc -lgcc_s -lgcc /usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o
+        GNU ld (GNU Binutils for Ubuntu) 2.44
+        COLLECT_GCC_OPTIONS='-v' '-o' 'cmTC_38375' '-foffload-options=-l_GCC_stdc++' '-foffload-options=-l_GCC_m' '-shared-libgcc' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'cmTC_38375.'
+        /usr/bin/c++  -v -Wl,-v CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o -o cmTC_38375
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-DI1qIx'
+        
+      exitCode: 0
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCompilerABI.cmake:182 (message)"
+      - "/usr/share/cmake-3.31/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      Parsed CXX implicit include dir info: rv=done
+        found start of include info
+        found start of implicit include info
+          add: [/usr/include/c++/15]
+          add: [/usr/include/aarch64-linux-gnu/c++/15]
+          add: [/usr/include/c++/15/backward]
+          add: [/usr/lib/gcc/aarch64-linux-gnu/15/include]
+          add: [/usr/local/include]
+          add: [/usr/include/aarch64-linux-gnu]
+          add: [/usr/include]
+        end of search list found
+        collapse include dir [/usr/include/c++/15] ==> [/usr/include/c++/15]
+        collapse include dir [/usr/include/aarch64-linux-gnu/c++/15] ==> [/usr/include/aarch64-linux-gnu/c++/15]
+        collapse include dir [/usr/include/c++/15/backward] ==> [/usr/include/c++/15/backward]
+        collapse include dir [/usr/lib/gcc/aarch64-linux-gnu/15/include] ==> [/usr/lib/gcc/aarch64-linux-gnu/15/include]
+        collapse include dir [/usr/local/include] ==> [/usr/local/include]
+        collapse include dir [/usr/include/aarch64-linux-gnu] ==> [/usr/include/aarch64-linux-gnu]
+        collapse include dir [/usr/include] ==> [/usr/include]
+        implicit include dirs: [/usr/include/c++/15;/usr/include/aarch64-linux-gnu/c++/15;/usr/include/c++/15/backward;/usr/lib/gcc/aarch64-linux-gnu/15/include;/usr/local/include;/usr/include/aarch64-linux-gnu;/usr/include]
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCompilerABI.cmake:218 (message)"
+      - "/usr/share/cmake-3.31/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      Parsed CXX implicit link information:
+        link line regex: [^( *|.*[/\\])(ld[0-9]*(\\.[a-z]+)?|CMAKE_LINK_STARTFILE-NOTFOUND|([^/\\]+-)?ld|collect2)[^/\\]*( |$)]
+        linker tool regex: [^[ 	]*(->|")?[ 	]*(([^"]*[/\\])?(ld[0-9]*(\\.[a-z]+)?))("|,| |$)]
+        ignore line: [Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-DI1qIx']
+        ignore line: []
+        ignore line: [Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_38375/fast]
+        ignore line: [/usr/bin/gmake  -f CMakeFiles/cmTC_38375.dir/build.make CMakeFiles/cmTC_38375.dir/build]
+        ignore line: [gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-DI1qIx']
+        ignore line: [Building CXX object CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o]
+        ignore line: [/usr/bin/c++   -v -o CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o -c /usr/share/cmake-3.31/Modules/CMakeCXXCompilerABI.cpp]
+        ignore line: [Using built-in specs.]
+        ignore line: [COLLECT_GCC=/usr/bin/c++]
+        ignore line: [OFFLOAD_TARGET_NAMES=nvptx-none]
+        ignore line: [OFFLOAD_TARGET_DEFAULT=1]
+        ignore line: [Target: aarch64-linux-gnu]
+        ignore line: [Configured with: ../src/configure -v --with-pkgversion='Ubuntu 15-20250404-0ubuntu1' --with-bugurl=file:///usr/share/doc/gcc-15/README.Bugs --enable-languages=c ada c++ go d fortran objc obj-c++ m2 rust cobol algol68 --prefix=/usr --with-gcc-major-version-only --program-suffix=-15 --program-prefix=aarch64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/libexec --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-bootstrap --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-libstdcxx-backtrace --enable-gnu-unique-object --disable-libquadmath --disable-libquadmath-support --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --enable-fix-cortex-a53-843419 --disable-werror --enable-offload-targets=nvptx-none=/build/gcc-15-xDE5Sv/gcc-15-15-20250404/debian/tmp-nvptx/usr --enable-offload-defaulted --without-cuda-driver --enable-checking=release --build=aarch64-linux-gnu --host=aarch64-linux-gnu --target=aarch64-linux-gnu --with-build-config=bootstrap-lto-lean --enable-link-serialization=4]
+        ignore line: [Thread model: posix]
+        ignore line: [Supported LTO compression algorithms: zlib zstd]
+        ignore line: [gcc version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be] (Ubuntu 15-20250404-0ubuntu1) ]
+        ignore line: [COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o' '-c' '-shared-libgcc' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'CMakeFiles/cmTC_38375.dir/']
+        ignore line: [ /usr/libexec/gcc/aarch64-linux-gnu/15/cc1plus -quiet -v -imultiarch aarch64-linux-gnu -D_GNU_SOURCE /usr/share/cmake-3.31/Modules/CMakeCXXCompilerABI.cpp -quiet -dumpdir CMakeFiles/cmTC_38375.dir/ -dumpbase CMakeCXXCompilerABI.cpp.cpp -dumpbase-ext .cpp -mlittle-endian -mabi=lp64 -version -fasynchronous-unwind-tables -fstack-protector-strong -Wformat -Wformat-security -fstack-clash-protection -o /tmp/ccKFdui4.s]
+        ignore line: [GNU C++17 (Ubuntu 15-20250404-0ubuntu1) version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be] (aarch64-linux-gnu)]
+        ignore line: [	compiled by GNU C version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be]  GMP version 6.3.0  MPFR version 4.2.2  MPC version 1.3.1  isl version isl-0.27-GMP]
+        ignore line: []
+        ignore line: [GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072]
+        ignore line: [ignoring duplicate directory "/usr/include/aarch64-linux-gnu/c++/15"]
+        ignore line: [ignoring nonexistent directory "/usr/local/include/aarch64-linux-gnu"]
+        ignore line: [ignoring nonexistent directory "/usr/lib/gcc/aarch64-linux-gnu/15/include-fixed/aarch64-linux-gnu"]
+        ignore line: [ignoring nonexistent directory "/usr/lib/gcc/aarch64-linux-gnu/15/include-fixed"]
+        ignore line: [ignoring nonexistent directory "/usr/lib/gcc/aarch64-linux-gnu/15/../../../../aarch64-linux-gnu/include"]
+        ignore line: [#include "..." search starts here:]
+        ignore line: [#include <...> search starts here:]
+        ignore line: [ /usr/include/c++/15]
+        ignore line: [ /usr/include/aarch64-linux-gnu/c++/15]
+        ignore line: [ /usr/include/c++/15/backward]
+        ignore line: [ /usr/lib/gcc/aarch64-linux-gnu/15/include]
+        ignore line: [ /usr/local/include]
+        ignore line: [ /usr/include/aarch64-linux-gnu]
+        ignore line: [ /usr/include]
+        ignore line: [End of search list.]
+        ignore line: [Compiler executable checksum: ad92be005c758612989aabc4e1c42dc5]
+        ignore line: [COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o' '-c' '-shared-libgcc' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'CMakeFiles/cmTC_38375.dir/']
+        ignore line: [ as -v -EL -mabi=lp64 -o CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o /tmp/ccKFdui4.s]
+        ignore line: [GNU assembler version 2.44 (aarch64-linux-gnu) using BFD version (GNU Binutils for Ubuntu) 2.44]
+        ignore line: [COMPILER_PATH=/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/]
+        ignore line: [LIBRARY_PATH=/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib/:/lib/aarch64-linux-gnu/:/lib/../lib/:/usr/lib/aarch64-linux-gnu/:/usr/lib/../lib/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../:/lib/:/usr/lib/]
+        ignore line: [COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o' '-c' '-shared-libgcc' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.']
+        ignore line: [Linking CXX executable cmTC_38375]
+        ignore line: [/usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_38375.dir/link.txt --verbose=1]
+        ignore line: [Using built-in specs.]
+        ignore line: [COLLECT_GCC=/usr/bin/c++]
+        ignore line: [COLLECT_LTO_WRAPPER=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper]
+        ignore line: [OFFLOAD_TARGET_NAMES=nvptx-none]
+        ignore line: [OFFLOAD_TARGET_DEFAULT=1]
+        ignore line: [Target: aarch64-linux-gnu]
+        ignore line: [Configured with: ../src/configure -v --with-pkgversion='Ubuntu 15-20250404-0ubuntu1' --with-bugurl=file:///usr/share/doc/gcc-15/README.Bugs --enable-languages=c ada c++ go d fortran objc obj-c++ m2 rust cobol algol68 --prefix=/usr --with-gcc-major-version-only --program-suffix=-15 --program-prefix=aarch64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/libexec --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-bootstrap --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-libstdcxx-backtrace --enable-gnu-unique-object --disable-libquadmath --disable-libquadmath-support --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --enable-fix-cortex-a53-843419 --disable-werror --enable-offload-targets=nvptx-none=/build/gcc-15-xDE5Sv/gcc-15-15-20250404/debian/tmp-nvptx/usr --enable-offload-defaulted --without-cuda-driver --enable-checking=release --build=aarch64-linux-gnu --host=aarch64-linux-gnu --target=aarch64-linux-gnu --with-build-config=bootstrap-lto-lean --enable-link-serialization=4]
+        ignore line: [Thread model: posix]
+        ignore line: [Supported LTO compression algorithms: zlib zstd]
+        ignore line: [gcc version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be] (Ubuntu 15-20250404-0ubuntu1) ]
+        ignore line: [COMPILER_PATH=/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/]
+        ignore line: [LIBRARY_PATH=/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib/:/lib/aarch64-linux-gnu/:/lib/../lib/:/usr/lib/aarch64-linux-gnu/:/usr/lib/../lib/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../:/lib/:/usr/lib/]
+        ignore line: [COLLECT_GCC_OPTIONS='-v' '-o' 'cmTC_38375' '-foffload-options=-l_GCC_stdc++' '-foffload-options=-l_GCC_m' '-shared-libgcc' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'cmTC_38375.']
+        link line: [ /usr/libexec/gcc/aarch64-linux-gnu/15/collect2 -plugin /usr/libexec/gcc/aarch64-linux-gnu/15/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper -plugin-opt=-fresolution=/tmp/ccEzQd80.res -plugin-opt=-pass-through=-lgcc_s -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc_s -plugin-opt=-pass-through=-lgcc --build-id --eh-frame-hdr --hash-style=gnu --as-needed -dynamic-linker /lib/ld-linux-aarch64.so.1 -X -EL -maarch64linux --fix-cortex-a53-843419 -pie -z now -z relro -o cmTC_38375 /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o /usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o -L/usr/lib/gcc/aarch64-linux-gnu/15 -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib -L/lib/aarch64-linux-gnu -L/lib/../lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib/../lib -L/usr/lib/gcc/aarch64-linux-gnu/15/../../.. -L/lib -L/usr/lib -v CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o -lstdc++ -lm -lgcc_s -lgcc -lc -lgcc_s -lgcc /usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o]
+          arg [/usr/libexec/gcc/aarch64-linux-gnu/15/collect2] ==> ignore
+          arg [-plugin] ==> ignore
+          arg [/usr/libexec/gcc/aarch64-linux-gnu/15/liblto_plugin.so] ==> ignore
+          arg [-plugin-opt=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper] ==> ignore
+          arg [-plugin-opt=-fresolution=/tmp/ccEzQd80.res] ==> ignore
+          arg [-plugin-opt=-pass-through=-lgcc_s] ==> ignore
+          arg [-plugin-opt=-pass-through=-lgcc] ==> ignore
+          arg [-plugin-opt=-pass-through=-lc] ==> ignore
+          arg [-plugin-opt=-pass-through=-lgcc_s] ==> ignore
+          arg [-plugin-opt=-pass-through=-lgcc] ==> ignore
+          arg [--build-id] ==> ignore
+          arg [--eh-frame-hdr] ==> ignore
+          arg [--hash-style=gnu] ==> ignore
+          arg [--as-needed] ==> ignore
+          arg [-dynamic-linker] ==> ignore
+          arg [/lib/ld-linux-aarch64.so.1] ==> ignore
+          arg [-X] ==> ignore
+          arg [-EL] ==> ignore
+          arg [-maarch64linux] ==> ignore
+          arg [--fix-cortex-a53-843419] ==> ignore
+          arg [-pie] ==> ignore
+          arg [-znow] ==> ignore
+          arg [-zrelro] ==> ignore
+          arg [-o] ==> ignore
+          arg [cmTC_38375] ==> ignore
+          arg [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o] ==> obj [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o]
+          arg [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o] ==> obj [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o]
+          arg [/usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o] ==> obj [/usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o]
+          arg [-L/usr/lib/gcc/aarch64-linux-gnu/15] ==> dir [/usr/lib/gcc/aarch64-linux-gnu/15]
+          arg [-L/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu] ==> dir [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu]
+          arg [-L/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib] ==> dir [/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib]
+          arg [-L/lib/aarch64-linux-gnu] ==> dir [/lib/aarch64-linux-gnu]
+          arg [-L/lib/../lib] ==> dir [/lib/../lib]
+          arg [-L/usr/lib/aarch64-linux-gnu] ==> dir [/usr/lib/aarch64-linux-gnu]
+          arg [-L/usr/lib/../lib] ==> dir [/usr/lib/../lib]
+          arg [-L/usr/lib/gcc/aarch64-linux-gnu/15/../../..] ==> dir [/usr/lib/gcc/aarch64-linux-gnu/15/../../..]
+          arg [-L/lib] ==> dir [/lib]
+          arg [-L/usr/lib] ==> dir [/usr/lib]
+          arg [-v] ==> ignore
+          arg [CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o] ==> ignore
+          arg [-lstdc++] ==> lib [stdc++]
+          arg [-lm] ==> lib [m]
+          arg [-lgcc_s] ==> lib [gcc_s]
+          arg [-lgcc] ==> lib [gcc]
+          arg [-lc] ==> lib [c]
+          arg [-lgcc_s] ==> lib [gcc_s]
+          arg [-lgcc] ==> lib [gcc]
+          arg [/usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o] ==> obj [/usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o]
+          arg [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o] ==> obj [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o]
+        ignore line: [collect2 version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be]]
+        ignore line: [/usr/bin/ld -plugin /usr/libexec/gcc/aarch64-linux-gnu/15/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper -plugin-opt=-fresolution=/tmp/ccEzQd80.res -plugin-opt=-pass-through=-lgcc_s -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc_s -plugin-opt=-pass-through=-lgcc --build-id --eh-frame-hdr --hash-style=gnu --as-needed -dynamic-linker /lib/ld-linux-aarch64.so.1 -X -EL -maarch64linux --fix-cortex-a53-843419 -pie -z now -z relro -o cmTC_38375 /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o /usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o -L/usr/lib/gcc/aarch64-linux-gnu/15 -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib -L/lib/aarch64-linux-gnu -L/lib/../lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib/../lib -L/usr/lib/gcc/aarch64-linux-gnu/15/../../.. -L/lib -L/usr/lib -v CMakeFiles/cmTC_38375.dir/CMakeCXXCompilerABI.cpp.o -lstdc++ -lm -lgcc_s -lgcc -lc -lgcc_s -lgcc /usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o]
+        linker tool for 'CXX': /usr/bin/ld
+        collapse obj [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o] ==> [/usr/lib/aarch64-linux-gnu/Scrt1.o]
+        collapse obj [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o] ==> [/usr/lib/aarch64-linux-gnu/crti.o]
+        collapse obj [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o] ==> [/usr/lib/aarch64-linux-gnu/crtn.o]
+        collapse library dir [/usr/lib/gcc/aarch64-linux-gnu/15] ==> [/usr/lib/gcc/aarch64-linux-gnu/15]
+        collapse library dir [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu] ==> [/usr/lib/aarch64-linux-gnu]
+        collapse library dir [/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib] ==> [/usr/lib]
+        collapse library dir [/lib/aarch64-linux-gnu] ==> [/lib/aarch64-linux-gnu]
+        collapse library dir [/lib/../lib] ==> [/lib]
+        collapse library dir [/usr/lib/aarch64-linux-gnu] ==> [/usr/lib/aarch64-linux-gnu]
+        collapse library dir [/usr/lib/../lib] ==> [/usr/lib]
+        collapse library dir [/usr/lib/gcc/aarch64-linux-gnu/15/../../..] ==> [/usr/lib]
+        collapse library dir [/lib] ==> [/lib]
+        collapse library dir [/usr/lib] ==> [/usr/lib]
+        implicit libs: [stdc++;m;gcc_s;gcc;c;gcc_s;gcc]
+        implicit objs: [/usr/lib/aarch64-linux-gnu/Scrt1.o;/usr/lib/aarch64-linux-gnu/crti.o;/usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o;/usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o;/usr/lib/aarch64-linux-gnu/crtn.o]
+        implicit dirs: [/usr/lib/gcc/aarch64-linux-gnu/15;/usr/lib/aarch64-linux-gnu;/usr/lib;/lib/aarch64-linux-gnu;/lib]
+        implicit fwks: []
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/Internal/CMakeDetermineLinkerId.cmake:40 (message)"
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCompilerABI.cmake:255 (cmake_determine_linker_id)"
+      - "/usr/share/cmake-3.31/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      Running the CXX compiler's linker: "/usr/bin/ld" "-v"
+      GNU ld (GNU Binutils for Ubuntu) 2.44
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/Internal/CheckSourceCompiles.cmake:108 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/usr/share/cmake-3.31/Modules/CheckCXXCompilerFlag.cmake:55 (cmake_check_compiler_flag)"
+      - "build_warn/_deps/catch2-src/CMake/CatchMiscFunctions.cmake:12 (check_cxx_compiler_flag)"
+      - "build_warn/_deps/catch2-src/CMake/CatchMiscFunctions.cmake:118 (add_cxx_flag_if_supported_to_targets)"
+      - "build_warn/_deps/catch2-src/src/CMakeLists.txt:351 (add_build_reproducibility_settings)"
+    checks:
+      - "Performing Test HAVE_FLAG__ffile_prefix_map__home_ray_dr_Git_Elio_build_warn__deps_catch2_src__"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-aaFkCU"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-aaFkCU"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/CMake"
+    buildResult:
+      variable: "HAVE_FLAG__ffile_prefix_map__home_ray_dr_Git_Elio_build_warn__deps_catch2_src__"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-aaFkCU'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_36c90/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_36c90.dir/build.make CMakeFiles/cmTC_36c90.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-aaFkCU'
+        Building CXX object CMakeFiles/cmTC_36c90.dir/src.cxx.o
+        /usr/bin/c++ -DHAVE_FLAG__ffile_prefix_map__home_ray_dr_Git_Elio_build_warn__deps_catch2_src__  -std=c++20   -ffile-prefix-map=/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/= -o CMakeFiles/cmTC_36c90.dir/src.cxx.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-aaFkCU/src.cxx
+        Linking CXX executable cmTC_36c90
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_36c90.dir/link.txt --verbose=1
+        /usr/bin/c++ CMakeFiles/cmTC_36c90.dir/src.cxx.o -o cmTC_36c90
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-aaFkCU'
+        
+      exitCode: 0
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCCompiler.cmake:123 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:27 (project)"
+    message: |
+      Compiling the C compiler identification source file "CMakeCCompilerId.c" succeeded.
+      Compiler: /usr/bin/cc 
+      Build flags: 
+      Id flags:  
+      
+      The output was:
+      0
+      
+      
+      Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "a.out"
+      
+      The C compiler identification is GNU, found in:
+        /home/ray.dr/Git/Elio/build_warn/CMakeFiles/3.31.6/CompilerIdC/a.out
+      
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCompilerABI.cmake:74 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:27 (project)"
+    checks:
+      - "Detecting C compiler ABI info"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Ri6m9L"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Ri6m9L"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "CMAKE_C_ABI_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Ri6m9L'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_af72e/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_af72e.dir/build.make CMakeFiles/cmTC_af72e.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Ri6m9L'
+        Building C object CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o
+        /usr/bin/cc   -v -o CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o -c /usr/share/cmake-3.31/Modules/CMakeCCompilerABI.c
+        Using built-in specs.
+        COLLECT_GCC=/usr/bin/cc
+        OFFLOAD_TARGET_NAMES=nvptx-none
+        OFFLOAD_TARGET_DEFAULT=1
+        Target: aarch64-linux-gnu
+        Configured with: ../src/configure -v --with-pkgversion='Ubuntu 15-20250404-0ubuntu1' --with-bugurl=file:///usr/share/doc/gcc-15/README.Bugs --enable-languages=c,ada,c++,go,d,fortran,objc,obj-c++,m2,rust,cobol,algol68 --prefix=/usr --with-gcc-major-version-only --program-suffix=-15 --program-prefix=aarch64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/libexec --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-bootstrap --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-libstdcxx-backtrace --enable-gnu-unique-object --disable-libquadmath --disable-libquadmath-support --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --enable-fix-cortex-a53-843419 --disable-werror --enable-offload-targets=nvptx-none=/build/gcc-15-xDE5Sv/gcc-15-15-20250404/debian/tmp-nvptx/usr --enable-offload-defaulted --without-cuda-driver --enable-checking=release --build=aarch64-linux-gnu --host=aarch64-linux-gnu --target=aarch64-linux-gnu --with-build-config=bootstrap-lto-lean --enable-link-serialization=4
+        Thread model: posix
+        Supported LTO compression algorithms: zlib zstd
+        gcc version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be] (Ubuntu 15-20250404-0ubuntu1) 
+        COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o' '-c' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'CMakeFiles/cmTC_af72e.dir/'
+         /usr/libexec/gcc/aarch64-linux-gnu/15/cc1 -quiet -v -imultiarch aarch64-linux-gnu /usr/share/cmake-3.31/Modules/CMakeCCompilerABI.c -quiet -dumpdir CMakeFiles/cmTC_af72e.dir/ -dumpbase CMakeCCompilerABI.c.c -dumpbase-ext .c -mlittle-endian -mabi=lp64 -version -fasynchronous-unwind-tables -fstack-protector-strong -Wformat -Wformat-security -fstack-clash-protection -o /tmp/ccWKJY4D.s
+        GNU C23 (Ubuntu 15-20250404-0ubuntu1) version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be] (aarch64-linux-gnu)
+        	compiled by GNU C version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be], GMP version 6.3.0, MPFR version 4.2.2, MPC version 1.3.1, isl version isl-0.27-GMP
+        
+        GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072
+        ignoring nonexistent directory "/usr/local/include/aarch64-linux-gnu"
+        ignoring nonexistent directory "/usr/lib/gcc/aarch64-linux-gnu/15/include-fixed/aarch64-linux-gnu"
+        ignoring nonexistent directory "/usr/lib/gcc/aarch64-linux-gnu/15/include-fixed"
+        ignoring nonexistent directory "/usr/lib/gcc/aarch64-linux-gnu/15/../../../../aarch64-linux-gnu/include"
+        #include "..." search starts here:
+        #include <...> search starts here:
+         /usr/lib/gcc/aarch64-linux-gnu/15/include
+         /usr/local/include
+         /usr/include/aarch64-linux-gnu
+         /usr/include
+        End of search list.
+        Compiler executable checksum: b13216c1c7175c71565e2c84a92e6b9f
+        COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o' '-c' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'CMakeFiles/cmTC_af72e.dir/'
+         as -v -EL -mabi=lp64 -o CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o /tmp/ccWKJY4D.s
+        GNU assembler version 2.44 (aarch64-linux-gnu) using BFD version (GNU Binutils for Ubuntu) 2.44
+        COMPILER_PATH=/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/
+        LIBRARY_PATH=/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib/:/lib/aarch64-linux-gnu/:/lib/../lib/:/usr/lib/aarch64-linux-gnu/:/usr/lib/../lib/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../:/lib/:/usr/lib/
+        COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o' '-c' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.'
+        Linking C executable cmTC_af72e
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_af72e.dir/link.txt --verbose=1
+        Using built-in specs.
+        COLLECT_GCC=/usr/bin/cc
+        COLLECT_LTO_WRAPPER=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper
+        OFFLOAD_TARGET_NAMES=nvptx-none
+        OFFLOAD_TARGET_DEFAULT=1
+        Target: aarch64-linux-gnu
+        Configured with: ../src/configure -v --with-pkgversion='Ubuntu 15-20250404-0ubuntu1' --with-bugurl=file:///usr/share/doc/gcc-15/README.Bugs --enable-languages=c,ada,c++,go,d,fortran,objc,obj-c++,m2,rust,cobol,algol68 --prefix=/usr --with-gcc-major-version-only --program-suffix=-15 --program-prefix=aarch64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/libexec --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-bootstrap --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-libstdcxx-backtrace --enable-gnu-unique-object --disable-libquadmath --disable-libquadmath-support --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --enable-fix-cortex-a53-843419 --disable-werror --enable-offload-targets=nvptx-none=/build/gcc-15-xDE5Sv/gcc-15-15-20250404/debian/tmp-nvptx/usr --enable-offload-defaulted --without-cuda-driver --enable-checking=release --build=aarch64-linux-gnu --host=aarch64-linux-gnu --target=aarch64-linux-gnu --with-build-config=bootstrap-lto-lean --enable-link-serialization=4
+        Thread model: posix
+        Supported LTO compression algorithms: zlib zstd
+        gcc version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be] (Ubuntu 15-20250404-0ubuntu1) 
+        COMPILER_PATH=/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/
+        LIBRARY_PATH=/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib/:/lib/aarch64-linux-gnu/:/lib/../lib/:/usr/lib/aarch64-linux-gnu/:/usr/lib/../lib/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../:/lib/:/usr/lib/
+        COLLECT_GCC_OPTIONS='-v' '-o' 'cmTC_af72e' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'cmTC_af72e.'
+         /usr/libexec/gcc/aarch64-linux-gnu/15/collect2 -plugin /usr/libexec/gcc/aarch64-linux-gnu/15/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper -plugin-opt=-fresolution=/tmp/cc83KJAi.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s --build-id --eh-frame-hdr --hash-style=gnu --as-needed -dynamic-linker /lib/ld-linux-aarch64.so.1 -X -EL -maarch64linux --fix-cortex-a53-843419 -pie -z now -z relro -o cmTC_af72e /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o /usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o -L/usr/lib/gcc/aarch64-linux-gnu/15 -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib -L/lib/aarch64-linux-gnu -L/lib/../lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib/../lib -L/usr/lib/gcc/aarch64-linux-gnu/15/../../.. -L/lib -L/usr/lib -v CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o -lgcc --push-state --as-needed -lgcc_s --pop-state -lc -lgcc --push-state --as-needed -lgcc_s --pop-state /usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o
+        collect2 version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be]
+        /usr/bin/ld -plugin /usr/libexec/gcc/aarch64-linux-gnu/15/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper -plugin-opt=-fresolution=/tmp/cc83KJAi.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s --build-id --eh-frame-hdr --hash-style=gnu --as-needed -dynamic-linker /lib/ld-linux-aarch64.so.1 -X -EL -maarch64linux --fix-cortex-a53-843419 -pie -z now -z relro -o cmTC_af72e /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o /usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o -L/usr/lib/gcc/aarch64-linux-gnu/15 -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib -L/lib/aarch64-linux-gnu -L/lib/../lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib/../lib -L/usr/lib/gcc/aarch64-linux-gnu/15/../../.. -L/lib -L/usr/lib -v CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o -lgcc --push-state --as-needed -lgcc_s --pop-state -lc -lgcc --push-state --as-needed -lgcc_s --pop-state /usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o
+        GNU ld (GNU Binutils for Ubuntu) 2.44
+        COLLECT_GCC_OPTIONS='-v' '-o' 'cmTC_af72e' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'cmTC_af72e.'
+        /usr/bin/cc  -v -Wl,-v CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o -o cmTC_af72e
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Ri6m9L'
+        
+      exitCode: 0
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCompilerABI.cmake:182 (message)"
+      - "/usr/share/cmake-3.31/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:27 (project)"
+    message: |
+      Parsed C implicit include dir info: rv=done
+        found start of include info
+        found start of implicit include info
+          add: [/usr/lib/gcc/aarch64-linux-gnu/15/include]
+          add: [/usr/local/include]
+          add: [/usr/include/aarch64-linux-gnu]
+          add: [/usr/include]
+        end of search list found
+        collapse include dir [/usr/lib/gcc/aarch64-linux-gnu/15/include] ==> [/usr/lib/gcc/aarch64-linux-gnu/15/include]
+        collapse include dir [/usr/local/include] ==> [/usr/local/include]
+        collapse include dir [/usr/include/aarch64-linux-gnu] ==> [/usr/include/aarch64-linux-gnu]
+        collapse include dir [/usr/include] ==> [/usr/include]
+        implicit include dirs: [/usr/lib/gcc/aarch64-linux-gnu/15/include;/usr/local/include;/usr/include/aarch64-linux-gnu;/usr/include]
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCompilerABI.cmake:218 (message)"
+      - "/usr/share/cmake-3.31/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:27 (project)"
+    message: |
+      Parsed C implicit link information:
+        link line regex: [^( *|.*[/\\])(ld[0-9]*(\\.[a-z]+)?|CMAKE_LINK_STARTFILE-NOTFOUND|([^/\\]+-)?ld|collect2)[^/\\]*( |$)]
+        linker tool regex: [^[ 	]*(->|")?[ 	]*(([^"]*[/\\])?(ld[0-9]*(\\.[a-z]+)?))("|,| |$)]
+        ignore line: [Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Ri6m9L']
+        ignore line: []
+        ignore line: [Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_af72e/fast]
+        ignore line: [/usr/bin/gmake  -f CMakeFiles/cmTC_af72e.dir/build.make CMakeFiles/cmTC_af72e.dir/build]
+        ignore line: [gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Ri6m9L']
+        ignore line: [Building C object CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o]
+        ignore line: [/usr/bin/cc   -v -o CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o -c /usr/share/cmake-3.31/Modules/CMakeCCompilerABI.c]
+        ignore line: [Using built-in specs.]
+        ignore line: [COLLECT_GCC=/usr/bin/cc]
+        ignore line: [OFFLOAD_TARGET_NAMES=nvptx-none]
+        ignore line: [OFFLOAD_TARGET_DEFAULT=1]
+        ignore line: [Target: aarch64-linux-gnu]
+        ignore line: [Configured with: ../src/configure -v --with-pkgversion='Ubuntu 15-20250404-0ubuntu1' --with-bugurl=file:///usr/share/doc/gcc-15/README.Bugs --enable-languages=c ada c++ go d fortran objc obj-c++ m2 rust cobol algol68 --prefix=/usr --with-gcc-major-version-only --program-suffix=-15 --program-prefix=aarch64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/libexec --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-bootstrap --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-libstdcxx-backtrace --enable-gnu-unique-object --disable-libquadmath --disable-libquadmath-support --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --enable-fix-cortex-a53-843419 --disable-werror --enable-offload-targets=nvptx-none=/build/gcc-15-xDE5Sv/gcc-15-15-20250404/debian/tmp-nvptx/usr --enable-offload-defaulted --without-cuda-driver --enable-checking=release --build=aarch64-linux-gnu --host=aarch64-linux-gnu --target=aarch64-linux-gnu --with-build-config=bootstrap-lto-lean --enable-link-serialization=4]
+        ignore line: [Thread model: posix]
+        ignore line: [Supported LTO compression algorithms: zlib zstd]
+        ignore line: [gcc version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be] (Ubuntu 15-20250404-0ubuntu1) ]
+        ignore line: [COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o' '-c' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'CMakeFiles/cmTC_af72e.dir/']
+        ignore line: [ /usr/libexec/gcc/aarch64-linux-gnu/15/cc1 -quiet -v -imultiarch aarch64-linux-gnu /usr/share/cmake-3.31/Modules/CMakeCCompilerABI.c -quiet -dumpdir CMakeFiles/cmTC_af72e.dir/ -dumpbase CMakeCCompilerABI.c.c -dumpbase-ext .c -mlittle-endian -mabi=lp64 -version -fasynchronous-unwind-tables -fstack-protector-strong -Wformat -Wformat-security -fstack-clash-protection -o /tmp/ccWKJY4D.s]
+        ignore line: [GNU C23 (Ubuntu 15-20250404-0ubuntu1) version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be] (aarch64-linux-gnu)]
+        ignore line: [	compiled by GNU C version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be]  GMP version 6.3.0  MPFR version 4.2.2  MPC version 1.3.1  isl version isl-0.27-GMP]
+        ignore line: []
+        ignore line: [GGC heuristics: --param ggc-min-expand=100 --param ggc-min-heapsize=131072]
+        ignore line: [ignoring nonexistent directory "/usr/local/include/aarch64-linux-gnu"]
+        ignore line: [ignoring nonexistent directory "/usr/lib/gcc/aarch64-linux-gnu/15/include-fixed/aarch64-linux-gnu"]
+        ignore line: [ignoring nonexistent directory "/usr/lib/gcc/aarch64-linux-gnu/15/include-fixed"]
+        ignore line: [ignoring nonexistent directory "/usr/lib/gcc/aarch64-linux-gnu/15/../../../../aarch64-linux-gnu/include"]
+        ignore line: [#include "..." search starts here:]
+        ignore line: [#include <...> search starts here:]
+        ignore line: [ /usr/lib/gcc/aarch64-linux-gnu/15/include]
+        ignore line: [ /usr/local/include]
+        ignore line: [ /usr/include/aarch64-linux-gnu]
+        ignore line: [ /usr/include]
+        ignore line: [End of search list.]
+        ignore line: [Compiler executable checksum: b13216c1c7175c71565e2c84a92e6b9f]
+        ignore line: [COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o' '-c' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'CMakeFiles/cmTC_af72e.dir/']
+        ignore line: [ as -v -EL -mabi=lp64 -o CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o /tmp/ccWKJY4D.s]
+        ignore line: [GNU assembler version 2.44 (aarch64-linux-gnu) using BFD version (GNU Binutils for Ubuntu) 2.44]
+        ignore line: [COMPILER_PATH=/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/]
+        ignore line: [LIBRARY_PATH=/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib/:/lib/aarch64-linux-gnu/:/lib/../lib/:/usr/lib/aarch64-linux-gnu/:/usr/lib/../lib/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../:/lib/:/usr/lib/]
+        ignore line: [COLLECT_GCC_OPTIONS='-v' '-o' 'CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o' '-c' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.']
+        ignore line: [Linking C executable cmTC_af72e]
+        ignore line: [/usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_af72e.dir/link.txt --verbose=1]
+        ignore line: [Using built-in specs.]
+        ignore line: [COLLECT_GCC=/usr/bin/cc]
+        ignore line: [COLLECT_LTO_WRAPPER=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper]
+        ignore line: [OFFLOAD_TARGET_NAMES=nvptx-none]
+        ignore line: [OFFLOAD_TARGET_DEFAULT=1]
+        ignore line: [Target: aarch64-linux-gnu]
+        ignore line: [Configured with: ../src/configure -v --with-pkgversion='Ubuntu 15-20250404-0ubuntu1' --with-bugurl=file:///usr/share/doc/gcc-15/README.Bugs --enable-languages=c ada c++ go d fortran objc obj-c++ m2 rust cobol algol68 --prefix=/usr --with-gcc-major-version-only --program-suffix=-15 --program-prefix=aarch64-linux-gnu- --enable-shared --enable-linker-build-id --libexecdir=/usr/libexec --without-included-gettext --enable-threads=posix --libdir=/usr/lib --enable-nls --enable-bootstrap --enable-clocale=gnu --enable-libstdcxx-debug --enable-libstdcxx-time=yes --with-default-libstdcxx-abi=new --enable-libstdcxx-backtrace --enable-gnu-unique-object --disable-libquadmath --disable-libquadmath-support --enable-plugin --enable-default-pie --with-system-zlib --enable-libphobos-checking=release --with-target-system-zlib=auto --enable-objc-gc=auto --enable-multiarch --enable-fix-cortex-a53-843419 --disable-werror --enable-offload-targets=nvptx-none=/build/gcc-15-xDE5Sv/gcc-15-15-20250404/debian/tmp-nvptx/usr --enable-offload-defaulted --without-cuda-driver --enable-checking=release --build=aarch64-linux-gnu --host=aarch64-linux-gnu --target=aarch64-linux-gnu --with-build-config=bootstrap-lto-lean --enable-link-serialization=4]
+        ignore line: [Thread model: posix]
+        ignore line: [Supported LTO compression algorithms: zlib zstd]
+        ignore line: [gcc version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be] (Ubuntu 15-20250404-0ubuntu1) ]
+        ignore line: [COMPILER_PATH=/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/15/:/usr/libexec/gcc/aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/]
+        ignore line: [LIBRARY_PATH=/usr/lib/gcc/aarch64-linux-gnu/15/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib/:/lib/aarch64-linux-gnu/:/lib/../lib/:/usr/lib/aarch64-linux-gnu/:/usr/lib/../lib/:/usr/lib/gcc/aarch64-linux-gnu/15/../../../:/lib/:/usr/lib/]
+        ignore line: [COLLECT_GCC_OPTIONS='-v' '-o' 'cmTC_af72e' '-mlittle-endian' '-mabi=lp64' '-dumpdir' 'cmTC_af72e.']
+        link line: [ /usr/libexec/gcc/aarch64-linux-gnu/15/collect2 -plugin /usr/libexec/gcc/aarch64-linux-gnu/15/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper -plugin-opt=-fresolution=/tmp/cc83KJAi.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s --build-id --eh-frame-hdr --hash-style=gnu --as-needed -dynamic-linker /lib/ld-linux-aarch64.so.1 -X -EL -maarch64linux --fix-cortex-a53-843419 -pie -z now -z relro -o cmTC_af72e /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o /usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o -L/usr/lib/gcc/aarch64-linux-gnu/15 -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib -L/lib/aarch64-linux-gnu -L/lib/../lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib/../lib -L/usr/lib/gcc/aarch64-linux-gnu/15/../../.. -L/lib -L/usr/lib -v CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o -lgcc --push-state --as-needed -lgcc_s --pop-state -lc -lgcc --push-state --as-needed -lgcc_s --pop-state /usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o]
+          arg [/usr/libexec/gcc/aarch64-linux-gnu/15/collect2] ==> ignore
+          arg [-plugin] ==> ignore
+          arg [/usr/libexec/gcc/aarch64-linux-gnu/15/liblto_plugin.so] ==> ignore
+          arg [-plugin-opt=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper] ==> ignore
+          arg [-plugin-opt=-fresolution=/tmp/cc83KJAi.res] ==> ignore
+          arg [-plugin-opt=-pass-through=-lgcc] ==> ignore
+          arg [-plugin-opt=-pass-through=-lgcc_s] ==> ignore
+          arg [-plugin-opt=-pass-through=-lc] ==> ignore
+          arg [-plugin-opt=-pass-through=-lgcc] ==> ignore
+          arg [-plugin-opt=-pass-through=-lgcc_s] ==> ignore
+          arg [--build-id] ==> ignore
+          arg [--eh-frame-hdr] ==> ignore
+          arg [--hash-style=gnu] ==> ignore
+          arg [--as-needed] ==> ignore
+          arg [-dynamic-linker] ==> ignore
+          arg [/lib/ld-linux-aarch64.so.1] ==> ignore
+          arg [-X] ==> ignore
+          arg [-EL] ==> ignore
+          arg [-maarch64linux] ==> ignore
+          arg [--fix-cortex-a53-843419] ==> ignore
+          arg [-pie] ==> ignore
+          arg [-znow] ==> ignore
+          arg [-zrelro] ==> ignore
+          arg [-o] ==> ignore
+          arg [cmTC_af72e] ==> ignore
+          arg [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o] ==> obj [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o]
+          arg [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o] ==> obj [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o]
+          arg [/usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o] ==> obj [/usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o]
+          arg [-L/usr/lib/gcc/aarch64-linux-gnu/15] ==> dir [/usr/lib/gcc/aarch64-linux-gnu/15]
+          arg [-L/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu] ==> dir [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu]
+          arg [-L/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib] ==> dir [/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib]
+          arg [-L/lib/aarch64-linux-gnu] ==> dir [/lib/aarch64-linux-gnu]
+          arg [-L/lib/../lib] ==> dir [/lib/../lib]
+          arg [-L/usr/lib/aarch64-linux-gnu] ==> dir [/usr/lib/aarch64-linux-gnu]
+          arg [-L/usr/lib/../lib] ==> dir [/usr/lib/../lib]
+          arg [-L/usr/lib/gcc/aarch64-linux-gnu/15/../../..] ==> dir [/usr/lib/gcc/aarch64-linux-gnu/15/../../..]
+          arg [-L/lib] ==> dir [/lib]
+          arg [-L/usr/lib] ==> dir [/usr/lib]
+          arg [-v] ==> ignore
+          arg [CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o] ==> ignore
+          arg [-lgcc] ==> lib [gcc]
+          arg [--push-state] ==> ignore
+          arg [--as-needed] ==> ignore
+          arg [-lgcc_s] ==> lib [gcc_s]
+          arg [--pop-state] ==> ignore
+          arg [-lc] ==> lib [c]
+          arg [-lgcc] ==> lib [gcc]
+          arg [--push-state] ==> ignore
+          arg [--as-needed] ==> ignore
+          arg [-lgcc_s] ==> lib [gcc_s]
+          arg [--pop-state] ==> ignore
+          arg [/usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o] ==> obj [/usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o]
+          arg [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o] ==> obj [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o]
+        ignore line: [collect2 version 15.0.1 20250404 (experimental) [master r15-9193-g08e803aa9be]]
+        ignore line: [/usr/bin/ld -plugin /usr/libexec/gcc/aarch64-linux-gnu/15/liblto_plugin.so -plugin-opt=/usr/libexec/gcc/aarch64-linux-gnu/15/lto-wrapper -plugin-opt=-fresolution=/tmp/cc83KJAi.res -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s -plugin-opt=-pass-through=-lc -plugin-opt=-pass-through=-lgcc -plugin-opt=-pass-through=-lgcc_s --build-id --eh-frame-hdr --hash-style=gnu --as-needed -dynamic-linker /lib/ld-linux-aarch64.so.1 -X -EL -maarch64linux --fix-cortex-a53-843419 -pie -z now -z relro -o cmTC_af72e /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o /usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o -L/usr/lib/gcc/aarch64-linux-gnu/15 -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu -L/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib -L/lib/aarch64-linux-gnu -L/lib/../lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib/../lib -L/usr/lib/gcc/aarch64-linux-gnu/15/../../.. -L/lib -L/usr/lib -v CMakeFiles/cmTC_af72e.dir/CMakeCCompilerABI.c.o -lgcc --push-state --as-needed -lgcc_s --pop-state -lc -lgcc --push-state --as-needed -lgcc_s --pop-state /usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o /usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o]
+        linker tool for 'C': /usr/bin/ld
+        collapse obj [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/Scrt1.o] ==> [/usr/lib/aarch64-linux-gnu/Scrt1.o]
+        collapse obj [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crti.o] ==> [/usr/lib/aarch64-linux-gnu/crti.o]
+        collapse obj [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu/crtn.o] ==> [/usr/lib/aarch64-linux-gnu/crtn.o]
+        collapse library dir [/usr/lib/gcc/aarch64-linux-gnu/15] ==> [/usr/lib/gcc/aarch64-linux-gnu/15]
+        collapse library dir [/usr/lib/gcc/aarch64-linux-gnu/15/../../../aarch64-linux-gnu] ==> [/usr/lib/aarch64-linux-gnu]
+        collapse library dir [/usr/lib/gcc/aarch64-linux-gnu/15/../../../../lib] ==> [/usr/lib]
+        collapse library dir [/lib/aarch64-linux-gnu] ==> [/lib/aarch64-linux-gnu]
+        collapse library dir [/lib/../lib] ==> [/lib]
+        collapse library dir [/usr/lib/aarch64-linux-gnu] ==> [/usr/lib/aarch64-linux-gnu]
+        collapse library dir [/usr/lib/../lib] ==> [/usr/lib]
+        collapse library dir [/usr/lib/gcc/aarch64-linux-gnu/15/../../..] ==> [/usr/lib]
+        collapse library dir [/lib] ==> [/lib]
+        collapse library dir [/usr/lib] ==> [/usr/lib]
+        implicit libs: [gcc;gcc_s;c;gcc;gcc_s]
+        implicit objs: [/usr/lib/aarch64-linux-gnu/Scrt1.o;/usr/lib/aarch64-linux-gnu/crti.o;/usr/lib/gcc/aarch64-linux-gnu/15/crtbeginS.o;/usr/lib/gcc/aarch64-linux-gnu/15/crtendS.o;/usr/lib/aarch64-linux-gnu/crtn.o]
+        implicit dirs: [/usr/lib/gcc/aarch64-linux-gnu/15;/usr/lib/aarch64-linux-gnu;/usr/lib;/lib/aarch64-linux-gnu;/lib]
+        implicit fwks: []
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/Internal/CMakeDetermineLinkerId.cmake:40 (message)"
+      - "/usr/share/cmake-3.31/Modules/CMakeDetermineCompilerABI.cmake:255 (cmake_determine_linker_id)"
+      - "/usr/share/cmake-3.31/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:27 (project)"
+    message: |
+      Running the C compiler's linker: "/usr/bin/ld" "-v"
+      GNU ld (GNU Binutils for Ubuntu) 2.44
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/Internal/CheckSourceCompiles.cmake:108 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/CheckCSourceCompiles.cmake:58 (cmake_check_source_compiles)"
+      - "/usr/share/cmake-3.31/Modules/FindThreads.cmake:97 (CHECK_C_SOURCE_COMPILES)"
+      - "/usr/share/cmake-3.31/Modules/FindThreads.cmake:163 (_threads_check_libc)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:170 (find_package)"
+    checks:
+      - "Performing Test CMAKE_HAVE_LIBC_PTHREAD"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-5j4pWI"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-5j4pWI"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "CMAKE_HAVE_LIBC_PTHREAD"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-5j4pWI'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_714be/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_714be.dir/build.make CMakeFiles/cmTC_714be.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-5j4pWI'
+        Building C object CMakeFiles/cmTC_714be.dir/src.c.o
+        /usr/bin/cc -DCMAKE_HAVE_LIBC_PTHREAD   -o CMakeFiles/cmTC_714be.dir/src.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-5j4pWI/src.c
+        Linking C executable cmTC_714be
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_714be.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_714be.dir/src.c.o -o cmTC_714be
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-5j4pWI'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:314 (check_include_file)"
+    checks:
+      - "Looking for arpa/inet.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-6zTvVh"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-6zTvVh"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_ARPA_INET_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-6zTvVh'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_82559/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_82559.dir/build.make CMakeFiles/cmTC_82559.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-6zTvVh'
+        Building C object CMakeFiles/cmTC_82559.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_82559.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-6zTvVh/CheckIncludeFile.c
+        Linking C executable cmTC_82559
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_82559.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_82559.dir/CheckIncludeFile.c.o -o cmTC_82559
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-6zTvVh'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:315 (check_include_file)"
+    checks:
+      - "Looking for fcntl.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-pVzNC5"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-pVzNC5"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_FCNTL_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-pVzNC5'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_6596f/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_6596f.dir/build.make CMakeFiles/cmTC_6596f.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-pVzNC5'
+        Building C object CMakeFiles/cmTC_6596f.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_6596f.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-pVzNC5/CheckIncludeFile.c
+        Linking C executable cmTC_6596f
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_6596f.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_6596f.dir/CheckIncludeFile.c.o -o cmTC_6596f
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-pVzNC5'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:316 (check_include_file)"
+    checks:
+      - "Looking for inttypes.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-VZtbVW"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-VZtbVW"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_INTTYPES_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-VZtbVW'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_92c98/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_92c98.dir/build.make CMakeFiles/cmTC_92c98.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-VZtbVW'
+        Building C object CMakeFiles/cmTC_92c98.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_92c98.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-VZtbVW/CheckIncludeFile.c
+        Linking C executable cmTC_92c98
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_92c98.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_92c98.dir/CheckIncludeFile.c.o -o cmTC_92c98
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-VZtbVW'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:317 (check_include_file)"
+    checks:
+      - "Looking for limits.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-keCo1J"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-keCo1J"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_LIMITS_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-keCo1J'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_25e90/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_25e90.dir/build.make CMakeFiles/cmTC_25e90.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-keCo1J'
+        Building C object CMakeFiles/cmTC_25e90.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_25e90.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-keCo1J/CheckIncludeFile.c
+        Linking C executable cmTC_25e90
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_25e90.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_25e90.dir/CheckIncludeFile.c.o -o cmTC_25e90
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-keCo1J'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:318 (check_include_file)"
+    checks:
+      - "Looking for netdb.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-rbWqa8"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-rbWqa8"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_NETDB_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-rbWqa8'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_6766b/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_6766b.dir/build.make CMakeFiles/cmTC_6766b.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-rbWqa8'
+        Building C object CMakeFiles/cmTC_6766b.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_6766b.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-rbWqa8/CheckIncludeFile.c
+        Linking C executable cmTC_6766b
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_6766b.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_6766b.dir/CheckIncludeFile.c.o -o cmTC_6766b
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-rbWqa8'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:319 (check_include_file)"
+    checks:
+      - "Looking for netinet/in.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-C8Xn2d"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-C8Xn2d"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_NETINET_IN_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-C8Xn2d'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_98eaf/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_98eaf.dir/build.make CMakeFiles/cmTC_98eaf.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-C8Xn2d'
+        Building C object CMakeFiles/cmTC_98eaf.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_98eaf.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-C8Xn2d/CheckIncludeFile.c
+        Linking C executable cmTC_98eaf
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_98eaf.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_98eaf.dir/CheckIncludeFile.c.o -o cmTC_98eaf
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-C8Xn2d'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:320 (check_include_file)"
+    checks:
+      - "Looking for netinet/ip.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-C3Uryk"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-C3Uryk"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_NETINET_IP_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-C3Uryk'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_2ffd5/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_2ffd5.dir/build.make CMakeFiles/cmTC_2ffd5.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-C3Uryk'
+        Building C object CMakeFiles/cmTC_2ffd5.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_2ffd5.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-C3Uryk/CheckIncludeFile.c
+        Linking C executable cmTC_2ffd5
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_2ffd5.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_2ffd5.dir/CheckIncludeFile.c.o -o cmTC_2ffd5
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-C3Uryk'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:321 (check_include_file)"
+    checks:
+      - "Looking for pwd.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-CjrxmH"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-CjrxmH"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_PWD_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-CjrxmH'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_3a306/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_3a306.dir/build.make CMakeFiles/cmTC_3a306.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-CjrxmH'
+        Building C object CMakeFiles/cmTC_3a306.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_3a306.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-CjrxmH/CheckIncludeFile.c
+        Linking C executable cmTC_3a306
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_3a306.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_3a306.dir/CheckIncludeFile.c.o -o cmTC_3a306
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-CjrxmH'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:322 (check_include_file)"
+    checks:
+      - "Looking for sys/socket.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-QFbDCq"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-QFbDCq"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_SYS_SOCKET_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-QFbDCq'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_b3ba8/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_b3ba8.dir/build.make CMakeFiles/cmTC_b3ba8.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-QFbDCq'
+        Building C object CMakeFiles/cmTC_b3ba8.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_b3ba8.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-QFbDCq/CheckIncludeFile.c
+        Linking C executable cmTC_b3ba8
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_b3ba8.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_b3ba8.dir/CheckIncludeFile.c.o -o cmTC_b3ba8
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-QFbDCq'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:323 (check_include_file)"
+    checks:
+      - "Looking for sys/time.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-bIlXH8"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-bIlXH8"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_SYS_TIME_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-bIlXH8'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_f0d86/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_f0d86.dir/build.make CMakeFiles/cmTC_f0d86.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-bIlXH8'
+        Building C object CMakeFiles/cmTC_f0d86.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_f0d86.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-bIlXH8/CheckIncludeFile.c
+        Linking C executable cmTC_f0d86
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_f0d86.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_f0d86.dir/CheckIncludeFile.c.o -o cmTC_f0d86
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-bIlXH8'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:324 (check_include_file)"
+    checks:
+      - "Looking for syslog.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-hm5XUP"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-hm5XUP"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_SYSLOG_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-hm5XUP'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_dacb4/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_dacb4.dir/build.make CMakeFiles/cmTC_dacb4.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-hm5XUP'
+        Building C object CMakeFiles/cmTC_dacb4.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_dacb4.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-hm5XUP/CheckIncludeFile.c
+        Linking C executable cmTC_dacb4
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_dacb4.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_dacb4.dir/CheckIncludeFile.c.o -o cmTC_dacb4
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-hm5XUP'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:325 (check_include_file)"
+    checks:
+      - "Looking for unistd.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-E66cFB"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-E66cFB"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_UNISTD_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-E66cFB'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_6c277/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_6c277.dir/build.make CMakeFiles/cmTC_6c277.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-E66cFB'
+        Building C object CMakeFiles/cmTC_6c277.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_6c277.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-E66cFB/CheckIncludeFile.c
+        Linking C executable cmTC_6c277
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_6c277.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_6c277.dir/CheckIncludeFile.c.o -o cmTC_6c277
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-E66cFB'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:326 (check_include_file)"
+    checks:
+      - "Looking for windows.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-dvIq0q"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-dvIq0q"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_WINDOWS_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-dvIq0q'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_61a90/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_61a90.dir/build.make CMakeFiles/cmTC_61a90.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-dvIq0q'
+        Building C object CMakeFiles/cmTC_61a90.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_61a90.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-dvIq0q/CheckIncludeFile.c
+        /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-dvIq0q/CheckIncludeFile.c:1:10: fatal error: windows.h: No such file or directory
+            1 | #include <windows.h>
+              |          ^~~~~~~~~~~
+        compilation terminated.
+        gmake[1]: *** [CMakeFiles/cmTC_61a90.dir/build.make:81: CMakeFiles/cmTC_61a90.dir/CheckIncludeFile.c.o] Error 1
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-dvIq0q'
+        gmake: *** [Makefile:134: cmTC_61a90/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/CheckTypeSize.cmake:262 (check_include_file)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:331 (check_type_size)"
+    checks:
+      - "Looking for sys/types.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-0c8r98"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-0c8r98"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_SYS_TYPES_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-0c8r98'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_d14c4/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_d14c4.dir/build.make CMakeFiles/cmTC_d14c4.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-0c8r98'
+        Building C object CMakeFiles/cmTC_d14c4.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_d14c4.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-0c8r98/CheckIncludeFile.c
+        Linking C executable cmTC_d14c4
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_d14c4.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_d14c4.dir/CheckIncludeFile.c.o -o cmTC_d14c4
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-0c8r98'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/CheckTypeSize.cmake:263 (check_include_file)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:331 (check_type_size)"
+    checks:
+      - "Looking for stdint.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-zbu1Vd"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-zbu1Vd"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_STDINT_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-zbu1Vd'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_f6348/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_f6348.dir/build.make CMakeFiles/cmTC_f6348.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-zbu1Vd'
+        Building C object CMakeFiles/cmTC_f6348.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_f6348.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-zbu1Vd/CheckIncludeFile.c
+        Linking C executable cmTC_f6348
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_f6348.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_f6348.dir/CheckIncludeFile.c.o -o cmTC_f6348
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-zbu1Vd'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckIncludeFile.cmake:99 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/CheckTypeSize.cmake:264 (check_include_file)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:331 (check_type_size)"
+    checks:
+      - "Looking for stddef.h"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-IboINk"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-IboINk"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_STDDEF_H"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-IboINk'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_a2253/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_a2253.dir/build.make CMakeFiles/cmTC_a2253.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-IboINk'
+        Building C object CMakeFiles/cmTC_a2253.dir/CheckIncludeFile.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_a2253.dir/CheckIncludeFile.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-IboINk/CheckIncludeFile.c
+        Linking C executable cmTC_a2253
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_a2253.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_a2253.dir/CheckIncludeFile.c.o -o cmTC_a2253
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-IboINk'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckTypeSize.cmake:156 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/CheckTypeSize.cmake:283 (__check_type_size_impl)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:331 (check_type_size)"
+    checks:
+      - "Check size of ssize_t"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-ryMLYy"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-ryMLYy"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_SIZEOF_SSIZE_T"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-ryMLYy'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_ca6b3/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_ca6b3.dir/build.make CMakeFiles/cmTC_ca6b3.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-ryMLYy'
+        Building C object CMakeFiles/cmTC_ca6b3.dir/SIZEOF_SSIZE_T.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_ca6b3.dir/SIZEOF_SSIZE_T.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-ryMLYy/SIZEOF_SSIZE_T.c
+        Linking C executable cmTC_ca6b3
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_ca6b3.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_ca6b3.dir/SIZEOF_SSIZE_T.c.o -o cmTC_ca6b3
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-ryMLYy'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/Internal/CheckSourceCompiles.cmake:108 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/CheckSourceCompiles.cmake:89 (cmake_check_source_compiles)"
+      - "/usr/share/cmake-3.31/Modules/CheckStructHasMember.cmake:79 (CHECK_SOURCE_COMPILES)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:354 (check_struct_has_member)"
+    checks:
+      - "Performing Test HAVE_STRUCT_TM_TM_GMTOFF"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-09VRyz"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-09VRyz"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_STRUCT_TM_TM_GMTOFF"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-09VRyz'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_24218/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_24218.dir/build.make CMakeFiles/cmTC_24218.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-09VRyz'
+        Building C object CMakeFiles/cmTC_24218.dir/src.c.o
+        /usr/bin/cc -DHAVE_STRUCT_TM_TM_GMTOFF   -o CMakeFiles/cmTC_24218.dir/src.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-09VRyz/src.c
+        Linking C executable cmTC_24218
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_24218.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_24218.dir/src.c.o -o cmTC_24218
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-09VRyz'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckFunctionExists.cmake:93 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:358 (check_function_exists)"
+    checks:
+      - "Looking for _Exit"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-xzezeV"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-xzezeV"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE__EXIT"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-xzezeV'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_03d0f/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_03d0f.dir/build.make CMakeFiles/cmTC_03d0f.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-xzezeV'
+        Building C object CMakeFiles/cmTC_03d0f.dir/CheckFunctionExists.c.o
+        /usr/bin/cc   -DCHECK_FUNCTION_EXISTS=_Exit -o CMakeFiles/cmTC_03d0f.dir/CheckFunctionExists.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-xzezeV/CheckFunctionExists.c
+        <command-line>: warning: conflicting types for built-in function ‘_Exit’; expected ‘void(int)’ [-Wbuiltin-declaration-mismatch]
+        /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-xzezeV/CheckFunctionExists.c:7:3: note: in expansion of macro ‘CHECK_FUNCTION_EXISTS’
+            7 |   CHECK_FUNCTION_EXISTS(void);
+              |   ^~~~~~~~~~~~~~~~~~~~~
+        /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-xzezeV/CheckFunctionExists.c:1:1: note: ‘_Exit’ is declared in header ‘<stdlib.h>’
+          +++ |+#include <stdlib.h>
+            1 | #ifdef CHECK_FUNCTION_EXISTS
+        Linking C executable cmTC_03d0f
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_03d0f.dir/link.txt --verbose=1
+        /usr/bin/cc  -DCHECK_FUNCTION_EXISTS=_Exit CMakeFiles/cmTC_03d0f.dir/CheckFunctionExists.c.o -o cmTC_03d0f
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-xzezeV'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckFunctionExists.cmake:93 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:359 (check_function_exists)"
+    checks:
+      - "Looking for accept4"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Z7WE8D"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Z7WE8D"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_ACCEPT4"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Z7WE8D'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_887d5/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_887d5.dir/build.make CMakeFiles/cmTC_887d5.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Z7WE8D'
+        Building C object CMakeFiles/cmTC_887d5.dir/CheckFunctionExists.c.o
+        /usr/bin/cc   -DCHECK_FUNCTION_EXISTS=accept4 -o CMakeFiles/cmTC_887d5.dir/CheckFunctionExists.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Z7WE8D/CheckFunctionExists.c
+        Linking C executable cmTC_887d5
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_887d5.dir/link.txt --verbose=1
+        /usr/bin/cc  -DCHECK_FUNCTION_EXISTS=accept4 CMakeFiles/cmTC_887d5.dir/CheckFunctionExists.c.o -o cmTC_887d5
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-Z7WE8D'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckFunctionExists.cmake:93 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:360 (check_function_exists)"
+    checks:
+      - "Looking for clock_gettime"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-RMHIA4"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-RMHIA4"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_CLOCK_GETTIME"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-RMHIA4'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_7e373/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_7e373.dir/build.make CMakeFiles/cmTC_7e373.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-RMHIA4'
+        Building C object CMakeFiles/cmTC_7e373.dir/CheckFunctionExists.c.o
+        /usr/bin/cc   -DCHECK_FUNCTION_EXISTS=clock_gettime -o CMakeFiles/cmTC_7e373.dir/CheckFunctionExists.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-RMHIA4/CheckFunctionExists.c
+        Linking C executable cmTC_7e373
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_7e373.dir/link.txt --verbose=1
+        /usr/bin/cc  -DCHECK_FUNCTION_EXISTS=clock_gettime CMakeFiles/cmTC_7e373.dir/CheckFunctionExists.c.o -o cmTC_7e373
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-RMHIA4'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckFunctionExists.cmake:93 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:361 (check_function_exists)"
+    checks:
+      - "Looking for mkostemp"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-hKbcNV"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-hKbcNV"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_MKOSTEMP"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-hKbcNV'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_8d1bc/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_8d1bc.dir/build.make CMakeFiles/cmTC_8d1bc.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-hKbcNV'
+        Building C object CMakeFiles/cmTC_8d1bc.dir/CheckFunctionExists.c.o
+        /usr/bin/cc   -DCHECK_FUNCTION_EXISTS=mkostemp -o CMakeFiles/cmTC_8d1bc.dir/CheckFunctionExists.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-hKbcNV/CheckFunctionExists.c
+        Linking C executable cmTC_8d1bc
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_8d1bc.dir/link.txt --verbose=1
+        /usr/bin/cc  -DCHECK_FUNCTION_EXISTS=mkostemp CMakeFiles/cmTC_8d1bc.dir/CheckFunctionExists.c.o -o cmTC_8d1bc
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-hKbcNV'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckFunctionExists.cmake:93 (try_compile)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:362 (check_function_exists)"
+    checks:
+      - "Looking for pipe2"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-HsAm7W"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-HsAm7W"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_PIPE2"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-HsAm7W'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_d0701/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_d0701.dir/build.make CMakeFiles/cmTC_d0701.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-HsAm7W'
+        Building C object CMakeFiles/cmTC_d0701.dir/CheckFunctionExists.c.o
+        /usr/bin/cc   -DCHECK_FUNCTION_EXISTS=pipe2 -o CMakeFiles/cmTC_d0701.dir/CheckFunctionExists.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-HsAm7W/CheckFunctionExists.c
+        Linking C executable cmTC_d0701
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_d0701.dir/link.txt --verbose=1
+        /usr/bin/cc  -DCHECK_FUNCTION_EXISTS=pipe2 CMakeFiles/cmTC_d0701.dir/CheckFunctionExists.c.o -o cmTC_d0701
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-HsAm7W'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckSymbolExists.cmake:163 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/CheckSymbolExists.cmake:68 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:364 (check_symbol_exists)"
+    checks:
+      - "Looking for GetTickCount64"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-JFa1Ql"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-JFa1Ql"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_GETTICKCOUNT64"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-JFa1Ql'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_3b63b/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_3b63b.dir/build.make CMakeFiles/cmTC_3b63b.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-JFa1Ql'
+        Building C object CMakeFiles/cmTC_3b63b.dir/CheckSymbolExists.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_3b63b.dir/CheckSymbolExists.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-JFa1Ql/CheckSymbolExists.c
+        /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-JFa1Ql/CheckSymbolExists.c:2:10: fatal error: sysinfoapi.h: No such file or directory
+            2 | #include <sysinfoapi.h>
+              |          ^~~~~~~~~~~~~~
+        compilation terminated.
+        gmake[1]: *** [CMakeFiles/cmTC_3b63b.dir/build.make:81: CMakeFiles/cmTC_3b63b.dir/CheckSymbolExists.c.o] Error 1
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-JFa1Ql'
+        gmake: *** [Makefile:134: cmTC_3b63b/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckSymbolExists.cmake:163 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/CheckSymbolExists.cmake:68 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:368 (check_symbol_exists)"
+    checks:
+      - "Looking for initgroups"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-qNYCPX"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-qNYCPX"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_DECL_INITGROUPS"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-qNYCPX'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_f0d54/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_f0d54.dir/build.make CMakeFiles/cmTC_f0d54.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-qNYCPX'
+        Building C object CMakeFiles/cmTC_f0d54.dir/CheckSymbolExists.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_f0d54.dir/CheckSymbolExists.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-qNYCPX/CheckSymbolExists.c
+        Linking C executable cmTC_f0d54
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_f0d54.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_f0d54.dir/CheckSymbolExists.c.o -o cmTC_f0d54
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-qNYCPX'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/CheckSymbolExists.cmake:163 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/CheckSymbolExists.cmake:68 (__CHECK_SYMBOL_EXISTS_IMPL)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:377 (check_symbol_exists)"
+    checks:
+      - "Looking for CLOCK_MONOTONIC"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-U6CU0v"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-U6CU0v"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "HAVE_DECL_CLOCK_MONOTONIC"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-U6CU0v'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_cf7d4/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_cf7d4.dir/build.make CMakeFiles/cmTC_cf7d4.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-U6CU0v'
+        Building C object CMakeFiles/cmTC_cf7d4.dir/CheckSymbolExists.c.o
+        /usr/bin/cc    -o CMakeFiles/cmTC_cf7d4.dir/CheckSymbolExists.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-U6CU0v/CheckSymbolExists.c
+        Linking C executable cmTC_cf7d4
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_cf7d4.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_cf7d4.dir/CheckSymbolExists.c.o -o cmTC_cf7d4
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-U6CU0v'
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-3.31/Modules/Internal/CheckSourceCompiles.cmake:108 (try_compile)"
+      - "/usr/share/cmake-3.31/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/usr/share/cmake-3.31/Modules/CheckCCompilerFlag.cmake:56 (cmake_check_compiler_flag)"
+      - "build_warn/_deps/nghttp2-src/cmake/PickyWarningsC.cmake:155 (check_c_compiler_flag)"
+      - "build_warn/_deps/nghttp2-src/CMakeLists.txt:392 (include)"
+    checks:
+      - "Performing Test OPT_Wpragmas"
+    directories:
+      source: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-LQEOVS"
+      binary: "/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-LQEOVS"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/home/ray.dr/Git/Elio/build_warn/_deps/nghttp2-src/cmake;/home/ray.dr/Git/Elio/build_warn/_deps/catch2-src/extras"
+    buildResult:
+      variable: "OPT_Wpragmas"
+      cached: true
+      stdout: |
+        Change Dir: '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-LQEOVS'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_d8bbc/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_d8bbc.dir/build.make CMakeFiles/cmTC_d8bbc.dir/build
+        gmake[1]: Entering directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-LQEOVS'
+        Building C object CMakeFiles/cmTC_d8bbc.dir/src.c.o
+        /usr/bin/cc -DOPT_Wpragmas  -Wpragmas -o CMakeFiles/cmTC_d8bbc.dir/src.c.o -c /home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-LQEOVS/src.c
+        Linking C executable cmTC_d8bbc
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_d8bbc.dir/link.txt --verbose=1
+        /usr/bin/cc CMakeFiles/cmTC_d8bbc.dir/src.c.o -o cmTC_d8bbc
+        gmake[1]: Leaving directory '/home/ray.dr/Git/Elio/build_warn/CMakeFiles/CMakeScratch/TryCompile-LQEOVS'
+        
+      exitCode: 0
+...

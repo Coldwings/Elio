@@ -1,0 +1,15 @@
+set(CMAKE_HOST_SYSTEM "Linux-7.0.5-orbstack-00330-ge3df4e19b0a0-dirty")
+set(CMAKE_HOST_SYSTEM_NAME "Linux")
+set(CMAKE_HOST_SYSTEM_VERSION "7.0.5-orbstack-00330-ge3df4e19b0a0-dirty")
+set(CMAKE_HOST_SYSTEM_PROCESSOR "aarch64")
+
+
+
+set(CMAKE_SYSTEM "Linux-7.0.5-orbstack-00330-ge3df4e19b0a0-dirty")
+set(CMAKE_SYSTEM_NAME "Linux")
+set(CMAKE_SYSTEM_VERSION "7.0.5-orbstack-00330-ge3df4e19b0a0-dirty")
+set(CMAKE_SYSTEM_PROCESSOR "aarch64")
+
+set(CMAKE_CROSSCOMPILING "FALSE")
+
+set(CMAKE_SYSTEM_LOADED 1)

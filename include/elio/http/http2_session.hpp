@@ -92,13 +92,38 @@ public:
         }
     }
     
-    // Non-copyable, non-movable.
-    // Move is unsafe because nghttp2 callbacks capture raw `this` and
-    // coroutines may hold references to the session's maps mid-flight.
+    // Non-copyable, movable.
     h2_session(const h2_session&) = delete;
     h2_session& operator=(const h2_session&) = delete;
-    h2_session(h2_session&&) = delete;
-    h2_session& operator=(h2_session&&) = delete;
+    h2_session(h2_session&& other) noexcept
+        : session_(other.session_)
+        , stream_(other.stream_)
+        , streams_(std::move(other.streams_))
+        , pending_bodies_(std::move(other.pending_bodies_)) {
+        other.session_ = nullptr;
+        other.stream_ = nullptr;
+        if (session_) {
+            nghttp2_session_set_user_data(session_, this);
+        }
+    }
+
+    h2_session& operator=(h2_session&& other) noexcept {
+        if (this != &other) {
+            if (session_) {
+                nghttp2_session_del(session_);
+            }
+            session_ = other.session_;
+            stream_ = other.stream_;
+            streams_ = std::move(other.streams_);
+            pending_bodies_ = std::move(other.pending_bodies_);
+            other.session_ = nullptr;
+            other.stream_ = nullptr;
+            if (session_) {
+                nghttp2_session_set_user_data(session_, this);
+            }
+        }
+        return *this;
+    }
     
     /// Submit a request and get stream ID
     int32_t submit_request(method m, const url& target, std::string_view body = {},

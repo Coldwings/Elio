@@ -8,8 +8,10 @@
 
 using namespace elio::http;
 
-static_assert(std::is_move_constructible_v<h2_session>);
-static_assert(std::is_move_assignable_v<h2_session>);
+// h2_session is intentionally non-movable because nghttp2 callbacks
+// capture `this` and coroutines may hold references to internal maps.
+static_assert(!std::is_move_constructible_v<h2_session>);
+static_assert(!std::is_move_assignable_v<h2_session>);
 static_assert(std::is_move_constructible_v<h2_client>);
 static_assert(std::is_move_assignable_v<h2_client>);
 

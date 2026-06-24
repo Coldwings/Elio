@@ -169,12 +169,22 @@ public:
         return stream_.is_valid() && !closed_.load(std::memory_order_acquire);
     }
     
-    /// Close the client connection
+    /// Close the client connection.
+    /// @note This must be called explicitly to shut down the socket.
+    /// Dropping the last shared_ptr without calling close() will NOT
+    /// shut down the socket because the receive loop holds a strong
+    /// reference across the blocked read, preventing the destructor
+    /// from running until the peer sends data or TCP keepalive fires.
     void close() {
         if (closed_.exchange(true, std::memory_order_acq_rel)) {
             return;  // Already closed
         }
-        
+
+        // Shut down the underlying socket to force the receive loop's
+        // blocked read to return.  Without this, the receive loop stays
+        // alive until the peer sends data or TCP keepalive fires (hours).
+        stream_.shutdown_socket();
+
         // Cancel all pending requests
         for (auto& shard : pending_shards_) {
             std::lock_guard<std::mutex> lock(shard.mutex);

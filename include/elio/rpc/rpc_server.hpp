@@ -403,6 +403,7 @@ private:
                 resp_header.type = message_type::response;
                 resp_header.flags = message_flags::none;
                 resp_header.method_id = 0;
+                validate_payload_size(response_payload.size());
                 resp_header.payload_length = static_cast<uint32_t>(response_payload.size());
 
                 sent = co_await send_response(resp_header, response_payload);

@@ -185,15 +185,26 @@ struct error_payload {
 // Request ID generator
 // ============================================================================
 
-/// Thread-safe request ID generator
+/// Thread-safe request ID generator.
+/// Uses a 64-bit counter internally to skip the reserved sentinel (0).
+/// The wire format is uint32_t, so IDs still wrap with a period of
+/// UINT32_MAX (~4.29 billion). At ~1M req/s this is ~72 minutes.
+/// The 64-bit counter ensures 0 is never emitted (reserved sentinel),
+/// but does NOT prevent wraparound collisions — that requires the
+/// wire format to use uint64_t or a pending-ID skip mechanism.
 class request_id_generator {
 public:
     uint32_t next() noexcept {
-        return counter_.fetch_add(1, std::memory_order_relaxed);
+        // 64-bit counter ensures we skip 0 (reserved sentinel).
+        // Map to [1, UINT32_MAX] by modding against UINT32_MAX and adding 1.
+        // Note: wire format is still uint32_t, so wraparound collisions
+        // are possible after UINT32_MAX requests (~72 min at 1M req/s).
+        uint64_t val = counter_.fetch_add(1, std::memory_order_relaxed);
+        return static_cast<uint32_t>((val % UINT32_MAX) + 1);
     }
-    
+
 private:
-    std::atomic<uint32_t> counter_{1};
+    std::atomic<uint64_t> counter_{0};
 };
 
 // ============================================================================
@@ -457,6 +468,18 @@ coro::task<bool> write_frame(Stream& stream, const frame_header& header,
 // Message builders
 // ============================================================================
 
+/// Validate that payload fits in the wire-format uint32_t length field.
+/// The read path already enforces max_message_size (16 MiB); this guards
+/// the send path against silent truncation of oversized payloads.
+inline void validate_payload_size(size_t size) {
+    if (size > UINT32_MAX) {
+        throw std::runtime_error("rpc: payload size exceeds uint32_t capacity");
+    }
+    if (size > max_message_size) {
+        throw std::runtime_error("rpc: payload size exceeds max_message_size");
+    }
+}
+
 /// Build a request frame
 template<typename Request>
 std::pair<frame_header, buffer_writer> build_request(
@@ -486,6 +509,7 @@ std::pair<frame_header, buffer_writer> build_request(
     header.type = message_type::request;
     header.flags = flags;
     header.method_id = method_id;
+    validate_payload_size(payload.size());
     header.payload_length = static_cast<uint32_t>(payload.size());
     
     return {header, std::move(payload)};
@@ -506,6 +530,7 @@ std::pair<frame_header, buffer_writer> build_response(
     header.type = message_type::response;
     header.flags = enable_checksum ? message_flags::has_checksum : message_flags::none;
     header.method_id = 0;
+    validate_payload_size(payload.size());
     header.payload_length = static_cast<uint32_t>(payload.size());
     
     return {header, std::move(payload)};
@@ -527,6 +552,7 @@ inline std::pair<frame_header, buffer_writer> build_error_response(
     header.type = message_type::error;
     header.flags = enable_checksum ? message_flags::has_checksum : message_flags::none;
     header.method_id = 0;
+    validate_payload_size(payload.size());
     header.payload_length = static_cast<uint32_t>(payload.size());
     
     return {header, std::move(payload)};

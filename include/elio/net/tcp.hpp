@@ -742,6 +742,7 @@ public:
         if (!result_.success()) {
             if (fd_ >= 0) {
                 ::close(fd_);
+                fd_ = -1;
             }
             errno = result_.error_code();
             return std::nullopt;

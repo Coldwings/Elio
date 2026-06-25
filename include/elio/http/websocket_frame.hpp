@@ -412,6 +412,8 @@ inline bool is_valid_utf8(std::string_view s) {
         if (len == 2 && c < 0xC2) return false;
         if (len == 3) {
             if (c == 0xE0 && static_cast<uint8_t>(s[i+1]) < 0xA0) return false;
+            // Reject UTF-16 surrogate code points (U+D800–U+DFFF) per RFC 3629
+            if (c == 0xED && static_cast<uint8_t>(s[i+1]) >= 0xA0) return false;
         }
         if (len == 4) {
             if (c == 0xF0 && static_cast<uint8_t>(s[i+1]) < 0x90) return false;

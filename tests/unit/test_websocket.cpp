@@ -362,6 +362,53 @@ TEST_CASE("WebSocket frame parser", "[websocket][parser]") {
         REQUIRE(parser.has_error());
         REQUIRE(parser.error().find("maximum size") != std::string::npos);
     }
+
+    SECTION("invalid UTF-8 text frame rejected") {
+        frame_parser parser;
+        // 0xFF is never a valid UTF-8 byte
+        std::string bad_utf8 = "hello\xFF world";
+        auto frame = encode_text_frame(bad_utf8, false);
+        parser.parse(frame.data(), frame.size());
+
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::invalid_data);
+    }
+
+    SECTION("UTF-16 surrogate in text frame rejected") {
+        frame_parser parser;
+        // ED A0 80 encodes U+D800 (a high surrogate), invalid in UTF-8 per RFC 3629
+        std::string surrogate = "\xED\xA0\x80";
+        auto frame = encode_text_frame(surrogate, false);
+        parser.parse(frame.data(), frame.size());
+
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::invalid_data);
+    }
+
+    SECTION("invalid UTF-8 in fragmented text message rejected") {
+        frame_parser parser;
+        // First fragment: text frame with fin=false
+        frame_header hdr1;
+        hdr1.op = opcode::text;
+        hdr1.fin = false;
+        hdr1.masked = false;
+        auto frag1 = encode_frame(hdr1, "valid ");
+        // Second fragment: continuation frame with fin=true, containing invalid UTF-8
+        frame_header hdr2;
+        hdr2.op = opcode::continuation;
+        hdr2.fin = true;
+        hdr2.masked = false;
+        std::string bad = "bad\xFF";
+        auto frag2 = encode_frame(hdr2, bad);
+
+        parser.parse(frag1.data(), frag1.size());
+        REQUIRE_FALSE(parser.has_error());
+        REQUIRE_FALSE(parser.has_message());
+
+        parser.parse(frag2.data(), frag2.size());
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::invalid_data);
+    }
 }
 
 TEST_CASE("WebSocket close payload parsing", "[websocket][frame]") {

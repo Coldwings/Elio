@@ -10,6 +10,7 @@
 #include <string_view>
 #include <array>
 #include <algorithm>
+#include <stdexcept>
 #include <sys/random.h>
 
 #include <openssl/sha.h>

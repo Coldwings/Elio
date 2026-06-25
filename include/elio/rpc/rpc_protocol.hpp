@@ -31,7 +31,12 @@
 
 #include <algorithm>
 #include <climits>
-#include <sys/uio.h>
+#include <sys/uio.h>  // For struct iovec and IOV_MAX
+
+// IOV_MAX fallback for systems that don't define it
+#ifndef IOV_MAX
+#define IOV_MAX 1024
+#endif
 #include <elio/net/tcp.hpp>
 #include <elio/net/uds.hpp>
 #include <elio/log/macros.hpp>

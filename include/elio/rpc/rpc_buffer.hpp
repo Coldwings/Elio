@@ -24,13 +24,19 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <climits>
+#include <sys/uio.h>
+
+// IOV_MAX fallback for systems that don't define it
+#ifndef IOV_MAX
+#define IOV_MAX 1024
+#endif
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <stdexcept>
 #include <functional>
-#include <sys/uio.h>
 #include <type_traits>
 
 namespace elio::rpc {

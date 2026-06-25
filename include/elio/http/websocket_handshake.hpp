@@ -10,6 +10,7 @@
 #include <string_view>
 #include <array>
 #include <algorithm>
+#include <stdexcept>
 #include <sys/random.h>
 
 #include <openssl/sha.h>
@@ -89,10 +90,13 @@ inline std::string generate_websocket_key() {
     if (n < static_cast<ssize_t>(key.size())) {
         // Fallback: should never happen on Linux 3.17+
         FILE* f = fopen("/dev/urandom", "rb");
-        if (f) {
-            auto rd = fread(key.data(), 1, key.size(), f);
-            (void)rd;
-            fclose(f);
+        if (!f) {
+            throw std::runtime_error("Failed to open /dev/urandom for WebSocket key generation");
+        }
+        auto rd = fread(key.data(), 1, key.size(), f);
+        fclose(f);
+        if (rd != key.size()) {
+            throw std::runtime_error("Failed to read sufficient entropy for WebSocket key");
         }
     }
 

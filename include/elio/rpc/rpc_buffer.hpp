@@ -19,16 +19,23 @@
 
 #include <elio/hash/crc32.hpp>
 
+#include <climits>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <limits>
+#include <sys/uio.h>
+
+// IOV_MAX fallback for systems that don't define it
+#ifndef IOV_MAX
+#define IOV_MAX 1024
+#endif
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <stdexcept>
 #include <functional>
-#include <sys/uio.h>
 #include <type_traits>
 
 namespace elio::rpc {
@@ -401,6 +408,16 @@ public:
     /// Add a buffer segment
     void add(const void* data, size_t size) {
         if (size > 0) {
+            // Check IOV_MAX limit (typically 1024 on Linux)
+            if (iovecs_.size() >= IOV_MAX) {
+                throw serialization_error("iovec_buffer: exceeded IOV_MAX limit");
+            }
+
+            // Check for overflow
+            if (total_size_ > std::numeric_limits<size_t>::max() - size) {
+                throw serialization_error("iovec_buffer: total size overflow");
+            }
+
             iovecs_.push_back({const_cast<void*>(data), size});
             total_size_ += size;
         }

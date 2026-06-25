@@ -689,6 +689,8 @@ public:
             if (sched) {
                 sched->go([this, s = session]() { return run_session(s); });
             } else {
+                // No scheduler available - remove session from tracking and release slot
+                remove_session(session);
                 release_session_slot();
             }
         }
@@ -736,6 +738,8 @@ public:
             if (sched) {
                 sched->go([this, s = session]() { return run_session(s); });
             } else {
+                // No scheduler available - remove session from tracking and release slot
+                remove_session(session);
                 release_session_slot();
             }
         }
@@ -762,15 +766,8 @@ public:
 
         co_await session->run();
 
-        // Remove from active sessions
-        {
-            std::lock_guard<std::mutex> lock(sessions_mutex_);
-            sessions_.erase(
-                std::remove_if(sessions_.begin(), sessions_.end(),
-                    [&](const session_ptr& s) { return s == session; }),
-                sessions_.end()
-            );
-        }
+        // Remove from active sessions (swap-and-pop for O(1) removal)
+        remove_session(session);
         release_session_slot();
     }
     
@@ -844,19 +841,23 @@ private:
         active_sessions_.fetch_sub(1, std::memory_order_acq_rel);
     }
 
+    /// Remove a session from the tracking vector using swap-and-pop (O(1)).
+    /// Must be called without sessions_mutex_ held.
+    void remove_session(const session_ptr& session) {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        auto it = std::find(sessions_.begin(), sessions_.end(), session);
+        if (it != sessions_.end()) {
+            *it = std::move(sessions_.back());
+            sessions_.pop_back();
+        }
+    }
+
     /// Run a session and clean up when done
     coro::task<void> run_session(session_ptr session) {
         co_await session->run();
 
-        // Remove from active sessions
-        {
-            std::lock_guard<std::mutex> lock(sessions_mutex_);
-            sessions_.erase(
-                std::remove_if(sessions_.begin(), sessions_.end(),
-                    [&](const session_ptr& s) { return s == session; }),
-                sessions_.end()
-            );
-        }
+        // Remove from active sessions (swap-and-pop for O(1) removal)
+        remove_session(session);
         release_session_slot();
     }
 

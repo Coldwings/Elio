@@ -215,12 +215,11 @@ public:
         return token_.is_cancelled() || duration_ns_ <= 0;
     }
 
-    void await_suspend(std::coroutine_handle<> awaiter) {
+    bool await_suspend(std::coroutine_handle<> awaiter) {
         // Check if already cancelled before setting up
         if (token_.is_cancelled()) {
             already_cancelled_before_setup_ = true;
-            awaiter.resume();
-            return;
+            return false;  // Resume immediately (do not suspend)
         }
 
         // Get io_context from current worker or use provided one
@@ -278,8 +277,7 @@ public:
             // observes this state and bails before touching ctx with a
             // stale awaiter address.
             state->resumed.store(true, std::memory_order_release);
-            awaiter.resume();
-            return;
+            return false;  // Resume immediately (do not suspend)
         }
 
         // Use io_context timeout mechanism
@@ -301,7 +299,7 @@ public:
 
         if (ctx->prepare(req)) {
             ctx->submit();
-            return;
+            return true;  // Suspend (wait for timeout to complete)
         }
 
         // SQ full / submit failed: no SQE went out, drop the op_state
@@ -342,6 +340,7 @@ public:
                 awaiter.destroy();
             }
         }
+        return true;  // Suspend (blocking pool will resume when done)
     }
 
     cancel_result await_resume() noexcept {
@@ -409,11 +408,15 @@ private:
     };
 
     static cancel_executor make_cancel_executor(std::shared_ptr<shared_state> state) {
-        // Atomically claim the resume slot. If `resumed` was already true,
-        // the natural completion path has resumed (or is resuming) the
-        // awaiter and we'd risk cancelling a freshly-reused SQE keyed off
-        // the same op_state pointer. Bail early.
-        if (state->resumed.exchange(true, std::memory_order_acq_rel)) {
+        // Atomically claim the resume slot. Use compare_exchange to ensure
+        // we only set resumed to true once. If it was already true, the
+        // natural completion path has resumed (or is resuming) the awaiter
+        // and we'd risk cancelling a freshly-reused SQE keyed off the same
+        // op_state pointer. Bail early.
+        bool expected = false;
+        if (!state->resumed.compare_exchange_strong(expected, true,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_acquire)) {
             co_return;
         }
         if (state->ctx && state->op) {

@@ -132,10 +132,14 @@ public:
     void run_for(std::chrono::milliseconds duration) {
         auto end_time = std::chrono::steady_clock::now() + duration;
         while (std::chrono::steady_clock::now() < end_time) {
+            // Non-blocking drain: process any already-ready CQEs without
+            // blocking, so an idle context returns promptly.
+            poll(std::chrono::milliseconds(0));
             if (!has_pending()) break;
             auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                 end_time - std::chrono::steady_clock::now());
             if (remaining.count() <= 0) break;
+            // Block for remaining time waiting for new CQEs to arrive.
             poll(remaining);
         }
     }

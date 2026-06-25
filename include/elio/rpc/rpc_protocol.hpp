@@ -28,6 +28,9 @@
 
 #include <elio/coro/task.hpp>
 #include <elio/hash/crc32.hpp>
+
+#include <limits>
+#include <sys/uio.h>  // For IOV_MAX
 #include <elio/net/tcp.hpp>
 #include <elio/net/uds.hpp>
 #include <elio/log/macros.hpp>
@@ -268,16 +271,22 @@ coro::task<io::io_result> writev_exact(Stream& stream, struct iovec* iovecs, siz
     
     size_t current_iov = 0;
     size_t bytes_written = 0;
-    
+
     while (current_iov < iov_count) {
-        auto result = co_await stream.writev(&iovecs[current_iov], iov_count - current_iov);
+        // Batch writes to respect IOV_MAX limit (typically 1024 on Linux)
+        size_t batch_size = std::min(
+            static_cast<size_t>(iov_count - current_iov),
+            static_cast<size_t>(IOV_MAX)
+        );
+
+        auto result = co_await stream.writev(&iovecs[current_iov], batch_size);
         if (result.result <= 0) {
             co_return result;
         }
-        
+
         bytes_written += result.result;
         size_t written = static_cast<size_t>(result.result);
-        
+
         // Advance through iovecs based on how much was written
         while (written > 0 && current_iov < iov_count) {
             if (written >= iovecs[current_iov].iov_len) {
@@ -285,7 +294,7 @@ coro::task<io::io_result> writev_exact(Stream& stream, struct iovec* iovecs, siz
                 ++current_iov;
             } else {
                 // Partial write within this iovec entry
-                iovecs[current_iov].iov_base = 
+                iovecs[current_iov].iov_base =
                     static_cast<uint8_t*>(iovecs[current_iov].iov_base) + written;
                 iovecs[current_iov].iov_len -= written;
                 written = 0;
@@ -293,6 +302,10 @@ coro::task<io::io_result> writev_exact(Stream& stream, struct iovec* iovecs, siz
         }
     }
     
+    // Check for overflow before casting to int32_t
+    if (total_length > static_cast<size_t>(INT32_MAX)) {
+        co_return io::io_result{-EOVERFLOW, 0};
+    }
     co_return io::io_result{static_cast<int32_t>(total_length), 0};
 }
 

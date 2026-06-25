@@ -689,6 +689,15 @@ public:
             if (sched) {
                 sched->go([this, s = session]() { return run_session(s); });
             } else {
+                // No scheduler available - remove session from tracking and release slot
+                {
+                    std::lock_guard<std::mutex> lock(sessions_mutex_);
+                    sessions_.erase(
+                        std::remove_if(sessions_.begin(), sessions_.end(),
+                            [&](const session_ptr& s) { return s == session; }),
+                        sessions_.end()
+                    );
+                }
                 release_session_slot();
             }
         }
@@ -736,6 +745,15 @@ public:
             if (sched) {
                 sched->go([this, s = session]() { return run_session(s); });
             } else {
+                // No scheduler available - remove session from tracking and release slot
+                {
+                    std::lock_guard<std::mutex> lock(sessions_mutex_);
+                    sessions_.erase(
+                        std::remove_if(sessions_.begin(), sessions_.end(),
+                            [&](const session_ptr& s) { return s == session; }),
+                        sessions_.end()
+                    );
+                }
                 release_session_slot();
             }
         }
@@ -762,14 +780,14 @@ public:
 
         co_await session->run();
 
-        // Remove from active sessions
+        // Remove from active sessions (swap-and-pop for O(1) removal)
         {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
-            sessions_.erase(
-                std::remove_if(sessions_.begin(), sessions_.end(),
-                    [&](const session_ptr& s) { return s == session; }),
-                sessions_.end()
-            );
+            auto it = std::find(sessions_.begin(), sessions_.end(), session);
+            if (it != sessions_.end()) {
+                *it = std::move(sessions_.back());
+                sessions_.pop_back();
+            }
         }
         release_session_slot();
     }
@@ -848,14 +866,14 @@ private:
     coro::task<void> run_session(session_ptr session) {
         co_await session->run();
 
-        // Remove from active sessions
+        // Remove from active sessions (swap-and-pop for O(1) removal)
         {
             std::lock_guard<std::mutex> lock(sessions_mutex_);
-            sessions_.erase(
-                std::remove_if(sessions_.begin(), sessions_.end(),
-                    [&](const session_ptr& s) { return s == session; }),
-                sessions_.end()
-            );
+            auto it = std::find(sessions_.begin(), sessions_.end(), session);
+            if (it != sessions_.end()) {
+                *it = std::move(sessions_.back());
+                sessions_.pop_back();
+            }
         }
         release_session_slot();
     }

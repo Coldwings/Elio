@@ -1,7 +1,6 @@
 #pragma once
 
 #include <coroutine>
-#include <atomic>
 #include <mutex>
 #include <vector>
 #include <concepts>
@@ -193,7 +192,11 @@ public:
     /// mtx.unlock();
     /// @endcode
     coro::task<void> wait(mutex& m) {
+        // Atomically suspend and release mutex. When we resume, we must
+        // re-acquire the mutex before returning. The wait_suspend_awaitable
+        // handles the suspend+release, and we re-lock after resuming.
         co_await wait_suspend_awaitable(*this, m);
+        // Re-acquire mutex after resuming to maintain CV contract
         co_await m.lock();
     }
 
@@ -216,6 +219,12 @@ public:
             if (waiters_.empty()) return;
 
             auto* waiter = waiters_.pop_front();
+            // Mark as not suspended BEFORE releasing lock to prevent race
+            // with destructor. If the coroutine is destroyed after this
+            // point but before schedule_handle() is called, the destructor
+            // will see suspended_ == false and skip the remove() call,
+            // avoiding UAF on the handle.
+            waiter->suspended_ = false;
             to_schedule = waiter->handle_;
         }
         // Schedule outside lock to avoid deadlock if schedule_handle()
@@ -230,6 +239,12 @@ public:
             std::lock_guard<std::mutex> guard(internal_mutex_);
             while (!waiters_.empty()) {
                 auto* waiter = waiters_.pop_front();
+                // Mark as not suspended BEFORE releasing lock to prevent race
+                // with destructor. If the coroutine is destroyed after this
+                // point but before schedule_handle() is called, the destructor
+                // will see suspended_ == false and skip the remove() call,
+                // avoiding UAF on the handle.
+                waiter->suspended_ = false;
                 to_schedule.push_back(waiter->handle_);
             }
         }

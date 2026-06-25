@@ -77,24 +77,25 @@ public:
     }
 
     /// Write all data, retrying short writes
-    /// @return true if all data was written, false on error
-    coro::task<bool> write_all(const void* buffer, size_t length) {
+    /// @return io_result with total bytes written on success, or the failing
+    ///         io_result (result <= 0) on error, preserving the real error code
+    coro::task<io::io_result> write_all(const void* buffer, size_t length) {
         const auto* ptr = static_cast<const char*>(buffer);
         size_t remaining = length;
 
         while (remaining > 0) {
             auto result = co_await write(ptr, remaining);
             if (result.result <= 0) {
-                co_return false;
+                co_return result;
             }
             ptr += result.result;
             remaining -= static_cast<size_t>(result.result);
         }
-        co_return true;
+        co_return io::io_result{static_cast<int>(length), 0};
     }
 
     /// Write all data from string_view
-    coro::task<bool> write_all(std::string_view data) {
+    coro::task<io::io_result> write_all(std::string_view data) {
         return write_all(data.data(), data.size());
     }
 

@@ -391,7 +391,7 @@ private:
             coro::cancel_source ws_cancel;
             auto watchdog = arm_io_watchdog(sched, conn.fd(), io_deadline,
                                             ws_cancel.get_token(), timed_out);
-            bool ok = co_await conn.write_all(request_data);
+            write_result = co_await conn.write_all(request_data);
             ws_cancel.cancel();
             co_await watchdog;
             if (timed_out->load(std::memory_order_acquire)) {
@@ -401,18 +401,8 @@ private:
                 errno = ETIMEDOUT;
                 co_return std::nullopt;
             }
-            if (!ok) {
-                write_result = io::io_result{-errno, 0};
-            } else {
-                write_result = io::io_result{static_cast<int>(request_data.size()), 0};
-            }
         } else {
-            bool ok = co_await conn.write_all(request_data);
-            if (!ok) {
-                write_result = io::io_result{-errno, 0};
-            } else {
-                write_result = io::io_result{static_cast<int>(request_data.size()), 0};
-            }
+            write_result = co_await conn.write_all(request_data);
         }
         if (write_result.result <= 0) {
             ELIO_LOG_ERROR("Failed to send request: {}",

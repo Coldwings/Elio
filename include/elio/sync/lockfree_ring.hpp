@@ -74,7 +74,8 @@ public:
             if (diff == 0) {
                 // Slot is available, try to claim it
                 if (head_.compare_exchange_weak(head, head + 1,
-                                                 std::memory_order_relaxed)) {
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
                     // Successfully claimed, write value
                     slot.value = std::move(value);
                     // Mark slot as ready for consumption
@@ -114,7 +115,8 @@ public:
             if (diff == 0) {
                 // Slot has data, try to claim it
                 if (tail_.compare_exchange_weak(tail, tail + 1,
-                                                 std::memory_order_relaxed)) {
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire)) {
                     // Successfully claimed, read value
                     T value = std::move(*slot.value);
                     slot.value.reset();

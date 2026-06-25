@@ -86,8 +86,8 @@ struct task_state {
             std::lock_guard<std::mutex> lock(mutex_);
             value_.emplace(std::move(val));
             status_.store(task_status::completed, std::memory_order_release);
-            notify_waiter();
         }
+        notify_waiter();
         cv_.notify_all();
     }
 
@@ -96,8 +96,8 @@ struct task_state {
             std::lock_guard<std::mutex> lock(mutex_);
             failure_ = std::move(f);
             status_.store(task_status::logic_failed, std::memory_order_release);
-            notify_waiter();
         }
+        notify_waiter();
         cv_.notify_all();
     }
 
@@ -106,8 +106,8 @@ struct task_state {
             std::lock_guard<std::mutex> lock(mutex_);
             exception_ = ex;
             status_.store(task_status::exception, std::memory_order_release);
-            notify_waiter();
         }
+        notify_waiter();
         cv_.notify_all();
     }
 
@@ -115,8 +115,8 @@ struct task_state {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             status_.store(task_status::cancelled, std::memory_order_release);
-            notify_waiter();
         }
+        notify_waiter();
         cv_.notify_all();
     }
 
@@ -194,8 +194,8 @@ struct task_state<void> {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             status_.store(task_status::completed, std::memory_order_release);
-            notify_waiter();
         }
+        notify_waiter();
         cv_.notify_all();
     }
 
@@ -204,8 +204,8 @@ struct task_state<void> {
             std::lock_guard<std::mutex> lock(mutex_);
             failure_ = std::move(f);
             status_.store(task_status::logic_failed, std::memory_order_release);
-            notify_waiter();
         }
+        notify_waiter();
         cv_.notify_all();
     }
 
@@ -214,8 +214,8 @@ struct task_state<void> {
             std::lock_guard<std::mutex> lock(mutex_);
             exception_ = ex;
             status_.store(task_status::exception, std::memory_order_release);
-            notify_waiter();
         }
+        notify_waiter();
         cv_.notify_all();
     }
 
@@ -223,8 +223,8 @@ struct task_state<void> {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             status_.store(task_status::cancelled, std::memory_order_release);
-            notify_waiter();
         }
+        notify_waiter();
         cv_.notify_all();
     }
 

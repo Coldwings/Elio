@@ -19,6 +19,7 @@
 
 #include <elio/hash/crc32.hpp>
 
+#include <climits>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -404,12 +405,12 @@ public:
         if (size > 0) {
             // Check IOV_MAX limit (typically 1024 on Linux)
             if (iovecs_.size() >= IOV_MAX) {
-                throw std::runtime_error("iovec_buffer: exceeded IOV_MAX limit");
+                throw serialization_error("iovec_buffer: exceeded IOV_MAX limit");
             }
 
             // Check for overflow
             if (total_size_ > std::numeric_limits<size_t>::max() - size) {
-                throw std::runtime_error("iovec_buffer: total size overflow");
+                throw serialization_error("iovec_buffer: total size overflow");
             }
 
             iovecs_.push_back({const_cast<void*>(data), size});

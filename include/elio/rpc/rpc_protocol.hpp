@@ -29,8 +29,9 @@
 #include <elio/coro/task.hpp>
 #include <elio/hash/crc32.hpp>
 
-#include <limits>
-#include <sys/uio.h>  // For IOV_MAX
+#include <algorithm>
+#include <climits>
+#include <sys/uio.h>
 #include <elio/net/tcp.hpp>
 #include <elio/net/uds.hpp>
 #include <elio/log/macros.hpp>

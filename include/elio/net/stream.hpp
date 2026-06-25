@@ -82,7 +82,6 @@ public:
     coro::task<io::io_result> write_all(const void* buffer, size_t length) {
         const auto* ptr = static_cast<const char*>(buffer);
         size_t remaining = length;
-        size_t total_written = 0;
 
         while (remaining > 0) {
             auto result = co_await write(ptr, remaining);
@@ -91,7 +90,6 @@ public:
             }
             ptr += result.result;
             remaining -= static_cast<size_t>(result.result);
-            total_written += static_cast<size_t>(result.result);
         }
         co_return io::io_result{static_cast<int>(length), 0};
     }
@@ -105,6 +103,9 @@ public:
     coro::task<void> close() {
         if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
             co_await tls->shutdown();
+        } else if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
+            // Plain TCP streams have an async close() method
+            co_await tcp->close();
         }
         stream_ = std::monostate{};
     }

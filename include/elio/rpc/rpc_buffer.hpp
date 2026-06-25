@@ -24,7 +24,6 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
-#include <climits>
 #include <sys/uio.h>
 
 // IOV_MAX fallback for systems that don't define it

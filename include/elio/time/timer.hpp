@@ -215,12 +215,11 @@ public:
         return token_.is_cancelled() || duration_ns_ <= 0;
     }
 
-    void await_suspend(std::coroutine_handle<> awaiter) {
+    bool await_suspend(std::coroutine_handle<> awaiter) {
         // Check if already cancelled before setting up
         if (token_.is_cancelled()) {
             already_cancelled_before_setup_ = true;
-            awaiter.resume();
-            return;
+            return false;  // Resume immediately (do not suspend)
         }
 
         // Get io_context from current worker or use provided one
@@ -278,8 +277,7 @@ public:
             // observes this state and bails before touching ctx with a
             // stale awaiter address.
             state->resumed.store(true, std::memory_order_release);
-            awaiter.resume();
-            return;
+            return false;  // Resume immediately (do not suspend)
         }
 
         // Use io_context timeout mechanism
@@ -301,7 +299,7 @@ public:
 
         if (ctx->prepare(req)) {
             ctx->submit();
-            return;
+            return true;  // Suspend (wait for timeout to complete)
         }
 
         // SQ full / submit failed: no SQE went out, drop the op_state
@@ -342,6 +340,7 @@ public:
                 awaiter.destroy();
             }
         }
+        return true;  // Suspend (blocking pool will resume when done)
     }
 
     cancel_result await_resume() noexcept {
@@ -353,10 +352,15 @@ public:
         cancel_registration_.unregister();
         bool was_cancelled = already_cancelled_before_setup_;
         if (state_) {
-            // Set resumed first so any cancel executor that the worker
-            // pulls from its inbox after this point sees `resumed == true`
-            // and bails before dereferencing `state->ctx` with a stale
-            // awaiter address.
+            // Set resumed = true to signal to any cancel executor that
+            // has not yet run that the awaiter is already done. Safety
+            // is structural: both backends call safe_resume() (i.e.
+            // handle.resume()) synchronously inside poll(), so
+            // await_resume() always executes before the worker returns
+            // to get_next_task() and drains the inbox where the cancel
+            // executor waits. The store here thus always precedes the
+            // cancel executor's load in program order on the worker
+            // thread.
             state_->resumed.store(true, std::memory_order_release);
             was_cancelled = was_cancelled ||
                             state_->cancelled.load(std::memory_order_acquire);
@@ -409,11 +413,23 @@ private:
     };
 
     static cancel_executor make_cancel_executor(std::shared_ptr<shared_state> state) {
-        // Atomically claim the resume slot. If `resumed` was already true,
-        // the natural completion path has resumed (or is resuming) the
-        // awaiter and we'd risk cancelling a freshly-reused SQE keyed off
-        // the same op_state pointer. Bail early.
-        if (state->resumed.exchange(true, std::memory_order_acq_rel)) {
+        // Guard against running when the timer already completed naturally.
+        // Safety invariant: both io_uring and epoll backends call
+        // safe_resume() (handle.resume()) synchronously inside poll(),
+        // so await_resume() — which stores resumed=true — is always
+        // executed before the worker returns to get_next_task() and
+        // drains the inbox queue where this coroutine waits. Concretely:
+        //   * Timer CQE arrives inside poll_io_when_idle()
+        //   * resume_deferred() calls safe_resume(timer_coroutine) inline
+        //   * await_resume() stores resumed=true, returns
+        //   * poll() returns, poll_io_when_idle() returns
+        //   * Main loop: get_next_task() drains inbox → this coroutine
+        //     is dequeued and sees resumed==true → co_return safely
+        //
+        // For the normal early-cancel path (cancel fires before the
+        // timer CQE), resumed is still false here and we proceed to
+        // issue ctx->cancel() as intended.
+        if (state->resumed.load(std::memory_order_acquire)) {
             co_return;
         }
         if (state->ctx && state->op) {

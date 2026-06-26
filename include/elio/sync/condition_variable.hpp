@@ -218,13 +218,10 @@ public:
             std::lock_guard<std::mutex> guard(internal_mutex_);
             if (waiters_.empty()) return;
 
+            // Collect handle and pop from list under lock.
+            // Popping marks node as unlinked, so destructor's locked slow path
+            // won't try to remove it (is_linked() == false).
             auto* waiter = waiters_.pop_front();
-            // Mark as not suspended BEFORE releasing lock to prevent race
-            // with destructor. If the coroutine is destroyed after this
-            // point but before schedule_handle() is called, the destructor
-            // will see suspended_ == false and skip the remove() call,
-            // avoiding UAF on the handle.
-            waiter->suspended_ = false;
             to_schedule = waiter->handle_;
         }
         // Schedule outside lock to avoid deadlock if schedule_handle()
@@ -238,13 +235,9 @@ public:
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
             while (!waiters_.empty()) {
+                // Collect handles and pop from list under lock.
+                // Popping marks nodes as unlinked, so destructors won't try to remove them.
                 auto* waiter = waiters_.pop_front();
-                // Mark as not suspended BEFORE releasing lock to prevent race
-                // with destructor. If the coroutine is destroyed after this
-                // point but before schedule_handle() is called, the destructor
-                // will see suspended_ == false and skip the remove() call,
-                // avoiding UAF on the handle.
-                waiter->suspended_ = false;
                 to_schedule.push_back(waiter->handle_);
             }
         }

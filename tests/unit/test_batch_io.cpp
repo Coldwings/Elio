@@ -176,6 +176,42 @@ TEST_CASE("file_helpers: write_file and read_file roundtrip", "[io][file_helpers
     unlink(path.c_str());
 }
 
+TEST_CASE("file_helpers: read_file handles empty files", "[io][file_helpers]") {
+    std::string path = "/tmp/elio_file_helpers_empty_" + std::to_string(getpid()) + ".txt";
+    unlink(path.c_str());
+
+    int fd = open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    REQUIRE(fd >= 0);
+    close(fd);
+
+    run_on_scheduler([&]() -> task<void> {
+        auto content = co_await read_file(path);
+        REQUIRE(content.has_value());
+        REQUIRE(content->empty());
+    });
+
+    unlink(path.c_str());
+}
+
+TEST_CASE("file_helpers: read_file handles multi-chunk reads", "[io][file_helpers]") {
+    std::string path = "/tmp/elio_file_helpers_large_" + std::to_string(getpid()) + ".txt";
+    unlink(path.c_str());
+
+    std::string expected((1024 * 1024 * 2) + 123, 'x');
+    expected.back() = 'z';
+
+    run_on_scheduler([&]() -> task<void> {
+        auto written = co_await write_file(path, expected);
+        REQUIRE(written);
+
+        auto content = co_await read_file(path);
+        REQUIRE(content.has_value());
+        REQUIRE(*content == expected);
+    });
+
+    unlink(path.c_str());
+}
+
 TEST_CASE("file_helpers: append_file", "[io][file_helpers]") {
     std::string path = "/tmp/elio_append_" + std::to_string(getpid()) + ".txt";
     unlink(path.c_str());

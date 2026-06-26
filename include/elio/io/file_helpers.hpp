@@ -73,7 +73,7 @@ inline coro::task<std::optional<std::string>> read_file(const std::string& path)
     // Get initial size estimate, but don't rely on it for correctness
     struct stat st;
     size_t initial_size = 0;
-    if (stat(path.c_str(), &st) == 0 && st.st_size > 0) {
+    if (fstat(fd, &st) == 0 && st.st_size > 0) {
         initial_size = static_cast<size_t>(st.st_size);
     }
 
@@ -101,6 +101,7 @@ inline coro::task<std::optional<std::string>> read_file(const std::string& path)
         if (!result.success() || result.result == 0) {
             // EOF or error - truncate to actual read size
             buffer.resize(total_read);
+            buffer.shrink_to_fit();
             if (total_read == 0 && !result.success()) {
                 co_return std::nullopt;
             }

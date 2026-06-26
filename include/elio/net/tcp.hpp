@@ -394,7 +394,7 @@ public:
         int flag = enable ? 1 : 0;
         return setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag)) == 0;
     }
-    
+
 private:
     /// Release the fd. Prefers ``IORING_OP_CLOSE`` when called from a worker
     /// running on an io_uring backend, so the kernel can drain any in-flight
@@ -488,7 +488,7 @@ public:
             , listener_(listener) {}
 
         template<typename Promise>
-        void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bool await_suspend(std::coroutine_handle<Promise> awaiter) {
             bind_to_worker(awaiter);
             auto& ctx = io::current_io_context();
 
@@ -504,9 +504,9 @@ public:
             if (!ctx.prepare(req)) {
                 clear_op_state();
                 result_ = io::io_result{-EAGAIN, 0};
-                awaiter.resume();
-                return;
+                return false;  // Don't suspend, resume immediately
             }
+            return true;  // Suspend, will be resumed by completion handler
         }
 
         std::optional<tcp_stream> await_resume() {

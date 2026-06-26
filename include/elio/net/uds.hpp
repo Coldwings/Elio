@@ -415,7 +415,7 @@ public:
             , listener_(listener) {}
 
         template<typename Promise>
-        void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bool await_suspend(std::coroutine_handle<Promise> awaiter) {
             bind_to_worker(awaiter);
             auto& ctx = io::current_io_context();
 
@@ -431,9 +431,9 @@ public:
             if (!ctx.prepare(req)) {
                 clear_op_state();
                 result_ = io::io_result{-EAGAIN, 0};
-                awaiter.resume();
-                return;
+                return false;  // Don't suspend, resume immediately
             }
+            return true;  // Suspend, will be resumed by completion handler
         }
 
         std::optional<uds_stream> await_resume() {

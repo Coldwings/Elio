@@ -40,6 +40,15 @@ public:
             std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
             if (this->is_linked()) {
                 mtx_.waiters_.remove(this);
+            } else {
+                // We were already popped from the waiters list by unlock().
+                // If state is set to sentinel (1), it means lock is being
+                // transferred to us but we're being destroyed before resuming.
+                // Release the lock to prevent deadlock.
+                void* expected = reinterpret_cast<void*>(1);
+                mtx_.state_.compare_exchange_strong(
+                    expected, nullptr,
+                    std::memory_order_release, std::memory_order_relaxed);
             }
         }
 

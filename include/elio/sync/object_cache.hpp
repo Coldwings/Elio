@@ -270,7 +270,9 @@ private:
                 if (addr) {
                     return false;
                 }
-                return true;
+                // We got nullptr back, which means another thread already
+                // exchanged the waiter and scheduled us. Don't suspend.
+                return false;
             }
             return true;
         }

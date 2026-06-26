@@ -323,6 +323,7 @@ public:
                         if (!send_waiters_.empty()) {
                             auto* sender = send_waiters_.front();
                             if (ring_->try_push(sender->value_)) {
+                                sender->success_ = true;
                                 sender_handle = sender->handle_;
                                 send_waiters_.pop_front();
                             }
@@ -475,6 +476,7 @@ public:
                 while (!send_waiters_.empty()) {
                     auto* sender = send_waiters_.pop_front();
                     queue_.push(std::move(sender->value_));
+                    sender->success_ = true;  // Value was delivered to queue
                     to_schedule.push_back(sender->handle_);
                 }
             }
@@ -484,6 +486,7 @@ public:
                 while (!send_waiters_.empty()) {
                     auto* sender = send_waiters_.pop_front();
                     queue_.push(std::move(sender->value_));
+                    sender->success_ = true;  // Value was delivered to queue
                     to_schedule.push_back(sender->handle_);
                 }
             }

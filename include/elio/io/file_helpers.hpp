@@ -16,51 +16,101 @@
 
 namespace elio::io {
 
+/// RAII wrapper for file descriptors to ensure cleanup
+class fd_guard {
+public:
+    explicit fd_guard(int fd) noexcept : fd_(fd) {}
+
+    ~fd_guard() {
+        if (fd_ >= 0) {
+            close_fd_for_destructor(fd_);
+        }
+    }
+
+    // Non-copyable
+    fd_guard(const fd_guard&) = delete;
+    fd_guard& operator=(const fd_guard&) = delete;
+
+    // Movable
+    fd_guard(fd_guard&& other) noexcept : fd_(other.fd_) {
+        other.fd_ = -1;
+    }
+
+    fd_guard& operator=(fd_guard&& other) noexcept {
+        if (this != &other) {
+            if (fd_ >= 0) {
+                close_fd_for_destructor(fd_);
+            }
+            fd_ = other.fd_;
+            other.fd_ = -1;
+        }
+        return *this;
+    }
+
+    int get() const noexcept { return fd_; }
+
+    int release() noexcept {
+        int fd = fd_;
+        fd_ = -1;
+        return fd;
+    }
+
+private:
+    int fd_;
+};
+
 /// Read entire file content into a string
 /// Returns nullopt if file cannot be opened or read
 inline coro::task<std::optional<std::string>> read_file(const std::string& path) {
-    // Get file size first
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0) {
-        co_return std::nullopt;
-    }
-    
-    if (st.st_size == 0) {
-        co_return std::string{};
-    }
-    
-    auto file_size = static_cast<size_t>(st.st_size);
-    std::string buffer(file_size, '\0');
-    
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         co_return std::nullopt;
     }
-    
-    // Read in chunks to handle large files
+
+    // Use RAII to ensure fd is always closed
+    fd_guard guard(fd);
+
+    // Get initial size estimate, but don't rely on it for correctness
+    struct stat st;
+    size_t initial_size = 0;
+    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+        initial_size = static_cast<size_t>(st.st_size);
+    }
+
+    // Read the file in chunks, handling TOCTOU where file size may change
+    std::string buffer;
+    buffer.reserve(initial_size > 0 ? initial_size : 4096);
+
     size_t total_read = 0;
-    while (total_read < file_size) {
-        size_t remaining = file_size - total_read;
-        size_t chunk = std::min(remaining, size_t(1024 * 1024)); // 1MB chunks
-        
+    while (true) {
+        // Ensure we have space to read
+        size_t capacity = buffer.capacity();
+        if (total_read >= capacity) {
+            // Double the buffer size
+            buffer.resize(capacity * 2);
+        } else {
+            buffer.resize(capacity);
+        }
+
+        // Read a chunk
+        size_t chunk = std::min(buffer.size() - total_read, size_t(1024 * 1024)); // 1MB chunks
         auto result = co_await async_read(fd,
             buffer.data() + total_read, chunk,
             static_cast<int64_t>(total_read));
-        
+
         if (!result.success() || result.result == 0) {
             // EOF or error - truncate to actual read size
             buffer.resize(total_read);
-            close(fd);
+            buffer.shrink_to_fit();
             if (total_read == 0 && !result.success()) {
                 co_return std::nullopt;
             }
             co_return buffer;
         }
-        
+
         total_read += static_cast<size_t>(result.result);
     }
-    
-    close(fd);
+
     co_return buffer;
 }
 
@@ -71,25 +121,26 @@ inline coro::task<bool> write_file(const std::string& path, const std::string& d
     if (fd < 0) {
         co_return false;
     }
-    
+
+    // Use RAII to ensure fd is always closed
+    fd_guard guard(fd);
+
     size_t total_written = 0;
     while (total_written < data.size()) {
         size_t remaining = data.size() - total_written;
         size_t chunk = std::min(remaining, size_t(1024 * 1024)); // 1MB chunks
-        
+
         auto result = co_await async_write(fd,
             data.data() + total_written, chunk,
             static_cast<int64_t>(total_written));
-        
+
         if (!result.success() || result.result == 0) {
-            close(fd);
             co_return false;
         }
-        
+
         total_written += static_cast<size_t>(result.result);
     }
-    
-    close(fd);
+
     co_return true;
 }
 
@@ -100,13 +151,28 @@ inline coro::task<bool> append_file(const std::string& path, const std::string& 
     if (fd < 0) {
         co_return false;
     }
-    
-    // For append, use current position (offset=-1 → offset 0 in pwrite,
-    // but O_APPEND ensures writes go to end)
-    auto result = co_await async_write(fd, data.data(), data.size(), -1);
-    
-    close(fd);
-    co_return result.success() && static_cast<size_t>(result.result) == data.size();
+
+    // Use RAII to ensure fd is always closed
+    fd_guard guard(fd);
+
+    size_t total_written = 0;
+    while (total_written < data.size()) {
+        size_t remaining = data.size() - total_written;
+        size_t chunk = std::min(remaining, size_t(1024 * 1024)); // 1MB chunks
+
+        // For append, use offset=-1 which io_uring translates to current position
+        // The O_APPEND flag ensures writes go to end regardless of offset
+        auto result = co_await async_write(fd,
+            data.data() + total_written, chunk, -1);
+
+        if (!result.success() || result.result == 0) {
+            co_return false;
+        }
+
+        total_written += static_cast<size_t>(result.result);
+    }
+
+    co_return true;
 }
 
 /// Check if a file exists

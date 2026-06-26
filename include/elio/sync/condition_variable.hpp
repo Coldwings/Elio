@@ -1,7 +1,6 @@
 #pragma once
 
 #include <coroutine>
-#include <atomic>
 #include <mutex>
 #include <vector>
 #include <concepts>
@@ -193,7 +192,11 @@ public:
     /// mtx.unlock();
     /// @endcode
     coro::task<void> wait(mutex& m) {
+        // Atomically suspend and release mutex. When we resume, we must
+        // re-acquire the mutex before returning. The wait_suspend_awaitable
+        // handles the suspend+release, and we re-lock after resuming.
         co_await wait_suspend_awaitable(*this, m);
+        // Re-acquire mutex after resuming to maintain CV contract
         co_await m.lock();
     }
 
@@ -215,6 +218,9 @@ public:
             std::lock_guard<std::mutex> guard(internal_mutex_);
             if (waiters_.empty()) return;
 
+            // Collect handle and pop from list under lock.
+            // Popping marks node as unlinked, so destructor's locked slow path
+            // won't try to remove it (is_linked() == false).
             auto* waiter = waiters_.pop_front();
             to_schedule = waiter->handle_;
         }
@@ -229,6 +235,8 @@ public:
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
             while (!waiters_.empty()) {
+                // Collect handles and pop from list under lock.
+                // Popping marks nodes as unlinked, so destructors won't try to remove them.
                 auto* waiter = waiters_.pop_front();
                 to_schedule.push_back(waiter->handle_);
             }

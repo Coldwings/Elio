@@ -322,10 +322,15 @@ public:
                         std::lock_guard<std::mutex> guard(mutex_);
                         if (!send_waiters_.empty()) {
                             auto* sender = send_waiters_.front();
-                            if (ring_->try_push(sender->value_)) {
-                                sender_handle = sender->handle_;
-                                send_waiters_.pop_front();
+                            // Retry try_push in a loop since we just freed space
+                            while (!ring_->try_push(sender->value_)) {
+                                // Ring should have space since we just popped,
+                                // but retry if another thread filled it
+                                std::this_thread::yield();
                             }
+                            sender->success_ = true;
+                            sender_handle = sender->handle_;
+                            send_waiters_.pop_front();
                         }
                     }
                     if (sender_handle) {
@@ -475,6 +480,7 @@ public:
                 while (!send_waiters_.empty()) {
                     auto* sender = send_waiters_.pop_front();
                     queue_.push(std::move(sender->value_));
+                    sender->success_ = true;  // Value was delivered to queue
                     to_schedule.push_back(sender->handle_);
                 }
             }
@@ -484,6 +490,7 @@ public:
                 while (!send_waiters_.empty()) {
                     auto* sender = send_waiters_.pop_front();
                     queue_.push(std::move(sender->value_));
+                    sender->success_ = true;  // Value was delivered to queue
                     to_schedule.push_back(sender->handle_);
                 }
             }

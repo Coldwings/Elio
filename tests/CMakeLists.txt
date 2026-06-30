@@ -27,6 +27,7 @@ set(TEST_SOURCES
     unit/test_sync_cancellation.cpp
     unit/test_channel_debug.cpp
     unit/test_channel_close.cpp
+    unit/test_channel_success.cpp
     unit/test_close_wake.cpp
     unit/test_simple_channel.cpp
     unit/test_cancel_token.cpp

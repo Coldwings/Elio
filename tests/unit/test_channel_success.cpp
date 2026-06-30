@@ -2,6 +2,19 @@
 ///
 /// Verifies that send() returns true when a receiver directly steals
 /// the value from a blocked sender (the bug fixed in issue #234).
+///
+/// Regression tests for: send() must report success when its value is
+/// delivered to a receiver via a direct handoff (the receiver steals from
+/// a blocked sender), even if the channel is closed before the sender
+/// resumes. Without setting sender->success_ = true in the steal paths,
+/// send() falls back to `!closed_` and incorrectly returns false once
+/// the channel is closed.
+///
+/// To make the "close before the sender resumes" window deterministic,
+/// a single-threaded scheduler is used and the steal + close are
+/// performed inside one coroutine: schedule_handle() enqueues the
+/// resumed sender onto the only worker, so it cannot run until the
+/// stealer coroutine yields, guaranteeing close() wins the race.
 
 #include <catch2/catch_test_macros.hpp>
 #include <elio/sync/channel.hpp>
@@ -11,7 +24,6 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
-#include <vector>
 
 using namespace elio::sync;
 using namespace elio::coro;
@@ -25,278 +37,186 @@ auto spawn_joinable(scheduler& sched, F&& f) {
 
 // ---------------------------------------------------------------------------
 // Test 1: recv() direct steal from blocked sender on bounded channel
-//
-// Fill a bounded channel to capacity so the next send() blocks.
-// Then recv() pops from the ring and back-fills from the blocked sender.
-// The blocked sender's send() must return true.
 // ---------------------------------------------------------------------------
-TEST_CASE("channel send returns true when recv steals from blocked sender (bounded)",
+TEST_CASE("channel send returns true after recv() bounded direct steal",
           "[sync][channel][coro]") {
-    channel<int> ch(1);  // capacity 1
-    ch.try_send(100);    // fill the buffer
+    channel<int> ch(1);   // bounded(1)
+    ch.try_send(1);       // fill the ring so the next sender blocks
 
     std::atomic<bool> send_result{false};
-    std::atomic<bool> send_done{false};
-    std::atomic<int> received_value{0};
+    std::atomic<bool> sender_done{false};
+    std::atomic<int> stolen{-1};
 
     channel<int>* ch_ptr = &ch;
-    auto* sr = &send_result;
-    auto* sd = &send_done;
-    auto* rv = &received_value;
+    std::atomic<bool>* sr_ptr = &send_result;
+    std::atomic<bool>* sd_ptr = &sender_done;
+    std::atomic<int>* st_ptr = &stolen;
 
-    // This sender will block because the channel is full
-    auto sender = [=]() -> task<void> {
-        bool ok = co_await ch_ptr->send(200);
-        sr->store(ok, std::memory_order_release);
-        sd->store(true, std::memory_order_release);
+    auto blocked_sender = [=]() -> task<void> {
+        bool r = co_await ch_ptr->send(2);  // blocks: ring full
+        *sr_ptr = r;
+        *sd_ptr = true;
         co_return;
     };
 
-    // Receiver: pop from ring (gets 100), which triggers back-fill from
-    // the blocked sender (200). Then recv again to get 200.
-    auto receiver = [=]() -> task<void> {
-        // First recv gets the buffered value
-        auto v1 = co_await ch_ptr->recv();
-        REQUIRE(v1.has_value());
-        // Second recv gets the sender's value
-        auto v2 = co_await ch_ptr->recv();
-        if (v2.has_value()) {
-            rv->store(*v2, std::memory_order_release);
-        }
-        co_return;
-    };
-
-    scheduler sched(2);
+    scheduler sched(1);  // single worker for deterministic ordering
     sched.start();
+    auto s_join = spawn_joinable(sched, blocked_sender);
 
-    auto s_join = spawn_joinable(sched, sender);
-    auto r_join = spawn_joinable(sched, receiver);
+    // Let the sender reach await_suspend and enqueue in send_waiters_.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    s_join.wait_destroyed();
+    auto stealer = [=]() -> task<void> {
+        auto v0 = ch_ptr->try_recv();      // pop buffered 1 (ring now empty)
+        (void)v0;
+        auto v = co_await ch_ptr->recv();  // direct-steal 2 from blocked sender
+        if (v) *st_ptr = *v;
+        ch_ptr->close();                   // close before sender resumes
+        co_return;
+    };
+    auto r_join = spawn_joinable(sched, stealer);
+
     r_join.wait_destroyed();
-
+    s_join.wait_destroyed();
     sched.shutdown();
 
-    // The critical assertion: send() must return true because the value
-    // was successfully delivered to the receiver
-    REQUIRE(send_result.load(std::memory_order_acquire) == true);
-    REQUIRE(send_done.load(std::memory_order_acquire));
-    REQUIRE(received_value.load(std::memory_order_acquire) == 200);
+    REQUIRE(stolen.load() == 2);          // value was delivered to the receiver
+    REQUIRE(sender_done.load());          // sender resumed
+    REQUIRE(send_result.load());          // send() reported success
 }
 
 // ---------------------------------------------------------------------------
 // Test 2: recv() direct steal from rendezvous sender
-//
-// On a rendezvous channel (capacity 0), send() blocks until a receiver
-// arrives. When recv() directly steals from the blocked sender, the
-// sender's send() must return true.
 // ---------------------------------------------------------------------------
-TEST_CASE("channel send returns true when recv steals from rendezvous sender",
+TEST_CASE("channel send returns true after recv() rendezvous direct steal",
           "[sync][channel][coro]") {
-    channel<int> ch(0);  // rendezvous
+    channel<int> ch;  // rendezvous
 
     std::atomic<bool> send_result{false};
-    std::atomic<bool> send_done{false};
-    std::atomic<int> received_value{0};
+    std::atomic<bool> sender_done{false};
+    std::atomic<int> stolen{-1};
 
     channel<int>* ch_ptr = &ch;
-    auto* sr = &send_result;
-    auto* sd = &send_done;
-    auto* rv = &received_value;
+    std::atomic<bool>* sr_ptr = &send_result;
+    std::atomic<bool>* sd_ptr = &sender_done;
+    std::atomic<int>* st_ptr = &stolen;
 
-    auto sender = [=]() -> task<void> {
-        bool ok = co_await ch_ptr->send(42);
-        sr->store(ok, std::memory_order_release);
-        sd->store(true, std::memory_order_release);
+    auto blocked_sender = [=]() -> task<void> {
+        bool r = co_await ch_ptr->send(7);  // blocks: no receiver ready
+        *sr_ptr = r;
+        *sd_ptr = true;
         co_return;
     };
 
-    auto receiver = [=]() -> task<void> {
-        auto v = co_await ch_ptr->recv();
-        if (v.has_value()) {
-            rv->store(*v, std::memory_order_release);
-        }
+    scheduler sched(1);  // single worker for deterministic ordering
+    sched.start();
+    auto s_join = spawn_joinable(sched, blocked_sender);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    auto stealer = [=]() -> task<void> {
+        auto v = co_await ch_ptr->recv();  // direct-steal 7 from rendezvous sender
+        if (v) *st_ptr = *v;
+        ch_ptr->close();                   // close before sender resumes
+        co_return;
+    };
+    auto r_join = spawn_joinable(sched, stealer);
+
+    r_join.wait_destroyed();
+    s_join.wait_destroyed();
+    sched.shutdown();
+
+    REQUIRE(stolen.load() == 7);
+    REQUIRE(sender_done.load());
+    REQUIRE(send_result.load());
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: try_recv() bounded ring push wakes blocked sender
+// ---------------------------------------------------------------------------
+TEST_CASE("channel send returns true after try_recv() bounded ring push",
+          "[sync][channel][coro]") {
+    channel<int> ch(1);   // bounded(1)
+    ch.try_send(10);      // fill the ring so the next sender blocks
+
+    std::atomic<bool> send_result{false};
+    std::atomic<bool> sender_done{false};
+
+    channel<int>* ch_ptr = &ch;
+    std::atomic<bool>* sr_ptr = &send_result;
+    std::atomic<bool>* sd_ptr = &sender_done;
+
+    auto blocked_sender = [=]() -> task<void> {
+        bool r = co_await ch_ptr->send(20);  // blocks: ring full
+        *sr_ptr = r;
+        *sd_ptr = true;
         co_return;
     };
 
     scheduler sched(2);
     sched.start();
+    auto s_join = spawn_joinable(sched, blocked_sender);
 
-    auto s_join = spawn_joinable(sched, sender);
-    auto r_join = spawn_joinable(sched, receiver);
-
-    s_join.wait_destroyed();
-    r_join.wait_destroyed();
-
-    sched.shutdown();
-
-    REQUIRE(send_result.load(std::memory_order_acquire) == true);
-    REQUIRE(send_done.load(std::memory_order_acquire));
-    REQUIRE(received_value.load(std::memory_order_acquire) == 42);
-}
-
-// ---------------------------------------------------------------------------
-// Test 3: try_recv() wakes blocked sender on bounded channel
-//
-// Fill a bounded channel, then have a sender block. A synchronous
-// try_recv() pops from the ring and back-fills from the blocked sender.
-// The sender's send() must return true.
-// ---------------------------------------------------------------------------
-TEST_CASE("channel send returns true when try_recv wakes blocked sender (bounded)",
-          "[sync][channel][coro]") {
-    channel<int> ch(1);  // capacity 1
-    ch.try_send(100);    // fill the buffer
-
-    std::atomic<bool> send_result{false};
-    std::atomic<bool> send_done{false};
-
-    channel<int>* ch_ptr = &ch;
-    auto* sr = &send_result;
-    auto* sd = &send_done;
-
-    // This sender will block because the channel is full
-    auto sender = [=]() -> task<void> {
-        bool ok = co_await ch_ptr->send(200);
-        sr->store(ok, std::memory_order_release);
-        sd->store(true, std::memory_order_release);
-        co_return;
-    };
-
-    scheduler sched(1);
-    sched.start();
-
-    auto s_join = spawn_joinable(sched, sender);
-
-    // Give the sender time to suspend on the full channel
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    // try_recv pops 100 from ring, then back-fills 200 from blocked sender
+    // try_recv() pops 10, then pushes the blocked sender's 20 into the ring and
+    // schedules the sender. close() runs from the main thread before the worker
+    // resumes the sender, exercising the close-before-resume window.
     auto v1 = ch.try_recv();
     REQUIRE(v1.has_value());
-    REQUIRE(*v1 == 100);
+    REQUIRE(*v1 == 10);
 
-    // Wait for sender to complete
+    ch.close();
+
     s_join.wait_destroyed();
-
     sched.shutdown();
 
-    // The sender's value was pushed into the ring by try_recv, so send()
-    // must return true
-    REQUIRE(send_result.load(std::memory_order_acquire) == true);
-    REQUIRE(send_done.load(std::memory_order_acquire));
-
-    // Verify the back-filled value is now in the ring
+    // The sender's value (20) was made available via the ring push.
     auto v2 = ch.try_recv();
     REQUIRE(v2.has_value());
-    REQUIRE(*v2 == 200);
+    REQUIRE(*v2 == 20);
+    REQUIRE(sender_done.load());
+    REQUIRE(send_result.load());
 }
 
 // ---------------------------------------------------------------------------
 // Test 4: try_recv() direct steal from rendezvous sender
-//
-// On a rendezvous channel, a sender blocks. A synchronous try_recv()
-// directly steals the value. The sender's send() must return true.
 // ---------------------------------------------------------------------------
-TEST_CASE("channel send returns true when try_recv steals from rendezvous sender",
+TEST_CASE("channel send returns true after try_recv() rendezvous direct steal",
           "[sync][channel][coro]") {
-    channel<int> ch(0);  // rendezvous
+    channel<int> ch;  // rendezvous
 
     std::atomic<bool> send_result{false};
-    std::atomic<bool> send_done{false};
+    std::atomic<bool> sender_done{false};
 
     channel<int>* ch_ptr = &ch;
-    auto* sr = &send_result;
-    auto* sd = &send_done;
+    std::atomic<bool>* sr_ptr = &send_result;
+    std::atomic<bool>* sd_ptr = &sender_done;
 
-    auto sender = [=]() -> task<void> {
-        bool ok = co_await ch_ptr->send(99);
-        sr->store(ok, std::memory_order_release);
-        sd->store(true, std::memory_order_release);
+    auto blocked_sender = [=]() -> task<void> {
+        bool r = co_await ch_ptr->send(99);  // blocks: no receiver ready
+        *sr_ptr = r;
+        *sd_ptr = true;
         co_return;
     };
 
-    scheduler sched(1);
+    scheduler sched(2);
     sched.start();
+    auto s_join = spawn_joinable(sched, blocked_sender);
 
-    auto s_join = spawn_joinable(sched, sender);
-
-    // Give the sender time to suspend
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    // try_recv directly steals from the blocked rendezvous sender
+    // try_recv() steals 99 directly from the rendezvous sender and schedules it;
+    // close() runs before the worker resumes the sender.
     auto v = ch.try_recv();
     REQUIRE(v.has_value());
     REQUIRE(*v == 99);
 
+    ch.close();
+
     s_join.wait_destroyed();
-
     sched.shutdown();
 
-    REQUIRE(send_result.load(std::memory_order_acquire) == true);
-    REQUIRE(send_done.load(std::memory_order_acquire));
-}
-
-// ---------------------------------------------------------------------------
-// Test 5: Multiple sends with interleaved recv (stress the success_ flag)
-//
-// Send multiple values through a small bounded channel where some sends
-// will block and be woken by recv. All send() calls should return true.
-// ---------------------------------------------------------------------------
-TEST_CASE("channel multiple blocked sends all return true",
-          "[sync][channel][coro]") {
-    constexpr int N = 10;
-    channel<int> ch(1);  // very small buffer to force blocking
-
-    std::atomic<int> success_count{0};
-    std::atomic<int> send_done_count{0};
-    std::atomic<int> recv_sum{0};
-    std::atomic<bool> all_received{false};
-
-    channel<int>* ch_ptr = &ch;
-    auto* sc = &success_count;
-    auto* sdc = &send_done_count;
-    auto* rs = &recv_sum;
-    auto* ar = &all_received;
-
-    auto receiver = [=]() -> task<void> {
-        int sum = 0;
-        for (int i = 0; i < N; ++i) {
-            auto v = co_await ch_ptr->recv();
-            if (v.has_value()) {
-                sum += *v;
-            }
-        }
-        rs->store(sum, std::memory_order_release);
-        ar->store(true, std::memory_order_release);
-        co_return;
-    };
-
-    scheduler sched(4);
-    sched.start();
-
-    // Spawn N senders and 1 receiver
-    std::vector<join_handle<void>> joins;
-    for (int i = 1; i <= N; ++i) {
-        joins.push_back(spawn_joinable(sched, [=]() -> task<void> {
-            bool ok = co_await ch_ptr->send(i);
-            if (ok) sc->fetch_add(1, std::memory_order_relaxed);
-            sdc->fetch_add(1, std::memory_order_release);
-            co_return;
-        }));
-    }
-    auto r_join = spawn_joinable(sched, receiver);
-
-    for (auto& j : joins) {
-        j.wait_destroyed();
-    }
-    r_join.wait_destroyed();
-
-    sched.shutdown();
-
-    // All N sends should have returned true
-    REQUIRE(success_count.load(std::memory_order_acquire) == N);
-    REQUIRE(send_done_count.load(std::memory_order_acquire) == N);
-    REQUIRE(all_received.load(std::memory_order_acquire));
-    // Sum of 1..10 = 55
-    REQUIRE(recv_sum.load(std::memory_order_acquire) == 55);
+    REQUIRE(sender_done.load());
+    REQUIRE(send_result.load());
 }

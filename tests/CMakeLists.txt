@@ -18,6 +18,7 @@ set(TEST_SOURCES
     unit/test_scheduler.cpp
     unit/test_scheduler_shutdown.cpp
     unit/test_blocking_pool.cpp
+    unit/test_spawn_blocking_uaf.cpp
     unit/test_affinity.cpp
     unit/test_io.cpp
     unit/test_batch_io.cpp

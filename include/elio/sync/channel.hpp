@@ -343,6 +343,7 @@ public:
                     if (!send_waiters_.empty()) {
                         auto* sender = send_waiters_.pop_front();
                         result = std::optional<T>(std::move(sender->value_));
+                        sender->success_ = true;  // value delivered to receiver
                         sender_handle = sender->handle_;
                     } else if (closed_.load(std::memory_order_acquire)) {
                         if (!queue_.empty()) {
@@ -380,6 +381,7 @@ public:
                 } else if (is_rendezvous() && !send_waiters_.empty()) {
                     auto* sender = send_waiters_.pop_front();
                     result = std::optional<T>(std::move(sender->value_));
+                    sender->success_ = true;  // value delivered to receiver
                     sender_handle = sender->handle_;
                 } else if (closed_.load(std::memory_order_acquire)) {
                     result = std::nullopt;
@@ -410,6 +412,7 @@ public:
                     if (!send_waiters_.empty()) {
                         auto* sender = send_waiters_.front();
                         if (ring_->try_push(sender->value_)) {
+                            sender->success_ = true;  // value delivered to ring
                             sender_handle = sender->handle_;
                             send_waiters_.pop_front();
                         }
@@ -440,6 +443,7 @@ public:
                 if (is_rendezvous() && !send_waiters_.empty()) {
                     auto* sender = send_waiters_.pop_front();
                     result = std::optional<T>(std::move(sender->value_));
+                    sender->success_ = true;  // value delivered to receiver
                     sender_handle = sender->handle_;
                 } else {
                     return std::nullopt;

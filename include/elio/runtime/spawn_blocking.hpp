@@ -2,9 +2,11 @@
 
 #include "scheduler.hpp"
 #include "blocking_pool.hpp"
+#include <atomic>
 #include <coroutine>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <thread>
 #include <type_traits>
@@ -12,32 +14,53 @@
 namespace elio {
 namespace detail {
 
-// State for non-void results
+// Shared state between the awaiting coroutine and the blocking worker thread.
+// Heap-allocated via shared_ptr so it outlives the coroutine frame if the
+// coroutine is destroyed while the blocking task is still running.
 template<typename T>
 struct blocking_state {
     std::optional<T> result;
     std::exception_ptr exception;
+    // Set to false by ~blocking_awaitable when the coroutine frame is destroyed.
+    // The worker thread checks this before writing results or resuming.
+    std::atomic<bool> caller_alive{true};
 };
 
-// State for void results (avoid std::optional<void>)
+// Void specialization (avoid std::optional<void>)
 template<>
 struct blocking_state<void> {
     bool completed = false;
     std::exception_ptr exception;
+    std::atomic<bool> caller_alive{true};
 };
 
 template<typename T, typename F>
 class blocking_awaitable {
 public:
     explicit blocking_awaitable(F&& f) : func_(std::forward<F>(f)) {}
-    blocking_awaitable(blocking_awaitable&&) = default;
+    blocking_awaitable(blocking_awaitable&& other) noexcept
+        : func_(std::move(other.func_)), state_(std::move(other.state_)) {}
     blocking_awaitable(const blocking_awaitable&) = delete;
     blocking_awaitable& operator=(const blocking_awaitable&) = delete;
+
+    // When the coroutine frame is destroyed (e.g., cancellation, scope exit),
+    // mark the shared state so the worker thread knows not to write to freed
+    // memory or resume a dead handle.
+    ~blocking_awaitable() {
+        if (state_) {
+            state_->caller_alive.store(false, std::memory_order_release);
+        }
+    }
 
     bool await_ready() const noexcept { return false; }
 
     void await_suspend(std::coroutine_handle<> caller) {
-        auto* state = &state_;
+        // Allocate shared state on the heap. Both the awaitable (via member)
+        // and the work lambda (via capture) hold a shared_ptr, ensuring the
+        // state survives even if the coroutine frame is freed first.
+        auto state = std::make_shared<blocking_state<T>>();
+        state_ = state;
+
         // Capture scheduler pointer to ensure we resume on the right scheduler,
         // not directly on the blocking pool thread.
         auto* sched = runtime::get_current_scheduler();
@@ -50,13 +73,26 @@ public:
             try {
                 if constexpr (std::is_void_v<T>) {
                     f();
-                    state->completed = true;
+                    if (state->caller_alive.load(std::memory_order_acquire)) {
+                        state->completed = true;
+                    }
                 } else {
-                    state->result.emplace(f());
+                    auto result = f();
+                    if (state->caller_alive.load(std::memory_order_acquire)) {
+                        state->result.emplace(std::move(result));
+                    }
                 }
             } catch (...) {
-                state->exception = std::current_exception();
+                if (state->caller_alive.load(std::memory_order_acquire)) {
+                    state->exception = std::current_exception();
+                }
             }
+
+            // Only resume if the caller coroutine is still alive.
+            if (!state->caller_alive.load(std::memory_order_acquire)) {
+                return;
+            }
+
             // Resume caller via scheduler to ensure it runs on the right thread.
             // If no scheduler, fall back to direct resume (single-threaded case).
             if (sched && sched->is_running()) {
@@ -82,19 +118,19 @@ public:
     }
 
     T await_resume() {
-        if (state_.exception) {
-            std::rethrow_exception(state_.exception);
+        if (state_->exception) {
+            std::rethrow_exception(state_->exception);
         }
         if constexpr (std::is_void_v<T>) {
             return;
         } else {
-            return std::move(*state_.result);
+            return std::move(*state_->result);
         }
     }
 
 private:
     F func_;
-    blocking_state<T> state_;
+    std::shared_ptr<blocking_state<T>> state_;
 };
 
 }  // namespace detail

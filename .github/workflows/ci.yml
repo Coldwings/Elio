@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main, develop, 'release/**' ]
 
+permissions:
+  contents: read
+
 jobs:
   # Detect which files changed to conditionally run expensive CI jobs
   changes:

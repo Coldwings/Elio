@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Elio VERSION 0.5.1 LANGUAGES CXX)
+project(Elio VERSION 0.5.2 LANGUAGES CXX)
 
 include(CMakePackageConfigHelpers)
 

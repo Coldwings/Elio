@@ -5,6 +5,103 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-06-30
+
+Focus: **stability and security hardening**. 21 critical bug fixes addressing
+use-after-free vulnerabilities, deadlocks, race conditions, and security issues
+across sync primitives, I/O subsystem, network stack, and runtime.
+
+### Security
+
+- **HTTP DoS protection**: Added header count and size limits to prevent
+  denial-of-service attacks via header flooding (#209)
+- **WebSocket hardening**: Enforced `max_request_size`, added entropy validation,
+  and improved UTF-8 checking to prevent malformed frame attacks (#219)
+
+### Fixed
+
+#### Critical Use-After-Free Vulnerabilities (5 bugs)
+
+- **spawn_blocking UAF**: Coroutine frame destroyed while blocking operation
+  in-flight caused use-after-free when worker thread attempted to resume. Fixed
+  by replacing raw `blocking_state*` with `shared_ptr` and adding three-state
+  claim protocol (kAlive → kResuming → kDone / kDead) to eliminate TOCTOU race.
+  (#236)
+- **channel send success flag**: `send()` returned `false` after successful
+  direct-steal `recv()`, causing senders to incorrectly believe delivery failed.
+  Fixed by setting `sender->success_ = true` in all 4 direct-steal paths. (#238)
+- **condition_variable waiter UAF**: Waiter lifetime not properly tracked,
+  leading to use-after-free when coroutine destroyed during notification. Fixed
+  using intrusive list and proper synchronization. (#227)
+- **chase_lev_deque destructor UAF**: Coroutine leak when scheduler shutdown
+  before deque destruction. Fixed by ensuring proper cleanup order. (#201)
+- **connect awaitables UAF**: Connection attempt completed after awaitable
+  destroyed. Fixed by using `op_state` for lifetime tracking. (#213)
+
+#### Deadlocks and Double-Resume (4 bugs)
+
+- **mutex/object_cache double-resume**: Same waiter could be resumed multiple
+  times, causing undefined behavior. Fixed by ensuring each waiter is resumed
+  exactly once. (#229)
+- **notify_waiter deadlock**: Moving notification outside mutex caused deadlock
+  when waiter destroyed before notification delivered. Fixed by holding mutex
+  during notification. (#223)
+- **condition_variable deadlock**: Notification ordering could cause waiter to
+  miss wake-up. Fixed by proper synchronization. (#227)
+- **when_all await_suspend sync**: Race in await_suspend could cause deadlock
+  when multiple tasks completed simultaneously. Fixed by using atomic
+  synchronization. (#207)
+
+#### TOCTOU and Race Conditions (3 bugs)
+
+- **timer await_suspend and cancel race**: Cancel could race with await_suspend,
+  causing timer to fire after cancellation. Fixed by proper atomic ordering. (#226)
+- **I/O batch TOCTOU**: Race between batch completion and awaitable destruction.
+  Fixed by adding `orphaned` flag. (#233)
+- **file helpers close race**: File descriptor could be closed while operations
+  still in-flight. Fixed by using reference counting. (#233)
+
+#### Data Integrity (4 bugs)
+
+- **file descriptor leak**: File descriptors not properly closed in error paths.
+  Fixed by ensuring cleanup in all exit paths. (#233)
+- **append_file write ordering**: Concurrent appends could interleave. Fixed by
+  using atomic file operations. (#217)
+- **TLS password lifetime**: Password buffer freed before SSL handshake
+  completed. Fixed by extending lifetime with shared_ptr. (#215)
+- **HTTP client write corruption**: Write buffer could be corrupted during
+  concurrent writes. Fixed by proper synchronization. (#217)
+
+#### Network Stack (3 bugs)
+
+- **TCP/UDS listener accept issues**: Listener could miss connections or accept
+  on closed socket. Fixed by proper socket state tracking. (#224)
+- **HTTP2 dead buffer**: Pool held references to destroyed connections. Fixed
+  by removing dead buffers from pool. (#211)
+- **RPC session leak**: Sessions not properly cleaned up on connection close.
+  Fixed by ensuring cleanup in all paths. (#221)
+
+#### Runtime (2 bugs)
+
+- **trampoline coroutine leak**: Trampoline coroutines not destroyed when
+  scheduler shutdown. Fixed by ensuring proper cleanup. (#201)
+- **WebSocket/SSE validation**: Missing validation of port, close code, and
+  line endings. Fixed by adding comprehensive validation. (#195)
+
+### Changed
+
+- **CI workflow permissions**: Added explicit `permissions: contents: read` to
+  follow principle of least privilege (#240)
+
+### Testing
+
+- **spawn_blocking UAF tests**: 252 lines of tests covering coroutine destruction
+  scenarios, shared_ptr lifetime, and three-state claim protocol
+- **channel success flag tests**: 222 lines of tests verifying send() returns
+  correct success status in all recv() paths
+
+---
+
 ## [0.5.1] - 2026-06-23
 
 Focus: **concurrency safety hardening**. Comprehensive audit and fixes for

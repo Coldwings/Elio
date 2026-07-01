@@ -1,5 +1,0 @@
-if(EXISTS "/home/runner/work/Elio/Elio/build-min/tests/elio_tests_asan-b12d07c_tests.cmake")
-  include("/home/runner/work/Elio/Elio/build-min/tests/elio_tests_asan-b12d07c_tests.cmake")
-else()
-  add_test(elio_tests_asan_NOT_BUILT-b12d07c elio_tests_asan_NOT_BUILT-b12d07c)
-endif()

@@ -206,7 +206,7 @@ static task<void> streaming_writer(streaming_ctx* ctx) {
 }
 
 static task<void> streaming_reader(streaming_ctx* ctx, streaming_counters* ctr) {
-    constexpr size_t kReadBufSize = 65536;
+    constexpr size_t kReadBufSize = bench::kStreamingRecvBufferSize;
     std::vector<char> recv_buf(kReadBufSize);
     size_t recv_offset = 0;
 

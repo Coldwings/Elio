@@ -392,7 +392,7 @@ static bench::streaming_stats run_client_streaming(const bench::config& cfg,
     st_client c;
     c.msg_size = msg_size;
     c.send_buf.assign(msg_size, 'X');
-    c.recv_buf.resize(65536);
+    c.recv_buf.resize(bench::kStreamingRecvBufferSize);
     c.pipeline_depth = std::min(cfg.pipeline_depth, 64);
 
     uv_tcp_init(&loop, &c.tcp);

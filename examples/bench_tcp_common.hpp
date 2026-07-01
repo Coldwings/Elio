@@ -94,6 +94,7 @@ inline config parse_args(int argc, char* argv[], const char* library_name) {
 
 constexpr size_t kMessageSizes[] = {64, 1024, 4096, 65536};
 constexpr int kNumMessageSizes = 4;
+constexpr size_t kStreamingRecvBufferSize = kMessageSizes[kNumMessageSizes - 1] * 2;
 
 inline std::string format_size(size_t bytes) {
     if (bytes >= 1024) {

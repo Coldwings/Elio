@@ -220,51 +220,21 @@ private:
 // Stream protocol helpers
 // ============================================================================
 
-/// Stream concept for TCP or UDS streams
+/// Stream concept for TCP or UDS streams.
+///
+/// RPC framing transfers whole messages, so it relies on the stream's
+/// exact-length helpers (``read_exactly`` / ``write_exactly``) rather than
+/// hand-rolling partial-read/write loops: a partial transfer of a frame means
+/// the message is corrupt regardless. ``writev`` is still required for the
+/// scatter-gather ``write_frame`` fast path.
 template<typename T>
-concept rpc_stream = requires(T& stream, void* buf, const void* cbuf, size_t len, 
+concept rpc_stream = requires(T& stream, void* buf, const void* cbuf, size_t len,
                               struct iovec* iovecs, size_t iov_count) {
-    { stream.read(buf, len) };
-    { stream.write(cbuf, len) };
+    { stream.read_exactly(buf, len) };
+    { stream.write_exactly(cbuf, len) };
     { stream.writev(iovecs, iov_count) };
     { stream.is_valid() } -> std::same_as<bool>;
 };
-
-/// Read exactly n bytes from stream
-template<rpc_stream Stream>
-coro::task<io::io_result> read_exact(Stream& stream, void* buffer, size_t length) {
-    uint8_t* ptr = static_cast<uint8_t*>(buffer);
-    size_t remaining = length;
-    
-    while (remaining > 0) {
-        auto result = co_await stream.read(ptr, remaining);
-        if (result.result <= 0) {
-            co_return result;
-        }
-        ptr += result.result;
-        remaining -= result.result;
-    }
-    
-    co_return io::io_result{static_cast<int32_t>(length), 0};
-}
-
-/// Write exactly n bytes to stream
-template<rpc_stream Stream>
-coro::task<io::io_result> write_exact(Stream& stream, const void* buffer, size_t length) {
-    const uint8_t* ptr = static_cast<const uint8_t*>(buffer);
-    size_t remaining = length;
-    
-    while (remaining > 0) {
-        auto result = co_await stream.write(ptr, remaining);
-        if (result.result <= 0) {
-            co_return result;
-        }
-        ptr += result.result;
-        remaining -= result.result;
-    }
-    
-    co_return io::io_result{static_cast<int32_t>(length), 0};
-}
 
 /// Write all data from iovec array to stream (scatter-gather write)
 /// Handles partial writes by adjusting iovec entries
@@ -326,7 +296,7 @@ coro::task<std::optional<std::pair<frame_header, message_buffer>>>
 read_frame_bounded(Stream& stream, uint32_t max_payload) {
     // Read header
     std::array<uint8_t, frame_header_size> header_buf;
-    auto result = co_await read_exact(stream, header_buf.data(), frame_header_size);
+    auto result = co_await stream.read_exactly(header_buf.data(), frame_header_size);
     if (result.result <= 0) {
         co_return std::nullopt;
     }
@@ -351,7 +321,7 @@ read_frame_bounded(Stream& stream, uint32_t max_payload) {
     // Read payload
     message_buffer payload(header.payload_length);
     if (header.payload_length > 0) {
-        result = co_await read_exact(stream, payload.data(), header.payload_length);
+        result = co_await stream.read_exactly(payload.data(), header.payload_length);
         if (result.result <= 0) {
             co_return std::nullopt;
         }
@@ -360,7 +330,7 @@ read_frame_bounded(Stream& stream, uint32_t max_payload) {
     // Verify checksum if present (LE on the wire)
     if (has_flag(header.flags, message_flags::has_checksum)) {
         std::array<uint8_t, checksum_size> chk_bytes{};
-        result = co_await read_exact(stream, chk_bytes.data(), checksum_size);
+        result = co_await stream.read_exactly(chk_bytes.data(), checksum_size);
         if (result.result <= 0) {
             co_return std::nullopt;
         }

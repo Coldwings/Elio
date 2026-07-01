@@ -10,14 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Exact-length stream I/O helpers**: `read_exactly()` / `write_exactly()` on
-  `net::tcp_stream`, `tls::tls_stream`, and the unified `net::stream`. They loop
-  over partial `read`/`write` results until exactly `length` bytes are
-  transferred, transparently waiting for socket readiness on transient
-  `EAGAIN`/`EWOULDBLOCK` (never surfaced to callers). `read_exactly()` returns
-  `-ENODATA` if the peer closes before `length` bytes arrive, and both helpers
-  return `-EOVERFLOW` when asked to transfer more than `INT32_MAX` bytes.
-  `net::stream::write_all()` is retained as a compatibility alias for
+  `net::tcp_stream`, `net::uds_stream`, `tls::tls_stream`, and the unified
+  `net::stream`. They loop over partial `read`/`write` results until exactly
+  `length` bytes are transferred, transparently waiting for socket readiness on
+  transient `EAGAIN`/`EWOULDBLOCK` (never surfaced to callers). `read_exactly()`
+  returns `-ENODATA` if the peer closes before `length` bytes arrive, and both
+  helpers return `-EOVERFLOW` when asked to transfer more than `INT32_MAX`
+  bytes. `net::stream::write_all()` is retained as a compatibility alias for
   `write_exactly()`. (#249)
+
+### Changed
+
+- **RPC framing reuses the stream exact-length helpers**: `read_frame_bounded()`
+  now calls the stream's `read_exactly()` instead of a private `read_exact()`
+  loop, and the `rpc::rpc_stream` concept now requires
+  `read_exactly()`/`write_exactly()`. A partial read/write of a frame means the
+  message is corrupt regardless, so there is no behavioral reason for RPC to
+  carry its own duplicate loop. The unused `rpc::read_exact()`/`rpc::write_exact()`
+  helpers were removed.
 
 ## [0.5.2] - 2026-06-30
 

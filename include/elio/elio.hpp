@@ -2,7 +2,7 @@
 
 /// Elio Coroutine Library - Main Header
 /// 
-/// Version: 0.5.0
+/// Version: 0.5.2
 /// 
 /// This header provides convenient access to all Elio components.
 /// Include this file to use the Elio coroutine library.
@@ -10,7 +10,7 @@
 // Version information
 #define ELIO_VERSION_MAJOR 0
 #define ELIO_VERSION_MINOR 5
-#define ELIO_VERSION_PATCH 0
+#define ELIO_VERSION_PATCH 2
 
 // Core coroutine types
 #include "coro/promise_base.hpp"
@@ -74,7 +74,7 @@ namespace elio {
 
 /// Get library version string
 inline const char* version() noexcept {
-    return "0.5.0";
+    return "0.5.2";
 }
 
 /// Get library version as tuple

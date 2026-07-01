@@ -38,3 +38,9 @@ benchmark
 .clangd
 __pycache__
 build-release/
+
+# AI assistant caches
+.claude/
+
+# Warm-up build directories
+build_warm/

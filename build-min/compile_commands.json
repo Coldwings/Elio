@@ -1,0 +1,1328 @@
+[
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -g -std=c++20 -o _deps/fmt-build/CMakeFiles/fmt.dir/src/format.cc.o -c /home/runner/work/Elio/Elio/build-min/_deps/fmt-src/src/format.cc",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/src/format.cc",
+  "output": "_deps/fmt-build/CMakeFiles/fmt.dir/src/format.cc.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -g -std=c++20 -o _deps/fmt-build/CMakeFiles/fmt.dir/src/os.cc.o -c /home/runner/work/Elio/Elio/build-min/_deps/fmt-src/src/os.cc",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/src/os.cc",
+  "output": "_deps/fmt-build/CMakeFiles/fmt.dir/src/os.cc.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/benchmark/catch_chronometer.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/benchmark/catch_chronometer.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/benchmark/catch_chronometer.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/benchmark/catch_chronometer.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/benchmark/detail/catch_analyse.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/benchmark/detail/catch_analyse.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/benchmark/detail/catch_analyse.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/benchmark/detail/catch_analyse.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/benchmark/detail/catch_benchmark_function.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/benchmark/detail/catch_benchmark_function.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/benchmark/detail/catch_benchmark_function.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/benchmark/detail/catch_benchmark_function.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/benchmark/detail/catch_run_for_at_least.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/benchmark/detail/catch_run_for_at_least.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/benchmark/detail/catch_run_for_at_least.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/benchmark/detail/catch_run_for_at_least.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/benchmark/detail/catch_stats.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/benchmark/detail/catch_stats.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/benchmark/detail/catch_stats.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/benchmark/detail/catch_stats.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/generators/catch_generator_exception.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/generators/catch_generator_exception.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/generators/catch_generator_exception.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/generators/catch_generator_exception.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/generators/catch_generators.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/generators/catch_generators.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/generators/catch_generators.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/generators/catch_generators.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/generators/catch_generators_random.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/generators/catch_generators_random.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/generators/catch_generators_random.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/generators/catch_generators_random.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_automake.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_automake.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_automake.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_automake.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_common_base.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_common_base.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_common_base.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_common_base.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_compact.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_compact.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_compact.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_compact.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_console.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_console.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_console.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_console.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_cumulative_base.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_cumulative_base.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_cumulative_base.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_cumulative_base.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_event_listener.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_event_listener.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_event_listener.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_event_listener.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_helpers.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_helpers.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_helpers.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_helpers.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_json.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_json.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_json.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_json.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_junit.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_junit.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_junit.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_junit.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_multi.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_multi.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_multi.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_multi.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_registrars.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_registrars.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_registrars.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_registrars.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_sonarqube.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_sonarqube.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_sonarqube.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_sonarqube.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_streaming_base.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_streaming_base.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_streaming_base.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_streaming_base.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_tap.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_tap.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_tap.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_tap.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_teamcity.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_teamcity.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_teamcity.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_teamcity.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_xml.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_xml.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/reporters/catch_reporter_xml.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/reporters/catch_reporter_xml.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_capture.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_capture.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_capture.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_capture.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_config.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_config.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_config.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_config.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_exception.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_exception.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_exception.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_exception.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_generatortracker.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_generatortracker.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_generatortracker.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_generatortracker.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_registry_hub.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_registry_hub.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_registry_hub.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_registry_hub.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_reporter.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_reporter.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_reporter.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_reporter.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_reporter_factory.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_reporter_factory.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_reporter_factory.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_reporter_factory.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_testcase.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_testcase.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/interfaces/catch_interfaces_testcase.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/interfaces/catch_interfaces_testcase.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_approx.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_approx.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_approx.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_approx.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_assertion_result.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_assertion_result.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_assertion_result.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_assertion_result.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_config.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_config.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_config.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_config.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_get_random_seed.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_get_random_seed.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_get_random_seed.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_get_random_seed.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_message.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_message.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_message.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_message.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_registry_hub.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_registry_hub.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_registry_hub.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_registry_hub.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_session.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_session.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_session.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_session.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_tag_alias_autoregistrar.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_tag_alias_autoregistrar.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_tag_alias_autoregistrar.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_tag_alias_autoregistrar.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_test_case_info.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_test_case_info.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_test_case_info.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_test_case_info.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_test_spec.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_test_spec.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_test_spec.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_test_spec.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_timer.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_timer.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_timer.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_timer.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_tostring.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_tostring.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_tostring.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_tostring.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_totals.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_totals.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_totals.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_totals.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_translate_exception.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_translate_exception.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_translate_exception.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_translate_exception.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_version.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_version.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/catch_version.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/catch_version.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_assertion_handler.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_assertion_handler.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_assertion_handler.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_assertion_handler.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_case_insensitive_comparisons.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_case_insensitive_comparisons.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_case_insensitive_comparisons.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_case_insensitive_comparisons.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_clara.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_clara.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_clara.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_clara.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_commandline.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_commandline.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_commandline.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_commandline.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_console_colour.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_console_colour.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_console_colour.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_console_colour.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_context.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_context.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_context.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_context.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_debug_console.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_debug_console.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_debug_console.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_debug_console.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_debugger.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_debugger.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_debugger.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_debugger.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_decomposer.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_decomposer.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_decomposer.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_decomposer.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_enforce.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_enforce.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_enforce.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_enforce.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_enum_values_registry.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_enum_values_registry.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_enum_values_registry.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_enum_values_registry.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_errno_guard.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_errno_guard.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_errno_guard.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_errno_guard.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_exception_translator_registry.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_exception_translator_registry.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_exception_translator_registry.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_exception_translator_registry.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_fatal_condition_handler.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_fatal_condition_handler.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_fatal_condition_handler.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_fatal_condition_handler.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_floating_point_helpers.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_floating_point_helpers.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_floating_point_helpers.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_floating_point_helpers.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_getenv.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_getenv.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_getenv.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_getenv.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_istream.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_istream.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_istream.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_istream.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_jsonwriter.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_jsonwriter.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_jsonwriter.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_jsonwriter.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_lazy_expr.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_lazy_expr.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_lazy_expr.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_lazy_expr.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_leak_detector.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_leak_detector.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_leak_detector.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_leak_detector.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_list.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_list.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_list.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_list.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_message_info.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_message_info.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_message_info.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_message_info.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_output_redirect.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_output_redirect.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_output_redirect.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_output_redirect.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_parse_numbers.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_parse_numbers.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_parse_numbers.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_parse_numbers.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_polyfills.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_polyfills.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_polyfills.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_polyfills.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_random_number_generator.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_random_number_generator.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_random_number_generator.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_random_number_generator.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_random_seed_generation.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_random_seed_generation.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_random_seed_generation.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_random_seed_generation.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_reporter_registry.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_reporter_registry.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_reporter_registry.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_reporter_registry.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_reporter_spec_parser.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_reporter_spec_parser.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_reporter_spec_parser.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_reporter_spec_parser.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_result_type.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_result_type.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_result_type.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_result_type.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_reusable_string_stream.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_reusable_string_stream.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_reusable_string_stream.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_reusable_string_stream.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_run_context.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_run_context.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_run_context.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_run_context.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_section.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_section.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_section.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_section.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_singletons.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_singletons.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_singletons.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_singletons.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_source_line_info.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_source_line_info.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_source_line_info.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_source_line_info.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_startup_exception_registry.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_startup_exception_registry.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_startup_exception_registry.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_startup_exception_registry.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_stdstreams.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_stdstreams.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_stdstreams.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_stdstreams.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_string_manip.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_string_manip.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_string_manip.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_string_manip.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_stringref.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_stringref.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_stringref.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_stringref.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_tag_alias_registry.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_tag_alias_registry.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_tag_alias_registry.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_tag_alias_registry.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_test_case_info_hasher.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_test_case_info_hasher.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_test_case_info_hasher.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_test_case_info_hasher.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_test_case_registry_impl.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_test_case_registry_impl.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_test_case_registry_impl.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_test_case_registry_impl.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_test_case_tracker.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_test_case_tracker.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_test_case_tracker.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_test_case_tracker.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_test_failure_exception.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_test_failure_exception.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_test_failure_exception.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_test_failure_exception.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_test_registry.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_test_registry.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_test_registry.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_test_registry.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_test_spec_parser.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_test_spec_parser.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_test_spec_parser.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_test_spec_parser.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_textflow.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_textflow.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_textflow.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_textflow.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_uncaught_exceptions.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_uncaught_exceptions.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_uncaught_exceptions.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_uncaught_exceptions.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_wildcard_pattern.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_wildcard_pattern.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_wildcard_pattern.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_wildcard_pattern.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_xmlwriter.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_xmlwriter.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_xmlwriter.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/internal/catch_xmlwriter.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_container_properties.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_container_properties.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_container_properties.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_container_properties.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_exception.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_exception.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_exception.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_exception.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_floating_point.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_floating_point.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_floating_point.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_floating_point.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_predicate.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_predicate.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_predicate.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_predicate.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_quantifiers.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_quantifiers.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_quantifiers.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_quantifiers.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_string.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_string.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_string.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_string.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_templated.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_templated.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/catch_matchers_templated.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/catch_matchers_templated.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/internal/catch_matchers_impl.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/internal/catch_matchers_impl.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/matchers/internal/catch_matchers_impl.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2.dir/catch2/matchers/internal/catch_matchers_impl.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -ffile-prefix-map=/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/= -o _deps/catch2-build/src/CMakeFiles/Catch2WithMain.dir/catch2/internal/catch_main.cpp.o -c /home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_main.cpp",
+  "file": "/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/internal/catch_main.cpp",
+  "output": "_deps/catch2-build/src/CMakeFiles/Catch2WithMain.dir/catch2/internal/catch_main.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/test_main.cpp.o -c /home/runner/work/Elio/Elio/tests/test_main.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/test_main.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/test_main.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/test_watchdog.cpp.o -c /home/runner/work/Elio/Elio/tests/test_watchdog.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/test_watchdog.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/test_watchdog.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_logger.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_logger.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_logger.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_logger.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_virtual_stack.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_virtual_stack.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_virtual_stack.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_virtual_stack.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_vthread_stack.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_vthread_stack.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_vthread_stack.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_vthread_stack.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_task.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_task.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_task.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_task.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_awaitable_base.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_awaitable_base.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_awaitable_base.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_awaitable_base.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_chase_lev_deque.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_chase_lev_deque.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_chase_lev_deque.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_chase_lev_deque.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_scheduler.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_scheduler.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_scheduler.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_scheduler.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_scheduler_shutdown.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_scheduler_shutdown.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_scheduler_shutdown.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_scheduler_shutdown.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_blocking_pool.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_blocking_pool.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_blocking_pool.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_blocking_pool.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_spawn_blocking_uaf.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_spawn_blocking_uaf.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_spawn_blocking_uaf.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_spawn_blocking_uaf.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_affinity.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_affinity.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_affinity.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_affinity.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_io.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_io.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_io.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_io.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_batch_io.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_batch_io.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_batch_io.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_batch_io.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_sync.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_sync.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_sync.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_sync.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_intrusive_list.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_intrusive_list.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_intrusive_list.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_intrusive_list.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_sync_cancellation.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_sync_cancellation.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_sync_cancellation.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_sync_cancellation.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_channel_debug.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_channel_debug.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_channel_debug.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_channel_debug.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_channel_close.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_channel_close.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_channel_close.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_channel_close.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_channel_success.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_channel_success.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_channel_success.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_channel_success.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_close_wake.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_close_wake.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_close_wake.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_close_wake.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_simple_channel.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_simple_channel.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_simple_channel.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_simple_channel.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_cancel_token.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_cancel_token.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_cancel_token.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_cancel_token.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_timer.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_timer.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_timer.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_timer.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_hash.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_hash.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_hash.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_hash.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_rpc.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_rpc.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_rpc.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_rpc.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_signalfd.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_signalfd.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_signalfd.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_signalfd.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_autoscaler.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_autoscaler.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_autoscaler.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_autoscaler.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_generator.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_generator.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_generator.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_generator.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_object_cache.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_object_cache.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_object_cache.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_object_cache.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_combinators.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_combinators.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_combinators.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_combinators.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/integration/test_scheduler_integration.cpp.o -c /home/runner/work/Elio/Elio/tests/integration/test_scheduler_integration.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/integration/test_scheduler_integration.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/integration/test_scheduler_integration.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/integration/test_exception_propagation.cpp.o -c /home/runner/work/Elio/Elio/tests/integration/test_exception_propagation.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/integration/test_exception_propagation.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/integration/test_exception_propagation.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/integration/test_parallel_tasks.cpp.o -c /home/runner/work/Elio/Elio/tests/integration/test_parallel_tasks.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/integration/test_parallel_tasks.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/integration/test_parallel_tasks.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/integration/test_dynamic_threads.cpp.o -c /home/runner/work/Elio/Elio/tests/integration/test_dynamic_threads.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/integration/test_dynamic_threads.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/integration/test_dynamic_threads.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/elio_tests.dir/unit/test_http_parser.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_http_parser.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_http_parser.cpp",
+  "output": "tests/CMakeFiles/elio_tests.dir/unit/test_http_parser.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/test_main.cpp.o -c /home/runner/work/Elio/Elio/tests/test_main.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/test_main.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/test_main.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/test_watchdog.cpp.o -c /home/runner/work/Elio/Elio/tests/test_watchdog.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/test_watchdog.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/test_watchdog.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_logger.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_logger.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_logger.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_logger.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_virtual_stack.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_virtual_stack.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_virtual_stack.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_virtual_stack.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_vthread_stack.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_vthread_stack.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_vthread_stack.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_vthread_stack.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_task.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_task.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_task.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_task.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_awaitable_base.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_awaitable_base.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_awaitable_base.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_awaitable_base.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_chase_lev_deque.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_chase_lev_deque.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_chase_lev_deque.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_chase_lev_deque.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_scheduler.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_scheduler.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_scheduler.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_scheduler.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_scheduler_shutdown.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_scheduler_shutdown.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_scheduler_shutdown.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_scheduler_shutdown.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_blocking_pool.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_blocking_pool.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_blocking_pool.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_blocking_pool.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_spawn_blocking_uaf.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_spawn_blocking_uaf.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_spawn_blocking_uaf.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_spawn_blocking_uaf.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_affinity.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_affinity.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_affinity.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_affinity.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_io.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_io.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_io.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_io.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_batch_io.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_batch_io.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_batch_io.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_batch_io.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_sync.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_sync.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_sync.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_sync.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_intrusive_list.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_intrusive_list.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_intrusive_list.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_intrusive_list.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_sync_cancellation.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_sync_cancellation.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_sync_cancellation.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_sync_cancellation.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_channel_debug.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_channel_debug.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_channel_debug.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_channel_debug.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_channel_close.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_channel_close.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_channel_close.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_channel_close.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_channel_success.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_channel_success.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_channel_success.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_channel_success.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_close_wake.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_close_wake.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_close_wake.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_close_wake.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_simple_channel.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_simple_channel.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_simple_channel.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_simple_channel.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_cancel_token.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_cancel_token.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_cancel_token.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_cancel_token.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_timer.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_timer.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_timer.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_timer.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_hash.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_hash.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_hash.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_hash.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_rpc.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_rpc.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_rpc.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_rpc.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_signalfd.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_signalfd.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_signalfd.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_signalfd.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_autoscaler.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_autoscaler.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_autoscaler.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_autoscaler.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_generator.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_generator.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_generator.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_generator.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_object_cache.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_object_cache.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_object_cache.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_object_cache.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_combinators.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_combinators.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_combinators.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_combinators.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/integration/test_scheduler_integration.cpp.o -c /home/runner/work/Elio/Elio/tests/integration/test_scheduler_integration.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/integration/test_scheduler_integration.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/integration/test_scheduler_integration.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/integration/test_exception_propagation.cpp.o -c /home/runner/work/Elio/Elio/tests/integration/test_exception_propagation.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/integration/test_exception_propagation.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/integration/test_exception_propagation.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/integration/test_parallel_tasks.cpp.o -c /home/runner/work/Elio/Elio/tests/integration/test_parallel_tasks.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/integration/test_parallel_tasks.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/integration/test_parallel_tasks.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/integration/test_dynamic_threads.cpp.o -c /home/runner/work/Elio/Elio/tests/integration/test_dynamic_threads.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/integration/test_dynamic_threads.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/integration/test_dynamic_threads.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=address -g -fno-omit-frame-pointer -o tests/CMakeFiles/elio_tests_asan.dir/unit/test_http_parser.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_http_parser.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_http_parser.cpp",
+  "output": "tests/CMakeFiles/elio_tests_asan.dir/unit/test_http_parser.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/test_main.cpp.o -c /home/runner/work/Elio/Elio/tests/test_main.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/test_main.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/test_main.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/test_watchdog.cpp.o -c /home/runner/work/Elio/Elio/tests/test_watchdog.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/test_watchdog.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/test_watchdog.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_logger.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_logger.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_logger.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_logger.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_virtual_stack.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_virtual_stack.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_virtual_stack.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_virtual_stack.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_vthread_stack.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_vthread_stack.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_vthread_stack.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_vthread_stack.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_task.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_task.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_task.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_task.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_awaitable_base.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_awaitable_base.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_awaitable_base.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_awaitable_base.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_chase_lev_deque.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_chase_lev_deque.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_chase_lev_deque.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_chase_lev_deque.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_scheduler.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_scheduler.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_scheduler.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_scheduler.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_scheduler_shutdown.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_scheduler_shutdown.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_scheduler_shutdown.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_scheduler_shutdown.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_blocking_pool.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_blocking_pool.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_blocking_pool.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_blocking_pool.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_spawn_blocking_uaf.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_spawn_blocking_uaf.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_spawn_blocking_uaf.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_spawn_blocking_uaf.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_affinity.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_affinity.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_affinity.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_affinity.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_io.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_io.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_io.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_io.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_batch_io.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_batch_io.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_batch_io.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_batch_io.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_sync.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_sync.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_sync.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_sync.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_intrusive_list.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_intrusive_list.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_intrusive_list.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_intrusive_list.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_sync_cancellation.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_sync_cancellation.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_sync_cancellation.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_sync_cancellation.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_channel_debug.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_channel_debug.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_channel_debug.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_channel_debug.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_channel_close.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_channel_close.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_channel_close.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_channel_close.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_channel_success.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_channel_success.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_channel_success.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_channel_success.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_close_wake.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_close_wake.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_close_wake.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_close_wake.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_simple_channel.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_simple_channel.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_simple_channel.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_simple_channel.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_cancel_token.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_cancel_token.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_cancel_token.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_cancel_token.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_timer.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_timer.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_timer.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_timer.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_hash.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_hash.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_hash.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_hash.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_rpc.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_rpc.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_rpc.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_rpc.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_signalfd.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_signalfd.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_signalfd.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_signalfd.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_autoscaler.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_autoscaler.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_autoscaler.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_autoscaler.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_generator.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_generator.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_generator.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_generator.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_object_cache.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_object_cache.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_object_cache.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_object_cache.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_combinators.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_combinators.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_combinators.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_combinators.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/integration/test_scheduler_integration.cpp.o -c /home/runner/work/Elio/Elio/tests/integration/test_scheduler_integration.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/integration/test_scheduler_integration.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/integration/test_scheduler_integration.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/integration/test_exception_propagation.cpp.o -c /home/runner/work/Elio/Elio/tests/integration/test_exception_propagation.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/integration/test_exception_propagation.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/integration/test_exception_propagation.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/integration/test_parallel_tasks.cpp.o -c /home/runner/work/Elio/Elio/tests/integration/test_parallel_tasks.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/integration/test_parallel_tasks.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/integration/test_parallel_tasks.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/integration/test_dynamic_threads.cpp.o -c /home/runner/work/Elio/Elio/tests/integration/test_dynamic_threads.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/integration/test_dynamic_threads.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/integration/test_dynamic_threads.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-src/src/catch2/.. -I/home/runner/work/Elio/Elio/build-min/_deps/catch2-build/generated-includes -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan -o tests/CMakeFiles/elio_tests_tsan.dir/unit/test_http_parser.cpp.o -c /home/runner/work/Elio/Elio/tests/unit/test_http_parser.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/unit/test_http_parser.cpp",
+  "output": "tests/CMakeFiles/elio_tests_tsan.dir/unit/test_http_parser.cpp.o"
+},
+{
+  "directory": "/home/runner/work/Elio/Elio/build-min",
+  "command": "/usr/bin/c++ -DELIO_DEBUG -DELIO_ENABLE_DEBUG_METADATA=1 -DELIO_HAS_IO_URING=1 -I/home/runner/work/Elio/Elio/include -I/home/runner/work/Elio/Elio/build-min/_deps/fmt-src/include -g -std=c++20 -Wall -Wextra -Wpedantic -Werror -o tests/CMakeFiles/stress_test_shared_mutex.dir/stress_test_shared_mutex.cpp.o -c /home/runner/work/Elio/Elio/tests/stress_test_shared_mutex.cpp",
+  "file": "/home/runner/work/Elio/Elio/tests/stress_test_shared_mutex.cpp",
+  "output": "tests/CMakeFiles/stress_test_shared_mutex.dir/stress_test_shared_mutex.cpp.o"
+}
+]

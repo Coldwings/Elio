@@ -20,7 +20,15 @@
 // TSAN annotations for coroutine frame reuse
 // These tell TSAN that memory allocated by one coroutine and freed by another
 // has a proper happens-before relationship, avoiding false positives.
-#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+#if defined(__SANITIZE_THREAD__)
+#define ELIO_TSAN_ACTIVE 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define ELIO_TSAN_ACTIVE 1
+#endif
+#endif
+
+#if ELIO_TSAN_ACTIVE
 extern "C" {
 void __tsan_acquire(void* addr);
 void __tsan_release(void* addr);

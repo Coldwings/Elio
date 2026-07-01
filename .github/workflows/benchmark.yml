@@ -34,10 +34,11 @@ jobs:
           sudo apt-get install -y libuv1-dev liburing-dev
 
       - name: Configure
-        run: cmake -B build \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DELIO_ENABLE_DEBUG_METADATA=OFF \
-          -DELIO_BUILD_TCP_BENCHMARKS=ON
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DELIO_ENABLE_DEBUG_METADATA=OFF \
+            -DELIO_BUILD_TCP_BENCHMARKS=ON
 
       - name: Build
         run: cmake --build build --parallel

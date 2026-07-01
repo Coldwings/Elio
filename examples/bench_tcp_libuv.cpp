@@ -86,12 +86,6 @@ static int run_server(const bench::config& cfg) {
     uv_tcp_t server;
     uv_tcp_init(&loop, &server);
 
-    int yes = 1;
-    uv_os_fd_t fd;
-    if (uv_fileno(reinterpret_cast<uv_handle_t*>(&server), &fd) == 0) {
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    }
-
     struct sockaddr_in addr;
     uv_ip4_addr("0.0.0.0", cfg.port, &addr);
     uv_tcp_bind(&server, reinterpret_cast<const struct sockaddr*>(&addr), 0);
@@ -308,7 +302,7 @@ static void st_alloc_cb(uv_handle_t* handle, size_t /*suggested*/,
                         uv_buf_t* buf) {
     auto* c = static_cast<st_client*>(handle->data);
     buf->base = c->recv_buf.data() + c->recv_offset;
-    buf->len  = static_cast<unsigned int>(c->msg_size - c->recv_offset);
+    buf->len  = static_cast<unsigned int>(c->recv_buf.size() - c->recv_offset);
 }
 
 static void st_close_cb(uv_handle_t* /*handle*/) {}
@@ -327,13 +321,20 @@ static void st_read_cb(uv_stream_t* stream, ssize_t nread,
         return;
     }
 
-    c->recv_offset += nread;
-    while (c->recv_offset >= c->msg_size) {
-        c->recv_offset -= c->msg_size;
+    size_t total = c->recv_offset + static_cast<size_t>(nread);
+    const char* ptr = c->recv_buf.data();
+    while (total >= c->msg_size) {
         if (c->measuring) {
             c->total_bytes.fetch_add(c->msg_size, std::memory_order_relaxed);
             c->total_msgs.fetch_add(1, std::memory_order_relaxed);
         }
+        ptr += c->msg_size;
+        total -= c->msg_size;
+    }
+
+    c->recv_offset = total;
+    if (total > 0) {
+        std::memmove(c->recv_buf.data(), ptr, total);
     }
 }
 
@@ -391,7 +392,7 @@ static bench::streaming_stats run_client_streaming(const bench::config& cfg,
     st_client c;
     c.msg_size = msg_size;
     c.send_buf.assign(msg_size, 'X');
-    c.recv_buf.resize(msg_size);
+    c.recv_buf.resize(65536);
     c.pipeline_depth = std::min(cfg.pipeline_depth, 64);
 
     uv_tcp_init(&loop, &c.tcp);

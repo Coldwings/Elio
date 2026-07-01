@@ -183,7 +183,7 @@ public:
         , msg_size_(msg_size)
         , pipeline_depth_(std::min(cfg.pipeline_depth, 64))
         , send_buf_(msg_size, 'X')
-        , recv_buf_(msg_size)
+        , recv_buf_(65536)
         , warmup_s_(cfg.warmup_s)
         , duration_s_(cfg.duration_s)
         , timer_(io)
@@ -234,20 +234,26 @@ private:
         auto self = shared_from_this();
         socket_.async_read_some(
             asio::buffer(recv_buf_.data() + recv_offset_,
-                         msg_size_ - recv_offset_),
+                         recv_buf_.size() - recv_offset_),
             [this, self](std::error_code ec, size_t length) {
                 if (ec) {
                     stopped_ = true;
                     return;
                 }
-                recv_offset_ += length;
-                while (recv_offset_ >= msg_size_) {
-                    recv_offset_ -= msg_size_;
+                size_t total = recv_offset_ + length;
+                const char* ptr = recv_buf_.data();
+                while (total >= msg_size_) {
                     if (measuring_) {
                         total_bytes_.fetch_add(msg_size_,
                                                std::memory_order_relaxed);
                         total_msgs_.fetch_add(1, std::memory_order_relaxed);
                     }
+                    ptr += msg_size_;
+                    total -= msg_size_;
+                }
+                recv_offset_ = total;
+                if (total > 0) {
+                    std::memmove(recv_buf_.data(), ptr, total);
                 }
                 do_read();
             });

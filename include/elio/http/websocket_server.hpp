@@ -198,7 +198,7 @@ public:
                 co_return std::nullopt;
             }
 
-            int parsed = parser_.parse(
+            ssize_t parsed = parser_.parse(
                 reinterpret_cast<const uint8_t*>(buffer_.data()),
                 static_cast<size_t>(result.result)
             );

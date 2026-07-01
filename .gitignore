@@ -42,5 +42,6 @@ build-release/
 # AI assistant caches
 .claude/
 
-# Warm-up build directories
+# Warm-up and warning build directories
 build_warm/
+build_warn/

@@ -163,3 +163,28 @@ if(TARGET elio_rdma_cuda)
     target_link_libraries(rdma_gpu_bw PRIVATE elio_rdma_cuda)
     target_link_options(rdma_gpu_bw PRIVATE ${STATIC_LINK_FLAGS})
 endif()
+
+# ---------------------------------------------------------------------------
+# TCP loopback benchmarks: Elio vs libuv vs standalone Asio
+# ---------------------------------------------------------------------------
+if(ELIO_BUILD_TCP_BENCHMARKS)
+    # Elio benchmark (always available when examples are built)
+    add_executable(bench_tcp_elio bench_tcp_elio.cpp)
+    target_link_libraries(bench_tcp_elio PRIVATE elio)
+    target_link_options(bench_tcp_elio PRIVATE ${STATIC_LINK_FLAGS})
+
+    # libuv benchmark (gated on system library)
+    if(LIBUV_INCLUDE_DIR AND LIBUV_LIBRARY)
+        add_executable(bench_tcp_libuv bench_tcp_libuv.cpp)
+        target_include_directories(bench_tcp_libuv PRIVATE ${LIBUV_INCLUDE_DIR})
+        target_link_libraries(bench_tcp_libuv PRIVATE ${LIBUV_LIBRARY} pthread dl)
+        target_link_options(bench_tcp_libuv PRIVATE ${STATIC_LINK_FLAGS})
+    endif()
+
+    # Standalone Asio benchmark (gated on FetchContent target)
+    if(TARGET asio)
+        add_executable(bench_tcp_asio bench_tcp_asio.cpp)
+        target_link_libraries(bench_tcp_asio PRIVATE asio pthread)
+        target_link_options(bench_tcp_asio PRIVATE ${STATIC_LINK_FLAGS})
+    endif()
+endif()

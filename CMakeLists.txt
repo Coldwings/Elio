@@ -59,6 +59,7 @@ include(FetchContent)
 FetchContent_Declare(fmt
     GIT_REPOSITORY https://github.com/fmtlib/fmt.git
     GIT_TAG 10.2.1
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(fmt)
 
@@ -67,6 +68,7 @@ if(ELIO_BUILD_TESTS)
     FetchContent_Declare(Catch2
         GIT_REPOSITORY https://github.com/catchorg/Catch2.git
         GIT_TAG v3.5.0
+        GIT_SHALLOW TRUE
     )
     FetchContent_MakeAvailable(Catch2)
 endif()
@@ -322,6 +324,38 @@ endif()
 if(ELIO_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# TCP loopback benchmarks (Elio vs libuv vs Asio)
+option(ELIO_BUILD_TCP_BENCHMARKS
+    "Build TCP loopback benchmarks comparing Elio vs libuv vs standalone Asio" OFF)
+
+if(ELIO_BUILD_TCP_BENCHMARKS)
+    # libuv: prefer system installation
+    find_path(LIBUV_INCLUDE_DIR uv.h)
+    find_library(LIBUV_LIBRARY NAMES uv uv_a)
+    if(LIBUV_INCLUDE_DIR AND LIBUV_LIBRARY)
+        message(STATUS "TCP benchmark: libuv found at ${LIBUV_LIBRARY}")
+    else()
+        message(STATUS "TCP benchmark: libuv not found — bench_tcp_libuv will not be built")
+    endif()
+
+    # Standalone Asio: fetch via FetchContent (header-only, no Boost needed)
+    include(FetchContent)
+    FetchContent_Declare(asio
+        GIT_REPOSITORY https://github.com/chriskohlhoff/asio.git
+        GIT_TAG        asio-1-30-2
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(asio)
+    # Asio is header-only — create an INTERFACE target
+    if(NOT TARGET asio)
+        add_library(asio INTERFACE)
+        target_include_directories(asio INTERFACE
+            ${asio_SOURCE_DIR}/asio/include)
+        target_compile_definitions(asio INTERFACE ASIO_STANDALONE)
+    endif()
+    message(STATUS "TCP benchmark: standalone Asio enabled")
 endif()
 
 # Examples

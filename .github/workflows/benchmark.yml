@@ -40,10 +40,12 @@ jobs:
             -DCMAKE_C_COMPILER=gcc-14 \
             -DCMAKE_CXX_COMPILER=g++-14 \
             -DELIO_ENABLE_DEBUG_METADATA=OFF \
+            -DELIO_BUILD_TESTS=OFF \
+            -DELIO_BUILD_EXAMPLES=OFF \
             -DELIO_BUILD_TCP_BENCHMARKS=ON
 
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel 4
 
       - name: Run Elio benchmark
         run: |

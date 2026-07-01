@@ -856,6 +856,7 @@ TEST_CASE("buffer_ref type traits", "[rpc][buffer_ref]") {
 #include <elio/net/tcp.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/time/timer.hpp>
+#include "../test_main.cpp"  // scaled_ms / scaled_sec timeout helpers
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -1545,4 +1546,109 @@ TEST_CASE("call_impl keeps client alive while awaiting response",
 
     sched.shutdown(std::chrono::seconds(30));
     ::close(fds[1]);
+}
+
+// ============================================================================
+// call() timeout-watcher cancellation regression (issue #246)
+// ============================================================================
+//
+// rpc_client::call_impl() spawns a detached timeout watcher that sleeps for
+// the full per-call timeout. Before the fix, that watcher observed ONLY the
+// caller-supplied cancellation token, so a call that completed normally (fast
+// server response) left the watcher sleeping until the timeout expired. Each
+// such watcher is a tracked scheduler task (spawned via go()) that also holds
+// a shared_ptr<pending_request>, so it retained state and an idle task for the
+// full timeout window.
+//
+// This test drives a fast round-trip with a deliberately LONG per-call
+// timeout, then asserts the scheduler drains well within a budget far shorter
+// than that timeout. Because the watcher is a tracked task, an un-cancelled
+// watcher keeps active_tasks() > 0, so shutdown(budget) would return false
+// (and block for the whole long timeout). With the fix the watcher is
+// cancelled the moment the call completes, and the scheduler drains promptly.
+
+// File-scope method types (ELIO_RPC_FIELDS inside a function body triggers
+// -Wunused-local-typedefs; matches the pattern used earlier in this file).
+struct WatcherEchoReq { int32_t value; ELIO_RPC_FIELDS(WatcherEchoReq, value) };
+struct WatcherEchoResp { int32_t value; ELIO_RPC_FIELDS(WatcherEchoResp, value) };
+using WatcherEchoMethod = ELIO_RPC_METHOD(303, WatcherEchoReq, WatcherEchoResp);
+
+TEST_CASE("call timeout watcher is cancelled after completion",
+          "[rpc][timeout][cancel]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    auto server = std::make_shared<rpc_server<tcp_stream>>();
+    server->register_method<WatcherEchoMethod>(
+        [](const WatcherEchoReq& r) -> coro::task<WatcherEchoResp> {
+            // Respond immediately — the call completes long before its
+            // per-call timeout would ever fire.
+            co_return WatcherEchoResp{r.value};
+        });
+
+    scheduler sched(2);
+    sched.start();
+
+    // Server: accept exactly one connection and serve it.
+    sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
+        auto s = co_await lst.accept();
+        if (!s) co_return;
+        co_await server->handle_client(std::move(*s));
+    });
+
+    // A per-call timeout that is enormous relative to the round-trip. If the
+    // watcher is not cancelled, it sleeps this long and keeps the scheduler
+    // from draining.
+    const auto call_timeout = elio::test::scaled_sec(30);
+
+    std::promise<bool> call_ok_promise;
+    auto call_ok = call_ok_promise.get_future();
+
+    sched.go([&, p = std::move(call_ok_promise)]() mutable -> coro::task<void> {
+        auto client_opt = co_await tcp_rpc_client::connect("::1", port);
+        if (!client_opt) { p.set_value(false); co_return; }
+        auto client = *client_opt;
+
+        auto r = co_await client->call<WatcherEchoMethod>(
+            WatcherEchoReq{42}, call_timeout);
+
+        bool ok = r.ok() && r->value == 42;
+
+        // Close the client so its receive loop's blocked read returns and the
+        // loop exits. This does NOT touch the per-call timeout watcher, which
+        // is what we are exercising: with the bug it keeps sleeping for
+        // call_timeout regardless of close().
+        client->close();
+
+        p.set_value(ok);
+    });
+
+    // The call itself must succeed quickly (generous ceiling for slow CI).
+    auto status = call_ok.wait_for(std::chrono::seconds(60));
+    REQUIRE(status == std::future_status::ready);
+    REQUIRE(call_ok.get() == true);
+
+    // Let the server-side session loop exit too, so the only thing that could
+    // still be keeping the scheduler busy is a leaked timeout watcher.
+    server->stop();
+
+    // Drain budget is comfortably larger than any legitimate teardown yet far
+    // smaller than call_timeout. With the fix the watcher is already
+    // cancelled, so this drains fast and returns true. Without the fix the
+    // sleeping watcher is still a tracked task, so drain would only complete
+    // after call_timeout (30s+) — i.e. this budget expires and drained==false.
+    const auto drain_budget = elio::test::scaled_sec(5);
+    auto drain_start = std::chrono::steady_clock::now();
+    bool drained = sched.shutdown(drain_budget);
+    auto drain_elapsed = std::chrono::steady_clock::now() - drain_start;
+
+    REQUIRE(drained);
+    // Sanity: draining must be far quicker than the per-call timeout, proving
+    // we did not simply wait out the watcher's sleep.
+    REQUIRE(drain_elapsed < call_timeout);
 }

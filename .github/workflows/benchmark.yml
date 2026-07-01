@@ -1,0 +1,112 @@
+name: TCP Loopback Benchmark
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Measurement duration per size (seconds)'
+        required: false
+        default: '5'
+      warmup:
+        description: 'Warmup per size (seconds)'
+        required: false
+        default: '2'
+      mode:
+        description: 'Test mode (pingpong|streaming|both)'
+        required: false
+        default: 'both'
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libuv1-dev liburing-dev
+
+      - name: Configure
+        run: cmake -B build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DELIO_ENABLE_DEBUG_METADATA=OFF \
+          -DELIO_BUILD_TCP_BENCHMARKS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run Elio benchmark
+        run: |
+          ./build/examples/bench_tcp_elio -s -p 9876 &
+          SERVER_PID=$!
+          sleep 1
+          ./build/examples/bench_tcp_elio -c -p 9876 \
+            -d ${{ inputs.duration || '5' }} \
+            -w ${{ inputs.warmup || '2' }} \
+            -m ${{ inputs.mode || 'both' }} \
+            | tee elio_results.txt
+          kill $SERVER_PID
+          wait $SERVER_PID 2>/dev/null || true
+
+      - name: Run libuv benchmark
+        run: |
+          ./build/examples/bench_tcp_libuv -s -p 9877 &
+          SERVER_PID=$!
+          sleep 1
+          ./build/examples/bench_tcp_libuv -c -p 9877 \
+            -d ${{ inputs.duration || '5' }} \
+            -w ${{ inputs.warmup || '2' }} \
+            -m ${{ inputs.mode || 'both' }} \
+            | tee libuv_results.txt
+          kill $SERVER_PID
+          wait $SERVER_PID 2>/dev/null || true
+
+      - name: Run Asio benchmark
+        run: |
+          ./build/examples/bench_tcp_asio -s -p 9878 &
+          SERVER_PID=$!
+          sleep 1
+          ./build/examples/bench_tcp_asio -c -p 9878 \
+            -d ${{ inputs.duration || '5' }} \
+            -w ${{ inputs.warmup || '2' }} \
+            -m ${{ inputs.mode || 'both' }} \
+            | tee asio_results.txt
+          kill $SERVER_PID
+          wait $SERVER_PID 2>/dev/null || true
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: |
+            elio_results.txt
+            libuv_results.txt
+            asio_results.txt
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Summary
+        run: |
+          echo "## TCP Loopback Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Elio" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat elio_results.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### libuv" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat libuv_results.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Asio" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat asio_results.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

@@ -1,11 +1,45 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/http/websocket.hpp>
 
+#include <cstdlib>
+#include <new>
 #include <string>
+#include <type_traits>
 #include <vector>
-#include <cstring>
 
 using namespace elio::http::websocket;
+
+// ----------------------------------------------------------------------------
+// Opt-in allocation tracking used by the WebSocket DoS regression test below.
+//
+// These replaceable global operators simply forward to malloc/free (so ASAN
+// still intercepts them) and, only while ws_alloc_tracking is enabled, count
+// how many allocations of at least ws_alloc_threshold bytes occur.  The flag is
+// only toggled inside a single-threaded test section, so the plain counters are
+// safe.
+// ----------------------------------------------------------------------------
+namespace {
+bool   ws_alloc_tracking = false;
+size_t ws_alloc_threshold = 0;
+size_t ws_big_alloc_count = 0;
+
+inline void* ws_tracked_alloc(std::size_t n) {
+    if (ws_alloc_tracking && n >= ws_alloc_threshold) {
+        ++ws_big_alloc_count;
+    }
+    void* p = std::malloc(n ? n : 1);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+} // namespace
+
+void* operator new(std::size_t n) { return ws_tracked_alloc(n); }
+void* operator new[](std::size_t n) { return ws_tracked_alloc(n); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+
 
 // ============================================================================
 // WebSocket Frame Tests
@@ -355,12 +389,112 @@ TEST_CASE("WebSocket frame parser", "[websocket][parser]") {
     SECTION("max message size enforcement") {
         frame_parser parser;
         parser.set_max_message_size(10);
-        
+
         auto frame = encode_text_frame("This message is too long!", false);
         parser.parse(frame.data(), frame.size());
-        
+
         REQUIRE(parser.has_error());
         REQUIRE(parser.error().find("maximum size") != std::string::npos);
+    }
+
+    SECTION("oversized frame reports too_large close code") {
+        frame_parser parser;
+        parser.set_max_message_size(10);
+
+        auto frame = encode_binary_frame(std::string(64, 'x'), false);
+        auto consumed = parser.parse(frame.data(), frame.size());
+
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::too_large);
+        REQUIRE(consumed < 0);
+    }
+
+    SECTION("oversized frame rejected before allocating payload") {
+        // Regression test for the DoS bug where the parser copied the full frame
+        // payload into a std::string *before* enforcing max_message_size.
+        //
+        // We feed one complete, oversized data frame.  parse() first copies the
+        // frame into its internal buffer_ (one large allocation, unavoidable).
+        // The buggy code then built a second payload-sized std::string before the
+        // size check; the fixed code rejects first, so only ONE allocation at or
+        // above the payload size must occur.
+        const size_t limit = 1024;
+        const size_t payload_bytes = 4u * 1024 * 1024;  // 4 MiB, well above limit
+
+        auto frame = encode_binary_frame(std::string(payload_bytes, 'x'), false);
+
+        frame_parser parser;
+        parser.set_max_message_size(limit);
+
+        ws_big_alloc_count = 0;
+        ws_alloc_threshold = payload_bytes;  // only count payload-sized allocations
+        ws_alloc_tracking = true;
+        auto consumed = parser.parse(frame.data(), frame.size());
+        ws_alloc_tracking = false;
+
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::too_large);
+        REQUIRE(consumed < 0);
+        // Only buffer_ should allocate at/above the payload size.  A second such
+        // allocation means the payload was materialised before the size check.
+        REQUIRE(ws_big_alloc_count == 1);
+    }
+
+    SECTION("fragmented message rejected before exceeding limit") {
+        // First fragment fits under the limit; the continuation fragment would
+        // push the accumulated message over it and must be rejected using the
+        // frame header length before its payload is appended.
+        frame_parser parser;
+        parser.set_max_message_size(10);
+
+        frame_header hdr1;
+        hdr1.op = opcode::binary;
+        hdr1.fin = false;
+        hdr1.masked = false;
+        auto frag1 = encode_frame(hdr1, std::string(6, 'a'));  // 6 bytes, under 10
+
+        frame_header hdr2;
+        hdr2.op = opcode::continuation;
+        hdr2.fin = true;
+        hdr2.masked = false;
+        auto frag2 = encode_frame(hdr2, std::string(8, 'b'));  // 6 + 8 = 14 > 10
+
+        parser.parse(frag1.data(), frag1.size());
+        REQUIRE_FALSE(parser.has_error());
+        REQUIRE_FALSE(parser.has_message());
+
+        auto consumed = parser.parse(frag2.data(), frag2.size());
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::too_large);
+        REQUIRE(consumed < 0);
+    }
+
+    SECTION("payload exactly at the limit is accepted") {
+        frame_parser parser;
+        parser.set_max_message_size(5);
+
+        auto frame = encode_binary_frame(std::string(5, 'z'), false);
+        auto consumed = parser.parse(frame.data(), frame.size());
+
+        REQUIRE_FALSE(parser.has_error());
+        REQUIRE(consumed == static_cast<ssize_t>(frame.size()));
+        auto msg = parser.get_message();
+        REQUIRE(msg.has_value());
+        REQUIRE(msg->data.size() == 5);
+    }
+
+    SECTION("parse returns a wide signed byte count") {
+        // parse() must return a signed type wide enough that a large consumed
+        // byte count cannot overflow into the negative error sentinel.
+        frame_parser parser;
+        auto frame = encode_text_frame("Hello", false);
+        auto consumed = parser.parse(frame.data(), frame.size());
+
+        static_assert(std::is_signed_v<decltype(consumed)>,
+                      "frame_parser::parse() must return a signed type");
+        static_assert(sizeof(decltype(consumed)) >= sizeof(size_t),
+                      "frame_parser::parse() return type must be as wide as size_t");
+        REQUIRE(consumed == static_cast<ssize_t>(frame.size()));
     }
 
     SECTION("invalid UTF-8 text frame rejected") {

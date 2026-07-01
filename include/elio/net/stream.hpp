@@ -16,6 +16,7 @@
 
 #include <variant>
 #include <chrono>
+#include <limits>
 #include <type_traits>
 
 namespace elio::net {
@@ -119,7 +120,13 @@ public:
     /// Write all data, retrying short writes.
     /// @deprecated Prefer ``write_exactly``; retained as a compatibility alias.
     /// @return io_result with total bytes written on success, or the failing
-    ///         io_result (result <= 0) on error, preserving the real error code
+    ///         io_result (result < 0) on a hard error, preserving the real
+    ///         error code
+    ///
+    /// Transient readiness results (-EAGAIN/-EWOULDBLOCK) and interruptions
+    /// (-EINTR) are retried rather than treated as terminal: the underlying
+    /// stream write() awaits writability before retrying, so this does not
+    /// busy-loop. A zero-byte write terminates the loop to avoid spinning.
     coro::task<io::io_result> write_all(const void* buffer, size_t length) {
         return write_exactly(buffer, length);
     }

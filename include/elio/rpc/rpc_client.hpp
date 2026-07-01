@@ -350,11 +350,19 @@ private:
         }
 
         // Wait for response with timeout
-        // Spawn timeout watcher
+        // Spawn timeout watcher. Use a per-call local cancellation source
+        // (rather than the caller-supplied token) so the watcher can be
+        // cancelled promptly whenever the request completes for ANY reason —
+        // response, error, caller cancellation, or connection close — not
+        // only when the caller cancels. Without this the sleeping watcher
+        // would linger for the full timeout on every fast/normal completion,
+        // retaining the pending_request and an idle background task (mirrors
+        // the pattern already used by ping()).
+        coro::cancel_source timeout_cancel;
         auto* sched = runtime::scheduler::current();
         if (sched) {
             sched->go([ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
-                       p = pending, tok = token]() mutable {
+                       p = pending, tok = timeout_cancel.get_token()]() mutable {
                 return [](std::chrono::milliseconds ms,
                           std::shared_ptr<pending_request> pending,
                           coro::cancel_token tok)
@@ -374,6 +382,10 @@ private:
 
         // Wait for completion (either response, timeout, or cancellation)
         co_await pending->completion_event.wait();
+
+        // Cancel the timeout watcher so it stops sleeping immediately once
+        // the request has completed, regardless of how completion happened.
+        timeout_cancel.cancel();
 
         // Unregister cancellation callback
         cancel_registration.unregister();

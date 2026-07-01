@@ -447,13 +447,15 @@ public:
     /// Parse incoming data
     /// @param data Input data
     /// @param len Length of input data
-    /// @return Number of bytes consumed (0 if incomplete, <0 on error)
-    int parse(const uint8_t* data, size_t len) {
+    /// @return Number of bytes consumed (0 if incomplete, <0 on error).
+    ///         Returned as ssize_t so large consumed counts cannot overflow and
+    ///         be misread as the negative error sentinel.
+    ssize_t parse(const uint8_t* data, size_t len) {
         if (len == 0) return 0;
-        
+
         // Append to buffer
         buffer_.insert(buffer_.end(), data, data + len);
-        
+
         return process_buffer();
     }
     
@@ -497,7 +499,7 @@ public:
     }
     
 private:
-    int process_buffer() {
+    ssize_t process_buffer() {
         size_t total_consumed = 0;
         
         while (buffer_.size() >= 2) {
@@ -537,22 +539,26 @@ private:
                 return -1;
             }
             
-            // Extract payload
-            std::string payload(
-                reinterpret_cast<const char*>(buffer_.data() + result.header_size),
-                header.payload_len
-            );
-            
-            // Unmask if needed
-            if (header.masked) {
-                apply_mask(reinterpret_cast<uint8_t*>(payload.data()), 
-                          payload.size(), header.mask_key.data());
-            }
-            
+            // Helper to extract (and unmask) the frame payload from the buffer.
+            // Deferred so that we can reject oversized data frames *before*
+            // allocating/copying the payload (see the size check below).
+            auto extract_payload = [&]() {
+                std::string payload(
+                    reinterpret_cast<const char*>(buffer_.data() + result.header_size),
+                    header.payload_len
+                );
+                if (header.masked) {
+                    apply_mask(reinterpret_cast<uint8_t*>(payload.data()),
+                              payload.size(), header.mask_key.data());
+                }
+                return payload;
+            };
+
             // Process frame
             if (is_control_frame(header.op)) {
-                // Control frames can be interleaved
-                control_frames_.emplace_back(header.op, std::move(payload));
+                // Control frames can be interleaved.  Their payload is capped at
+                // 125 bytes by parse_frame_header(), so no size check is needed.
+                control_frames_.emplace_back(header.op, extract_payload());
             } else {
                 // Data frame
                 if (header.op != opcode::continuation) {
@@ -578,16 +584,20 @@ private:
                     }
                 }
 
-                // Check message size limit
+                // Check message size limit BEFORE allocating/copying the payload.
+                // header.payload_len is already known from the frame header, so we
+                // can reject an oversized frame without materialising it as a
+                // std::string.  Uses subtraction to avoid uint64_t overflow.
                 if (max_message_size_ > 0 &&
-                    current_message_.data.size() + payload.size() > max_message_size_) {
+                    header.payload_len > max_message_size_ - current_message_.data.size()) {
                     has_error_ = true;
                     error_msg_ = "Message exceeds maximum size";
                     error_close_code_ = close_code::too_large;
                     return -1;
                 }
 
-                current_message_.data.append(payload);
+                // Extract (and unmask) the payload only after passing the size check.
+                current_message_.data.append(extract_payload());
 
                 if (header.fin) {
                     // RFC 6455 §8.1: text messages MUST be valid UTF-8.
@@ -612,7 +622,7 @@ private:
             total_consumed += result.frame_size;
         }
         
-        return static_cast<int>(total_consumed);
+        return static_cast<ssize_t>(total_consumed);
     }
     
     std::vector<uint8_t> buffer_;

@@ -962,12 +962,24 @@ inline void worker_thread::run() {
     // This ensures shutdown() returns only when all submitted tasks have
     // fully completed (including coroutine cleanup and lambda destruction).
     //
+    // Retirement vs. shutdown: if the SCHEDULER is still running, this
+    // worker is being retired by a pool shrink (set_thread_count), not a
+    // full shutdown. In that case queued tasks must be redistributed to
+    // active workers rather than resumed here — resuming a queued coroutine
+    // on the retiring worker lets it start a fresh async I/O that binds to
+    // this worker's io_context (via worker_thread::current()), which stops
+    // being polled once this thread exits, orphaning the operation and
+    // hanging the coroutine. shutdown_force() flips the scheduler's
+    // running_ to false BEFORE joining workers, so a genuine shutdown still
+    // takes the run_task() path below and drains locally.
+    //
     // Note: pop() (steal-style CAS path) — NOT pop_local(false). Other
     // workers may still be inside try_steal()->steal_task() against this
     // worker's deque because they haven't yet observed our running_=false.
     // Chase-Lev requires either single-threaded owner pop OR concurrent
     // steal+pop synchronized via the seq_cst fence inside pop(); the
     // single-thread fast path of pop_local() races with those stealers.
+    const bool retiring = scheduler_->is_running();
     while (true) {
         drain_inbox();
         void* addr = queue_->pop();
@@ -975,8 +987,19 @@ inline void worker_thread::run() {
 
         auto handle = std::coroutine_handle<>::from_address(addr);
         if (handle && !handle.done()) {
-            needs_sync_ = true;  // Conservatively ensure memory visibility for drained tasks
-            run_task(handle);
+            if (retiring) {
+                // Hand the task back to the scheduler; do_spawn() routes it to
+                // a surviving worker (num_threads_ was already lowered before
+                // this worker was stopped, so it never lands back here). The
+                // release fence inside do_spawn() carries frame visibility, so
+                // no needs_sync_ handshake is required on the receiving worker.
+                scheduler_->spawn(handle);
+            } else {
+                needs_sync_ = true;  // Conservatively ensure memory visibility for drained tasks
+                run_task(handle);
+            }
+        } else if (handle) {
+            handle.destroy();
         }
     }
     

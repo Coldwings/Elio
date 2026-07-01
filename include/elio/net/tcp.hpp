@@ -14,7 +14,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
-#include <climits>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <string_view>

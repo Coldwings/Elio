@@ -12,12 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Exact-length stream I/O helpers**: `read_exactly()` / `write_exactly()` on
   `net::tcp_stream`, `net::uds_stream`, `tls::tls_stream`, and the unified
   `net::stream`. They loop over partial `read`/`write` results until exactly
-  `length` bytes are transferred, transparently waiting for socket readiness on
-  transient `EAGAIN`/`EWOULDBLOCK` (never surfaced to callers). `read_exactly()`
-  returns `-ENODATA` if the peer closes before `length` bytes arrive, and both
-  helpers return `-EOVERFLOW` when asked to transfer more than `INT32_MAX`
-  bytes. `net::stream::write_all()` is retained as a compatibility alias for
-  `write_exactly()`. (#249)
+  `length` bytes are transferred, transparently retrying on transient
+  `EAGAIN`/`EWOULDBLOCK` (waiting for socket readiness) and `EINTR` (never
+  surfaced to callers). `read_exactly()` returns `-ENODATA` if the peer closes
+  before `length` bytes arrive, and both helpers return `-EOVERFLOW` when asked
+  to transfer more than `INT32_MAX` bytes. `net::stream::write_all()` is retained
+  as a compatibility alias for `write_exactly()`. (#249)
 
 ### Changed
 

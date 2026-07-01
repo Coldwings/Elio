@@ -10,7 +10,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
-#include <climits>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -284,6 +284,10 @@ public:
                 if (poll.result < 0) {
                     co_return poll;
                 }
+            } else if (result.result == -EINTR) {
+                // Interrupted before any data: retry the recv directly. The
+                // underlying read() is a raw async_recv with no internal retry.
+                continue;
             } else {
                 // Terminal error.
                 co_return result;
@@ -327,6 +331,11 @@ public:
                 if (poll.result < 0) {
                     co_return poll;
                 }
+            } else if (result.result == -EINTR) {
+                // Interrupted before any bytes were sent: retry the send
+                // directly. The underlying write() is a raw async_send with no
+                // internal retry.
+                continue;
             } else {
                 // Terminal error (or a 0-byte write, which for a socket send
                 // indicates the write side can make no further progress).

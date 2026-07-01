@@ -861,7 +861,10 @@ TEST_CASE("buffer_ref type traits", "[rpc][buffer_ref]") {
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <memory>
 #include <utility>
+#include <sys/socket.h>
+#include <unistd.h>
 
 TEST_CASE("oversized vector count is rejected", "[rpc][security]") {
     // Wire layout for vector<int32_t>: <count:u32><n * int32>.
@@ -1428,6 +1431,121 @@ TEST_CASE("server out-of-order dispatch does not head-of-line block",
     // before the scheduler tears down its workers — keeps ASAN clean.
     server->stop();
     sched.shutdown(std::chrono::seconds(30));
+}
+
+// ============================================================================
+// Lifetime regression: rpc_client member coroutines must outlive the client
+// object (issue #245 — "rpc_client member coroutines can outlive the client
+// object").
+//
+// rpc_client<Stream> derives from enable_shared_from_this, but call_impl()
+// stores raw `this` (and pending_eraser stores a raw rpc_client*) across every
+// co_await. If the last external shared_ptr is dropped while a call is parked
+// on its completion_event, ~rpc_client() would free stream_, send_mutex_ and
+// pending_shards_ while the suspended coroutine still references them — a
+// use-after-free. The fix takes a strong self-reference at the top of the
+// coroutine (auto self = this->shared_from_this()).
+//
+// This test reproduces the race deterministically without a server:
+//   * a socketpair provides a real, valid fd for the client stream;
+//   * the client is created WITHOUT starting its receive loop, so nothing
+//     other than the external shared_ptr keeps it alive;
+//   * the call is spawned through a *raw* pointer so the wrapper frame holds
+//     no shared_ptr — exactly the "member coroutine holds only raw this"
+//     scenario from the bug report;
+//   * the peer end of the socketpair is drained with a blocking read, which
+//     only returns once call_impl() has actually written its request frame and
+//     is therefore suspended on completion_event;
+//   * the external shared_ptr is then dropped. With the fix the strong self
+//     reference keeps the object alive (weak_ptr stays valid); without it ASAN
+//     flags the use-after-free and the weak_ptr would have expired.
+// The call is given a short timeout so its watcher wakes it, the coroutine
+// unwinds, and the client is finally destroyed.
+// ============================================================================
+
+// File-scope method to avoid -Wunused-local-typedefs from ELIO_RPC_FIELDS.
+struct LifetimeReq { int32_t x; ELIO_RPC_FIELDS(LifetimeReq, x) };
+struct LifetimeResp { int32_t x; ELIO_RPC_FIELDS(LifetimeResp, x) };
+using LifetimeMethod = ELIO_RPC_METHOD(202, LifetimeReq, LifetimeResp);
+
+TEST_CASE("call_impl keeps client alive while awaiting response",
+          "[rpc][uaf][lifetime]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    int fds[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    // Client owns fds[0]; fds[1] is the peer we drain from the test thread.
+    auto client = tcp_rpc_client::create(tcp_stream(fds[0]));
+    std::weak_ptr<tcp_rpc_client> wk = client;
+    // Raw pointer handed to the spawned coroutine. Intentionally NOT a
+    // shared_ptr: the wrapper frame must not hold any strong reference, so
+    // that the only strong references are the external `client` here and the
+    // `self` grabbed inside call_impl().
+    tcp_rpc_client* raw = client.get();
+
+    scheduler sched(2);
+    sched.start();
+
+    // Signals that the spawned call coroutine has actually started running
+    // (and therefore has dereferenced `raw` before we drop `client`).
+    std::atomic<bool> call_started{false};
+    // Error code observed by the call once it completes (times out). Captured
+    // via an atomic because the TEST_CASE body is not a coroutine and cannot
+    // co_await the join_handle for its value.
+    std::atomic<int> call_error{-1};
+
+    // A short per-call timeout guarantees the parked coroutine is eventually
+    // woken by its timeout watcher, unwinds, releases `self`, and lets the
+    // client be destroyed — even though there is no server to answer.
+    auto call_timeout = std::chrono::milliseconds(500);
+    auto h = sched.go_joinable(
+        [raw, &call_started, &call_error, call_timeout]() -> coro::task<void> {
+            call_started.store(true, std::memory_order_release);
+            auto r = co_await raw->call<LifetimeMethod>(LifetimeReq{7}, call_timeout);
+            // No server ever replies, so this must time out.
+            call_error.store(static_cast<int>(r.error()), std::memory_order_release);
+        });
+
+    // Wait until the coroutine has begun (bounded so a hang surfaces).
+    for (int i = 0; i < 2000 && !call_started.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(call_started.load(std::memory_order_acquire));
+
+    // Drain the request frame from the peer end. read() returns only once
+    // call_impl() has written the frame, i.e. it is now suspended on
+    // completion_event with `self` held. This is our deterministic
+    // "call is in flight" barrier.
+    uint8_t buf[64];
+    ssize_t n = ::read(fds[1], buf, sizeof(buf));
+    REQUIRE(n > 0);
+    // A full request frame is at least the fixed-size header.
+    REQUIRE(n >= static_cast<ssize_t>(frame_header_size));
+
+    // Drop the last external strong reference while the call is suspended.
+    // With the fix, call_impl()'s `self` keeps the object alive.
+    client.reset();
+
+    // The client must still be alive: only the fix's strong self-reference
+    // can be keeping it so. Without the fix this object was destroyed by the
+    // reset above (and ASAN would have reported the UAF on resume).
+    REQUIRE_FALSE(wk.expired());
+
+    // Let the call time out, unwind, drop `self`, and destroy the client.
+    // wait_destroyed() blocks safely from this non-coroutine context.
+    h.wait_destroyed();
+    REQUIRE(call_error.load(std::memory_order_acquire) ==
+            static_cast<int>(rpc_error::timeout));
+
+    // Now that the coroutine has fully unwound, the last strong reference is
+    // gone and the client has been destroyed.
+    REQUIRE(wk.expired());
+
+    sched.shutdown(std::chrono::seconds(30));
+    ::close(fds[1]);
 }
 
 // ============================================================================

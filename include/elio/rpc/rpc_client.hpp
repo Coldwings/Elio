@@ -302,6 +302,16 @@ private:
     {
         using Response = typename Method::response_type;
 
+        // Keep the client alive for the full duration of this coroutine.
+        // The frame stores raw `this` (and `pending_eraser` stores a raw
+        // rpc_client*) across every co_await below. Without this strong
+        // self-reference, dropping the last external shared_ptr while the
+        // call is suspended (waiting for send, response, timeout, or the
+        // completion_event) would run ~rpc_client() and free members such
+        // as stream_, send_mutex_ and pending_shards_ that the coroutine
+        // still touches on resumption — a use-after-free.
+        auto self = this->shared_from_this();
+
         // Check if already cancelled
         if (token.is_cancelled()) {
             co_return rpc_result<Response>(rpc_error::cancelled);
@@ -418,21 +428,32 @@ public:
     /// Send a one-way message (no response expected)
     template<typename Method>
     coro::task<bool> send_oneway(const typename Method::request_type& request) {
+        // Hold a strong self-reference: the write below suspends while it
+        // touches send_mutex_ and stream_, so the client must outlive it.
+        auto self = this->shared_from_this();
+
         if (!is_connected()) {
             co_return false;
         }
-        
+
         uint32_t request_id = id_generator_.next();
         auto request_frame = build_request(request_id, Method::id, request);
-        
+
         co_await send_mutex_.lock();
         sync::lock_guard send_guard(send_mutex_);
-        
+
         co_return co_await write_frame(stream_, request_frame.first, request_frame.second);
     }
-    
+
     /// Send a ping and wait for pong
     coro::task<bool> ping(std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+        // Hold a strong self-reference for the coroutine's lifetime. Like
+        // call_impl(), this suspends on send_mutex_, stream_ writes and the
+        // pending_request completion_event, and pending_eraser stores a raw
+        // rpc_client*; dropping the last external shared_ptr mid-ping would
+        // otherwise free those members and cause a use-after-free.
+        auto self = this->shared_from_this();
+
         if (!is_connected()) {
             co_return false;
         }

@@ -14,10 +14,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <string>
 #include <string_view>
 #include <memory>
 #include <optional>
+#include <span>
 
 namespace elio::tls {
 
@@ -282,7 +284,90 @@ public:
     coro::task<io::io_result> write(std::string_view data) {
         return write(data.data(), data.size());
     }
-    
+
+    /// Read exactly ``length`` bytes into ``buffer``.
+    ///
+    /// Loops over partial reads until ``length`` bytes have been stored, a
+    /// terminal error occurs, or the peer closes the connection (EOF). The
+    /// underlying TLS ``read`` already waits for readiness internally, so no
+    /// ``-EAGAIN`` / ``-EWOULDBLOCK`` is ever surfaced here.
+    ///
+    /// @return ``io_result`` whose ``result`` is ``length`` on success. If the
+    ///         peer closes before ``length`` bytes arrive, returns ``-ENODATA``
+    ///         (short read / unexpected EOF). Any other terminal error from the
+    ///         underlying ``read`` is returned as-is.
+    coro::task<io::io_result> read_exactly(void* buffer, size_t length) {
+        if (length > static_cast<size_t>(INT32_MAX)) {
+            co_return io::io_result{-EOVERFLOW, 0};
+        }
+
+        auto* ptr = static_cast<char*>(buffer);
+        size_t remaining = length;
+
+        while (remaining > 0) {
+            auto result = co_await read(ptr, remaining);
+            if (result.result > 0) {
+                ptr += result.result;
+                remaining -= static_cast<size_t>(result.result);
+            } else if (result.result == 0) {
+                // Clean EOF before the requested count was satisfied.
+                co_return io::io_result{-ENODATA, 0};
+            } else {
+                // Terminal error (TLS read never returns -EAGAIN).
+                co_return result;
+            }
+        }
+        co_return io::io_result{static_cast<int32_t>(length), 0};
+    }
+
+    /// Read exactly enough bytes to fill ``buffer``.
+    template<typename T>
+    coro::task<io::io_result> read_exactly(std::span<T> buffer) {
+        return read_exactly(buffer.data(), buffer.size_bytes());
+    }
+
+    /// Write exactly ``length`` bytes from ``buffer``.
+    ///
+    /// Loops over partial writes until ``length`` bytes have been accepted or a
+    /// terminal error occurs. The underlying TLS ``write`` already waits for
+    /// readiness internally, so no ``-EAGAIN`` / ``-EWOULDBLOCK`` is ever
+    /// surfaced here.
+    ///
+    /// @return ``io_result`` whose ``result`` is ``length`` on success, or the
+    ///         failing ``io_result`` (``result <= 0``) on a terminal error,
+    ///         preserving the real error code.
+    coro::task<io::io_result> write_exactly(const void* buffer, size_t length) {
+        if (length > static_cast<size_t>(INT32_MAX)) {
+            co_return io::io_result{-EOVERFLOW, 0};
+        }
+
+        const auto* ptr = static_cast<const char*>(buffer);
+        size_t remaining = length;
+
+        while (remaining > 0) {
+            auto result = co_await write(ptr, remaining);
+            if (result.result > 0) {
+                ptr += result.result;
+                remaining -= static_cast<size_t>(result.result);
+            } else {
+                // Terminal error (TLS write never returns -EAGAIN).
+                co_return result;
+            }
+        }
+        co_return io::io_result{static_cast<int32_t>(length), 0};
+    }
+
+    /// Write exactly all bytes from ``buffer``.
+    template<typename T>
+    coro::task<io::io_result> write_exactly(std::span<const T> buffer) {
+        return write_exactly(buffer.data(), buffer.size_bytes());
+    }
+
+    /// Write exactly all bytes from ``str``.
+    coro::task<io::io_result> write_exactly(std::string_view str) {
+        return write_exactly(str.data(), str.size());
+    }
+
     /// Perform TLS shutdown.
     ///
     /// Splits the handshake into two phases:

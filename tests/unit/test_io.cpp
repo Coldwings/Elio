@@ -17,6 +17,9 @@
 #include <thread>
 #include <atomic>
 #include <array>
+#include <algorithm>
+#include <string>
+#include <vector>
 
 using namespace elio::io;
 using namespace elio::coro;
@@ -974,6 +977,13 @@ TEST_CASE("UDS echo test", "[uds][echo]") {
 // ============================================================================
 
 #include <elio/net/tcp.hpp>
+#include <elio/time/timer.hpp>
+
+// net::stream pulls in the TLS headers (OpenSSL). Only include it when TLS is
+// compiled in so the plain-TCP build of these tests stays OpenSSL-free.
+#if defined(ELIO_HAS_TLS)
+#include <elio/net/stream.hpp>
+#endif
 
 static task<void> tcp_connect_regression_attempt(
     uint16_t port,
@@ -1263,6 +1273,339 @@ TEST_CASE("TCP IPv6 listener and connect", "[tcp][ipv6][integration]") {
         REQUIRE(client_stream.has_value());
     }
 }
+
+TEST_CASE("tcp_stream read_exactly/write_exactly", "[tcp][stream][exact]") {
+    // Establish a loopback TCP pair on IPv6 (::1) so we exercise the real
+    // async read/write path used by the exact-length helpers.
+    auto listener = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener.has_value());
+
+    uint16_t port = listener->local_address().port();
+    REQUIRE(port > 0);
+
+    std::optional<tcp_stream> server_stream;
+    std::optional<tcp_stream> client_stream;
+    std::atomic<int> setup_complete{0};
+
+    scheduler sched(2);
+    sched.start();
+
+    auto accept_coro = [&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        server_stream = std::move(stream);
+        setup_complete++;
+        co_return;
+    };
+
+    auto connect_coro = [&]() -> task<void> {
+        auto stream = co_await tcp_connect(ipv6_address("::1", port));
+        client_stream = std::move(stream);
+        setup_complete++;
+        co_return;
+    };
+
+    sched.go(accept_coro);
+    sched.go(connect_coro);
+
+    for (int i = 0; i < 200 && setup_complete < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    REQUIRE(setup_complete == 2);
+    REQUIRE(server_stream.has_value());
+    REQUIRE(client_stream.has_value());
+
+    SECTION("write_exactly then read_exactly transfers full payload") {
+        // A payload larger than typical socket buffers so the kernel is
+        // likely to split it across several read/write syscalls, exercising
+        // the aggregation loop inside the exact helpers.
+        constexpr size_t kSize = 256 * 1024;
+        std::vector<char> src(kSize);
+        for (size_t i = 0; i < kSize; ++i) {
+            src[i] = static_cast<char>(i * 31 + 7);
+        }
+        std::vector<char> dst(kSize, 0);
+
+        std::atomic<bool> write_done{false};
+        std::atomic<bool> read_done{false};
+        io_result write_result{};
+        io_result read_result{};
+
+        auto write_coro = [&]() -> task<void> {
+            write_result = co_await client_stream->write_exactly(src.data(), src.size());
+            write_done = true;
+        };
+        auto read_coro = [&]() -> task<void> {
+            read_result = co_await server_stream->read_exactly(dst.data(), dst.size());
+            read_done = true;
+        };
+
+        sched.go(write_coro);
+        sched.go(read_coro);
+
+        for (int i = 0; i < 500 && (!write_done || !read_done); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        REQUIRE(write_done);
+        REQUIRE(read_done);
+        REQUIRE(write_result.success());
+        REQUIRE(read_result.success());
+        REQUIRE(write_result.bytes_transferred() == static_cast<int>(kSize));
+        REQUIRE(read_result.bytes_transferred() == static_cast<int>(kSize));
+        REQUIRE(dst == src);
+    }
+
+    SECTION("read_exactly aggregates several short writes") {
+        // The writer emits the payload in small chunks with a brief pause
+        // between them; a single read_exactly on the reader must gather all
+        // of them before completing.
+        const std::string payload = "The quick brown fox jumps over the lazy dog.";
+        std::string received(payload.size(), '\0');
+
+        std::atomic<bool> write_done{false};
+        std::atomic<bool> read_done{false};
+        io_result read_result{};
+
+        auto write_coro = [&]() -> task<void> {
+            size_t offset = 0;
+            constexpr size_t chunk = 5;
+            while (offset < payload.size()) {
+                size_t n = std::min(chunk, payload.size() - offset);
+                auto r = co_await server_stream->write(payload.data() + offset, n);
+                if (r.result <= 0) break;
+                offset += static_cast<size_t>(r.result);
+                // Yield so the reader observes a partial buffer and loops.
+                co_await elio::time::sleep_for(std::chrono::milliseconds(5));
+            }
+            write_done = true;
+        };
+        auto read_coro = [&]() -> task<void> {
+            read_result = co_await client_stream->read_exactly(received.data(),
+                                                               received.size());
+            read_done = true;
+        };
+
+        sched.go(read_coro);
+        sched.go(write_coro);
+
+        for (int i = 0; i < 500 && (!write_done || !read_done); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        REQUIRE(write_done);
+        REQUIRE(read_done);
+        REQUIRE(read_result.success());
+        REQUIRE(read_result.bytes_transferred() == static_cast<int>(payload.size()));
+        REQUIRE(received == payload);
+    }
+
+    SECTION("read_exactly returns -ENODATA on EOF before completion") {
+        // The peer sends fewer bytes than requested, then closes. read_exactly
+        // must surface the truncated stream as -ENODATA rather than a partial
+        // success.
+        const std::string partial = "half";
+
+        std::atomic<bool> write_done{false};
+        std::atomic<bool> read_done{false};
+        io_result read_result{};
+        char buffer[32] = {0};
+
+        auto write_coro = [&]() -> task<void> {
+            co_await server_stream->write(partial.data(), partial.size());
+            co_await server_stream->close();
+            write_done = true;
+        };
+        auto read_coro = [&]() -> task<void> {
+            // Request more than will ever arrive.
+            read_result = co_await client_stream->read_exactly(buffer, sizeof(buffer));
+            read_done = true;
+        };
+
+        sched.go(read_coro);
+        sched.go(write_coro);
+
+        for (int i = 0; i < 500 && (!write_done || !read_done); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        REQUIRE(write_done);
+        REQUIRE(read_done);
+        REQUIRE_FALSE(read_result.success());
+        REQUIRE(read_result.result == -ENODATA);
+    }
+
+    SECTION("write_exactly/read_exactly with zero length are no-ops") {
+        std::atomic<bool> done{false};
+        io_result write_result{100, 0};
+        io_result read_result{100, 0};
+
+        auto coro = [&]() -> task<void> {
+            write_result = co_await client_stream->write_exactly(nullptr, 0);
+            read_result = co_await server_stream->read_exactly(nullptr, 0);
+            done = true;
+        };
+
+        sched.go(coro);
+
+        for (int i = 0; i < 200 && !done; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        REQUIRE(done);
+        REQUIRE(write_result.result == 0);
+        REQUIRE(read_result.result == 0);
+    }
+
+    sched.shutdown();
+}
+
+#if defined(ELIO_HAS_TLS)
+TEST_CASE("net::stream read_exactly/write_exactly delegate to TCP",
+          "[tcp][stream][exact][net_stream]") {
+    // Wrap plain TCP endpoints in the unified net::stream and confirm the
+    // exact-length helpers (and the write_all alias) delegate correctly.
+    auto listener = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener.has_value());
+
+    uint16_t port = listener->local_address().port();
+    REQUIRE(port > 0);
+
+    std::optional<tcp_stream> raw_server;
+    std::optional<tcp_stream> raw_client;
+    std::atomic<int> setup_complete{0};
+
+    scheduler sched(2);
+    sched.start();
+
+    auto accept_coro = [&]() -> task<void> {
+        auto s = co_await listener->accept();
+        raw_server = std::move(s);
+        setup_complete++;
+        co_return;
+    };
+    auto connect_coro = [&]() -> task<void> {
+        auto s = co_await tcp_connect(ipv6_address("::1", port));
+        raw_client = std::move(s);
+        setup_complete++;
+        co_return;
+    };
+
+    sched.go(accept_coro);
+    sched.go(connect_coro);
+
+    for (int i = 0; i < 200 && setup_complete < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    REQUIRE(setup_complete == 2);
+    REQUIRE(raw_server.has_value());
+    REQUIRE(raw_client.has_value());
+
+    elio::net::stream server_stream(std::move(*raw_server));
+    elio::net::stream client_stream(std::move(*raw_client));
+
+    SECTION("write_exactly and read_exactly round-trip") {
+        const std::string payload = "unified stream exact transfer";
+        std::string received(payload.size(), '\0');
+
+        std::atomic<bool> write_done{false};
+        std::atomic<bool> read_done{false};
+        io_result write_result{};
+        io_result read_result{};
+
+        auto write_coro = [&]() -> task<void> {
+            write_result = co_await client_stream.write_exactly(payload);
+            write_done = true;
+        };
+        auto read_coro = [&]() -> task<void> {
+            read_result = co_await server_stream.read_exactly(received.data(),
+                                                              received.size());
+            read_done = true;
+        };
+
+        sched.go(write_coro);
+        sched.go(read_coro);
+
+        for (int i = 0; i < 500 && (!write_done || !read_done); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        REQUIRE(write_done);
+        REQUIRE(read_done);
+        REQUIRE(write_result.success());
+        REQUIRE(read_result.success());
+        REQUIRE(read_result.bytes_transferred() == static_cast<int>(payload.size()));
+        REQUIRE(received == payload);
+    }
+
+    SECTION("write_all remains a compatibility alias for write_exactly") {
+        const std::string payload = "legacy write_all alias";
+        std::string received(payload.size(), '\0');
+
+        std::atomic<bool> write_done{false};
+        std::atomic<bool> read_done{false};
+        io_result write_result{};
+        io_result read_result{};
+
+        auto write_coro = [&]() -> task<void> {
+            write_result = co_await client_stream.write_all(payload);
+            write_done = true;
+        };
+        auto read_coro = [&]() -> task<void> {
+            read_result = co_await server_stream.read_exactly(received.data(),
+                                                              received.size());
+            read_done = true;
+        };
+
+        sched.go(write_coro);
+        sched.go(read_coro);
+
+        for (int i = 0; i < 500 && (!write_done || !read_done); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        REQUIRE(write_done);
+        REQUIRE(read_done);
+        REQUIRE(write_result.success());
+        REQUIRE(write_result.bytes_transferred() == static_cast<int>(payload.size()));
+        REQUIRE(received == payload);
+    }
+
+    sched.shutdown();
+}
+
+TEST_CASE("net::stream exact helpers on disconnected stream return -ENOTCONN",
+          "[tcp][stream][exact][net_stream]") {
+    elio::net::stream disconnected;
+
+    std::atomic<bool> done{false};
+    io_result read_result{};
+    io_result write_result{};
+    char buffer[8] = {0};
+
+    scheduler sched(1);
+    sched.start();
+
+    auto coro = [&]() -> task<void> {
+        read_result = co_await disconnected.read_exactly(buffer, sizeof(buffer));
+        write_result = co_await disconnected.write_exactly("data", 4);
+        done = true;
+    };
+
+    sched.go(coro);
+
+    for (int i = 0; i < 200 && !done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(done);
+    REQUIRE(read_result.result == -ENOTCONN);
+    REQUIRE(write_result.result == -ENOTCONN);
+}
+#endif // ELIO_HAS_TLS
 
 TEST_CASE("TCP connect regression avoids double connect", "[tcp][connect][regression]") {
     auto listener = tcp_listener::bind(ipv6_address("::1", 0));

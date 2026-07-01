@@ -16,6 +16,7 @@
 
 #include <variant>
 #include <chrono>
+#include <limits>
 #include <type_traits>
 
 namespace elio::net {
@@ -78,20 +79,43 @@ public:
 
     /// Write all data, retrying short writes
     /// @return io_result with total bytes written on success, or the failing
-    ///         io_result (result <= 0) on error, preserving the real error code
+    ///         io_result (result < 0) on a hard error, preserving the real
+    ///         error code
+    ///
+    /// Transient readiness results (-EAGAIN/-EWOULDBLOCK) and interruptions
+    /// (-EINTR) are retried rather than treated as terminal: the underlying
+    /// stream write() awaits writability before retrying, so this does not
+    /// busy-loop. A zero-byte write terminates the loop to avoid spinning.
     coro::task<io::io_result> write_all(const void* buffer, size_t length) {
         const auto* ptr = static_cast<const char*>(buffer);
         size_t remaining = length;
 
         while (remaining > 0) {
             auto result = co_await write(ptr, remaining);
-            if (result.result <= 0) {
-                co_return result;
+            if (result.result > 0) {
+                ptr += result.result;
+                remaining -= static_cast<size_t>(result.result);
+                continue;
             }
-            ptr += result.result;
-            remaining -= static_cast<size_t>(result.result);
+            if (result.result == -EAGAIN || result.result == -EWOULDBLOCK ||
+                result.result == -EINTR) {
+                // Transient: the underlying write() has already awaited
+                // readiness, so retry without surfacing the error.
+                continue;
+            }
+            // Hard error (result < 0) or no-progress zero write (result == 0):
+            // stop and report it, preserving the real error code.
+            co_return result;
         }
-        co_return io::io_result{static_cast<int>(length), 0};
+        // All bytes written. io_result::result is int32_t, so clamp the
+        // reported count to INT_MAX to avoid wrapping to a negative value
+        // (which callers would misread as an error) for >2 GiB writes.
+        const size_t written = length;
+        const auto reported = written > static_cast<size_t>(
+                                            std::numeric_limits<int32_t>::max())
+                                  ? std::numeric_limits<int32_t>::max()
+                                  : static_cast<int32_t>(written);
+        co_return io::io_result{reported, 0};
     }
 
     /// Write all data from string_view

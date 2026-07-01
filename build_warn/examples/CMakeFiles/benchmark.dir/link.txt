@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -g -DNDEBUG -static-libgcc -static-libstdc++ -Wl,--dependency-file=CMakeFiles/benchmark.dir/link.d CMakeFiles/benchmark.dir/benchmark.cpp.o -o benchmark  ../_deps/fmt-build/libfmt.a -lpthread -luring

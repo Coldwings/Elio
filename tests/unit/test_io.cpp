@@ -5,6 +5,7 @@
 #include <elio/coro/cancel_token.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/net/resolve.hpp>
+#include <elio/time/timer.hpp>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -17,6 +18,7 @@
 #include <thread>
 #include <atomic>
 #include <array>
+#include <vector>
 
 using namespace elio::io;
 using namespace elio::coro;
@@ -1758,5 +1760,207 @@ TEST_CASE("Cancellable connect already cancelled", "[io][cancel]") {
     REQUIRE(connect_result.was_cancelled());
 
     close(fd);
+}
+
+// ============================================================================
+// Regression tests for #247: tcp_stream read/write must await readiness and
+// retry on transient -EAGAIN/-EWOULDBLOCK instead of surfacing them.
+// ============================================================================
+
+namespace {
+
+// Establish a connected TCP loopback pair on ::1 with small socket buffers so
+// that a large transfer is guaranteed to saturate the kernel send buffer and
+// exercise the internal writability-retry loop. Returns the accepted (server)
+// and connected (client) streams.
+struct tcp_pair {
+    std::optional<tcp_stream> server;
+    std::optional<tcp_stream> client;
+};
+
+tcp_pair make_small_buffer_tcp_pair(scheduler& sched) {
+    auto listener = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+    REQUIRE(port > 0);
+
+    tcp_pair pair;
+    std::atomic<bool> accepted{false};
+    std::atomic<bool> connected{false};
+
+    auto accept_coro = [&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        pair.server = std::move(stream);
+        accepted = true;
+        co_return;
+    };
+    auto connect_coro = [&]() -> task<void> {
+        auto stream = co_await tcp_connect(ipv6_address("::1", port));
+        pair.client = std::move(stream);
+        connected = true;
+        co_return;
+    };
+
+    sched.go(accept_coro);
+    sched.go(connect_coro);
+
+    for (int i = 0; i < 300 && (!accepted || !connected); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    REQUIRE(accepted);
+    REQUIRE(connected);
+    REQUIRE(pair.server.has_value());
+    REQUIRE(pair.client.has_value());
+
+    // Shrink both send and receive buffers so the transfer cannot complete in
+    // a single syscall; this forces the send side to hit EAGAIN internally.
+    const int small = 4096;
+    for (int fd : {pair.server->fd(), pair.client->fd()}) {
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+    }
+
+    return pair;
+}
+
+} // namespace
+
+TEST_CASE("tcp_stream write awaits writability under backpressure",
+          "[tcp][stream][eagain][regression]") {
+    scheduler sched(2);
+    sched.start();
+
+    auto pair = make_small_buffer_tcp_pair(sched);
+
+    // Payload far larger than the (shrunk) socket buffers so the send side is
+    // guaranteed to saturate the kernel buffer and receive EAGAIN internally.
+    constexpr size_t kPayload = 1 * 1024 * 1024;  // 1 MiB
+    std::vector<char> to_send(kPayload);
+    for (size_t i = 0; i < kPayload; ++i) {
+        to_send[i] = static_cast<char>(i & 0xFF);
+    }
+
+    std::atomic<bool> writer_done{false};
+    std::atomic<bool> reader_done{false};
+    std::atomic<bool> saw_eagain{false};
+    std::atomic<size_t> total_written{0};
+    std::atomic<size_t> total_read{0};
+    std::atomic<bool> data_ok{true};
+
+    // Writer: push the whole payload through, retrying short writes at the
+    // application level. Every individual write() must return a positive count
+    // or a terminal error -- it must NEVER surface -EAGAIN/-EWOULDBLOCK, since
+    // tcp_stream::write() now awaits writability internally.
+    auto writer = [&]() -> task<void> {
+        size_t off = 0;
+        while (off < kPayload) {
+            auto r = co_await pair.client->write(to_send.data() + off,
+                                                 kPayload - off);
+            if (r.result == -EAGAIN || r.result == -EWOULDBLOCK) {
+                saw_eagain = true;
+                break;
+            }
+            if (r.result <= 0) {
+                break;  // terminal error / peer closed
+            }
+            off += static_cast<size_t>(r.result);
+        }
+        total_written = off;
+        writer_done = true;
+        co_return;
+    };
+
+    // Reader: drain slowly so the writer is forced to wait on writability.
+    auto reader = [&]() -> task<void> {
+        std::vector<char> buf(64 * 1024);
+        size_t got = 0;
+        while (got < kPayload) {
+            auto r = co_await pair.server->read(buf.data(), buf.size());
+            if (r.result <= 0) {
+                break;
+            }
+            // Verify byte integrity as we go.
+            for (int i = 0; i < r.result; ++i) {
+                if (buf[static_cast<size_t>(i)] !=
+                    static_cast<char>((got + static_cast<size_t>(i)) & 0xFF)) {
+                    data_ok = false;
+                }
+            }
+            got += static_cast<size_t>(r.result);
+        }
+        total_read = got;
+        reader_done = true;
+        co_return;
+    };
+
+    sched.go(reader);
+    sched.go(writer);
+
+    for (int i = 0; i < 1000 && (!writer_done || !reader_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(writer_done);
+    REQUIRE(reader_done);
+    // The core assertion: write() never leaked a transient EAGAIN to the app.
+    REQUIRE_FALSE(saw_eagain.load());
+    REQUIRE(total_written.load() == kPayload);
+    REQUIRE(total_read.load() == kPayload);
+    REQUIRE(data_ok.load());
+}
+
+TEST_CASE("tcp_stream read awaits readability for deferred data",
+          "[tcp][stream][eagain][regression]") {
+    scheduler sched(2);
+    sched.start();
+
+    auto pair = make_small_buffer_tcp_pair(sched);
+
+    const char* msg = "deferred payload after readiness wait";
+    const size_t msg_len = strlen(msg);
+
+    std::atomic<bool> reader_done{false};
+    std::atomic<bool> writer_done{false};
+    io_result read_result{};
+    char buffer[128] = {0};
+
+    // Reader starts immediately against an empty socket. A non-blocking recv
+    // would return EAGAIN here; read() must instead await readability and only
+    // complete once the writer sends data below.
+    auto reader = [&]() -> task<void> {
+        read_result = co_await pair.server->read(buffer, sizeof(buffer) - 1);
+        reader_done = true;
+        co_return;
+    };
+
+    // Writer delays before sending so the reader is guaranteed to have entered
+    // the readiness wait first.
+    auto writer = [&]() -> task<void> {
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        co_await pair.client->write(msg, msg_len);
+        writer_done = true;
+        co_return;
+    };
+
+    sched.go(reader);
+    sched.go(writer);
+
+    for (int i = 0; i < 500 && (!reader_done || !writer_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(reader_done);
+    REQUIRE(writer_done);
+    // read() must not surface EAGAIN; it must return the real payload.
+    REQUIRE(read_result.result != -EAGAIN);
+    REQUIRE(read_result.result != -EWOULDBLOCK);
+    REQUIRE(read_result.success());
+    REQUIRE(read_result.bytes_transferred() == static_cast<int>(msg_len));
+    REQUIRE(std::string(buffer) == msg);
 }
 

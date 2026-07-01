@@ -31,12 +31,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libuv1-dev liburing-dev
+          sudo apt-get install -y libuv1-dev liburing-dev g++-14
 
       - name: Configure
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-14 \
+            -DCMAKE_CXX_COMPILER=g++-14 \
             -DELIO_ENABLE_DEBUG_METADATA=OFF \
             -DELIO_BUILD_TCP_BENCHMARKS=ON
 

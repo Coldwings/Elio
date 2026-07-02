@@ -77,7 +77,48 @@ public:
         return write(data.data(), data.size());
     }
 
-    /// Write all data, retrying short writes
+    /// Read exactly ``length`` bytes into ``buffer``.
+    ///
+    /// Loops over partial reads until ``length`` bytes have been stored, a
+    /// terminal error occurs, or the peer closes the connection. Delegates to
+    /// the active underlying stream's ``read_exactly``.
+    ///
+    /// @return io_result with ``result == length`` on success. Returns
+    ///         ``-ENODATA`` if the peer closes before ``length`` bytes arrive,
+    ///         ``-ENOTCONN`` if the stream is disconnected, or the underlying
+    ///         terminal error otherwise.
+    coro::task<io::io_result> read_exactly(void* buffer, size_t length) {
+        if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
+            co_return co_await tcp->read_exactly(buffer, length);
+        } else if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+            co_return co_await tls->read_exactly(buffer, length);
+        }
+        co_return io::io_result{-ENOTCONN, 0};
+    }
+
+    /// Write exactly ``length`` bytes from ``buffer``, retrying short writes.
+    ///
+    /// Delegates to the active underlying stream's ``write_exactly``.
+    ///
+    /// @return io_result with ``result == length`` on success, ``-ENOTCONN`` if
+    ///         disconnected, or the failing io_result (``result <= 0``) on a
+    ///         terminal error, preserving the real error code.
+    coro::task<io::io_result> write_exactly(const void* buffer, size_t length) {
+        if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
+            co_return co_await tcp->write_exactly(buffer, length);
+        } else if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+            co_return co_await tls->write_exactly(buffer, length);
+        }
+        co_return io::io_result{-ENOTCONN, 0};
+    }
+
+    /// Write exactly all bytes from ``data``.
+    coro::task<io::io_result> write_exactly(std::string_view data) {
+        return write_exactly(data.data(), data.size());
+    }
+
+    /// Write all data, retrying short writes.
+    /// @deprecated Prefer ``write_exactly``; retained as a compatibility alias.
     /// @return io_result with total bytes written on success, or the failing
     ///         io_result (result < 0) on a hard error, preserving the real
     ///         error code
@@ -87,40 +128,13 @@ public:
     /// stream write() awaits writability before retrying, so this does not
     /// busy-loop. A zero-byte write terminates the loop to avoid spinning.
     coro::task<io::io_result> write_all(const void* buffer, size_t length) {
-        const auto* ptr = static_cast<const char*>(buffer);
-        size_t remaining = length;
-
-        while (remaining > 0) {
-            auto result = co_await write(ptr, remaining);
-            if (result.result > 0) {
-                ptr += result.result;
-                remaining -= static_cast<size_t>(result.result);
-                continue;
-            }
-            if (result.result == -EAGAIN || result.result == -EWOULDBLOCK ||
-                result.result == -EINTR) {
-                // Transient: the underlying write() has already awaited
-                // readiness, so retry without surfacing the error.
-                continue;
-            }
-            // Hard error (result < 0) or no-progress zero write (result == 0):
-            // stop and report it, preserving the real error code.
-            co_return result;
-        }
-        // All bytes written. io_result::result is int32_t, so clamp the
-        // reported count to INT_MAX to avoid wrapping to a negative value
-        // (which callers would misread as an error) for >2 GiB writes.
-        const size_t written = length;
-        const auto reported = written > static_cast<size_t>(
-                                            std::numeric_limits<int32_t>::max())
-                                  ? std::numeric_limits<int32_t>::max()
-                                  : static_cast<int32_t>(written);
-        co_return io::io_result{reported, 0};
+        return write_exactly(buffer, length);
     }
 
-    /// Write all data from string_view
+    /// Write all data from string_view.
+    /// @deprecated Prefer ``write_exactly``; retained as a compatibility alias.
     coro::task<io::io_result> write_all(std::string_view data) {
-        return write_all(data.data(), data.size());
+        return write_exactly(data.data(), data.size());
     }
 
     /// Close/shutdown the stream

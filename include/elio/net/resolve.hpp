@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -249,6 +250,56 @@ inline bool try_parse_ipv6_literal(std::string_view host, uint16_t port,
     return true;
 }
 
+namespace detail {
+
+struct dns_lookup_result {
+    std::vector<socket_address> addresses;
+    int error = 0;
+};
+
+struct dns_lookup_request {
+    std::string host;
+    uint16_t port = 0;
+};
+
+struct dns_lookup_operation {
+    dns_lookup_request* request = nullptr;
+
+    dns_lookup_result operator()() {
+        auto* raw_request = request;
+        request = nullptr;
+        std::unique_ptr<dns_lookup_request> request_owner(raw_request);
+        dns_lookup_result result;
+
+        struct addrinfo hints{};
+        struct addrinfo* ai_result = nullptr;
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+
+        std::string service = std::to_string(request_owner->port);
+        int rc = getaddrinfo(request_owner->host.c_str(), service.c_str(), &hints, &ai_result);
+        if (rc == 0 && ai_result) {
+            for (auto* current = ai_result; current != nullptr; current = current->ai_next) {
+                if (current->ai_family == AF_INET6) {
+                    auto* sa = reinterpret_cast<struct sockaddr_in6*>(current->ai_addr);
+                    result.addresses.push_back(socket_address(ipv6_address(*sa)));
+                } else if (current->ai_family == AF_INET) {
+                    auto* sa = reinterpret_cast<struct sockaddr_in*>(current->ai_addr);
+                    result.addresses.push_back(socket_address(ipv4_address(*sa)));
+                }
+            }
+            freeaddrinfo(ai_result);
+        }
+
+        if (result.addresses.empty()) {
+            result.error = (rc == EAI_SYSTEM) ? errno : EHOSTUNREACH;
+        }
+        return result;
+    }
+};
+
+}  // namespace detail
+
 inline coro::task<std::vector<socket_address>> resolve_all(
     std::string_view host,
     uint16_t port,
@@ -291,40 +342,10 @@ inline coro::task<std::vector<socket_address>> resolve_all(
         cache->record_miss();
     }
 
-    // Perform blocking DNS resolution via spawn_blocking
-    std::string host_str(host);
-    auto dns_result = co_await elio::spawn_blocking([host_str, port]() {
-        struct resolve_result {
-            std::vector<socket_address> addresses;
-            int error = 0;
-        };
-
-        resolve_result result;
-        struct addrinfo hints{};
-        struct addrinfo* ai_result = nullptr;
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-
-        std::string service = std::to_string(port);
-        int rc = getaddrinfo(host_str.c_str(), service.c_str(), &hints, &ai_result);
-        if (rc == 0 && ai_result) {
-            for (auto* current = ai_result; current != nullptr; current = current->ai_next) {
-                if (current->ai_family == AF_INET6) {
-                    auto* sa = reinterpret_cast<struct sockaddr_in6*>(current->ai_addr);
-                    result.addresses.push_back(socket_address(ipv6_address(*sa)));
-                } else if (current->ai_family == AF_INET) {
-                    auto* sa = reinterpret_cast<struct sockaddr_in*>(current->ai_addr);
-                    result.addresses.push_back(socket_address(ipv4_address(*sa)));
-                }
-            }
-            freeaddrinfo(ai_result);
-        }
-
-        if (result.addresses.empty()) {
-            result.error = (rc == EAI_SYSTEM) ? errno : EHOSTUNREACH;
-        }
-        return result;
-    });
+    // Perform blocking DNS resolution via spawn_blocking. The operation owns
+    // the request so the co_await expression does not carry string captures.
+    auto* request = new detail::dns_lookup_request{std::string(host), port};
+    auto dns_result = co_await elio::spawn_blocking(detail::dns_lookup_operation{request});
 
     // Update cache based on result
     if (options.use_cache) {

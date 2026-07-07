@@ -19,6 +19,7 @@
 #include <thread>
 #include <algorithm>
 #include <functional>
+#include <stdexcept>
 #include <vector>
 
 namespace elio::runtime {
@@ -341,35 +342,7 @@ public:
     }
 
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle) {
-        if (!handle) [[unlikely]] return;
-        if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
-            handle.destroy();
-            return;
-        }
-
-        // Detach from current thread's frame chain before spawning to another thread
-        // to avoid use-after-free when this thread creates another coroutine.
-        auto* promise = coro::get_promise_base(handle.address());
-        if (promise) {
-            promise->detach_from_parent();
-        }
-
-        size_t n = num_threads_.load(std::memory_order_acquire);
-        if (n == 0) [[unlikely]] {
-            handle.destroy();
-            return;
-        }
-        size_t idx = worker_id % n;
-        // Verify the chosen slot is still running. After a shrink the worker at
-        // this index may have been stopped (or be in the process of being
-        // stopped) — pushing into its inbox would orphan the task. Fall through
-        // to do_spawn() so the round-robin path picks a worker that is still
-        // accepting work.
-        if (workers_[idx] && workers_[idx]->is_running()) {
-            workers_[idx]->schedule(handle);
-            return;
-        }
-        do_spawn(handle);
+        (void)do_spawn_to_(worker_id, handle);
     }
 
     [[nodiscard]] size_t num_threads(std::memory_order order = std::memory_order_relaxed) const noexcept {
@@ -601,6 +574,14 @@ public:
     }
 
 private:
+    static std::exception_ptr spawn_rejected_exception_() noexcept {
+        try {
+            throw std::runtime_error("scheduler rejected joinable task before execution");
+        } catch (...) {
+            return std::current_exception();
+        }
+    }
+
     /// Pair an ``on_task_spawned()`` increment with a deferred decrement
     /// installed on the wrapper coroutine's promise. The decrement fires
     /// from ``promise_base::~promise_base`` whenever the frame is freed —
@@ -657,18 +638,22 @@ private:
             auto state = std::make_shared<coro::detail::join_state<T>>();
             handle.promise().join_state_ = state;
             mark_tracked_(handle.promise());
+            bool scheduled = false;
             if constexpr (Pinned) {
-                spawn_to(worker_id, handle);
+                scheduled = do_spawn_to_(worker_id, handle);
             } else {
-                do_spawn(handle);
+                scheduled = do_spawn(handle);
+            }
+            if (!scheduled) {
+                state->set_exception(spawn_rejected_exception_());
             }
             return coro::join_handle<T>(std::move(state));
         } else {
             mark_tracked_(handle.promise());
             if constexpr (Pinned) {
-                spawn_to(worker_id, handle);
+                (void)do_spawn_to_(worker_id, handle);
             } else {
-                do_spawn(handle);
+                (void)do_spawn(handle);
             }
         }
     }
@@ -687,7 +672,40 @@ private:
             draining_workers_.end());
     }
 
-    void do_spawn(std::coroutine_handle<> handle) {
+    bool do_spawn_to_(size_t worker_id, std::coroutine_handle<> handle) {
+        if (!handle) [[unlikely]] return false;
+        if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
+            handle.destroy();
+            return false;
+        }
+
+        // Detach from current thread's frame chain before spawning to another thread
+        // to avoid use-after-free when this thread creates another coroutine.
+        auto* promise = coro::get_promise_base(handle.address());
+        if (promise) {
+            promise->detach_from_parent();
+        }
+
+        size_t n = num_threads_.load(std::memory_order_acquire);
+        if (n == 0) [[unlikely]] {
+            handle.destroy();
+            return false;
+        }
+        size_t idx = worker_id % n;
+        // Verify the chosen slot is still running. After a shrink the worker at
+        // this index may have been stopped (or be in the process of being
+        // stopped) — pushing into its inbox would orphan the task. Fall through
+        // to do_spawn() so the round-robin path picks a worker that is still
+        // accepting work.
+        if (workers_[idx] && workers_[idx]->is_running()) {
+            workers_[idx]->schedule(handle);
+            return true;
+        }
+        return do_spawn(handle);
+    }
+
+    bool do_spawn(std::coroutine_handle<> handle) {
+        if (!handle) [[unlikely]] return false;
         // Release fence ensures all writes to the coroutine frame (including
         // captured lambda state) are visible to the worker that will run this task
         std::atomic_thread_fence(std::memory_order_release);
@@ -695,7 +713,7 @@ private:
         size_t n = num_threads_.load(std::memory_order_acquire);
         if (n == 0) [[unlikely]] {
             handle.destroy();
-            return;
+            return false;
         }
 
         // Check if task has affinity - if so, schedule to that specific worker
@@ -703,7 +721,7 @@ private:
         if (affinity != coro::NO_AFFINITY && affinity < n) {
             if (workers_[affinity]->is_running()) {
                 workers_[affinity]->schedule(handle);
-                return;
+                return true;
             }
             // Target worker not running - clear affinity and fall through
             auto* promise = coro::get_promise_base(handle.address());
@@ -718,7 +736,7 @@ private:
             size_t index = (start_index + i) % n;
             if (workers_[index]->is_running()) {
                 workers_[index]->schedule(handle);
-                return;
+                return true;
             }
         }
 
@@ -726,8 +744,10 @@ private:
         n = num_threads_.load(std::memory_order_acquire);
         if (n > 0 && workers_[0]->is_running()) {
             workers_[0]->schedule(handle);
+            return true;
         } else {
             handle.destroy();
+            return false;
         }
     }
 

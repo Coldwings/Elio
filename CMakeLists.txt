@@ -198,6 +198,48 @@ endif()
 # the user opts in by setting ELIO_ENABLE_RDMA_CM=ON. We try
 # pkg-config first, then fall back to find_library so packages that
 # ship librdmacm without a .pc file still work.
+if(ELIO_ENABLE_RDMA_CM)
+    if(NOT TARGET elio_rdma)
+        message(FATAL_ERROR
+            "ELIO_ENABLE_RDMA_CM=ON requires ELIO_ENABLE_RDMA=ON")
+    endif()
+    find_package(PkgConfig QUIET)
+    set(_RDMACM_LIB "")
+    set(_RDMACM_INC "")
+    if(PkgConfig_FOUND)
+        pkg_check_modules(RDMACM QUIET librdmacm)
+        if(RDMACM_FOUND)
+            set(_RDMACM_LIB "${RDMACM_LIBRARIES}")
+            set(_RDMACM_INC "${RDMACM_INCLUDE_DIRS}")
+        endif()
+    endif()
+    if(NOT _RDMACM_LIB)
+        find_library(_RDMACM_LIB_FALLBACK rdmacm)
+        find_path(_RDMACM_INC_FALLBACK rdma/rdma_cma.h)
+        if(_RDMACM_LIB_FALLBACK AND _RDMACM_INC_FALLBACK)
+            set(_RDMACM_LIB "${_RDMACM_LIB_FALLBACK}")
+            set(_RDMACM_INC "${_RDMACM_INC_FALLBACK}")
+        endif()
+    endif()
+    if(NOT _RDMACM_LIB)
+        message(FATAL_ERROR
+            "ELIO_ENABLE_RDMA_CM=ON but librdmacm was not found "
+            "(checked pkg-config librdmacm and find_library(rdmacm)). "
+            "Install librdmacm-dev or set CMAKE_PREFIX_PATH.")
+    endif()
+    add_library(elio_rdma_cm INTERFACE)
+    target_include_directories(elio_rdma_cm INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+    if(_RDMACM_INC)
+        target_include_directories(elio_rdma_cm INTERFACE ${_RDMACM_INC})
+    endif()
+    target_link_libraries(elio_rdma_cm INTERFACE elio_rdma ${_RDMACM_LIB})
+    target_compile_definitions(elio_rdma_cm INTERFACE ELIO_HAS_RDMA_CM=1)
+    message(STATUS "RDMA CM helper enabled (linking ${_RDMACM_LIB})")
+endif()
+
 # Optional libibverbs lookup, shared by ELIO_ENABLE_RDMA_IBVERBS
 # (the public backend / cq_drain / endpoint module) and
 # ELIO_ENABLE_RDMA_IBVERBS_TESTS (the integration test binary).
@@ -276,48 +318,6 @@ if(ELIO_ENABLE_RDMA_CUDA)
         elio_rdma_ibverbs CUDA::cudart)
     target_compile_definitions(elio_rdma_cuda INTERFACE ELIO_HAS_RDMA_CUDA=1)
     message(STATUS "RDMA CUDA GPUDirect helpers enabled")
-endif()
-
-if(ELIO_ENABLE_RDMA_CM)
-    if(NOT TARGET elio_rdma)
-        message(FATAL_ERROR
-            "ELIO_ENABLE_RDMA_CM=ON requires ELIO_ENABLE_RDMA=ON")
-    endif()
-    find_package(PkgConfig QUIET)
-    set(_RDMACM_LIB "")
-    set(_RDMACM_INC "")
-    if(PkgConfig_FOUND)
-        pkg_check_modules(RDMACM QUIET librdmacm)
-        if(RDMACM_FOUND)
-            set(_RDMACM_LIB "${RDMACM_LIBRARIES}")
-            set(_RDMACM_INC "${RDMACM_INCLUDE_DIRS}")
-        endif()
-    endif()
-    if(NOT _RDMACM_LIB)
-        find_library(_RDMACM_LIB_FALLBACK rdmacm)
-        find_path(_RDMACM_INC_FALLBACK rdma/rdma_cma.h)
-        if(_RDMACM_LIB_FALLBACK AND _RDMACM_INC_FALLBACK)
-            set(_RDMACM_LIB "${_RDMACM_LIB_FALLBACK}")
-            set(_RDMACM_INC "${_RDMACM_INC_FALLBACK}")
-        endif()
-    endif()
-    if(NOT _RDMACM_LIB)
-        message(FATAL_ERROR
-            "ELIO_ENABLE_RDMA_CM=ON but librdmacm was not found "
-            "(checked pkg-config librdmacm and find_library(rdmacm)). "
-            "Install librdmacm-dev or set CMAKE_PREFIX_PATH.")
-    endif()
-    add_library(elio_rdma_cm INTERFACE)
-    target_include_directories(elio_rdma_cm INTERFACE
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
-    )
-    if(_RDMACM_INC)
-        target_include_directories(elio_rdma_cm INTERFACE ${_RDMACM_INC})
-    endif()
-    target_link_libraries(elio_rdma_cm INTERFACE elio_rdma ${_RDMACM_LIB})
-    target_compile_definitions(elio_rdma_cm INTERFACE ELIO_HAS_RDMA_CM=1)
-    message(STATUS "RDMA CM helper enabled (linking ${_RDMACM_LIB})")
 endif()
 
 # Testing

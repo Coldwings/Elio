@@ -101,8 +101,8 @@ if(TARGET elio_rdma_cm)
 endif()
 
 # elio_rdma_ibverbs endpoint smoke tests (S13). Requires libibverbs
-# at compile + link.
-if(TARGET elio_rdma_ibverbs)
+# and librdmacm at compile + link.
+if(TARGET elio_rdma_ibverbs AND TARGET elio_rdma_cm)
     list(APPEND TEST_SOURCES
         unit/test_rdma_ibverbs_endpoint.cpp
     )

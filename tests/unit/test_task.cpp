@@ -7,6 +7,9 @@
 #include <string>
 #include <atomic>
 #include <chrono>
+#include <latch>
+#include <thread>
+#include <vector>
 #include "../test_main.cpp"  // For scaled timeouts
 
 using namespace elio::coro;
@@ -584,6 +587,53 @@ TEST_CASE("go() task throws — handler is called", "[task][spawn][exception]") 
 
     REQUIRE(handler_called.load(std::memory_order_acquire));
     REQUIRE(handler_message == "go task exception");
+}
+
+TEST_CASE("scheduler exception handler can be replaced during reports", "[task][spawn][exception]") {
+    scheduler sched(1);
+
+    constexpr int reporter_count = 4;
+    std::latch reporters_ready(reporter_count);
+    std::latch start_reporting(1);
+    std::atomic<bool> done{false};
+    std::atomic<int> handled{0};
+
+    sched.set_unhandled_exception_handler([&handled](std::exception_ptr) {
+        handled.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    auto reporter = [&] {
+        reporters_ready.count_down();
+        start_reporting.wait();
+        do {
+            sched.report_unhandled_exception(
+                std::make_exception_ptr(std::runtime_error("reported")));
+        } while (!done.load(std::memory_order_acquire));
+    };
+
+    std::vector<std::thread> reporters;
+    for (int i = 0; i < reporter_count; ++i) {
+        reporters.emplace_back(reporter);
+    }
+
+    std::thread updater([&] {
+        reporters_ready.wait();
+        start_reporting.count_down();
+        for (int i = 0; i < 20000; ++i) {
+            sched.set_unhandled_exception_handler(
+                [&handled](std::exception_ptr) {
+                    handled.fetch_add(1, std::memory_order_relaxed);
+                });
+        }
+        done.store(true, std::memory_order_release);
+    });
+
+    updater.join();
+    for (auto& t : reporters) {
+        t.join();
+    }
+
+    REQUIRE(handled.load(std::memory_order_relaxed) > 0);
 }
 
 TEST_CASE("go() task throws — default log when no handler set", "[task][spawn][exception]") {

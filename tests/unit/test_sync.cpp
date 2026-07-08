@@ -90,6 +90,47 @@ TEST_CASE("mutex with coroutines", "[sync][mutex][coro]") {
     REQUIRE(completed.load(std::memory_order_relaxed) == NUM_TASKS);
 }
 
+TEST_CASE("mutex waiter keeps transferred lock until explicit unlock", "[sync][mutex][coro]") {
+    mutex m;
+    REQUIRE(m.try_lock());
+
+    bool waiter_entered = false;
+    bool third_actor_ran = false;
+    bool third_actor_acquired = false;
+
+    auto third_actor_task = [&]() -> task<void> {
+        third_actor_ran = true;
+        if (m.try_lock()) {
+            third_actor_acquired = true;
+            m.unlock();
+        }
+        co_return;
+    };
+    auto third_actor = third_actor_task();
+    auto third_actor_handle = elio::coro::detail::task_access::release(third_actor);
+
+    auto waiter_task = [&]() -> task<void> {
+        co_await m.lock();
+        waiter_entered = true;
+        third_actor_handle.resume();
+        m.unlock();
+    };
+
+    auto t = waiter_task();
+    auto h = elio::coro::detail::task_access::release(t);
+    h.resume();
+
+    REQUIRE_FALSE(waiter_entered);
+    REQUIRE(m.is_locked());
+
+    m.unlock();
+
+    REQUIRE(waiter_entered);
+    REQUIRE(third_actor_ran);
+    REQUIRE_FALSE(third_actor_acquired);
+    REQUIRE_FALSE(m.is_locked());
+}
+
 TEST_CASE("lock_guard RAII", "[sync][mutex]") {
     mutex m;
     

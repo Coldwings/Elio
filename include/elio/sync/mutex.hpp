@@ -40,7 +40,7 @@ public:
             std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
             if (this->is_linked()) {
                 mtx_.waiters_.remove(this);
-            } else {
+            } else if (!resumed_) {
                 // We were already popped from the waiters list by unlock().
                 // If state is set to sentinel (1), it means lock is being
                 // transferred to us but we're being destroyed before resuming.
@@ -83,12 +83,15 @@ public:
             return true; // Suspend
         }
 
-        void await_resume() const noexcept {}
+        void await_resume() noexcept {
+            resumed_ = true;
+        }
 
     private:
         mutex& mtx_;
         std::coroutine_handle<> handle_;
         bool suspended_ = false;  // True if enqueued in waiters_
+        bool resumed_ = false;    // True after a popped waiter resumes normally
 
         friend class mutex;
     };

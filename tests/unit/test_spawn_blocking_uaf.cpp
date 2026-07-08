@@ -250,3 +250,31 @@ TEST_CASE("spawn_blocking detached thread fallback respects caller_alive",
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
+
+TEST_CASE("spawn_blocking detached thread fallback completes without self-deadlock",
+          "[spawn_blocking][fallback]") {
+    // Force the detached-thread fallback by running outside any scheduler
+    // context. The fallback worker resumes this coroutine inline; the
+    // awaitable destructor must not wait for kDone on the same resume stack.
+    std::atomic<bool> completed{false};
+    std::atomic<int> result{0};
+
+    auto task_fn = [&completed, &result]() -> task<void> {
+        int value = co_await elio::spawn_blocking([] { return 123; });
+        result.store(value, std::memory_order_release);
+        completed.store(true, std::memory_order_release);
+    };
+
+    auto t = task_fn();
+    auto handle = elio::coro::detail::task_access::release(t);
+    handle.resume();
+
+    const auto deadline = std::chrono::steady_clock::now() + scaled_ms(5000);
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(scaled_ms(10));
+    }
+
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(result.load(std::memory_order_acquire) == 123);
+}

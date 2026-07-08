@@ -33,6 +33,26 @@ enum resume_state_t : int {
     kDone     = 3,  // worker finished resuming; destructor may proceed
 };
 
+inline thread_local const void* inline_resuming_state = nullptr;
+
+class inline_resume_guard {
+public:
+    explicit inline_resume_guard(const void* state) noexcept
+        : previous_(inline_resuming_state) {
+        inline_resuming_state = state;
+    }
+
+    ~inline_resume_guard() {
+        inline_resuming_state = previous_;
+    }
+
+    inline_resume_guard(const inline_resume_guard&) = delete;
+    inline_resume_guard& operator=(const inline_resume_guard&) = delete;
+
+private:
+    const void* previous_;
+};
+
 // Shared state between the awaiting coroutine and the blocking worker thread.
 // Heap-allocated via shared_ptr so it outlives the coroutine frame if the
 // coroutine is destroyed while the blocking task is still running.
@@ -75,6 +95,17 @@ public:
         // Worker claimed first (state is kResuming).  Spin until it signals
         // kDone, meaning resume/spawn has completed and the handle is no
         // longer being touched.
+        //
+        // If this destructor is running inside the same thread's direct
+        // caller.resume() fallback, waiting for kDone would self-deadlock:
+        // kDone is stored only after caller.resume() returns.  In that case
+        // the worker still owns the heap state and will not touch the
+        // coroutine handle after resume returns, so the awaitable may finish
+        // destruction without waiting.  Destruction from any other thread is
+        // still blocked until kDone protects the coroutine frame.
+        if (expected == kResuming && inline_resuming_state == state_.get()) {
+            return;
+        }
         while (state_->resume_state.load(std::memory_order_acquire) != kDone) {
             // Spin — worker is in the middle of resume and will set kDone
             // shortly (a few instructions, no blocking calls).
@@ -130,6 +161,7 @@ public:
             if (sched && sched->is_running()) {
                 sched->spawn(caller);
             } else if (caller && !caller.done()) {
+                inline_resume_guard guard(state.get());
                 caller.resume();
             }
 

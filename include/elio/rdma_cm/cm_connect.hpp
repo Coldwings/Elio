@@ -97,7 +97,8 @@ inline coro::task<cm_id> resolve(event_channel& ch,
 
     // Wait for ADDR_RESOLVED.
     {
-        rdma_cm_event* event = co_await ch.next_event(token);
+        rdma_cm_event* event = co_await ch.next_event_for(
+            id.native(), token);
         if (!event) co_return fail(ECANCELED);
         const auto type   = event->event;
         const auto status = event->status;
@@ -111,7 +112,8 @@ inline coro::task<cm_id> resolve(event_channel& ch,
         co_return fail(errno);
     }
     {
-        rdma_cm_event* event = co_await ch.next_event(token);
+        rdma_cm_event* event = co_await ch.next_event_for(
+            id.native(), token);
         if (!event) co_return fail(ECANCELED);
         const auto type   = event->event;
         const auto status = event->status;
@@ -139,7 +141,7 @@ inline coro::task<cm_status> complete_connect(
         co_return detail::make_cm_status(errno);
     }
 
-    rdma_cm_event* event = co_await ch.next_event(token);
+    rdma_cm_event* event = co_await ch.next_event_for(id.native(), token);
     if (!event) co_return detail::make_cm_status(ECANCELED);
     const auto type   = event->event;
     const auto status = event->status;

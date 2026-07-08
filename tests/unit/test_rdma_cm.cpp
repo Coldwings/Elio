@@ -87,6 +87,36 @@ TEST_CASE("cm_status reports invalid cm_id as exact -EINVAL",
     REQUIRE_FALSE(status.ok());
 }
 
+TEST_CASE("event backlog preserves events for their matching cm_id",
+          "[rdma_cm][event_channel][routing]") {
+    auto* id_a = reinterpret_cast<rdma_cm_id*>(0x1000);
+    auto* id_b = reinterpret_cast<rdma_cm_id*>(0x2000);
+
+    rdma_cm_event event_b{};
+    event_b.id = id_b;
+    event_b.event = RDMA_CM_EVENT_ROUTE_RESOLVED;
+
+    rdma_cm_event event_a{};
+    event_a.id = id_a;
+    event_a.event = RDMA_CM_EVENT_ADDR_RESOLVED;
+
+    elio::rdma_cm::detail::event_backlog backlog;
+    backlog.stash(&event_b);
+    backlog.stash(&event_a);
+
+    auto* got_a = backlog.take_if([id_a](rdma_cm_event* event) {
+        return event && event->id == id_a;
+    });
+    REQUIRE(got_a == &event_a);
+    REQUIRE(backlog.size() == 1);
+
+    auto* got_b = backlog.take_if([id_b](rdma_cm_event* event) {
+        return event && event->id == id_b;
+    });
+    REQUIRE(got_b == &event_b);
+    REQUIRE(backlog.empty());
+}
+
 TEST_CASE("rdma_cm module version is the S8 string",
           "[rdma_cm][version]") {
     REQUIRE(std::string(elio::rdma_cm::module_version) == "0.0.11-S8");

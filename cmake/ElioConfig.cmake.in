@@ -32,4 +32,8 @@ if(@ELIO_PACKAGE_NEEDS_NGHTTP2@)
     endif()
 endif()
 
+if(@ELIO_PACKAGE_NEEDS_CUDATOOLKIT@)
+    find_dependency(CUDAToolkit REQUIRED)
+endif()
+
 include(${CMAKE_CURRENT_LIST_DIR}/ElioTargets.cmake)

@@ -107,7 +107,14 @@ public:
             co_return cm_id{};
         }
         while (!token.is_cancelled()) {
-            rdma_cm_event* event = co_await channel_->next_event(token);
+            rdma_cm_id* listen_id = listen_id_.native();
+            rdma_cm_event* event = co_await channel_->next_event_if(
+                [listen_id](rdma_cm_event* event) noexcept {
+                    return event
+                        && (event->event == RDMA_CM_EVENT_CONNECT_REQUEST
+                            || event->id == listen_id);
+                },
+                token);
             if (!event) {
                 if (out_status) {
                     out_status->status =
@@ -157,7 +164,7 @@ inline coro::task<cm_status> accept_connect(
                       const_cast<rdma_conn_param*>(conn_param)) != 0) {
         co_return detail::make_cm_status(errno);
     }
-    rdma_cm_event* event = co_await ch.next_event(token);
+    rdma_cm_event* event = co_await ch.next_event_for(id.native(), token);
     if (!event) co_return detail::make_cm_status(ECANCELED);
     const auto type   = event->event;
     const auto status = event->status;

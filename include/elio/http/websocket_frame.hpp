@@ -494,6 +494,7 @@ public:
         messages_.clear();
         control_frames_.clear();
         has_error_ = false;
+        has_initial_frame_ = false;
         error_msg_.clear();
         error_close_code_ = close_code::protocol_error;
     }
@@ -516,6 +517,39 @@ private:
             if (!result.complete) {
                 // Need more data
                 break;
+            }
+
+            // Reject impossible data-message growth as soon as the complete
+            // header reveals the payload length. This keeps a peer from
+            // forcing buffer_ to grow toward an already-invalid frame size.
+            if (!is_control_frame(header.op) && max_message_size_ > 0) {
+                size_t current_size = 0;
+                if (header.op == opcode::continuation) {
+                    // Continuations count against the message currently being
+                    // assembled. If there is no message, the frame is invalid
+                    // even before its payload arrives.
+                    if (!has_initial_frame_) {
+                        has_error_ = true;
+                        error_msg_ = "Continuation frame without initial frame";
+                        error_close_code_ = close_code::protocol_error;
+                        return -1;
+                    }
+                    current_size = current_message_.data.size();
+                } else if (has_initial_frame_) {
+                    has_error_ = true;
+                    error_msg_ = "New message started before previous completed";
+                    error_close_code_ = close_code::protocol_error;
+                    return -1;
+                }
+
+                if (current_size > max_message_size_ ||
+                    header.payload_len >
+                        static_cast<uint64_t>(max_message_size_ - current_size)) {
+                    has_error_ = true;
+                    error_msg_ = "Message exceeds maximum size";
+                    error_close_code_ = close_code::too_large;
+                    return -1;
+                }
             }
 
             if (buffer_.size() < result.frame_size) {
@@ -541,7 +575,7 @@ private:
             
             // Helper to extract (and unmask) the frame payload from the buffer.
             // Deferred so that we can reject oversized data frames *before*
-            // allocating/copying the payload (see the size check below).
+            // allocating/copying the payload.
             auto extract_payload = [&]() {
                 std::string payload(
                     reinterpret_cast<const char*>(buffer_.data() + result.header_size),
@@ -563,7 +597,7 @@ private:
                 // Data frame
                 if (header.op != opcode::continuation) {
                     // Start of new message
-                    if (!current_message_.data.empty() && !current_message_.complete) {
+                    if (has_initial_frame_) {
                         has_error_ = true;
                         error_msg_ = "New message started before previous completed";
                         error_close_code_ = close_code::protocol_error;
@@ -582,18 +616,6 @@ private:
                         error_close_code_ = close_code::protocol_error;
                         return -1;
                     }
-                }
-
-                // Check message size limit BEFORE allocating/copying the payload.
-                // header.payload_len is already known from the frame header, so we
-                // can reject an oversized frame without materialising it as a
-                // std::string.  Uses subtraction to avoid uint64_t overflow.
-                if (max_message_size_ > 0 &&
-                    header.payload_len > max_message_size_ - current_message_.data.size()) {
-                    has_error_ = true;
-                    error_msg_ = "Message exceeds maximum size";
-                    error_close_code_ = close_code::too_large;
-                    return -1;
                 }
 
                 // Extract (and unmask) the payload only after passing the size check.

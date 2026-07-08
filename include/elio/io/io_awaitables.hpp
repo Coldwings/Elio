@@ -1374,6 +1374,115 @@ private:
     bool already_cancelled_before_setup_ = false;
 };
 
+/// Awaitable for cancellable async poll-read operations
+class cancellable_async_poll_read_awaitable : public io_awaitable_base {
+public:
+    cancellable_async_poll_read_awaitable(int fd,
+                                          coro::cancel_token token) noexcept
+        : io_awaitable_base()
+        , fd_(fd)
+        , token_(std::move(token)) {}
+
+    bool await_ready() const noexcept {
+        return token_.is_cancelled();
+    }
+
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        if (token_.is_cancelled()) {
+            already_cancelled_before_setup_ = true;
+            result_ = io_result{-ECANCELED, 0};
+            awaiter.resume();
+            return;
+        }
+
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+
+        auto state = std::make_shared<detail::io_cancel_state>();
+        state->ctx = &ctx;
+        state->awaiter = awaiter;
+        state->worker = runtime::worker_thread::current();
+        state_ = state;
+
+        cancel_registration_ = token_.on_cancel([state]() {
+            state->cancelled.store(true, std::memory_order_release);
+            if (!state->worker) {
+                return;
+            }
+            auto exec = detail::make_io_cancel_executor(
+                state, /*allow_epoll_cancel=*/true);
+            if (auto* promise = coro::get_promise_base(exec.handle.address())) {
+                promise->set_affinity(state->worker->worker_id());
+                promise->detach_from_parent();
+            }
+            state->worker->schedule(exec.handle);
+        });
+
+        if (token_.is_cancelled()) {
+            cancel_registration_.unregister();
+            state->resumed.store(true, std::memory_order_release);
+            result_ = io_result{-ECANCELED, 0};
+            awaiter.resume();
+            return;
+        }
+
+        io_request req{};
+        req.op = io_op::poll_read;
+        req.fd = fd_;
+        req.awaiter = awaiter;
+        req.state = setup_op_state(awaiter);
+        state->op = req.state;
+
+        if (!ctx.prepare(req)) {
+            clear_op_state();
+            state->op = nullptr;
+            cancel_registration_.unregister();
+            result_ = io_result{-EAGAIN, 0};
+            awaiter.resume();
+            return;
+        }
+
+        // Post-registration race: cancel may have fired between on_cancel()
+        // and setting state->op above. Re-check and submit async cancel
+        // inline so the poll op is actually aborted.
+        if (state->cancelled.load(std::memory_order_acquire)) {
+            ctx.cancel(tagged_op_state_user_data(req.state));
+        }
+    }
+
+    cancellable_io_result await_resume() noexcept {
+        cancel_registration_.unregister();
+        bool was_cancelled = already_cancelled_before_setup_;
+        if (!state_ && token_.is_cancelled()) {
+            was_cancelled = true;
+        }
+        if (state_) {
+            state_->resumed.store(true, std::memory_order_release);
+            was_cancelled = was_cancelled ||
+                            state_->cancelled.load(std::memory_order_acquire);
+        }
+        result_ = read_result_from_op_state();
+        if (was_cancelled && result_.result == 0) {
+            result_ = io_result{-ECANCELED, 0};
+        }
+        restore_affinity();
+        return cancellable_io_result{
+            result_,
+            (was_cancelled || token_.is_cancelled())
+                ? coro::cancel_result::cancelled
+                : coro::cancel_result::completed
+        };
+    }
+
+private:
+    int fd_;
+    coro::cancel_token token_;
+    coro::cancel_token::registration cancel_registration_;
+    std::shared_ptr<detail::io_cancel_state> state_;
+    bool already_cancelled_before_setup_ = false;
+};
+
 /// Factory functions for cancellable I/O operations
 
 /// Create a cancellable async recv awaitable
@@ -1396,6 +1505,11 @@ inline auto async_connect(int fd,
                           coro::cancel_token token) {
     return cancellable_async_connect_awaitable(fd, addr, addrlen,
                                                 std::move(token));
+}
+
+/// Create a cancellable async poll awaitable for reading
+inline auto async_poll_read(int fd, coro::cancel_token token) {
+    return cancellable_async_poll_read_awaitable(fd, std::move(token));
 }
 
 } // namespace elio::io

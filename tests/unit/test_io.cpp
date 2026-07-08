@@ -10,11 +10,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <thread>
 #include <atomic>
@@ -2205,6 +2207,59 @@ TEST_CASE("Cancellable recv cancelled during wait", "[io][cancel]") {
 
     close(sv[0]);
     close(sv[1]);
+}
+
+TEST_CASE("Cancellable poll_read cancelled during wait without readiness",
+          "[io][cancel][poll][poll-cancel-regression]") {
+    int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    REQUIRE(efd >= 0);
+
+    std::atomic<bool> started{false};
+    std::atomic<bool> completed{false};
+    cancellable_io_result poll_result{};
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+
+    auto poll_coro = [&]() -> task<void> {
+        started = true;
+        auto result = co_await async_poll_read(efd, source.get_token());
+        poll_result = result;
+        completed = true;
+        co_return;
+    };
+
+    sched.go(poll_coro);
+
+    for (int i = 0; i < 100 && !started; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(started);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    REQUIRE_FALSE(completed);
+
+    source.cancel();
+
+    for (int i = 0; i < 200 && !completed; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    REQUIRE(sched.shutdown(std::chrono::milliseconds(5000)));
+
+    REQUIRE(completed);
+    REQUIRE(poll_result.was_cancelled());
+    REQUIRE_FALSE(poll_result.success());
+    REQUIRE(poll_result.error_code() == ECANCELED);
+
+    std::uint64_t value = 0;
+    errno = 0;
+    REQUIRE(::read(efd, &value, sizeof(value)) == -1);
+    REQUIRE(errno == EAGAIN);
+
+    close(efd);
 }
 
 TEST_CASE("Cancellable send completes normally", "[io][cancel]") {

@@ -183,7 +183,7 @@ struct backend_invoker<polymorphic_backend> {
     return flags;
 }
 
-[[nodiscard]] constexpr std::uint32_t byte_count_hint_(std::size_t bytes) noexcept {
+[[nodiscard]] constexpr std::uint32_t byte_count_hint_(std::uint64_t bytes) noexcept {
     constexpr auto max = std::numeric_limits<std::uint32_t>::max();
     return bytes > max ? max : static_cast<std::uint32_t>(bytes);
 }
@@ -329,8 +329,8 @@ protected:
 
     /// Total bytes across the resolved SGE list. Used by S5b's inline
     /// send precondition check.
-    [[nodiscard]] std::size_t total_bytes_() const noexcept {
-        std::size_t total = 0;
+    [[nodiscard]] std::uint64_t total_bytes_() const noexcept {
+        std::uint64_t total = 0;
         for (const auto& s : effective_sges_()) {
             total += s.length;
         }

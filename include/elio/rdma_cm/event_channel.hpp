@@ -9,7 +9,7 @@
 /// fd that becomes readable when an event is pending; the
 /// application then calls `rdma_get_cm_event()` to read it. This
 /// wrapper sets the fd to non-blocking, polls it via Elio's
-/// `io::async_poll_read`, and consumes one event per iteration.
+/// cancellable `io::async_poll_read`, and consumes one event per iteration.
 ///
 /// **Lifetime**: the channel and its fd live as long as this object;
 /// destruction calls `rdma_destroy_event_channel`. Any
@@ -100,7 +100,8 @@ public:
                 co_return nullptr;  // hard error
             }
             // No event ready; wait for the fd to become readable.
-            auto result = co_await io::async_poll_read(channel_->fd);
+            auto result = co_await io::async_poll_read(channel_->fd, token);
+            if (result.was_cancelled()) co_return nullptr;
             if (token.is_cancelled()) co_return nullptr;
             if (!result.success()) {
                 const int err = result.error_code();

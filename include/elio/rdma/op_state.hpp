@@ -8,19 +8,23 @@
 /// low bit for SRQ routing) and races the awaiter's destructor for
 /// ownership of the heap node:
 ///
-///   * Each awaiter (S3+) holds a `std::unique_ptr<op_state>` and posts
-///     its WR with `wr_id = dispatcher::make_wr_id(state.get())`.
-///   * On completion, the dispatcher decodes the wr_id, CASes
+///   * Each awaiter (S3+) holds a `std::unique_ptr<op_state>`, arms it
+///     as `posting`, and posts its WR with
+///     `wr_id = dispatcher::make_wr_id(state.get())`.
+///   * Once post_* returns, the awaiter commits `posting → pending`.
+///     On completion, the dispatcher decodes the wr_id, CASes
 ///     `pending → completed`, fills the `wc_result`, and resumes the
-///     coroutine. The dispatcher then takes ownership and frees the
-///     op_state.
+///     coroutine. The awaiter then frees the op_state after
+///     await_resume consumes the result.
+///   * If completion arrives inline before post_* returns, the
+///     dispatcher records the result with `posting → completed` and
+///     the awaiter resumes inline only after await_suspend returns.
 ///   * If the awaiter is destroyed before the CQE arrives (e.g. its
 ///     parent task was cancelled), the awaiter's destructor CASes
 ///     `pending → orphaned`. If that CAS wins, the dispatcher's later
 ///     CQE arrival sees `orphaned` and frees the state. If that CAS
-///     loses, the dispatcher already won and freed the state; the
-///     awaiter's unique_ptr was already `.release()`d so its destructor
-///     becomes a no-op.
+///     loses, the dispatcher already completed it and the awaiter's
+///     unique_ptr frees the state normally.
 ///
 /// Net invariant: exactly one party (dispatcher or awaiter destructor)
 /// frees the op_state, and the coroutine handle is resumed at most once.
@@ -36,20 +40,24 @@
 
 namespace elio::rdma::detail {
 
-/// Three-phase state of an in-flight RDMA operation.
+/// Four-phase state of an in-flight RDMA operation.
 ///
-///   * `pending`   — initial; both the dispatcher and the awaiter
-///                   destructor may transition out.
-///   * `completed` — dispatcher won the race (CQE arrived first).
-///                   The dispatcher owns the heap node and resumes
-///                   the coroutine.
+///   * `pending`   — posted and suspended; both the dispatcher and
+///                   the awaiter destructor may transition out.
+///   * `posting`   — await_suspend is still inside the backend
+///                   post_* call. A completion may record the result
+///                   here, but must not resume the coroutine yet.
+///   * `completed` — dispatcher won the race (CQE arrived first) or
+///                   post failed synchronously. The awaiter still owns
+///                   the heap node and frees it after await_resume.
 ///   * `orphaned`  — awaiter destructor won the race (frame went
 ///                   away first). The dispatcher's later CQE will
 ///                   silently drop and free the node.
 enum class op_phase : std::uint8_t {
     pending   = 0,
-    completed = 1,
-    orphaned  = 2,
+    posting   = 1,
+    completed = 2,
+    orphaned  = 3,
 };
 
 /// Heap node owned through the lifetime race described above.

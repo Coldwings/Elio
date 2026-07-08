@@ -53,6 +53,10 @@ struct mock_state {
     send_flags       last_send_flags{};
     std::uint32_t    last_send_imm = 0;
     void*            last_qp = nullptr;
+    dispatcher*      inline_dispatcher = nullptr;
+    bool*            inline_done = nullptr;
+    bool             inline_send_success = false;
+    bool             resumed_before_post_return = false;
 };
 
 struct mock_static_backend {
@@ -68,6 +72,16 @@ struct mock_static_backend {
             state->last_send_flags = flags;
             state->last_send_imm   = imm_data;
             state->last_qp         = qp;
+            if (state->inline_send_success && state->inline_dispatcher
+                && state->send_rc == 0) {
+                state->inline_dispatcher->deliver(
+                    id, wc_status::success,
+                    sges.empty() ? 0 : sges.front().length,
+                    imm_data, /*wc_flags=*/0);
+                if (state->inline_done && *state->inline_done) {
+                    state->resumed_before_post_return = true;
+                }
+            }
             return state->send_rc;
         }
         return 0;
@@ -213,6 +227,32 @@ TEST_CASE("send: happy path suspends and dispatcher resumes",
     REQUIRE(result.byte_len == 16u);
     REQUIRE(result.imm_data == 0xABCDu);
     REQUIRE(result.wc_flags == 0x2u);
+}
+
+TEST_CASE("send: inline successful completion resumes after post returns",
+          "[rdma][send][inline-completion]") {
+    mock_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 101;
+    connection<mock_static_backend> c{&qp_value, disp};
+
+    alignas(8) char payload[16] = {};
+    buffer_view bv{payload, sizeof(payload), 0xC0DE};
+
+    wc_result result{};
+    bool done = false;
+    st.inline_dispatcher = &disp;
+    st.inline_done = &done;
+    st.inline_send_success = true;
+
+    auto task = run_send(c, bv, send_flags{}, result, done);
+
+    REQUIRE(st.sends.load() == 1);
+    REQUIRE_FALSE(st.resumed_before_post_return);
+    REQUIRE(done);
+    REQUIRE(result.ok());
+    REQUIRE(result.byte_len == 16u);
 }
 
 TEST_CASE("send: awaited operation forces completion for unsignaled flags",

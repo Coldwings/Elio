@@ -49,6 +49,22 @@ inline int64_t steady_now_ns() noexcept {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+#ifdef ELIO_OBJECT_CACHE_TEST_HOOKS
+struct release_waiter_published_test_hook {
+    std::atomic<void (*)(void*)> callback{nullptr};
+    std::atomic<void*> context{nullptr};
+
+    void run() const noexcept {
+        auto* cb = callback.load(std::memory_order_acquire);
+        if (cb) {
+            cb(context.load(std::memory_order_acquire));
+        }
+    }
+};
+
+inline release_waiter_published_test_hook release_waiter_published_hook;
+#endif
+
 } // namespace detail_oc
 
 template<typename Key, typename Value,
@@ -264,15 +280,21 @@ private:
                     std::memory_order_release, std::memory_order_relaxed)) {
                 return false;
             }
+#ifdef ELIO_OBJECT_CACHE_TEST_HOOKS
+            detail_oc::release_waiter_published_hook.run();
+#endif
             if (refcount->load(std::memory_order_acquire) == 1) {
                 void* addr = waiter->exchange(
                     nullptr, std::memory_order_acq_rel);
                 if (addr) {
+                    // We still own the waiter and no other borrow can resume
+                    // us, so continue inline.
                     return false;
                 }
                 // We got nullptr back, which means another thread already
-                // exchanged the waiter and scheduled us. Don't suspend.
-                return false;
+                // exchanged the waiter and scheduled us. Stay suspended so
+                // the coroutine is resumed exactly once by that handoff owner.
+                return true;
             }
             return true;
         }

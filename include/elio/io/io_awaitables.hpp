@@ -1085,13 +1085,6 @@ public:
         req.state = setup_op_state(awaiter);
         state->op = req.state;
 
-        // Post-registration race: cancel may have fired between on_cancel()
-        // and setting state->op above. Re-check and submit async cancel
-        // inline so the kernel op is actually aborted.
-        if (state->cancelled.load(std::memory_order_acquire)) {
-            ctx.cancel(tagged_op_state_user_data(req.state));
-        }
-
         if (!ctx.prepare(req)) {
             clear_op_state();
             state->op = nullptr;
@@ -1099,6 +1092,13 @@ public:
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
+        }
+
+        // Post-registration race: cancel may have fired between on_cancel()
+        // and setting state->op above. Re-check after prepare so the backend
+        // can actually find the staged operation and abort it.
+        if (state->cancelled.load(std::memory_order_acquire)) {
+            ctx.cancel(tagged_op_state_user_data(req.state));
         }
     }
 
@@ -1206,13 +1206,6 @@ public:
         req.state = setup_op_state(awaiter);
         state->op = req.state;
 
-        // Post-registration race: cancel may have fired between on_cancel()
-        // and setting state->op above. Re-check and submit async cancel
-        // inline so the kernel op is actually aborted.
-        if (state->cancelled.load(std::memory_order_acquire)) {
-            ctx.cancel(tagged_op_state_user_data(req.state));
-        }
-
         if (!ctx.prepare(req)) {
             clear_op_state();
             state->op = nullptr;
@@ -1220,6 +1213,13 @@ public:
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
+        }
+
+        // Post-registration race: cancel may have fired between on_cancel()
+        // and setting state->op above. Re-check after prepare so the backend
+        // can actually find the staged operation and abort it.
+        if (state->cancelled.load(std::memory_order_acquire)) {
+            ctx.cancel(tagged_op_state_user_data(req.state));
         }
     }
 
@@ -1323,13 +1323,6 @@ public:
         req.state = setup_op_state(awaiter);
         state->op = req.state;
 
-        // Post-registration race: cancel may have fired between on_cancel()
-        // and setting state->op above. Re-check and submit async cancel
-        // inline so the kernel op is actually aborted.
-        if (state->cancelled.load(std::memory_order_acquire)) {
-            ctx.cancel(tagged_op_state_user_data(req.state));
-        }
-
         if (!ctx.prepare(req)) {
             clear_op_state();
             state->op = nullptr;
@@ -1337,6 +1330,13 @@ public:
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
             return;
+        }
+
+        // Post-registration race: cancel may have fired between on_cancel()
+        // and setting state->op above. Re-check after prepare so the backend
+        // can actually find the staged operation and abort it.
+        if (state->cancelled.load(std::memory_order_acquire)) {
+            ctx.cancel(tagged_op_state_user_data(req.state));
         }
     }
 

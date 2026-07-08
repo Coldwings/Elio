@@ -101,13 +101,18 @@ public:
         cm_status* out_status = nullptr,
         coro::cancel_token token = {}) {
         if (!channel_) {
-            if (out_status) out_status->status = EINVAL;
+            if (out_status) {
+                out_status->status = detail::make_cm_status(EINVAL).status;
+            }
             co_return cm_id{};
         }
         while (!token.is_cancelled()) {
             rdma_cm_event* event = co_await channel_->next_event(token);
             if (!event) {
-                if (out_status) out_status->status = ECANCELED;
+                if (out_status) {
+                    out_status->status =
+                        detail::make_cm_status(ECANCELED).status;
+                }
                 co_return cm_id{};
             }
             const auto type = event->event;
@@ -124,10 +129,13 @@ public:
             // re-poll. Errors leave the listener usable as long as
             // the channel survives.
             if (status && out_status) {
-                out_status->status = status;
+                out_status->status =
+                    detail::make_cm_status(status).status;
             }
         }
-        if (out_status) out_status->status = ECANCELED;
+        if (out_status) {
+            out_status->status = detail::make_cm_status(ECANCELED).status;
+        }
         co_return cm_id{};
     }
 
@@ -143,19 +151,19 @@ inline coro::task<cm_status> accept_connect(
     event_channel& ch, cm_id& id,
     const rdma_conn_param* conn_param = nullptr,
     coro::cancel_token token = {}) {
-    if (!id) co_return cm_status{EINVAL};
+    if (auto st = detail::cm_id_status(id); !st.ok()) co_return st;
 
     if (::rdma_accept(id.native(),
                       const_cast<rdma_conn_param*>(conn_param)) != 0) {
-        co_return cm_status{errno};
+        co_return detail::make_cm_status(errno);
     }
     rdma_cm_event* event = co_await ch.next_event(token);
-    if (!event) co_return cm_status{ECANCELED};
+    if (!event) co_return detail::make_cm_status(ECANCELED);
     const auto type   = event->event;
     const auto status = event->status;
     ch.ack(event);
     if (type != RDMA_CM_EVENT_ESTABLISHED) {
-        co_return cm_status{status ? status : EPROTO};
+        co_return detail::make_cm_status(status ? status : EPROTO);
     }
     co_return cm_status{0};
 }

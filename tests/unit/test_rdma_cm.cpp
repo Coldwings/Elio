@@ -19,6 +19,7 @@
 
 #include <elio/rdma_cm/rdma_cm.hpp>
 
+#include <cerrno>
 #include <utility>
 
 using elio::rdma_cm::cm_id;
@@ -60,6 +61,30 @@ TEST_CASE("cm_status::ok matches status==0",
     REQUIRE(zero.ok());
     cm_status err{-22};
     REQUIRE_FALSE(err.ok());
+}
+
+TEST_CASE("cm_status helpers preserve the documented -errno contract",
+          "[rdma_cm][status]") {
+    auto zero = elio::rdma_cm::detail::make_cm_status(0);
+    REQUIRE(zero.status == 0);
+    REQUIRE(zero.ok());
+
+    auto positive_errno = elio::rdma_cm::detail::make_cm_status(EAGAIN);
+    REQUIRE(positive_errno.status == -EAGAIN);
+    REQUIRE_FALSE(positive_errno.ok());
+
+    auto negative_errno =
+        elio::rdma_cm::detail::make_cm_status(-ETIMEDOUT);
+    REQUIRE(negative_errno.status == -ETIMEDOUT);
+    REQUIRE_FALSE(negative_errno.ok());
+}
+
+TEST_CASE("cm_status reports invalid cm_id as exact -EINVAL",
+          "[rdma_cm][status][cm_id]") {
+    cm_id id{};
+    auto status = elio::rdma_cm::detail::cm_id_status(id);
+    REQUIRE(status.status == -EINVAL);
+    REQUIRE_FALSE(status.ok());
 }
 
 TEST_CASE("rdma_cm module version is the S8 string",

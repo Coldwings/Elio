@@ -180,6 +180,13 @@ catch_discover_tests(elio_tests)
 catch_discover_tests(elio_tests_asan)
 catch_discover_tests(elio_tests_tsan)
 
+add_test(NAME package_rdma_cuda_export_metadata
+    COMMAND ${CMAKE_COMMAND}
+        -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+        -DELIO_BINARY_DIR=${CMAKE_BINARY_DIR}/tests/cmake/package_rdma_cuda_export
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_rdma_cuda_package_export.cmake
+)
+
 # Optional libibverbs-backed RDMA integration test (S10). The binary
 # is separate so linking libibverbs is opt-in and devices without
 # rxe simply skip the test rather than failing the build. Discovered

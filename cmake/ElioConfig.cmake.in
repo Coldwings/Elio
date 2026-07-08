@@ -20,8 +20,7 @@ if(@ELIO_PACKAGE_NEEDS_NGHTTP2@)
             if(NOT ELIO_NGHTTP2_LIBRARY OR NOT ELIO_NGHTTP2_INCLUDE_DIR)
                 set(Elio_FOUND FALSE)
                 set(Elio_NOT_FOUND_MESSAGE
-                    "Elio HTTP/2 support requires nghttp2, but no bundled "
-                    "nghttp2 target or system nghttp2 library/header was found.")
+                    "Elio HTTP/2 support requires nghttp2, but no bundled nghttp2 target or system nghttp2 library/header was found.")
                 return()
             endif()
             add_library(nghttp2::nghttp2_static UNKNOWN IMPORTED)

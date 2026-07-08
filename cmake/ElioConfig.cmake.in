@@ -49,6 +49,40 @@ if(@ELIO_PACKAGE_NEEDS_LIBURING@)
     endif()
 endif()
 
+if(@ELIO_PACKAGE_NEEDS_RDMACM@)
+    if(NOT TARGET rdmacm::rdmacm)
+        find_library(ELIO_RDMACM_LIBRARY NAMES rdmacm)
+        find_path(ELIO_RDMACM_INCLUDE_DIR NAMES rdma/rdma_cma.h)
+        if(NOT ELIO_RDMACM_LIBRARY OR NOT ELIO_RDMACM_INCLUDE_DIR)
+            set(Elio_FOUND FALSE)
+            set(Elio_NOT_FOUND_MESSAGE
+                "Elio RDMA CM support requires librdmacm, but no system librdmacm library/header was found.")
+            return()
+        endif()
+        add_library(rdmacm::rdmacm UNKNOWN IMPORTED)
+        set_target_properties(rdmacm::rdmacm PROPERTIES
+            IMPORTED_LOCATION "${ELIO_RDMACM_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${ELIO_RDMACM_INCLUDE_DIR}")
+    endif()
+endif()
+
+if(@ELIO_PACKAGE_NEEDS_IBVERBS@)
+    if(NOT TARGET ibverbs::ibverbs)
+        find_library(ELIO_IBVERBS_LIBRARY NAMES ibverbs)
+        find_path(ELIO_IBVERBS_INCLUDE_DIR NAMES infiniband/verbs.h)
+        if(NOT ELIO_IBVERBS_LIBRARY OR NOT ELIO_IBVERBS_INCLUDE_DIR)
+            set(Elio_FOUND FALSE)
+            set(Elio_NOT_FOUND_MESSAGE
+                "Elio RDMA ibverbs support requires libibverbs, but no system libibverbs library/header was found.")
+            return()
+        endif()
+        add_library(ibverbs::ibverbs UNKNOWN IMPORTED)
+        set_target_properties(ibverbs::ibverbs PROPERTIES
+            IMPORTED_LOCATION "${ELIO_IBVERBS_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${ELIO_IBVERBS_INCLUDE_DIR}")
+    endif()
+endif()
+
 if(@ELIO_PACKAGE_NEEDS_CUDATOOLKIT@)
     find_dependency(CUDAToolkit REQUIRED)
 endif()

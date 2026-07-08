@@ -201,9 +201,9 @@ endif()
 # exposes a TCP-style listen / connect surface that hands an
 # established ibv_qp* back to elio::rdma::connection for the data
 # path. Unlike elio_rdma itself, this DOES link a system library —
-# the user opts in by setting ELIO_ENABLE_RDMA_CM=ON. We try
-# pkg-config first, then fall back to find_library so packages that
-# ship librdmacm without a .pc file still work.
+# the user opts in by setting ELIO_ENABLE_RDMA_CM=ON. We use
+# pkg-config hints when available, then resolve the actual library/header
+# with find_library/find_path so packages without a .pc file still work.
 if(ELIO_ENABLE_RDMA_CM)
     if(NOT TARGET elio_rdma)
         message(FATAL_ERROR
@@ -212,36 +212,38 @@ if(ELIO_ENABLE_RDMA_CM)
     find_package(PkgConfig QUIET)
     set(_RDMACM_LIB "")
     set(_RDMACM_INC "")
+    set(_RDMACM_LIBRARY_HINTS "")
+    set(_RDMACM_INCLUDE_HINTS "")
     if(PkgConfig_FOUND)
         pkg_check_modules(RDMACM QUIET librdmacm)
         if(RDMACM_FOUND)
-            set(_RDMACM_LIB "${RDMACM_LIBRARIES}")
-            set(_RDMACM_INC "${RDMACM_INCLUDE_DIRS}")
+            set(_RDMACM_LIBRARY_HINTS ${RDMACM_LIBRARY_DIRS})
+            set(_RDMACM_INCLUDE_HINTS ${RDMACM_INCLUDE_DIRS})
         endif()
     endif()
-    if(NOT _RDMACM_LIB)
-        find_library(_RDMACM_LIB_FALLBACK rdmacm)
-        find_path(_RDMACM_INC_FALLBACK rdma/rdma_cma.h)
-        if(_RDMACM_LIB_FALLBACK AND _RDMACM_INC_FALLBACK)
-            set(_RDMACM_LIB "${_RDMACM_LIB_FALLBACK}")
-            set(_RDMACM_INC "${_RDMACM_INC_FALLBACK}")
-        endif()
-    endif()
-    if(NOT _RDMACM_LIB)
+    find_library(_RDMACM_LIB_PATH NAMES rdmacm HINTS ${_RDMACM_LIBRARY_HINTS})
+    find_path(_RDMACM_INC_PATH NAMES rdma/rdma_cma.h HINTS ${_RDMACM_INCLUDE_HINTS})
+    if(NOT _RDMACM_LIB_PATH OR NOT _RDMACM_INC_PATH)
         message(FATAL_ERROR
             "ELIO_ENABLE_RDMA_CM=ON but librdmacm was not found "
-            "(checked pkg-config librdmacm and find_library(rdmacm)). "
+            "(checked pkg-config librdmacm, find_library(rdmacm), "
+            "and find_path(rdma/rdma_cma.h)). "
             "Install librdmacm-dev or set CMAKE_PREFIX_PATH.")
+    endif()
+    set(_RDMACM_LIB "${_RDMACM_LIB_PATH}")
+    set(_RDMACM_INC "${_RDMACM_INC_PATH}")
+    if(NOT TARGET rdmacm::rdmacm)
+        add_library(rdmacm::rdmacm UNKNOWN IMPORTED)
+        set_target_properties(rdmacm::rdmacm PROPERTIES
+            IMPORTED_LOCATION "${_RDMACM_LIB}"
+            INTERFACE_INCLUDE_DIRECTORIES "${_RDMACM_INC}")
     endif()
     add_library(elio_rdma_cm INTERFACE)
     target_include_directories(elio_rdma_cm INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
     )
-    if(_RDMACM_INC)
-        target_include_directories(elio_rdma_cm INTERFACE ${_RDMACM_INC})
-    endif()
-    target_link_libraries(elio_rdma_cm INTERFACE elio_rdma ${_RDMACM_LIB})
+    target_link_libraries(elio_rdma_cm INTERFACE elio_rdma rdmacm::rdmacm)
     target_compile_definitions(elio_rdma_cm INTERFACE ELIO_HAS_RDMA_CM=1)
     message(STATUS "RDMA CM helper enabled (linking ${_RDMACM_LIB})")
 endif()
@@ -249,10 +251,12 @@ endif()
 # Optional libibverbs lookup, shared by ELIO_ENABLE_RDMA_IBVERBS
 # (the public backend / cq_drain / endpoint module) and
 # ELIO_ENABLE_RDMA_IBVERBS_TESTS (the integration test binary).
-# Same detection pattern as librdmacm: pkg-config first,
-# find_library fallback.
+# Same detection pattern as librdmacm: pkg-config hints, then
+# find_library/find_path resolution.
 set(_IBVERBS_LIB "")
 set(_IBVERBS_INC "")
+set(_IBVERBS_LIBRARY_HINTS "")
+set(_IBVERBS_INCLUDE_HINTS "")
 if(ELIO_ENABLE_RDMA_IBVERBS OR ELIO_ENABLE_RDMA_IBVERBS_TESTS)
     if(NOT TARGET elio_rdma)
         message(FATAL_ERROR
@@ -262,24 +266,28 @@ if(ELIO_ENABLE_RDMA_IBVERBS OR ELIO_ENABLE_RDMA_IBVERBS_TESTS)
     if(PkgConfig_FOUND)
         pkg_check_modules(IBVERBS QUIET libibverbs)
         if(IBVERBS_FOUND)
-            set(_IBVERBS_LIB "${IBVERBS_LIBRARIES}")
-            set(_IBVERBS_INC "${IBVERBS_INCLUDE_DIRS}")
+            set(_IBVERBS_LIBRARY_HINTS ${IBVERBS_LIBRARY_DIRS})
+            set(_IBVERBS_INCLUDE_HINTS ${IBVERBS_INCLUDE_DIRS})
         endif()
     endif()
-    if(NOT _IBVERBS_LIB)
-        find_library(_IBVERBS_LIB_FALLBACK ibverbs)
-        find_path(_IBVERBS_INC_FALLBACK infiniband/verbs.h)
-        if(_IBVERBS_LIB_FALLBACK AND _IBVERBS_INC_FALLBACK)
-            set(_IBVERBS_LIB "${_IBVERBS_LIB_FALLBACK}")
-            set(_IBVERBS_INC "${_IBVERBS_INC_FALLBACK}")
-        endif()
-    endif()
-    if(NOT _IBVERBS_LIB)
+    find_library(_IBVERBS_LIB_PATH NAMES ibverbs HINTS ${_IBVERBS_LIBRARY_HINTS})
+    find_path(_IBVERBS_INC_PATH NAMES infiniband/verbs.h HINTS ${_IBVERBS_INCLUDE_HINTS})
+    if(NOT _IBVERBS_LIB_PATH OR NOT _IBVERBS_INC_PATH)
         message(FATAL_ERROR
-            "ELIO_ENABLE_RDMA_IBVERBS / _TESTS=ON but libibverbs was not found.")
+            "ELIO_ENABLE_RDMA_IBVERBS / _TESTS=ON but libibverbs was not found "
+            "(checked pkg-config libibverbs, find_library(ibverbs), "
+            "and find_path(infiniband/verbs.h)).")
     endif()
-    set(ELIO_IBVERBS_LIB "${_IBVERBS_LIB}" CACHE INTERNAL
-        "libibverbs link spec")
+    set(_IBVERBS_LIB "${_IBVERBS_LIB_PATH}")
+    set(_IBVERBS_INC "${_IBVERBS_INC_PATH}")
+    if(NOT TARGET ibverbs::ibverbs)
+        add_library(ibverbs::ibverbs UNKNOWN IMPORTED)
+        set_target_properties(ibverbs::ibverbs PROPERTIES
+            IMPORTED_LOCATION "${_IBVERBS_LIB}"
+            INTERFACE_INCLUDE_DIRECTORIES "${_IBVERBS_INC}")
+    endif()
+    set(ELIO_IBVERBS_LIB ibverbs::ibverbs CACHE INTERNAL
+        "libibverbs CMake target")
     set(ELIO_IBVERBS_INC "${_IBVERBS_INC}" CACHE INTERNAL
         "libibverbs include dir")
 endif()
@@ -292,10 +300,7 @@ if(ELIO_ENABLE_RDMA_IBVERBS)
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
     )
-    if(ELIO_IBVERBS_INC)
-        target_include_directories(elio_rdma_ibverbs INTERFACE ${ELIO_IBVERBS_INC})
-    endif()
-    target_link_libraries(elio_rdma_ibverbs INTERFACE elio_rdma ${ELIO_IBVERBS_LIB})
+    target_link_libraries(elio_rdma_ibverbs INTERFACE elio_rdma ibverbs::ibverbs)
     target_compile_definitions(elio_rdma_ibverbs INTERFACE ELIO_HAS_RDMA_IBVERBS=1)
     # If the CM helper is also enabled, the endpoint wrapper becomes
     # active and needs to pull in librdmacm transitively.
@@ -408,6 +413,16 @@ endif()
 set(ELIO_PACKAGE_NEEDS_LIBURING OFF)
 if(URING_LIBRARY AND URING_INCLUDE_DIR)
     set(ELIO_PACKAGE_NEEDS_LIBURING ON)
+endif()
+
+set(ELIO_PACKAGE_NEEDS_RDMACM OFF)
+if(TARGET elio_rdma_cm)
+    set(ELIO_PACKAGE_NEEDS_RDMACM ON)
+endif()
+
+set(ELIO_PACKAGE_NEEDS_IBVERBS OFF)
+if(TARGET elio_rdma_ibverbs)
+    set(ELIO_PACKAGE_NEEDS_IBVERBS ON)
 endif()
 
 set(ELIO_PACKAGE_NEEDS_CUDATOOLKIT OFF)

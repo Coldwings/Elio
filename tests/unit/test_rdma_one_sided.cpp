@@ -321,6 +321,52 @@ TEST_CASE("rdma_read: backend receives local SGE + remote_buffer; "
     REQUIRE(result.byte_len == 200u);
 }
 
+TEST_CASE("rdma_write: local bytes exceeding remote length rejected pre-post",
+          "[rdma][write][length]") {
+    one_sided_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 23;
+    connection<one_sided_static_backend> c{&qp_value, disp};
+
+    char payload[16] = {};
+    buffer_view local{payload, sizeof(payload), 0x1111};
+    remote_buffer remote{0xCAFE, 8, 0x2222};
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_write(c, local, remote, send_flags{}, result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.writes.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == sizeof(payload));
+}
+
+TEST_CASE("rdma_read: local bytes exceeding remote length rejected pre-post",
+          "[rdma][read][length]") {
+    one_sided_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 24;
+    connection<one_sided_static_backend> c{&qp_value, disp};
+
+    char payload[32] = {};
+    buffer_view local{payload, sizeof(payload), 0x3333};
+    remote_buffer remote{0xBEEF, 16, 0x4444};
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_read(c, local, remote, result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.reads.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == sizeof(payload));
+}
+
 TEST_CASE("rdma_write: post failure resumes inline with flush error",
           "[rdma][write][error]") {
     one_sided_state st;

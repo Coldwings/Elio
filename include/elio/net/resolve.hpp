@@ -19,6 +19,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace elio::net {
@@ -262,24 +263,57 @@ struct dns_lookup_request {
     uint16_t port = 0;
 };
 
+struct addrinfo_deleter {
+    void operator()(addrinfo* info) const noexcept {
+        if (info) {
+            freeaddrinfo(info);
+        }
+    }
+};
+
+using addrinfo_owner = std::unique_ptr<addrinfo, addrinfo_deleter>;
+
 struct dns_lookup_operation {
-    dns_lookup_request* request = nullptr;
+    std::unique_ptr<dns_lookup_request> request;
+
+    explicit dns_lookup_operation(std::unique_ptr<dns_lookup_request> request_in) noexcept
+        : request(std::move(request_in)) {}
+
+    dns_lookup_operation(const dns_lookup_operation& other)
+        : request(other.request ? std::make_unique<dns_lookup_request>(*other.request) : nullptr) {}
+
+    dns_lookup_operation& operator=(const dns_lookup_operation& other) {
+        if (this != &other) {
+            request = other.request ? std::make_unique<dns_lookup_request>(*other.request) : nullptr;
+        }
+        return *this;
+    }
+
+    dns_lookup_operation(dns_lookup_operation&&) noexcept = default;
+    dns_lookup_operation& operator=(dns_lookup_operation&&) noexcept = default;
 
     dns_lookup_result operator()() {
-        auto* raw_request = request;
-        request = nullptr;
-        std::unique_ptr<dns_lookup_request> request_owner(raw_request);
         dns_lookup_result result;
+        auto request_owner = std::move(request);
+        if (!request_owner) {
+            result.error = EINVAL;
+            return result;
+        }
+
+        std::string host = std::move(request_owner->host);
+        uint16_t port = request_owner->port;
+        request_owner.reset();
 
         struct addrinfo hints{};
-        struct addrinfo* ai_result = nullptr;
+        struct addrinfo* ai_raw_result = nullptr;
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
 
-        std::string service = std::to_string(request_owner->port);
-        int rc = getaddrinfo(request_owner->host.c_str(), service.c_str(), &hints, &ai_result);
+        std::string service = std::to_string(port);
+        int rc = getaddrinfo(host.c_str(), service.c_str(), &hints, &ai_raw_result);
+        addrinfo_owner ai_result(ai_raw_result);
         if (rc == 0 && ai_result) {
-            for (auto* current = ai_result; current != nullptr; current = current->ai_next) {
+            for (auto* current = ai_result.get(); current != nullptr; current = current->ai_next) {
                 if (current->ai_family == AF_INET6) {
                     auto* sa = reinterpret_cast<struct sockaddr_in6*>(current->ai_addr);
                     result.addresses.push_back(socket_address(ipv6_address(*sa)));
@@ -288,7 +322,6 @@ struct dns_lookup_operation {
                     result.addresses.push_back(socket_address(ipv4_address(*sa)));
                 }
             }
-            freeaddrinfo(ai_result);
         }
 
         if (result.addresses.empty()) {
@@ -343,9 +376,11 @@ inline coro::task<std::vector<socket_address>> resolve_all(
     }
 
     // Perform blocking DNS resolution via spawn_blocking. The operation owns
-    // the request so the co_await expression does not carry string captures.
-    auto* request = new detail::dns_lookup_request{std::string(host), port};
-    auto dns_result = co_await elio::spawn_blocking(detail::dns_lookup_operation{request});
+    // the request without carrying string captures in the coroutine frame.
+    auto request = std::make_unique<detail::dns_lookup_request>(
+        detail::dns_lookup_request{std::string(host), port});
+    auto dns_result = co_await elio::spawn_blocking(
+        detail::dns_lookup_operation(std::move(request)));
 
     // Update cache based on result
     if (options.use_cache) {

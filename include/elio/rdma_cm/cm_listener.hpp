@@ -110,9 +110,15 @@ public:
             rdma_cm_id* listen_id = listen_id_.native();
             rdma_cm_event* event = co_await channel_->next_event_if(
                 [listen_id](rdma_cm_event* event) noexcept {
-                    return event
-                        && (event->event == RDMA_CM_EVENT_CONNECT_REQUEST
-                            || event->id == listen_id);
+                    if (!event) return false;
+                    // CONNECT_REQUEST carries the new connection id in
+                    // event->id, not the listener id; use listen_id to
+                    // route it to the correct cm_listener when multiple
+                    // listeners share one event_channel.
+                    if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
+                        return event->listen_id == listen_id;
+                    }
+                    return event->id == listen_id;
                 },
                 token);
             if (!event) {

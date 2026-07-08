@@ -1201,13 +1201,8 @@ TEST_CASE("UDS echo test", "[uds][echo]") {
 // ============================================================================
 
 #include <elio/net/tcp.hpp>
-#include <elio/time/timer.hpp>
-
-// net::stream pulls in the TLS headers (OpenSSL). Only include it when TLS is
-// compiled in so the plain-TCP build of these tests stays OpenSSL-free.
-#if defined(ELIO_HAS_TLS)
 #include <elio/net/stream.hpp>
-#endif
+#include <elio/time/timer.hpp>
 
 static task<void> tcp_connect_regression_attempt(
     uint16_t port,
@@ -1684,7 +1679,6 @@ TEST_CASE("tcp_stream read_exactly/write_exactly", "[tcp][stream][exact]") {
     sched.shutdown();
 }
 
-#if defined(ELIO_HAS_TLS)
 TEST_CASE("net::stream read_exactly/write_exactly delegate to TCP",
           "[tcp][stream][exact][net_stream]") {
     // Wrap plain TCP endpoints in the unified net::stream and confirm the
@@ -1829,7 +1823,37 @@ TEST_CASE("net::stream exact helpers on disconnected stream return -ENOTCONN",
     REQUIRE(read_result.result == -ENOTCONN);
     REQUIRE(write_result.result == -ENOTCONN);
 }
-#endif // ELIO_HAS_TLS
+
+#if !defined(ELIO_HAS_TLS) || !ELIO_HAS_TLS
+TEST_CASE("net::connect secure request without TLS reports unsupported",
+          "[tcp][stream][connect][net_stream]") {
+    std::optional<elio::net::stream> result;
+    std::atomic<bool> done{false};
+    int observed_errno = 0;
+
+    scheduler sched(1);
+    sched.start();
+
+    auto coro = [&]() -> task<void> {
+        errno = 0;
+        result = co_await elio::net::connect("localhost", 443, true, nullptr);
+        observed_errno = errno;
+        done = true;
+    };
+
+    sched.go(coro);
+
+    for (int i = 0; i < 200 && !done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(done);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(observed_errno == ENOTSUP);
+}
+#endif
 
 TEST_CASE("TCP connect regression avoids double connect", "[tcp][connect][regression]") {
     auto listener = tcp_listener::bind(ipv6_address("::1", 0));

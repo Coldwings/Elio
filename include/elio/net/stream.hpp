@@ -1,31 +1,41 @@
 #pragma once
 
 /// @file stream.hpp
-/// @brief Unified stream abstraction for TCP and TLS connections
+/// @brief Stream abstraction for TCP connections, with optional TLS support
 ///
 /// This file provides a polymorphic stream wrapper that abstracts over
-/// plain TCP streams and TLS-encrypted streams, eliminating code
-/// duplication in HTTP, WebSocket, and SSE clients.
+/// plain TCP streams and, when ELIO_HAS_TLS is enabled, TLS-encrypted streams,
+/// eliminating code duplication in HTTP, WebSocket, and SSE clients.
 
 #include <elio/net/tcp.hpp>
 #include <elio/net/resolve.hpp>
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
 #include <elio/tls/tls_context.hpp>
 #include <elio/tls/tls_stream.hpp>
+#endif
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
 
 #include <variant>
 #include <chrono>
+#include <cerrno>
+#include <cstddef>
 #include <limits>
+#include <optional>
+#include <string_view>
 #include <type_traits>
 
 namespace elio::net {
 
-/// Unified stream type that can be either plain TCP or TLS encrypted
-/// Provides a common interface for read/write operations
+/// Stream type that can be plain TCP, or TLS encrypted when ELIO_HAS_TLS is set.
+/// Provides a common interface for read/write operations.
 class stream {
 public:
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
     using variant_type = std::variant<std::monostate, tcp_stream, tls::tls_stream>;
+#else
+    using variant_type = std::variant<std::monostate, tcp_stream>;
+#endif
 
     /// Default constructor - creates a disconnected stream
     stream() = default;
@@ -34,9 +44,11 @@ public:
     explicit stream(tcp_stream tcp)
         : stream_(std::move(tcp)) {}
 
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
     /// Create from a TLS stream
     explicit stream(tls::tls_stream tls)
         : stream_(std::move(tls)) {}
+#endif
 
     // Move only
     stream(stream&&) = default;
@@ -56,9 +68,12 @@ public:
     coro::task<io::io_result> read(void* buffer, size_t length) {
         if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
             co_return co_await tcp->read(buffer, length);
-        } else if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+        }
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
             co_return co_await tls->read(buffer, length);
         }
+#endif
         co_return io::io_result{-ENOTCONN, 0};
     }
 
@@ -66,9 +81,12 @@ public:
     coro::task<io::io_result> write(const void* buffer, size_t length) {
         if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
             co_return co_await tcp->write(buffer, length);
-        } else if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+        }
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
             co_return co_await tls->write(buffer, length);
         }
+#endif
         co_return io::io_result{-ENOTCONN, 0};
     }
 
@@ -90,9 +108,12 @@ public:
     coro::task<io::io_result> read_exactly(void* buffer, size_t length) {
         if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
             co_return co_await tcp->read_exactly(buffer, length);
-        } else if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+        }
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
             co_return co_await tls->read_exactly(buffer, length);
         }
+#endif
         co_return io::io_result{-ENOTCONN, 0};
     }
 
@@ -106,9 +127,12 @@ public:
     coro::task<io::io_result> write_exactly(const void* buffer, size_t length) {
         if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
             co_return co_await tcp->write_exactly(buffer, length);
-        } else if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+        }
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
             co_return co_await tls->write_exactly(buffer, length);
         }
+#endif
         co_return io::io_result{-ENOTCONN, 0};
     }
 
@@ -139,9 +163,14 @@ public:
 
     /// Close/shutdown the stream
     coro::task<void> close() {
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
         if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
             co_await tls->shutdown();
-        } else if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
+            stream_ = std::monostate{};
+            co_return;
+        }
+#endif
+        if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
             // Plain TCP streams have an async close() method
             co_await tcp->close();
         }
@@ -184,6 +213,7 @@ public:
         return std::get<tcp_stream>(stream_);
     }
 
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
     /// Access underlying TLS stream (throws if not TLS or disconnected)
     tls::tls_stream& as_tls() {
         return std::get<tls::tls_stream>(stream_);
@@ -192,6 +222,7 @@ public:
     const tls::tls_stream& as_tls() const {
         return std::get<tls::tls_stream>(stream_);
     }
+#endif
 
     /// Check if holds TCP stream
     bool is_tcp() const noexcept {
@@ -200,7 +231,11 @@ public:
 
     /// Check if holds TLS stream
     bool is_tls() const noexcept {
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
         return std::holds_alternative<tls::tls_stream>(stream_);
+#else
+        return false;
+#endif
     }
 
 private:
@@ -208,12 +243,13 @@ private:
     std::chrono::steady_clock::time_point last_use_ = std::chrono::steady_clock::now();
 };
 
-/// Connect to a host, automatically selecting TCP or TLS based on secure flag
-/// @param host Hostname to connect to
-/// @param port Port number
-/// @param secure If true, establish TLS connection
-/// @param tls_ctx TLS context (required if secure=true)
-/// @return Connected stream on success, std::nullopt on error
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+/// Connect to a host, automatically selecting TCP or TLS based on secure flag.
+/// @param host Hostname to connect to.
+/// @param port Port number.
+/// @param secure If true, establish TLS connection.
+/// @param tls_ctx TLS context (required if secure=true).
+/// @return Connected stream on success, std::nullopt on error.
 inline coro::task<std::optional<stream>>
 connect(std::string_view host, uint16_t port, bool secure = false,
         tls::tls_context* tls_ctx = nullptr,
@@ -240,5 +276,30 @@ connect(std::string_view host, uint16_t port, bool secure = false,
         co_return stream(std::move(*result));
     }
 }
+#else
+/// Connect to a host using plain TCP. If secure is requested without TLS
+/// support compiled in, the connection fails with std::nullopt.
+inline coro::task<std::optional<stream>>
+connect(std::string_view host, uint16_t port, bool secure = false,
+        std::nullptr_t tls_ctx = nullptr,
+        resolve_options resolve_opts = default_cached_resolve_options()) {
+    (void)tls_ctx;
+    if (secure) {
+        errno = ENOTSUP;
+        co_return std::nullopt;
+    }
+
+    auto resolved = co_await resolve_hostname(host, port, resolve_opts);
+    if (!resolved) {
+        co_return std::nullopt;
+    }
+
+    auto result = co_await tcp_connect(*resolved);
+    if (!result) {
+        co_return std::nullopt;
+    }
+    co_return stream(std::move(*result));
+}
+#endif
 
 } // namespace elio::net

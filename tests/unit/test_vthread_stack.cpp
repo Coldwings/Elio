@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <elio/coro/promise_base.hpp>
 #include <elio/elio.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <elio/coro/vthread_stack.hpp>

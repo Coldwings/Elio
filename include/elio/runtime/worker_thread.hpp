@@ -202,6 +202,11 @@ public:
 private:
     void request_stop() noexcept;
 
+    void leave_draining_mode() noexcept {
+        draining_deadline_ = {};
+        draining_.store(false, std::memory_order_release);
+    }
+
     void run();
     void drain_inbox() noexcept;
     [[nodiscard]] std::coroutine_handle<> get_next_task() noexcept;

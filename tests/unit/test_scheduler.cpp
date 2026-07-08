@@ -55,6 +55,18 @@ task<void> io_after_resume_task(std::chrono::milliseconds sleep_for_dur,
     done->store(true, std::memory_order_release);
 }
 
+task<void> gated_io_task(std::atomic<bool>* running,
+                         std::atomic<bool>* proceed,
+                         std::chrono::milliseconds sleep_for_dur,
+                         std::atomic<bool>* done) {
+    running->store(true, std::memory_order_release);
+    while (!proceed->load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    co_await sleep_for(sleep_for_dur);
+    done->store(true, std::memory_order_release);
+}
+
 } // namespace
 
 TEST_CASE("Scheduler construction", "[scheduler]") {
@@ -387,6 +399,64 @@ TEST_CASE("Scheduler shrink does not orphan I/O from a retiring worker",
     REQUIRE(sched.num_threads() == 1);
 
     // The redistributed I/O task must complete on the surviving worker.
+    auto io_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!io_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < io_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(io_done.load(std::memory_order_acquire));
+
+    sched.shutdown();
+}
+
+TEST_CASE("Scheduler shrink drains I/O started after retirement begins",
+          "[scheduler]") {
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> task_running{false};
+    std::atomic<bool> proceed{false};
+    std::atomic<bool> io_done{false};
+
+    sched.go_to(1, gated_io_task, &task_running, &proceed,
+                scaled_ms(40), &io_done);
+
+    auto running_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!task_running.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < running_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(task_running.load(std::memory_order_acquire));
+
+    std::exception_ptr shrink_error;
+    std::thread shrinker([&] {
+        try {
+            sched.set_thread_count(1);
+        } catch (...) {
+            shrink_error = std::current_exception();
+        }
+    });
+
+    auto shrink_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (sched.num_threads(std::memory_order_acquire) != 1 &&
+           std::chrono::steady_clock::now() < shrink_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    bool shrink_visible = (sched.num_threads(std::memory_order_acquire) == 1);
+
+    // Give the old shrink path time to reach stop()+join while the retiring
+    // worker is still inside the gated task and has no pending I/O yet.
+    if (shrink_visible) {
+        std::this_thread::sleep_for(scaled_ms(50));
+    }
+    proceed.store(true, std::memory_order_release);
+
+    shrinker.join();
+    if (shrink_error) {
+        std::rethrow_exception(shrink_error);
+    }
+    REQUIRE(shrink_visible);
+
     auto io_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
     while (!io_done.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < io_deadline) {

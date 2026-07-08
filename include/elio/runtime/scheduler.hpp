@@ -201,9 +201,15 @@ public:
         // Stop and join any draining workers left from prior shrink operations.
         {
             std::lock_guard<std::mutex> lock(workers_mutex_);
-            for (auto& [w, t] : draining_workers_) {
-                w->stop();
+            for (auto& [idx, t] : draining_workers_) {
+                auto* worker = workers_[idx].get();
+                if (worker) {
+                    worker->stop();
+                }
                 if (t.joinable()) t.join();
+                if (worker) {
+                    worker->leave_draining_mode();
+                }
             }
             draining_workers_.clear();
         }
@@ -410,8 +416,10 @@ public:
             
             for (size_t i = old_count; i < count; ++i) {
                 if (workers_[i]) {
-                    // Slot already populated (either by ctor or a prior grow
-                    // that was later shrunk). Restart the worker in place.
+                    // Slot already populated by the ctor or a prior shrink.
+                    // If the prior worker is still draining I/O, wait for its
+                    // detached thread before restarting this slot in place.
+                    wait_for_draining_worker_(i);
                     if (running_.load(std::memory_order_relaxed)) {
                         workers_[i]->start();
                     }
@@ -453,40 +461,19 @@ public:
             // Update count first so new spawns go to remaining workers.
             num_threads_.store(count, std::memory_order_release);
 
-            // Wait for the doomed workers' I/O contexts to drain before stopping
-            // them. If a worker is stopped while it has pending I/O (e.g. a
-            // coroutine suspended on co_await recv()), the io_context is no
-            // longer polled and those coroutines never resume — silent leak.
-            constexpr auto io_drain_timeout = std::chrono::seconds(5);
-            constexpr auto poll_interval = std::chrono::milliseconds(1);
-            auto deadline = std::chrono::steady_clock::now() + io_drain_timeout;
-            while (std::chrono::steady_clock::now() < deadline) {
-                bool all_drained = true;
-                for (size_t i = count; i < old_count; ++i) {
-                    if (workers_[i]->io_context().pending_count() > 0) {
-                        all_drained = false;
-                        break;
-                    }
-                }
-                if (all_drained) break;
-                std::this_thread::sleep_for(poll_interval);
-            }
-
             // Join any previously-draining workers that have finished.
             reap_draining_workers_();
 
-            for (size_t i = count; i < old_count; ++i) {
-                if (workers_[i]->io_context().pending_count() == 0) {
-                    // Fully drained — stop immediately.
-                    workers_[i]->stop();
-                    workers_[i]->redistribute_tasks(this);
-                } else {
-                    // Still has pending I/O — enter draining mode. The worker
-                    // continues polling its io_context and self-exits when
-                    // pending_count() reaches 0.
+            // Move retiring workers out of normal task execution before
+            // deciding whether their I/O contexts are drained. Otherwise a
+            // worker can observe pending_count()==0, run a queued task before
+            // stop() takes effect, and bind fresh I/O to an io_context that is
+            // about to stop being polled.
+            if (running_.load(std::memory_order_relaxed)) {
+                for (size_t i = count; i < old_count; ++i) {
                     workers_[i]->enter_draining_mode();
                     std::thread t = workers_[i]->detach_thread();
-                    draining_workers_.emplace_back(std::move(workers_[i]), std::move(t));
+                    draining_workers_.emplace_back(i, std::move(t));
                 }
             }
         }
@@ -693,17 +680,29 @@ private:
     }
 
     void reap_draining_workers_() noexcept {
-        draining_workers_.erase(
-            std::remove_if(draining_workers_.begin(), draining_workers_.end(),
-                [](auto& entry) {
-                    auto& [w, t] = entry;
-                    if (!w->is_running()) {
-                        if (t.joinable()) t.join();
-                        return true;
-                    }
-                    return false;
-                }),
-            draining_workers_.end());
+        auto it = draining_workers_.begin();
+        while (it != draining_workers_.end()) {
+            auto& [idx, t] = *it;
+            auto* worker = workers_[idx].get();
+            if (!worker || !worker->is_running()) {
+                if (t.joinable()) t.join();
+                if (worker) worker->leave_draining_mode();
+                it = draining_workers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void wait_for_draining_worker_(size_t index) noexcept {
+        auto it = std::find_if(draining_workers_.begin(), draining_workers_.end(),
+            [index](const auto& entry) { return entry.first == index; });
+        if (it == draining_workers_.end()) return;
+
+        auto* worker = workers_[index].get();
+        if (it->second.joinable()) it->second.join();
+        if (worker) worker->leave_draining_mode();
+        draining_workers_.erase(it);
     }
 
     bool do_spawn_to_(size_t worker_id, std::coroutine_handle<> handle,
@@ -826,9 +825,11 @@ private:
     mutable std::mutex idle_mutex_;
     mutable std::condition_variable idle_cv_;
 
-    // Workers that are draining pending I/O after a shrink operation.
+    // Join handles for workers that are draining pending I/O after a shrink
+    // operation. The worker objects stay in workers_ slots so stale lock-free
+    // readers that loaded the old thread count never race with unique_ptr moves.
     // Protected by workers_mutex_.
-    std::vector<std::pair<std::unique_ptr<worker_thread>, std::thread>> draining_workers_;
+    std::vector<std::pair<size_t, std::thread>> draining_workers_;
 
     // Per-scheduler unhandled exception handler. Empty means default behavior
     // (log ERROR). Atomic shared ownership keeps a loaded handler alive while a

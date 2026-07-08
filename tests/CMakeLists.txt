@@ -195,6 +195,14 @@ add_test(NAME package_rdma_cuda_export_metadata
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_rdma_cuda_package_export.cmake
 )
 
+add_test(NAME package_elio_compile_feature_export
+    COMMAND ${CMAKE_COMMAND}
+        -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+        -DELIO_BINARY_DIR=${CMAKE_BINARY_DIR}/tests/cmake/package_elio_compile_feature_export
+        -DELIO_PARENT_BINARY_DIR=${CMAKE_BINARY_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_elio_compile_feature_export.cmake
+)
+
 add_executable(elio_rdma_cuda_lifetime_tests
     unit/test_rdma_cuda_gpu_memory_region.cpp
 )

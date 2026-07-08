@@ -44,6 +44,7 @@ target_include_directories(elio INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+target_compile_features(elio INTERFACE cxx_std_20)
 
 # Debug metadata option
 if(ELIO_ENABLE_DEBUG_METADATA)

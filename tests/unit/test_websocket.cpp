@@ -385,6 +385,29 @@ TEST_CASE("WebSocket frame parser", "[websocket][parser]") {
         auto msg = parser.get_message();
         REQUIRE(msg->data == "Hello");
     }
+
+    SECTION("reset clears partial message state") {
+        frame_parser parser;
+
+        frame_header partial_hdr;
+        partial_hdr.op = opcode::binary;
+        partial_hdr.fin = false;
+        partial_hdr.masked = false;
+        auto partial = encode_frame(partial_hdr, "partial");
+        parser.parse(partial.data(), partial.size());
+
+        parser.reset();
+
+        auto complete = encode_binary_frame("fresh", false);
+        auto consumed = parser.parse(complete.data(), complete.size());
+
+        REQUIRE_FALSE(parser.has_error());
+        REQUIRE(consumed == static_cast<ssize_t>(complete.size()));
+        REQUIRE(parser.has_message());
+        auto msg = parser.get_message();
+        REQUIRE(msg.has_value());
+        REQUIRE(msg->data == "fresh");
+    }
     
     SECTION("max message size enforcement") {
         frame_parser parser;
@@ -403,6 +426,19 @@ TEST_CASE("WebSocket frame parser", "[websocket][parser]") {
 
         auto frame = encode_binary_frame(std::string(64, 'x'), false);
         auto consumed = parser.parse(frame.data(), frame.size());
+
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::too_large);
+        REQUIRE(consumed < 0);
+    }
+
+    SECTION("oversized frame rejected after header before payload arrives") {
+        frame_parser parser;
+        parser.set_max_message_size(10);
+
+        auto frame = encode_binary_frame(std::string(64, 'x'), false);
+        const auto header_size = frame.size() - 64;
+        auto consumed = parser.parse(frame.data(), header_size);
 
         REQUIRE(parser.has_error());
         REQUIRE(parser.error_close_code() == close_code::too_large);
@@ -464,6 +500,33 @@ TEST_CASE("WebSocket frame parser", "[websocket][parser]") {
         REQUIRE_FALSE(parser.has_message());
 
         auto consumed = parser.parse(frag2.data(), frag2.size());
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::too_large);
+        REQUIRE(consumed < 0);
+    }
+
+    SECTION("fragmented continuation rejected after header before payload arrives") {
+        frame_parser parser;
+        parser.set_max_message_size(10);
+
+        frame_header hdr1;
+        hdr1.op = opcode::binary;
+        hdr1.fin = false;
+        hdr1.masked = false;
+        auto frag1 = encode_frame(hdr1, std::string(6, 'a'));  // 6 bytes, under 10
+
+        frame_header hdr2;
+        hdr2.op = opcode::continuation;
+        hdr2.fin = true;
+        hdr2.masked = false;
+        auto frag2 = encode_frame(hdr2, std::string(8, 'b'));  // 6 + 8 = 14 > 10
+        const auto frag2_header_size = frag2.size() - 8;
+
+        parser.parse(frag1.data(), frag1.size());
+        REQUIRE_FALSE(parser.has_error());
+        REQUIRE_FALSE(parser.has_message());
+
+        auto consumed = parser.parse(frag2.data(), frag2_header_size);
         REQUIRE(parser.has_error());
         REQUIRE(parser.error_close_code() == close_code::too_large);
         REQUIRE(consumed < 0);

@@ -82,9 +82,8 @@ public:
         
         for (auto& [fd, state] : fd_states_) {
             for (auto& op : state.pending_ops) {
-                if (op.awaiter && !op.awaiter.done()) {
-                    deferred_resumes.push_back({op.awaiter, io_result{-ECANCELED, 0}});
-                }
+                enqueue_resume(op.req.state, op.awaiter,
+                               io_result{-ECANCELED, 0}, &deferred_resumes);
             }
         }
         fd_states_.clear();
@@ -92,9 +91,8 @@ public:
         // Cancel all pending timers
         while (!timer_queue_.empty()) {
             auto& entry = timer_queue_.top();
-            if (entry.awaiter && !entry.awaiter.done()) {
-                deferred_resumes.push_back({entry.awaiter, io_result{-ECANCELED, 0}});
-            }
+            enqueue_resume(entry.state, entry.awaiter,
+                           io_result{-ECANCELED, 0}, &deferred_resumes);
             timer_queue_.pop();
         }
         
@@ -166,7 +164,7 @@ public:
                 void* ckey = req.state
                     ? tagged_op_state_user_data(req.state)
                     : req.awaiter.address();
-                timer_queue_.push(timer_entry{deadline, req.awaiter, ckey});
+                timer_queue_.push(timer_entry{deadline, req.awaiter, ckey, req.state});
                 pending_count_++;
 
                 ELIO_LOG_DEBUG("Prepared timeout: {}ns", timeout_ns);
@@ -308,9 +306,7 @@ public:
             
             io_result result{0, 0};  // Timeout completed successfully
             
-            if (entry.awaiter && !entry.awaiter.done()) {
-                deferred_resumes.push_back({entry.awaiter, result});
-            }
+            enqueue_resume(entry.state, entry.awaiter, result, &deferred_resumes);
             
             pending_count_--;
             completions++;
@@ -436,11 +432,8 @@ public:
                                     });
             
             if (it != state.pending_ops.end()) {
-                // Collect handle for deferred resumption
-                if (it->awaiter && !it->awaiter.done()) {
-                    to_resume = {it->awaiter, io_result{-ECANCELED, 0}};
-                    found_entry = true;
-                }
+                found_entry = claim_resume(it->req.state, it->awaiter,
+                                           io_result{-ECANCELED, 0}, to_resume);
                 state.pending_ops.erase(it);
                 pending_count_--;
                 
@@ -462,10 +455,9 @@ public:
                 timer_queue_.pop();
                 // Match against cancel_key (tagged op_state or awaiter address)
                 if (entry.cancel_key == user_data) {
-                    if (entry.awaiter && !entry.awaiter.done()) {
-                        to_resume = {entry.awaiter, io_result{-ECANCELED, 0}};
-                        found_entry = true;
-                    }
+                    found_entry = claim_resume(entry.state, entry.awaiter,
+                                               io_result{-ECANCELED, 0}, to_resume)
+                                  || found_entry;
                     pending_count_--;
                     // Don't add back to remaining
                 } else {
@@ -533,6 +525,7 @@ private:
         std::chrono::steady_clock::time_point deadline;
         std::coroutine_handle<> awaiter;
         void* cancel_key = nullptr;  ///< Key for cancel matching (tagged op_state or awaiter address)
+        op_state* state = nullptr;
 
         /// Comparison for min-heap (earliest deadline first)
         bool operator>(const timer_entry& other) const {
@@ -545,6 +538,50 @@ private:
         std::coroutine_handle<> handle;
         io_result result;
     };
+
+    static bool claim_resume(op_state* state,
+                             std::coroutine_handle<> fallback,
+                             io_result result,
+                             deferred_resume_entry& out) {
+        auto handle = fallback;
+        if (state) {
+            state->result = result.result;
+            state->flags = result.flags;
+
+            uint8_t expected = op_state::phase_pending;
+            if (!state->phase.compare_exchange_strong(
+                    expected, op_state::phase_completed,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                if (expected == op_state::phase_orphaned) {
+                    delete state;
+                }
+                return false;
+            }
+            handle = state->handle;
+        }
+
+        if (!handle || handle.done()) {
+            return false;
+        }
+        out = {handle, result};
+        return true;
+    }
+
+    static void enqueue_resume(op_state* state,
+                               std::coroutine_handle<> fallback,
+                               io_result result,
+                               std::vector<deferred_resume_entry>* deferred_resumes) {
+        deferred_resume_entry entry{};
+        if (!claim_resume(state, fallback, result, entry)) {
+            return;
+        }
+        if (deferred_resumes) {
+            deferred_resumes->push_back(entry);
+        } else {
+            last_result_ = entry.result;
+            safe_resume(entry.handle);
+        }
+    }
     
     /// Min-heap priority queue for timers
     using timer_queue_t = std::priority_queue<timer_entry, 
@@ -570,14 +607,7 @@ private:
 
         io_result res{result, 0};
 
-        if (op.awaiter && !op.awaiter.done()) {
-            if (deferred_resumes) {
-                deferred_resumes->push_back({op.awaiter, res});
-            } else {
-                last_result_ = res;
-                op.awaiter.resume();
-            }
-        }
+        enqueue_resume(op.req.state, op.awaiter, res, deferred_resumes);
     }
     
     /// Execute async I/O operation
@@ -687,14 +717,7 @@ private:
         ELIO_LOG_DEBUG("Completed io_op::{} on fd={}: result={}", 
                        static_cast<int>(op.req.op), op.req.fd, result);
         
-        if (op.awaiter && !op.awaiter.done()) {
-            if (deferred_resumes) {
-                deferred_resumes->push_back({op.awaiter, io_res});
-            } else {
-                last_result_ = io_res;
-                safe_resume(op.awaiter);
-            }
-        }
+        enqueue_resume(op.req.state, op.awaiter, io_res, deferred_resumes);
     }
 
     /// Safely resume a coroutine handle with proper vthread_stack context

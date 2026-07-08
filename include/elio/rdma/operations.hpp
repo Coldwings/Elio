@@ -175,6 +175,12 @@ struct backend_invoker<polymorphic_backend> {
     }
 };
 
+/// Awaited send-queue operations must request a CQE to resume safely.
+[[nodiscard]] constexpr send_flags require_completion_(send_flags flags) noexcept {
+    flags.signaled = true;
+    return flags;
+}
+
 /// Shared awaiter machinery — owns the op_state, runs the orphan race
 /// in the destructor, exposes a typed `await_resume` returning the
 /// `wc_result` filled in by the dispatcher.
@@ -333,7 +339,8 @@ public:
                    std::size_t max_inline = 0,
                    std::uint32_t imm_data = 0) noexcept
         : sge_holder(buf), qp_(qp), backend_(backend_or_null),
-          flags_(flags), max_inline_(max_inline), imm_data_(imm_data) {}
+          flags_(require_completion_(flags)), max_inline_(max_inline),
+          imm_data_(imm_data) {}
 
     send_awaitable(void* qp,
                    Backend* backend_or_null,
@@ -342,7 +349,8 @@ public:
                    std::size_t max_inline = 0,
                    std::uint32_t imm_data = 0) noexcept
         : sge_holder(sges), qp_(qp), backend_(backend_or_null),
-          flags_(flags), max_inline_(max_inline), imm_data_(imm_data) {}
+          flags_(require_completion_(flags)), max_inline_(max_inline),
+          imm_data_(imm_data) {}
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
         const auto id = arm_(h);
@@ -411,8 +419,8 @@ public:
                          std::size_t max_inline = 0,
                          std::uint32_t imm_data = 0) noexcept
         : sge_holder(local), qp_(qp), backend_(backend_or_null),
-          remote_(remote), flags_(flags), max_inline_(max_inline),
-          imm_data_(imm_data) {}
+          remote_(remote), flags_(require_completion_(flags)),
+          max_inline_(max_inline), imm_data_(imm_data) {}
 
     rdma_write_awaitable(void* qp,
                          Backend* backend_or_null,
@@ -422,8 +430,8 @@ public:
                          std::size_t max_inline = 0,
                          std::uint32_t imm_data = 0) noexcept
         : sge_holder(locals), qp_(qp), backend_(backend_or_null),
-          remote_(remote), flags_(flags), max_inline_(max_inline),
-          imm_data_(imm_data) {}
+          remote_(remote), flags_(require_completion_(flags)),
+          max_inline_(max_inline), imm_data_(imm_data) {}
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
         const auto id = arm_(h);
@@ -495,7 +503,8 @@ public:
                        send_flags flags) noexcept
         : qp_(qp), backend_(backend_or_null),
           local_(local), remote_(remote),
-          compare_(compare), swap_(swap), flags_(flags) {}
+          compare_(compare), swap_(swap),
+          flags_(require_completion_(flags)) {}
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
         const auto sge_val = sge::from(local_);
@@ -537,7 +546,7 @@ public:
                        send_flags flags) noexcept
         : qp_(qp), backend_(backend_or_null),
           local_(local), remote_(remote),
-          add_(add), flags_(flags) {}
+          add_(add), flags_(require_completion_(flags)) {}
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
         const auto sge_val = sge::from(local_);

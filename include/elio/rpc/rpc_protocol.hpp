@@ -233,6 +233,7 @@ concept rpc_stream = requires(T& stream, void* buf, const void* cbuf, size_t len
     { stream.read_exactly(buf, len) };
     { stream.write_exactly(cbuf, len) };
     { stream.writev(iovecs, iov_count) };
+    { stream.poll_write() };
     { stream.is_valid() } -> std::same_as<bool>;
 };
 
@@ -256,6 +257,16 @@ coro::task<io::io_result> writev_exact(Stream& stream, struct iovec* iovecs, siz
         );
 
         auto result = co_await stream.writev(&iovecs[current_iov], batch_size);
+        if (result.result == -EAGAIN || result.result == -EWOULDBLOCK) {
+            auto poll = co_await stream.poll_write();
+            if (poll.result < 0) {
+                co_return poll;
+            }
+            continue;
+        }
+        if (result.result == -EINTR) {
+            continue;
+        }
         if (result.result <= 0) {
             co_return result;
         }

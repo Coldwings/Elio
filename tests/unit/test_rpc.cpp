@@ -866,6 +866,123 @@ TEST_CASE("buffer_ref type traits", "[rpc][buffer_ref]") {
 #include <sys/socket.h>
 #include <unistd.h>
 
+namespace {
+
+struct scripted_rpc_stream {
+    std::vector<elio::io::io_result> writev_results;
+    std::vector<elio::io::io_result> poll_write_results;
+    size_t writev_calls = 0;
+    size_t poll_write_calls = 0;
+    std::string written;
+
+    elio::coro::task<elio::io::io_result> read_exactly(void*, size_t) {
+        co_return elio::io::io_result{-ENOSYS, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> write_exactly(const void*, size_t) {
+        co_return elio::io::io_result{-ENOSYS, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> writev(struct iovec* iovecs, size_t iov_count) {
+        const size_t call_index = writev_calls++;
+        if (call_index >= writev_results.size()) {
+            co_return elio::io::io_result{-EIO, 0};
+        }
+        auto result = writev_results[call_index];
+        if (result.result > 0) {
+            size_t remaining = static_cast<size_t>(result.result);
+            for (size_t i = 0; i < iov_count && remaining > 0; ++i) {
+                size_t n = std::min(remaining, iovecs[i].iov_len);
+                written.append(static_cast<const char*>(iovecs[i].iov_base), n);
+                remaining -= n;
+            }
+        }
+        co_return result;
+    }
+
+    elio::coro::task<elio::io::io_result> poll_write() {
+        ++poll_write_calls;
+        if (poll_write_calls <= poll_write_results.size()) {
+            co_return poll_write_results[poll_write_calls - 1];
+        }
+        co_return elio::io::io_result{0, 0};
+    }
+
+    bool is_valid() const noexcept { return true; }
+};
+
+elio::io::io_result run_scripted_writev(scripted_rpc_stream& stream,
+                                        struct iovec* iovecs,
+                                        size_t iov_count) {
+    elio::runtime::scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> done{false};
+    elio::io::io_result observed{-ETIMEDOUT, 0};
+
+    auto handle = sched.go_joinable(
+        [&]() -> elio::coro::task<void> {
+            observed = co_await writev_exact(stream, iovecs, iov_count);
+            done.store(true, std::memory_order_release);
+        });
+    (void)handle;
+
+    for (int i = 0; i < 5000 && !done.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    auto drained = sched.shutdown(elio::test::scaled_sec(5));
+
+    REQUIRE(drained);
+    REQUIRE(done.load(std::memory_order_acquire));
+    return observed;
+}
+
+} // namespace
+
+TEST_CASE("rpc writev_exact retries transient writev errors",
+          "[rpc][protocol][writev]") {
+    SECTION("retries readiness and interruption before completing") {
+        char first[] = {'a', 'b', 'c'};
+        char second[] = {'d', 'e', 'f'};
+        struct iovec iovecs[2] = {
+            {first, sizeof(first)},
+            {second, sizeof(second)}
+        };
+
+        scripted_rpc_stream stream;
+        stream.writev_results = {
+            {-EAGAIN, 0},
+            {2, 0},
+            {-EINTR, 0},
+            {-EWOULDBLOCK, 0},
+            {4, 0}
+        };
+
+        auto result = run_scripted_writev(stream, iovecs, 2);
+
+        REQUIRE(result.result == 6);
+        REQUIRE(stream.writev_calls == 5);
+        REQUIRE(stream.poll_write_calls == 2);
+        REQUIRE(stream.written == "abcdef");
+    }
+
+    SECTION("returns poll_write errors") {
+        char data[] = {'x'};
+        struct iovec iovecs[1] = {{data, sizeof(data)}};
+
+        scripted_rpc_stream stream;
+        stream.writev_results = {{-EAGAIN, 0}};
+        stream.poll_write_results = {{-EPIPE, 0}};
+
+        auto result = run_scripted_writev(stream, iovecs, 1);
+
+        REQUIRE(result.result == -EPIPE);
+        REQUIRE(stream.writev_calls == 1);
+        REQUIRE(stream.poll_write_calls == 1);
+        REQUIRE(stream.written.empty());
+    }
+}
+
 TEST_CASE("rpc_server stop wakes TCP serve blocked in accept",
           "[rpc][server][shutdown]") {
     using namespace elio::net;

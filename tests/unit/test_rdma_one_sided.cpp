@@ -48,6 +48,10 @@ struct one_sided_state {
     send_flags       last_write_flags{};
     std::uint32_t    last_write_imm = 0;
     void*            last_qp = nullptr;
+    dispatcher*      inline_dispatcher = nullptr;
+    bool*            inline_done = nullptr;
+    bool             inline_write_success = false;
+    bool             resumed_before_post_return = false;
 };
 
 struct one_sided_static_backend {
@@ -71,6 +75,15 @@ struct one_sided_static_backend {
             state->last_write_flags  = flags;
             state->last_write_imm    = imm_data;
             state->last_qp           = qp;
+            if (state->inline_write_success && state->inline_dispatcher
+                && state->write_rc == 0) {
+                state->inline_dispatcher->deliver(
+                    id, wc_status::success, /*byte_len=*/0,
+                    imm_data, /*wc_flags=*/0);
+                if (state->inline_done && *state->inline_done) {
+                    state->resumed_before_post_return = true;
+                }
+            }
             return state->write_rc;
         }
         return 0;
@@ -210,6 +223,33 @@ TEST_CASE("rdma_write: backend receives local SGE + remote_buffer + flags",
     // RDMA WRITE's CQE typically reports byte_len=0; verify the value
     // the dispatcher hands us is what surfaces.
     disp.deliver(st.last_write_id, wc_status::success, /*byte_len=*/0);
+    REQUIRE(done);
+    REQUIRE(result.ok());
+    REQUIRE(result.byte_len == 0u);
+}
+
+TEST_CASE("rdma_write: inline successful completion resumes after post returns",
+          "[rdma][write][inline-completion]") {
+    one_sided_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 14;
+    connection<one_sided_static_backend> c{&qp_value, disp};
+
+    alignas(8) char payload[32] = {};
+    buffer_view local{payload, sizeof(payload), 0x777};
+    remote_buffer remote{0xCAFE, sizeof(payload), 0xBEEF};
+
+    wc_result result{};
+    bool done = false;
+    st.inline_dispatcher = &disp;
+    st.inline_done = &done;
+    st.inline_write_success = true;
+
+    auto task = run_write(c, local, remote, send_flags{}, result, done);
+
+    REQUIRE(st.writes.load() == 1);
+    REQUIRE_FALSE(st.resumed_before_post_return);
     REQUIRE(done);
     REQUIRE(result.ok());
     REQUIRE(result.byte_len == 0u);

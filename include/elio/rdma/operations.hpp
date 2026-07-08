@@ -38,6 +38,7 @@
 #include <elio/rdma/op_state.hpp>
 #include <elio/rdma/types.hpp>
 
+#include <cassert>
 #include <coroutine>
 #include <cstdint>
 #include <memory>
@@ -218,9 +219,8 @@ public:
 
     [[nodiscard]] wc_result await_resume() noexcept {
         // op_ is guaranteed live here (the awaiter destructor hasn't
-        // run yet, and the resume can only happen via dispatcher::
-        // deliver which CASed to completed before the schedule_handle
-        // call). Snapshot then return.
+        // run yet, and resumption only happens after the op reached
+        // completed). Snapshot then return.
         return op_->result;
     }
 
@@ -229,10 +229,9 @@ protected:
     /// Returns the wr_id to pass into the backend's post_* function.
     [[nodiscard]] wr_id arm_(std::coroutine_handle<> h) noexcept {
         op_->handle = h;
-        // Release-store so that a deliver() on another thread (which
-        // does acq_rel CAS on phase) formally acquires the handle write.
-        // No-op on TSO (x86); single dmb on ARM.
-        op_->phase.store(detail::op_phase::pending,
+        // `posting` blocks an inline CQE from resuming the coroutine
+        // until finalize_post_() knows post_* has returned.
+        op_->phase.store(detail::op_phase::posting,
                          std::memory_order_release);
         return dispatcher::make_wr_id(op_.get());
     }
@@ -242,7 +241,22 @@ protected:
     /// awaiter resumes inline without suspending. Otherwise return true.
     [[nodiscard]] bool finalize_post_(int rc) noexcept {
         if (rc == 0) {
-            return true;  // suspend; CQE will arrive later
+            auto expected = op_phase::posting;
+            if (op_->phase.compare_exchange_strong(
+                    expected,
+                    op_phase::pending,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;  // suspend; CQE will arrive later
+            }
+
+            // A CQE arrived from inside post_*(). The dispatcher
+            // already stored op_->result and marked the op completed;
+            // return false so the coroutine resumes only after
+            // await_suspend returns to the compiler-generated caller.
+            assert(expected == op_phase::completed &&
+                   "post completion escaped the posting/completed states");
+            return false;
         }
         // Post failed at submission time. There will be no CQE. Write
         // the synthesised result and flip phase → completed so the
@@ -250,6 +264,10 @@ protected:
         // ever deliver for this wr_id, so we must own the free here).
         // The unique_ptr in op_awaiter_base will free `op_` on
         // destruction.
+        if (op_->phase.load(std::memory_order_acquire)
+            == op_phase::completed) {
+            return false;
+        }
         op_->result = wc_result{
             .status   = wc_status::wr_flush_error,
             .byte_len = 0,

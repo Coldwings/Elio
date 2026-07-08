@@ -83,36 +83,61 @@ public:
             return;  // null wr_id used by no-awaiter paths (e.g. cancel SQEs).
         }
 
-        auto expected = detail::op_phase::pending;
-        const bool we_won = op->phase.compare_exchange_strong(
-            expected,
-            detail::op_phase::completed,
-            std::memory_order_acq_rel,
-            std::memory_order_acquire);
+        const wc_result result{status, byte_len, imm_data, wc_flags};
+        auto expected = op->phase.load(std::memory_order_acquire);
 
-        if (we_won) {
-            // We own the race. Fill the result, hand the coroutine off
-            // to the scheduler (or resume inline if no scheduler is
-            // current). We do NOT free `op` here — the awaiter still
-            // holds a `unique_ptr<op_state>` and is responsible for the
-            // free after it has consumed `op->result` via await_resume.
-            //
-            // When the awaiter's destructor eventually runs, try_orphan
-            // observes `completed` and returns false, so the unique_ptr
-            // retains ownership and frees `op` normally.
-            op->result = wc_result{status, byte_len, imm_data, wc_flags};
-            auto handle = op->handle;
-            runtime::schedule_handle(handle);
+        for (;;) {
+            if (expected == detail::op_phase::posting) {
+                // await_suspend is still executing post_*(). Publish
+                // the result, but leave resumption to finalize_post_()
+                // so the awaiter cannot be destroyed before
+                // await_suspend returns.
+                op->result = result;
+                if (op->phase.compare_exchange_strong(
+                        expected,
+                        detail::op_phase::completed,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    return;
+                }
+                continue;
+            }
+
+            if (expected == detail::op_phase::pending) {
+                op->result = result;
+                if (!op->phase.compare_exchange_strong(
+                        expected,
+                        detail::op_phase::completed,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    continue;
+                }
+
+                // We own the race. Hand the coroutine off to the scheduler
+                // (or resume inline if no scheduler is current). We do NOT
+                // free `op` here — the awaiter still holds a
+                // `unique_ptr<op_state>` and is responsible for the free
+                // after it has consumed `op->result` via await_resume.
+                //
+                // When the awaiter's destructor eventually runs, try_orphan
+                // observes `completed` and returns false, so the unique_ptr
+                // retains ownership and frees `op` normally.
+                auto handle = op->handle;
+                runtime::schedule_handle(handle);
+                return;
+            }
+
+            // The awaiter destructor already CASed pending → orphaned.
+            // No coroutine to resume; we own the heap node now and must
+            // free it. Assert the expected phase to catch duplicate CQEs
+            // (deliver called twice for the same wr_id) in debug builds.
+            assert(expected == detail::op_phase::orphaned &&
+                   "deliver() on non-pending op_state (duplicate CQE?)");
+            if (expected == detail::op_phase::orphaned) {
+                delete op;
+            }
             return;
         }
-
-        // The awaiter destructor already CASed pending → orphaned.
-        // No coroutine to resume; we own the heap node now and must
-        // free it. Assert the expected phase to catch duplicate CQEs
-        // (deliver called twice for the same wr_id) in debug builds.
-        assert(expected == detail::op_phase::orphaned &&
-               "deliver() on non-pending op_state (duplicate CQE?)");
-        delete op;
     }
 
     /// Awaiter destructor helper: attempt the inverse race.

@@ -32,6 +32,23 @@ if(@ELIO_PACKAGE_NEEDS_NGHTTP2@)
     endif()
 endif()
 
+if(@ELIO_PACKAGE_NEEDS_LIBURING@)
+    if(NOT TARGET liburing::liburing)
+        find_library(ELIO_LIBURING_LIBRARY NAMES uring)
+        find_path(ELIO_LIBURING_INCLUDE_DIR NAMES liburing.h)
+        if(NOT ELIO_LIBURING_LIBRARY OR NOT ELIO_LIBURING_INCLUDE_DIR)
+            set(Elio_FOUND FALSE)
+            set(Elio_NOT_FOUND_MESSAGE
+                "Elio io_uring support requires liburing, but no system liburing library/header was found.")
+            return()
+        endif()
+        add_library(liburing::liburing UNKNOWN IMPORTED)
+        set_target_properties(liburing::liburing PROPERTIES
+            IMPORTED_LOCATION "${ELIO_LIBURING_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${ELIO_LIBURING_INCLUDE_DIR}")
+    endif()
+endif()
+
 if(@ELIO_PACKAGE_NEEDS_CUDATOOLKIT@)
     find_dependency(CUDAToolkit REQUIRED)
 endif()

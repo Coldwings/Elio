@@ -80,9 +80,14 @@ find_path(URING_INCLUDE_DIR liburing.h)
 
 if(URING_LIBRARY AND URING_INCLUDE_DIR)
     message(STATUS "Found liburing: ${URING_LIBRARY}")
+    if(NOT TARGET liburing::liburing)
+        add_library(liburing::liburing UNKNOWN IMPORTED)
+        set_target_properties(liburing::liburing PROPERTIES
+            IMPORTED_LOCATION "${URING_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${URING_INCLUDE_DIR}")
+    endif()
     target_compile_definitions(elio INTERFACE ELIO_HAS_IO_URING=1)
-    target_include_directories(elio INTERFACE ${URING_INCLUDE_DIR})
-    target_link_libraries(elio INTERFACE fmt::fmt pthread uring)
+    target_link_libraries(elio INTERFACE fmt::fmt pthread liburing::liburing)
 else()
     message(STATUS "liburing not found, io_uring backend will be disabled")
     target_compile_definitions(elio INTERFACE ELIO_HAS_IO_URING=0)
@@ -398,6 +403,11 @@ endif()
 set(ELIO_PACKAGE_NEEDS_NGHTTP2 OFF)
 if(TARGET elio_http2)
     set(ELIO_PACKAGE_NEEDS_NGHTTP2 ON)
+endif()
+
+set(ELIO_PACKAGE_NEEDS_LIBURING OFF)
+if(URING_LIBRARY AND URING_INCLUDE_DIR)
+    set(ELIO_PACKAGE_NEEDS_LIBURING ON)
 endif()
 
 set(ELIO_PACKAGE_NEEDS_CUDATOOLKIT OFF)

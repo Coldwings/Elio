@@ -42,24 +42,41 @@ struct connect_options {
 };
 
 /// Result of a single CM step. status==0 on success; otherwise -errno
-/// from rdma_resolve_* or a synthesised value (e.g. ECANCELED if the
-/// token fired, ETIMEDOUT on event mismatch).
+/// from rdma_resolve_* or a synthesised errno (e.g. -ECANCELED if the
+/// token fired, -ETIMEDOUT on event mismatch).
 struct cm_status {
     int status = 0;
     [[nodiscard]] bool ok() const noexcept { return status == 0; }
 };
 
+namespace detail {
+
+[[nodiscard]] inline cm_status make_cm_status(int status) noexcept {
+    if (status == 0) {
+        return cm_status{0};
+    }
+    return cm_status{status < 0 ? status : -status};
+}
+
+[[nodiscard]] inline cm_status cm_id_status(const cm_id& id) noexcept {
+    return id ? cm_status{0} : make_cm_status(EINVAL);
+}
+
+}  // namespace detail
+
 /// Step 1+2+3: create a cm_id and resolve the destination address +
 /// route. Returns the cm_id on success; populates `out_status` with
-/// the underlying errno on failure (the returned cm_id is then null).
+/// the underlying -errno on failure (the returned cm_id is then null).
 inline coro::task<cm_id> resolve(event_channel& ch,
                                  const struct sockaddr* dst,
                                  socklen_t dst_len,
                                  connect_options opts = {},
                                  cm_status* out_status = nullptr,
                                  coro::cancel_token token = {}) {
-    auto fail = [&](int err) -> cm_id {
-        if (out_status) out_status->status = err;
+    auto fail = [&](int status) -> cm_id {
+        if (out_status) {
+            out_status->status = detail::make_cm_status(status).status;
+        }
         return cm_id{};
     };
 
@@ -115,20 +132,20 @@ inline coro::task<cm_status> complete_connect(
     event_channel& ch, cm_id& id,
     const rdma_conn_param* conn_param = nullptr,
     coro::cancel_token token = {}) {
-    if (!id) co_return cm_status{EINVAL};
+    if (auto st = detail::cm_id_status(id); !st.ok()) co_return st;
 
     if (::rdma_connect(id.native(),
                        const_cast<rdma_conn_param*>(conn_param)) != 0) {
-        co_return cm_status{errno};
+        co_return detail::make_cm_status(errno);
     }
 
     rdma_cm_event* event = co_await ch.next_event(token);
-    if (!event) co_return cm_status{ECANCELED};
+    if (!event) co_return detail::make_cm_status(ECANCELED);
     const auto type   = event->event;
     const auto status = event->status;
     ch.ack(event);
     if (type != RDMA_CM_EVENT_ESTABLISHED) {
-        co_return cm_status{status ? status : EPROTO};
+        co_return detail::make_cm_status(status ? status : EPROTO);
     }
     co_return cm_status{0};
 }

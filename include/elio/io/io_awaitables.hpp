@@ -1098,6 +1098,9 @@ public:
     cancellable_io_result await_resume() noexcept {
         cancel_registration_.unregister();
         bool was_cancelled = already_cancelled_before_setup_;
+        if (!state_ && token_.is_cancelled()) {
+            was_cancelled = true;
+        }
         if (state_) {
             state_->resumed.store(true, std::memory_order_release);
             was_cancelled = was_cancelled ||
@@ -1216,6 +1219,9 @@ public:
     cancellable_io_result await_resume() noexcept {
         cancel_registration_.unregister();
         bool was_cancelled = already_cancelled_before_setup_;
+        if (!state_ && token_.is_cancelled()) {
+            was_cancelled = true;
+        }
         if (state_) {
             state_->resumed.store(true, std::memory_order_release);
             was_cancelled = was_cancelled ||
@@ -1330,6 +1336,9 @@ public:
     cancellable_io_result await_resume() noexcept {
         cancel_registration_.unregister();
         bool was_cancelled = already_cancelled_before_setup_;
+        if (!state_ && token_.is_cancelled()) {
+            was_cancelled = true;
+        }
         if (state_) {
             state_->resumed.store(true, std::memory_order_release);
             was_cancelled = was_cancelled ||

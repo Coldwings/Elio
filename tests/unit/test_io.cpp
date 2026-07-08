@@ -2133,6 +2133,8 @@ TEST_CASE("Cancellable recv already cancelled", "[io][cancel]") {
 
     REQUIRE(completed);
     REQUIRE(recv_result.was_cancelled());
+    REQUIRE_FALSE(recv_result.success());
+    REQUIRE(recv_result.error_code() == ECANCELED);
 
     close(sv[0]);
     close(sv[1]);
@@ -2258,15 +2260,15 @@ TEST_CASE("Cancellable send already cancelled", "[io][cancel]") {
 
     REQUIRE(completed);
     REQUIRE(send_result.was_cancelled());
+    REQUIRE_FALSE(send_result.success());
+    REQUIRE(send_result.error_code() == ECANCELED);
 
     close(sv[0]);
     close(sv[1]);
 }
 
 TEST_CASE("Cancellable connect already cancelled", "[io][cancel]") {
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    REQUIRE(fd >= 0);
-
+    int fd = -1;
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(12345);
@@ -2299,8 +2301,8 @@ TEST_CASE("Cancellable connect already cancelled", "[io][cancel]") {
 
     REQUIRE(completed);
     REQUIRE(connect_result.was_cancelled());
-
-    close(fd);
+    REQUIRE_FALSE(connect_result.success());
+    REQUIRE(connect_result.error_code() == ECANCELED);
 }
 
 // ============================================================================

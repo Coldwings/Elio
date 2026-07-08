@@ -191,7 +191,8 @@ TEST_CASE("HTTP response parser - basic 200 OK", "[http][parser]") {
 TEST_CASE("HTTP response parser - various status codes", "[http][parser]") {
     auto test_status = [](uint16_t code, const char* reason, status expected) {
         response_parser parser;
-        std::string response = "HTTP/1.1 " + std::to_string(code) + " " + reason + "\r\n\r\n";
+        std::string response = "HTTP/1.1 " + std::to_string(code) + " " + reason +
+            "\r\nContent-Length: 0\r\n\r\n";
         auto [result, consumed] = parser.parse(response);
         REQUIRE(result == parse_result::complete);
         REQUIRE(parser.get_status() == expected);
@@ -266,6 +267,109 @@ TEST_CASE("HTTP response parser - no body", "[http][parser]") {
     REQUIRE(parser.body().empty());
 }
 
+TEST_CASE("HTTP response parser - no-body statuses ignore advertised length", "[http][parser]") {
+    SECTION("204 completes at the header boundary") {
+        response_parser parser;
+
+        std::string response =
+            "HTTP/1.1 204 No Content\r\n"
+            "Content-Length: 5\r\n"
+            "\r\n"
+            "hello";
+
+        auto [result, consumed] = parser.parse(response);
+
+        REQUIRE(result == parse_result::complete);
+        REQUIRE(parser.body().empty());
+        REQUIRE(parser.bytes_remaining() == 5);
+        REQUIRE(consumed == response.size() - 5);
+    }
+
+    SECTION("304 completes at the header boundary") {
+        response_parser parser;
+
+        std::string response =
+            "HTTP/1.1 304 Not Modified\r\n"
+            "Content-Length: 5\r\n"
+            "\r\n"
+            "hello";
+
+        auto [result, consumed] = parser.parse(response);
+
+        REQUIRE(result == parse_result::complete);
+        REQUIRE(parser.status_code() == 304);
+        REQUIRE(parser.body().empty());
+        REQUIRE(parser.bytes_remaining() == 5);
+        REQUIRE(consumed == response.size() - 5);
+    }
+}
+
+TEST_CASE("HTTP response parser - HEAD response has no body", "[http][parser]") {
+    response_parser parser;
+    parser.set_request_method(method::HEAD);
+
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n"
+        "hello";
+
+    auto [result, consumed] = parser.parse(response);
+
+    REQUIRE(result == parse_result::complete);
+    REQUIRE(parser.status_code() == 200);
+    REQUIRE(parser.body().empty());
+    REQUIRE(parser.bytes_remaining() == 5);
+    REQUIRE(consumed == response.size() - 5);
+}
+
+TEST_CASE("HTTP response parser - close-delimited body completes on EOF", "[http][parser]") {
+    response_parser parser;
+
+    std::string first =
+        "HTTP/1.1 200 OK\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "hello";
+
+    auto [r1, c1] = parser.parse(first);
+    REQUIRE(r1 == parse_result::need_more);
+    REQUIRE(c1 == first.size());
+    REQUIRE(parser.is_close_delimited());
+    REQUIRE(parser.body() == "hello");
+    REQUIRE_FALSE(parser.is_complete());
+
+    auto [r2, c2] = parser.parse(" world");
+    REQUIRE(r2 == parse_result::need_more);
+    REQUIRE(c2 == 6);
+    REQUIRE(parser.body() == "hello world");
+
+    auto [r3, c3] = parser.finish_eof();
+    REQUIRE(r3 == parse_result::complete);
+    REQUIRE(c3 == 0);
+    REQUIRE(parser.is_complete());
+    REQUIRE(parser.body() == "hello world");
+}
+
+TEST_CASE("HTTP response parser - EOF before framed body completes is an error", "[http][parser]") {
+    response_parser parser;
+
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 5\r\n"
+        "\r\n"
+        "he";
+
+    auto [r1, c1] = parser.parse(response);
+    REQUIRE(r1 == parse_result::need_more);
+    REQUIRE(parser.body() == "he");
+
+    auto [r2, c2] = parser.finish_eof();
+    REQUIRE(r2 == parse_result::error);
+    REQUIRE(c2 == 0);
+    REQUIRE(parser.has_error());
+}
+
 TEST_CASE("HTTP response parser - case insensitive headers", "[http][parser]") {
     response_parser parser;
 
@@ -301,7 +405,7 @@ TEST_CASE("HTTP response parser - header whitespace trimming", "[http][parser]")
 TEST_CASE("HTTP response parser - reset", "[http][parser]") {
     response_parser parser;
 
-    std::string response1 = "HTTP/1.1 404 Not Found\r\n\r\n";
+    std::string response1 = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
     auto [r1, c1] = parser.parse(response1);
     REQUIRE(r1 == parse_result::complete);
     REQUIRE(parser.status_code() == 404);

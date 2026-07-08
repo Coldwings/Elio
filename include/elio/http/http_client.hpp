@@ -417,6 +417,7 @@ private:
         response_parser parser;
         parser.set_max_headers(config_.max_headers);
         parser.set_max_header_size(config_.max_header_size);
+        parser.set_request_method(req.get_method());
 
         while (!parser.is_complete() && !parser.has_error()) {
             // Check cancellation before read
@@ -460,8 +461,12 @@ private:
             }
 
             if (read_result.result <= 0) {
-                if (read_result.result == 0 && parser.is_complete()) {
-                    break;  // Clean close after response
+                if (read_result.result == 0) {
+                    auto [result, consumed] = parser.finish_eof();
+                    (void)consumed;
+                    if (result == parse_result::complete) {
+                        break;  // Clean close after a close-delimited response
+                    }
                 }
                 ELIO_LOG_ERROR("Failed to read response: {}",
                               read_result.result == 0 ? "connection closed" : strerror(-read_result.result));
@@ -511,6 +516,7 @@ private:
         // head of the next response (response-splitting). On any failure of
         // these conditions the connection is simply dropped on scope exit.
         if (parser.is_complete() &&
+            !parser.is_close_delimited() &&
             parser.bytes_remaining() == 0 &&
             parser.get_headers().keep_alive(parser.version())) {
             pool_.release(target.host, target.effective_port(), target.is_secure(), std::move(conn));

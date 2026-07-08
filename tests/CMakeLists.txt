@@ -195,6 +195,13 @@ add_test(NAME package_rdma_cuda_export_metadata
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_rdma_cuda_package_export.cmake
 )
 
+add_test(NAME package_liburing_export_metadata
+    COMMAND ${CMAKE_COMMAND}
+        -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+        -DELIO_BINARY_DIR=${CMAKE_BINARY_DIR}/tests/cmake/package_liburing_export
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_liburing_package_export.cmake
+)
+
 add_test(NAME package_elio_compile_feature_export
     COMMAND ${CMAKE_COMMAND}
         -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}

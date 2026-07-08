@@ -27,6 +27,8 @@ class scheduler;
 /// This design eliminates contention between external producers and
 /// the owner thread, enabling linear scaling with thread count.
 class worker_thread {
+    friend class scheduler;
+
 public:
     worker_thread(scheduler* sched, size_t worker_id,
                    wait_strategy strategy = wait_strategy::blocking())
@@ -198,6 +200,8 @@ public:
     }
 
 private:
+    void request_stop() noexcept;
+
     void run();
     void drain_inbox() noexcept;
     [[nodiscard]] std::coroutine_handle<> get_next_task() noexcept;

@@ -519,22 +519,20 @@ private:
                 break;
             }
 
-            // Reject impossible data-message growth as soon as the complete
-            // header reveals the payload length. This keeps a peer from
-            // forcing buffer_ to grow toward an already-invalid frame size.
-            if (!is_control_frame(header.op) && max_message_size_ > 0) {
-                size_t current_size = 0;
+            // Validate fragmentation state as soon as the complete header is
+            // known — before the full payload arrives — so that protocol errors
+            // are caught early regardless of whether a size limit is configured.
+            if (!is_control_frame(header.op)) {
                 if (header.op == opcode::continuation) {
-                    // Continuations count against the message currently being
-                    // assembled. If there is no message, the frame is invalid
-                    // even before its payload arrives.
+                    // Continuation frame: RFC 6455 §5.4 requires a preceding
+                    // initial text/binary frame.  If none exists, this is a
+                    // protocol error even before its payload arrives.
                     if (!has_initial_frame_) {
                         has_error_ = true;
                         error_msg_ = "Continuation frame without initial frame";
                         error_close_code_ = close_code::protocol_error;
                         return -1;
                     }
-                    current_size = current_message_.data.size();
                 } else if (has_initial_frame_) {
                     has_error_ = true;
                     error_msg_ = "New message started before previous completed";
@@ -542,13 +540,19 @@ private:
                     return -1;
                 }
 
-                if (current_size > max_message_size_ ||
-                    header.payload_len >
-                        static_cast<uint64_t>(max_message_size_ - current_size)) {
-                    has_error_ = true;
-                    error_msg_ = "Message exceeds maximum size";
-                    error_close_code_ = close_code::too_large;
-                    return -1;
+                // Reject impossible data-message growth as soon as the complete
+                // header reveals the payload length. This keeps a peer from
+                // forcing buffer_ to grow toward an already-invalid frame size.
+                if (max_message_size_ > 0) {
+                    size_t current_size = current_message_.data.size();
+                    if (current_size > max_message_size_ ||
+                        header.payload_len >
+                            static_cast<uint64_t>(max_message_size_ - current_size)) {
+                        has_error_ = true;
+                        error_msg_ = "Message exceeds maximum size";
+                        error_close_code_ = close_code::too_large;
+                        return -1;
+                    }
                 }
             }
 
@@ -594,28 +598,14 @@ private:
                 // 125 bytes by parse_frame_header(), so no size check is needed.
                 control_frames_.emplace_back(header.op, extract_payload());
             } else {
-                // Data frame
+                // Data frame — fragmentation-state and size checks were already
+                // applied in the early-validation block above, so start
+                // accumulating the payload directly.
                 if (header.op != opcode::continuation) {
                     // Start of new message
-                    if (has_initial_frame_) {
-                        has_error_ = true;
-                        error_msg_ = "New message started before previous completed";
-                        error_close_code_ = close_code::protocol_error;
-                        return -1;
-                    }
                     current_message_ = message{};
                     current_message_.type = header.op;
                     has_initial_frame_ = true;
-                } else {
-                    // Continuation frame: RFC 6455 §5.4 requires a preceding
-                    // initial text/binary frame.  If none exists, this is a
-                    // protocol error.
-                    if (!has_initial_frame_) {
-                        has_error_ = true;
-                        error_msg_ = "Continuation frame without initial frame";
-                        error_close_code_ = close_code::protocol_error;
-                        return -1;
-                    }
                 }
 
                 // Extract (and unmask) the payload only after passing the size check.

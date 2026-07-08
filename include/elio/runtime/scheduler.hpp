@@ -131,6 +131,13 @@ public:
             return true;
         }
 
+        if (worker_thread::current() != nullptr) [[unlikely]] {
+            ELIO_LOG_WARNING(
+                "shutdown() called from a worker thread; falling back to shutdown_force() to avoid deadlock");
+            shutdown_force();
+            return active_tasks() == 0;
+        }
+
         bool drained = wait_for_idle(timeout);
         shutdown_force();
         return drained;
@@ -161,7 +168,12 @@ public:
             return;
         }
 
-        // Stop all workers (sets running_=false and joins threads).
+        auto* current_worker = worker_thread::current();
+
+        // Stop all workers (sets running_=false and joins threads). If this is
+        // called from a worker, request that worker to stop but let its run()
+        // loop unwind after the current task returns; joining it here would
+        // self-join.
         // Iterate the visible range; slots beyond num_threads_ are either
         // unpopulated (nullptr) or correspond to workers already stopped by
         // a prior shrink (whose tasks were redistributed at shrink time).
@@ -169,13 +181,20 @@ public:
         // call stop()/drain via ~worker_thread(), which is idempotent.
         size_t n = num_threads_.load(std::memory_order_acquire);
         for (size_t i = 0; i < n; ++i) {
-            workers_[i]->stop();
+            if (workers_[i].get() == current_worker) {
+                workers_[i]->request_stop();
+            } else {
+                workers_[i]->stop();
+            }
         }
 
-        // Now that ALL workers are stopped, drain remaining tasks
-        // This is safe because no worker can steal from another at this point
+        // Now that joined workers are stopped, drain remaining tasks there.
+        // The current worker, if any, will run its normal drain phase after
+        // this task returns.
         for (size_t i = 0; i < n; ++i) {
-            workers_[i]->drain_remaining_tasks();
+            if (workers_[i].get() != current_worker) {
+                workers_[i]->drain_remaining_tasks();
+            }
         }
 
         // Stop and join any draining workers left from prior shrink operations.
@@ -878,12 +897,19 @@ inline void worker_thread::start() {
     thread_ = std::thread(&worker_thread::run, this);
 }
 
-inline void worker_thread::stop() {
+inline void worker_thread::request_stop() noexcept {
     bool expected = true;
     if (!running_.compare_exchange_strong(expected, false, 
             std::memory_order_release, std::memory_order_relaxed)) return;
     wake();  // Wake the worker if it's blocked in I/O poll
-    if (thread_.joinable()) thread_.join();
+}
+
+inline void worker_thread::stop() {
+    request_stop();
+    if (!thread_.joinable()) return;
+    if (thread_.get_id() != std::this_thread::get_id()) {
+        thread_.join();
+    }
 }
 
 /// Final cleanup for any orphaned tasks - only call after ALL workers have stopped.

@@ -35,6 +35,31 @@ task<void> increment_only(std::atomic<int>* counter) {
     co_return;
 }
 
+task<void> call_shutdown_from_worker(scheduler* sched,
+                                     std::atomic<bool>* returned,
+                                     std::atomic<bool>* drained) {
+    bool result = sched->shutdown(scaled_ms(1000));
+    drained->store(result, std::memory_order_release);
+    returned->store(true, std::memory_order_release);
+    co_return;
+}
+
+task<void> call_shutdown_force_from_worker(scheduler* sched,
+                                           std::atomic<bool>* returned) {
+    sched->shutdown_force();
+    returned->store(true, std::memory_order_release);
+    co_return;
+}
+
+bool wait_for_flag(std::atomic<bool>& flag, std::chrono::milliseconds timeout) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!flag.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return flag.load(std::memory_order_acquire);
+}
+
 // Suspends on an event until the test releases it. Used by tests that need a
 // task to remain "in-flight and tracked" for an arbitrary, observer-controlled
 // window (replaces timing-fragile sleep-based gates).
@@ -110,6 +135,32 @@ TEST_CASE("shutdown_force on idle scheduler is near-immediate",
 
     REQUIRE(!sched.is_running());
     REQUIRE(elapsed < scaled_ms(200));
+}
+
+TEST_CASE("shutdown from worker task falls back without self-join",
+          "[scheduler][shutdown]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> returned{false};
+    std::atomic<bool> drained{true};
+    sched.go(call_shutdown_from_worker, &sched, &returned, &drained);
+
+    REQUIRE(wait_for_flag(returned, scaled_ms(2000)));
+    REQUIRE(!drained.load(std::memory_order_acquire));
+    REQUIRE(!sched.is_running());
+}
+
+TEST_CASE("shutdown_force from worker task does not self-join",
+          "[scheduler][shutdown]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> returned{false};
+    sched.go(call_shutdown_force_from_worker, &sched, &returned);
+
+    REQUIRE(wait_for_flag(returned, scaled_ms(2000)));
+    REQUIRE(!sched.is_running());
 }
 
 TEST_CASE("wait_for_idle returns when all tracked tasks complete",

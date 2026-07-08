@@ -36,19 +36,20 @@ public:
             // so no wake function could hold a reference to us.
             if (!suspended_) return;
 
+            std::coroutine_handle<> to_schedule;
             // Slow path: acquire internal_mutex_ to prevent race with unlock()
-            std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
-            if (this->is_linked()) {
-                mtx_.waiters_.remove(this);
-            } else if (!resumed_) {
-                // We were already popped from the waiters list by unlock().
-                // If state is set to sentinel (1), it means lock is being
-                // transferred to us but we're being destroyed before resuming.
-                // Release the lock to prevent deadlock.
-                void* expected = reinterpret_cast<void*>(1);
-                mtx_.state_.compare_exchange_strong(
-                    expected, nullptr,
-                    std::memory_order_release, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+                if (this->is_linked()) {
+                    mtx_.waiters_.remove(this);
+                } else if (grant_pending_ && !resumed_) {
+                    grant_pending_ = false;
+                    to_schedule = mtx_.recover_cancelled_handoff_locked();
+                }
+            }
+
+            if (to_schedule) {
+                runtime::schedule_handle(to_schedule);
             }
         }
 
@@ -85,6 +86,7 @@ public:
 
         void await_resume() noexcept {
             resumed_ = true;
+            grant_pending_ = false;
         }
 
     private:
@@ -92,6 +94,7 @@ public:
         std::coroutine_handle<> handle_;
         bool suspended_ = false;  // True if enqueued in waiters_
         bool resumed_ = false;    // True after a popped waiter resumes normally
+        bool grant_pending_ = false;  // True after unlock() transfers ownership
 
         friend class mutex;
     };
@@ -146,6 +149,7 @@ public:
                 // Collect handle and pop from list under lock.
                 // Popping marks node as unlinked, so destructor won't try to remove it.
                 auto* waiter = waiters_.pop_front();
+                waiter->grant_pending_ = true;
                 to_schedule = waiter->handle_;
             }
         }
@@ -165,6 +169,18 @@ private:
     std::atomic<void*> state_{nullptr};
     mutable std::mutex internal_mutex_;
     elio::detail::intrusive_list<lock_awaitable> waiters_;
+
+    std::coroutine_handle<> recover_cancelled_handoff_locked() noexcept {
+        if (waiters_.empty()) {
+            state_.store(nullptr, std::memory_order_release);
+            return nullptr;
+        }
+
+        state_.store(reinterpret_cast<void*>(1), std::memory_order_release);
+        auto* waiter = waiters_.pop_front();
+        waiter->grant_pending_ = true;
+        return waiter->handle_;
+    }
 };
 
 /// RAII lock guard for mutex (synchronous)

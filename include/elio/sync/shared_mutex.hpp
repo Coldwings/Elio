@@ -50,10 +50,20 @@ public:
             // Fast path: if we never suspended, we were never enqueued
             if (!suspended_) return;
 
+            bool release_grant = false;
             // Slow path: acquire internal_mutex_ to prevent race with unlock
-            std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
-            if (this->is_linked()) {
-                mtx_.reader_waiters_.remove(this);
+            {
+                std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+                if (this->is_linked()) {
+                    mtx_.reader_waiters_.remove(this);
+                } else if (grant_pending_ && !resumed_) {
+                    grant_pending_ = false;
+                    release_grant = true;
+                }
+            }
+
+            if (release_grant) {
+                mtx_.unlock_shared();
             }
         }
 
@@ -98,12 +108,17 @@ public:
             return true;  // Suspend
         }
 
-        void await_resume() const noexcept {}
+        void await_resume() noexcept {
+            resumed_ = true;
+            grant_pending_ = false;
+        }
 
     private:
         shared_mutex& mtx_;
         std::coroutine_handle<> handle_;
         bool suspended_ = false;
+        bool resumed_ = false;
+        bool grant_pending_ = false;
 
         friend class shared_mutex;
     };
@@ -119,6 +134,7 @@ public:
 
             // Slow path: acquire internal_mutex_ to prevent race with unlock
             std::vector<std::coroutine_handle<>> readers_to_wake;
+            bool release_grant = false;
             {
                 std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
                 if (this->is_linked()) {
@@ -139,6 +155,7 @@ public:
 
                             while (!mtx_.reader_waiters_.empty()) {
                                 auto* reader = mtx_.reader_waiters_.pop_front();
+                                reader->grant_pending_ = true;
                                 readers_to_wake.push_back(reader->handle_);
                             }
 
@@ -150,11 +167,17 @@ public:
                             mtx_.state_.fetch_add(parked_count, std::memory_order_release);
                         }
                     }
+                } else if (grant_pending_ && !resumed_) {
+                    grant_pending_ = false;
+                    release_grant = true;
                 }
             }
             // Schedule readers outside the lock
             for (auto h : readers_to_wake) {
                 runtime::schedule_handle(h);
+            }
+            if (release_grant) {
+                mtx_.unlock();
             }
         }
 
@@ -197,12 +220,17 @@ public:
             return true;  // Suspend
         }
 
-        void await_resume() const noexcept {}
+        void await_resume() noexcept {
+            resumed_ = true;
+            grant_pending_ = false;
+        }
 
     private:
         shared_mutex& mtx_;
         std::coroutine_handle<> handle_;
         bool suspended_ = false;
+        bool resumed_ = false;
+        bool grant_pending_ = false;
 
         friend class shared_mutex;
     };
@@ -279,6 +307,7 @@ public:
                     new_state |= WRITER_WAITING;
                 }
                 state_.store(new_state, std::memory_order_release);
+                writer->grant_pending_ = true;
                 to_resume = writer->handle_;
             }
         }
@@ -315,6 +344,7 @@ public:
                 state_.store(new_state, std::memory_order_release);
 
                 // Writer path: always exactly one handle — fits in inline buffer
+                writer->grant_pending_ = true;
                 inline_buf[0] = writer->handle_;
                 inline_count = 1;
             } else {
@@ -322,6 +352,7 @@ public:
                 size_t reader_count = reader_waiters_.size();
                 while (!reader_waiters_.empty()) {
                     auto* reader = reader_waiters_.pop_front();
+                    reader->grant_pending_ = true;
                     if (inline_count < kInlineCapacity) {
                         inline_buf[inline_count++] = reader->handle_;
                     } else {

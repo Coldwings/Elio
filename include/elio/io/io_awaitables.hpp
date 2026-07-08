@@ -973,7 +973,8 @@ struct io_cancel_executor {
 };
 
 inline io_cancel_executor make_io_cancel_executor(
-    std::shared_ptr<io_cancel_state> state) {
+    std::shared_ptr<io_cancel_state> state,
+    bool allow_epoll_cancel = false) {
     if (state->resumed.exchange(true, std::memory_order_acq_rel)) {
         co_return;
     }
@@ -981,15 +982,21 @@ inline io_cancel_executor make_io_cancel_executor(
 #if ELIO_HAS_IO_URING
         if (state->ctx->is_io_uring()) {
             state->ctx->cancel(tagged_op_state_user_data(state->op));
+        } else if (allow_epoll_cancel) {
+            state->ctx->cancel(tagged_op_state_user_data(state->op));
         } else {
             ELIO_LOG_WARNING(
                 "cancellable I/O: epoll backend does not support async cancel "
                 "(fd reuse race risk); cancel_token is no-op");
         }
 #else
-        ELIO_LOG_WARNING(
-            "cancellable I/O: epoll backend does not support async cancel "
-            "(fd reuse race risk); cancel_token is no-op");
+        if (allow_epoll_cancel) {
+            state->ctx->cancel(tagged_op_state_user_data(state->op));
+        } else {
+            ELIO_LOG_WARNING(
+                "cancellable I/O: epoll backend does not support async cancel "
+                "(fd reuse race risk); cancel_token is no-op");
+        }
 #endif
     }
     co_return;

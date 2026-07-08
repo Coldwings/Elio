@@ -453,7 +453,10 @@ public:
             auto it = std::find_if(state.pending_ops.begin(), 
                                     state.pending_ops.end(),
                                     [user_data](const pending_operation& op) {
-                                        return op.awaiter.address() == user_data;
+                                        void* cancel_key = op.req.state
+                                            ? tagged_op_state_user_data(op.req.state)
+                                            : op.awaiter.address();
+                                        return cancel_key == user_data;
                                     });
             
             if (it != state.pending_ops.end()) {

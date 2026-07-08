@@ -653,10 +653,14 @@ public:
         freeze_handlers();
         ELIO_LOG_INFO("RPC server starting on {}",
                      listener.local_address().to_string());
+        auto accept_token = reset_accept_cancel_source();
         running_.store(true, std::memory_order_release);
 
         while (running_.load(std::memory_order_acquire)) {
-            auto stream = co_await listener.accept();
+            auto stream = co_await listener.accept(accept_token);
+            if (accept_loop_should_stop(accept_token)) {
+                break;
+            }
             if (!stream) {
                 if (running_.load(std::memory_order_acquire)) {
                     ELIO_LOG_ERROR("RPC server: accept failed");
@@ -705,10 +709,14 @@ public:
         freeze_handlers();
         ELIO_LOG_INFO("RPC server starting on {}",
                      listener.local_address().to_string());
+        auto accept_token = reset_accept_cancel_source();
         running_.store(true, std::memory_order_release);
 
         while (running_.load(std::memory_order_acquire)) {
-            auto stream = co_await listener.accept();
+            auto stream = co_await listener.accept(accept_token);
+            if (accept_loop_should_stop(accept_token)) {
+                break;
+            }
             if (!stream) {
                 if (running_.load(std::memory_order_acquire)) {
                     ELIO_LOG_ERROR("RPC server: accept failed");
@@ -774,6 +782,7 @@ public:
     /// Stop the server
     void stop() {
         running_.store(false, std::memory_order_release);
+        cancel_active_accept();
         
         // Close all sessions
         std::lock_guard<std::mutex> lock(sessions_mutex_);
@@ -841,6 +850,26 @@ private:
         active_sessions_.fetch_sub(1, std::memory_order_acq_rel);
     }
 
+    coro::cancel_token reset_accept_cancel_source() {
+        std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+        accept_cancel_source_ = coro::cancel_source{};
+        return accept_cancel_source_.get_token();
+    }
+
+    void cancel_active_accept() {
+        std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+        accept_cancel_source_.cancel();
+    }
+
+    bool accept_loop_should_stop(const coro::cancel_token& accept_token) noexcept {
+        if (!running_.load(std::memory_order_acquire) ||
+            accept_token.is_cancelled()) {
+            running_.store(false, std::memory_order_release);
+            return true;
+        }
+        return false;
+    }
+
     /// Remove a session from the tracking vector using swap-and-pop (O(1)).
     /// Must be called without sessions_mutex_ held.
     void remove_session(const session_ptr& session) {
@@ -871,6 +900,8 @@ private:
 
     mutable std::mutex sessions_mutex_;
     std::vector<session_ptr> sessions_;
+    mutable std::mutex accept_cancel_mutex_;
+    coro::cancel_source accept_cancel_source_;
 };
 
 /// Type alias for TCP RPC server

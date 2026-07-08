@@ -1824,6 +1824,37 @@ TEST_CASE("net::stream exact helpers on disconnected stream return -ENOTCONN",
     REQUIRE(write_result.result == -ENOTCONN);
 }
 
+#if !defined(ELIO_HAS_TLS) || !ELIO_HAS_TLS
+TEST_CASE("net::connect secure request without TLS reports unsupported",
+          "[tcp][stream][connect][net_stream]") {
+    std::optional<elio::net::stream> result;
+    std::atomic<bool> done{false};
+    int observed_errno = 0;
+
+    scheduler sched(1);
+    sched.start();
+
+    auto coro = [&]() -> task<void> {
+        errno = 0;
+        result = co_await elio::net::connect("localhost", 443, true, nullptr);
+        observed_errno = errno;
+        done = true;
+    };
+
+    sched.go(coro);
+
+    for (int i = 0; i < 200 && !done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(done);
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(observed_errno == ENOTSUP);
+}
+#endif
+
 TEST_CASE("TCP connect regression avoids double connect", "[tcp][connect][regression]") {
     auto listener = tcp_listener::bind(ipv6_address("::1", 0));
     REQUIRE(listener.has_value());

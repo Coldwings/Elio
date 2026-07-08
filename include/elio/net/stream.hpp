@@ -18,6 +18,7 @@
 
 #include <variant>
 #include <chrono>
+#include <cerrno>
 #include <cstddef>
 #include <limits>
 #include <optional>

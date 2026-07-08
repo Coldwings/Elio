@@ -145,7 +145,9 @@ struct atomic_result {
 ///
 /// `signaled`     — request a completion (CQE). Most production WRs set
 ///                  this; backends are free to suppress CQEs for unset
-///                  WRs to reduce CQ pressure. Default ON.
+///                  WRs to reduce CQ pressure. Awaited connection
+///                  operations force this on so they can resume.
+///                  Default ON.
 /// `solicited`    — set IBV_SEND_SOLICITED (peer's CQ event fires on
 ///                  this WR's reception). Two-sided messaging hint.
 /// `inline_send`  — request inline send (S5b); valid only when

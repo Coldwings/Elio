@@ -54,6 +54,7 @@ struct atomic_state {
     std::uint64_t    last_swap{0};
     std::uint64_t    last_add{0};
     sge              last_sge{};
+    send_flags       last_flags{};
     int              cas_rc = 0;
     int              faa_rc = 0;
 
@@ -83,7 +84,7 @@ struct atomic_static_backend {
                                remote_buffer rb,
                                std::uint64_t compare,
                                std::uint64_t swap,
-                               send_flags /*flags*/,
+                               send_flags flags,
                                wr_id id) noexcept {
         if (!state) return 0;
         state->cas_calls.fetch_add(1);
@@ -93,6 +94,7 @@ struct atomic_static_backend {
         state->last_compare = compare;
         state->last_swap    = swap;
         state->last_sge     = sges.empty() ? sge{} : sges.front();
+        state->last_flags   = flags;
         // Simulate the hardware: write the (claimed) old value
         // big-endian into the local buffer.
         if (!sges.empty() && sges.front().addr
@@ -106,7 +108,7 @@ struct atomic_static_backend {
                                      std::span<const sge> sges,
                                      remote_buffer rb,
                                      std::uint64_t add,
-                                     send_flags /*flags*/,
+                                     send_flags flags,
                                      wr_id id) noexcept {
         if (!state) return 0;
         state->faa_calls.fetch_add(1);
@@ -115,6 +117,7 @@ struct atomic_static_backend {
         state->last_remote = rb;
         state->last_add    = add;
         state->last_sge    = sges.empty() ? sge{} : sges.front();
+        state->last_flags  = flags;
         if (!sges.empty() && sges.front().addr
             && sges.front().length >= 8) {
             std::uint64_t be = htobe64(state->fake_old_value_host);
@@ -147,7 +150,7 @@ struct atomic_poly_backend : polymorphic_backend {
 
     int post_atomic_cas(void* qp, std::span<const sge> sges,
                         remote_buffer rb, std::uint64_t compare,
-                        std::uint64_t swap, send_flags /*flags*/,
+                        std::uint64_t swap, send_flags flags,
                         wr_id id) noexcept override {
         state.cas_calls.fetch_add(1);
         state.last_id      = id;
@@ -156,6 +159,7 @@ struct atomic_poly_backend : polymorphic_backend {
         state.last_compare = compare;
         state.last_swap    = swap;
         state.last_sge     = sges.empty() ? sge{} : sges.front();
+        state.last_flags   = flags;
         if (!sges.empty() && sges.front().addr
             && sges.front().length >= 8) {
             std::uint64_t be = htobe64(state.fake_old_value_host);
@@ -165,7 +169,7 @@ struct atomic_poly_backend : polymorphic_backend {
     }
     int post_atomic_fetch_add(void* qp, std::span<const sge> sges,
                               remote_buffer rb, std::uint64_t add,
-                              send_flags /*flags*/,
+                              send_flags flags,
                               wr_id id) noexcept override {
         state.faa_calls.fetch_add(1);
         state.last_id     = id;
@@ -173,6 +177,7 @@ struct atomic_poly_backend : polymorphic_backend {
         state.last_remote = rb;
         state.last_add    = add;
         state.last_sge    = sges.empty() ? sge{} : sges.front();
+        state.last_flags  = flags;
         if (!sges.empty() && sges.front().addr
             && sges.front().length >= 8) {
             std::uint64_t be = htobe64(state.fake_old_value_host);
@@ -266,6 +271,39 @@ TEST_CASE("cas: backend receives args verbatim; old value round-trips",
     REQUIRE(result.old_value_raw() == htobe64(0xDEADBEEFCAFEBABEull));
 }
 
+TEST_CASE("cas: awaited operation forces completion for unsignaled flags",
+          "[rdma][atomic][cas][signaled]") {
+    atomic_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 12;
+    connection<atomic_static_backend> c{&qp_value, disp};
+
+    alignas(8) char local[8] = {};
+    buffer_view bv{local, sizeof(local), 0x123};
+    remote_buffer remote{0x1000, 8, 0xCAFE};
+
+    send_flags flags = send_flags::none();
+    flags.fence = true;
+
+    atomic_result result{};
+    bool done = false;
+    auto run = [&]() -> probe_task {
+        result = co_await c.cas(bv, remote, 1, 2, flags);
+        done = true;
+    };
+    auto task = run();
+
+    REQUIRE_FALSE(done);
+    REQUIRE(st.cas_calls.load() == 1);
+    REQUIRE(st.last_flags.signaled);
+    REQUIRE(st.last_flags.fence);
+
+    disp.deliver(st.last_id, wc_status::success, /*byte_len=*/8);
+    REQUIRE(done);
+    REQUIRE(result.ok());
+}
+
 TEST_CASE("fetch_add: backend receives add operand; old value round-trips",
           "[rdma][atomic][faa]") {
     atomic_state st;
@@ -295,6 +333,39 @@ TEST_CASE("fetch_add: backend receives add operand; old value round-trips",
     REQUIRE(done);
     REQUIRE(result.ok());
     REQUIRE(result.old_value_host() == 0xAABBCCDD00112233ull);
+}
+
+TEST_CASE("fetch_add: awaited operation forces completion for unsignaled flags",
+          "[rdma][atomic][faa][signaled]") {
+    atomic_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 13;
+    connection<atomic_static_backend> c{&qp_value, disp};
+
+    alignas(8) char local[8] = {};
+    buffer_view bv{local, sizeof(local), 0};
+    remote_buffer remote{0x2000, 8, 0xBEEF};
+
+    send_flags flags = send_flags::none();
+    flags.solicited = true;
+
+    atomic_result result{};
+    bool done = false;
+    auto run = [&]() -> probe_task {
+        result = co_await c.fetch_add(bv, remote, 7, flags);
+        done = true;
+    };
+    auto task = run();
+
+    REQUIRE_FALSE(done);
+    REQUIRE(st.faa_calls.load() == 1);
+    REQUIRE(st.last_flags.signaled);
+    REQUIRE(st.last_flags.solicited);
+
+    disp.deliver(st.last_id, wc_status::success, /*byte_len=*/8);
+    REQUIRE(done);
+    REQUIRE(result.ok());
 }
 
 TEST_CASE("cas: synchronous post failure resumes inline as flush error",

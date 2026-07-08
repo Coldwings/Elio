@@ -215,6 +215,35 @@ TEST_CASE("rdma_write: backend receives local SGE + remote_buffer + flags",
     REQUIRE(result.byte_len == 0u);
 }
 
+TEST_CASE("rdma_write: awaited operation forces completion for unsignaled flags",
+          "[rdma][write][signaled]") {
+    one_sided_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 12;
+    connection<one_sided_static_backend> c{&qp_value, disp};
+
+    char payload[16] = {};
+    buffer_view local{payload, sizeof(payload), 0x1234};
+    remote_buffer remote{0xCAFE, sizeof(payload), 0xBEEF};
+
+    send_flags flags = send_flags::none();
+    flags.fence = true;
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_write(c, local, remote, flags, result, done);
+
+    REQUIRE_FALSE(done);
+    REQUIRE(st.writes.load() == 1);
+    REQUIRE(st.last_write_flags.signaled);
+    REQUIRE(st.last_write_flags.fence);
+
+    disp.deliver(st.last_write_id, wc_status::success, /*byte_len=*/0);
+    REQUIRE(done);
+    REQUIRE(result.ok());
+}
+
 TEST_CASE("rdma_read: backend receives local SGE + remote_buffer; "
           "byte_len returned to caller",
           "[rdma][read]") {

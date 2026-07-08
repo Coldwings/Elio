@@ -215,6 +215,34 @@ TEST_CASE("send: happy path suspends and dispatcher resumes",
     REQUIRE(result.wc_flags == 0x2u);
 }
 
+TEST_CASE("send: awaited operation forces completion for unsignaled flags",
+          "[rdma][send][signaled]") {
+    mock_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 100;
+    connection<mock_static_backend> c{&qp_value, disp};
+
+    char payload[8] = {};
+    buffer_view bv{payload, sizeof(payload), 0x1234};
+
+    send_flags flags = send_flags::none();
+    flags.solicited = true;
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_send(c, bv, flags, result, done);
+
+    REQUIRE_FALSE(done);
+    REQUIRE(st.sends.load() == 1);
+    REQUIRE(st.last_send_flags.signaled);
+    REQUIRE(st.last_send_flags.solicited);
+
+    disp.deliver(st.last_send_id, wc_status::success, /*byte_len=*/8);
+    REQUIRE(done);
+    REQUIRE(result.ok());
+}
+
 TEST_CASE("recv: happy path suspends and dispatcher resumes",
           "[rdma][recv]") {
     mock_state st;

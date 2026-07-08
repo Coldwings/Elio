@@ -231,8 +231,8 @@ private:
                 co_return false;
             }
             if (len > 0) {
-                auto result = co_await stream_->write(data, len);
-                if (result.result <= 0) {
+                auto result = co_await stream_->write_exactly(data, static_cast<size_t>(len));
+                if (result.result != len) {
                     ELIO_LOG_ERROR("HTTP/2 write failed");
                     co_return false;
                 }
@@ -301,7 +301,11 @@ public:
             const uint8_t* data;
             ssize_t len = nghttp2_session_mem_send(session_, &data);
             if (len > 0) {
-                co_await stream_->write(data, len);
+                auto result = co_await stream_->write_exactly(data, static_cast<size_t>(len));
+                if (result.result != len) {
+                    ELIO_LOG_ERROR("HTTP/2 GOAWAY write failed");
+                    break;
+                }
             } else {
                 break;
             }

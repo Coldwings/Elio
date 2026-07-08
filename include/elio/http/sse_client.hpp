@@ -429,8 +429,8 @@ private:
         
         request += "\r\n";
         
-        auto send_result = co_await write(request.data(), request.size());
-        if (send_result.result <= 0) {
+        auto send_result = co_await write_exactly(request.data(), request.size());
+        if (send_result.result != static_cast<ssize_t>(request.size())) {
             ELIO_LOG_ERROR("Failed to send SSE request");
             state_ = client_state::disconnected;
             co_return false;
@@ -595,6 +595,10 @@ private:
 
     coro::task<io::io_result> write(const void* buf, size_t len) {
         co_return co_await stream_.write(buf, len);
+    }
+
+    coro::task<io::io_result> write_exactly(const void* buf, size_t len) {
+        co_return co_await stream_.write_exactly(buf, len);
     }
     
     client_config config_;

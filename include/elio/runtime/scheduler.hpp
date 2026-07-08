@@ -95,8 +95,9 @@ public:
             // Users wanting drain-on-exit should call shutdown() explicitly.
             shutdown_force();
         }
-        // Clean up exception handler
-        delete unhandled_exception_handler_.exchange(nullptr, std::memory_order_acq_rel);
+        unhandled_exception_handler_.store(
+            std::shared_ptr<const unhandled_exception_handler>{},
+            std::memory_order_release);
     }
 
     scheduler(const scheduler&) = delete;
@@ -554,26 +555,32 @@ public:
     /// Default behavior (no handler set): log ERROR with exception info.
     /// When handler is set: invoke handler instead of logging.
     ///
-    /// Thread-safe: handler pointer is atomic. Can be set from any thread.
+    /// Thread-safe: handler ownership is published atomically. Can be set from
+    /// any thread; racing reporters keep the loaded handler alive while calling it.
     void set_unhandled_exception_handler(unhandled_exception_handler handler) {
-        auto* new_handler = handler
-            ? new unhandled_exception_handler(std::move(handler))
-            : nullptr;
-        auto* old_handler = unhandled_exception_handler_.exchange(
-            new_handler, std::memory_order_acq_rel);
-        delete old_handler;
+        std::shared_ptr<const unhandled_exception_handler> new_handler;
+        if (handler) {
+            new_handler = std::make_shared<unhandled_exception_handler>(
+                std::move(handler));
+        }
+        unhandled_exception_handler_.store(
+            std::move(new_handler), std::memory_order_release);
     }
 
     /// Get the current unhandled exception handler (may be nullptr).
+    /// The returned pointer is backed by a thread-local shared snapshot and
+    /// remains valid until this thread calls the getter again or exits.
     [[nodiscard]] const unhandled_exception_handler* get_unhandled_exception_handler() const noexcept {
-        return unhandled_exception_handler_.load(std::memory_order_acquire);
+        static thread_local std::shared_ptr<const unhandled_exception_handler> snapshot;
+        snapshot = unhandled_exception_handler_.load(std::memory_order_acquire);
+        return snapshot.get();
     }
 
     /// Report an unhandled exception. If handler is set, invoke it.
     /// Otherwise log ERROR.
     void report_unhandled_exception(std::exception_ptr ex) noexcept {
         if (!ex) return;
-        auto* handler = unhandled_exception_handler_.load(std::memory_order_acquire);
+        auto handler = unhandled_exception_handler_.load(std::memory_order_acquire);
         if (handler) {
             try {
                 (*handler)(std::move(ex));
@@ -813,10 +820,10 @@ private:
     // Protected by workers_mutex_.
     std::vector<std::pair<std::unique_ptr<worker_thread>, std::thread>> draining_workers_;
 
-    // Per-scheduler unhandled exception handler. Nullptr means default behavior
-    // (log ERROR). Owned via raw pointer + atomic for lock-free reads on hot path.
-    // Set/delete via set_unhandled_exception_handler().
-    std::atomic<unhandled_exception_handler*> unhandled_exception_handler_{nullptr};
+    // Per-scheduler unhandled exception handler. Empty means default behavior
+    // (log ERROR). Atomic shared ownership keeps a loaded handler alive while a
+    // racing set_unhandled_exception_handler() publishes a replacement.
+    std::atomic<std::shared_ptr<const unhandled_exception_handler>> unhandled_exception_handler_{};
 
     static inline thread_local scheduler* current_scheduler_ = nullptr;
 };

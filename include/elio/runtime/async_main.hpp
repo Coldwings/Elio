@@ -212,13 +212,29 @@ auto run(F&& f, const run_config& config = {})
         }
     };
 
+    std::exception_ptr wait_exception;
     if constexpr (std::is_void_v<T>) {
-        signal.wait();
+        try {
+            signal.wait();
+        } catch (...) {
+            wait_exception = std::current_exception();
+        }
         do_shutdown();
+        if (wait_exception) {
+            std::rethrow_exception(wait_exception);
+        }
     } else {
-        T result = signal.wait();
+        std::optional<T> result;
+        try {
+            result.emplace(signal.wait());
+        } catch (...) {
+            wait_exception = std::current_exception();
+        }
         do_shutdown();
-        return result;
+        if (wait_exception) {
+            std::rethrow_exception(wait_exception);
+        }
+        return std::move(*result);
     }
 }
 

@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <stdexcept>
 #include <thread>
 
 #include "../test_main.cpp"  // For scaled_ms / scaled_sec
@@ -183,6 +184,29 @@ TEST_CASE("elio::run waits for spawned tasks to complete (graceful by default)",
     });
 
     REQUIRE(children_done.load() == 3);
+}
+
+TEST_CASE("elio::run shuts down spawned tasks when async_main throws",
+          "[scheduler][shutdown]") {
+    std::atomic<int> children_done{0};
+
+    run_config config;
+    config.num_threads = 1;
+    config.shutdown_timeout = scaled_ms(1000);
+
+    REQUIRE_THROWS_AS(
+        elio::run([&]() -> task<int> {
+            auto* sched = scheduler::current();
+            REQUIRE(sched != nullptr);
+
+            sched->go(mark_after_sleep_counter, scaled_ms(50), &children_done);
+
+            throw std::runtime_error("async_main failed");
+            co_return 0;
+        }, config),
+        std::runtime_error);
+
+    REQUIRE(children_done.load() == 1);
 }
 
 TEST_CASE("shutdown can be called twice safely (idempotent)",

@@ -16,9 +16,11 @@
 
 #include <elio/rdma/rdma.hpp>
 
+#include <array>
 #include <atomic>
 #include <coroutine>
 #include <cstdint>
+#include <limits>
 #include <span>
 
 using elio::rdma::buffer_view;
@@ -177,9 +179,24 @@ probe_task run_write(Conn& c, buffer_view local, remote_buffer remote,
 }
 
 template <typename Conn>
+probe_task run_write_sges(Conn& c, std::span<const sge> locals,
+                          remote_buffer remote, send_flags flags,
+                          wc_result& out, bool& done) {
+    out  = co_await c.rdma_write(locals, remote, flags);
+    done = true;
+}
+
+template <typename Conn>
 probe_task run_read(Conn& c, buffer_view local, remote_buffer remote,
                     wc_result& out, bool& done) {
     out  = co_await c.rdma_read(local, remote);
+    done = true;
+}
+
+template <typename Conn>
+probe_task run_read_sges(Conn& c, std::span<const sge> locals,
+                         remote_buffer remote, wc_result& out, bool& done) {
+    out  = co_await c.rdma_read(locals, remote);
     done = true;
 }
 
@@ -319,6 +336,108 @@ TEST_CASE("rdma_read: backend receives local SGE + remote_buffer; "
     REQUIRE(done);
     REQUIRE(result.ok());
     REQUIRE(result.byte_len == 200u);
+}
+
+TEST_CASE("rdma_write: local bytes exceeding remote length rejected pre-post",
+          "[rdma][write][length]") {
+    one_sided_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 23;
+    connection<one_sided_static_backend> c{&qp_value, disp};
+
+    char payload[16] = {};
+    buffer_view local{payload, sizeof(payload), 0x1111};
+    remote_buffer remote{0xCAFE, 8, 0x2222};
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_write(c, local, remote, send_flags{}, result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.writes.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == sizeof(payload));
+}
+
+TEST_CASE("rdma_read: local bytes exceeding remote length rejected pre-post",
+          "[rdma][read][length]") {
+    one_sided_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 24;
+    connection<one_sided_static_backend> c{&qp_value, disp};
+
+    char payload[32] = {};
+    buffer_view local{payload, sizeof(payload), 0x3333};
+    remote_buffer remote{0xBEEF, 16, 0x4444};
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_read(c, local, remote, result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.reads.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == sizeof(payload));
+}
+
+TEST_CASE("rdma_write: remote length check uses a wide multi-SGE total",
+          "[rdma][write][length]") {
+    one_sided_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 25;
+    connection<one_sided_static_backend> c{&qp_value, disp};
+
+    char payload = 0;
+    constexpr auto max_u32 = std::numeric_limits<std::uint32_t>::max();
+    std::array<sge, 2> locals{
+        sge{&payload, max_u32, 0x1111},
+        sge{&payload, 2, 0x1111},
+    };
+    remote_buffer remote{0xCAFE, max_u32, 0x2222};
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_write_sges(c, std::span<const sge>(locals), remote,
+                               send_flags{}, result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.writes.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == max_u32);
+}
+
+TEST_CASE("rdma_read: remote length check uses a wide multi-SGE total",
+          "[rdma][read][length]") {
+    one_sided_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 26;
+    connection<one_sided_static_backend> c{&qp_value, disp};
+
+    char payload = 0;
+    constexpr auto max_u32 = std::numeric_limits<std::uint32_t>::max();
+    std::array<sge, 2> locals{
+        sge{&payload, max_u32, 0x3333},
+        sge{&payload, 1, 0x3333},
+    };
+    remote_buffer remote{0xBEEF, max_u32, 0x4444};
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_read_sges(c, std::span<const sge>(locals), remote,
+                              result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.reads.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == max_u32);
 }
 
 TEST_CASE("rdma_write: post failure resumes inline with flush error",

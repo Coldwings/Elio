@@ -41,6 +41,7 @@
 #include <cassert>
 #include <coroutine>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <span>
 
@@ -180,6 +181,11 @@ struct backend_invoker<polymorphic_backend> {
 [[nodiscard]] constexpr send_flags require_completion_(send_flags flags) noexcept {
     flags.signaled = true;
     return flags;
+}
+
+[[nodiscard]] constexpr std::uint32_t byte_count_hint_(std::uint64_t bytes) noexcept {
+    constexpr auto max = std::numeric_limits<std::uint32_t>::max();
+    return bytes > max ? max : static_cast<std::uint32_t>(bytes);
 }
 
 /// Shared awaiter machinery — owns the op_state, runs the orphan race
@@ -323,8 +329,8 @@ protected:
 
     /// Total bytes across the resolved SGE list. Used by S5b's inline
     /// send precondition check.
-    [[nodiscard]] std::size_t total_bytes_() const noexcept {
-        std::size_t total = 0;
+    [[nodiscard]] std::uint64_t total_bytes_() const noexcept {
+        std::uint64_t total = 0;
         for (const auto& s : effective_sges_()) {
             total += s.length;
         }
@@ -372,12 +378,13 @@ public:
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
         const auto id = arm_(h);
-        if (flags_.inline_send && total_bytes_() > max_inline_) {
+        const auto total = total_bytes_();
+        if (flags_.inline_send && total > max_inline_) {
             // Pass the offending byte count back via imm_data so the
             // caller can log it without re-walking the SGE list.
             return fail_pre_post_(
                 wc_status::local_length_error,
-                static_cast<std::uint32_t>(total_bytes_()));
+                byte_count_hint_(total));
         }
         const int rc = backend_invoker<Backend>::post_send(
             qp_, effective_sges_(), flags_, imm_data_, id, backend_);
@@ -453,10 +460,16 @@ public:
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
         const auto id = arm_(h);
-        if (flags_.inline_send && total_bytes_() > max_inline_) {
+        const auto total = total_bytes_();
+        if (total > remote_.length) {
             return fail_pre_post_(
                 wc_status::local_length_error,
-                static_cast<std::uint32_t>(total_bytes_()));
+                byte_count_hint_(total));
+        }
+        if (flags_.inline_send && total > max_inline_) {
+            return fail_pre_post_(
+                wc_status::local_length_error,
+                byte_count_hint_(total));
         }
         const int rc = backend_invoker<Backend>::post_rdma_write(
             qp_, effective_sges_(), remote_, flags_, imm_data_, id, backend_);
@@ -494,6 +507,12 @@ public:
 
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
         const auto id = arm_(h);
+        const auto total = total_bytes_();
+        if (total > remote_.length) {
+            return fail_pre_post_(
+                wc_status::local_length_error,
+                byte_count_hint_(total));
+        }
         const int rc = backend_invoker<Backend>::post_rdma_read(
             qp_, effective_sges_(), remote_, id, backend_);
         return finalize_post_(rc);

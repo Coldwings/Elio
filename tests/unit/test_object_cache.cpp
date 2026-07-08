@@ -1,10 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
+#define ELIO_OBJECT_CACHE_TEST_HOOKS 1
 #include <elio/sync/object_cache.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/time/timer.hpp>
 
 #include <atomic>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -384,6 +386,74 @@ TEST_CASE("object_cache release waits for other borrows", "[object_cache]") {
     }
 
     REQUIRE(released.load());
+    sched.shutdown();
+}
+
+TEST_CASE("object_cache release handoff resumes once when final borrow drops after waiter publish",
+          "[object_cache][release]") {
+    scheduler sched(1);
+    sched.start();
+
+    using cache_type = object_cache<std::string, int>;
+
+    std::atomic<int> hook_calls{0};
+    std::atomic<int> release_continuations{0};
+    std::optional<cache_type::borrow> other;
+
+    struct hook_context {
+        std::optional<cache_type::borrow>* other;
+        std::atomic<int>* hook_calls;
+    } ctx{&other, &hook_calls};
+
+    struct hook_guard {
+        hook_guard(void (*cb)(void*), void* ctx) {
+            detail_oc::release_waiter_published_hook.context.store(
+                ctx, std::memory_order_release);
+            detail_oc::release_waiter_published_hook.callback.store(
+                cb, std::memory_order_release);
+        }
+
+        ~hook_guard() {
+            detail_oc::release_waiter_published_hook.callback.store(
+                nullptr, std::memory_order_release);
+            detail_oc::release_waiter_published_hook.context.store(
+                nullptr, std::memory_order_release);
+        }
+    } guard{
+        [](void* raw) noexcept {
+            auto* c = static_cast<hook_context*>(raw);
+            if (c->hook_calls->fetch_add(1, std::memory_order_acq_rel) == 0) {
+                c->other->reset();
+            }
+        },
+        &ctx};
+
+    {
+        cache_type cache({.num_shards = 4});
+
+        auto h = spawn_joinable(sched, [&]() -> task<void> {
+            auto releaser = co_await cache.get("race_key", []() -> task<int> {
+                co_return 101;
+            });
+            other.emplace(co_await cache.get("race_key", []() -> task<int> {
+                co_return 202;
+            }));
+
+            auto owned = co_await releaser.release();
+            release_continuations.fetch_add(1, std::memory_order_relaxed);
+
+            REQUIRE(owned != nullptr);
+            REQUIRE(*owned == 101);
+            REQUIRE(!releaser);
+            co_return;
+        });
+
+        h.wait_destroyed();
+    }
+
+    REQUIRE(hook_calls.load(std::memory_order_acquire) == 1);
+    REQUIRE(release_continuations.load(std::memory_order_acquire) == 1);
+
     sched.shutdown();
 }
 

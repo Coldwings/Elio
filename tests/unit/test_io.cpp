@@ -1201,13 +1201,8 @@ TEST_CASE("UDS echo test", "[uds][echo]") {
 // ============================================================================
 
 #include <elio/net/tcp.hpp>
-#include <elio/time/timer.hpp>
-
-// net::stream pulls in the TLS headers (OpenSSL). Only include it when TLS is
-// compiled in so the plain-TCP build of these tests stays OpenSSL-free.
-#if defined(ELIO_HAS_TLS)
 #include <elio/net/stream.hpp>
-#endif
+#include <elio/time/timer.hpp>
 
 static task<void> tcp_connect_regression_attempt(
     uint16_t port,
@@ -1684,7 +1679,6 @@ TEST_CASE("tcp_stream read_exactly/write_exactly", "[tcp][stream][exact]") {
     sched.shutdown();
 }
 
-#if defined(ELIO_HAS_TLS)
 TEST_CASE("net::stream read_exactly/write_exactly delegate to TCP",
           "[tcp][stream][exact][net_stream]") {
     // Wrap plain TCP endpoints in the unified net::stream and confirm the
@@ -1829,7 +1823,6 @@ TEST_CASE("net::stream exact helpers on disconnected stream return -ENOTCONN",
     REQUIRE(read_result.result == -ENOTCONN);
     REQUIRE(write_result.result == -ENOTCONN);
 }
-#endif // ELIO_HAS_TLS
 
 TEST_CASE("TCP connect regression avoids double connect", "[tcp][connect][regression]") {
     auto listener = tcp_listener::bind(ipv6_address("::1", 0));

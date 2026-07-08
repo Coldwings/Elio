@@ -33,12 +33,14 @@ file(WRITE "${_consumer_source_dir}/main.cpp" [=[
 #include <concepts>
 #include <coroutine>
 #include <elio/coro/task.hpp>
+#include <elio/net/stream.hpp>
 
 static_assert(__cplusplus >= 202002L,
     "Elio::elio must propagate a C++20 compile requirement");
 
 int main() {
-    return 0;
+    elio::net::stream stream;
+    return (stream.is_connected() || stream.is_secure()) ? 1 : 0;
 }
 ]=])
 file(READ "${_consumer_source_dir}/CMakeLists.txt" _consumer_cmake)
@@ -137,7 +139,7 @@ execute_process(
 )
 if(NOT _consumer_build_result EQUAL 0)
     message(FATAL_ERROR
-        "Downstream consumer did not build with Elio::elio's exported C++20 requirement\n"
+        "Downstream consumer did not build with Elio::elio's exported C++20 requirement and TCP-only stream header\n"
         "stdout:\n${_consumer_build_stdout}\n"
         "stderr:\n${_consumer_build_stderr}")
 endif()

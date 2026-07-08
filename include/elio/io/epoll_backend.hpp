@@ -177,16 +177,34 @@ public:
         }
         
         // Get or create fd state
-        auto& state = fd_states_[req.fd];
+        auto state_it = fd_states_.find(req.fd);
+        if (state_it == fd_states_.end()) {
+            state_it = fd_states_.emplace(req.fd, fd_state{}).first;
+        }
+        auto& state = state_it->second;
         bool is_sync = op.synchronous;
-        state.pending_ops.push_back(std::move(op));
         
         if (!is_sync) {
             // Register with epoll
-            state.events |= events;
+            uint32_t previous_events = state.events;
+            bool previous_registered = state.registered;
+            uint32_t requested_events = state.events | events;
+
+            auto fail_registration = [&](int err) {
+                state.events = previous_events;
+                state.registered = previous_registered;
+                io_result result{-err, 0};
+                last_result_ = result;
+                ELIO_LOG_WARNING("epoll_ctl failed for fd {}: {}",
+                                 req.fd, strerror(err));
+                if (state.pending_ops.empty() && !state.registered) {
+                    fd_states_.erase(state_it);
+                }
+                return false;
+            };
             
-            struct epoll_event ev;
-            ev.events = state.events;
+            struct epoll_event ev{};
+            ev.events = requested_events;
             ev.data.fd = req.fd;
             
             int ret;
@@ -200,19 +218,26 @@ public:
             }
             
             if (ret < 0) {
-                if (errno == EEXIST) {
+                int err = errno;
+                if (err == EEXIST && !previous_registered) {
                     // fd is already registered (e.g. from a prior ADD that
-                    // succeeded but whose state was lost). Treat as
-                    // registered so subsequent prepare() calls use
-                    // EPOLL_CTL_MOD instead of retrying ADD forever.
-                    state.registered = true;
+                    // succeeded but whose state was lost). Apply the new
+                    // interest mask before trusting the recovered state.
+                    ret = epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, req.fd, &ev);
+                    if (ret == 0) {
+                        state.registered = true;
+                    } else {
+                        return fail_registration(errno);
+                    }
                 } else {
-                    ELIO_LOG_WARNING("epoll_ctl failed for fd {}: {}",
-                                     req.fd, strerror(errno));
+                    return fail_registration(err);
                 }
             }
+
+            state.events = requested_events;
         }
         
+        state.pending_ops.push_back(std::move(op));
         pending_count_++;
         ELIO_LOG_DEBUG("Prepared io_op::{} on fd={}", 
                        static_cast<int>(req.op), req.fd);

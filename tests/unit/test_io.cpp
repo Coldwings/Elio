@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <cerrno>
 #include <cstring>
 #include <thread>
 #include <atomic>
@@ -100,6 +101,27 @@ TEST_CASE("epoll_backend basic operations", "[io][epoll]") {
     SECTION("is_available returns true") {
         REQUIRE(epoll_backend::is_available());
     }
+}
+
+TEST_CASE("epoll_backend registration failure does not leave pending op", "[io][epoll][registration]") {
+    epoll_backend backend;
+    char buffer = 0;
+
+    io_request req{};
+    req.op = io_op::read;
+    req.fd = -1;
+    req.buffer = &buffer;
+    req.length = sizeof(buffer);
+
+    SECTION("returns failure to raw prepare caller") {
+        REQUIRE_FALSE(backend.prepare(req));
+
+        auto result = epoll_backend::get_last_result();
+        REQUIRE(result.result == -EBADF);
+    }
+
+    REQUIRE_FALSE(backend.has_pending());
+    REQUIRE(backend.pending_count() == 0);
 }
 
 TEST_CASE("Pipe read/write with epoll", "[io][epoll][pipe]") {

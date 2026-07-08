@@ -4,6 +4,7 @@
 #include <elio/runtime/scheduler.hpp>
 
 #include <atomic>
+#include <coroutine>
 
 using namespace elio::sync;
 using namespace elio::coro;
@@ -44,6 +45,27 @@ TEST_CASE("mutex: destroying waiter does not crash on unlock()", "[sync][mutex][
     m.unlock();  // Must NOT crash
 }
 
+TEST_CASE("mutex: destroying popped waiter transfers lock handoff", "[sync][mutex][cancellation]") {
+    mutex m;
+    REQUIRE(m.try_lock());
+
+    auto second = m.lock();
+    {
+        auto first = m.lock();
+
+        REQUIRE(first.await_suspend(std::noop_coroutine()));
+        REQUIRE(second.await_suspend(std::noop_coroutine()));
+
+        m.unlock();
+        REQUIRE(m.is_locked());
+    }
+
+    REQUIRE(m.is_locked());
+    second.await_resume();
+    m.unlock();
+    REQUIRE_FALSE(m.is_locked());
+}
+
 TEST_CASE("semaphore: destroying waiter does not crash on release()", "[sync][semaphore][cancellation]") {
     semaphore sem(0);  // No permits available
 
@@ -57,6 +79,26 @@ TEST_CASE("semaphore: destroying waiter does not crash on release()", "[sync][se
 
     h.destroy();
     sem.release();  // Must NOT crash
+}
+
+TEST_CASE("semaphore: destroying popped waiter transfers permit handoff", "[sync][semaphore][cancellation]") {
+    semaphore sem(0);
+
+    auto second = sem.acquire();
+    {
+        auto first = sem.acquire();
+
+        REQUIRE(first.await_suspend(std::noop_coroutine()));
+        REQUIRE(second.await_suspend(std::noop_coroutine()));
+
+        sem.release();
+        REQUIRE(sem.count() == 0);
+    }
+
+    REQUIRE(sem.count() == 0);
+    second.await_resume();
+    sem.release();
+    REQUIRE(sem.count() == 1);
 }
 
 TEST_CASE("condition_variable: destroying waiter does not crash on notify()", "[sync][condvar][cancellation]") {
@@ -131,6 +173,27 @@ TEST_CASE("shared_mutex: destroying reader waiter does not crash on unlock()", "
     sm.unlock();  // Writer unlock — must NOT crash when scanning reader_waiters_
 }
 
+TEST_CASE("shared_mutex: destroying popped reader releases reader handoff", "[sync][shared_mutex][cancellation]") {
+    shared_mutex sm;
+    REQUIRE(sm.try_lock());
+
+    auto second = sm.lock_shared();
+    {
+        auto first = sm.lock_shared();
+
+        REQUIRE(first.await_suspend(std::noop_coroutine()));
+        REQUIRE(second.await_suspend(std::noop_coroutine()));
+
+        sm.unlock();
+        REQUIRE(sm.reader_count() == 2);
+    }
+
+    REQUIRE(sm.reader_count() == 1);
+    second.await_resume();
+    sm.unlock_shared();
+    REQUIRE(sm.reader_count() == 0);
+}
+
 TEST_CASE("shared_mutex: destroying writer waiter does not deadlock subsequent operations", "[sync][shared_mutex][cancellation]") {
     shared_mutex sm;
     sm.try_lock_shared();  // Reader holds lock, so writer will suspend and set WRITER_WAITING
@@ -165,6 +228,27 @@ TEST_CASE("shared_mutex: destroying writer waiter does not deadlock subsequent o
     auto wt = writer_task();
     auto wh = elio::coro::detail::task_access::release(wt);
     wh.resume();  // Should complete without suspending
+}
+
+TEST_CASE("shared_mutex: destroying popped writer transfers writer handoff", "[sync][shared_mutex][cancellation]") {
+    shared_mutex sm;
+    REQUIRE(sm.try_lock_shared());
+
+    auto second = sm.lock();
+    {
+        auto first = sm.lock();
+
+        REQUIRE(first.await_suspend(std::noop_coroutine()));
+        REQUIRE(second.await_suspend(std::noop_coroutine()));
+
+        sm.unlock_shared();
+        REQUIRE(sm.is_writer_active());
+    }
+
+    REQUIRE(sm.is_writer_active());
+    second.await_resume();
+    sm.unlock();
+    REQUIRE_FALSE(sm.is_writer_active());
 }
 
 TEST_CASE("shared_mutex: destroying writer waiter wakes parked readers", "[sync][shared_mutex][cancellation]") {

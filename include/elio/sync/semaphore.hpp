@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cassert>
+#include <climits>
 #include <coroutine>
 #include <atomic>
 #include <mutex>
@@ -42,10 +43,20 @@ public:
             // so no wake function could hold a reference to us.
             if (!suspended_) return;
 
+            std::coroutine_handle<> to_schedule;
             // Slow path: acquire mutex to prevent race with release()
-            std::lock_guard<std::mutex> guard(sem_.mutex_);
-            if (this->is_linked()) {
-                sem_.waiters_.remove(this);
+            {
+                std::lock_guard<std::mutex> guard(sem_.mutex_);
+                if (this->is_linked()) {
+                    sem_.waiters_.remove(this);
+                } else if (grant_pending_ && !resumed_) {
+                    grant_pending_ = false;
+                    to_schedule = sem_.recover_cancelled_handoff_locked();
+                }
+            }
+
+            if (to_schedule) {
+                runtime::schedule_handle(to_schedule);
             }
         }
 
@@ -67,12 +78,17 @@ public:
             return true;  // Suspend
         }
 
-        void await_resume() const noexcept {}
+        void await_resume() noexcept {
+            resumed_ = true;
+            grant_pending_ = false;
+        }
 
     private:
         semaphore& sem_;
         std::coroutine_handle<> handle_;
         bool suspended_ = false;  // True if enqueued in waiters_
+        bool resumed_ = false;    // True after a popped waiter resumes normally
+        bool grant_pending_ = false;  // True after release() transfers a permit
 
         friend class semaphore;
     };
@@ -107,6 +123,7 @@ public:
             // Popping marks nodes as unlinked, so destructors won't try to remove them.
             for (int i = 0; i < to_wake; ++i) {
                 auto* waiter = waiters_.pop_front();
+                waiter->grant_pending_ = true;
                 to_schedule.push_back(waiter->handle_);
             }
 
@@ -132,6 +149,18 @@ private:
     mutable std::mutex mutex_;
     int count_;
     elio::detail::intrusive_list<acquire_awaitable> waiters_;
+
+    std::coroutine_handle<> recover_cancelled_handoff_locked() noexcept {
+        if (!waiters_.empty()) {
+            auto* waiter = waiters_.pop_front();
+            waiter->grant_pending_ = true;
+            return waiter->handle_;
+        }
+
+        assert(count_ < INT_MAX && "semaphore count overflow");
+        ++count_;
+        return nullptr;
+    }
 };
 
 } // namespace elio::sync

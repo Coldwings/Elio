@@ -53,6 +53,21 @@ private:
     const void* previous_;
 };
 
+struct scheduler_spawn_test_hook {
+    std::atomic<void (*)(void*)> callback{nullptr};
+    std::atomic<void*> context{nullptr};
+
+    void run() const noexcept {
+        auto* cb = callback.load(std::memory_order_acquire);
+        if (cb) {
+            cb(context.load(std::memory_order_acquire));
+        }
+    }
+};
+
+inline scheduler_spawn_test_hook before_scheduler_spawn_hook;
+inline scheduler_spawn_test_hook after_scheduler_spawn_hook;
+
 // Shared state between the awaiting coroutine and the blocking worker thread.
 // Heap-allocated via shared_ptr so it outlives the coroutine frame if the
 // coroutine is destroyed while the blocking task is still running.
@@ -158,8 +173,17 @@ public:
 
             // We claimed resume rights.  The destructor will spin-wait until
             // we store kDone, so the frame stays alive throughout this block.
+            bool ran_scheduler_handoff = false;
             if (sched && sched->is_running()) {
-                sched->spawn(caller);
+                before_scheduler_spawn_hook.run();
+                ran_scheduler_handoff = true;
+                inline_resume_guard guard(state.get());
+                // Scheduler shutdown can race between is_running() and enqueue.
+                // If it rejects without taking ownership, finish the awaiter
+                // inline so the continuation chain can unwind and release.
+                if (!sched->try_spawn(caller) && caller && !caller.done()) {
+                    caller.resume();
+                }
             } else if (caller && !caller.done()) {
                 inline_resume_guard guard(state.get());
                 caller.resume();
@@ -167,6 +191,9 @@ public:
 
             // Signal the destructor that we're done with the handle.
             state->resume_state.store(kDone, std::memory_order_release);
+            if (ran_scheduler_handoff) {
+                after_scheduler_spawn_hook.run();
+            }
         };
 
         // Try blocking pool first, fallback to detached thread.

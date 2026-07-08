@@ -530,6 +530,10 @@ public:
     /// Set maximum size of a single header line in bytes (default: 8192)
     void set_max_header_size(size_t max) noexcept { max_header_size_ = max; }
 
+    /// Set the request method whose response is being parsed. This lets the
+    /// parser apply response-body rules for HEAD responses.
+    void set_request_method(method m) noexcept { request_method_ = m; }
+
     /// Reset parser state
     void reset() {
         state_ = parse_state::status_line;
@@ -541,9 +545,11 @@ public:
         content_length_ = 0;
         body_received_ = 0;
         chunked_ = false;
+        close_delimited_ = false;
         chunk_size_ = 0;
         error_message_.clear();
         header_count_ = 0;
+        request_method_.reset();
     }
 
     /// Parse incoming data
@@ -618,6 +624,26 @@ public:
         return {parse_result::need_more, consumed};
     }
 
+    /// Finish parsing when the peer closes the connection.
+    ///
+    /// Close-delimited HTTP/1 responses do not become complete until EOF. For
+    /// fixed-length or chunked responses, EOF before completion is a parse
+    /// error because the advertised framing was truncated.
+    std::pair<parse_result, size_t> finish_eof() {
+        if (state_ == parse_state::error) {
+            return {parse_result::error, 0};
+        }
+        if (state_ == parse_state::complete) {
+            return {parse_result::complete, 0};
+        }
+        if (close_delimited_ && state_ == parse_state::body) {
+            state_ = parse_state::complete;
+            return {parse_result::complete, 0};
+        }
+        set_error("Connection closed before response complete");
+        return {parse_result::error, 0};
+    }
+
     /// Get parsed status
     status get_status() const noexcept { return status_; }
     
@@ -649,6 +675,9 @@ public:
     /// Check if there's an error
     bool has_error() const noexcept { return state_ == parse_state::error; }
 
+    /// True when this response body is delimited only by connection close.
+    bool is_close_delimited() const noexcept { return close_delimited_; }
+
     /// Move out any unconsumed bytes still sitting in the parser's internal
     /// buffer.  Used after a protocol upgrade (e.g. WebSocket client receiving
     /// the 101 response with a piggybacked frame in the same TCP segment).
@@ -678,6 +707,18 @@ public:
     }
 
 private:
+    bool response_body_forbidden() const noexcept {
+        if (request_method_ && *request_method_ == method::HEAD) {
+            return true;
+        }
+
+        auto code = static_cast<uint16_t>(status_);
+        return (code >= 100 && code < 200) ||
+               code == 204 ||
+               code == 205 ||
+               code == 304;
+    }
+
     bool parse_status_line() {
         auto line_end = buffer_.find("\r\n");
         if (line_end == std::string::npos) {
@@ -740,6 +781,12 @@ private:
                 // through downstream proxies.
                 bool has_te = headers_.contains("Transfer-Encoding");
                 bool has_cl = headers_.contains("Content-Length");
+
+                if (response_body_forbidden()) {
+                    state_ = parse_state::complete;
+                    return true;
+                }
+
                 if (has_te && has_cl) {
                     set_error("Both Transfer-Encoding and Content-Length present");
                     return false;
@@ -765,8 +812,9 @@ private:
                         state_ = parse_state::complete;
                     }
                 } else {
-                    // No body or connection close
-                    state_ = parse_state::complete;
+                    // Response body length is determined by connection close.
+                    close_delimited_ = true;
+                    state_ = parse_state::body;
                 }
                 return true;
             }
@@ -820,6 +868,13 @@ private:
     }
 
     bool parse_body() {
+        if (close_delimited_) {
+            body_received_ += buffer_.size();
+            body_.append(buffer_.data(), buffer_.size());
+            buffer_.clear();
+            return true;
+        }
+
         size_t remaining = content_length_ - body_received_;
         size_t available = std::min(remaining, buffer_.size());
 
@@ -937,8 +992,10 @@ private:
     size_t content_length_ = 0;
     size_t body_received_ = 0;
     bool chunked_ = false;
+    bool close_delimited_ = false;
     size_t chunk_size_ = 0;
     std::string error_message_;
+    std::optional<method> request_method_;
 
     // DoS protection limits
     size_t max_headers_ = 100;

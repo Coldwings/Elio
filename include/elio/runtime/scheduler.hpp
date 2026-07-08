@@ -301,11 +301,12 @@ public:
     void pause() { paused_.store(true, std::memory_order_relaxed); }
     void resume() { paused_.store(false, std::memory_order_relaxed); }
 
-    void spawn(std::coroutine_handle<> handle) {
-        if (!handle) [[unlikely]] return;
+    /// Try to enqueue a raw coroutine handle. On failure the handle remains
+    /// live, so the caller must either resume it or destroy it.
+    [[nodiscard]] bool try_spawn(std::coroutine_handle<> handle) {
+        if (!handle) [[unlikely]] return false;
         if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
-            handle.destroy();
-            return;
+            return false;
         }
         // Detach from current thread's frame chain before spawning to another thread
         // to avoid use-after-free when this thread creates another coroutine.
@@ -313,7 +314,14 @@ public:
         if (promise) {
             promise->detach_from_parent();
         }
-        do_spawn(handle);
+        return do_spawn(handle, false);
+    }
+
+    void spawn(std::coroutine_handle<> handle) {
+        if (!handle) [[unlikely]] return;
+        if (!try_spawn(handle)) {
+            handle.destroy();
+        }
     }
     
     /// Spawn a task directly (convenience overload)
@@ -698,10 +706,11 @@ private:
             draining_workers_.end());
     }
 
-    bool do_spawn_to_(size_t worker_id, std::coroutine_handle<> handle) {
+    bool do_spawn_to_(size_t worker_id, std::coroutine_handle<> handle,
+                      bool destroy_on_failure = true) {
         if (!handle) [[unlikely]] return false;
         if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
-            handle.destroy();
+            if (destroy_on_failure) handle.destroy();
             return false;
         }
 
@@ -714,7 +723,7 @@ private:
 
         size_t n = num_threads_.load(std::memory_order_acquire);
         if (n == 0) [[unlikely]] {
-            handle.destroy();
+            if (destroy_on_failure) handle.destroy();
             return false;
         }
         size_t idx = worker_id % n;
@@ -727,10 +736,11 @@ private:
             workers_[idx]->schedule(handle);
             return true;
         }
-        return do_spawn(handle);
+        return do_spawn(handle, destroy_on_failure);
     }
 
-    bool do_spawn(std::coroutine_handle<> handle) {
+    bool do_spawn(std::coroutine_handle<> handle,
+                  bool destroy_on_failure = true) {
         if (!handle) [[unlikely]] return false;
         // Release fence ensures all writes to the coroutine frame (including
         // captured lambda state) are visible to the worker that will run this task
@@ -738,7 +748,7 @@ private:
 
         size_t n = num_threads_.load(std::memory_order_acquire);
         if (n == 0) [[unlikely]] {
-            handle.destroy();
+            if (destroy_on_failure) handle.destroy();
             return false;
         }
 
@@ -772,7 +782,7 @@ private:
             workers_[0]->schedule(handle);
             return true;
         } else {
-            handle.destroy();
+            if (destroy_on_failure) handle.destroy();
             return false;
         }
     }

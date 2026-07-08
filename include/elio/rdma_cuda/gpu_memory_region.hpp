@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <utility>
 
 #include <elio/rdma_cuda/gpu_buffer.hpp>
 #include <elio/rdma/memory_region.hpp>
@@ -20,7 +21,14 @@ public:
           mr_(pd, buf_.data(), buf_.size(), access) {}
 
     gpu_memory_region(gpu_memory_region&&) = default;
-    gpu_memory_region& operator=(gpu_memory_region&&) = default;
+    gpu_memory_region& operator=(gpu_memory_region&& other) noexcept {
+        if (this != &other) {
+            // Deregister the old MR before gpu_buffer frees the old CUDA allocation.
+            mr_ = std::move(other.mr_);
+            buf_ = std::move(other.buf_);
+        }
+        return *this;
+    }
     gpu_memory_region(const gpu_memory_region&) = delete;
     gpu_memory_region& operator=(const gpu_memory_region&) = delete;
 

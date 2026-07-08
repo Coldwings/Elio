@@ -195,6 +195,17 @@ add_test(NAME package_rdma_cuda_export_metadata
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_rdma_cuda_package_export.cmake
 )
 
+add_executable(elio_rdma_cuda_lifetime_tests
+    unit/test_rdma_cuda_gpu_memory_region.cpp
+)
+target_include_directories(elio_rdma_cuda_lifetime_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/stubs/rdma_cuda
+)
+target_link_libraries(elio_rdma_cuda_lifetime_tests PRIVATE
+    elio Catch2::Catch2WithMain)
+target_compile_definitions(elio_rdma_cuda_lifetime_tests PRIVATE ELIO_DEBUG)
+catch_discover_tests(elio_rdma_cuda_lifetime_tests)
+
 # Optional libibverbs-backed RDMA integration test (S10). The binary
 # is separate so linking libibverbs is opt-in and devices without
 # rxe simply skip the test rather than failing the build. Discovered
@@ -217,7 +228,7 @@ endif()
 # Add custom targets for convenience
 add_custom_target(test_all
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS elio_tests
+    DEPENDS elio_tests elio_rdma_cuda_lifetime_tests
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 

@@ -100,6 +100,14 @@ if(TARGET elio_rdma_cm)
     )
 endif()
 
+# elio_rdma_ibverbs backend tests. Requires libibverbs at compile + link,
+# but no RDMA device at runtime.
+if(TARGET elio_rdma_ibverbs)
+    list(APPEND TEST_SOURCES
+        unit/test_rdma_ibverbs_backend.cpp
+    )
+endif()
+
 # elio_rdma_ibverbs endpoint smoke tests (S13). Requires libibverbs
 # and librdmacm at compile + link.
 if(TARGET elio_rdma_ibverbs AND TARGET elio_rdma_cm)

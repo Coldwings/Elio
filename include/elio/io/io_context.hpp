@@ -8,6 +8,7 @@
 #include <chrono>
 #include <atomic>
 #include <thread>
+#include <stdexcept>
 
 namespace elio::io {
 
@@ -30,18 +31,26 @@ public:
         switch (type) {
             case backend_type::auto_detect:
 #if ELIO_HAS_IO_URING
-                ELIO_LOG_INFO("io_context using io_uring backend (auto-detected)");
-                backend_type_ = backend_type::io_uring;
-                return;
-#else
-                epoll_backend_ = std::make_unique<epoll_backend>();
+                try {
+                    backend_ = std::make_unique<io_uring_backend>();
+                    backend_type_ = backend_type::io_uring;
+                    ELIO_LOG_INFO("io_context using io_uring backend (auto-detected)");
+                    return;
+                } catch (const std::exception& ex) {
+                    ELIO_LOG_WARNING(
+                        "io_context auto-detect could not initialize io_uring: {}; "
+                        "falling back to epoll",
+                        ex.what());
+                }
+#endif
+                backend_ = std::make_unique<epoll_backend>();
                 backend_type_ = backend_type::epoll;
                 ELIO_LOG_INFO("io_context using epoll backend");
                 break;
-#endif
 
             case backend_type::io_uring:
 #if ELIO_HAS_IO_URING
+                backend_ = std::make_unique<io_uring_backend>();
                 backend_type_ = backend_type::io_uring;
                 ELIO_LOG_INFO("io_context using io_uring backend (explicit)");
 #else
@@ -50,15 +59,9 @@ public:
                 break;
 
             case backend_type::epoll:
-#if ELIO_HAS_IO_URING
-                // io_uring direct-hold mode: epoll is unavailable, use io_uring instead.
-                backend_type_ = backend_type::io_uring;
-                ELIO_LOG_INFO("io_context using io_uring backend (epoll requested but unavailable)");
-#else
-                epoll_backend_ = std::make_unique<epoll_backend>();
+                backend_ = std::make_unique<epoll_backend>();
                 backend_type_ = backend_type::epoll;
                 ELIO_LOG_INFO("io_context using epoll backend (explicit)");
-#endif
                 break;
         }
     }
@@ -70,20 +73,12 @@ public:
     io_context(io_context&&) = delete;
     io_context& operator=(io_context&&) = delete;
 
-    auto& backend() noexcept {
-#if ELIO_HAS_IO_URING
-        return uring_backend_;
-#else
-        return *epoll_backend_;
-#endif
+    io_backend& backend() noexcept {
+        return *backend_;
     }
 
-    const auto& backend() const noexcept {
-#if ELIO_HAS_IO_URING
-        return uring_backend_;
-#else
-        return *epoll_backend_;
-#endif
+    const io_backend& backend() const noexcept {
+        return *backend_;
     }
 
     bool prepare(const io_request& req) { return backend().prepare(req); }
@@ -150,23 +145,15 @@ public:
         }
     }
 
-    io_backend* get_backend() noexcept { return &backend(); }
+    io_backend* get_backend() noexcept { return backend_.get(); }
 
     bool is_io_uring() const noexcept {
-#if ELIO_HAS_IO_URING
-        return true;
-#else
-        return false;
-#endif
+        return backend_->is_io_uring();
     }
 
 private:
-#if ELIO_HAS_IO_URING
-    io_uring_backend uring_backend_;
-#else
-    std::unique_ptr<io_backend> epoll_backend_;
-#endif
-    backend_type backend_type_;
+    std::unique_ptr<io_backend> backend_;
+    backend_type backend_type_ = backend_type::auto_detect;
 };
 
 /// Global default io_context for convenience

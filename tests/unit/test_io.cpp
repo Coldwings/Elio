@@ -37,12 +37,26 @@ TEST_CASE("io_context creation", "[io][context]") {
     
     SECTION("explicit epoll backend") {
         io_context ctx(io_context::backend_type::epoll);
-#if ELIO_HAS_IO_URING
-        // io_uring direct-hold mode: epoll request silently uses io_uring
-        REQUIRE(ctx.get_backend_type() == io_context::backend_type::io_uring);
-#else
         REQUIRE(ctx.get_backend_type() == io_context::backend_type::epoll);
         REQUIRE(std::string(ctx.get_backend_name()) == "epoll");
+        REQUIRE_FALSE(ctx.is_io_uring());
+    }
+
+    SECTION("auto-detect falls back when io_uring is unavailable") {
+#if ELIO_HAS_IO_URING
+        if (!io_uring_backend::is_available()) {
+            io_context ctx(io_context::backend_type::auto_detect);
+            REQUIRE(ctx.get_backend_type() == io_context::backend_type::epoll);
+            REQUIRE(std::string(ctx.get_backend_name()) == "epoll");
+            REQUIRE_FALSE(ctx.is_io_uring());
+        } else {
+            SUCCEED("io_uring is available at runtime");
+        }
+#else
+        io_context ctx(io_context::backend_type::auto_detect);
+        REQUIRE(ctx.get_backend_type() == io_context::backend_type::epoll);
+        REQUIRE(std::string(ctx.get_backend_name()) == "epoll");
+        REQUIRE_FALSE(ctx.is_io_uring());
 #endif
     }
     
@@ -2490,4 +2504,3 @@ TEST_CASE("tcp_stream read awaits readability for deferred data",
     REQUIRE(read_result.bytes_transferred() == static_cast<int>(msg_len));
     REQUIRE(std::string(buffer) == msg);
 }
-

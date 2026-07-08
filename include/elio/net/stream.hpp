@@ -284,6 +284,7 @@ connect(std::string_view host, uint16_t port, bool secure = false,
         resolve_options resolve_opts = default_cached_resolve_options()) {
     (void)tls_ctx;
     if (secure) {
+        errno = ENOTSUP;
         co_return std::nullopt;
     }
 

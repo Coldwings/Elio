@@ -866,6 +866,78 @@ TEST_CASE("buffer_ref type traits", "[rpc][buffer_ref]") {
 #include <sys/socket.h>
 #include <unistd.h>
 
+TEST_CASE("rpc_server stop wakes TCP serve blocked in accept",
+          "[rpc][server][shutdown]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    int bind_errno = errno;
+    CAPTURE(bind_errno);
+    if (!listener_opt && bind_errno == EPERM) {
+        SKIP("TCP listener creation is denied by this sandbox");
+    }
+    REQUIRE(listener_opt.has_value());
+
+    rpc_server<tcp_stream> server;
+    scheduler sched(1);
+    sched.start();
+
+    sched.go([&]() -> coro::task<void> {
+        co_await server.serve(*listener_opt);
+    });
+
+    std::atomic<bool> stop_called{false};
+    sched.go([&]() -> coro::task<void> {
+        co_await elio::time::sleep_for(elio::test::scaled_ms(50));
+        server.stop();
+        stop_called.store(true, std::memory_order_release);
+    });
+
+    bool drained = sched.shutdown(elio::test::scaled_sec(5));
+    REQUIRE(stop_called.load(std::memory_order_acquire));
+    REQUIRE(drained);
+    REQUIRE_FALSE(server.is_running());
+}
+
+TEST_CASE("rpc_server stop wakes UDS serve blocked in accept",
+          "[rpc][server][shutdown][uds]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto addr = unix_address::abstract(
+        "elio_rpc_stop_accept_" + std::to_string(getpid()));
+    auto listener_opt = uds_listener::bind(addr);
+    int bind_errno = errno;
+    CAPTURE(bind_errno);
+    if (!listener_opt && bind_errno == EPERM) {
+        SKIP("UDS listener creation is denied by this sandbox");
+    }
+    REQUIRE(listener_opt.has_value());
+
+    rpc_server<uds_stream> server;
+    scheduler sched(1);
+    sched.start();
+
+    sched.go([&]() -> coro::task<void> {
+        co_await server.serve(*listener_opt);
+    });
+
+    std::atomic<bool> stop_called{false};
+    sched.go([&]() -> coro::task<void> {
+        co_await elio::time::sleep_for(elio::test::scaled_ms(50));
+        server.stop();
+        stop_called.store(true, std::memory_order_release);
+    });
+
+    bool drained = sched.shutdown(elio::test::scaled_sec(5));
+    REQUIRE(stop_called.load(std::memory_order_acquire));
+    REQUIRE(drained);
+    REQUIRE_FALSE(server.is_running());
+}
+
 TEST_CASE("oversized vector count is rejected", "[rpc][security]") {
     // Wire layout for vector<int32_t>: <count:u32><n * int32>.
     // We craft a payload that claims count=0xFFFFFFFF but provides no

@@ -16,10 +16,12 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <optional>
 #include <span>
+#include <utility>
 #include <variant>
 
 namespace elio::net {
@@ -620,14 +622,57 @@ public:
     /// Accept a connection awaitable
     class accept_awaitable : public io::io_awaitable_base {
     public:
-        accept_awaitable(tcp_listener& listener)
+        explicit accept_awaitable(tcp_listener& listener)
             : io::io_awaitable_base()
             , listener_(listener) {}
 
+        accept_awaitable(tcp_listener& listener, coro::cancel_token token)
+            : io::io_awaitable_base()
+            , listener_(listener)
+            , token_(std::move(token))
+            , cancellable_(true) {}
+
+        bool await_ready() const noexcept {
+            return false;
+        }
+
         template<typename Promise>
         bool await_suspend(std::coroutine_handle<Promise> awaiter) {
+            if (is_cancellable() && token_.is_cancelled()) {
+                result_ = io::io_result{-ECANCELED, 0};
+                return false;
+            }
+
             bind_to_worker(awaiter);
             auto& ctx = io::current_io_context();
+
+            if (is_cancellable()) {
+                auto state = std::make_shared<io::detail::io_cancel_state>();
+                state->ctx = &ctx;
+                state->awaiter = awaiter;
+                state->worker = runtime::worker_thread::current();
+                cancel_state_ = state;
+
+                cancel_registration_ = token_.on_cancel([state]() {
+                    state->cancelled.store(true, std::memory_order_release);
+                    if (!state->worker) {
+                        return;
+                    }
+                    auto exec = io::detail::make_io_cancel_executor(state, true);
+                    if (auto* promise = coro::get_promise_base(exec.handle.address())) {
+                        promise->set_affinity(state->worker->worker_id());
+                        promise->detach_from_parent();
+                    }
+                    state->worker->schedule(exec.handle);
+                });
+
+                if (token_.is_cancelled()) {
+                    cancel_registration_.unregister();
+                    state->resumed.store(true, std::memory_order_release);
+                    result_ = io::io_result{-ECANCELED, 0};
+                    return false;
+                }
+            }
 
             io::io_request req{};
             req.op = io::io_op::accept;
@@ -638,8 +683,23 @@ public:
             req.awaiter = awaiter;
             req.state = setup_op_state(awaiter);
 
+            if (cancel_state_) {
+                cancel_state_->op = req.state;
+                if (cancel_state_->cancelled.load(std::memory_order_acquire)) {
+                    clear_op_state();
+                    cancel_state_->op = nullptr;
+                    cancel_registration_.unregister();
+                    result_ = io::io_result{-ECANCELED, 0};
+                    return false;
+                }
+            }
+
             if (!ctx.prepare(req)) {
                 clear_op_state();
+                if (cancel_state_) {
+                    cancel_state_->op = nullptr;
+                }
+                cancel_registration_.unregister();
                 result_ = io::io_result{-EAGAIN, 0};
                 return false;  // Don't suspend, resume immediately
             }
@@ -647,6 +707,10 @@ public:
         }
 
         std::optional<tcp_stream> await_resume() {
+            cancel_registration_.unregister();
+            if (cancel_state_) {
+                cancel_state_->resumed.store(true, std::memory_order_release);
+            }
             result_ = read_result_from_op_state();
             restore_affinity();
 
@@ -676,14 +740,25 @@ public:
         }
 
     private:
+        bool is_cancellable() const noexcept { return cancellable_; }
+
         tcp_listener& listener_;
+        coro::cancel_token token_;
+        coro::cancel_token::registration cancel_registration_;
+        std::shared_ptr<io::detail::io_cancel_state> cancel_state_;
         struct sockaddr_storage peer_addr_{};
         socklen_t peer_addr_len_ = sizeof(peer_addr_);
+        bool cancellable_ = false;
     };
     
     /// Accept a new connection
     auto accept() {
         return accept_awaitable(*this);
+    }
+
+    /// Accept a new connection, cancellable by token
+    auto accept(coro::cancel_token token) {
+        return accept_awaitable(*this, std::move(token));
     }
     
     /// Close the listener

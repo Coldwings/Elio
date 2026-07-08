@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <elio/coro/promise_base.hpp>
 #include <elio/elio.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <elio/coro/vthread_stack.hpp>
@@ -559,10 +560,11 @@ TEST_CASE("deep nested co_await chain", "[vthread_stack]") {
 }
 
 // ============================================================================
-// I/O completion vthread_stack context verification
+// I/O completion coroutine context verification
 // This test verifies that I/O completion callbacks correctly restore
-// the vthread_stack context, preventing stack corruption.
-// See: https://github.com/Coldwings/Elio/issues/XXX
+// the vthread_stack and current_frame context, preventing stack corruption
+// and preserving the virtual frame chain.
+// See: https://github.com/Coldwings/Elio/issues/261
 // ============================================================================
 
 #include <elio/io/io_context.hpp>
@@ -572,17 +574,21 @@ TEST_CASE("deep nested co_await chain", "[vthread_stack]") {
 
 namespace {
     task<void> io_vstack_test_helper(int fd, char* buffer, size_t size, std::atomic<bool>& done) {
-        // Get the current vstack before I/O
+        // Get the current coroutine context before I/O
         auto* vstack_before = vthread_stack::current();
+        auto* frame_before = promise_base::current_frame();
         REQUIRE(vstack_before != nullptr);
+        REQUIRE(frame_before != nullptr);
 
         // Perform async read - this will suspend and resume via I/O completion
         auto result = co_await elio::io::async_read(fd, buffer, size);
         REQUIRE(result.success());
 
-        // After I/O completion, current_ should still be correct
+        // After I/O completion, coroutine context should still be correct
         auto* vstack_after = vthread_stack::current();
+        auto* frame_after = promise_base::current_frame();
         REQUIRE(vstack_after == vstack_before);
+        REQUIRE(frame_after == frame_before);
 
         // Allocate and deallocate on the vstack to verify it's not corrupted
         void* p1 = vstack_before->push(64);

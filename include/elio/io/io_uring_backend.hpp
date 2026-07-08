@@ -796,17 +796,20 @@ private:
         }
     }
     
-    /// Safely resume a coroutine handle with proper vthread_stack context
-    /// This ensures current_ is set to the coroutine's vstack before resume
-    /// and restored afterwards, preventing vthread_stack corruption.
+    /// Safely resume a coroutine handle with proper coroutine context.
+    /// This mirrors scheduler worker resumes so both the vthread stack and
+    /// virtual frame chain are valid while user code runs after I/O completion.
     static void safe_resume(std::coroutine_handle<> handle) {
         auto* promise = coro::get_promise_base(handle.address());
         auto* prev_vstack = coro::vthread_stack::current();
+        auto* prev_frame = coro::promise_base::current_frame();
         if (promise) {
             coro::vthread_stack::set_current(promise->vstack());
+            coro::promise_base::set_current_frame(promise);
         }
         handle.resume();
         coro::vthread_stack::set_current(prev_vstack);
+        coro::promise_base::set_current_frame(prev_frame);
     }
 
     /// Resume collected coroutine handles (call outside of lock)

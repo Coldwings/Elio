@@ -153,7 +153,7 @@ if(ELIO_ENABLE_HTTP AND TARGET elio_tls)
         target_link_libraries(elio_http2 INTERFACE
             elio_http
             $<BUILD_INTERFACE:nghttp2_static>
-            $<INSTALL_INTERFACE:nghttp2>
+            $<INSTALL_INTERFACE:nghttp2::nghttp2_static>
         )
         target_compile_definitions(elio_http2 INTERFACE ELIO_HAS_HTTP2=1)
         message(STATUS "HTTP/2 support enabled via nghttp2")

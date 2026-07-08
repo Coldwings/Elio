@@ -16,7 +16,6 @@
 #include <endian.h>
 
 #include <array>
-#include <cassert>
 #include <cerrno>
 #include <cstring>
 #include <span>
@@ -36,11 +35,14 @@ struct ibverbs_backend {
                          std::uint32_t imm_data,
                          elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
-        auto [raw, n] = convert_sges_(sges);
+        auto converted = convert_sges_(sges);
+        if (converted.rc != 0) {
+            return converted.rc;
+        }
         ibv_send_wr wr{};
         wr.wr_id      = id;
-        wr.sg_list    = n > 0 ? raw.data() : nullptr;
-        wr.num_sge    = static_cast<int>(n);
+        wr.sg_list    = converted.count > 0 ? converted.data.data() : nullptr;
+        wr.num_sge    = static_cast<int>(converted.count);
         wr.opcode     = flags.with_imm ? IBV_WR_SEND_WITH_IMM : IBV_WR_SEND;
         if (flags.with_imm) {
             wr.imm_data = ::htobe32(imm_data);
@@ -55,11 +57,14 @@ struct ibverbs_backend {
                          std::span<const elio::rdma::sge> sges,
                          elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
-        auto [raw, n] = convert_sges_(sges);
+        auto converted = convert_sges_(sges);
+        if (converted.rc != 0) {
+            return converted.rc;
+        }
         ibv_recv_wr wr{};
         wr.wr_id   = id;
-        wr.sg_list = n > 0 ? raw.data() : nullptr;
-        wr.num_sge = static_cast<int>(n);
+        wr.sg_list = converted.count > 0 ? converted.data.data() : nullptr;
+        wr.num_sge = static_cast<int>(converted.count);
         ibv_recv_wr* bad = nullptr;
         const int rc = ::ibv_post_recv(qp, &wr, &bad);
         return rc == 0 ? 0 : -rc;
@@ -72,11 +77,14 @@ struct ibverbs_backend {
                                std::uint32_t imm_data,
                                elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
-        auto [raw, n] = convert_sges_(sges);
+        auto converted = convert_sges_(sges);
+        if (converted.rc != 0) {
+            return converted.rc;
+        }
         ibv_send_wr wr{};
         wr.wr_id              = id;
-        wr.sg_list            = n > 0 ? raw.data() : nullptr;
-        wr.num_sge            = static_cast<int>(n);
+        wr.sg_list            = converted.count > 0 ? converted.data.data() : nullptr;
+        wr.num_sge            = static_cast<int>(converted.count);
         wr.opcode             = flags.with_imm
             ? IBV_WR_RDMA_WRITE_WITH_IMM : IBV_WR_RDMA_WRITE;
         if (flags.with_imm) {
@@ -95,11 +103,14 @@ struct ibverbs_backend {
                               elio::rdma::remote_buffer rb,
                               elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
-        auto [raw, n] = convert_sges_(sges);
+        auto converted = convert_sges_(sges);
+        if (converted.rc != 0) {
+            return converted.rc;
+        }
         ibv_send_wr wr{};
         wr.wr_id               = id;
-        wr.sg_list             = n > 0 ? raw.data() : nullptr;
-        wr.num_sge             = static_cast<int>(n);
+        wr.sg_list             = converted.count > 0 ? converted.data.data() : nullptr;
+        wr.num_sge             = static_cast<int>(converted.count);
         wr.opcode              = IBV_WR_RDMA_READ;
         wr.send_flags          = IBV_SEND_SIGNALED;
         wr.wr.rdma.remote_addr = rb.addr;
@@ -134,11 +145,14 @@ struct ibverbs_backend {
                                elio::rdma::send_flags flags,
                                elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
-        auto [raw, n] = convert_sges_(sges);
+        auto converted = convert_sges_(sges);
+        if (converted.rc != 0) {
+            return converted.rc;
+        }
         ibv_send_wr wr{};
         wr.wr_id              = id;
-        wr.sg_list            = n > 0 ? raw.data() : nullptr;
-        wr.num_sge            = static_cast<int>(n);
+        wr.sg_list            = converted.count > 0 ? converted.data.data() : nullptr;
+        wr.num_sge            = static_cast<int>(converted.count);
         wr.opcode             = IBV_WR_ATOMIC_CMP_AND_SWP;
         wr.send_flags         = make_send_flags_(flags);
         wr.wr.atomic.remote_addr = rb.addr;
@@ -156,11 +170,14 @@ struct ibverbs_backend {
                                      elio::rdma::send_flags flags,
                                      elio::rdma::wr_id id) noexcept {
         auto* qp = static_cast<ibv_qp*>(qp_ptr);
-        auto [raw, n] = convert_sges_(sges);
+        auto converted = convert_sges_(sges);
+        if (converted.rc != 0) {
+            return converted.rc;
+        }
         ibv_send_wr wr{};
         wr.wr_id              = id;
-        wr.sg_list            = n > 0 ? raw.data() : nullptr;
-        wr.num_sge            = static_cast<int>(n);
+        wr.sg_list            = converted.count > 0 ? converted.data.data() : nullptr;
+        wr.num_sge            = static_cast<int>(converted.count);
         wr.opcode             = IBV_WR_ATOMIC_FETCH_AND_ADD;
         wr.send_flags         = make_send_flags_(flags);
         wr.wr.atomic.remote_addr = rb.addr;
@@ -175,12 +192,15 @@ private:
     struct sge_buf {
         std::array<ibv_sge, kMaxSge> data{};
         std::size_t count = 0;
+        int rc = 0;
     };
     static sge_buf convert_sges_(std::span<const elio::rdma::sge> sges) noexcept {
         sge_buf buf;
-        buf.count = sges.size() < kMaxSge ? sges.size() : kMaxSge;
-        assert(sges.size() <= kMaxSge &&
-               "SGE count exceeds ibverbs_backend::kMaxSge");
+        if (sges.size() > kMaxSge) {
+            buf.rc = -EMSGSIZE;
+            return buf;
+        }
+        buf.count = sges.size();
         for (std::size_t i = 0; i < buf.count; ++i) {
             buf.data[i] = ibv_sge{
                 .addr   = reinterpret_cast<std::uint64_t>(sges[i].addr),

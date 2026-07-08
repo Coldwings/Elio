@@ -884,8 +884,11 @@ struct scripted_rpc_stream {
     }
 
     elio::coro::task<elio::io::io_result> writev(struct iovec* iovecs, size_t iov_count) {
-        REQUIRE(writev_calls < writev_results.size());
-        auto result = writev_results[writev_calls++];
+        const size_t call_index = writev_calls++;
+        if (call_index >= writev_results.size()) {
+            co_return elio::io::io_result{-EIO, 0};
+        }
+        auto result = writev_results[call_index];
         if (result.result > 0) {
             size_t remaining = static_cast<size_t>(result.result);
             for (size_t i = 0; i < iov_count && remaining > 0; ++i) {

@@ -9,9 +9,26 @@ if(@ELIO_PACKAGE_NEEDS_OPENSSL@)
 endif()
 
 if(@ELIO_PACKAGE_NEEDS_NGHTTP2@)
-    find_library(ELIO_NGHTTP2_LIBRARY nghttp2)
-    if(NOT ELIO_NGHTTP2_LIBRARY)
-        set(ELIO_NGHTTP2_LIBRARY nghttp2)
+    if(NOT TARGET nghttp2::nghttp2_static)
+        set(_ELIO_NGHTTP2_TARGETS_FILE
+            "${CMAKE_CURRENT_LIST_DIR}/../nghttp2/nghttp2-targets.cmake")
+        if(EXISTS "${_ELIO_NGHTTP2_TARGETS_FILE}")
+            include("${_ELIO_NGHTTP2_TARGETS_FILE}")
+        else()
+            find_library(ELIO_NGHTTP2_LIBRARY NAMES nghttp2)
+            find_path(ELIO_NGHTTP2_INCLUDE_DIR NAMES nghttp2/nghttp2.h)
+            if(NOT ELIO_NGHTTP2_LIBRARY OR NOT ELIO_NGHTTP2_INCLUDE_DIR)
+                set(Elio_FOUND FALSE)
+                set(Elio_NOT_FOUND_MESSAGE
+                    "Elio HTTP/2 support requires nghttp2, but no bundled nghttp2 target or system nghttp2 library/header was found.")
+                return()
+            endif()
+            add_library(nghttp2::nghttp2_static UNKNOWN IMPORTED)
+            set_target_properties(nghttp2::nghttp2_static PROPERTIES
+                IMPORTED_LOCATION "${ELIO_NGHTTP2_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${ELIO_NGHTTP2_INCLUDE_DIR}")
+        endif()
+        unset(_ELIO_NGHTTP2_TARGETS_FILE)
     endif()
 endif()
 

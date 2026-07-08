@@ -576,7 +576,7 @@ public:
 private:
     static std::exception_ptr spawn_rejected_exception_() noexcept {
         try {
-            throw std::runtime_error("scheduler rejected joinable task before execution");
+            throw std::logic_error("scheduler rejected joinable task before execution");
         } catch (...) {
             return std::current_exception();
         }

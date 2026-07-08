@@ -290,7 +290,18 @@ TEST_CASE("go_joinable before start returns completed exception",
 
     REQUIRE(handle.is_ready());
     REQUIRE(handle.is_destroyed());
-    REQUIRE_THROWS_AS(handle.await_resume(), std::runtime_error);
+    REQUIRE_THROWS_AS(handle.await_resume(), std::logic_error);
+}
+
+TEST_CASE("go_joinable_to before start returns completed exception",
+          "[scheduler][join_handle]") {
+    scheduler sched(2);
+
+    auto handle = sched.go_joinable_to(0, return_int_task, 42);
+
+    REQUIRE(handle.is_ready());
+    REQUIRE(handle.is_destroyed());
+    REQUIRE_THROWS_AS(handle.await_resume(), std::logic_error);
 }
 
 TEST_CASE("go_joinable after shutdown returns completed exception",
@@ -303,7 +314,20 @@ TEST_CASE("go_joinable after shutdown returns completed exception",
 
     REQUIRE(handle.is_ready());
     REQUIRE(handle.is_destroyed());
-    REQUIRE_THROWS_AS(handle.await_resume(), std::runtime_error);
+    REQUIRE_THROWS_AS(handle.await_resume(), std::logic_error);
+}
+
+TEST_CASE("go_joinable_to after shutdown returns completed exception",
+          "[scheduler][join_handle]") {
+    scheduler sched(2);
+    sched.start();
+    REQUIRE(sched.shutdown(scaled_ms(1000)));
+
+    auto handle = sched.go_joinable_to(0, return_int_task, 42);
+
+    REQUIRE(handle.is_ready());
+    REQUIRE(handle.is_destroyed());
+    REQUIRE_THROWS_AS(handle.await_resume(), std::logic_error);
 }
 
 // Regression test for the "shrink orphans I/O started by retired workers"

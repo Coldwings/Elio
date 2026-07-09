@@ -12,6 +12,7 @@
 #include <string_view>
 #include <array>
 #include <algorithm>
+#include <cstdio>
 #include <cstdint>
 #include <stdexcept>
 #include <sys/random.h>

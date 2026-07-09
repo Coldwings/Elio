@@ -34,6 +34,7 @@ struct client_config : http::base_client_config {
     int default_retry_ms = 3000;                  ///< Default reconnect interval
     bool auto_reconnect = true;                   ///< Enable auto-reconnection
     size_t max_reconnect_attempts = 0;            ///< Max reconnect attempts (0 = unlimited)
+    size_t max_event_buffer_size = 1024 * 1024;   ///< Max pending SSE line/event buffer bytes
     std::string last_event_id;                    ///< Initial Last-Event-ID
 
     client_config() {
@@ -54,15 +55,63 @@ enum class client_state {
 /// SSE event parser
 class event_parser {
 public:
-    event_parser() = default;
+    static constexpr size_t default_max_buffer_size = 1024 * 1024;
+
+    explicit event_parser(size_t max_buffer_size = default_max_buffer_size) noexcept
+        : max_buffer_size_(max_buffer_size) {}
     
     /// Parse incoming data and extract events
     /// @param data Input data
     /// @return Number of events parsed
     size_t parse(std::string_view data) {
-        buffer_.append(data);
-        return process_buffer();
+        if (failed_) {
+            return 0;
+        }
+
+        size_t events_found = 0;
+        while (!data.empty() && !failed_) {
+            auto lf_pos = data.find('\n');
+            auto cr_pos = data.find('\r');
+
+            size_t line_end = std::string::npos;
+            size_t consume = 0;
+            if (lf_pos == std::string::npos && cr_pos == std::string::npos) {
+                if (append_would_exceed_limit(buffer_.size(), data.size(), 0)) {
+                    fail("SSE line exceeds configured buffer limit");
+                    break;
+                }
+                buffer_.append(data);
+                break;
+            } else if (cr_pos != std::string::npos &&
+                       (lf_pos == std::string::npos || cr_pos < lf_pos)) {
+                line_end = cr_pos;
+                consume = (cr_pos + 1 < data.size() && data[cr_pos + 1] == '\n')
+                        ? cr_pos + 2
+                        : cr_pos + 1;
+            } else {
+                line_end = lf_pos;
+                consume = lf_pos + 1;
+            }
+
+            // Limit applies to line content. The 1-2 terminator bytes are
+            // appended with the line and immediately consumed by process_buffer().
+            if (append_would_exceed_limit(buffer_.size(), line_end, 0)) {
+                fail("SSE line exceeds configured buffer limit");
+                break;
+            }
+            buffer_.append(data.substr(0, consume));
+            data.remove_prefix(consume);
+            events_found += process_buffer();
+        }
+
+        return failed_ ? 0 : events_found;
     }
+
+    /// True after an input line or in-progress event exceeds the configured limit.
+    bool failed() const noexcept { return failed_; }
+
+    /// Human-readable parser failure reason, empty if parsing has not failed.
+    std::string_view error_message() const noexcept { return error_message_; }
     
     /// Check if an event is available
     bool has_event() const { return !events_.empty(); }
@@ -86,6 +135,8 @@ public:
         buffer_.clear();
         current_event_ = event{};
         events_.clear();
+        failed_ = false;
+        error_message_.clear();
         // Don't reset last_event_id_ or retry_ms_ - these persist
     }
     
@@ -103,6 +154,8 @@ private:
             size_t consume = 0;  // bytes to erase including terminator
 
             if (lf_pos == std::string::npos && cr_pos == std::string::npos) {
+                // parse() enforces the partial-line limit before appending
+                // unterminated input. No complete line is available yet.
                 break;  // no line terminator found
             } else if (cr_pos != std::string::npos &&
                        (lf_pos == std::string::npos || cr_pos < lf_pos)) {
@@ -125,6 +178,11 @@ private:
                 // \n found first (no preceding \r — that case is handled above)
                 line_end = lf_pos;
                 consume = lf_pos + 1;
+            }
+
+            if (line_end > max_buffer_size_) {
+                fail("SSE line exceeds configured buffer limit");
+                break;
             }
 
             std::string line = buffer_.substr(0, line_end);
@@ -182,6 +240,11 @@ private:
             if (field == "event") {
                 current_event_.type = value;
             } else if (field == "data") {
+                if (append_would_exceed_limit(current_event_.data.size(),
+                                              value.size(), 1)) {
+                    fail("SSE event data exceeds configured buffer limit");
+                    break;
+                }
                 current_event_.data += value;
                 current_event_.data += '\n';
             } else if (field == "id") {
@@ -216,12 +279,36 @@ private:
         
         return events_found;
     }
+
+    bool append_would_exceed_limit(size_t current,
+                                   size_t value_size,
+                                   size_t extra) const noexcept {
+        if (value_size > max_buffer_size_) {
+            return true;
+        }
+        const size_t append_size = value_size + extra;
+        if (append_size < value_size || append_size > max_buffer_size_) {
+            return true;
+        }
+        return current > max_buffer_size_ - append_size;
+    }
+
+    void fail(std::string_view message) {
+        failed_ = true;
+        error_message_ = std::string(message);
+        buffer_.clear();
+        current_event_ = event{};
+        events_.clear();
+    }
     
     std::string buffer_;
     event current_event_;
     std::vector<event> events_;
     std::string last_event_id_;
     int retry_ms_ = 3000;
+    size_t max_buffer_size_ = default_max_buffer_size;
+    bool failed_ = false;
+    std::string error_message_;
 };
 
 /// SSE client
@@ -233,7 +320,8 @@ public:
     /// Create SSE client with configuration
     explicit sse_client(client_config config)
         : config_(config)
-        , tls_ctx_(tls::tls_mode::client) {
+        , tls_ctx_(tls::tls_mode::client)
+        , parser_(config_.max_event_buffer_size) {
         // Setup TLS context using shared utility
         http::init_client_tls_context(tls_ctx_, config_.verify_certificate);
 
@@ -381,6 +469,11 @@ private:
 
             parser_.parse(std::string_view(buffer_.data(),
                                            static_cast<size_t>(result.result)));
+            if (parser_.failed()) {
+                ELIO_LOG_ERROR("SSE parse error: {}", parser_.error_message());
+                state_ = client_state::disconnected;
+                co_return std::nullopt;
+            }
         }
 
         co_return std::nullopt;
@@ -504,6 +597,12 @@ private:
                 if (header_block_size < response_data.size()) {
                     parser_.parse(std::string_view(response_data)
                                       .substr(header_block_size));
+                    if (parser_.failed()) {
+                        ELIO_LOG_ERROR("SSE parse error: {}",
+                                       parser_.error_message());
+                        state_ = client_state::disconnected;
+                        co_return false;
+                    }
                 }
 
                 break;

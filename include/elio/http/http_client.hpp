@@ -323,6 +323,10 @@ private:
             });
     }
 
+    static bool is_informational_status(uint16_t code) noexcept {
+        return code >= 100 && code < 200;
+    }
+
     /// Send request with redirect handling
     coro::task<std::optional<response>> send_request(request& req, const url& target,
                                                            size_t redirect_count,
@@ -418,64 +422,98 @@ private:
         parser.set_max_headers(config_.max_headers);
         parser.set_max_header_size(config_.max_header_size);
         parser.set_request_method(req.get_method());
+        std::string pending_response_bytes;
 
-        while (!parser.is_complete() && !parser.has_error()) {
+        while (true) {
+            if (parser.is_complete()) {
+                auto code = parser.status_code();
+                if (!is_informational_status(code)) {
+                    break;
+                }
+
+                if (code == static_cast<uint16_t>(status::switching_protocols)) {
+                    ELIO_LOG_ERROR("Unexpected HTTP 101 Switching Protocols response");
+                    errno = EBADMSG;
+                    co_return std::nullopt;
+                }
+
+                pending_response_bytes = parser.take_remaining();
+                parser.reset();
+                parser.set_request_method(req.get_method());
+                continue;
+            }
+
+            if (parser.has_error()) {
+                break;
+            }
+
             // Check cancellation before read
             if (token.is_cancelled()) {
                 errno = ECANCELED;
                 co_return std::nullopt;
             }
 
-            io::io_result read_result{};
-            std::shared_ptr<std::atomic<bool>> read_timed_out;
-            if (deadline_enforced) {
-                // Use remaining time from the absolute response deadline
-                // rather than a fresh per-read timeout.  This prevents a
-                // slowloris-style server from keeping the connection alive
-                // indefinitely by trickling data just before each per-read
-                // deadline expires.
-                auto remaining = response_deadline - std::chrono::steady_clock::now();
-                if (remaining.count() <= 0) {
-                    ELIO_LOG_ERROR("Total response timeout exceeded for {}:{}",
-                                   target.host, target.effective_port());
-                    errno = ETIMEDOUT;
-                    co_return std::nullopt;
-                }
-                read_timed_out = std::make_shared<std::atomic<bool>>(false);
-                coro::cancel_source ws_cancel;
-                auto watchdog = arm_io_watchdog(sched, conn.fd(), remaining,
-                                                ws_cancel.get_token(),
-                                                read_timed_out);
-                read_result = co_await conn.read(buffer.data(), buffer.size());
-                ws_cancel.cancel();
-                co_await watchdog;
-                if (read_timed_out->load(std::memory_order_acquire)) {
-                    ELIO_LOG_ERROR("Read from {}:{} timed out after {}s",
-                                   target.host, target.effective_port(),
-                                   std::chrono::duration_cast<std::chrono::seconds>(io_deadline).count());
-                    errno = ETIMEDOUT;
-                    co_return std::nullopt;
-                }
+            parse_result result = parse_result::need_more;
+
+            if (!pending_response_bytes.empty()) {
+                auto [parse_result_value, consumed] = parser.parse(pending_response_bytes);
+                (void)consumed;
+                result = parse_result_value;
+                pending_response_bytes.clear();
             } else {
-                read_result = co_await conn.read(buffer.data(), buffer.size());
-            }
-
-            if (read_result.result <= 0) {
-                if (read_result.result == 0) {
-                    auto [result, consumed] = parser.finish_eof();
-                    (void)consumed;
-                    if (result == parse_result::complete) {
-                        break;  // Clean close after a close-delimited response
+                io::io_result read_result{};
+                std::shared_ptr<std::atomic<bool>> read_timed_out;
+                if (deadline_enforced) {
+                    // Use remaining time from the absolute response deadline
+                    // rather than a fresh per-read timeout.  This prevents a
+                    // slowloris-style server from keeping the connection alive
+                    // indefinitely by trickling data just before each per-read
+                    // deadline expires.
+                    auto remaining = response_deadline - std::chrono::steady_clock::now();
+                    if (remaining.count() <= 0) {
+                        ELIO_LOG_ERROR("Total response timeout exceeded for {}:{}",
+                                       target.host, target.effective_port());
+                        errno = ETIMEDOUT;
+                        co_return std::nullopt;
                     }
+                    read_timed_out = std::make_shared<std::atomic<bool>>(false);
+                    coro::cancel_source ws_cancel;
+                    auto watchdog = arm_io_watchdog(sched, conn.fd(), remaining,
+                                                    ws_cancel.get_token(),
+                                                    read_timed_out);
+                    read_result = co_await conn.read(buffer.data(), buffer.size());
+                    ws_cancel.cancel();
+                    co_await watchdog;
+                    if (read_timed_out->load(std::memory_order_acquire)) {
+                        ELIO_LOG_ERROR("Read from {}:{} timed out after {}s",
+                                       target.host, target.effective_port(),
+                                       std::chrono::duration_cast<std::chrono::seconds>(io_deadline).count());
+                        errno = ETIMEDOUT;
+                        co_return std::nullopt;
+                    }
+                } else {
+                    read_result = co_await conn.read(buffer.data(), buffer.size());
                 }
-                ELIO_LOG_ERROR("Failed to read response: {}",
-                              read_result.result == 0 ? "connection closed" : strerror(-read_result.result));
-                errno = read_result.result == 0 ? ECONNRESET : -read_result.result;
-                co_return std::nullopt;
-            }
 
-            auto [result, consumed] = parser.parse(
-                std::string_view(buffer.data(), read_result.result));
+                if (read_result.result <= 0) {
+                    if (read_result.result == 0) {
+                        auto [eof_result, consumed] = parser.finish_eof();
+                        (void)consumed;
+                        if (eof_result == parse_result::complete) {
+                            continue;  // Let the loop inspect final vs interim.
+                        }
+                    }
+                    ELIO_LOG_ERROR("Failed to read response: {}",
+                                  read_result.result == 0 ? "connection closed" : strerror(-read_result.result));
+                    errno = read_result.result == 0 ? ECONNRESET : -read_result.result;
+                    co_return std::nullopt;
+                }
+
+                auto [parse_result_value, consumed] = parser.parse(
+                    std::string_view(buffer.data(), read_result.result));
+                (void)consumed;
+                result = parse_result_value;
+            }
 
             if (result == parse_result::error) {
                 ELIO_LOG_ERROR("Response parse error: {}", parser.error_message());

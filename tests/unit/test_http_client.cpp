@@ -212,6 +212,114 @@ TEST_CASE("HTTP client returns OK for clean keep-alive responses",
     REQUIRE(got_status == 200);
 }
 
+TEST_CASE("HTTP client skips informational responses before final response",
+          "[http][client]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<int> got_status{0};
+    std::string got_body;
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        co_await drain_request_headers(*stream);
+        std::string resp =
+            "HTTP/1.1 100 Continue\r\n"
+            "\r\n"
+            "HTTP/1.1 103 Early Hints\r\n"
+            "Link: </style.css>; rel=preload; as=style\r\n"
+            "\r\n"
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 5\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "hello";
+        co_await stream->write(resp);
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(5);
+        elio::http::client c(cfg);
+
+        auto resp = co_await c.get(make_url(port));
+        if (resp) {
+            got_status = resp->status_code();
+            got_body = std::string(resp->body());
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(got_status == 200);
+    REQUIRE(got_body == "hello");
+}
+
+TEST_CASE("HTTP client rejects unexpected switching protocols response",
+          "[http][client]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_failed{false};
+    std::atomic<int> client_errno{0};
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        co_await drain_request_headers(*stream);
+        std::string resp =
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Connection: Upgrade\r\n"
+            "Upgrade: websocket\r\n"
+            "\r\n";
+        co_await stream->write(resp);
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(5);
+        elio::http::client c(cfg);
+
+        auto resp = co_await c.get(make_url(port));
+        if (!resp) {
+            client_failed = true;
+            client_errno = errno;
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(client_failed);
+    REQUIRE(client_errno == EBADMSG);
+}
+
 TEST_CASE("HTTP client accepts close-delimited response bodies",
           "[http][client]") {
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));

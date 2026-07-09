@@ -4,6 +4,7 @@
 #include <elio/time/timer.hpp>
 #include <atomic>
 #include <chrono>
+#include <coroutine>
 #include <stdexcept>
 #include <thread>
 #include "../test_main.cpp"  // For scaled timeouts
@@ -79,6 +80,18 @@ TEST_CASE("Scheduler construction clamps oversized thread count", "[scheduler]")
     scheduler sched(scheduler::MAX_THREADS + 1);
     REQUIRE(sched.num_threads() == scheduler::MAX_THREADS);
     REQUIRE(!sched.is_running());
+}
+
+TEST_CASE("Worker schedule rejects stopped workers", "[scheduler]") {
+    scheduler sched(1);
+    worker_thread worker(&sched, 0);
+
+    REQUIRE_FALSE(worker.schedule(std::noop_coroutine()));
+
+    worker.start();
+    worker.stop();
+
+    REQUIRE_FALSE(worker.schedule(std::noop_coroutine()));
 }
 
 TEST_CASE("Scheduler start/shutdown", "[scheduler]") {

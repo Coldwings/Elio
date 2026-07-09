@@ -561,7 +561,7 @@ public:
                         promise->set_affinity(state->worker->worker_id());
                         promise->detach_from_parent();
                     }
-                    state->worker->schedule(exec.handle);
+                    state->worker->schedule_or_destroy(exec.handle);
                 });
 
                 if (token_.is_cancelled()) {

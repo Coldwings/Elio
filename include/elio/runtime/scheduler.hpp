@@ -736,8 +736,7 @@ private:
         // stopped) — pushing into its inbox would orphan the task. Fall through
         // to do_spawn() so the round-robin path picks a worker that is still
         // accepting work.
-        if (workers_[idx] && workers_[idx]->is_running()) {
-            workers_[idx]->schedule(handle);
+        if (workers_[idx] && workers_[idx]->schedule(handle)) {
             return true;
         }
         return do_spawn(handle, destroy_on_failure);
@@ -759,8 +758,7 @@ private:
         // Check if task has affinity - if so, schedule to that specific worker
         size_t affinity = coro::get_affinity(handle.address());
         if (affinity != coro::NO_AFFINITY && affinity < n) {
-            if (workers_[affinity]->is_running()) {
-                workers_[affinity]->schedule(handle);
+            if (workers_[affinity] && workers_[affinity]->schedule(handle)) {
                 return true;
             }
             // Target worker not running - clear affinity and fall through
@@ -774,16 +772,14 @@ private:
         size_t start_index = spawn_index_.fetch_add(1, std::memory_order_relaxed) % n;
         for (size_t i = 0; i < n; ++i) {
             size_t index = (start_index + i) % n;
-            if (workers_[index]->is_running()) {
-                workers_[index]->schedule(handle);
+            if (workers_[index] && workers_[index]->schedule(handle)) {
                 return true;
             }
         }
 
         // All workers stopped, try again with current thread count
         n = num_threads_.load(std::memory_order_acquire);
-        if (n > 0 && workers_[0]->is_running()) {
-            workers_[0]->schedule(handle);
+        if (n > 0 && workers_[0] && workers_[0]->schedule(handle)) {
             return true;
         } else {
             if (destroy_on_failure) handle.destroy();
@@ -915,15 +911,19 @@ inline void report_detached_exception(std::exception_ptr ex) noexcept {
 }
 
 inline void worker_thread::start() {
+    std::lock_guard<std::mutex> lock(schedule_mutex_);
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true)) return;
     thread_ = std::thread(&worker_thread::run, this);
 }
 
 inline void worker_thread::request_stop() noexcept {
-    bool expected = true;
-    if (!running_.compare_exchange_strong(expected, false, 
-            std::memory_order_release, std::memory_order_relaxed)) return;
+    {
+        std::lock_guard<std::mutex> lock(schedule_mutex_);
+        bool expected = true;
+        if (!running_.compare_exchange_strong(expected, false,
+                std::memory_order_release, std::memory_order_relaxed)) return;
+    }
     wake();  // Wake the worker if it's blocked in I/O poll
 }
 
@@ -1005,7 +1005,10 @@ inline void worker_thread::run() {
             redistribute_tasks(scheduler_);
             if (io_context_->pending_count() == 0 ||
                 std::chrono::steady_clock::now() >= draining_deadline_) {
-                running_.store(false, std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lock(schedule_mutex_);
+                    running_.store(false, std::memory_order_release);
+                }
                 break;
             }
             io_context_->poll(std::chrono::milliseconds(50));

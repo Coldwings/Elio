@@ -1000,7 +1000,10 @@ inline void worker_thread::run() {
             redistribute_tasks(scheduler_);
             if (io_context_->pending_count() == 0 ||
                 std::chrono::steady_clock::now() >= draining_deadline_) {
-                running_.store(false, std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lock(schedule_mutex_);
+                    running_.store(false, std::memory_order_release);
+                }
                 break;
             }
             io_context_->poll(std::chrono::milliseconds(50));

@@ -81,7 +81,6 @@ public:
                     break;
                 }
                 buffer_.append(data);
-                data.remove_prefix(data.size());
                 break;
             } else if (cr_pos != std::string::npos &&
                        (lf_pos == std::string::npos || cr_pos < lf_pos)) {

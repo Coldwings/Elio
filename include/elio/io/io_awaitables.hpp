@@ -1061,6 +1061,7 @@ public:
             auto exec = detail::make_io_cancel_executor(state);
             if (auto* promise = coro::get_promise_base(exec.handle.address())) {
                 promise->set_affinity(state->worker->worker_id());
+                promise->set_worker_local();
                 promise->detach_from_parent();
             }
             state->worker->schedule_or_destroy(exec.handle);
@@ -1183,6 +1184,7 @@ public:
             auto exec = detail::make_io_cancel_executor(state);
             if (auto* promise = coro::get_promise_base(exec.handle.address())) {
                 promise->set_affinity(state->worker->worker_id());
+                promise->set_worker_local();
                 promise->detach_from_parent();
             }
             state->worker->schedule_or_destroy(exec.handle);
@@ -1301,6 +1303,7 @@ public:
             auto exec = detail::make_io_cancel_executor(state);
             if (auto* promise = coro::get_promise_base(exec.handle.address())) {
                 promise->set_affinity(state->worker->worker_id());
+                promise->set_worker_local();
                 promise->detach_from_parent();
             }
             state->worker->schedule_or_destroy(exec.handle);
@@ -1414,6 +1417,7 @@ public:
                 state, /*allow_epoll_cancel=*/true);
             if (auto* promise = coro::get_promise_base(exec.handle.address())) {
                 promise->set_affinity(state->worker->worker_id());
+                promise->set_worker_local();
                 promise->detach_from_parent();
             }
             state->worker->schedule_or_destroy(exec.handle);

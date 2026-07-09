@@ -730,6 +730,17 @@ private:
             if (destroy_on_failure) handle.destroy();
             return false;
         }
+
+        if (promise && promise->is_worker_local()) {
+            size_t affinity = promise->affinity();
+            if (affinity == worker_id && affinity < n &&
+                workers_[affinity] && workers_[affinity]->schedule(handle)) {
+                return true;
+            }
+            if (destroy_on_failure) handle.destroy();
+            return false;
+        }
+
         size_t idx = worker_id % n;
         // Verify the chosen slot is still running. After a shrink the worker at
         // this index may have been stopped (or be in the process of being
@@ -755,17 +766,24 @@ private:
             return false;
         }
 
-        // Check if task has affinity - if so, schedule to that specific worker
-        size_t affinity = coro::get_affinity(handle.address());
+        // Check if task has affinity - if so, schedule to that specific worker.
+        auto* promise = coro::get_promise_base(handle.address());
+        size_t affinity = promise ? promise->affinity() : coro::NO_AFFINITY;
         if (affinity != coro::NO_AFFINITY && affinity < n) {
             if (workers_[affinity] && workers_[affinity]->schedule(handle)) {
                 return true;
             }
+            if (promise && promise->is_worker_local()) {
+                if (destroy_on_failure) handle.destroy();
+                return false;
+            }
             // Target worker not running - clear affinity and fall through
-            auto* promise = coro::get_promise_base(handle.address());
             if (promise) {
                 promise->clear_affinity();
             }
+        } else if (affinity != coro::NO_AFFINITY && promise && promise->is_worker_local()) {
+            if (destroy_on_failure) handle.destroy();
+            return false;
         }
 
         // No affinity or invalid affinity - round-robin to any running worker
@@ -952,6 +970,22 @@ inline void worker_thread::drain_remaining_tasks() noexcept {
     }
 }
 
+/// Run worker-local maintenance tasks on this retiring worker; redistribute
+/// normal user tasks to active workers so they cannot start fresh I/O on a
+/// worker whose io_context is about to stop being polled.
+inline void worker_thread::run_or_redistribute_retiring_task(
+    scheduler* sched,
+    std::coroutine_handle<> handle) noexcept {
+    auto* promise = coro::get_promise_base(handle.address());
+    if (promise && promise->is_worker_local() && promise->affinity() == worker_id_) {
+        needs_sync_ = true;
+        run_task(handle);
+        return;
+    }
+
+    sched->spawn(handle);
+}
+
 /// Redistribute remaining tasks to active workers - call during thread pool shrink
 inline void worker_thread::redistribute_tasks(scheduler* sched) noexcept {
     // First drain inbox to deque
@@ -963,8 +997,7 @@ inline void worker_thread::redistribute_tasks(scheduler* sched) noexcept {
     while ((addr = queue_->pop()) != nullptr) {
         auto handle = std::coroutine_handle<>::from_address(addr);
         if (handle && !handle.done()) {
-            // Respawn to an active worker
-            sched->spawn(handle);
+            run_or_redistribute_retiring_task(sched, handle);
         } else if (handle) {
             handle.destroy();
         }
@@ -1060,12 +1093,12 @@ inline void worker_thread::run() {
         auto handle = std::coroutine_handle<>::from_address(addr);
         if (handle && !handle.done()) {
             if (retiring) {
-                // Hand the task back to the scheduler; do_spawn() routes it to
-                // a surviving worker (num_threads_ was already lowered before
-                // this worker was stopped, so it never lands back here). The
-                // release fence inside do_spawn() carries frame visibility, so
-                // no needs_sync_ handshake is required on the receiving worker.
-                scheduler_->spawn(handle);
+                // Hand normal tasks back to the scheduler; do_spawn() routes
+                // them to a surviving worker (num_threads_ was already lowered
+                // before this worker was stopped, so they never land back here).
+                // Worker-local maintenance tasks are the exception: they touch
+                // this worker's io_context and must run here before exit.
+                run_or_redistribute_retiring_task(scheduler_, handle);
             } else {
                 needs_sync_ = true;  // Conservatively ensure memory visibility for drained tasks
                 run_task(handle);
@@ -1176,7 +1209,26 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
         auto handle = victim->steal_task();
         if (handle) {
             // Check if this task has affinity for a different worker
-            size_t affinity = coro::get_affinity(handle.address());
+            auto* promise = coro::get_promise_base(handle.address());
+            size_t affinity = promise ? promise->affinity() : coro::NO_AFFINITY;
+
+            if (promise && promise->is_worker_local()) {
+                if (affinity == worker_id_) {
+                    steals_executed_.fetch_add(1, std::memory_order_relaxed);
+                    return handle;
+                }
+                if (affinity < num_workers) {
+                    scheduler_->spawn_to(affinity, handle);
+                } else {
+                    handle.destroy();
+                }
+                if (++retry_count >= max_retries) {
+                    return nullptr;
+                }
+                i = static_cast<size_t>(-1);
+                start = (steal_start + retry_count) % num_workers;
+                continue;
+            }
             
             if (affinity == coro::NO_AFFINITY || affinity == worker_id_) {
                 steals_executed_.fetch_add(1, std::memory_order_relaxed);
@@ -1187,7 +1239,6 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
             if (affinity < num_workers) {
                 scheduler_->spawn_to(affinity, handle);
             } else {
-                auto* promise = coro::get_promise_base(handle.address());
                 if (promise) {
                     promise->clear_affinity();
                 }

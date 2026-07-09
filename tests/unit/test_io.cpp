@@ -245,6 +245,51 @@ TEST_CASE("Socket pair with epoll", "[io][epoll][socket]") {
     close(sv[1]);
 }
 
+TEST_CASE("epoll_backend drains readable data before EOF on hangup",
+          "[io][epoll][socket][hup]") {
+    int sv[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+    const char* msg = "final frame before close";
+    REQUIRE(send(sv[0], msg, strlen(msg), 0) ==
+            static_cast<ssize_t>(strlen(msg)));
+    REQUIRE(shutdown(sv[0], SHUT_WR) == 0);
+
+    epoll_backend backend;
+    char buffer[64] = {};
+
+    io_request req{};
+    req.op = io_op::recv;
+    req.fd = sv[1];
+    req.buffer = buffer;
+    req.length = sizeof(buffer);
+    req.awaiter = std::noop_coroutine();
+
+    REQUIRE(backend.prepare(req));
+    REQUIRE(backend.poll(std::chrono::milliseconds(100)) == 1);
+
+    auto result = epoll_backend::get_last_result();
+    REQUIRE(result.result == static_cast<int>(strlen(msg)));
+    REQUIRE(std::string(buffer, strlen(msg)) == msg);
+
+    char eof_buffer[1] = {};
+    io_request eof_req{};
+    eof_req.op = io_op::recv;
+    eof_req.fd = sv[1];
+    eof_req.buffer = eof_buffer;
+    eof_req.length = sizeof(eof_buffer);
+    eof_req.awaiter = std::noop_coroutine();
+
+    REQUIRE(backend.prepare(eof_req));
+    REQUIRE(backend.poll(std::chrono::milliseconds(100)) == 1);
+
+    auto eof_result = epoll_backend::get_last_result();
+    REQUIRE(eof_result.result == 0);
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
 TEST_CASE("io_context run methods", "[io][context][run]") {
     io_context ctx;
     

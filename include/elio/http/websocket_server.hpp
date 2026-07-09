@@ -365,9 +365,8 @@ inline upgrade_result validate_upgrade_request(const request& req,
         return result;
     }
     
-    // Decode and check key length (should be 16 bytes = 24 chars base64)
-    if (ws_key.size() != 24) {
-        result.error = "Invalid Sec-WebSocket-Key length";
+    if (!is_valid_websocket_key(ws_key)) {
+        result.error = "Invalid Sec-WebSocket-Key";
         return result;
     }
     

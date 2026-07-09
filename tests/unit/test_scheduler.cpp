@@ -493,6 +493,59 @@ TEST_CASE("Scheduler shrink drains I/O started after retirement begins",
     sched.shutdown();
 }
 
+TEST_CASE("Scheduler accounting includes pending I/O on draining workers",
+          "[scheduler]") {
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> task_running{false};
+    std::atomic<bool> proceed{false};
+    std::atomic<bool> io_done{false};
+
+    auto raw_task = gated_io_task(&task_running, &proceed,
+                                  scaled_ms(300), &io_done);
+    auto handle = elio::coro::detail::task_access::release(raw_task);
+    handle.promise().set_affinity(1);
+    handle.promise().detach_from_parent();
+
+    sched.spawn_to(1, handle);
+
+    auto running_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!task_running.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < running_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(task_running.load(std::memory_order_acquire));
+
+    sched.set_thread_count(1);
+    REQUIRE(sched.num_threads(std::memory_order_acquire) == 1);
+
+    proceed.store(true, std::memory_order_release);
+
+    bool saw_pending = false;
+    bool saw_active = false;
+    auto accounting_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while ((!saw_pending || !saw_active) &&
+           !io_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < accounting_deadline) {
+        saw_pending = saw_pending || (sched.pending_tasks() > 0);
+        saw_active = saw_active || (sched.active_tasks() > 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    REQUIRE(saw_pending);
+    REQUIRE(saw_active);
+
+    auto io_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!io_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < io_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(io_done.load(std::memory_order_acquire));
+
+    sched.shutdown();
+}
+
 TEST_CASE("Scheduler shrink runs worker-local maintenance on retiring worker",
           "[scheduler]") {
     scheduler sched(2);

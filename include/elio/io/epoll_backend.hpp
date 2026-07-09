@@ -646,24 +646,26 @@ private:
                           std::vector<deferred_resume_entry>* deferred_resumes = nullptr) {
         int result = 0;
         
+        auto is_read_data_op = [](io_op op) noexcept {
+            switch (op) {
+                case io_op::read:
+                case io_op::readv:
+                case io_op::recv:
+                    return true;
+                default:
+                    return false;
+            }
+        };
+
         // Check for errors first
         if (revents & EPOLLERR) {
             int error = 0;
             socklen_t len = sizeof(error);
             getsockopt(op.req.fd, SOL_SOCKET, SO_ERROR, &error, &len);
             result = -error;
-        } else if (revents & EPOLLHUP) {
-            // For reads, HUP means EOF (result = 0)
-            // For other operations, it's an error
-            switch (op.req.op) {
-                case io_op::read:
-                case io_op::recv:
-                    result = 0;  // EOF
-                    break;
-                default:
-                    result = -EPIPE;
-                    break;
-            }
+        } else if ((revents & EPOLLHUP) && !is_read_data_op(op.req.op)) {
+            // Non-read data operations cannot drain bytes on HUP.
+            result = -EPIPE;
         } else {
             // Execute the actual I/O operation
             switch (op.req.op) {

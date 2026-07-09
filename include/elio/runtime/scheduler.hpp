@@ -459,10 +459,7 @@ public:
             if (running) {
                 draining_workers_.reserve(
                     draining_workers_.size() + (old_count - count));
-                for (size_t i = count; i < old_count; ++i) {
-                    draining_slots_[i].store(true, std::memory_order_release);
-                }
-                publish_draining_scan_bound_(old_count);
+                mark_draining_range_(count, old_count);
             }
 
             // Update count after publishing draining slots so accounting readers
@@ -622,34 +619,47 @@ private:
         for (size_t i = 0; i < visible_count; ++i) {
             total += worker_pending_load_at_(i);
         }
-        size_t scan_bound = draining_scan_bound_.load(std::memory_order_acquire);
-        for (size_t i = visible_count; i < scan_bound; ++i) {
-            if (draining_slots_[i].load(std::memory_order_acquire)) {
-                total += worker_pending_load_at_(i);
+        // Fast path: skip the draining-slot scan entirely when no slots are
+        // draining (the common case after startup and when no shrink is active).
+        if (draining_count_.load(std::memory_order_acquire) > 0) {
+            size_t upper = draining_upper_bound_.load(std::memory_order_acquire);
+            for (size_t i = visible_count; i < upper; ++i) {
+                if (draining_slots_[i].load(std::memory_order_acquire)) {
+                    total += worker_pending_load_at_(i);
+                }
             }
         }
         return total;
     }
 
-    void publish_draining_scan_bound_(size_t bound) noexcept {
-        size_t current = draining_scan_bound_.load(std::memory_order_relaxed);
-        if (bound > current) {
-            draining_scan_bound_.store(bound, std::memory_order_release);
+    /// Mark slots [first, last) as draining and update accounting counters.
+    /// Must be called under workers_mutex_ before publishing the new num_threads_.
+    void mark_draining_range_(size_t first, size_t last) noexcept {
+        if (first >= last) return;
+        for (size_t i = first; i < last; ++i) {
+            draining_slots_[i].store(true, std::memory_order_release);
+        }
+        draining_count_.fetch_add(last - first, std::memory_order_release);
+        // Update upper bound (max-only; reset in clear_draining_slot_ when the
+        // count drops back to zero).
+        size_t expected = draining_upper_bound_.load(std::memory_order_relaxed);
+        while (expected < last) {
+            if (draining_upper_bound_.compare_exchange_weak(
+                    expected, last,
+                    std::memory_order_release, std::memory_order_relaxed))
+                break;
         }
     }
 
+    /// Clear a single draining slot and update accounting counters.
+    /// Must be called under workers_mutex_.
     void clear_draining_slot_(size_t index) noexcept {
         draining_slots_[index].store(false, std::memory_order_release);
-
-        size_t current = draining_scan_bound_.load(std::memory_order_relaxed);
-        if (index + 1 != current) return;
-
-        size_t new_bound = index;
-        while (new_bound > 0 &&
-               !draining_slots_[new_bound - 1].load(std::memory_order_acquire)) {
-            --new_bound;
+        // When the last draining slot is cleared, reset the upper bound so
+        // subsequent accounting reads take the O(1) early-exit path.
+        if (draining_count_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            draining_upper_bound_.store(0, std::memory_order_release);
         }
-        draining_scan_bound_.store(new_bound, std::memory_order_release);
     }
 
     /// Pair an ``on_task_spawned()`` increment with a deferred decrement
@@ -866,7 +876,14 @@ private:
     // lock-free accounting readers a stable way to include workers that are no
     // longer inside the num_threads_ visible range.
     std::array<std::atomic<bool>, MAX_THREADS> draining_slots_{};
-    std::atomic<size_t> draining_scan_bound_{0};
+    // Number of currently-active draining slots. When zero, accounting readers
+    // skip the draining-slot scan entirely (O(1) fast path).
+    std::atomic<size_t> draining_count_{0};
+    // Exclusive upper bound of draining slot indices. The scan loop in
+    // worker_pending_load_() only needs to iterate up to this value. Updated
+    // (max-only) when slots are marked, reset to 0 when draining_count_ reaches
+    // zero.
+    std::atomic<size_t> draining_upper_bound_{0};
 
     // Frequently-read fields on their own cache line to avoid false sharing
     // with the spawn counter and the slow-path workers_mutex_.

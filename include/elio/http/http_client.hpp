@@ -281,7 +281,7 @@ private:
         }
         
         request req(m, parsed->path_with_query());
-        req.set_host(parsed->authority());
+        req.set_host(parsed->host_authority());
         
         if (!body.empty()) {
             req.set_body(body);
@@ -350,7 +350,7 @@ private:
 
         // Ensure Host header is set
         if (req.header("Host").empty()) {
-            req.set_host(target.authority());
+            req.set_host(target.host_authority());
         }
 
         // Add keep-alive header
@@ -570,7 +570,7 @@ private:
                     }
                     
                     request redirect_req(redirect_method, redirect_url->path_with_query());
-                    redirect_req.set_host(redirect_url->authority());
+                    redirect_req.set_host(redirect_url->host_authority());
                     if (!config_.user_agent.empty()) {
                         redirect_req.set_header("User-Agent", config_.user_agent);
                     }

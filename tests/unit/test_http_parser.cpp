@@ -465,6 +465,7 @@ TEST_CASE("URL parsing - basic URLs", "[http][url]") {
         REQUIRE(u->userinfo == "user:pass");
         REQUIRE(u->host == "example.com");
         REQUIRE(u->authority() == "user:pass@example.com");
+        REQUIRE(u->host_authority() == "example.com");
     }
 }
 
@@ -501,6 +502,33 @@ TEST_CASE("URL parsing - IPv6", "[http][url]") {
     REQUIRE(u->host == "::1");
     REQUIRE(u->port == 8080);
     REQUIRE(u->path == "/test");
+    REQUIRE(u->authority() == "[::1]:8080");
+    REQUIRE(u->host_authority() == "[::1]:8080");
+    REQUIRE(u->to_string() == "http://[::1]:8080/test");
+}
+
+TEST_CASE("URL header authority excludes userinfo and brackets IPv6", "[http][url]") {
+    SECTION("userinfo is preserved in URL authority only") {
+        auto u = url::parse("https://user:pass@example.com:8443/resource");
+        REQUIRE(u.has_value());
+        REQUIRE(u->authority() == "user:pass@example.com:8443");
+        REQUIRE(u->host_authority() == "example.com:8443");
+    }
+
+    SECTION("IPv6 literals are bracketed in header authority") {
+        auto u = url::parse("https://user:pass@[2001:db8::1]:8443/resource");
+        REQUIRE(u.has_value());
+        REQUIRE(u->host == "2001:db8::1");
+        REQUIRE(u->authority() == "user:pass@[2001:db8::1]:8443");
+        REQUIRE(u->host_authority() == "[2001:db8::1]:8443");
+    }
+
+    SECTION("default ports are omitted consistently") {
+        auto u = url::parse("https://[2001:db8::1]:443/resource");
+        REQUIRE(u.has_value());
+        REQUIRE(u->authority() == "[2001:db8::1]");
+        REQUIRE(u->host_authority() == "[2001:db8::1]");
+    }
 }
 
 TEST_CASE("URL encoding/decoding", "[http][url]") {

@@ -75,6 +75,12 @@ TEST_CASE("Scheduler construction", "[scheduler]") {
     REQUIRE(!sched.is_running());
 }
 
+TEST_CASE("Scheduler construction clamps oversized thread count", "[scheduler]") {
+    scheduler sched(scheduler::MAX_THREADS + 1);
+    REQUIRE(sched.num_threads() == scheduler::MAX_THREADS);
+    REQUIRE(!sched.is_running());
+}
+
 TEST_CASE("Scheduler start/shutdown", "[scheduler]") {
     scheduler sched(2);
     REQUIRE(!sched.is_running());

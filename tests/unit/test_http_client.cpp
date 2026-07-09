@@ -3,6 +3,7 @@
 //   2. read_timeout interrupts a stalled response read.
 //   3. A connection with leftover bytes after the response is NOT pooled
 //      (response-splitting prevention).
+//   4. Repeated informational responses cannot bypass max_response_size.
 //
 // These exercise the post-PR send_request path. We stand up a tiny TCP
 // listener that pretends to be an HTTP server and craft hand-built byte
@@ -267,6 +268,72 @@ TEST_CASE("HTTP client skips informational responses before final response",
     REQUIRE(client_done);
     REQUIRE(got_status == 200);
     REQUIRE(got_body == "hello");
+}
+
+TEST_CASE("HTTP client caps cumulative informational responses",
+          "[http][client][security]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_failed{false};
+    std::atomic<int> client_errno{0};
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        co_await drain_request_headers(*stream);
+
+        std::string interim =
+            "HTTP/1.1 103 Early Hints\r\n"
+            "Link: </very-large-early-hints-entry.css>; rel=preload\r\n"
+            "\r\n";
+        for (int i = 0; i < 4; ++i) {
+            auto w = co_await stream->write(interim);
+            if (w.result <= 0) {
+                server_done = true;
+                co_return;
+            }
+            co_await elio::time::sleep_for(std::chrono::milliseconds(20));
+        }
+        std::string final_response =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 2\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "ok";
+        co_await stream->write(final_response);
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::client_config cfg;
+        cfg.max_response_size = 128;
+        cfg.read_timeout = std::chrono::seconds(0);
+        elio::http::client c(cfg);
+
+        auto resp = co_await c.get(make_url(port));
+        if (!resp) {
+            client_failed = true;
+            client_errno = errno;
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(client_failed);
+    REQUIRE(client_errno == EMSGSIZE);
 }
 
 TEST_CASE("HTTP client rejects unexpected switching protocols response",

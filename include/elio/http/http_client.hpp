@@ -423,6 +423,8 @@ private:
         parser.set_max_header_size(config_.max_header_size);
         parser.set_request_method(req.get_method());
         std::string pending_response_bytes;
+        size_t current_response_bytes = 0;
+        size_t skipped_informational_bytes = 0;
 
         while (true) {
             if (parser.is_complete()) {
@@ -437,9 +439,23 @@ private:
                     co_return std::nullopt;
                 }
 
+                if (current_response_bytes >
+                    config_.max_response_size - skipped_informational_bytes) {
+                    ELIO_LOG_ERROR("Informational responses from {}:{} exceed "
+                                   "max_response_size ({} > {})",
+                                   target.host,
+                                   target.effective_port(),
+                                   skipped_informational_bytes + current_response_bytes,
+                                   config_.max_response_size);
+                    errno = EMSGSIZE;
+                    co_return std::nullopt;
+                }
+
+                skipped_informational_bytes += current_response_bytes;
                 pending_response_bytes = parser.take_remaining();
                 parser.reset();
                 parser.set_request_method(req.get_method());
+                current_response_bytes = 0;
                 continue;
             }
 
@@ -457,7 +473,7 @@ private:
 
             if (!pending_response_bytes.empty()) {
                 auto [parse_result_value, consumed] = parser.parse(pending_response_bytes);
-                (void)consumed;
+                current_response_bytes += consumed;
                 result = parse_result_value;
                 pending_response_bytes.clear();
             } else {
@@ -511,7 +527,7 @@ private:
 
                 auto [parse_result_value, consumed] = parser.parse(
                     std::string_view(buffer.data(), read_result.result));
-                (void)consumed;
+                current_response_bytes += consumed;
                 result = parse_result_value;
             }
 

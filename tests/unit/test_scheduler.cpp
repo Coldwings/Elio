@@ -68,6 +68,13 @@ task<void> gated_io_task(std::atomic<bool>* running,
     done->store(true, std::memory_order_release);
 }
 
+task<void> record_current_worker_task(std::atomic<size_t>* observed_worker) {
+    auto* worker = worker_thread::current();
+    observed_worker->store(worker ? worker->worker_id() : NO_AFFINITY,
+                           std::memory_order_release);
+    co_return;
+}
+
 } // namespace
 
 TEST_CASE("Scheduler construction", "[scheduler]") {
@@ -482,6 +489,44 @@ TEST_CASE("Scheduler shrink drains I/O started after retirement begins",
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     REQUIRE(io_done.load(std::memory_order_acquire));
+
+    sched.shutdown();
+}
+
+TEST_CASE("Scheduler shrink runs worker-local maintenance on retiring worker",
+          "[scheduler]") {
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> occupier_running{false};
+    std::atomic<size_t> observed_worker{NO_AFFINITY};
+
+    sched.go_to(1, occupy_worker_task, &occupier_running, scaled_ms(300));
+
+    auto deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!occupier_running.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(occupier_running.load(std::memory_order_acquire));
+
+    auto worker_local_task = record_current_worker_task(&observed_worker);
+    auto handle = elio::coro::detail::task_access::release(worker_local_task);
+    handle.promise().set_affinity(1);
+    handle.promise().set_worker_local();
+    handle.promise().detach_from_parent();
+
+    sched.spawn_to(1, handle);
+
+    sched.set_thread_count(1);
+    REQUIRE(sched.num_threads() == 1);
+
+    auto observed_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (observed_worker.load(std::memory_order_acquire) == NO_AFFINITY &&
+           std::chrono::steady_clock::now() < observed_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(observed_worker.load(std::memory_order_acquire) == 1);
 
     sched.shutdown();
 }

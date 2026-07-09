@@ -256,6 +256,18 @@ public:
         affinity_.store(NO_AFFINITY, std::memory_order_release); 
     }
 
+    /// Mark this coroutine as internal work that must run on its affinity
+    /// owner. Used by scheduler maintenance tasks that access worker-local
+    /// state such as an io_context.
+    void set_worker_local(bool worker_local = true) noexcept {
+        worker_local_.store(worker_local, std::memory_order_release);
+    }
+
+    /// Check whether this coroutine must stay on its affinity owner.
+    [[nodiscard]] bool is_worker_local() const noexcept {
+        return worker_local_.load(std::memory_order_acquire);
+    }
+
     // vthread_stack accessors
     [[nodiscard]] vthread_stack* vstack() const noexcept { 
         return vstack_.load(std::memory_order_acquire); 
@@ -306,6 +318,10 @@ private:
     // Thread affinity: NO_AFFINITY means can migrate freely
     // Must be atomic to avoid data races in work-stealing scenarios
     std::atomic<size_t> affinity_;
+
+    // Internal scheduler maintenance tasks may access worker-local state and
+    // must not be migrated when their affinity owner is retired.
+    std::atomic<bool> worker_local_{false};
 
     // vthread_stack support
     std::atomic<vthread_stack*> vstack_{nullptr};

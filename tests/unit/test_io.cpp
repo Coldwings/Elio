@@ -253,7 +253,7 @@ TEST_CASE("epoll_backend drains readable data before EOF on hangup",
     const char* msg = "final frame before close";
     REQUIRE(send(sv[0], msg, strlen(msg), 0) ==
             static_cast<ssize_t>(strlen(msg)));
-    REQUIRE(shutdown(sv[0], SHUT_WR) == 0);
+    REQUIRE(close(sv[0]) == 0);
 
     epoll_backend backend;
     char buffer[64] = {};
@@ -286,7 +286,6 @@ TEST_CASE("epoll_backend drains readable data before EOF on hangup",
     auto eof_result = epoll_backend::get_last_result();
     REQUIRE(eof_result.result == 0);
 
-    close(sv[0]);
     close(sv[1]);
 }
 

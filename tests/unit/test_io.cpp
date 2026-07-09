@@ -1020,6 +1020,168 @@ TEST_CASE("uds_stream read_exactly/write_exactly", "[uds][stream][exact]") {
     sched.shutdown();
 }
 
+namespace {
+
+struct uds_pair {
+    std::optional<uds_stream> server;
+    std::optional<uds_stream> client;
+};
+
+uds_pair make_small_buffer_uds_pair() {
+    int sv[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+    uds_pair pair{uds_stream(sv[0]), uds_stream(sv[1])};
+
+    const int small = 4096;
+    for (int fd : {pair.server->fd(), pair.client->fd()}) {
+        REQUIRE(::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &small,
+                             sizeof(small)) == 0);
+        REQUIRE(::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small,
+                             sizeof(small)) == 0);
+    }
+
+    return pair;
+}
+
+} // namespace
+
+TEST_CASE("uds_stream write awaits writability under backpressure",
+          "[uds][stream][eagain][regression]") {
+    scheduler sched(2);
+    sched.start();
+
+    auto pair = make_small_buffer_uds_pair();
+
+    constexpr size_t kPayload = 1 * 1024 * 1024;
+    std::vector<char> to_send(kPayload);
+    for (size_t i = 0; i < kPayload; ++i) {
+        to_send[i] = static_cast<char>((i * 17) & 0xFF);
+    }
+
+    std::atomic<bool> writer_done{false};
+    std::atomic<bool> reader_done{false};
+    std::atomic<bool> saw_eagain{false};
+    std::atomic<size_t> total_written{0};
+    std::atomic<size_t> total_read{0};
+    std::atomic<bool> data_ok{true};
+
+    auto writer = [&]() -> task<void> {
+        size_t off = 0;
+        while (off < kPayload) {
+            auto r = co_await pair.client->write(to_send.data() + off,
+                                                 kPayload - off);
+            if (r.result == -EAGAIN || r.result == -EWOULDBLOCK) {
+                saw_eagain = true;
+                break;
+            }
+            if (r.result <= 0) {
+                break;
+            }
+            off += static_cast<size_t>(r.result);
+        }
+        total_written = off;
+        writer_done = true;
+        co_return;
+    };
+
+    auto reader = [&]() -> task<void> {
+        std::vector<char> buf(64 * 1024);
+        size_t got = 0;
+        while (got < kPayload) {
+            auto r = co_await pair.server->read(buf.data(), buf.size());
+            if (r.result <= 0) {
+                break;
+            }
+            for (int i = 0; i < r.result; ++i) {
+                const auto index = got + static_cast<size_t>(i);
+                const auto expected = static_cast<char>((index * 17) & 0xFF);
+                if (buf[static_cast<size_t>(i)] != expected) {
+                    data_ok = false;
+                }
+            }
+            got += static_cast<size_t>(r.result);
+        }
+        total_read = got;
+        reader_done = true;
+        co_return;
+    };
+
+    sched.go(reader);
+    sched.go(writer);
+
+    for (int i = 0; i < 1000 && (!writer_done || !reader_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(writer_done);
+    REQUIRE(reader_done);
+    REQUIRE_FALSE(saw_eagain.load());
+    REQUIRE(total_written.load() == kPayload);
+    REQUIRE(total_read.load() == kPayload);
+    REQUIRE(data_ok.load());
+}
+
+TEST_CASE("uds_stream read awaits readability for deferred data",
+          "[uds][stream][eagain][regression]") {
+    scheduler sched(2);
+    sched.start();
+
+    auto pair = make_small_buffer_uds_pair();
+
+    const char* msg = "deferred UDS payload after readiness wait";
+    const size_t msg_len = strlen(msg);
+
+    std::atomic<bool> reader_done{false};
+    std::atomic<bool> writer_done{false};
+    std::atomic<size_t> total_written{0};
+    io_result read_result{};
+    char buffer[128] = {0};
+
+    auto reader = [&]() -> task<void> {
+        read_result = co_await pair.server->read(
+            std::span<char>(buffer, sizeof(buffer) - 1));
+        reader_done = true;
+        co_return;
+    };
+
+    auto writer = [&]() -> task<void> {
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        size_t off = 0;
+        while (off < msg_len) {
+            auto r = co_await pair.client->write(
+                std::string_view(msg + off, msg_len - off));
+            if (r.result <= 0) {
+                break;
+            }
+            off += static_cast<size_t>(r.result);
+        }
+        total_written = off;
+        writer_done = off == msg_len;
+        co_return;
+    };
+
+    sched.go(reader);
+    sched.go(writer);
+
+    for (int i = 0; i < 500 && (!reader_done || !writer_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(reader_done);
+    REQUIRE(writer_done);
+    REQUIRE(total_written.load() == msg_len);
+    REQUIRE(read_result.result != -EAGAIN);
+    REQUIRE(read_result.result != -EWOULDBLOCK);
+    REQUIRE(read_result.success());
+    REQUIRE(read_result.bytes_transferred() == static_cast<int>(msg_len));
+    REQUIRE(std::string(buffer) == msg);
+}
+
 TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {
     auto addr = unix_address::abstract("elio_test_concurrent_" + std::to_string(getpid()));
 

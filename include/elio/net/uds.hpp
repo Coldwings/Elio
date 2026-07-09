@@ -210,31 +210,67 @@ public:
         peer_addr_ = addr;
     }
     
-    /// Async read
-    auto read(void* buffer, size_t length) {
-        return io::async_recv(fd_, buffer, length);
+    /// Async read.
+    ///
+    /// Waits for the socket to become readable and retries on transient
+    /// readiness errors (-EAGAIN/-EWOULDBLOCK) or interruption (-EINTR)
+    /// rather than surfacing them to the caller. A positive short read is
+    /// returned as-is; a hard error or a poll failure is returned unchanged.
+    coro::task<io::io_result> read(void* buffer, size_t length) {
+        while (true) {
+            auto result = co_await io::async_recv(fd_, buffer, length);
+            if (result.result == -EAGAIN || result.result == -EWOULDBLOCK) {
+                auto ready = co_await io::async_poll_read(fd_);
+                if (ready.result < 0) {
+                    co_return ready;
+                }
+                continue;
+            }
+            if (result.result == -EINTR) {
+                continue;
+            }
+            co_return result;
+        }
     }
     
     /// Async read into span
     template<typename T>
-    auto read(std::span<T> buffer) {
-        return io::async_recv(fd_, buffer.data(), buffer.size_bytes());
+    coro::task<io::io_result> read(std::span<T> buffer) {
+        return read(buffer.data(), buffer.size_bytes());
     }
     
-    /// Async write
-    auto write(const void* buffer, size_t length) {
-        return io::async_send(fd_, buffer, length);
+    /// Async write.
+    ///
+    /// Waits for the socket to become writable and retries on transient
+    /// readiness errors (-EAGAIN/-EWOULDBLOCK) or interruption (-EINTR)
+    /// rather than surfacing them to the caller. A positive short write is
+    /// returned as-is; a hard error or a poll failure is returned unchanged.
+    coro::task<io::io_result> write(const void* buffer, size_t length) {
+        while (true) {
+            auto result = co_await io::async_send(fd_, buffer, length);
+            if (result.result == -EAGAIN || result.result == -EWOULDBLOCK) {
+                auto ready = co_await io::async_poll_write(fd_);
+                if (ready.result < 0) {
+                    co_return ready;
+                }
+                continue;
+            }
+            if (result.result == -EINTR) {
+                continue;
+            }
+            co_return result;
+        }
     }
     
     /// Async write from span
     template<typename T>
-    auto write(std::span<const T> buffer) {
-        return io::async_send(fd_, buffer.data(), buffer.size_bytes());
+    coro::task<io::io_result> write(std::span<const T> buffer) {
+        return write(buffer.data(), buffer.size_bytes());
     }
     
     /// Async write string
-    auto write(std::string_view str) {
-        return io::async_send(fd_, str.data(), str.size());
+    coro::task<io::io_result> write(std::string_view str) {
+        return write(str.data(), str.size());
     }
     
     /// Async writev (scatter-gather write)
@@ -287,8 +323,7 @@ public:
                     co_return poll;
                 }
             } else if (result.result == -EINTR) {
-                // Interrupted before any data: retry the recv directly. The
-                // underlying read() is a raw async_recv with no internal retry.
+                // Interrupted before any data: retry the read directly.
                 continue;
             } else {
                 // Terminal error.
@@ -334,9 +369,8 @@ public:
                     co_return poll;
                 }
             } else if (result.result == -EINTR) {
-                // Interrupted before any bytes were sent: retry the send
-                // directly. The underlying write() is a raw async_send with no
-                // internal retry.
+                // Interrupted before any bytes were sent: retry the write
+                // directly.
                 continue;
             } else {
                 // Terminal error (or a 0-byte write, which for a socket send

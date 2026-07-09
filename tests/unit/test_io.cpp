@@ -6,6 +6,7 @@
 #include <elio/runtime/scheduler.hpp>
 #include <elio/net/resolve.hpp>
 #include <elio/time/timer.hpp>
+#include "../test_main.cpp"
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -22,6 +23,8 @@
 #include <atomic>
 #include <array>
 #include <algorithm>
+#include <chrono>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -2312,6 +2315,42 @@ TEST_CASE("resolve_options ttl controls cache expiry", "[tcp][dns][cache][config
 // Cancellable I/O tests
 // ============================================================================
 
+namespace {
+
+template<typename Predicate>
+bool wait_for_io_cancel_test(Predicate&& predicate,
+                             std::chrono::milliseconds timeout =
+                                 elio::test::scaled_ms(2000)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(10));
+    }
+    return predicate();
+}
+
+void fill_socket_send_buffer(int fd) {
+    int sndbuf = 4096;
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    std::array<char, 4096> chunk{};
+    size_t total_written = 0;
+    for (int i = 0; i < 10000; ++i) {
+        ssize_t n = send(fd, chunk.data(), chunk.size(), MSG_DONTWAIT);
+        if (n > 0) {
+            total_written += static_cast<size_t>(n);
+            continue;
+        }
+        REQUIRE(n == -1);
+        REQUIRE((errno == EAGAIN || errno == EWOULDBLOCK));
+        REQUIRE(total_written > 0);
+        return;
+    }
+
+    FAIL("socket send buffer did not fill");
+}
+
+} // namespace
+
 TEST_CASE("Cancellable recv completes normally", "[io][cancel]") {
     int sv[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
@@ -2394,7 +2433,8 @@ TEST_CASE("Cancellable recv already cancelled", "[io][cancel]") {
     close(sv[1]);
 }
 
-TEST_CASE("Cancellable recv cancelled during wait", "[io][cancel]") {
+TEST_CASE("Cancellable recv cancelled during wait",
+          "[io][cancel][epoll-cancel-regression]") {
     int sv[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
 
@@ -2419,21 +2459,19 @@ TEST_CASE("Cancellable recv cancelled during wait", "[io][cancel]") {
 
     sched.go(recv_coro);
 
-    for (int i = 0; i < 100 && !started; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    REQUIRE(wait_for_io_cancel_test([&] { return started.load(); }));
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::this_thread::sleep_for(elio::test::scaled_ms(50));
     source.cancel();
 
-    for (int i = 0; i < 200 && !completed; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    REQUIRE(wait_for_io_cancel_test([&] { return completed.load(); }));
 
-    sched.shutdown();
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
 
     REQUIRE(completed);
     REQUIRE(recv_result.was_cancelled());
+    REQUIRE_FALSE(recv_result.success());
+    REQUIRE(recv_result.error_code() == ECANCELED);
 
     close(sv[0]);
     close(sv[1]);
@@ -2574,6 +2612,51 @@ TEST_CASE("Cancellable send already cancelled", "[io][cancel]") {
     close(sv[1]);
 }
 
+TEST_CASE("Cancellable send cancelled during wait without writability",
+          "[io][cancel][epoll-cancel-regression]") {
+    int sv[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+    fill_socket_send_buffer(sv[0]);
+
+    const char byte = 'x';
+    std::atomic<bool> started{false};
+    std::atomic<bool> completed{false};
+    cancellable_io_result send_result{};
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+
+    auto send_coro = [&]() -> task<void> {
+        started = true;
+        auto result = co_await async_send(sv[0], &byte, sizeof(byte), 0,
+                                          source.get_token());
+        send_result = result;
+        completed = true;
+        co_return;
+    };
+
+    sched.go(send_coro);
+
+    REQUIRE(wait_for_io_cancel_test([&] { return started.load(); }));
+
+    std::this_thread::sleep_for(elio::test::scaled_ms(50));
+    REQUIRE_FALSE(completed);
+
+    source.cancel();
+
+    REQUIRE(wait_for_io_cancel_test([&] { return completed.load(); }));
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+
+    REQUIRE(send_result.was_cancelled());
+    REQUIRE_FALSE(send_result.success());
+    REQUIRE(send_result.error_code() == ECANCELED);
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
 TEST_CASE("Cancellable connect already cancelled", "[io][cancel]") {
     int fd = -1;
     struct sockaddr_in addr{};
@@ -2610,6 +2693,76 @@ TEST_CASE("Cancellable connect already cancelled", "[io][cancel]") {
     REQUIRE(connect_result.was_cancelled());
     REQUIRE_FALSE(connect_result.success());
     REQUIRE(connect_result.error_code() == ECANCELED);
+}
+
+TEST_CASE("Cancellable connect cancelled during epoll wait",
+          "[io][cancel][epoll-cancel-regression]") {
+    int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    REQUIRE(efd >= 0);
+
+    // The connect awaitable's epoll path only registers EPOLLOUT before a
+    // cancellation can arrive. A saturated eventfd gives a stable non-writable
+    // fd without relying on external network black-hole behavior.
+    std::uint64_t saturated =
+        std::numeric_limits<std::uint64_t>::max() - 1;
+    REQUIRE(::write(efd, &saturated, sizeof(saturated)) ==
+            static_cast<ssize_t>(sizeof(saturated)));
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(9);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+    std::atomic<bool> started{false};
+    std::atomic<bool> completed{false};
+    std::atomic<bool> used_epoll{false};
+    cancellable_io_result connect_result{};
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+
+    auto connect_coro = [&]() -> task<void> {
+        if (current_io_context().get_backend_type() !=
+            io_context::backend_type::epoll) {
+            completed = true;
+            co_return;
+        }
+        used_epoll = true;
+        started = true;
+        auto result = co_await async_connect(
+            efd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr),
+            source.get_token());
+        connect_result = result;
+        completed = true;
+        co_return;
+    };
+
+    sched.go(connect_coro);
+
+    REQUIRE(wait_for_io_cancel_test([&] { return completed.load() || started.load(); }));
+
+    if (!used_epoll) {
+        REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+        SUCCEED("connect epoll cancellation regression is skipped on io_uring backend");
+        close(efd);
+        return;
+    }
+
+    std::this_thread::sleep_for(elio::test::scaled_ms(50));
+    REQUIRE_FALSE(completed);
+
+    source.cancel();
+
+    REQUIRE(wait_for_io_cancel_test([&] { return completed.load(); }));
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+
+    REQUIRE(connect_result.was_cancelled());
+    REQUIRE_FALSE(connect_result.success());
+    REQUIRE(connect_result.error_code() == ECANCELED);
+
+    close(efd);
 }
 
 // ============================================================================

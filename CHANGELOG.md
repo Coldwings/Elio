@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behind a completed keep-alive request before waiting for another socket read,
   preventing pipelined clients from stalling when multiple requests arrive in
   one TCP read. (#342)
+- **Cancellable epoll I/O**: `async_recv()`, `async_send()`, and
+  `async_connect()` now cancel pending epoll operations promptly when their
+  `cancel_token` fires, matching the existing `async_poll_read()` behavior.
+  (#339)
 
 ## [0.5.2] - 2026-06-30
 

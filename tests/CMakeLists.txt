@@ -227,6 +227,23 @@ target_link_libraries(elio_rdma_cuda_lifetime_tests PRIVATE
     elio Catch2::Catch2WithMain)
 target_compile_definitions(elio_rdma_cuda_lifetime_tests PRIVATE ELIO_DEBUG)
 catch_discover_tests(elio_rdma_cuda_lifetime_tests)
+set(ELIO_ADDITIONAL_TEST_TARGETS elio_rdma_cuda_lifetime_tests)
+
+if(NOT TARGET elio_rdma_ibverbs)
+    add_executable(elio_rdma_ibverbs_backend_stub_tests
+        unit/test_rdma_ibverbs_backend.cpp
+    )
+    target_include_directories(elio_rdma_ibverbs_backend_stub_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/stubs/rdma_cuda
+    )
+    target_link_libraries(elio_rdma_ibverbs_backend_stub_tests PRIVATE
+        elio Catch2::Catch2WithMain)
+    target_compile_definitions(elio_rdma_ibverbs_backend_stub_tests PRIVATE
+        ELIO_DEBUG)
+    catch_discover_tests(elio_rdma_ibverbs_backend_stub_tests)
+    list(APPEND ELIO_ADDITIONAL_TEST_TARGETS
+        elio_rdma_ibverbs_backend_stub_tests)
+endif()
 
 # Optional libibverbs-backed RDMA integration test (S10). The binary
 # is separate so linking libibverbs is opt-in and devices without
@@ -250,7 +267,7 @@ endif()
 # Add custom targets for convenience
 add_custom_target(test_all
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS elio_tests elio_rdma_cuda_lifetime_tests
+    DEPENDS elio_tests ${ELIO_ADDITIONAL_TEST_TARGETS}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 

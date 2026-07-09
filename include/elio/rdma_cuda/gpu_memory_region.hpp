@@ -14,7 +14,7 @@ namespace elio::rdma_cuda {
 /// destruction is reverse-declaration-order).
 class gpu_memory_region {
 public:
-    gpu_memory_region() = default;
+    gpu_memory_region() noexcept = default;
 
     gpu_memory_region(void* pd, std::size_t size, int access)
         : buf_(size),

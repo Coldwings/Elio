@@ -44,6 +44,8 @@ namespace elio::rdma {
 template <typename Backend>
 class memory_region {
 public:
+    memory_region() noexcept requires backend_with_mr<Backend> = default;
+
     memory_region(void* pd, void* addr, std::size_t length,
                   int access) noexcept
         requires backend_with_mr<Backend>

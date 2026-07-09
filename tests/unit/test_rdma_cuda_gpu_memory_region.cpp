@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <new>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -64,6 +65,41 @@ extern "C" int elio_rdma_cuda_test_ibv_dereg_mr(ibv_mr* mr) {
     }
     delete mr;
     return 0;
+}
+
+TEST_CASE("gpu_memory_region default constructs to an empty move target",
+          "[rdma][cuda][move]") {
+    using elio::rdma_cuda::gpu_memory_region;
+
+    static_assert(std::is_default_constructible_v<gpu_memory_region>);
+    static_assert(std::is_nothrow_default_constructible_v<gpu_memory_region>);
+
+    test_state state;
+    active_state = &state;
+
+    gpu_memory_region empty;
+    REQUIRE(empty.gpu_data() == nullptr);
+    REQUIRE(empty.size() == 0);
+    REQUIRE_FALSE(empty.ok());
+
+    {
+        gpu_memory_region registered{nullptr, 64, /*access=*/0x7};
+        void* const registered_addr = registered.gpu_data();
+
+        REQUIRE(registered_addr != nullptr);
+        REQUIRE(registered.ok());
+
+        state.events.clear();
+
+        empty = std::move(registered);
+
+        REQUIRE(empty.gpu_data() == registered_addr);
+        REQUIRE(empty.size() == 64);
+        REQUIRE(empty.ok());
+        REQUIRE(state.events.empty());
+    }
+
+    active_state = nullptr;
 }
 
 TEST_CASE("gpu_memory_region move assignment deregisters old MR before cudaFree",

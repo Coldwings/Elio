@@ -488,16 +488,31 @@ struct url {
         return (path.empty() ? "/" : path) + "?" + query;
     }
     
-    /// Get the authority (host:port)
+    /// Get host plus optional port for Host and :authority headers. Userinfo is
+    /// intentionally excluded, and IPv6 literals are bracketed per RFC 3986.
+    std::string host_authority() const {
+        std::string result;
+        if (host.find(':') != std::string::npos) {
+            result.reserve(host.size() + 2);
+            result += "[";
+            result += host;
+            result += "]";
+        } else {
+            result = host;
+        }
+        if (port != 0 && port != default_port()) {
+            result += ":" + std::to_string(port);
+        }
+        return result;
+    }
+
+    /// Get the URL authority component, including userinfo when present.
     std::string authority() const {
         std::string result;
         if (!userinfo.empty()) {
             result = userinfo + "@";
         }
-        result += host;
-        if (port != 0 && port != default_port()) {
-            result += ":" + std::to_string(port);
-        }
+        result += host_authority();
         return result;
     }
     

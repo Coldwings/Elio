@@ -503,7 +503,7 @@ private:
         request += url_.path_with_query();
         request += " HTTP/1.1\r\n";
         request += "Host: ";
-        request += url_.authority();
+        request += url_.host_authority();
         request += "\r\n";
         request += "Accept: text/event-stream\r\n";
         request += "Cache-Control: no-cache\r\n";

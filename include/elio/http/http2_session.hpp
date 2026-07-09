@@ -111,7 +111,7 @@ public:
         auto path = target.path_with_query();
         header_values.push_back(path.empty() ? "/" : path);
         header_values.push_back(target.scheme);
-        header_values.push_back(target.authority());
+        header_values.push_back(target.host_authority());
         header_values.push_back("elio-http2/1.0");
         header_values.push_back("*/*");
         

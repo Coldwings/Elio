@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry its own duplicate loop. The unused `rpc::read_exact()`/`rpc::write_exact()`
   helpers were removed.
 
+### Fixed
+
+- **HTTP keep-alive pipelining**: The server now consumes request bytes buffered
+  behind a completed keep-alive request before waiting for another socket read,
+  preventing pipelined clients from stalling when multiple requests arrive in
+  one TCP read. (#342)
+
 ## [0.5.2] - 2026-06-30
 
 Focus: **stability and security hardening**. 21 critical bug fixes addressing

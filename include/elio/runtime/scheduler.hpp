@@ -76,7 +76,8 @@ public:
         , paused_(false)
         , spawn_index_(0)
         , wait_strategy_(strategy)
-        , blocking_pool_(std::make_unique<blocking_pool>(blocking_threads)) {
+        , blocking_pool_(std::make_unique<blocking_pool>(
+              blocking_threads == 0 ? size_t{1} : blocking_threads)) {
 
         size_t n = num_threads_.load(std::memory_order_relaxed);
         // Fixed-size storage avoids the data race vector::push_back triggers

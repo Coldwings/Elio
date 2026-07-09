@@ -129,6 +129,18 @@ task<int> spawn_blocking_returning_42() {
     co_return v;
 }
 
+task<void> spawn_blocking_until_released(std::atomic<bool>* started,
+                                         std::atomic<bool>* release,
+                                         std::atomic<bool>* finished) {
+    co_await elio::spawn_blocking([=] {
+        started->store(true, std::memory_order_release);
+        while (!release->load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        finished->store(true, std::memory_order_release);
+    });
+}
+
 }  // namespace
 
 TEST_CASE("spawn_blocking races with scheduler shutdown without hanging",
@@ -151,5 +163,44 @@ TEST_CASE("spawn_blocking races with scheduler shutdown without hanging",
     // it must still resolve (run or fall back to a detached thread) so
     // their callers can finish before active_tasks drains.
     REQUIRE(sched.shutdown(scaled_ms(5000)));
+    REQUIRE_FALSE(sched.is_running());
+}
+
+TEST_CASE("scheduler zero blocking_threads still joins accepted blocking work",
+          "[scheduler][shutdown][blocking_pool]") {
+    scheduler sched(1, wait_strategy::blocking(), 0);
+    sched.start();
+
+    std::atomic<bool> work_started{false};
+    std::atomic<bool> release_work{false};
+    std::atomic<bool> work_finished{false};
+    std::atomic<bool> shutdown_returned{false};
+
+    sched.go(spawn_blocking_until_released,
+             &work_started,
+             &release_work,
+             &work_finished);
+
+    const auto started_deadline =
+        std::chrono::steady_clock::now() + scaled_ms(5000);
+    while (!work_started.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < started_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(work_started.load(std::memory_order_acquire));
+
+    std::thread shutdowner([&] {
+        sched.shutdown_force();
+        shutdown_returned.store(true, std::memory_order_release);
+    });
+
+    std::this_thread::sleep_for(scaled_ms(50));
+    REQUIRE_FALSE(shutdown_returned.load(std::memory_order_acquire));
+
+    release_work.store(true, std::memory_order_release);
+    shutdowner.join();
+
+    REQUIRE(shutdown_returned.load(std::memory_order_acquire));
+    REQUIRE(work_finished.load(std::memory_order_acquire));
     REQUIRE_FALSE(sched.is_running());
 }

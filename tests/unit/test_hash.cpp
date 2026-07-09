@@ -1,6 +1,16 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/hash/hash.hpp>
 
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+static_assert(sizeof(__m128i) == 16);
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+static_assert(sizeof(uint32x4_t) == 16);
+#endif
+
 #include <cstring>
 #include <span>
 #include <string>

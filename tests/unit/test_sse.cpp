@@ -269,6 +269,58 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
         auto evt = parser.get_event();
         REQUIRE(evt->data == "Hello");
     }
+
+    SECTION("unterminated line over limit fails closed") {
+        event_parser parser(8);
+
+        parser.parse("data: 12");
+        REQUIRE_FALSE(parser.failed());
+        REQUIRE_FALSE(parser.has_event());
+
+        parser.parse("3");
+        REQUIRE(parser.failed());
+        REQUIRE_FALSE(parser.has_event());
+        REQUIRE_FALSE(parser.error_message().empty());
+    }
+
+    SECTION("terminated overlong line fails closed") {
+        event_parser parser(8);
+
+        parser.parse("data: 123\n\n");
+        REQUIRE(parser.failed());
+        REQUIRE_FALSE(parser.has_event());
+        REQUIRE_FALSE(parser.error_message().empty());
+    }
+
+    SECTION("event data over limit fails closed") {
+        event_parser parser(10);
+
+        parser.parse("data: abc\n");
+        REQUIRE_FALSE(parser.failed());
+        parser.parse("data: def\n");
+        REQUIRE_FALSE(parser.failed());
+
+        parser.parse("data: ghi\n");
+        REQUIRE(parser.failed());
+        REQUIRE_FALSE(parser.has_event());
+        REQUIRE_FALSE(parser.error_message().empty());
+    }
+
+    SECTION("reset clears parser limit failure") {
+        event_parser parser(8);
+
+        parser.parse("data: 123");
+        REQUIRE(parser.failed());
+
+        parser.reset();
+        REQUIRE_FALSE(parser.failed());
+        REQUIRE(parser.error_message().empty());
+
+        parser.parse("data: ok\n\n");
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt->data == "ok");
+    }
     
     SECTION("CRLF line endings") {
         event_parser parser;

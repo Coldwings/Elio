@@ -12,10 +12,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace elio;
@@ -187,8 +190,8 @@ struct streaming_ctx {
     tcp_stream* stream;
     const char* send_buf;
     size_t msg_size;
-    int pipeline_depth;
     std::atomic<bool>* stop;
+    cancel_token token;
 };
 
 struct streaming_counters {
@@ -196,13 +199,30 @@ struct streaming_counters {
     std::atomic<uint64_t> total_msgs{0};
 };
 
-static task<void> streaming_writer(streaming_ctx* ctx) {
-    while (!ctx->stop->load(std::memory_order_relaxed)) {
-        if (!co_await write_exact(*ctx->stream, ctx->send_buf, ctx->msg_size)) {
-            co_return;
+static task<bool> write_exact_cancellable(tcp_stream& stream, const char* buf,
+                                          size_t n, cancel_token token) {
+    while (n > 0) {
+        if (token.is_cancelled()) {
+            co_return false;
+        }
+
+        auto result = co_await io::async_send(stream.fd(), buf, n, 0, token);
+        if (result.was_cancelled()) {
+            co_return false;
+        }
+
+        if (result.io.result > 0) {
+            n -= result.io.result;
+            buf += result.io.result;
+        } else if (result.io.result == -EAGAIN ||
+                   result.io.result == -EWOULDBLOCK ||
+                   result.io.result == -EINTR) {
+            co_await time::yield();
+        } else {
+            co_return false;
         }
     }
-    co_return;
+    co_return true;
 }
 
 static task<void> streaming_reader(streaming_ctx* ctx, streaming_counters* ctr) {
@@ -212,11 +232,21 @@ static task<void> streaming_reader(streaming_ctx* ctx, streaming_counters* ctr) 
 
     while (!ctx->stop->load(std::memory_order_relaxed)) {
         size_t avail = kReadBufSize - recv_offset;
-        auto r = co_await ctx->stream->read(recv_buf.data() + recv_offset, avail);
-        if (r.result <= 0) {
+        auto r = co_await io::async_recv(ctx->stream->fd(),
+                                         recv_buf.data() + recv_offset,
+                                         avail, 0, ctx->token);
+        if (r.was_cancelled()) {
             co_return;
         }
-        recv_offset += static_cast<size_t>(r.result);
+        if (r.io.result == -EAGAIN || r.io.result == -EWOULDBLOCK ||
+            r.io.result == -EINTR) {
+            co_await time::yield();
+            continue;
+        }
+        if (r.io.result <= 0) {
+            co_return;
+        }
+        recv_offset += static_cast<size_t>(r.io.result);
 
         const char* ptr = recv_buf.data();
         while (recv_offset >= ctx->msg_size) {
@@ -258,43 +288,84 @@ static task<void> client_streaming(const bench::config& cfg,
 
     std::atomic<bool> stop{false};
     streaming_counters counters;
+    cancel_source cancel;
 
-    streaming_ctx ctx{&*stream, send_buf.data(), msg_size,
-                      cfg.pipeline_depth, &stop};
+    streaming_ctx ctx{&*stream, send_buf.data(), msg_size, &stop,
+                      cancel.get_token()};
 
     auto* sched = get_current_scheduler();
-
-    int depth = std::max(1, cfg.pipeline_depth);
-    std::vector<join_handle<void>> w_handles;
-    w_handles.reserve(depth);
-    for (int i = 0; i < depth; ++i) {
-        w_handles.push_back(sched->go_joinable(streaming_writer, &ctx));
-    }
-
     auto r_handle = sched->go_joinable(streaming_reader, &ctx, &counters);
 
-    // Warmup
-    co_await elio::time::sleep_for(std::chrono::seconds(cfg.warmup_s));
-    counters.total_bytes.store(0, std::memory_order_release);
-    counters.total_msgs.store(0, std::memory_order_release);
+    std::atomic<uint64_t> measured_bytes{0};
+    std::atomic<uint64_t> measured_msgs{0};
+    std::mutex timer_mutex;
+    std::condition_variable timer_cv;
+    bool timer_cancelled = false;
 
-    // Measure
-    auto measure_start = std::chrono::steady_clock::now();
-    co_await elio::time::sleep_for(std::chrono::seconds(cfg.duration_s));
-    auto measure_end = std::chrono::steady_clock::now();
-    stop.store(true, std::memory_order_release);
+    std::thread timer_thread([&]() {
+        auto wait_or_cancel = [&](std::chrono::seconds duration) {
+            std::unique_lock<std::mutex> lock(timer_mutex);
+            return timer_cv.wait_for(lock, duration, [&]() {
+                return timer_cancelled;
+            });
+        };
 
-    for (auto& h : w_handles) {
-        co_await h;
+        if (wait_or_cancel(std::chrono::seconds(cfg.warmup_s))) {
+            return;
+        }
+
+        counters.total_bytes.store(0, std::memory_order_release);
+        counters.total_msgs.store(0, std::memory_order_release);
+
+        if (wait_or_cancel(std::chrono::seconds(cfg.duration_s))) {
+            return;
+        }
+
+        measured_bytes.store(
+            counters.total_bytes.load(std::memory_order_acquire),
+            std::memory_order_release);
+        measured_msgs.store(
+            counters.total_msgs.load(std::memory_order_acquire),
+            std::memory_order_release);
+        stop.store(true, std::memory_order_release);
+        cancel.cancel();
+        stream->shutdown_socket();
+    });
+
+    while (!stop.load(std::memory_order_acquire)) {
+        if (!co_await write_exact_cancellable(
+                *stream, send_buf.data(), msg_size, cancel.get_token())) {
+            break;
+        }
     }
+
     co_await r_handle;
 
-    double elapsed = std::chrono::duration<double>(
-        measure_end - measure_start).count();
+    if (!stop.load(std::memory_order_acquire)) {
+        measured_bytes.store(
+            counters.total_bytes.load(std::memory_order_acquire),
+            std::memory_order_release);
+        measured_msgs.store(
+            counters.total_msgs.load(std::memory_order_acquire),
+            std::memory_order_release);
+        stop.store(true, std::memory_order_release);
+        cancel.cancel();
+        stream->shutdown_socket();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(timer_mutex);
+        timer_cancelled = true;
+    }
+    timer_cv.notify_one();
+    if (timer_thread.joinable()) {
+        timer_thread.join();
+    }
+
     out = bench::streaming_stats::compute(
-        counters.total_bytes.load(std::memory_order_acquire),
-        counters.total_msgs.load(std::memory_order_acquire),
-        elapsed);
+        measured_bytes.load(std::memory_order_acquire),
+        measured_msgs.load(std::memory_order_acquire),
+        static_cast<double>(cfg.duration_s));
     co_return;
 }
 

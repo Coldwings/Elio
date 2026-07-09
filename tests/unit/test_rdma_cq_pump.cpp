@@ -76,6 +76,10 @@ struct mock_cq {
     }
 };
 
+void wait_for_idle_poll() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+}
+
 }  // namespace
 
 TEST_CASE("cq_pump: drain runs on each fd readiness signal",
@@ -137,8 +141,8 @@ TEST_CASE("cq_pump: drain runs on each fd readiness signal",
     }
     REQUIRE(delivered.load() == 3);
 
+    wait_for_idle_poll();
     src.cancel();
-    cq.wake();  // unblock the in-flight poll so the loop exits
 
     REQUIRE(sched.shutdown(std::chrono::milliseconds(5000)));
 }
@@ -177,7 +181,7 @@ TEST_CASE("cq_pump: cancel_token aborts an idle poll without fd readiness",
     // Give the pump time to re-enter async_poll_read() with an empty
     // eventfd. Cancellation must abort that in-flight poll; the test
     // intentionally does not write another eventfd value here.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    wait_for_idle_poll();
     src.cancel();
 
     REQUIRE(sched.shutdown(std::chrono::milliseconds(5000)));
@@ -214,7 +218,7 @@ TEST_CASE("cq_pump: dispatcher passed to drain is the same instance",
     }
     REQUIRE(seen.load() == &disp);
 
+    wait_for_idle_poll();
     src.cancel();
-    cq.wake();
     REQUIRE(sched.shutdown(std::chrono::milliseconds(5000)));
 }

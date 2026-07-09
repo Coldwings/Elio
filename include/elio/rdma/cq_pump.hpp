@@ -106,7 +106,7 @@ template <detail::cq_drain_callable Drain>
 
         // POLLHUP / graceful close: result == 0 means the fd was closed.
         // drain() was called one final time above; now exit the loop.
-        if (result.io.result == 0) {
+        if (result.bytes_transferred() == 0) {
             break;
         }
     }

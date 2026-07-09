@@ -60,20 +60,42 @@ public:
     /// Redistribute remaining tasks to active workers - call during thread pool shrink
     void redistribute_tasks(scheduler* sched) noexcept;
 
-    /// Schedule a task from external thread - pushes to lock-free MPSC inbox
-    /// Retries with back-off if inbox is temporarily full
-    void schedule(std::coroutine_handle<> handle) {
-        if (!handle) [[unlikely]] return;
+    /// Schedule a task from external thread - pushes to lock-free MPSC inbox.
+    /// Returns false without taking ownership if this worker is stopped or the
+    /// inbox remains full after bounded retries.
+    [[nodiscard]] bool schedule(std::coroutine_handle<> handle) {
+        if (!handle) [[unlikely]] return false;
 
-        // Try fast path: push to lock-free inbox
-        if (inbox_->push(handle.address())) [[likely]] {
+        enum class push_result {
+            accepted,
+            full,
+            stopped,
+        };
+
+        auto try_push = [&]() -> push_result {
+            std::lock_guard<std::mutex> lock(schedule_mutex_);
+            if (!running_.load(std::memory_order_acquire)) {
+                return push_result::stopped;
+            }
+            if (!inbox_->push(handle.address())) {
+                return push_result::full;
+            }
             // Always wake on cross-thread submit. The eventfd dedupes via its
             // counter — calling wake() on a busy worker just bumps the counter
             // and is consumed in the next poll cycle. The previous "lazy wake"
             // load on idle_ raced with the worker's relaxed idle_=false store,
             // missing wakes and producing 10 ms tail latency on weak hardware.
             wake();
-            return;
+            return push_result::accepted;
+        };
+
+        switch (try_push()) {
+        case push_result::accepted:
+            return true;
+        case push_result::stopped:
+            return false;
+        case push_result::full:
+            break;
         }
 
         // Slow path: inbox full, retry with exponential back-off
@@ -81,15 +103,6 @@ public:
         int backoff = 1;
         constexpr int max_total_retries = 1024;
         for (int total = 0; total < max_total_retries; ++total) {
-            // Bail out promptly if the worker is being shut down — otherwise
-            // an external producer keeps spinning while the inbox stays full.
-            if (!running_.load(std::memory_order_acquire)) {
-                ELIO_LOG_ERROR("worker {} schedule(): destroying handle "
-                              "— worker shut down during inbox retry",
-                              worker_id_);
-                handle.destroy();
-                return;
-            }
             for (int i = 0; i < backoff; ++i) {
                 #if defined(__x86_64__) || defined(_M_X64)
                 __builtin_ia32_pause();
@@ -97,18 +110,28 @@ public:
                 std::this_thread::yield();
                 #endif
             }
-            if (inbox_->push(handle.address())) {
-                wake();
-                return;
+            switch (try_push()) {
+            case push_result::accepted:
+                return true;
+            case push_result::stopped:
+                return false;
+            case push_result::full:
+                break;
             }
             backoff = std::min(backoff * 2, 1024);
             std::this_thread::yield();
         }
 
-        ELIO_LOG_ERROR("worker {} schedule(): destroying handle after {} "
-                      "inbox retries exhausted — possible task loss",
+        ELIO_LOG_ERROR("worker {} schedule(): rejecting handle after {} "
+                      "inbox retries exhausted",
                       worker_id_, max_total_retries);
-        handle.destroy();
+        return false;
+    }
+
+    void schedule_or_destroy(std::coroutine_handle<> handle) {
+        if (!schedule(handle) && handle) {
+            handle.destroy();
+        }
     }
     
     /// Schedule a task from owner thread - pushes directly to local deque
@@ -220,6 +243,7 @@ private:
     std::unique_ptr<mpsc_queue<void>> inbox_;           // External submissions (MPSC)
     std::thread thread_;
     std::atomic<bool> running_;
+    std::mutex schedule_mutex_;
     std::atomic<bool> draining_{false};
     std::chrono::steady_clock::time_point draining_deadline_{};
     // Hot-write fields (owner thread writes per task) — isolated cache line

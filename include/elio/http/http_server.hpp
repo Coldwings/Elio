@@ -512,42 +512,61 @@ private:
 
             // Read and parse request, enforcing max_request_size on every
             // accumulation step so a peer cannot stream gigabytes through
-            // the parser before we notice.
+            // the parser before we notice. When a previous keep-alive request
+            // left pipelined bytes in the parser, consume those bytes once
+            // before waiting for another socket read.
             bool sent_response = false;
             bool early_exit = false;
+            bool parse_buffered = parser.buffered_input_size() > 0;
+            size_t current_request_size = 0;
+            auto send_payload_too_large = [&]() -> coro::task<void> {
+                co_await stop_watchdog();
+                auto resp = response(status::payload_too_large, "Payload Too Large");
+                resp.set_header("Connection", "close");
+                co_await this->send_response(stream, resp);
+                sent_response = true;
+                co_return;
+            };
+
             while (!parser.is_complete() && !parser.has_error()) {
-                auto result = co_await stream.read(buffer.data(), buffer.size());
+                std::string_view input;
+                if (parse_buffered) {
+                    parse_buffered = false;
+                } else {
+                    auto result = co_await stream.read(buffer.data(), buffer.size());
 
-                if (timed_out->load(std::memory_order_acquire)) {
-                    early_exit = true;
-                    break;
-                }
-                if (result.result <= 0) {
-                    early_exit = true;
-                    break;
+                    if (timed_out->load(std::memory_order_acquire)) {
+                        early_exit = true;
+                        break;
+                    }
+                    if (result.result <= 0) {
+                        early_exit = true;
+                        break;
+                    }
+
+                    input = std::string_view(buffer.data(),
+                                             static_cast<size_t>(result.result));
                 }
 
-                size_t incoming = static_cast<size_t>(result.result);
-                if (parser.bytes_buffered() + incoming > config_.max_request_size) {
-                    co_await stop_watchdog();
-                    auto resp = response(status::payload_too_large, "Payload Too Large");
-                    resp.set_header("Connection", "close");
-                    co_await send_response(stream, resp);
-                    co_return;
-                }
-
-                auto [pres, consumed] = parser.parse(
-                    std::string_view(buffer.data(), incoming));
+                auto [pres, consumed] = parser.parse(input);
+                current_request_size += consumed;
 
                 // Once the parser has finished headers we know any declared
                 // Content-Length. Reject early so we never even allocate the
                 // body string for a multi-GB POST.
                 if (auto declared = parser.declared_content_length();
                     declared && *declared > config_.max_request_size) {
-                    co_await stop_watchdog();
-                    auto resp = response(status::payload_too_large, "Payload Too Large");
-                    resp.set_header("Connection", "close");
-                    co_await send_response(stream, resp);
+                    co_await send_payload_too_large();
+                    co_return;
+                }
+
+                size_t effective_request_size = current_request_size;
+                if (!parser.is_complete()) {
+                    effective_request_size += parser.buffered_input_size();
+                }
+                if (effective_request_size > config_.max_request_size ||
+                    parser.body().size() > config_.max_request_size) {
+                    co_await send_payload_too_large();
                     co_return;
                 }
 

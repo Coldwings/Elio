@@ -49,6 +49,11 @@ set(TEST_SOURCES
 list(APPEND TEST_SOURCES
     unit/test_http_parser.cpp
 )
+if(TARGET elio_http)
+    list(APPEND TEST_SOURCES
+        unit/test_http_server.cpp
+    )
+endif()
 
 # HTTP client integration tests need TLS because the client surface owns TLS
 # context setup for HTTPS connections.
@@ -119,6 +124,9 @@ endif()
 # Standard test executable
 add_executable(elio_tests ${TEST_SOURCES})
 target_link_libraries(elio_tests PRIVATE elio Catch2::Catch2WithMain)
+if(TARGET elio_http)
+    target_link_libraries(elio_tests PRIVATE elio_http)
+endif()
 if(TARGET elio_tls)
     target_link_libraries(elio_tests PRIVATE elio_tls)
 endif()
@@ -136,6 +144,9 @@ target_compile_definitions(elio_tests PRIVATE ELIO_DEBUG)
 # ASAN-enabled test executable
 add_executable(elio_tests_asan ${TEST_SOURCES})
 target_link_libraries(elio_tests_asan PRIVATE elio Catch2::Catch2WithMain)
+if(TARGET elio_http)
+    target_link_libraries(elio_tests_asan PRIVATE elio_http)
+endif()
 if(TARGET elio_tls)
     target_link_libraries(elio_tests_asan PRIVATE elio_tls)
 endif()
@@ -155,6 +166,9 @@ target_compile_definitions(elio_tests_asan PRIVATE ELIO_DEBUG)
 # TSAN-enabled test executable
 add_executable(elio_tests_tsan ${TEST_SOURCES})
 target_link_libraries(elio_tests_tsan PRIVATE elio Catch2::Catch2WithMain)
+if(TARGET elio_http)
+    target_link_libraries(elio_tests_tsan PRIVATE elio_http)
+endif()
 if(TARGET elio_tls)
     target_link_libraries(elio_tests_tsan PRIVATE elio_tls)
 endif()

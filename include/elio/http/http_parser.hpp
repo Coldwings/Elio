@@ -181,9 +181,15 @@ public:
         return out;
     }
 
+    /// Bytes currently held as unconsumed input. Unlike bytes_buffered(), this
+    /// does not include body bytes already extracted for the current message.
+    size_t buffered_input_size() const noexcept {
+        return buffer_.size();
+    }
+
     /// Bytes currently held by the parser (un-consumed buffered input plus
-    /// any body bytes already extracted into body_). The HTTP server uses
-    /// this to enforce server_config::max_request_size after every read.
+    /// any body bytes already extracted into body_). Callers use this to
+    /// enforce aggregate buffered-size limits after reads.
     size_t bytes_buffered() const noexcept {
         return buffer_.size() + body_.size();
     }

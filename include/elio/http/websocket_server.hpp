@@ -17,6 +17,7 @@
 #include <elio/net/tcp.hpp>
 #include <elio/tls/tls_stream.hpp>
 #include <elio/io/io_context.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/sync/primitives.hpp>
@@ -26,6 +27,7 @@
 #include <string_view>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <variant>
 #include <atomic>
 #include <vector>
@@ -537,12 +539,16 @@ public:
         ELIO_LOG_INFO("WebSocket server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
-        running_ = true;
+        auto accept_token = reset_accept_cancel_source();
+        running_.store(true, std::memory_order_release);
 
-        while (running_) {
-            auto stream_result = co_await listener.accept();
+        while (running_.load(std::memory_order_acquire)) {
+            auto stream_result = co_await listener.accept(accept_token);
+            if (accept_loop_should_stop(accept_token)) {
+                break;
+            }
             if (!stream_result) {
-                if (running_) {
+                if (running_.load(std::memory_order_acquire)) {
                     ELIO_LOG_ERROR("Accept error: {}", strerror(errno));
                 }
                 continue;
@@ -575,15 +581,19 @@ public:
         ELIO_LOG_INFO("Secure WebSocket server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
-        running_ = true;
+        auto accept_token = reset_accept_cancel_source();
+        running_.store(true, std::memory_order_release);
 
         // Capture by pointer — see doc comment above for lifetime requirement.
         auto* tls_ctx_ptr = &tls_ctx;
 
-        while (running_) {
-            auto stream_result = co_await listener.accept();
+        while (running_.load(std::memory_order_acquire)) {
+            auto stream_result = co_await listener.accept(accept_token);
+            if (accept_loop_should_stop(accept_token)) {
+                break;
+            }
             if (!stream_result) {
-                if (running_) {
+                if (running_.load(std::memory_order_acquire)) {
                     ELIO_LOG_ERROR("Accept error: {}", strerror(errno));
                 }
                 continue;
@@ -598,7 +608,8 @@ public:
     
     /// Stop the server
     void stop() {
-        running_ = false;
+        running_.store(false, std::memory_order_release);
+        cancel_active_accept();
     }
     
     /// Check if server is running
@@ -765,10 +776,32 @@ private:
             sent += result.result;
         }
     }
+
+    coro::cancel_token reset_accept_cancel_source() {
+        std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+        accept_cancel_source_ = coro::cancel_source{};
+        return accept_cancel_source_.get_token();
+    }
+
+    void cancel_active_accept() {
+        std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+        accept_cancel_source_.cancel();
+    }
+
+    bool accept_loop_should_stop(const coro::cancel_token& accept_token) noexcept {
+        if (!running_.load(std::memory_order_acquire) ||
+            accept_token.is_cancelled()) {
+            running_.store(false, std::memory_order_release);
+            return true;
+        }
+        return false;
+    }
     
     ws_router router_;
     http::server_config http_config_;
     std::atomic<bool> running_{false};
+    mutable std::mutex accept_cancel_mutex_;
+    coro::cancel_source accept_cancel_source_;
 };
 
 } // namespace elio::http::websocket

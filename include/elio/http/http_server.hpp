@@ -18,6 +18,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -300,13 +301,16 @@ public:
         ELIO_LOG_INFO("HTTP server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
-        listener_fd_ = listener.fd();
-        running_ = true;
+        auto accept_token = reset_accept_cancel_source();
+        running_.store(true, std::memory_order_release);
 
-        while (running_) {
-            auto stream_result = co_await listener.accept();
+        while (running_.load(std::memory_order_acquire)) {
+            auto stream_result = co_await listener.accept(accept_token);
+            if (accept_loop_should_stop(accept_token)) {
+                break;
+            }
             if (!stream_result) {
-                if (running_) {
+                if (running_.load(std::memory_order_acquire)) {
                     ELIO_LOG_ERROR("Accept error: {}", strerror(errno));
                 }
                 continue;
@@ -343,8 +347,8 @@ public:
         ELIO_LOG_INFO("HTTPS server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
-        listener_fd_ = listener.fd();
-        running_ = true;
+        auto accept_token = reset_accept_cancel_source();
+        running_.store(true, std::memory_order_release);
 
         // Capture tls_ctx by pointer rather than by reference so that the
         // lambda does not silently dangle when listen_tls's coroutine frame
@@ -352,10 +356,13 @@ public:
         // handlers — this is documented above.
         auto* tls_ctx_ptr = &tls_ctx;
 
-        while (running_) {
-            auto stream_result = co_await listener.accept();
+        while (running_.load(std::memory_order_acquire)) {
+            auto stream_result = co_await listener.accept(accept_token);
+            if (accept_loop_should_stop(accept_token)) {
+                break;
+            }
             if (!stream_result) {
-                if (running_) {
+                if (running_.load(std::memory_order_acquire)) {
                     ELIO_LOG_ERROR("Accept error: {}", strerror(errno));
                 }
                 continue;
@@ -371,11 +378,8 @@ public:
 
     /// Stop the server
     void stop() {
-        running_ = false;
-        if (listener_fd_ >= 0) {
-            ::shutdown(listener_fd_, SHUT_RDWR);
-            listener_fd_ = -1;
-        }
+        running_.store(false, std::memory_order_release);
+        cancel_active_accept();
     }
 
     /// Check if server is running
@@ -691,6 +695,26 @@ private:
         }
         co_return true;
     }
+
+    coro::cancel_token reset_accept_cancel_source() {
+        std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+        accept_cancel_source_ = coro::cancel_source{};
+        return accept_cancel_source_.get_token();
+    }
+
+    void cancel_active_accept() {
+        std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+        accept_cancel_source_.cancel();
+    }
+
+    bool accept_loop_should_stop(const coro::cancel_token& accept_token) noexcept {
+        if (!running_.load(std::memory_order_acquire) ||
+            accept_token.is_cancelled()) {
+            running_.store(false, std::memory_order_release);
+            return true;
+        }
+        return false;
+    }
     
     router router_;
     server_config config_;
@@ -698,7 +722,8 @@ private:
     std::function<response(const std::exception&)> error_handler_;
     std::atomic<bool> running_{false};
     std::atomic<size_t> active_connections_{0};  ///< In-flight connection handlers
-    int listener_fd_ = -1;
+    mutable std::mutex accept_cancel_mutex_;
+    coro::cancel_source accept_cancel_source_;
 };
 
 /// Convenience function to create a simple HTTP server

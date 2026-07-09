@@ -71,7 +71,7 @@ public:
     explicit scheduler(size_t num_threads = std::thread::hardware_concurrency(),
                        wait_strategy strategy = wait_strategy::blocking(),
                        size_t blocking_threads = 4)
-        : num_threads_(num_threads == 0 ? 1 : num_threads)
+        : num_threads_(std::min(num_threads == 0 ? size_t{1} : num_threads, MAX_THREADS))
         , running_(false)
         , paused_(false)
         , spawn_index_(0)

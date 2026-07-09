@@ -94,6 +94,8 @@ public:
                 consume = lf_pos + 1;
             }
 
+            // Limit applies to line content. The 1-2 terminator bytes are
+            // appended with the line and immediately consumed by process_buffer().
             if (append_would_exceed_limit(buffer_.size(), line_end, 0)) {
                 fail("SSE line exceeds configured buffer limit");
                 break;
@@ -153,9 +155,8 @@ private:
             size_t consume = 0;  // bytes to erase including terminator
 
             if (lf_pos == std::string::npos && cr_pos == std::string::npos) {
-                if (buffer_.size() > max_buffer_size_) {
-                    fail("SSE line exceeds configured buffer limit");
-                }
+                // parse() enforces the partial-line limit before appending
+                // unterminated input. No complete line is available yet.
                 break;  // no line terminator found
             } else if (cr_pos != std::string::npos &&
                        (lf_pos == std::string::npos || cr_pos < lf_pos)) {

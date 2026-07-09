@@ -20,7 +20,11 @@ namespace elio::runtime {
 struct run_config {
     /// Number of worker threads (0 = hardware concurrency)
     size_t num_threads = 0;
-    /// Blocking thread pool size (0 = fallback to std::thread per task)
+    /// Blocking thread pool size.
+    /// When used with the scheduler (e.g. via elio::run / async_main), 0 is
+    /// treated as 1 so that the pool stays joinable during shutdown_force().
+    /// Standalone blocking_pool(0) retains the original per-task std::thread
+    /// (detached) behavior.
     size_t blocking_threads = 4;
     /// After async_main completes, how long to wait for tasks spawned via
     /// go/go_to/go_joinable (and their pending I/O) to drain before forcing

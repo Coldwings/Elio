@@ -28,10 +28,12 @@
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #define ELIO_SHA256_HAVE_ARM_DISPATCH 1
+#include <arm_neon.h>
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #define ELIO_SHA256_HAVE_X86_DISPATCH 1
+#include <immintrin.h>
 #endif
 
 namespace elio::hash {
@@ -345,7 +347,6 @@ private:
 #ifdef ELIO_SHA256_HAVE_ARM_DISPATCH
 #pragma GCC push_options
 #pragma GCC target("+crypto")
-#include <arm_neon.h>
 
 inline void sha256_context::process_block_arm(const uint8_t* block) noexcept {
     // Reference: Crypto++ sha_simd.cpp SHA256_HashMultipleBlocks_ARMV8.
@@ -497,7 +498,6 @@ inline void sha256_context::process_block_arm(const uint8_t* block) noexcept {
 #ifdef ELIO_SHA256_HAVE_X86_DISPATCH
 #pragma GCC push_options
 #pragma GCC target("sha,sse4.2,ssse3")
-#include <immintrin.h>
 
 inline void sha256_context::process_block_sha_ni(const uint8_t* block) noexcept {
     // Reference: Crypto++ sha_simd.cpp SHA256_HashMultipleBlocks_SHANI.

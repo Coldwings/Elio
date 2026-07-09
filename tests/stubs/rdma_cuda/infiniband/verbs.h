@@ -5,6 +5,7 @@
 
 struct ibv_pd {};
 struct ibv_qp {};
+struct ibv_srq {};
 
 struct ibv_mr {
     void*         addr = nullptr;
@@ -78,5 +79,9 @@ inline int ibv_post_send(ibv_qp*, ibv_send_wr*, ibv_send_wr**) {
 }
 
 inline int ibv_post_recv(ibv_qp*, ibv_recv_wr*, ibv_recv_wr**) {
+    return 0;
+}
+
+inline int ibv_post_srq_recv(ibv_srq*, ibv_recv_wr*, ibv_recv_wr**) {
     return 0;
 }

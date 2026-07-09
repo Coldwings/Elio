@@ -70,6 +70,23 @@ struct ibverbs_backend {
         return rc == 0 ? 0 : -rc;
     }
 
+    static int post_srq_recv(void* srq_ptr,
+                             std::span<const elio::rdma::sge> sges,
+                             elio::rdma::wr_id id) noexcept {
+        auto* srq = static_cast<ibv_srq*>(srq_ptr);
+        auto converted = convert_sges_(sges);
+        if (converted.rc != 0) {
+            return converted.rc;
+        }
+        ibv_recv_wr wr{};
+        wr.wr_id   = id;
+        wr.sg_list = converted.count > 0 ? converted.data.data() : nullptr;
+        wr.num_sge = static_cast<int>(converted.count);
+        ibv_recv_wr* bad = nullptr;
+        const int rc = ::ibv_post_srq_recv(srq, &wr, &bad);
+        return rc == 0 ? 0 : -rc;
+    }
+
     static int post_rdma_write(void* qp_ptr,
                                std::span<const elio::rdma::sge> sges,
                                elio::rdma::remote_buffer rb,

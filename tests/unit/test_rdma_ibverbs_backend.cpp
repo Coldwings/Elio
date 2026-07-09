@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <elio/rdma/backend_traits.hpp>
 #include <elio/rdma_ibverbs/ibverbs_backend.hpp>
 
 #include <array>
@@ -11,6 +12,8 @@ using elio::rdma::remote_buffer;
 using elio::rdma::send_flags;
 using elio::rdma::sge;
 using elio::rdma_ibverbs::ibverbs_backend;
+
+static_assert(elio::rdma::backend_with_srq<ibverbs_backend>);
 
 TEST_CASE("ibverbs_backend rejects oversized SGE lists before posting",
           "[rdma][ibverbs][sge]") {
@@ -29,6 +32,8 @@ TEST_CASE("ibverbs_backend rejects oversized SGE lists before posting",
     REQUIRE(ibverbs_backend::post_send(nullptr, oversized, flags, 0, 1) ==
             -EMSGSIZE);
     REQUIRE(ibverbs_backend::post_recv(nullptr, oversized, 2) == -EMSGSIZE);
+    REQUIRE(ibverbs_backend::post_srq_recv(nullptr, oversized, 7) ==
+            -EMSGSIZE);
     REQUIRE(ibverbs_backend::post_rdma_write(
                 nullptr, oversized, remote, flags, 0, 3) == -EMSGSIZE);
     REQUIRE(ibverbs_backend::post_rdma_read(nullptr, oversized, remote, 4) ==

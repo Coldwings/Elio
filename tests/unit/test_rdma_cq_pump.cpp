@@ -9,8 +9,8 @@
 // Coverage:
 //   * Single signal → single drain call → dispatcher delivers.
 //   * Multiple signals processed in order.
-//   * cancel_token stops the pump cleanly (token + eventfd wake to
-//     unblock the in-flight poll).
+//   * cancel_token stops the pump cleanly without requiring an
+//     eventfd wake to unblock the in-flight poll.
 //   * The drain receives the *same* dispatcher instance every time.
 
 #include <catch2/catch_test_macros.hpp>
@@ -68,14 +68,17 @@ struct mock_cq {
         (void)written;
     }
 
-    // Wake a blocked pump without enqueueing work (used by the
-    // cancellation test to unblock async_poll_read after cancel()).
+    // Wake a blocked pump without enqueueing work.
     void wake() {
         std::uint64_t one = 1;
         auto written = ::write(fd, &one, sizeof(one));
         (void)written;
     }
 };
+
+void wait_for_idle_poll() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+}
 
 }  // namespace
 
@@ -138,13 +141,13 @@ TEST_CASE("cq_pump: drain runs on each fd readiness signal",
     }
     REQUIRE(delivered.load() == 3);
 
+    wait_for_idle_poll();
     src.cancel();
-    cq.wake();  // unblock the in-flight poll so the loop exits
 
     REQUIRE(sched.shutdown(std::chrono::milliseconds(5000)));
 }
 
-TEST_CASE("cq_pump: cancel_token stops the loop after the next drain",
+TEST_CASE("cq_pump: cancel_token aborts an idle poll without fd readiness",
           "[rdma][cq_pump][cancel]") {
     scheduler sched(2);
     sched.start();
@@ -175,14 +178,14 @@ TEST_CASE("cq_pump: cancel_token stops the loop after the next drain",
     }
     REQUIRE(drain_calls.load() >= 1);
 
-    // Cancellation arrives mid-flight. The pump's next iteration
-    // observes is_cancelled() and exits without invoking drain again
-    // for spurious wakes. We still write to the fd to unblock the
-    // already-issued poll.
+    // Give the pump time to re-enter async_poll_read() with an empty
+    // eventfd. Cancellation must abort that in-flight poll; the test
+    // intentionally does not write another eventfd value here.
+    wait_for_idle_poll();
     src.cancel();
-    cq.wake();
 
     REQUIRE(sched.shutdown(std::chrono::milliseconds(5000)));
+    REQUIRE(drain_calls.load() == 1);
 }
 
 TEST_CASE("cq_pump: dispatcher passed to drain is the same instance",
@@ -215,7 +218,7 @@ TEST_CASE("cq_pump: dispatcher passed to drain is the same instance",
     }
     REQUIRE(seen.load() == &disp);
 
+    wait_for_idle_poll();
     src.cancel();
-    cq.wake();
     REQUIRE(sched.shutdown(std::chrono::milliseconds(5000)));
 }

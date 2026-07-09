@@ -24,9 +24,9 @@
 ///
 /// **Cancellation**: pass a `cancel_token` to stop the pump cleanly.
 /// The loop checks the token between iterations, before and after
-/// each poll. To wake a blocked poll, write a byte / eventfd value to
-/// the fd from the cancelling side; `drain` can then no-op when it
-/// sees no real CQE.
+/// each poll. A blocked poll is registered with the token, so
+/// cancelling the token aborts the in-flight wait without requiring
+/// a synthetic fd wakeup.
 ///
 /// **Error handling**: any non-recoverable poll error (errno other
 /// than EINTR / EAGAIN / ECANCELED) ends the loop. A graceful close
@@ -80,15 +80,15 @@ concept cq_drain_callable = requires(Drain d, dispatcher& disp) {
 ///               `ibv_create_comp_channel` → `comp_channel->fd`).
 /// @param disp   Dispatcher passed to the drain callable.
 /// @param drain  User-supplied drain callable.
-/// @param token  Optional cancel_token; if cancelled the loop exits
-///               after the current poll returns.
+/// @param token  Optional cancel_token; if cancelled, an in-flight
+///               poll is aborted and the loop exits cleanly.
 template <detail::cq_drain_callable Drain>
 [[nodiscard]] inline coro::task<void> cq_pump(int fd,
                                               dispatcher& disp,
                                               Drain drain,
                                               coro::cancel_token token = {}) {
     while (!token.is_cancelled()) {
-        auto result = co_await io::async_poll_read(fd);
+        auto result = co_await io::async_poll_read(fd, token);
 
         if (token.is_cancelled()) {
             break;
@@ -106,7 +106,7 @@ template <detail::cq_drain_callable Drain>
 
         // POLLHUP / graceful close: result == 0 means the fd was closed.
         // drain() was called one final time above; now exit the loop.
-        if (result.result == 0) {
+        if (result.bytes_transferred() == 0) {
             break;
         }
     }

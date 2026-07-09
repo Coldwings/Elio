@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <sys/random.h>
+#include <vector>
 
 #include <openssl/sha.h>
 #include <openssl/evp.h>

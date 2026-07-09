@@ -80,8 +80,8 @@ concept cq_drain_callable = requires(Drain d, dispatcher& disp) {
 ///               `ibv_create_comp_channel` → `comp_channel->fd`).
 /// @param disp   Dispatcher passed to the drain callable.
 /// @param drain  User-supplied drain callable.
-/// @param token  Optional cancel_token; if cancelled the loop exits
-///               after the current poll returns.
+/// @param token  Optional cancel_token; if cancelled, an in-flight
+///               poll is aborted and the loop exits cleanly.
 template <detail::cq_drain_callable Drain>
 [[nodiscard]] inline coro::task<void> cq_pump(int fd,
                                               dispatcher& disp,

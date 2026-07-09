@@ -67,8 +67,43 @@ public:
         if (failed_) {
             return 0;
         }
-        buffer_.append(data);
-        return process_buffer();
+
+        size_t events_found = 0;
+        while (!data.empty() && !failed_) {
+            auto lf_pos = data.find('\n');
+            auto cr_pos = data.find('\r');
+
+            size_t line_end = std::string::npos;
+            size_t consume = 0;
+            if (lf_pos == std::string::npos && cr_pos == std::string::npos) {
+                if (append_would_exceed_limit(buffer_.size(), data.size(), 0)) {
+                    fail("SSE line exceeds configured buffer limit");
+                    break;
+                }
+                buffer_.append(data);
+                data.remove_prefix(data.size());
+                break;
+            } else if (cr_pos != std::string::npos &&
+                       (lf_pos == std::string::npos || cr_pos < lf_pos)) {
+                line_end = cr_pos;
+                consume = (cr_pos + 1 < data.size() && data[cr_pos + 1] == '\n')
+                        ? cr_pos + 2
+                        : cr_pos + 1;
+            } else {
+                line_end = lf_pos;
+                consume = lf_pos + 1;
+            }
+
+            if (append_would_exceed_limit(buffer_.size(), line_end, 0)) {
+                fail("SSE line exceeds configured buffer limit");
+                break;
+            }
+            buffer_.append(data.substr(0, consume));
+            data.remove_prefix(consume);
+            events_found += process_buffer();
+        }
+
+        return failed_ ? 0 : events_found;
     }
 
     /// True after an input line or in-progress event exceeds the configured limit.

@@ -283,6 +283,34 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
         REQUIRE_FALSE(parser.error_message().empty());
     }
 
+    SECTION("line at limit can be completed by later terminator") {
+        event_parser parser(8);
+
+        parser.parse("data: ok");
+        REQUIRE_FALSE(parser.failed());
+
+        parser.parse("\n\n");
+        REQUIRE_FALSE(parser.failed());
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt->data == "ok");
+    }
+
+    SECTION("large chunk with short lines is processed incrementally") {
+        event_parser parser(8);
+
+        parser.parse("data: a\n\ndata: b\n\n");
+        REQUIRE_FALSE(parser.failed());
+
+        REQUIRE(parser.has_event());
+        auto evt1 = parser.get_event();
+        REQUIRE(evt1->data == "a");
+
+        REQUIRE(parser.has_event());
+        auto evt2 = parser.get_event();
+        REQUIRE(evt2->data == "b");
+    }
+
     SECTION("terminated overlong line fails closed") {
         event_parser parser(8);
 

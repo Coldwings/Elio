@@ -639,9 +639,9 @@ private:
         for (size_t i = first; i < last; ++i) {
             draining_slots_[i].store(true, std::memory_order_release);
         }
-        draining_count_.fetch_add(last - first, std::memory_order_release);
-        // Update upper bound (max-only; reset in clear_draining_slot_ when the
-        // count drops back to zero).
+        // Publish the scan bound before incrementing the count. Readers use
+        // draining_count_ as the fast-path gate; once they observe count > 0,
+        // they must also be able to observe an upper bound covering this range.
         size_t expected = draining_upper_bound_.load(std::memory_order_relaxed);
         while (expected < last) {
             if (draining_upper_bound_.compare_exchange_weak(
@@ -649,6 +649,7 @@ private:
                     std::memory_order_release, std::memory_order_relaxed))
                 break;
         }
+        draining_count_.fetch_add(last - first, std::memory_order_release);
     }
 
     /// Clear a single draining slot and update accounting counters.

@@ -680,6 +680,7 @@ struct batch_write_segment {
 
 namespace detail {
 
+#if ELIO_HAS_IO_URING
 /// Submit a batch via io_uring without blocking the worker.
 /// Returns true on success (caller must NOT resume; the final CQE will
 /// resume the awaiter via the trampolines). Returns false if the io_uring
@@ -757,6 +758,7 @@ inline bool submit_batch_io_uring(io_uring_backend* backend,
     }
     return true;
 }
+#endif
 
 } // namespace detail
 
@@ -795,9 +797,8 @@ public:
             return;
         }
 
-        auto& ctx = current_io_context();
-
 #if ELIO_HAS_IO_URING
+        auto& ctx = current_io_context();
         // Fast path: skip RTTI/dynamic_cast — io_context already exposes
         // an is_io_uring() check, and we know the backend hierarchy
         // statically here.
@@ -877,9 +878,8 @@ public:
             return;
         }
 
-        auto& ctx = current_io_context();
-
 #if ELIO_HAS_IO_URING
+        auto& ctx = current_io_context();
         // Fast path: skip RTTI/dynamic_cast — io_context already exposes
         // an is_io_uring() check, and we know the backend hierarchy
         // statically here.
@@ -1058,7 +1058,8 @@ public:
             if (!state->worker) {
                 return;
             }
-            auto exec = detail::make_io_cancel_executor(state);
+            auto exec = detail::make_io_cancel_executor(
+                state, /*allow_epoll_cancel=*/true);
             if (auto* promise = coro::get_promise_base(exec.handle.address())) {
                 promise->set_affinity(state->worker->worker_id());
                 promise->set_worker_local();
@@ -1181,7 +1182,8 @@ public:
             if (!state->worker) {
                 return;
             }
-            auto exec = detail::make_io_cancel_executor(state);
+            auto exec = detail::make_io_cancel_executor(
+                state, /*allow_epoll_cancel=*/true);
             if (auto* promise = coro::get_promise_base(exec.handle.address())) {
                 promise->set_affinity(state->worker->worker_id());
                 promise->set_worker_local();
@@ -1300,7 +1302,8 @@ public:
             if (!state->worker) {
                 return;
             }
-            auto exec = detail::make_io_cancel_executor(state);
+            auto exec = detail::make_io_cancel_executor(
+                state, /*allow_epoll_cancel=*/true);
             if (auto* promise = coro::get_promise_base(exec.handle.address())) {
                 promise->set_affinity(state->worker->worker_id());
                 promise->set_worker_local();

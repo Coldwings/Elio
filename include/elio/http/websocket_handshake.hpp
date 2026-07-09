@@ -6,12 +6,17 @@
 /// This file provides utilities for WebSocket connection handshake,
 /// including Sec-WebSocket-Key generation and validation.
 
+#include <elio/http/http_common.hpp>
+
 #include <string>
 #include <string_view>
 #include <array>
 #include <algorithm>
+#include <cstdio>
+#include <cstdint>
 #include <stdexcept>
 #include <sys/random.h>
+#include <vector>
 
 #include <openssl/sha.h>
 #include <openssl/evp.h>
@@ -80,6 +85,82 @@ inline std::string base64_decode(std::string_view encoded) {
     }
     
     return result;
+}
+
+namespace detail {
+
+inline int base64_value(unsigned char c) noexcept {
+    if (c >= 'A' && c <= 'Z') return static_cast<int>(c - 'A');
+    if (c >= 'a' && c <= 'z') return static_cast<int>(c - 'a') + 26;
+    if (c >= '0' && c <= '9') return static_cast<int>(c - '0') + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+/// Strict Base64 decoder used for protocol validation.  Unlike base64_decode(),
+/// this rejects skipped characters, misplaced padding, and non-zero pad bits.
+inline bool base64_decode_strict(std::string_view encoded, std::string& decoded) {
+    decoded.clear();
+    if (encoded.empty() || encoded.size() % 4 != 0) return false;
+
+    size_t padding = 0;
+    if (!encoded.empty() && encoded.back() == '=') {
+        padding = 1;
+        if (encoded.size() >= 2 && encoded[encoded.size() - 2] == '=') {
+            padding = 2;
+        }
+    }
+
+    decoded.reserve((encoded.size() / 4) * 3 - padding);
+
+    for (size_t i = 0; i < encoded.size(); i += 4) {
+        const bool final_block = i + 4 == encoded.size();
+        unsigned char c0 = static_cast<unsigned char>(encoded[i]);
+        unsigned char c1 = static_cast<unsigned char>(encoded[i + 1]);
+        unsigned char c2 = static_cast<unsigned char>(encoded[i + 2]);
+        unsigned char c3 = static_cast<unsigned char>(encoded[i + 3]);
+
+        int v0 = base64_value(c0);
+        int v1 = base64_value(c1);
+        if (v0 < 0 || v1 < 0) return false;
+
+        if (c2 == '=') {
+            if (!final_block || c3 != '=') return false;
+            if ((v1 & 0x0F) != 0) return false;
+            decoded += static_cast<char>((v0 << 2) | (v1 >> 4));
+            continue;
+        }
+
+        int v2 = base64_value(c2);
+        if (v2 < 0) return false;
+
+        if (c3 == '=') {
+            if (!final_block) return false;
+            if ((v2 & 0x03) != 0) return false;
+            decoded += static_cast<char>((v0 << 2) | (v1 >> 4));
+            decoded += static_cast<char>(((v1 & 0x0F) << 4) | (v2 >> 2));
+            continue;
+        }
+
+        int v3 = base64_value(c3);
+        if (v3 < 0) return false;
+
+        decoded += static_cast<char>((v0 << 2) | (v1 >> 4));
+        decoded += static_cast<char>(((v1 & 0x0F) << 4) | (v2 >> 2));
+        decoded += static_cast<char>(((v2 & 0x03) << 6) | v3);
+    }
+
+    return true;
+}
+
+} // namespace detail
+
+inline bool is_valid_websocket_key(std::string_view key) {
+    if (key.size() != 24) return false;
+
+    std::string decoded;
+    return detail::base64_decode_strict(key, decoded) && decoded.size() == 16;
 }
 
 /// Generate a random 16-byte Sec-WebSocket-Key (base64 encoded).
@@ -187,6 +268,30 @@ inline std::string negotiate_protocol(const std::vector<std::string>& client_pro
     return "";
 }
 
+namespace detail {
+
+inline bool header_has_token(std::string_view value, std::string_view token) {
+    size_t pos = 0;
+    while (pos <= value.size()) {
+        auto comma = value.find(',', pos);
+        auto part = comma == std::string_view::npos
+            ? value.substr(pos)
+            : value.substr(pos, comma - pos);
+        part = ::elio::http::detail::trim_ows(part);
+
+        if (::elio::http::detail::ascii_iequals(part, token)) {
+            return true;
+        }
+
+        if (comma == std::string_view::npos) break;
+        pos = comma + 1;
+    }
+
+    return false;
+}
+
+} // namespace detail
+
 /// WebSocket handshake request info
 struct handshake_request {
     std::string key;                      ///< Sec-WebSocket-Key
@@ -211,21 +316,11 @@ inline bool is_websocket_upgrade(std::string_view method,
     // Must be GET
     if (method != "GET") return false;
     
-    // Upgrade header must contain "websocket" (case-insensitive)
-    std::string upgrade_lower;
-    upgrade_lower.reserve(upgrade.size());
-    for (char c : upgrade) {
-        upgrade_lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    if (upgrade_lower.find("websocket") == std::string::npos) return false;
+    // Upgrade header is a comma-separated list of protocol tokens.
+    if (!detail::header_has_token(upgrade, "websocket")) return false;
     
-    // Connection header must contain "Upgrade" (case-insensitive)
-    std::string connection_lower;
-    connection_lower.reserve(connection.size());
-    for (char c : connection) {
-        connection_lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    if (connection_lower.find("upgrade") == std::string::npos) return false;
+    // Connection header is a comma-separated list of hop-by-hop option tokens.
+    if (!detail::header_has_token(connection, "upgrade")) return false;
     
     // Version must be "13"
     if (version != "13") return false;

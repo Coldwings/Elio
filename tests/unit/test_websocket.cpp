@@ -692,6 +692,28 @@ TEST_CASE("WebSocket base64 decoding", "[websocket][handshake]") {
     }
 }
 
+TEST_CASE("WebSocket key validation", "[websocket][handshake]") {
+    SECTION("valid key decodes to 16-byte nonce") {
+        REQUIRE(is_valid_websocket_key("dGhlIHNhbXBsZSBub25jZQ=="));
+    }
+
+    SECTION("reject wrong encoded length") {
+        REQUIRE_FALSE(is_valid_websocket_key("dGhlIHNhbXBsZSBub25jZQ="));
+    }
+
+    SECTION("reject invalid base64 characters") {
+        REQUIRE_FALSE(is_valid_websocket_key("dGhlIHNhbXBsZSBub25jZQ!="));
+    }
+
+    SECTION("reject misplaced padding") {
+        REQUIRE_FALSE(is_valid_websocket_key("dGhlIHNhbXBsZSBub25jZQ=A"));
+    }
+
+    SECTION("reject decoded length other than 16 bytes") {
+        REQUIRE_FALSE(is_valid_websocket_key("AAAAAAAAAAAAAAAAAAAAAAAA"));
+    }
+}
+
 TEST_CASE("WebSocket key generation", "[websocket][handshake]") {
     SECTION("generated key is base64 encoded 16 bytes") {
         auto key = generate_websocket_key();
@@ -735,6 +757,7 @@ TEST_CASE("WebSocket upgrade validation", "[websocket][handshake]") {
         REQUIRE(is_websocket_upgrade("GET", "websocket", "Upgrade", "13"));
         REQUIRE(is_websocket_upgrade("GET", "WebSocket", "upgrade", "13"));
         REQUIRE(is_websocket_upgrade("GET", "websocket", "keep-alive, Upgrade", "13"));
+        REQUIRE(is_websocket_upgrade("GET", "h2c, WebSocket", "keep-alive, upgrade", "13"));
     }
     
     SECTION("invalid method") {
@@ -744,13 +767,71 @@ TEST_CASE("WebSocket upgrade validation", "[websocket][handshake]") {
     SECTION("missing upgrade header") {
         REQUIRE_FALSE(is_websocket_upgrade("GET", "http", "Upgrade", "13"));
     }
+
+    SECTION("upgrade header requires exact websocket token") {
+        REQUIRE_FALSE(is_websocket_upgrade("GET", "xwebsocket", "Upgrade", "13"));
+        REQUIRE_FALSE(is_websocket_upgrade("GET", "websocket2", "Upgrade", "13"));
+        REQUIRE_FALSE(is_websocket_upgrade("GET", "h2c, xwebsocket", "Upgrade", "13"));
+    }
     
     SECTION("missing connection upgrade") {
         REQUIRE_FALSE(is_websocket_upgrade("GET", "websocket", "close", "13"));
     }
+
+    SECTION("connection header requires exact upgrade token") {
+        REQUIRE_FALSE(is_websocket_upgrade("GET", "websocket", "xupgrade", "13"));
+        REQUIRE_FALSE(is_websocket_upgrade("GET", "websocket", "upgraded", "13"));
+        REQUIRE_FALSE(is_websocket_upgrade("GET", "websocket", "keep-alive, xupgrade", "13"));
+    }
     
     SECTION("wrong version") {
         REQUIRE_FALSE(is_websocket_upgrade("GET", "websocket", "Upgrade", "12"));
+    }
+}
+
+TEST_CASE("WebSocket server upgrade request validation", "[websocket][handshake]") {
+    auto make_request = [](std::string_view upgrade,
+                           std::string_view connection,
+                           std::string_view key) {
+        elio::http::request req(elio::http::method::GET, "/ws");
+        req.set_header("Upgrade", upgrade);
+        req.set_header("Connection", connection);
+        req.set_header("Sec-WebSocket-Key", key);
+        req.set_header("Sec-WebSocket-Version", "13");
+        return req;
+    };
+
+    server_config config;
+
+    SECTION("accept valid request") {
+        auto req = make_request("websocket", "keep-alive, Upgrade",
+                                "dGhlIHNhbXBsZSBub25jZQ==");
+        auto result = validate_upgrade_request(req, config);
+        REQUIRE(result.success);
+    }
+
+    SECTION("reject malformed upgrade and connection tokens") {
+        auto bad_upgrade = make_request("xwebsocket", "Upgrade",
+                                        "dGhlIHNhbXBsZSBub25jZQ==");
+        REQUIRE_FALSE(validate_upgrade_request(bad_upgrade, config).success);
+
+        auto bad_connection = make_request("websocket", "keep-alive, xupgrade",
+                                           "dGhlIHNhbXBsZSBub25jZQ==");
+        REQUIRE_FALSE(validate_upgrade_request(bad_connection, config).success);
+    }
+
+    SECTION("reject invalid Sec-WebSocket-Key values") {
+        auto invalid_chars = make_request("websocket", "Upgrade",
+                                          "dGhlIHNhbXBsZSBub25jZQ!=");
+        REQUIRE_FALSE(validate_upgrade_request(invalid_chars, config).success);
+
+        auto invalid_padding = make_request("websocket", "Upgrade",
+                                            "dGhlIHNhbXBsZSBub25jZQ=A");
+        REQUIRE_FALSE(validate_upgrade_request(invalid_padding, config).success);
+
+        auto wrong_decoded_length = make_request("websocket", "Upgrade",
+                                                 "AAAAAAAAAAAAAAAAAAAAAAAA");
+        REQUIRE_FALSE(validate_upgrade_request(wrong_decoded_length, config).success);
     }
 }
 

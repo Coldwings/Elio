@@ -394,8 +394,12 @@ sync::channel<int> bch(100);
 // Unbounded channel: faster but can grow indefinitely
 auto uch = sync::channel<int>::unbounded();
 
-// SPSC queue: single producer/consumer (fastest)
-runtime::spsc_queue<int> spsc(1000);
+// Low-level bounded MPMC ring: non-blocking try_push/try_pop
+// Requires #include <elio/sync/lockfree_ring.hpp>
+sync::LockfreeMPMCRing<int> ring(1024);
+int value = 42;
+bool pushed = ring.try_push(value);
+auto popped = ring.try_pop();
 ```
 
 ## Network Performance

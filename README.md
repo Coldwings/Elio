@@ -83,7 +83,20 @@ target_link_libraries(your_target PRIVATE Elio::elio)
 # Elio::elio_tls
 # Elio::elio_http
 # Elio::elio_http2
+# Elio::elio_rdma
+# Elio::elio_rdma_cm
+# Elio::elio_rdma_ibverbs
+# Elio::elio_rdma_cuda
 ```
+
+Installed packages export only the targets that were enabled when Elio was
+built. RDMA package consumers should link the most specific enabled target:
+`Elio::elio_rdma` for the header-only core abstraction, `Elio::elio_rdma_cm`
+for the Connection Manager helper, `Elio::elio_rdma_ibverbs` for the reference
+libibverbs backend, or `Elio::elio_rdma_cuda` for CUDA GPUDirect helpers. The
+installed config restores the corresponding system dependencies during
+`find_package(Elio)`: `librdmacm` for RDMA CM, `libibverbs` for ibverbs, and
+`CUDAToolkit` for CUDA.
 
 ### Running Tests
 

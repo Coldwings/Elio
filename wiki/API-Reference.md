@@ -285,17 +285,23 @@ coro::task<void> consume() {
 **With Async Operations:**
 ```cpp
 // Producer can use co_await for async I/O
-generator<std::string> read_lines(tcp::socket& sock) {
-    while (sock.is_open()) {
-        auto line = co_await sock.read_line();
-        co_yield std::move(line);
+generator<std::string> read_chunks(net::tcp_stream& stream) {
+    char buffer[4096];
+
+    while (stream.is_valid()) {
+        auto result = co_await stream.read(buffer, sizeof(buffer));
+        if (result.result <= 0) {
+            break;
+        }
+
+        co_yield std::string(buffer, static_cast<std::size_t>(result.result));
     }
 }
 
-coro::task<void> process(tcp::socket& sock) {
-    auto lines = read_lines(sock);
-    ELIO_CO_FOR(line, lines) {
-        handle_line(line);
+coro::task<void> process(net::tcp_stream& stream) {
+    auto chunks = read_chunks(stream);
+    ELIO_CO_FOR(chunk, chunks) {
+        handle_chunk(chunk);
     }
 }
 ```

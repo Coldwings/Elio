@@ -10,12 +10,16 @@
 #include <asio.hpp>
 #include "bench_tcp_common.hpp"
 
+#include <sys/socket.h>
+
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -113,13 +117,46 @@ static void run_client_pingpong(const bench::config& cfg, size_t msg_size,
 
     std::vector<char> send_buf(msg_size, 'X');
     std::vector<char> recv_buf(msg_size);
+    std::atomic<bool> timed_out{false};
+    std::mutex timer_mutex;
+    std::condition_variable timer_cv;
+    bool timer_cancelled = false;
+
+    std::thread timer_thread([&]() {
+        std::unique_lock<std::mutex> lock(timer_mutex);
+        const auto budget =
+            std::chrono::seconds(cfg.warmup_s + cfg.duration_s);
+        if (timer_cv.wait_for(lock, budget, [&]() {
+                return timer_cancelled;
+            })) {
+            return;
+        }
+        timed_out.store(true, std::memory_order_release);
+        ::shutdown(socket.native_handle(), SHUT_RDWR);
+    });
+
+    auto stop_timer = [&]() {
+        {
+            std::lock_guard<std::mutex> lock(timer_mutex);
+            timer_cancelled = true;
+        }
+        timer_cv.notify_one();
+        if (timer_thread.joinable()) {
+            timer_thread.join();
+        }
+    };
 
     // Helper: full write
     auto write_all = [&](const char* data, size_t n) -> bool {
         while (n > 0) {
+            if (timed_out.load(std::memory_order_acquire)) {
+                return false;
+            }
             std::error_code wec;
             size_t written = socket.write_some(asio::buffer(data, n), wec);
-            if (wec) return false;
+            if (wec) {
+                return false;
+            }
             n -= written;
             data += written;
         }
@@ -129,9 +166,14 @@ static void run_client_pingpong(const bench::config& cfg, size_t msg_size,
     // Helper: full read
     auto read_all = [&](char* data, size_t n) -> bool {
         while (n > 0) {
+            if (timed_out.load(std::memory_order_acquire)) {
+                return false;
+            }
             std::error_code rec;
             size_t got = socket.read_some(asio::buffer(data, n), rec);
-            if (rec) return false;
+            if (rec) {
+                return false;
+            }
             n -= got;
             data += got;
         }
@@ -144,9 +186,18 @@ static void run_client_pingpong(const bench::config& cfg, size_t msg_size,
     // Warmup
     auto warmup_end = std::chrono::steady_clock::now() +
                       std::chrono::seconds(cfg.warmup_s);
-    while (std::chrono::steady_clock::now() < warmup_end) {
-        if (!write_all(send_buf.data(), msg_size)) return;
-        if (!read_all(recv_buf.data(), msg_size)) return;
+    while (!timed_out.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < warmup_end) {
+        if (!write_all(send_buf.data(), msg_size)) {
+            stop_timer();
+            out.timed_out = timed_out.load(std::memory_order_acquire);
+            return;
+        }
+        if (!read_all(recv_buf.data(), msg_size)) {
+            stop_timer();
+            out.timed_out = timed_out.load(std::memory_order_acquire);
+            return;
+        }
     }
 
     latencies.clear();
@@ -154,19 +205,33 @@ static void run_client_pingpong(const bench::config& cfg, size_t msg_size,
     // Measurement
     auto measure_start = std::chrono::steady_clock::now();
     auto measure_end   = measure_start + std::chrono::seconds(cfg.duration_s);
+    auto finish = [&]() {
+        out = bench::pingpong_stats::compute(latencies,
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - measure_start).count());
+        out.timed_out = timed_out.load(std::memory_order_acquire);
+    };
 
-    while (std::chrono::steady_clock::now() < measure_end) {
+    while (!timed_out.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < measure_end) {
         auto t0 = std::chrono::steady_clock::now();
-        if (!write_all(send_buf.data(), msg_size)) return;
-        if (!read_all(recv_buf.data(), msg_size)) return;
+        if (!write_all(send_buf.data(), msg_size)) {
+            finish();
+            stop_timer();
+            return;
+        }
+        if (!read_all(recv_buf.data(), msg_size)) {
+            finish();
+            stop_timer();
+            return;
+        }
         auto t1 = std::chrono::steady_clock::now();
         latencies.push_back(
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     }
 
-    double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - measure_start).count();
-    out = bench::pingpong_stats::compute(latencies, elapsed);
+    stop_timer();
+    finish();
 }
 
 // ---------------------------------------------------------------------------

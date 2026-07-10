@@ -140,6 +140,7 @@ struct pingpong_stats {
     double max_us    = 0.0;
     size_t count     = 0;
     double req_s     = 0.0;
+    bool timed_out   = false;
 
     static pingpong_stats compute(std::vector<uint64_t>& latencies_ns,
                                   double elapsed_s) {
@@ -173,6 +174,13 @@ struct pingpong_stats {
     }
 
     void print_row(size_t message_size) const {
+        if (timed_out) {
+            std::printf("%-8s %-10s %-10s %-10s %-10s %-10s\n",
+                        format_size(message_size).c_str(),
+                        "TIMEOUT", "TIMEOUT", "TIMEOUT", "TIMEOUT",
+                        "TIMEOUT");
+            return;
+        }
         std::printf("%-8s %-10.2f %-10.2f %-10.2f %-10.2f %-10.0f\n",
                     format_size(message_size).c_str(),
                     avg_us, median_us, p99_us, max_us, req_s);

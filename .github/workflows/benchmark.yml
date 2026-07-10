@@ -46,71 +46,169 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 4
 
-      - name: Run Elio benchmark
+      - name: Run benchmarks
+        shell: bash
         run: |
-          ./build/examples/bench_tcp_elio -s -p 9876 &
-          SERVER_PID=$!
-          sleep 1
-          ./build/examples/bench_tcp_elio -c -p 9876 \
-            -d ${{ inputs.duration || '5' }} \
-            -w ${{ inputs.warmup || '2' }} \
-            -m ${{ inputs.mode || 'both' }} \
-            | tee elio_results.txt
-          kill $SERVER_PID
-          wait $SERVER_PID 2>/dev/null || true
+          set -euo pipefail
 
-      - name: Run libuv benchmark
-        run: |
-          ./build/examples/bench_tcp_libuv -s -p 9877 &
-          SERVER_PID=$!
-          sleep 1
-          ./build/examples/bench_tcp_libuv -c -p 9877 \
-            -d ${{ inputs.duration || '5' }} \
-            -w ${{ inputs.warmup || '2' }} \
-            -m ${{ inputs.mode || 'both' }} \
-            | tee libuv_results.txt
-          kill $SERVER_PID
-          wait $SERVER_PID 2>/dev/null || true
+          duration="${{ inputs.duration || '5' }}"
+          warmup="${{ inputs.warmup || '2' }}"
+          mode="${{ inputs.mode || 'both' }}"
 
-      - name: Run Asio benchmark
-        run: |
-          ./build/examples/bench_tcp_asio -s -p 9878 &
-          SERVER_PID=$!
-          sleep 1
-          ./build/examples/bench_tcp_asio -c -p 9878 \
-            -d ${{ inputs.duration || '5' }} \
-            -w ${{ inputs.warmup || '2' }} \
-            -m ${{ inputs.mode || 'both' }} \
-            | tee asio_results.txt
-          kill $SERVER_PID
-          wait $SERVER_PID 2>/dev/null || true
+          if [[ ! "$duration" =~ ^[0-9]+$ || ! "$warmup" =~ ^[0-9]+$ ]]; then
+            echo "::error::duration and warmup must be non-negative integers"
+            exit 2
+          fi
+
+          case "$mode" in
+            pingpong|streaming) phase_count=1 ;;
+            both) phase_count=2 ;;
+            *)
+              echo "::error::mode must be pingpong, streaming, or both"
+              exit 2
+              ;;
+          esac
+
+          message_size_count=4
+          client_timeout=$(( (duration + warmup) * message_size_count * phase_count + 60 ))
+          if (( client_timeout < 60 )); then
+            client_timeout=60
+          fi
+
+          cleanup_server() {
+            local pid="${1:-}"
+            [[ -z "$pid" ]] && return 0
+
+            if kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" 2>/dev/null || true
+              for _ in {1..20}; do
+                if ! kill -0 "$pid" 2>/dev/null; then
+                  break
+                fi
+                sleep 0.2
+              done
+              kill -9 "$pid" 2>/dev/null || true
+            fi
+            wait "$pid" 2>/dev/null || true
+          }
+
+          wait_for_server() {
+            local pid="$1"
+            local port="$2"
+            local server_log="$3"
+
+            for _ in {1..20}; do
+              if ! kill -0 "$pid" 2>/dev/null; then
+                echo "::error::benchmark server exited before accepting connections"
+                cat "$server_log" || true
+                return 1
+              fi
+              if (: > "/dev/tcp/127.0.0.1/${port}") >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 0.25
+            done
+
+            echo "::error::benchmark server did not accept connections on port ${port}"
+            cat "$server_log" || true
+            return 1
+          }
+
+          run_backend() {
+            local name="$1"
+            local binary="$2"
+            local port="$3"
+            local result_file="$4"
+            local server_log="$5"
+            local server_pid
+
+            echo "::group::${name} TCP loopback benchmark"
+            "$binary" -s -p "$port" >"$server_log" 2>&1 &
+            server_pid=$!
+
+            if ! wait_for_server "$server_pid" "$port" "$server_log"; then
+              cleanup_server "$server_pid"
+              echo "::endgroup::"
+              return 1
+            fi
+
+            set +e
+            timeout --kill-after=10s "${client_timeout}s" \
+              "$binary" -c -p "$port" \
+                -d "$duration" \
+                -w "$warmup" \
+                -m "$mode" \
+              | tee "$result_file"
+            local client_status=${PIPESTATUS[0]}
+            set -e
+
+            cleanup_server "$server_pid"
+
+            if (( client_status != 0 )); then
+              echo "::error title=${name} benchmark failed::client exited with status ${client_status} after timeout budget ${client_timeout}s"
+              echo "::endgroup::"
+              return "$client_status"
+            fi
+
+            echo "::endgroup::"
+            return 0
+          }
+
+          overall_status=0
+          run_backend "Elio" ./build/examples/bench_tcp_elio 9876 elio_results.txt elio_server.log || overall_status=$?
+          run_backend "libuv" ./build/examples/bench_tcp_libuv 9877 libuv_results.txt libuv_server.log || overall_status=$?
+          run_backend "Asio" ./build/examples/bench_tcp_asio 9878 asio_results.txt asio_server.log || overall_status=$?
+
+          exit "$overall_status"
 
       - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-${{ github.sha }}
           path: |
             elio_results.txt
+            elio_server.log
             libuv_results.txt
+            libuv_server.log
             asio_results.txt
+            asio_server.log
           retention-days: 90
           if-no-files-found: warn
 
       - name: Summary
+        if: always()
+        shell: bash
         run: |
+          append_result() {
+            local name="$1"
+            local result_file="$2"
+            local server_log="$3"
+
+            echo "### ${name}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            if [[ -f "$result_file" ]]; then
+              cat "$result_file" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "No client results produced." >> $GITHUB_STEP_SUMMARY
+            fi
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "<details><summary>${name} server log</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            if [[ -s "$server_log" ]]; then
+              tail -n 120 "$server_log" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "No server log output." >> $GITHUB_STEP_SUMMARY
+            fi
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "</details>" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          }
+
           echo "## TCP Loopback Benchmark Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Elio" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat elio_results.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### libuv" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat libuv_results.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Asio" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat asio_results.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          append_result "Elio" elio_results.txt elio_server.log
+          append_result "libuv" libuv_results.txt libuv_server.log
+          append_result "Asio" asio_results.txt asio_server.log

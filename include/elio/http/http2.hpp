@@ -36,8 +36,7 @@ namespace http {
 /// using namespace elio::http;
 /// 
 /// coro::task<void> fetch_example() {
-///     auto& ctx = io::default_io_context();
-///     h2_client client(ctx);
+///     h2_client client;
 ///     
 ///     // Simple GET request (HTTP/2 requires HTTPS)
 ///     auto resp = co_await client.get("https://example.com/");

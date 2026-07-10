@@ -29,7 +29,7 @@
 ///     }
 /// }
 ///
-/// int main() {
+/// coro::task<int> async_main() {
 ///     ws_router router;
 ///     router.websocket("/ws", handle_websocket);
 ///     router.get("/", [](context& ctx) -> coro::task<response> {
@@ -37,18 +37,12 @@
 ///     });
 ///     
 ///     ws_server srv(std::move(router));
-///     
-///     runtime::scheduler sched(4);
-///     sched.start();
-///     
-///     auto task = srv.listen(net::ipv4_address(8080), 
-///                           io::default_io_context(), sched);
-///     sched.spawn(task.release());
-///     
-///     // Wait for shutdown...
-///     sched.shutdown();
-///     return 0;
+///     auto addr = net::socket_address(net::ipv4_address(8080));
+///     co_await elio::serve(srv, [&]() { return srv.listen(addr); });
+///     co_return 0;
 /// }
+///
+/// ELIO_ASYNC_MAIN(async_main)
 /// @endcode
 ///
 /// @example WebSocket Client Example
@@ -60,8 +54,7 @@
 /// using namespace elio::http::websocket;
 ///
 /// coro::task<void> connect_to_server() {
-///     auto& ctx = io::default_io_context();
-///     ws_client client(ctx);
+///     ws_client client;
 ///     
 ///     if (!co_await client.connect("ws://localhost:8080/ws")) {
 ///         ELIO_LOG_ERROR("Failed to connect");

@@ -43,9 +43,7 @@
 /// using namespace elio::http::sse;
 ///
 /// coro::task<void> listen_to_events() {
-///     auto& ctx = io::default_io_context();
-///     
-///     sse_client client(ctx);
+///     sse_client client;
 ///     if (!co_await client.connect("http://localhost:8080/events")) {
 ///         ELIO_LOG_ERROR("Failed to connect");
 ///         co_return;

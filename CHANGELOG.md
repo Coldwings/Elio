@@ -42,6 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **HTTP/WebSocket server stop**: `stop()` now cancels the active listener
   accept operation so idle listen loops exit promptly without needing a new
   client connection to wake them. (#341)
+- **TLS shutdown timeout enforcement**: `tls::tls_stream::shutdown()` now bounds
+  readiness waits with cancellable poll operations, so a peer that never sends
+  `close_notify` cannot keep shutdown suspended beyond the configured timeout.
+  (#338)
 
 ## [0.5.2] - 2026-06-30
 

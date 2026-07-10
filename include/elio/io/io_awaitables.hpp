@@ -1380,13 +1380,14 @@ private:
     bool already_cancelled_before_setup_ = false;
 };
 
-/// Awaitable for cancellable async poll-read operations
-class cancellable_async_poll_read_awaitable : public io_awaitable_base {
+/// Awaitable for cancellable async poll operations
+class cancellable_async_poll_awaitable : public io_awaitable_base {
 public:
-    cancellable_async_poll_read_awaitable(int fd,
-                                          coro::cancel_token token) noexcept
+    cancellable_async_poll_awaitable(int fd, bool for_read,
+                                     coro::cancel_token token) noexcept
         : io_awaitable_base()
         , fd_(fd)
+        , for_read_(for_read)
         , token_(std::move(token)) {}
 
     bool await_ready() const noexcept {
@@ -1435,7 +1436,7 @@ public:
         }
 
         io_request req{};
-        req.op = io_op::poll_read;
+        req.op = for_read_ ? io_op::poll_read : io_op::poll_write;
         req.fd = fd_;
         req.awaiter = awaiter;
         req.state = setup_op_state(awaiter);
@@ -1484,10 +1485,29 @@ public:
 
 private:
     int fd_;
+    bool for_read_;
     coro::cancel_token token_;
     coro::cancel_token::registration cancel_registration_;
     std::shared_ptr<detail::io_cancel_state> state_;
     bool already_cancelled_before_setup_ = false;
+};
+
+/// Awaitable for cancellable async poll-read operations
+class cancellable_async_poll_read_awaitable
+    : public cancellable_async_poll_awaitable {
+public:
+    cancellable_async_poll_read_awaitable(int fd,
+                                          coro::cancel_token token) noexcept
+        : cancellable_async_poll_awaitable(fd, true, std::move(token)) {}
+};
+
+/// Awaitable for cancellable async poll-write operations
+class cancellable_async_poll_write_awaitable
+    : public cancellable_async_poll_awaitable {
+public:
+    cancellable_async_poll_write_awaitable(int fd,
+                                           coro::cancel_token token) noexcept
+        : cancellable_async_poll_awaitable(fd, false, std::move(token)) {}
 };
 
 /// Factory functions for cancellable I/O operations
@@ -1517,6 +1537,11 @@ inline auto async_connect(int fd,
 /// Create a cancellable async poll awaitable for reading
 inline auto async_poll_read(int fd, coro::cancel_token token) {
     return cancellable_async_poll_read_awaitable(fd, std::move(token));
+}
+
+/// Create a cancellable async poll awaitable for writing
+inline auto async_poll_write(int fd, coro::cancel_token token) {
+    return cancellable_async_poll_write_awaitable(fd, std::move(token));
 }
 
 } // namespace elio::io

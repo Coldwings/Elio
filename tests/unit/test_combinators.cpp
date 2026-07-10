@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include "../test_main.cpp"
 
 using namespace elio;
@@ -25,6 +26,18 @@ bool wait_for_count(const std::atomic<int>& value, int expected) {
     }
     return value.load(std::memory_order_acquire) == expected;
 }
+
+struct throwing_move_callable {
+    throwing_move_callable() = default;
+    throwing_move_callable(const throwing_move_callable&) = delete;
+    throwing_move_callable& operator=(const throwing_move_callable&) = delete;
+    throwing_move_callable(throwing_move_callable&&) noexcept(false) {}
+    throwing_move_callable& operator=(throwing_move_callable&&) = delete;
+
+    task<int> operator()() {
+        co_return 1;
+    }
+};
 
 } // namespace
 
@@ -436,6 +449,19 @@ TEST_CASE("destroyed when_any waiter is unregistered",
     });
     REQUIRE(wait_for_count(completed, 2));
     sched.shutdown();
+}
+
+TEST_CASE("combinator awaitable move traits follow callables",
+          "[sync][combinators]") {
+    using AllAwaitable = elio::detail::when_all_awaitable<throwing_move_callable>;
+    using AnyAwaitable = elio::detail::when_any_awaitable<throwing_move_callable>;
+
+    STATIC_REQUIRE(std::is_move_constructible_v<AllAwaitable>);
+    STATIC_REQUIRE(std::is_move_constructible_v<AnyAwaitable>);
+    STATIC_REQUIRE_FALSE(std::is_nothrow_move_constructible_v<AllAwaitable>);
+    STATIC_REQUIRE_FALSE(std::is_nothrow_move_constructible_v<AnyAwaitable>);
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<AllAwaitable>);
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<AnyAwaitable>);
 }
 
 // --- with_timeout tests ---

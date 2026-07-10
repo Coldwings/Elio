@@ -111,19 +111,22 @@ struct when_any_state {
 template<typename... Fs>
 struct when_any_awaitable {
     using state_type = when_any_state<Fs...>;
+    using callables_type = std::tuple<Fs...>;
     std::shared_ptr<state_type> state_;
-    std::tuple<Fs...> callables_;
     coro::detail::completion_waiter waiter_;
+    callables_type callables_;
 
     explicit when_any_awaitable(Fs... fs)
         : state_(std::make_shared<state_type>())
-        , callables_(std::move(fs)...)
-        , waiter_(state_->waiter_) {}
+        , waiter_(state_->waiter_)
+        , callables_(std::move(fs)...) {}
 
-    when_any_awaitable(when_any_awaitable&&) noexcept = default;
+    when_any_awaitable(when_any_awaitable&&)
+        noexcept(std::is_nothrow_move_constructible_v<callables_type>) = default;
 
     when_any_awaitable& operator=(when_any_awaitable&& other)
-        noexcept(std::is_nothrow_move_assignable_v<std::tuple<Fs...>>) {
+        noexcept(std::is_nothrow_move_assignable_v<callables_type>)
+        requires std::is_move_assignable_v<callables_type> {
         if (this != &other) {
             waiter_ = std::move(other.waiter_);
             state_ = std::move(other.state_);

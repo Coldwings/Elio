@@ -1,13 +1,9 @@
 #pragma once
 
+#include <elio/http/client_base.hpp>
 #include <elio/http/http_common.hpp>
 #include <elio/http/http_message.hpp>
 #include <elio/http/http2_session.hpp>
-#include <elio/net/tcp.hpp>
-#include <elio/net/resolve.hpp>
-#include <elio/tls/tls_context.hpp>
-#include <elio/tls/tls_stream.hpp>
-#include <elio/io/io_context.hpp>
 #include <elio/coro/cancel_token.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/runtime/scheduler.hpp>
@@ -22,13 +18,12 @@
 #include <optional>
 #include <unordered_map>
 #include <chrono>
-#include <mutex>
 
 namespace elio::http {
 
 /// HTTP/2 client configuration
 struct h2_client_config {
-    std::chrono::seconds connect_timeout{10};     ///< Reserved; not currently enforced
+    std::chrono::seconds connect_timeout{10};     ///< TCP connect + TLS handshake timeout; <=0 disables
     std::chrono::seconds read_timeout{30};        ///< Session I/O timeout; <=0 disables
     size_t max_concurrent_streams = 100;          ///< Max concurrent streams per connection
     uint32_t initial_window_size = 65535;         ///< Initial flow control window size
@@ -43,12 +38,15 @@ class h2_connection {
 public:
     h2_connection() = default;
     
-    /// Create HTTP/2 connection (takes ownership of TLS stream)
-    explicit h2_connection(tls::tls_stream tls,
+    /// Create HTTP/2 connection (takes ownership of a TLS stream wrapper)
+    explicit h2_connection(net::stream stream,
                            h2_session_config config = {})
-        : tls_stream_(std::make_unique<tls::tls_stream>(std::move(tls)))
-        , session_(std::make_unique<h2_session>(*tls_stream_,
-                                                std::move(config))) {}
+        : stream_(std::make_unique<net::stream>(std::move(stream))) {
+        if (stream_->is_tls()) {
+            session_ = std::make_unique<h2_session>(stream_->as_tls(),
+                                                    std::move(config));
+        }
+    }
     
     // Move only
     h2_connection(h2_connection&&) = default;
@@ -58,22 +56,25 @@ public:
     
     /// Check if connected
     bool is_connected() const noexcept {
-        return tls_stream_ && session_ && session_->is_alive();
+        return stream_ && stream_->is_connected() && session_ &&
+               session_->is_alive();
     }
     
     /// Get the HTTP/2 session
     h2_session* session() noexcept { return session_.get(); }
     
     /// Get the TLS stream
-    tls::tls_stream* tls() noexcept { return tls_stream_.get(); }
+    tls::tls_stream* tls() noexcept {
+        return stream_ && stream_->is_tls() ? &stream_->as_tls() : nullptr;
+    }
     
     /// Close the connection
     coro::task<void> close() {
         if (session_) {
             co_await session_->shutdown();
         }
-        if (tls_stream_) {
-            co_await tls_stream_->shutdown();
+        if (stream_) {
+            co_await stream_->close();
         }
     }
     
@@ -88,7 +89,7 @@ public:
     }
     
 private:
-    std::unique_ptr<tls::tls_stream> tls_stream_;
+    std::unique_ptr<net::stream> stream_;
     std::unique_ptr<h2_session> session_;
     std::chrono::steady_clock::time_point last_use_ = std::chrono::steady_clock::now();
 };
@@ -102,8 +103,7 @@ public:
     /// Create HTTP/2 client with configuration
     explicit h2_client(h2_client_config config)
         : config_(config)
-        , tls_ctx_(tls::tls_mode::client)
-        , rotation_state_(std::make_unique<rotation_state>()) {
+        , tls_ctx_(tls::tls_mode::client) {
         // Setup TLS context for HTTP/2
         tls_ctx_.use_default_verify_paths();
         tls_ctx_.set_verify_mode(tls::verify_mode::peer);
@@ -308,57 +308,35 @@ private:
             co_return std::move(conn);
         }
         
-        auto addresses = co_await net::resolve_all(host, port, config_.resolve_options);
-        if (addresses.empty()) {
-            ELIO_LOG_ERROR("Failed to resolve {}:{}", host, port);
+        errno = 0;
+        auto stream = co_await client_connect(host, port, true, &tls_ctx_,
+                                              config_.resolve_options,
+                                              config_.rotate_resolved_addresses,
+                                              config_.connect_timeout);
+        if (!stream) {
+            if (errno == 0) {
+                errno = ECONNREFUSED;
+            }
             co_return std::nullopt;
         }
 
-        size_t offset = 0;
-        if (config_.rotate_resolved_addresses) {
-            std::lock_guard<std::mutex> lock(rotation_state_->mutex);
-            size_t& cursor = rotation_state_->cursor[key];
-            offset = cursor % addresses.size();
-            cursor = (cursor + 1) % addresses.size();
+        auto alpn = stream->as_tls().alpn_protocol();
+        if (alpn != "h2") {
+            ELIO_LOG_ERROR("Server does not support HTTP/2 (ALPN: {})",
+                           alpn.empty() ? "(none)" : std::string(alpn));
+            errno = EPROTONOSUPPORT;
+            co_return std::nullopt;
         }
 
-        for (size_t i = 0; i < addresses.size(); ++i) {
-            const auto& addr = addresses[(offset + i) % addresses.size()];
+        ELIO_LOG_DEBUG("HTTP/2 connection established to {}:{}", host, port);
 
-            auto tcp_result = co_await net::tcp_connect(addr);
-            if (!tcp_result) {
-                continue;
-            }
-
-            tls::tls_stream tls_stream(std::move(*tcp_result), tls_ctx_);
-            tls_stream.set_hostname(host);
-
-            auto hs_result = co_await tls_stream.handshake();
-            if (!hs_result) {
-                continue;
-            }
-
-            auto alpn = tls_stream.alpn_protocol();
-            if (alpn != "h2") {
-                ELIO_LOG_ERROR("Server does not support HTTP/2 (ALPN: {})",
-                               alpn.empty() ? "(none)" : std::string(alpn));
-                continue;
-            }
-
-            ELIO_LOG_DEBUG("HTTP/2 connection established to {}:{}", host, port);
-
-            h2_connection conn(std::move(tls_stream),
-                               make_session_config(config_));
-            if (!co_await process_with_timeout(conn, host, port)) {
-                ELIO_LOG_ERROR("HTTP/2 session initialization failed");
-                continue;
-            }
-
-            co_return std::move(conn);
+        h2_connection conn(std::move(*stream), make_session_config(config_));
+        if (!co_await process_with_timeout(conn, host, port)) {
+            ELIO_LOG_ERROR("HTTP/2 session initialization failed");
+            co_return std::nullopt;
         }
 
-        ELIO_LOG_ERROR("Failed to connect to any resolved address for {}:{}", host, port);
-        co_return std::nullopt;
+        co_return std::move(conn);
     }
     
     /// Return a connection to the pool
@@ -371,15 +349,9 @@ private:
         connections_[key] = std::move(conn);
     }
 
-    struct rotation_state {
-        std::mutex mutex;
-        std::unordered_map<std::string, size_t> cursor;
-    };
-
     h2_client_config config_;
     tls::tls_context tls_ctx_;
     std::unordered_map<std::string, h2_connection> connections_;
-    std::unique_ptr<rotation_state> rotation_state_;
 };
 
 /// Convenience function for one-off HTTP/2 GET request

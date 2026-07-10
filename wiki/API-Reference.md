@@ -1353,7 +1353,7 @@ public:
 
 ```cpp
 struct h2_client_config {
-    std::chrono::seconds connect_timeout{10};  // Reserved; not currently enforced
+    std::chrono::seconds connect_timeout{10};  // TCP connect + TLS handshake timeout
     std::chrono::seconds read_timeout{30};     // Session I/O timeout; <=0 disables
     size_t max_concurrent_streams = 100;
     uint32_t initial_window_size = 65535;

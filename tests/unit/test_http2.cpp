@@ -93,18 +93,25 @@ bool wait_until(Pred pred, std::chrono::milliseconds timeout) {
 
 class scoped_sigpipe_ignore {
 public:
-    scoped_sigpipe_ignore()
-        : old_(std::signal(SIGPIPE, SIG_IGN)) {}
+    scoped_sigpipe_ignore() {
+#ifdef SIGPIPE
+        old_ = std::signal(SIGPIPE, SIG_IGN);
+#endif
+    }
 
     ~scoped_sigpipe_ignore() {
+#ifdef SIGPIPE
         std::signal(SIGPIPE, old_);
+#endif
     }
 
     scoped_sigpipe_ignore(const scoped_sigpipe_ignore&) = delete;
     scoped_sigpipe_ignore& operator=(const scoped_sigpipe_ignore&) = delete;
 
 private:
-    void (*old_)(int);
+#ifdef SIGPIPE
+    void (*old_)(int) = SIG_DFL;
+#endif
 };
 #endif
 

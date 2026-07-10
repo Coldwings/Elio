@@ -2,6 +2,7 @@
 
 #include "promise_base.hpp"
 #include "cancel_token.hpp"
+#include "detail/completion_waiter.hpp"
 #include <coroutine>
 #include <optional>
 #include <exception>
@@ -73,7 +74,7 @@ struct task_state {
     std::exception_ptr exception_;
 
     // Waiter management
-    std::atomic<void*> waiter_{nullptr};
+    alignas(64) completion_waiter_slot waiter_;
     std::mutex mutex_;
     // Used by blocking wait()/wait_for() in non-coroutine contexts.
     std::condition_variable cv_;
@@ -121,9 +122,8 @@ struct task_state {
     }
 
     void notify_waiter() {
-        void* waiter_addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-        if (waiter_addr) {
-            auto waiter = std::coroutine_handle<>::from_address(waiter_addr);
+        auto waiter = waiter_.take();
+        if (waiter) {
             runtime::schedule_handle(waiter);
         }
     }
@@ -136,37 +136,12 @@ struct task_state {
                s == task_status::cancelled;
     }
 
-    // Returns true if waiter was stored (should suspend), false if caller must resume locally.
-    bool set_waiter(std::coroutine_handle<> h) noexcept {
-        // Fast path: check if already done before trying to set waiter
-        // This avoids the race of setting a waiter on an already-completed task
-        if (is_done()) {
-            return false;
-        }
-
-        // Try to atomically set the waiter
-        void* expected = nullptr;
-        if (waiter_.compare_exchange_strong(expected, h.address(),
-                std::memory_order_release, std::memory_order_acquire)) {
-            // Race: completion may have happened between is_done() and CAS.
-            if (is_done()) {
-                // Try to reclaim the waiter slot before notify_waiter() does.
-                void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-                if (addr) {
-                    // We won the race: notify_waiter() did not take the waiter,
-                    // so it will not schedule us. Resume locally; do NOT schedule
-                    // here (that would double-resume the coroutine).
-                    return false;
-                }
-                // We lost the race: notify_waiter() already grabbed the waiter
-                // and scheduled (or is about to schedule) it on a worker. Suspend
-                // so the scheduler resumes us exactly once.
-                return true;
-            }
-            return true;
-        }
-        // Another waiter already set (shouldn't happen with single await)
-        return false;
+    // Returns true if waiter was stored (should suspend), false if already done.
+    bool set_waiter(completion_waiter& waiter,
+                    std::coroutine_handle<> h) noexcept {
+        return waiter_.register_waiter(waiter, h, [this] {
+            return is_done();
+        });
     }
 
     void request_cancel() {
@@ -184,7 +159,7 @@ struct task_state<void> {
     std::atomic<task_status> status_{task_status::pending};
     failure failure_;
     std::exception_ptr exception_;
-    std::atomic<void*> waiter_{nullptr};
+    alignas(64) completion_waiter_slot waiter_;
     std::mutex mutex_;
     // Used by blocking wait()/wait_for() in non-coroutine contexts.
     std::condition_variable cv_;
@@ -229,9 +204,8 @@ struct task_state<void> {
     }
 
     void notify_waiter() {
-        void* waiter_addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-        if (waiter_addr) {
-            auto waiter = std::coroutine_handle<>::from_address(waiter_addr);
+        auto waiter = waiter_.take();
+        if (waiter) {
             runtime::schedule_handle(waiter);
         }
     }
@@ -244,37 +218,12 @@ struct task_state<void> {
                s == task_status::cancelled;
     }
 
-    // Returns true if waiter was stored (should suspend), false if caller must resume locally.
-    bool set_waiter(std::coroutine_handle<> h) noexcept {
-        // Fast path: check if already done before trying to set waiter
-        // This avoids the race of setting a waiter on an already-completed task
-        if (is_done()) {
-            return false;
-        }
-
-        // Try to atomically set the waiter
-        void* expected = nullptr;
-        if (waiter_.compare_exchange_strong(expected, h.address(),
-                std::memory_order_release, std::memory_order_acquire)) {
-            // Race: completion may have happened between is_done() and CAS.
-            if (is_done()) {
-                // Try to reclaim the waiter slot before notify_waiter() does.
-                void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-                if (addr) {
-                    // We won the race: notify_waiter() did not take the waiter,
-                    // so it will not schedule us. Resume locally; do NOT schedule
-                    // here (that would double-resume the coroutine).
-                    return false;
-                }
-                // We lost the race: notify_waiter() already grabbed the waiter
-                // and scheduled (or is about to schedule) it on a worker. Suspend
-                // so the scheduler resumes us exactly once.
-                return true;
-            }
-            return true;
-        }
-        // Another waiter already set (shouldn't happen with single await)
-        return false;
+    // Returns true if waiter was stored (should suspend), false if already done.
+    bool set_waiter(completion_waiter& waiter,
+                    std::coroutine_handle<> h) noexcept {
+        return waiter_.register_waiter(waiter, h, [this] {
+            return is_done();
+        });
     }
 
     void request_cancel() {
@@ -672,6 +621,11 @@ public:
     auto operator co_await() const {
         struct awaiter {
             std::shared_ptr<detail::task_state<T>> state;
+            detail::completion_waiter waiter;
+
+            explicit awaiter(std::shared_ptr<detail::task_state<T>> s)
+                : state(std::move(s))
+                , waiter(state ? &state->waiter_ : nullptr) {}
             
             bool await_ready() const noexcept {
                 if (!state) return true;
@@ -680,7 +634,7 @@ public:
             
             bool await_suspend(std::coroutine_handle<> h) noexcept {
                 if (!state) return false;
-                return state->set_waiter(h);
+                return state->set_waiter(waiter, h);
             }
             
             task_result<T> await_resume() {
@@ -709,7 +663,7 @@ public:
                 }
             }
         };
-        return awaiter{state_};
+        return awaiter(state_);
     }
     
 private:
@@ -857,6 +811,11 @@ public:
     auto operator co_await() const {
         struct awaiter {
             std::shared_ptr<detail::task_state<void>> state;
+            detail::completion_waiter waiter;
+
+            explicit awaiter(std::shared_ptr<detail::task_state<void>> s)
+                : state(std::move(s))
+                , waiter(state ? &state->waiter_ : nullptr) {}
             
             bool await_ready() const noexcept {
                 if (!state) return true;
@@ -865,7 +824,7 @@ public:
             
             bool await_suspend(std::coroutine_handle<> h) noexcept {
                 if (!state) return false;
-                return state->set_waiter(h);
+                return state->set_waiter(waiter, h);
             }
             
             task_result<void> await_resume() {
@@ -890,7 +849,7 @@ public:
                 }
             }
         };
-        return awaiter{state_};
+        return awaiter(state_);
     }
     
 private:

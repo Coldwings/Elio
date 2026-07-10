@@ -5,13 +5,41 @@
 #include <elio/coro/with_timeout.hpp>
 #include <elio/time/timer.hpp>
 #include <atomic>
+#include <chrono>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <type_traits>
 #include "../test_main.cpp"
 
 using namespace elio;
 using namespace elio::coro;
 using namespace elio::test;
+
+namespace {
+
+bool wait_for_count(const std::atomic<int>& value, int expected) {
+    const auto deadline = std::chrono::steady_clock::now() + scaled_ms(2000);
+    while (value.load(std::memory_order_acquire) != expected &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return value.load(std::memory_order_acquire) == expected;
+}
+
+struct throwing_move_callable {
+    throwing_move_callable() = default;
+    throwing_move_callable(const throwing_move_callable&) = delete;
+    throwing_move_callable& operator=(const throwing_move_callable&) = delete;
+    throwing_move_callable(throwing_move_callable&&) noexcept(false) {}
+    throwing_move_callable& operator=(throwing_move_callable&&) = delete;
+
+    task<int> operator()() {
+        co_return 1;
+    }
+};
+
+} // namespace
 
 // --- when_all tests ---
 
@@ -358,6 +386,82 @@ TEST_CASE("when_any winner exception propagates", "[sync][combinators]") {
     runtime::scheduler sched(2);
     sched.go(test);
     sched.shutdown();
+}
+
+TEST_CASE("destroyed when_all waiter is unregistered",
+          "[sync][combinators][cancellation]") {
+    sync::event gate;
+    std::atomic<int> started{0};
+    std::atomic<int> completed{0};
+
+    auto child = [&]() -> task<void> {
+        started.fetch_add(1, std::memory_order_release);
+        co_await gate.wait();
+        completed.fetch_add(1, std::memory_order_release);
+    };
+    auto outer = [&]() -> task<void> {
+        co_await when_all(child, child);
+    };
+
+    runtime::scheduler sched(2);
+    sched.start();
+    auto outer_task = outer();
+    auto h = elio::coro::detail::task_access::release(outer_task);
+    sched.spawn(h);
+
+    REQUIRE(wait_for_count(started, 2));
+    h.destroy();
+    sched.go([&]() -> task<void> {
+        gate.set();
+        co_return;
+    });
+    REQUIRE(wait_for_count(completed, 2));
+    sched.shutdown();
+}
+
+TEST_CASE("destroyed when_any waiter is unregistered",
+          "[sync][combinators][cancellation]") {
+    sync::event gate;
+    std::atomic<int> started{0};
+    std::atomic<int> completed{0};
+
+    auto child = [&]() -> task<int> {
+        started.fetch_add(1, std::memory_order_release);
+        co_await gate.wait();
+        completed.fetch_add(1, std::memory_order_release);
+        co_return 1;
+    };
+    auto outer = [&]() -> task<void> {
+        (void)co_await when_any(child, child);
+    };
+
+    runtime::scheduler sched(2);
+    sched.start();
+    auto outer_task = outer();
+    auto h = elio::coro::detail::task_access::release(outer_task);
+    sched.spawn(h);
+
+    REQUIRE(wait_for_count(started, 2));
+    h.destroy();
+    sched.go([&]() -> task<void> {
+        gate.set();
+        co_return;
+    });
+    REQUIRE(wait_for_count(completed, 2));
+    sched.shutdown();
+}
+
+TEST_CASE("combinator awaitable move traits follow callables",
+          "[sync][combinators]") {
+    using AllAwaitable = elio::detail::when_all_awaitable<throwing_move_callable>;
+    using AnyAwaitable = elio::detail::when_any_awaitable<throwing_move_callable>;
+
+    STATIC_REQUIRE(std::is_move_constructible_v<AllAwaitable>);
+    STATIC_REQUIRE(std::is_move_constructible_v<AnyAwaitable>);
+    STATIC_REQUIRE_FALSE(std::is_nothrow_move_constructible_v<AllAwaitable>);
+    STATIC_REQUIRE_FALSE(std::is_nothrow_move_constructible_v<AnyAwaitable>);
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<AllAwaitable>);
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<AnyAwaitable>);
 }
 
 // --- with_timeout tests ---

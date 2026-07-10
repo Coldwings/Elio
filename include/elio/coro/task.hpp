@@ -2,6 +2,7 @@
 
 #include "promise_base.hpp"
 #include "vthread_stack.hpp"
+#include "detail/completion_waiter.hpp"
 #include <coroutine>
 #include <optional>
 #include <exception>
@@ -100,7 +101,7 @@ struct task_access {
 };
 
 struct join_state_base {
-    alignas(64) std::atomic<void*> waiter_{nullptr};
+    alignas(64) completion_waiter_slot waiter_;
     std::atomic<bool> completed_{false};
     std::atomic<bool> destroyed_{false};
     std::mutex destroyed_mtx_;
@@ -108,9 +109,8 @@ struct join_state_base {
 
     void complete() {
         completed_.store(true, std::memory_order_release);
-        void* waiter_addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-        if (waiter_addr) {
-            auto waiter = std::coroutine_handle<>::from_address(waiter_addr);
+        auto waiter = waiter_.take();
+        if (waiter) {
             runtime::schedule_handle(waiter);
         }
     }
@@ -138,18 +138,11 @@ struct join_state_base {
         return completed_.load(std::memory_order_acquire);
     }
 
-    bool set_waiter(std::coroutine_handle<> h) noexcept {
-        void* expected = nullptr;
-        if (waiter_.compare_exchange_strong(expected, h.address(),
-                std::memory_order_release, std::memory_order_acquire)) {
-            if (completed_.load(std::memory_order_acquire)) {
-                void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-                if (addr) return false;
-                return true;
-            }
-            return true;
-        }
-        return false;
+    bool set_waiter(completion_waiter& waiter,
+                    std::coroutine_handle<> h) noexcept {
+        return waiter_.register_waiter(waiter, h, [this] {
+            return completed_.load(std::memory_order_acquire);
+        });
     }
 };
 
@@ -198,10 +191,16 @@ template<typename T>
 class join_handle {
 public:
     explicit join_handle(std::shared_ptr<detail::join_state<T>> state) noexcept
-        : state_(std::move(state)) {}
+        : state_(std::move(state)), waiter_(state_->waiter_) {}
 
     join_handle(join_handle&&) noexcept = default;
-    join_handle& operator=(join_handle&&) noexcept = default;
+    join_handle& operator=(join_handle&& other) noexcept {
+        if (this != &other) {
+            waiter_ = std::move(other.waiter_);
+            state_ = std::move(other.state_);
+        }
+        return *this;
+    }
 
     join_handle(const join_handle&) = delete;
     join_handle& operator=(const join_handle&) = delete;
@@ -213,7 +212,7 @@ public:
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
         // Keep a local copy of the shared_ptr to prevent use-after-free.
         auto state = state_;
-        return state->set_waiter(awaiter);
+        return state->set_waiter(waiter_, awaiter);
     }
 
     T await_resume() {
@@ -244,6 +243,7 @@ public:
 
 private:
     std::shared_ptr<detail::join_state<T>> state_;
+    detail::completion_waiter waiter_;
 };
 
 /// Specialization for void
@@ -251,10 +251,16 @@ template<>
 class join_handle<void> {
 public:
     explicit join_handle(std::shared_ptr<detail::join_state<void>> state) noexcept
-        : state_(std::move(state)) {}
+        : state_(std::move(state)), waiter_(state_->waiter_) {}
     
     join_handle(join_handle&&) noexcept = default;
-    join_handle& operator=(join_handle&&) noexcept = default;
+    join_handle& operator=(join_handle&& other) noexcept {
+        if (this != &other) {
+            waiter_ = std::move(other.waiter_);
+            state_ = std::move(other.state_);
+        }
+        return *this;
+    }
     
     join_handle(const join_handle&) = delete;
     join_handle& operator=(const join_handle&) = delete;
@@ -267,7 +273,7 @@ public:
         // Keep a local copy of the shared_ptr to prevent use-after-free.
         // See join_handle<T>::await_suspend for detailed explanation.
         auto state = state_;
-        return state->set_waiter(awaiter);
+        return state->set_waiter(waiter_, awaiter);
     }
 
     void await_resume() {
@@ -297,6 +303,7 @@ public:
 
 private:
     std::shared_ptr<detail::join_state<void>> state_;
+    detail::completion_waiter waiter_;
 };
 
 /// Primary template for task<T> where T is not void

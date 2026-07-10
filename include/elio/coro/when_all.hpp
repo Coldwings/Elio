@@ -12,6 +12,7 @@
 
 #include "traits.hpp"
 #include "cancel_token.hpp"
+#include "detail/completion_waiter.hpp"
 #include "../log/macros.hpp"
 #include "../runtime/spawn.hpp"
 
@@ -32,7 +33,7 @@ using when_all_slot_t = typename when_all_slot<T>::type;
 template<typename... Fs>
 struct when_all_state {
     std::atomic<size_t> remaining_;
-    std::atomic<void*> waiter_{nullptr};
+    coro::detail::completion_waiter_slot waiter_;
     std::tuple<std::optional<when_all_slot_t<callable_result_t<Fs>>>...> values_;
     std::exception_ptr first_exception_;
     std::atomic<bool> has_exception_{false};
@@ -42,12 +43,18 @@ struct when_all_state {
 
     void complete_one() {
         if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-            if (addr) {
-                runtime::schedule_handle(
-                    std::coroutine_handle<>::from_address(addr));
+            auto waiter = waiter_.take();
+            if (waiter) {
+                runtime::schedule_handle(waiter);
             }
         }
+    }
+
+    bool set_waiter(coro::detail::completion_waiter& waiter,
+                    std::coroutine_handle<> handle) noexcept {
+        return waiter_.register_waiter(waiter, handle, [this] {
+            return remaining_.load(std::memory_order_acquire) == 0;
+        });
     }
 
     void store_exception(std::exception_ptr ex) {
@@ -66,12 +73,29 @@ struct when_all_state {
 template<typename... Fs>
 struct when_all_awaitable {
     using state_type = when_all_state<Fs...>;
+    using callables_type = std::tuple<Fs...>;
     std::shared_ptr<state_type> state_;
-    std::tuple<Fs...> callables_;
+    coro::detail::completion_waiter waiter_;
+    callables_type callables_;
 
     explicit when_all_awaitable(Fs... fs)
         : state_(std::make_shared<state_type>(sizeof...(Fs)))
+        , waiter_(state_->waiter_)
         , callables_(std::move(fs)...) {}
+
+    when_all_awaitable(when_all_awaitable&&)
+        noexcept(std::is_nothrow_move_constructible_v<callables_type>) = default;
+
+    when_all_awaitable& operator=(when_all_awaitable&& other)
+        noexcept(std::is_nothrow_move_assignable_v<callables_type>)
+        requires std::is_move_assignable_v<callables_type> {
+        if (this != &other) {
+            waiter_ = std::move(other.waiter_);
+            state_ = std::move(other.state_);
+            callables_ = std::move(other.callables_);
+        }
+        return *this;
+    }
 
     bool await_ready() const noexcept { return false; }
 
@@ -101,21 +125,20 @@ struct when_all_awaitable {
     }
 
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        void* expected = nullptr;
-        state_->waiter_.compare_exchange_strong(expected, awaiter.address(),
-            std::memory_order_release, std::memory_order_relaxed);
+        bool should_suspend = state_->set_waiter(waiter_, awaiter);
 
         spawn_all(std::index_sequence_for<Fs...>{});
 
-        // Always suspend and rely on complete_one() -> schedule_handle()
-        // for resumption.  schedule_handle() provides sufficient internal
+        // Non-empty inputs suspend and rely on complete_one() ->
+        // schedule_handle() for resumption. An empty input is already complete.
+        // schedule_handle() provides sufficient internal
         // synchronization (mutex/atomic in the scheduler's mpsc_queue) to
         // establish happens-before between sub-task data writes and the
         // waiter's await_resume reads.  An inline fast-path (returning
         // false when remaining_ is already 0) would lack this synchronization:
         // the waiter's acquire load on remaining_ only synchronizes with
         // the decrement, not the subsequent data stores in complete_one().
-        return true;
+        return should_suspend;
     }
 
     auto await_resume() {

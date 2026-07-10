@@ -86,19 +86,27 @@ jobs:
             exit 2
           fi
 
+          server_job_running() {
+            local pid="$1"
+            jobs -pr | grep -Fxq "$pid"
+          }
+
           cleanup_server() {
             local pid="${1:-}"
             [[ -z "$pid" ]] && return 0
 
-            if kill -0 "$pid" 2>/dev/null; then
+            if server_job_running "$pid"; then
               kill "$pid" 2>/dev/null || true
               for _ in {1..20}; do
-                if ! kill -0 "$pid" 2>/dev/null; then
-                  break
+                if ! server_job_running "$pid"; then
+                  wait "$pid" 2>/dev/null || true
+                  return 0
                 fi
                 sleep 0.2
               done
-              kill -9 "$pid" 2>/dev/null || true
+              if server_job_running "$pid"; then
+                kill -9 "$pid" 2>/dev/null || true
+              fi
             fi
             wait "$pid" 2>/dev/null || true
           }
@@ -109,7 +117,8 @@ jobs:
             local server_log="$3"
 
             for _ in {1..20}; do
-              if ! kill -0 "$pid" 2>/dev/null; then
+              if ! server_job_running "$pid"; then
+                wait "$pid" 2>/dev/null || true
                 echo "::error::benchmark server exited before accepting connections"
                 cat "$server_log" || true
                 return 1

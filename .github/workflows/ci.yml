@@ -171,22 +171,24 @@ jobs:
         find_package(Elio REQUIRED)
 
         add_executable(consumer main.cpp)
-        target_link_libraries(consumer PRIVATE Elio::elio)
+        foreach(required_target IN ITEMS
+            Elio::elio_tls
+            Elio::elio_http
+            Elio::elio_http2)
+          if(NOT TARGET ${required_target})
+            message(FATAL_ERROR "Expected installed target ${required_target}")
+          endif()
+        endforeach()
 
-        if(TARGET Elio::elio_tls)
-          target_link_libraries(consumer PRIVATE Elio::elio_tls)
-          target_compile_definitions(consumer PRIVATE ELIO_HAS_TLS_TARGET=1)
-        endif()
-
-        if(TARGET Elio::elio_http)
-          target_link_libraries(consumer PRIVATE Elio::elio_http)
-          target_compile_definitions(consumer PRIVATE ELIO_HAS_HTTP_TARGET=1)
-        endif()
-
-        if(TARGET Elio::elio_http2)
-          target_link_libraries(consumer PRIVATE Elio::elio_http2)
-          target_compile_definitions(consumer PRIVATE ELIO_HAS_HTTP2_TARGET=1)
-        endif()
+        target_link_libraries(consumer PRIVATE
+          Elio::elio
+          Elio::elio_tls
+          Elio::elio_http
+          Elio::elio_http2)
+        target_compile_definitions(consumer PRIVATE
+          ELIO_HAS_TLS_TARGET=1
+          ELIO_HAS_HTTP_TARGET=1
+          ELIO_HAS_HTTP2_TARGET=1)
         EOF
 
         cat > consumer/main.cpp << 'EOF'

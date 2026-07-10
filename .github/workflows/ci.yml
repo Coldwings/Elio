@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   # Detect which files changed to conditionally run expensive CI jobs

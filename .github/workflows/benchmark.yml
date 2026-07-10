@@ -59,6 +59,8 @@ jobs:
             echo "::error::duration and warmup must be non-negative integers"
             exit 2
           fi
+          duration=$((10#$duration))
+          warmup=$((10#$warmup))
 
           case "$mode" in
             pingpong|streaming) phase_count=1 ;;
@@ -73,6 +75,15 @@ jobs:
           client_timeout=$(( (duration + warmup) * message_size_count * phase_count + 60 ))
           if (( client_timeout < 60 )); then
             client_timeout=60
+          fi
+
+          backend_count=3
+          job_timeout_s=$((30 * 60))
+          setup_margin_s=300
+          max_total_client_timeout=$((job_timeout_s - setup_margin_s))
+          if (( client_timeout * backend_count > max_total_client_timeout )); then
+            echo "::error::duration, warmup, and mode require up to $((client_timeout * backend_count))s of client timeout budget, which does not fit in the 30-minute job timeout with setup margin"
+            exit 2
           fi
 
           cleanup_server() {

@@ -462,41 +462,36 @@ coro::task<void> advanced_h2_client() {
 ### TLS Client
 
 ```cpp
+#include <elio/elio.hpp>
 #include <elio/tls/tls.hpp>
+#include <string_view>
 
+using namespace elio;
 using namespace elio::tls;
 
 coro::task<void> secure_connection() {
-    // Create TLS context
-    tls_context tls_ctx(tls_mode::client);
-    tls_ctx.use_default_verify_paths();
-    tls_ctx.set_verify_mode(verify_mode::peer);
+    auto tls_ctx = tls_context::make_client();
 
-    // Connect TCP
-    auto tcp = co_await tcp_connect(ipv4_address("example.com", 443));
-    if (!tcp) co_return;
-
-    // Wrap with TLS
-    tls_stream stream(std::move(*tcp), tls_ctx);
-    stream.set_hostname("example.com");  // SNI
-    
-    // Perform handshake
-    auto hs = co_await stream.handshake();
-    if (!hs) {
-        ELIO_LOG_ERROR("TLS handshake failed");
+    // Resolve the hostname, connect TCP, and complete the TLS handshake.
+    auto stream = co_await tls_connect(tls_ctx, "example.com", 443);
+    if (!stream) {
+        ELIO_LOG_ERROR("TLS connection failed");
         co_return;
     }
-    
+
     // Send HTTPS request
-    const char* req = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-    co_await stream.write(req, strlen(req));
-    
+    constexpr std::string_view request =
+        "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    co_await stream->write_exactly(request);
+
     // Read response
     char buffer[4096];
-    auto result = co_await stream.read(buffer, sizeof(buffer));
+    auto result = co_await stream->read(buffer, sizeof(buffer));
     if (result.result > 0) {
         ELIO_LOG_INFO("Response: {}", std::string_view(buffer, result.result));
     }
+
+    co_await stream->shutdown();
     co_return;
 }
 ```
@@ -504,26 +499,25 @@ coro::task<void> secure_connection() {
 ### TLS Server
 
 ```cpp
+#include <elio/elio.hpp>
+#include <elio/tls/tls.hpp>
+
+using namespace elio;
+using namespace elio::tls;
+
 coro::task<void> tls_server(uint16_t port) {
     // Create TLS context with certificate
-    tls_context tls_ctx(tls_mode::server);
-    tls_ctx.load_certificate("server.crt");
-    tls_ctx.load_private_key("server.key");
+    auto tls_ctx = tls_context::make_server("server.crt", "server.key");
 
-    auto listener = tcp_listener::bind(ipv4_address(port));
+    auto listener = tls_listener::bind(net::ipv4_address(port), tls_ctx);
     if (!listener) co_return;
 
     while (true) {
-        auto tcp = co_await listener->accept();
-        if (!tcp) continue;
+        // accept() completes the TLS handshake before returning.
+        auto stream = co_await listener->accept();
+        if (!stream) continue;
 
-        // Wrap accepted connection with TLS
-        tls_stream stream(std::move(*tcp), tls_ctx);
-
-        auto hs = co_await stream.handshake();
-        if (hs) {
-            // Handle secure connection
-        }
+        // Handle secure connection...
     }
 }
 ```

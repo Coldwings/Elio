@@ -240,6 +240,15 @@ inline std::array<uint8_t, 4> generate_mask_key() {
 /// @param payload Payload data (will be masked if header.masked is true)
 /// @return Encoded frame as bytes
 inline std::vector<uint8_t> encode_frame(const frame_header& header, std::string_view payload) {
+    if (is_control_frame(header.op)) {
+        if (!header.fin) {
+            throw std::invalid_argument("websocket: control frame cannot be fragmented");
+        }
+        if (payload.size() > 125) {
+            throw std::invalid_argument("websocket: control frame payload too large");
+        }
+    }
+
     std::vector<uint8_t> frame;
     
     // Calculate header size

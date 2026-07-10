@@ -141,9 +141,9 @@ public:
             co_return;
         }
 
+        auto frame = encode_close_frame(code, reason, true);
         state_ = connection_state::closing;
 
-        auto frame = encode_close_frame(code, reason, true);
         co_await send_raw(frame);
 
         // Wait for close response (with timeout)

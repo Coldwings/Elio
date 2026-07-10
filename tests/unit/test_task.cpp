@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/coro/task_handle.hpp>
 #include <elio/coro/frame.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/spawn.hpp>
@@ -67,6 +68,43 @@ TEST_CASE("task is non-movable", "[task]") {
     STATIC_REQUIRE_FALSE(std::is_move_assignable_v<task<void>>);
     STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<task<void>>);
     STATIC_REQUIRE_FALSE(std::is_copy_assignable_v<task<void>>);
+}
+
+TEST_CASE("destroyed task_handle waiter is unregistered",
+          "[task][task_handle][cancellation]") {
+    auto state = std::make_shared<elio::coro::detail::task_state<void>>();
+    task_handle<void> handle(state);
+
+    auto waiter_task = [&]() -> task<void> {
+        auto result = co_await handle;
+        (void)result;
+    };
+
+    auto waiter = waiter_task();
+    auto h = elio::coro::detail::task_access::release(waiter);
+    h.resume();
+    REQUIRE_FALSE(h.done());
+
+    h.destroy();
+    state->set_value();
+}
+
+TEST_CASE("destroyed join_handle waiter is unregistered",
+          "[task][join_handle][cancellation]") {
+    auto state = std::make_shared<elio::coro::detail::join_state<void>>();
+
+    auto waiter_task = [state]() -> task<void> {
+        join_handle<void> handle(state);
+        co_await handle;
+    };
+
+    auto waiter = waiter_task();
+    auto h = elio::coro::detail::task_access::release(waiter);
+    h.resume();
+    REQUIRE_FALSE(h.done());
+
+    h.destroy();
+    state->set_value();
 }
 
 TEST_CASE("task<int> co_return value", "[task]") {

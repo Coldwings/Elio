@@ -12,6 +12,7 @@
 #include "traits.hpp"
 #include "when_all.hpp"
 #include "cancel_token.hpp"
+#include "detail/completion_waiter.hpp"
 #include "../log/macros.hpp"
 #include "../runtime/scheduler.hpp"
 #include "../runtime/spawn.hpp"
@@ -49,7 +50,7 @@ struct when_any_state {
     using result_type = std::variant<when_all_slot_t<when_any_result_t<Fs>>...>;
 
     std::atomic<bool> resolved_{false};
-    std::atomic<void*> waiter_{nullptr};
+    coro::detail::completion_waiter_slot waiter_;
     result_type result_;
     std::exception_ptr exception_;
     size_t winner_index_{0};
@@ -93,11 +94,17 @@ struct when_any_state {
     }
 
     void resume_waiter() {
-        void* addr = waiter_.exchange(nullptr, std::memory_order_acq_rel);
-        if (addr) {
-            runtime::schedule_handle(
-                std::coroutine_handle<>::from_address(addr));
+        auto waiter = waiter_.take();
+        if (waiter) {
+            runtime::schedule_handle(waiter);
         }
+    }
+
+    bool set_waiter(coro::detail::completion_waiter& waiter,
+                    std::coroutine_handle<> handle) noexcept {
+        return waiter_.register_waiter(waiter, handle, [this] {
+            return resolved_.load(std::memory_order_acquire);
+        });
     }
 };
 
@@ -106,10 +113,24 @@ struct when_any_awaitable {
     using state_type = when_any_state<Fs...>;
     std::shared_ptr<state_type> state_;
     std::tuple<Fs...> callables_;
+    coro::detail::completion_waiter waiter_;
 
     explicit when_any_awaitable(Fs... fs)
         : state_(std::make_shared<state_type>())
-        , callables_(std::move(fs)...) {}
+        , callables_(std::move(fs)...)
+        , waiter_(state_->waiter_) {}
+
+    when_any_awaitable(when_any_awaitable&&) noexcept = default;
+
+    when_any_awaitable& operator=(when_any_awaitable&& other)
+        noexcept(std::is_nothrow_move_assignable_v<std::tuple<Fs...>>) {
+        if (this != &other) {
+            waiter_ = std::move(other.waiter_);
+            state_ = std::move(other.state_);
+            callables_ = std::move(other.callables_);
+        }
+        return *this;
+    }
 
     bool await_ready() const noexcept { return false; }
 
@@ -144,14 +165,12 @@ struct when_any_awaitable {
     }
 
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        void* expected = nullptr;
-        state_->waiter_.compare_exchange_strong(expected, awaiter.address(),
-            std::memory_order_release, std::memory_order_relaxed);
+        bool should_suspend = state_->set_waiter(waiter_, awaiter);
 
         spawn_all(std::index_sequence_for<Fs...>{});
 
-        // Always suspend and rely on resume_waiter() -> schedule_handle()
-        // for resumption.  schedule_handle() provides sufficient internal
+        // Suspend and rely on resume_waiter() -> schedule_handle() for
+        // resumption. schedule_handle() provides sufficient internal
         // synchronization (mutex/atomic in the scheduler's mpsc_queue) to
         // establish happens-before between the winner's data writes
         // (winner_index_, result_) and the waiter's await_resume reads.
@@ -159,7 +178,7 @@ struct when_any_awaitable {
         // true) would lack this synchronization: the waiter's acquire load
         // on resolved_ only synchronizes with writes BEFORE the CAS release
         // in resolve(), not the subsequent data stores.
-        return true;
+        return should_suspend;
     }
 
     auto await_resume() {

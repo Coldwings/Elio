@@ -126,25 +126,25 @@ tls_ctx.load_certificate("/path/to/client.crt");
 tls_ctx.load_private_key("/path/to/client.key");
 ```
 
-## Concurrent Requests
+## Connection Reuse and Concurrency
 
-HTTP/2 excels at handling multiple concurrent requests:
+`h2_client` reuses pooled HTTP/2 connections for sequential requests. The
+current high-level client does not coordinate multiple in-flight requests over
+one shared connection; callers that need application-level concurrency should
+use separate client instances or serialize calls until shared-session
+multiplexing is implemented.
 
 ```cpp
-coro::task<void> parallel_requests() {
+coro::task<void> repeated_requests() {
     h2_client client;
 
-    // Spawn multiple requests concurrently
-    auto h1 = elio::spawn([&]() { return client.get("https://api.example.com/users/1"); });
-    auto h2 = elio::spawn([&]() { return client.get("https://api.example.com/users/2"); });
-    auto h3 = elio::spawn([&]() { return client.get("https://api.example.com/users/3"); });
-
-    // Wait for all responses
-    auto r1 = co_await h1;
-    auto r2 = co_await h2;
-    auto r3 = co_await h3;
-
-    // All requests used the same TCP connection!
+    for (int id = 1; id <= 3; ++id) {
+        auto resp = co_await client.get("https://api.example.com/users/" +
+                                        std::to_string(id));
+        if (!resp) {
+            co_return;
+        }
+    }
 }
 ```
 
@@ -253,17 +253,17 @@ coro::task<void> connection_lifecycle() {
 
 | Feature | HTTP/2 | HTTP/1.1 |
 |---------|--------|----------|
-| Multiplexing | Yes | No (pipelining limited) |
+| Multiplexing | Protocol/session support; high-level client serializes pooled use | No (pipelining limited) |
 | Header compression | HPACK | None |
 | Binary protocol | Yes | Text-based |
 | Server push | Supported | No |
 | TLS required | Yes (in practice) | No |
-| Connection reuse | Single connection | Connection pool |
+| Connection reuse | Sequential pooled reuse | Connection pool |
 
 ### When to Use HTTP/2
 
 **Use HTTP/2 when:**
-- Making many concurrent requests to the same host
+- Making repeated HTTPS requests to the same host
 - Bandwidth is limited (header compression helps)
 - Low latency is critical
 - Server supports HTTP/2
@@ -295,8 +295,9 @@ auto resp = co_await client.get("https://example.com/");
 
 ## Best Practices
 
-1. **Reuse clients**: Create one h2_client per host and reuse it
-2. **Use concurrency**: Take advantage of multiplexing with parallel requests
+1. **Reuse clients**: Create one h2_client per host and reuse it for sequential requests
+2. **Avoid concurrent use of one h2_client**: use separate clients for
+   parallel work until high-level shared-session multiplexing is implemented
 3. **Handle errors**: Always check response validity
 4. **Set timeouts**: Configure appropriate timeouts for your use case
 5. **Verify certificates**: Only disable certificate verification for testing

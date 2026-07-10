@@ -2,7 +2,7 @@
 /// @brief HTTP/2 Client Example
 ///
 /// This example demonstrates how to make HTTP/2 requests using Elio's
-/// HTTP/2 client with multiplexed streams over TLS.
+/// HTTP/2 client with TLS/ALPN and sequential connection reuse.
 ///
 /// Usage: ./http2_client [url]
 /// Default: Fetches https://nghttp2.org/
@@ -52,10 +52,10 @@ coro::task<void> run_demo(const std::string& base_url) {
         }
     }
 
-    // 2. Multiple requests using same connection (HTTP/2 multiplexing)
-    ELIO_LOG_INFO("\n--- HTTP/2 Connection Multiplexing ---");
+    // 2. Multiple sequential requests using the client's connection pool
+    ELIO_LOG_INFO("\n--- HTTP/2 Connection Reuse ---");
     {
-        ELIO_LOG_INFO("Making multiple requests over single HTTP/2 connection...");
+        ELIO_LOG_INFO("Making multiple sequential requests with one client...");
         for (int i = 1; i <= 3; ++i) {
             ELIO_LOG_INFO("Request {}/3...", i);
             auto result = co_await client.get(base_url);
@@ -67,7 +67,7 @@ coro::task<void> run_demo(const std::string& base_url) {
                 ELIO_LOG_ERROR("  Request {} failed", i);
             }
         }
-        ELIO_LOG_INFO("All requests used HTTP/2 multiplexed streams on single connection");
+        ELIO_LOG_INFO("Sequential requests completed");
     }
 
     ELIO_LOG_INFO("\n=== HTTP/2 Client Example Complete ===");

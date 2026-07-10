@@ -167,8 +167,8 @@ private:
 ///
 /// Usage:
 ///   auto [a, b] = co_await elio::when_all(
-///       []() -> task<int> { co_return 1; },
-///       []() -> task<int> { co_return 2; }
+///       []() -> coro::task<int> { co_return 1; },
+///       []() -> coro::task<int> { co_return 2; }
 ///   );
 template<typename... Fs>
     requires ((std::invocable<Fs> && detail::is_task_v<std::invoke_result_t<Fs>>) && ...)

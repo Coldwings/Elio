@@ -502,7 +502,7 @@ sync::event evt;
 
 // This is safe even if the waiter times out and is destroyed:
 coro::task<void> waiter_with_timeout() {
-    auto result = co_await with_timeout(5s, [](cancel_token tok) -> task<void> {
+    auto result = co_await with_timeout(5s, [](coro::cancel_token tok) -> coro::task<void> {
         co_await evt.wait();
     });
     if (!result) {  // timed out

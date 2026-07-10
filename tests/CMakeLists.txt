@@ -244,6 +244,18 @@ add_test(NAME package_elio_compile_feature_export
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_elio_compile_feature_export.cmake
 )
 
+if(TARGET nghttp2_static)
+    add_test(NAME http2_fetchcontent_cache_scope
+        COMMAND ${CMAKE_COMMAND}
+            -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+            -DELIO_BINARY_DIR=${CMAKE_BINARY_DIR}/tests/cmake/http2_fetchcontent_cache_scope
+            -DELIO_PARENT_BINARY_DIR=${CMAKE_BINARY_DIR}
+            -DELIO_PARENT_FMT_SOURCE_DIR=${fmt_SOURCE_DIR}
+            -DELIO_PARENT_NGHTTP2_SOURCE_DIR=${nghttp2_SOURCE_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_http2_fetchcontent_cache_scope.cmake
+    )
+endif()
+
 add_test(NAME package_version_compatibility
     COMMAND ${CMAKE_COMMAND}
         -DELIO_VERSION_FILE=${CMAKE_BINARY_DIR}/ElioConfigVersion.cmake

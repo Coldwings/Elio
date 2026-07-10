@@ -134,19 +134,67 @@ if(ELIO_ENABLE_HTTP AND TARGET elio_tls)
             GIT_REPOSITORY https://github.com/nghttp2/nghttp2.git
             GIT_TAG v1.64.0
         )
-        # Configure nghttp2 build options
-        set(ENABLE_LIB_ONLY ON CACHE BOOL "" FORCE)
-        set(ENABLE_STATIC_LIB ON CACHE BOOL "" FORCE)
-        set(ENABLE_SHARED_LIB OFF CACHE BOOL "" FORCE)
-        set(ENABLE_DOC OFF CACHE BOOL "" FORCE)
-        set(ENABLE_APP OFF CACHE BOOL "" FORCE)
-        set(ENABLE_HPACK_TOOLS OFF CACHE BOOL "" FORCE)
-        set(ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
-        set(ENABLE_FAILMALLOC OFF CACHE BOOL "" FORCE)
-        set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-        set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
-        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-        FetchContent_MakeAvailable(nghttp2)
+
+        function(_elio_fetch_nghttp2)
+            # Keep nghttp2's generic option names scoped to the dependency.
+            # With CMP0077 NEW (CMake 3.14+ in nghttp2), normal variables
+            # drive option() defaults without rewriting the parent cache.
+            set(_elio_nghttp2_cache_vars
+                CMAKE_BUILD_TYPE
+                ENABLE_LIB_ONLY
+                ENABLE_DOC
+                ENABLE_APP
+                ENABLE_HPACK_TOOLS
+                ENABLE_EXAMPLES
+                ENABLE_FAILMALLOC
+                BUILD_TESTING
+                BUILD_STATIC_LIBS
+                BUILD_SHARED_LIBS
+            )
+            foreach(_var IN LISTS _elio_nghttp2_cache_vars)
+                get_property(_had_cache CACHE "${_var}" PROPERTY TYPE SET)
+                set("_elio_nghttp2_${_var}_had_cache" "${_had_cache}")
+                if(_had_cache)
+                    get_property("_elio_nghttp2_${_var}_type"
+                        CACHE "${_var}" PROPERTY TYPE)
+                    get_property("_elio_nghttp2_${_var}_help"
+                        CACHE "${_var}" PROPERTY HELPSTRING)
+                    get_property("_elio_nghttp2_${_var}_value"
+                        CACHE "${_var}" PROPERTY VALUE)
+                endif()
+            endforeach()
+
+            set(ENABLE_LIB_ONLY ON)
+            set(ENABLE_DOC OFF)
+            set(ENABLE_APP OFF)
+            set(ENABLE_HPACK_TOOLS OFF)
+            set(ENABLE_EXAMPLES OFF)
+            set(ENABLE_FAILMALLOC OFF)
+            set(BUILD_TESTING OFF)
+            set(BUILD_STATIC_LIBS ON)
+            set(BUILD_SHARED_LIBS OFF)
+
+            FetchContent_MakeAvailable(nghttp2)
+            FetchContent_GetProperties(nghttp2
+                SOURCE_DIR _elio_nghttp2_source_dir
+                BINARY_DIR _elio_nghttp2_binary_dir)
+            set(nghttp2_SOURCE_DIR "${_elio_nghttp2_source_dir}" PARENT_SCOPE)
+            set(nghttp2_BINARY_DIR "${_elio_nghttp2_binary_dir}" PARENT_SCOPE)
+
+            foreach(_var IN LISTS _elio_nghttp2_cache_vars)
+                set(_had_var "_elio_nghttp2_${_var}_had_cache")
+                if(${_had_var})
+                    set(_value_var "_elio_nghttp2_${_var}_value")
+                    set(_type_var "_elio_nghttp2_${_var}_type")
+                    set(_help_var "_elio_nghttp2_${_var}_help")
+                    set(${_var} "${${_value_var}}"
+                        CACHE "${${_type_var}}" "${${_help_var}}" FORCE)
+                else()
+                    unset(${_var} CACHE)
+                endif()
+            endforeach()
+        endfunction()
+        _elio_fetch_nghttp2()
 
         # Create elio_http2 target with HTTP/2 support
         add_library(elio_http2 INTERFACE)

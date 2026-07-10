@@ -21,7 +21,7 @@
 - **File Helpers**: High-level async read/write/append operations
 - **TCP Networking**: async client/server with connection management
 - **HTTP/1.1**: full client and server implementation
-- **HTTP/2**: client with multiplexed streams via nghttp2
+- **HTTP/2**: HTTPS client built on nghttp2 with HPACK and stream handling
 - **WebSocket**: bidirectional real-time communication (RFC 6455)
 - **Server-Sent Events**: server-to-client event streaming
 - **TLS/HTTPS**: OpenSSL-based with ALPN and certificate verification

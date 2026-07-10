@@ -182,6 +182,31 @@ TEST_CASE("HTTP/2 stream state", "[http2]") {
     }
 }
 
+TEST_CASE("HTTP/2 client configuration", "[http2][config]") {
+    SECTION("session config defaults match documented client defaults") {
+        h2_session_config cfg;
+        REQUIRE(cfg.max_concurrent_streams == 100);
+        REQUIRE(cfg.initial_window_size == NGHTTP2_INITIAL_WINDOW_SIZE);
+        REQUIRE(cfg.user_agent == "elio-http2/1.0");
+        REQUIRE_FALSE(cfg.enable_push);
+    }
+
+    SECTION("h2_client preserves custom public config values") {
+        h2_client_config cfg;
+        cfg.max_concurrent_streams = 7;
+        cfg.initial_window_size = 32768;
+        cfg.user_agent = "elio-test-agent/1.0";
+        cfg.enable_push = true;
+
+        h2_client client(cfg);
+
+        REQUIRE(client.config().max_concurrent_streams == 7);
+        REQUIRE(client.config().initial_window_size == 32768);
+        REQUIRE(client.config().user_agent == "elio-test-agent/1.0");
+        REQUIRE(client.config().enable_push);
+    }
+}
+
 TEST_CASE("nghttp2 library version", "[http2]") {
     // Basic check that nghttp2 is linked and functional
     nghttp2_info* info = nghttp2_version(0);

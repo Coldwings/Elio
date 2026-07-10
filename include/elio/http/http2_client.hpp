@@ -44,9 +44,11 @@ public:
     h2_connection() = default;
     
     /// Create HTTP/2 connection (takes ownership of TLS stream)
-    explicit h2_connection(tls::tls_stream tls)
+    explicit h2_connection(tls::tls_stream tls,
+                           h2_session_config config = {})
         : tls_stream_(std::make_unique<tls::tls_stream>(std::move(tls)))
-        , session_(std::make_unique<h2_session>(*tls_stream_)) {}
+        , session_(std::make_unique<h2_session>(*tls_stream_,
+                                                std::move(config))) {}
     
     // Move only
     h2_connection(h2_connection&&) = default;
@@ -181,6 +183,16 @@ public:
     const h2_client_config& config() const noexcept { return config_; }
     
 private:
+    static h2_session_config make_session_config(
+        const h2_client_config& config) {
+        return h2_session_config{
+            .max_concurrent_streams = config.max_concurrent_streams,
+            .initial_window_size = config.initial_window_size,
+            .user_agent = config.user_agent,
+            .enable_push = config.enable_push,
+        };
+    }
+
     static coro::join_handle<void>
     arm_tls_io_watchdog(runtime::scheduler* sched,
                         tls::tls_stream* stream,
@@ -335,7 +347,8 @@ private:
 
             ELIO_LOG_DEBUG("HTTP/2 connection established to {}:{}", host, port);
 
-            h2_connection conn(std::move(tls_stream));
+            h2_connection conn(std::move(tls_stream),
+                               make_session_config(config_));
             if (!co_await process_with_timeout(conn, host, port)) {
                 ELIO_LOG_ERROR("HTTP/2 session initialization failed");
                 continue;

@@ -300,7 +300,7 @@ Each `promise_base` also carries debug metadata:
 
 ## Coroutine Frame Allocation
 
-Coroutine frames are heap-allocated by default using `::operator new/delete`. When the optional `vthread_stack` allocator is enabled (gated by `ELIO_ENABLE_VTHREAD_STACK`), each vthread maintains its own segmented bump-pointer stack allocator. Coroutine frames are allocated in LIFO order within segments. When a segment is exhausted, a new segment is allocated and linked.
+Coroutine frames use `vthread_stack` whenever a coroutine is running inside a vthread stack context. Each vthread maintains its own segmented bump-pointer stack allocator, so nested coroutine frames are allocated in LIFO order within segments. When a segment is exhausted, a new segment is allocated and linked.
 
 ### Sanitizer compatibility
 

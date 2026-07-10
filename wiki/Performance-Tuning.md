@@ -309,12 +309,7 @@ For best io_uring performance:
 
 ### Coroutine Frame Allocation
 
-By default, coroutine frames are allocated using `::operator new/delete`. When the optional `vthread_stack` allocator is enabled (gated by `ELIO_ENABLE_VTHREAD_STACK`), each vthread maintains a segmented bump-pointer stack allocator for coroutine frames. Under sanitizers, all allocations automatically fall back to `::operator new/delete`.
-
-```cpp
-// Enable vthread_stack allocator (optional)
-// cmake -DELIО_ENABLE_VTHREAD_STACK=ON ..
-```
+Coroutine frames use `vthread_stack` whenever a coroutine is running inside a vthread stack context. Each vthread maintains a segmented bump-pointer stack allocator for coroutine frames. Under sanitizers, all allocations automatically fall back to `::operator new/delete`.
 
 ### Avoiding Allocations
 

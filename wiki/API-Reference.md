@@ -882,8 +882,18 @@ auto result = co_await async_writev(fd, iovecs, count);
 auto result = co_await async_recv(fd, buffer, length, flags);
 auto result = co_await async_send(fd, buffer, length, flags);
 
-// Accept
-auto [client_fd, addr] = co_await async_accept(listen_fd, &addr, &addrlen);
+// Accept. The accepted fd is returned in io_result::result; peer storage is
+// populated through the addr/addrlen pointers when provided.
+struct sockaddr_storage peer_addr{};
+socklen_t peer_len = sizeof(peer_addr);
+auto accept_result = co_await async_accept(
+    listen_fd,
+    reinterpret_cast<struct sockaddr*>(&peer_addr),
+    &peer_len);
+if (accept_result.result >= 0) {
+    int client_fd = accept_result.result;
+    // peer_addr contains the peer address.
+}
 
 // Connect
 auto result = co_await async_connect(fd, addr, addrlen);

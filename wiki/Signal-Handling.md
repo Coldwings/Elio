@@ -108,10 +108,10 @@ if (sigfd) { /* ... */ }  // bool conversion
 int fd = sigfd.fd();
 
 // Async wait
-auto info = co_await sigfd.wait();
+auto async_info = co_await sigfd.wait();
 
 // Sync try-read (non-blocking)
-auto info = sigfd.try_read();
+auto ready_info = sigfd.try_read();
 
 // Update signal set
 signal_set new_sigs{SIGUSR2};
@@ -249,6 +249,9 @@ coro::task<void> shutdown_handler() {
     signal_fd sigfd(sigs);
 
     auto info = co_await sigfd.wait();
+    if (!info) {
+        co_return;
+    }
     ELIO_LOG_INFO("Shutdown signal received: {}", info->full_name());
     g_running = false;
     co_return;
@@ -315,6 +318,9 @@ coro::task<void> signal_handler() {
     signal_fd sigfd(signal_set{SIGINT, SIGTERM});
     
     auto info = co_await sigfd.wait();  // Full coroutine support!
+    if (!info) {
+        co_return;
+    }
     
     // Can use any function here
     co_await cleanup_connections();

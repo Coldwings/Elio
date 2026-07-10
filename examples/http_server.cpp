@@ -149,7 +149,7 @@ coro::task<response> user_handler(context& ctx) {
     co_return response::json(json);
 }
 
-/// Async main - uses ELIO_ASYNC_MAIN with elio::serve() for clean server lifecycle
+/// Async main - run from main() after shutdown signals are masked for signalfd
 coro::task<int> async_main(int argc, char* argv[]) {
     uint16_t port = 8080;
     bool use_https = false;
@@ -226,7 +226,7 @@ coro::task<int> async_main(int argc, char* argv[]) {
     ELIO_LOG_INFO("Press Ctrl+C to stop");
 
     // Start server and wait for shutdown signal
-    // elio::serve() handles signal waiting and graceful shutdown automatically
+    // elio::serve() waits for masked shutdown signals and stops the server
     if (use_https) {
         try {
             auto tls_ctx = tls::tls_context::make_server(cert_file, key_file);
@@ -244,5 +244,8 @@ coro::task<int> async_main(int argc, char* argv[]) {
     co_return 0;
 }
 
-// Use ELIO_ASYNC_MAIN - handles scheduler creation, execution, and shutdown automatically
-ELIO_ASYNC_MAIN(async_main)
+int main(int argc, char* argv[]) {
+    elio::signal::signal_set shutdown_signals(elio::default_shutdown_signals);
+    shutdown_signals.block_all_threads();
+    return elio::run(async_main, argc, argv);
+}

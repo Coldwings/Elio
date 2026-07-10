@@ -20,7 +20,11 @@
 ///     co_return 0;
 /// }
 ///
-/// ELIO_ASYNC_MAIN(async_main)
+/// int main(int argc, char* argv[]) {
+///     elio::signal::signal_set shutdown_signals(elio::default_shutdown_signals);
+///     shutdown_signals.block_all_threads();
+///     return elio::run(async_main, argc, argv);
+/// }
 /// @endcode
 
 #include <elio/coro/task.hpp>
@@ -67,6 +71,11 @@ inline void ignore_sigpipe_in_serve_once() {
 /// @param signals Signal set to wait for (defaults to SIGINT, SIGTERM)
 /// @return signal_info about the received signal
 ///
+/// @note Process-directed shutdown signals must be blocked before scheduler
+/// threads are created, so they remain pending for signalfd instead of being
+/// delivered to an unmasked thread. Use an explicit main() that calls
+/// signal_set::block_all_threads() before elio::run().
+///
 /// Example:
 /// @code
 /// coro::task<void> server_main() {
@@ -105,6 +114,11 @@ inline coro::task<signal::signal_info> wait_shutdown_signal(
 /// @param listen_func Function that returns the listen coroutine task
 /// @param signals Signals to wait for shutdown (defaults to SIGINT, SIGTERM)
 ///
+/// @note Block the same shutdown signals before starting the scheduler, for
+/// example in main() before elio::run(). ELIO_ASYNC_MAIN does not mask the
+/// calling thread, so a process-directed SIGINT/SIGTERM can terminate the
+/// process before serve() observes it.
+///
 /// Example:
 /// @code
 /// coro::task<int> async_main(int argc, char* argv[]) {
@@ -117,7 +131,11 @@ inline coro::task<signal::signal_info> wait_shutdown_signal(
 ///     co_return 0;
 /// }
 ///
-/// ELIO_ASYNC_MAIN(async_main)
+/// int main(int argc, char* argv[]) {
+///     elio::signal::signal_set shutdown_signals(elio::default_shutdown_signals);
+///     shutdown_signals.block_all_threads();
+///     return elio::run(async_main, argc, argv);
+/// }
 /// @endcode
 template<typename Server, typename ListenFunc>
     requires std::invocable<ListenFunc>
@@ -168,6 +186,8 @@ coro::task<void> serve(Server& server, ListenFunc listen_func,
 /// @param listen_func Callable returning the TLS listen coroutine task
 /// @param signals Signals to wait for shutdown
 ///
+/// @note See serve() for the required shutdown-signal masking setup.
+///
 /// Example:
 /// @code
 /// coro::task<int> async_main(int argc, char* argv[]) {
@@ -209,6 +229,12 @@ coro::task<void> serve(Server& server, ListenFunc listen_func,
 ///             [&]() { return ws_srv.listen(addr2); }
 ///         )
 ///     );
+/// }
+///
+/// int main() {
+///     elio::signal::signal_set shutdown_signals(elio::default_shutdown_signals);
+///     shutdown_signals.block_all_threads();
+///     return elio::run(run_servers);
 /// }
 /// @endcode
 template<typename... Servers, typename... ListenFuncs>

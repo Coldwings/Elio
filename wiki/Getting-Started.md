@@ -78,6 +78,10 @@ Elio has several optional feature flags, each controlled by a CMake option. The 
 | `ELIO_ENABLE_TLS` | OpenSSL | TLS/SSL streams, HTTPS support |
 | `ELIO_ENABLE_HTTP` | OpenSSL via the current `elio_tls` target | HTTP/1.1 client and server, WebSocket, SSE; plaintext and TLS endpoints at runtime |
 | `ELIO_ENABLE_HTTP2` | nghttp2 plus enabled HTTP/TLS targets | HTTP/2 multiplexed connections over TLS |
+| `ELIO_ENABLE_RDMA` | None beyond core Elio dependencies | Header-only RDMA-Core abstraction |
+| `ELIO_ENABLE_RDMA_CM` | `librdmacm` plus enabled RDMA core target | RDMA Connection Manager helpers |
+| `ELIO_ENABLE_RDMA_IBVERBS` | `libibverbs` plus enabled RDMA core target | Reference libibverbs backend and endpoint wrapper |
+| `ELIO_ENABLE_RDMA_CUDA` | CUDA Toolkit plus enabled ibverbs target | CUDA GPUDirect RDMA helpers |
 
 Link the target for the feature your code includes:
 
@@ -87,6 +91,10 @@ Link the target for the feature your code includes:
 | TLS | `elio_tls` | `Elio::elio_tls` |
 | HTTP/1.1, WebSocket, SSE | `elio_http` | `Elio::elio_http` |
 | HTTP/2 | `elio_http2` | `Elio::elio_http2` |
+| RDMA core | `elio_rdma` | `Elio::elio_rdma` |
+| RDMA CM helper | `elio_rdma_cm` | `Elio::elio_rdma_cm` |
+| RDMA ibverbs backend | `elio_rdma_ibverbs` | `Elio::elio_rdma_ibverbs` |
+| RDMA CUDA helpers | `elio_rdma_cuda` | `Elio::elio_rdma_cuda` |
 
 Feature targets exist only when their options are enabled. For FetchContent or
 `add_subdirectory`, set the options before adding Elio:
@@ -103,6 +111,12 @@ target_link_libraries(your_target PRIVATE elio_http2)
 An installed package exports only the feature targets that were enabled when
 that package was built. `Elio::elio_http2` therefore requires an Elio install
 configured with TLS, HTTP, and HTTP/2 enabled.
+
+The same rule applies to installed RDMA targets. `Elio::elio_rdma` is the
+header-only RDMA core abstraction. `Elio::elio_rdma_cm` restores `librdmacm`,
+`Elio::elio_rdma_ibverbs` restores `libibverbs`, and `Elio::elio_rdma_cuda`
+restores `CUDAToolkit` when `find_package(Elio)` loads the installed package.
+Link the most specific RDMA target whose headers your code includes.
 
 `elio_http` currently depends on the TLS target at build/link time, so
 OpenSSL must be available even if your application only uses plaintext

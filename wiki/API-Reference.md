@@ -170,7 +170,7 @@ auto result = co_await h;
 
 ### `join_handle<T>`
 
-Handle for awaiting spawned tasks. Returned by `task<T>::spawn()`.
+Handle for awaiting spawned tasks. Returned by `elio::spawn(...)`.
 
 ```cpp
 template<typename T = void>
@@ -376,20 +376,20 @@ public:
 
 **Basic Example:**
 ```cpp
-task<void> cancellable_work(cancel_token token) {
+coro::task<void> cancellable_work(coro::cancel_token token) {
     while (!token.is_cancelled()) {
         // Do some work...
         
         // Cancellable sleep
         auto result = co_await time::sleep_for(100ms, token);
-        if (result == cancel_result::cancelled) {
+        if (result == coro::cancel_result::cancelled) {
             break;  // Exit early
         }
     }
 }
 
-task<void> controller() {
-    cancel_source source;
+coro::task<void> controller() {
+    coro::cancel_source source;
     
     // Start work with token
     elio::go(cancellable_work, source.get_token());
@@ -1771,10 +1771,10 @@ template<typename Rep, typename Period>
 /* awaitable */ sleep_for(std::chrono::duration<Rep, Period> duration);
 
 // Sleep for duration with cancellation support
-// Returns cancel_result::completed or cancel_result::cancelled
+// Returns coro::cancel_result::completed or coro::cancel_result::cancelled
 template<typename Rep, typename Period>
-/* awaitable<cancel_result> */ sleep_for(std::chrono::duration<Rep, Period> duration,
-                                          coro::cancel_token token);
+/* awaitable<coro::cancel_result> */ sleep_for(std::chrono::duration<Rep, Period> duration,
+                                               coro::cancel_token token);
 
 // Sleep until time point
 template<typename Clock, typename Duration>
@@ -1786,7 +1786,7 @@ template<typename Clock, typename Duration>
 
 **Example:**
 ```cpp
-task<void> example(coro::cancel_token token) {
+coro::task<void> example(coro::cancel_token token) {
     // Simple sleep
     co_await time::sleep_for(100ms);
     

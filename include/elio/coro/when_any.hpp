@@ -212,8 +212,8 @@ struct when_any_awaitable {
 ///
 /// Usage:
 ///   auto [idx, value] = co_await elio::when_any(
-///       [](cancel_token tok) -> task<int> { co_return co_await fetch(key, tok); },
-///       []() -> task<int> { co_await sleep_for(10s); co_return -1; }
+///       [](coro::cancel_token tok) -> coro::task<int> { co_return co_await fetch(key, tok); },
+///       []() -> coro::task<int> { co_await sleep_for(10s); co_return -1; }
 ///   );
 template<typename... Fs>
     requires (detail::when_any_callable<Fs> && ...)

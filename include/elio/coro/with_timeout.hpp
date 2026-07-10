@@ -39,7 +39,7 @@ struct timeout_result<void> {
 /// Use operator bool() or .timed_out to check, operator*() to get the value.
 ///
 /// Usage:
-///   if (auto r = co_await with_timeout(200ms, [](cancel_token tok) -> task<int> {
+///   if (auto r = co_await with_timeout(200ms, [](coro::cancel_token tok) -> coro::task<int> {
 ///       co_return co_await remote_fetch(key, tok);
 ///   })) {
 ///       use(*r);

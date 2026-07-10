@@ -186,7 +186,7 @@ struct join_state<void> : join_state_base {
 } // namespace detail
 
 /// Join handle for awaiting spawned tasks
-/// Returned by task<T>::spawn(), allows co_await to get the result
+/// Returned by elio::spawn(), allows co_await to get the result
 template<typename T>
 class join_handle {
 public:

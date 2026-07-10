@@ -218,7 +218,9 @@ public:
     ///
     /// Spawn this alongside the producer loop, e.g.
     /// ```cpp
-    /// conn.run_heartbeat(std::chrono::seconds(30), token).go();
+    /// elio::go([&conn, token]() {
+    ///     return conn.run_heartbeat(std::chrono::seconds(30), token);
+    /// });
     /// ```
     /// The loop exits when the connection is no longer active, when the
     /// optional cancellation token fires, or when `interval == 0`.

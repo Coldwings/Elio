@@ -111,7 +111,10 @@ if(ELIO_ENABLE_TLS AND OPENSSL_FOUND)
     target_compile_definitions(elio_tls INTERFACE ELIO_HAS_TLS=1)
     message(STATUS "TLS support enabled")
 elseif(ELIO_ENABLE_TLS AND NOT OPENSSL_FOUND)
-    message(STATUS "OpenSSL not found, TLS support will be disabled")
+    message(FATAL_ERROR
+        "ELIO_ENABLE_TLS=ON requires OpenSSL development files. "
+        "Install libssl-dev/openssl-devel or configure with "
+        "-DELIO_ENABLE_TLS=OFF.")
 elseif(NOT ELIO_ENABLE_TLS)
     message(STATUS "TLS support disabled (ELIO_ENABLE_TLS=OFF)")
 endif()
@@ -213,7 +216,10 @@ if(ELIO_ENABLE_HTTP AND TARGET elio_tls)
         message(STATUS "HTTP/2 support enabled via nghttp2")
     endif()
 elseif(ELIO_ENABLE_HTTP AND NOT TARGET elio_tls)
-    message(STATUS "HTTP support requires TLS, but TLS is not available")
+    message(FATAL_ERROR
+        "ELIO_ENABLE_HTTP=ON requires TLS support. Enable "
+        "ELIO_ENABLE_TLS=ON with OpenSSL available, or configure with "
+        "-DELIO_ENABLE_HTTP=OFF.")
 elseif(NOT ELIO_ENABLE_HTTP)
     message(STATUS "HTTP support disabled (ELIO_ENABLE_HTTP=OFF)")
 endif()

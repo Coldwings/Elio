@@ -34,7 +34,6 @@ jobs:
 
   build-and-test:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -47,10 +46,16 @@ jobs:
     name: ${{ matrix.arch.name }}-${{ matrix.build_type }}
 
     steps:
+    - name: Skip non-code changes
+      if: needs.changes.outputs.code != 'true'
+      run: echo "No code changes detected; CI matrix job intentionally skipped."
+
     - name: Checkout repository
+      if: needs.changes.outputs.code == 'true'
       uses: actions/checkout@v7
 
     - name: Install dependencies
+      if: needs.changes.outputs.code == 'true'
       run: |
         sudo apt-get update
         sudo apt-get install -y \
@@ -60,6 +65,7 @@ jobs:
           g++-14
 
     - name: Configure CMake
+      if: needs.changes.outputs.code == 'true'
       run: |
         cmake -B build -G Ninja \
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
@@ -72,42 +78,49 @@ jobs:
           -DELIO_ENABLE_HTTP2=ON
 
     - name: Build
+      if: needs.changes.outputs.code == 'true'
       run: cmake --build build --parallel
 
     - name: Run unit tests
+      if: needs.changes.outputs.code == 'true'
       run: ./build/tests/elio_tests
 
     - name: Run ASAN tests
-      if: matrix.build_type == 'Debug'
+      if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Debug'
       run: ./build/tests/elio_tests_asan
       env:
         ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
 
     - name: Run TSAN tests
-      if: matrix.build_type == 'Debug'
+      if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Debug'
       run: ./build/tests/elio_tests_tsan
       env:
         TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
 
     - name: Run benchmark
-      if: matrix.build_type == 'Release'
+      if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
       run: ./build/examples/benchmark
 
     - name: Run channel benchmark
-      if: matrix.build_type == 'Release'
+      if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
       run: ./build/examples/bench_channel
 
   package-consumer-check:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     name: package-consumer-check
 
     steps:
+    - name: Skip non-code changes
+      if: needs.changes.outputs.code != 'true'
+      run: echo "No code changes detected; package consumer check intentionally skipped."
+
     - name: Checkout repository
+      if: needs.changes.outputs.code == 'true'
       uses: actions/checkout@v7
 
     - name: Install dependencies
+      if: needs.changes.outputs.code == 'true'
       run: |
         sudo apt-get update
         sudo apt-get install -y \
@@ -119,6 +132,7 @@ jobs:
           g++-14
 
     - name: Configure CMake (installable build)
+      if: needs.changes.outputs.code == 'true'
       run: |
         cmake -B build -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
@@ -131,11 +145,13 @@ jobs:
           -DELIO_ENABLE_HTTP2=ON
 
     - name: Build and install
+      if: needs.changes.outputs.code == 'true'
       run: |
         cmake --build build --parallel
         cmake --install build --prefix ${{ github.workspace }}/_install
 
     - name: Verify downstream consumption
+      if: needs.changes.outputs.code == 'true'
       run: |
         mkdir -p consumer
         cat > consumer/CMakeLists.txt << 'EOF'

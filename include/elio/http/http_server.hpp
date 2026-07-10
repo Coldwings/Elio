@@ -301,7 +301,8 @@ public:
         ELIO_LOG_INFO("HTTP server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
-        auto accept_token = reset_accept_cancel_source();
+        auto accept_source = register_accept_cancel_source();
+        auto accept_token = accept_source->get_token();
         running_.store(true, std::memory_order_release);
 
         while (running_.load(std::memory_order_acquire)) {
@@ -347,7 +348,8 @@ public:
         ELIO_LOG_INFO("HTTPS server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
-        auto accept_token = reset_accept_cancel_source();
+        auto accept_source = register_accept_cancel_source();
+        auto accept_token = accept_source->get_token();
         running_.store(true, std::memory_order_release);
 
         // Capture tls_ctx by pointer rather than by reference so that the
@@ -379,7 +381,7 @@ public:
     /// Stop the server
     void stop() {
         running_.store(false, std::memory_order_release);
-        cancel_active_accept();
+        cancel_active_accepts();
     }
 
     /// Check if server is running
@@ -696,15 +698,39 @@ private:
         co_return true;
     }
 
-    coro::cancel_token reset_accept_cancel_source() {
+    std::shared_ptr<coro::cancel_source> register_accept_cancel_source() {
+        auto source = std::make_shared<coro::cancel_source>();
         std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
-        accept_cancel_source_ = coro::cancel_source{};
-        return accept_cancel_source_.get_token();
+        auto it = active_accept_sources_.begin();
+        while (it != active_accept_sources_.end()) {
+            if (it->expired()) {
+                it = active_accept_sources_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        active_accept_sources_.push_back(source);
+        return source;
     }
 
-    void cancel_active_accept() {
-        std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
-        accept_cancel_source_.cancel();
+    void cancel_active_accepts() {
+        std::vector<std::shared_ptr<coro::cancel_source>> sources;
+        {
+            std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+            auto it = active_accept_sources_.begin();
+            while (it != active_accept_sources_.end()) {
+                if (auto source = it->lock()) {
+                    sources.push_back(std::move(source));
+                    ++it;
+                } else {
+                    it = active_accept_sources_.erase(it);
+                }
+            }
+        }
+
+        for (auto& source : sources) {
+            source->cancel();
+        }
     }
 
     bool accept_loop_should_stop(const coro::cancel_token& accept_token) noexcept {
@@ -723,7 +749,7 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<size_t> active_connections_{0};  ///< In-flight connection handlers
     mutable std::mutex accept_cancel_mutex_;
-    coro::cancel_source accept_cancel_source_;
+    std::vector<std::weak_ptr<coro::cancel_source>> active_accept_sources_;
 };
 
 /// Convenience function to create a simple HTTP server

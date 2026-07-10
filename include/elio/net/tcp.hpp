@@ -868,6 +868,15 @@ public:
         : io::io_awaitable_base()
         , addr_(addr), opts_(opts) {}
 
+    tcp_connect_awaitable(const socket_address& addr,
+                          coro::cancel_token token,
+                          const tcp_options& opts = {})
+        : io::io_awaitable_base()
+        , addr_(addr)
+        , opts_(opts)
+        , token_(std::move(token))
+        , cancellable_(true) {}
+
     ~tcp_connect_awaitable() {
         if (fd_ >= 0) {
             io::close_fd_for_destructor(fd_);
@@ -885,7 +894,44 @@ public:
 
     template<typename Promise>
     bool await_suspend(std::coroutine_handle<Promise> awaiter) {
+        if (is_cancellable() && token_.is_cancelled()) {
+            already_cancelled_before_setup_ = true;
+            result_ = io::io_result{-ECANCELED, 0};
+            return false;
+        }
+
         bind_to_worker(awaiter);
+        auto& ctx = io::current_io_context();
+
+        if (is_cancellable()) {
+            auto state = std::make_shared<io::detail::io_cancel_state>();
+            state->ctx = &ctx;
+            state->awaiter = awaiter;
+            state->worker = runtime::worker_thread::current();
+            cancel_state_ = state;
+
+            cancel_registration_ = token_.on_cancel([state]() {
+                state->cancelled.store(true, std::memory_order_release);
+                if (!state->worker) {
+                    return;
+                }
+                auto exec = io::detail::make_io_cancel_executor(state, true);
+                if (auto* promise = coro::get_promise_base(exec.handle.address())) {
+                    promise->set_affinity(state->worker->worker_id());
+                    promise->set_worker_local();
+                    promise->detach_from_parent();
+                }
+                state->worker->schedule_or_destroy(exec.handle);
+            });
+
+            if (token_.is_cancelled()) {
+                cancel_registration_.unregister();
+                state->resumed.store(true, std::memory_order_release);
+                already_cancelled_before_setup_ = true;
+                result_ = io::io_result{-ECANCELED, 0};
+                return false;
+            }
+        }
 
         // Create socket with appropriate address family
         fd_ = socket(addr_.family(), SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -921,7 +967,6 @@ public:
 
         // Connection in progress, wait for socket to become writable
         connect_in_progress_ = true;
-        auto& ctx = io::current_io_context();
 
         io::io_request req{};
         req.op = io::io_op::poll_write;
@@ -931,28 +976,64 @@ public:
         req.awaiter = awaiter;
         req.state = setup_op_state(awaiter);
 
+        if (cancel_state_) {
+            cancel_state_->op = req.state;
+            if (cancel_state_->cancelled.load(std::memory_order_acquire)) {
+                clear_op_state();
+                cancel_state_->op = nullptr;
+                cancel_registration_.unregister();
+                ::close(fd_);
+                fd_ = -1;
+                result_ = io::io_result{-ECANCELED, 0};
+                return false;
+            }
+        }
+
         if (!ctx.prepare(req)) {
             clear_op_state();
+            if (cancel_state_) {
+                cancel_state_->op = nullptr;
+            }
+            cancel_registration_.unregister();
             ::close(fd_);
             fd_ = -1;
             result_ = io::io_result{-EAGAIN, 0};
             return false;  // Don't suspend, resume immediately
+        }
+        if (cancel_state_ &&
+            cancel_state_->cancelled.load(std::memory_order_acquire)) {
+            ctx.cancel(io::tagged_op_state_user_data(req.state));
         }
         // No explicit submit: poll() auto-submits at the top of its loop
         return true;  // Suspend, will be resumed by completion handler
     }
     
     std::optional<tcp_stream> await_resume() {
+        cancel_registration_.unregister();
+        bool was_cancelled = already_cancelled_before_setup_;
+        if (is_cancellable()) {
+            was_cancelled = was_cancelled || token_.is_cancelled();
+        }
+        if (cancel_state_) {
+            cancel_state_->resumed.store(true, std::memory_order_release);
+            was_cancelled = was_cancelled ||
+                            cancel_state_->cancelled.load(std::memory_order_acquire);
+        }
+
         restore_affinity();
 
         // Async path completion result comes from op_state.
         if (connect_in_progress_ && fd_ >= 0) {
             result_ = read_result_from_op_state();
         }
+        if (was_cancelled && result_.success()) {
+            result_ = io::io_result{-ECANCELED, 0};
+        }
 
         // For non-blocking connect, writability means completion, not success.
         // Use SO_ERROR to fetch the actual connect result.
-        if (connect_in_progress_ && result_.success() && fd_ >= 0) {
+        if (!was_cancelled && connect_in_progress_ && result_.success() &&
+            fd_ >= 0) {
             int so_error = 0;
             socklen_t len = sizeof(so_error);
             if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &so_error, &len) != 0) {
@@ -987,6 +1068,13 @@ private:
     socklen_t sa_len_ = sizeof(sa_);
     int fd_ = -1;
     bool connect_in_progress_ = false;
+    coro::cancel_token token_;
+    coro::cancel_token::registration cancel_registration_;
+    std::shared_ptr<io::detail::io_cancel_state> cancel_state_;
+    bool cancellable_ = false;
+    bool already_cancelled_before_setup_ = false;
+
+    bool is_cancellable() const noexcept { return cancellable_; }
 };
 
 /// Connect to a remote TCP server (IPv4)
@@ -995,16 +1083,37 @@ inline auto tcp_connect(const ipv4_address& addr,
     return tcp_connect_awaitable(socket_address(addr), opts);
 }
 
+/// Connect to a remote TCP server (IPv4), cancellable by token
+inline auto tcp_connect(const ipv4_address& addr,
+                        coro::cancel_token token,
+                        const tcp_options& opts = {}) {
+    return tcp_connect_awaitable(socket_address(addr), std::move(token), opts);
+}
+
 /// Connect to a remote TCP server (IPv6)
 inline auto tcp_connect(const ipv6_address& addr,
                         const tcp_options& opts = {}) {
     return tcp_connect_awaitable(socket_address(addr), opts);
 }
 
+/// Connect to a remote TCP server (IPv6), cancellable by token
+inline auto tcp_connect(const ipv6_address& addr,
+                        coro::cancel_token token,
+                        const tcp_options& opts = {}) {
+    return tcp_connect_awaitable(socket_address(addr), std::move(token), opts);
+}
+
 /// Connect to a remote TCP server (generic address)
 inline auto tcp_connect(const socket_address& addr,
                         const tcp_options& opts = {}) {
     return tcp_connect_awaitable(addr, opts);
+}
+
+/// Connect to a remote TCP server (generic address), cancellable by token
+inline auto tcp_connect(const socket_address& addr,
+                        coro::cancel_token token,
+                        const tcp_options& opts = {}) {
+    return tcp_connect_awaitable(addr, std::move(token), opts);
 }
 
 } // namespace elio::net

@@ -11,13 +11,19 @@
 #include <elio/net/stream.hpp>
 #include <elio/net/resolve.hpp>
 #include <elio/tls/tls_context.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/log/macros.hpp>
+#include <elio/runtime/scheduler.hpp>
+#include <elio/time/timer.hpp>
 
+#include <atomic>
 #include <string>
 #include <chrono>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 namespace elio::http {
@@ -45,8 +51,8 @@ inline size_t next_rotation_offset(const std::string& host, uint16_t port, size_
 /// Base configuration shared by all HTTP-based clients
 /// Can be embedded in more specific configuration structures
 struct base_client_config {
-    std::chrono::seconds connect_timeout{10};     ///< Connection timeout
-    std::chrono::seconds read_timeout{30};        ///< Read timeout
+    std::chrono::seconds connect_timeout{10};     ///< TCP connect + TLS handshake timeout; <=0 disables
+    std::chrono::seconds read_timeout{30};        ///< Read timeout; <=0 disables
     size_t read_buffer_size = 8192;               ///< Read buffer size
     std::string user_agent;                          ///< User-Agent header (empty = no header)
     bool verify_certificate = true;               ///< Verify TLS certificates
@@ -75,12 +81,14 @@ inline void init_client_tls_context(tls::tls_context& ctx, bool verify_certifica
 /// @param port Port number
 /// @param secure If true, use TLS
 /// @param tls_ctx TLS context (required if secure)
+/// @param connect_timeout TCP connect + TLS handshake timeout; <=0 disables
 /// @return Connected stream or std::nullopt on error
 inline coro::task<std::optional<net::stream>>
 client_connect(std::string_view host, uint16_t port, bool secure,
                tls::tls_context* tls_ctx,
                net::resolve_options resolve_opts = net::default_cached_resolve_options(),
-               bool rotate_resolved_addresses = true) {
+               bool rotate_resolved_addresses = true,
+               std::chrono::nanoseconds connect_timeout = std::chrono::nanoseconds::zero()) {
 
     auto addresses = co_await net::resolve_all(host, port, resolve_opts);
     if (addresses.empty()) {
@@ -92,40 +100,110 @@ client_connect(std::string_view host, uint16_t port, bool secure,
         ? detail::next_rotation_offset(std::string(host), port, addresses.size())
         : 0;
 
+    auto* sched = runtime::scheduler::current();
+    const bool deadline_enforced = sched != nullptr && connect_timeout.count() > 0;
+    auto op_cancel_src = std::make_shared<coro::cancel_source>();
+    auto timer_cancel_src = std::make_shared<coro::cancel_source>();
+    auto timed_out = std::make_shared<std::atomic<bool>>(false);
+    std::optional<coro::join_handle<void>> watchdog;
+
+    if (deadline_enforced) {
+        watchdog.emplace(sched->go_joinable(
+            [timeout = connect_timeout,
+             timer_source = timer_cancel_src,
+             op_source = op_cancel_src,
+             flag = timed_out]() -> coro::task<void> {
+                auto r = co_await elio::time::sleep_for(
+                    timeout, timer_source->get_token());
+                if (r == coro::cancel_result::completed) {
+                    flag->store(true, std::memory_order_release);
+                    op_source->cancel();
+                }
+                co_return;
+            }));
+    }
+
+    auto stop_watchdog = [&]() -> coro::task<void> {
+        timer_cancel_src->cancel();
+        if (watchdog) {
+            auto wd = std::move(*watchdog);
+            watchdog.reset();
+            co_await std::move(wd);
+        }
+        co_return;
+    };
+
+    auto check_timeout = [&]() -> bool {
+        if (timed_out->load(std::memory_order_acquire)) {
+            errno = ETIMEDOUT;
+            return true;
+        }
+        return false;
+    };
+
     if (secure) {
         if (!tls_ctx) {
+            co_await stop_watchdog();
             ELIO_LOG_ERROR("TLS context required for secure connection to {}:{}", host, port);
             co_return std::nullopt;
         }
 
         for (size_t i = 0; i < addresses.size(); ++i) {
             const auto& addr = addresses[(offset + i) % addresses.size()];
-            auto tcp = co_await net::tcp_connect(addr);
+            std::optional<net::tcp_stream> tcp;
+            if (deadline_enforced) {
+                tcp = co_await net::tcp_connect(addr, op_cancel_src->get_token());
+            } else {
+                tcp = co_await net::tcp_connect(addr);
+            }
+            if (check_timeout()) {
+                co_await stop_watchdog();
+                co_return std::nullopt;
+            }
             if (!tcp) {
                 continue;
             }
 
             tls::tls_stream tls_stream(std::move(*tcp), *tls_ctx);
             tls_stream.set_hostname(host);
-            auto hs = co_await tls_stream.handshake();
+            auto hs = deadline_enforced
+                ? co_await tls_stream.handshake(op_cancel_src->get_token())
+                : co_await tls_stream.handshake();
+            if (check_timeout()) {
+                co_await stop_watchdog();
+                co_return std::nullopt;
+            }
             if (!hs) {
                 continue;
             }
 
+            co_await stop_watchdog();
             co_return net::stream(std::move(tls_stream));
         }
 
+        co_await stop_watchdog();
         ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(errno));
         co_return std::nullopt;
     } else {
         for (size_t i = 0; i < addresses.size(); ++i) {
             const auto& addr = addresses[(offset + i) % addresses.size()];
-            auto result = co_await net::tcp_connect(addr);
+            std::optional<net::tcp_stream> result;
+            if (deadline_enforced) {
+                result = co_await net::tcp_connect(addr, op_cancel_src->get_token());
+            } else {
+                result = co_await net::tcp_connect(addr);
+            }
+            if (check_timeout()) {
+                co_await stop_watchdog();
+                co_return std::nullopt;
+            }
             if (result) {
+                co_await stop_watchdog();
                 co_return net::stream(std::move(*result));
             }
         }
 
+        co_await stop_watchdog();
         ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(errno));
         co_return std::nullopt;
     }

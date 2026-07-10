@@ -312,6 +312,8 @@ coro::task<void> advanced_client() {
     config.user_agent = "MyApp/1.0";
     config.follow_redirects = true;
     config.max_redirects = 5;
+    config.connect_timeout = std::chrono::seconds(10);  // TCP connect + TLS handshake
+    config.read_timeout = std::chrono::seconds(30);     // request/response I/O
 
     client c(config);
     

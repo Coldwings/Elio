@@ -1225,6 +1225,8 @@ struct client_config : base_client_config {
     std::chrono::seconds pool_idle_timeout{60};
     size_t max_response_size = 16 * 1024 * 1024;
     // Inherited: connect_timeout{10}, read_timeout{30}, user_agent
+    // connect_timeout bounds TCP connect and TLS handshake; <=0 disables
+    // read_timeout bounds request/response I/O; <=0 disables
 };
 ```
 

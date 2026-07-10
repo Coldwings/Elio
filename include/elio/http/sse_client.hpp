@@ -490,7 +490,8 @@ private:
             url_.is_secure(),
             &tls_ctx_,
             config_.resolve_options,
-            config_.rotate_resolved_addresses);
+            config_.rotate_resolved_addresses,
+            config_.connect_timeout);
         if (!conn_result) {
             state_ = client_state::disconnected;
             co_return false;

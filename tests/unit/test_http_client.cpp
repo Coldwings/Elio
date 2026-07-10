@@ -1,9 +1,10 @@
 // Integration tests for elio::http::client hardening:
 //   1. max_response_size aborts a body that exceeds the cap.
 //   2. read_timeout interrupts a stalled response read.
-//   3. A connection with leftover bytes after the response is NOT pooled
+//   3. connect_timeout interrupts stalled TLS handshake during setup.
+//   4. A connection with leftover bytes after the response is NOT pooled
 //      (response-splitting prevention).
-//   4. Repeated informational responses cannot bypass max_response_size.
+//   5. Repeated informational responses cannot bypass max_response_size.
 //
 // These exercise the post-PR send_request path. We stand up a tiny TCP
 // listener that pretends to be an HTTP server and craft hand-built byte
@@ -15,8 +16,12 @@
 #include <elio/net/tcp.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/time/timer.hpp>
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+#include <elio/tls/tls_context.hpp>
+#endif
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -30,6 +35,11 @@ namespace {
 
 std::string make_url(uint16_t port, std::string_view path = "/") {
     return std::string("http://127.0.0.1:") + std::to_string(port) +
+           std::string(path);
+}
+
+std::string make_https_url(uint16_t port, std::string_view path = "/") {
+    return std::string("https://127.0.0.1:") + std::to_string(port) +
            std::string(path);
 }
 
@@ -163,6 +173,66 @@ TEST_CASE("HTTP client read_timeout fires on a stalled server",
     REQUIRE(client_failed);
     REQUIRE(client_errno == ETIMEDOUT);
 }
+
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+TEST_CASE("HTTP client connect_timeout fires on a stalled TLS handshake",
+          "[http][client][timeout][tls]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_failed{false};
+    std::atomic<int> client_errno{0};
+    std::atomic<int64_t> client_elapsed_ms{-1};
+
+    // Server: accept TCP, but never speak TLS. The client must not wait for
+    // read_timeout here; connect_timeout covers connection setup.
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        co_await elio::time::sleep_for(std::chrono::seconds(3));
+        stream->shutdown_socket();
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::client_config cfg;
+        cfg.connect_timeout = std::chrono::seconds(1);
+        cfg.read_timeout = std::chrono::seconds(10);
+        elio::http::client c(cfg);
+        c.tls_context().set_verify_mode(elio::tls::verify_mode::none);
+
+        auto t0 = std::chrono::steady_clock::now();
+        auto resp = co_await c.get(make_https_url(port));
+        auto elapsed = std::chrono::steady_clock::now() - t0;
+
+        client_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            elapsed).count();
+        if (!resp) {
+            client_failed = true;
+            client_errno = errno;
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(client_failed);
+    REQUIRE(client_errno == ETIMEDOUT);
+    REQUIRE(client_elapsed_ms.load() >= 0);
+    REQUIRE(client_elapsed_ms.load() < 3000);
+}
+#endif
 
 TEST_CASE("HTTP client returns OK for clean keep-alive responses",
           "[http][client]") {

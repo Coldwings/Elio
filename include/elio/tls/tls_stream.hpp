@@ -194,6 +194,61 @@ public:
             }
         }
     }
+
+    /// Perform TLS handshake asynchronously, cancellable by token
+    /// @return true on success, false on error or cancellation (check errno)
+    coro::task<bool> handshake(coro::cancel_token token) {
+        while (true) {
+            if (token.is_cancelled()) {
+                errno = ECANCELED;
+                co_return false;
+            }
+
+            ERR_clear_error();
+            int ret = (mode_ == tls_mode::client) ? SSL_connect(ssl_) : SSL_accept(ssl_);
+
+            if (ret == 1) {
+                handshake_complete_ = true;
+                ELIO_LOG_DEBUG("TLS handshake complete (protocol: {}, cipher: {})",
+                              SSL_get_version(ssl_), SSL_get_cipher_name(ssl_));
+                co_return true;
+            }
+
+            int err = SSL_get_error(ssl_, ret);
+
+            if (err == SSL_ERROR_WANT_READ) {
+                auto result = co_await tcp_.poll_read(token);
+                if (result.was_cancelled() || result.io.result == -ECANCELED) {
+                    errno = ECANCELED;
+                    co_return false;
+                }
+                if (result.io.result < 0) {
+                    errno = -result.io.result;
+                    co_return false;
+                }
+            } else if (err == SSL_ERROR_WANT_WRITE) {
+                auto result = co_await tcp_.poll_write(token);
+                if (result.was_cancelled() || result.io.result == -ECANCELED) {
+                    errno = ECANCELED;
+                    co_return false;
+                }
+                if (result.io.result < 0) {
+                    errno = -result.io.result;
+                    co_return false;
+                }
+            } else {
+                // Handshake failed
+                long verify_err = SSL_get_verify_result(ssl_);
+                if (verify_err != X509_V_OK) {
+                    ELIO_LOG_ERROR("TLS certificate verification failed: {} ({})",
+                                  X509_verify_cert_error_string(verify_err), verify_err);
+                }
+                ELIO_LOG_ERROR("TLS handshake failed: {}", get_ssl_error_string(err));
+                errno = err;
+                co_return false;
+            }
+        }
+    }
     
     /// Read data asynchronously
     /// @param buffer Buffer to read into

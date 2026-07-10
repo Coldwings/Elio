@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HTTP header-line limits**: Request and response parsers now reject an
+  oversized header line as soon as the buffered unterminated line exceeds
+  `max_header_size`, instead of waiting for a trailing CRLF. (#377)
 - **HTTP keep-alive pipelining**: The server now consumes request bytes buffered
   behind a completed keep-alive request before waiting for another socket read,
   preventing pipelined clients from stalling when multiple requests arrive in

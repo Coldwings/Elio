@@ -33,6 +33,7 @@ namespace http {
 /// @code
 /// #include <elio/elio.hpp>
 /// #include <elio/http/http.hpp>
+/// #include <utility>
 /// 
 /// using namespace elio;
 /// using namespace elio::http;
@@ -41,7 +42,7 @@ namespace http {
 ///     co_return response::ok("Hello, World!");
 /// }
 /// 
-/// int main() {
+/// coro::task<int> async_main(int, char**) {
 ///     router r;
 ///     r.get("/", hello_handler);
 ///     r.get("/users/:id", [](context& ctx) -> coro::task<response> {
@@ -50,30 +51,26 @@ namespace http {
 ///     });
 ///     
 ///     server srv(std::move(r));
-///     
-///     runtime::scheduler sched(4);
-///     sched.start();
-///     
-///     auto task = srv.listen(net::ipv4_address(8080), io::default_io_context(), sched);
-///     sched.spawn(task.release());
-///     
-///     // Wait...
-///     sched.shutdown();
-///     return 0;
+///     co_await elio::serve(srv, [&]() {
+///         return srv.listen(net::ipv4_address(8080));
+///     });
+///     co_return 0;
 /// }
+///
+/// ELIO_ASYNC_MAIN(async_main)
 /// @endcode
 
 /// @example HTTP Client Example
 /// @code
 /// #include <elio/elio.hpp>
 /// #include <elio/http/http.hpp>
+/// #include <iostream>
 /// 
 /// using namespace elio;
 /// using namespace elio::http;
 /// 
 /// coro::task<void> fetch_example() {
-///     auto& ctx = io::default_io_context();
-///     client c(ctx);
+///     client c;
 ///     
 ///     // Simple GET request
 ///     auto resp = co_await c.get("https://example.com/");

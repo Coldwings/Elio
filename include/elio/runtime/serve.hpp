@@ -12,8 +12,10 @@
 ///     http::router r;
 ///     r.get("/", hello_handler);
 ///
-///     http::server srv(r);
-///     co_await elio::serve(srv, net::ipv4_address(8080));
+///     http::server srv(std::move(r));
+///     co_await elio::serve(srv, [&]() {
+///         return srv.listen(net::ipv4_address(8080));
+///     });
 ///
 ///     co_return 0;
 /// }
@@ -109,7 +111,7 @@ inline coro::task<signal::signal_info> wait_shutdown_signal(
 ///     http::router r;
 ///     r.get("/", handler);
 ///
-///     http::server srv(r);
+///     http::server srv(std::move(r));
 ///     co_await serve(srv, [&]() { return srv.listen(net::ipv4_address(8080)); });
 ///
 ///     co_return 0;
@@ -172,10 +174,11 @@ coro::task<void> serve(Server& server, ListenFunc listen_func,
 ///     http::router r;
 ///     r.get("/", handler);
 ///
-///     http::server srv(r);
+///     http::server srv(std::move(r));
 ///     auto tls_ctx = tls::tls_context::make_server("cert.pem", "key.pem");
+///     auto addr = net::ipv4_address(8443);
 ///
-///     co_await serve(srv, srv.listen_tls(addr, tls_ctx));
+///     co_await serve(srv, [&]() { return srv.listen_tls(addr, tls_ctx); });
 ///
 ///     co_return 0;
 /// }
@@ -196,8 +199,8 @@ coro::task<void> serve(Server& server, ListenFunc listen_func,
 /// Example:
 /// @code
 /// coro::task<void> run_servers() {
-///     http::server http_srv(router);
-///     websocket::ws_server ws_srv(ws_router);
+///     http::server http_srv(std::move(http_router));
+///     websocket::ws_server ws_srv(std::move(ws_router));
 ///
 ///     co_await serve_all(
 ///         std::tie(http_srv, ws_srv),

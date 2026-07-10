@@ -19,25 +19,26 @@ namespace elio::tls {
 /// @code
 /// #include <elio/elio.hpp>
 /// #include <elio/tls/tls.hpp>
+/// #include <iostream>
+/// #include <string_view>
 /// 
 /// using namespace elio;
 /// using namespace elio::tls;
 /// 
 /// coro::task<void> tls_client() {
-///     auto& ctx = io::default_io_context();
-///     
 ///     // Create client TLS context with system CA certificates
 ///     auto tls_ctx = tls_context::make_client();
 ///     
-///     // Connect to HTTPS server
-///     auto stream = co_await tls_connect(tls_ctx, ctx, "example.com", 443);
+///     // Resolve, connect, and complete the TLS handshake
+///     auto stream = co_await tls_connect(tls_ctx, "example.com", 443);
 ///     if (!stream) {
 ///         std::cerr << "Connection failed" << std::endl;
 ///         co_return;
 ///     }
 ///     
 ///     // Send HTTP request
-///     co_await stream->write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+///     co_await stream->write_exactly(
+///         "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
 ///     
 ///     // Read response
 ///     char buffer[4096];
@@ -54,26 +55,25 @@ namespace elio::tls {
 /// @code
 /// #include <elio/elio.hpp>
 /// #include <elio/tls/tls.hpp>
+/// #include <iostream>
 /// 
 /// using namespace elio;
 /// using namespace elio::tls;
 /// 
 /// coro::task<void> tls_server() {
-///     auto& ctx = io::default_io_context();
-///     
 ///     // Create server TLS context with certificate
 ///     auto tls_ctx = tls_context::make_server("server.crt", "server.key");
 ///     
 ///     // Create TLS listener on IPv6 (accepts both IPv4 and IPv6 by default)
-///     auto listener = tls_listener::bind(net::ipv6_address(8443), ctx, tls_ctx);
+///     auto listener = tls_listener::bind(net::ipv6_address(8443), tls_ctx);
 ///     if (!listener) {
 ///         std::cerr << "Failed to bind" << std::endl;
 ///         co_return;
 ///     }
 ///     
 ///     // Or bind to specific address:
-///     // auto listener = tls_listener::bind(net::socket_address("::1", 8443), ctx, tls_ctx);
-///     // auto listener = tls_listener::bind(net::ipv4_address("0.0.0.0", 8443), ctx, tls_ctx);
+///     // auto listener = tls_listener::bind(net::socket_address("::1", 8443), tls_ctx);
+///     // auto listener = tls_listener::bind(net::ipv4_address("0.0.0.0", 8443), tls_ctx);
 ///     
 ///     while (true) {
 ///         auto stream = co_await listener->accept();

@@ -88,6 +88,7 @@ inline constexpr auto version_tuple() noexcept {
 /// 
 /// ```cpp
 /// #include <elio/elio.hpp>
+/// #include <iostream>
 /// 
 /// using namespace elio;
 /// 

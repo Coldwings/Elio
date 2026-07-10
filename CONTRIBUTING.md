@@ -133,7 +133,9 @@ perf(runtime): add alignas(64) to worker_thread hot fields
 
 1. **Title**: follow the same conventional commit format as commit messages.
 2. **Description**: explain *what* changed and *why*. Reference related issues.
-3. **CI must pass**: all matrix builds (x64/arm64, Release/Debug) and ASAN.
+3. **CI must pass**: all required GitHub Actions checks, including matrix
+   builds (x64/arm64, Release/Debug), ASAN/TSAN, release benchmarks, and the
+   package-consumer check.
 4. **One logical change per PR**: keep PRs focused. Split unrelated changes.
 5. **Breaking changes**: clearly document in the PR description and prefix the
    commit with `!` (e.g., `fix(sync)!: make channel non-movable`).

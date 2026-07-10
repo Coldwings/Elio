@@ -19,7 +19,7 @@ Elio's RPC framework provides high-performance remote procedure calls over TCP a
 
 ### Why a custom wire format instead of protobuf/gRPC
 
-The RPC framework uses a custom binary wire format to maintain zero external dependencies for the core protocol. The 18-byte fixed header enables fast parsing without schema negotiation -- the receiver always knows exactly how many bytes to read before it can dispatch a message. CRC32 checksums provide integrity verification without the overhead of a full serialization framework. This keeps the library header-only and avoids pulling in protobuf's code generator toolchain or gRPC's runtime.
+The RPC framework uses a custom binary wire format to maintain zero external dependencies for the core protocol. The 19-byte fixed header enables fast parsing without schema negotiation -- the receiver always knows exactly how many bytes to read before it can dispatch a message. CRC32 checksums provide integrity verification without the overhead of a full serialization framework. This keeps the library header-only and avoids pulling in protobuf's code generator toolchain or gRPC's runtime.
 
 ### Why zero-copy with buffer_ref
 

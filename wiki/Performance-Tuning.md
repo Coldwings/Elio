@@ -461,7 +461,7 @@ Debug logging has overhead; disable in production:
 
 ```cpp
 // Set at compile time
-// cmake -DELIО_ENABLE_DEBUG_METADATA=OFF ..
+// cmake -DELIO_ENABLE_DEBUG_METADATA=OFF ..
 
 // Or at runtime
 elio::log::logger::instance().set_level(elio::log::level::warning);
@@ -473,7 +473,7 @@ Use virtual stack for debugging without significant overhead:
 
 ```cpp
 // Enable in debug builds only
-#ifdef ELIO_ENABLE_DEBUG_METADATA
+#if ELIO_ENABLE_DEBUG_METADATA
     auto* frame = coro::promise_base::current_frame();
     auto stack = coro::dump_virtual_stack();
     for (const auto& entry : stack) {

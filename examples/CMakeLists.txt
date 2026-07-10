@@ -72,7 +72,7 @@ add_executable(debug_test debug_test.cpp)
 target_link_libraries(debug_test PRIVATE elio)
 target_link_options(debug_test PRIVATE ${STATIC_LINK_FLAGS})
 target_compile_options(debug_test PRIVATE -g -O0)  # Full debug info
-target_compile_definitions(debug_test PRIVATE ELIO_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_compile_definitions(debug_test PRIVATE ELIO_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 
 # Network examples
 add_executable(tcp_echo_server tcp_echo_server.cpp)

@@ -24,19 +24,16 @@
 ///
 /// ## Stage status
 ///
-/// Through S8 the umbrella re-exports: types, op_state, dispatcher,
-/// backend_traits (incl. the extended `backend_with_mr` requiring
-/// `lkey_of` / `rkey_of`), polymorphic_backend, connection, all four
-/// data-path awaiters (SEND / RECV / RDMA_WRITE / RDMA_READ), the
-/// multi-SGE / inline-send extensions, the shared receive queue
-/// abstraction (`srq.hpp`), the `memory_region<Backend>` RAII
-/// wrapper (`memory_region.hpp`), and the default `cq_pump`
-/// coroutine that binds a completion-channel fd to an `io_context`
-/// (`cq_pump.hpp`). The optional librdmacm-backed CM helper lives
-/// in a separate `elio_rdma_cm` CMake target (`<elio/rdma_cm/*>`).
-///
-/// See spec/rdma-support-plan.md (feature/rdma-support local branch) for
-/// the full design plan and stage breakdown.
+/// Through S15 the umbrella re-exports: types, op_state, dispatcher,
+/// backend_traits (including `backend_with_mr` and `backend_with_atomic`),
+/// polymorphic_backend, connection, SEND / RECV / RDMA_WRITE / RDMA_READ
+/// awaiters, immediate-data write/receive helpers, 8-byte CAS and fetch-add
+/// atomics, multi-SGE / inline-send extensions, the shared receive queue
+/// abstraction (`srq.hpp`), the `memory_region<Backend>` RAII wrapper
+/// (`memory_region.hpp`), and the default `cq_pump` coroutine that binds a
+/// completion-channel fd to an `io_context` (`cq_pump.hpp`). The optional
+/// librdmacm-backed CM helper lives in a separate `elio_rdma_cm` CMake target
+/// (`<elio/rdma_cm/*>`).
 
 #include <elio/rdma/types.hpp>
 #include <elio/rdma/op_state.hpp>

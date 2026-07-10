@@ -88,6 +88,22 @@ Link the target for the feature your code includes:
 | HTTP/1.1, WebSocket, SSE | `elio_http` | `Elio::elio_http` |
 | HTTP/2 | `elio_http2` | `Elio::elio_http2` |
 
+Feature targets exist only when their options are enabled. For FetchContent or
+`add_subdirectory`, set the options before adding Elio:
+
+```cmake
+set(ELIO_ENABLE_TLS ON CACHE BOOL "" FORCE)
+set(ELIO_ENABLE_HTTP ON CACHE BOOL "" FORCE)
+set(ELIO_ENABLE_HTTP2 ON CACHE BOOL "" FORCE)
+
+# Then call FetchContent_MakeAvailable(elio) or add_subdirectory(path/to/elio).
+target_link_libraries(your_target PRIVATE elio_http2)
+```
+
+An installed package exports only the feature targets that were enabled when
+that package was built. `Elio::elio_http2` therefore requires an Elio install
+configured with TLS, HTTP, and HTTP/2 enabled.
+
 Enable them at configure time:
 
 ```bash

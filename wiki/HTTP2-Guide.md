@@ -89,8 +89,8 @@ coro::task<void> post_example() {
 
 ```cpp
 struct h2_client_config {
-    std::chrono::seconds connect_timeout{10};
-    std::chrono::seconds read_timeout{30};
+    std::chrono::seconds connect_timeout{10};  // Reserved; not currently enforced
+    std::chrono::seconds read_timeout{30};     // Session I/O timeout; <=0 disables
     size_t max_concurrent_streams = 100;
     uint32_t initial_window_size = 65535;
     std::string user_agent = "elio-http2/1.0";
@@ -105,6 +105,10 @@ config.max_concurrent_streams = 50;
 
 h2_client client(config);
 ```
+
+`read_timeout` bounds HTTP/2 session initialization and response waits. The
+`connect_timeout` field is reserved for future TCP/TLS connect deadline support
+and is not currently enforced.
 
 ### TLS Configuration
 

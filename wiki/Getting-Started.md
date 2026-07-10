@@ -114,7 +114,13 @@ When `ELIO_ENABLE_HTTP2` is set, Elio fetches nghttp2 automatically via
 CMake's `FetchContent`. OpenSSL and liburing must be installed separately (see
 Prerequisites above).
 
-Additional options include RDMA support (`ELIO_ENABLE_RDMA`, `ELIO_ENABLE_RDMA_CM`, `ELIO_ENABLE_RDMA_IBVERBS`), build controls (`ELIO_BUILD_TESTS`, `ELIO_BUILD_EXAMPLES`), developer warnings (`ELIO_ENABLE_DEVELOPER_WARNINGS`, `ELIO_WARNINGS_AS_ERRORS`), and debug metadata (`ELIO_ENABLE_DEBUG_METADATA`). See CLAUDE.md for the full list.
+Additional options include RDMA support (`ELIO_ENABLE_RDMA`,
+`ELIO_ENABLE_RDMA_CM`, `ELIO_ENABLE_RDMA_IBVERBS`,
+`ELIO_ENABLE_RDMA_IBVERBS_TESTS`, `ELIO_ENABLE_RDMA_CUDA`), build controls
+(`ELIO_BUILD_TESTS`, `ELIO_BUILD_EXAMPLES`, `ELIO_BUILD_TCP_BENCHMARKS`),
+developer warnings (`ELIO_ENABLE_DEVELOPER_WARNINGS`,
+`ELIO_WARNINGS_AS_ERRORS`), and debug metadata (`ELIO_ENABLE_DEBUG_METADATA`).
+See the top-level `CMakeLists.txt` for the authoritative option list.
 
 ## Your First Program
 

@@ -62,6 +62,13 @@ add_subdirectory(path/to/elio)
 target_link_libraries(your_target PRIVATE elio)
 ```
 
+#### Using an Installed Package
+
+```cmake
+find_package(Elio REQUIRED CONFIG)
+target_link_libraries(your_target PRIVATE Elio::elio)
+```
+
 #### Optional Features
 
 Elio has several optional feature flags, each controlled by a CMake option. The primary feature flags are:
@@ -72,13 +79,24 @@ Elio has several optional feature flags, each controlled by a CMake option. The 
 | `ELIO_ENABLE_HTTP` | (none beyond TLS if HTTPS needed) | HTTP/1.1 client and server, WebSocket, SSE |
 | `ELIO_ENABLE_HTTP2` | nghttp2 | HTTP/2 multiplexed connections |
 
+Link the target for the feature your code includes:
+
+| Feature | FetchContent / add_subdirectory | Installed package |
+|---|---|---|
+| Core | `elio` | `Elio::elio` |
+| TLS | `elio_tls` | `Elio::elio_tls` |
+| HTTP/1.1, WebSocket, SSE | `elio_http` | `Elio::elio_http` |
+| HTTP/2 | `elio_http2` | `Elio::elio_http2` |
+
 Enable them at configure time:
 
 ```bash
 cmake -B build -DELIO_ENABLE_TLS=ON -DELIO_ENABLE_HTTP=ON -DELIO_ENABLE_HTTP2=ON
 ```
 
-When `ELIO_ENABLE_HTTP2` is set, nghttp2 is fetched automatically via CMake's `FetchContent` if it is not already installed on the system. OpenSSL and liburing must be installed separately (see Prerequisites above).
+When `ELIO_ENABLE_HTTP2` is set, Elio fetches nghttp2 automatically via
+CMake's `FetchContent`. OpenSSL and liburing must be installed separately (see
+Prerequisites above).
 
 Additional options include RDMA support (`ELIO_ENABLE_RDMA`, `ELIO_ENABLE_RDMA_CM`, `ELIO_ENABLE_RDMA_IBVERBS`), build controls (`ELIO_BUILD_TESTS`, `ELIO_BUILD_EXAMPLES`), developer warnings (`ELIO_ENABLE_DEVELOPER_WARNINGS`, `ELIO_WARNINGS_AS_ERRORS`), and debug metadata (`ELIO_ENABLE_DEBUG_METADATA`). See CLAUDE.md for the full list.
 

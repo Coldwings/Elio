@@ -23,6 +23,17 @@ HTTP/2 support requires:
 
 Note: HTTP/2 requires HTTPS (h2 over TLS). For plaintext HTTP, use the HTTP/1.1 client.
 
+Link the HTTP/2 feature target so nghttp2 headers and libraries propagate to
+your application:
+
+```cmake
+# FetchContent or add_subdirectory
+target_link_libraries(your_target PRIVATE elio_http2)
+
+# Installed package after find_package(Elio REQUIRED CONFIG)
+target_link_libraries(your_target PRIVATE Elio::elio_http2)
+```
+
 ## Basic Usage
 
 ### Simple GET Request

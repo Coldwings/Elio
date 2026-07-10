@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/http/http_server.hpp>
+#include <elio/http/websocket_server.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include "../test_main.cpp"  // For scaled timeouts
 
@@ -315,6 +316,172 @@ TEST_CASE("HTTP server consumes fully buffered pipelined keep-alive requests",
 
     auto result = run_pipelined_exchange(request);
     require_two_ordered_responses(result);
+}
+
+TEST_CASE("HTTP server stop cancels idle accept without a wake connection",
+          "[http][server][stop][accept-cancel-regression]") {
+    router routes;
+    server_config config;
+    config.enable_logging = false;
+
+    server srv(std::move(routes), config);
+    const uint16_t port = reserve_loopback_port();
+
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    const bool started = wait_until([&] { return srv.is_running(); },
+                                    elio::test::scaled_sec(2));
+    if (started) {
+        srv.stop();
+    }
+
+    const bool stopped = wait_until(
+        [&] { return listen_done.load(std::memory_order_acquire); },
+        elio::test::scaled_sec(2));
+    const bool drained = sched.shutdown(elio::test::scaled_sec(5));
+
+    REQUIRE(started);
+    REQUIRE(stopped);
+    REQUIRE(drained);
+}
+
+TEST_CASE("WebSocket server stop cancels idle accept without a wake connection",
+          "[websocket][server][stop][accept-cancel-regression]") {
+    elio::http::websocket::ws_router routes;
+    server_config config;
+    config.enable_logging = false;
+
+    elio::http::websocket::ws_server srv(std::move(routes), config);
+    const uint16_t port = reserve_loopback_port();
+
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    const bool started = wait_until([&] { return srv.is_running(); },
+                                    elio::test::scaled_sec(2));
+    if (started) {
+        srv.stop();
+    }
+
+    const bool stopped = wait_until(
+        [&] { return listen_done.load(std::memory_order_acquire); },
+        elio::test::scaled_sec(2));
+    const bool drained = sched.shutdown(elio::test::scaled_sec(5));
+
+    REQUIRE(started);
+    REQUIRE(stopped);
+    REQUIRE(drained);
+}
+
+TEST_CASE("HTTP server stop cancels overlapping idle accepts",
+          "[http][server][stop][accept-cancel-regression]") {
+    router routes;
+    server_config config;
+    config.enable_logging = false;
+
+    server srv(std::move(routes), config);
+    const uint16_t first_port = reserve_loopback_port();
+    const uint16_t second_port = reserve_loopback_port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> first_done{false};
+    std::atomic<bool> second_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", first_port));
+        first_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    auto first_client = connect_loopback(first_port);
+    first_client.reset();
+    REQUIRE(wait_until([&] { return srv.active_connections() == 0; },
+                       elio::test::scaled_sec(2)));
+
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", second_port));
+        second_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    auto second_client = connect_loopback(second_port);
+    second_client.reset();
+    REQUIRE(wait_until([&] { return srv.active_connections() == 0; },
+                       elio::test::scaled_sec(2)));
+
+    srv.stop();
+
+    const bool stopped = wait_until([&] {
+        return first_done.load(std::memory_order_acquire) &&
+               second_done.load(std::memory_order_acquire);
+    }, elio::test::scaled_sec(2));
+    const bool drained = sched.shutdown(elio::test::scaled_sec(5));
+
+    REQUIRE(stopped);
+    REQUIRE(drained);
+}
+
+TEST_CASE("WebSocket server stop cancels overlapping idle accepts",
+          "[websocket][server][stop][accept-cancel-regression]") {
+    elio::http::websocket::ws_router routes;
+    server_config config;
+    config.enable_logging = false;
+
+    elio::http::websocket::ws_server srv(std::move(routes), config);
+    const uint16_t first_port = reserve_loopback_port();
+    const uint16_t second_port = reserve_loopback_port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> first_done{false};
+    std::atomic<bool> second_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", first_port));
+        first_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    auto first_client = connect_loopback(first_port);
+    first_client.reset();
+    std::this_thread::sleep_for(elio::test::scaled_ms(50));
+
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", second_port));
+        second_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    auto second_client = connect_loopback(second_port);
+    second_client.reset();
+    std::this_thread::sleep_for(elio::test::scaled_ms(50));
+
+    srv.stop();
+
+    const bool stopped = wait_until([&] {
+        return first_done.load(std::memory_order_acquire) &&
+               second_done.load(std::memory_order_acquire);
+    }, elio::test::scaled_sec(2));
+    const bool drained = sched.shutdown(elio::test::scaled_sec(5));
+
+    REQUIRE(stopped);
+    REQUIRE(drained);
 }
 
 TEST_CASE("HTTP server reads after partial buffered pipelined request",

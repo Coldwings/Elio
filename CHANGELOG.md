@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `async_connect()` now cancel pending epoll operations promptly when their
   `cancel_token` fires, matching the existing `async_poll_read()` behavior.
   (#339)
+- **HTTP/WebSocket server stop**: `stop()` now cancels the active listener
+  accept operation so idle listen loops exit promptly without needing a new
+  client connection to wake them. (#341)
 
 ## [0.5.2] - 2026-06-30
 

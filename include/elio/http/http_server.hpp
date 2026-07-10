@@ -18,6 +18,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -285,6 +286,41 @@ public:
     /// Start listening on address (plain HTTP)
     coro::task<void> listen(const net::socket_address& addr,
                            const net::tcp_options& opts = {}) {
+        const auto start_epoch = stop_epoch_.load(std::memory_order_acquire);
+        return listen_impl(addr, opts, start_epoch);
+    }
+
+    /// Start listening with TLS (HTTPS)
+    /// @note The caller must ensure `tls_ctx` outlives all spawned connection
+    ///       handlers.  In practice this means `tls_ctx` should be stored as a
+    ///       member or otherwise kept alive until after `stop()` returns and
+    ///       all in-flight handlers have completed.
+    coro::task<void> listen_tls(const net::socket_address& addr,
+                                tls::tls_context& tls_ctx,
+                                const net::tcp_options& opts = {}) {
+        const auto start_epoch = stop_epoch_.load(std::memory_order_acquire);
+        return listen_tls_impl(addr, tls_ctx, opts, start_epoch);
+    }
+
+    /// Stop the server
+    void stop() {
+        cancel_active_accepts();
+    }
+
+    /// Check if server is running
+    bool is_running() const noexcept { return running_; }
+
+    /// Return the number of in-flight connection handlers.  Callers that
+    /// destroy the server after stop() should wait until this returns 0
+    /// to avoid use-after-free on router_, config_, etc.
+    size_t active_connections() const noexcept {
+        return active_connections_.load(std::memory_order_acquire);
+    }
+
+private:
+    coro::task<void> listen_impl(const net::socket_address& addr,
+                                 const net::tcp_options& opts,
+                                 size_t start_epoch) {
         auto* sched = runtime::scheduler::current();
         if (!sched) {
             ELIO_LOG_ERROR("HTTP server must be started from within a scheduler context");
@@ -300,13 +336,19 @@ public:
         ELIO_LOG_INFO("HTTP server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
-        listener_fd_ = listener.fd();
-        running_ = true;
+        auto accept_source = begin_accept_loop(start_epoch);
+        if (!accept_source) {
+            co_return;
+        }
+        auto accept_token = accept_source->get_token();
 
-        while (running_) {
-            auto stream_result = co_await listener.accept();
+        while (running_.load(std::memory_order_acquire)) {
+            auto stream_result = co_await listener.accept(accept_token);
+            if (accept_loop_should_stop(accept_token)) {
+                break;
+            }
             if (!stream_result) {
-                if (running_) {
+                if (running_.load(std::memory_order_acquire)) {
                     ELIO_LOG_ERROR("Accept error: {}", strerror(errno));
                 }
                 continue;
@@ -320,14 +362,10 @@ public:
         }
     }
 
-    /// Start listening with TLS (HTTPS)
-    /// @note The caller must ensure `tls_ctx` outlives all spawned connection
-    ///       handlers.  In practice this means `tls_ctx` should be stored as a
-    ///       member or otherwise kept alive until after `stop()` returns and
-    ///       all in-flight handlers have completed.
-    coro::task<void> listen_tls(const net::socket_address& addr,
-                                tls::tls_context& tls_ctx,
-                                const net::tcp_options& opts = {}) {
+    coro::task<void> listen_tls_impl(const net::socket_address& addr,
+                                     tls::tls_context& tls_ctx,
+                                     const net::tcp_options& opts,
+                                     size_t start_epoch) {
         auto* sched = runtime::scheduler::current();
         if (!sched) {
             ELIO_LOG_ERROR("HTTPS server must be started from within a scheduler context");
@@ -343,8 +381,11 @@ public:
         ELIO_LOG_INFO("HTTPS server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
-        listener_fd_ = listener.fd();
-        running_ = true;
+        auto accept_source = begin_accept_loop(start_epoch);
+        if (!accept_source) {
+            co_return;
+        }
+        auto accept_token = accept_source->get_token();
 
         // Capture tls_ctx by pointer rather than by reference so that the
         // lambda does not silently dangle when listen_tls's coroutine frame
@@ -352,10 +393,13 @@ public:
         // handlers — this is documented above.
         auto* tls_ctx_ptr = &tls_ctx;
 
-        while (running_) {
-            auto stream_result = co_await listener.accept();
+        while (running_.load(std::memory_order_acquire)) {
+            auto stream_result = co_await listener.accept(accept_token);
+            if (accept_loop_should_stop(accept_token)) {
+                break;
+            }
             if (!stream_result) {
-                if (running_) {
+                if (running_.load(std::memory_order_acquire)) {
                     ELIO_LOG_ERROR("Accept error: {}", strerror(errno));
                 }
                 continue;
@@ -368,27 +412,6 @@ public:
             });
         }
     }
-
-    /// Stop the server
-    void stop() {
-        running_ = false;
-        if (listener_fd_ >= 0) {
-            ::shutdown(listener_fd_, SHUT_RDWR);
-            listener_fd_ = -1;
-        }
-    }
-
-    /// Check if server is running
-    bool is_running() const noexcept { return running_; }
-
-    /// Return the number of in-flight connection handlers.  Callers that
-    /// destroy the server after stop() should wait until this returns 0
-    /// to avoid use-after-free on router_, config_, etc.
-    size_t active_connections() const noexcept {
-        return active_connections_.load(std::memory_order_acquire);
-    }
-
-private:
     /// Guard wrapper that decrements the active-connection counter on exit.
     coro::task<void> handle_connection_guarded(net::tcp_stream stream) {
         co_await handle_connection(std::move(stream));
@@ -691,6 +714,56 @@ private:
         }
         co_return true;
     }
+
+    std::shared_ptr<coro::cancel_source> begin_accept_loop(size_t start_epoch) {
+        auto source = std::make_shared<coro::cancel_source>();
+        std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+        if (stop_epoch_.load(std::memory_order_acquire) != start_epoch) {
+            return {};
+        }
+        auto it = active_accept_sources_.begin();
+        while (it != active_accept_sources_.end()) {
+            if (it->expired()) {
+                it = active_accept_sources_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        active_accept_sources_.push_back(source);
+        running_.store(true, std::memory_order_release);
+        return source;
+    }
+
+    void cancel_active_accepts() {
+        std::vector<std::shared_ptr<coro::cancel_source>> sources;
+        {
+            std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+            stop_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            running_.store(false, std::memory_order_release);
+            auto it = active_accept_sources_.begin();
+            while (it != active_accept_sources_.end()) {
+                if (auto source = it->lock()) {
+                    sources.push_back(std::move(source));
+                    ++it;
+                } else {
+                    it = active_accept_sources_.erase(it);
+                }
+            }
+        }
+
+        for (auto& source : sources) {
+            source->cancel();
+        }
+    }
+
+    bool accept_loop_should_stop(const coro::cancel_token& accept_token) noexcept {
+        if (!running_.load(std::memory_order_acquire) ||
+            accept_token.is_cancelled()) {
+            running_.store(false, std::memory_order_release);
+            return true;
+        }
+        return false;
+    }
     
     router router_;
     server_config config_;
@@ -698,7 +771,9 @@ private:
     std::function<response(const std::exception&)> error_handler_;
     std::atomic<bool> running_{false};
     std::atomic<size_t> active_connections_{0};  ///< In-flight connection handlers
-    int listener_fd_ = -1;
+    std::atomic<size_t> stop_epoch_{0};
+    mutable std::mutex accept_cancel_mutex_;
+    std::vector<std::weak_ptr<coro::cancel_source>> active_accept_sources_;
 };
 
 /// Convenience function to create a simple HTTP server

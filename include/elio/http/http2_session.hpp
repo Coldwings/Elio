@@ -8,6 +8,7 @@
 
 #include <nghttp2/nghttp2.h>
 
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -17,6 +18,8 @@
 #include <queue>
 #include <optional>
 #include <cstring>
+#include <limits>
+#include <utility>
 
 namespace elio::http {
 
@@ -54,12 +57,22 @@ struct h2_stream {
     }
 };
 
+/// Configuration used when creating an HTTP/2 session.
+struct h2_session_config {
+    size_t max_concurrent_streams = 100;
+    uint32_t initial_window_size = NGHTTP2_INITIAL_WINDOW_SIZE;
+    std::string user_agent = "elio-http2/1.0";
+    bool enable_push = false;
+};
+
 /// HTTP/2 session (client-side)
 class h2_session {
 public:
     /// Create client session
-    explicit h2_session(tls::tls_stream& stream)
-        : stream_(&stream) {
+    explicit h2_session(tls::tls_stream& stream,
+                        h2_session_config config = {})
+        : stream_(&stream)
+        , config_(std::move(config)) {
         nghttp2_session_callbacks* callbacks;
         nghttp2_session_callbacks_new(&callbacks);
 
@@ -77,10 +90,16 @@ public:
         nghttp2_session_callbacks_del(callbacks);
         
         // Send client connection preface (settings)
+        const auto max_streams = static_cast<uint32_t>(
+            std::min(config_.max_concurrent_streams,
+                     static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        const auto initial_window = std::min(
+            config_.initial_window_size,
+            static_cast<uint32_t>(NGHTTP2_MAX_WINDOW_SIZE));
         nghttp2_settings_entry settings[] = {
-            {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100},
-            {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 65535},
-            {NGHTTP2_SETTINGS_ENABLE_PUSH, 0}  // Disable server push for client
+            {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, max_streams},
+            {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, initial_window},
+            {NGHTTP2_SETTINGS_ENABLE_PUSH, config_.enable_push ? 1u : 0u}
         };
         nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, settings, 
                                sizeof(settings) / sizeof(settings[0]));
@@ -99,6 +118,9 @@ public:
     h2_session& operator=(const h2_session&) = delete;
     h2_session(h2_session&&) = delete;
     h2_session& operator=(h2_session&&) = delete;
+
+    /// Get the session configuration.
+    const h2_session_config& config() const noexcept { return config_; }
     
     /// Submit a request and get stream ID
     int32_t submit_request(method m, const url& target, std::string_view body = {},
@@ -112,7 +134,7 @@ public:
         header_values.push_back(path.empty() ? "/" : path);
         header_values.push_back(target.scheme);
         header_values.push_back(target.host_authority());
-        header_values.push_back("elio-http2/1.0");
+        header_values.push_back(config_.user_agent);
         header_values.push_back("*/*");
         
         std::vector<nghttp2_nv> nva;
@@ -460,6 +482,7 @@ private:
 
     nghttp2_session* session_ = nullptr;
     tls::tls_stream* stream_ = nullptr;
+    h2_session_config config_;
     std::unordered_map<int32_t, h2_stream> streams_;
     std::unordered_map<int32_t, std::shared_ptr<std::string>> pending_bodies_;
 };

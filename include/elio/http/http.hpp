@@ -57,7 +57,11 @@ namespace http {
 ///     co_return 0;
 /// }
 ///
-/// ELIO_ASYNC_MAIN(async_main)
+/// int main(int argc, char* argv[]) {
+///     elio::signal::signal_set shutdown_signals(elio::default_shutdown_signals);
+///     shutdown_signals.block_all_threads();
+///     return elio::run(async_main, argc, argv);
+/// }
 /// @endcode
 
 /// @example HTTP Client Example

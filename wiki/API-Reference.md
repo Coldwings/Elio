@@ -632,6 +632,11 @@ The function:
 3. Calls `server.stop()` when signal is received
 4. Waits for the listen task to complete
 
+For process-directed signals to be consumed by `signalfd`, block the same
+shutdown signals before scheduler threads are created. Use an explicit
+`main()` that calls `signal_set::block_all_threads()` before `elio::run()`;
+`ELIO_ASYNC_MAIN` does not mask the calling thread.
+
 **Example:**
 ```cpp
 coro::task<int> async_main(int argc, char* argv[]) {
@@ -640,13 +645,17 @@ coro::task<int> async_main(int argc, char* argv[]) {
 
     http::server srv(r);
 
-    // serve() handles everything: listen, wait for Ctrl+C, stop cleanly
+    // serve() listens, waits for masked shutdown signals, and stops cleanly
     co_await elio::serve(srv, [&]() { return srv.listen(addr); });
 
     co_return 0;
 }
 
-ELIO_ASYNC_MAIN(async_main)
+int main(int argc, char* argv[]) {
+    elio::signal::signal_set shutdown_signals(elio::default_shutdown_signals);
+    shutdown_signals.block_all_threads();
+    return elio::run(async_main, argc, argv);
+}
 ```
 
 ### `serve_all()`
@@ -673,6 +682,12 @@ coro::task<void> run_servers() {
             [&]() { return ws_srv.listen(ws_addr); }
         )
     );
+}
+
+int main() {
+    elio::signal::signal_set shutdown_signals(elio::default_shutdown_signals);
+    shutdown_signals.block_all_threads();
+    return elio::run(run_servers);
 }
 ```
 

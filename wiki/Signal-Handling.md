@@ -216,7 +216,8 @@ coro::task<void> signal_router() {
 
 ### 3. Graceful Shutdown Pattern
 
-For simple server applications, use `elio::serve()` which handles all shutdown logic automatically:
+For simple server applications, use `elio::serve()` with shutdown signals
+blocked before the scheduler starts:
 
 ```cpp
 coro::task<int> async_main(int argc, char* argv[]) {
@@ -225,13 +226,17 @@ coro::task<int> async_main(int argc, char* argv[]) {
 
     http::server srv(r);
 
-    // serve() waits for SIGINT/SIGTERM and calls srv.stop() automatically
+    // serve() waits for masked SIGINT/SIGTERM and calls srv.stop()
     co_await elio::serve(srv, [&]() { return srv.listen(addr); });
 
     co_return 0;
 }
 
-ELIO_ASYNC_MAIN(async_main)
+int main(int argc, char* argv[]) {
+    elio::signal::signal_set shutdown_signals(elio::default_shutdown_signals);
+    shutdown_signals.block_all_threads();
+    return elio::run(async_main, argc, argv);
+}
 ```
 
 For more complex scenarios with custom shutdown logic:

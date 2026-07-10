@@ -1067,6 +1067,20 @@ TEST_CASE("HTTP request parser rejects oversized unterminated header line",
     REQUIRE(parser.has_error());
 }
 
+TEST_CASE("HTTP request parser accepts a boundary header with split CRLF",
+          "[http][parser][security]") {
+    std::string first_chunk =
+        "GET / HTTP/1.1\r\nX: " + std::string(8189, 'x') + "\r";
+
+    request_parser parser;
+    auto [partial, _1] = parser.parse(first_chunk);
+    REQUIRE(partial == parse_result::need_more);
+    REQUIRE_FALSE(parser.has_error());
+
+    auto [complete, _2] = parser.parse("\n\r\n");
+    REQUIRE(complete == parse_result::complete);
+}
+
 TEST_CASE("HTTP request parser accepts header line exactly at max_header_size",
           "[http][parser][security]") {
     // A header line of exactly 8192 bytes (name + ": " + value) must be
@@ -1116,4 +1130,18 @@ TEST_CASE("HTTP response parser rejects oversized unterminated header line",
     auto [result, _] = parser.parse(response);
     REQUIRE(result == parse_result::error);
     REQUIRE(parser.has_error());
+}
+
+TEST_CASE("HTTP response parser accepts a boundary header with split CRLF",
+          "[http][parser][security]") {
+    std::string first_chunk =
+        "HTTP/1.1 204 No Content\r\nX: " + std::string(8189, 'x') + "\r";
+
+    response_parser parser;
+    auto [partial, _1] = parser.parse(first_chunk);
+    REQUIRE(partial == parse_result::need_more);
+    REQUIRE_FALSE(parser.has_error());
+
+    auto [complete, _2] = parser.parse("\n\r\n");
+    REQUIRE(complete == parse_result::complete);
 }

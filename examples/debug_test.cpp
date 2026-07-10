@@ -16,9 +16,22 @@
 #include <chrono>
 #include <thread>
 #include <atomic>
+#include <string>
 
 using namespace elio;
 using namespace elio::signal;
+
+#ifndef ELIO_SOURCE_DIR
+#define ELIO_SOURCE_DIR "."
+#endif
+
+namespace {
+
+std::string tool_path(const char* script) {
+    return std::string(ELIO_SOURCE_DIR) + "/tools/" + script;
+}
+
+} // namespace
 
 // Global flag for signal handling
 std::atomic<bool> g_running{true};
@@ -132,10 +145,15 @@ coro::task<int> async_main(int argc, char* argv[]) {
     std::cout << std::endl;
     
     if (pause_mode) {
+        const auto gdb_script = tool_path("elio-gdb.py");
+        const auto lldb_script = tool_path("elio_lldb.py");
         std::cout << "Paused for debugger. Use one of:" << std::endl;
         std::cout << "  elio-pstack " << getpid() << std::endl;
-        std::cout << "  gdb -p " << getpid() << " -ex 'source tools/elio-gdb.py' -ex 'elio bt'" << std::endl;
-        std::cout << "  lldb -p " << getpid() << " -o 'command script import tools/elio_lldb.py' -o 'elio bt'" << std::endl;
+        std::cout << "  gdb -p " << getpid() << " -ex 'source "
+                  << gdb_script << "' -ex 'elio bt'" << std::endl;
+        std::cout << "  lldb -p " << getpid()
+                  << " -o 'command script import " << lldb_script
+                  << "' -o 'elio bt'" << std::endl;
         std::cout << std::endl;
         std::cout << "Press Ctrl+C to exit." << std::endl;
         std::cout << std::endl;

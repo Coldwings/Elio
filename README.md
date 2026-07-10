@@ -259,10 +259,10 @@ Explore the `examples/` directory for detailed examples:
 Build and run examples:
 ```bash
 cd build
-make
-./hello_world
-./parallel_tasks
-./benchmark
+cmake --build . --target hello_world parallel_tasks benchmark
+./examples/hello_world
+./examples/parallel_tasks
+./examples/benchmark
 ```
 
 ## Debugging
@@ -275,13 +275,13 @@ elio-pstack <pid>              # Attach to running process
 elio-pstack ./myapp core.1234  # Analyze coredump
 
 # GDB extension
-gdb -ex 'source tools/elio-gdb.py' ./myapp
+gdb -ex 'source /path/to/Elio/tools/elio-gdb.py' ./myapp
 (gdb) elio list                # List all vthreads
 (gdb) elio bt                  # Show all backtraces
 (gdb) elio bt 42               # Show backtrace for vthread #42
 
 # LLDB extension
-lldb -o 'command script import tools/elio_lldb.py' ./myapp
+lldb -o 'command script import /path/to/Elio/tools/elio_lldb.py' ./myapp
 (lldb) elio list
 (lldb) elio bt
 ```
@@ -457,22 +457,22 @@ Elio achieves competitive performance through careful optimization:
 
 ```bash
 cd build
-cmake --build .
+cmake --build . --target quick_benchmark microbench io_benchmark benchmark scalability_test
 
 # Quick benchmark (spawn, context switch, yield)
-./quick_benchmark
+./examples/quick_benchmark
 
 # Microbenchmarks (individual operations)
-./microbench
+./examples/microbench
 
 # I/O throughput benchmark
-./io_benchmark
+./examples/io_benchmark
 
 # Full benchmark suite
-./benchmark
+./examples/benchmark
 
 # Scalability test
-./scalability_test
+./examples/scalability_test
 ```
 
 See [Performance Tuning Guide](wiki/Performance-Tuning.md) for optimization tips.

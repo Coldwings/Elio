@@ -515,19 +515,19 @@ public:
 
     /// Get current queue size
     size_t size() const noexcept {
-        if (is_bounded()) {
-            return ring_->size();
-        }
         std::lock_guard<std::mutex> guard(mutex_);
+        if (is_bounded()) {
+            return ring_->size() + queue_.size();
+        }
         return queue_.size();
     }
 
     /// Check if channel is empty
     bool empty() const noexcept {
-        if (is_bounded()) {
-            return ring_->empty();
-        }
         std::lock_guard<std::mutex> guard(mutex_);
+        if (is_bounded()) {
+            return ring_->empty() && queue_.empty();
+        }
         return queue_.empty();
     }
 

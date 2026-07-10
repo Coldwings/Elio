@@ -319,6 +319,28 @@ TEST_CASE("channel basic operations", "[sync][channel]") {
         // Cannot send after close
         REQUIRE_FALSE(c.try_send(3));
     }
+
+    SECTION("bounded close preserves observable buffered state") {
+        channel<int> c(3);
+        REQUIRE(c.try_send(1));
+        REQUIRE(c.try_send(2));
+
+        c.close();
+        REQUIRE_FALSE(c.empty());
+        REQUIRE(c.size() == 2);
+
+        auto v1 = c.try_recv();
+        REQUIRE(v1.has_value());
+        REQUIRE(*v1 == 1);
+        REQUIRE_FALSE(c.empty());
+        REQUIRE(c.size() == 1);
+
+        auto v2 = c.try_recv();
+        REQUIRE(v2.has_value());
+        REQUIRE(*v2 == 2);
+        REQUIRE(c.empty());
+        REQUIRE(c.size() == 0);
+    }
 }
 
 TEST_CASE("channel with coroutines", "[sync][channel][coro]") {

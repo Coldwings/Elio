@@ -36,13 +36,16 @@ coro::task<void> echo_handler(ws_connection& conn) {
     }
 }
 
-int main() {
+coro::task<int> async_main(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
+
     // Create WebSocket-enabled router
     ws_router router;
     
     // Regular HTTP routes
-    router.get("/", [](context& ctx) -> coro::task<response> {
-        co_return response::ok("Hello!");
+    router.get("/", [](http::context& ctx) -> coro::task<http::response> {
+        co_return http::response::ok("Hello!");
     });
     
     // WebSocket routes
@@ -54,15 +57,14 @@ int main() {
     // Create and start server
     ws_server srv(std::move(router));
     
-    runtime::scheduler sched(4);
-    sched.start();
-    
-    sched.go([&srv]() -> coro::task<void> { co_await srv.listen(net::ipv4_address(8080)); });
-    
-    // Run until stopped...
-    sched.shutdown();
-    return 0;
+    auto bind_addr = net::socket_address(net::ipv4_address(8080));
+
+    // Run until SIGINT/SIGTERM, then stop the listener cleanly.
+    co_await elio::serve(srv, [&]() { return srv.listen(bind_addr); });
+    co_return 0;
 }
+
+ELIO_ASYNC_MAIN(async_main)
 ```
 
 ### WebSocket Client

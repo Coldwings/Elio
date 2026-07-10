@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -177,6 +178,10 @@ public:
                     seg.value.assign(comp.data() + 1, comp.size() - 1);
                     r.param_names.push_back(seg.value);
                 } else if (comp == "*") {
+                    if (i != pattern.size()) {
+                        throw std::invalid_argument(
+                            "HTTP route wildcard must be the final path segment");
+                    }
                     seg.kind = segment_kind::wildcard;
                 } else {
                     seg.kind = segment_kind::literal;

@@ -1,12 +1,114 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/http/http2_client.hpp>
 #include <elio/http/http2_session.hpp>
+#include <elio/net/tcp.hpp>
+#include <elio/runtime/scheduler.hpp>
+#include <elio/time/timer.hpp>
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+#include <elio/tls/tls_context.hpp>
+#include <elio/tls/tls_stream.hpp>
+#include <openssl/evp.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
+#endif
+#include "../test_main.cpp"
 
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
+#include <utility>
 
 using namespace elio::http;
+
+namespace {
+
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+bool install_test_certificate(elio::tls::tls_context& ctx) {
+    using key_ctx_ptr = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
+    using key_ptr = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+    using cert_ptr = std::unique_ptr<X509, decltype(&X509_free)>;
+
+    key_ctx_ptr key_ctx(EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr),
+                        EVP_PKEY_CTX_free);
+    if (!key_ctx) {
+        return false;
+    }
+    if (EVP_PKEY_keygen_init(key_ctx.get()) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_keygen_bits(key_ctx.get(), 2048) <= 0) {
+        return false;
+    }
+
+    EVP_PKEY* raw_key = nullptr;
+    if (EVP_PKEY_keygen(key_ctx.get(), &raw_key) <= 0) {
+        return false;
+    }
+    key_ptr pkey(raw_key, EVP_PKEY_free);
+
+    cert_ptr cert(X509_new(), X509_free);
+    if (!cert) {
+        return false;
+    }
+
+    if (X509_set_version(cert.get(), 2) != 1 ||
+        ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 1) != 1 ||
+        X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0) == nullptr ||
+        X509_gmtime_adj(X509_getm_notAfter(cert.get()), 3600) == nullptr ||
+        X509_set_pubkey(cert.get(), pkey.get()) != 1) {
+        return false;
+    }
+
+    auto* name = X509_get_subject_name(cert.get());
+    if (!name ||
+        X509_NAME_add_entry_by_txt(
+            name, "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>("localhost"),
+            -1, -1, 0) != 1 ||
+        X509_set_issuer_name(cert.get(), name) != 1 ||
+        X509_sign(cert.get(), pkey.get(), EVP_sha256()) <= 0) {
+        return false;
+    }
+
+    return SSL_CTX_use_certificate(ctx.native_handle(), cert.get()) == 1 &&
+           SSL_CTX_use_PrivateKey(ctx.native_handle(), pkey.get()) == 1 &&
+           SSL_CTX_check_private_key(ctx.native_handle()) == 1;
+}
+
+template<typename Pred>
+bool wait_until(Pred pred, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) {
+            return true;
+        }
+        std::this_thread::sleep_for(elio::test::scaled_ms(10));
+    }
+    return pred();
+}
+
+class scoped_sigpipe_ignore {
+public:
+    scoped_sigpipe_ignore()
+        : old_(std::signal(SIGPIPE, SIG_IGN)) {}
+
+    ~scoped_sigpipe_ignore() {
+        std::signal(SIGPIPE, old_);
+    }
+
+    scoped_sigpipe_ignore(const scoped_sigpipe_ignore&) = delete;
+    scoped_sigpipe_ignore& operator=(const scoped_sigpipe_ignore&) = delete;
+
+private:
+    void (*old_)(int);
+};
+#endif
+
+} // namespace
 
 // h2_session is intentionally non-movable because nghttp2 callbacks
 // capture `this` and coroutines may hold references to internal maps.
@@ -81,6 +183,92 @@ TEST_CASE("nghttp2 library version", "[http2]") {
 
     INFO("nghttp2 version: " << info->version_str);
 }
+
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+TEST_CASE("HTTP/2 read_timeout aborts stalled session initialization",
+          "[http2][timeout]") {
+    using elio::coro::task;
+    using elio::net::ipv4_address;
+    using elio::net::tcp_listener;
+    using elio::runtime::scheduler;
+
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    const uint16_t port = listener->local_address().port();
+
+    scoped_sigpipe_ignore ignore_sigpipe;
+
+    elio::tls::tls_context server_ctx(elio::tls::tls_mode::server);
+    REQUIRE(install_test_certificate(server_ctx));
+    REQUIRE(server_ctx.set_alpn_protocols("h2"));
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_handshake{false};
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> release_server{false};
+    std::atomic<int> client_errno{0};
+    std::atomic<int64_t> client_elapsed_ms{-1};
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+
+        elio::tls::tls_stream tls(std::move(*stream), server_ctx);
+        bool ok = co_await tls.handshake();
+        server_handshake.store(ok, std::memory_order_release);
+
+        while (ok && !release_server.load(std::memory_order_acquire)) {
+            co_await elio::time::sleep_for(elio::test::scaled_ms(10));
+        }
+
+        tls.shutdown_socket();
+        server_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    sched.go([&]() -> task<void> {
+        h2_client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(1);
+        h2_client client(cfg);
+        client.tls_context().set_verify_mode(elio::tls::verify_mode::none);
+
+        const auto start = std::chrono::steady_clock::now();
+        auto resp = co_await client.get(
+            std::string("https://127.0.0.1:") + std::to_string(port) + "/");
+        client_elapsed_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count(),
+            std::memory_order_release);
+
+        if (!resp) {
+            client_errno.store(errno, std::memory_order_release);
+        }
+        client_done.store(true, std::memory_order_release);
+        release_server.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] {
+        return client_done.load(std::memory_order_acquire);
+    }, elio::test::scaled_sec(5)));
+
+    release_server.store(true, std::memory_order_release);
+    REQUIRE(wait_until([&] {
+        return server_done.load(std::memory_order_acquire);
+    }, elio::test::scaled_sec(5)));
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+
+    REQUIRE(server_handshake.load(std::memory_order_acquire));
+    REQUIRE(client_errno.load(std::memory_order_acquire) == ETIMEDOUT);
+    REQUIRE(client_elapsed_ms.load(std::memory_order_acquire) >= 0);
+    REQUIRE(client_elapsed_ms.load(std::memory_order_acquire) <
+            elio::test::scaled_sec(5).count() * 1000);
+}
+#endif
 
 // Regression for the PR #67 / on_header_callback noexcept bug:
 //

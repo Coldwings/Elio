@@ -1351,12 +1351,14 @@ public:
 
 ```cpp
 struct h2_client_config {
-    std::chrono::seconds connect_timeout{10};
-    std::chrono::seconds read_timeout{30};
+    std::chrono::seconds connect_timeout{10};  // Reserved; not currently enforced
+    std::chrono::seconds read_timeout{30};     // Session I/O timeout; <=0 disables
     size_t max_concurrent_streams = 100;
     uint32_t initial_window_size = 65535;
     std::string user_agent = "elio-http2/1.0";
     bool enable_push = false;  // Server push (rarely needed)
+    net::resolve_options resolve_options = net::default_cached_resolve_options();
+    bool rotate_resolved_addresses = true;
 };
 ```
 

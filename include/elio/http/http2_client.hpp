@@ -8,9 +8,14 @@
 #include <elio/tls/tls_context.hpp>
 #include <elio/tls/tls_stream.hpp>
 #include <elio/io/io_context.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/runtime/scheduler.hpp>
+#include <elio/time/timer.hpp>
 #include <elio/log/macros.hpp>
 
+#include <atomic>
+#include <cerrno>
 #include <string>
 #include <string_view>
 #include <memory>
@@ -23,8 +28,8 @@ namespace elio::http {
 
 /// HTTP/2 client configuration
 struct h2_client_config {
-    std::chrono::seconds connect_timeout{10};     ///< Connection timeout
-    std::chrono::seconds read_timeout{30};        ///< Read timeout
+    std::chrono::seconds connect_timeout{10};     ///< Reserved; not currently enforced
+    std::chrono::seconds read_timeout{30};        ///< Session I/O timeout; <=0 disables
     size_t max_concurrent_streams = 100;          ///< Max concurrent streams per connection
     uint32_t initial_window_size = 65535;         ///< Initial flow control window size
     std::string user_agent = "elio-http2/1.0";    ///< User-Agent header
@@ -155,7 +160,7 @@ public:
             co_return std::nullopt;
         }
 
-        auto resp = co_await conn->session()->wait_for_stream(stream_id);
+        auto resp = co_await wait_for_stream_with_timeout(*conn, stream_id, target);
 
         // Only return connection to pool if the request succeeded.
         // Errored connections may have corrupted nghttp2 internal state
@@ -176,6 +181,86 @@ public:
     const h2_client_config& config() const noexcept { return config_; }
     
 private:
+    static coro::join_handle<void>
+    arm_tls_io_watchdog(runtime::scheduler* sched,
+                        tls::tls_stream* stream,
+                        std::chrono::nanoseconds timeout,
+                        coro::cancel_token watchdog_token,
+                        std::shared_ptr<std::atomic<bool>> timed_out) {
+        return sched->go_joinable(
+            [stream, timeout, tok = std::move(watchdog_token),
+             flag = std::move(timed_out)]() -> coro::task<void> {
+                auto r = co_await elio::time::sleep_for(timeout, tok);
+                if (r == coro::cancel_result::completed) {
+                    flag->store(true, std::memory_order_release);
+                    if (stream) {
+                        stream->shutdown_socket();
+                    }
+                }
+                co_return;
+            });
+    }
+
+    coro::task<bool> process_with_timeout(h2_connection& conn,
+                                          const std::string& host,
+                                          uint16_t port) {
+        auto* sched = runtime::scheduler::current();
+        if (sched == nullptr || config_.read_timeout.count() <= 0) {
+            co_return co_await conn.session()->process();
+        }
+
+        auto timed_out = std::make_shared<std::atomic<bool>>(false);
+        coro::cancel_source watchdog_cancel;
+        auto watchdog = arm_tls_io_watchdog(
+            sched, conn.tls(), config_.read_timeout,
+            watchdog_cancel.get_token(), timed_out);
+
+        bool ok = co_await conn.session()->process();
+
+        watchdog_cancel.cancel();
+        co_await watchdog;
+
+        if (timed_out->load(std::memory_order_acquire)) {
+            ELIO_LOG_ERROR("HTTP/2 session I/O to {}:{} timed out after {}s",
+                           host, port, config_.read_timeout.count());
+            errno = ETIMEDOUT;
+            co_return false;
+        }
+
+        co_return ok;
+    }
+
+    coro::task<std::optional<response>>
+    wait_for_stream_with_timeout(h2_connection& conn,
+                                 int32_t stream_id,
+                                 const url& target) {
+        auto* sched = runtime::scheduler::current();
+        if (sched == nullptr || config_.read_timeout.count() <= 0) {
+            co_return co_await conn.session()->wait_for_stream(stream_id);
+        }
+
+        auto timed_out = std::make_shared<std::atomic<bool>>(false);
+        coro::cancel_source watchdog_cancel;
+        auto watchdog = arm_tls_io_watchdog(
+            sched, conn.tls(), config_.read_timeout,
+            watchdog_cancel.get_token(), timed_out);
+
+        auto resp = co_await conn.session()->wait_for_stream(stream_id);
+
+        watchdog_cancel.cancel();
+        co_await watchdog;
+
+        if (timed_out->load(std::memory_order_acquire)) {
+            ELIO_LOG_ERROR("HTTP/2 response from {}:{} timed out after {}s",
+                           target.host, target.effective_port(),
+                           config_.read_timeout.count());
+            errno = ETIMEDOUT;
+            co_return std::nullopt;
+        }
+
+        co_return resp;
+    }
+
     /// Perform request to URL
     coro::task<std::optional<response>> request_url(method m,
                                                     std::string_view url_str,
@@ -251,7 +336,7 @@ private:
             ELIO_LOG_DEBUG("HTTP/2 connection established to {}:{}", host, port);
 
             h2_connection conn(std::move(tls_stream));
-            if (!co_await conn.session()->process()) {
+            if (!co_await process_with_timeout(conn, host, port)) {
                 ELIO_LOG_ERROR("HTTP/2 session initialization failed");
                 continue;
             }

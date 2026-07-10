@@ -91,32 +91,51 @@ static task<void> server_main(const bench::config& cfg, scheduler& sched) {
     co_return;
 }
 
-// ---------------------------------------------------------------------------
-// Client: helper — full read (handle partial reads)
-// ---------------------------------------------------------------------------
-
-static task<bool> read_exact(tcp_stream& stream, char* buf, size_t n) {
+static task<bool> read_exact_cancellable(tcp_stream& stream, char* buf,
+                                         size_t n, cancel_token token) {
     while (n > 0) {
-        auto r = co_await stream.read(buf, n);
-        if (r.result <= 0) co_return false;
-        n -= r.result;
-        buf += r.result;
+        if (token.is_cancelled()) {
+            co_return false;
+        }
+
+        auto result = co_await io::async_recv(stream.fd(), buf, n, 0, token);
+        if (result.was_cancelled()) {
+            co_return false;
+        }
+
+        if (result.io.result > 0) {
+            n -= result.io.result;
+            buf += result.io.result;
+        } else if (result.io.result == -EAGAIN ||
+                   result.io.result == -EWOULDBLOCK ||
+                   result.io.result == -EINTR) {
+            co_await time::yield();
+        } else {
+            co_return false;
+        }
     }
     co_return true;
 }
 
-// ---------------------------------------------------------------------------
-// Client: helper — full write (handle partial writes)
-// ---------------------------------------------------------------------------
-
-static task<bool> write_exact(tcp_stream& stream, const char* buf, size_t n) {
+static task<bool> write_exact_cancellable(tcp_stream& stream, const char* buf,
+                                          size_t n, cancel_token token) {
     while (n > 0) {
-        auto w = co_await stream.write(buf, n);
-        if (w.result > 0) {
-            n -= w.result;
-            buf += w.result;
-        } else if (w.result == -EAGAIN || w.result == -EWOULDBLOCK) {
-            continue;
+        if (token.is_cancelled()) {
+            co_return false;
+        }
+
+        auto result = co_await io::async_send(stream.fd(), buf, n, 0, token);
+        if (result.was_cancelled()) {
+            co_return false;
+        }
+
+        if (result.io.result > 0) {
+            n -= result.io.result;
+            buf += result.io.result;
+        } else if (result.io.result == -EAGAIN ||
+                   result.io.result == -EWOULDBLOCK ||
+                   result.io.result == -EINTR) {
+            co_await time::yield();
         } else {
             co_return false;
         }
@@ -151,12 +170,54 @@ static task<void> client_pingpong(const bench::config& cfg,
     std::vector<uint64_t> latencies;
     latencies.reserve(static_cast<size_t>(cfg.duration_s) * 200000);
 
+    cancel_source cancel;
+    std::atomic<bool> timed_out{false};
+    std::mutex timer_mutex;
+    std::condition_variable timer_cv;
+    bool timer_cancelled = false;
+
+    std::thread timer_thread([&]() {
+        std::unique_lock<std::mutex> lock(timer_mutex);
+        const auto budget =
+            std::chrono::seconds(cfg.warmup_s + cfg.duration_s);
+        if (timer_cv.wait_for(lock, budget, [&]() {
+                return timer_cancelled;
+            })) {
+            return;
+        }
+        timed_out.store(true, std::memory_order_release);
+        cancel.cancel();
+        stream->shutdown_socket();
+    });
+
+    auto stop_timer = [&]() {
+        {
+            std::lock_guard<std::mutex> lock(timer_mutex);
+            timer_cancelled = true;
+        }
+        timer_cv.notify_one();
+        if (timer_thread.joinable()) {
+            timer_thread.join();
+        }
+    };
+
     // Warmup phase
     auto warmup_end = std::chrono::steady_clock::now() +
                       std::chrono::seconds(cfg.warmup_s);
-    while (std::chrono::steady_clock::now() < warmup_end) {
-        if (!co_await write_exact(*stream, send_buf.data(), msg_size)) co_return;
-        if (!co_await read_exact(*stream, recv_buf.data(), msg_size)) co_return;
+    while (!timed_out.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < warmup_end) {
+        if (!co_await write_exact_cancellable(
+                *stream, send_buf.data(), msg_size, cancel.get_token())) {
+            stop_timer();
+            out.timed_out = timed_out.load(std::memory_order_acquire);
+            co_return;
+        }
+        if (!co_await read_exact_cancellable(
+                *stream, recv_buf.data(), msg_size, cancel.get_token())) {
+            stop_timer();
+            out.timed_out = timed_out.load(std::memory_order_acquire);
+            co_return;
+        }
     }
 
     latencies.clear();
@@ -164,21 +225,37 @@ static task<void> client_pingpong(const bench::config& cfg,
     // Measurement phase
     auto measure_start = std::chrono::steady_clock::now();
     auto measure_end   = measure_start + std::chrono::seconds(cfg.duration_s);
+    auto finish = [&]() {
+        double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - measure_start).count();
+        out = bench::pingpong_stats::compute(latencies, elapsed);
+        out.timed_out = timed_out.load(std::memory_order_acquire);
+    };
 
-    while (std::chrono::steady_clock::now() < measure_end) {
+    while (!timed_out.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < measure_end) {
         auto t0 = std::chrono::steady_clock::now();
 
-        if (!co_await write_exact(*stream, send_buf.data(), msg_size)) co_return;
-        if (!co_await read_exact(*stream, recv_buf.data(), msg_size)) co_return;
+        if (!co_await write_exact_cancellable(
+                *stream, send_buf.data(), msg_size, cancel.get_token())) {
+            finish();
+            stop_timer();
+            co_return;
+        }
+        if (!co_await read_exact_cancellable(
+                *stream, recv_buf.data(), msg_size, cancel.get_token())) {
+            finish();
+            stop_timer();
+            co_return;
+        }
 
         auto t1 = std::chrono::steady_clock::now();
         latencies.push_back(
             std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     }
 
-    double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - measure_start).count();
-    out = bench::pingpong_stats::compute(latencies, elapsed);
+    stop_timer();
+    finish();
     co_return;
 }
 
@@ -198,32 +275,6 @@ struct streaming_counters {
     std::atomic<uint64_t> total_bytes{0};
     std::atomic<uint64_t> total_msgs{0};
 };
-
-static task<bool> write_exact_cancellable(tcp_stream& stream, const char* buf,
-                                          size_t n, cancel_token token) {
-    while (n > 0) {
-        if (token.is_cancelled()) {
-            co_return false;
-        }
-
-        auto result = co_await io::async_send(stream.fd(), buf, n, 0, token);
-        if (result.was_cancelled()) {
-            co_return false;
-        }
-
-        if (result.io.result > 0) {
-            n -= result.io.result;
-            buf += result.io.result;
-        } else if (result.io.result == -EAGAIN ||
-                   result.io.result == -EWOULDBLOCK ||
-                   result.io.result == -EINTR) {
-            co_await time::yield();
-        } else {
-            co_return false;
-        }
-    }
-    co_return true;
-}
 
 static task<void> streaming_reader(streaming_ctx* ctx, streaming_counters* ctr) {
     constexpr size_t kReadBufSize = bench::kStreamingRecvBufferSize;

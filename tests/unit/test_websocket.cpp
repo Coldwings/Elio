@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <new>
 #include <string>
+#include <stdexcept>
 #include <type_traits>
 #include <vector>
 
@@ -199,6 +200,48 @@ TEST_CASE("WebSocket frame encoding", "[websocket][frame]") {
         auto frame = encode_pong_frame("test", false);
         
         REQUIRE((frame[0] & 0x0F) == 0x0A);  // opcode = pong
+    }
+
+    SECTION("encode maximum-size control frames") {
+        std::string max_payload(125, 'x');
+        auto ping = encode_ping_frame(max_payload, false);
+
+        REQUIRE((ping[0] & 0x0F) == 0x09);
+        REQUIRE((ping[1] & 0x7F) == 125);
+
+        frame_header ping_header;
+        auto ping_result = parse_frame_header(ping.data(), ping.size(), ping_header);
+        REQUIRE(ping_result.complete);
+        REQUIRE_FALSE(ping_result.error);
+
+        std::string max_reason(123, 'r');
+        auto close = encode_close_frame(close_code::normal, max_reason, false);
+        REQUIRE((close[0] & 0x0F) == 0x08);
+        REQUIRE((close[1] & 0x7F) == 125);
+
+        frame_header close_header;
+        auto close_result = parse_frame_header(close.data(), close.size(), close_header);
+        REQUIRE(close_result.complete);
+        REQUIRE_FALSE(close_result.error);
+    }
+
+    SECTION("reject oversized control frame payloads before encoding") {
+        REQUIRE_THROWS_AS(encode_ping_frame(std::string(126, 'x'), false),
+                          std::invalid_argument);
+        REQUIRE_THROWS_AS(encode_pong_frame(std::string(126, 'x'), false),
+                          std::invalid_argument);
+        REQUIRE_THROWS_AS(encode_close_frame(close_code::normal,
+                                             std::string(124, 'x'),
+                                             false),
+                          std::invalid_argument);
+    }
+
+    SECTION("reject fragmented control frames before encoding") {
+        frame_header header;
+        header.op = opcode::ping;
+        header.fin = false;
+
+        REQUIRE_THROWS_AS(encode_frame(header, "x"), std::invalid_argument);
     }
 }
 

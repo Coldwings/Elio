@@ -392,24 +392,21 @@ public:
         auto remaining = [&]() {
             return std::chrono::steady_clock::now() < deadline;
         };
-        auto remaining_budget = [&]() -> std::chrono::milliseconds {
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) {
-                return 0ms;
-            }
-            return std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now);
-        };
         auto poll_until_deadline = [&](bool for_read) -> coro::task<io::io_result> {
-            const auto budget = remaining_budget();
-            if (budget <= 0ms) {
+            if (!remaining()) {
                 co_return io::io_result{-ETIMEDOUT, 0};
             }
 
             coro::cancel_source poll_cancel;
-            auto watchdog = elio::spawn([budget, &poll_cancel]() -> coro::task<void> {
+            auto watchdog = elio::spawn([deadline, &poll_cancel]() -> coro::task<void> {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    poll_cancel.cancel();
+                    co_return;
+                }
+
                 auto result = co_await time::sleep_for(
-                    budget, poll_cancel.get_token());
+                    deadline - now, poll_cancel.get_token());
                 if (result == coro::cancel_result::completed) {
                     poll_cancel.cancel();
                 }

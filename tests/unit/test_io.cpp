@@ -16,6 +16,9 @@
 
 #include <unistd.h>
 #include <fcntl.h>
+#ifdef __linux__
+#include <dirent.h>
+#endif
 #include <sys/socket.h>
 #include <sys/eventfd.h>
 #include <sys/un.h>
@@ -1505,6 +1508,27 @@ static task<void> resolve_all_attempt_with_options(
     co_return;
 }
 
+static int count_open_fds_for_tcp_test() {
+#ifdef __linux__
+    DIR* dir = ::opendir("/proc/self/fd");
+    if (!dir) {
+        return -1;
+    }
+
+    int count = 0;
+    while (auto* entry = ::readdir(dir)) {
+        if (std::strcmp(entry->d_name, ".") != 0 &&
+            std::strcmp(entry->d_name, "..") != 0) {
+            ++count;
+        }
+    }
+    ::closedir(dir);
+    return count;
+#else
+    return -1;
+#endif
+}
+
 TEST_CASE("ipv4_address basic operations", "[tcp][address][ipv4]") {
     SECTION("default constructor") {
         ipv4_address addr;
@@ -2098,6 +2122,101 @@ TEST_CASE("TCP connect regression avoids double connect", "[tcp][connect][regres
     INFO("connect failures=" << failed.load() << ", first errno=" << first_error.load());
     REQUIRE(connected == kAttempts);
     REQUIRE(failed == 0);
+}
+
+TEST_CASE("tcp_connect braced options remain source-compatible",
+          "[tcp][connect][api]") {
+    [[maybe_unused]] auto v4 =
+        tcp_connect(ipv4_address("127.0.0.1", 9), {});
+    [[maybe_unused]] auto v6 =
+        tcp_connect(ipv6_address("::1", 9), {});
+    [[maybe_unused]] auto generic =
+        tcp_connect(socket_address(ipv4_address("127.0.0.1", 9)), {});
+    SUCCEED("braced tcp_options overloads remain unambiguous");
+}
+
+TEST_CASE("tcp_connect observes already-cancelled token",
+          "[tcp][connect][cancel]") {
+    std::optional<tcp_stream> stream;
+    std::atomic<bool> done{false};
+    int observed_errno = 0;
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+    source.cancel();
+
+    sched.go([&]() -> task<void> {
+        errno = 0;
+        stream = co_await tcp_connect(
+            ipv4_address("127.0.0.1", 9), source.get_token());
+        observed_errno = errno;
+        done = true;
+        co_return;
+    });
+
+    for (int i = 0; i < 200 && !done; ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(10));
+    }
+
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+
+    REQUIRE(done);
+    REQUIRE_FALSE(stream.has_value());
+    REQUIRE(observed_errno == ECANCELED);
+}
+
+TEST_CASE("tcp_connect cancellation during pending connect cleans up fd",
+          "[tcp][connect][cancel]") {
+    std::optional<tcp_stream> stream;
+    std::atomic<bool> started{false};
+    std::atomic<bool> done{false};
+    int observed_errno = 0;
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+    sched.go([&]() -> task<void> {
+        started = true;
+        errno = 0;
+        stream = co_await tcp_connect(
+            ipv4_address("192.0.2.1", 9), source.get_token());
+        observed_errno = errno;
+        done = true;
+        co_return;
+    });
+
+    for (int i = 0; i < 200 && !started; ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(10));
+    }
+    REQUIRE(started);
+
+    std::this_thread::sleep_for(elio::test::scaled_ms(50));
+    if (done) {
+        REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+        SUCCEED("platform completed the connect before cancellation");
+        return;
+    }
+
+    const int pending_fds = count_open_fds_for_tcp_test();
+    source.cancel();
+
+    for (int i = 0; i < 500 && !done; ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(10));
+    }
+
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+
+    REQUIRE(done);
+    REQUIRE_FALSE(stream.has_value());
+    REQUIRE(observed_errno == ECANCELED);
+
+    const int after_fds = count_open_fds_for_tcp_test();
+    if (pending_fds >= 0 && after_fds >= 0) {
+        REQUIRE(after_fds < pending_fds);
+    }
 }
 
 TEST_CASE("explicit hostname resolution", "[tcp][address][dns]") {

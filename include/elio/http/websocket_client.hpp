@@ -264,7 +264,8 @@ private:
             secure_,
             &tls_ctx_,
             config_.resolve_options,
-            config_.rotate_resolved_addresses);
+            config_.rotate_resolved_addresses,
+            config_.connect_timeout);
         if (!conn_result) {
             co_return false;
         }

@@ -61,7 +61,9 @@ public:
     coro::task<std::optional<connection>> acquire(const std::string& host,
                                                    uint16_t port,
                                                    bool secure,
-                                                   tls::tls_context* tls_ctx = nullptr) {
+                                                   tls::tls_context* tls_ctx = nullptr,
+                                                   std::chrono::nanoseconds connect_timeout =
+                                                       std::chrono::nanoseconds::zero()) {
         std::string key = make_key(host, port, secure);
         auto& shard = shard_for(key);
 
@@ -97,7 +99,8 @@ public:
             secure,
             tls_ctx,
             config_.resolve_options,
-            config_.rotate_resolved_addresses);
+            config_.rotate_resolved_addresses,
+            connect_timeout);
         if (!result) {
             co_return std::nullopt;
         }
@@ -337,16 +340,16 @@ private:
             co_return std::nullopt;
         }
 
-        // Get connection from pool. We do not enforce connect_timeout here
-        // because the underlying tcp_connect/tls handshake awaitables don't
-        // accept a cancel_token; properly bounding connect time would require
-        // plumbing a token through net::tcp_connect and tls::tls_stream::handshake.
-        // Tracked as a follow-up; once implemented this acquire should be
-        // wrapped the same way the read loop below is.
+        // Get connection from pool. connect_timeout is enforced inside the
+        // shared client_connect path for TCP connect and TLS handshake.
+        errno = 0;
         auto conn_opt = co_await pool_.acquire(target.host, target.effective_port(),
-                                                target.is_secure(), &tls_ctx_);
+                                                target.is_secure(), &tls_ctx_,
+                                                config_.connect_timeout);
         if (!conn_opt) {
-            errno = ECONNREFUSED;
+            if (errno == 0) {
+                errno = ECONNREFUSED;
+            }
             co_return std::nullopt;
         }
 

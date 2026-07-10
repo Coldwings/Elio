@@ -280,6 +280,9 @@ private:
         while (true) {
             auto line_end = buffer_.find("\r\n");
             if (line_end == std::string::npos) {
+                if (buffer_.size() > max_header_size_) {
+                    set_error("Header line too long");
+                }
                 return false;
             }
 
@@ -774,6 +777,9 @@ private:
         while (true) {
             auto line_end = buffer_.find("\r\n");
             if (line_end == std::string::npos) {
+                if (buffer_.size() > max_header_size_) {
+                    set_error("Header line too long");
+                }
                 return false;
             }
 

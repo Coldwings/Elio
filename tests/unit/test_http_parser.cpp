@@ -1056,6 +1056,17 @@ TEST_CASE("HTTP request parser rejects oversized header line",
     REQUIRE(parser.has_error());
 }
 
+TEST_CASE("HTTP request parser rejects oversized unterminated header line",
+          "[http][parser][security]") {
+    std::string request =
+        "GET / HTTP/1.1\r\nX: " + std::string(8190, 'x');
+
+    request_parser parser;
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::error);
+    REQUIRE(parser.has_error());
+}
+
 TEST_CASE("HTTP request parser accepts header line exactly at max_header_size",
           "[http][parser][security]") {
     // A header line of exactly 8192 bytes (name + ": " + value) must be
@@ -1089,6 +1100,17 @@ TEST_CASE("HTTP response parser rejects oversized header line",
     std::string long_value(8193, 'x');
     std::string response =
         "HTTP/1.1 200 OK\r\nX-Big: " + long_value + "\r\n\r\n";
+
+    response_parser parser;
+    auto [result, _] = parser.parse(response);
+    REQUIRE(result == parse_result::error);
+    REQUIRE(parser.has_error());
+}
+
+TEST_CASE("HTTP response parser rejects oversized unterminated header line",
+          "[http][parser][security]") {
+    std::string response =
+        "HTTP/1.1 200 OK\r\nX: " + std::string(8190, 'x');
 
     response_parser parser;
     auto [result, _] = parser.parse(response);

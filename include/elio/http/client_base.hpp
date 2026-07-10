@@ -133,6 +133,13 @@ client_connect(std::string_view host, uint16_t port, bool secure,
         co_return;
     };
 
+    auto stop_watchdog_preserving_errno = [&]() -> coro::task<void> {
+        int saved_errno = errno;
+        co_await stop_watchdog();
+        errno = saved_errno;
+        co_return;
+    };
+
     auto check_timeout = [&]() -> bool {
         if (timed_out->load(std::memory_order_acquire)) {
             errno = ETIMEDOUT;
@@ -143,7 +150,8 @@ client_connect(std::string_view host, uint16_t port, bool secure,
 
     if (secure) {
         if (!tls_ctx) {
-            co_await stop_watchdog();
+            errno = EINVAL;
+            co_await stop_watchdog_preserving_errno();
             ELIO_LOG_ERROR("TLS context required for secure connection to {}:{}", host, port);
             co_return std::nullopt;
         }
@@ -157,7 +165,7 @@ client_connect(std::string_view host, uint16_t port, bool secure,
                 tcp = co_await net::tcp_connect(addr);
             }
             if (check_timeout()) {
-                co_await stop_watchdog();
+                co_await stop_watchdog_preserving_errno();
                 co_return std::nullopt;
             }
             if (!tcp) {
@@ -170,7 +178,7 @@ client_connect(std::string_view host, uint16_t port, bool secure,
                 ? co_await tls_stream.handshake(op_cancel_src->get_token())
                 : co_await tls_stream.handshake();
             if (check_timeout()) {
-                co_await stop_watchdog();
+                co_await stop_watchdog_preserving_errno();
                 co_return std::nullopt;
             }
             if (!hs) {
@@ -181,7 +189,9 @@ client_connect(std::string_view host, uint16_t port, bool secure,
             co_return net::stream(std::move(tls_stream));
         }
 
+        int connect_errno = errno ? errno : ECONNREFUSED;
         co_await stop_watchdog();
+        errno = connect_errno;
         ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(errno));
         co_return std::nullopt;
     } else {
@@ -194,7 +204,7 @@ client_connect(std::string_view host, uint16_t port, bool secure,
                 result = co_await net::tcp_connect(addr);
             }
             if (check_timeout()) {
-                co_await stop_watchdog();
+                co_await stop_watchdog_preserving_errno();
                 co_return std::nullopt;
             }
             if (result) {
@@ -203,7 +213,9 @@ client_connect(std::string_view host, uint16_t port, bool secure,
             }
         }
 
+        int connect_errno = errno ? errno : ECONNREFUSED;
         co_await stop_watchdog();
+        errno = connect_errno;
         ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(errno));
         co_return std::nullopt;
     }

@@ -21,6 +21,7 @@
 #include <string_view>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
@@ -869,8 +870,8 @@ public:
         , addr_(addr), opts_(opts) {}
 
     tcp_connect_awaitable(const socket_address& addr,
-                          coro::cancel_token token,
-                          const tcp_options& opts = {})
+                          const tcp_options& opts,
+                          coro::cancel_token token)
         : io::io_awaitable_base()
         , addr_(addr)
         , opts_(opts)
@@ -1084,10 +1085,13 @@ inline auto tcp_connect(const ipv4_address& addr,
 }
 
 /// Connect to a remote TCP server (IPv4), cancellable by token
+template<typename Token>
+    requires std::is_same_v<std::remove_cvref_t<Token>, coro::cancel_token>
 inline auto tcp_connect(const ipv4_address& addr,
-                        coro::cancel_token token,
+                        Token&& token,
                         const tcp_options& opts = {}) {
-    return tcp_connect_awaitable(socket_address(addr), std::move(token), opts);
+    return tcp_connect_awaitable(
+        socket_address(addr), opts, std::forward<Token>(token));
 }
 
 /// Connect to a remote TCP server (IPv6)
@@ -1097,10 +1101,13 @@ inline auto tcp_connect(const ipv6_address& addr,
 }
 
 /// Connect to a remote TCP server (IPv6), cancellable by token
+template<typename Token>
+    requires std::is_same_v<std::remove_cvref_t<Token>, coro::cancel_token>
 inline auto tcp_connect(const ipv6_address& addr,
-                        coro::cancel_token token,
+                        Token&& token,
                         const tcp_options& opts = {}) {
-    return tcp_connect_awaitable(socket_address(addr), std::move(token), opts);
+    return tcp_connect_awaitable(
+        socket_address(addr), opts, std::forward<Token>(token));
 }
 
 /// Connect to a remote TCP server (generic address)
@@ -1110,10 +1117,12 @@ inline auto tcp_connect(const socket_address& addr,
 }
 
 /// Connect to a remote TCP server (generic address), cancellable by token
+template<typename Token>
+    requires std::is_same_v<std::remove_cvref_t<Token>, coro::cancel_token>
 inline auto tcp_connect(const socket_address& addr,
-                        coro::cancel_token token,
+                        Token&& token,
                         const tcp_options& opts = {}) {
-    return tcp_connect_awaitable(addr, std::move(token), opts);
+    return tcp_connect_awaitable(addr, opts, std::forward<Token>(token));
 }
 
 } // namespace elio::net

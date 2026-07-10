@@ -163,9 +163,9 @@ coro::task<void> serve(Server& server, ListenFunc listen_func,
 /// Convenience overload for TLS servers.
 ///
 /// @tparam Server Server type (must have stop() method)
-/// @tparam ListenTask The awaitable returned by server.listen_tls()
+/// @tparam ListenFunc Callable type returning the server's TLS listen task
 /// @param server Reference to the server
-/// @param listen_task The TLS listen coroutine task
+/// @param listen_func Callable returning the TLS listen coroutine task
 /// @param signals Signals to wait for shutdown
 ///
 /// Example:

@@ -524,6 +524,31 @@ public:
     /// Start listening on address (plain HTTP/WS)
     coro::task<void> listen(const net::socket_address& addr,
                             const net::tcp_options& opts = {}) {
+        const auto start_epoch = stop_epoch_.load(std::memory_order_acquire);
+        return listen_impl(addr, opts, start_epoch);
+    }
+
+    /// Start listening with TLS (HTTPS/WSS)
+    /// @note The caller must ensure `tls_ctx` outlives all spawned connection
+    ///       handlers.  See http::server::listen_tls for details.
+    coro::task<void> listen_tls(const net::socket_address& addr, tls::tls_context& tls_ctx,
+                                const net::tcp_options& opts = {}) {
+        const auto start_epoch = stop_epoch_.load(std::memory_order_acquire);
+        return listen_tls_impl(addr, tls_ctx, opts, start_epoch);
+    }
+
+    /// Stop the server
+    void stop() {
+        cancel_active_accepts();
+    }
+
+    /// Check if server is running
+    bool is_running() const noexcept { return running_; }
+
+private:
+    coro::task<void> listen_impl(const net::socket_address& addr,
+                                 const net::tcp_options& opts,
+                                 size_t start_epoch) {
         auto* sched = runtime::scheduler::current();
         if (!sched) {
             ELIO_LOG_ERROR("WebSocket server must be started from within a scheduler context");
@@ -539,9 +564,11 @@ public:
         ELIO_LOG_INFO("WebSocket server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
-        auto accept_source = register_accept_cancel_source();
+        auto accept_source = begin_accept_loop(start_epoch);
+        if (!accept_source) {
+            co_return;
+        }
         auto accept_token = accept_source->get_token();
-        running_.store(true, std::memory_order_release);
 
         while (running_.load(std::memory_order_acquire)) {
             auto stream_result = co_await listener.accept(accept_token);
@@ -562,11 +589,10 @@ public:
         }
     }
 
-    /// Start listening with TLS (HTTPS/WSS)
-    /// @note The caller must ensure `tls_ctx` outlives all spawned connection
-    ///       handlers.  See http::server::listen_tls for details.
-    coro::task<void> listen_tls(const net::socket_address& addr, tls::tls_context& tls_ctx,
-                                const net::tcp_options& opts = {}) {
+    coro::task<void> listen_tls_impl(const net::socket_address& addr,
+                                     tls::tls_context& tls_ctx,
+                                     const net::tcp_options& opts,
+                                     size_t start_epoch) {
         auto* sched = runtime::scheduler::current();
         if (!sched) {
             ELIO_LOG_ERROR("Secure WebSocket server must be started from within a scheduler context");
@@ -582,9 +608,11 @@ public:
         ELIO_LOG_INFO("Secure WebSocket server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
-        auto accept_source = register_accept_cancel_source();
+        auto accept_source = begin_accept_loop(start_epoch);
+        if (!accept_source) {
+            co_return;
+        }
         auto accept_token = accept_source->get_token();
-        running_.store(true, std::memory_order_release);
 
         // Capture by pointer — see doc comment above for lifetime requirement.
         auto* tls_ctx_ptr = &tls_ctx;
@@ -607,17 +635,6 @@ public:
             });
         }
     }
-    
-    /// Stop the server
-    void stop() {
-        running_.store(false, std::memory_order_release);
-        cancel_active_accepts();
-    }
-    
-    /// Check if server is running
-    bool is_running() const noexcept { return running_; }
-    
-private:
     /// Handle a plain connection
     coro::task<void> handle_connection(net::tcp_stream stream) {
         auto peer = stream.peer_address();
@@ -779,9 +796,12 @@ private:
         }
     }
 
-    std::shared_ptr<coro::cancel_source> register_accept_cancel_source() {
+    std::shared_ptr<coro::cancel_source> begin_accept_loop(size_t start_epoch) {
         auto source = std::make_shared<coro::cancel_source>();
         std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+        if (stop_epoch_.load(std::memory_order_acquire) != start_epoch) {
+            return {};
+        }
         auto it = active_accept_sources_.begin();
         while (it != active_accept_sources_.end()) {
             if (it->expired()) {
@@ -791,6 +811,7 @@ private:
             }
         }
         active_accept_sources_.push_back(source);
+        running_.store(true, std::memory_order_release);
         return source;
     }
 
@@ -798,6 +819,8 @@ private:
         std::vector<std::shared_ptr<coro::cancel_source>> sources;
         {
             std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+            stop_epoch_.fetch_add(1, std::memory_order_acq_rel);
+            running_.store(false, std::memory_order_release);
             auto it = active_accept_sources_.begin();
             while (it != active_accept_sources_.end()) {
                 if (auto source = it->lock()) {
@@ -826,6 +849,7 @@ private:
     ws_router router_;
     http::server_config http_config_;
     std::atomic<bool> running_{false};
+    std::atomic<size_t> stop_epoch_{0};
     mutable std::mutex accept_cancel_mutex_;
     std::vector<std::weak_ptr<coro::cancel_source>> active_accept_sources_;
 };

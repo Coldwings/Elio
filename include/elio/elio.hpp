@@ -4,8 +4,9 @@
 /// 
 /// Version: 0.5.2
 /// 
-/// This header provides convenient access to all Elio components.
-/// Include this file to use the Elio coroutine library.
+/// This header provides convenient access to Elio's core/common components.
+/// Optional modules such as HTTP, TLS, RPC, and RDMA have separate aggregate
+/// headers to avoid pulling optional dependencies into every translation unit.
 
 // Version information
 #define ELIO_VERSION_MAJOR 0

@@ -280,7 +280,9 @@ auto listener = net::uds_listener::bind(addr);
 
 ## HTTP
 
-HTTP support requires linking with `elio_http` and OpenSSL.
+HTTP support requires linking with `elio_http` and OpenSSL. This is the
+current build/package target dependency; the HTTP/1.1 client and server can
+still use plaintext `http://` traffic at runtime.
 
 ### HTTP Client
 
@@ -446,10 +448,11 @@ coro::task<void> advanced_h2_client() {
 | Feature | HTTP/1.1 (`client`) | HTTP/2 (`h2_client`) |
 |---------|---------------------|----------------------|
 | Protocol | HTTP/1.1 | HTTP/2 (h2) |
-| TLS Required | No (supports both) | Yes (HTTPS only) |
+| Wire TLS required | No; supports plaintext HTTP and HTTPS | Yes (HTTPS only) |
 | Multiplexing | No (one request per connection) | Yes (multiple streams) |
 | Header Compression | No | Yes (HPACK) |
 | CMake Target | `elio_http` | `elio_http2` |
+| Build/link dependency | Current `elio_http` target depends on `elio_tls` / OpenSSL | `elio_http2` depends on `elio_http`, OpenSSL, and nghttp2 |
 
 ### When to Use HTTP/2
 

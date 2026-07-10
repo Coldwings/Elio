@@ -300,6 +300,73 @@ TEST_CASE("HTTP/2 read_timeout aborts stalled session initialization",
     REQUIRE(client_elapsed_ms.load(std::memory_order_acquire) <
             elio::test::scaled_sec(5).count() * 1000);
 }
+
+TEST_CASE("HTTP/2 connect_timeout aborts stalled TLS handshake",
+          "[http2][timeout][tls]") {
+    using elio::coro::task;
+    using elio::net::ipv4_address;
+    using elio::net::tcp_listener;
+    using elio::runtime::scheduler;
+
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    const uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<int> client_errno{0};
+    std::atomic<int64_t> client_elapsed_ms{-1};
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+
+        co_await elio::time::sleep_for(elio::test::scaled_sec(3));
+        stream->shutdown_socket();
+        server_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    sched.go([&]() -> task<void> {
+        h2_client_config cfg;
+        cfg.connect_timeout = std::chrono::seconds(1);
+        cfg.read_timeout = std::chrono::seconds(10);
+        h2_client client(cfg);
+        client.tls_context().set_verify_mode(elio::tls::verify_mode::none);
+
+        const auto start = std::chrono::steady_clock::now();
+        auto resp = co_await client.get(
+            std::string("https://127.0.0.1:") + std::to_string(port) + "/");
+        client_elapsed_ms.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count(),
+            std::memory_order_release);
+
+        if (!resp) {
+            client_errno.store(errno, std::memory_order_release);
+        }
+        client_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] {
+        return client_done.load(std::memory_order_acquire);
+    }, elio::test::scaled_sec(5)));
+
+    REQUIRE(wait_until([&] {
+        return server_done.load(std::memory_order_acquire);
+    }, elio::test::scaled_sec(5)));
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+
+    REQUIRE(client_errno.load(std::memory_order_acquire) == ETIMEDOUT);
+    REQUIRE(client_elapsed_ms.load(std::memory_order_acquire) >= 0);
+    REQUIRE(client_elapsed_ms.load(std::memory_order_acquire) <
+            elio::test::scaled_sec(3).count() * 1000);
+}
 #endif
 
 // Regression for the PR #67 / on_header_callback noexcept bug:

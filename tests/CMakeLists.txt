@@ -78,6 +78,19 @@ if(TARGET elio_tls)
     )
 endif()
 
+# Keep copyable public-header examples checked against the enabled HTTP/TLS API.
+# This object target compiles once and intentionally is not linked or executed.
+if(TARGET elio_http AND TARGET elio_tls)
+    add_library(elio_public_header_examples OBJECT
+        compile/public_header_examples.cpp
+    )
+    target_link_libraries(elio_public_header_examples PRIVATE
+        elio
+        elio_http
+        elio_tls
+    )
+endif()
+
 # RDMA abstraction tests (only when ELIO_ENABLE_RDMA=ON).
 # Header-only; no extra libraries required for the dispatcher / op_state
 # slice — the mock backend (S3+) and any real ibverbs backend are

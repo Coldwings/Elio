@@ -49,20 +49,19 @@
 ```bash
 git clone https://github.com/Coldwings/Elio.git
 cd Elio
-mkdir build && cd build
-cmake ..
-cmake --build .
+cmake -S . -B build
+cmake --build build
 ```
 
 ### CMake Options
 
 ```bash
 # Core toggles
-cmake .. -DELIO_BUILD_TESTS=ON -DELIO_BUILD_EXAMPLES=ON
-cmake .. -DELIO_ENABLE_TLS=ON -DELIO_ENABLE_HTTP=ON -DELIO_ENABLE_HTTP2=ON
+cmake -S . -B build -DELIO_BUILD_TESTS=ON -DELIO_BUILD_EXAMPLES=ON
+cmake -S . -B build -DELIO_ENABLE_TLS=ON -DELIO_ENABLE_HTTP=ON -DELIO_ENABLE_HTTP2=ON
 
 # Warning policy for repository-local targets (tests/examples only)
-cmake .. -DELIO_ENABLE_DEVELOPER_WARNINGS=ON -DELIO_WARNINGS_AS_ERRORS=ON
+cmake -S . -B build -DELIO_ENABLE_DEVELOPER_WARNINGS=ON -DELIO_WARNINGS_AS_ERRORS=ON
 ```
 
 Note: strict warning flags are applied only to Elio's tests/examples targets and are not propagated through exported interface targets.

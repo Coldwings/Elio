@@ -76,8 +76,8 @@ Elio has several optional feature flags, each controlled by a CMake option. The 
 | CMake option | Dependency | What it enables |
 |---|---|---|
 | `ELIO_ENABLE_TLS` | OpenSSL | TLS/SSL streams, HTTPS support |
-| `ELIO_ENABLE_HTTP` | (none beyond TLS if HTTPS needed) | HTTP/1.1 client and server, WebSocket, SSE |
-| `ELIO_ENABLE_HTTP2` | nghttp2 | HTTP/2 multiplexed connections |
+| `ELIO_ENABLE_HTTP` | OpenSSL via the current `elio_tls` target | HTTP/1.1 client and server, WebSocket, SSE; plaintext and TLS endpoints at runtime |
+| `ELIO_ENABLE_HTTP2` | nghttp2 plus enabled HTTP/TLS targets | HTTP/2 multiplexed connections over TLS |
 
 Link the target for the feature your code includes:
 
@@ -103,6 +103,11 @@ target_link_libraries(your_target PRIVATE elio_http2)
 An installed package exports only the feature targets that were enabled when
 that package was built. `Elio::elio_http2` therefore requires an Elio install
 configured with TLS, HTTP, and HTTP/2 enabled.
+
+`elio_http` currently depends on the TLS target at build/link time, so
+OpenSSL must be available even if your application only uses plaintext
+`http://`, `ws://`, or plain HTTP server traffic. This is a package target
+dependency, not a requirement that every HTTP/1.1 connection use TLS.
 
 Enable them at configure time:
 

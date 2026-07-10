@@ -4,7 +4,9 @@
 #include <elio/net/tcp.hpp>
 #include <elio/net/resolve.hpp>
 #include <elio/io/io_context.hpp>
+#include <elio/runtime/spawn.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/time/timer.hpp>
 #include <elio/log/macros.hpp>
 
 #include <openssl/ssl.h>
@@ -13,6 +15,7 @@
 #include <sys/socket.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -383,9 +386,46 @@ public:
             co_return;
         }
 
+        using namespace std::chrono_literals;
+
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         auto remaining = [&]() {
             return std::chrono::steady_clock::now() < deadline;
+        };
+        auto poll_until_deadline = [&](bool for_read) -> coro::task<io::io_result> {
+            if (!remaining()) {
+                co_return io::io_result{-ETIMEDOUT, 0};
+            }
+
+            coro::cancel_source poll_cancel;
+            auto watchdog = elio::spawn([deadline, &poll_cancel]() -> coro::task<void> {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    poll_cancel.cancel();
+                    co_return;
+                }
+
+                auto result = co_await time::sleep_for(
+                    deadline - now, poll_cancel.get_token());
+                if (result == coro::cancel_result::completed) {
+                    poll_cancel.cancel();
+                }
+            });
+
+            io::cancellable_io_result poll{};
+            if (for_read) {
+                poll = co_await tcp_.poll_read(poll_cancel.get_token());
+            } else {
+                poll = co_await tcp_.poll_write(poll_cancel.get_token());
+            }
+
+            poll_cancel.cancel();
+            co_await watchdog;
+
+            if (poll.was_cancelled() || poll.io.result == -ECANCELED) {
+                co_return io::io_result{-ETIMEDOUT, 0};
+            }
+            co_return poll.io;
         };
 
         // Phase 1: emit our close_notify. ``SSL_shutdown`` returning 0 means
@@ -407,13 +447,13 @@ public:
             }
             int err = SSL_get_error(ssl_, ret);
             if (err == SSL_ERROR_WANT_WRITE) {
-                auto poll = co_await tcp_.poll_write();
+                auto poll = co_await poll_until_deadline(false);
                 if (poll.result < 0) {
                     handshake_complete_ = false;
                     co_return;
                 }
             } else if (err == SSL_ERROR_WANT_READ) {
-                auto poll = co_await tcp_.poll_read();
+                auto poll = co_await poll_until_deadline(true);
                 if (poll.result < 0) {
                     handshake_complete_ = false;
                     co_return;
@@ -443,16 +483,16 @@ public:
             }
             if (ret == 0) {
                 // Our close_notify is out, peer's hasn't arrived yet.
-                auto poll = co_await tcp_.poll_read();
+                auto poll = co_await poll_until_deadline(true);
                 if (poll.result < 0) break;
                 continue;
             }
             int err = SSL_get_error(ssl_, ret);
             if (err == SSL_ERROR_WANT_READ) {
-                auto poll = co_await tcp_.poll_read();
+                auto poll = co_await poll_until_deadline(true);
                 if (poll.result < 0) break;
             } else if (err == SSL_ERROR_WANT_WRITE) {
-                auto poll = co_await tcp_.poll_write();
+                auto poll = co_await poll_until_deadline(false);
                 if (poll.result < 0) break;
             } else {
                 break;

@@ -6,6 +6,12 @@
 #include <elio/runtime/scheduler.hpp>
 #include <elio/net/resolve.hpp>
 #include <elio/time/timer.hpp>
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+#include <elio/tls/tls_stream.hpp>
+#include <openssl/evp.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
+#endif
 #include "../test_main.cpp"
 
 #include <unistd.h>
@@ -2349,6 +2355,58 @@ void fill_socket_send_buffer(int fd) {
     FAIL("socket send buffer did not fill");
 }
 
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+bool install_test_certificate(elio::tls::tls_context& ctx) {
+    using key_ctx_ptr = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
+    using key_ptr = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+    using cert_ptr = std::unique_ptr<X509, decltype(&X509_free)>;
+
+    key_ctx_ptr key_ctx(EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr),
+                        EVP_PKEY_CTX_free);
+    if (!key_ctx) {
+        return false;
+    }
+    if (EVP_PKEY_keygen_init(key_ctx.get()) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_keygen_bits(key_ctx.get(), 2048) <= 0) {
+        return false;
+    }
+
+    EVP_PKEY* raw_key = nullptr;
+    if (EVP_PKEY_keygen(key_ctx.get(), &raw_key) <= 0) {
+        return false;
+    }
+    key_ptr pkey(raw_key, EVP_PKEY_free);
+
+    cert_ptr cert(X509_new(), X509_free);
+    if (!cert) {
+        return false;
+    }
+
+    if (X509_set_version(cert.get(), 2) != 1 ||
+        ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 1) != 1 ||
+        X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0) == nullptr ||
+        X509_gmtime_adj(X509_getm_notAfter(cert.get()), 3600) == nullptr ||
+        X509_set_pubkey(cert.get(), pkey.get()) != 1) {
+        return false;
+    }
+
+    auto* name = X509_get_subject_name(cert.get());
+    if (!name ||
+        X509_NAME_add_entry_by_txt(
+            name, "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>("localhost"),
+            -1, -1, 0) != 1 ||
+        X509_set_issuer_name(cert.get(), name) != 1 ||
+        X509_sign(cert.get(), pkey.get(), EVP_sha256()) <= 0) {
+        return false;
+    }
+
+    return SSL_CTX_use_certificate(ctx.native_handle(), cert.get()) == 1 &&
+           SSL_CTX_use_PrivateKey(ctx.native_handle(), pkey.get()) == 1 &&
+           SSL_CTX_check_private_key(ctx.native_handle()) == 1;
+}
+#endif
+
 } // namespace
 
 TEST_CASE("Cancellable recv completes normally", "[io][cancel]") {
@@ -2526,6 +2584,52 @@ TEST_CASE("Cancellable poll_read cancelled during wait without readiness",
     errno = 0;
     REQUIRE(::read(efd, &value, sizeof(value)) == -1);
     REQUIRE(errno == EAGAIN);
+
+    close(efd);
+}
+
+TEST_CASE("Cancellable poll_write cancelled during wait without writability",
+          "[io][cancel][poll][poll-cancel-regression]") {
+    int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    REQUIRE(efd >= 0);
+
+    std::uint64_t saturated =
+        std::numeric_limits<std::uint64_t>::max() - 1;
+    REQUIRE(::write(efd, &saturated, sizeof(saturated)) ==
+            static_cast<ssize_t>(sizeof(saturated)));
+
+    std::atomic<bool> started{false};
+    std::atomic<bool> completed{false};
+    cancellable_io_result poll_result{};
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+
+    auto poll_coro = [&]() -> task<void> {
+        started = true;
+        auto result = co_await async_poll_write(efd, source.get_token());
+        poll_result = result;
+        completed = true;
+        co_return;
+    };
+
+    sched.go(poll_coro);
+
+    REQUIRE(wait_for_io_cancel_test([&] { return started.load(); }));
+
+    std::this_thread::sleep_for(elio::test::scaled_ms(50));
+    REQUIRE_FALSE(completed);
+
+    source.cancel();
+
+    REQUIRE(wait_for_io_cancel_test([&] { return completed.load(); }));
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+
+    REQUIRE(poll_result.was_cancelled());
+    REQUIRE_FALSE(poll_result.success());
+    REQUIRE(poll_result.error_code() == ECANCELED);
 
     close(efd);
 }
@@ -2764,6 +2868,89 @@ TEST_CASE("Cancellable connect cancelled during epoll wait",
 
     close(efd);
 }
+
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+TEST_CASE("TLS shutdown timeout cancels silent peer readiness wait",
+          "[tls][shutdown][timeout][poll-cancel-regression]") {
+    int sv[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+    elio::tls::tls_context server_ctx(elio::tls::tls_mode::server);
+    REQUIRE(install_test_certificate(server_ctx));
+
+    elio::tls::tls_context client_ctx(elio::tls::tls_mode::client);
+    client_ctx.set_verify_mode(elio::tls::verify_mode::none);
+
+    const auto shutdown_timeout = elio::test::scaled_ms(100);
+    const auto client_wait = shutdown_timeout + elio::test::scaled_ms(500);
+    const auto server_hold = elio::test::scaled_ms(2000);
+
+    std::atomic<bool> client_handshake{false};
+    std::atomic<bool> server_handshake{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> release_server{false};
+    std::atomic<int64_t> shutdown_elapsed_ms{-1};
+
+    scheduler sched(2);
+    sched.start();
+
+    auto client_task = [&]() -> task<void> {
+        {
+            elio::tls::tls_stream client{elio::net::tcp_stream(sv[0]), client_ctx};
+            bool ok = co_await client.handshake();
+            client_handshake = ok;
+            if (ok) {
+                const auto start = std::chrono::steady_clock::now();
+                co_await client.shutdown(shutdown_timeout);
+                shutdown_elapsed_ms = std::chrono::duration_cast<
+                    std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start).count();
+            }
+            client_done = true;
+            release_server = true;
+            while (!server_done) {
+                co_await elio::time::sleep_for(elio::test::scaled_ms(10));
+            }
+        }
+        co_return;
+    };
+
+    auto server_task = [&]() -> task<void> {
+        {
+            elio::tls::tls_stream server{elio::net::tcp_stream(sv[1]), server_ctx};
+            bool ok = co_await server.handshake();
+            server_handshake = ok;
+
+            const auto deadline = std::chrono::steady_clock::now() + server_hold;
+            while (ok && !release_server &&
+                   std::chrono::steady_clock::now() < deadline) {
+                co_await elio::time::sleep_for(elio::test::scaled_ms(10));
+            }
+        }
+
+        server_done = true;
+        co_return;
+    };
+
+    sched.go(client_task);
+    sched.go(server_task);
+
+    const bool client_finished_before_peer_release =
+        wait_for_io_cancel_test([&] { return client_done.load(); }, client_wait);
+    release_server = true;
+
+    REQUIRE(wait_for_io_cancel_test([&] { return server_done.load(); },
+                                    elio::test::scaled_ms(5000)));
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+
+    REQUIRE(client_handshake);
+    REQUIRE(server_handshake);
+    REQUIRE(client_finished_before_peer_release);
+    REQUIRE(shutdown_elapsed_ms.load() >= 0);
+    REQUIRE(shutdown_elapsed_ms.load() < server_hold.count());
+}
+#endif
 
 // ============================================================================
 // Regression tests for #247: tcp_stream read/write must await readiness and

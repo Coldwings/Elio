@@ -389,9 +389,19 @@ public:
         return io::async_poll_read(fd_);
     }
 
+    /// Wait for socket to be readable, cancellable by ``token``
+    auto poll_read(coro::cancel_token token) {
+        return io::async_poll_read(fd_, std::move(token));
+    }
+
     /// Wait for socket to be writable
     auto poll_write() {
         return io::async_poll_write(fd_);
+    }
+
+    /// Wait for socket to be writable, cancellable by ``token``
+    auto poll_write(coro::cancel_token token) {
+        return io::async_poll_write(fd_, std::move(token));
     }
 
     /// Read exactly ``length`` bytes into ``buffer``.

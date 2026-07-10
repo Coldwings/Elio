@@ -150,10 +150,9 @@ public:
         if (state_ != connection_state::open) {
             co_return;
         }
-        
-        state_ = connection_state::closing;
-        
+
         auto frame = encode_close_frame(code, reason, !is_server_);
+        state_ = connection_state::closing;
         co_await send_raw(frame);
         
         // Wait briefly for close acknowledgment

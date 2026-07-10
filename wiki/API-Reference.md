@@ -1206,8 +1206,11 @@ public:
     int fd() const noexcept;
     
     // Get peer address
-    std::optional<ipv4_address> peer_address() const;
+    std::optional<socket_address> peer_address() const;
 };
+
+// peer_address() returns the generic socket_address wrapper so callers can
+// inspect IPv4 or IPv6 peers.
 
 // Connect to address (awaitable, returns std::optional<tcp_stream>)
 /* awaitable */ tcp_connect(const ipv4_address& addr);

@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -302,6 +303,36 @@ void require_two_ordered_responses(const pipeline_result& result) {
 }
 
 } // namespace
+
+TEST_CASE("HTTP router rejects non-terminal wildcard route patterns",
+          "[http][router][wildcard]") {
+    router routes;
+    auto handler = [](context&) {
+        return response::ok("matched");
+    };
+
+    REQUIRE_THROWS_AS(routes.get("/admin/*/delete", handler),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(routes.get("*/suffix", handler),
+                      std::invalid_argument);
+}
+
+TEST_CASE("HTTP router preserves terminal wildcard route semantics",
+          "[http][router][wildcard]") {
+    router routes;
+    routes.get("/static/*", [](context&) {
+        return response::ok("matched");
+    });
+
+    std::unordered_map<std::string, std::string> params;
+    REQUIRE(routes.find_route(method::GET, "/static/", params) != nullptr);
+
+    params.clear();
+    REQUIRE(routes.find_route(method::GET, "/static/css/app.css", params) != nullptr);
+
+    params.clear();
+    REQUIRE(routes.find_route(method::GET, "/static", params) == nullptr);
+}
 
 TEST_CASE("HTTP server consumes fully buffered pipelined keep-alive requests",
           "[http][server][pipeline][regression]") {

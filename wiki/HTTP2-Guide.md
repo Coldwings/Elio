@@ -94,7 +94,8 @@ struct h2_client_config {
     size_t max_concurrent_streams = 100;
     uint32_t initial_window_size = 65535;
     std::string user_agent = "elio-http2/1.0";
-    bool enable_push = false;  // Server push (rarely needed)
+    bool enable_push = false;  // Advertise SETTINGS_ENABLE_PUSH only;
+                               // pushed responses are not exposed
     net::resolve_options resolve_options = net::default_cached_resolve_options();
     bool rotate_resolved_addresses = true;
 };
@@ -108,6 +109,9 @@ h2_client client(config);
 
 `connect_timeout` bounds TCP connect and TLS/ALPN handshake setup.
 `read_timeout` bounds HTTP/2 session initialization and response waits.
+`enable_push` only controls the HTTP/2 `SETTINGS_ENABLE_PUSH` value sent to the
+peer. Elio does not currently expose pushed responses through the public client
+API, so applications cannot observe or consume server-pushed streams.
 
 ### TLS Configuration
 
@@ -255,7 +259,7 @@ coro::task<void> connection_lifecycle() {
 | Multiplexing | Protocol/session support; high-level client serializes pooled use | No (pipelining limited) |
 | Header compression | HPACK | None |
 | Binary protocol | Yes | Text-based |
-| Server push | Supported | No |
+| Server push | SETTINGS advertisement only; pushed responses are not exposed | No |
 | TLS required | Yes (in practice) | No |
 | Connection reuse | Sequential pooled reuse | Connection pool |
 

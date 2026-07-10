@@ -62,7 +62,7 @@ struct h2_session_config {
     size_t max_concurrent_streams = 100;
     uint32_t initial_window_size = NGHTTP2_INITIAL_WINDOW_SIZE;
     std::string user_agent = "elio-http2/1.0";
-    bool enable_push = false;
+    bool enable_push = false;  ///< Advertise SETTINGS_ENABLE_PUSH; pushed responses are not exposed
 };
 
 /// HTTP/2 session (client-side)

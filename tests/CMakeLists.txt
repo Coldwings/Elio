@@ -231,6 +231,12 @@ add_test(NAME package_elio_compile_feature_export
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_elio_compile_feature_export.cmake
 )
 
+add_test(NAME package_version_compatibility
+    COMMAND ${CMAKE_COMMAND}
+        -DELIO_VERSION_FILE=${CMAKE_BINARY_DIR}/ElioConfigVersion.cmake
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_elio_version_compatibility.cmake
+)
+
 add_executable(elio_rdma_cuda_lifetime_tests
     unit/test_rdma_cuda_gpu_memory_region.cpp
 )

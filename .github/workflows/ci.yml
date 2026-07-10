@@ -150,6 +150,13 @@ jobs:
         cmake --build build --parallel
         cmake --install build --prefix ${{ github.workspace }}/_install
 
+    - name: Verify package version compatibility
+      if: needs.changes.outputs.code == 'true'
+      run: |
+        cmake \
+          -DELIO_VERSION_FILE=${{ github.workspace }}/_install/lib/cmake/Elio/ElioConfigVersion.cmake \
+          -P tests/cmake/check_elio_version_compatibility.cmake
+
     - name: Verify downstream consumption
       if: needs.changes.outputs.code == 'true'
       run: |

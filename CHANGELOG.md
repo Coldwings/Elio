@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Pre-1.0 package version compatibility**: Installed package metadata now
+  treats each `0.<minor>` release line as a separate compatibility boundary,
+  so Elio 0.5.x no longer satisfies incompatible 0.4 or 0.6 requests. (#380)
 - **HTTP header-line limits**: Request and response parsers now reject an
   oversized header line as soon as the buffered unterminated line exceeds
   `max_header_size`, instead of waiting for a trailing CRLF. (#377)

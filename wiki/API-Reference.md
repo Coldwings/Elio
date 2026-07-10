@@ -1379,7 +1379,8 @@ struct h2_client_config {
     size_t max_concurrent_streams = 100;
     uint32_t initial_window_size = 65535;
     std::string user_agent = "elio-http2/1.0";
-    bool enable_push = false;  // Server push (rarely needed)
+    bool enable_push = false;  // Advertise SETTINGS_ENABLE_PUSH only;
+                               // pushed responses are not exposed
     net::resolve_options resolve_options = net::default_cached_resolve_options();
     bool rotate_resolved_addresses = true;
 };

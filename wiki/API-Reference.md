@@ -2083,6 +2083,8 @@ ELIO_RPC_METHOD(method_id, RequestType, ResponseType)
 #### `frame_header`
 
 ```cpp
+constexpr size_t frame_header_size = 19;
+
 struct frame_header {
     uint32_t magic;           // 0x454C494F ("ELIO")
     uint32_t request_id;
@@ -2092,7 +2094,7 @@ struct frame_header {
     uint32_t payload_length;
     
     bool is_valid() const noexcept;
-    std::array<uint8_t, 18> to_bytes() const;
+    std::array<uint8_t, frame_header_size> to_bytes() const;
     static frame_header from_bytes(const uint8_t* data);
 };
 ```

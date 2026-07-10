@@ -970,7 +970,8 @@ public:
     bool block(sigset_t* old_mask = nullptr) const;  // Block for thread
     bool unblock() const;                             // Unblock for thread
     bool set_mask(sigset_t* old_mask = nullptr) const;
-    bool block_all_threads() const;  // Block process-wide (call before threads)
+    // Blocks the current thread. Call before creating workers so they inherit it.
+    bool block_all_threads() const;
 };
 ```
 
@@ -981,8 +982,11 @@ Async-friendly signalfd wrapper.
 ```cpp
 class signal_fd {
 public:
-    // Create signalfd (auto_block=true blocks signals automatically)
-    explicit signal_fd(const signal_set& signals, bool auto_block = true);
+    // Create signalfd (auto_block=true blocks signals on the calling thread)
+    explicit signal_fd(
+        const signal_set& signals,
+        io::io_context& ctx = io::current_io_context(),
+        bool auto_block = true);
     
     signal_fd(signal_fd&& other) noexcept;
     signal_fd& operator=(signal_fd&& other) noexcept;
@@ -1043,9 +1047,14 @@ public:
 
 ```cpp
 // Wait for signals (convenience, creates temporary signal_fd)
-/* awaitable */ wait_signal(const signal_set& signals, bool auto_block = true);
+coro::task<signal_info> wait_signal(
+    const signal_set& signals,
+    io::io_context& ctx = io::current_io_context(),
+    bool auto_block = true);
 
-/* awaitable */ wait_signal(int signo);
+coro::task<signal_info> wait_signal(
+    int signo,
+    io::io_context& ctx = io::current_io_context());
 
 // Signal name/number conversion
 const char* signal_name(int signo);        // SIGINT -> "INT"

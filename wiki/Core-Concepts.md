@@ -300,7 +300,7 @@ Each `promise_base` also carries debug metadata:
 
 ## Coroutine Frame Allocation
 
-Coroutine frames use `vthread_stack` whenever a coroutine is running inside a vthread stack context. Each vthread maintains its own segmented bump-pointer stack allocator, so nested coroutine frames are allocated in LIFO order within segments. When a segment is exhausted, a new segment is allocated and linked.
+`coro::task` frames allocate from `vthread_stack` when the task coroutine is created inside an active vthread stack context. Each vthread maintains its own segmented bump-pointer stack allocator, so nested task frames are allocated in LIFO order within segments. If no vthread stack context is active, task frames fall back to `::operator new`; other coroutine types may use their own allocation strategy.
 
 ### Sanitizer compatibility
 

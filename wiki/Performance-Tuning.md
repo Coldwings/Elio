@@ -309,7 +309,7 @@ For best io_uring performance:
 
 ### Coroutine Frame Allocation
 
-Coroutine frames use `vthread_stack` whenever a coroutine is running inside a vthread stack context. Each vthread maintains a segmented bump-pointer stack allocator for coroutine frames. Under sanitizers, all allocations automatically fall back to `::operator new/delete`.
+`coro::task` frames allocate from `vthread_stack` when the task coroutine is created inside an active vthread stack context. Each vthread maintains a segmented bump-pointer stack allocator for nested task frames. If no vthread stack context is active, task frames fall back to `::operator new`; other coroutine types may use their own allocation strategy. Under sanitizers, task frame allocation automatically falls back to `::operator new/delete`.
 
 ### Avoiding Allocations
 

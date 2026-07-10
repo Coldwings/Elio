@@ -18,7 +18,7 @@
 /// // Wait for signals in a coroutine
 /// while (true) {
 ///     auto info = co_await sigfd.wait();
-///     if (info.signo == SIGINT) {
+///     if (info && info->signo == SIGINT) {
 ///         // Handle SIGINT
 ///     }
 /// }

@@ -443,10 +443,15 @@ configure_package_config_file(
     INSTALL_DESTINATION lib/cmake/Elio
 )
 
+set(_ELIO_VERSION_COMPATIBILITY SameMajorVersion)
+if(PROJECT_VERSION_MAJOR EQUAL 0)
+    set(_ELIO_VERSION_COMPATIBILITY SameMinorVersion)
+endif()
+
 write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/ElioConfigVersion.cmake
     VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion
+    COMPATIBILITY ${_ELIO_VERSION_COMPATIBILITY}
 )
 
 install(FILES

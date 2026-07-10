@@ -3,6 +3,13 @@ name: TCP Loopback Benchmark
 on:
   push:
     branches: [main]
+    paths:
+      - 'include/**'
+      - 'examples/**'
+      - 'CMakeLists.txt'
+      - '*.cmake'
+      - 'cmake/**'
+      - '.github/workflows/benchmark.yml'
   workflow_dispatch:
     inputs:
       duration:

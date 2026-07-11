@@ -71,6 +71,21 @@ int main(int argc, char* argv[]) {
 }
 ```
 
+#### WebSocket Route Patterns
+
+`ws_router::websocket()` uses the same path pattern grammar as the HTTP
+router:
+
+| Pattern form | Meaning |
+|--------------|---------|
+| `/ws` | Matches the literal path `/ws` |
+| `/chat/:room` | Captures one path component as `room` |
+| `/assets/*` | Matches `/assets/` and any remaining path tail |
+
+The `*` wildcard is only valid as the final path segment. Patterns such as
+`/chat/*/admin` are rejected during route registration because a non-terminal
+wildcard would make the remaining literal segments unreachable.
+
 ### WebSocket Client
 
 ```cpp

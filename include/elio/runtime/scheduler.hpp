@@ -288,15 +288,16 @@ public:
         return active_tasks() == 0;
     }
 
-    /// Internal: increment tracked-task counter. Called by task_lifecycle_guard
-    /// at the top of every wrapper coroutine body.
+    /// Internal: increment tracked-task counter. Called by mark_tracked_()
+    /// before the wrapper handle is exposed to the scheduler.
     void on_task_spawned() noexcept {
         active_tracked_.fetch_add(1, std::memory_order_acq_rel);
     }
 
-    /// Internal: decrement tracked-task counter. Called by task_lifecycle_guard
-    /// when the wrapper body exits (normal or exceptional). Notifies waiters
-    /// when the counter transitions to zero.
+    /// Internal: decrement tracked-task counter. Called from the wrapper
+    /// promise destructor through on_spawn_completion_, so the counter is
+    /// balanced even if the handle is destroyed before its body runs.
+    /// Notifies waiters when the counter transitions to zero.
     void on_task_completed() noexcept {
         if (active_tracked_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             if (waiters_.load(std::memory_order_acquire) > 0) {
@@ -902,10 +903,10 @@ private:
     std::unique_ptr<blocking_pool> blocking_pool_;
 
     // Tracked-task accounting for graceful shutdown / wait_for_idle.
-    // active_tracked_ is incremented by every wrapper coroutine on first
-    // resume and decremented when the wrapper's body exits. waiters_ is
-    // a hint so the on-completion path skips the CV mutex when no one is
-    // parked in wait_for_idle.
+    // active_tracked_ is incremented before spawning a scheduler-owned wrapper
+    // coroutine and decremented from that wrapper promise's destructor.
+    // waiters_ is a hint so the on-completion path skips the CV mutex when no
+    // one is parked in wait_for_idle.
     alignas(64) std::atomic<size_t> active_tracked_{0};
     alignas(64) std::atomic<size_t> waiters_{0};
     mutable std::mutex idle_mutex_;

@@ -226,8 +226,6 @@ using namespace elio;
 using namespace elio::http::sse;
 
 coro::task<void> listen_events() {
-    auto& ctx = io::default_io_context();
-    
     // Configure client
     client_config config;
     config.auto_reconnect = true;

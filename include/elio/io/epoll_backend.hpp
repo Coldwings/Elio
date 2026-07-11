@@ -575,6 +575,7 @@ private:
         if (state) {
             state->result = result.result;
             state->flags = result.flags;
+            handle = state->handle;
 
             uint8_t expected = op_state::phase_pending;
             if (!state->phase.compare_exchange_strong(
@@ -585,7 +586,6 @@ private:
                 }
                 return false;
             }
-            handle = state->handle;
         }
 
         if (!handle || handle.done()) {

@@ -80,6 +80,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   awaitable and compile/runtime coverage for scatter-gather reads. (#624)
 - **TCP benchmark mode parsing**: Invalid `-m` values now fail fast instead of
   silently running both ping-pong and streaming benchmarks. (#625)
+- **TCP benchmark workflow scope**: The main-branch TCP loopback benchmark
+  workflow now triggers only for benchmark-affecting source and workflow paths,
+  instead of every example change. (#626)
 
 ## [0.5.2] - 2026-06-30
 

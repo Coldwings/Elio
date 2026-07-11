@@ -65,6 +65,7 @@ jobs:
           cmake \
           ninja-build \
           liburing-dev \
+          libssl-dev \
           g++-14
 
     - name: Configure CMake

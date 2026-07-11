@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      tcp_benchmark: ${{ steps.filter.outputs.tcp_benchmark }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v7
@@ -33,6 +34,15 @@ jobs:
             - '*.cmake'
             - 'cmake/**'
             - 'tools/**'
+            - '.github/workflows/**'
+          tcp_benchmark:
+            - 'include/**'
+            - 'examples/bench_tcp_*.cpp'
+            - 'examples/bench_tcp_common.hpp'
+            - 'examples/CMakeLists.txt'
+            - 'CMakeLists.txt'
+            - '*.cmake'
+            - 'cmake/**'
             - '.github/workflows/**'
 
   build-and-test:
@@ -248,3 +258,49 @@ jobs:
           -DCMAKE_CXX_COMPILER=g++-14 \
           -DCMAKE_PREFIX_PATH=${{ github.workspace }}/_install
         cmake --build consumer/build --parallel
+
+  tcp-benchmark-compile:
+    needs: changes
+    runs-on: ubuntu-24.04
+    name: tcp-benchmark-compile
+
+    steps:
+    - name: Skip TCP benchmark compile
+      if: needs.changes.outputs.tcp_benchmark != 'true'
+      run: echo "No TCP benchmark-affecting changes detected; compile check intentionally skipped."
+
+    - name: Checkout repository
+      if: needs.changes.outputs.tcp_benchmark == 'true'
+      uses: actions/checkout@v7
+
+    - name: Install dependencies
+      if: needs.changes.outputs.tcp_benchmark == 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          cmake \
+          ninja-build \
+          liburing-dev \
+          libuv1-dev \
+          g++-14
+
+    - name: Configure TCP benchmark build
+      if: needs.changes.outputs.tcp_benchmark == 'true'
+      run: |
+        cmake -B build-tcp-benchmark -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=gcc-14 \
+          -DCMAKE_CXX_COMPILER=g++-14 \
+          -DELIO_BUILD_TESTS=OFF \
+          -DELIO_BUILD_EXAMPLES=ON \
+          -DELIO_ENABLE_TLS=OFF \
+          -DELIO_ENABLE_HTTP=OFF \
+          -DELIO_ENABLE_HTTP2=OFF \
+          -DELIO_BUILD_TCP_BENCHMARKS=ON
+
+    - name: Build TCP benchmark targets
+      if: needs.changes.outputs.tcp_benchmark == 'true'
+      run: |
+        cmake --build build-tcp-benchmark \
+          --target bench_tcp_elio bench_tcp_libuv bench_tcp_asio \
+          --parallel 2

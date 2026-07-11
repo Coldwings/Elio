@@ -47,6 +47,13 @@ ctest --output-on-failure
 
 ### CMake Integration
 
+Elio is header-only, but consumers should still link one of Elio's CMake
+interface targets. Those targets propagate required dependencies such as
+`fmt::fmt`, `pthread`, optional backend libraries like liburing, and the
+protocol/RDMA dependencies for enabled feature targets. If you integrate Elio
+without CMake, provide the equivalent include paths, compile definitions, and
+link libraries manually.
+
 #### Using FetchContent
 
 ```cmake
@@ -240,7 +247,14 @@ A few deliberate choices shaped how Elio is built.
 
 ### Header-only
 
-Elio ships as a header-only library. Coroutine-heavy code is inherently template-heavy -- the compiler needs to see full definitions to instantiate coroutine frames, promise types, and awaitables. A separate compilation model would add link-time complexity for very little gain. Header-only also means zero build integration friction: add the include path and you are done. There are no ABI compatibility concerns between your code and the library, because there is no compiled library.
+Elio ships as a header-only library. Coroutine-heavy code is inherently
+template-heavy -- the compiler needs to see full definitions to instantiate
+coroutine frames, promise types, and awaitables. A separate compilation model
+would add link-time complexity for very little gain. Header-only also avoids
+Elio-specific ABI compatibility concerns, because there is no compiled Elio
+library. It does not remove normal consumer dependencies: prefer the CMake
+targets, or mirror their include paths, compile definitions, and link libraries
+manually.
 
 ### C++20 coroutines
 

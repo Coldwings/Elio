@@ -162,7 +162,7 @@ private:
 
 // Global state
 std::atomic<bool> g_running{true};
-std::atomic<int> g_listener_fd{-1};
+std::atomic<tcp_rpc_server*> g_rpc_server{nullptr};
 UserStore g_user_store;
 
 /// Signal handler coroutine - waits for SIGINT/SIGTERM
@@ -178,11 +178,8 @@ task<void> signal_handler_task() {
     }
     
     g_running = false;
-    
-    // Close the listener to interrupt the pending accept
-    int fd = g_listener_fd.exchange(-1);
-    if (fd >= 0) {
-        ::close(fd);
+    if (auto* server = g_rpc_server.load(std::memory_order_acquire)) {
+        server->stop();
     }
     
     co_return;
@@ -197,10 +194,10 @@ task<void> server_main(uint16_t port, [[maybe_unused]] scheduler& sched) {
     }
     
     auto& listener = *listener_result;
-    g_listener_fd.store(listener.fd(), std::memory_order_release);
     
     // Create RPC server
     tcp_rpc_server server;
+    g_rpc_server.store(&server, std::memory_order_release);
     
     // Register GetUser handler
     server.register_method<GetUser>([](const GetUserRequest& req) 
@@ -303,6 +300,7 @@ task<void> server_main(uint16_t port, [[maybe_unused]] scheduler& sched) {
     
     // Serve until shutdown
     co_await server.serve(listener);
+    g_rpc_server.store(nullptr, std::memory_order_release);
 }
 
 int main(int argc, char* argv[]) {

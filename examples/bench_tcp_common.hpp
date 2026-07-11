@@ -215,6 +215,34 @@ struct streaming_stats {
     }
 };
 
+inline const char* pingpong_failure_reason(const pingpong_stats& stats) noexcept {
+    if (stats.timed_out) {
+        return "timed out";
+    }
+    if (stats.count == 0) {
+        return "produced no samples";
+    }
+    return nullptr;
+}
+
+inline const char* streaming_failure_reason(const streaming_stats& stats) noexcept {
+    if (stats.total_bytes == 0 || stats.total_msgs == 0) {
+        return "produced no samples";
+    }
+    return nullptr;
+}
+
+inline void print_failure(const char* library_name,
+                          const char* test_name,
+                          size_t message_size,
+                          const char* reason) {
+    std::fflush(stdout);
+    std::fprintf(stderr, "%s %s %s failed: %s\n",
+                 library_name, test_name, format_size(message_size).c_str(),
+                 reason);
+    std::fflush(stderr);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

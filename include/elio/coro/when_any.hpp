@@ -49,7 +49,9 @@ template<typename... Fs>
 struct when_any_state {
     using result_type = std::variant<when_all_slot_t<when_any_result_t<Fs>>...>;
 
+    std::atomic<bool> winner_claimed_{false};
     std::atomic<bool> resolved_{false};
+    std::atomic<bool> launch_complete_{false};
     coro::detail::completion_waiter_slot waiter_;
     result_type result_;
     std::exception_ptr exception_;
@@ -59,22 +61,22 @@ struct when_any_state {
     template<size_t I, typename... Args>
     void resolve(Args&&... args) {
         bool expected = false;
-        if (resolved_.compare_exchange_strong(expected, true,
+        if (winner_claimed_.compare_exchange_strong(expected, true,
                 std::memory_order_acq_rel)) {
             winner_index_ = I;
             result_.template emplace<I>(std::forward<Args>(args)...);
             cancel_source_.cancel();
-            resume_waiter();
+            publish_resolved();
         }
     }
 
     void resolve_exception(std::exception_ptr ex) {
         bool expected = false;
-        if (resolved_.compare_exchange_strong(expected, true,
+        if (winner_claimed_.compare_exchange_strong(expected, true,
                 std::memory_order_acq_rel)) {
             exception_ = std::move(ex);
             cancel_source_.cancel();
-            resume_waiter();
+            publish_resolved();
         } else {
             // Loser exception: winner already resolved, report via scheduler
             auto* sched = runtime::get_current_scheduler();
@@ -93,10 +95,10 @@ struct when_any_state {
         }
     }
 
-    void resume_waiter() {
-        auto waiter = waiter_.take();
-        if (waiter) {
-            runtime::schedule_handle(waiter);
+    void finish_launching() noexcept {
+        launch_complete_.store(true, std::memory_order_release);
+        if (resolved_.load(std::memory_order_acquire)) {
+            resume_waiter();
         }
     }
 
@@ -105,6 +107,25 @@ struct when_any_state {
         return waiter_.register_waiter(waiter, handle, [this] {
             return resolved_.load(std::memory_order_acquire);
         });
+    }
+
+private:
+    void publish_resolved() noexcept {
+        resolved_.store(true, std::memory_order_release);
+        resume_waiter_if_ready();
+    }
+
+    void resume_waiter_if_ready() noexcept {
+        if (launch_complete_.load(std::memory_order_acquire)) {
+            resume_waiter();
+        }
+    }
+
+    void resume_waiter() noexcept {
+        auto waiter = waiter_.take();
+        if (waiter) {
+            runtime::schedule_handle(waiter);
+        }
     }
 };
 
@@ -168,9 +189,11 @@ struct when_any_awaitable {
     }
 
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        bool should_suspend = state_->set_waiter(waiter_, awaiter);
+        auto state = state_;
+        bool should_suspend = state->set_waiter(waiter_, awaiter);
 
         spawn_all(std::index_sequence_for<Fs...>{});
+        state->finish_launching();
 
         // Suspend and rely on resume_waiter() -> schedule_handle() for
         // resumption. schedule_handle() provides sufficient internal
@@ -178,9 +201,8 @@ struct when_any_awaitable {
         // establish happens-before between the winner's data writes
         // (winner_index_, result_) and the waiter's await_resume reads.
         // An inline fast-path (returning false when resolved_ is already
-        // true) would lack this synchronization: the waiter's acquire load
-        // on resolved_ only synchronizes with writes BEFORE the CAS release
-        // in resolve(), not the subsequent data stores.
+        // true) would not route the waiter through the scheduler queue, so
+        // keep all non-empty resumptions on the scheduled path.
         return should_suspend;
     }
 

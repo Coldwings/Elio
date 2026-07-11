@@ -258,6 +258,42 @@ private:
         }
     };
 
+    class construction_guard {
+    public:
+        construction_guard(std::shared_ptr<internals> state,
+                           shard& owner_shard,
+                           std::shared_ptr<entry> constructing) noexcept
+            : state_(std::move(state))
+            , shard_(&owner_shard)
+            , entry_(std::move(constructing)) {}
+
+        ~construction_guard() {
+            if (committed_ || !entry_) return;
+
+            {
+                std::lock_guard lock(shard_->mutex);
+                shard_->reclaim_unlink(entry_.get());
+                auto it = shard_->map.find(entry_->key_);
+                if (it != shard_->map.end() && it->second.get() == entry_.get()) {
+                    shard_->map.erase(it);
+                }
+            }
+
+            entry_->state_.store(entry::state::failed, std::memory_order_release);
+            entry_->ready_event_.set();
+        }
+
+        void commit() noexcept {
+            committed_ = true;
+        }
+
+    private:
+        std::shared_ptr<internals> state_;
+        shard* shard_ = nullptr;
+        std::shared_ptr<entry> entry_;
+        bool committed_ = false;
+    };
+
     class release_awaitable {
     public:
         explicit release_awaitable(std::shared_ptr<entry> e) noexcept
@@ -576,12 +612,15 @@ private:
                 throw std::runtime_error("object_cache: construction failed");
             }
 
+            construction_guard guard(state_, s, e);
+
             try {
                 auto value = co_await std::forward<Ctor>(ctor)();
                 e->value_ = std::make_unique<Value>(std::move(value));
                 e->refcount_.fetch_add(1, std::memory_order_relaxed);
                 e->state_.store(entry::state::ready, std::memory_order_release);
                 e->ready_event_.set();
+                guard.commit();
                 co_return borrow(std::move(e), state_);
             } catch (...) {
                 e->error_ = std::current_exception();
@@ -594,6 +633,7 @@ private:
                         s.map.erase(it);
                     }
                 }
+                guard.commit();
                 throw;
             }
         }

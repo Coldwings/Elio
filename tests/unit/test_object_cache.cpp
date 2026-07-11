@@ -159,6 +159,56 @@ TEST_CASE("object_cache construction failure and retry", "[object_cache]") {
     sched.shutdown();
 }
 
+TEST_CASE("object_cache constructor destruction clears constructing entry",
+          "[object_cache][construction][cancellation]") {
+    using cache_type = object_cache<std::string, int>;
+
+    scheduler sched(1);
+    sched.start();
+
+    {
+        cache_type cache({.num_shards = 4});
+        event unblock_constructor;
+        std::atomic<bool> ctor_started{false};
+
+        auto owner_task = [&]() -> task<void> {
+            (void)co_await cache.get("cancel_key", [&]() -> task<int> {
+                ctor_started.store(true, std::memory_order_release);
+                co_await unblock_constructor.wait();
+                co_return 1;
+            });
+            co_return;
+        };
+
+        auto owner = owner_task();
+        auto h = elio::coro::detail::task_access::release(owner);
+        h.resume();
+
+        REQUIRE(ctor_started.load(std::memory_order_acquire));
+        REQUIRE(cache.size() == 1);
+
+        h.destroy();
+        REQUIRE(cache.size() == 0);
+
+        std::atomic<int> retry_ctors{0};
+        int value = 0;
+        auto retry = spawn_joinable(sched, [&]() -> task<void> {
+            auto b = co_await cache.get("cancel_key", [&]() -> task<int> {
+                retry_ctors.fetch_add(1, std::memory_order_relaxed);
+                co_return 2;
+            });
+            value = *b;
+            co_return;
+        });
+        retry.wait_destroyed();
+
+        REQUIRE(retry_ctors.load(std::memory_order_relaxed) == 1);
+        REQUIRE(value == 2);
+    }
+
+    sched.shutdown();
+}
+
 TEST_CASE("object_cache refcount and reclaim delay", "[object_cache]") {
     TrackedValue::reset_counts();
 

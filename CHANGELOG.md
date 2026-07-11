@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   readiness waits with cancellable poll operations, so a peer that never sends
   `close_notify` cannot keep shutdown suspended beyond the configured timeout.
   (#338)
+- **RDMA CM backlog wakeups**: `event_channel` now wakes filtered waiters when
+  another waiter consumes and stashes their CM event, preventing
+  `next_event_for()` / `accept_connect()` from sleeping indefinitely until an
+  unrelated future CM event arrives. (#607)
 
 ## [0.5.2] - 2026-06-30
 

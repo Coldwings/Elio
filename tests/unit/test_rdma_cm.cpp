@@ -17,14 +17,40 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <elio/io/io_awaitables.hpp>
 #include <elio/rdma_cm/rdma_cm.hpp>
+#include <elio/runtime/scheduler.hpp>
 
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+#include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <memory>
+#include <string>
+#include <thread>
 #include <utility>
+
+#include "../test_main.cpp"
 
 using elio::rdma_cm::cm_id;
 using elio::rdma_cm::cm_status;
 using elio::rdma_cm::connect_options;
+
+namespace {
+
+bool wait_for_flag(const std::atomic<bool>& flag) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + elio::test::scaled_ms(2000);
+    while (!flag.load(std::memory_order_acquire)
+           && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return flag.load(std::memory_order_acquire);
+}
+
+}  // namespace
 
 TEST_CASE("cm_id default construct and move are safe with no librdmacm call",
           "[rdma_cm][cm_id]") {
@@ -115,6 +141,69 @@ TEST_CASE("event backlog preserves events for their matching cm_id",
     });
     REQUIRE(got_b == &event_b);
     REQUIRE(backlog.empty());
+}
+
+TEST_CASE("backlog waiter registry cancels fd poll waiters on stash wake",
+          "[rdma_cm][event_channel][routing][regression]") {
+    elio::rdma_cm::detail::backlog_wait_registry registry;
+
+    auto source = std::make_shared<elio::coro::cancel_source>();
+    auto token = source->get_token();
+    auto subscription = registry.subscribe(source);
+
+    REQUIRE_FALSE(token.is_cancelled());
+    registry.cancel_all();
+    REQUIRE(token.is_cancelled());
+
+    subscription.reset();
+}
+
+TEST_CASE("backlog waiter registry wakes a coroutine blocked in fd poll",
+          "[rdma_cm][event_channel][routing][regression]") {
+    const int fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    REQUIRE(fd >= 0);
+
+    elio::rdma_cm::detail::backlog_wait_registry registry;
+    auto source = std::make_shared<elio::coro::cancel_source>();
+    auto subscription = registry.subscribe(source);
+
+    std::atomic<bool> started{false};
+    std::atomic<bool> cancelled{false};
+
+    auto poller = [&]() -> elio::coro::task<void> {
+        started.store(true, std::memory_order_release);
+        auto result = co_await elio::io::async_poll_read(
+            fd, source->get_token());
+        cancelled.store(result.was_cancelled(), std::memory_order_release);
+    };
+
+    elio::runtime::scheduler sched(1);
+    sched.start();
+    sched.go(poller);
+
+    REQUIRE(wait_for_flag(started));
+    registry.cancel_all();
+
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(2000)));
+    subscription.reset();
+    ::close(fd);
+
+    REQUIRE(cancelled.load(std::memory_order_acquire));
+}
+
+TEST_CASE("backlog waiter subscription unregisters completed waiters",
+          "[rdma_cm][event_channel][routing][regression]") {
+    elio::rdma_cm::detail::backlog_wait_registry registry;
+
+    auto source = std::make_shared<elio::coro::cancel_source>();
+    auto token = source->get_token();
+    {
+        auto subscription = registry.subscribe(source);
+        REQUIRE_FALSE(token.is_cancelled());
+    }
+
+    registry.cancel_all();
+    REQUIRE_FALSE(token.is_cancelled());
 }
 
 TEST_CASE("rdma_cm module version is the S8 string",

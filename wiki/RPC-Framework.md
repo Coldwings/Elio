@@ -558,9 +558,28 @@ uint32_t checksum = elio::hash::crc32_iovec(iov, 2);
 uint32_t checksum = elio::rpc::crc32(data, length);
 ```
 
-### Message Size Limits
+### Server Configuration
 
-Default maximum message size is 16MB. This is defined by `max_message_size` in `rpc_buffer.hpp`.
+`rpc_server_config` controls the per-server operational limits:
+
+```cpp
+rpc_server_config config;
+config.max_sessions = 1024;                         // 0 = unlimited
+config.frame_read_timeout = std::chrono::seconds(30); // 0s = disabled
+config.max_message_size = elio::rpc::max_message_size; // 16 MiB default
+
+tcp_rpc_server server(config);
+```
+
+- **max_sessions**: Maximum concurrent sessions accepted by `serve()`.
+  Connections beyond the cap are accepted and immediately closed so the
+  kernel listen backlog does not fill.
+- **frame_read_timeout**: Deadline for receiving one complete frame
+  (header, payload, and optional checksum). This mitigates peers that
+  trickle bytes indefinitely.
+- **max_message_size**: Maximum payload bytes accepted per frame. The
+  default is the protocol-wide 16 MiB limit defined by `max_message_size`
+  in `rpc_buffer.hpp`; reduce it when an application has smaller messages.
 
 ## Thread Safety
 

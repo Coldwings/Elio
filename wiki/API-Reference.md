@@ -2280,12 +2280,34 @@ operations.
 using cleanup_callback_t = std::function<void()>;
 ```
 
+#### `rpc_server_config`
+
+```cpp
+struct rpc_server_config {
+    size_t max_sessions = 1024;
+    std::chrono::seconds frame_read_timeout{30};
+    uint32_t max_message_size = elio::rpc::max_message_size;
+};
+```
+
+- `max_sessions`: Maximum concurrent sessions accepted by `serve()`.
+  `0` disables the cap.
+- `frame_read_timeout`: Per-frame deadline for receiving the header,
+  payload, and optional checksum. `0s` disables the deadline.
+- `max_message_size`: Maximum payload bytes accepted per frame. The
+  default is the protocol-wide 16 MiB limit.
+
 #### `rpc_server<Stream>`
 
 ```cpp
 template<typename Stream>
 class rpc_server {
 public:
+    rpc_server() = default;
+    explicit rpc_server(rpc_server_config config);
+
+    const rpc_server_config& config() const noexcept;
+
     // Register async handler
     template<typename Method, typename Handler>
     void register_method(Handler handler);

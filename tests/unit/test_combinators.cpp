@@ -27,6 +27,15 @@ bool wait_for_count(const std::atomic<int>& value, int expected) {
     return value.load(std::memory_order_acquire) == expected;
 }
 
+bool wait_for_flag(const std::atomic<bool>& value) {
+    const auto deadline = std::chrono::steady_clock::now() + scaled_ms(2000);
+    while (!value.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return value.load(std::memory_order_acquire);
+}
+
 struct throwing_move_callable {
     throwing_move_callable() = default;
     throwing_move_callable(const throwing_move_callable&) = delete;
@@ -36,6 +45,37 @@ struct throwing_move_callable {
 
     task<int> operator()() {
         co_return 1;
+    }
+};
+
+struct launch_blocker {
+    std::atomic<bool> block_moves{false};
+    std::atomic<bool> move_started{false};
+    std::atomic<bool> allow_move{false};
+};
+
+struct blocking_move_callable {
+    launch_blocker* blocker{};
+
+    explicit blocking_move_callable(launch_blocker& b) : blocker(&b) {}
+    blocking_move_callable(const blocking_move_callable&) = delete;
+    blocking_move_callable& operator=(const blocking_move_callable&) = delete;
+
+    blocking_move_callable(blocking_move_callable&& other) noexcept
+        : blocker(other.blocker) {
+        if (!blocker || !blocker->block_moves.load(std::memory_order_acquire)) {
+            return;
+        }
+        blocker->move_started.store(true, std::memory_order_release);
+        while (!blocker->allow_move.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    blocking_move_callable& operator=(blocking_move_callable&&) = delete;
+
+    task<int> operator()() {
+        co_return 2;
     }
 };
 
@@ -139,6 +179,34 @@ TEST_CASE("when_all single task", "[sync][combinators]") {
     sched.shutdown();
 }
 
+TEST_CASE("when_all does not resume while launching children",
+          "[sync][combinators][regression]") {
+    launch_blocker blocker;
+    std::atomic<bool> resumed_during_launch{false};
+
+    auto test = [&]() -> task<void> {
+        auto ready = []() -> task<int> { co_return 1; };
+        auto combo = when_all(ready, ready, blocking_move_callable(blocker));
+        blocker.block_moves.store(true, std::memory_order_release);
+
+        auto result = co_await combo;
+        (void)result;
+        if (blocker.move_started.load(std::memory_order_acquire) &&
+            !blocker.allow_move.load(std::memory_order_acquire)) {
+            resumed_during_launch.store(true, std::memory_order_release);
+        }
+    };
+
+    runtime::scheduler sched(4);
+    sched.start();
+    sched.go(test);
+    REQUIRE(wait_for_flag(blocker.move_started));
+    std::this_thread::sleep_for(scaled_ms(20));
+    REQUIRE_FALSE(resumed_during_launch.load(std::memory_order_acquire));
+    blocker.allow_move.store(true, std::memory_order_release);
+    REQUIRE(sched.shutdown(scaled_ms(2000)));
+}
+
 // --- when_any tests ---
 
 TEST_CASE("when_any returns first completer", "[sync][combinators]") {
@@ -160,6 +228,34 @@ TEST_CASE("when_any returns first completer", "[sync][combinators]") {
     runtime::scheduler sched(2);
     sched.go(test);
     sched.shutdown();
+}
+
+TEST_CASE("when_any does not resume while launching children",
+          "[sync][combinators][regression]") {
+    launch_blocker blocker;
+    std::atomic<bool> resumed_during_launch{false};
+
+    auto test = [&]() -> task<void> {
+        auto ready = []() -> task<int> { co_return 1; };
+        auto combo = when_any(ready, blocking_move_callable(blocker));
+        blocker.block_moves.store(true, std::memory_order_release);
+
+        auto result = co_await combo;
+        (void)result;
+        if (blocker.move_started.load(std::memory_order_acquire) &&
+            !blocker.allow_move.load(std::memory_order_acquire)) {
+            resumed_during_launch.store(true, std::memory_order_release);
+        }
+    };
+
+    runtime::scheduler sched(4);
+    sched.start();
+    sched.go(test);
+    REQUIRE(wait_for_flag(blocker.move_started));
+    std::this_thread::sleep_for(scaled_ms(20));
+    REQUIRE_FALSE(resumed_during_launch.load(std::memory_order_acquire));
+    blocker.allow_move.store(true, std::memory_order_release);
+    REQUIRE(sched.shutdown(scaled_ms(2000)));
 }
 
 TEST_CASE("when_any second finishes first", "[sync][combinators]") {

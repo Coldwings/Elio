@@ -33,6 +33,7 @@ using when_all_slot_t = typename when_all_slot<T>::type;
 template<typename... Fs>
 struct when_all_state {
     std::atomic<size_t> remaining_;
+    std::atomic<bool> launch_complete_{false};
     coro::detail::completion_waiter_slot waiter_;
     std::tuple<std::optional<when_all_slot_t<callable_result_t<Fs>>>...> values_;
     std::exception_ptr first_exception_;
@@ -43,10 +44,14 @@ struct when_all_state {
 
     void complete_one() {
         if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            auto waiter = waiter_.take();
-            if (waiter) {
-                runtime::schedule_handle(waiter);
-            }
+            resume_waiter_if_ready();
+        }
+    }
+
+    void finish_launching() noexcept {
+        launch_complete_.store(true, std::memory_order_release);
+        if (remaining_.load(std::memory_order_acquire) == 0) {
+            resume_waiter();
         }
     }
 
@@ -66,6 +71,20 @@ struct when_all_state {
         } else {
             ELIO_LOG_WARNING("when_all: discarding subsequent exception "
                              "(only the first is propagated)");
+        }
+    }
+
+private:
+    void resume_waiter_if_ready() noexcept {
+        if (launch_complete_.load(std::memory_order_acquire)) {
+            resume_waiter();
+        }
+    }
+
+    void resume_waiter() noexcept {
+        auto waiter = waiter_.take();
+        if (waiter) {
+            runtime::schedule_handle(waiter);
         }
     }
 };
@@ -125,9 +144,11 @@ struct when_all_awaitable {
     }
 
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        bool should_suspend = state_->set_waiter(waiter_, awaiter);
+        auto state = state_;
+        bool should_suspend = state->set_waiter(waiter_, awaiter);
 
         spawn_all(std::index_sequence_for<Fs...>{});
+        state->finish_launching();
 
         // Non-empty inputs suspend and rely on complete_one() ->
         // schedule_handle() for resumption. An empty input is already complete.

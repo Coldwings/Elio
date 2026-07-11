@@ -793,18 +793,17 @@ coro::task<void> batch_write_example(int fd) {
 All examples are built automatically with CMake:
 
 ```bash
-cd build
-make
+cmake --build build
 
 # Run individual examples
-./examples/hello_world
-./examples/tcp_echo_server
-./examples/uds_echo_server /tmp/echo.sock
-./examples/uds_echo_server @my_socket    # Abstract socket
-./examples/uds_echo_client /tmp/echo.sock
-./examples/http_client https://httpbin.org/get
-./examples/http2_client https://nghttp2.org/
-./examples/signal_handling              # Signal handling example
+./build/examples/hello_world
+./build/examples/tcp_echo_server
+./build/examples/uds_echo_server /tmp/echo.sock
+./build/examples/uds_echo_server @my_socket    # Abstract socket
+./build/examples/uds_echo_client /tmp/echo.sock
+./build/examples/http_client https://httpbin.org/get
+./build/examples/http2_client https://nghttp2.org/
+./build/examples/signal_handling              # Signal handling example
 ```
 
 ## Autoscaler

@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cerrno>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,11 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+#include <openssl/evp.h>
+#include <openssl/x509.h>
+#endif
 
 using namespace elio::coro;
 using namespace elio::http;
@@ -164,6 +170,27 @@ void send_all(int fd, std::string_view data) {
     }
 }
 
+template<typename Rep, typename Period>
+bool wait_for_peer_close(int fd, std::chrono::duration<Rep, Period> timeout) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    char byte = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        ssize_t n = ::recv(fd, &byte, sizeof(byte), MSG_DONTWAIT);
+        if (n == 0) {
+            return true;
+        }
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::this_thread::sleep_for(elio::test::scaled_ms(10));
+                continue;
+            }
+            return true;
+        }
+        std::this_thread::sleep_for(elio::test::scaled_ms(10));
+    }
+    return false;
+}
+
 size_t count_occurrences(std::string_view haystack, std::string_view needle) {
     size_t count = 0;
     size_t pos = 0;
@@ -201,6 +228,58 @@ std::string read_two_ok_responses(int fd) {
 
     return out;
 }
+
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+bool install_test_certificate(elio::tls::tls_context& ctx) {
+    using key_ctx_ptr = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
+    using key_ptr = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+    using cert_ptr = std::unique_ptr<X509, decltype(&X509_free)>;
+
+    key_ctx_ptr key_ctx(EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr),
+                        EVP_PKEY_CTX_free);
+    if (!key_ctx) {
+        return false;
+    }
+    if (EVP_PKEY_keygen_init(key_ctx.get()) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_keygen_bits(key_ctx.get(), 2048) <= 0) {
+        return false;
+    }
+
+    EVP_PKEY* raw_key = nullptr;
+    if (EVP_PKEY_keygen(key_ctx.get(), &raw_key) <= 0) {
+        return false;
+    }
+    key_ptr pkey(raw_key, EVP_PKEY_free);
+
+    cert_ptr cert(X509_new(), X509_free);
+    if (!cert) {
+        return false;
+    }
+
+    if (X509_set_version(cert.get(), 2) != 1 ||
+        ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 1) != 1 ||
+        X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0) == nullptr ||
+        X509_gmtime_adj(X509_getm_notAfter(cert.get()), 3600) == nullptr ||
+        X509_set_pubkey(cert.get(), pkey.get()) != 1) {
+        return false;
+    }
+
+    auto* name = X509_get_subject_name(cert.get());
+    if (!name ||
+        X509_NAME_add_entry_by_txt(
+            name, "CN", MBSTRING_ASC,
+            reinterpret_cast<const unsigned char*>("localhost"),
+            -1, -1, 0) != 1 ||
+        X509_set_issuer_name(cert.get(), name) != 1 ||
+        X509_sign(cert.get(), pkey.get(), EVP_sha256()) <= 0) {
+        return false;
+    }
+
+    return SSL_CTX_use_certificate(ctx.native_handle(), cert.get()) == 1 &&
+           SSL_CTX_use_PrivateKey(ctx.native_handle(), pkey.get()) == 1 &&
+           SSL_CTX_check_private_key(ctx.native_handle()) == 1;
+}
+#endif
 
 struct pipeline_result {
     std::string response_bytes;
@@ -418,6 +497,104 @@ TEST_CASE("WebSocket server stop cancels idle accept without a wake connection",
     REQUIRE(stopped);
     REQUIRE(drained);
 }
+
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+TEST_CASE("HTTPS server times out a silent inbound TLS handshake",
+          "[http][server][tls][timeout][regression]") {
+    router routes;
+    server_config config;
+    config.enable_logging = false;
+    config.keep_alive_timeout = elio::test::scaled_sec(1);
+
+    server srv(std::move(routes), config);
+    elio::tls::tls_context tls_ctx(elio::tls::tls_mode::server);
+    REQUIRE(install_test_certificate(tls_ctx));
+
+    const uint16_t port = reserve_loopback_port();
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen_tls(elio::net::ipv4_address("127.0.0.1", port),
+                                tls_ctx);
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] { return srv.is_running(); },
+                       elio::test::scaled_sec(2)));
+
+    auto client = connect_loopback(port);
+    const bool handler_started = wait_until(
+        [&] { return srv.active_connections() > 0; },
+        elio::test::scaled_sec(2));
+    const bool handler_stopped = wait_until(
+        [&] { return srv.active_connections() == 0; },
+        config.keep_alive_timeout + elio::test::scaled_sec(2));
+    const bool peer_closed = wait_for_peer_close(
+        client.get(), config.keep_alive_timeout + elio::test::scaled_sec(2));
+    client.reset();
+
+    srv.stop();
+    try_wake_listener(port);
+
+    const bool stopped = wait_until(
+        [&] { return listen_done.load(std::memory_order_acquire); },
+        elio::test::scaled_sec(2));
+    const bool drained = sched.shutdown(elio::test::scaled_sec(5));
+
+    REQUIRE(handler_started);
+    REQUIRE(handler_stopped);
+    REQUIRE(peer_closed);
+    REQUIRE(stopped);
+    REQUIRE(drained);
+}
+
+TEST_CASE("WSS server times out a silent inbound TLS handshake",
+          "[websocket][server][tls][timeout][regression]") {
+    elio::http::websocket::ws_router routes;
+    server_config config;
+    config.enable_logging = false;
+    config.keep_alive_timeout = elio::test::scaled_sec(1);
+
+    elio::http::websocket::ws_server srv(std::move(routes), config);
+    elio::tls::tls_context tls_ctx(elio::tls::tls_mode::server);
+    REQUIRE(install_test_certificate(tls_ctx));
+
+    const uint16_t port = reserve_loopback_port();
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen_tls(elio::net::ipv4_address("127.0.0.1", port),
+                                tls_ctx);
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] { return srv.is_running(); },
+                       elio::test::scaled_sec(2)));
+
+    auto client = connect_loopback(port);
+    const bool peer_closed = wait_for_peer_close(
+        client.get(), config.keep_alive_timeout + elio::test::scaled_sec(2));
+    client.reset();
+
+    srv.stop();
+    try_wake_listener(port);
+
+    const bool stopped = wait_until(
+        [&] { return listen_done.load(std::memory_order_acquire); },
+        elio::test::scaled_sec(2));
+    const bool drained = sched.shutdown(elio::test::scaled_sec(5));
+
+    REQUIRE(peer_closed);
+    REQUIRE(stopped);
+    REQUIRE(drained);
+}
+#endif
 
 TEST_CASE("HTTP server stop cancels overlapping idle accepts",
           "[http][server][stop][accept-cancel-regression]") {

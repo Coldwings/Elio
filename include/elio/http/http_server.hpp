@@ -24,9 +24,59 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace elio::http {
+
+namespace detail {
+
+struct tls_handshake_result {
+    bool ok = false;
+    bool timed_out = false;
+};
+
+inline coro::task<tls_handshake_result>
+perform_tls_handshake_with_timeout(tls::tls_stream& stream,
+                                   std::chrono::seconds timeout) {
+    auto* sched = runtime::scheduler::current();
+    if (!sched || timeout.count() <= 0) {
+        tls_handshake_result result;
+        result.ok = co_await stream.handshake();
+        co_return result;
+    }
+
+    auto timed_out = std::make_shared<std::atomic<bool>>(false);
+    auto handshake_done = std::make_shared<std::atomic<bool>>(false);
+    auto cancel_src = std::make_shared<coro::cancel_source>();
+    auto* stream_ptr = &stream;
+
+    auto watchdog = sched->go_joinable(
+        [stream_ptr, timed_out, handshake_done, cancel_src,
+         timeout]() -> coro::task<void> {
+            auto r = co_await elio::time::sleep_for(timeout,
+                                                    cancel_src->get_token());
+            if (r == coro::cancel_result::completed &&
+                !handshake_done->load(std::memory_order_acquire)) {
+                timed_out->store(true, std::memory_order_release);
+                cancel_src->cancel();
+                stream_ptr->shutdown_socket();
+            }
+            co_return;
+        });
+
+    bool ok = co_await stream.handshake(cancel_src->get_token());
+    handshake_done->store(true, std::memory_order_release);
+    cancel_src->cancel();
+    co_await std::move(watchdog);
+
+    tls_handshake_result result;
+    result.timed_out = timed_out->load(std::memory_order_acquire);
+    result.ok = ok && !result.timed_out;
+    co_return result;
+}
+
+} // namespace detail
 
 /// HTTP request context passed to handlers
 class context {
@@ -262,7 +312,7 @@ private:
 struct server_config {
     size_t max_request_size = 10 * 1024 * 1024;  ///< Max request body size (10MB)
     size_t read_buffer_size = 8192;               ///< Read buffer size
-    std::chrono::seconds keep_alive_timeout{30};  ///< Keep-alive timeout
+    std::chrono::seconds keep_alive_timeout{30};  ///< Keep-alive and inbound TLS handshake timeout
     size_t max_keep_alive_requests = 100;         ///< Max requests per connection
     bool enable_logging = true;                   ///< Log requests
 
@@ -454,11 +504,15 @@ private:
             ELIO_LOG_DEBUG("HTTPS connection from {}", client_addr);
         }
         
-        // Create TLS stream and perform handshake
         tls::tls_stream stream(std::move(tcp), tls_ctx);
-        auto hs_result = co_await stream.handshake();
-        if (!hs_result) {
-            ELIO_LOG_ERROR("TLS handshake failed for {}", client_addr);
+        auto hs_result = co_await detail::perform_tls_handshake_with_timeout(
+            stream, config_.keep_alive_timeout);
+        if (!hs_result.ok) {
+            if (hs_result.timed_out) {
+                ELIO_LOG_ERROR("TLS handshake timed out for {}", client_addr);
+            } else {
+                ELIO_LOG_ERROR("TLS handshake failed for {}", client_addr);
+            }
             co_return;
         }
         

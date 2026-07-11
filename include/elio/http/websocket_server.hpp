@@ -656,9 +656,14 @@ private:
         }
         
         tls::tls_stream stream(std::move(tcp), tls_ctx);
-        auto hs_result = co_await stream.handshake();
-        if (!hs_result) {
-            ELIO_LOG_ERROR("TLS handshake failed for {}", client_addr);
+        auto hs_result = co_await http::detail::perform_tls_handshake_with_timeout(
+            stream, http_config_.keep_alive_timeout);
+        if (!hs_result.ok) {
+            if (hs_result.timed_out) {
+                ELIO_LOG_ERROR("TLS handshake timed out for {}", client_addr);
+            } else {
+                ELIO_LOG_ERROR("TLS handshake failed for {}", client_addr);
+            }
             co_return;
         }
         

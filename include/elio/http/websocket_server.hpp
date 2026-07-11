@@ -549,6 +549,13 @@ public:
     /// Check if server is running
     bool is_running() const noexcept { return running_; }
 
+    /// Return the number of in-flight connection handlers.  Callers that
+    /// destroy the server after stop() should wait until this returns 0
+    /// to avoid use-after-free on router_, http_config_, etc.
+    size_t active_connections() const noexcept {
+        return active_connections_.load(std::memory_order_acquire);
+    }
+
 private:
     coro::task<void> listen_impl(const net::socket_address& addr,
                                  const net::tcp_options& opts,
@@ -586,9 +593,10 @@ private:
                 continue;
             }
 
-            // Spawn connection handler
+            // Spawn connection handler (tracked for graceful shutdown)
+            active_connections_.fetch_add(1, std::memory_order_relaxed);
             sched->go([this, s = std::move(*stream_result)]() mutable {
-                return handle_connection(std::move(s));
+                return handle_connection_guarded(std::move(s));
             });
         }
     }
@@ -633,12 +641,43 @@ private:
                 continue;
             }
 
-            // Spawn TLS connection handler
+            // Spawn TLS connection handler (tracked for graceful shutdown)
+            active_connections_.fetch_add(1, std::memory_order_relaxed);
             sched->go([this, s = std::move(*stream_result), tls_ctx_ptr]() mutable {
-                return handle_tls_connection(std::move(s), *tls_ctx_ptr);
+                return handle_tls_connection_guarded(std::move(s), *tls_ctx_ptr);
             });
         }
     }
+
+    class active_connection_guard {
+    public:
+        explicit active_connection_guard(std::atomic<size_t>& active) noexcept
+            : active_(active) {}
+
+        ~active_connection_guard() {
+            active_.fetch_sub(1, std::memory_order_relaxed);
+        }
+
+        active_connection_guard(const active_connection_guard&) = delete;
+        active_connection_guard& operator=(const active_connection_guard&) = delete;
+
+    private:
+        std::atomic<size_t>& active_;
+    };
+
+    /// Guard wrapper that decrements the active-connection counter on exit.
+    coro::task<void> handle_connection_guarded(net::tcp_stream stream) {
+        active_connection_guard guard(active_connections_);
+        co_await handle_connection(std::move(stream));
+    }
+
+    /// Guard wrapper for TLS connections.
+    coro::task<void> handle_tls_connection_guarded(net::tcp_stream tcp,
+                                                   tls::tls_context& tls_ctx) {
+        active_connection_guard guard(active_connections_);
+        co_await handle_tls_connection(std::move(tcp), tls_ctx);
+    }
+
     /// Handle a plain connection
     coro::task<void> handle_connection(net::tcp_stream stream) {
         auto peer = stream.peer_address();
@@ -899,6 +938,7 @@ private:
     ws_router router_;
     http::server_config http_config_;
     std::atomic<bool> running_{false};
+    std::atomic<size_t> active_connections_{0};  ///< In-flight connection handlers
     std::atomic<size_t> stop_epoch_{0};
     mutable std::mutex accept_cancel_mutex_;
     std::vector<std::weak_ptr<coro::cancel_source>> active_accept_sources_;

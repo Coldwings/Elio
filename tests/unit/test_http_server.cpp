@@ -1,7 +1,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/http/http_server.hpp>
 #include <elio/http/websocket_server.hpp>
+#include <elio/runtime/serve.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/sync/primitives.hpp>
 #include "../test_main.cpp"  // For scaled timeouts
 
 #include <arpa/inet.h>
@@ -467,6 +469,40 @@ void require_two_ordered_responses(const pipeline_result& result) {
 
 } // namespace
 
+TEST_CASE("serve drain helper waits for active connection count",
+          "[serve][shutdown][active-connections]") {
+    struct tracked_server {
+        std::atomic<size_t> active{1};
+
+        size_t active_connections() const noexcept {
+            return active.load(std::memory_order_acquire);
+        }
+    } srv;
+
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> drained{false};
+    auto handle = sched.go_joinable([&]() -> task<void> {
+        co_await elio::detail::wait_active_connections_drained(srv);
+        drained.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE_FALSE(wait_until([&] { return drained.load(std::memory_order_acquire); },
+                             elio::test::scaled_ms(100)));
+
+    srv.active.store(0, std::memory_order_release);
+
+    const bool completed = wait_until(
+        [&] { return drained.load(std::memory_order_acquire); },
+        elio::test::scaled_sec(2));
+
+    REQUIRE(completed);
+    handle.wait_destroyed();
+    sched.shutdown();
+}
+
 TEST_CASE("HTTP router rejects non-terminal wildcard route patterns",
           "[http][router][wildcard]") {
     router routes;
@@ -869,6 +905,69 @@ TEST_CASE("WebSocket server stop cancels overlapping idle accepts",
 
     REQUIRE(stopped);
     REQUIRE(drained);
+}
+
+TEST_CASE("WebSocket server tracks active upgraded handlers",
+          "[websocket][server][shutdown][active-connections]") {
+    elio::http::websocket::ws_router routes;
+    server_config config;
+    config.enable_logging = false;
+
+    elio::sync::event release_handler;
+    std::atomic<bool> handler_started{false};
+
+    routes.websocket("/ws", [&](elio::http::websocket::ws_connection&) -> task<void> {
+        handler_started.store(true, std::memory_order_release);
+        co_await release_handler.wait();
+        co_return;
+    });
+
+    elio::http::websocket::ws_server srv(std::move(routes), config);
+    const uint16_t port = reserve_loopback_port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] { return srv.is_running(); },
+                       elio::test::scaled_sec(2)));
+
+    auto client = connect_loopback(port);
+    send_all(client.get(),
+             "GET /ws HTTP/1.1\r\n"
+             "Host: localhost\r\n"
+             "Upgrade: websocket\r\n"
+             "Connection: Upgrade\r\n"
+             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+             "Sec-WebSocket-Version: 13\r\n"
+             "\r\n");
+
+    REQUIRE(wait_until(
+        [&] {
+            return handler_started.load(std::memory_order_acquire) &&
+                   srv.active_connections() == 1;
+        },
+        elio::test::scaled_sec(2)));
+
+    srv.stop();
+    try_wake_listener(port);
+
+    REQUIRE(wait_until([&] { return listen_done.load(std::memory_order_acquire); },
+                       elio::test::scaled_sec(2)));
+    REQUIRE(srv.active_connections() == 1);
+
+    release_handler.set();
+    client.reset();
+
+    REQUIRE(wait_until([&] { return srv.active_connections() == 0; },
+                       elio::test::scaled_sec(2)));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 }
 
 TEST_CASE("HTTP server reads after partial buffered pipelined request",

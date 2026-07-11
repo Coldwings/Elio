@@ -1287,6 +1287,36 @@ public:
 /* awaitable */ get(const std::string& url, coro::cancel_token token);
 ```
 
+### `base_client_config`
+
+Shared by `http::client_config`, `websocket::client_config`, and
+`sse::client_config`.
+
+```cpp
+struct base_client_config {
+    std::chrono::seconds connect_timeout{10};
+    std::chrono::seconds read_timeout{30};
+    size_t read_buffer_size = 8192;
+    std::string user_agent;
+    bool verify_certificate = true;
+    net::resolve_options resolve_options = net::default_cached_resolve_options();
+    bool rotate_resolved_addresses = true;
+    size_t max_headers = 100;
+    size_t max_header_size = 8192;
+};
+```
+
+- `connect_timeout`: TCP connect and TLS handshake deadline. `<=0` disables it.
+- `read_timeout`: Request/response, WebSocket upgrade, or SSE response header
+  read deadline depending on the client. `<=0` disables it.
+- `read_buffer_size`: Per-client read buffer size.
+- `user_agent`: User-Agent header; empty disables the header.
+- `verify_certificate`: TLS certificate verification policy.
+- `resolve_options`: DNS resolution and cache behavior.
+- `rotate_resolved_addresses`: Rotate the starting address across DNS results.
+- `max_headers`: Maximum response headers accepted by parsers.
+- `max_header_size`: Maximum size of one response header line in bytes.
+
 ### `client_config`
 
 ```cpp
@@ -1296,17 +1326,13 @@ struct client_config : base_client_config {
     size_t max_connections_per_host = 6;
     std::chrono::seconds pool_idle_timeout{60};
     size_t max_response_size = 16 * 1024 * 1024;
-    // Inherited: connect_timeout{10}, read_timeout{30}, user_agent
-    // connect_timeout bounds TCP connect and TLS handshake; <=0 disables
-    // read_timeout bounds request/response I/O; <=0 disables
+    // Inherits all base_client_config fields.
 };
 ```
 
 `websocket::client_config` and `sse::client_config` also inherit
-`base_client_config`: `connect_timeout` bounds TCP connect and TLS handshake,
-while `read_timeout` bounds the WebSocket upgrade response and SSE response
-header read performed by `connect()`. A value less than or equal to zero
-disables these client-side read deadlines.
+`base_client_config`, including timeout, read-buffer, TLS verification, DNS
+resolution/cache, address rotation, and response-header limit settings.
 
 Cancellation tokens are independent from configured deadlines. Passing a token
 to HTTP, WebSocket, or SSE client operations cancels the underlying pending I/O

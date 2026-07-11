@@ -317,6 +317,9 @@ coro::task<void> advanced_client() {
     config.max_redirects = 5;
     config.connect_timeout = std::chrono::seconds(10);  // TCP connect + TLS handshake
     config.read_timeout = std::chrono::seconds(30);     // request/response I/O
+    config.verify_certificate = true;
+    config.max_headers = 100;
+    config.max_header_size = 8192;
 
     client c(config);
     
@@ -350,6 +353,10 @@ coro::task<void> advanced_client() {
 HTTP client overloads that accept `coro::cancel_token` propagate cancellation
 into pending TCP connect, TLS handshake, request write, and response reads. A
 cancelled request returns `std::nullopt` and sets `errno` to `ECANCELED`.
+
+HTTP, WebSocket, and SSE client configs inherit `base_client_config`, including
+read buffer sizing, TLS certificate verification, DNS resolve/cache options,
+address rotation across resolved endpoints, and response-header limits.
 
 ### HTTP Server
 

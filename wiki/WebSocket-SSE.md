@@ -264,6 +264,12 @@ handshake setup. `read_timeout` bounds the protocol response headers read by
 `text/event-stream` response headers. Values less than or equal to zero disable
 these client-side read deadlines.
 
+Both client configs inherit the shared HTTP `base_client_config` fields:
+`read_buffer_size`, `user_agent`, `verify_certificate`, `resolve_options`,
+`rotate_resolved_addresses`, `max_headers`, and `max_header_size`. These control
+buffer sizing, TLS verification, DNS cache/rotation behavior, and response
+header parser limits during connection setup.
+
 Both clients also provide cancellation-token overloads. Cancelling the token
 passed to `connect()` aborts pending TCP connect, TLS handshake, request write,
 and response header reads. Cancelling the token passed to `receive()` aborts a

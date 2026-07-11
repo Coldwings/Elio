@@ -432,6 +432,7 @@ private:
             ws_cancel.cancel();
             co_await watchdog;
             if (timed_out->load(std::memory_order_acquire)) {
+                conn.mark_externally_shut_down();
                 ELIO_LOG_ERROR("Write to {}:{} timed out after {}s",
                                target.host, target.effective_port(),
                                std::chrono::duration_cast<std::chrono::seconds>(io_deadline).count());
@@ -540,6 +541,7 @@ private:
                     ws_cancel.cancel();
                     co_await watchdog;
                     if (read_timed_out->load(std::memory_order_acquire)) {
+                        conn.mark_externally_shut_down();
                         ELIO_LOG_ERROR("Read from {}:{} timed out after {}s",
                                        target.host, target.effective_port(),
                                        std::chrono::duration_cast<std::chrono::seconds>(io_deadline).count());

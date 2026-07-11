@@ -30,9 +30,12 @@
 #include <elio/coro/task.hpp>
 #include <elio/signal/signalfd.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/time/timer.hpp>
 #include <elio/log/macros.hpp>
 
+#include <chrono>
 #include <csignal>
+#include <exception>
 #include <initializer_list>
 #include <mutex>
 #include <type_traits>
@@ -59,6 +62,16 @@ inline void ignore_sigpipe_in_serve_once() {
         sigemptyset(&sa.sa_mask);
         ::sigaction(SIGPIPE, &sa, nullptr);
     });
+}
+
+template<typename Server>
+coro::task<void> wait_active_connections_drained(Server& server) {
+    if constexpr (requires { server.active_connections(); }) {
+        while (server.active_connections() != 0) {
+            co_await time::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    co_return;
 }
 
 } // namespace detail
@@ -169,8 +182,20 @@ coro::task<void> serve(Server& server, ListenFunc listen_func,
     // Stop the server
     server.stop();
 
-    // Wait for listen task to complete
-    co_await listen_handle;
+    // Wait for listen task to complete, then drain any detached connection
+    // handlers tracked by the server before a stack server can be destroyed.
+    std::exception_ptr listen_error;
+    try {
+        co_await listen_handle;
+    } catch (...) {
+        listen_error = std::current_exception();
+    }
+
+    co_await detail::wait_active_connections_drained(server);
+
+    if (listen_error) {
+        std::rethrow_exception(listen_error);
+    }
 
     ELIO_LOG_INFO("Server stopped");
     co_return;
@@ -276,7 +301,22 @@ coro::task<void> serve_all(std::tuple<Servers&...> servers,
     auto await_handles = [](auto&&... hs) -> coro::task<void> {
         (co_await hs, ...);
     };
-    co_await std::apply(await_handles, std::move(handles));
+    std::exception_ptr listen_error;
+    try {
+        co_await std::apply(await_handles, std::move(handles));
+    } catch (...) {
+        listen_error = std::current_exception();
+    }
+
+    auto await_drains = [](auto&... srvs) -> coro::task<void> {
+        (co_await detail::wait_active_connections_drained(srvs), ...);
+        co_return;
+    };
+    co_await std::apply(await_drains, servers);
+
+    if (listen_error) {
+        std::rethrow_exception(listen_error);
+    }
 
     ELIO_LOG_INFO("All servers stopped");
     co_return;

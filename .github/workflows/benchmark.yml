@@ -5,7 +5,9 @@ on:
     branches: [main]
     paths:
       - 'include/**'
-      - 'examples/**'
+      - 'examples/bench_tcp_*.cpp'
+      - 'examples/bench_tcp_common.hpp'
+      - 'examples/CMakeLists.txt'
       - 'CMakeLists.txt'
       - '*.cmake'
       - 'cmake/**'

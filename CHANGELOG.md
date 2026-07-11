@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before `length` bytes arrive, and both helpers return `-EOVERFLOW` when asked
   to transfer more than `INT32_MAX` bytes. `net::stream::write_all()` is retained
   as a compatibility alias for `write_exactly()`. (#249)
+- **TCP loopback benchmarks**: Added Elio, libuv, and standalone Asio benchmark
+  targets plus workflow support for ping-pong and streaming TCP loopback
+  measurements. (#241)
+- **RDMA ibverbs receive and CUDA package surface**: Added shared receive queue
+  support for the ibverbs backend and exported the optional
+  `Elio::elio_rdma_cuda` package target for GPUDirect RDMA consumers. (#289)
 
 ### Changed
 
@@ -28,9 +34,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message is corrupt regardless, so there is no behavioral reason for RPC to
   carry its own duplicate loop. The unused `rpc::read_exact()`/`rpc::write_exact()`
   helpers were removed.
+- **0.5.3 development metadata**: The in-tree development version is now 0.5.3,
+  with README, public header, and CMake release metadata aligned after v0.5.2.
+- **Documentation and examples**: README/wiki/API snippets now reflect the
+  current OpenSSL and default-build requirements, CMake options, installed
+  package consumption flow, HTTP/2 and HTTP/TLS APIs, UDS networking, RDMA
+  targets, RPC buffer semantics, scheduler APIs, signal handling, and
+  generator-neutral example build commands.
+- **CI and package validation coverage**: Pull-request CI now keeps required
+  checks green for docs-only changes, runs registered CTest/package checks,
+  verifies HTTP/2 option dependencies and optional installed targets, compiles
+  TCP benchmark targets, and bounds release benchmark runtime.
 
 ### Fixed
 
+- **Network stream readiness and socket setup**: TCP and UDS stream operations
+  now wait for readiness on transient `EAGAIN`/`EWOULDBLOCK`, preserve readable
+  data before HUP/EOF, apply requested `tcp_connect` socket options, and restore
+  the active coroutine frame around I/O resumes. (#247)
+- **Scheduler and runtime shutdown**: Fixed scheduler shrink/draining behavior,
+  stopped-worker scheduling, blocking-pool joinability, `spawn_blocking`
+  handoff/direct-resume deadlocks, exception-handler lifetime, `elio::run`
+  shutdown on exceptions, rejected `go_joinable` handles, worker self-join, and
+  task-completion waiter lifetime races. (#391)
+- **Synchronization and object-cache lifetime**: Fixed mutex waiter lock
+  transfer lifetime, sync handoff cancellation leaks, object-cache release
+  handoff and canceled-construction cleanup, bounded-channel close state, and
+  combinator waiter resume ordering. (#290)
+- **RPC cancellation and framing**: Fixed complete protocol writes, transient
+  RPC `writev` retries, `rpc_client` timeout-watcher cleanup, member-coroutine
+  self lifetime, end-to-end cancellation propagation, server accept wakeups on
+  stop, and RPC frame-header documentation. (#246, #253, #294)
+- **HTTP/1 client and server robustness**: Fixed response-body framing, skipped
+  informational responses, URL authority parsing, client cancellation
+  propagation, connect/handshake/read timeout enforcement, failed handshake
+  cleanup, outbound header-injection rejection, and forbidden response-body
+  suppression. (#321)
+- **WebSocket and SSE validation**: Fixed oversized WebSocket frame
+  preallocation, malformed close payloads, close encode state preservation,
+  subprotocol selection validation, non-terminal route wildcards, IPv6 client
+  URLs, upgrade read timeouts, non-SSE content-type rejection, and SSE parser
+  buffering limits. (#320)
+- **HTTP/2 client behavior**: Fixed connect/read timeout enforcement, session
+  config application, buffered response-body caps, HTTP/2 option dependency
+  validation, nghttp2 FetchContent cache scoping, and installed nghttp2 target
+  restoration. (#270)
+- **RDMA correctness and optional build support**: Fixed RDMA CM event routing
+  and status signs, cancellable CM polling, awaited operation completion
+  requests, inline completion awaiter lifetimes, SGE and remote-buffer length
+  validation, CQ pump cancellation, GPU memory-region move/default construction,
+  and package/export metadata for optional RDMA targets. (#286, #291, #297)
+- **Installed package and consumer metadata**: Installed packages now restore
+  exported RDMA, liburing, nghttp2, C++20, and optional target requirements, and
+  consumer checks validate those package contracts. (#269, #270)
+- **Header and hash portability**: Public headers gained missing includes, SHA
+  intrinsic includes no longer leak into the `elio` namespace, and CRC32C
+  documentation now covers hardware and software implementations.
 - **Pre-1.0 package version compatibility**: Installed package metadata now
   treats each `0.<minor>` release line as a separate compatibility boundary,
   so Elio 0.5.x no longer satisfies incompatible 0.4 or 0.6 requests. (#380)

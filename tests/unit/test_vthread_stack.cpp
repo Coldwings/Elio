@@ -4,6 +4,7 @@
 #include <elio/runtime/spawn.hpp>
 #include <elio/coro/vthread_stack.hpp>
 #include <atomic>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 #include "../test_main.cpp"  // For scaled timeouts
@@ -107,6 +108,24 @@ TEST_CASE("vthread_stack thread-local current", "[vthread_stack]") {
     
     vthread_stack::set_current(nullptr);
     REQUIRE(vthread_stack::current() == nullptr);
+}
+
+TEST_CASE("vthread_stack_scope restores previous stack on exception", "[vthread_stack]") {
+    auto* previous = vthread_stack::current();
+
+    vthread_stack outer;
+    vthread_stack inner;
+    vthread_stack::set_current(&outer);
+
+    try {
+        vthread_stack_scope scope(&inner);
+        REQUIRE(vthread_stack::current() == &inner);
+        throw std::runtime_error("forced failure");
+    } catch (const std::runtime_error&) {
+    }
+
+    REQUIRE(vthread_stack::current() == &outer);
+    vthread_stack::set_current(previous);
 }
 
 TEST_CASE("vthread_stack thread-local isolation", "[vthread_stack]") {

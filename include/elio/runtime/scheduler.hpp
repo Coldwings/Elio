@@ -687,19 +687,16 @@ private:
 
         auto vstack_owner = std::make_unique<coro::vthread_stack>();
         auto* new_vstack = vstack_owner.get();
-        auto* old_vstack = coro::vthread_stack::current();
         auto* old_frame = coro::promise_base::current_frame();
-        coro::vthread_stack::set_current(new_vstack);
 
         auto wrapper = [&] {
+            coro::vthread_stack_scope vstack_scope(new_vstack);
             if constexpr (Joinable) {
                 return detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
             } else {
                 return detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
             }
         }();
-
-        coro::vthread_stack::set_current(old_vstack);
 
         auto handle = coro::detail::task_access::release(wrapper);
         handle.promise().detached_ = true;

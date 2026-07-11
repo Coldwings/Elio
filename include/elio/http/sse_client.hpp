@@ -396,6 +396,7 @@ private:
     coro::task<bool> connect_impl(std::string_view url_str, coro::cancel_token token) {
         // Check if already cancelled
         if (token.is_cancelled()) {
+            errno = ECANCELED;
             co_return false;
         }
         
@@ -427,6 +428,7 @@ private:
         while (state_ == client_state::connected) {
             // Check for cancellation
             if (cancelled()) {
+                errno = ECANCELED;
                 co_return std::nullopt;
             }
 
@@ -439,10 +441,25 @@ private:
                 co_return evt;
             }
 
-            // Read more data
-            auto result = co_await read(buffer_.data(), buffer_.size());
+            // Read more data. Either the per-receive token or the
+            // connect-time token must be able to cancel the pending read.
+            auto read_cancel = std::make_shared<coro::cancel_source>();
+            auto propagate_cancel =
+                [read_cancel]() { read_cancel->cancel(); };
+            auto receive_cancel_registration = token.on_cancel(propagate_cancel);
+            auto connection_cancel_registration =
+                token_.on_cancel(std::move(propagate_cancel));
+            if (cancelled()) {
+                read_cancel->cancel();
+            }
+            auto result = co_await read(buffer_.data(), buffer_.size(),
+                                        read_cancel->get_token());
 
             if (result.result <= 0) {
+                if (result.result == -ECANCELED && cancelled()) {
+                    errno = ECANCELED;
+                    co_return std::nullopt;
+                }
                 if (result.result == 0) {
                     ELIO_LOG_DEBUG("SSE connection closed by server");
                 } else {
@@ -492,7 +509,8 @@ private:
             &tls_ctx_,
             config_.resolve_options,
             config_.rotate_resolved_addresses,
-            config_.connect_timeout);
+            config_.connect_timeout,
+            token_);
         if (!conn_result) {
             state_ = client_state::disconnected;
             co_return false;
@@ -532,9 +550,16 @@ private:
         
         request += "\r\n";
         
-        auto send_result = co_await write_exactly(request.data(), request.size());
+        auto send_result = co_await write_exactly(request.data(), request.size(),
+                                                  token_);
         if (send_result.result != static_cast<ssize_t>(request.size())) {
+            if (send_result.result == -ECANCELED && token_.is_cancelled()) {
+                http::detail::abort_stream_io(stream_);
+                errno = ECANCELED;
+                co_return fail_connect();
+            }
             ELIO_LOG_ERROR("Failed to send SSE request");
+            errno = send_result.result == 0 ? ECONNRESET : -send_result.result;
             co_return fail_connect();
         }
         
@@ -579,7 +604,8 @@ private:
                 auto watchdog = http::detail::arm_fd_shutdown_watchdog(
                     sched, stream_.fd(), remaining,
                     watchdog_cancel.get_token(), timed_out);
-                read_result = co_await read(buffer_.data(), buffer_.size());
+                read_result = co_await read(buffer_.data(), buffer_.size(),
+                                            token_);
                 watchdog_cancel.cancel();
                 co_await watchdog;
                 if (timed_out->load(std::memory_order_acquire)) {
@@ -590,10 +616,16 @@ private:
                     co_return fail_connect();
                 }
             } else {
-                read_result = co_await read(buffer_.data(), buffer_.size());
+                read_result = co_await read(buffer_.data(), buffer_.size(),
+                                            token_);
             }
 
             if (read_result.result <= 0) {
+                if (read_result.result == -ECANCELED && token_.is_cancelled()) {
+                    http::detail::abort_stream_io(stream_);
+                    errno = ECANCELED;
+                    co_return fail_connect();
+                }
                 ELIO_LOG_ERROR("Failed to read SSE response");
                 errno = read_result.result == 0 ? ECONNRESET : -read_result.result;
                 co_return fail_connect();
@@ -740,12 +772,22 @@ private:
         co_return co_await stream_.read(buf, len);
     }
 
+    coro::task<io::io_result> read(void* buf, size_t len,
+                                   coro::cancel_token token) {
+        co_return co_await stream_.read(buf, len, std::move(token));
+    }
+
     coro::task<io::io_result> write(const void* buf, size_t len) {
         co_return co_await stream_.write(buf, len);
     }
 
     coro::task<io::io_result> write_exactly(const void* buf, size_t len) {
         co_return co_await stream_.write_exactly(buf, len);
+    }
+
+    coro::task<io::io_result> write_exactly(const void* buf, size_t len,
+                                            coro::cancel_token token) {
+        co_return co_await stream_.write_exactly(buf, len, std::move(token));
     }
     
     client_config config_;

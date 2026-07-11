@@ -298,6 +298,61 @@ public:
             }
         }
     }
+
+    /// Read data asynchronously, cancellable by ``token``.
+    coro::task<io::io_result> read(void* buffer, size_t length,
+                                   coro::cancel_token token) {
+        if (!handshake_complete_) {
+            auto hs = co_await handshake(token);
+            if (!hs) {
+                co_return io::io_result{-errno, 0};
+            }
+        }
+
+        while (true) {
+            if (token.is_cancelled()) {
+                co_return io::io_result{-ECANCELED, 0};
+            }
+
+            ERR_clear_error();
+            int ret = SSL_read(ssl_, buffer, static_cast<int>(length));
+
+            if (ret > 0) {
+                co_return io::io_result{ret, 0};
+            }
+
+            if (ret == 0) {
+                int err = SSL_get_error(ssl_, ret);
+                if (err == SSL_ERROR_ZERO_RETURN) {
+                    co_return io::io_result{0, 0};
+                }
+                co_return io::io_result{-EIO, 0};
+            }
+
+            int err = SSL_get_error(ssl_, ret);
+
+            if (err == SSL_ERROR_WANT_READ) {
+                auto result = co_await tcp_.poll_read(token);
+                if (result.was_cancelled() || result.io.result == -ECANCELED) {
+                    co_return io::io_result{-ECANCELED, 0};
+                }
+                if (result.io.result < 0) {
+                    co_return result.io;
+                }
+            } else if (err == SSL_ERROR_WANT_WRITE) {
+                auto result = co_await tcp_.poll_write(token);
+                if (result.was_cancelled() || result.io.result == -ECANCELED) {
+                    co_return io::io_result{-ECANCELED, 0};
+                }
+                if (result.io.result < 0) {
+                    co_return result.io;
+                }
+            } else {
+                ELIO_LOG_ERROR("TLS read error: {}", get_ssl_error_string(err));
+                co_return io::io_result{-EIO, 0};
+            }
+        }
+    }
     
     /// Write data asynchronously
     /// @param buffer Data to write
@@ -337,10 +392,63 @@ public:
             }
         }
     }
+
+    /// Write data asynchronously, cancellable by ``token``.
+    coro::task<io::io_result> write(const void* buffer, size_t length,
+                                    coro::cancel_token token) {
+        if (!handshake_complete_) {
+            auto hs = co_await handshake(token);
+            if (!hs) {
+                co_return io::io_result{-errno, 0};
+            }
+        }
+
+        while (true) {
+            if (token.is_cancelled()) {
+                co_return io::io_result{-ECANCELED, 0};
+            }
+
+            ERR_clear_error();
+            int ret = SSL_write(ssl_, buffer, static_cast<int>(length));
+
+            if (ret > 0) {
+                co_return io::io_result{ret, 0};
+            }
+
+            int err = SSL_get_error(ssl_, ret);
+
+            if (err == SSL_ERROR_WANT_READ) {
+                auto result = co_await tcp_.poll_read(token);
+                if (result.was_cancelled() || result.io.result == -ECANCELED) {
+                    co_return io::io_result{-ECANCELED, 0};
+                }
+                if (result.io.result < 0) {
+                    co_return result.io;
+                }
+            } else if (err == SSL_ERROR_WANT_WRITE) {
+                auto result = co_await tcp_.poll_write(token);
+                if (result.was_cancelled() || result.io.result == -ECANCELED) {
+                    co_return io::io_result{-ECANCELED, 0};
+                }
+                if (result.io.result < 0) {
+                    co_return result.io;
+                }
+            } else {
+                ELIO_LOG_ERROR("TLS write error: {}", get_ssl_error_string(err));
+                co_return io::io_result{-EIO, 0};
+            }
+        }
+    }
     
     /// Write string data
     coro::task<io::io_result> write(std::string_view data) {
         return write(data.data(), data.size());
+    }
+
+    /// Write string data, cancellable by ``token``.
+    coro::task<io::io_result> write(std::string_view data,
+                                    coro::cancel_token token) {
+        return write(data.data(), data.size(), std::move(token));
     }
 
     /// Read exactly ``length`` bytes into ``buffer``.
@@ -378,10 +486,45 @@ public:
         co_return io::io_result{static_cast<int32_t>(length), 0};
     }
 
+    /// Read exactly ``length`` bytes into ``buffer``, cancellable by ``token``.
+    coro::task<io::io_result> read_exactly(void* buffer, size_t length,
+                                           coro::cancel_token token) {
+        if (length > static_cast<size_t>(INT32_MAX)) {
+            co_return io::io_result{-EOVERFLOW, 0};
+        }
+
+        auto* ptr = static_cast<char*>(buffer);
+        size_t remaining = length;
+
+        while (remaining > 0) {
+            if (token.is_cancelled()) {
+                co_return io::io_result{-ECANCELED, 0};
+            }
+
+            auto result = co_await read(ptr, remaining, token);
+            if (result.result > 0) {
+                ptr += result.result;
+                remaining -= static_cast<size_t>(result.result);
+            } else if (result.result == 0) {
+                co_return io::io_result{-ENODATA, 0};
+            } else {
+                co_return result;
+            }
+        }
+        co_return io::io_result{static_cast<int32_t>(length), 0};
+    }
+
     /// Read exactly enough bytes to fill ``buffer``.
     template<typename T>
     coro::task<io::io_result> read_exactly(std::span<T> buffer) {
         return read_exactly(buffer.data(), buffer.size_bytes());
+    }
+
+    /// Read exactly enough bytes to fill ``buffer``, cancellable by ``token``.
+    template<typename T>
+    coro::task<io::io_result> read_exactly(std::span<T> buffer,
+                                           coro::cancel_token token) {
+        return read_exactly(buffer.data(), buffer.size_bytes(), std::move(token));
     }
 
     /// Write exactly ``length`` bytes from ``buffer``.
@@ -415,15 +558,54 @@ public:
         co_return io::io_result{static_cast<int32_t>(length), 0};
     }
 
+    /// Write exactly ``length`` bytes from ``buffer``, cancellable by ``token``.
+    coro::task<io::io_result> write_exactly(const void* buffer, size_t length,
+                                            coro::cancel_token token) {
+        if (length > static_cast<size_t>(INT32_MAX)) {
+            co_return io::io_result{-EOVERFLOW, 0};
+        }
+
+        const auto* ptr = static_cast<const char*>(buffer);
+        size_t remaining = length;
+
+        while (remaining > 0) {
+            if (token.is_cancelled()) {
+                co_return io::io_result{-ECANCELED, 0};
+            }
+
+            auto result = co_await write(ptr, remaining, token);
+            if (result.result > 0) {
+                ptr += result.result;
+                remaining -= static_cast<size_t>(result.result);
+            } else {
+                co_return result;
+            }
+        }
+        co_return io::io_result{static_cast<int32_t>(length), 0};
+    }
+
     /// Write exactly all bytes from ``buffer``.
     template<typename T>
     coro::task<io::io_result> write_exactly(std::span<const T> buffer) {
         return write_exactly(buffer.data(), buffer.size_bytes());
     }
 
+    /// Write exactly all bytes from ``buffer``, cancellable by ``token``.
+    template<typename T>
+    coro::task<io::io_result> write_exactly(std::span<const T> buffer,
+                                            coro::cancel_token token) {
+        return write_exactly(buffer.data(), buffer.size_bytes(), std::move(token));
+    }
+
     /// Write exactly all bytes from ``str``.
     coro::task<io::io_result> write_exactly(std::string_view str) {
         return write_exactly(str.data(), str.size());
+    }
+
+    /// Write exactly all bytes from ``str``, cancellable by ``token``.
+    coro::task<io::io_result> write_exactly(std::string_view str,
+                                            coro::cancel_token token) {
+        return write_exactly(str.data(), str.size(), std::move(token));
     }
 
     /// Perform TLS shutdown.

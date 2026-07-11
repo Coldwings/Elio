@@ -7,6 +7,7 @@
 //   5. Repeated informational responses cannot bypass max_response_size.
 //   6. WebSocket and SSE client handshakes honor read_timeout while waiting
 //      for protocol response headers.
+//   7. Client cancellation tokens abort pending HTTP, WebSocket, and SSE I/O.
 //
 // These stand up a tiny TCP listener that pretends to be an HTTP-based server
 // and craft hand-built byte sequences for each scenario -- no real
@@ -37,6 +38,20 @@ using elio::runtime::scheduler;
 
 namespace {
 
+constexpr bool running_under_tsan() {
+#if defined(__SANITIZE_THREAD__)
+    return true;
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+    return true;
+#else
+    return false;
+#endif
+#else
+    return false;
+#endif
+}
+
 std::string make_url(uint16_t port, std::string_view path = "/") {
     return std::string("http://127.0.0.1:") + std::to_string(port) +
            std::string(path);
@@ -52,17 +67,41 @@ std::string make_ws_url(uint16_t port, std::string_view path = "/ws") {
            std::string(path);
 }
 
-// Drain a single request from the stream (until "\r\n\r\n"). Used by the
+// Read a single request from the stream (until "\r\n\r\n"). Used by the
 // fake server to know when to start writing its response.
-task<void> drain_request_headers(elio::net::tcp_stream& s) {
+task<std::string> read_request_headers(elio::net::tcp_stream& s) {
     std::string accum;
     char buf[1024];
     while (accum.find("\r\n\r\n") == std::string::npos) {
         auto r = co_await s.read(buf, sizeof(buf));
-        if (r.result <= 0) co_return;
+        if (r.result <= 0) co_return accum;
         accum.append(buf, static_cast<size_t>(r.result));
     }
+    co_return accum;
+}
+
+task<void> drain_request_headers(elio::net::tcp_stream& s) {
+    (void)co_await read_request_headers(s);
     co_return;
+}
+
+std::string request_header_value(std::string_view headers, std::string_view name) {
+    std::string needle = "\r\n";
+    needle += name;
+    needle += ":";
+    auto pos = headers.find(needle);
+    if (pos == std::string_view::npos) {
+        return {};
+    }
+    pos += needle.size();
+    while (pos < headers.size() && (headers[pos] == ' ' || headers[pos] == '\t')) {
+        ++pos;
+    }
+    auto end = headers.find("\r\n", pos);
+    if (end == std::string_view::npos) {
+        end = headers.size();
+    }
+    return std::string(headers.substr(pos, end - pos));
 }
 
 } // namespace
@@ -290,6 +329,387 @@ TEST_CASE("SSE client read_timeout fires on stalled response headers",
     REQUIRE(client_done);
     REQUIRE(client_failed);
     REQUIRE(client_errno == ETIMEDOUT);
+    REQUIRE(client_elapsed_ms.load() >= 0);
+    REQUIRE(client_elapsed_ms.load() < 3000);
+}
+
+TEST_CASE("HTTP client cancellation aborts a pending response read",
+          "[http][client][cancel][regression]") {
+    if constexpr (running_under_tsan()) {
+        SKIP("connect-cancellation fake server drain is covered by normal and ASAN runs");
+    }
+
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_failed{false};
+    std::atomic<int> client_errno{0};
+    std::atomic<int64_t> client_elapsed_ms{-1};
+    elio::coro::cancel_source cancel_source;
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        co_await drain_request_headers(*stream);
+        char extra[1];
+        (void)co_await stream->read(extra, sizeof(extra));
+        stream->shutdown_socket();
+    });
+
+    sched.go([&]() -> task<void> {
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        cancel_source.cancel();
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(0);
+        elio::http::client c(cfg);
+
+        auto t0 = std::chrono::steady_clock::now();
+        auto resp = co_await c.get(make_url(port), cancel_source.get_token());
+        auto elapsed = std::chrono::steady_clock::now() - t0;
+
+        client_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            elapsed).count();
+        if (!resp) {
+            client_failed = true;
+            client_errno = errno;
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!client_done) {
+        cancel_source.cancel();
+        for (int i = 0; i < 500 && !client_done; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    REQUIRE(sched.shutdown(std::chrono::seconds(10)));
+
+    REQUIRE(client_done);
+    REQUIRE(client_failed);
+    REQUIRE(client_errno == ECANCELED);
+    REQUIRE(client_elapsed_ms.load() >= 0);
+    REQUIRE(client_elapsed_ms.load() < 3000);
+}
+
+TEST_CASE("WebSocket client cancellation aborts stalled handshake response",
+          "[websocket][client][cancel][regression]") {
+    if constexpr (running_under_tsan()) {
+        SKIP("connect-cancellation fake server drain is covered by normal and ASAN runs");
+    }
+
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_failed{false};
+    std::atomic<int> client_errno{0};
+    std::atomic<int64_t> client_elapsed_ms{-1};
+    elio::coro::cancel_source cancel_source;
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        co_await drain_request_headers(*stream);
+        char extra[1];
+        (void)co_await stream->read(extra, sizeof(extra));
+        stream->shutdown_socket();
+    });
+
+    sched.go([&]() -> task<void> {
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        cancel_source.cancel();
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::websocket::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(0);
+        elio::http::websocket::ws_client client(cfg);
+
+        auto t0 = std::chrono::steady_clock::now();
+        bool ok = co_await client.connect(make_ws_url(port), cancel_source.get_token());
+        auto elapsed = std::chrono::steady_clock::now() - t0;
+
+        client_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            elapsed).count();
+        if (!ok) {
+            client_failed = true;
+            client_errno = errno;
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!client_done) {
+        cancel_source.cancel();
+        for (int i = 0; i < 500 && !client_done; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    REQUIRE(sched.shutdown(std::chrono::seconds(10)));
+
+    REQUIRE(client_done);
+    REQUIRE(client_failed);
+    REQUIRE(client_errno == ECANCELED);
+    REQUIRE(client_elapsed_ms.load() >= 0);
+    REQUIRE(client_elapsed_ms.load() < 3000);
+}
+
+TEST_CASE("SSE client cancellation aborts stalled response headers",
+          "[sse][client][cancel][regression]") {
+    if constexpr (running_under_tsan()) {
+        SKIP("connect-cancellation fake server drain is covered by normal and ASAN runs");
+    }
+
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_failed{false};
+    std::atomic<int> client_errno{0};
+    std::atomic<int64_t> client_elapsed_ms{-1};
+    elio::coro::cancel_source cancel_source;
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        co_await drain_request_headers(*stream);
+        char extra[1];
+        (void)co_await stream->read(extra, sizeof(extra));
+        stream->shutdown_socket();
+    });
+
+    sched.go([&]() -> task<void> {
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        cancel_source.cancel();
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::sse::client_config cfg;
+        cfg.auto_reconnect = false;
+        cfg.read_timeout = std::chrono::seconds(0);
+        elio::http::sse::sse_client client(cfg);
+
+        auto t0 = std::chrono::steady_clock::now();
+        bool ok = co_await client.connect(make_url(port, "/events"),
+                                          cancel_source.get_token());
+        auto elapsed = std::chrono::steady_clock::now() - t0;
+
+        client_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            elapsed).count();
+        if (!ok) {
+            client_failed = true;
+            client_errno = errno;
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!client_done) {
+        cancel_source.cancel();
+        for (int i = 0; i < 500 && !client_done; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    REQUIRE(sched.shutdown(std::chrono::seconds(10)));
+
+    REQUIRE(client_done);
+    REQUIRE(client_failed);
+    REQUIRE(client_errno == ECANCELED);
+    REQUIRE(client_elapsed_ms.load() >= 0);
+    REQUIRE(client_elapsed_ms.load() < 3000);
+}
+
+TEST_CASE("SSE receive cancellation aborts a pending event read",
+          "[sse][client][cancel][regression]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_connected{false};
+    std::atomic<bool> client_failed{false};
+    std::atomic<bool> still_connected_after_cancel{false};
+    std::atomic<int> client_errno{0};
+    std::atomic<int64_t> client_elapsed_ms{-1};
+    elio::coro::cancel_source cancel_source;
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        co_await drain_request_headers(*stream);
+        std::string headers =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n";
+        co_await stream->write(headers);
+        char extra[1];
+        (void)co_await stream->read(extra, sizeof(extra));
+        stream->shutdown_socket();
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::sse::client_config cfg;
+        cfg.auto_reconnect = false;
+        cfg.read_timeout = std::chrono::seconds(0);
+        elio::http::sse::sse_client client(cfg);
+
+        bool ok = co_await client.connect(make_url(port, "/events"));
+        client_connected = ok;
+        if (!ok) {
+            client_failed = true;
+            client_errno = errno;
+            client_done = true;
+            co_return;
+        }
+
+        sched.go([&]() -> task<void> {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+            cancel_source.cancel();
+        });
+
+        auto t0 = std::chrono::steady_clock::now();
+        auto evt = co_await client.receive(cancel_source.get_token());
+        auto elapsed = std::chrono::steady_clock::now() - t0;
+
+        client_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            elapsed).count();
+        if (!evt) {
+            client_failed = true;
+            client_errno = errno;
+        }
+        still_connected_after_cancel = client.is_connected();
+        co_await client.close();
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!client_done) {
+        cancel_source.cancel();
+        for (int i = 0; i < 500 && !client_done; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    REQUIRE(sched.shutdown(std::chrono::seconds(10)));
+
+    REQUIRE(client_done);
+    REQUIRE(client_connected);
+    REQUIRE(client_failed);
+    REQUIRE(client_errno == ECANCELED);
+    REQUIRE(still_connected_after_cancel);
+    REQUIRE(client_elapsed_ms.load() >= 0);
+    REQUIRE(client_elapsed_ms.load() < 3000);
+}
+
+TEST_CASE("WebSocket receive cancellation aborts a pending message read",
+          "[websocket][client][cancel][regression]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_connected{false};
+    std::atomic<bool> client_failed{false};
+    std::atomic<bool> still_open_after_cancel{false};
+    std::atomic<int> client_errno{0};
+    std::atomic<int64_t> client_elapsed_ms{-1};
+    elio::coro::cancel_source cancel_source;
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        auto headers = co_await read_request_headers(*stream);
+        auto key = request_header_value(headers, "Sec-WebSocket-Key");
+        REQUIRE_FALSE(key.empty());
+        auto accept = elio::http::websocket::compute_websocket_accept(key);
+        auto response = elio::http::websocket::build_server_handshake(accept);
+        co_await stream->write(response);
+        char extra[1];
+        (void)co_await stream->read(extra, sizeof(extra));
+        stream->shutdown_socket();
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::websocket::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(0);
+        elio::http::websocket::ws_client client(cfg);
+
+        bool ok = co_await client.connect(make_ws_url(port));
+        client_connected = ok;
+        if (!ok) {
+            client_failed = true;
+            client_errno = errno;
+            client_done = true;
+            co_return;
+        }
+
+        sched.go([&]() -> task<void> {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+            cancel_source.cancel();
+        });
+
+        auto t0 = std::chrono::steady_clock::now();
+        auto msg = co_await client.receive(cancel_source.get_token());
+        auto elapsed = std::chrono::steady_clock::now() - t0;
+
+        client_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            elapsed).count();
+        if (!msg) {
+            client_failed = true;
+            client_errno = errno;
+        }
+        still_open_after_cancel = client.is_open();
+        co_await client.close();
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!client_done) {
+        cancel_source.cancel();
+        for (int i = 0; i < 500 && !client_done; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    REQUIRE(sched.shutdown(std::chrono::seconds(10)));
+
+    REQUIRE(client_done);
+    REQUIRE(client_connected);
+    REQUIRE(client_failed);
+    REQUIRE(client_errno == ECANCELED);
+    REQUIRE(still_open_after_cancel);
     REQUIRE(client_elapsed_ms.load() >= 0);
     REQUIRE(client_elapsed_ms.load() < 3000);
 }

@@ -412,6 +412,13 @@ coro::task<void> controller() {
 | `sse::sse_client::connect()` | `co_await client.connect(url, token)` |
 | `sse::sse_client::receive()` | `co_await client.receive(token)` |
 
+HTTP, WebSocket, and SSE client cancellation is propagated into pending socket
+operations. A token passed to `connect()` or an HTTP request can abort TCP
+connect, TLS handshake, request write, and response-header/body reads. A token
+passed to WebSocket or SSE `receive()` can abort a pending frame/event read.
+Cancelled client operations return the normal failure shape (`std::nullopt` or
+`false`) and set `errno` to `ECANCELED`.
+
 ---
 
 ## Runtime (`elio::runtime`)
@@ -1189,9 +1196,17 @@ public:
     
     // Read data (awaitable)
     /* awaitable */ read(void* buffer, size_t size);
+    /* awaitable */ read(void* buffer, size_t size, coro::cancel_token token);
     
     // Write data (awaitable)
     /* awaitable */ write(const void* data, size_t size);
+    /* awaitable */ write(const void* data, size_t size, coro::cancel_token token);
+
+    // Exact-length helpers (awaitable)
+    /* awaitable */ read_exactly(void* buffer, size_t size);
+    /* awaitable */ read_exactly(void* buffer, size_t size, coro::cancel_token token);
+    /* awaitable */ write_exactly(const void* data, size_t size);
+    /* awaitable */ write_exactly(const void* data, size_t size, coro::cancel_token token);
     
     // Scatter-gather write (awaitable) - writes multiple buffers atomically
     /* awaitable */ writev(struct iovec* iovecs, size_t count);
@@ -1214,6 +1229,7 @@ public:
 
 // Connect to address (awaitable, returns std::optional<tcp_stream>)
 /* awaitable */ tcp_connect(const ipv4_address& addr);
+/* awaitable */ tcp_connect(const ipv4_address& addr, coro::cancel_token token);
 ```
 
 ---
@@ -1232,21 +1248,29 @@ public:
 
     // GET request (awaitable)
     /* awaitable */ get(const std::string& url);
+    /* awaitable */ get(const std::string& url, coro::cancel_token token);
 
     // POST request (awaitable)
     /* awaitable */ post(const std::string& url,
                          const std::string& body,
                          const std::string& content_type);
+    /* awaitable */ post(const std::string& url,
+                         const std::string& body,
+                         coro::cancel_token token,
+                         const std::string& content_type);
 
     // HEAD request (awaitable)
     /* awaitable */ head(const std::string& url);
+    /* awaitable */ head(const std::string& url, coro::cancel_token token);
 
     // Send custom request (awaitable)
-    /* awaitable */ send(const request& req, const url& target);
+    /* awaitable */ send(request& req, const url& target);
+    /* awaitable */ send(request& req, const url& target, coro::cancel_token token);
 };
 
 // Convenience function for one-off GET
 /* awaitable */ get(const std::string& url);
+/* awaitable */ get(const std::string& url, coro::cancel_token token);
 ```
 
 ### `client_config`
@@ -1269,6 +1293,10 @@ struct client_config : base_client_config {
 while `read_timeout` bounds the WebSocket upgrade response and SSE response
 header read performed by `connect()`. A value less than or equal to zero
 disables these client-side read deadlines.
+
+Cancellation tokens are independent from configured deadlines. Passing a token
+to HTTP, WebSocket, or SSE client operations cancels the underlying pending I/O
+instead of only checking the token between I/O calls.
 
 ### `server_config`
 

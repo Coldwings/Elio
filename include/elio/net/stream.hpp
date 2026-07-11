@@ -77,6 +77,20 @@ public:
         co_return io::io_result{-ENOTCONN, 0};
     }
 
+    /// Read data from the stream, cancellable by ``token``.
+    coro::task<io::io_result> read(void* buffer, size_t length,
+                                   coro::cancel_token token) {
+        if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
+            co_return co_await tcp->read(buffer, length, token);
+        }
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+            co_return co_await tls->read(buffer, length, token);
+        }
+#endif
+        co_return io::io_result{-ENOTCONN, 0};
+    }
+
     /// Write data to the stream
     coro::task<io::io_result> write(const void* buffer, size_t length) {
         if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
@@ -90,9 +104,29 @@ public:
         co_return io::io_result{-ENOTCONN, 0};
     }
 
+    /// Write data to the stream, cancellable by ``token``.
+    coro::task<io::io_result> write(const void* buffer, size_t length,
+                                    coro::cancel_token token) {
+        if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
+            co_return co_await tcp->write(buffer, length, token);
+        }
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+            co_return co_await tls->write(buffer, length, token);
+        }
+#endif
+        co_return io::io_result{-ENOTCONN, 0};
+    }
+
     /// Write string_view data
     coro::task<io::io_result> write(std::string_view data) {
         return write(data.data(), data.size());
+    }
+
+    /// Write string_view data, cancellable by ``token``.
+    coro::task<io::io_result> write(std::string_view data,
+                                    coro::cancel_token token) {
+        return write(data.data(), data.size(), std::move(token));
     }
 
     /// Read exactly ``length`` bytes into ``buffer``.
@@ -117,6 +151,20 @@ public:
         co_return io::io_result{-ENOTCONN, 0};
     }
 
+    /// Read exactly ``length`` bytes into ``buffer``, cancellable by ``token``.
+    coro::task<io::io_result> read_exactly(void* buffer, size_t length,
+                                           coro::cancel_token token) {
+        if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
+            co_return co_await tcp->read_exactly(buffer, length, token);
+        }
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+            co_return co_await tls->read_exactly(buffer, length, token);
+        }
+#endif
+        co_return io::io_result{-ENOTCONN, 0};
+    }
+
     /// Write exactly ``length`` bytes from ``buffer``, retrying short writes.
     ///
     /// Delegates to the active underlying stream's ``write_exactly``.
@@ -136,9 +184,29 @@ public:
         co_return io::io_result{-ENOTCONN, 0};
     }
 
+    /// Write exactly ``length`` bytes from ``buffer``, cancellable by ``token``.
+    coro::task<io::io_result> write_exactly(const void* buffer, size_t length,
+                                            coro::cancel_token token) {
+        if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
+            co_return co_await tcp->write_exactly(buffer, length, token);
+        }
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+            co_return co_await tls->write_exactly(buffer, length, token);
+        }
+#endif
+        co_return io::io_result{-ENOTCONN, 0};
+    }
+
     /// Write exactly all bytes from ``data``.
     coro::task<io::io_result> write_exactly(std::string_view data) {
         return write_exactly(data.data(), data.size());
+    }
+
+    /// Write exactly all bytes from ``data``, cancellable by ``token``.
+    coro::task<io::io_result> write_exactly(std::string_view data,
+                                            coro::cancel_token token) {
+        return write_exactly(data.data(), data.size(), std::move(token));
     }
 
     /// Write all data, retrying short writes.
@@ -155,10 +223,24 @@ public:
         return write_exactly(buffer, length);
     }
 
+    /// Write all data, retrying short writes; cancellable by ``token``.
+    /// @deprecated Prefer ``write_exactly``; retained as a compatibility alias.
+    coro::task<io::io_result> write_all(const void* buffer, size_t length,
+                                        coro::cancel_token token) {
+        return write_exactly(buffer, length, std::move(token));
+    }
+
     /// Write all data from string_view.
     /// @deprecated Prefer ``write_exactly``; retained as a compatibility alias.
     coro::task<io::io_result> write_all(std::string_view data) {
         return write_exactly(data.data(), data.size());
+    }
+
+    /// Write all data from string_view; cancellable by ``token``.
+    /// @deprecated Prefer ``write_exactly``; retained as a compatibility alias.
+    coro::task<io::io_result> write_all(std::string_view data,
+                                        coro::cancel_token token) {
+        return write_exactly(data.data(), data.size(), std::move(token));
     }
 
     /// Close/shutdown the stream

@@ -74,6 +74,14 @@ arm_fd_shutdown_watchdog(runtime::scheduler* sched,
         });
 }
 
+inline void abort_stream_io(net::stream& stream) noexcept {
+    int fd = stream.fd();
+    if (fd >= 0) {
+        ::shutdown(fd, SHUT_RDWR);
+        stream.mark_externally_shut_down();
+    }
+}
+
 } // namespace detail
 
 /// Base configuration shared by all HTTP-based clients
@@ -116,9 +124,19 @@ client_connect(std::string_view host, uint16_t port, bool secure,
                tls::tls_context* tls_ctx,
                net::resolve_options resolve_opts = net::default_cached_resolve_options(),
                bool rotate_resolved_addresses = true,
-               std::chrono::nanoseconds connect_timeout = std::chrono::nanoseconds::zero()) {
+               std::chrono::nanoseconds connect_timeout = std::chrono::nanoseconds::zero(),
+               coro::cancel_token token = {}) {
+
+    if (token.is_cancelled()) {
+        errno = ECANCELED;
+        co_return std::nullopt;
+    }
 
     auto addresses = co_await net::resolve_all(host, port, resolve_opts);
+    if (token.is_cancelled()) {
+        errno = ECANCELED;
+        co_return std::nullopt;
+    }
     if (addresses.empty()) {
         ELIO_LOG_ERROR("Failed to resolve {}:{}: {}", host, port, strerror(errno));
         co_return std::nullopt;
@@ -134,6 +152,8 @@ client_connect(std::string_view host, uint16_t port, bool secure,
     auto timer_cancel_src = std::make_shared<coro::cancel_source>();
     auto timed_out = std::make_shared<std::atomic<bool>>(false);
     std::optional<coro::join_handle<void>> watchdog;
+    auto user_cancel_registration =
+        token.on_cancel([op_cancel_src]() { op_cancel_src->cancel(); });
 
     if (deadline_enforced) {
         watchdog.emplace(sched->go_joinable(
@@ -176,6 +196,14 @@ client_connect(std::string_view host, uint16_t port, bool secure,
         return false;
     };
 
+    auto check_cancelled = [&]() -> bool {
+        if (token.is_cancelled()) {
+            errno = ECANCELED;
+            return true;
+        }
+        return false;
+    };
+
     if (secure) {
         if (!tls_ctx) {
             errno = EINVAL;
@@ -187,12 +215,15 @@ client_connect(std::string_view host, uint16_t port, bool secure,
         for (size_t i = 0; i < addresses.size(); ++i) {
             const auto& addr = addresses[(offset + i) % addresses.size()];
             std::optional<net::tcp_stream> tcp;
-            if (deadline_enforced) {
-                tcp = co_await net::tcp_connect(addr, op_cancel_src->get_token());
-            } else {
-                tcp = co_await net::tcp_connect(addr);
-            }
+            tcp = co_await net::tcp_connect(addr, op_cancel_src->get_token());
             if (check_timeout()) {
+                co_await stop_watchdog_preserving_errno();
+                co_return std::nullopt;
+            }
+            if (check_cancelled()) {
+                if (tcp) {
+                    tcp->shutdown_socket();
+                }
                 co_await stop_watchdog_preserving_errno();
                 co_return std::nullopt;
             }
@@ -202,10 +233,13 @@ client_connect(std::string_view host, uint16_t port, bool secure,
 
             tls::tls_stream tls_stream(std::move(*tcp), *tls_ctx);
             tls_stream.set_hostname(host);
-            auto hs = deadline_enforced
-                ? co_await tls_stream.handshake(op_cancel_src->get_token())
-                : co_await tls_stream.handshake();
+            auto hs = co_await tls_stream.handshake(op_cancel_src->get_token());
             if (check_timeout()) {
+                co_await stop_watchdog_preserving_errno();
+                co_return std::nullopt;
+            }
+            if (check_cancelled()) {
+                tls_stream.shutdown_socket();
                 co_await stop_watchdog_preserving_errno();
                 co_return std::nullopt;
             }
@@ -226,12 +260,15 @@ client_connect(std::string_view host, uint16_t port, bool secure,
         for (size_t i = 0; i < addresses.size(); ++i) {
             const auto& addr = addresses[(offset + i) % addresses.size()];
             std::optional<net::tcp_stream> result;
-            if (deadline_enforced) {
-                result = co_await net::tcp_connect(addr, op_cancel_src->get_token());
-            } else {
-                result = co_await net::tcp_connect(addr);
-            }
+            result = co_await net::tcp_connect(addr, op_cancel_src->get_token());
             if (check_timeout()) {
+                co_await stop_watchdog_preserving_errno();
+                co_return std::nullopt;
+            }
+            if (check_cancelled()) {
+                if (result) {
+                    result->shutdown_socket();
+                }
                 co_await stop_watchdog_preserving_errno();
                 co_return std::nullopt;
             }

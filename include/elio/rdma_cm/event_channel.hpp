@@ -26,12 +26,16 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <deque>
 #include <cstring>
+#include <mutex>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace elio::rdma_cm {
 
@@ -78,6 +82,110 @@ public:
 
 private:
     std::deque<rdma_cm_event*> events_;
+};
+
+class backlog_wait_registry {
+public:
+    class subscription {
+    public:
+        subscription() = default;
+        subscription(backlog_wait_registry& registry,
+                     std::shared_ptr<coro::cancel_source> source)
+            : registry_(&registry),
+              source_(std::move(source)) {}
+
+        subscription(const subscription&) = delete;
+        subscription& operator=(const subscription&) = delete;
+
+        subscription(subscription&& other) noexcept
+            : registry_(std::exchange(other.registry_, nullptr)),
+              source_(std::move(other.source_)) {}
+
+        subscription& operator=(subscription&& other) noexcept {
+            if (this != &other) {
+                reset();
+                registry_ = std::exchange(other.registry_, nullptr);
+                source_ = std::move(other.source_);
+            }
+            return *this;
+        }
+
+        ~subscription() { reset(); }
+
+        void reset() noexcept {
+            if (registry_ && source_) {
+                registry_->unsubscribe(source_);
+            }
+            registry_ = nullptr;
+            source_.reset();
+        }
+
+    private:
+        backlog_wait_registry* registry_ = nullptr;
+        std::shared_ptr<coro::cancel_source> source_{};
+    };
+
+    backlog_wait_registry() = default;
+
+    backlog_wait_registry(const backlog_wait_registry&) = delete;
+    backlog_wait_registry& operator=(const backlog_wait_registry&) = delete;
+    backlog_wait_registry(backlog_wait_registry&&) = delete;
+    backlog_wait_registry& operator=(backlog_wait_registry&&) = delete;
+
+    [[nodiscard]] subscription subscribe(
+        std::shared_ptr<coro::cancel_source> source) {
+        if (!source) {
+            return {};
+        }
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            compact_locked_();
+            waiters_.push_back(source);
+        }
+        return subscription(*this, std::move(source));
+    }
+
+    void cancel_all() {
+        std::vector<std::shared_ptr<coro::cancel_source>> to_cancel;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            for (auto it = waiters_.begin(); it != waiters_.end();) {
+                if (auto source = it->lock()) {
+                    to_cancel.push_back(std::move(source));
+                    ++it;
+                } else {
+                    it = waiters_.erase(it);
+                }
+            }
+        }
+        for (auto& source : to_cancel) {
+            source->cancel();
+        }
+    }
+
+private:
+    void unsubscribe(const std::shared_ptr<coro::cancel_source>& source) noexcept {
+        std::lock_guard<std::mutex> guard(mutex_);
+        waiters_.erase(
+            std::remove_if(waiters_.begin(), waiters_.end(),
+                [&](const std::weak_ptr<coro::cancel_source>& waiter) {
+                    auto locked = waiter.lock();
+                    return !locked || locked.get() == source.get();
+                }),
+            waiters_.end());
+    }
+
+    void compact_locked_() {
+        waiters_.erase(
+            std::remove_if(waiters_.begin(), waiters_.end(),
+                [](const std::weak_ptr<coro::cancel_source>& waiter) {
+                    return waiter.expired();
+                }),
+            waiters_.end());
+    }
+
+    std::mutex mutex_{};
+    std::vector<std::weak_ptr<coro::cancel_source>> waiters_{};
 };
 
 }  // namespace detail
@@ -202,6 +310,8 @@ private:
     next_event_matching_(Predicate pred,
                          coro::cancel_token token) {
         while (!token.is_cancelled()) {
+            std::shared_ptr<coro::cancel_source> backlog_cancel;
+            detail::backlog_wait_registry::subscription backlog_subscription;
             {
                 co_await event_mutex_.lock();
                 event_lock_guard lock{event_mutex_};
@@ -225,24 +335,41 @@ private:
 
                     // Let any waiter for this event's cm_id acquire the
                     // channel before we continue waiting for our own event.
+                    // The fd-readable event has been consumed, so wake any
+                    // waiter already suspended in async_poll_read().
                     lock.unlock();
+                    backlog_waiters_.cancel_all();
                     continue;
                 }
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
                     lock.unlock();
                     co_return nullptr;  // hard error
                 }
+
+                backlog_cancel = std::make_shared<coro::cancel_source>();
+                backlog_subscription =
+                    backlog_waiters_.subscribe(backlog_cancel);
+                lock.unlock();
+            }
+
+            auto token_registration = token.on_cancel([backlog_cancel]() {
+                backlog_cancel->cancel();
+            });
+            if (token.is_cancelled()) {
+                backlog_cancel->cancel();
             }
 
             // No matching event ready; wait without holding event_mutex_
             // so other helpers can consume already-backlogged events and
             // their cancel tokens are not blocked behind this waiter.
-            auto result = co_await io::async_poll_read(channel_->fd, token);
-            if (result.was_cancelled()) {
-                co_return nullptr;
-            }
+            auto result = co_await io::async_poll_read(
+                channel_->fd, backlog_cancel->get_token());
+            backlog_subscription.reset();
             if (token.is_cancelled()) {
                 co_return nullptr;
+            }
+            if (result.was_cancelled()) {
+                continue;  // local backlog wake-up; retry and re-check backlog
             }
             if (!result.success()) {
                 const int err = result.error_code();
@@ -268,6 +395,7 @@ private:
     rdma_event_channel* channel_ = nullptr;
     sync::mutex         event_mutex_{};
     detail::event_backlog backlog_{};
+    detail::backlog_wait_registry backlog_waiters_{};
 };
 
 }  // namespace elio::rdma_cm

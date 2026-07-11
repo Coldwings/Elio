@@ -84,6 +84,7 @@ struct rpc_context {
     uint32_t request_id;                    ///< Request ID for correlation
     method_id_t method_id;                  ///< Method being called
     std::optional<uint32_t> timeout_ms;     ///< Client-specified timeout (if any)
+    coro::cancel_token cancel_token;        ///< Cancelled when the client cancels this request
     
     /// Check if request has a timeout
     bool has_timeout() const noexcept {
@@ -172,9 +173,9 @@ public:
                 }
 
                 case message_type::cancel:
-                    // TODO: Support request cancellation
                     ELIO_LOG_DEBUG("RPC session: received cancel for request {}",
                                    header.request_id);
+                    cancel_request(header.request_id);
                     break;
 
                 default:
@@ -184,6 +185,7 @@ public:
             }
         }
 
+        cancel_all_active_requests();
         closed_.store(true, std::memory_order_release);
         ELIO_LOG_DEBUG("RPC session ended");
     }
@@ -198,6 +200,7 @@ public:
             // write that risks SIGPIPE on OpenSSL builds without
             // MSG_NOSIGNAL.
             stream_.shutdown_socket();
+            cancel_all_active_requests();
         }
     }
 
@@ -207,6 +210,29 @@ public:
     }
 
 private:
+    struct active_request_state {
+        coro::cancel_source cancel;
+    };
+
+    struct active_request_eraser {
+        rpc_session* self = nullptr;
+        uint32_t request_id = 0;
+        std::shared_ptr<active_request_state> active;
+
+        active_request_eraser() = default;
+        active_request_eraser(rpc_session* s,
+                              uint32_t id,
+                              std::shared_ptr<active_request_state> a)
+            : self(s), request_id(id), active(std::move(a)) {}
+        active_request_eraser(const active_request_eraser&) = delete;
+        active_request_eraser& operator=(const active_request_eraser&) = delete;
+        ~active_request_eraser() {
+            if (self && active) {
+                self->erase_active_request(request_id, active);
+            }
+        }
+    };
+
     rpc_session(Stream stream,
                 std::shared_ptr<const handler_map> handlers,
                 rpc_server_config config)
@@ -320,15 +346,27 @@ private:
                            header.request_id);
             return;
         }
+        auto active = std::make_shared<active_request_state>();
+        {
+            std::lock_guard<std::mutex> lock(active_requests_mutex_);
+            active_requests_[header.request_id] = active;
+        }
         auto self = this->shared_from_this();
-        sched->go([self, hdr = header, pl = std::move(payload)]() mutable
+        sched->go([self,
+                   hdr = header,
+                   pl = std::move(payload),
+                   active = std::move(active)]() mutable
                       -> coro::task<void> {
-            co_await self->handle_request(hdr, std::move(pl));
+            co_await self->handle_request(hdr, std::move(pl), std::move(active));
         });
     }
 
     /// Handle an incoming request (runs concurrently with the read loop).
-    coro::task<void> handle_request(const frame_header& header, message_buffer payload) {
+    coro::task<void> handle_request(const frame_header& header,
+                                    message_buffer payload,
+                                    std::shared_ptr<active_request_state> active) {
+        active_request_eraser active_guard(this, header.request_id, active);
+
         // Find handler
         auto it = handlers_->find(header.method_id);
         if (it == handlers_->end()) {
@@ -346,6 +384,7 @@ private:
         rpc_context ctx;
         ctx.request_id = header.request_id;
         ctx.method_id = header.method_id;
+        ctx.cancel_token = active->cancel.get_token();
 
         // Call handler and capture result or error
         bool handler_success = false;
@@ -434,6 +473,50 @@ private:
         }
     }
 
+    void cancel_request(uint32_t request_id) {
+        std::shared_ptr<active_request_state> active;
+        {
+            std::lock_guard<std::mutex> lock(active_requests_mutex_);
+            auto it = active_requests_.find(request_id);
+            if (it != active_requests_.end()) {
+                active = it->second;
+            }
+        }
+
+        if (active) {
+            active->cancel.cancel();
+        }
+    }
+
+    void cancel_all_active_requests() {
+        std::vector<std::shared_ptr<active_request_state>> active;
+        {
+            std::lock_guard<std::mutex> lock(active_requests_mutex_);
+            active.reserve(active_requests_.size());
+            for (auto& [id, request] : active_requests_) {
+                (void)id;
+                active.push_back(request);
+            }
+        }
+
+        for (auto& request : active) {
+            request->cancel.cancel();
+        }
+    }
+
+    void erase_active_request(uint32_t request_id,
+                              const std::shared_ptr<active_request_state>& active) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(active_requests_mutex_);
+            auto it = active_requests_.find(request_id);
+            if (it != active_requests_.end() && it->second == active) {
+                active_requests_.erase(it);
+            }
+        } catch (...) {
+            // Erase from a noexcept path must not propagate.
+        }
+    }
+
     /// Send a response frame; serialised against other concurrent handlers
     /// on the same connection by `send_mutex_`.
     /// @return true if the frame was written successfully, false otherwise.
@@ -452,6 +535,8 @@ private:
     rpc_server_config config_;
     std::atomic<bool> closed_{false};
     sync::mutex send_mutex_;
+    std::mutex active_requests_mutex_;
+    std::unordered_map<uint32_t, std::shared_ptr<active_request_state>> active_requests_;
 };
 
 // ============================================================================

@@ -1762,6 +1762,10 @@ struct WatcherEchoReq { int32_t value; ELIO_RPC_FIELDS(WatcherEchoReq, value) };
 struct WatcherEchoResp { int32_t value; ELIO_RPC_FIELDS(WatcherEchoResp, value) };
 using WatcherEchoMethod = ELIO_RPC_METHOD(303, WatcherEchoReq, WatcherEchoResp);
 
+struct CancelProbeReq { int32_t value; ELIO_RPC_FIELDS(CancelProbeReq, value) };
+struct CancelProbeResp { int32_t value; ELIO_RPC_FIELDS(CancelProbeResp, value) };
+using CancelProbeMethod = ELIO_RPC_METHOD(304, CancelProbeReq, CancelProbeResp);
+
 TEST_CASE("call timeout watcher is cancelled after completion",
           "[rpc][timeout][cancel]") {
     using namespace elio::net;
@@ -1840,4 +1844,112 @@ TEST_CASE("call timeout watcher is cancelled after completion",
     // Sanity: draining must be far quicker than the per-call timeout, proving
     // we did not simply wait out the watcher's sleep.
     REQUIRE(drain_elapsed < call_timeout);
+}
+
+TEST_CASE("rpc call cancellation reaches server context token",
+          "[rpc][cancel][regression]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    auto server = std::make_shared<rpc_server<tcp_stream>>();
+    std::atomic<bool> handler_started{false};
+    std::atomic<bool> server_cancel_seen{false};
+
+    server->register_method_with_context<CancelProbeMethod>(
+        [&handler_started, &server_cancel_seen](
+            const rpc_context& ctx,
+            const CancelProbeReq& req) -> coro::task<CancelProbeResp> {
+            handler_started.store(true, std::memory_order_release);
+
+            for (int i = 0; i < 2000; ++i) {
+                if (ctx.cancel_token.is_cancelled()) {
+                    server_cancel_seen.store(true, std::memory_order_release);
+                    co_return CancelProbeResp{-1};
+                }
+
+                auto result = co_await elio::time::sleep_for(
+                    elio::test::scaled_ms(5),
+                    ctx.cancel_token);
+                if (result == coro::cancel_result::cancelled ||
+                    ctx.cancel_token.is_cancelled()) {
+                    server_cancel_seen.store(true, std::memory_order_release);
+                    co_return CancelProbeResp{-1};
+                }
+            }
+
+            co_return CancelProbeResp{req.value};
+        });
+
+    scheduler sched(3);
+    sched.start();
+
+    sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
+        auto s = co_await lst.accept();
+        if (!s) co_return;
+        co_await server->handle_client(std::move(*s));
+    });
+
+    coro::cancel_source cancel_source;
+    std::promise<std::pair<int, bool>> done_promise;
+    auto done = done_promise.get_future();
+
+    sched.go([&, p = std::move(done_promise)]() mutable -> coro::task<void> {
+        auto client_opt = co_await tcp_rpc_client::connect("::1", port);
+        if (!client_opt) {
+            p.set_value({static_cast<int>(rpc_error::connection_closed), false});
+            co_return;
+        }
+        auto client = *client_opt;
+
+        auto* current_sched = scheduler::current();
+        REQUIRE(current_sched != nullptr);
+
+        auto call = current_sched->go_joinable(
+            [client, token = cancel_source.get_token()]() mutable
+                -> coro::task<int> {
+                auto r = co_await client->call<CancelProbeMethod>(
+                    CancelProbeReq{7},
+                    elio::test::scaled_sec(30),
+                    std::move(token));
+                co_return static_cast<int>(r.error());
+            });
+
+        for (int i = 0;
+             i < 2000 && !handler_started.load(std::memory_order_acquire);
+             ++i) {
+            co_await elio::time::sleep_for(elio::test::scaled_ms(1));
+        }
+        if (!handler_started.load(std::memory_order_acquire)) {
+            client->close();
+            p.set_value({static_cast<int>(rpc_error::timeout), false});
+            co_return;
+        }
+
+        cancel_source.cancel();
+        int call_error = co_await std::move(call);
+
+        for (int i = 0;
+             i < 2000 && !server_cancel_seen.load(std::memory_order_acquire);
+             ++i) {
+            co_await elio::time::sleep_for(elio::test::scaled_ms(1));
+        }
+
+        bool observed = server_cancel_seen.load(std::memory_order_acquire);
+        client->close();
+        p.set_value({call_error, observed});
+    });
+
+    auto status = done.wait_for(std::chrono::seconds(60));
+    REQUIRE(status == std::future_status::ready);
+    auto [call_error, observed] = done.get();
+    REQUIRE(call_error == static_cast<int>(rpc_error::cancelled));
+    REQUIRE(observed);
+
+    server->stop();
+    REQUIRE(sched.shutdown(std::chrono::seconds(30)));
 }

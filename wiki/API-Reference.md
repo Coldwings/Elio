@@ -1303,30 +1303,64 @@ public:
     explicit client(const client_config& config);
 
     // GET request (awaitable)
-    /* awaitable */ get(const std::string& url);
-    /* awaitable */ get(const std::string& url, coro::cancel_token token);
+    /* awaitable */ get(std::string_view url);
+    /* awaitable */ get(std::string_view url, coro::cancel_token token);
 
     // POST request (awaitable)
-    /* awaitable */ post(const std::string& url,
-                         const std::string& body,
-                         const std::string& content_type);
-    /* awaitable */ post(const std::string& url,
-                         const std::string& body,
+    /* awaitable */ post(std::string_view url,
+                         std::string_view body,
+                         std::string_view content_type = mime::application_form_urlencoded);
+    /* awaitable */ post(std::string_view url,
+                         std::string_view body,
                          coro::cancel_token token,
-                         const std::string& content_type);
+                         std::string_view content_type = mime::application_form_urlencoded);
+
+    // PUT request (awaitable)
+    /* awaitable */ put(std::string_view url,
+                        std::string_view body,
+                        std::string_view content_type = mime::application_json);
+    /* awaitable */ put(std::string_view url,
+                        std::string_view body,
+                        coro::cancel_token token,
+                        std::string_view content_type = mime::application_json);
+
+    // DELETE request (awaitable)
+    /* awaitable */ del(std::string_view url);
+    /* awaitable */ del(std::string_view url, coro::cancel_token token);
+
+    // PATCH request (awaitable)
+    /* awaitable */ patch(std::string_view url,
+                          std::string_view body,
+                          std::string_view content_type = mime::application_json);
+    /* awaitable */ patch(std::string_view url,
+                          std::string_view body,
+                          coro::cancel_token token,
+                          std::string_view content_type = mime::application_json);
 
     // HEAD request (awaitable)
-    /* awaitable */ head(const std::string& url);
-    /* awaitable */ head(const std::string& url, coro::cancel_token token);
+    /* awaitable */ head(std::string_view url);
+    /* awaitable */ head(std::string_view url, coro::cancel_token token);
 
     // Send custom request (awaitable)
     /* awaitable */ send(request& req, const url& target);
     /* awaitable */ send(request& req, const url& target, coro::cancel_token token);
+
+    // Configure TLS and client options
+    tls::tls_context& tls_context() noexcept;
+    client_config& config() noexcept;
+    const client_config& config() const noexcept;
 };
 
-// Convenience function for one-off GET
-/* awaitable */ get(const std::string& url);
-/* awaitable */ get(const std::string& url, coro::cancel_token token);
+// Convenience functions for one-off requests
+/* awaitable */ get(std::string_view url);
+/* awaitable */ get(std::string_view url, coro::cancel_token token);
+/* awaitable */ post(std::string_view url,
+                     std::string_view body,
+                     std::string_view content_type = mime::application_form_urlencoded);
+/* awaitable */ post(std::string_view url,
+                     std::string_view body,
+                     coro::cancel_token token,
+                     std::string_view content_type = mime::application_form_urlencoded);
 ```
 
 ### `base_client_config`

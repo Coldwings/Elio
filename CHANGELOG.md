@@ -76,6 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WebSocket route parameters**: Named `:param` captures in WebSocket route
   patterns are now exposed through `ws_connection::param()` and `params()`, so
   `/chat/:room` handlers can read the captured room value. (#623)
+- **Async readv API reference**: Added the documented public `async_readv()`
+  awaitable and compile/runtime coverage for scatter-gather reads. (#624)
 
 ## [0.5.2] - 2026-06-30
 

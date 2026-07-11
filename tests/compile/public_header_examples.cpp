@@ -5,6 +5,7 @@
 
 #include <iostream>
 #include <string_view>
+#include <sys/uio.h>
 #include <tuple>
 #include <utility>
 
@@ -80,6 +81,21 @@ coro::task<void> tls_server() {
 
     auto stream = co_await listener->accept();
     (void)stream;
+}
+
+coro::task<void> vectored_io(int fd) {
+    char first[8]{};
+    char second[8]{};
+    struct iovec iovecs[2] = {
+        {first, sizeof(first)},
+        {second, sizeof(second)},
+    };
+
+    auto read_result = co_await io::async_readv(fd, iovecs, 2);
+    (void)read_result;
+
+    auto write_result = co_await io::async_writev(fd, iovecs, 2);
+    (void)write_result;
 }
 
 coro::task<void> multiple_servers() {

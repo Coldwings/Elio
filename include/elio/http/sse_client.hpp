@@ -22,6 +22,7 @@
 
 #include <string>
 #include <string_view>
+#include <cerrno>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -497,6 +498,14 @@ private:
             co_return false;
         }
         stream_ = std::move(*conn_result);
+
+        auto fail_connect = [&]() noexcept {
+            int saved_errno = errno;
+            stream_.disconnect();
+            errno = saved_errno;
+            state_ = client_state::disconnected;
+            return false;
+        };
         
         // Send HTTP request
         std::string request;
@@ -526,8 +535,7 @@ private:
         auto send_result = co_await write_exactly(request.data(), request.size());
         if (send_result.result != static_cast<ssize_t>(request.size())) {
             ELIO_LOG_ERROR("Failed to send SSE request");
-            state_ = client_state::disconnected;
-            co_return false;
+            co_return fail_connect();
         }
         
         // Read response headers.
@@ -543,13 +551,52 @@ private:
         // delimiter directly to the SSE event parser.
         std::string response_data;
         response_data.reserve(1024);
+        auto* sched = runtime::scheduler::current();
+        const bool deadline_enforced =
+            sched != nullptr && config_.read_timeout.count() > 0;
+        const auto response_deadline =
+            std::chrono::steady_clock::now() + config_.read_timeout;
 
         while (true) {
-            auto read_result = co_await read(buffer_.data(), buffer_.size());
+            if (token_.is_cancelled()) {
+                errno = ECANCELED;
+                co_return fail_connect();
+            }
+
+            io::io_result read_result{};
+            if (deadline_enforced) {
+                auto remaining =
+                    response_deadline - std::chrono::steady_clock::now();
+                if (remaining.count() <= 0) {
+                    ELIO_LOG_ERROR("SSE response headers timed out after {}s",
+                                   config_.read_timeout.count());
+                    errno = ETIMEDOUT;
+                    co_return fail_connect();
+                }
+
+                auto timed_out = std::make_shared<std::atomic<bool>>(false);
+                coro::cancel_source watchdog_cancel;
+                auto watchdog = http::detail::arm_fd_shutdown_watchdog(
+                    sched, stream_.fd(), remaining,
+                    watchdog_cancel.get_token(), timed_out);
+                read_result = co_await read(buffer_.data(), buffer_.size());
+                watchdog_cancel.cancel();
+                co_await watchdog;
+                if (timed_out->load(std::memory_order_acquire)) {
+                    stream_.mark_externally_shut_down();
+                    ELIO_LOG_ERROR("SSE response headers timed out after {}s",
+                                   config_.read_timeout.count());
+                    errno = ETIMEDOUT;
+                    co_return fail_connect();
+                }
+            } else {
+                read_result = co_await read(buffer_.data(), buffer_.size());
+            }
+
             if (read_result.result <= 0) {
                 ELIO_LOG_ERROR("Failed to read SSE response");
-                state_ = client_state::disconnected;
-                co_return false;
+                errno = read_result.result == 0 ? ECONNRESET : -read_result.result;
+                co_return fail_connect();
             }
 
             response_data.append(buffer_.data(), static_cast<size_t>(read_result.result));
@@ -575,16 +622,16 @@ private:
                 if (result == parse_result::error) {
                     ELIO_LOG_ERROR("Failed to parse SSE response: {}",
                                    parser.error_message());
-                    state_ = client_state::disconnected;
-                    co_return false;
+                    errno = EBADMSG;
+                    co_return fail_connect();
                 }
 
                 // Check status code
                 if (parser.get_status() != status::ok) {
                     ELIO_LOG_ERROR("SSE request failed: {}",
                                   static_cast<int>(parser.get_status()));
-                    state_ = client_state::disconnected;
-                    co_return false;
+                    errno = EBADMSG;
+                    co_return fail_connect();
                 }
 
                 // Check content type
@@ -601,8 +648,8 @@ private:
                     if (parser_.failed()) {
                         ELIO_LOG_ERROR("SSE parse error: {}",
                                        parser_.error_message());
-                        state_ = client_state::disconnected;
-                        co_return false;
+                        errno = EBADMSG;
+                        co_return fail_connect();
                     }
                 }
 
@@ -611,8 +658,8 @@ private:
 
             if (response_data.size() > 8192) {
                 ELIO_LOG_ERROR("SSE response headers too large");
-                state_ = client_state::disconnected;
-                co_return false;
+                errno = EMSGSIZE;
+                co_return fail_connect();
             }
         }
         

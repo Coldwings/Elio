@@ -5,14 +5,18 @@
 //   4. A connection with leftover bytes after the response is NOT pooled
 //      (response-splitting prevention).
 //   5. Repeated informational responses cannot bypass max_response_size.
+//   6. WebSocket and SSE client handshakes honor read_timeout while waiting
+//      for protocol response headers.
 //
-// These exercise the post-PR send_request path. We stand up a tiny TCP
-// listener that pretends to be an HTTP server and craft hand-built byte
-// sequences for each scenario — no real http::server in the loop.
+// These stand up a tiny TCP listener that pretends to be an HTTP-based server
+// and craft hand-built byte sequences for each scenario -- no real
+// http::server in the loop.
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <elio/http/http_client.hpp>
+#include <elio/http/sse.hpp>
+#include <elio/http/websocket.hpp>
 #include <elio/net/tcp.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/time/timer.hpp>
@@ -40,6 +44,11 @@ std::string make_url(uint16_t port, std::string_view path = "/") {
 
 std::string make_https_url(uint16_t port, std::string_view path = "/") {
     return std::string("https://127.0.0.1:") + std::to_string(port) +
+           std::string(path);
+}
+
+std::string make_ws_url(uint16_t port, std::string_view path = "/ws") {
+    return std::string("ws://127.0.0.1:") + std::to_string(port) +
            std::string(path);
 }
 
@@ -172,6 +181,117 @@ TEST_CASE("HTTP client read_timeout fires on a stalled server",
     REQUIRE(client_done);
     REQUIRE(client_failed);
     REQUIRE(client_errno == ETIMEDOUT);
+}
+
+TEST_CASE("WebSocket client read_timeout fires on a stalled handshake response",
+          "[websocket][client][timeout][regression]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_failed{false};
+    std::atomic<int> client_errno{0};
+    std::atomic<int64_t> client_elapsed_ms{-1};
+
+    // Server: accept and drain the WebSocket upgrade request, but never send
+    // the 101 response. The client's read_timeout must bound this phase.
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        co_await drain_request_headers(*stream);
+        co_await elio::time::sleep_for(std::chrono::seconds(3));
+        stream->shutdown_socket();
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::websocket::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(1);
+        elio::http::websocket::ws_client client(cfg);
+
+        auto t0 = std::chrono::steady_clock::now();
+        bool ok = co_await client.connect(make_ws_url(port));
+        auto elapsed = std::chrono::steady_clock::now() - t0;
+
+        client_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            elapsed).count();
+        if (!ok) {
+            client_failed = true;
+            client_errno = errno;
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(client_failed);
+    REQUIRE(client_errno == ETIMEDOUT);
+    REQUIRE(client_elapsed_ms.load() >= 0);
+    REQUIRE(client_elapsed_ms.load() < 3000);
+}
+
+TEST_CASE("SSE client read_timeout fires on stalled response headers",
+          "[sse][client][timeout][regression]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_failed{false};
+    std::atomic<int> client_errno{0};
+    std::atomic<int64_t> client_elapsed_ms{-1};
+
+    // Server: accept and drain the SSE GET request, but never send HTTP
+    // headers. The client's read_timeout must bound response header reads.
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        co_await drain_request_headers(*stream);
+        co_await elio::time::sleep_for(std::chrono::seconds(3));
+        stream->shutdown_socket();
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::sse::client_config cfg;
+        cfg.auto_reconnect = false;
+        cfg.read_timeout = std::chrono::seconds(1);
+        elio::http::sse::sse_client client(cfg);
+
+        auto t0 = std::chrono::steady_clock::now();
+        bool ok = co_await client.connect(make_url(port, "/events"));
+        auto elapsed = std::chrono::steady_clock::now() - t0;
+
+        client_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            elapsed).count();
+        if (!ok) {
+            client_failed = true;
+            client_errno = errno;
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(client_failed);
+    REQUIRE(client_errno == ETIMEDOUT);
+    REQUIRE(client_elapsed_ms.load() >= 0);
+    REQUIRE(client_elapsed_ms.load() < 3000);
 }
 
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS

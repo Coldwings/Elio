@@ -18,6 +18,8 @@
 #include <elio/runtime/scheduler.hpp>
 #include <elio/time/timer.hpp>
 
+#include <sys/socket.h>
+
 #include <atomic>
 #include <string>
 #include <chrono>
@@ -25,6 +27,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 
 namespace elio::http {
 
@@ -44,6 +47,31 @@ inline size_t next_rotation_offset(const std::string& host, uint16_t port, size_
     size_t offset = cursor % count;
     cursor = (cursor + 1) % count;
     return offset;
+}
+
+/// Spawn a watchdog that shutdown(2)s `fd` after `timeout` elapses.
+///
+/// The returned join_handle must be awaited after the I/O operation completes;
+/// the caller cancels `watchdog_token` to wake the watchdog early on success.
+/// `timed_out` is set only when the deadline fired before cancellation.
+inline coro::join_handle<void>
+arm_fd_shutdown_watchdog(runtime::scheduler* sched,
+                         int fd,
+                         std::chrono::nanoseconds timeout,
+                         coro::cancel_token watchdog_token,
+                         std::shared_ptr<std::atomic<bool>> timed_out) {
+    return sched->go_joinable(
+        [fd, timeout, tok = std::move(watchdog_token),
+         flag = std::move(timed_out)]() -> coro::task<void> {
+            auto r = co_await elio::time::sleep_for(timeout, tok);
+            if (r == coro::cancel_result::completed) {
+                flag->store(true, std::memory_order_release);
+                if (fd >= 0) {
+                    ::shutdown(fd, SHUT_RDWR);
+                }
+            }
+            co_return;
+        });
 }
 
 } // namespace detail

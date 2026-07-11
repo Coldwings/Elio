@@ -31,8 +31,8 @@ using namespace elio::signal;
 // Global flag for graceful shutdown
 std::atomic<bool> g_running{true};
 
-// Global listener fd for cancellation on shutdown
-std::atomic<int> g_listener_fd{-1};
+// Cancels the pending accept on shutdown without closing behind the listener.
+cancel_source g_accept_cancel;
 
 /// Signal handler coroutine - waits for SIGINT/SIGTERM
 task<void> signal_handler_task() {
@@ -47,12 +47,7 @@ task<void> signal_handler_task() {
     }
     
     g_running = false;
-    
-    // Close the listener to interrupt the pending accept
-    int fd = g_listener_fd.exchange(-1);
-    if (fd >= 0) {
-        ::close(fd);
-    }
+    g_accept_cancel.cancel();
     
     co_return;
 }
@@ -108,9 +103,6 @@ task<void> server_main(const socket_address& bind_addr, const tcp_options& opts,
     
     auto& listener = *listener_result;
     
-    // Store listener fd for shutdown cancellation
-    g_listener_fd.store(listener.fd(), std::memory_order_release);
-    
     ELIO_LOG_INFO("Echo server listening on {}", bind_addr.to_string());
     ELIO_LOG_INFO("Press Ctrl+C to stop");
     
@@ -118,14 +110,14 @@ task<void> server_main(const socket_address& bind_addr, const tcp_options& opts,
     
     while (g_running) {
         // Accept new connection
-        auto stream_result = co_await listener.accept();
+        auto stream_result = co_await listener.accept(g_accept_cancel.get_token());
         
         if (!stream_result) {
             if (g_running) {
                 ELIO_LOG_ERROR("Accept error: {}", strerror(errno));
             }
-            // Exit loop if listener was closed for shutdown
-            if (!g_running || errno == EBADF) {
+            // Exit loop if shutdown cancellation interrupted the accept
+            if (!g_running || g_accept_cancel.is_cancelled()) {
                 break;
             }
             continue;

@@ -681,6 +681,10 @@ struct batch_write_segment {
 
 namespace detail {
 
+inline void mark_batch_inline_completed(batch_state& st) noexcept {
+    st.phase.store(batch_state::phase_completed, std::memory_order_release);
+}
+
 #if ELIO_HAS_IO_URING
 /// Submit a batch via io_uring without blocking the worker.
 /// Returns true on success (caller must NOT resume; the final CQE will
@@ -822,6 +826,7 @@ public:
             if (!submitted) {
                 // No SQEs made it onto the ring: every result is already
                 // -EAGAIN. Resume inline.
+                detail::mark_batch_inline_completed(*batch_st_);
                 awaiter.resume();
             }
             // Otherwise the final CQE drives the resume via the backend.
@@ -835,6 +840,7 @@ public:
             batch_st_->results[i] = static_cast<int>(
                 pread(fd_, segments_[i].buffer, segments_[i].length, off));
         }
+        detail::mark_batch_inline_completed(*batch_st_);
         awaiter.resume();
     }
 
@@ -899,6 +905,7 @@ public:
                         static_cast<unsigned>(segments_[i].length), off);
                 });
             if (!submitted) {
+                detail::mark_batch_inline_completed(*batch_st_);
                 awaiter.resume();
             }
             return;
@@ -911,6 +918,7 @@ public:
             batch_st_->results[i] = static_cast<int>(
                 pwrite(fd_, segments_[i].buffer, segments_[i].length, off));
         }
+        detail::mark_batch_inline_completed(*batch_st_);
         awaiter.resume();
     }
 

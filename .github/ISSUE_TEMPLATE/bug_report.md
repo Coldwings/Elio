@@ -37,6 +37,8 @@ If possible, provide a minimal code example that demonstrates the bug:
 ```cpp
 #include <elio/elio.hpp>
 
+#include <chrono>
+
 using namespace elio;
 
 // Your minimal example here
@@ -49,8 +51,7 @@ int main() {
     runtime::scheduler sched(2);
     sched.start();
     sched.go(reproduce_bug);
-    // ...
-    return 0;
+    return sched.shutdown(std::chrono::seconds(5)) ? 0 : 1;
 }
 ```
 

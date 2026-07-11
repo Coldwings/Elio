@@ -1063,6 +1063,23 @@ inline io_cancel_executor make_io_cancel_executor(
     co_return;
 }
 
+inline io_result finalize_cancellable_io_result(
+    bool cancelled_without_backend_completion,
+    io_result result) noexcept {
+    if (cancelled_without_backend_completion && result.success()) {
+        return io_result{-ECANCELED, result.flags};
+    }
+    return result;
+}
+
+inline coro::cancel_result classify_cancellable_io_result(
+    bool cancelled_without_backend_completion,
+    io_result result) noexcept {
+    return (cancelled_without_backend_completion || result.result == -ECANCELED)
+        ? coro::cancel_result::cancelled
+        : coro::cancel_result::completed;
+}
+
 }  // namespace detail
 
 /// Result of a cancellable I/O operation
@@ -1167,28 +1184,19 @@ public:
 
     cancellable_io_result await_resume() noexcept {
         cancel_registration_.unregister();
-        bool was_cancelled = already_cancelled_before_setup_;
-        if (!state_ && token_.is_cancelled()) {
-            was_cancelled = true;
-        }
+        const bool cancelled_without_backend_completion =
+            already_cancelled_before_setup_ ||
+            (!state_ && token_.is_cancelled());
         if (state_) {
             state_->resumed.store(true, std::memory_order_release);
-            was_cancelled = was_cancelled ||
-                            state_->cancelled.load(std::memory_order_acquire);
         }
-        result_ = read_result_from_op_state();
-        // Ensure cancelled results carry a distinguishable error code so
-        // callers checking success() before was_cancelled() don't confuse
-        // cancellation with a legitimate zero-byte read.
-        if (was_cancelled && result_.result == 0) {
-            result_ = io_result{-ECANCELED, 0};
-        }
+        result_ = detail::finalize_cancellable_io_result(
+            cancelled_without_backend_completion, read_result_from_op_state());
         restore_affinity();
         return cancellable_io_result{
             result_,
-            (was_cancelled || token_.is_cancelled())
-                ? coro::cancel_result::cancelled
-                : coro::cancel_result::completed
+            detail::classify_cancellable_io_result(
+                cancelled_without_backend_completion, result_)
         };
     }
 
@@ -1290,25 +1298,19 @@ public:
 
     cancellable_io_result await_resume() noexcept {
         cancel_registration_.unregister();
-        bool was_cancelled = already_cancelled_before_setup_;
-        if (!state_ && token_.is_cancelled()) {
-            was_cancelled = true;
-        }
+        const bool cancelled_without_backend_completion =
+            already_cancelled_before_setup_ ||
+            (!state_ && token_.is_cancelled());
         if (state_) {
             state_->resumed.store(true, std::memory_order_release);
-            was_cancelled = was_cancelled ||
-                            state_->cancelled.load(std::memory_order_acquire);
         }
-        result_ = read_result_from_op_state();
-        if (was_cancelled && result_.result == 0) {
-            result_ = io_result{-ECANCELED, 0};
-        }
+        result_ = detail::finalize_cancellable_io_result(
+            cancelled_without_backend_completion, read_result_from_op_state());
         restore_affinity();
         return cancellable_io_result{
             result_,
-            (was_cancelled || token_.is_cancelled())
-                ? coro::cancel_result::cancelled
-                : coro::cancel_result::completed
+            detail::classify_cancellable_io_result(
+                cancelled_without_backend_completion, result_)
         };
     }
 
@@ -1409,25 +1411,19 @@ public:
 
     cancellable_io_result await_resume() noexcept {
         cancel_registration_.unregister();
-        bool was_cancelled = already_cancelled_before_setup_;
-        if (!state_ && token_.is_cancelled()) {
-            was_cancelled = true;
-        }
+        const bool cancelled_without_backend_completion =
+            already_cancelled_before_setup_ ||
+            (!state_ && token_.is_cancelled());
         if (state_) {
             state_->resumed.store(true, std::memory_order_release);
-            was_cancelled = was_cancelled ||
-                            state_->cancelled.load(std::memory_order_acquire);
         }
-        result_ = read_result_from_op_state();
-        if (was_cancelled && result_.result == 0) {
-            result_ = io_result{-ECANCELED, 0};
-        }
+        result_ = detail::finalize_cancellable_io_result(
+            cancelled_without_backend_completion, read_result_from_op_state());
         restore_affinity();
         return cancellable_io_result{
             result_,
-            (was_cancelled || token_.is_cancelled())
-                ? coro::cancel_result::cancelled
-                : coro::cancel_result::completed
+            detail::classify_cancellable_io_result(
+                cancelled_without_backend_completion, result_)
         };
     }
 
@@ -1522,25 +1518,19 @@ public:
 
     cancellable_io_result await_resume() noexcept {
         cancel_registration_.unregister();
-        bool was_cancelled = already_cancelled_before_setup_;
-        if (!state_ && token_.is_cancelled()) {
-            was_cancelled = true;
-        }
+        const bool cancelled_without_backend_completion =
+            already_cancelled_before_setup_ ||
+            (!state_ && token_.is_cancelled());
         if (state_) {
             state_->resumed.store(true, std::memory_order_release);
-            was_cancelled = was_cancelled ||
-                            state_->cancelled.load(std::memory_order_acquire);
         }
-        result_ = read_result_from_op_state();
-        if (was_cancelled && result_.result == 0) {
-            result_ = io_result{-ECANCELED, 0};
-        }
+        result_ = detail::finalize_cancellable_io_result(
+            cancelled_without_backend_completion, read_result_from_op_state());
         restore_affinity();
         return cancellable_io_result{
             result_,
-            (was_cancelled || token_.is_cancelled())
-                ? coro::cancel_result::cancelled
-                : coro::cancel_result::completed
+            detail::classify_cancellable_io_result(
+                cancelled_without_backend_completion, result_)
         };
     }
 

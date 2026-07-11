@@ -1177,14 +1177,10 @@ public:
     
     std::optional<tcp_stream> await_resume() {
         cancel_registration_.unregister();
-        bool was_cancelled = already_cancelled_before_setup_;
-        if (is_cancellable()) {
-            was_cancelled = was_cancelled || token_.is_cancelled();
-        }
+        const bool cancelled_without_backend_completion =
+            already_cancelled_before_setup_;
         if (cancel_state_) {
             cancel_state_->resumed.store(true, std::memory_order_release);
-            was_cancelled = was_cancelled ||
-                            cancel_state_->cancelled.load(std::memory_order_acquire);
         }
 
         restore_affinity();
@@ -1193,14 +1189,10 @@ public:
         if (connect_in_progress_ && fd_ >= 0) {
             result_ = read_result_from_op_state();
         }
-        if (was_cancelled && result_.success()) {
-            result_ = io::io_result{-ECANCELED, 0};
-        }
 
         // For non-blocking connect, writability means completion, not success.
         // Use SO_ERROR to fetch the actual connect result.
-        if (!was_cancelled && connect_in_progress_ && result_.success() &&
-            fd_ >= 0) {
+        if (connect_in_progress_ && result_.success() && fd_ >= 0) {
             int so_error = 0;
             socklen_t len = sizeof(so_error);
             if (::getsockopt(fd_, SOL_SOCKET, SO_ERROR, &so_error, &len) != 0) {
@@ -1209,6 +1201,8 @@ public:
                 result_ = io::io_result{-so_error, 0};
             }
         }
+        result_ = io::detail::finalize_cancellable_io_result(
+            cancelled_without_backend_completion, result_);
 
         if (!result_.success()) {
             if (fd_ >= 0) {

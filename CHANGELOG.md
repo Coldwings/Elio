@@ -83,6 +83,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **TCP benchmark workflow scope**: The main-branch TCP loopback benchmark
   workflow now triggers only for benchmark-affecting source and workflow paths,
   instead of every example change. (#626)
+- **Cancellable I/O completion ordering**: Completed TCP connects and lower-level
+  cancellable I/O operations now preserve the backend completion result when a
+  token is cancelled before `await_resume()`, instead of rewriting successful
+  completions to `ECANCELED`. (#627)
 
 ## [0.5.2] - 2026-06-30
 

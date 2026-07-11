@@ -1330,7 +1330,7 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
 inline void worker_thread::poll_io_when_idle() {
     constexpr int idle_timeout_ms = 10;
 
-    // Mark as idle before any blocking - enables lazy wake optimization
+    // Mark as idle before any blocking so diagnostics can observe wait state.
     idle_.store(true, std::memory_order_release);
 
     // Optional spinning phase (if configured via wait_strategy)

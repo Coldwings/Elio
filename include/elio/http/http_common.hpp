@@ -248,6 +248,24 @@ inline constexpr std::string_view status_reason(status s) noexcept {
     }
 }
 
+namespace detail {
+
+inline constexpr bool status_forbids_response_body(status s) noexcept {
+    const auto code = static_cast<uint16_t>(s);
+    return (code >= 100 && code < 200) ||
+           code == 204 ||
+           code == 205 ||
+           code == 304;
+}
+
+inline constexpr bool response_body_forbidden(method request_method,
+                                              status response_status) noexcept {
+    return request_method == method::HEAD ||
+           status_forbids_response_body(response_status);
+}
+
+} // namespace detail
+
 /// Case-insensitive hash for headers using FNV-1a.
 /// The previous polynomial hash (hash * 31 + c) was vulnerable to HashDoS
 /// collision attacks. FNV-1a provides significantly better avalanche

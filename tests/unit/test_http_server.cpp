@@ -229,6 +229,45 @@ std::string read_two_ok_responses(int fd) {
     return out;
 }
 
+std::string read_until_close(int fd) {
+    std::string out;
+    char buf[1024];
+    auto deadline = std::chrono::steady_clock::now() + elio::test::scaled_sec(3);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            out.append(buf, static_cast<size_t>(n));
+            continue;
+        }
+        if (n == 0) {
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+        }
+        INFO("recv failed: " << std::strerror(errno));
+        REQUIRE(false);
+    }
+
+    return out;
+}
+
+std::string response_block(std::string_view bytes,
+                           std::string_view status_line) {
+    const auto start = bytes.find(status_line);
+    REQUIRE(start != std::string_view::npos);
+
+    const auto next = bytes.find("HTTP/1.1 ", start + status_line.size());
+    const auto size = next == std::string_view::npos
+        ? std::string_view::npos
+        : next - start;
+    return std::string(bytes.substr(start, size));
+}
+
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
 bool install_test_certificate(elio::tls::tls_context& ctx) {
     using key_ctx_ptr = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>;
@@ -369,6 +408,51 @@ pipeline_result run_pipelined_exchange(std::string_view first_write,
     return {std::move(response_bytes), std::move(paths_copy)};
 }
 
+std::string run_single_connection_exchange(router routes, std::string_view request_bytes) {
+    server_config config;
+    config.enable_logging = false;
+    config.keep_alive_timeout = elio::test::scaled_sec(1);
+    config.max_keep_alive_requests = 8;
+
+    server srv(std::move(routes), config);
+    const uint16_t port = reserve_loopback_port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    const bool started = wait_until([&] { return srv.is_running(); },
+                                    elio::test::scaled_sec(2));
+    std::string response_bytes;
+
+    if (started) {
+        auto client = connect_loopback(port);
+        send_all(client.get(), request_bytes);
+        response_bytes = read_until_close(client.get());
+        client.reset();
+    }
+
+    srv.stop();
+    try_wake_listener(port);
+
+    const bool stopped = wait_until([&] {
+        return listen_done.load(std::memory_order_acquire) &&
+               srv.active_connections() == 0;
+    }, elio::test::scaled_sec(2));
+
+    sched.shutdown();
+
+    REQUIRE(started);
+    REQUIRE(stopped);
+    return response_bytes;
+}
+
 void require_two_ordered_responses(const pipeline_result& result) {
     const std::vector<std::string> expected_paths{"/first", "/second"};
     REQUIRE(result.paths == expected_paths);
@@ -426,6 +510,60 @@ TEST_CASE("HTTP server consumes fully buffered pipelined keep-alive requests",
 
     auto result = run_pipelined_exchange(request);
     require_two_ordered_responses(result);
+}
+
+TEST_CASE("HTTP server suppresses bodies for HEAD and no-body statuses",
+          "[http][server][response][regression]") {
+    router routes;
+    routes.add_route(method::HEAD, "/head", [](context&) {
+        return response(status::ok, "head-body");
+    });
+    routes.get("/no-content", [](context&) {
+        return response(status::no_content, "no-content-body");
+    });
+    routes.get("/reset-content", [](context&) {
+        return response(status::reset_content, "reset-content-body");
+    });
+    routes.get("/not-modified", [](context&) {
+        return response(status::not_modified, "not-modified-body");
+    });
+
+    const std::string request =
+        "HEAD /head HTTP/1.1\r\n"
+        "Host: test\r\n"
+        "\r\n"
+        "GET /no-content HTTP/1.1\r\n"
+        "Host: test\r\n"
+        "\r\n"
+        "GET /reset-content HTTP/1.1\r\n"
+        "Host: test\r\n"
+        "\r\n"
+        "GET /not-modified HTTP/1.1\r\n"
+        "Host: test\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+
+    auto response_bytes = run_single_connection_exchange(std::move(routes), request);
+
+    auto head = response_block(response_bytes, "HTTP/1.1 200 OK\r\n");
+    auto no_content =
+        response_block(response_bytes, "HTTP/1.1 204 No Content\r\n");
+    auto reset_content =
+        response_block(response_bytes, "HTTP/1.1 205 Reset Content\r\n");
+    auto not_modified =
+        response_block(response_bytes, "HTTP/1.1 304 Not Modified\r\n");
+
+    REQUIRE(head.find("Content-Length: 9\r\n") != std::string::npos);
+    REQUIRE(head.find("head-body") == std::string::npos);
+
+    REQUIRE(no_content.find("Content-Length: ") == std::string::npos);
+    REQUIRE(no_content.find("no-content-body") == std::string::npos);
+
+    REQUIRE(reset_content.find("Content-Length: ") == std::string::npos);
+    REQUIRE(reset_content.find("reset-content-body") == std::string::npos);
+
+    REQUIRE(not_modified.find("Content-Length: ") == std::string::npos);
+    REQUIRE(not_modified.find("not-modified-body") == std::string::npos);
 }
 
 TEST_CASE("HTTP server stop cancels idle accept without a wake connection",

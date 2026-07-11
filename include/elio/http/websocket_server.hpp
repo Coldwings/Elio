@@ -734,7 +734,7 @@ private:
                 co_await stop_watchdog();
                 auto resp = response(status::payload_too_large, "Payload Too Large");
                 resp.set_header("Connection", "close");
-                co_await send_response(stream, resp);
+                co_await send_response(stream, resp, parser.get_method());
                 co_return;
             }
 
@@ -765,7 +765,7 @@ private:
             if (!upgrade.success) {
                 ELIO_LOG_WARNING("WebSocket upgrade failed: {}", upgrade.error);
                 auto resp = response::bad_request(upgrade.error);
-                co_await send_response(stream, resp);
+                co_await send_response(stream, resp, req.get_method());
                 co_return;
             }
             
@@ -778,7 +778,7 @@ private:
             // Send upgrade response
             auto ws_key = req.header("Sec-WebSocket-Key");
             auto resp = build_upgrade_response(ws_key, upgrade.accepted_protocol);
-            co_await send_response(stream, resp);
+            co_await send_response(stream, resp, req.get_method());
 
             if (http_config_.enable_logging) {
                 ELIO_LOG_INFO("WebSocket upgrade: {} from {}", req.path(), client_addr);
@@ -824,14 +824,17 @@ private:
                 resp = response::not_found();
             }
             
-            co_await send_response(stream, resp);
+            co_await send_response(stream, resp, ctx.req().get_method());
         }
     }
     
     /// Send HTTP response
     template<typename Stream>
-    coro::task<void> send_response(Stream& stream, const response& resp) {
-        auto data = resp.serialize();
+    coro::task<void> send_response(Stream& stream,
+                                   const response& resp,
+                                   std::optional<method> request_method = std::nullopt) {
+        auto data = request_method ? resp.serialize(*request_method)
+                                   : resp.serialize();
         
         size_t sent = 0;
         while (sent < data.size()) {

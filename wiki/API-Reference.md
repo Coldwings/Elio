@@ -1233,6 +1233,14 @@ public:
         const ipv4_address& addr,
         const tcp_options& opts = {}
     );
+    static std::optional<tcp_listener> bind(
+        const ipv6_address& addr,
+        const tcp_options& opts = {}
+    );
+    static std::optional<tcp_listener> bind(
+        const socket_address& addr,
+        const tcp_options& opts = {}
+    );
     
     // Accept a connection (awaitable, returns std::optional<tcp_stream>)
     /* awaitable */ accept();
@@ -1288,8 +1296,18 @@ public:
 // inspect IPv4 or IPv6 peers.
 
 // Connect to address (awaitable, returns std::optional<tcp_stream>)
-/* awaitable */ tcp_connect(const ipv4_address& addr);
-/* awaitable */ tcp_connect(const ipv4_address& addr, coro::cancel_token token);
+/* awaitable */ tcp_connect(const ipv4_address& addr, const tcp_options& opts = {});
+/* awaitable */ tcp_connect(const ipv4_address& addr,
+                            coro::cancel_token token,
+                            const tcp_options& opts = {});
+/* awaitable */ tcp_connect(const ipv6_address& addr, const tcp_options& opts = {});
+/* awaitable */ tcp_connect(const ipv6_address& addr,
+                            coro::cancel_token token,
+                            const tcp_options& opts = {});
+/* awaitable */ tcp_connect(const socket_address& addr, const tcp_options& opts = {});
+/* awaitable */ tcp_connect(const socket_address& addr,
+                            coro::cancel_token token,
+                            const tcp_options& opts = {});
 ```
 
 ### Unix Domain Sockets
@@ -1523,16 +1541,28 @@ class request {
 public:
     request(method m, std::string_view path);
     
-    void set_host(const std::string& host);
-    void set_header(const std::string& name, const std::string& value);
-    void set_body(const std::string& body);
+    void set_method(method m) noexcept;
+    void set_path(std::string_view path);
+    void set_query(std::string_view query);
+    void set_header(std::string_view name, std::string_view value);
+    void set_body(std::string_view body);
+    void set_body(std::string&& body);
+    void set_host(std::string_view host);
+    void set_content_type(std::string_view type);
     
     method get_method() const noexcept;
-    const std::string& path() const;
+    std::string_view path() const noexcept;
+    std::string_view query() const noexcept;
+    std::string_view version() const noexcept;
     std::string_view header(std::string_view name) const;
     std::string_view body() const noexcept;
+    std::string_view host() const;
+    std::string_view content_type() const;
 };
 ```
+
+`set_path()` and `set_query()` validate request-target components and throw
+`std::invalid_argument` for invalid control characters or spaces.
 
 ### `response`
 
@@ -1541,16 +1571,18 @@ HTTP response message.
 ```cpp
 class response {
 public:
-    int status_code() const;
-    status get_status() const;
+    uint16_t status_code() const noexcept;
+    status get_status() const noexcept;
     
     std::string_view header(std::string_view name) const;
-    std::string content_type() const;
+    std::string_view content_type() const;
     std::string_view body() const noexcept;
     
-    void set_status(status s);
-    void set_header(const std::string& name, const std::string& value);
-    void set_body(const std::string& body);
+    void set_status(status s) noexcept;
+    void set_header(std::string_view name, std::string_view value);
+    void set_body(std::string_view body);
+    void set_body(std::string&& body);
+    void set_content_type(std::string_view type);
 };
 ```
 
@@ -1598,30 +1630,39 @@ public:
     explicit h2_client(const h2_client_config& config);
 
     // GET request (awaitable)
-    /* awaitable */ get(const std::string& url);
+    coro::task<std::optional<response>> get(std::string_view url);
 
     // POST request (awaitable)
-    /* awaitable */ post(const std::string& url,
-                         const std::string& body,
-                         const std::string& content_type);
+    coro::task<std::optional<response>> post(
+        std::string_view url,
+        std::string_view body,
+        std::string_view content_type = mime::application_form_urlencoded
+    );
 
     // PUT request (awaitable)
-    /* awaitable */ put(const std::string& url,
-                        const std::string& body,
-                        const std::string& content_type);
+    coro::task<std::optional<response>> put(
+        std::string_view url,
+        std::string_view body,
+        std::string_view content_type = mime::application_json
+    );
 
     // DELETE request (awaitable)
-    /* awaitable */ del(const std::string& url);
+    coro::task<std::optional<response>> del(std::string_view url);
 
     // PATCH request (awaitable)
-    /* awaitable */ patch(const std::string& url,
-                          const std::string& body,
-                          const std::string& content_type);
+    coro::task<std::optional<response>> patch(
+        std::string_view url,
+        std::string_view body,
+        std::string_view content_type = mime::application_json
+    );
 
     // Send custom request (awaitable)
-    /* awaitable */ send(method m, const url& target,
-                         std::string_view body = {},
-                         std::string_view content_type = {});
+    coro::task<std::optional<response>> send(
+        method m,
+        const url& target,
+        std::string_view body = {},
+        std::string_view content_type = {}
+    );
 
     // Access TLS context and client configuration
     tls::tls_context& tls_context() noexcept;
@@ -1630,11 +1671,14 @@ public:
 };
 
 // Convenience function for one-off HTTP/2 GET
-/* awaitable */ h2_get(const std::string& url);
+coro::task<std::optional<response>> h2_get(std::string_view url);
 
 // Convenience function for one-off HTTP/2 POST
-/* awaitable */ h2_post(const std::string& url,
-                        const std::string& body, const std::string& content_type);
+coro::task<std::optional<response>> h2_post(
+    std::string_view url,
+    std::string_view body,
+    std::string_view content_type = mime::application_form_urlencoded
+);
 ```
 
 ### `h2_client_config`

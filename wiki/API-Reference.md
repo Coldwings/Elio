@@ -1264,6 +1264,12 @@ struct client_config : base_client_config {
 };
 ```
 
+`websocket::client_config` and `sse::client_config` also inherit
+`base_client_config`: `connect_timeout` bounds TCP connect and TLS handshake,
+while `read_timeout` bounds the WebSocket upgrade response and SSE response
+header read performed by `connect()`. A value less than or equal to zero
+disables these client-side read deadlines.
+
 ### `server_config`
 
 ```cpp

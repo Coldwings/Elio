@@ -183,6 +183,21 @@ public:
         stream_ = std::monostate{};
     }
 
+    /// Mark the active TLS stream as externally shut down.
+    ///
+    /// Timeout watchdogs may interrupt an in-flight TLS read/write by calling
+    /// shutdown(2) on the file descriptor from another coroutine.  After the
+    /// I/O operation returns and the watchdog has been joined, call this before
+    /// destroying the stream so tls_stream skips SSL_shutdown on the unusable
+    /// socket. Plain TCP streams do not need any extra bookkeeping.
+    void mark_externally_shut_down() noexcept {
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+            tls->mark_externally_shut_down();
+        }
+#endif
+    }
+
     /// Get last use time (for connection pooling)
     std::chrono::steady_clock::time_point last_use() const noexcept {
         return last_use_;

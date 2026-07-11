@@ -84,6 +84,8 @@ coro::task<void> connect_example() {
     // Create client
     client_config config;
     config.subprotocols = {"chat", "json"};  // Optional subprotocols
+    config.connect_timeout = std::chrono::seconds(10);
+    config.read_timeout = std::chrono::seconds(30);  // Upgrade response deadline
 
     ws_client client(config);
     
@@ -213,6 +215,8 @@ coro::task<void> listen_events() {
     client_config config;
     config.auto_reconnect = true;
     config.default_retry_ms = 3000;
+    config.connect_timeout = std::chrono::seconds(10);
+    config.read_timeout = std::chrono::seconds(30);  // Response header deadline
     
     sse_client client(config);
     
@@ -234,6 +238,12 @@ coro::task<void> listen_events() {
     }
 }
 ```
+
+For WebSocket and SSE clients, `connect_timeout` bounds TCP connect and TLS
+handshake setup. `read_timeout` bounds the protocol response headers read by
+`connect()` -- the WebSocket `101 Switching Protocols` response or the SSE
+`text/event-stream` response headers. Values less than or equal to zero disable
+these client-side read deadlines.
 
 ### SSE Event Format
 

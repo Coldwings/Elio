@@ -24,6 +24,7 @@
 
 #include <string>
 #include <string_view>
+#include <cerrno>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -278,7 +279,7 @@ private:
         }
         
         // Perform WebSocket handshake
-        bool success = co_await perform_handshake();
+        bool success = co_await perform_handshake(std::move(token));
         if (success) {
             state_ = connection_state::open;
             ELIO_LOG_DEBUG("WebSocket connected to {}{}", host_, path_);
@@ -359,7 +360,7 @@ private:
     }
     
     /// Perform WebSocket upgrade handshake
-    coro::task<bool> perform_handshake() {
+    coro::task<bool> perform_handshake(coro::cancel_token token) {
         // Generate key
         ws_key_ = generate_websocket_key();
         
@@ -400,10 +401,53 @@ private:
         parser.set_max_headers(config_.max_headers);
         parser.set_max_header_size(config_.max_header_size);
         size_t total_read = 0;
+        auto* sched = runtime::scheduler::current();
+        const bool deadline_enforced =
+            sched != nullptr && config_.read_timeout.count() > 0;
+        const auto response_deadline =
+            std::chrono::steady_clock::now() + config_.read_timeout;
         while (!parser.is_complete() && !parser.has_error()) {
-            auto read_result = co_await read(buffer_.data(), buffer_.size());
+            if (token.is_cancelled()) {
+                errno = ECANCELED;
+                stream_.disconnect();
+                co_return false;
+            }
+
+            io::io_result read_result{};
+            if (deadline_enforced) {
+                auto remaining =
+                    response_deadline - std::chrono::steady_clock::now();
+                if (remaining.count() <= 0) {
+                    ELIO_LOG_ERROR("WebSocket handshake response timed out after {}s",
+                                   config_.read_timeout.count());
+                    errno = ETIMEDOUT;
+                    stream_.disconnect();
+                    co_return false;
+                }
+
+                auto timed_out = std::make_shared<std::atomic<bool>>(false);
+                coro::cancel_source watchdog_cancel;
+                auto watchdog = http::detail::arm_fd_shutdown_watchdog(
+                    sched, stream_.fd(), remaining,
+                    watchdog_cancel.get_token(), timed_out);
+                read_result = co_await read(buffer_.data(), buffer_.size());
+                watchdog_cancel.cancel();
+                co_await watchdog;
+                if (timed_out->load(std::memory_order_acquire)) {
+                    stream_.mark_externally_shut_down();
+                    ELIO_LOG_ERROR("WebSocket handshake response timed out after {}s",
+                                   config_.read_timeout.count());
+                    errno = ETIMEDOUT;
+                    stream_.disconnect();
+                    co_return false;
+                }
+            } else {
+                read_result = co_await read(buffer_.data(), buffer_.size());
+            }
+
             if (read_result.result <= 0) {
                 ELIO_LOG_ERROR("Failed to read WebSocket handshake response");
+                errno = read_result.result == 0 ? ECONNRESET : -read_result.result;
                 co_return false;
             }
 
@@ -413,18 +457,21 @@ private:
 
             if (pres == parse_result::error) {
                 ELIO_LOG_ERROR("Failed to parse WebSocket handshake response");
+                errno = EBADMSG;
                 co_return false;
             }
 
             total_read += static_cast<size_t>(read_result.result);
             if (total_read > 8192 && !parser.is_complete()) {
                 ELIO_LOG_ERROR("WebSocket handshake response too large");
+                errno = EMSGSIZE;
                 co_return false;
             }
         }
 
         if (parser.has_error()) {
             ELIO_LOG_ERROR("Failed to parse WebSocket handshake response");
+            errno = EBADMSG;
             co_return false;
         }
 
@@ -432,6 +479,7 @@ private:
         if (parser.get_status() != status::switching_protocols) {
             ELIO_LOG_ERROR("WebSocket handshake failed: {}",
                           static_cast<int>(parser.get_status()));
+            errno = EBADMSG;
             co_return false;
         }
 
@@ -439,6 +487,7 @@ private:
         auto accept = parser.get_headers().get("Sec-WebSocket-Accept");
         if (!verify_websocket_accept(accept, ws_key_)) {
             ELIO_LOG_ERROR("Invalid Sec-WebSocket-Accept header");
+            errno = EBADMSG;
             co_return false;
         }
 

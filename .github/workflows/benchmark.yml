@@ -48,6 +48,9 @@ jobs:
             -DCMAKE_CXX_COMPILER=g++-14 \
             -DELIO_ENABLE_DEBUG_METADATA=OFF \
             -DELIO_BUILD_TESTS=OFF \
+            -DELIO_ENABLE_TLS=OFF \
+            -DELIO_ENABLE_HTTP=OFF \
+            -DELIO_ENABLE_HTTP2=OFF \
             -DELIO_BUILD_TCP_BENCHMARKS=ON
 
       - name: Build

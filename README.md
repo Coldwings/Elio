@@ -124,13 +124,15 @@ installed config restores the corresponding system dependencies during
 ### Running Tests
 
 ```bash
-# Standard tests
+# Run every registered CTest entry, including sanitizer-discovered tests
+# and package/config checks
 ctest --test-dir build --output-on-failure
 
-# ASAN tests (memory safety)
-./build/tests/elio_tests_asan
+# Direct non-sanitized test binary for focused local runs
+./build/tests/elio_tests
 
-# TSAN tests (thread safety)
+# Direct sanitizer binaries
+./build/tests/elio_tests_asan
 ./build/tests/elio_tests_tsan
 ```
 
@@ -445,14 +447,15 @@ Elio includes comprehensive tests:
 - **TSAN Tests**: Detect data races and thread safety issues
 
 ```bash
-# Run all tests
+# Run every registered CTest entry, including sanitizer-discovered tests
+# and package/config checks
 ctest --test-dir build --output-on-failure
 
 # Run specific test suites
 ./build/tests/elio_tests "[scheduler]"
 ./build/tests/elio_tests "[integration]"
 
-# Run with sanitizers
+# Run sanitizer binaries directly
 ./build/tests/elio_tests_asan    # Memory safety
 ./build/tests/elio_tests_tsan    # Thread safety
 ```

@@ -227,6 +227,12 @@ add_test(NAME package_rdma_cuda_export_metadata
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_rdma_cuda_package_export.cmake
 )
 
+add_test(NAME rdma_cuda_example_api_metadata
+    COMMAND ${CMAKE_COMMAND}
+        -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_rdma_cuda_example_api.cmake
+)
+
 add_test(NAME package_liburing_export_metadata
     COMMAND ${CMAKE_COMMAND}
         -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}

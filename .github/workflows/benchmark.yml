@@ -73,8 +73,7 @@ jobs:
           warmup=$((10#$warmup))
 
           case "$mode" in
-            pingpong|streaming) phase_count=1 ;;
-            both) phase_count=2 ;;
+            pingpong|streaming|both) ;;
             *)
               echo "::error::mode must be pingpong, streaming, or both"
               exit 2
@@ -82,7 +81,25 @@ jobs:
           esac
 
           message_size_count=4
-          client_timeout=$(( (duration + warmup) * message_size_count * phase_count + 60 ))
+          phase_budget=$((duration + warmup))
+          pingpong_watchdog_grace=$duration
+          if (( pingpong_watchdog_grace < 5 )); then
+            pingpong_watchdog_grace=5
+          fi
+          pingpong_timeout=$(( (phase_budget + pingpong_watchdog_grace) * message_size_count ))
+          streaming_timeout=$(( phase_budget * message_size_count ))
+
+          case "$mode" in
+            pingpong)
+              client_timeout=$(( pingpong_timeout + 60 ))
+              ;;
+            streaming)
+              client_timeout=$(( streaming_timeout + 60 ))
+              ;;
+            both)
+              client_timeout=$(( pingpong_timeout + streaming_timeout + 60 ))
+              ;;
+          esac
           if (( client_timeout < 60 )); then
             client_timeout=60
           fi

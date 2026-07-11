@@ -2,7 +2,7 @@
 
 /// Elio Coroutine Library - Main Header
 /// 
-/// Version: 0.5.2
+/// Version: 0.5.3
 /// 
 /// This header provides convenient access to Elio's core/common components.
 /// Optional modules such as HTTP, TLS, RPC, and RDMA have separate aggregate
@@ -11,7 +11,7 @@
 // Version information
 #define ELIO_VERSION_MAJOR 0
 #define ELIO_VERSION_MINOR 5
-#define ELIO_VERSION_PATCH 2
+#define ELIO_VERSION_PATCH 3
 
 // Core coroutine types
 #include "coro/promise_base.hpp"
@@ -75,7 +75,7 @@ namespace elio {
 
 /// Get library version string
 inline const char* version() noexcept {
-    return "0.5.2";
+    return "0.5.3";
 }
 
 /// Get library version as tuple

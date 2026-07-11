@@ -248,7 +248,7 @@ public:
         : io_(io)
         , socket_(io)
         , msg_size_(msg_size)
-        , pipeline_depth_(std::min(cfg.pipeline_depth, 64))
+        , pipeline_depth_(bench::clamped_pipeline_depth(cfg))
         , send_buf_(msg_size, 'X')
         , recv_buf_(bench::kStreamingRecvBufferSize)
         , warmup_s_(cfg.warmup_s)

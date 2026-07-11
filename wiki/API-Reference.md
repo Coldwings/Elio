@@ -22,6 +22,7 @@ This page provides a reference for Elio's public API.
 | `elio::rdma` | RDMA verbs abstraction (core, header-only, `ELIO_ENABLE_RDMA`) |
 | `elio::rdma_cm` | RDMA Connection Manager helpers (`ELIO_ENABLE_RDMA_CM`) |
 | `elio::rdma_ibverbs` | Reference libibverbs backend + endpoint (`ELIO_ENABLE_RDMA_IBVERBS`) |
+| `elio::rdma_cuda` | CUDA GPUDirect RDMA helpers (`ELIO_ENABLE_RDMA_CUDA`) |
 
 ---
 

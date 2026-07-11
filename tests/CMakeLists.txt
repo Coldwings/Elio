@@ -266,6 +266,13 @@ add_test(NAME package_version_compatibility
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_elio_version_compatibility.cmake
 )
 
+add_test(NAME http2_option_requires_http
+    COMMAND ${CMAKE_COMMAND}
+        -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+        -DELIO_BINARY_DIR=${CMAKE_BINARY_DIR}/tests/cmake/http2_option_requires_http
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_http2_option_dependencies.cmake
+)
+
 add_executable(elio_rdma_cuda_lifetime_tests
     unit/test_rdma_cuda_gpu_memory_region.cpp
 )

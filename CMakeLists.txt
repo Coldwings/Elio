@@ -15,7 +15,7 @@ option(ELIO_BUILD_TESTS "Build Elio tests" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_BUILD_EXAMPLES "Build Elio examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_TLS "Enable TLS support (requires OpenSSL)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_HTTP "Enable HTTP client/server support (requires TLS)" ${ELIO_IS_TOP_LEVEL})
-option(ELIO_ENABLE_HTTP2 "Enable HTTP/2 support (requires nghttp2)" ${ELIO_IS_TOP_LEVEL})
+option(ELIO_ENABLE_HTTP2 "Enable HTTP/2 support (requires HTTP, TLS, and nghttp2)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_RDMA "Enable RDMA-Core abstraction layer (header-only; user supplies ibverbs backend)" OFF)
 option(ELIO_ENABLE_RDMA_CM "Enable optional librdmacm-backed CM helper (requires librdmacm)" OFF)
 option(ELIO_ENABLE_RDMA_IBVERBS "Enable optional libibverbs backend + cq_drain helper + endpoint wrapper (requires libibverbs)" OFF)
@@ -24,6 +24,13 @@ option(ELIO_ENABLE_RDMA_CUDA "Enable CUDA GPUDirect RDMA helpers (requires CUDA 
 option(ELIO_ENABLE_DEVELOPER_WARNINGS "Enable strict warning flags for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_WARNINGS_AS_ERRORS "Treat warnings as errors for Elio tests/examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_DEBUG_METADATA "Enable coroutine debug metadata" ON)
+
+if(ELIO_ENABLE_HTTP2 AND NOT ELIO_ENABLE_HTTP)
+    message(FATAL_ERROR
+        "ELIO_ENABLE_HTTP2=ON requires ELIO_ENABLE_HTTP=ON because "
+        "HTTP/2 support builds on the HTTP/TLS target. Configure with "
+        "-DELIO_ENABLE_HTTP=ON or -DELIO_ENABLE_HTTP2=OFF.")
+endif()
 
 # Platform check - Linux only
 if(NOT UNIX OR APPLE)

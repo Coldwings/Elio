@@ -464,6 +464,50 @@ private:
     int fd_;
 };
 
+/// Awaitable for async readv operations (scatter-gather read)
+class async_readv_awaitable : public io_awaitable_base {
+public:
+    async_readv_awaitable(int fd, struct iovec* iovecs,
+                          size_t iovec_count) noexcept
+        : io_awaitable_base()
+        , fd_(fd)
+        , iovecs_(iovecs)
+        , iovec_count_(iovec_count) {}
+
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+
+        io_request req{};
+        req.op = io_op::readv;
+        req.fd = fd_;
+        req.iovecs = iovecs_;
+        req.iovec_count = iovec_count_;
+        req.offset = -1;
+        req.awaiter = awaiter;
+        req.state = setup_op_state(awaiter);
+
+        if (!ctx.prepare(req)) {
+            clear_op_state();
+            result_ = io_result{-EAGAIN, 0};
+            awaiter.resume();
+            return;
+        }
+    }
+
+    io_result await_resume() noexcept {
+        result_ = read_result_from_op_state();
+        restore_affinity();
+        return result_;
+    }
+
+private:
+    int fd_;
+    struct iovec* iovecs_;
+    size_t iovec_count_;
+};
+
 /// Awaitable for async writev operations (scatter-gather write)
 class async_writev_awaitable : public io_awaitable_base {
 public:
@@ -484,6 +528,7 @@ public:
         req.fd = fd_;
         req.iovecs = iovecs_;
         req.iovec_count = iovec_count_;
+        req.offset = -1;
         req.awaiter = awaiter;
         req.state = setup_op_state(awaiter);
 
@@ -589,6 +634,12 @@ inline auto async_recv(int fd, void* buffer, size_t length,
 inline auto async_send(int fd, const void* buffer, 
                        size_t length, int flags = 0) {
     return async_send_awaitable(fd, buffer, length, flags);
+}
+
+/// Create an async readv awaitable (scatter-gather read)
+inline auto async_readv(int fd, struct iovec* iovecs,
+                        size_t iovec_count) {
+    return async_readv_awaitable(fd, iovecs, iovec_count);
 }
 
 /// Create an async writev awaitable (scatter-gather write)

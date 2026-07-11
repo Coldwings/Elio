@@ -185,6 +185,55 @@ TEST_CASE("Pipe read/write with epoll", "[io][epoll][pipe]") {
     close(pipefd[1]);
 }
 
+TEST_CASE("Pipe readv with scheduler", "[io][readv][pipe]") {
+    int pipefd[2];
+    REQUIRE(pipe(pipefd) == 0);
+
+    fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+    fcntl(pipefd[1], F_SETFL, O_NONBLOCK);
+
+    const char* test_data = "Hello, Elio!";
+    ssize_t written = write(pipefd[1], test_data, strlen(test_data));
+    REQUIRE(written == static_cast<ssize_t>(strlen(test_data)));
+
+    std::array<char, 7> first{};
+    std::array<char, 5> second{};
+    struct iovec iovecs[2] = {
+        {first.data(), first.size()},
+        {second.data(), second.size()},
+    };
+    std::atomic<bool> completed{false};
+    io_result read_result{};
+
+    scheduler sched(1);
+    sched.start();
+
+    auto read_coro = [&]() -> task<void> {
+        auto result = co_await async_readv(pipefd[0], iovecs, 2);
+        read_result = result;
+        completed = true;
+    };
+
+    sched.go(read_coro);
+
+    for (int i = 0; i < 100 && !completed; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(completed);
+    REQUIRE(read_result.success());
+    REQUIRE(read_result.bytes_transferred() ==
+            static_cast<int>(strlen(test_data)));
+    auto actual = std::string(first.data(), first.size()) +
+                  std::string(second.data(), second.size());
+    REQUIRE(actual == test_data);
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+}
+
 TEST_CASE("File operations with epoll", "[io][epoll][file]") {
     // Create a temp file
     char tmpfile[] = "/tmp/elio_test_XXXXXX";

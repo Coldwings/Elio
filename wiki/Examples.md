@@ -790,10 +790,17 @@ coro::task<void> batch_write_example(int fd) {
 
 ## Building Examples
 
-All examples are built automatically with CMake:
+Configure with `ELIO_BUILD_EXAMPLES=ON` to build examples. Some example groups
+are only created when their feature targets are enabled:
+
+- HTTP, WebSocket, SSE, and HTTP client examples require `elio_http`.
+- HTTP/2 examples require `elio_http2`.
+- RDMA examples require the matching `elio_rdma*` targets.
+- TCP benchmark comparison programs require `ELIO_BUILD_TCP_BENCHMARKS=ON`.
 
 ```bash
-cmake --build build
+cmake -S . -B build -DELIO_BUILD_EXAMPLES=ON
+cmake --build build --target hello_world tcp_echo_server uds_echo_server
 
 # Run individual examples
 ./build/examples/hello_world
@@ -801,6 +808,8 @@ cmake --build build
 ./build/examples/uds_echo_server /tmp/echo.sock
 ./build/examples/uds_echo_server @my_socket    # Abstract socket
 ./build/examples/uds_echo_client /tmp/echo.sock
+
+# Feature-gated examples are available when their targets were configured
 ./build/examples/http_client https://httpbin.org/get
 ./build/examples/http2_client https://nghttp2.org/
 ./build/examples/signal_handling              # Signal handling example

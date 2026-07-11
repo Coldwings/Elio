@@ -397,8 +397,6 @@ static task<void> client_streaming(const bench::config& cfg,
         }
     }
 
-    co_await r_handle;
-
     if (!stop.load(std::memory_order_acquire)) {
         measured_bytes.store(
             counters.total_bytes.load(std::memory_order_acquire),
@@ -410,6 +408,8 @@ static task<void> client_streaming(const bench::config& cfg,
         cancel.cancel();
         stream->shutdown_socket();
     }
+
+    co_await r_handle;
 
     {
         std::lock_guard<std::mutex> lock(timer_mutex);

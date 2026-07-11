@@ -124,8 +124,10 @@ static void run_client_pingpong(const bench::config& cfg, size_t msg_size,
 
     std::thread timer_thread([&]() {
         std::unique_lock<std::mutex> lock(timer_mutex);
-        const auto budget =
-            std::chrono::seconds(cfg.warmup_s + cfg.duration_s);
+        // This is a stall watchdog, not the normal phase boundary. Warmup and
+        // measurement end through the loop deadlines below; allow one extra
+        // measurement window (at least 5s) before declaring a real timeout.
+        const auto budget = bench::pingpong_watchdog_budget(cfg);
         if (timer_cv.wait_for(lock, budget, [&]() {
                 return timer_cancelled;
             })) {

@@ -56,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another waiter consumes and stashes their CM event, preventing
   `next_event_for()` / `accept_connect()` from sleeping indefinitely until an
   unrelated future CM event arrives. (#607)
+- **Asio TCP ping-pong benchmark watchdog**: The Asio backend now uses the same
+  grace window as the Elio backend before reporting `TIMEOUT`, so normal phase
+  completion near the measurement boundary no longer fails the benchmark. (#609)
 
 ## [0.5.2] - 2026-06-30
 

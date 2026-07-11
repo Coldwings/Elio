@@ -103,6 +103,14 @@ inline std::string format_size(size_t bytes) {
     return std::to_string(bytes) + "B";
 }
 
+inline std::chrono::seconds pingpong_watchdog_budget(const config& cfg) {
+    const auto phase_budget =
+        std::chrono::seconds(cfg.warmup_s + cfg.duration_s);
+    const auto watchdog_grace =
+        std::chrono::seconds(std::max(5, cfg.duration_s));
+    return phase_budget + watchdog_grace;
+}
+
 // ---------------------------------------------------------------------------
 // Output formatting
 // ---------------------------------------------------------------------------

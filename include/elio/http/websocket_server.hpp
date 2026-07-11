@@ -28,6 +28,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <variant>
 #include <atomic>
 #include <vector>
@@ -479,6 +480,10 @@ public:
                     seg.value.assign(comp.data() + 1, comp.size() - 1);
                     route.param_names.push_back(seg.value);
                 } else if (comp == "*") {
+                    if (i != pattern.size()) {
+                        throw std::invalid_argument(
+                            "WebSocket route wildcard must be the final path segment");
+                    }
                     seg.kind = segment_kind::wildcard;
                 } else {
                     seg.kind = segment_kind::literal;

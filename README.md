@@ -560,4 +560,4 @@ For questions, issues, or feature requests, please open an issue on the reposito
 
 ---
 
-**Status**: Approaching Stable | **Version**: 0.5.2 | **Date**: 2026-06-30
+**Status**: Approaching Stable | **Version**: 0.5.3 (unreleased) | **Last Release**: 0.5.2 (2026-06-30)

@@ -1623,8 +1623,10 @@ public:
                          std::string_view body = {},
                          std::string_view content_type = {});
 
-    // Access TLS context for configuration
-    tls_context& tls_context();
+    // Access TLS context and client configuration
+    tls::tls_context& tls_context() noexcept;
+    h2_client_config& config() noexcept;
+    const h2_client_config& config() const noexcept;
 };
 
 // Convenience function for one-off HTTP/2 GET

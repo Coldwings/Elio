@@ -33,6 +33,7 @@
 
 using elio::coro::task;
 using elio::net::ipv4_address;
+using elio::net::ipv6_address;
 using elio::net::tcp_listener;
 using elio::runtime::scheduler;
 
@@ -64,6 +65,11 @@ std::string make_https_url(uint16_t port, std::string_view path = "/") {
 
 std::string make_ws_url(uint16_t port, std::string_view path = "/ws") {
     return std::string("ws://127.0.0.1:") + std::to_string(port) +
+           std::string(path);
+}
+
+std::string make_ws_ipv6_url(uint16_t port, std::string_view path = "/ws") {
+    return std::string("ws://[::1]:") + std::to_string(port) +
            std::string(path);
 }
 
@@ -275,6 +281,64 @@ TEST_CASE("WebSocket client read_timeout fires on a stalled handshake response",
     REQUIRE(client_errno == ETIMEDOUT);
     REQUIRE(client_elapsed_ms.load() >= 0);
     REQUIRE(client_elapsed_ms.load() < 3000);
+}
+
+TEST_CASE("WebSocket client parses bracketed IPv6 URLs",
+          "[websocket][client][ipv6][regression]") {
+    auto listener = tcp_listener::bind(ipv6_address("::1", 0));
+    if (!listener) {
+        SKIP("IPv6 loopback listener is unavailable in this environment");
+    }
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_connected{false};
+    std::atomic<int> client_errno{0};
+    std::string observed_host;
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        auto headers = co_await read_request_headers(*stream);
+        observed_host = request_header_value(headers, "Host");
+        auto key = request_header_value(headers, "Sec-WebSocket-Key");
+        REQUIRE_FALSE(key.empty());
+        auto accept = elio::http::websocket::compute_websocket_accept(key);
+        auto response = elio::http::websocket::build_server_handshake(accept);
+        co_await stream->write(response);
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        stream->shutdown_socket();
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::websocket::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(2);
+        elio::http::websocket::ws_client client(cfg);
+
+        bool ok = co_await client.connect(make_ws_ipv6_url(port, "/ws?room=1"));
+        client_connected = ok;
+        if (!ok) {
+            client_errno = errno;
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(client_connected);
+    REQUIRE(client_errno == 0);
+    REQUIRE(observed_host == "[::1]:" + std::to_string(port));
 }
 
 TEST_CASE("SSE client read_timeout fires on stalled response headers",

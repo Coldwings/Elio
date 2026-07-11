@@ -1292,6 +1292,82 @@ public:
 /* awaitable */ tcp_connect(const ipv4_address& addr, coro::cancel_token token);
 ```
 
+### Unix Domain Sockets
+
+Local Unix Domain Socket networking.
+
+```cpp
+struct uds_options {
+    bool reuse_addr = false;
+    int recv_buffer = 0;
+    int send_buffer = 0;
+    int backlog = 128;
+    bool unlink_on_bind = true;
+};
+
+struct unix_address {
+    explicit unix_address(std::string_view path);
+
+    // Linux abstract socket address (does not create a filesystem entry)
+    static unix_address abstract(std::string_view name);
+
+    bool is_abstract() const;
+    std::string to_string() const;
+};
+
+class uds_listener {
+public:
+    // Bind to filesystem or abstract UDS address
+    static std::optional<uds_listener> bind(
+        const unix_address& addr,
+        const uds_options& opts = {}
+    );
+
+    // Accept a connection (awaitable, returns std::optional<uds_stream>)
+    /* awaitable */ accept();
+    /* awaitable */ accept(coro::cancel_token token);
+
+    int fd() const noexcept;
+    const unix_address& local_address() const noexcept;
+};
+
+class uds_stream {
+public:
+    uds_stream(uds_stream&& other) noexcept;
+
+    // Read data (awaitable)
+    /* awaitable */ read(void* buffer, size_t size);
+
+    // Write data (awaitable)
+    /* awaitable */ write(const void* data, size_t size);
+
+    // Exact-length helpers (awaitable)
+    /* awaitable */ read_exactly(void* buffer, size_t size);
+    /* awaitable */ write_exactly(const void* data, size_t size);
+
+    // Scatter-gather write and readiness polling
+    /* awaitable */ writev(struct iovec* iovecs, size_t count);
+    /* awaitable */ poll_read();
+    /* awaitable */ poll_read(coro::cancel_token token);
+    /* awaitable */ poll_write();
+    /* awaitable */ poll_write(coro::cancel_token token);
+
+    // Socket metadata and Linux credential passing
+    int fd() const noexcept;
+    std::optional<unix_address> peer_address() const;
+    bool set_pass_credentials(bool enable);
+};
+
+// Connect to UDS address/path (awaitable, returns std::optional<uds_stream>)
+/* awaitable */ uds_connect(const unix_address& addr);
+/* awaitable */ uds_connect(std::string_view path);
+```
+
+UDS streams share the same concurrency contract as TCP streams: one reader and
+one writer may operate concurrently, but multiple concurrent reads, multiple
+concurrent writes, or a read racing with `close()` require external
+serialization.
+
 ---
 
 ## HTTP (`elio::http`)

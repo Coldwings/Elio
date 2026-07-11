@@ -944,3 +944,22 @@ TEST_CASE("WebSocket handshake building", "[websocket][handshake]") {
         REQUIRE(response.find("Connection: close\r\n") != std::string::npos);
     }
 }
+
+TEST_CASE("WebSocket route wildcard validation", "[websocket][router]") {
+    auto handler = [](ws_connection&) -> elio::coro::task<void> {
+        co_return;
+    };
+
+    ws_router router;
+    REQUIRE_NOTHROW(router.websocket("/chat/*", handler));
+    REQUIRE(router.find_ws_route("/chat/room") != nullptr);
+    REQUIRE(router.find_ws_route("/chat/") != nullptr);
+    REQUIRE(router.find_ws_route("/chat") == nullptr);
+
+    REQUIRE_THROWS_AS(router.websocket("/chat/*/admin", handler),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(router.websocket("*/tail", handler),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(router.websocket("/chat/*/", handler),
+                      std::invalid_argument);
+}

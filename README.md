@@ -476,7 +476,7 @@ Elio achieves competitive performance through careful optimization:
 
 ### Key Optimizations
 
-- **Lazy Wake**: Workers only receive wake signals when idle, reducing syscall overhead
+- **Unconditional Wake**: Cross-thread submissions always wake the target worker; eventfd deduplication prevents lost wakes
 - **io_uring Batch Submit**: Automatic batching of I/O operations
 - **Coroutine Frame Pooling**: Hot path allocation ~72 ns vs cold ~250 ns
 - **Lock-free Scheduling**: MPSC inbox (~5 ns) + Chase-Lev deque (~13 ns)

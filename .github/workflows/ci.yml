@@ -263,6 +263,7 @@ jobs:
     needs: changes
     runs-on: ubuntu-24.04
     name: tcp-benchmark-compile
+    timeout-minutes: 15
 
     steps:
     - name: Skip TCP benchmark compile

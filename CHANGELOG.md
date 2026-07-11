@@ -63,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accounts for ping-pong watchdog grace when sizing the outer client timeout,
   preventing accepted inputs from being killed before in-program timeout
   reporting can finish. (#611)
+- **TCP benchmark compile CI timeout**: The PR compile-only TCP benchmark job
+  now has a repository-controlled job timeout so configure/build stalls fail
+  promptly instead of waiting for the GitHub Actions platform default. (#612)
 
 ## [0.5.2] - 2026-06-30
 

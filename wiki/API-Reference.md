@@ -444,26 +444,47 @@ Manages coroutine execution across worker threads.
 ```cpp
 class scheduler {
 public:
-    // Create scheduler with specified number of workers and wait strategy
-    explicit scheduler(size_t num_workers = std::thread::hardware_concurrency(),
-                       wait_strategy strategy = wait_strategy::blocking());
+    // Create scheduler with worker threads, wait strategy, and blocking pool size
+    explicit scheduler(size_t num_threads = std::thread::hardware_concurrency(),
+                       wait_strategy strategy = wait_strategy::blocking(),
+                       size_t blocking_threads = 4);
     ~scheduler();
     
     // Start worker threads
     void start();
     
-    // Stop all workers and wait for completion
-    void shutdown();
+    // Gracefully wait for tracked tasks, then stop workers.
+    // Returns true if all tracked work drained before the timeout.
+    bool shutdown(std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
+
+    // Stop workers immediately. Suspended I/O may be orphaned.
+    void shutdown_force();
+
+    // Inspect or wait for tracked work
+    size_t active_tasks() const noexcept;
+    bool wait_for_idle(std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
     
     // Spawn a coroutine for execution
     void spawn(std::coroutine_handle<> handle);
+    bool try_spawn(std::coroutine_handle<> handle);
     
     // Spawn a task directly (convenience overload)
     template<typename Task>
     void spawn(Task&& t);  // Accepts any type with release() method
-    
+
+    // High-level scheduler-owned spawning APIs
+    template<typename F, typename... Args>
+    void go(F&& f, Args&&... args);
+    template<typename F, typename... Args>
+    void go_to(size_t worker_id, F&& f, Args&&... args);
+    template<typename F, typename... Args>
+    coro::join_handle</* task value */> go_joinable(F&& f, Args&&... args);
+    template<typename F, typename... Args>
+    coro::join_handle</* task value */> go_joinable_to(size_t worker_id, F&& f, Args&&... args);
+    void spawn_to(size_t worker_id, std::coroutine_handle<> handle);
+
     // Get number of worker threads
-    size_t num_threads() const noexcept;
+    size_t num_threads(std::memory_order order = std::memory_order_relaxed) const noexcept;
 
     // Get total pending tasks across all workers
     size_t pending_tasks() const noexcept;
@@ -473,6 +494,10 @@ public:
 
     // Get tasks executed by a specific worker
     size_t worker_tasks_executed(size_t worker_id) const noexcept;
+
+    // Get steal counters
+    size_t total_steals_executed() const noexcept;
+    size_t worker_steals_executed(size_t worker_id) const noexcept;
 
     // Check scheduler state
     bool is_running() const noexcept;
@@ -487,8 +512,25 @@ public:
 
     // Get the current scheduler (thread-local)
     static scheduler* current() noexcept;
+
+    // Advanced accessors
+    worker_thread* get_worker(size_t index);
+    const wait_strategy& get_wait_strategy() const noexcept;
+    blocking_pool* get_blocking_pool() noexcept;
+
+    // Unhandled exception reporting for detached tasks and when_any losers
+    using unhandled_exception_handler = std::function<void(std::exception_ptr)>;
+    void set_unhandled_exception_handler(unhandled_exception_handler handler);
+    const unhandled_exception_handler* get_unhandled_exception_handler() const noexcept;
+    void report_unhandled_exception(std::exception_ptr ex) noexcept;
 };
 ```
+
+`shutdown()` is the graceful path: it waits for tasks spawned through
+`go()`, `go_to()`, `go_joinable()`, `go_joinable_to()`, or `elio::run()` to
+finish, including work suspended on scheduler-owned I/O, and returns whether the
+drain completed before the timeout. Use `shutdown_force()` only when immediate
+teardown is required.
 
 **Example:**
 ```cpp

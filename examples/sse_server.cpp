@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <mutex>
 
 using namespace elio;
 using namespace elio::http;
@@ -118,10 +119,14 @@ public:
         ELIO_LOG_INFO("SSE server listening on {}", addr.to_string());
 
         auto& listener = *listener_result;
+        auto accept_token = reset_accept_cancel_source();
         running_ = true;
 
         while (running_) {
-            auto stream_result = co_await listener.accept();
+            auto stream_result = co_await listener.accept(accept_token);
+            if (accept_token.is_cancelled()) {
+                break;
+            }
             if (!stream_result) {
                 if (running_) {
                     ELIO_LOG_ERROR("Accept error: {}", strerror(errno));
@@ -138,9 +143,21 @@ public:
     void stop() {
         running_ = false;
         g_sse_active = false;
+        cancel_active_accept();
     }
 
 private:
+    coro::cancel_token reset_accept_cancel_source() {
+        std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+        accept_cancel_source_ = coro::cancel_source{};
+        return accept_cancel_source_.get_token();
+    }
+
+    void cancel_active_accept() {
+        std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
+        accept_cancel_source_.cancel();
+    }
+
     coro::task<void> handle_connection(net::tcp_stream stream) {
         std::vector<char> buffer(config_.read_buffer_size);
         request_parser parser;
@@ -213,6 +230,8 @@ private:
     router router_;
     server_config config_;
     std::atomic<bool> running_{false};
+    std::mutex accept_cancel_mutex_;
+    coro::cancel_source accept_cancel_source_;
 };
 
 // HTTP handler: Serve test page

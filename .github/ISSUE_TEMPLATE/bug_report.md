@@ -21,6 +21,18 @@ Please complete the following information:
 - **Build Type**: [e.g., Debug, Release, RelWithDebInfo]
 - **CMake Version**: [e.g., 3.28]
 
+## Build and Dependency Configuration
+
+If this is a build, install, package, or dependency issue, please include:
+
+- **Full CMake configure command**: [e.g., `cmake -S . -B build -DELIO_ENABLE_TLS=ON`]
+- **Changed `ELIO_*` options**: [e.g., `ELIO_BUILD_TESTS=ON`, `ELIO_ENABLE_HTTP2=ON`]
+- **Consumption mode**: [source checkout, add_subdirectory, FetchContent, installed package, downstream consumer]
+- **Package/dependency paths**: [e.g., `CMAKE_PREFIX_PATH`, `<Package>_DIR`, system package paths]
+- **Dependency versions**: [e.g., OpenSSL, nghttp2, liburing, RDMA/Core, CUDA Toolkit]
+- **FetchContent/network/cache context**: [proxy settings, offline mode, cached dependency directories]
+- **Relevant logs**: [configure, build, install, and downstream consumer output]
+
 ## Steps to Reproduce
 
 Steps to reproduce the behavior:

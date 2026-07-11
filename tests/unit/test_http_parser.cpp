@@ -802,6 +802,18 @@ TEST_CASE("HTTP URL parser rejects raw request-splitting bytes",
     REQUIRE(url::parse("http://example.com/%0d%0a"));
 }
 
+TEST_CASE("HTTP URL parser rejects malformed ports",
+          "[http][url][security]") {
+    REQUIRE_FALSE(url::parse("http://example.com:/"));
+    REQUIRE_FALSE(url::parse("http://example.com:80abc/"));
+    REQUIRE_FALSE(url::parse("http://example.com:abc/"));
+    REQUIRE_FALSE(url::parse("http://example.com:65536/"));
+
+    REQUIRE_FALSE(url::parse("http://[::1]:/"));
+    REQUIRE_FALSE(url::parse("http://[::1]:443x/"));
+    REQUIRE_FALSE(url::parse("http://[::1]junk/"));
+}
+
 TEST_CASE("HTTP request serialization rejects invalid request targets",
           "[http][message][security]") {
     REQUIRE_THROWS_AS(request(method::GET, "/ok\r\nInjected: yes"),

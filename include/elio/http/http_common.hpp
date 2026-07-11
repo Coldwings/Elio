@@ -77,6 +77,21 @@ inline bool is_valid_url_input(std::string_view value) noexcept {
     return !value.empty() && !has_request_target_forbidden_char(value);
 }
 
+inline std::optional<uint16_t> parse_url_port(std::string_view value) noexcept {
+    if (value.empty()) {
+        return std::nullopt;
+    }
+
+    uint16_t port = 0;
+    auto* begin = value.data();
+    auto* end = begin + value.size();
+    auto [ptr, ec] = std::from_chars(begin, end, port);
+    if (ec != std::errc{} || ptr != end) {
+        return std::nullopt;
+    }
+    return port;
+}
+
 /// Trim leading and trailing OWS (space / horizontal-tab) per RFC 7230.
 inline std::string_view trim_ows(std::string_view s) noexcept {
     while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.remove_prefix(1);
@@ -660,23 +675,24 @@ struct url {
             result.host = str.substr(1, bracket_end - 1);
             str = str.substr(bracket_end + 1);
             if (!str.empty() && str[0] == ':') {
-                str = str.substr(1);
-                uint16_t port = 0;
-                auto [ptr, ec] = std::from_chars(str.data(), str.data() + str.size(), port);
-                if (ec == std::errc{}) {
-                    result.port = port;
+                auto port = detail::parse_url_port(str.substr(1));
+                if (!port) {
+                    return std::nullopt;
                 }
+                result.port = *port;
+            } else if (!str.empty()) {
+                return std::nullopt;
             }
         } else {
             auto colon_pos = str.rfind(':');
             if (colon_pos != std::string_view::npos) {
                 result.host = str.substr(0, colon_pos);
                 auto port_str = str.substr(colon_pos + 1);
-                uint16_t port = 0;
-                auto [ptr, ec] = std::from_chars(port_str.data(), port_str.data() + port_str.size(), port);
-                if (ec == std::errc{}) {
-                    result.port = port;
+                auto port = detail::parse_url_port(port_str);
+                if (!port) {
+                    return std::nullopt;
                 }
+                result.port = *port;
             } else {
                 result.host = str;
             }

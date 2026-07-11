@@ -25,8 +25,18 @@
 - Linux (kernel 5.1+ for io_uring, or any modern Linux for epoll)
 - GCC 12+ with C++20 support
 - CMake 3.20+
+- OpenSSL development files for the default top-level build (TLS, HTTP, and
+  HTTP/2 are enabled by default)
 - liburing (optional, for io_uring backend)
-- OpenSSL (optional, for TLS/HTTPS support)
+
+To configure without OpenSSL, disable the dependent protocol targets:
+
+```bash
+cmake -S . -B build-no-tls \
+  -DELIO_ENABLE_TLS=OFF \
+  -DELIO_ENABLE_HTTP=OFF \
+  -DELIO_ENABLE_HTTP2=OFF
+```
 
 ## Quick Start
 

@@ -254,6 +254,7 @@ private:
         host_ = parsed->host;
         path_ = parsed->path.empty() ? "/" : parsed->path;
         secure_ = parsed->secure;
+        host_authority_ = parsed->host_authority;
         
         uint16_t port = parsed->port;
         if (port == 0) {
@@ -326,58 +327,44 @@ private:
         uint16_t port = 0;
         std::string path;
         bool secure = false;
+        std::string host_authority;
     };
     
     /// Parse WebSocket URL
     static std::optional<ws_url> parse_ws_url(std::string_view url_str) {
-        ws_url result;
-        
-        // Check scheme
+        std::string normalized;
         if (url_str.starts_with("wss://")) {
-            result.secure = true;
+            normalized = "https://";
             url_str = url_str.substr(6);
         } else if (url_str.starts_with("ws://")) {
-            result.secure = false;
+            normalized = "http://";
             url_str = url_str.substr(5);
         } else if (url_str.starts_with("https://")) {
-            result.secure = true;
-            url_str = url_str.substr(8);
+            normalized.assign(url_str);
+            url_str = {};
         } else if (url_str.starts_with("http://")) {
-            result.secure = false;
-            url_str = url_str.substr(7);
+            normalized.assign(url_str);
+            url_str = {};
         } else {
             return std::nullopt;
         }
-        
-        // Find path
-        auto path_pos = url_str.find('/');
-        if (path_pos != std::string_view::npos) {
-            result.path = url_str.substr(path_pos);
-            url_str = url_str.substr(0, path_pos);
-        } else {
-            result.path = "/";
-        }
-        
-        // Parse host:port
-        auto colon_pos = url_str.rfind(':');
-        if (colon_pos != std::string_view::npos) {
-            result.host = url_str.substr(0, colon_pos);
-            auto port_str = url_str.substr(colon_pos + 1);
-            uint16_t port = 0;
-            auto [ptr, ec] = std::from_chars(port_str.data(), 
-                                              port_str.data() + port_str.size(), 
-                                              port);
-            if (ec == std::errc{}) {
-                result.port = port;
-            }
-        } else {
-            result.host = url_str;
-        }
-        
-        if (result.host.empty()) {
+
+        normalized.append(url_str);
+        auto parsed = http::url::parse(normalized);
+        if (!parsed) {
             return std::nullopt;
         }
-        
+
+        if (parsed->scheme != "http" && parsed->scheme != "https") {
+            return std::nullopt;
+        }
+
+        ws_url result;
+        result.host = parsed->host;
+        result.port = parsed->port;
+        result.path = parsed->path_with_query();
+        result.secure = parsed->is_secure();
+        result.host_authority = parsed->host_authority();
         return result;
     }
     
@@ -387,12 +374,7 @@ private:
         ws_key_ = generate_websocket_key();
         
         // Build handshake request
-        std::string authority = host_;
-        if ((secure_ && port_ != 443) || (!secure_ && port_ != 80)) {
-            authority += ":" + std::to_string(port_);
-        }
-        
-        auto request = build_client_handshake(authority, path_, ws_key_,
+        auto request = build_client_handshake(host_authority_, path_, ws_key_,
                                                config_.subprotocols, config_.origin);
         
         // Add User-Agent if configured
@@ -639,6 +621,7 @@ private:
     net::stream stream_;
     
     std::string host_;
+    std::string host_authority_;
     std::string path_;
     uint16_t port_ = 0;
     bool secure_ = false;

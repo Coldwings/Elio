@@ -1392,7 +1392,9 @@ HTTP/2 support requires linking with `elio_http2`.
 
 ### `h2_client`
 
-HTTP/2 client with connection multiplexing.
+HTTP/2 client with sequential pooled connection reuse. The underlying session
+layer supports HTTP/2 streams, but the current high-level client does not
+coordinate multiple in-flight requests over one shared connection.
 
 ```cpp
 class h2_client {

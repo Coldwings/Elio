@@ -443,7 +443,9 @@ coro::task<void> advanced_h2_client() {
         mime::application_json
     );
     
-    // Multiple requests reuse the same HTTP/2 connection (multiplexing)
+    // Sequential requests can reuse pooled HTTP/2 connections.
+    // The high-level client does not run these requests concurrently on one
+    // shared session.
     for (int i = 0; i < 10; ++i) {
         auto r = co_await client.get("https://api.example.com/items/" + std::to_string(i));
     }
@@ -458,7 +460,7 @@ coro::task<void> advanced_h2_client() {
 |---------|---------------------|----------------------|
 | Protocol | HTTP/1.1 | HTTP/2 (h2) |
 | Wire TLS required | No; supports plaintext HTTP and HTTPS | Yes (HTTPS only) |
-| Multiplexing | No (one request per connection) | Yes (multiple streams) |
+| Multiplexing | No (one request per connection) | Protocol/session support; high-level client serializes pooled use |
 | Header Compression | No | Yes (HPACK) |
 | CMake Target | `elio_http` | `elio_http2` |
 | Build/link dependency | Current `elio_http` target depends on `elio_tls` / OpenSSL | `elio_http2` depends on `elio_http`, OpenSSL, and nghttp2 |
@@ -467,7 +469,9 @@ coro::task<void> advanced_h2_client() {
 
 - Use `h2_client` when connecting to modern APIs that support HTTP/2
 - Use `client` (HTTP/1.1) for plaintext HTTP or legacy servers
-- HTTP/2 provides better performance for multiple concurrent requests to the same host
+- HTTP/2 can improve repeated HTTPS requests to the same host through HPACK and
+  connection reuse; use separate clients for parallel high-level requests until
+  shared-session multiplexing is implemented
 
 
 

@@ -312,7 +312,7 @@ private:
 struct server_config {
     size_t max_request_size = 10 * 1024 * 1024;  ///< Max request body size (10MB)
     size_t read_buffer_size = 8192;               ///< Read buffer size
-    std::chrono::seconds keep_alive_timeout{30};  ///< Keep-alive and inbound TLS handshake timeout
+    std::chrono::seconds keep_alive_timeout{30};  ///< Request and inbound TLS handshake timeout
     size_t max_keep_alive_requests = 100;         ///< Max requests per connection
     bool enable_logging = true;                   ///< Log requests
 

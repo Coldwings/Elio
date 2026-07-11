@@ -323,7 +323,7 @@ ELIO_ASYNC_MAIN(async_main)
 
 ## HTTP/2 Client
 
-Making HTTP/2 requests with multiplexed streams:
+Making HTTP/2 requests with sequential connection reuse:
 
 ```cpp
 #include <elio/elio.hpp>
@@ -358,15 +358,17 @@ coro::task<int> async_main(int argc, char* argv[]) {
         ELIO_LOG_INFO("Status: {}", static_cast<int>(post_resp->get_status()));
     }
 
-    // Multiple requests on same connection (HTTP/2 multiplexing)
-    ELIO_LOG_INFO("=== HTTP/2 Multiplexing ===");
+    // Sequential requests can reuse pooled HTTP/2 connections.
+    ELIO_LOG_INFO("=== HTTP/2 Connection Reuse ===");
     for (int i = 0; i < 5; ++i) {
         auto resp = co_await client.get("https://nghttp2.org/");
         if (resp) {
             ELIO_LOG_INFO("Request {}: {} bytes", i + 1, resp->body().size());
         }
     }
-    // All requests above reused the same underlying connection
+    // Requests above are awaited sequentially; use separate clients for
+    // parallel high-level requests until shared-session multiplexing is
+    // implemented.
 
     co_return 0;
 }

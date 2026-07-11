@@ -498,6 +498,14 @@ private:
             co_return false;
         }
         stream_ = std::move(*conn_result);
+
+        auto fail_connect = [&]() noexcept {
+            int saved_errno = errno;
+            stream_.disconnect();
+            errno = saved_errno;
+            state_ = client_state::disconnected;
+            return false;
+        };
         
         // Send HTTP request
         std::string request;
@@ -527,8 +535,7 @@ private:
         auto send_result = co_await write_exactly(request.data(), request.size());
         if (send_result.result != static_cast<ssize_t>(request.size())) {
             ELIO_LOG_ERROR("Failed to send SSE request");
-            state_ = client_state::disconnected;
-            co_return false;
+            co_return fail_connect();
         }
         
         // Read response headers.
@@ -553,9 +560,7 @@ private:
         while (true) {
             if (token_.is_cancelled()) {
                 errno = ECANCELED;
-                stream_.disconnect();
-                state_ = client_state::disconnected;
-                co_return false;
+                co_return fail_connect();
             }
 
             io::io_result read_result{};
@@ -566,9 +571,7 @@ private:
                     ELIO_LOG_ERROR("SSE response headers timed out after {}s",
                                    config_.read_timeout.count());
                     errno = ETIMEDOUT;
-                    stream_.disconnect();
-                    state_ = client_state::disconnected;
-                    co_return false;
+                    co_return fail_connect();
                 }
 
                 auto timed_out = std::make_shared<std::atomic<bool>>(false);
@@ -584,9 +587,7 @@ private:
                     ELIO_LOG_ERROR("SSE response headers timed out after {}s",
                                    config_.read_timeout.count());
                     errno = ETIMEDOUT;
-                    stream_.disconnect();
-                    state_ = client_state::disconnected;
-                    co_return false;
+                    co_return fail_connect();
                 }
             } else {
                 read_result = co_await read(buffer_.data(), buffer_.size());
@@ -595,8 +596,7 @@ private:
             if (read_result.result <= 0) {
                 ELIO_LOG_ERROR("Failed to read SSE response");
                 errno = read_result.result == 0 ? ECONNRESET : -read_result.result;
-                state_ = client_state::disconnected;
-                co_return false;
+                co_return fail_connect();
             }
 
             response_data.append(buffer_.data(), static_cast<size_t>(read_result.result));
@@ -623,8 +623,7 @@ private:
                     ELIO_LOG_ERROR("Failed to parse SSE response: {}",
                                    parser.error_message());
                     errno = EBADMSG;
-                    state_ = client_state::disconnected;
-                    co_return false;
+                    co_return fail_connect();
                 }
 
                 // Check status code
@@ -632,8 +631,7 @@ private:
                     ELIO_LOG_ERROR("SSE request failed: {}",
                                   static_cast<int>(parser.get_status()));
                     errno = EBADMSG;
-                    state_ = client_state::disconnected;
-                    co_return false;
+                    co_return fail_connect();
                 }
 
                 // Check content type
@@ -651,8 +649,7 @@ private:
                         ELIO_LOG_ERROR("SSE parse error: {}",
                                        parser_.error_message());
                         errno = EBADMSG;
-                        state_ = client_state::disconnected;
-                        co_return false;
+                        co_return fail_connect();
                     }
                 }
 
@@ -662,8 +659,7 @@ private:
             if (response_data.size() > 8192) {
                 ELIO_LOG_ERROR("SSE response headers too large");
                 errno = EMSGSIZE;
-                state_ = client_state::disconnected;
-                co_return false;
+                co_return fail_connect();
             }
         }
         

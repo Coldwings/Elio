@@ -229,8 +229,11 @@ private:
     
     /// Internal connect implementation
     coro::task<bool> connect_impl(std::string_view url_str, coro::cancel_token token) {
+        state_ = connection_state::connecting;
+
         // Check if already cancelled
         if (token.is_cancelled()) {
+            state_ = connection_state::closed;
             co_return false;
         }
         
@@ -238,6 +241,7 @@ private:
         auto parsed = parse_ws_url(url_str);
         if (!parsed) {
             ELIO_LOG_ERROR("Invalid WebSocket URL: {}", url_str);
+            state_ = connection_state::closed;
             co_return false;
         }
         
@@ -255,6 +259,7 @@ private:
         
         // Check cancellation before connection
         if (token.is_cancelled()) {
+            state_ = connection_state::closed;
             co_return false;
         }
         
@@ -268,6 +273,7 @@ private:
             config_.rotate_resolved_addresses,
             config_.connect_timeout);
         if (!conn_result) {
+            state_ = connection_state::closed;
             co_return false;
         }
         stream_ = std::move(*conn_result);
@@ -275,6 +281,7 @@ private:
         // Check cancellation before handshake
         if (token.is_cancelled()) {
             stream_.disconnect();
+            state_ = connection_state::closed;
             co_return false;
         }
         
@@ -283,6 +290,11 @@ private:
         if (success) {
             state_ = connection_state::open;
             ELIO_LOG_DEBUG("WebSocket connected to {}{}", host_, path_);
+        } else {
+            int saved_errno = errno;
+            stream_.disconnect();
+            errno = saved_errno;
+            state_ = connection_state::closed;
         }
         
         co_return success;

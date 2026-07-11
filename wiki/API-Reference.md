@@ -1386,6 +1386,48 @@ one writer may operate concurrently, but multiple concurrent reads, multiple
 concurrent writes, or a read racing with `close()` require external
 serialization.
 
+### `net::stream`
+
+Type-erased wrapper over `tcp_stream` and, when TLS support is enabled,
+`tls_stream`. It delegates I/O to the active underlying stream.
+
+```cpp
+class stream {
+public:
+    stream();
+    explicit stream(tcp_stream tcp);
+    explicit stream(tls::tls_stream tls);  // When ELIO_HAS_TLS is enabled
+
+    bool is_connected() const noexcept;
+    bool is_secure() const noexcept;
+
+    // Read/write data (awaitable)
+    /* awaitable */ read(void* buffer, size_t size);
+    /* awaitable */ read(void* buffer, size_t size, coro::cancel_token token);
+    /* awaitable */ write(const void* data, size_t size);
+    /* awaitable */ write(const void* data, size_t size, coro::cancel_token token);
+    /* awaitable */ write(std::string_view data);
+    /* awaitable */ write(std::string_view data, coro::cancel_token token);
+
+    // Exact-length helpers (awaitable)
+    /* awaitable */ read_exactly(void* buffer, size_t size);
+    /* awaitable */ read_exactly(void* buffer, size_t size, coro::cancel_token token);
+    /* awaitable */ write_exactly(const void* data, size_t size);
+    /* awaitable */ write_exactly(const void* data, size_t size, coro::cancel_token token);
+    /* awaitable */ write_exactly(std::string_view data);
+    /* awaitable */ write_exactly(std::string_view data, coro::cancel_token token);
+
+    // Compatibility aliases for write_exactly(); prefer write_exactly() in new code
+    /* awaitable */ write_all(const void* data, size_t size);
+    /* awaitable */ write_all(const void* data, size_t size, coro::cancel_token token);
+    /* awaitable */ write_all(std::string_view data);
+    /* awaitable */ write_all(std::string_view data, coro::cancel_token token);
+
+    // Close/shutdown the active stream (awaitable)
+    /* awaitable */ close();
+};
+```
+
 ---
 
 ## HTTP (`elio::http`)
@@ -1774,9 +1816,19 @@ public:
     
     // Read decrypted data (awaitable)
     /* awaitable */ read(void* buffer, size_t size);
+    /* awaitable */ read(void* buffer, size_t size, coro::cancel_token token);
     
     // Write data to encrypt (awaitable)
     /* awaitable */ write(const void* data, size_t size);
+    /* awaitable */ write(const void* data, size_t size, coro::cancel_token token);
+
+    // Exact-length helpers (awaitable)
+    /* awaitable */ read_exactly(void* buffer, size_t size);
+    /* awaitable */ read_exactly(void* buffer, size_t size, coro::cancel_token token);
+    /* awaitable */ write_exactly(const void* data, size_t size);
+    /* awaitable */ write_exactly(const void* data, size_t size, coro::cancel_token token);
+    /* awaitable */ write_exactly(std::string_view data);
+    /* awaitable */ write_exactly(std::string_view data, coro::cancel_token token);
     
     // Get negotiated ALPN protocol
     std::string alpn_protocol() const;

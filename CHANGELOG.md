@@ -59,6 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Asio TCP ping-pong benchmark watchdog**: The Asio backend now uses the same
   grace window as the Elio backend before reporting `TIMEOUT`, so normal phase
   completion near the measurement boundary no longer fails the benchmark. (#609)
+- **TCP benchmark workflow timeout budget**: Manual benchmark dispatch now
+  accounts for ping-pong watchdog grace when sizing the outer client timeout,
+  preventing accepted inputs from being killed before in-program timeout
+  reporting can finish. (#611)
 
 ## [0.5.2] - 2026-06-30
 

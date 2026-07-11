@@ -435,23 +435,23 @@ public:
             // acquire to make the slot writes visible.
             num_threads_.store(count, std::memory_order_release);
         } else if (count < old_count) {
-            // Hold the lock across the entire shrink — including I/O drain,
-            // stop(), and redistribute_tasks(). This serializes shrink against
-            // a concurrent grow: without it, a grow that runs in the window
-            // between the num_threads_ store and the stop() calls would
-            // observe doomed workers as still "running" (because stop() hasn't
-            // run yet) and republish num_threads_ to a value that re-exposes
-            // them — only for shrink to then stop them, leaving slots inside
-            // the visible range backed by stopped workers and routing new
-            // spawns into stopped inboxes.
+            // Hold the lock across the entire shrink transition — marking the
+            // retiring slots, publishing the smaller visible range, and
+            // detaching the retiring threads. This serializes shrink against a
+            // concurrent grow: without it, a grow that runs in the window
+            // between the num_threads_ store and thread detachment could reuse
+            // slots whose worker threads are still transitioning into drain
+            // mode, leaving tasks and I/O accounting split across two lifetimes
+            // for the same slot.
             //
-            // stop() joins the worker thread which can take a few ticks, but
-            // bounded by the worker's poll timeout and any in-flight task.
             // Correctness wins over throughput here: set_thread_count is a
-            // slow-path control operation, not a hot path.
+            // slow-path control operation, not a hot path. The detached worker
+            // continues polling its own I/O context until all pending operations
+            // complete; grow waits for that worker before reusing the slot.
             //
-            // Note: must NOT be called from a worker thread — joining the
-            // current thread would deadlock. Same caveat as before this fix.
+            // Note: must NOT be called from a worker thread. Resize control
+            // operations can wait for draining threads on grow/reap paths, and
+            // re-entering them from a running worker would be unsafe.
             std::lock_guard<std::mutex> lock(workers_mutex_);
             old_count = num_threads_.load(std::memory_order_relaxed);
             if (count >= old_count) return;
@@ -470,11 +470,11 @@ public:
             // Join any previously-draining workers that have finished.
             reap_draining_workers_();
 
-            // Move retiring workers out of normal task execution before
-            // deciding whether their I/O contexts are drained. Otherwise a
-            // worker can observe pending_count()==0, run a queued task before
-            // stop() takes effect, and bind fresh I/O to an io_context that is
-            // about to stop being polled.
+            // Move retiring workers out of normal task execution before their
+            // I/O contexts are allowed to drain. Otherwise a worker can observe
+            // pending_count()==0, run a queued task before draining takes
+            // effect, and bind fresh I/O to an io_context that is about to
+            // leave the visible worker pool.
             if (running) {
                 for (size_t i = count; i < old_count; ++i) {
                     workers_[i]->enter_draining_mode();
@@ -1104,8 +1104,7 @@ inline void worker_thread::run() {
             // Draining mode: only poll I/O, no new tasks or stealing.
             // Redistribute any queued tasks, then wait for pending I/O to complete.
             redistribute_tasks(scheduler_);
-            if (io_context_->pending_count() == 0 ||
-                std::chrono::steady_clock::now() >= draining_deadline_) {
+            if (io_context_->pending_count() == 0) {
                 {
                     std::lock_guard<std::mutex> lock(schedule_mutex_);
                     running_.store(false, std::memory_order_release);

@@ -422,11 +422,12 @@ TEST_CASE("go_joinable_to after shutdown returns completed exception",
 //      worker 1. Because worker 1 is busy, this task sits in worker 1's MPSC
 //      inbox. It cannot be stolen (stealing only touches the deque), so it
 //      stays pinned to the retiring worker.
-//   3. Call set_thread_count(1). The scheduler lowers the thread count, sees
-//      worker 1's io_context has 0 pending ops (the occupier does no async
-//      I/O and the I/O task hasn't run yet), then stop()s + joins worker 1.
-//   4. The join blocks until the occupier's sleep ends. Worker 1 then enters
-//      its drain phase, moves the I/O task from inbox to deque, and pops it.
+//   3. Call set_thread_count(1). The scheduler lowers the visible thread
+//      count and marks worker 1 as draining while worker 1's io_context has
+//      0 pending ops (the occupier does no async I/O and the I/O task hasn't
+//      run yet).
+//   4. When the occupier's sleep ends, worker 1 enters draining mode, moves the
+//      I/O task from inbox to deque, and pops it.
 //
 // Without the fix: worker 1 resumes the I/O task locally, its co_await
 // sleep_for binds to worker 1's (soon-orphaned) io_context, worker 1 exits,
@@ -510,8 +511,8 @@ TEST_CASE("Scheduler shrink drains I/O started after retirement begins",
     }
     bool shrink_visible = (sched.num_threads(std::memory_order_acquire) == 1);
 
-    // Give the old shrink path time to reach stop()+join while the retiring
-    // worker is still inside the gated task and has no pending I/O yet.
+    // Give the shrink path time to publish worker 1 as draining while the
+    // retiring worker is still inside the gated task and has no pending I/O yet.
     if (shrink_visible) {
         std::this_thread::sleep_for(scaled_ms(50));
     }
@@ -543,7 +544,7 @@ TEST_CASE("Scheduler accounting includes pending I/O on draining workers",
     std::atomic<bool> io_done{false};
 
     auto raw_task = gated_io_task(&task_running, &proceed,
-                                  scaled_ms(300), &io_done);
+                                  scaled_ms(500), &io_done);
     auto handle = elio::coro::detail::task_access::release(raw_task);
     handle.promise().set_affinity(1);
     handle.promise().detach_from_parent();
@@ -575,6 +576,7 @@ TEST_CASE("Scheduler accounting includes pending I/O on draining workers",
 
     REQUIRE(saw_pending);
     REQUIRE(saw_active);
+    REQUIRE_FALSE(sched.wait_for_idle(scaled_ms(50)));
 
     auto io_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
     while (!io_done.load(std::memory_order_acquire) &&
@@ -582,6 +584,7 @@ TEST_CASE("Scheduler accounting includes pending I/O on draining workers",
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     REQUIRE(io_done.load(std::memory_order_acquire));
+    REQUIRE(sched.wait_for_idle(scaled_sec(5)));
 
     sched.shutdown();
 }

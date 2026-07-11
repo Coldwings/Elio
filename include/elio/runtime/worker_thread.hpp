@@ -168,7 +168,6 @@ public:
     }
 
     void enter_draining_mode() noexcept {
-        draining_deadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         draining_.store(true, std::memory_order_release);
         wake();
     }
@@ -226,7 +225,6 @@ private:
     void request_stop() noexcept;
 
     void leave_draining_mode() noexcept {
-        draining_deadline_ = {};
         draining_.store(false, std::memory_order_release);
     }
 
@@ -247,7 +245,6 @@ private:
     std::atomic<bool> running_;
     std::mutex schedule_mutex_;
     std::atomic<bool> draining_{false};
-    std::chrono::steady_clock::time_point draining_deadline_{};
     // Hot-write fields (owner thread writes per task) — isolated cache line
     alignas(64) std::atomic<size_t> tasks_executed_;
     std::atomic<size_t> steals_executed_{0};

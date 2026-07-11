@@ -492,21 +492,36 @@ private:
         if (!sched) return;
         if (state_->sweep_started_.exchange(true, std::memory_order_acq_rel)) return;
 
-        auto* new_vstack = new coro::vthread_stack();
-        auto* old_vstack = coro::vthread_stack::current();
-        coro::vthread_stack::set_current(new_vstack);
+        struct sweep_started_guard {
+            internals* state;
+            bool committed = false;
 
-        auto t = sweep_coroutine(
-            std::weak_ptr<internals>(state_), state_->cfg_.sweep_interval,
-            sweep_cancel_.get_token());
+            ~sweep_started_guard() {
+                if (!committed) {
+                    state->sweep_started_.store(false, std::memory_order_release);
+                }
+            }
+        } started_guard{state_.get()};
 
-        coro::vthread_stack::set_current(old_vstack);
+        auto vstack_owner = std::make_unique<coro::vthread_stack>();
+        auto* new_vstack = vstack_owner.get();
+
+        auto t = [&] {
+            coro::vthread_stack_scope vstack_scope(new_vstack);
+            return sweep_coroutine(
+                std::weak_ptr<internals>(state_), state_->cfg_.sweep_interval,
+                sweep_cancel_.get_token());
+        }();
 
         auto handle = coro::detail::task_access::release(t);
         handle.promise().detached_ = true;
-        handle.promise().set_vstack_owner(new_vstack);
+        handle.promise().set_vstack_owner(vstack_owner.release());
         handle.promise().detach_from_parent();
-        sched->spawn(handle);
+        if (sched->try_spawn(handle)) {
+            started_guard.committed = true;
+        } else {
+            handle.destroy();
+        }
     }
 
     template<typename Ctor>

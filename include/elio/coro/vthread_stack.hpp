@@ -232,4 +232,24 @@ private:
     static inline thread_local vthread_stack* current_ = nullptr;
 };
 
+class vthread_stack_scope {
+public:
+    explicit vthread_stack_scope(vthread_stack* next) noexcept
+        : previous_(vthread_stack::current()) {
+        vthread_stack::set_current(next);
+    }
+
+    ~vthread_stack_scope() {
+        vthread_stack::set_current(previous_);
+    }
+
+    vthread_stack_scope(const vthread_stack_scope&) = delete;
+    vthread_stack_scope& operator=(const vthread_stack_scope&) = delete;
+    vthread_stack_scope(vthread_stack_scope&&) = delete;
+    vthread_stack_scope& operator=(vthread_stack_scope&&) = delete;
+
+private:
+    vthread_stack* previous_;
+};
+
 } // namespace elio::coro

@@ -35,6 +35,26 @@ task<int> return_int_task(int value) {
     co_return value;
 }
 
+struct throwing_factory_error : std::runtime_error {
+    throwing_factory_error() : std::runtime_error("factory construction failed") {}
+};
+
+struct throwing_task_factory {
+    throwing_task_factory() = default;
+
+    throwing_task_factory(const throwing_task_factory&) {
+        throw throwing_factory_error();
+    }
+
+    throwing_task_factory(throwing_task_factory&&) {
+        throw throwing_factory_error();
+    }
+
+    task<void> operator()() const {
+        co_return;
+    }
+};
+
 // Occupies a worker thread with a plain (non-coroutine) sleep so the worker
 // cannot drain its inbox while this runs. Sets `running` once it starts so the
 // test can synchronize on the worker actually being busy. Does NOT register any
@@ -87,6 +107,26 @@ TEST_CASE("Scheduler construction clamps oversized thread count", "[scheduler]")
     scheduler sched(scheduler::MAX_THREADS + 1);
     REQUIRE(sched.num_threads() == scheduler::MAX_THREADS);
     REQUIRE(!sched.is_running());
+}
+
+TEST_CASE("Scheduler restores vthread stack when wrapper construction throws",
+          "[scheduler][vthread_stack]") {
+    scheduler sched(1);
+    throwing_task_factory factory;
+
+    auto* previous = vthread_stack::current();
+    struct current_stack_restore {
+        vthread_stack* previous;
+        ~current_stack_restore() {
+            vthread_stack::set_current(previous);
+        }
+    } restore{previous};
+
+    vthread_stack caller_stack;
+    vthread_stack::set_current(&caller_stack);
+
+    REQUIRE_THROWS_AS(sched.go(factory), throwing_factory_error);
+    REQUIRE(vthread_stack::current() == &caller_stack);
 }
 
 TEST_CASE("Worker schedule rejects stopped workers", "[scheduler]") {

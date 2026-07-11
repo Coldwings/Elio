@@ -44,6 +44,10 @@
   - Catch2 3.5.0 (for tests)
   - nghttp2 1.64.0 (for HTTP/2, requires OpenSSL)
 
+The FetchContent dependencies above apply when building Elio from source. If
+you consume an installed Elio package, the downstream project must also make
+Elio's exported dependencies discoverable by CMake.
+
 ### Building
 
 ```bash
@@ -89,7 +93,14 @@ target_link_libraries(your_target PRIVATE Elio::elio)
 ```
 
 Installed packages export only the targets that were enabled when Elio was
-built. RDMA package consumers should link the most specific enabled target:
+built. The installed config restores required dependencies during
+`find_package(Elio)`: `fmt` is always required, `liburing` is required when
+Elio was built with io_uring support, OpenSSL is required by the TLS/HTTP
+targets, and nghttp2 is required by the HTTP/2 target. Install those packages
+or pass their package locations through `CMAKE_PREFIX_PATH`/`fmt_DIR` and the
+equivalent CMake hints for your environment.
+
+RDMA package consumers should link the most specific enabled target:
 `Elio::elio_rdma` for the header-only core abstraction, `Elio::elio_rdma_cm`
 for the Connection Manager helper, `Elio::elio_rdma_ibverbs` for the reference
 libibverbs backend, or `Elio::elio_rdma_cuda` for CUDA GPUDirect helpers. The
@@ -101,7 +112,7 @@ installed config restores the corresponding system dependencies during
 
 ```bash
 # Standard tests
-ctest --output-on-failure
+ctest --test-dir build --output-on-failure
 
 # ASAN tests (memory safety)
 ./build/tests/elio_tests_asan

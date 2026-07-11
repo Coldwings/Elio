@@ -180,12 +180,13 @@ The `ELIO_ASYNC_MAIN` macro handles scheduler setup, I/O context initialization,
 
 ### Using I/O Context
 
-The scheduler automatically creates and manages an I/O context. Access it via `io::default_io_context()`:
+The scheduler automatically creates and manages worker I/O contexts. Access the
+current worker's context via `io::current_io_context()`:
 
 ```cpp
 coro::task<int> async_main(int argc, char* argv[]) {
-    // Get the I/O context for async operations
-    auto& ctx = io::default_io_context();
+    // Get the current scheduler worker's I/O context
+    auto& ctx = io::current_io_context();
     
     // Use ctx for networking, timers, etc.
     co_await time::sleep_for(std::chrono::seconds(1));
@@ -195,6 +196,9 @@ coro::task<int> async_main(int argc, char* argv[]) {
 
 ELIO_ASYNC_MAIN(async_main)
 ```
+
+Outside a scheduler worker, `io::current_io_context()` falls back to the global
+`io::default_io_context()`.
 
 ### Alternative: Using elio::run()
 

@@ -331,11 +331,6 @@ int main(int argc, char* argv[]) {
     
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     
-    auto& ctx = io::default_io_context();
-    for (int i = 0; i < 10 && ctx.has_pending(); ++i) {
-        ctx.poll(std::chrono::milliseconds(10));
-    }
-    
     sched.shutdown();
     
     ELIO_LOG_INFO("Server stopped");

@@ -373,12 +373,6 @@ int main(int argc, char* argv[]) {
     // Wait for completion
     std::this_thread::sleep_for(std::chrono::seconds(5));
     
-    // Clean up
-    auto& ctx = io::default_io_context();
-    for (int i = 0; i < 20 && ctx.has_pending(); ++i) {
-        ctx.poll(std::chrono::milliseconds(50));
-    }
-    
     sched.shutdown();
     
     return 0;

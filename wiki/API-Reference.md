@@ -860,7 +860,7 @@ public:
     ~io_context();
     
     // Poll for I/O completions (with optional timeout)
-    size_t poll(std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+    int poll(std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
     
     // Check if there are pending operations
     bool has_pending() const noexcept;
@@ -869,7 +869,11 @@ public:
     io_backend& backend() noexcept;
 };
 
-// Get the default global I/O context
+// Get the current scheduler worker's I/O context, or the global fallback
+// outside a scheduler worker.
+io_context& current_io_context() noexcept;
+
+// Get the default global I/O context.
 io_context& default_io_context();
 ```
 

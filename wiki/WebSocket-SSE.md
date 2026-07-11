@@ -153,9 +153,9 @@ co_await client.connect("wss://example.com/ws");
 ```
 
 The server-side TLS handshake is bounded by the `http::server_config`
-passed to `ws_server`; `keep_alive_timeout` controls the inbound TLS handshake
-before WebSocket upgrade parsing begins. Set it to a non-positive duration to
-disable that handshake deadline.
+passed to `ws_server`; `keep_alive_timeout` controls both the inbound TLS
+handshake and the HTTP upgrade request read. Set it to a non-positive duration
+to disable those deadlines.
 
 ## Server-Sent Events (SSE)
 

@@ -675,16 +675,50 @@ private:
     /// Handle HTTP request (check for WebSocket upgrade)
     template<typename Stream>
     coro::task<void> handle_request(Stream& stream, const std::string& client_addr) {
+        auto* sched = runtime::scheduler::current();
         std::vector<char> buffer(http_config_.read_buffer_size);
         request_parser parser;
         parser.set_max_headers(http_config_.max_headers);
         parser.set_max_header_size(http_config_.max_header_size);
 
+        auto timed_out = std::make_shared<std::atomic<bool>>(false);
+        auto cancel_src = std::make_shared<coro::cancel_source>();
+        auto* stream_ptr = &stream;
+        auto timeout = http_config_.keep_alive_timeout;
+        std::optional<coro::join_handle<void>> watchdog;
+        if (sched && timeout.count() > 0) {
+            watchdog.emplace(sched->go_joinable(
+                [stream_ptr, timed_out, cancel_src, timeout]() -> coro::task<void> {
+                    auto r = co_await elio::time::sleep_for(
+                        timeout, cancel_src->get_token());
+                    if (r == coro::cancel_result::completed) {
+                        timed_out->store(true, std::memory_order_release);
+                        stream_ptr->shutdown_socket();
+                    }
+                    co_return;
+                }));
+        }
+
+        auto stop_watchdog = [&]() -> coro::task<void> {
+            if (watchdog) {
+                cancel_src->cancel();
+                auto wd = std::move(*watchdog);
+                watchdog.reset();
+                co_await std::move(wd);
+            }
+            co_return;
+        };
+
         // Read HTTP request
         while (!parser.is_complete() && !parser.has_error()) {
             auto result = co_await stream.read(buffer.data(), buffer.size());
 
+            if (timed_out->load(std::memory_order_acquire)) {
+                co_await stop_watchdog();
+                co_return;
+            }
             if (result.result <= 0) {
+                co_await stop_watchdog();
                 co_return;
             }
 
@@ -692,6 +726,7 @@ private:
             size_t incoming = static_cast<size_t>(result.result);
             if (parser.bytes_buffered() + incoming > http_config_.max_request_size) {
                 ELIO_LOG_WARNING("WebSocket upgrade request exceeds max_request_size");
+                co_await stop_watchdog();
                 auto resp = response(status::payload_too_large, "Payload Too Large");
                 resp.set_header("Connection", "close");
                 co_await send_response(stream, resp);
@@ -702,11 +737,14 @@ private:
                 std::string_view(buffer.data(), result.result));
 
             if (parse_result == parse_result::error) {
+                co_await stop_watchdog();
                 co_return;
             }
         }
+
+        co_await stop_watchdog();
         
-        if (parser.has_error()) {
+        if (timed_out->load(std::memory_order_acquire) || parser.has_error()) {
             co_return;
         }
         

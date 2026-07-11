@@ -498,6 +498,47 @@ TEST_CASE("WebSocket server stop cancels idle accept without a wake connection",
     REQUIRE(drained);
 }
 
+TEST_CASE("WebSocket server times out a silent HTTP upgrade request",
+          "[websocket][server][timeout][regression]") {
+    elio::http::websocket::ws_router routes;
+    server_config config;
+    config.enable_logging = false;
+    config.keep_alive_timeout = elio::test::scaled_sec(1);
+
+    elio::http::websocket::ws_server srv(std::move(routes), config);
+    const uint16_t port = reserve_loopback_port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] { return srv.is_running(); },
+                       elio::test::scaled_sec(2)));
+
+    auto client = connect_loopback(port);
+    const bool peer_closed = wait_for_peer_close(
+        client.get(), config.keep_alive_timeout + elio::test::scaled_sec(2));
+    client.reset();
+
+    srv.stop();
+    try_wake_listener(port);
+
+    const bool stopped = wait_until(
+        [&] { return listen_done.load(std::memory_order_acquire); },
+        elio::test::scaled_sec(2));
+    const bool drained = sched.shutdown(elio::test::scaled_sec(5));
+
+    REQUIRE(peer_closed);
+    REQUIRE(stopped);
+    REQUIRE(drained);
+}
+
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
 TEST_CASE("HTTPS server times out a silent inbound TLS handshake",
           "[http][server][tls][timeout][regression]") {

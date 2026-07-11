@@ -1278,10 +1278,11 @@ struct server_config {
 };
 ```
 
-`keep_alive_timeout` bounds each incoming request handled by `http::server`.
-For `server::listen_tls()` and `websocket::ws_server::listen_tls()`, it also
-bounds the inbound TLS handshake. A value less than or equal to zero disables
-the server-side TLS handshake deadline.
+`keep_alive_timeout` bounds each incoming request handled by `http::server`
+and the HTTP upgrade request read handled by `websocket::ws_server`. For
+`server::listen_tls()` and `websocket::ws_server::listen_tls()`, it also bounds
+the inbound TLS handshake. A value less than or equal to zero disables these
+server-side deadlines.
 
 ### `request`
 

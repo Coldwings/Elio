@@ -212,8 +212,12 @@ target_compile_definitions(stress_test_shared_mutex PRIVATE ELIO_DEBUG)
 # Register tests with CTest
 include(Catch)
 catch_discover_tests(elio_tests)
-catch_discover_tests(elio_tests_asan)
-catch_discover_tests(elio_tests_tsan)
+catch_discover_tests(elio_tests_asan
+    TEST_PREFIX "elio_tests_asan."
+)
+catch_discover_tests(elio_tests_tsan
+    TEST_PREFIX "elio_tests_tsan."
+)
 
 add_test(NAME package_rdma_cuda_export_metadata
     COMMAND ${CMAKE_COMMAND}
@@ -317,13 +321,13 @@ add_custom_target(test_all
 )
 
 add_custom_target(test_asan
-    COMMAND ${CMAKE_CTEST_COMMAND} -R elio_tests_asan --output-on-failure
+    COMMAND ${CMAKE_CTEST_COMMAND} -R "^elio_tests_asan\\." --output-on-failure
     DEPENDS elio_tests_asan
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
 add_custom_target(test_tsan
-    COMMAND ${CMAKE_CTEST_COMMAND} -R elio_tests_tsan --output-on-failure
+    COMMAND ${CMAKE_CTEST_COMMAND} -R "^elio_tests_tsan\\." --output-on-failure
     DEPENDS elio_tests_tsan
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )

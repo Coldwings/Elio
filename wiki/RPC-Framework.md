@@ -1,10 +1,10 @@
 # RPC Framework
 
-Elio's RPC framework provides high-performance remote procedure calls over TCP and Unix domain sockets. It features zero-copy serialization, out-of-order call support, and per-call timeouts.
+Elio's RPC framework provides high-performance remote procedure calls over TCP and Unix domain sockets. It features zero-copy deserialization, out-of-order call support, and per-call timeouts.
 
 ## Features
 
-- **Zero-copy deserialization**: Binary format with direct memory access for reads; buffer_ref avoids extra allocations on the send path (data is still copied into the wire buffer)
+- **Zero-copy deserialization**: Binary format with direct memory access for reads; `buffer_ref` avoids owning a second source buffer on the send path, but the current writer still copies the bytes into the outgoing wire buffer
 - **Out-of-order calls**: Multiple concurrent requests with response correlation by request ID
 - **Per-call timeouts**: Individual timeout per RPC call
 - **Nested types**: Support for complex nested structures
@@ -12,7 +12,7 @@ Elio's RPC framework provides high-performance remote procedure calls over TCP a
 - **TCP and UDS**: Works over TCP sockets or Unix domain sockets
 - **C++ templates**: No code generation needed - define schemas with C++ structs
 - **Message integrity**: Optional CRC32 checksum for data verification
-- **Zero-copy binary fields**: `buffer_ref` type for referencing external buffers without copying
+- **External binary references**: `buffer_ref` type for referencing external buffers while building messages
 - **Resource cleanup**: Cleanup callbacks for releasing resources after response is sent
 
 ## Design Choices
@@ -21,13 +21,13 @@ Elio's RPC framework provides high-performance remote procedure calls over TCP a
 
 The RPC framework uses a custom binary wire format to maintain zero external dependencies for the core protocol. The 19-byte fixed header enables fast parsing without schema negotiation -- the receiver always knows exactly how many bytes to read before it can dispatch a message. CRC32 checksums provide integrity verification without the overhead of a full serialization framework. This keeps the library header-only and avoids pulling in protobuf's code generator toolchain or gRPC's runtime.
 
-### Why zero-copy with buffer_ref
+### Why buffer_ref
 
-Large payloads such as file contents or binary data can be referenced without an extra allocation. Note: on the send path the data is currently still copied into the wire buffer; true zero-copy iovec-tail send is planned. The `buffer_ref` type holds a pointer and size, referencing memory that lives elsewhere (e.g., an mmap'd file or a pre-allocated buffer). Combined with `iovec_buffer`, this enables scatter-gather writes that combine the header and payload in a single `writev()` syscall, reducing memory allocations on the send path.
+Large payloads such as file contents or binary data can be referenced without first copying them into an application-owned `std::vector` or `std::string`. The `buffer_ref` type holds a pointer and size, referencing memory that lives elsewhere (e.g., an mmap'd file or a pre-allocated buffer). On the send path, the current serializer still copies those bytes into the outgoing wire buffer; true zero-copy iovec-tail send is planned but not currently implemented.
 
 ### Why cleanup callbacks
 
-When a response references data that must outlive the send operation (e.g., memory-mapped files, shared buffers), cleanup callbacks ensure that the referenced data is released only after the response is fully transmitted. Without this mechanism, the server would need to either copy all response data into owned buffers (defeating zero-copy) or risk use-after-free if the backing memory is released before the write completes.
+When a response references data that must outlive serialization and the send operation (e.g., memory-mapped files, shared buffers), cleanup callbacks ensure that the referenced data is released only after the response is fully transmitted. Without this mechanism, the server could release the backing memory while the RPC layer is still building or sending the response.
 
 ## Quick Start
 
@@ -225,14 +225,14 @@ struct BlobExample {
 };
 ```
 
-### Zero-Copy Binary References (buffer_ref)
+### External Binary References (buffer_ref)
 
-For zero-copy handling of binary data from external sources (e.g., mmap'd files, pre-allocated buffers), use `buffer_ref`:
+For binary data from external sources (e.g., mmap'd files, pre-allocated buffers), use `buffer_ref`:
 
 ```cpp
 struct FileDataResponse {
     std::string filename;
-    buffer_ref content;  // references external buffer without copying
+    buffer_ref content;  // references external buffer while the response is serialized
     
     ELIO_RPC_FIELDS(FileDataResponse, filename, content)
 };
@@ -259,9 +259,13 @@ server.register_method_with_cleanup<GetFileData>(
 ```
 
 `buffer_ref` provides:
-- Zero-copy serialization of external memory
+- A lightweight pointer+size reference to external memory
 - Construction from pointer+size, `std::span`, or `iovec`
 - Conversion to `span`, `iovec`, or `string_view`
+
+**Note**: `buffer_ref` is zero-copy when deserializing into a view of the
+received payload. When serializing a response or request, the current
+implementation copies the referenced bytes into the outgoing wire buffer.
 
 **Important**: The referenced data must remain valid until:
 - For client: the RPC call completes
@@ -502,7 +506,7 @@ auto listener = net::uds_listener::bind(addr);
 
 ### Atomic Frame Writing
 
-The RPC framework uses scatter-gather I/O (`writev`) to write frames atomically. This means the header, payload, and optional checksum are written in a single syscall, which:
+The RPC framework uses scatter-gather I/O (`writev`) to write frames atomically. This means the header, the already-serialized contiguous payload buffer, and optional checksum are written in a single syscall, which:
 
 - Reduces the number of syscalls (typically 1 instead of 2-3)
 - Minimizes context switching under high concurrency

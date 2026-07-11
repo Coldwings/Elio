@@ -78,7 +78,7 @@ Paste test output here (optional)
 <!-- Mark items with an 'x' when completed -->
 
 ### Code Quality
-- [ ] My code follows the project's [code style](CONTRIBUTING.md#code-style)
+- [ ] My code follows the project's [code style](https://github.com/Coldwings/Elio/blob/main/CONTRIBUTING.md#code-style)
 - [ ] I have added/updated comments for complex logic
 - [ ] I have removed any debug code, TODOs, or commented-out code
 - [ ] My changes generate no new warnings

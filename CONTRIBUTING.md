@@ -65,6 +65,13 @@ cmake -B build \
   -DELIO_ENABLE_TLS=ON \
   -DELIO_ENABLE_HTTP=ON \
   -DELIO_ENABLE_HTTP2=ON \
+  -DELIO_ENABLE_RDMA=OFF \
+  -DELIO_ENABLE_RDMA_CM=OFF \
+  -DELIO_ENABLE_RDMA_IBVERBS=OFF \
+  -DELIO_ENABLE_RDMA_IBVERBS_TESTS=OFF \
+  -DELIO_ENABLE_RDMA_CUDA=OFF \
+  -DELIO_BUILD_TCP_BENCHMARKS=OFF \
+  -DELIO_ENABLE_DEBUG_METADATA=ON \
   -DELIO_ENABLE_DEVELOPER_WARNINGS=ON \
   -DELIO_WARNINGS_AS_ERRORS=ON
 ```
@@ -72,6 +79,9 @@ cmake -B build \
 Enable `ELIO_ENABLE_DEVELOPER_WARNINGS` and `ELIO_WARNINGS_AS_ERRORS` during
 development to catch issues early. These flags only apply to tests and examples
 and are not propagated to downstream consumers.
+
+Optional RDMA, CUDA, and TCP benchmark flags default to `OFF`; enable only the
+modules you are actively developing or validating locally.
 
 ## Code Style
 

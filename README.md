@@ -78,11 +78,29 @@ cmake --build build-no-tls
 cmake -S . -B build -DELIO_BUILD_TESTS=ON -DELIO_BUILD_EXAMPLES=ON
 cmake -S . -B build -DELIO_ENABLE_TLS=ON -DELIO_ENABLE_HTTP=ON -DELIO_ENABLE_HTTP2=ON
 
+# Optional RDMA modules and tests
+cmake -S . -B build-rdma \
+  -DELIO_ENABLE_RDMA=ON \
+  -DELIO_ENABLE_RDMA_CM=ON \
+  -DELIO_ENABLE_RDMA_IBVERBS=ON \
+  -DELIO_ENABLE_RDMA_IBVERBS_TESTS=ON \
+  -DELIO_ENABLE_RDMA_CUDA=ON
+
+# Optional TCP benchmark comparison targets
+cmake -S . -B build-tcp-bench \
+  -DELIO_BUILD_EXAMPLES=ON \
+  -DELIO_BUILD_TCP_BENCHMARKS=ON
+
 # Warning policy for repository-local targets (tests/examples only)
 cmake -S . -B build -DELIO_ENABLE_DEVELOPER_WARNINGS=ON -DELIO_WARNINGS_AS_ERRORS=ON
+
+# Coroutine debug metadata is enabled by default; disable it for leaner builds
+cmake -S . -B build -DELIO_ENABLE_DEBUG_METADATA=OFF
 ```
 
 Note: strict warning flags are applied only to Elio's tests/examples targets and are not propagated through exported interface targets.
+Enable RDMA, ibverbs, RDMA CM, CUDA, and TCP benchmark options only when the
+corresponding system dependencies are installed.
 
 ### Install And Use As A Package
 

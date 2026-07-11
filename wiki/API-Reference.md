@@ -2209,6 +2209,17 @@ uint32_t crc32_update(const void* data, size_t length, uint32_t crc);
 uint32_t crc32_finalize(uint32_t crc);
 ```
 
+### CRC32C
+
+```cpp
+// Compute CRC32C (Castagnoli polynomial)
+uint32_t crc32c(const void* data, size_t length, uint32_t crc = 0xFFFFFFFF);
+uint32_t crc32c(std::span<const uint8_t> data, uint32_t crc = 0xFFFFFFFF);
+
+// Check whether hardware CRC32C is available at runtime
+bool crc32c_hw_available() noexcept;
+```
+
 ### SHA-1
 
 ```cpp

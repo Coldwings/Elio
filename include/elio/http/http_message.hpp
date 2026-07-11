@@ -205,6 +205,24 @@ public:
     
     /// Serialize response to string (HTTP/1.1 format)
     std::string serialize() const {
+        const bool status_forbids_body =
+            detail::status_forbids_response_body(status_);
+        return serialize_impl(!status_forbids_body, status_forbids_body);
+    }
+
+    /// Serialize response for a specific request method.  HEAD responses and
+    /// statuses that cannot carry a response body serialize headers only.
+    std::string serialize(method request_method) const {
+        const bool status_forbids_body =
+            detail::status_forbids_response_body(status_);
+        return serialize_impl(
+            !detail::response_body_forbidden(request_method, status_),
+            status_forbids_body);
+    }
+
+private:
+    std::string serialize_impl(bool include_body,
+                               bool status_forbids_body) const {
         std::string result;
         
         // Status line
@@ -216,18 +234,25 @@ public:
         result += "\r\n";
         
         // Headers
-        result += headers_.serialize();
+        auto serialized_headers = headers_;
+        if (status_forbids_body) {
+            serialized_headers.remove("Content-Length");
+            serialized_headers.remove("Transfer-Encoding");
+        }
+        result += serialized_headers.serialize();
         
         // End of headers
         result += "\r\n";
         
         // Body
-        if (!body_.empty()) {
+        if (include_body && !body_.empty()) {
             result += body_;
         }
         
         return result;
     }
+
+public:
     
     /// Create from parser
     static response from_parser(response_parser& parser) {

@@ -970,15 +970,39 @@ TEST_CASE("HTTP response creation", "[http][message]") {
 }
 
 TEST_CASE("HTTP response serialization", "[http][message]") {
-    response resp(status::ok, "Hello", mime::text_plain);
-    resp.set_header("X-Custom", "value");
+    SECTION("ordinary response includes body") {
+        response resp(status::ok, "Hello", mime::text_plain);
+        resp.set_header("X-Custom", "value");
 
-    std::string serialized = resp.serialize();
+        std::string serialized = resp.serialize();
 
-    REQUIRE(serialized.find("HTTP/1.1 200 OK\r\n") != std::string::npos);
-    REQUIRE(serialized.find("Content-Type: text/plain\r\n") != std::string::npos);
-    REQUIRE(serialized.find("X-Custom: value\r\n") != std::string::npos);
-    REQUIRE(serialized.find("\r\n\r\nHello") != std::string::npos);
+        REQUIRE(serialized.find("HTTP/1.1 200 OK\r\n") != std::string::npos);
+        REQUIRE(serialized.find("Content-Type: text/plain\r\n") != std::string::npos);
+        REQUIRE(serialized.find("X-Custom: value\r\n") != std::string::npos);
+        REQUIRE(serialized.find("\r\n\r\nHello") != std::string::npos);
+    }
+
+    SECTION("HEAD response omits body bytes") {
+        response resp(status::ok, "head-body", mime::text_plain);
+
+        std::string serialized = resp.serialize(method::HEAD);
+
+        REQUIRE(serialized.find("HTTP/1.1 200 OK\r\n") != std::string::npos);
+        REQUIRE(serialized.find("Content-Length: 9\r\n") != std::string::npos);
+        REQUIRE(serialized.find("head-body") == std::string::npos);
+    }
+
+    SECTION("no-body response status omits body bytes and framing headers") {
+        response resp(status::no_content, "forbidden-body", mime::text_plain);
+        resp.set_header("Transfer-Encoding", "chunked");
+
+        std::string serialized = resp.serialize();
+
+        REQUIRE(serialized.find("HTTP/1.1 204 No Content\r\n") != std::string::npos);
+        REQUIRE(serialized.find("Content-Length: ") == std::string::npos);
+        REQUIRE(serialized.find("Transfer-Encoding: ") == std::string::npos);
+        REQUIRE(serialized.find("forbidden-body") == std::string::npos);
+    }
 }
 
 TEST_CASE("HTTP response from parser roundtrip", "[http][message]") {

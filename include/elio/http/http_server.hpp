@@ -605,7 +605,7 @@ private:
                 co_await stop_watchdog();
                 auto resp = response(status::payload_too_large, "Payload Too Large");
                 resp.set_header("Connection", "close");
-                co_await this->send_response(stream, resp);
+                co_await this->send_response(stream, resp, parser.get_method());
                 sent_response = true;
                 co_return;
             };
@@ -656,7 +656,7 @@ private:
                     co_await stop_watchdog();
                     auto resp = response::bad_request(parser.error_message());
                     resp.set_header("Connection", "close");
-                    co_await send_response(stream, resp);
+                    co_await send_response(stream, resp, parser.get_method());
                     sent_response = true;
                     co_return;
                 }
@@ -723,7 +723,8 @@ private:
             }
 
             // Send response
-            bool send_ok = co_await send_response(stream, resp);
+            bool send_ok = co_await send_response(stream, resp,
+                                                  ctx.req().get_method());
 
             if (!send_ok || !keep_alive) {
                 break;
@@ -757,8 +758,11 @@ private:
     /// Send HTTP response.  Returns true if the entire response was written
     /// successfully, false on write failure (truncated / broken stream).
     template<typename Stream>
-    coro::task<bool> send_response(Stream& stream, const response& resp) {
-        auto data = resp.serialize();
+    coro::task<bool> send_response(Stream& stream,
+                                   const response& resp,
+                                   std::optional<method> request_method = std::nullopt) {
+        auto data = request_method ? resp.serialize(*request_method)
+                                   : resp.serialize();
 
         size_t sent = 0;
         while (sent < data.size()) {

@@ -725,11 +725,7 @@ private:
             return true;
         }
 
-        auto code = static_cast<uint16_t>(status_);
-        return (code >= 100 && code < 200) ||
-               code == 204 ||
-               code == 205 ||
-               code == 304;
+        return detail::status_forbids_response_body(status_);
     }
 
     bool parse_status_line() {

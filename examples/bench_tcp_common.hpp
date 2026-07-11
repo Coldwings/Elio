@@ -138,6 +138,10 @@ inline std::chrono::seconds pingpong_watchdog_budget(const config& cfg) {
     return phase_budget + watchdog_grace;
 }
 
+inline int clamped_pipeline_depth(const config& cfg) noexcept {
+    return std::clamp(cfg.pipeline_depth, 1, 64);
+}
+
 // ---------------------------------------------------------------------------
 // Output formatting
 // ---------------------------------------------------------------------------

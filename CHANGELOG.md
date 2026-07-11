@@ -90,6 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **TCP benchmark workflow build surface**: The main-branch TCP loopback
   benchmark workflow now builds only the TCP benchmark targets, keeping its
   build surface aligned with its narrowed trigger paths. (#635)
+- **Elio TCP streaming benchmark pipeline depth**: The Elio backend now applies
+  the documented `-q` streaming pipeline depth by writing message bursts, and all
+  TCP benchmark backends share the same 1..64 normalized depth. (#649)
 
 ## [0.5.2] - 2026-06-30
 

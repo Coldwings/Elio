@@ -338,7 +338,8 @@ static task<void> client_streaming(const bench::config& cfg,
     }
     stream->set_no_delay(true);
 
-    std::vector<char> send_buf(msg_size, 'X');
+    const int pipeline_depth = bench::clamped_pipeline_depth(cfg);
+    std::vector<char> send_buf(msg_size * static_cast<size_t>(pipeline_depth), 'X');
 
     std::atomic<bool> stop{false};
     streaming_counters counters;
@@ -388,7 +389,7 @@ static task<void> client_streaming(const bench::config& cfg,
 
     while (!stop.load(std::memory_order_acquire)) {
         if (!co_await write_exact_cancellable(
-                *stream, send_buf.data(), msg_size, cancel.get_token())) {
+                *stream, send_buf.data(), send_buf.size(), cancel.get_token())) {
             break;
         }
     }

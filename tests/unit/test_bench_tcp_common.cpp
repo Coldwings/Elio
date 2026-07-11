@@ -48,3 +48,19 @@ TEST_CASE("TCP benchmark parser rejects invalid modes", "[bench][tcp][args]") {
     REQUIRE_THROWS_AS(bench::parse_args(3, argv, "Test"),
                       bench::argument_error);
 }
+
+TEST_CASE("TCP benchmark pipeline depth is clamped for backend use",
+          "[bench][tcp][args]") {
+    bench::config cfg;
+
+    CHECK(bench::clamped_pipeline_depth(cfg) == 16);
+
+    cfg.pipeline_depth = 128;
+    CHECK(bench::clamped_pipeline_depth(cfg) == 64);
+
+    cfg.pipeline_depth = 0;
+    CHECK(bench::clamped_pipeline_depth(cfg) == 1);
+
+    cfg.pipeline_depth = -4;
+    CHECK(bench::clamped_pipeline_depth(cfg) == 1);
+}

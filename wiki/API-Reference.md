@@ -1264,6 +1264,25 @@ struct client_config : base_client_config {
 };
 ```
 
+### `server_config`
+
+```cpp
+struct server_config {
+    size_t max_request_size = 10 * 1024 * 1024;
+    size_t read_buffer_size = 8192;
+    std::chrono::seconds keep_alive_timeout{30};
+    size_t max_keep_alive_requests = 100;
+    bool enable_logging = true;
+    size_t max_headers = 100;
+    size_t max_header_size = 8192;
+};
+```
+
+`keep_alive_timeout` bounds each incoming request handled by `http::server`.
+For `server::listen_tls()` and `websocket::ws_server::listen_tls()`, it also
+bounds the inbound TLS handshake. A value less than or equal to zero disables
+the server-side TLS handshake deadline.
+
 ### `request`
 
 HTTP request message.

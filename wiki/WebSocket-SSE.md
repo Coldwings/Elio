@@ -152,6 +152,11 @@ client.tls_context().use_default_verify_paths();
 co_await client.connect("wss://example.com/ws");
 ```
 
+The server-side TLS handshake is bounded by the `http::server_config`
+passed to `ws_server`; `keep_alive_timeout` controls the inbound TLS handshake
+before WebSocket upgrade parsing begins. Set it to a non-positive duration to
+disable that handshake deadline.
+
 ## Server-Sent Events (SSE)
 
 SSE provides server-to-client event streaming over HTTP.

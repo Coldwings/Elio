@@ -110,6 +110,7 @@ jobs:
           package_rdma_dependency_export_metadata
           package_elio_compile_feature_export
           http2_fetchcontent_cache_scope
+          http2_option_requires_http
           package_version_compatibility
         )
 
@@ -122,7 +123,7 @@ jobs:
         done
 
         ctest --test-dir build --output-on-failure \
-          -R "^(package_rdma_cuda_export_metadata|package_liburing_export_metadata|package_rdma_dependency_export_metadata|package_elio_compile_feature_export|http2_fetchcontent_cache_scope|package_version_compatibility)$"
+          -R "^(package_rdma_cuda_export_metadata|package_liburing_export_metadata|package_rdma_dependency_export_metadata|package_elio_compile_feature_export|http2_fetchcontent_cache_scope|http2_option_requires_http|package_version_compatibility)$"
 
         for test_binary in \
           ./build/tests/elio_rdma_cuda_lifetime_tests \

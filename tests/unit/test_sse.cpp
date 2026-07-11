@@ -7,6 +7,7 @@
 #include <elio/time/timer.hpp>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -844,6 +845,66 @@ TEST_CASE("sse_client does not eat events into HTTP body even when the "
     REQUIRE(got[1].data == "1");
     REQUIRE(got[2].type == "tick");
     REQUIRE(got[2].data == "2");
+}
+
+TEST_CASE("sse_client rejects non-event-stream responses",
+          "[sse][client][regression]") {
+    using namespace elio;
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    bool connected = true;
+    int connect_errno = 0;
+
+    sched.go([&]() -> coro::task<void> {
+        auto server_stream = co_await listener_opt->accept();
+        REQUIRE(server_stream.has_value());
+
+        auto req = co_await read_request_headers(*server_stream);
+        REQUIRE(!req.empty());
+
+        std::string headers =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Cache-Control: no-cache\r\n"
+            "\r\n";
+        REQUIRE(co_await write_all(*server_stream, headers));
+        co_await server_stream->close();
+        server_done = true;
+    });
+
+    sched.go([&]() -> coro::task<void> {
+        client_config cfg;
+        cfg.auto_reconnect = false;
+        sse_client client(cfg);
+        std::string url =
+            "http://127.0.0.1:" + std::to_string(port) + "/events";
+
+        errno = 0;
+        connected = co_await client.connect(url);
+        connect_errno = errno;
+        REQUIRE_FALSE(connected);
+        REQUIRE(connect_errno == EBADMSG);
+        REQUIRE_FALSE(client.is_connected());
+        client_done = true;
+        co_await client.close();
+    });
+
+    REQUIRE(wait_for([&] { return client_done.load() && server_done.load(); }));
+    sched.shutdown();
+
+    REQUIRE_FALSE(connected);
+    REQUIRE(connect_errno == EBADMSG);
 }
 
 TEST_CASE("sse_client receive(token) observes the per-call cancel token",

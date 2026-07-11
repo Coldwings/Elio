@@ -182,11 +182,32 @@ TEST_CASE("HTTP/2 stream state", "[http2]") {
     }
 }
 
+TEST_CASE("HTTP/2 stream response body enforces max size",
+          "[http2][security]") {
+    h2_stream stream;
+
+    REQUIRE(stream.append_response_data("1234", 5));
+    REQUIRE(stream.response_body == "1234");
+    REQUIRE_FALSE(stream.response_size_exceeded);
+    REQUIRE(stream.error == h2_error::none);
+
+    REQUIRE(stream.append_response_data("5", 5));
+    REQUIRE(stream.response_body == "12345");
+
+    REQUIRE_FALSE(stream.append_response_data("6", 5));
+    REQUIRE(stream.response_body == "12345");
+    REQUIRE(stream.response_size_exceeded);
+    REQUIRE(stream.error == h2_error::cancel);
+    REQUIRE(stream.body_complete);
+    REQUIRE(stream.closed);
+}
+
 TEST_CASE("HTTP/2 client configuration", "[http2][config]") {
     SECTION("session config defaults match documented client defaults") {
         h2_session_config cfg;
         REQUIRE(cfg.max_concurrent_streams == 100);
         REQUIRE(cfg.initial_window_size == NGHTTP2_INITIAL_WINDOW_SIZE);
+        REQUIRE(cfg.max_response_size == 16 * 1024 * 1024);
         REQUIRE(cfg.user_agent == "elio-http2/1.0");
         REQUIRE_FALSE(cfg.enable_push);
     }
@@ -195,6 +216,7 @@ TEST_CASE("HTTP/2 client configuration", "[http2][config]") {
         h2_client_config cfg;
         cfg.max_concurrent_streams = 7;
         cfg.initial_window_size = 32768;
+        cfg.max_response_size = 4096;
         cfg.user_agent = "elio-test-agent/1.0";
         cfg.enable_push = true;
 
@@ -202,6 +224,7 @@ TEST_CASE("HTTP/2 client configuration", "[http2][config]") {
 
         REQUIRE(client.config().max_concurrent_streams == 7);
         REQUIRE(client.config().initial_window_size == 32768);
+        REQUIRE(client.config().max_response_size == 4096);
         REQUIRE(client.config().user_agent == "elio-test-agent/1.0");
         REQUIRE(client.config().enable_push);
     }

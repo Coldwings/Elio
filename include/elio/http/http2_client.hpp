@@ -27,6 +27,10 @@ struct h2_client_config {
     std::chrono::seconds read_timeout{30};        ///< Session I/O timeout; <=0 disables
     size_t max_concurrent_streams = 100;          ///< Max concurrent streams per connection
     uint32_t initial_window_size = 65535;         ///< Initial flow control window size
+    /// Hard cap on the buffered response body for a single stream. HTTP/2 DATA
+    /// frames are accumulated into http::response, so untrusted peers must be
+    /// bounded just like HTTP/1.x responses.
+    size_t max_response_size = 16 * 1024 * 1024;  ///< Max response body size (16 MiB)
     std::string user_agent = "elio-http2/1.0";    ///< User-Agent header
     bool enable_push = false;                     ///< Advertise SETTINGS_ENABLE_PUSH; pushed responses are not exposed
     net::resolve_options resolve_options = net::default_cached_resolve_options();  ///< DNS resolve/cache behavior
@@ -188,6 +192,7 @@ private:
         return h2_session_config{
             .max_concurrent_streams = config.max_concurrent_streams,
             .initial_window_size = config.initial_window_size,
+            .max_response_size = config.max_response_size,
             .user_agent = config.user_agent,
             .enable_push = config.enable_push,
         };

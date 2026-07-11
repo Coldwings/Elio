@@ -9,6 +9,7 @@
 #include <nghttp2/nghttp2.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -51,9 +52,30 @@ struct h2_stream {
     bool body_complete = false;
     bool closed = false;
     h2_error error = h2_error::none;
+    bool response_size_exceeded = false;
     
     bool is_complete() const noexcept {
         return headers_complete && body_complete;
+    }
+
+    bool append_response_data(std::string_view data,
+                              size_t max_response_size) {
+        if (error != h2_error::none) {
+            return false;
+        }
+
+        const auto current = response_body.size();
+        if (data.size() > max_response_size ||
+            current > max_response_size - data.size()) {
+            response_size_exceeded = true;
+            error = h2_error::cancel;
+            body_complete = true;
+            closed = true;
+            return false;
+        }
+
+        response_body.append(data);
+        return true;
     }
 };
 
@@ -61,6 +83,7 @@ struct h2_stream {
 struct h2_session_config {
     size_t max_concurrent_streams = 100;
     uint32_t initial_window_size = NGHTTP2_INITIAL_WINDOW_SIZE;
+    size_t max_response_size = 16 * 1024 * 1024;
     std::string user_agent = "elio-http2/1.0";
     bool enable_push = false;  ///< Advertise SETTINGS_ENABLE_PUSH; pushed responses are not exposed
 };
@@ -285,6 +308,10 @@ public:
         auto& stream = it->second;
         
         if (stream.error != h2_error::none) {
+            if (stream.response_size_exceeded) {
+                errno = EMSGSIZE;
+            }
+            streams_.erase(it);
             co_return std::nullopt;
         }
         
@@ -390,13 +417,28 @@ private:
         return 0;
     }
     
-    static int on_data_chunk_recv_callback(nghttp2_session*, uint8_t,
+    static int on_data_chunk_recv_callback(nghttp2_session* session, uint8_t,
                                             int32_t stream_id, const uint8_t* data,
                                             size_t len, void* user_data) {
         auto* self = static_cast<h2_session*>(user_data);
         auto* stream = self->get_stream(stream_id);
         if (stream) {
-            stream->response_body.append(reinterpret_cast<const char*>(data), len);
+            if (!stream->append_response_data(
+                    {reinterpret_cast<const char*>(data), len},
+                    self->config_.max_response_size)) {
+                if (!stream->response_size_exceeded) {
+                    return 0;
+                }
+                ELIO_LOG_ERROR("HTTP/2 response body on stream {} exceeds "
+                               "max_response_size ({} > {})",
+                               stream_id, stream->response_body.size() + len,
+                               self->config_.max_response_size);
+                if (session) {
+                    nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                              stream_id, NGHTTP2_CANCEL);
+                }
+                return 0;
+            }
         }
         // NOTE: nghttp2 automatically manages the flow control window when
         // auto window update is enabled (the default).  No explicit

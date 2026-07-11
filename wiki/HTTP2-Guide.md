@@ -93,6 +93,7 @@ struct h2_client_config {
     std::chrono::seconds read_timeout{30};     // Session I/O timeout; <=0 disables
     size_t max_concurrent_streams = 100;
     uint32_t initial_window_size = 65535;
+    size_t max_response_size = 16 * 1024 * 1024;  // Max buffered body bytes
     std::string user_agent = "elio-http2/1.0";
     bool enable_push = false;  // Advertise SETTINGS_ENABLE_PUSH only;
                                // pushed responses are not exposed
@@ -109,6 +110,9 @@ h2_client client(config);
 
 `connect_timeout` bounds TCP connect and TLS/ALPN handshake setup.
 `read_timeout` bounds HTTP/2 session initialization and response waits.
+`max_response_size` bounds the accumulated DATA payload stored in the returned
+`http::response`; responses exceeding the limit fail instead of continuing to
+buffer in memory.
 `enable_push` only controls the HTTP/2 `SETTINGS_ENABLE_PUSH` value sent to the
 peer. Elio does not currently expose pushed responses through the public client
 API, so applications cannot observe or consume server-pushed streams.

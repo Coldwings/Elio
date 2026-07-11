@@ -96,6 +96,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **HTTP URL port validation**: URL parsing now rejects empty ports, overflowing
   ports, IPv6 authority suffixes, and trailing garbage after numeric ports instead
   of silently accepting the numeric prefix. (#647)
+- **HTTP/1 TLS timeout cleanup**: Client read/write timeout paths now mark
+  TLS-backed streams as externally shut down after watchdog-driven `shutdown(2)`,
+  preventing destructor-time `SSL_shutdown()` on an unusable socket. (#648)
 
 ## [0.5.2] - 2026-06-30
 

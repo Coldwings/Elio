@@ -33,6 +33,7 @@
 #include <atomic>
 #include <vector>
 #include <optional>
+#include <unordered_map>
 
 namespace elio::http::websocket {
 
@@ -108,6 +109,25 @@ public:
     
     /// Get negotiated subprotocol
     std::string_view subprotocol() const noexcept { return subprotocol_; }
+
+    /// Get path parameter by name.
+    std::string_view param(std::string_view name) const {
+        auto it = params_.find(std::string(name));
+        if (it != params_.end()) {
+            return it->second;
+        }
+        return {};
+    }
+
+    /// Set path parameter.
+    void set_param(std::string_view name, std::string_view value) {
+        params_[std::string(name)] = std::string(value);
+    }
+
+    /// Get all path parameters.
+    const std::unordered_map<std::string, std::string>& params() const noexcept {
+        return params_;
+    }
     
     /// Send a text message
     coro::task<bool> send_text(std::string_view message) {
@@ -329,6 +349,7 @@ private:
     connection_state state_ = connection_state::connecting;
     bool is_server_ = true;
     std::string subprotocol_;
+    std::unordered_map<std::string, std::string> params_;
     frame_parser parser_;
     std::vector<char> buffer_ = std::vector<char>(8192);
     sync::mutex send_mutex_;  ///< Serializes frame writes; see class comment.
@@ -412,7 +433,7 @@ using ws_handler_func = std::function<coro::task<void>(ws_connection&)>;
 struct ws_route {
     std::string pattern;
     std::vector<route_segment> segments;
-    std::vector<std::string> param_names;  ///< For introspection / future use
+    std::vector<std::string> param_names;  ///< Captured parameter names.
     ws_handler_func handler;
     server_config config;
 
@@ -457,7 +478,8 @@ public:
     ws_router() = default;
 
     /// Add a WebSocket route.  Pattern grammar matches the HTTP router:
-    ///   - `:name` captures one path component
+    ///   - `:name` captures one path component; handlers read it from
+    ///     `ws_connection::param("name")`
     ///   - trailing `*` matches the rest of the path
     ///   - anything else is a literal component
     void websocket(std::string_view pattern, ws_handler_func handler,
@@ -498,8 +520,9 @@ public:
     }
 
     /// Find matching WebSocket route
-    const ws_route* find_ws_route(std::string_view path) const {
-        std::unordered_map<std::string, std::string> params;
+    const ws_route* find_ws_route(
+        std::string_view path,
+        std::unordered_map<std::string, std::string>& params) const {
         for (const auto& route : ws_routes_) {
             params.clear();
             if (route.match(path, params)) {
@@ -507,6 +530,11 @@ public:
             }
         }
         return nullptr;
+    }
+
+    const ws_route* find_ws_route(std::string_view path) const {
+        std::unordered_map<std::string, std::string> params;
+        return find_ws_route(path, params);
     }
 
     /// Check if path matches a WebSocket route
@@ -795,7 +823,8 @@ private:
         auto req = request::from_parser(parser);
         
         // Check for WebSocket upgrade
-        auto* ws_route = router_.find_ws_route(req.path());
+        std::unordered_map<std::string, std::string> ws_params;
+        auto* ws_route = router_.find_ws_route(req.path(), ws_params);
         
         if (ws_route) {
             // Handle WebSocket upgrade
@@ -829,6 +858,9 @@ private:
             conn.set_max_message_size(ws_route->config.max_message_size);
             conn.set_buffer_size(ws_route->config.read_buffer_size);
             conn.seed_pipelined_bytes(pipelined);
+            for (const auto& [name, value] : ws_params) {
+                conn.set_param(name, value);
+            }
             
             try {
                 co_await ws_route->handler(conn);

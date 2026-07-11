@@ -990,3 +990,31 @@ TEST_CASE("WebSocket route wildcard validation", "[websocket][router]") {
     REQUIRE_THROWS_AS(router.websocket("/chat/*/", handler),
                       std::invalid_argument);
 }
+
+TEST_CASE("WebSocket route parameters are exposed to connections",
+          "[websocket][router]") {
+    auto handler = [](ws_connection&) -> elio::coro::task<void> {
+        co_return;
+    };
+
+    ws_router router;
+    router.websocket("/chat/:room/users/:user", handler);
+
+    std::unordered_map<std::string, std::string> params;
+    auto* route = router.find_ws_route("/chat/lobby/users/alice", params);
+
+    REQUIRE(route != nullptr);
+    REQUIRE(params.size() == 2);
+    REQUIRE(params.at("room") == "lobby");
+    REQUIRE(params.at("user") == "alice");
+
+    ws_connection conn(static_cast<elio::net::tcp_stream*>(nullptr));
+    for (const auto& [name, value] : params) {
+        conn.set_param(name, value);
+    }
+
+    REQUIRE(conn.param("room") == "lobby");
+    REQUIRE(conn.param("user") == "alice");
+    REQUIRE(conn.param("missing").empty());
+    REQUIRE(conn.params().size() == 2);
+}

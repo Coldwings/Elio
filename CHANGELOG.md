@@ -73,6 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Installed package thread dependency**: The exported `elio` target now links
   `Threads::Threads` instead of raw `pthread`, and installed package config
   restores the Threads dependency before loading exported targets. (#622)
+- **WebSocket route parameters**: Named `:param` captures in WebSocket route
+  patterns are now exposed through `ws_connection::param()` and `params()`, so
+  `/chat/:room` handlers can read the captured room value. (#623)
 
 ## [0.5.2] - 2026-06-30
 

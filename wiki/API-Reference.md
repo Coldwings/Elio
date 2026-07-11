@@ -2157,6 +2157,7 @@ ELIO_RPC_METHOD(method_id, RequestType, ResponseType)
 #### `frame_header`
 
 ```cpp
+constexpr uint8_t protocol_version = 1;
 constexpr size_t frame_header_size = 19;
 
 struct frame_header {
@@ -2166,12 +2167,16 @@ struct frame_header {
     message_flags flags;
     method_id_t method_id;
     uint32_t payload_length;
+    uint8_t version;          // protocol_version
     
     bool is_valid() const noexcept;
     std::array<uint8_t, frame_header_size> to_bytes() const;
     static frame_header from_bytes(const uint8_t* data);
 };
 ```
+
+The fixed 19-byte wire header includes the final 1-byte `version` field.
+Frames are valid only when `version == protocol_version`.
 
 #### `message_type`
 

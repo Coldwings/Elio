@@ -274,9 +274,9 @@ server.register_method_with_cleanup<GetFileData>(
 All messages use a binary wire format with little-endian byte order:
 
 ```
-+----------+----------+-------+--------+------------+---------+
-| magic(4) | req_id(4)| type(1)| flags(1)| method(4) | len(4)  |
-+----------+----------+-------+--------+------------+---------+
++----------+----------+-------+--------+------------+---------+--------+
+| magic(4) | req_id(4)| type(1)| flags(1)| method(4) | len(4)  | ver(1) |
++----------+----------+-------+--------+------------+---------+--------+
 | payload (len bytes)                                         |
 +-------------------------------------------------------------+
 | checksum(4) - optional, present if has_checksum flag set    |
@@ -289,9 +289,10 @@ All messages use a binary wire format with little-endian byte order:
 - **flags** (1 byte): Message flags (has_timeout=0x01, has_checksum=0x02)
 - **method_id** (4 bytes): Method being called (for requests)
 - **payload_length** (4 bytes): Length of payload in bytes
+- **version** (1 byte): Protocol version, currently `protocol_version` (1)
 - **checksum** (4 bytes, optional): CRC32 checksum of header + payload
 
-Total header size: 19 bytes
+Total header size: 19 bytes, including the final version byte
 Checksum trailer: 4 bytes (optional)
 
 ### Message Types

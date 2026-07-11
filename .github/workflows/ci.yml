@@ -134,11 +134,11 @@ jobs:
 
     - name: Run benchmark
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
-      run: ./build/examples/benchmark
+      run: timeout --kill-after=10s 5m ./build/examples/benchmark
 
     - name: Run channel benchmark
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
-      run: ./build/examples/bench_channel
+      run: timeout --kill-after=10s 5m ./build/examples/bench_channel
 
   package-consumer-check:
     needs: changes

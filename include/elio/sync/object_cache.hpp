@@ -90,7 +90,7 @@ private:
         std::chrono::milliseconds ttl_{0};
 
         std::atomic<bool> release_requested_{false};
-        std::atomic<void*> release_waiter_{nullptr};
+        coro::detail::completion_waiter_slot release_waiter_;
 
         entry* reclaim_prev = nullptr;
         entry* reclaim_next = nullptr;
@@ -261,48 +261,32 @@ private:
     class release_awaitable {
     public:
         explicit release_awaitable(std::shared_ptr<entry> e) noexcept
-            : entry_sp_(std::move(e)) {}
+            : entry_sp_(std::move(e))
+            , waiter_(entry_sp_->release_waiter_) {}
 
         bool await_ready() const noexcept {
             return entry_sp_->refcount_.load(std::memory_order_acquire) == 1;
         }
 
         bool await_suspend(std::coroutine_handle<> h) noexcept {
-            // Pin entry alive on our stack — after CAS another thread may
-            // resume our coroutine and drop the borrow's shared_ptr.
             auto pin = entry_sp_;
-            auto* refcount = &pin->refcount_;
-            auto* waiter = &pin->release_waiter_;
-
-            void* expected = nullptr;
-            if (!waiter->compare_exchange_strong(
-                    expected, h.address(),
-                    std::memory_order_release, std::memory_order_relaxed)) {
-                return false;
-            }
+            bool suspend = pin->release_waiter_.register_waiter(
+                waiter_, h, [&] {
+                    return pin->refcount_.load(std::memory_order_acquire) == 1;
+                });
 #ifdef ELIO_OBJECT_CACHE_TEST_HOOKS
-            detail_oc::release_waiter_published_hook.run();
-#endif
-            if (refcount->load(std::memory_order_acquire) == 1) {
-                void* addr = waiter->exchange(
-                    nullptr, std::memory_order_acq_rel);
-                if (addr) {
-                    // We still own the waiter and no other borrow can resume
-                    // us, so continue inline.
-                    return false;
-                }
-                // We got nullptr back, which means another thread already
-                // exchanged the waiter and scheduled us. Stay suspended so
-                // the coroutine is resumed exactly once by that handoff owner.
-                return true;
+            if (suspend) {
+                detail_oc::release_waiter_published_hook.run();
             }
-            return true;
+#endif
+            return suspend;
         }
 
         void await_resume() const noexcept {}
 
     private:
         std::shared_ptr<entry> entry_sp_;
+        coro::detail::completion_waiter waiter_;
     };
 
 public:
@@ -387,11 +371,9 @@ public:
             auto prev = entry_->refcount_.fetch_sub(1, std::memory_order_acq_rel);
 
             if (prev == 2 && entry_->release_requested_.load(std::memory_order_acquire)) {
-                void* waiter = entry_->release_waiter_.exchange(
-                    nullptr, std::memory_order_acq_rel);
+                auto waiter = entry_->release_waiter_.take();
                 if (waiter) {
-                    runtime::schedule_handle(
-                        std::coroutine_handle<>::from_address(waiter));
+                    runtime::schedule_handle(waiter);
                 }
             } else if (prev == 1) {
                 if (!entry_->force_evict_.load(std::memory_order_acquire)) {

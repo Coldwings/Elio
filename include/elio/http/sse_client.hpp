@@ -668,8 +668,16 @@ private:
 
                 // Check content type
                 auto content_type = parser.get_headers().get("Content-Type");
-                if (content_type.find("text/event-stream") == std::string_view::npos) {
-                    ELIO_LOG_WARNING("Unexpected Content-Type: {}", content_type);
+                std::string_view media_type = content_type;
+                if (auto semicolon = media_type.find(';');
+                    semicolon != std::string_view::npos) {
+                    media_type = media_type.substr(0, semicolon);
+                }
+                media_type = http::detail::trim_ows(media_type);
+                if (!http::detail::ascii_iequals(media_type, SSE_CONTENT_TYPE)) {
+                    ELIO_LOG_ERROR("Unexpected SSE Content-Type: {}", content_type);
+                    errno = EBADMSG;
+                    co_return fail_connect();
                 }
 
                 // Anything past the header delimiter is SSE event data,

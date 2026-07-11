@@ -2366,6 +2366,32 @@ TEST_CASE("tcp_connect cancellation during pending connect cleans up fd",
     }
 }
 
+TEST_CASE("tcp_connect completion wins over late cancellation",
+          "[tcp][connect][cancel][regression]") {
+    auto listener = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener.has_value());
+
+    cancel_source source;
+    auto connect_op = tcp_connect(
+        ipv6_address("::1", listener->local_address().port()),
+        source.get_token());
+
+    const bool suspended = connect_op.await_suspend(std::noop_coroutine());
+    if (suspended) {
+        default_io_context().run_for(elio::test::scaled_ms(1000));
+        REQUIRE_FALSE(default_io_context().has_pending());
+    }
+
+    source.cancel();
+
+    errno = 0;
+    auto stream = connect_op.await_resume();
+
+    INFO("late-cancel errno=" << errno);
+    REQUIRE(stream.has_value());
+    REQUIRE(stream->is_valid());
+}
+
 TEST_CASE("explicit hostname resolution", "[tcp][address][dns]") {
     SECTION("localhost resolves asynchronously") {
         scheduler sched(1);
@@ -2718,6 +2744,38 @@ TEST_CASE("Cancellable recv completes normally", "[io][cancel]") {
     close(sv[1]);
 }
 
+TEST_CASE("Cancellable recv completion wins over late cancellation",
+          "[io][cancel][regression]") {
+    int sv[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+    const char* msg = "late cancel data";
+    REQUIRE(send(sv[0], msg, strlen(msg), 0) ==
+            static_cast<ssize_t>(strlen(msg)));
+
+    char buffer[64] = {};
+    cancel_source source;
+    auto recv_op = async_recv(sv[1], buffer, sizeof(buffer) - 1, 0,
+                              source.get_token());
+
+    REQUIRE_FALSE(recv_op.await_ready());
+    recv_op.await_suspend(std::noop_coroutine());
+    default_io_context().run_for(elio::test::scaled_ms(1000));
+    REQUIRE_FALSE(default_io_context().has_pending());
+
+    source.cancel();
+
+    auto recv_result = recv_op.await_resume();
+
+    REQUIRE(recv_result.success());
+    REQUIRE_FALSE(recv_result.was_cancelled());
+    REQUIRE(recv_result.bytes_transferred() == static_cast<int>(strlen(msg)));
+    REQUIRE(std::string(buffer) == msg);
+
+    close(sv[0]);
+    close(sv[1]);
+}
+
 TEST_CASE("Cancellable recv already cancelled", "[io][cancel]") {
     int sv[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
@@ -2851,6 +2909,36 @@ TEST_CASE("Cancellable poll_read cancelled during wait without readiness",
     REQUIRE(::read(efd, &value, sizeof(value)) == -1);
     REQUIRE(errno == EAGAIN);
 
+    close(efd);
+}
+
+TEST_CASE("Cancellable poll_read readiness wins over late cancellation",
+          "[io][cancel][poll][regression]") {
+    int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    REQUIRE(efd >= 0);
+
+    std::uint64_t value = 1;
+    REQUIRE(::write(efd, &value, sizeof(value)) ==
+            static_cast<ssize_t>(sizeof(value)));
+
+    cancel_source source;
+    auto poll_op = async_poll_read(efd, source.get_token());
+
+    REQUIRE_FALSE(poll_op.await_ready());
+    poll_op.await_suspend(std::noop_coroutine());
+    default_io_context().run_for(elio::test::scaled_ms(1000));
+    REQUIRE_FALSE(default_io_context().has_pending());
+
+    source.cancel();
+
+    auto poll_result = poll_op.await_resume();
+
+    REQUIRE(poll_result.success());
+    REQUIRE_FALSE(poll_result.was_cancelled());
+    REQUIRE(poll_result.error_code() == 0);
+
+    REQUIRE(::read(efd, &value, sizeof(value)) ==
+            static_cast<ssize_t>(sizeof(value)));
     close(efd);
 }
 

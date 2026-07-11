@@ -73,7 +73,7 @@ using namespace elio;
 using namespace elio::signal;
 
 std::atomic<bool> g_running{true};
-std::atomic<int> g_listener_fd{-1};
+coro::cancel_source g_accept_cancel;
 
 // Signal handler coroutine - waits for SIGINT/SIGTERM
 coro::task<void> signal_handler_task() {
@@ -86,10 +86,7 @@ coro::task<void> signal_handler_task() {
     }
 
     g_running = false;
-
-    // Close listener to interrupt pending accept
-    int fd = g_listener_fd.exchange(-1);
-    if (fd >= 0) ::close(fd);
+    g_accept_cancel.cancel();
 }
 
 coro::task<void> handle_client(net::tcp_stream stream, int id) {
@@ -120,13 +117,15 @@ coro::task<int> async_main(int argc, char* argv[]) {
         co_return 1;
     }
 
-    g_listener_fd.store(listener->fd());
     ELIO_LOG_INFO("Server listening on port 8080");
 
     int client_id = 0;
     while (g_running) {
-        auto stream = co_await listener->accept();
-        if (!stream) continue;
+        auto stream = co_await listener->accept(g_accept_cancel.get_token());
+        if (!stream) {
+            if (!g_running || g_accept_cancel.is_cancelled()) break;
+            continue;
+        }
 
         elio::go([stream = std::move(*stream), id = ++client_id]() mutable {
             return handle_client(std::move(stream), id);
@@ -150,7 +149,7 @@ using namespace elio;
 using namespace elio::signal;
 
 std::atomic<bool> g_running{true};
-std::atomic<int> g_listener_fd{-1};
+coro::cancel_source g_accept_cancel;
 
 // Signal handler coroutine
 coro::task<void> signal_handler_task() {
@@ -163,8 +162,7 @@ coro::task<void> signal_handler_task() {
     }
 
     g_running = false;
-    int fd = g_listener_fd.exchange(-1);
-    if (fd >= 0) ::close(fd);
+    g_accept_cancel.cancel();
 }
 
 coro::task<void> handle_client(net::uds_stream stream, int id) {
@@ -203,13 +201,15 @@ coro::task<int> async_main(int argc, char* argv[]) {
         co_return 1;
     }
 
-    g_listener_fd.store(listener->fd());
     ELIO_LOG_INFO("Server listening on {}", addr.to_string());
 
     int client_id = 0;
     while (g_running) {
-        auto stream = co_await listener->accept();
-        if (!stream) continue;
+        auto stream = co_await listener->accept(g_accept_cancel.get_token());
+        if (!stream) {
+            if (!g_running || g_accept_cancel.is_cancelled()) break;
+            continue;
+        }
 
         elio::go([stream = std::move(*stream), id = ++client_id]() mutable {
             return handle_client(std::move(stream), id);

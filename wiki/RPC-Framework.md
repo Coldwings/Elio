@@ -303,7 +303,7 @@ Checksum trailer: 4 bytes (optional)
 | error | 2 | Error response from server |
 | ping | 3 | Keepalive ping |
 | pong | 4 | Keepalive pong |
-| cancel | 5 | Cancel pending request |
+| cancel | 5 | Cancel pending request; cancels `rpc_context::cancel_token` for context-aware handlers |
 
 ### Serialization Format
 
@@ -370,12 +370,22 @@ server.register_method_with_context<GetUser>(
     if (ctx.has_timeout()) {
         ELIO_LOG_DEBUG("Timeout: {}ms", *ctx.timeout_ms);
     }
+    if (ctx.cancel_token.is_cancelled()) {
+        co_return GetUserResponse{};
+    }
     
     GetUserResponse resp;
     // ... populate response
     co_return resp;
 });
 ```
+
+RPC call cancellation is cooperative. Cancelling the token passed to
+`rpc_client::call()` completes the client call with `rpc_error::cancelled` and,
+if the request frame was already sent, sends a best-effort cancel frame to the
+server. Context-aware handlers can observe that request-specific cancellation
+through `ctx.cancel_token` and should pass it to cancellable operations or poll
+it before long-running work.
 
 ### Synchronous Handlers
 

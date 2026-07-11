@@ -423,12 +423,15 @@ coro::task<void> controller() {
 | `sse::sse_client::connect()` | `co_await client.connect(url, token)` |
 | `sse::sse_client::receive()` | `co_await client.receive(token)` |
 
-HTTP, WebSocket, and SSE client cancellation is propagated into pending socket
-operations. A token passed to `connect()` or an HTTP request can abort TCP
-connect, TLS handshake, request write, and response-header/body reads. A token
-passed to WebSocket or SSE `receive()` can abort a pending frame/event read.
-Cancelled client operations return the normal failure shape (`std::nullopt` or
-`false`) and set `errno` to `ECANCELED`.
+RPC client cancellation returns `rpc_error::cancelled` and, after a request has
+been written, sends a best-effort cancel frame so context-aware server handlers
+can observe `rpc_context::cancel_token`. HTTP, WebSocket, and SSE client
+cancellation is propagated into pending socket operations. A token passed to
+`connect()` or an HTTP request can abort TCP connect, TLS handshake, request
+write, and response-header/body reads. A token passed to WebSocket or SSE
+`receive()` can abort a pending frame/event read. Cancelled client operations
+return the normal failure shape (`std::nullopt` or `false`) and set `errno` to
+`ECANCELED`.
 
 ---
 
@@ -2255,10 +2258,16 @@ struct rpc_context {
     uint32_t request_id;
     method_id_t method_id;
     std::optional<uint32_t> timeout_ms;
+    coro::cancel_token cancel_token;
     
     bool has_timeout() const noexcept;
 };
 ```
+
+`cancel_token` is cancelled when the client sends an RPC cancel frame for this
+request or when the session is closed. Cancellation is cooperative; handlers
+that need to stop early should poll the token or pass it to cancellable Elio
+operations.
 
 #### `cleanup_callback_t`
 

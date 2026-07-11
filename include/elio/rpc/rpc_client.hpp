@@ -336,7 +336,9 @@ private:
         // caller-driven destruction while awaiting completion_event).
         pending_eraser eraser(this, request_id);
 
-        // Register cancellation callback
+        // Register cancellation callback. The callback completes the local
+        // pending request; the coroutine starts the wire-level cancel send
+        // after it resumes so callbacks never block on socket I/O.
         auto cancel_registration = token.on_cancel([this, pending, request_id]() {
             if (pending->try_complete()) {
                 pending->error = rpc_error::cancelled;
@@ -348,15 +350,30 @@ private:
         auto timeout_ms = static_cast<uint32_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count());
         auto request_frame = build_request(request_id, Method::id, request, timeout_ms);
+        bool request_sent = false;
 
         {
             co_await send_mutex_.lock();
             sync::lock_guard send_guard(send_mutex_);
 
+            if (pending->is_completed()) {
+                co_return rpc_result<Response>(pending->error);
+            }
+
             bool sent = co_await write_frame(stream_, request_frame.first, request_frame.second);
             if (!sent) {
                 co_return rpc_result<Response>(rpc_error::connection_closed);
             }
+            request_sent = true;
+        }
+
+        if (pending->is_completed()) {
+            if (pending->error == rpc_error::cancelled && request_sent) {
+                if (!start_cancel_frame(request_id)) {
+                    co_await send_cancel_frame(request_id);
+                }
+            }
+            co_return rpc_result<Response>(pending->error);
         }
 
         // Wait for response with timeout
@@ -400,6 +417,12 @@ private:
         // Unregister cancellation callback
         cancel_registration.unregister();
 
+        if (pending->error == rpc_error::cancelled && request_sent) {
+            if (!start_cancel_frame(request_id)) {
+                co_await send_cancel_frame(request_id);
+            }
+        }
+
         // eraser's destructor removes the shard entry below.
 
         // Check result
@@ -422,6 +445,39 @@ private:
             ELIO_LOG_ERROR("Failed to deserialize response: {}", e.what());
             co_return rpc_result<Response>(rpc_error::serialization_error);
         }
+    }
+
+    /// Best-effort wire-level cancellation for a request that has already
+    /// been sent. The caller has already completed locally with cancelled.
+    bool start_cancel_frame(uint32_t request_id) {
+        auto* sched = runtime::scheduler::current();
+        if (!sched) {
+            return false;
+        }
+
+        auto self = this->shared_from_this();
+        sched->go([self, request_id]() -> coro::task<void> {
+            co_await self->send_cancel_frame(request_id);
+        });
+        return true;
+    }
+
+    coro::task<void> send_cancel_frame(uint32_t request_id) {
+        if (!is_connected()) {
+            co_return;
+        }
+
+        auto header = build_cancel(request_id);
+        buffer_writer empty;
+
+        co_await send_mutex_.lock();
+        sync::lock_guard send_guard(send_mutex_);
+
+        if (!is_connected()) {
+            co_return;
+        }
+
+        (void)co_await write_frame(stream_, header, empty);
     }
     
 public:

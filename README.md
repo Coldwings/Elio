@@ -41,10 +41,11 @@
 - **Required for the default top-level build**: OpenSSL development files
   (TLS, HTTP, and HTTP/2 are enabled by default)
 - **Optional**: liburing (for io_uring backend)
-- **Dependencies**: Automatically fetched via CMake FetchContent
+- **Dependencies**: Automatically fetched via CMake FetchContent for source builds
   - fmtlib 10.2.1
   - Catch2 3.5.0 (for tests)
   - nghttp2 1.64.0 (for HTTP/2)
+  - standalone Asio 1.30.2 (only when `ELIO_BUILD_TCP_BENCHMARKS=ON`)
 
 The FetchContent dependencies above apply when building Elio from source. If
 you consume an installed Elio package, the downstream project must also make

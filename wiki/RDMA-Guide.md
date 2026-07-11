@@ -402,12 +402,20 @@ other).
 
 ## Integration testing on Soft-RoCE (rxe)
 
-The default test binary (`elio_tests`) runs every `[rdma]` test
-purely against mock backends and needs no hardware. End-to-end
-validation against a real verbs stack lives in a separate binary
-gated behind `ELIO_ENABLE_RDMA_IBVERBS_TESTS=ON`. The test binary links the
-ibverbs target, so configure both `ELIO_ENABLE_RDMA_IBVERBS=ON` and
-`ELIO_ENABLE_RDMA_IBVERBS_TESTS=ON`. Build it like:
+RDMA mock tests are included in the default test binary (`elio_tests`)
+only when RDMA support is configured with `ELIO_ENABLE_RDMA=ON`. These
+`[rdma]` tests run purely against mock backends and need no hardware:
+
+```bash
+cmake -B build -DELIO_ENABLE_RDMA=ON
+cmake --build build --target elio_tests
+./build/tests/elio_tests "[rdma]"
+```
+
+End-to-end validation against a real verbs stack lives in a separate
+binary gated behind `ELIO_ENABLE_RDMA_IBVERBS_TESTS=ON`. The test binary
+links the ibverbs target, so configure both `ELIO_ENABLE_RDMA_IBVERBS=ON`
+and `ELIO_ENABLE_RDMA_IBVERBS_TESTS=ON`. Build it like:
 
 ```bash
 cmake -B build \

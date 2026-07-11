@@ -675,8 +675,11 @@ inline bool is_valid_close_code(uint16_t code) {
 /// Validates the close code per RFC 6455 §7.4.1 and the reason per §7.1.6.
 /// Returns protocol_error for invalid codes or non-UTF-8 reasons.
 inline std::pair<close_code, std::string> parse_close_payload(std::string_view payload) {
-    if (payload.size() < 2) {
+    if (payload.empty()) {
         return {close_code::no_status, ""};
+    }
+    if (payload.size() == 1) {
+        return {close_code::protocol_error, ""};
     }
 
     uint16_t code = (static_cast<uint8_t>(payload[0]) << 8) |

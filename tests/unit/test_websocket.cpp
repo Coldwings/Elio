@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <new>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -679,6 +680,13 @@ TEST_CASE("WebSocket close payload parsing", "[websocket][frame]") {
         auto [code, reason] = parse_close_payload("");
         
         REQUIRE(code == close_code::no_status);
+        REQUIRE(reason.empty());
+    }
+
+    SECTION("reject one-byte close payload") {
+        auto [code, reason] = parse_close_payload(std::string_view("\x03", 1));
+
+        REQUIRE(code == close_code::protocol_error);
         REQUIRE(reason.empty());
     }
 }

@@ -243,8 +243,8 @@ endif()
 # backend (for tests), or any other implementation that satisfies the
 # elio::rdma::backend_traits concept.
 #
-# A separate elio_rdma_cm target (Stage 8) will provide an optional
-# librdmacm-backed connection helper; it is not built by this option.
+# The optional librdmacm-backed connection helper is enabled separately with
+# ELIO_ENABLE_RDMA_CM and builds the elio_rdma_cm target below.
 if(ELIO_ENABLE_RDMA)
     add_library(elio_rdma INTERFACE)
     target_include_directories(elio_rdma INTERFACE

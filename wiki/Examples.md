@@ -104,10 +104,6 @@ coro::task<void> handle_client(net::tcp_stream stream, int id) {
 }
 
 coro::task<int> async_main(int argc, char* argv[]) {
-    // Block signals before they can be delivered to worker threads
-    signal_set sigs{SIGINT, SIGTERM};
-    sigs.block_all_threads();
-
     // Spawn signal handler
     elio::go(signal_handler_task);
 
@@ -134,7 +130,13 @@ coro::task<int> async_main(int argc, char* argv[]) {
     co_return 0;
 }
 
-ELIO_ASYNC_MAIN(async_main)
+int main(int argc, char* argv[]) {
+    // Block shutdown signals before scheduler worker threads are created
+    signal_set sigs{SIGINT, SIGTERM};
+    sigs.block_all_threads();
+
+    return elio::run(async_main, argc, argv);
+}
 ```
 
 ## UDS Echo Server
@@ -180,10 +182,6 @@ coro::task<void> handle_client(net::uds_stream stream, int id) {
 }
 
 coro::task<int> async_main(int argc, char* argv[]) {
-    // Block signals before they can be delivered to worker threads
-    signal_set sigs{SIGINT, SIGTERM};
-    sigs.block_all_threads();
-
     // Spawn signal handler
     elio::go(signal_handler_task);
 
@@ -218,7 +216,13 @@ coro::task<int> async_main(int argc, char* argv[]) {
     co_return 0;
 }
 
-ELIO_ASYNC_MAIN(async_main)
+int main(int argc, char* argv[]) {
+    // Block shutdown signals before scheduler worker threads are created
+    signal_set sigs{SIGINT, SIGTERM};
+    sigs.block_all_threads();
+
+    return elio::run(async_main, argc, argv);
+}
 ```
 
 ## UDS Client

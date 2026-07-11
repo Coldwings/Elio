@@ -38,11 +38,13 @@
 - **Compiler**: GCC 12+ or Clang 15+ with C++20 support
 - **OS**: Linux (kernel 5.1+ for io_uring, or any modern Linux for epoll)
 - **CMake**: 3.20 or higher
-- **Optional**: liburing (for io_uring backend), OpenSSL (for TLS/HTTPS)
+- **Required for the default top-level build**: OpenSSL development files
+  (TLS, HTTP, and HTTP/2 are enabled by default)
+- **Optional**: liburing (for io_uring backend)
 - **Dependencies**: Automatically fetched via CMake FetchContent
   - fmtlib 10.2.1
   - Catch2 3.5.0 (for tests)
-  - nghttp2 1.64.0 (for HTTP/2, requires OpenSSL)
+  - nghttp2 1.64.0 (for HTTP/2)
 
 The FetchContent dependencies above apply when building Elio from source. If
 you consume an installed Elio package, the downstream project must also make
@@ -55,6 +57,17 @@ git clone https://github.com/Coldwings/Elio.git
 cd Elio
 cmake -S . -B build
 cmake --build build
+```
+
+The default top-level build enables TLS, HTTP, and HTTP/2. To configure without
+OpenSSL, disable the dependent protocol targets:
+
+```bash
+cmake -S . -B build-no-tls \
+  -DELIO_ENABLE_TLS=OFF \
+  -DELIO_ENABLE_HTTP=OFF \
+  -DELIO_ENABLE_HTTP2=OFF
+cmake --build build-no-tls
 ```
 
 ### CMake Options

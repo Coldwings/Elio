@@ -92,17 +92,23 @@ auto spawn(F&& f, Args&&... args)
 
 } // namespace elio
 
-// Macros — syntactic sugar for inline lambda coroutines
-// These capture by reference and wrap the expression in a lambda returning task
+// Macros — syntactic sugar for inline lambda coroutines.
+// These capture by reference and wrap the expression in a lambda returning task.
+// Use them only when every referenced object outlives the spawned task. Prefer
+// elio::go / elio::spawn with an explicit lambda capture list for detached work
+// that touches local state.
 
 /// Fire-and-forget macro for inline coroutine expressions
+/// WARNING: captures referenced names by reference; ensure they outlive the task.
 /// Usage: ELIO_GO(some_async_operation())
 #define ELIO_GO(...)    elio::go([&]() { return __VA_ARGS__; })
 
 /// Fire-and-forget macro for inline coroutine expressions pinned to a worker
+/// WARNING: captures referenced names by reference; ensure they outlive the task.
 /// Usage: ELIO_GO_TO(0, some_async_operation())
 #define ELIO_GO_TO(worker_id, ...)    elio::go_to(worker_id, [&]() { return __VA_ARGS__; })
 
 /// Spawn macro for inline coroutine expressions, returns join_handle
+/// WARNING: captures referenced names by reference; keep them alive until joined.
 /// Usage: auto h = ELIO_SPAWN(compute_async()); auto result = co_await h;
 #define ELIO_SPAWN(...) elio::spawn([&]() { return __VA_ARGS__; })

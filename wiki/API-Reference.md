@@ -169,6 +169,16 @@ auto h = ELIO_SPAWN(compute_async());
 auto result = co_await h;
 ```
 
+These macros expand to lambdas with `[&]` captures. Use them only when every
+referenced object outlives the spawned task. For detached work that touches local
+state, prefer `elio::go()` / `elio::spawn()` with an explicit capture list:
+
+```cpp
+elio::go([value = std::move(value)]() mutable -> coro::task<void> {
+    co_await use_value(value);
+});
+```
+
 ### `join_handle<T>`
 
 Handle for awaiting spawned tasks. Returned by `elio::spawn(...)`.

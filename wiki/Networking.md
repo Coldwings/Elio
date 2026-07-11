@@ -287,9 +287,11 @@ still use plaintext `http://` traffic at runtime.
 ### HTTP Client
 
 ```cpp
+#include <elio/elio.hpp>
 #include <elio/http/http.hpp>
 #include <elio/tls/tls.hpp>
 
+using namespace elio;
 using namespace elio::http;
 
 coro::task<void> fetch_url() {
@@ -361,8 +363,10 @@ address rotation across resolved endpoints, and response-header limits.
 ### HTTP Server
 
 ```cpp
+#include <elio/elio.hpp>
 #include <elio/http/http.hpp>
 
+using namespace elio;
 using namespace elio::http;
 
 coro::task<response> handle_request(context& ctx) {
@@ -410,8 +414,10 @@ HTTP/2 support requires linking with `elio_http2`, OpenSSL, and nghttp2 (fetched
 ### HTTP/2 Client
 
 ```cpp
+#include <elio/elio.hpp>
 #include <elio/http/http2.hpp>
 
+using namespace elio;
 using namespace elio::http;
 
 coro::task<void> fetch_url_h2() {

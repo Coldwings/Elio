@@ -271,37 +271,35 @@ The scheduler manages a pool of worker threads, each with a local task queue. Ke
 
 ## Examples
 
-Explore the `examples/` directory for detailed examples:
+Explore the `examples/` directory for detailed examples. Core examples are
+available when `ELIO_BUILD_EXAMPLES=ON`; protocol and RDMA examples also require
+their corresponding feature targets.
 
-- **hello_world.cpp** - Basic coroutine usage
-- **chained_coroutines.cpp** - Virtual stack demonstration
-- **exception_handling.cpp** - Exception propagation
-- **parallel_tasks.cpp** - Work stealing in action
-- **dynamic_threads.cpp** - Dynamic thread pool
-- **thread_affinity.cpp** - Thread affinity for vthreads
-- **tcp_echo_server.cpp** - TCP server example
-- **tcp_echo_client.cpp** - TCP client example
-- **http_server.cpp** - HTTP server example
-- **http_client.cpp** - HTTP/HTTPS client example
-- **http2_client.cpp** - HTTP/2 client example
-- **websocket_server.cpp** - WebSocket server with echo and chat
-- **websocket_client.cpp** - WebSocket client example
-- **sse_server.cpp** - Server-Sent Events server
-- **sse_client.cpp** - SSE client example
-- **async_file_io.cpp** - Async file operations
-- **debug_test.cpp** - Debugging tools demonstration
-- **benchmark.cpp** - Full performance measurements
-- **quick_benchmark.cpp** - Fast spawn/switch/yield benchmarks
-- **microbench.cpp** - Individual operation microbenchmarks
-- **io_benchmark.cpp** - I/O throughput benchmarks
+- **Coroutine/runtime**: `hello_world.cpp`, `chained_coroutines.cpp`,
+  `exception_handling.cpp`, `parallel_tasks.cpp`, `dynamic_threads.cpp`,
+  `autoscaler_example.cpp`, `thread_affinity.cpp`, `signal_handling.cpp`,
+  `debug_test.cpp`
+- **Benchmarks**: `benchmark.cpp`, `quick_benchmark.cpp`, `microbench.cpp`,
+  `io_benchmark.cpp`, `scalability_test.cpp`, `bench_channel.cpp`
+- **TCP/UDS/RPC/file I/O**: `tcp_echo_server.cpp`, `tcp_echo_client.cpp`,
+  `uds_echo_server.cpp`, `uds_echo_client.cpp`, `rpc_server_example.cpp`,
+  `rpc_client_example.cpp`, `async_file_io.cpp`
+- **HTTP/TLS protocols** (`elio_http` / `elio_http2`): `http_server.cpp`,
+  `http_client.cpp`, `http2_client.cpp`, `websocket_server.cpp`,
+  `websocket_client.cpp`, `sse_server.cpp`, `sse_client.cpp`
+- **RDMA** (`elio_rdma`, `elio_rdma_ibverbs`, `elio_rdma_cm`,
+  `elio_rdma_cuda`): `rdma_pingpong_mock.cpp`, `rdma_req_resp_ibverbs.cpp`,
+  `rdma_perf.cpp`, `rdma_gpu_bw.cpp`
+- **TCP benchmark comparison** (`ELIO_BUILD_TCP_BENCHMARKS=ON`):
+  `bench_tcp_elio.cpp`, `bench_tcp_libuv.cpp`, `bench_tcp_asio.cpp`
 
 Build and run examples:
 ```bash
-cd build
-cmake --build . --target hello_world parallel_tasks benchmark
-./examples/hello_world
-./examples/parallel_tasks
-./examples/benchmark
+cmake -S . -B build -DELIO_BUILD_EXAMPLES=ON
+cmake --build build --target hello_world parallel_tasks benchmark
+./build/examples/hello_world
+./build/examples/parallel_tasks
+./build/examples/benchmark
 ```
 
 ## Debugging

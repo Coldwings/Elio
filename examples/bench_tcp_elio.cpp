@@ -10,6 +10,7 @@
 #include <elio/elio.hpp>
 #include "bench_tcp_common.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -178,8 +179,14 @@ static task<void> client_pingpong(const bench::config& cfg,
 
     std::thread timer_thread([&]() {
         std::unique_lock<std::mutex> lock(timer_mutex);
-        const auto budget =
+        // This is a stall watchdog, not the normal phase boundary. Warmup and
+        // measurement end through the loop deadlines below; allow one extra
+        // measurement window (at least 5s) before declaring a real timeout.
+        const auto phase_budget =
             std::chrono::seconds(cfg.warmup_s + cfg.duration_s);
+        const auto watchdog_grace =
+            std::chrono::seconds(std::max(5, cfg.duration_s));
+        const auto budget = phase_budget + watchdog_grace;
         if (timer_cv.wait_for(lock, budget, [&]() {
                 return timer_cancelled;
             })) {

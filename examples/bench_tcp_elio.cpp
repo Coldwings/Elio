@@ -431,7 +431,8 @@ static task<void> client_streaming(const bench::config& cfg,
 // Client: drive all message sizes
 // ---------------------------------------------------------------------------
 
-static task<void> client_main(const bench::config& cfg) {
+static task<void> client_main(const bench::config& cfg,
+                              std::atomic<bool>& ok) {
     bench::print_header("Elio", cfg);
 
     bool do_pingpong  = (cfg.type == bench::config::test_type::pingpong ||
@@ -446,6 +447,10 @@ static task<void> client_main(const bench::config& cfg) {
             bench::pingpong_stats stats;
             co_await client_pingpong(cfg, sz, stats);
             stats.print_row(sz);
+            if (const char* reason = bench::pingpong_failure_reason(stats)) {
+                bench::print_failure("Elio", "ping-pong", sz, reason);
+                ok.store(false, std::memory_order_release);
+            }
             std::fflush(stdout);
         }
         std::printf("\n");
@@ -458,6 +463,10 @@ static task<void> client_main(const bench::config& cfg) {
             bench::streaming_stats stats;
             co_await client_streaming(cfg, sz, stats);
             stats.print_row(sz);
+            if (const char* reason = bench::streaming_failure_reason(stats)) {
+                bench::print_failure("Elio", "streaming", sz, reason);
+                ok.store(false, std::memory_order_release);
+            }
             std::fflush(stdout);
         }
         std::printf("\n");
@@ -479,6 +488,7 @@ int main(int argc, char* argv[]) {
     sched.start();
 
     std::atomic<bool> done{false};
+    std::atomic<bool> client_ok{true};
 
     if (cfg.run_mode == bench::config::mode::server) {
         sched.go([&]() -> task<void> {
@@ -490,7 +500,7 @@ int main(int argc, char* argv[]) {
         }
     } else {
         sched.go([&]() -> task<void> {
-            co_await client_main(cfg);
+            co_await client_main(cfg, client_ok);
             done.store(true, std::memory_order_release);
         });
         while (!done.load(std::memory_order_acquire)) {
@@ -500,5 +510,5 @@ int main(int argc, char* argv[]) {
 
     g_running.store(false, std::memory_order_release);
     sched.shutdown();
-    return 0;
+    return client_ok.load(std::memory_order_acquire) ? 0 : 1;
 }

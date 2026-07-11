@@ -394,13 +394,14 @@ static void run_client_streaming(const bench::config& cfg, size_t msg_size,
 // Client: drive all message sizes
 // ---------------------------------------------------------------------------
 
-static void run_client(const bench::config& cfg) {
+static bool run_client(const bench::config& cfg) {
     bench::print_header("Asio", cfg);
 
     bool do_pingpong  = (cfg.type == bench::config::test_type::pingpong ||
                          cfg.type == bench::config::test_type::both);
     bool do_streaming = (cfg.type == bench::config::test_type::streaming ||
                          cfg.type == bench::config::test_type::both);
+    bool ok = true;
 
     if (do_pingpong) {
         bench::print_pingpong_table_header();
@@ -409,6 +410,10 @@ static void run_client(const bench::config& cfg) {
             bench::pingpong_stats stats;
             run_client_pingpong(cfg, sz, stats);
             stats.print_row(sz);
+            if (const char* reason = bench::pingpong_failure_reason(stats)) {
+                bench::print_failure("Asio", "ping-pong", sz, reason);
+                ok = false;
+            }
             std::fflush(stdout);
         }
         std::printf("\n");
@@ -421,10 +426,16 @@ static void run_client(const bench::config& cfg) {
             bench::streaming_stats stats;
             run_client_streaming(cfg, sz, stats);
             stats.print_row(sz);
+            if (const char* reason = bench::streaming_failure_reason(stats)) {
+                bench::print_failure("Asio", "streaming", sz, reason);
+                ok = false;
+            }
             std::fflush(stdout);
         }
         std::printf("\n");
     }
+
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +449,7 @@ int main(int argc, char* argv[]) {
     if (cfg.run_mode == bench::config::mode::server) {
         run_server(cfg);
     } else {
-        run_client(cfg);
+        return run_client(cfg) ? 0 : 1;
     }
     return 0;
 }

@@ -457,6 +457,70 @@ TEST_CASE("object_cache release handoff resumes once when final borrow drops aft
     sched.shutdown();
 }
 
+TEST_CASE("object_cache release unregisters waiter when suspended release is destroyed",
+          "[object_cache][release][cancellation]") {
+    using cache_type = object_cache<std::string, int>;
+
+    cache_type cache({.num_shards = 4});
+    std::optional<cache_type::borrow> other;
+    std::atomic<int> hook_calls{0};
+    std::atomic<int> release_continuations{0};
+
+    struct hook_context {
+        std::atomic<int>* hook_calls;
+    } ctx{&hook_calls};
+
+    struct hook_guard {
+        hook_guard(void (*cb)(void*), void* ctx) {
+            detail_oc::release_waiter_published_hook.context.store(
+                ctx, std::memory_order_release);
+            detail_oc::release_waiter_published_hook.callback.store(
+                cb, std::memory_order_release);
+        }
+
+        ~hook_guard() {
+            detail_oc::release_waiter_published_hook.callback.store(
+                nullptr, std::memory_order_release);
+            detail_oc::release_waiter_published_hook.context.store(
+                nullptr, std::memory_order_release);
+        }
+    } guard{
+        [](void* raw) noexcept {
+            auto* c = static_cast<hook_context*>(raw);
+            c->hook_calls->fetch_add(1, std::memory_order_acq_rel);
+        },
+        &ctx};
+
+    auto waiter_task = [&]() -> task<void> {
+        auto releaser = co_await cache.get("cancel_key", []() -> task<int> {
+            co_return 7;
+        });
+        other.emplace(co_await cache.get("cancel_key", []() -> task<int> {
+            co_return 9;
+        }));
+
+        auto owned = co_await releaser.release();
+        release_continuations.fetch_add(1, std::memory_order_relaxed);
+
+        REQUIRE(owned != nullptr);
+        REQUIRE(*owned == 7);
+        co_return;
+    };
+
+    auto t = waiter_task();
+    auto h = elio::coro::detail::task_access::release(t);
+    h.resume();
+
+    REQUIRE(hook_calls.load(std::memory_order_acquire) == 1);
+    REQUIRE(other.has_value());
+    REQUIRE(release_continuations.load(std::memory_order_acquire) == 0);
+
+    h.destroy();
+    other.reset();
+
+    REQUIRE(release_continuations.load(std::memory_order_acquire) == 0);
+}
+
 TEST_CASE("object_cache TTL expiry", "[object_cache]") {
     scheduler sched(1);
     sched.start();

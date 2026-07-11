@@ -15,7 +15,9 @@ public:
     
     /// Create a request with method and path
     request(method m, std::string_view path)
-        : method_(m), path_(path) {}
+        : method_(m) {
+        set_path(path);
+    }
     
     /// Get/set method
     method get_method() const noexcept { return method_; }
@@ -23,11 +25,21 @@ public:
     
     /// Get/set path
     std::string_view path() const noexcept { return path_; }
-    void set_path(std::string_view p) { path_ = p; }
+    void set_path(std::string_view p) {
+        if (!detail::is_valid_request_target_component(p)) {
+            throw std::invalid_argument("elio::http::request: invalid path");
+        }
+        path_ = p;
+    }
     
     /// Get/set query string
     std::string_view query() const noexcept { return query_; }
-    void set_query(std::string_view q) { query_ = q; }
+    void set_query(std::string_view q) {
+        if (!detail::is_valid_request_target_component(q)) {
+            throw std::invalid_argument("elio::http::request: invalid query");
+        }
+        query_ = q;
+    }
     
     /// Get/set HTTP version
     std::string_view version() const noexcept { return version_; }
@@ -82,7 +94,9 @@ public:
         // Request line
         result += method_to_string(method_);
         result += ' ';
-        result += path_with_query();
+        auto target = path_with_query();
+        detail::validate_request_target(target);
+        result += target;
         result += ' ';
         result += version_.empty() ? "HTTP/1.1" : version_;
         result += "\r\n";

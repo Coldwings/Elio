@@ -501,6 +501,21 @@ private:
         ELIO_LOG_DEBUG("Connecting to SSE endpoint {}:{}{}",
                       url_.host, url_.effective_port(), url_.path);
 
+        if (!config_.user_agent.empty() &&
+            !http::detail::is_valid_header_value(config_.user_agent)) {
+            ELIO_LOG_ERROR("Invalid SSE User-Agent header value");
+            errno = EINVAL;
+            state_ = client_state::disconnected;
+            co_return false;
+        }
+        if (!last_event_id_.empty() &&
+            !http::detail::is_valid_header_value(last_event_id_)) {
+            ELIO_LOG_ERROR("Invalid SSE Last-Event-ID header value");
+            errno = EINVAL;
+            state_ = client_state::disconnected;
+            co_return false;
+        }
+
         // Establish connection using shared utility
         auto conn_result = co_await http::client_connect(
             url_.host,

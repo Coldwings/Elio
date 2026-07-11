@@ -934,6 +934,25 @@ TEST_CASE("WebSocket handshake building", "[websocket][handshake]") {
         REQUIRE(request.find("Sec-WebSocket-Version: 13\r\n") != std::string::npos);
         REQUIRE(request.find("Sec-WebSocket-Protocol: chat\r\n") != std::string::npos);
     }
+
+    SECTION("reject client handshake injection inputs") {
+        const auto key = "dGhlIHNhbXBsZSBub25jZQ==";
+
+        REQUIRE_THROWS_AS(build_client_handshake(
+                              "example.com\r\nInjected: yes", "/ws", key),
+                          std::invalid_argument);
+        REQUIRE_THROWS_AS(build_client_handshake(
+                              "example.com", "/ws\r\nInjected: yes", key),
+                          std::invalid_argument);
+        REQUIRE_THROWS_AS(build_client_handshake(
+                              "example.com", "/ws", key,
+                              {"chat\r\nInjected: yes"}),
+                          std::invalid_argument);
+        REQUIRE_THROWS_AS(build_client_handshake(
+                              "example.com", "/ws", key, {},
+                              "https://example.com\r\nInjected: yes"),
+                          std::invalid_argument);
+    }
     
     SECTION("build server handshake") {
         auto response = build_server_handshake("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "chat");

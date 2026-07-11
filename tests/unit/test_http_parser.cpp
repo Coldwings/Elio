@@ -781,15 +781,39 @@ TEST_CASE("HTTP chunked detection requires final coding to be chunked",
     REQUIRE(h4.is_chunked());
 }
 
-TEST_CASE("HTTP headers reject CR/LF/NUL in values (CRLF injection)",
+TEST_CASE("HTTP headers reject control characters in values",
           "[http][headers][security]") {
     headers h;
     REQUIRE_THROWS_AS(h.set("Location", "/next\r\nX-Evil: yes"),
                       std::invalid_argument);
     REQUIRE_THROWS_AS(h.set("Location", "/next\nfoo"), std::invalid_argument);
     REQUIRE_THROWS_AS(h.set("X", std::string("\0", 1)), std::invalid_argument);
+    REQUIRE_THROWS_AS(h.set("X", std::string("\x01", 1)), std::invalid_argument);
     // OK to set a clean value
     REQUIRE_NOTHROW(h.set("Location", "/next"));
+}
+
+TEST_CASE("HTTP URL parser rejects raw request-splitting bytes",
+          "[http][url][security]") {
+    REQUIRE_FALSE(url::parse("http://example.com/path\r\nInjected: yes"));
+    REQUIRE_FALSE(url::parse("http://example.com/path?x=1\nInjected: yes"));
+    REQUIRE_FALSE(url::parse("http://exa\r\nmple.com/"));
+    REQUIRE_FALSE(url::parse("http://example.com/raw space"));
+    REQUIRE(url::parse("http://example.com/%0d%0a"));
+}
+
+TEST_CASE("HTTP request serialization rejects invalid request targets",
+          "[http][message][security]") {
+    REQUIRE_THROWS_AS(request(method::GET, "/ok\r\nInjected: yes"),
+                      std::invalid_argument);
+
+    request req(method::GET, "/ok");
+    REQUIRE_THROWS_AS(req.set_query("x=1\nInjected: yes"),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(req.set_path("/raw space"), std::invalid_argument);
+
+    REQUIRE_NOTHROW(req.set_query("x=%0d%0a"));
+    REQUIRE_NOTHROW(req.serialize());
 }
 
 TEST_CASE("HTTP headers reject malformed names", "[http][headers][security]") {

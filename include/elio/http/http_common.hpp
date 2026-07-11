@@ -23,23 +23,58 @@ inline constexpr bool is_tchar(unsigned char c) noexcept {
            c == '`' || c == '|' || c == '~';
 }
 
-/// Validate an HTTP header field-name: must be a non-empty token (1*tchar)
-/// per RFC 7230 §3.2. Whitespace, CR, LF, NUL and any non-tchar byte are rejected.
-inline bool is_valid_header_name(std::string_view name) noexcept {
-    if (name.empty()) return false;
-    for (unsigned char c : name) {
+/// Validate an HTTP token: must be a non-empty 1*tchar sequence.
+inline bool is_valid_token(std::string_view value) noexcept {
+    if (value.empty()) return false;
+    for (unsigned char c : value) {
         if (!is_tchar(c)) return false;
     }
     return true;
 }
 
-/// Validate an HTTP header field-value: rejects CR, LF and NUL which are the
-/// bytes responsible for header/body smuggling and request-splitting attacks.
+/// Validate an HTTP header field-name: must be a non-empty token (1*tchar)
+/// per RFC 7230 §3.2. Whitespace, CR, LF, NUL and any non-tchar byte are rejected.
+inline bool is_valid_header_name(std::string_view name) noexcept {
+    return is_valid_token(name);
+}
+
+/// Validate an HTTP header field-value: rejects invalid control characters.
+/// CR, LF and NUL are the bytes responsible for header/body smuggling and
+/// request-splitting attacks. Other C0 controls and DEL are invalid field
+/// content as well; horizontal tab remains allowed for OWS compatibility.
 inline bool is_valid_header_value(std::string_view value) noexcept {
-    for (char c : value) {
-        if (c == '\r' || c == '\n' || c == '\0') return false;
+    for (unsigned char c : value) {
+        if ((c < 0x20 && c != '\t') || c == 0x7F) return false;
     }
     return true;
+}
+
+/// Raw request targets and URLs must not contain spaces or control bytes.
+/// Percent-encoded octets remain valid because they are serialized as visible
+/// ASCII characters, not decoded into the request line.
+inline bool has_request_target_forbidden_char(std::string_view value) noexcept {
+    for (unsigned char c : value) {
+        if (c <= 0x20 || c == 0x7F) return true;
+    }
+    return false;
+}
+
+inline bool is_valid_request_target(std::string_view target) noexcept {
+    return !target.empty() && !has_request_target_forbidden_char(target);
+}
+
+inline bool is_valid_request_target_component(std::string_view component) noexcept {
+    return !has_request_target_forbidden_char(component);
+}
+
+inline void validate_request_target(std::string_view target) {
+    if (!is_valid_request_target(target)) {
+        throw std::invalid_argument("elio::http: invalid request target");
+    }
+}
+
+inline bool is_valid_url_input(std::string_view value) noexcept {
+    return !value.empty() && !has_request_target_forbidden_char(value);
 }
 
 /// Trim leading and trailing OWS (space / horizontal-tab) per RFC 7230.
@@ -564,6 +599,10 @@ struct url {
     
     /// Parse URL from string
     static std::optional<url> parse(std::string_view str) {
+        if (!detail::is_valid_url_input(str)) {
+            return std::nullopt;
+        }
+
         url result;
         
         // Find scheme

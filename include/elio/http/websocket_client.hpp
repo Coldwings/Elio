@@ -27,6 +27,7 @@
 #include <cerrno>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace elio::http::websocket {
@@ -250,6 +251,29 @@ private:
             state_ = connection_state::closed;
             co_return false;
         }
+
+        if (!config_.user_agent.empty() &&
+            !http::detail::is_valid_header_value(config_.user_agent)) {
+            ELIO_LOG_ERROR("Invalid WebSocket User-Agent header value");
+            errno = EINVAL;
+            state_ = connection_state::closed;
+            co_return false;
+        }
+        if (!config_.origin.empty() &&
+            !http::detail::is_valid_header_value(config_.origin)) {
+            ELIO_LOG_ERROR("Invalid WebSocket Origin header value");
+            errno = EINVAL;
+            state_ = connection_state::closed;
+            co_return false;
+        }
+        for (const auto& protocol : config_.subprotocols) {
+            if (!http::detail::is_valid_token(protocol)) {
+                ELIO_LOG_ERROR("Invalid WebSocket subprotocol value");
+                errno = EINVAL;
+                state_ = connection_state::closed;
+                co_return false;
+            }
+        }
         
         host_ = parsed->host;
         path_ = parsed->path.empty() ? "/" : parsed->path;
@@ -373,17 +397,31 @@ private:
         // Generate key
         ws_key_ = generate_websocket_key();
         
-        // Build handshake request
-        auto request = build_client_handshake(host_authority_, path_, ws_key_,
-                                               config_.subprotocols, config_.origin);
-        
-        // Add User-Agent if configured
-        if (!config_.user_agent.empty()) {
-            // Insert before final \r\n
-            size_t pos = request.rfind("\r\n\r\n");
-            if (pos != std::string::npos) {
-                request.insert(pos, "\r\nUser-Agent: " + config_.user_agent);
+        std::string request;
+        try {
+            // Build handshake request
+            request = build_client_handshake(host_authority_, path_, ws_key_,
+                                             config_.subprotocols,
+                                             config_.origin);
+
+            // Add User-Agent if configured
+            if (!config_.user_agent.empty()) {
+                if (!http::detail::is_valid_header_value(config_.user_agent)) {
+                    throw std::invalid_argument(
+                        "elio::http::websocket: invalid User-Agent header value");
+                }
+
+                // Insert before final \r\n
+                size_t pos = request.rfind("\r\n\r\n");
+                if (pos != std::string::npos) {
+                    request.insert(pos, "\r\nUser-Agent: " + config_.user_agent);
+                }
             }
+        } catch (const std::invalid_argument& ex) {
+            ELIO_LOG_ERROR("Invalid WebSocket handshake request: {}",
+                           ex.what());
+            errno = EINVAL;
+            co_return false;
         }
         
         ELIO_LOG_DEBUG("Sending WebSocket handshake");

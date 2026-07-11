@@ -290,6 +290,15 @@ inline bool header_has_token(std::string_view value, std::string_view token) {
     return false;
 }
 
+inline void validate_client_handshake_value(bool valid,
+                                            std::string_view field) {
+    if (!valid) {
+        throw std::invalid_argument(
+            "elio::http::websocket: invalid client handshake " +
+            std::string(field));
+    }
+}
+
 } // namespace detail
 
 /// WebSocket handshake request info
@@ -340,6 +349,22 @@ inline std::string build_client_handshake(std::string_view host,
                                           std::string_view key,
                                           const std::vector<std::string>& protocols = {},
                                           std::string_view origin = "") {
+    detail::validate_client_handshake_value(
+        ::elio::http::detail::is_valid_url_input(host), "host");
+    detail::validate_client_handshake_value(
+        path.empty() || ::elio::http::detail::is_valid_request_target(path),
+        "path");
+    detail::validate_client_handshake_value(
+        ::elio::http::detail::is_valid_header_value(key), "key");
+    detail::validate_client_handshake_value(
+        origin.empty() || ::elio::http::detail::is_valid_header_value(origin),
+        "origin");
+    for (const auto& protocol : protocols) {
+        detail::validate_client_handshake_value(
+            ::elio::http::detail::is_valid_token(protocol),
+            "subprotocol");
+    }
+
     std::string request;
     request.reserve(512);
     

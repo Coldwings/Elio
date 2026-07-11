@@ -30,7 +30,10 @@ guidelines and instructions for contributing to the project.
 - **Compiler**: GCC 12+ or Clang 15+ with C++20 support
 - **OS**: Linux (kernel 5.1+ for io_uring, or any modern Linux for epoll)
 - **CMake**: 3.20 or higher
-- **Optional**: liburing-dev, libssl-dev (for TLS/HTTPS)
+- **Required for the default top-level build**: OpenSSL development files
+  (`libssl-dev`/`openssl-devel`) because TLS, HTTP, and HTTP/2 are enabled by
+  default.
+- **Optional**: liburing-dev (for the io_uring backend)
 
 ### Building
 
@@ -43,6 +46,15 @@ cmake --build build -j$(nproc)
 
 Dependencies (fmtlib, Catch2, nghttp2) are fetched automatically via CMake
 FetchContent.
+
+To build without OpenSSL, disable the dependent protocol targets:
+
+```bash
+cmake -B build-no-tls \
+  -DELIO_ENABLE_TLS=OFF \
+  -DELIO_ENABLE_HTTP=OFF \
+  -DELIO_ENABLE_HTTP2=OFF
+```
 
 ### CMake Options
 

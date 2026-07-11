@@ -79,12 +79,16 @@ router:
 | Pattern form | Meaning |
 |--------------|---------|
 | `/ws` | Matches the literal path `/ws` |
-| `/chat/:room` | Captures one path component as `room` |
+| `/chat/:room` | Captures one path component as `room`; read it with `conn.param("room")` |
 | `/assets/*` | Matches `/assets/` and any remaining path tail |
 
 The `*` wildcard is only valid as the final path segment. Patterns such as
 `/chat/*/admin` are rejected during route registration because a non-terminal
 wildcard would make the remaining literal segments unreachable.
+
+Named `:param` captures are stored on the `ws_connection` passed to the
+handler. Use `conn.param("name")` for one value or `conn.params()` to inspect
+all captured path parameters.
 
 ### WebSocket Client
 

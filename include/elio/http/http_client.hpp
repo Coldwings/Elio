@@ -24,6 +24,7 @@
 #include <unordered_map>
 #include <chrono>
 #include <optional>
+#include <stdexcept>
 
 namespace elio::http {
 
@@ -284,6 +285,19 @@ private:
             errno = EINVAL;
             co_return std::nullopt;
         }
+
+        if (!config_.user_agent.empty() &&
+            !detail::is_valid_header_value(config_.user_agent)) {
+            ELIO_LOG_ERROR("Invalid User-Agent header value");
+            errno = EINVAL;
+            co_return std::nullopt;
+        }
+        if (!content_type.empty() &&
+            !detail::is_valid_header_value(content_type)) {
+            ELIO_LOG_ERROR("Invalid Content-Type header value");
+            errno = EINVAL;
+            co_return std::nullopt;
+        }
         
         request req(m, parsed->path_with_query());
         req.set_host(parsed->host_authority());
@@ -342,6 +356,13 @@ private:
             co_return std::nullopt;
         }
 
+        if (!detail::is_valid_url_input(target.host_authority()) ||
+            !detail::is_valid_request_target(req.path_with_query())) {
+            ELIO_LOG_ERROR("Invalid outbound HTTP request target");
+            errno = EINVAL;
+            co_return std::nullopt;
+        }
+
         // Get connection from pool. connect_timeout is enforced inside the
         // shared client_connect path for TCP connect and TLS handshake.
         errno = 0;
@@ -368,7 +389,14 @@ private:
         }
 
         // Serialize and send request
-        auto request_data = req.serialize();
+        std::string request_data;
+        try {
+            request_data = req.serialize();
+        } catch (const std::invalid_argument& ex) {
+            ELIO_LOG_ERROR("Invalid outbound HTTP request: {}", ex.what());
+            errno = EINVAL;
+            co_return std::nullopt;
+        }
 
         ELIO_LOG_DEBUG("Sending request to {}:{}\n{}", target.host, target.effective_port(), request_data);
 
@@ -598,6 +626,12 @@ private:
             auto location = resp.header("Location");
             if (!location.empty()) {
                 ELIO_LOG_DEBUG("Following redirect to: {}", location);
+
+                if (!detail::is_valid_url_input(location)) {
+                    ELIO_LOG_WARNING("Rejecting invalid redirect Location: {}",
+                                     location);
+                    co_return resp;
+                }
                 
                 // Parse redirect URL
                 std::optional<url> redirect_url;

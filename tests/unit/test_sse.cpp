@@ -680,6 +680,37 @@ elio::coro::task<std::string> read_request_headers(elio::net::tcp_stream& s) {
 
 }  // namespace
 
+TEST_CASE("sse_client rejects invalid outbound header config",
+          "[sse][client][security]") {
+    using namespace elio::runtime;
+
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    bool connected = true;
+    int connect_errno = 0;
+
+    sched.go([&]() -> elio::coro::task<void> {
+        client_config cfg;
+        cfg.auto_reconnect = false;
+        cfg.last_event_id = "last\r\nInjected: yes";
+        sse_client client(cfg);
+
+        errno = 0;
+        connected = co_await client.connect("http://127.0.0.1:1/events");
+        connect_errno = errno;
+        client_done = true;
+        co_await client.close();
+    });
+
+    REQUIRE(wait_for([&] { return client_done.load(); }));
+    sched.shutdown();
+
+    REQUIRE_FALSE(connected);
+    REQUIRE(connect_errno == EINVAL);
+}
+
 TEST_CASE("sse_connection serializes concurrent send_event calls",
           "[sse][concurrent][regression]") {
     using namespace elio;

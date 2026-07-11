@@ -291,7 +291,7 @@ All messages use a binary wire format with little-endian byte order:
 - **payload_length** (4 bytes): Length of payload in bytes
 - **checksum** (4 bytes, optional): CRC32 checksum of header + payload
 
-Total header size: 18 bytes
+Total header size: 19 bytes
 Checksum trailer: 4 bytes (optional)
 
 ### Message Types

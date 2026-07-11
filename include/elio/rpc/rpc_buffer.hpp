@@ -56,12 +56,13 @@ public:
 };
 
 // ============================================================================
-// Buffer reference (zero-copy external data reference)
+// Buffer reference (external data reference)
 // ============================================================================
 
-/// A reference to external buffer data for zero-copy serialization
-/// This type allows including external memory regions (like mmap'd files or 
-/// pre-allocated buffers) in RPC messages without copying.
+/// A reference to external buffer data.
+/// This type can view received payload bytes without copying. When serializing
+/// a request or response, the current writer copies referenced bytes into the
+/// outgoing wire buffer.
 /// 
 /// IMPORTANT: The referenced data must remain valid until:
 /// - For client: the RPC call completes

@@ -69,6 +69,13 @@ find_package(Elio REQUIRED CONFIG)
 target_link_libraries(your_target PRIVATE Elio::elio)
 ```
 
+Installed-package consumers must make Elio's exported dependencies
+discoverable to CMake as well. `fmt` is always required by the installed
+package config; install a system fmt CMake package or pass its location with
+`CMAKE_PREFIX_PATH`/`fmt_DIR`. Feature targets add their own dependencies,
+such as liburing for io_uring-enabled builds, OpenSSL for TLS/HTTP targets,
+nghttp2 for HTTP/2, and the RDMA/CUDA libraries listed below.
+
 #### Optional Features
 
 Elio has several optional feature flags, each controlled by a CMake option. The primary feature flags are:

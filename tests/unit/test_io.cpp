@@ -24,6 +24,7 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstdint>
@@ -1452,6 +1453,66 @@ static task<void> accept_n_connections(
     co_return;
 }
 
+struct tcp_connect_option_observations {
+    std::atomic<bool> done{false};
+    std::atomic<int> first_error{0};
+    std::atomic<int> no_delay{-1};
+    std::atomic<int> keep_alive{-1};
+    std::atomic<int> reuse_addr{-1};
+    std::atomic<int> reuse_port{-1};
+    std::atomic<int> recv_buffer{-1};
+    std::atomic<int> send_buffer{-1};
+};
+
+static int read_socket_option_int(int fd, int level, int optname) {
+    int value = 0;
+    socklen_t len = sizeof(value);
+    if (::getsockopt(fd, level, optname, &value, &len) != 0) {
+        return -errno;
+    }
+    return value;
+}
+
+static task<void> tcp_connect_with_options_attempt(
+    uint16_t port,
+    tcp_connect_option_observations& observed) {
+    tcp_options opts;
+    opts.reuse_addr = true;
+    opts.reuse_port = true;
+    opts.no_delay = true;
+    opts.keep_alive = true;
+    opts.recv_buffer = 4096;
+    opts.send_buffer = 8192;
+
+    auto stream = co_await tcp_connect(ipv6_address("::1", port), opts);
+    if (!stream) {
+        observed.first_error.store(errno, std::memory_order_relaxed);
+        observed.done.store(true, std::memory_order_release);
+        co_return;
+    }
+
+    observed.no_delay.store(
+        read_socket_option_int(stream->fd(), IPPROTO_TCP, TCP_NODELAY),
+        std::memory_order_relaxed);
+    observed.keep_alive.store(
+        read_socket_option_int(stream->fd(), SOL_SOCKET, SO_KEEPALIVE),
+        std::memory_order_relaxed);
+    observed.reuse_addr.store(
+        read_socket_option_int(stream->fd(), SOL_SOCKET, SO_REUSEADDR),
+        std::memory_order_relaxed);
+    observed.reuse_port.store(
+        read_socket_option_int(stream->fd(), SOL_SOCKET, SO_REUSEPORT),
+        std::memory_order_relaxed);
+    observed.recv_buffer.store(
+        read_socket_option_int(stream->fd(), SOL_SOCKET, SO_RCVBUF),
+        std::memory_order_relaxed);
+    observed.send_buffer.store(
+        read_socket_option_int(stream->fd(), SOL_SOCKET, SO_SNDBUF),
+        std::memory_order_relaxed);
+    observed.done.store(true, std::memory_order_release);
+    co_return;
+}
+
 static task<void> tcp_connect_hostname_attempt(
     std::string host,
     uint16_t port,
@@ -2133,6 +2194,43 @@ TEST_CASE("tcp_connect braced options remain source-compatible",
     [[maybe_unused]] auto generic =
         tcp_connect(socket_address(ipv4_address("127.0.0.1", 9)), {});
     SUCCEED("braced tcp_options overloads remain unambiguous");
+}
+
+TEST_CASE("tcp_connect applies client socket options",
+          "[tcp][connect][options]") {
+    auto listener = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener.has_value());
+
+    const uint16_t port = listener->local_address().port();
+    REQUIRE(port > 0);
+
+    std::atomic<int> accepted{0};
+    tcp_connect_option_observations observed;
+
+    scheduler sched(2);
+    sched.start();
+
+    sched.go([&]() { return accept_n_connections(*listener, 1, accepted); });
+    sched.go([&]() { return tcp_connect_with_options_attempt(port, observed); });
+
+    for (int i = 0; i < 300 &&
+            (!observed.done.load(std::memory_order_acquire) ||
+             accepted.load(std::memory_order_relaxed) < 1); ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(10));
+    }
+
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+
+    INFO("connect errno=" << observed.first_error.load(std::memory_order_relaxed));
+    REQUIRE(observed.done.load(std::memory_order_acquire));
+    REQUIRE(accepted.load(std::memory_order_relaxed) == 1);
+    REQUIRE(observed.first_error.load(std::memory_order_relaxed) == 0);
+    REQUIRE(observed.no_delay.load(std::memory_order_relaxed) != 0);
+    REQUIRE(observed.keep_alive.load(std::memory_order_relaxed) != 0);
+    REQUIRE(observed.reuse_addr.load(std::memory_order_relaxed) != 0);
+    REQUIRE(observed.reuse_port.load(std::memory_order_relaxed) != 0);
+    REQUIRE(observed.recv_buffer.load(std::memory_order_relaxed) >= 4096);
+    REQUIRE(observed.send_buffer.load(std::memory_order_relaxed) >= 8192);
 }
 
 TEST_CASE("tcp_connect observes already-cancelled token",

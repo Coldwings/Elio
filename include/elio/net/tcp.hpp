@@ -39,6 +39,47 @@ struct tcp_options {
     bool ipv6_only = false;      ///< IPV6_V6ONLY (disable dual-stack on IPv6 sockets)
 };
 
+namespace detail {
+
+inline void apply_tcp_socket_options(int fd, int family, const tcp_options& opts) noexcept {
+    if (opts.reuse_addr) {
+        int flag = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
+    }
+
+    if (opts.reuse_port) {
+        int flag = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag));
+    }
+
+    if (opts.recv_buffer > 0) {
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &opts.recv_buffer, sizeof(opts.recv_buffer));
+    }
+
+    if (opts.send_buffer > 0) {
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &opts.send_buffer, sizeof(opts.send_buffer));
+    }
+
+    if (family == AF_INET6) {
+        int flag = opts.ipv6_only ? 1 : 0;
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &flag, sizeof(flag));
+    }
+}
+
+inline void apply_tcp_stream_options(int fd, const tcp_options& opts) noexcept {
+    if (opts.no_delay) {
+        int flag = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    }
+
+    if (opts.keep_alive) {
+        int flag = 1;
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &flag, sizeof(flag));
+    }
+}
+
+} // namespace detail
+
 /// IPv4 address wrapper
 struct ipv4_address {
     uint32_t addr = INADDR_ANY;
@@ -889,12 +930,7 @@ public:
             tcp_stream stream(client_fd);
 
             // Apply TCP options
-            if (listener_.opts_.no_delay) {
-                stream.set_no_delay(true);
-            }
-            if (listener_.opts_.keep_alive) {
-                stream.set_keep_alive(true);
-            }
+            detail::apply_tcp_stream_options(stream.fd(), listener_.opts_);
 
             // Set peer address
             socket_address peer(peer_addr_);
@@ -944,29 +980,7 @@ private:
         }
         
         // Apply socket options
-        if (opts.reuse_addr) {
-            int flag = 1;
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag));
-        }
-        
-        if (opts.reuse_port) {
-            int flag = 1;
-            setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag));
-        }
-        
-        if (opts.recv_buffer > 0) {
-            setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &opts.recv_buffer, sizeof(opts.recv_buffer));
-        }
-        
-        if (opts.send_buffer > 0) {
-            setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &opts.send_buffer, sizeof(opts.send_buffer));
-        }
-        
-        // IPv6-specific options
-        if (family == AF_INET6) {
-            int flag = opts.ipv6_only ? 1 : 0;
-            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &flag, sizeof(flag));
-        }
+        detail::apply_tcp_socket_options(fd, family, opts);
         
         // Bind
         struct sockaddr_storage ss{};
@@ -1095,11 +1109,9 @@ public:
             return false;  // Don't suspend, resume immediately
         }
 
-        // Apply options
-        if (opts_.no_delay) {
-            int flag = 1;
-            setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-        }
+        // Apply options before connect. `backlog` remains listener-only.
+        detail::apply_tcp_socket_options(fd_, addr_.family(), opts_);
+        detail::apply_tcp_stream_options(fd_, opts_);
 
         // Get sockaddr
         socklen_t sa_len = addr_.to_sockaddr(sa_);

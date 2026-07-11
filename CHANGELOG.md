@@ -87,6 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancellable I/O operations now preserve the backend completion result when a
   token is cancelled before `await_resume()`, instead of rewriting successful
   completions to `ECANCELED`. (#627)
+- **TCP benchmark workflow build surface**: The main-branch TCP loopback
+  benchmark workflow now builds only the TCP benchmark targets, keeping its
+  build surface aligned with its narrowed trigger paths. (#635)
 
 ## [0.5.2] - 2026-06-30
 

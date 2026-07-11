@@ -56,7 +56,10 @@ jobs:
             -DELIO_BUILD_TCP_BENCHMARKS=ON
 
       - name: Build
-        run: cmake --build build --parallel 4
+        run: |
+          cmake --build build \
+            --target bench_tcp_elio bench_tcp_libuv bench_tcp_asio \
+            --parallel 2
 
       - name: Run benchmarks
         shell: bash

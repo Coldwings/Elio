@@ -23,7 +23,7 @@
 ## Requirements
 
 - Linux (kernel 5.1+ for io_uring, or any modern Linux for epoll)
-- GCC 12+ with C++20 support
+- GCC 12+ or Clang 15+ with C++20 support
 - CMake 3.20+
 - OpenSSL development files for the default top-level build (TLS, HTTP, and
   HTTP/2 are enabled by default)

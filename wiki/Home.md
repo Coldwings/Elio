@@ -17,7 +17,7 @@
 - **TLS/HTTPS**: OpenSSL-based TLS with ALPN and certificate verification
 - **RPC Framework**: High-performance RPC with buffer views, checksums, and cleanup callbacks
 - **Hash Functions**: CRC32, SHA-1, and SHA-256 with incremental hashing support
-- **Header-only**: Easy integration - just include and go
+- **Header-only**: Use the CMake target to inherit required dependencies
 - **CI/CD**: Automated testing with ASAN and TSAN
 
 ## Requirements
@@ -65,7 +65,10 @@ int main() {
 
 Elio is built around a few key technical decisions:
 
-- **Header-only**: No separate build step, no ABI compatibility concerns. Template-heavy coroutine code naturally suits header-only distribution.
+- **Header-only**: No separate build step, no ABI compatibility concerns.
+  Template-heavy coroutine code naturally suits header-only distribution. Link
+  the CMake target so consumers inherit required dependencies such as fmt,
+  pthread, and enabled feature/backend libraries.
 - **Linux-native**: Deep integration with io_uring and signalfd enables optimal performance on modern Linux kernels. epoll provides a fallback for older systems.
 - **Per-worker I/O**: Each scheduler thread owns its I/O backend (io_uring or epoll), eliminating I/O-related locking entirely. Cross-thread communication uses lock-free MPSC queues.
 - **Work-stealing**: The Chase-Lev deque provides lock-free local operations with a global load balancing fallback. Tasks with thread affinity are respected during stealing.

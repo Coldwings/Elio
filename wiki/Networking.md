@@ -293,8 +293,11 @@ still use plaintext `http://` traffic at runtime.
 using namespace elio::http;
 
 coro::task<void> fetch_url() {
+    coro::cancel_source cancel;
+
     // Simple one-off request
-    auto result = co_await http::get("https://httpbin.org/get");
+    auto result = co_await http::get("https://httpbin.org/get",
+                                     cancel.get_token());
 
     if (result) {
         ELIO_LOG_INFO("Status: {}", result->status_code());
@@ -343,6 +346,10 @@ coro::task<void> advanced_client() {
     co_return;
 }
 ```
+
+HTTP client overloads that accept `coro::cancel_token` propagate cancellation
+into pending TCP connect, TLS handshake, request write, and response reads. A
+cancelled request returns `std::nullopt` and sets `errno` to `ECANCELED`.
 
 ### HTTP Server
 

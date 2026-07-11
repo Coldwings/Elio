@@ -637,12 +637,25 @@ auto response = co_await client.get(url, token);
 // RPC call with cancellation
 auto result = co_await rpc_client->call<Method>(req, timeout, token);
 
+// WebSocket connect with cancellation
+bool connected = co_await ws_client.connect(ws_url, token);
+
 // WebSocket receive with cancellation
 auto msg = co_await ws_client.receive(token);
+
+// SSE connect with cancellation
+bool listening = co_await sse_client.connect(sse_url, token);
 
 // SSE event receive with cancellation
 auto event = co_await sse_client.receive(token);
 ```
+
+For client networking operations, cancellation is wired into pending I/O.
+Cancelling the token passed to an HTTP request, WebSocket `connect()`, or SSE
+`connect()` can abort TCP connect, TLS handshake, request write, and response
+header/body reads. Cancelling the token passed to WebSocket or SSE `receive()`
+can abort a blocked frame/event read. These operations report cancellation via
+their normal failure return and set `errno` to `ECANCELED`.
 
 ### Implementing Cancellable Operations
 

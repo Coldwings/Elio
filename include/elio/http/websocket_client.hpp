@@ -173,6 +173,7 @@ private:
         while (state_ == connection_state::open || state_ == connection_state::closing) {
             // Check for cancellation
             if (token.is_cancelled()) {
+                errno = ECANCELED;
                 co_return std::nullopt;
             }
 
@@ -200,9 +201,13 @@ private:
             }
 
             // Read more data
-            auto result = co_await read(buffer_.data(), buffer_.size());
+            auto result = co_await read(buffer_.data(), buffer_.size(), token);
 
             if (result.result <= 0) {
+                if (result.result == -ECANCELED && token.is_cancelled()) {
+                    errno = ECANCELED;
+                    co_return std::nullopt;
+                }
                 if (result.result == 0) {
                     ELIO_LOG_DEBUG("WebSocket connection closed by server");
                 } else {
@@ -233,6 +238,7 @@ private:
 
         // Check if already cancelled
         if (token.is_cancelled()) {
+            errno = ECANCELED;
             state_ = connection_state::closed;
             co_return false;
         }
@@ -259,6 +265,7 @@ private:
         
         // Check cancellation before connection
         if (token.is_cancelled()) {
+            errno = ECANCELED;
             state_ = connection_state::closed;
             co_return false;
         }
@@ -271,7 +278,8 @@ private:
             &tls_ctx_,
             config_.resolve_options,
             config_.rotate_resolved_addresses,
-            config_.connect_timeout);
+            config_.connect_timeout,
+            token);
         if (!conn_result) {
             state_ = connection_state::closed;
             co_return false;
@@ -280,6 +288,8 @@ private:
         
         // Check cancellation before handshake
         if (token.is_cancelled()) {
+            http::detail::abort_stream_io(stream_);
+            errno = ECANCELED;
             stream_.disconnect();
             state_ = connection_state::closed;
             co_return false;
@@ -397,9 +407,16 @@ private:
         ELIO_LOG_DEBUG("Sending WebSocket handshake");
         
         // Send handshake
-        auto send_result = co_await write_exactly(request.data(), request.size());
+        auto send_result = co_await write_exactly(request.data(), request.size(),
+                                                  token);
         if (send_result.result != static_cast<ssize_t>(request.size())) {
+            if (send_result.result == -ECANCELED && token.is_cancelled()) {
+                http::detail::abort_stream_io(stream_);
+                errno = ECANCELED;
+                co_return false;
+            }
             ELIO_LOG_ERROR("Failed to send WebSocket handshake");
+            errno = send_result.result == 0 ? ECONNRESET : -send_result.result;
             co_return false;
         }
         
@@ -442,7 +459,8 @@ private:
                 auto watchdog = http::detail::arm_fd_shutdown_watchdog(
                     sched, stream_.fd(), remaining,
                     watchdog_cancel.get_token(), timed_out);
-                read_result = co_await read(buffer_.data(), buffer_.size());
+                read_result = co_await read(buffer_.data(), buffer_.size(),
+                                            token);
                 watchdog_cancel.cancel();
                 co_await watchdog;
                 if (timed_out->load(std::memory_order_acquire)) {
@@ -454,10 +472,16 @@ private:
                     co_return false;
                 }
             } else {
-                read_result = co_await read(buffer_.data(), buffer_.size());
+                read_result = co_await read(buffer_.data(), buffer_.size(),
+                                            token);
             }
 
             if (read_result.result <= 0) {
+                if (read_result.result == -ECANCELED && token.is_cancelled()) {
+                    http::detail::abort_stream_io(stream_);
+                    errno = ECANCELED;
+                    co_return false;
+                }
                 ELIO_LOG_ERROR("Failed to read WebSocket handshake response");
                 errno = read_result.result == 0 ? ECONNRESET : -read_result.result;
                 co_return false;
@@ -525,12 +549,22 @@ private:
         co_return co_await stream_.read(buf, len);
     }
 
+    coro::task<io::io_result> read(void* buf, size_t len,
+                                   coro::cancel_token token) {
+        co_return co_await stream_.read(buf, len, std::move(token));
+    }
+
     coro::task<io::io_result> write(const void* buf, size_t len) {
         co_return co_await stream_.write(buf, len);
     }
 
     coro::task<io::io_result> write_exactly(const void* buf, size_t len) {
         co_return co_await stream_.write_exactly(buf, len);
+    }
+
+    coro::task<io::io_result> write_exactly(const void* buf, size_t len,
+                                            coro::cancel_token token) {
+        co_return co_await stream_.write_exactly(buf, len, std::move(token));
     }
     
     /// Serialize an entire frame onto the wire under a per-connection mutex

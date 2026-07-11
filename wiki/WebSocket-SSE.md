@@ -88,9 +88,11 @@ coro::task<void> connect_example() {
     config.read_timeout = std::chrono::seconds(30);  // Upgrade response deadline
 
     ws_client client(config);
+    coro::cancel_source cancel;
     
     // Connect to server
-    if (!co_await client.connect("ws://localhost:8080/ws")) {
+    if (!co_await client.connect("ws://localhost:8080/ws",
+                                 cancel.get_token())) {
         ELIO_LOG_ERROR("Failed to connect");
         co_return;
     }
@@ -103,7 +105,7 @@ coro::task<void> connect_example() {
     
     // Receive messages
     while (client.is_open()) {
-        auto msg = co_await client.receive();
+        auto msg = co_await client.receive(cancel.get_token());
         if (!msg) break;
         
         if (msg->type == opcode::text) {
@@ -219,16 +221,18 @@ coro::task<void> listen_events() {
     config.read_timeout = std::chrono::seconds(30);  // Response header deadline
     
     sse_client client(config);
+    coro::cancel_source cancel;
     
     // Connect
-    if (!co_await client.connect("http://localhost:8080/events")) {
+    if (!co_await client.connect("http://localhost:8080/events",
+                                 cancel.get_token())) {
         ELIO_LOG_ERROR("Failed to connect");
         co_return;
     }
     
     // Receive events
     while (client.is_connected()) {
-        auto evt = co_await client.receive();
+        auto evt = co_await client.receive(cancel.get_token());
         if (!evt) break;
         
         ELIO_LOG_INFO("Event: type={} id={} data={}", 
@@ -244,6 +248,12 @@ handshake setup. `read_timeout` bounds the protocol response headers read by
 `connect()` -- the WebSocket `101 Switching Protocols` response or the SSE
 `text/event-stream` response headers. Values less than or equal to zero disable
 these client-side read deadlines.
+
+Both clients also provide cancellation-token overloads. Cancelling the token
+passed to `connect()` aborts pending TCP connect, TLS handshake, request write,
+and response header reads. Cancelling the token passed to `receive()` aborts a
+blocked WebSocket frame or SSE event read. Cancellation returns `false` or
+`std::nullopt` and sets `errno` to `ECANCELED`.
 
 ### SSE Event Format
 

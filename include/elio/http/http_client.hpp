@@ -63,7 +63,8 @@ public:
                                                    bool secure,
                                                    tls::tls_context* tls_ctx = nullptr,
                                                    std::chrono::nanoseconds connect_timeout =
-                                                       std::chrono::nanoseconds::zero()) {
+                                                       std::chrono::nanoseconds::zero(),
+                                                   coro::cancel_token token = {}) {
         std::string key = make_key(host, port, secure);
         auto& shard = shard_for(key);
 
@@ -100,7 +101,8 @@ public:
             tls_ctx,
             config_.resolve_options,
             config_.rotate_resolved_addresses,
-            connect_timeout);
+            connect_timeout,
+            std::move(token));
         if (!result) {
             co_return std::nullopt;
         }
@@ -345,7 +347,7 @@ private:
         errno = 0;
         auto conn_opt = co_await pool_.acquire(target.host, target.effective_port(),
                                                 target.is_secure(), &tls_ctx_,
-                                                config_.connect_timeout);
+                                                config_.connect_timeout, token);
         if (!conn_opt) {
             if (errno == 0) {
                 errno = ECONNREFUSED;
@@ -398,7 +400,7 @@ private:
             coro::cancel_source ws_cancel;
             auto watchdog = arm_io_watchdog(sched, conn.fd(), io_deadline,
                                             ws_cancel.get_token(), timed_out);
-            write_result = co_await conn.write_all(request_data);
+            write_result = co_await conn.write_all(request_data, token);
             ws_cancel.cancel();
             co_await watchdog;
             if (timed_out->load(std::memory_order_acquire)) {
@@ -409,9 +411,14 @@ private:
                 co_return std::nullopt;
             }
         } else {
-            write_result = co_await conn.write_all(request_data);
+            write_result = co_await conn.write_all(request_data, token);
         }
         if (write_result.result <= 0) {
+            if (write_result.result == -ECANCELED && token.is_cancelled()) {
+                detail::abort_stream_io(conn);
+                errno = ECANCELED;
+                co_return std::nullopt;
+            }
             ELIO_LOG_ERROR("Failed to send request: {}",
                            write_result.result == 0 ? "connection closed"
                                                     : strerror(-write_result.result));
@@ -500,7 +507,8 @@ private:
                     auto watchdog = arm_io_watchdog(sched, conn.fd(), remaining,
                                                     ws_cancel.get_token(),
                                                     read_timed_out);
-                    read_result = co_await conn.read(buffer.data(), buffer.size());
+                    read_result = co_await conn.read(buffer.data(), buffer.size(),
+                                                    token);
                     ws_cancel.cancel();
                     co_await watchdog;
                     if (read_timed_out->load(std::memory_order_acquire)) {
@@ -511,10 +519,16 @@ private:
                         co_return std::nullopt;
                     }
                 } else {
-                    read_result = co_await conn.read(buffer.data(), buffer.size());
+                    read_result = co_await conn.read(buffer.data(), buffer.size(),
+                                                    token);
                 }
 
                 if (read_result.result <= 0) {
+                    if (read_result.result == -ECANCELED && token.is_cancelled()) {
+                        detail::abort_stream_io(conn);
+                        errno = ECANCELED;
+                        co_return std::nullopt;
+                    }
                     if (read_result.result == 0) {
                         auto [eof_result, consumed] = parser.finish_eof();
                         (void)consumed;

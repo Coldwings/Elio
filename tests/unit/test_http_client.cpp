@@ -341,6 +341,68 @@ TEST_CASE("WebSocket client parses bracketed IPv6 URLs",
     REQUIRE(observed_host == "[::1]:" + std::to_string(port));
 }
 
+TEST_CASE("WebSocket client rejects unoffered server subprotocol",
+          "[websocket][client][handshake][regression]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_failed{false};
+    std::atomic<int> client_errno{0};
+    std::string observed_protocols;
+    std::string negotiated_protocol;
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        auto headers = co_await read_request_headers(*stream);
+        observed_protocols = request_header_value(headers, "Sec-WebSocket-Protocol");
+        auto key = request_header_value(headers, "Sec-WebSocket-Key");
+        REQUIRE_FALSE(key.empty());
+
+        auto accept = elio::http::websocket::compute_websocket_accept(key);
+        auto response = elio::http::websocket::build_server_handshake(
+            accept, "admin");
+        co_await stream->write(response);
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        stream->shutdown_socket();
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::websocket::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(2);
+        cfg.subprotocols = {"chat"};
+        elio::http::websocket::ws_client client(cfg);
+
+        bool ok = co_await client.connect(make_ws_url(port));
+        if (!ok) {
+            client_failed = true;
+            client_errno = errno;
+        }
+        negotiated_protocol = std::string(client.subprotocol());
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(client_failed);
+    REQUIRE(client_errno == EBADMSG);
+    REQUIRE(observed_protocols == "chat");
+    REQUIRE(negotiated_protocol.empty());
+}
+
 TEST_CASE("SSE client read_timeout fires on stalled response headers",
           "[sse][client][timeout][regression]") {
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));

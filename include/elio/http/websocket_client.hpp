@@ -511,8 +511,23 @@ private:
 
         // Get negotiated protocol
         auto protocol = parser.get_headers().get("Sec-WebSocket-Protocol");
+        subprotocol_.clear();
         if (!protocol.empty()) {
-            subprotocol_ = protocol;
+            auto selected = http::detail::trim_ows(protocol);
+            bool offered = false;
+            for (const auto& offered_protocol : config_.subprotocols) {
+                if (selected == offered_protocol) {
+                    offered = true;
+                    break;
+                }
+            }
+            if (!offered) {
+                ELIO_LOG_ERROR("Server selected unoffered WebSocket subprotocol: {}",
+                               protocol);
+                errno = EBADMSG;
+                co_return false;
+            }
+            subprotocol_ = selected;
         }
 
         // Recover any bytes the server pipelined behind the 101 response so

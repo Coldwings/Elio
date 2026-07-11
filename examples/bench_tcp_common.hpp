@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,11 @@ struct config {
     int         pipeline_depth = 16;
 };
 
+class argument_error : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 inline void print_usage(const char* prog, const char* library_name) {
     std::printf(
         "TCP Loopback Benchmark: %s\n"
@@ -53,6 +59,23 @@ inline void print_usage(const char* prog, const char* library_name) {
         "  -m MODE         pingpong | streaming | both (default: both)\n"
         "  -h              Show help\n",
         library_name, prog);
+}
+
+inline bool parse_test_type(const std::string& value,
+                            config::test_type& type) {
+    if (value == "pingpong") {
+        type = config::test_type::pingpong;
+        return true;
+    }
+    if (value == "streaming") {
+        type = config::test_type::streaming;
+        return true;
+    }
+    if (value == "both") {
+        type = config::test_type::both;
+        return true;
+    }
+    return false;
 }
 
 inline config parse_args(int argc, char* argv[], const char* library_name) {
@@ -77,9 +100,13 @@ inline config parse_args(int argc, char* argv[], const char* library_name) {
             cfg.pipeline_depth = std::stoi(argv[++i]);
         } else if (arg == "-m" && i + 1 < argc) {
             std::string m = argv[++i];
-            if (m == "pingpong") cfg.type = config::test_type::pingpong;
-            else if (m == "streaming") cfg.type = config::test_type::streaming;
-            else cfg.type = config::test_type::both;
+            if (!parse_test_type(m, cfg.type)) {
+                std::fprintf(stderr,
+                             "Invalid mode '%s'; expected pingpong, streaming, or both.\n",
+                             m.c_str());
+                print_usage(argv[0], library_name);
+                throw argument_error("invalid TCP benchmark mode");
+            }
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0], library_name);
             std::exit(0);

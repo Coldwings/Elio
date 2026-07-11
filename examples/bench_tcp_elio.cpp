@@ -478,7 +478,12 @@ static task<void> client_main(const bench::config& cfg,
 int main(int argc, char* argv[]) {
     std::signal(SIGPIPE, SIG_IGN);
     elio::log::logger::instance().set_level(elio::log::level::error);
-    auto cfg = bench::parse_args(argc, argv, "Elio");
+    bench::config cfg;
+    try {
+        cfg = bench::parse_args(argc, argv, "Elio");
+    } catch (const bench::argument_error&) {
+        return 1;
+    }
 
     scheduler sched(std::max(1, cfg.threads));
     sched.start();

@@ -478,7 +478,12 @@ static bool run_client(const bench::config& cfg) {
 
 int main(int argc, char* argv[]) {
     std::signal(SIGPIPE, SIG_IGN);
-    auto cfg = bench::parse_args(argc, argv, "libuv");
+    bench::config cfg;
+    try {
+        cfg = bench::parse_args(argc, argv, "libuv");
+    } catch (const bench::argument_error&) {
+        return 1;
+    }
 
     if (cfg.run_mode == bench::config::mode::server) {
         return run_server(cfg);

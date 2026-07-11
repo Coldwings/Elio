@@ -15,7 +15,7 @@
 - **TCP Networking**: Async TCP client/server with connection management
 - **HTTP/1.1**: Full HTTP client and server implementation
 - **TLS/HTTPS**: OpenSSL-based TLS with ALPN and certificate verification
-- **RPC Framework**: High-performance RPC with zero-copy serialization, checksums, and cleanup callbacks
+- **RPC Framework**: High-performance RPC with buffer views, checksums, and cleanup callbacks
 - **Hash Functions**: CRC32, SHA-1, and SHA-256 with incremental hashing support
 - **Header-only**: Easy integration - just include and go
 - **CI/CD**: Automated testing with ASAN and TSAN
@@ -82,7 +82,7 @@ Elio is built around a few key technical decisions:
 - [[Security Guidelines]] - Secure configuration and vulnerability reporting guidance
 - [[WebSocket SSE]] - WebSocket and Server-Sent Events
 - [[Batch IO and File Helpers]] - Batch I/O operations and file utilities
-- [[RPC Framework]] - High-performance RPC with zero-copy serialization
+- [[RPC Framework]] - High-performance RPC with buffer views and checksums
 - [[Hash Functions]] - CRC32, SHA-1, and SHA-256
 - [[RDMA Guide]] - Optional RDMA-Core abstraction (header-only, bring-your-own-backend)
 - [[Performance Tuning]] - Optimization and benchmarking

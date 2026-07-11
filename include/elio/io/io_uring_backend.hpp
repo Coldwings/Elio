@@ -124,7 +124,9 @@ inline void* tagged_op_state_user_data(op_state* st) noexcept {
 /// UAF when the awaiting coroutine is destroyed while SQEs are in flight:
 /// the destructor CAS's ``phase`` from ``phase_pending`` to ``phase_orphaned``,
 /// releasing ownership. The final CQE handler sees ``phase_orphaned`` and
-/// deletes the state instead of resuming a dangling awaiter.
+/// deletes the state instead of resuming a dangling awaiter. Before publishing
+/// ``phase_completed``, the final CQE handler copies every field it still needs
+/// so the awaitable may free the state after observing completion.
 struct batch_state {
     static constexpr uint8_t phase_pending = 0;
     static constexpr uint8_t phase_orphaned = 1;
@@ -704,7 +706,8 @@ private:
     }
 
     /// Dispatch a CQE matched to an awaitable-owned ``op_state``.
-    /// CAS pending->completed: we won; stamp result/flags and resume.
+    /// Stamp result/flags and copy the handle before CAS pending->completed.
+    /// After publishing completed, the awaitable destructor may free ``st``.
     /// CAS fails because phase is orphaned: the awaitable was destroyed
     /// before this CQE arrived; just delete the storage and skip resume.
     static void dispatch_op_state(
@@ -715,6 +718,9 @@ private:
         if (!st) {
             return;
         }
+        st->result = res;
+        st->flags = flags;
+        auto handle = st->handle;
         uint8_t expected = op_state::phase_pending;
         if (!st->phase.compare_exchange_strong(
                 expected, op_state::phase_completed,
@@ -724,9 +730,6 @@ private:
             delete st;
             return;
         }
-        st->result = res;
-        st->flags = flags;
-        auto handle = st->handle;
         if (!handle) {
             return;
         }
@@ -773,6 +776,7 @@ private:
             delete st;
             return;
         }
+        auto handle = st->awaiter;
         // Mark as completed so the destructor's CAS fails and unique_ptr cleans up.
         // Use CAS instead of unconditional store to handle the race where destructor
         // CAS's to orphaned between our load above and this store.
@@ -785,7 +789,6 @@ private:
             delete st;
             return;
         }
-        auto handle = st->awaiter;
         if (!handle) {
             return;
         }

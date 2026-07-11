@@ -25,9 +25,10 @@ namespace elio::io {
 /// phases tracked by the ``phase`` atomic:
 ///
 ///   * ``pending`` (0): SQE is in flight, awaitable still owns the state.
-///   * ``completed`` (1): the CQE arrived first. ``process_completion``
-///     stamps ``result``/``flags``, resumes ``handle``, and the awaitable's
-///     ``unique_ptr`` frees the state on destruction.
+///   * ``completed`` (1): the CQE arrived first. Before publishing this
+///     phase, ``process_completion`` has stamped ``result``/``flags`` and
+///     copied every field it still needs, so the awaitable's ``unique_ptr``
+///     may free the state on destruction.
 ///   * ``orphaned`` (2): the awaitable was destroyed before the CQE arrived
 ///     (e.g. forced ``coroutine_handle::destroy()`` or vthread teardown). The
 ///     destructor releases ownership; ``process_completion`` sees the

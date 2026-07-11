@@ -69,8 +69,9 @@ public:
             (void)op_state_.release();
             return;
         }
-        // CAS failed: phase was already phase_completed. The CQE handler
-        // wrote result/flags and queued our resume; unique_ptr cleans up.
+        // CAS failed: phase was already phase_completed. The CQE handler has
+        // already copied everything it still needs from op_state_; unique_ptr
+        // cleans up.
     }
 
     /// Never ready immediately - always suspend
@@ -783,8 +784,9 @@ public:
             // We won the CAS: CQE handler will delete. Release ownership.
             (void)batch_st_.release();
         }
-        // If CAS failed, phase was already completed or something else —
-        // unique_ptr cleans up normally.
+        // If CAS failed, phase was already completed or something else. A
+        // completed final CQE has already copied everything it still needs,
+        // so unique_ptr cleans up normally.
     }
 
     template<typename Promise>

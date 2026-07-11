@@ -7,14 +7,20 @@ This guide will help you get Elio up and running in your project.
 ### Prerequisites
 
 ```bash
-# Ubuntu/Debian (22.04+)
-sudo apt install build-essential cmake ninja-build g++-12 liburing-dev libssl-dev
+# Ubuntu/Debian (22.04+) default build requirements
+sudo apt install build-essential cmake ninja-build g++-12 libssl-dev
+# Optional io_uring backend
+sudo apt install liburing-dev
 
-# Fedora
-sudo dnf install gcc-c++ cmake ninja-build liburing-devel openssl-devel
+# Fedora default build requirements
+sudo dnf install gcc-c++ cmake ninja-build openssl-devel
+# Optional io_uring backend
+sudo dnf install liburing-devel
 
-# Arch Linux
-sudo pacman -S base-devel cmake ninja liburing openssl
+# Arch Linux default build requirements
+sudo pacman -S base-devel cmake ninja openssl
+# Optional io_uring backend
+sudo pacman -S liburing
 ```
 
 ### Building from Source
@@ -137,8 +143,9 @@ cmake -B build -DELIO_ENABLE_TLS=ON -DELIO_ENABLE_HTTP=ON -DELIO_ENABLE_HTTP2=ON
 ```
 
 When `ELIO_ENABLE_HTTP2` is set, Elio fetches nghttp2 automatically via
-CMake's `FetchContent`. OpenSSL and liburing must be installed separately (see
-Prerequisites above).
+CMake's `FetchContent`. OpenSSL must be installed separately for the default
+TLS/HTTP/HTTP2 targets. liburing is optional; install it only when you want the
+io_uring backend, otherwise Elio builds with the epoll fallback.
 
 Additional options include RDMA support (`ELIO_ENABLE_RDMA`,
 `ELIO_ENABLE_RDMA_CM`, `ELIO_ENABLE_RDMA_IBVERBS`,

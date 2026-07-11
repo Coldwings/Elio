@@ -240,6 +240,13 @@ add_test(NAME package_liburing_export_metadata
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_liburing_package_export.cmake
 )
 
+add_test(NAME package_threads_export_metadata
+    COMMAND ${CMAKE_COMMAND}
+        -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+        -DELIO_BINARY_DIR=${CMAKE_BINARY_DIR}/tests/cmake/package_threads_export
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_threads_package_export.cmake
+)
+
 add_test(NAME package_rdma_dependency_export_metadata
     COMMAND ${CMAKE_COMMAND}
         -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}

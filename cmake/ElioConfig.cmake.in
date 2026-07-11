@@ -3,6 +3,7 @@
 include(CMakeFindDependencyMacro)
 
 find_dependency(fmt REQUIRED)
+find_dependency(Threads REQUIRED)
 
 if(@ELIO_PACKAGE_NEEDS_OPENSSL@)
     find_dependency(OpenSSL REQUIRED)

@@ -82,6 +82,7 @@ if(ELIO_BUILD_TESTS)
 endif()
 
 # Check for liburing (optional, for io_uring backend)
+find_package(Threads REQUIRED)
 find_library(URING_LIBRARY uring)
 find_path(URING_INCLUDE_DIR liburing.h)
 
@@ -94,11 +95,12 @@ if(URING_LIBRARY AND URING_INCLUDE_DIR)
             INTERFACE_INCLUDE_DIRECTORIES "${URING_INCLUDE_DIR}")
     endif()
     target_compile_definitions(elio INTERFACE ELIO_HAS_IO_URING=1)
-    target_link_libraries(elio INTERFACE fmt::fmt pthread liburing::liburing)
+    target_link_libraries(elio INTERFACE
+        fmt::fmt Threads::Threads liburing::liburing)
 else()
     message(STATUS "liburing not found, io_uring backend will be disabled")
     target_compile_definitions(elio INTERFACE ELIO_HAS_IO_URING=0)
-    target_link_libraries(elio INTERFACE fmt::fmt pthread)
+    target_link_libraries(elio INTERFACE fmt::fmt Threads::Threads)
 endif()
 
 # Check for OpenSSL (optional, for TLS support)

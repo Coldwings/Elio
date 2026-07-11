@@ -70,6 +70,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   example is now gated on the CM helper it uses and has been updated from stale
   endpoint/receive helper calls to the current `event_channel`, `acceptor`,
   free `connect`, and `recv(buffer_view)` APIs. (#621)
+- **Installed package thread dependency**: The exported `elio` target now links
+  `Threads::Threads` instead of raw `pthread`, and installed package config
+  restores the Threads dependency before loading exported targets. (#622)
 
 ## [0.5.2] - 2026-06-30
 

@@ -49,7 +49,7 @@ ctest --output-on-failure
 
 Elio is header-only, but consumers should still link one of Elio's CMake
 interface targets. Those targets propagate required dependencies such as
-`fmt::fmt`, `pthread`, optional backend libraries like liburing, and the
+`fmt::fmt`, `Threads::Threads`, optional backend libraries like liburing, and the
 protocol/RDMA dependencies for enabled feature targets. If you integrate Elio
 without CMake, provide the equivalent include paths, compile definitions, and
 link libraries manually.
@@ -83,11 +83,12 @@ target_link_libraries(your_target PRIVATE Elio::elio)
 ```
 
 Installed-package consumers must make Elio's exported dependencies
-discoverable to CMake as well. `fmt` is always required by the installed
-package config; install a system fmt CMake package or pass its location with
-`CMAKE_PREFIX_PATH`/`fmt_DIR`. Feature targets add their own dependencies,
-such as liburing for io_uring-enabled builds, OpenSSL for TLS/HTTP targets,
-nghttp2 for HTTP/2, and the RDMA/CUDA libraries listed below.
+discoverable to CMake as well. `fmt` and CMake's `Threads::Threads` target are
+always required by the installed package config; install a system fmt CMake
+package or pass its location with `CMAKE_PREFIX_PATH`/`fmt_DIR`. Feature
+targets add their own dependencies, such as liburing for io_uring-enabled
+builds, OpenSSL for TLS/HTTP targets, nghttp2 for HTTP/2, and the RDMA/CUDA
+libraries listed below.
 
 #### Optional Features
 

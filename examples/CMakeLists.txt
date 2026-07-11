@@ -159,7 +159,7 @@ if(TARGET elio_rdma_ibverbs AND TARGET elio_rdma_cm)
     target_link_options(rdma_perf PRIVATE ${STATIC_LINK_FLAGS})
 endif()
 
-if(TARGET elio_rdma_cuda)
+if(TARGET elio_rdma_cuda AND TARGET elio_rdma_cm)
     add_executable(rdma_gpu_bw rdma_gpu_bw.cpp)
     target_link_libraries(rdma_gpu_bw PRIVATE elio_rdma_cuda)
     target_link_options(rdma_gpu_bw PRIVATE ${STATIC_LINK_FLAGS})

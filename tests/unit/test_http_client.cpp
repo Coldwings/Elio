@@ -205,6 +205,35 @@ TEST_CASE("WebSocket client rejects invalid outbound handshake config",
     REQUIRE(client_errno == EINVAL);
 }
 
+TEST_CASE("WebSocket client sets errno for invalid URLs",
+          "[websocket][client][security]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    bool connected = true;
+    int client_errno = 0;
+
+    sched.go([&]() -> task<void> {
+        elio::http::websocket::ws_client client;
+
+        errno = EBUSY;
+        connected = co_await client.connect("not-a-websocket-url");
+        client_errno = errno;
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE_FALSE(connected);
+    REQUIRE(client_errno == EINVAL);
+}
+
 TEST_CASE("HTTP client rejects response exceeding max_response_size",
           "[http][client][security]") {
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
@@ -568,6 +597,37 @@ TEST_CASE("SSE client rejects unsupported URL schemes",
 
         errno = 0;
         connected = co_await client.connect("ftp://127.0.0.1/events");
+        client_errno = errno;
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE_FALSE(connected);
+    REQUIRE(client_errno == EINVAL);
+}
+
+TEST_CASE("SSE client sets errno for invalid URLs",
+          "[sse][client][security]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    bool connected = true;
+    int client_errno = 0;
+
+    sched.go([&]() -> task<void> {
+        elio::http::sse::client_config cfg;
+        cfg.auto_reconnect = false;
+        elio::http::sse::sse_client client(cfg);
+
+        errno = EBUSY;
+        connected = co_await client.connect("bad url");
         client_errno = errno;
         client_done = true;
     });

@@ -248,6 +248,7 @@ private:
         auto parsed = parse_ws_url(url_str);
         if (!parsed) {
             ELIO_LOG_ERROR("Invalid WebSocket URL: {}", url_str);
+            errno = EINVAL;
             state_ = connection_state::closed;
             co_return false;
         }

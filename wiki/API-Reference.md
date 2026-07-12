@@ -1491,7 +1491,7 @@ HTTP client with connection pooling.
 class client {
 public:
     client();
-    explicit client(const client_config& config);
+    explicit client(client_config config);
 
     // GET request (awaitable)
     /* awaitable */ get(std::string_view url);
@@ -1724,7 +1724,7 @@ coordinate multiple in-flight requests over one shared connection.
 class h2_client {
 public:
     h2_client();
-    explicit h2_client(const h2_client_config& config);
+    explicit h2_client(h2_client_config config);
 
     // GET request (awaitable)
     coro::task<std::optional<response>> get(std::string_view url);
@@ -1802,7 +1802,8 @@ Low-level HTTP/2 session (for advanced use).
 ```cpp
 class h2_session {
 public:
-    explicit h2_session(tls::tls_stream& stream);
+    explicit h2_session(tls::tls_stream& stream,
+                        h2_session_config config = {});
     
     // Submit a request, returns stream ID
     int32_t submit_request(method m, const url& target,

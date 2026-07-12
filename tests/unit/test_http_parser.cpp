@@ -808,6 +808,9 @@ TEST_CASE("HTTP URL parser rejects malformed ports",
     REQUIRE_FALSE(url::parse("http://example.com:80abc/"));
     REQUIRE_FALSE(url::parse("http://example.com:abc/"));
     REQUIRE_FALSE(url::parse("http://example.com:65536/"));
+    REQUIRE_FALSE(url::parse("http://example.com:80:90/"));
+    REQUIRE_FALSE(url::parse("http://::1/"));
+    REQUIRE_FALSE(url::parse("http://2001:db8::1/"));
 
     REQUIRE_FALSE(url::parse("http://[::1]:/"));
     REQUIRE_FALSE(url::parse("http://[::1]:443x/"));

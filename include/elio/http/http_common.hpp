@@ -693,6 +693,9 @@ struct url {
                     return std::nullopt;
                 }
                 result.port = *port;
+                if (result.host.find(':') != std::string::npos) {
+                    return std::nullopt;
+                }
             } else {
                 result.host = str;
             }

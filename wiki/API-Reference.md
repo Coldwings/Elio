@@ -109,6 +109,11 @@ template<typename F, typename... Args>
 void go_to(size_t worker_id, F&& f, Args&&... args);
 ```
 
+`worker_id` should be less than the scheduler's current `num_threads()` for
+deterministic placement. Out-of-range values are not rejected, but exact pinning
+to that numeric worker is not guaranteed; the scheduler may enqueue through a
+fallback path if the selected slot is unavailable during resizing.
+
 **Example:**
 ```cpp
 coro::task<void> io_handler(int fd) {
@@ -483,6 +488,9 @@ public:
     template<typename F, typename... Args>
     coro::join_handle</* task value */> go_joinable_to(size_t worker_id, F&& f, Args&&... args);
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle);
+
+    // For go_to(), go_joinable_to(), and spawn_to(), exact placement requires
+    // worker_id in [0, num_threads()). Larger values use fallback scheduling.
 
     // Get number of worker threads
     size_t num_threads(std::memory_order order = std::memory_order_relaxed) const noexcept;

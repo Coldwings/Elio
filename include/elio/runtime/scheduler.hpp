@@ -360,6 +360,7 @@ public:
     /// High-level API: fire-and-forget, pinned to a specific worker.
     /// Affinity is set so the task cannot be stolen by other workers;
     /// if stolen it will be bounced back to the target worker.
+    /// For deterministic placement, worker_id must be less than num_threads().
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
     void go_to(size_t worker_id, F&& f, Args&&... args) {
@@ -378,7 +379,8 @@ public:
     /// High-level API: spawn + join, pinned to a specific worker.
     /// Affinity is set so the task cannot be stolen; I/O is bound to that
     /// worker's io_context. Use when spawned task and caller must share fate
-    /// w.r.t. thread-pool resizing.
+    /// w.r.t. thread-pool resizing. For deterministic placement, worker_id
+    /// must be less than num_threads().
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
     auto go_joinable_to(size_t worker_id, F&& f, Args&&... args)
@@ -387,6 +389,8 @@ public:
         return do_go_<true, true>(worker_id, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
+    /// Spawn an existing coroutine toward worker_id. Exact placement requires
+    /// worker_id < num_threads(); otherwise scheduling is best-effort fallback.
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle) {
         (void)do_spawn_to_(worker_id, handle);
     }
@@ -810,6 +814,9 @@ private:
             return false;
         }
 
+        // Public pinning APIs require worker_id < num_threads() for exact
+        // placement. Out-of-range values are treated as best-effort enqueue
+        // fallback rather than a stable placement contract.
         size_t idx = worker_id % n;
         // Verify the chosen slot is still running. After a shrink the worker at
         // this index may have been stopped (or be in the process of being

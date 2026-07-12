@@ -267,6 +267,10 @@ elio::go([]{
 
 `go_to()` places the task directly on the target worker's queue with the `Pinned` flag set, so the task is never stolen. This avoids the brief scheduling window where the task could execute on the wrong worker before `set_affinity` takes effect.
 
+Use a worker id in `[0, scheduler.num_threads())` when exact placement matters.
+Out-of-range ids are not rejected, but they are fallback behavior rather than a
+stable pinning contract, especially while the pool is being resized.
+
 ## I/O Backend Selection
 
 ### io_uring vs epoll

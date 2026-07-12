@@ -187,6 +187,10 @@ coro::task<void> parallel_example() {
 
 Use `elio::go_to()` to spawn a task pinned to a specific worker thread. The task is placed directly on the target worker's queue with affinity set — it cannot be stolen by other workers.
 
+For deterministic placement, pass a worker id in `[0, scheduler.num_threads())`.
+Out-of-range ids are not rejected, but they are treated as scheduler fallback
+behavior rather than a precise pinning contract.
+
 ```cpp
 coro::task<void> connection_handler(int fd) {
     // This entire task runs on the designated worker

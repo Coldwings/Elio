@@ -39,10 +39,12 @@ void go(F&& f, Args&&... args) {
 
 /// Fire-and-forget: spawn a coroutine pinned to a specific worker.
 /// The task is bound to the given worker and cannot be stolen by others.
+/// For deterministic placement, worker_id must be less than the current
+/// scheduler worker count.
 ///
 /// @tparam F  Callable type that returns a task<T>
 /// @tparam Args  Argument types
-/// @param worker_id  Target worker index
+/// @param worker_id  Target worker index in [0, scheduler.num_threads())
 /// @param f  Callable to invoke (must return a task)
 /// @param args  Arguments to forward to the callable
 ///

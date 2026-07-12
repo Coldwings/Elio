@@ -88,6 +88,7 @@ cmake -S . -B build-rdma \
 
 # Optional TCP benchmark comparison targets
 cmake -S . -B build-tcp-bench \
+  -DCMAKE_BUILD_TYPE=Release \
   -DELIO_BUILD_EXAMPLES=ON \
   -DELIO_BUILD_TCP_BENCHMARKS=ON
 

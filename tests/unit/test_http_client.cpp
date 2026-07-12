@@ -1146,6 +1146,68 @@ TEST_CASE("HTTP client returns OK for clean keep-alive responses",
     REQUIRE(got_status == 200);
 }
 
+TEST_CASE("HTTP client resolves redirect Location references",
+          "[http][client]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<int> got_status{0};
+    std::string final_request;
+
+    sched.go([&]() -> task<void> {
+        auto first = co_await listener->accept();
+        REQUIRE(first.has_value());
+        co_await drain_request_headers(*first);
+        std::string redirect =
+            "HTTP/1.1 302 Found\r\n"
+            "Location: ../final?ok=1#ignored-by-http\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        co_await first->write(redirect);
+
+        auto second = co_await listener->accept();
+        REQUIRE(second.has_value());
+        final_request = co_await read_request_headers(*second);
+        std::string ok =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 2\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "ok";
+        co_await second->write(ok);
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::client c;
+        auto resp = co_await c.get(make_url(port, "/start/path/page?old=1"));
+        if (resp) {
+            got_status = resp->status_code();
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(got_status == 200);
+    REQUIRE(final_request.find("GET /start/final?ok=1 HTTP/1.1\r\n") !=
+            std::string::npos);
+    REQUIRE(final_request.find("#ignored-by-http") == std::string::npos);
+}
+
 TEST_CASE("HTTP client skips informational responses before final response",
           "[http][client]") {
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));

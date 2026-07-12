@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <thread>
 
 #include "../test_main.cpp"  // For scaled_ms / scaled_sec
@@ -68,6 +69,29 @@ TEST_CASE("blocking_pool::shutdown drains pending tasks inline",
     std::atomic<bool> late{false};
     REQUIRE_FALSE(pool.submit([&] { late.store(true); }));
     REQUIRE_FALSE(late.load());
+}
+
+TEST_CASE("blocking_pool::shutdown can run from a pool worker",
+          "[blocking_pool][shutdown]") {
+    auto pool = std::make_unique<blocking_pool>(1);
+    std::atomic<bool> shutdown_returned{false};
+
+    REQUIRE(pool->submit([&] {
+        pool->shutdown();
+        shutdown_returned.store(true, std::memory_order_release);
+    }));
+
+    const auto deadline = std::chrono::steady_clock::now() + scaled_ms(5000);
+    while (!shutdown_returned.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(scaled_ms(10));
+    }
+
+    REQUIRE(shutdown_returned.load(std::memory_order_acquire));
+
+    // Destroying the pool after a worker-initiated shutdown must not see a
+    // joinable std::thread left behind for the current worker.
+    pool.reset();
 }
 
 TEST_CASE("spawn_blocking does not strand awaiter when scheduler shuts down",

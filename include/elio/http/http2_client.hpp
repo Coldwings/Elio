@@ -155,6 +155,12 @@ public:
     coro::task<std::optional<response>> send(method m, const url& target,
                                              std::string_view body = {},
                                              std::string_view content_type = {}) {
+        if (!target.is_secure()) {
+            ELIO_LOG_ERROR("HTTP/2 requires HTTPS (h2). Use http:// URLs with HTTP/1.1 client.");
+            errno = EPROTONOSUPPORT;
+            co_return std::nullopt;
+        }
+
         auto conn = co_await get_connection(target.host, target.effective_port());
         if (!conn) {
             co_return std::nullopt;

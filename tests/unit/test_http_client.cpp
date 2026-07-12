@@ -205,6 +205,41 @@ TEST_CASE("HTTP client rejects unsupported URL schemes",
     REQUIRE(client_errno == EINVAL);
 }
 
+TEST_CASE("HTTP client custom send rejects unsupported URL schemes",
+          "[http][client][security]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    bool request_failed = false;
+    int client_errno = 0;
+
+    sched.go([&]() -> task<void> {
+        elio::http::client c;
+        elio::http::request req(elio::http::method::GET, "/resource");
+        elio::http::url target;
+        target.scheme = "ftp";
+        target.host = "127.0.0.1";
+        target.path = "/resource";
+
+        errno = 0;
+        auto resp = co_await c.send(req, target);
+        request_failed = !resp;
+        client_errno = errno;
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(request_failed);
+    REQUIRE(client_errno == EINVAL);
+}
+
 TEST_CASE("WebSocket client rejects invalid outbound handshake config",
           "[websocket][client][security]") {
     scheduler sched(1);

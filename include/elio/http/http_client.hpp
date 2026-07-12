@@ -251,12 +251,17 @@ public:
     /// Send a custom request
     /// @return Response on success, std::nullopt on error (check errno)
     coro::task<std::optional<response>> send(request& req, const url& target) {
-        return send_request(req, target, 0, coro::cancel_token{});
+        co_return co_await send(req, target, coro::cancel_token{});
     }
     
     /// Send a custom request with cancellation support
     coro::task<std::optional<response>> send(request& req, const url& target, coro::cancel_token token) {
-        return send_request(req, target, 0, std::move(token));
+        if (!detail::is_supported_http_url_scheme(target.scheme)) {
+            ELIO_LOG_ERROR("Unsupported HTTP URL scheme: {}", target.scheme);
+            errno = EINVAL;
+            co_return std::nullopt;
+        }
+        co_return co_await send_request(req, target, 0, std::move(token));
     }
     
     /// Get TLS context for configuration

@@ -143,6 +143,41 @@ jobs:
             wait "$pid" 2>/dev/null || true
           }
 
+          pick_free_port() {
+            python3 -c 'import socket; sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM); sock.bind(("127.0.0.1", 0)); print(sock.getsockname()[1]); sock.close()'
+          }
+
+          pick_distinct_port() {
+            local port
+            local existing
+            local used
+
+            while true; do
+              port="$(pick_free_port)"
+              used=0
+              for existing in "$@"; do
+                if [[ "$port" == "$existing" ]]; then
+                  used=1
+                  break
+                fi
+              done
+              if (( used == 0 )); then
+                echo "$port"
+                return 0
+              fi
+            done
+          }
+
+          ensure_port_free() {
+            local name="$1"
+            local port="$2"
+
+            if (: > "/dev/tcp/127.0.0.1/${port}") >/dev/null 2>&1; then
+              echo "::error title=${name} benchmark port busy::port ${port} already accepts connections before the benchmark server starts"
+              return 1
+            fi
+          }
+
           wait_for_server() {
             local pid="$1"
             local port="$2"
@@ -175,6 +210,12 @@ jobs:
             local server_pid
 
             echo "::group::${name} TCP loopback benchmark"
+            echo "Using loopback port ${port}"
+            if ! ensure_port_free "$name" "$port"; then
+              echo "::endgroup::"
+              return 1
+            fi
+
             "$binary" -s -p "$port" >"$server_log" 2>&1 &
             server_pid=$!
 
@@ -186,7 +227,7 @@ jobs:
 
             set +e
             timeout --kill-after=10s "${client_timeout}s" \
-              "$binary" -c -p "$port" \
+              "$binary" -c -H 127.0.0.1 -p "$port" \
                 -d "$duration" \
                 -w "$warmup" \
                 -m "$mode" \
@@ -207,9 +248,14 @@ jobs:
           }
 
           overall_status=0
-          run_backend "Elio" ./build/examples/bench_tcp_elio 9876 elio_results.txt elio_server.log || overall_status=$?
-          run_backend "libuv" ./build/examples/bench_tcp_libuv 9877 libuv_results.txt libuv_server.log || overall_status=$?
-          run_backend "Asio" ./build/examples/bench_tcp_asio 9878 asio_results.txt asio_server.log || overall_status=$?
+          elio_port="$(pick_free_port)"
+          libuv_port="$(pick_distinct_port "$elio_port")"
+          asio_port="$(pick_distinct_port "$elio_port" "$libuv_port")"
+          echo "Selected benchmark ports: Elio=${elio_port}, libuv=${libuv_port}, Asio=${asio_port}"
+
+          run_backend "Elio" ./build/examples/bench_tcp_elio "$elio_port" elio_results.txt elio_server.log || overall_status=$?
+          run_backend "libuv" ./build/examples/bench_tcp_libuv "$libuv_port" libuv_results.txt libuv_server.log || overall_status=$?
+          run_backend "Asio" ./build/examples/bench_tcp_asio "$asio_port" asio_results.txt asio_server.log || overall_status=$?
 
           exit "$overall_status"
 

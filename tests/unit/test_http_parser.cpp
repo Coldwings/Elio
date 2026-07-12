@@ -531,6 +531,63 @@ TEST_CASE("URL header authority excludes userinfo and brackets IPv6", "[http][ur
     }
 }
 
+TEST_CASE("URL reference resolution follows RFC 3986 path semantics",
+          "[http][url]") {
+    auto base = url::parse("http://example.com/dir/page.html?old=1#frag");
+    REQUIRE(base.has_value());
+
+    SECTION("relative paths merge with the base directory and remove dot segments") {
+        auto resolved = url::resolve_reference(*base, "../next?q=1#section");
+        REQUIRE(resolved.has_value());
+        REQUIRE(resolved->scheme == "http");
+        REQUIRE(resolved->host == "example.com");
+        REQUIRE(resolved->path == "/next");
+        REQUIRE(resolved->query == "q=1");
+        REQUIRE(resolved->fragment == "section");
+    }
+
+    SECTION("absolute paths replace the base path") {
+        auto resolved = url::resolve_reference(*base, "/root/./final?x=1#top");
+        REQUIRE(resolved.has_value());
+        REQUIRE(resolved->path == "/root/final");
+        REQUIRE(resolved->query == "x=1");
+        REQUIRE(resolved->fragment == "top");
+    }
+
+    SECTION("query-only references keep the base path and replace the query") {
+        auto resolved = url::resolve_reference(*base, "?new=1");
+        REQUIRE(resolved.has_value());
+        REQUIRE(resolved->path == "/dir/page.html");
+        REQUIRE(resolved->query == "new=1");
+        REQUIRE(resolved->fragment.empty());
+    }
+
+    SECTION("fragment-only references keep the request target") {
+        auto resolved = url::resolve_reference(*base, "#new");
+        REQUIRE(resolved.has_value());
+        REQUIRE(resolved->path == "/dir/page.html");
+        REQUIRE(resolved->query == "old=1");
+        REQUIRE(resolved->fragment == "new");
+        REQUIRE(resolved->path_with_query() == "/dir/page.html?old=1");
+    }
+
+    SECTION("scheme-relative references inherit the base scheme") {
+        auto resolved = url::resolve_reference(*base, "//other.example/a/../b");
+        REQUIRE(resolved.has_value());
+        REQUIRE(resolved->scheme == "http");
+        REQUIRE(resolved->host == "other.example");
+        REQUIRE(resolved->path == "/b");
+    }
+
+    SECTION("absolute references are accepted case-insensitively") {
+        auto resolved = url::resolve_reference(*base, "HTTPS://Example.COM/a/./b");
+        REQUIRE(resolved.has_value());
+        REQUIRE(resolved->scheme == "https");
+        REQUIRE(resolved->host == "Example.COM");
+        REQUIRE(resolved->path == "/a/b");
+    }
+}
+
 TEST_CASE("URL encoding/decoding", "[http][url]") {
     SECTION("Encode special characters") {
         REQUIRE(url_encode("hello world") == "hello%20world");

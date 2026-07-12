@@ -640,31 +640,15 @@ private:
                     co_return resp;
                 }
                 
-                // Parse redirect URL
-                std::optional<url> redirect_url;
-                if (location.starts_with("http://") || location.starts_with("https://")) {
-                    redirect_url = url::parse(location);
-                } else {
-                    // Relative URL
-                    url rel;
-                    rel.scheme = target.scheme;
-                    rel.host = target.host;
-                    rel.port = target.port;
-                    if (location.starts_with("/")) {
-                        rel.path = location;
-                    } else {
-                        // Resolve relative to current path
-                        auto last_slash = target.path.rfind('/');
-                        if (last_slash != std::string::npos) {
-                            rel.path = target.path.substr(0, last_slash + 1) + std::string(location);
-                        } else {
-                            rel.path = "/" + std::string(location);
-                        }
-                    }
-                    redirect_url = rel;
-                }
+                auto redirect_url = url::resolve_reference(target, location);
                 
                 if (redirect_url) {
+                    if (!detail::is_supported_http_url_scheme(redirect_url->scheme)) {
+                        ELIO_LOG_WARNING("Rejecting unsupported redirect scheme: {}",
+                                         redirect_url->scheme);
+                        co_return resp;
+                    }
+
                     // Reject HTTPS -> HTTP downgrades to prevent SSL stripping
                     if (target.is_secure() && !redirect_url->is_secure()) {
                         ELIO_LOG_WARNING("Rejecting insecure redirect from HTTPS to HTTP: {}",

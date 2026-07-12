@@ -1448,6 +1448,41 @@ public:
 
 ## HTTP (`elio::http`)
 
+### `url`
+
+Parsed HTTP URL components used by HTTP, WebSocket, SSE, and HTTP/2 clients.
+
+```cpp
+struct url {
+    std::string scheme;
+    std::string host;
+    uint16_t port = 0;
+    std::string path;
+    std::string query;
+    std::string fragment;
+    std::string userinfo;
+
+    std::string path_with_query() const;
+    std::string host_authority() const;
+    std::string authority() const;
+    std::string to_string() const;
+    uint16_t effective_port() const;
+    uint16_t default_port() const;
+    bool is_secure() const;
+
+    static std::optional<url> parse(std::string_view str);
+    static std::optional<url> resolve_reference(
+        const url& base,
+        std::string_view reference);
+};
+```
+
+`path_with_query()` intentionally excludes `fragment`, because fragments are
+client-side URL components and are not sent in HTTP request targets.
+`resolve_reference()` resolves redirect-style `Location` references against a
+base URL, including relative paths, query-only references, fragment-only
+references, scheme-relative references, and dot-segment removal.
+
 ### `client`
 
 HTTP client with connection pooling.
@@ -1561,6 +1596,10 @@ struct client_config : base_client_config {
     // Inherits all base_client_config fields.
 };
 ```
+
+When `follow_redirects` is enabled, the client resolves `Location` values with
+`url::resolve_reference()`, rejects unsupported schemes, and rejects HTTPS to
+HTTP downgrades.
 
 `websocket::client_config` and `sse::client_config` also inherit
 `base_client_config`, including timeout, read-buffer, TLS verification, DNS

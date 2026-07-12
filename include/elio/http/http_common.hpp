@@ -81,6 +81,107 @@ inline bool is_supported_http_url_scheme(std::string_view scheme) noexcept {
     return scheme == "http" || scheme == "https";
 }
 
+inline bool has_uri_scheme(std::string_view value) noexcept {
+    if (value.empty() ||
+        !std::isalpha(static_cast<unsigned char>(value.front()))) {
+        return false;
+    }
+
+    for (char c : value) {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (c == ':') {
+            return true;
+        }
+        if (c == '/' || c == '?' || c == '#') {
+            return false;
+        }
+        if (!std::isalnum(uc) && c != '+' && c != '-' && c != '.') {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+inline std::string remove_dot_segments(std::string_view path) {
+    if (path.empty()) {
+        return {};
+    }
+
+    const bool absolute = path.front() == '/';
+    const bool trailing_separator = path.back() == '/';
+    const bool trailing_dot =
+        path == "." || path.ends_with("/.");
+    const bool trailing_dot_dot =
+        path == ".." || path.ends_with("/..");
+
+    std::vector<std::string_view> segments;
+    size_t pos = 0;
+    while (pos <= path.size()) {
+        auto slash = path.find('/', pos);
+        auto end = slash == std::string_view::npos ? path.size() : slash;
+        auto segment = path.substr(pos, end - pos);
+
+        if (segment.empty() || segment == ".") {
+            // Skip empty and current-directory segments.
+        } else if (segment == "..") {
+            if (!segments.empty() && segments.back() != "..") {
+                segments.pop_back();
+            } else if (!absolute) {
+                segments.push_back(segment);
+            }
+        } else {
+            segments.push_back(segment);
+        }
+
+        if (slash == std::string_view::npos) {
+            break;
+        }
+        pos = slash + 1;
+    }
+
+    std::string result;
+    if (absolute) {
+        result += '/';
+    }
+    for (size_t i = 0; i < segments.size(); ++i) {
+        if (i > 0 || (absolute && result.size() > 1)) {
+            result += '/';
+        }
+        result += segments[i];
+    }
+
+    if ((trailing_separator || trailing_dot || trailing_dot_dot) &&
+        !result.empty() && result.back() != '/') {
+        result += '/';
+    }
+    if (result.empty() && absolute) {
+        result = "/";
+    }
+
+    return result;
+}
+
+inline std::string merge_url_paths(std::string_view base_path,
+                                   std::string_view reference_path) {
+    if (base_path.empty()) {
+        std::string result = "/";
+        result += reference_path;
+        return result;
+    }
+
+    auto last_slash = base_path.rfind('/');
+    if (last_slash == std::string_view::npos) {
+        std::string result = "/";
+        result += reference_path;
+        return result;
+    }
+
+    std::string result(base_path.substr(0, last_slash + 1));
+    result += reference_path;
+    return result;
+}
+
 inline std::optional<uint16_t> parse_url_port(std::string_view value) noexcept {
     if (value.empty()) {
         return std::nullopt;
@@ -710,6 +811,72 @@ struct url {
         }
         
         return result;
+    }
+
+    /// Resolve a URI-reference against this URL per RFC 3986 section 5.
+    static std::optional<url> resolve_reference(const url& base,
+                                                std::string_view reference) {
+        if (!detail::is_valid_url_input(reference)) {
+            return std::nullopt;
+        }
+
+        if (detail::has_uri_scheme(reference)) {
+            auto resolved = parse(reference);
+            if (resolved) {
+                resolved->path = detail::remove_dot_segments(resolved->path);
+            }
+            return resolved;
+        }
+
+        if (reference.starts_with("//")) {
+            std::string absolute = base.scheme + ":";
+            absolute += reference;
+            auto resolved = parse(absolute);
+            if (resolved) {
+                resolved->path = detail::remove_dot_segments(resolved->path);
+            }
+            return resolved;
+        }
+
+        auto resolved = base;
+        resolved.fragment.clear();
+
+        auto path_and_query = reference;
+        auto fragment_pos = path_and_query.find('#');
+        if (fragment_pos != std::string_view::npos) {
+            resolved.fragment = path_and_query.substr(fragment_pos + 1);
+            path_and_query = path_and_query.substr(0, fragment_pos);
+        }
+
+        std::string_view reference_path = path_and_query;
+        std::string_view reference_query;
+        bool has_reference_query = false;
+        auto query_pos = path_and_query.find('?');
+        if (query_pos != std::string_view::npos) {
+            has_reference_query = true;
+            reference_query = path_and_query.substr(query_pos + 1);
+            reference_path = path_and_query.substr(0, query_pos);
+        }
+
+        if (reference_path.empty()) {
+            if (has_reference_query) {
+                resolved.query = reference_query;
+            }
+        } else {
+            if (reference_path.front() == '/') {
+                resolved.path = detail::remove_dot_segments(reference_path);
+            } else {
+                resolved.path = detail::remove_dot_segments(
+                    detail::merge_url_paths(base.path, reference_path));
+            }
+            resolved.query = has_reference_query ? std::string(reference_query) : "";
+        }
+
+        if (resolved.path.empty()) {
+            resolved.path = "/";
+        }
+
+        return resolved;
     }
 };
 

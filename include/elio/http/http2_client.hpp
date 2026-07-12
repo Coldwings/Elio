@@ -161,6 +161,13 @@ public:
             co_return std::nullopt;
         }
 
+        if (!detail::is_valid_url_input(target.host_authority()) ||
+            !detail::is_valid_request_target(target.path_with_query())) {
+            ELIO_LOG_ERROR("Invalid outbound HTTP/2 request target");
+            errno = EINVAL;
+            co_return std::nullopt;
+        }
+
         auto conn = co_await get_connection(target.host, target.effective_port());
         if (!conn) {
             co_return std::nullopt;

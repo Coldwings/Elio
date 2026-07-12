@@ -10,6 +10,7 @@
 #include <uv.h>
 #include "bench_tcp_common.hpp"
 
+#include <netdb.h>
 #include <sys/socket.h>
 
 #include <atomic>
@@ -33,6 +34,25 @@ struct echo_write_req {
     uv_write_t    req;
     std::vector<char> data;
 };
+
+static bool resolve_ipv4_host(const bench::config& cfg, sockaddr_in& addr) {
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo* result = nullptr;
+    std::string service = std::to_string(cfg.port);
+    int rc = getaddrinfo(cfg.host.c_str(), service.c_str(), &hints, &result);
+    if (rc != 0 || result == nullptr) {
+        std::fprintf(stderr, "Resolve %s:%d failed: %s\n",
+                     cfg.host.c_str(), cfg.port, gai_strerror(rc));
+        return false;
+    }
+
+    addr = *reinterpret_cast<sockaddr_in*>(result->ai_addr);
+    freeaddrinfo(result);
+    return true;
+}
 
 static void server_alloc_cb(uv_handle_t* handle, size_t /*suggested*/,
                             uv_buf_t* buf) {
@@ -224,6 +244,11 @@ static void pp_connect_cb(uv_connect_t* req, int status) {
 
 static bench::pingpong_stats run_client_pingpong(const bench::config& cfg,
                                                   size_t msg_size) {
+    struct sockaddr_in addr;
+    if (!resolve_ipv4_host(cfg, addr)) {
+        return {};
+    }
+
     uv_loop_t loop;
     uv_loop_init(&loop);
 
@@ -246,8 +271,6 @@ static bench::pingpong_stats run_client_pingpong(const bench::config& cfg,
                    (cfg.warmup_s + cfg.duration_s) * 1000, 0);
 
     c.connect_req.data = &c;
-    struct sockaddr_in addr;
-    uv_ip4_addr(cfg.host.c_str(), cfg.port, &addr);
     uv_tcp_connect(&c.connect_req, &c.tcp,
                    reinterpret_cast<const struct sockaddr*>(&addr),
                    pp_connect_cb);
@@ -386,6 +409,11 @@ static void st_connect_cb(uv_connect_t* req, int status) {
 
 static bench::streaming_stats run_client_streaming(const bench::config& cfg,
                                                     size_t msg_size) {
+    struct sockaddr_in addr;
+    if (!resolve_ipv4_host(cfg, addr)) {
+        return {};
+    }
+
     uv_loop_t loop;
     uv_loop_init(&loop);
 
@@ -409,8 +437,6 @@ static bench::streaming_stats run_client_streaming(const bench::config& cfg,
                    (cfg.warmup_s + cfg.duration_s) * 1000, 0);
 
     c.connect_req.data = &c;
-    struct sockaddr_in addr;
-    uv_ip4_addr(cfg.host.c_str(), cfg.port, &addr);
     uv_tcp_connect(&c.connect_req, &c.tcp,
                    reinterpret_cast<const struct sockaddr*>(&addr),
                    st_connect_cb);

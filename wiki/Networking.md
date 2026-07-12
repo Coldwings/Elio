@@ -29,6 +29,13 @@ auto listener = tcp_listener::bind(ipv4_address(8080), opts);
 
 ## TCP
 
+### Write Size Contract
+
+`read()` and `write()` perform a single readiness-aware operation. A successful
+`write()` can still report a positive short write, so use `write_exactly()` for
+complete protocol messages, echo responses, and other full-buffer sends. If you
+use `write()` directly, loop until all bytes have been accepted.
+
 ### TCP Server
 
 ```cpp
@@ -44,7 +51,8 @@ coro::task<void> handle_client(tcp_stream stream) {
         auto result = co_await stream.read(buffer, sizeof(buffer));
         if (result.result <= 0) break;
         
-        co_await stream.write(buffer, result.result);
+        auto written = co_await stream.write_exactly(buffer, result.result);
+        if (written.result <= 0) break;
     }
     co_return;
 }
@@ -85,7 +93,7 @@ coro::task<void> client(const std::string& host, uint16_t port) {
     
     // Send data
     const char* msg = "Hello, server!";
-    co_await stream->write(msg, strlen(msg));
+    co_await stream->write_exactly(msg, strlen(msg));
     
     // Receive response
     char buffer[1024];
@@ -181,7 +189,8 @@ coro::task<void> handle_client(uds_stream stream) {
         auto result = co_await stream.read(buffer, sizeof(buffer));
         if (result.result <= 0) break;
         
-        co_await stream.write(buffer, result.result);
+        auto written = co_await stream.write_exactly(buffer, result.result);
+        if (written.result <= 0) break;
     }
     co_return;
 }
@@ -220,7 +229,7 @@ coro::task<void> client(const unix_address& addr) {
     
     // Send data
     const char* msg = "Hello via UDS!";
-    co_await stream->write(msg, strlen(msg));
+    co_await stream->write_exactly(msg, strlen(msg));
     
     // Receive response
     char buffer[1024];

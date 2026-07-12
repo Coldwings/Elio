@@ -136,7 +136,7 @@ coro::task<void> connect_example() {
     }
 
     // Use the stream
-    co_await stream->write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    co_await stream->write_exactly("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
 
     char buffer[4096];
     auto result = co_await stream->read(buffer, sizeof(buffer));

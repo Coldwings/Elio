@@ -97,7 +97,8 @@ coro::task<void> handle_client(net::tcp_stream stream, int id) {
         auto result = co_await stream.read(buffer, sizeof(buffer));
         if (result.result <= 0) break;
 
-        co_await stream.write(buffer, result.result);
+        auto written = co_await stream.write_exactly(buffer, result.result);
+        if (written.result <= 0) break;
     }
 
     ELIO_LOG_INFO("[Client {}] Disconnected", id);
@@ -175,7 +176,8 @@ coro::task<void> handle_client(net::uds_stream stream, int id) {
         auto result = co_await stream.read(buffer, sizeof(buffer));
         if (result.result <= 0) break;
 
-        co_await stream.write(buffer, result.result);
+        auto written = co_await stream.write_exactly(buffer, result.result);
+        if (written.result <= 0) break;
     }
 
     ELIO_LOG_INFO("[Client {}] Disconnected", id);
@@ -247,7 +249,7 @@ coro::task<void> client_main(const net::unix_address& addr) {
 
     // Send message
     const char* msg = "Hello via Unix Domain Socket!";
-    co_await stream->write(msg, strlen(msg));
+    co_await stream->write_exactly(msg, strlen(msg));
 
     // Receive echo
     char buffer[1024];

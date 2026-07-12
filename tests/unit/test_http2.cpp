@@ -267,6 +267,43 @@ TEST_CASE("HTTP/2 custom send rejects non-HTTPS targets",
     REQUIRE(client_errno == EPROTONOSUPPORT);
 }
 
+TEST_CASE("HTTP/2 custom send rejects invalid request targets",
+          "[http2][client][security]") {
+    using elio::coro::task;
+    using elio::runtime::scheduler;
+
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    bool request_failed = false;
+    int client_errno = 0;
+
+    sched.go([&]() -> task<void> {
+        h2_client client;
+        url target;
+        target.scheme = "https";
+        target.host = "127.0.0.1";
+        target.path = "/bad path";
+
+        errno = 0;
+        auto resp = co_await client.send(method::GET, target);
+        request_failed = !resp;
+        client_errno = errno;
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(request_failed);
+    REQUIRE(client_errno == EINVAL);
+}
+
 TEST_CASE("nghttp2 library version", "[http2]") {
     // Basic check that nghttp2 is linked and functional
     nghttp2_info* info = nghttp2_version(0);

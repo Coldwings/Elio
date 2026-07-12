@@ -77,6 +77,10 @@ inline bool is_valid_url_input(std::string_view value) noexcept {
     return !value.empty() && !has_request_target_forbidden_char(value);
 }
 
+inline bool is_supported_http_url_scheme(std::string_view scheme) noexcept {
+    return scheme == "http" || scheme == "https";
+}
+
 inline std::optional<uint16_t> parse_url_port(std::string_view value) noexcept {
     if (value.empty()) {
         return std::nullopt;

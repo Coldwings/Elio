@@ -406,6 +406,11 @@ private:
             ELIO_LOG_ERROR("Invalid SSE URL: {}", url_str);
             co_return false;
         }
+        if (!http::detail::is_supported_http_url_scheme(parsed->scheme)) {
+            ELIO_LOG_ERROR("Unsupported SSE URL scheme: {}", parsed->scheme);
+            errno = EINVAL;
+            co_return false;
+        }
         
         url_ = *parsed;
         token_ = std::move(token);

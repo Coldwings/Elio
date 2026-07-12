@@ -30,6 +30,7 @@
 #include <chrono>
 #include <string>
 #include <thread>
+#include <vector>
 
 using elio::coro::task;
 using elio::net::ipv4_address;
@@ -210,16 +211,25 @@ TEST_CASE("WebSocket client sets errno for invalid URLs",
     scheduler sched(1);
     sched.start();
 
+    const std::vector<std::string> invalid_urls = {
+        "not-a-websocket-url",
+        "http://127.0.0.1/ws",
+        "https://127.0.0.1/ws",
+        "ws://127.0.0.1/ws#fragment",
+        "wss://127.0.0.1/ws#fragment",
+    };
+
     std::atomic<bool> client_done{false};
-    bool connected = true;
-    int client_errno = 0;
+    std::vector<bool> connected(invalid_urls.size(), true);
+    std::vector<int> client_errno(invalid_urls.size(), 0);
 
     sched.go([&]() -> task<void> {
-        elio::http::websocket::ws_client client;
-
-        errno = EBUSY;
-        connected = co_await client.connect("not-a-websocket-url");
-        client_errno = errno;
+        for (size_t i = 0; i < invalid_urls.size(); ++i) {
+            elio::http::websocket::ws_client client;
+            errno = EBUSY;
+            connected[i] = co_await client.connect(invalid_urls[i]);
+            client_errno[i] = errno;
+        }
         client_done = true;
     });
 
@@ -230,8 +240,11 @@ TEST_CASE("WebSocket client sets errno for invalid URLs",
     sched.shutdown();
 
     REQUIRE(client_done);
-    REQUIRE_FALSE(connected);
-    REQUIRE(client_errno == EINVAL);
+    for (size_t i = 0; i < invalid_urls.size(); ++i) {
+        CAPTURE(invalid_urls[i]);
+        REQUIRE_FALSE(connected[i]);
+        REQUIRE(client_errno[i] == EINVAL);
+    }
 }
 
 TEST_CASE("HTTP client rejects response exceeding max_response_size",

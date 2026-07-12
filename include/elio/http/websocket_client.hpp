@@ -364,12 +364,6 @@ private:
         } else if (url_str.starts_with("ws://")) {
             normalized = "http://";
             url_str = url_str.substr(5);
-        } else if (url_str.starts_with("https://")) {
-            normalized.assign(url_str);
-            url_str = {};
-        } else if (url_str.starts_with("http://")) {
-            normalized.assign(url_str);
-            url_str = {};
         } else {
             return std::nullopt;
         }
@@ -381,6 +375,9 @@ private:
         }
 
         if (parsed->scheme != "http" && parsed->scheme != "https") {
+            return std::nullopt;
+        }
+        if (!parsed->fragment.empty()) {
             return std::nullopt;
         }
 

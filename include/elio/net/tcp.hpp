@@ -716,10 +716,14 @@ public:
         }
     }
 
-    /// Half-close one direction of the connection without releasing the fd.
+    /// Half-close one direction of the TCP connection without releasing the fd.
+    ///
+    /// This is a direct ``::shutdown`` wrapper for the socket half-close. It
+    /// does not perform protocol-level close handshakes such as TLS
+    /// ``close_notify``; use ``tls::tls_stream::shutdown()`` for TLS streams.
+    ///
     /// @param how One of ``SHUT_RD``, ``SHUT_WR``, ``SHUT_RDWR``.
     /// @return true on success, false on error (check ``errno``).
-    /// Mirrors the contract on ``tls::tls_stream::shutdown()`` for symmetry.
     bool shutdown(int how) noexcept {
         if (fd_ < 0) {
             errno = EBADF;

@@ -404,6 +404,7 @@ private:
         auto parsed = url::parse(url_str);
         if (!parsed) {
             ELIO_LOG_ERROR("Invalid SSE URL: {}", url_str);
+            errno = EINVAL;
             co_return false;
         }
         if (!http::detail::is_supported_http_url_scheme(parsed->scheme)) {

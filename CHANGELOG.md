@@ -81,8 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WebSocket and SSE validation**: Fixed oversized WebSocket frame
   preallocation, malformed close payloads, close encode state preservation,
   subprotocol selection validation, non-terminal route wildcards, IPv6 client
-  URLs, upgrade read timeouts, non-SSE content-type rejection, and SSE parser
-  buffering limits. (#320)
+  URLs, upgrade read timeouts, non-SSE content-type rejection, SSE parser
+  buffering limits, and invalid URL errno reporting. (#320, #658)
 - **HTTP/2 client behavior**: Fixed connect/read timeout enforcement, session
   config application, buffered response-body caps, HTTP/2 option dependency
   validation, nghttp2 FetchContent cache scoping, and installed nghttp2 target

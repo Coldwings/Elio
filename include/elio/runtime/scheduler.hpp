@@ -400,6 +400,11 @@ public:
         return worker_pending_load_(n);
     }
 
+    /// Dynamically resize the worker thread pool.
+    ///
+    /// Must be called from outside scheduler worker threads. Calls from a
+    /// worker thread are ignored after logging a warning, because the shrink
+    /// path joins worker threads and would otherwise be able to deadlock.
     void set_thread_count(size_t count) {
         // Guard against calling from a worker thread. The shrink path joins
         // worker threads while holding workers_mutex_; if the joined worker's

@@ -508,7 +508,8 @@ public:
     void pause();
     void resume();
 
-    // Dynamically resize the thread pool
+    // Dynamically resize the thread pool.
+    // Must be called from outside scheduler worker threads.
     void set_thread_count(size_t count);
 
     // Get the current scheduler (thread-local)
@@ -534,6 +535,10 @@ drain completed before the timeout. Use `shutdown_force()` only when
 non-graceful teardown is required: it does not wait for tracked coroutine or
 pending-I/O drain, but it may still wait for already-accepted scheduler-owned
 blocking work before stopping workers.
+
+`set_thread_count()` must be called from outside scheduler worker threads. If a
+worker thread calls it, Elio logs a warning and leaves the worker count
+unchanged to avoid deadlocking the resize path while joining worker threads.
 
 **Example:**
 ```cpp

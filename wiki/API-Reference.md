@@ -457,7 +457,8 @@ public:
     // Returns true if all tracked work drained before the timeout.
     bool shutdown(std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
 
-    // Stop workers immediately. Suspended I/O may be orphaned.
+    // Stop scheduler workers without graceful coroutine/I/O drain.
+    // Accepted scheduler-owned blocking work is drained first.
     void shutdown_force();
 
     // Inspect or wait for tracked work
@@ -529,8 +530,10 @@ public:
 `shutdown()` is the graceful path: it waits for tasks spawned through
 `go()`, `go_to()`, `go_joinable()`, `go_joinable_to()`, or `elio::run()` to
 finish, including work suspended on scheduler-owned I/O, and returns whether the
-drain completed before the timeout. Use `shutdown_force()` only when immediate
-teardown is required.
+drain completed before the timeout. Use `shutdown_force()` only when
+non-graceful teardown is required: it does not wait for tracked coroutine or
+pending-I/O drain, but it may still wait for already-accepted scheduler-owned
+blocking work before stopping workers.
 
 **Example:**
 ```cpp

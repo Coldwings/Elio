@@ -96,8 +96,11 @@ public:
 
     ~scheduler() {
         if (running_.load(std::memory_order_relaxed)) {
-            // Destructor must not block — fall back to immediate shutdown.
-            // Users wanting drain-on-exit should call shutdown() explicitly.
+            // Use force shutdown during destruction: do not wait for graceful
+            // coroutine/I/O drain, but shutdown_force() may still wait for
+            // scheduler-owned blocking work that was already accepted.
+            // Call shutdown() explicitly when callers need a graceful drain
+            // deadline/result before object teardown.
             shutdown_force();
         }
         if (current_scheduler_ == this) {
@@ -152,8 +155,11 @@ public:
         return drained;
     }
 
-    /// Force shutdown: stop workers immediately. Tasks suspended on I/O will
-    /// be orphaned (their CQEs are lost, and their frames are destroyed via
+    /// Force shutdown: stop scheduler workers without gracefully draining
+    /// tracked tasks or pending I/O. Already-accepted scheduler-owned blocking
+    /// work is drained first so spawn_blocking continuations can resume on
+    /// scheduler workers before teardown. Tasks suspended on I/O will be
+    /// orphaned (their CQEs are lost, and their frames are destroyed via
     /// drain_remaining_tasks). Use shutdown() for graceful drain.
     void shutdown_force() {
         // Drain the blocking pool BEFORE flipping running_=false. Pool tasks

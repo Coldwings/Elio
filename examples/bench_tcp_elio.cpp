@@ -39,19 +39,10 @@ static task<void> echo_handler(tcp_stream stream) {
         auto r = co_await stream.read(buf, sizeof(buf));
         if (r.result <= 0) break;
 
-        // Full write loop (handle partial writes and EAGAIN)
-        size_t remaining = r.result;
-        const char* ptr  = buf;
-        while (remaining > 0) {
-            auto w = co_await stream.write(ptr, remaining);
-            if (w.result > 0) {
-                remaining -= w.result;
-                ptr += w.result;
-            } else if (w.result == -EAGAIN || w.result == -EWOULDBLOCK) {
-                continue;
-            } else {
-                co_return;
-            }
+        auto w = co_await stream.write_exactly(
+            buf, static_cast<size_t>(r.result));
+        if (w.result <= 0) {
+            co_return;
         }
     }
     co_return;
@@ -99,18 +90,12 @@ static task<bool> read_exact_cancellable(tcp_stream& stream, char* buf,
             co_return false;
         }
 
-        auto result = co_await io::async_recv(stream.fd(), buf, n, 0, token);
-        if (result.was_cancelled()) {
+        auto result = co_await stream.read(buf, n, token);
+        if (result.result > 0) {
+            n -= result.result;
+            buf += result.result;
+        } else if (result.result == -ECANCELED) {
             co_return false;
-        }
-
-        if (result.io.result > 0) {
-            n -= result.io.result;
-            buf += result.io.result;
-        } else if (result.io.result == -EAGAIN ||
-                   result.io.result == -EWOULDBLOCK ||
-                   result.io.result == -EINTR) {
-            co_await time::yield();
         } else {
             co_return false;
         }
@@ -125,18 +110,12 @@ static task<bool> write_exact_cancellable(tcp_stream& stream, const char* buf,
             co_return false;
         }
 
-        auto result = co_await io::async_send(stream.fd(), buf, n, 0, token);
-        if (result.was_cancelled()) {
+        auto result = co_await stream.write(buf, n, token);
+        if (result.result > 0) {
+            n -= result.result;
+            buf += result.result;
+        } else if (result.result == -ECANCELED) {
             co_return false;
-        }
-
-        if (result.io.result > 0) {
-            n -= result.io.result;
-            buf += result.io.result;
-        } else if (result.io.result == -EAGAIN ||
-                   result.io.result == -EWOULDBLOCK ||
-                   result.io.result == -EINTR) {
-            co_await time::yield();
         } else {
             co_return false;
         }
@@ -286,21 +265,12 @@ static task<void> streaming_reader(streaming_ctx* ctx, streaming_counters* ctr) 
 
     while (!ctx->stop->load(std::memory_order_relaxed)) {
         size_t avail = kReadBufSize - recv_offset;
-        auto r = co_await io::async_recv(ctx->stream->fd(),
-                                         recv_buf.data() + recv_offset,
-                                         avail, 0, ctx->token);
-        if (r.was_cancelled()) {
+        auto r = co_await ctx->stream->read(
+            recv_buf.data() + recv_offset, avail, ctx->token);
+        if (r.result <= 0) {
             co_return;
         }
-        if (r.io.result == -EAGAIN || r.io.result == -EWOULDBLOCK ||
-            r.io.result == -EINTR) {
-            co_await time::yield();
-            continue;
-        }
-        if (r.io.result <= 0) {
-            co_return;
-        }
-        recv_offset += static_cast<size_t>(r.io.result);
+        recv_offset += static_cast<size_t>(r.result);
 
         const char* ptr = recv_buf.data();
         while (recv_offset >= ctx->msg_size) {

@@ -100,6 +100,9 @@ public:
             // Users wanting drain-on-exit should call shutdown() explicitly.
             shutdown_force();
         }
+        if (current_scheduler_ == this) {
+            current_scheduler_ = nullptr;
+        }
         unhandled_exception_handler_.store(
             std::shared_ptr<const unhandled_exception_handler>{},
             std::memory_order_release);

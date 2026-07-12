@@ -255,6 +255,10 @@ public:
     /// @param length Maximum bytes to read
     /// @return Number of bytes read, or negative error code
     coro::task<io::io_result> read(void* buffer, size_t length) {
+        if (length > static_cast<size_t>(INT32_MAX)) {
+            co_return io::io_result{-EOVERFLOW, 0};
+        }
+
         if (!handshake_complete_) {
             auto hs = co_await handshake();
             if (!hs) {
@@ -302,6 +306,10 @@ public:
     /// Read data asynchronously, cancellable by ``token``.
     coro::task<io::io_result> read(void* buffer, size_t length,
                                    coro::cancel_token token) {
+        if (length > static_cast<size_t>(INT32_MAX)) {
+            co_return io::io_result{-EOVERFLOW, 0};
+        }
+
         if (!handshake_complete_) {
             auto hs = co_await handshake(token);
             if (!hs) {
@@ -359,6 +367,10 @@ public:
     /// @param length Number of bytes to write
     /// @return Number of bytes written, or negative error code
     coro::task<io::io_result> write(const void* buffer, size_t length) {
+        if (length > static_cast<size_t>(INT32_MAX)) {
+            co_return io::io_result{-EOVERFLOW, 0};
+        }
+
         if (!handshake_complete_) {
             auto hs = co_await handshake();
             if (!hs) {
@@ -396,6 +408,10 @@ public:
     /// Write data asynchronously, cancellable by ``token``.
     coro::task<io::io_result> write(const void* buffer, size_t length,
                                     coro::cancel_token token) {
+        if (length > static_cast<size_t>(INT32_MAX)) {
+            co_return io::io_result{-EOVERFLOW, 0};
+        }
+
         if (!handshake_complete_) {
             auto hs = co_await handshake(token);
             if (!hs) {

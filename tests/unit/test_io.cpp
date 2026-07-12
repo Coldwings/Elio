@@ -3304,6 +3304,53 @@ TEST_CASE("TLS shutdown timeout cancels silent peer readiness wait",
     REQUIRE(shutdown_elapsed_ms.load() >= 0);
     REQUIRE(shutdown_elapsed_ms.load() < server_hold.count());
 }
+
+TEST_CASE("tls_stream base read and write reject oversized lengths",
+          "[tls][stream][overflow]") {
+    int sv[2];
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+
+    elio::tls::tls_context client_ctx(elio::tls::tls_mode::client);
+    client_ctx.set_verify_mode(elio::tls::verify_mode::none);
+    elio::tls::tls_stream stream{elio::net::tcp_stream(sv[0]), client_ctx};
+
+    close(sv[1]);
+
+    constexpr size_t oversized = static_cast<size_t>(INT32_MAX) + 1;
+    char byte = 0;
+    io_result read_result{};
+    io_result write_result{};
+    io_result read_token_result{};
+    io_result write_token_result{};
+    std::atomic<bool> done{false};
+
+    scheduler sched(1);
+    sched.start();
+
+    sched.go([&]() -> task<void> {
+        cancel_source source;
+        read_result = co_await stream.read(&byte, oversized);
+        write_result = co_await stream.write(&byte, oversized);
+        read_token_result =
+            co_await stream.read(&byte, oversized, source.get_token());
+        write_token_result =
+            co_await stream.write(&byte, oversized, source.get_token());
+        done = true;
+        co_return;
+    });
+
+    for (int i = 0; i < 200 && !done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+
+    REQUIRE(done);
+    REQUIRE(read_result.result == -EOVERFLOW);
+    REQUIRE(write_result.result == -EOVERFLOW);
+    REQUIRE(read_token_result.result == -EOVERFLOW);
+    REQUIRE(write_token_result.result == -EOVERFLOW);
+}
 #endif
 
 // ============================================================================

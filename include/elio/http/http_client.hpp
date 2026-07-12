@@ -356,6 +356,19 @@ private:
         return code >= 100 && code < 200;
     }
 
+    static bool is_auto_follow_redirect(status s) noexcept {
+        switch (s) {
+        case status::moved_permanently:
+        case status::found:
+        case status::see_other:
+        case status::temporary_redirect:
+        case status::permanent_redirect:
+            return true;
+        default:
+            return false;
+        }
+    }
+
     /// Send request with redirect handling
     coro::task<std::optional<response>> send_request(request& req, const url& target,
                                                            size_t redirect_count,
@@ -634,7 +647,9 @@ private:
         }
         
         // Handle redirects
-        if (config_.follow_redirects && resp.is_redirect() && redirect_count < config_.max_redirects) {
+        if (config_.follow_redirects &&
+            is_auto_follow_redirect(resp.get_status()) &&
+            redirect_count < config_.max_redirects) {
             auto location = resp.header("Location");
             if (!location.empty()) {
                 ELIO_LOG_DEBUG("Following redirect to: {}", location);

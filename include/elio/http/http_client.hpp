@@ -671,9 +671,15 @@ private:
                         redirect_req.set_header("User-Agent", config_.user_agent);
                     }
                     
-                    // Keep body for 307/308
-                    if (resp.get_status() == status::temporary_redirect ||
-                        resp.get_status() == status::permanent_redirect) {
+                    // Keep the payload whenever redirect handling preserves
+                    // the original method. 303 intentionally switches to GET.
+                    const bool method_preserved =
+                        redirect_method == req.get_method() &&
+                        resp.get_status() != status::see_other;
+                    if ((resp.get_status() == status::temporary_redirect ||
+                         resp.get_status() == status::permanent_redirect ||
+                         method_preserved) &&
+                        !req.body().empty()) {
                         redirect_req.set_body(req.body());
                         auto ct = req.content_type();
                         if (!ct.empty()) {

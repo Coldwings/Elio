@@ -86,7 +86,7 @@ inline std::optional<uint16_t> parse_url_port(std::string_view value) noexcept {
     auto* begin = value.data();
     auto* end = begin + value.size();
     auto [ptr, ec] = std::from_chars(begin, end, port);
-    if (ec != std::errc{} || ptr != end) {
+    if (ec != std::errc{} || ptr != end || port == 0) {
         return std::nullopt;
     }
     return port;

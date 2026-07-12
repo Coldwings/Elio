@@ -141,6 +141,25 @@ TEST_CASE("HTTP request parser - invalid request", "[http][parser]") {
         REQUIRE(result == parse_result::error);
     }
 
+    SECTION("Malformed HTTP version") {
+        const char* invalid_versions[] = {
+            "HTTP/",
+            "HTTP/1",
+            "HTTP/1.",
+            "HTTP/.1",
+            "HTTP/one.one",
+            "HTTP/1.1 extra",
+        };
+
+        for (auto* version : invalid_versions) {
+            request_parser parser;
+            std::string request =
+                std::string("GET / ") + version + "\r\n\r\n";
+            auto [result, consumed] = parser.parse(request);
+            REQUIRE(result == parse_result::error);
+        }
+    }
+
     SECTION("Missing colon in header") {
         request_parser parser;
         auto [result, consumed] = parser.parse("GET / HTTP/1.1\r\nBadHeader\r\n\r\n");
@@ -210,6 +229,25 @@ TEST_CASE("HTTP response parser - various status codes", "[http][parser]") {
     test_status(404, "Not Found", status::not_found);
     test_status(500, "Internal Server Error", status::internal_server_error);
     test_status(503, "Service Unavailable", status::service_unavailable);
+}
+
+TEST_CASE("HTTP response parser rejects malformed versions", "[http][parser]") {
+    const char* invalid_versions[] = {
+        "FTP/1.0",
+        "HTTP/",
+        "HTTP/1",
+        "HTTP/1.",
+        "HTTP/.1",
+        "HTTP/one.one",
+    };
+
+    for (auto* version : invalid_versions) {
+        response_parser parser;
+        std::string response =
+            std::string(version) + " 200 OK\r\nContent-Length: 0\r\n\r\n";
+        auto [result, consumed] = parser.parse(response);
+        REQUIRE(result == parse_result::error);
+    }
 }
 
 TEST_CASE("HTTP response parser - chunked response", "[http][parser]") {
@@ -906,13 +944,6 @@ TEST_CASE("HTTP message versions reject invalid serialization bytes",
                       std::invalid_argument);
     REQUIRE_THROWS_AS(req.set_version("HTTP/one.one"),
                       std::invalid_argument);
-
-    request_parser parser;
-    auto [parse_result_value, consumed] = parser.parse(
-        "GET / HTTP/1.1 extra\r\nHost: example.com\r\n\r\n");
-    REQUIRE(parse_result_value == parse_result::complete);
-    auto parsed_request = request::from_parser(parser);
-    REQUIRE_THROWS_AS(parsed_request.serialize(), std::invalid_argument);
 
     response resp(status::ok);
 

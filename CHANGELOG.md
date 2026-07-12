@@ -348,7 +348,7 @@ O(1) safe waiter unlinking.
 - **Cancellation safety**: Added comprehensive documentation for cancellation safety
   guarantees across all synchronization primitives in wiki and API reference
 - **GitHub community files**: Added CONTRIBUTING.md, CODE_OF_CONDUCT.md,
-  SECURITY.md, and FUNDING.yml for better community governance
+  and SECURITY.md for better community governance
 
 ### Testing
 

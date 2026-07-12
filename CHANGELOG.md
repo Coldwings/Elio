@@ -73,6 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **HTTP URL authority validation**: The URL parser now rejects unbracketed IPv6
   literals and authorities with multiple port separators instead of treating the
   last colon as a valid port delimiter. (#655)
+- **HTTP URL port validation**: Explicit `:0` ports are rejected instead of
+  being confused with the parser's default-port sentinel. (#656)
 - **WebSocket and SSE validation**: Fixed oversized WebSocket frame
   preallocation, malformed close payloads, close encode state preservation,
   subprotocol selection validation, non-terminal route wildcards, IPv6 client

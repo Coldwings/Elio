@@ -41,6 +41,8 @@
 - **Required for the default top-level build**: OpenSSL development files
   (TLS, HTTP, and HTTP/2 are enabled by default)
 - **Optional**: liburing (for io_uring backend)
+- **Optional for TCP benchmark comparison**: libuv development files
+  (`libuv1-dev` on Debian/Ubuntu) for `bench_tcp_libuv`
 - **Dependencies**: Automatically fetched via CMake FetchContent for source builds
   - fmtlib 10.2.1
   - Catch2 3.5.0 (for tests)
@@ -101,7 +103,9 @@ cmake -S . -B build -DELIO_ENABLE_DEBUG_METADATA=OFF
 
 Note: strict warning flags are applied only to Elio's tests/examples targets and are not propagated through exported interface targets.
 Enable RDMA, ibverbs, RDMA CM, CUDA, and TCP benchmark options only when the
-corresponding system dependencies are installed.
+corresponding system dependencies are installed. For TCP benchmark comparison
+builds, install the libuv development package if you need `bench_tcp_libuv`;
+without libuv, CMake skips that target.
 
 ### Install And Use As A Package
 
@@ -311,6 +315,7 @@ their corresponding feature targets.
   `rdma_perf.cpp`, `rdma_gpu_bw.cpp`
 - **TCP benchmark comparison** (`ELIO_BUILD_TCP_BENCHMARKS=ON`):
   `bench_tcp_elio.cpp`, `bench_tcp_libuv.cpp`, `bench_tcp_asio.cpp`
+  (`bench_tcp_libuv` requires system libuv development files)
 
 Build and run examples:
 ```bash

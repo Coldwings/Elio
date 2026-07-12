@@ -798,7 +798,9 @@ are only created when their feature targets are enabled:
 - HTTP, WebSocket, SSE, and HTTP client examples require `elio_http`.
 - HTTP/2 examples require `elio_http2`.
 - RDMA examples require the matching `elio_rdma*` targets.
-- TCP benchmark comparison programs require `ELIO_BUILD_TCP_BENCHMARKS=ON`.
+- TCP benchmark comparison programs require `ELIO_BUILD_TCP_BENCHMARKS=ON`;
+  install libuv development files (`libuv1-dev` on Debian/Ubuntu) if you need
+  `bench_tcp_libuv`.
 
 ```bash
 cmake -S . -B build -DELIO_BUILD_EXAMPLES=ON

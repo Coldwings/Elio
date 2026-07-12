@@ -163,6 +163,26 @@ TEST_CASE("shutdown_force from worker task does not self-join",
     REQUIRE(!sched.is_running());
 }
 
+TEST_CASE("scheduler destructor clears current after cross-thread shutdown",
+          "[scheduler][shutdown][regression]") {
+    REQUIRE(scheduler::current() == nullptr);
+
+    {
+        scheduler sched(1);
+        sched.start();
+        REQUIRE(scheduler::current() == &sched);
+
+        std::thread shutdowner([&sched]() {
+            sched.shutdown_force();
+        });
+        shutdowner.join();
+
+        REQUIRE(!sched.is_running());
+    }
+
+    REQUIRE(scheduler::current() == nullptr);
+}
+
 TEST_CASE("wait_for_idle returns when all tracked tasks complete",
           "[scheduler][shutdown]") {
     scheduler sched(2);

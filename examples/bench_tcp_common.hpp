@@ -8,14 +8,19 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace bench {
@@ -51,14 +56,53 @@ inline void print_usage(const char* prog, const char* library_name) {
         "  -s              Server mode (default: client)\n"
         "  -c              Client mode (explicit)\n"
         "  -H HOST         Server host (default: 127.0.0.1)\n"
-        "  -p PORT         Port (default: 9876)\n"
-        "  -t THREADS      Thread count (default: 1)\n"
-        "  -d SECONDS      Measurement duration per size (default: 5)\n"
-        "  -w SECONDS      Warmup per size (default: 2)\n"
-        "  -q DEPTH        Pipeline depth for streaming (default: 16)\n"
+        "  -p PORT         Port, 1..65535 (default: 9876)\n"
+        "  -t THREADS      Thread count, >= 1 (default: 1)\n"
+        "  -d SECONDS      Measurement duration per size, >= 1 (default: 5)\n"
+        "  -w SECONDS      Warmup per size, >= 0 (default: 2)\n"
+        "  -q DEPTH        Pipeline depth for streaming, 1..64 (default: 16)\n"
         "  -m MODE         pingpong | streaming | both (default: both)\n"
         "  -h              Show help\n",
         library_name, prog);
+}
+
+[[noreturn]] inline void fail_args(const char* prog,
+                                   const char* library_name,
+                                   const std::string& message) {
+    std::fprintf(stderr, "%s\n", message.c_str());
+    print_usage(prog, library_name);
+    throw argument_error(message);
+}
+
+inline const char* require_value(int argc,
+                                 char* argv[],
+                                 int& index,
+                                 const char* option,
+                                 const char* library_name) {
+    if (index + 1 >= argc) {
+        fail_args(argv[0], library_name,
+                  std::string("Missing value for ") + option);
+    }
+    return argv[++index];
+}
+
+inline int parse_integer_option(const char* prog,
+                                const char* library_name,
+                                std::string_view option,
+                                std::string_view value,
+                                int min_value,
+                                int max_value) {
+    int parsed = 0;
+    const char* begin = value.data();
+    const char* end = begin + value.size();
+    auto [ptr, ec] = std::from_chars(begin, end, parsed);
+    if (ec != std::errc{} || ptr != end ||
+        parsed < min_value || parsed > max_value) {
+        fail_args(prog, library_name,
+                  "Invalid value '" + std::string(value) + "' for " +
+                  std::string(option));
+    }
+    return parsed;
 }
 
 inline bool parse_test_type(const std::string& value,
@@ -86,30 +130,42 @@ inline config parse_args(int argc, char* argv[], const char* library_name) {
             cfg.run_mode = config::mode::server;
         } else if (arg == "-c") {
             cfg.run_mode = config::mode::client;
-        } else if (arg == "-H" && i + 1 < argc) {
-            cfg.host = argv[++i];
-        } else if (arg == "-p" && i + 1 < argc) {
-            cfg.port = static_cast<uint16_t>(std::stoi(argv[++i]));
-        } else if (arg == "-t" && i + 1 < argc) {
-            cfg.threads = std::stoi(argv[++i]);
-        } else if (arg == "-d" && i + 1 < argc) {
-            cfg.duration_s = std::stoi(argv[++i]);
-        } else if (arg == "-w" && i + 1 < argc) {
-            cfg.warmup_s = std::stoi(argv[++i]);
-        } else if (arg == "-q" && i + 1 < argc) {
-            cfg.pipeline_depth = std::stoi(argv[++i]);
-        } else if (arg == "-m" && i + 1 < argc) {
-            std::string m = argv[++i];
+        } else if (arg == "-H") {
+            cfg.host = require_value(argc, argv, i, "-H", library_name);
+        } else if (arg == "-p") {
+            const char* value = require_value(argc, argv, i, "-p", library_name);
+            cfg.port = static_cast<uint16_t>(parse_integer_option(
+                argv[0], library_name, "-p", value,
+                1, std::numeric_limits<uint16_t>::max()));
+        } else if (arg == "-t") {
+            const char* value = require_value(argc, argv, i, "-t", library_name);
+            cfg.threads = parse_integer_option(
+                argv[0], library_name, "-t", value, 1, 1024);
+        } else if (arg == "-d") {
+            const char* value = require_value(argc, argv, i, "-d", library_name);
+            cfg.duration_s = parse_integer_option(
+                argv[0], library_name, "-d", value, 1, 86400);
+        } else if (arg == "-w") {
+            const char* value = require_value(argc, argv, i, "-w", library_name);
+            cfg.warmup_s = parse_integer_option(
+                argv[0], library_name, "-w", value, 0, 86400);
+        } else if (arg == "-q") {
+            const char* value = require_value(argc, argv, i, "-q", library_name);
+            cfg.pipeline_depth = parse_integer_option(
+                argv[0], library_name, "-q", value, 1, 64);
+        } else if (arg == "-m") {
+            std::string m = require_value(argc, argv, i, "-m", library_name);
             if (!parse_test_type(m, cfg.type)) {
-                std::fprintf(stderr,
-                             "Invalid mode '%s'; expected pingpong, streaming, or both.\n",
-                             m.c_str());
-                print_usage(argv[0], library_name);
-                throw argument_error("invalid TCP benchmark mode");
+                fail_args(argv[0], library_name,
+                          "Invalid mode '" + m +
+                          "'; expected pingpong, streaming, or both.");
             }
         } else if (arg == "-h" || arg == "--help") {
             print_usage(argv[0], library_name);
             std::exit(0);
+        } else {
+            fail_args(argv[0], library_name,
+                      "Unknown option '" + arg + "'");
         }
     }
     return cfg;

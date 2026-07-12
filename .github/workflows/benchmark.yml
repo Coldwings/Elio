@@ -76,6 +76,10 @@ jobs:
           fi
           duration=$((10#$duration))
           warmup=$((10#$warmup))
+          if (( duration < 1 )); then
+            echo "::error::duration must be at least 1 second"
+            exit 2
+          fi
 
           case "$mode" in
             pingpong|streaming|both) ;;

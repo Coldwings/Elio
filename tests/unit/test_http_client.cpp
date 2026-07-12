@@ -1273,6 +1273,55 @@ TEST_CASE("HTTP client resolves redirect Location references",
     REQUIRE(final_request.find("#ignored-by-http") == std::string::npos);
 }
 
+TEST_CASE("HTTP client does not follow non-redirect 3xx Location",
+          "[http][client]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<int> got_status{0};
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        co_await drain_request_headers(*stream);
+        std::string response =
+            "HTTP/1.1 304 Not Modified\r\n"
+            "Location: /next\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        co_await stream->write(response);
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(1);
+        elio::http::client c(cfg);
+        auto resp = co_await c.get(make_url(port, "/cached"));
+        if (resp) {
+            got_status = resp->status_code();
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(got_status == 304);
+}
+
 TEST_CASE("HTTP client preserves payload when redirect keeps method",
           "[http][client]") {
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));

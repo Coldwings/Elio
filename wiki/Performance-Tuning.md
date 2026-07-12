@@ -259,9 +259,10 @@ When you know the target worker at spawn time, `go_to()` is more efficient than 
 elio::go_to(2, cache_sensitive_work);
 
 // Alternative: task may briefly run on another worker before migrating
-elio::go([]{
+elio::go([]() -> coro::task<void> {
     co_await elio::set_affinity(2);
     // ...
+    co_return;
 });
 ```
 

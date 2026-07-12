@@ -285,6 +285,11 @@ private:
             errno = EINVAL;
             co_return std::nullopt;
         }
+        if (!detail::is_supported_http_url_scheme(parsed->scheme)) {
+            ELIO_LOG_ERROR("Unsupported HTTP URL scheme: {}", parsed->scheme);
+            errno = EINVAL;
+            co_return std::nullopt;
+        }
 
         if (!config_.user_agent.empty() &&
             !detail::is_valid_header_value(config_.user_agent)) {

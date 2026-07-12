@@ -144,6 +144,36 @@ TEST_CASE("HTTP client rejects invalid outbound request inputs",
     REQUIRE(client_errno == EINVAL);
 }
 
+TEST_CASE("HTTP client rejects unsupported URL schemes",
+          "[http][client][security]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    bool request_failed = false;
+    int client_errno = 0;
+
+    sched.go([&]() -> task<void> {
+        elio::http::client c;
+
+        errno = 0;
+        auto resp = co_await c.get("ftp://127.0.0.1/resource");
+        request_failed = !resp;
+        client_errno = errno;
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(request_failed);
+    REQUIRE(client_errno == EINVAL);
+}
+
 TEST_CASE("WebSocket client rejects invalid outbound handshake config",
           "[websocket][client][security]") {
     scheduler sched(1);
@@ -520,6 +550,37 @@ TEST_CASE("SSE client read_timeout fires on stalled response headers",
     REQUIRE(client_errno == ETIMEDOUT);
     REQUIRE(client_elapsed_ms.load() >= 0);
     REQUIRE(client_elapsed_ms.load() < 3000);
+}
+
+TEST_CASE("SSE client rejects unsupported URL schemes",
+          "[sse][client][security]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    bool connected = true;
+    int client_errno = 0;
+
+    sched.go([&]() -> task<void> {
+        elio::http::sse::client_config cfg;
+        cfg.auto_reconnect = false;
+        elio::http::sse::sse_client client(cfg);
+
+        errno = 0;
+        connected = co_await client.connect("ftp://127.0.0.1/events");
+        client_errno = errno;
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE_FALSE(connected);
+    REQUIRE(client_errno == EINVAL);
 }
 
 TEST_CASE("HTTP client cancellation aborts a pending response read",

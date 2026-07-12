@@ -890,6 +890,46 @@ TEST_CASE("HTTP request serialization rejects invalid request targets",
     REQUIRE_NOTHROW(req.serialize());
 }
 
+TEST_CASE("HTTP message versions reject invalid serialization bytes",
+          "[http][message][security]") {
+    request req(method::GET, "/");
+
+    REQUIRE_NOTHROW(req.set_version(""));
+    REQUIRE(req.serialize().starts_with("GET / HTTP/1.1\r\n"));
+
+    REQUIRE_NOTHROW(req.set_version("HTTP/2.0"));
+    REQUIRE(req.serialize().starts_with("GET / HTTP/2.0\r\n"));
+
+    REQUIRE_THROWS_AS(req.set_version("HTTP/1.1\r\nInjected: yes"),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(req.set_version("HTTP/1.1 extra"),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(req.set_version("HTTP/one.one"),
+                      std::invalid_argument);
+
+    request_parser parser;
+    auto [parse_result_value, consumed] = parser.parse(
+        "GET / HTTP/1.1 extra\r\nHost: example.com\r\n\r\n");
+    REQUIRE(parse_result_value == parse_result::complete);
+    auto parsed_request = request::from_parser(parser);
+    REQUIRE_THROWS_AS(parsed_request.serialize(), std::invalid_argument);
+
+    response resp(status::ok);
+
+    REQUIRE_NOTHROW(resp.set_version(""));
+    REQUIRE(resp.serialize().starts_with("HTTP/1.1 200 OK\r\n"));
+
+    REQUIRE_NOTHROW(resp.set_version("HTTP/2.0"));
+    REQUIRE(resp.serialize().starts_with("HTTP/2.0 200 OK\r\n"));
+
+    REQUIRE_THROWS_AS(resp.set_version("HTTP/1.1\r\nInjected: yes"),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(resp.set_version("HTTP/1.1 extra"),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(resp.set_version("HTTP/one.one"),
+                      std::invalid_argument);
+}
+
 TEST_CASE("HTTP headers reject malformed names", "[http][headers][security]") {
     headers h;
     REQUIRE_THROWS_AS(h.set("", "v"), std::invalid_argument);

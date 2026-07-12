@@ -5,6 +5,7 @@
 #include <deque>
 #include <functional>
 #include <latch>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -14,16 +15,28 @@ namespace elio::runtime {
 // A simple thread pool for executing blocking tasks.
 // Supports both pooled mode (fixed threads) and non-pooled mode (spawn per task).
 class blocking_pool {
+    struct shared_state {
+        explicit shared_state(size_t n) : num_threads(n) {}
+
+        std::vector<std::thread> threads;
+        std::deque<std::function<void()>> queue;
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::atomic<bool> stopped{false};
+        size_t num_threads;
+    };
+
 public:
     // num_threads: pool size. 0 means no pooling, each submit spawns a new thread.
     explicit blocking_pool(size_t num_threads)
-        : num_threads_(num_threads) {
-        threads_.reserve(num_threads);
+        : state_(std::make_shared<shared_state>(num_threads)) {
+        auto state = state_;
+        state->threads.reserve(num_threads);
         std::latch ready(static_cast<std::ptrdiff_t>(num_threads));
         for (size_t i = 0; i < num_threads; ++i) {
-            threads_.emplace_back([this, &ready] {
+            state->threads.emplace_back([state, &ready] {
                 ready.count_down();
-                worker_loop();
+                worker_loop(state);
             });
         }
         ready.wait();
@@ -47,19 +60,20 @@ public:
     // races with shutdown() could enqueue a task no worker will ever run,
     // stranding the caller's awaiter forever.
     [[nodiscard]] bool submit(std::function<void()>&& task) {
-        if (num_threads_ == 0) {
-            if (stopped_.load(std::memory_order_acquire)) return false;
+        auto state = state_;
+        if (state->num_threads == 0) {
+            if (state->stopped.load(std::memory_order_acquire)) return false;
             std::thread(std::move(task)).detach();
             return true;
         }
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<std::mutex> lock(state->mutex);
             // Re-check under the mutex so shutdown()'s drain phase (which
             // also acquires this mutex) cannot miss a task we just pushed.
-            if (stopped_.load(std::memory_order_relaxed)) return false;
-            queue_.push_back(std::move(task));
+            if (state->stopped.load(std::memory_order_relaxed)) return false;
+            state->queue.push_back(std::move(task));
         }
-        cv_.notify_one();
+        state->cv.notify_one();
         return true;
     }
 
@@ -70,21 +84,29 @@ public:
     // already returned from its wait loop without picking up the new task).
     // After shutdown() returns, submit() will reject all further submissions.
     void shutdown() {
+        auto state = state_;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (stopped_.exchange(true, std::memory_order_release)) return;
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->stopped.exchange(true, std::memory_order_release)) return;
         }
-        cv_.notify_all();
-        for (auto& t : threads_) {
-            if (t.joinable()) t.join();
+        state->cv.notify_all();
+
+        const auto self = std::this_thread::get_id();
+        for (auto& t : state->threads) {
+            if (!t.joinable()) continue;
+            if (t.get_id() == self) {
+                t.detach();
+            } else {
+                t.join();
+            }
         }
         // Drain any leftover tasks inline. Running them here (rather than
         // discarding) keeps the "submitted task always runs" contract that
         // spawn_blocking awaiters rely on for resumption.
         std::deque<std::function<void()>> remaining;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            remaining.swap(queue_);
+            std::lock_guard<std::mutex> lock(state->mutex);
+            remaining.swap(state->queue);
         }
         for (auto& task : remaining) {
             if (task) task();
@@ -92,19 +114,21 @@ public:
     }
 
 private:
-    void worker_loop() {
-        while (!stopped_.load(std::memory_order_relaxed)) {
+    static void worker_loop(std::shared_ptr<shared_state> state) {
+        while (!state->stopped.load(std::memory_order_relaxed)) {
             std::function<void()> task;
 
             // Block until task available or stopped
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] {
-                return stopped_.load(std::memory_order_relaxed) || !queue_.empty();
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->cv.wait(lock, [&] {
+                return state->stopped.load(std::memory_order_relaxed) ||
+                       !state->queue.empty();
             });
-            if (stopped_.load(std::memory_order_relaxed) && queue_.empty()) return;
-            if (!queue_.empty()) {
-                task = std::move(queue_.front());
-                queue_.pop_front();
+            if (state->stopped.load(std::memory_order_relaxed) &&
+                state->queue.empty()) return;
+            if (!state->queue.empty()) {
+                task = std::move(state->queue.front());
+                state->queue.pop_front();
             }
 
             lock.unlock();
@@ -114,12 +138,7 @@ private:
         }
     }
 
-    std::vector<std::thread> threads_;
-    std::deque<std::function<void()>> queue_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::atomic<bool> stopped_{false};
-    size_t num_threads_;
+    std::shared_ptr<shared_state> state_;
 };
 
 }  // namespace elio::runtime

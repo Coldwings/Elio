@@ -57,7 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handoff/direct-resume deadlocks, exception-handler lifetime, `elio::run`
   shutdown on exceptions, rejected `go_joinable` handles, worker self-join,
   task-completion waiter lifetime races, and stale current-scheduler TLS after
-  cross-thread shutdown. (#391, #660)
+  cross-thread shutdown, and blocking-pool worker self-shutdown. (#391, #660,
+  #665)
 - **Synchronization and object-cache lifetime**: Fixed mutex waiter lock
   transfer lifetime, sync handoff cancellation leaks, object-cache release
   handoff and canceled-construction cleanup, bounded-channel close state, and

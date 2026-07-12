@@ -43,7 +43,10 @@ public:
     
     /// Get/set HTTP version
     std::string_view version() const noexcept { return version_; }
-    void set_version(std::string_view v) { version_ = v; }
+    void set_version(std::string_view v) {
+        detail::validate_http_version(v);
+        version_ = v;
+    }
     
     /// Get/set headers
     const headers& get_headers() const noexcept { return headers_; }
@@ -98,7 +101,11 @@ public:
         detail::validate_request_target(target);
         result += target;
         result += ' ';
-        result += version_.empty() ? "HTTP/1.1" : version_;
+        std::string_view version =
+            version_.empty() ? std::string_view("HTTP/1.1")
+                             : std::string_view(version_);
+        detail::validate_http_version(version);
+        result += version;
         result += "\r\n";
         
         // Headers
@@ -160,7 +167,10 @@ public:
     
     /// Get/set HTTP version
     std::string_view version() const noexcept { return version_; }
-    void set_version(std::string_view v) { version_ = v; }
+    void set_version(std::string_view v) {
+        detail::validate_http_version(v);
+        version_ = v;
+    }
     
     /// Get/set headers
     const headers& get_headers() const noexcept { return headers_; }
@@ -240,7 +250,11 @@ private:
         std::string result;
         
         // Status line
-        result += version_.empty() ? "HTTP/1.1" : version_;
+        std::string_view version =
+            version_.empty() ? std::string_view("HTTP/1.1")
+                             : std::string_view(version_);
+        detail::validate_http_version(version);
+        result += version;
         result += ' ';
         result += std::to_string(static_cast<uint16_t>(status_));
         result += ' ';

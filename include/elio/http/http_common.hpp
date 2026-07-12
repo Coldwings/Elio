@@ -67,6 +67,45 @@ inline bool is_valid_request_target_component(std::string_view component) noexce
     return !has_request_target_forbidden_char(component);
 }
 
+inline constexpr bool is_http_version_digit(char c) noexcept {
+    return c >= '0' && c <= '9';
+}
+
+inline bool is_valid_http_version(std::string_view version) noexcept {
+    if (version.empty()) {
+        return true;
+    }
+
+    constexpr std::string_view prefix = "HTTP/";
+    if (!version.starts_with(prefix)) {
+        return false;
+    }
+
+    auto numbers = version.substr(prefix.size());
+    auto dot = numbers.find('.');
+    if (dot == std::string_view::npos || dot == 0 ||
+        dot + 1 == numbers.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < numbers.size(); ++i) {
+        if (i == dot) {
+            continue;
+        }
+        if (!is_http_version_digit(numbers[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+inline void validate_http_version(std::string_view version) {
+    if (!is_valid_http_version(version)) {
+        throw std::invalid_argument("elio::http: invalid HTTP version");
+    }
+}
+
 inline void validate_request_target(std::string_view target) {
     if (!is_valid_request_target(target)) {
         throw std::invalid_argument("elio::http: invalid request target");

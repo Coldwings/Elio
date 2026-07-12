@@ -111,6 +111,36 @@ std::string request_header_value(std::string_view headers, std::string_view name
     return std::string(headers.substr(pos, end - pos));
 }
 
+size_t request_content_length(std::string_view headers) {
+    auto value = request_header_value(headers, "Content-Length");
+    size_t result = 0;
+    for (char c : value) {
+        if (c < '0' || c > '9') {
+            return 0;
+        }
+        result = result * 10 + static_cast<size_t>(c - '0');
+    }
+    return result;
+}
+
+task<std::string> read_request_message(elio::net::tcp_stream& s) {
+    std::string accum;
+    char buf[1024];
+    size_t expected_size = 0;
+    while (expected_size == 0 || accum.size() < expected_size) {
+        auto r = co_await s.read(buf, sizeof(buf));
+        if (r.result <= 0) co_return accum;
+        accum.append(buf, static_cast<size_t>(r.result));
+
+        auto header_end = accum.find("\r\n\r\n");
+        if (header_end != std::string::npos) {
+            auto headers = std::string_view(accum).substr(0, header_end + 4);
+            expected_size = header_end + 4 + request_content_length(headers);
+        }
+    }
+    co_return accum;
+}
+
 } // namespace
 
 TEST_CASE("HTTP client rejects invalid outbound request inputs",
@@ -1206,6 +1236,78 @@ TEST_CASE("HTTP client resolves redirect Location references",
     REQUIRE(final_request.find("GET /start/final?ok=1 HTTP/1.1\r\n") !=
             std::string::npos);
     REQUIRE(final_request.find("#ignored-by-http") == std::string::npos);
+}
+
+TEST_CASE("HTTP client preserves payload when redirect keeps method",
+          "[http][client]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<int> got_status{0};
+    std::string redirected_request;
+
+    sched.go([&]() -> task<void> {
+        auto first = co_await listener->accept();
+        REQUIRE(first.has_value());
+        auto first_request = co_await read_request_message(*first);
+        REQUIRE(first_request.find("PUT /start HTTP/1.1\r\n") !=
+                std::string::npos);
+        REQUIRE(first_request.find("payload") != std::string::npos);
+
+        std::string redirect =
+            "HTTP/1.1 302 Found\r\n"
+            "Location: /next\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        co_await first->write(redirect);
+
+        auto second = co_await listener->accept();
+        REQUIRE(second.has_value());
+        redirected_request = co_await read_request_message(*second);
+        std::string ok =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 2\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "ok";
+        co_await second->write(ok);
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::client c;
+        auto resp = co_await c.put(
+            make_url(port, "/start"),
+            "payload",
+            elio::http::mime::text_plain);
+        if (resp) {
+            got_status = resp->status_code();
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(got_status == 200);
+    REQUIRE(redirected_request.find("PUT /next HTTP/1.1\r\n") !=
+            std::string::npos);
+    REQUIRE(request_header_value(redirected_request, "Content-Length") == "7");
+    REQUIRE(request_header_value(redirected_request, "Content-Type") ==
+            elio::http::mime::text_plain);
+    REQUIRE(redirected_request.ends_with("payload"));
 }
 
 TEST_CASE("HTTP client skips informational responses before final response",

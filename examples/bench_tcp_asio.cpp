@@ -26,6 +26,28 @@
 
 using asio::ip::tcp;
 
+static bool connect_socket(asio::io_context& io,
+                           tcp::socket& socket,
+                           const std::string& host,
+                           uint16_t port) {
+    tcp::resolver resolver(io);
+    std::error_code ec;
+    auto endpoints = resolver.resolve(host, std::to_string(port), ec);
+    if (ec) {
+        std::fprintf(stderr, "Resolve %s:%d failed: %s\n",
+                     host.c_str(), port, ec.message().c_str());
+        return false;
+    }
+
+    asio::connect(socket, endpoints, ec);
+    if (ec) {
+        std::fprintf(stderr, "Connect to %s:%d failed: %s\n",
+                     host.c_str(), port, ec.message().c_str());
+        return false;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Server: echo via Asio callbacks
 // ---------------------------------------------------------------------------
@@ -105,12 +127,7 @@ static void run_client_pingpong(const bench::config& cfg, size_t msg_size,
     asio::io_context io;
 
     tcp::socket socket(io);
-    tcp::endpoint ep(asio::ip::make_address(cfg.host), cfg.port);
-
-    std::error_code ec;
-    socket.connect(ep, ec);
-    if (ec) {
-        std::fprintf(stderr, "Connect failed: %s\n", ec.message().c_str());
+    if (!connect_socket(io, socket, cfg.host, cfg.port)) {
         return;
     }
     socket.set_option(tcp::no_delay(true));
@@ -259,13 +276,9 @@ public:
 
     void run(bench::streaming_stats& out, const std::string& host, uint16_t port) {
         out_ref_ = &out;
-        tcp::endpoint ep(asio::ip::make_address(host), port);
 
         auto self = shared_from_this();
-        std::error_code ec;
-        socket_.connect(ep, ec);
-        if (ec) {
-            std::fprintf(stderr, "Connect failed: %s\n", ec.message().c_str());
+        if (!connect_socket(io_, socket_, host, port)) {
             return;
         }
         socket_.set_option(tcp::no_delay(true));

@@ -14,7 +14,7 @@ A clear and concise description of what the bug is.
 
 Please complete the following information:
 
-- **Elio Version**: [e.g., 0.5.2]
+- **Elio Version**: [e.g., 0.5.x, commit SHA, or release tag]
 - **Compiler**: [e.g., GCC 14.1, Clang 18]
 - **OS**: [e.g., Ubuntu 24.04, Fedora 40]
 - **Kernel Version**: [e.g., 6.8.0]

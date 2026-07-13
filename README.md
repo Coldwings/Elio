@@ -14,7 +14,7 @@
 - **Work-Stealing Scheduler** with lock-free Chase-Lev deques
 - **Dynamic Thread Pool** with runtime adjustment
 - **Autoscaler** for automatic worker thread scaling under load
-- **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel, spinlock, condition_variable — all coroutine-aware primitives (mutex, shared_mutex, semaphore, event, channel, condition_variable) are cancellation-safe via intrusive waiter tracking
+- **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel, spinlock, condition_variable; coroutine-aware waiters use intrusive lifetime cleanup, while cancellation support remains operation-specific
 - **Timers**: sleep_for, sleep_until, yield
 - **I/O Backends**: io_uring (preferred) and epoll fallback
 - **Batch I/O**: Submit multiple file operations in a single syscall
@@ -219,13 +219,13 @@ elio::
 │   └── intrusive_list<T>    // Generic intrusive doubly-linked list
 │
 ├── sync::                   // Synchronization primitives
-│   ├── mutex                // Async mutex (cancellation-safe)
-│   ├── shared_mutex         // Reader-writer mutex (cancellation-safe)
-│   ├── semaphore            // Counting semaphore (cancellation-safe)
-│   ├── event                // One-shot event (cancellation-safe)
-│   ├── channel<T>           // MPMC channel (cancellation-safe)
+│   ├── mutex                // Async mutex with waiter cleanup
+│   ├── shared_mutex         // Reader-writer mutex with waiter cleanup
+│   ├── semaphore            // Counting semaphore with waiter cleanup
+│   ├── event                // One-shot event with waiter cleanup
+│   ├── channel<T>           // MPMC channel with waiter cleanup
 │   ├── spinlock             // Busy-wait lock
-│   └── condition_variable   // Async condition variable (cancellation-safe)
+│   └── condition_variable   // Async condition variable with waiter cleanup
 │
 ├── time::                   // Timer utilities
 │   ├── sleep_for            // Duration-based sleep

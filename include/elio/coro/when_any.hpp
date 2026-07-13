@@ -4,6 +4,7 @@
 #include <coroutine>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -53,7 +54,7 @@ struct when_any_state {
     std::atomic<bool> resolved_{false};
     std::atomic<bool> launch_complete_{false};
     coro::detail::completion_waiter_slot waiter_;
-    result_type result_;
+    std::optional<result_type> result_;
     std::exception_ptr exception_;
     size_t winner_index_{0};
     coro::cancel_source cancel_source_;
@@ -65,7 +66,8 @@ struct when_any_state {
                 std::memory_order_acq_rel)) {
             winner_index_ = I;
             try {
-                result_.template emplace<I>(std::forward<Args>(args)...);
+                result_.emplace(
+                    std::in_place_index<I>, std::forward<Args>(args)...);
             } catch (...) {
                 exception_ = std::current_exception();
             }
@@ -231,9 +233,9 @@ struct when_any_awaitable {
             return std::pair{state_->winner_index_,
                 std::visit([](auto&& v) -> common_t {
                     return std::forward<decltype(v)>(v);
-                }, std::move(state_->result_))};
+                }, std::move(*state_->result_))};
         } else {
-            return std::pair{state_->winner_index_, std::move(state_->result_)};
+            return std::pair{state_->winner_index_, std::move(*state_->result_)};
         }
     }
 };

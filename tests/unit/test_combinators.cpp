@@ -67,6 +67,17 @@ struct throwing_result {
     static inline std::atomic<bool> throw_on_move{false};
 };
 
+struct non_default_result {
+    explicit non_default_result(int input) : value(input) {}
+    non_default_result() = delete;
+    non_default_result(const non_default_result&) = delete;
+    non_default_result& operator=(const non_default_result&) = delete;
+    non_default_result(non_default_result&&) noexcept = default;
+    non_default_result& operator=(non_default_result&&) noexcept = default;
+
+    int value;
+};
+
 struct launch_blocker {
     std::atomic<bool> block_moves{false};
     std::atomic<bool> move_started{false};
@@ -415,6 +426,48 @@ TEST_CASE("when_any with heterogeneous types", "[sync][combinators]") {
     sched.shutdown();
 }
 
+TEST_CASE("when_any supports non-default-constructible results",
+          "[sync][combinators][regression]") {
+    auto test = []() -> task<void> {
+        auto [idx, value] = co_await when_any(
+            []() -> task<non_default_result> {
+                co_return non_default_result{42};
+            },
+            [](coro::cancel_token tok) -> task<non_default_result> {
+                co_await time::sleep_for(std::chrono::milliseconds(500), tok);
+                co_return non_default_result{-1};
+            }
+        );
+        REQUIRE(idx == 0);
+        REQUIRE(value.value == 42);
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("when_any supports a non-default first heterogeneous result",
+          "[sync][combinators][regression]") {
+    auto test = []() -> task<void> {
+        auto [idx, value] = co_await when_any(
+            [](coro::cancel_token tok) -> task<non_default_result> {
+                co_await time::sleep_for(std::chrono::milliseconds(500), tok);
+                co_return non_default_result{-1};
+            },
+            []() -> task<int> {
+                co_return 42;
+            }
+        );
+        REQUIRE(idx == 1);
+        REQUIRE(std::get<1>(value) == 42);
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
 TEST_CASE("when_any loser exception is logged", "[sync][combinators]") {
     auto test = []() -> task<void> {
         auto [idx, value] = co_await when_any(
@@ -543,7 +596,8 @@ TEST_CASE("when_any publishes winner when loser cancellation throws",
     REQUIRE(callback_invoked);
     REQUIRE(state.resolved_.load(std::memory_order_acquire));
     REQUIRE(state.exception_ == nullptr);
-    REQUIRE(std::get<0>(state.result_) == 42);
+    REQUIRE(state.result_.has_value());
+    REQUIRE(std::get<0>(*state.result_) == 42);
 }
 
 TEST_CASE("destroyed when_all waiter is unregistered",
@@ -636,6 +690,43 @@ TEST_CASE("with_timeout task completes before timeout", "[sync][combinators]") {
         REQUIRE(static_cast<bool>(result));
         REQUIRE(!result.timed_out);
         REQUIRE(*result == 42);
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("with_timeout supports non-default-constructible results",
+          "[sync][combinators][regression]") {
+    auto test = []() -> task<void> {
+        auto result = co_await with_timeout(
+            std::chrono::milliseconds(500),
+            []() -> task<non_default_result> {
+                co_return non_default_result{42};
+            }
+        );
+        REQUIRE(result);
+        REQUIRE((*result).value == 42);
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("with_timeout times out non-default-constructible results",
+          "[sync][combinators][regression]") {
+    auto test = []() -> task<void> {
+        auto result = co_await with_timeout(
+            std::chrono::milliseconds(1),
+            [](coro::cancel_token tok) -> task<non_default_result> {
+                co_await time::sleep_for(std::chrono::milliseconds(500), tok);
+                co_return non_default_result{42};
+            }
+        );
+        REQUIRE_FALSE(result);
+        REQUIRE(result.timed_out);
     };
 
     runtime::scheduler sched(2);

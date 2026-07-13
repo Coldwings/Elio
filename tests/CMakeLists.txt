@@ -46,6 +46,18 @@ set(TEST_SOURCES
     integration/test_dynamic_threads.cpp
 )
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)$" AND
+   CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
+    list(APPEND TEST_SOURCES
+        unit/crc32c_capability_baseline.cpp
+        unit/crc32c_capability_sse42.cpp
+    )
+    set_source_files_properties(unit/crc32c_capability_baseline.cpp
+        PROPERTIES COMPILE_OPTIONS -mno-sse4.2)
+    set_source_files_properties(unit/crc32c_capability_sse42.cpp
+        PROPERTIES COMPILE_OPTIONS -msse4.2)
+endif()
+
 # Add HTTP tests (no TLS dependency for parser tests)
 list(APPEND TEST_SOURCES
     unit/test_http_parser.cpp

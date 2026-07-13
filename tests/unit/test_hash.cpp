@@ -18,6 +18,17 @@ static_assert(sizeof(uint32x4_t) == 16);
 
 using namespace elio::hash;
 
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+using crc32c_fn = uint32_t (*)(const void*, size_t, uint32_t) noexcept;
+using crc32c_capability_fn = bool (*)() noexcept;
+
+extern "C" crc32c_fn elio_test_crc32c_baseline_fn() noexcept;
+extern "C" crc32c_fn elio_test_crc32c_sse42_fn() noexcept;
+extern "C" crc32c_capability_fn elio_test_crc32c_baseline_capability_fn() noexcept;
+extern "C" crc32c_capability_fn elio_test_crc32c_sse42_capability_fn() noexcept;
+#endif
+
 // ============================================================================
 // CRC32 tests
 // ============================================================================
@@ -105,6 +116,36 @@ TEST_CASE("crc32c basic", "[hash][crc32c]") {
         REQUIRE(crc32c(std::span<const uint8_t>(v)) == 0xE3069283);
     }
 }
+
+TEST_CASE("crc32c hardware availability matches the compiled path", "[hash][crc32c]") {
+#if defined(ELIO_CRC32_HW_X86) || defined(ELIO_CRC32_HW_ARM64)
+    REQUIRE(crc32c_hw_available() == has_hw_crc32());
+#else
+    REQUIRE_FALSE(crc32c_hw_available());
+#endif
+}
+
+#if (defined(__x86_64__) || defined(__i386__)) && \
+    (defined(__GNUC__) || defined(__clang__))
+TEST_CASE("crc32c dispatch remains translation-unit local across ISA flags",
+          "[hash][crc32c][odr]") {
+    const auto baseline_crc32c = elio_test_crc32c_baseline_fn();
+    const auto sse42_crc32c = elio_test_crc32c_sse42_fn();
+    const auto baseline_capability = elio_test_crc32c_baseline_capability_fn();
+    const auto sse42_capability = elio_test_crc32c_sse42_capability_fn();
+
+    REQUIRE(baseline_crc32c != sse42_crc32c);
+    REQUIRE(baseline_capability != sse42_capability);
+    REQUIRE_FALSE(baseline_capability());
+    REQUIRE(sse42_capability() == has_hw_crc32());
+
+    const char* data = "123456789";
+    REQUIRE(baseline_crc32c(data, 9, 0xFFFFFFFF) == 0xE3069283);
+    if (sse42_capability()) {
+        REQUIRE(sse42_crc32c(data, 9, 0xFFFFFFFF) == 0xE3069283);
+    }
+}
+#endif
 
 // ============================================================================
 // SHA-1 tests

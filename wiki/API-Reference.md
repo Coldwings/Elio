@@ -2316,12 +2316,16 @@ uint32_t crc32_finalize(uint32_t crc);
 
 ### CRC32C
 
+The header-only CRC32C entry points use translation-unit-local linkage so
+sources compiled with different ISA flags keep independent dispatch paths.
+
 ```cpp
 // Compute CRC32C (Castagnoli polynomial)
 uint32_t crc32c(const void* data, size_t length, uint32_t crc = 0xFFFFFFFF);
 uint32_t crc32c(std::span<const uint8_t> data, uint32_t crc = 0xFFFFFFFF);
 
-// Check whether hardware CRC32C is available at runtime
+// Check whether this translation unit has a compiled hardware CRC32C path
+// supported by the current CPU
 bool crc32c_hw_available() noexcept;
 ```
 

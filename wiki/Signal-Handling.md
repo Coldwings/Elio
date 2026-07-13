@@ -54,6 +54,9 @@ coro::task<void> handle_shutdown() {
 // Simple one-shot signal wait
 auto info = co_await wait_signal(SIGTERM);
 ELIO_LOG_INFO("Received {}", info.full_name());
+
+// wait_signal() acquires the block; release it after all users are finished
+signal_set{SIGTERM}.unblock();
 ```
 
 ## API Reference
@@ -117,8 +120,9 @@ auto ready_info = sigfd.try_read();
 signal_set new_sigs{SIGUSR2};
 sigfd.update(new_sigs);
 
-// Restore original signal mask
-sigfd.restore_mask();
+// Explicitly release signals after every user that needs them blocked is done
+signal_set released{SIGUSR1, SIGUSR2};
+released.unblock();
 
 // Close explicitly
 sigfd.close();
@@ -130,7 +134,15 @@ masks and avoids exposing a removed pending signal before the descriptor update
 commits. Explicitly unblock signals when their process-level disposition is no
 longer needed. If the descriptor update fails, `update()` restores the calling
 thread's prior mask. Passing `false` as the second argument leaves the thread
-mask unchanged.
+mask unchanged. Closing, moving, or destroying a `signal_fd` never changes the
+thread mask.
+
+`signal_fd::restore_mask()` is deprecated and is now a no-op that returns
+`false`. A whole-thread snapshot cannot be restored safely when other live
+`signal_fd` instances or later caller operations have added blocks. Keep the
+signals blocked for as long as any descriptor or worker depends on them, then
+release them explicitly with `signal_set::unblock()` from the owning thread.
+The `wait_signal()` convenience helpers follow the same acquire-only rule.
 
 ### signal_info
 

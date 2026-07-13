@@ -217,7 +217,10 @@ private:
 
 /// Async signal file descriptor
 /// Creates a signalfd that can be used to wait for signals in coroutines.
-/// The signals in the set are automatically blocked when the signal_fd is created.
+/// The signals in the set are automatically blocked when the signal_fd is
+/// created. This blocking is acquire-only: signal_fd never restores or
+/// unblocks the calling thread's mask. Callers must explicitly unblock signals
+/// after all users that require them blocked have finished.
 class signal_fd {
 public:
     /// Construct a signal_fd for the given signal set
@@ -229,24 +232,25 @@ public:
                        io::io_context& ctx = io::current_io_context(),
                        bool auto_block = true)
         : ctx_(&ctx)
-        , signals_(signals)
-        , old_mask_saved_(false) {
+        , signals_(signals) {
+        sigset_t previous_mask{};
+        bool mask_changed = false;
         
         // Block the signals before creating signalfd
         if (auto_block) {
-            if (!signals_.block(&old_mask_)) {
+            if (!signals_.block(&previous_mask)) {
                 throw std::system_error(errno, std::system_category(),
                                        "failed to block signals");
             }
-            old_mask_saved_ = true;
+            mask_changed = true;
         }
         
         // Create the signalfd
         fd_ = signalfd(-1, &signals_.mask(), SFD_NONBLOCK | SFD_CLOEXEC);
         if (fd_ < 0) {
             int saved_errno = errno;
-            if (old_mask_saved_) {
-                pthread_sigmask(SIG_SETMASK, &old_mask_, nullptr);
+            if (mask_changed) {
+                pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr);
             }
             throw std::system_error(saved_errno, std::system_category(),
                                    "signalfd creation failed");
@@ -255,7 +259,7 @@ public:
         ELIO_LOG_DEBUG("signal_fd created with fd={}", fd_);
     }
     
-    /// Destructor - closes the fd and optionally restores signal mask
+    /// Destructor - closes the fd without changing the signal mask
     ~signal_fd() {
         if (fd_ >= 0) {
             // Use close_fd_for_destructor to let io_uring drain any in-flight
@@ -265,9 +269,6 @@ public:
             io::close_fd_for_destructor(fd_);
             ELIO_LOG_DEBUG("signal_fd closed fd={}", fd_);
         }
-        // Note: We don't restore the old mask by default in destructor
-        // because the user might want signals to stay blocked.
-        // Call restore_mask() explicitly if needed.
     }
     
     // Non-copyable
@@ -278,9 +279,7 @@ public:
     signal_fd(signal_fd&& other) noexcept
         : ctx_(std::exchange(other.ctx_, nullptr))
         , fd_(std::exchange(other.fd_, -1))
-        , signals_(std::move(other.signals_))
-        , old_mask_(other.old_mask_)
-        , old_mask_saved_(std::exchange(other.old_mask_saved_, false)) {}
+        , signals_(std::move(other.signals_)) {}
 
     signal_fd& operator=(signal_fd&& other) noexcept {
         if (this != &other) {
@@ -290,8 +289,6 @@ public:
             ctx_ = std::exchange(other.ctx_, nullptr);
             fd_ = std::exchange(other.fd_, -1);
             signals_ = std::move(other.signals_);
-            old_mask_ = other.old_mask_;
-            old_mask_saved_ = std::exchange(other.old_mask_saved_, false);
         }
         return *this;
     }
@@ -354,13 +351,13 @@ public:
         return true;
     }
     
-    /// Restore the original signal mask (before this signal_fd was created)
-    /// This is useful when you want to restore signal handling to the previous state
+    /// Deprecated: signal_fd does not own a composable thread-mask snapshot.
+    /// Whole-mask restoration can undo blocks established later by callers or
+    /// overlapping signal_fd instances. This method is a no-op and returns false;
+    /// use signal_set::unblock() explicitly after all mask users are finished.
+    [[deprecated("signal_fd mask restoration is unsafe; use signal_set::unblock() explicitly")]]
     bool restore_mask() noexcept {
-        if (old_mask_saved_) {
-            return pthread_sigmask(SIG_SETMASK, &old_mask_, nullptr) == 0;
-        }
-        return true;
+        return false;
     }
     
     /// Close the signalfd explicitly
@@ -375,8 +372,6 @@ private:
     io::io_context* ctx_;
     int fd_ = -1;
     signal_set signals_;
-    sigset_t old_mask_{};
-    bool old_mask_saved_;
 };
 
 /// RAII guard to block signals for the scope
@@ -409,6 +404,8 @@ private:
 /// @param ctx Optional I/O context
 /// @param auto_block If true (default), automatically block the signals
 /// @return task that yields signal_info when a signal is received
+/// @note Automatic blocking is acquire-only. Explicitly unblock the signal set
+///       after no descriptor or worker depends on it.
 inline coro::task<signal_info> wait_signal(const signal_set& signals,
                                            io::io_context& ctx = io::current_io_context(),
                                            bool auto_block = true) {
@@ -424,6 +421,8 @@ inline coro::task<signal_info> wait_signal(const signal_set& signals,
 /// @param signo The signal to wait for
 /// @param ctx Optional I/O context
 /// @return task that yields signal_info when the signal is received
+/// @note This overload leaves signo blocked on the thread that performs the
+///       wait. Explicitly unblock it after the last dependent user finishes.
 inline coro::task<signal_info> wait_signal(int signo,
                                            io::io_context& ctx = io::current_io_context()) {
     signal_set signals;

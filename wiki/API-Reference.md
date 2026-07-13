@@ -1120,12 +1120,20 @@ public:
     // Update the signal set
     bool update(const signal_set& new_signals, bool block = true);
     
-    // Restore original signal mask
+    // Deprecated no-op; returns false
+    [[deprecated("use signal_set::unblock() explicitly")]]
     bool restore_mask() noexcept;
     
     void close();  // Close explicitly
 };
 ```
+
+Automatic blocking by `signal_fd` is acquire-only. `close()`, moves, and
+destruction do not restore or unblock the calling thread's mask. Whole-mask
+snapshots are not composable with overlapping descriptors or later caller mask
+changes, so `restore_mask()` is deprecated, performs no operation, and returns
+`false`. Once no descriptor or worker depends on a blocked signal, release it
+explicitly with `signal_set::unblock()` on the thread that owns the mask.
 
 ### `signal_info`
 

@@ -676,9 +676,11 @@ private:
                         co_return resp;
                     }
 
-                    // Change method to GET for 303 or POST->GET for 301/302
+                    // Change method to GET for 303, except HEAD must remain
+                    // HEAD so its response-body semantics are preserved.
                     method redirect_method = req.get_method();
-                    if (resp.get_status() == status::see_other ||
+                    if ((resp.get_status() == status::see_other &&
+                         req.get_method() != method::HEAD) ||
                         ((resp.get_status() == status::moved_permanently || 
                           resp.get_status() == status::found) && 
                          req.get_method() == method::POST)) {

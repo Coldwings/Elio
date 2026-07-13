@@ -94,7 +94,7 @@ inline constexpr unsigned int IBV_SEND_SIGNALED = 1u << 0;
 inline constexpr unsigned int IBV_SEND_SOLICITED = 1u << 1;
 inline constexpr unsigned int IBV_SEND_INLINE = 1u << 2;
 inline constexpr unsigned int IBV_SEND_FENCE = 1u << 3;
-inline constexpr std::uint32_t IBV_WC_WITH_IMM = 1u << 0;
+inline constexpr std::uint32_t IBV_WC_WITH_IMM = 1u << 1;
 
 extern "C" ibv_mr* elio_rdma_cuda_test_ibv_reg_mr(
     ibv_pd* pd, void* addr, std::size_t length, int access);

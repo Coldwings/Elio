@@ -816,6 +816,58 @@ TEST_CASE("condition_variable with mutex notify_one", "[sync][condvar][coro]") {
     REQUIRE(ready.load());
 }
 
+TEST_CASE("condition_variable generic wait does not resume before unlock returns",
+          "[sync][condvar][regression]") {
+    auto run_case = [](bool notify_all) {
+        condition_variable cv;
+
+        struct notifying_lock {
+            condition_variable* cv = nullptr;
+            bool notify_all = false;
+            bool unlock_returned = false;
+            bool resumed_before_unlock_return = false;
+
+            void unlock() {
+                if (notify_all) {
+                    cv->notify_all();
+                } else {
+                    cv->notify_one();
+                }
+                unlock_returned = true;
+            }
+
+            void lock() {
+                if (!unlock_returned) {
+                    resumed_before_unlock_return = true;
+                }
+            }
+        } lock{&cv, notify_all};
+
+        bool completed = false;
+        auto waiter = [&]() -> task<void> {
+            co_await cv.wait(lock);
+            completed = true;
+        };
+
+        auto t = waiter();
+        auto h = elio::coro::detail::task_access::release(t);
+        h.resume();
+
+        REQUIRE(lock.unlock_returned);
+        REQUIRE_FALSE(lock.resumed_before_unlock_return);
+        REQUIRE(completed);
+        REQUIRE_FALSE(cv.has_waiters());
+    };
+
+    SECTION("notify_one") {
+        run_case(false);
+    }
+
+    SECTION("notify_all") {
+        run_case(true);
+    }
+}
+
 TEST_CASE("condition_variable with mutex notify_all", "[sync][condvar][coro]") {
     mutex mtx;
     condition_variable cv;

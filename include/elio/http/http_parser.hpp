@@ -241,6 +241,10 @@ private:
         }
         
         auto uri = line.substr(path_start, space2 - path_start);
+        if (!detail::is_valid_request_target(uri)) {
+            set_error("Invalid request-target");
+            return false;
+        }
 
         // Reject NUL bytes and bare control characters (0x01-0x1F, 0x7F)
         // in the request-target.  These can cause log injection, path

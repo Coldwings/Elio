@@ -37,8 +37,9 @@ void go(F&& f, Args&&... args) {
     std::abort();
 }
 
-/// Fire-and-forget: spawn a coroutine pinned to a specific worker.
-/// The task is bound to the given worker and cannot be stolen by others.
+/// Fire-and-forget: spawn a coroutine with affinity to a specific worker.
+/// The task is bound to the given worker before first resume. Steal attempts
+/// that observe it on another queue bounce it back instead of executing it.
 /// For deterministic placement, worker_id must be less than the current
 /// scheduler worker count.
 ///
@@ -105,7 +106,7 @@ auto spawn(F&& f, Args&&... args)
 /// Usage: ELIO_GO(some_async_operation())
 #define ELIO_GO(...)    elio::go([&]() { return __VA_ARGS__; })
 
-/// Fire-and-forget macro for inline coroutine expressions pinned to a worker
+/// Fire-and-forget macro for inline coroutine expressions with worker affinity
 /// WARNING: captures referenced names by reference; ensure they outlive the task.
 /// Usage: ELIO_GO_TO(0, some_async_operation())
 #define ELIO_GO_TO(worker_id, ...)    elio::go_to(worker_id, [&]() { return __VA_ARGS__; })

@@ -79,7 +79,7 @@ task<void> handle_client(tcp_stream stream, int client_id) {
         total_bytes += result.result;
         
         // Echo back to client
-        auto written = co_await stream.write(buffer, result.result);
+        auto written = co_await stream.write_exactly(buffer, result.result);
         if (written.result <= 0) {
             ELIO_LOG_ERROR("[Client {}] Write error: {} ({})", client_id,
                           strerror(-written.result), written.result);

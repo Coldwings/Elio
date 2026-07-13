@@ -202,6 +202,37 @@ TEST_CASE("HTTP/2 stream response body enforces max size",
     REQUIRE(stream.closed);
 }
 
+TEST_CASE("HTTP/2 response materialization preserves peer headers",
+          "[http2][message]") {
+    SECTION("Peer Content-Length is not rewritten") {
+        h2_stream stream;
+        stream.response_status = status::ok;
+        stream.response_body = "hello";
+        stream.response_headers.set("content-type", "text/plain");
+        stream.response_headers.set("content-length", "999");
+
+        auto resp = detail::materialize_h2_response(stream);
+
+        REQUIRE(resp.status_code() == 200);
+        REQUIRE(resp.body() == "hello");
+        REQUIRE(resp.header("Content-Type") == "text/plain");
+        REQUIRE(resp.header("Content-Length") == "999");
+    }
+
+    SECTION("Missing peer Content-Length stays missing") {
+        h2_stream stream;
+        stream.response_status = status::ok;
+        stream.response_body = "hello";
+        stream.response_headers.set("content-type", "text/plain");
+
+        auto resp = detail::materialize_h2_response(stream);
+
+        REQUIRE(resp.body() == "hello");
+        REQUIRE(resp.header("Content-Type") == "text/plain");
+        REQUIRE_FALSE(resp.get_headers().contains("Content-Length"));
+    }
+}
+
 TEST_CASE("HTTP/2 client configuration", "[http2][config]") {
     SECTION("session config defaults match documented client defaults") {
         h2_session_config cfg;

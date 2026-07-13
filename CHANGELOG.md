@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Timeout cancellation documentation**: Clarified that `with_timeout()`
   cooperatively cancels token-aware work and does not forcibly destroy a losing
   child suspended in `event::wait()`. (#773)
+- **WebSocket public-header example**: Qualified the HTTP route context and
+  response types and added compile-only coverage for the documented namespace
+  imports. (#772)
 - **CI and package validation coverage**: Pull-request CI now keeps required
   checks green for docs-only changes, runs registered CTest/package checks,
   verifies HTTP/2 option dependencies and optional installed targets, compiles

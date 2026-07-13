@@ -45,12 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks green for docs-only changes, runs registered CTest/package checks,
   verifies HTTP/2 option dependencies and optional installed targets, compiles
   TCP benchmark targets, and bounds release benchmark runtime.
-- **Linux platform validation**: CMake now rejects every non-Linux target at
-  configure time instead of allowing unsupported Unix systems to fail later in
-  Linux-specific headers. (#770)
 
 ### Fixed
 
+- **Linux platform validation**: CMake now rejects every non-Linux target at
+  configure time instead of allowing unsupported Unix systems to fail later in
+  Linux-specific headers. (#770)
 - **Network stream readiness and socket setup**: TCP and UDS stream operations
   now wait for readiness on transient `EAGAIN`/`EWOULDBLOCK`, preserve readable
   data before HUP/EOF, apply requested `tcp_connect` socket options, and restore

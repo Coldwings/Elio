@@ -292,6 +292,8 @@ add_test(NAME non_linux_platform_rejected
         -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}
         -DELIO_BINARY_DIR=${CMAKE_BINARY_DIR}/tests/cmake/non_linux_platform
         -DELIO_FMT_SOURCE_DIR=${fmt_SOURCE_DIR}
+        -DELIO_CMAKE_GENERATOR=${CMAKE_GENERATOR}
+        -DELIO_CXX_COMPILER=${CMAKE_CXX_COMPILER}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_linux_platform.cmake
 )
 

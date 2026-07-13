@@ -119,6 +119,27 @@ struct wc_result {
 **Errors are returned, not thrown** — same shape as Elio's
 `io_result` / `cancel_result`.
 
+Constructing one of these operations is lazy: `auto op = conn.recv(buf);`
+does not post a work request by itself. The WR is posted when the awaiter is
+`co_await`ed. When receive preposting or a real send/read/write pipeline is
+required, call `.start()` explicitly:
+
+```cpp
+auto recv_op = conn.recv(buffer).start();  // posts immediately
+
+// ...issue peer-visible work...
+
+auto wc = co_await std::move(recv_op);     // waits for the already-posted WR
+```
+
+`start()` returns the same move-only awaiter type, so started operations can be
+stored in a queue and awaited later. Synchronous post failures and completions
+that arrive before the later `co_await` are stored and returned by that await.
+For `std::span<const sge>` overloads, the span array must outlive the operation
+that posts the WR: either the `co_await` for lazy operations or `.start()` for
+eager operations. The underlying payload buffers must outlive the hardware
+operation itself.
+
 ### Shared receive queues
 
 ```cpp
@@ -139,7 +160,7 @@ buffer"), use the `*_with_imm` variants:
 
 ```cpp
 // Client side: post recv for the OOB notify first.
-auto notify_awaiter = conn.recv(notify_mr.view());
+auto notify_awaiter = conn.recv(notify_mr.view()).start();
 
 // ...peer does an RDMA_WRITE...
 
@@ -147,7 +168,7 @@ auto notify_awaiter = conn.recv(notify_mr.view());
 co_await conn.send_with_imm(notify_mr.view(0, 0), payload_len);
 
 // Notify side observes the imm in wc_result.imm_data.
-auto wc = co_await notify_awaiter;
+auto wc = co_await std::move(notify_awaiter);
 auto written = wc.imm_data;
 ```
 

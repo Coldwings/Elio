@@ -24,12 +24,13 @@
 ///
 /// ## Stage status
 ///
-/// Through S15 the umbrella re-exports: types, op_state, dispatcher,
+/// Through S16 the umbrella re-exports: types, op_state, dispatcher,
 /// backend_traits (including `backend_with_mr` and `backend_with_atomic`),
 /// polymorphic_backend, connection, SEND / RECV / RDMA_WRITE / RDMA_READ
 /// awaiters, immediate-data write/receive helpers, 8-byte CAS and fetch-add
-/// atomics, multi-SGE / inline-send extensions, the shared receive queue
-/// abstraction (`srq.hpp`), the `memory_region<Backend>` RAII wrapper
+/// atomics, multi-SGE / inline-send extensions, explicit started operations
+/// for preposting/pipelining, the shared receive queue abstraction
+/// (`srq.hpp`), the `memory_region<Backend>` RAII wrapper
 /// (`memory_region.hpp`), and the default `cq_pump` coroutine that binds a
 /// completion-channel fd to an `io_context` (`cq_pump.hpp`). The optional
 /// librdmacm-backed CM helper lives in a separate `elio_rdma_cm` CMake target
@@ -49,6 +50,6 @@ namespace elio::rdma {
 
 /// Module version string, bumped per stage so downstream code can
 /// feature-detect during this incremental rollout.
-inline constexpr const char* module_version = "0.0.15-S15";
+inline constexpr const char* module_version = "0.0.16-S16";
 
 }  // namespace elio::rdma

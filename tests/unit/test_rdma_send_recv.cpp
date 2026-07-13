@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <span>
 #include <type_traits>
+#include <utility>
 
 using elio::rdma::buffer_view;
 using elio::rdma::connection;
@@ -199,6 +200,12 @@ probe_task run_recv(Conn& c, buffer_view buf,
     done = true;
 }
 
+template <typename Awaiter>
+probe_task run_started(Awaiter op, wc_result& out, bool& done) {
+    out  = co_await std::move(op);
+    done = true;
+}
+
 }  // namespace
 
 TEST_CASE("unawaited RDMA operations release their unstarted state",
@@ -253,6 +260,144 @@ TEST_CASE("RDMA operation awaitables are movable but not move-assignable",
     STATIC_REQUIRE_FALSE(std::is_move_assignable_v<cas_op>);
     STATIC_REQUIRE_FALSE(std::is_move_assignable_v<faa_op>);
     STATIC_REQUIRE_FALSE(std::is_move_assignable_v<srq_recv_op>);
+
+    STATIC_REQUIRE(std::is_same_v<decltype(std::declval<send_op&>().start()),
+                                  send_op&>);
+    STATIC_REQUIRE(std::is_same_v<decltype(std::declval<send_op&&>().start()),
+                                  send_op>);
+    STATIC_REQUIRE(std::is_same_v<decltype(std::declval<recv_op&>().start()),
+                                  recv_op&>);
+    STATIC_REQUIRE(std::is_same_v<decltype(std::declval<recv_op&&>().start()),
+                                  recv_op>);
+}
+
+TEST_CASE("recv: start posts immediately and later await does not repost",
+          "[rdma][recv][start]") {
+    mock_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 701;
+    connection<mock_static_backend> c{&qp_value, disp};
+
+    alignas(8) char payload[32] = {};
+    buffer_view bv{payload, sizeof(payload), 0xCAFE};
+
+    auto op = c.recv(bv).start();
+    REQUIRE(st.recvs.load() == 1);
+    const auto id = st.last_recv_id;
+    REQUIRE(id != 0);
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_started(std::move(op), result, done);
+
+    REQUIRE_FALSE(done);
+    REQUIRE(st.recvs.load() == 1);
+
+    disp.deliver(id, wc_status::success, /*byte_len=*/24,
+                 /*imm=*/0x1234, /*flags=*/0x2);
+    REQUIRE(done);
+    REQUIRE(result.ok());
+    REQUIRE(result.byte_len == 24u);
+    REQUIRE(result.imm_data == 0x1234u);
+    REQUIRE(result.wc_flags == 0x2u);
+}
+
+TEST_CASE("recv: completion before awaiting a started operation resumes inline",
+          "[rdma][recv][start][completed-before-await]") {
+    mock_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 702;
+    connection<mock_static_backend> c{&qp_value, disp};
+
+    char payload[16] = {};
+    buffer_view bv{payload, sizeof(payload), 0xBEEF};
+
+    auto op = c.recv(bv).start();
+    const auto id = st.last_recv_id;
+    disp.deliver(id, wc_status::success, /*byte_len=*/12);
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_started(std::move(op), result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.recvs.load() == 1);
+    REQUIRE(result.ok());
+    REQUIRE(result.byte_len == 12u);
+}
+
+TEST_CASE("send: inline completion during start is stored for later await",
+          "[rdma][send][start][inline-completion]") {
+    mock_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 703;
+    connection<mock_static_backend> c{&qp_value, disp};
+
+    char payload[8] = {};
+    buffer_view bv{payload, sizeof(payload), 0x1234};
+    st.inline_dispatcher = &disp;
+    st.inline_send_success = true;
+
+    auto op = c.send(bv).start();
+    REQUIRE(st.sends.load() == 1);
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_started(std::move(op), result, done);
+
+    REQUIRE(done);
+    REQUIRE(result.ok());
+    REQUIRE(result.byte_len == 8u);
+}
+
+TEST_CASE("send: started post failure is returned on later await",
+          "[rdma][send][start][error]") {
+    mock_state st;
+    st.send_rc = -11;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 704;
+    connection<mock_static_backend> c{&qp_value, disp};
+
+    char payload[8] = {};
+    buffer_view bv{payload, sizeof(payload), 0x1};
+
+    auto op = c.send(bv).start();
+    REQUIRE(st.sends.load() == 1);
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_started(std::move(op), result, done);
+
+    REQUIRE(done);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::wr_flush_error);
+    REQUIRE(result.imm_data == 11u);
+}
+
+TEST_CASE("send: started operation can be orphaned before CQE",
+          "[rdma][send][start][orphan]") {
+    mock_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 705;
+    connection<mock_static_backend> c{&qp_value, disp};
+
+    char payload[8] = {};
+    buffer_view bv{payload, sizeof(payload), 0x1};
+
+    wr_id captured = 0;
+    {
+        auto op = c.send(bv).start();
+        captured = st.last_send_id;
+        REQUIRE(captured != 0);
+    }
+
+    disp.deliver(captured, wc_status::success, 8);
+    SUCCEED();
 }
 
 TEST_CASE("send: happy path suspends and dispatcher resumes",

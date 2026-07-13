@@ -20,18 +20,15 @@
 ///     `polymorphic_backend*` carried in the awaiter.
 ///
 /// Lifetime: every awaiter owns a `std::unique_ptr<op_state>` while
-/// suspended. The op_state ↔ dispatcher race (see op_state.hpp +
-/// completion.hpp) decides which side frees the node on the final
-/// transition.
+/// suspended or explicitly started. The op_state ↔ dispatcher race
+/// (see op_state.hpp + completion.hpp) decides which side frees the
+/// node on the final transition.
 ///
 /// Multi-SGE lifetime: when an awaiter is constructed from a
 /// `std::span<const sge>`, the underlying SGE array must outlive the
-/// `co_await` expression. In practice the awaiter is a temporary
-/// inside the caller's coroutine frame and the SGE array typically
-/// lives in the same frame; the span is only dereferenced inside
-/// `await_suspend` (i.e. while the caller is still in scope), so this
-/// is the same lifetime requirement as the underlying buffer
-/// payloads.
+/// call that posts the WR: either `co_await` for lazy operations or
+/// `.start()` for explicitly started operations. The payload buffers
+/// themselves must still outlive the hardware operation.
 
 #include <elio/rdma/backend_traits.hpp>
 #include <elio/rdma/completion.hpp>
@@ -41,9 +38,11 @@
 #include <cassert>
 #include <coroutine>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <span>
+#include <utility>
 
 namespace elio::rdma::detail {
 
@@ -192,10 +191,11 @@ struct backend_invoker<polymorphic_backend> {
 /// in the destructor, exposes a typed `await_resume` returning the
 /// `wc_result` filled in by the dispatcher.
 ///
-/// Subclasses must implement `do_post()` returning the backend's int
-/// status; on a non-zero return the awaiter synthesises a failed
-/// `wc_result` (status = wr_flush_error) and resumes inline rather
-/// than suspending.
+/// Derived awaiters share the same post-once path between lazy
+/// `co_await op` and explicit `op.start()`. On a non-zero backend
+/// return, the awaiter synthesises a failed `wc_result` (status =
+/// wr_flush_error) and resumes inline or stores the error for a later
+/// await.
 class op_awaiter_base {
 public:
     op_awaiter_base() noexcept
@@ -207,28 +207,100 @@ public:
     op_awaiter_base& operator=(op_awaiter_base&&) = delete;
 
     ~op_awaiter_base() noexcept {
-        // If we still own a posted `op_`, try to flip pending → orphaned
-        // so the dispatcher's later CQE arrival frees the heap node instead
-        // of us. For unstarted and completed operations try_orphan returns
-        // false, so the unique_ptr frees the node directly.
+        // If we still own a posted `op_`, try to flip posted/pending →
+        // orphaned so the dispatcher's later CQE arrival frees the heap node
+        // instead of us. For unstarted and consumed completed operations,
+        // try_orphan returns false and the unique_ptr frees the node directly.
         if (op_) {
             if (dispatcher::try_orphan(op_.get())) {
                 // Dispatcher will take it from here.
                 (void)op_.release();
+            } else if (op_->phase.load(std::memory_order_acquire)
+                           == op_phase::completed
+                       && op_->handle) {
+                // The dispatcher won the completion race before this
+                // destructor could orphan the suspended operation, but
+                // await_resume has not consumed the result yet. Destroying the
+                // frame here would leave the scheduler with a stale handle, so
+                // fail closed instead of turning a cancellation race into UAF.
+                std::terminate();
             }
         }
     }
 
-    [[nodiscard]] bool await_ready() const noexcept { return false; }
+    [[nodiscard]] bool await_ready() const noexcept {
+        return op_
+            && op_->phase.load(std::memory_order_acquire)
+                   == op_phase::completed;
+    }
 
     [[nodiscard]] wc_result await_resume() noexcept {
         // op_ is guaranteed live here (the awaiter destructor hasn't
         // run yet, and resumption only happens after the op reached
         // completed). Snapshot then return.
-        return op_->result;
+        auto result = op_->result;
+        op_->handle = {};
+        return result;
     }
 
 protected:
+    enum class await_action {
+        post_needed,
+        suspend,
+        resume_inline,
+    };
+
+    /// Common await entry. A lazy operation returns post_needed and lets
+    /// the derived awaiter submit the WR. A started operation either
+    /// installs the coroutine handle on the already posted state or
+    /// observes a stored completion and resumes inline.
+    [[nodiscard]] await_action prepare_await_(
+        std::coroutine_handle<> h) noexcept {
+        auto phase = op_->phase.load(std::memory_order_acquire);
+        if (phase == op_phase::completed) {
+            return await_action::resume_inline;
+        }
+        if (phase == op_phase::unstarted) {
+            return await_action::post_needed;
+        }
+        if (phase == op_phase::posted) {
+            op_->handle = h;
+            auto expected = op_phase::posted;
+            if (op_->phase.compare_exchange_strong(
+                    expected,
+                    op_phase::pending,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return await_action::suspend;
+            }
+            if (expected == op_phase::completed) {
+                return await_action::resume_inline;
+            }
+            invalid_lifecycle_();
+        }
+        invalid_lifecycle_();
+    }
+
+    /// Start an operation without a coroutine waiter. Returns 0 when the
+    /// operation has already been posted or completed, so callers can
+    /// make repeated start() calls no-ops rather than double-posting.
+    [[nodiscard]] wr_id begin_start_() noexcept {
+        auto expected = op_phase::unstarted;
+        if (!op_->phase.compare_exchange_strong(
+                expected,
+                op_phase::posting,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            assert((expected == op_phase::posted
+                    || expected == op_phase::completed
+                    || expected == op_phase::pending)
+                   && "RDMA operation awaitables are single-use");
+            return 0;
+        }
+        op_->handle = {};
+        return dispatcher::make_wr_id(op_.get());
+    }
+
     /// Called by derived class's await_suspend before posting the WR.
     /// Returns the wr_id to pass into the backend's post_* function.
     [[nodiscard]] wr_id arm_(std::coroutine_handle<> h) noexcept {
@@ -241,6 +313,27 @@ protected:
         assert(previous == detail::op_phase::unstarted &&
                "RDMA operation awaitables are single-use");
         return dispatcher::make_wr_id(op_.get());
+    }
+
+    /// Commit a post submitted by start(). With no awaiting coroutine,
+    /// a successful post moves to `posted`; a completion that arrived
+    /// inline during post_* is already `completed`; post failure is
+    /// stored as an immediately awaitable synthetic completion.
+    void finalize_start_(int rc) noexcept {
+        if (rc == 0) {
+            auto expected = op_phase::posting;
+            if (op_->phase.compare_exchange_strong(
+                    expected,
+                    op_phase::posted,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return;
+            }
+            assert(expected == op_phase::completed &&
+                   "post completion escaped the posting/completed states");
+            return;
+        }
+        (void)finalize_post_(rc);
     }
 
     /// If the backend reported a synchronous failure to post (rc != 0),
@@ -305,14 +398,20 @@ protected:
     }
 
 private:
+    [[noreturn]] static void invalid_lifecycle_() noexcept {
+        assert(false && "RDMA operation awaitables are single-use");
+        std::terminate();
+    }
+
     std::unique_ptr<op_state> op_;
 };
 
 /// Tiny mixin that all four awaiters share: dual storage for either a
 /// single inline SGE (built from a `buffer_view`) or a caller-owned
 /// SGE span. `effective_sges_()` resolves to one or the other at the
-/// point the WR is posted. Built inside `await_suspend`, never
-/// stored; safe under awaiter moves.
+/// point the WR is posted, either by `await_suspend` or by `.start()`.
+/// The resolved span is not used again after a started operation has
+/// submitted its WR.
 class sge_holder {
 public:
     explicit sge_holder(buffer_view buf) noexcept
@@ -377,7 +476,26 @@ public:
           flags_(require_completion_(flags)), max_inline_(max_inline),
           imm_data_(imm_data) {}
 
+    send_awaitable& start() & noexcept {
+        start_();
+        return *this;
+    }
+
+    [[nodiscard("store or co_await the started RDMA operation")]]
+    send_awaitable start() && noexcept {
+        start_();
+        return std::move(*this);
+    }
+
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+        switch (prepare_await_(h)) {
+            case await_action::post_needed:
+                break;
+            case await_action::suspend:
+                return true;
+            case await_action::resume_inline:
+                return false;
+        }
         const auto id = arm_(h);
         const auto total = total_bytes_();
         if (flags_.inline_send && total > max_inline_) {
@@ -393,6 +511,23 @@ public:
     }
 
 private:
+    void start_() noexcept {
+        const auto id = begin_start_();
+        if (id == 0) {
+            return;
+        }
+        const auto total = total_bytes_();
+        if (flags_.inline_send && total > max_inline_) {
+            (void)fail_pre_post_(
+                wc_status::local_length_error,
+                byte_count_hint_(total));
+            return;
+        }
+        const int rc = backend_invoker<Backend>::post_send(
+            qp_, effective_sges_(), flags_, imm_data_, id, backend_);
+        finalize_start_(rc);
+    }
+
     void*         qp_;
     Backend*      backend_;
     send_flags    flags_;
@@ -415,7 +550,26 @@ public:
                    std::span<const sge> sges) noexcept
         : sge_holder(sges), qp_(qp), backend_(backend_or_null) {}
 
+    recv_awaitable& start() & noexcept {
+        start_();
+        return *this;
+    }
+
+    [[nodiscard("store or co_await the started RDMA operation")]]
+    recv_awaitable start() && noexcept {
+        start_();
+        return std::move(*this);
+    }
+
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+        switch (prepare_await_(h)) {
+            case await_action::post_needed:
+                break;
+            case await_action::suspend:
+                return true;
+            case await_action::resume_inline:
+                return false;
+        }
         const auto id = arm_(h);
         const int rc = backend_invoker<Backend>::post_recv(
             qp_, effective_sges_(), id, backend_);
@@ -423,6 +577,16 @@ public:
     }
 
 private:
+    void start_() noexcept {
+        const auto id = begin_start_();
+        if (id == 0) {
+            return;
+        }
+        const int rc = backend_invoker<Backend>::post_recv(
+            qp_, effective_sges_(), id, backend_);
+        finalize_start_(rc);
+    }
+
     void*    qp_;
     Backend* backend_;
 };
@@ -459,7 +623,26 @@ public:
           remote_(remote), flags_(require_completion_(flags)),
           max_inline_(max_inline), imm_data_(imm_data) {}
 
+    rdma_write_awaitable& start() & noexcept {
+        start_();
+        return *this;
+    }
+
+    [[nodiscard("store or co_await the started RDMA operation")]]
+    rdma_write_awaitable start() && noexcept {
+        start_();
+        return std::move(*this);
+    }
+
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+        switch (prepare_await_(h)) {
+            case await_action::post_needed:
+                break;
+            case await_action::suspend:
+                return true;
+            case await_action::resume_inline:
+                return false;
+        }
         const auto id = arm_(h);
         const auto total = total_bytes_();
         if (total > remote_.length) {
@@ -478,6 +661,29 @@ public:
     }
 
 private:
+    void start_() noexcept {
+        const auto id = begin_start_();
+        if (id == 0) {
+            return;
+        }
+        const auto total = total_bytes_();
+        if (total > remote_.length) {
+            (void)fail_pre_post_(
+                wc_status::local_length_error,
+                byte_count_hint_(total));
+            return;
+        }
+        if (flags_.inline_send && total > max_inline_) {
+            (void)fail_pre_post_(
+                wc_status::local_length_error,
+                byte_count_hint_(total));
+            return;
+        }
+        const int rc = backend_invoker<Backend>::post_rdma_write(
+            qp_, effective_sges_(), remote_, flags_, imm_data_, id, backend_);
+        finalize_start_(rc);
+    }
+
     void*         qp_;
     Backend*      backend_;
     remote_buffer remote_;
@@ -506,7 +712,26 @@ public:
         : sge_holder(locals), qp_(qp), backend_(backend_or_null),
           remote_(remote) {}
 
+    rdma_read_awaitable& start() & noexcept {
+        start_();
+        return *this;
+    }
+
+    [[nodiscard("store or co_await the started RDMA operation")]]
+    rdma_read_awaitable start() && noexcept {
+        start_();
+        return std::move(*this);
+    }
+
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+        switch (prepare_await_(h)) {
+            case await_action::post_needed:
+                break;
+            case await_action::suspend:
+                return true;
+            case await_action::resume_inline:
+                return false;
+        }
         const auto id = arm_(h);
         const auto total = total_bytes_();
         if (total > remote_.length) {
@@ -520,6 +745,23 @@ public:
     }
 
 private:
+    void start_() noexcept {
+        const auto id = begin_start_();
+        if (id == 0) {
+            return;
+        }
+        const auto total = total_bytes_();
+        if (total > remote_.length) {
+            (void)fail_pre_post_(
+                wc_status::local_length_error,
+                byte_count_hint_(total));
+            return;
+        }
+        const int rc = backend_invoker<Backend>::post_rdma_read(
+            qp_, effective_sges_(), remote_, id, backend_);
+        finalize_start_(rc);
+    }
+
     void*         qp_;
     Backend*      backend_;
     remote_buffer remote_;
@@ -544,7 +786,26 @@ public:
           compare_(compare), swap_(swap),
           flags_(require_completion_(flags)) {}
 
+    rdma_cas_awaitable& start() & noexcept {
+        start_();
+        return *this;
+    }
+
+    [[nodiscard("store or co_await the started RDMA operation")]]
+    rdma_cas_awaitable start() && noexcept {
+        start_();
+        return std::move(*this);
+    }
+
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+        switch (prepare_await_(h)) {
+            case await_action::post_needed:
+                break;
+            case await_action::suspend:
+                return true;
+            case await_action::resume_inline:
+                return false;
+        }
         const auto sge_val = sge::from(local_);
         auto sges = std::span<const sge>(&sge_val, 1);
         const auto id = arm_(h);
@@ -561,6 +822,18 @@ public:
     }
 
 private:
+    void start_() noexcept {
+        const auto id = begin_start_();
+        if (id == 0) {
+            return;
+        }
+        const auto sge_val = sge::from(local_);
+        auto sges = std::span<const sge>(&sge_val, 1);
+        const int rc = backend_invoker<Backend>::post_atomic_cas(
+            qp_, sges, remote_, compare_, swap_, flags_, id, backend_);
+        finalize_start_(rc);
+    }
+
     void*         qp_;
     Backend*      backend_;
     buffer_view   local_;
@@ -586,7 +859,26 @@ public:
           local_(local), remote_(remote),
           add_(add), flags_(require_completion_(flags)) {}
 
+    rdma_faa_awaitable& start() & noexcept {
+        start_();
+        return *this;
+    }
+
+    [[nodiscard("store or co_await the started RDMA operation")]]
+    rdma_faa_awaitable start() && noexcept {
+        start_();
+        return std::move(*this);
+    }
+
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+        switch (prepare_await_(h)) {
+            case await_action::post_needed:
+                break;
+            case await_action::suspend:
+                return true;
+            case await_action::resume_inline:
+                return false;
+        }
         const auto sge_val = sge::from(local_);
         auto sges = std::span<const sge>(&sge_val, 1);
         const auto id = arm_(h);
@@ -603,6 +895,18 @@ public:
     }
 
 private:
+    void start_() noexcept {
+        const auto id = begin_start_();
+        if (id == 0) {
+            return;
+        }
+        const auto sge_val = sge::from(local_);
+        auto sges = std::span<const sge>(&sge_val, 1);
+        const int rc = backend_invoker<Backend>::post_atomic_fetch_add(
+            qp_, sges, remote_, add_, flags_, id, backend_);
+        finalize_start_(rc);
+    }
+
     void*         qp_;
     Backend*      backend_;
     buffer_view   local_;
@@ -628,7 +932,26 @@ public:
                        std::span<const sge> sges) noexcept
         : sge_holder(sges), srq_(srq_ptr), backend_(backend_or_null) {}
 
+    srq_recv_awaitable& start() & noexcept {
+        start_();
+        return *this;
+    }
+
+    [[nodiscard("store or co_await the started RDMA operation")]]
+    srq_recv_awaitable start() && noexcept {
+        start_();
+        return std::move(*this);
+    }
+
     [[nodiscard]] bool await_suspend(std::coroutine_handle<> h) noexcept {
+        switch (prepare_await_(h)) {
+            case await_action::post_needed:
+                break;
+            case await_action::suspend:
+                return true;
+            case await_action::resume_inline:
+                return false;
+        }
         const auto id = arm_(h);
         const int rc = backend_invoker<Backend>::post_srq_recv(
             srq_, effective_sges_(), id, backend_);
@@ -636,6 +959,16 @@ public:
     }
 
 private:
+    void start_() noexcept {
+        const auto id = begin_start_();
+        if (id == 0) {
+            return;
+        }
+        const int rc = backend_invoker<Backend>::post_srq_recv(
+            srq_, effective_sges_(), id, backend_);
+        finalize_start_(rc);
+    }
+
     void*    srq_;
     Backend* backend_;
 };

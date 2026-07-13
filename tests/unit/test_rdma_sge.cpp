@@ -15,6 +15,7 @@
 #include <coroutine>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 using elio::rdma::buffer_view;
@@ -181,6 +182,12 @@ probe_task run_read_span(Conn& c, std::span<const sge> locals,
     done = true;
 }
 
+template <typename Awaiter>
+probe_task run_started(Awaiter op, wc_result& out, bool& done) {
+    out  = co_await std::move(op);
+    done = true;
+}
+
 }  // namespace
 
 TEST_CASE("send: multi-SGE span threads through to the backend verbatim",
@@ -253,6 +260,43 @@ TEST_CASE("recv: multi-SGE span threads through to the backend verbatim",
     disp.deliver(st.last_id, wc_status::success, 80);
     REQUIRE(done);
     REQUIRE(result.byte_len == 80u);
+}
+
+TEST_CASE("recv: started multi-SGE operation does not reread span on await",
+          "[rdma][recv][sge][start]") {
+    sge_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 20;
+    connection<sge_static_backend> c{&qp_value, disp};
+
+    alignas(8) char a[16] = {};
+    alignas(8) char b[16] = {};
+
+    auto op = [&]() {
+        std::array<sge, 2> sges{
+            sge{a, 16, 0x1},
+            sge{b, 16, 0x2},
+        };
+        return c.recv(std::span<const sge>(sges)).start();
+    }();
+
+    REQUIRE(st.posts.load() == 1);
+    REQUIRE(st.last_sges.size() == 2u);
+    const auto id = st.last_id;
+    REQUIRE(id != 0);
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_started(std::move(op), result, done);
+
+    REQUIRE_FALSE(done);
+    REQUIRE(st.posts.load() == 1);
+
+    disp.deliver(id, wc_status::success, 32);
+    REQUIRE(done);
+    REQUIRE(result.ok());
+    REQUIRE(result.byte_len == 32u);
 }
 
 TEST_CASE("rdma_write: multi-SGE gather with remote_buffer + flags",

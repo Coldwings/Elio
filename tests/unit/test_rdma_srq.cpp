@@ -24,6 +24,7 @@
 #include <coroutine>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 using elio::rdma::buffer_view;
@@ -173,6 +174,12 @@ probe_task run_srq_recv_span(SRQ& q, std::span<const sge> sges,
     done = true;
 }
 
+template <typename Awaiter>
+probe_task run_started(Awaiter op, wc_result& out, bool& done) {
+    out  = co_await std::move(op);
+    done = true;
+}
+
 }  // namespace
 
 TEST_CASE("srq<Backend>::recv posts to backend and resumes on CQE",
@@ -205,6 +212,56 @@ TEST_CASE("srq<Backend>::recv posts to backend and resumes on CQE",
     REQUIRE(result.ok());
     REQUIRE(result.byte_len == 24u);
     REQUIRE(result.imm_data == 0xCAFEu);
+}
+
+TEST_CASE("srq<Backend>::recv start posts immediately and later await does not repost",
+          "[rdma][srq][start]") {
+    srq_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int srq_handle = 0xBCDE;
+    srq<srq_static_backend> q{&srq_handle, disp};
+
+    char payload[32] = {};
+    buffer_view bv{payload, sizeof(payload), 0x55};
+
+    auto op = q.recv(bv).start();
+    REQUIRE(st.posts.load() == 1);
+    const auto id = st.last_id;
+    REQUIRE(id != 0);
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_started(std::move(op), result, done);
+
+    REQUIRE_FALSE(done);
+    REQUIRE(st.posts.load() == 1);
+
+    disp.deliver(id, wc_status::success, 20);
+    REQUIRE(done);
+    REQUIRE(result.ok());
+    REQUIRE(result.byte_len == 20u);
+}
+
+TEST_CASE("srq<polymorphic_backend>::started default ENOTSUP is awaitable",
+          "[rdma][srq][start][polymorphic][default]") {
+    poly_no_srq impl{};
+    dispatcher disp;
+    int srq_handle = 0;
+    srq<polymorphic_backend> q{&srq_handle, impl, disp};
+
+    char buf[4] = {};
+    buffer_view bv{buf, 4, 0};
+
+    auto op = q.recv(bv).start();
+    wc_result result{};
+    bool done = false;
+    auto task = run_started(std::move(op), result, done);
+
+    REQUIRE(done);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::wr_flush_error);
+    REQUIRE(result.imm_data == 95u);
 }
 
 TEST_CASE("srq<Backend>::recv multi-SGE scatter list",

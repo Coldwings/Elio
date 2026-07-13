@@ -25,6 +25,7 @@
 #include <coroutine>
 #include <cstdint>
 #include <span>
+#include <utility>
 
 using elio::rdma::buffer_view;
 using elio::rdma::connection;
@@ -130,6 +131,12 @@ probe_task run_write_buf(Conn& c, buffer_view buf, remote_buffer remote,
     done = true;
 }
 
+template <typename Awaiter>
+probe_task run_started(Awaiter op, wc_result& out, bool& done) {
+    out  = co_await std::move(op);
+    done = true;
+}
+
 }  // namespace
 
 TEST_CASE("inline send: payload within max_inline_data posts normally",
@@ -209,6 +216,34 @@ TEST_CASE("inline send: payload beyond max_inline_data is rejected pre-post",
     REQUIRE_FALSE(result.ok());
     REQUIRE(result.status == wc_status::local_length_error);
     REQUIRE(result.imm_data == 256u);  // offending payload size
+}
+
+TEST_CASE("inline send: started oversized payload is rejected before post",
+          "[rdma][send][inline][reject][start]") {
+    inline_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 33;
+    connection<inline_static_backend> c{
+        &qp_value, disp, connection_config{.max_inline_data = 16}};
+
+    char buf[32] = {};
+    buffer_view bv{buf, sizeof(buf), 0};
+
+    send_flags flags{};
+    flags.inline_send = true;
+    auto op = c.send(bv, flags).start();
+
+    REQUIRE(st.sends.load() == 0);
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_started(std::move(op), result, done);
+
+    REQUIRE(done);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == 32u);
 }
 
 TEST_CASE("inline send: multi-SGE total exceeds limit → rejected",

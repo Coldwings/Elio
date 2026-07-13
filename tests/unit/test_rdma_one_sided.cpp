@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <utility>
 
 using elio::rdma::buffer_view;
 using elio::rdma::connection;
@@ -200,6 +201,12 @@ probe_task run_read_sges(Conn& c, std::span<const sge> locals,
     done = true;
 }
 
+template <typename Awaiter>
+probe_task run_started(Awaiter op, wc_result& out, bool& done) {
+    out  = co_await std::move(op);
+    done = true;
+}
+
 }  // namespace
 
 TEST_CASE("rdma_write: backend receives local SGE + remote_buffer + flags",
@@ -299,6 +306,62 @@ TEST_CASE("rdma_write: awaited operation forces completion for unsignaled flags"
     disp.deliver(st.last_write_id, wc_status::success, /*byte_len=*/0);
     REQUIRE(done);
     REQUIRE(result.ok());
+}
+
+TEST_CASE("rdma_write: start posts immediately and later await does not repost",
+          "[rdma][write][start]") {
+    one_sided_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 15;
+    connection<one_sided_static_backend> c{&qp_value, disp};
+
+    alignas(8) char payload[32] = {};
+    buffer_view local{payload, sizeof(payload), 0x777};
+    remote_buffer remote{0xCAFE, sizeof(payload), 0xBEEF};
+
+    auto op = c.rdma_write(local, remote).start();
+    REQUIRE(st.writes.load() == 1);
+    const auto id = st.last_write_id;
+    REQUIRE(id != 0);
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_started(std::move(op), result, done);
+
+    REQUIRE_FALSE(done);
+    REQUIRE(st.writes.load() == 1);
+
+    disp.deliver(id, wc_status::success, /*byte_len=*/0);
+    REQUIRE(done);
+    REQUIRE(result.ok());
+}
+
+TEST_CASE("rdma_read: completion before awaiting a started op resumes inline",
+          "[rdma][read][start][completed-before-await]") {
+    one_sided_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 16;
+    connection<one_sided_static_backend> c{&qp_value, disp};
+
+    alignas(8) char payload[64] = {};
+    buffer_view local{payload, sizeof(payload), 0x888};
+    remote_buffer remote{0xABCD, sizeof(payload), 0xBEEF};
+
+    auto op = c.rdma_read(local, remote).start();
+    REQUIRE(st.reads.load() == 1);
+    const auto id = st.last_read_id;
+    disp.deliver(id, wc_status::success, /*byte_len=*/48);
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_started(std::move(op), result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.reads.load() == 1);
+    REQUIRE(result.ok());
+    REQUIRE(result.byte_len == 48u);
 }
 
 TEST_CASE("rdma_read: backend receives local SGE + remote_buffer; "

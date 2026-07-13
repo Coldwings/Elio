@@ -103,8 +103,28 @@ public:
                 continue;
             }
 
+            if (expected == detail::op_phase::posted) {
+                op->result = result;
+                if (!op->phase.compare_exchange_strong(
+                        expected,
+                        detail::op_phase::completed,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    continue;
+                }
+                // The operation was explicitly started but no coroutine
+                // has awaited it yet. Store the CQE; a later await will
+                // observe `completed` and resume inline.
+                return;
+            }
+
             if (expected == detail::op_phase::pending) {
                 op->result = result;
+                // Snapshot the handle before publishing `completed`. Once the
+                // CAS succeeds, a concurrently destroyed awaiter may observe
+                // completed and free op_state; do not dereference `op` after
+                // this point.
+                auto handle = op->handle;
                 if (!op->phase.compare_exchange_strong(
                         expected,
                         detail::op_phase::completed,
@@ -122,12 +142,11 @@ public:
                 // When the awaiter's destructor eventually runs, try_orphan
                 // observes `completed` and returns false, so the unique_ptr
                 // retains ownership and frees `op` normally.
-                auto handle = op->handle;
                 runtime::schedule_handle(handle);
                 return;
             }
 
-            // The awaiter destructor already CASed pending → orphaned.
+            // The awaiter destructor already CASed posted/pending → orphaned.
             // No coroutine to resume; we own the heap node now and must
             // free it. Assert the expected phase to catch duplicate CQEs
             // (deliver called twice for the same wr_id) in debug builds.
@@ -142,16 +161,24 @@ public:
 
     /// Awaiter destructor helper: attempt the inverse race.
     ///
-    /// Returns true if this call won the race (state was `pending`,
-    /// now `orphaned`); the dispatcher will eventually free `op` when
-    /// the CQE arrives. The awaiter must NOT free `op` itself in this
-    /// case (call `.release()` on the unique_ptr).
+    /// Returns true if this call won the race (state was `posted` or
+    /// `pending`, now `orphaned`); the dispatcher will eventually free
+    /// `op` when the CQE arrives. The awaiter must NOT free `op` itself
+    /// in this case (call `.release()` on the unique_ptr).
     ///
     /// Returns false if the operation was never started or the dispatcher
     /// already completed it; the awaiter retains ownership of `op` and its
     /// unique_ptr destructor frees it.
     [[nodiscard]] static bool try_orphan(detail::op_state* op) noexcept {
         if (op == nullptr) return false;
+        auto posted = detail::op_phase::posted;
+        if (op->phase.compare_exchange_strong(
+                posted,
+                detail::op_phase::orphaned,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return true;
+        }
         auto expected = detail::op_phase::pending;
         return op->phase.compare_exchange_strong(
             expected,

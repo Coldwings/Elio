@@ -10,6 +10,7 @@
 #include <cstring>
 #include <thread>
 #include <atomic>
+#include <cerrno>
 #include <optional>
 
 using namespace elio::io;
@@ -152,6 +153,24 @@ TEST_CASE("batch_read: single segment works", "[io][batch][read]") {
 
     close(fd);
     unlink(tmpfile);
+}
+
+TEST_CASE("batch I/O reports negative errno for failed segments",
+          "[io][batch][error][regression]") {
+    run_on_scheduler([]() -> task<void> {
+        char read_buffer{};
+        batch_read_segment read_segment{0, &read_buffer, 1};
+        auto read_results = co_await batch_read(
+            -1, std::span<const batch_read_segment>(&read_segment, 1));
+
+        const char write_buffer = 'x';
+        batch_write_segment write_segment{0, &write_buffer, 1};
+        auto write_results = co_await batch_write(
+            -1, std::span<const batch_write_segment>(&write_segment, 1));
+
+        REQUIRE(read_results == std::vector<int>{-EBADF});
+        REQUIRE(write_results == std::vector<int>{-EBADF});
+    });
 }
 
 // ============================================================================

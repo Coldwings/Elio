@@ -250,6 +250,26 @@ TEST_CASE("HTTP response parser rejects malformed versions", "[http][parser]") {
     }
 }
 
+TEST_CASE("HTTP response parser rejects malformed status codes", "[http][parser]") {
+    const char* invalid_codes[] = {
+        "",
+        "20",
+        "2000",
+        "302x",
+        "30x",
+        "x02",
+    };
+
+    for (auto* code : invalid_codes) {
+        response_parser parser;
+        std::string response =
+            std::string("HTTP/1.1 ") + code + " Found\r\n"
+            "Content-Length: 0\r\n\r\n";
+        auto [result, consumed] = parser.parse(response);
+        REQUIRE(result == parse_result::error);
+    }
+}
+
 TEST_CASE("HTTP response parser - chunked response", "[http][parser]") {
     response_parser parser;
 

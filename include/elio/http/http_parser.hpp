@@ -761,8 +761,10 @@ private:
         }
         
         uint16_t code = 0;
-        auto [ptr, ec] = std::from_chars(status_str.data(), status_str.data() + status_str.size(), code);
-        if (ec != std::errc{}) {
+        auto status_begin = status_str.data();
+        auto status_end = status_begin + status_str.size();
+        auto [ptr, ec] = std::from_chars(status_begin, status_end, code);
+        if (status_str.size() != 3 || ec != std::errc{} || ptr != status_end) {
             set_error("Invalid status code");
             return false;
         }

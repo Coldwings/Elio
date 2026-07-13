@@ -183,9 +183,9 @@ coro::task<void> parallel_example() {
 }
 ```
 
-#### Pinned Spawn with `elio::go_to()`
+#### Affinity Spawn with `elio::go_to()`
 
-Use `elio::go_to()` to spawn a task pinned to a specific worker thread. The task is placed directly on the target worker's queue with affinity set — it cannot be stolen by other workers.
+Use `elio::go_to()` to spawn a task with affinity to a specific worker thread. The task is placed on the target worker's queue with affinity set before it first resumes. If a steal attempt later observes the task on another queue, the scheduler requeues it to the affinity worker instead of executing it on the wrong worker.
 
 For deterministic placement, pass a worker id in `[0, scheduler.num_threads())`.
 Out-of-range ids are not rejected, but they are treated as scheduler fallback
@@ -248,7 +248,7 @@ This design ensures:
 
 ### Thread Affinity
 
-Tasks can be pinned to specific worker threads using the affinity API. A pinned task will not be stolen by other workers.
+Tasks can request a specific worker thread using the affinity API. The scheduler respects affinity during stealing: a stolen affinity task is requeued to its bound worker instead of being executed by the thief.
 
 ```cpp
 #include <elio/runtime/affinity.hpp>

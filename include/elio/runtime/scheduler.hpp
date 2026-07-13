@@ -357,9 +357,10 @@ public:
         do_go_<false, false>(0, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
-    /// High-level API: fire-and-forget, pinned to a specific worker.
-    /// Affinity is set so the task cannot be stolen by other workers;
-    /// if stolen it will be bounced back to the target worker.
+    /// High-level API: fire-and-forget, with affinity to a specific worker.
+    /// Affinity is set before first resume; steal attempts that observe the
+    /// task on another queue bounce it back to the target worker instead of
+    /// executing it there.
     /// For deterministic placement, worker_id must be less than num_threads().
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
@@ -376,11 +377,12 @@ public:
         return do_go_<true, false>(0, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
-    /// High-level API: spawn + join, pinned to a specific worker.
-    /// Affinity is set so the task cannot be stolen; I/O is bound to that
-    /// worker's io_context. Use when spawned task and caller must share fate
-    /// w.r.t. thread-pool resizing. For deterministic placement, worker_id
-    /// must be less than num_threads().
+    /// High-level API: spawn + join, with affinity to a specific worker.
+    /// Affinity is set before first resume; I/O is bound to that worker's
+    /// io_context, and steal attempts bounce the task back to the affinity
+    /// worker instead of executing it elsewhere. Use when spawned task and
+    /// caller must share fate w.r.t. thread-pool resizing. For deterministic
+    /// placement, worker_id must be less than num_threads().
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
     auto go_joinable_to(size_t worker_id, F&& f, Args&&... args)

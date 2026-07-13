@@ -481,14 +481,14 @@ Binding vthreads to specific worker threads:
 
 using namespace elio;
 
-// Task that stays pinned to a specific worker
+// Task with affinity to a specific worker
 coro::task<void> pinned_worker(size_t target_worker) {
     // Bind to target worker and migrate there
     co_await set_affinity(target_worker);
 
     std::cout << "Running on worker " << current_worker_id() << std::endl;
 
-    // Do work - will not be stolen by other workers
+    // Do work - steal attempts bounce the task back to this worker
     for (int i = 0; i < 5; ++i) {
         co_await time::yield();
         // Still on the same worker

@@ -100,9 +100,9 @@ coro::task<void> main_task() {
 }
 ```
 
-#### `elio::go_to()` - Pinned Fire-and-Forget
+#### `elio::go_to()` - Affinity Fire-and-Forget
 
-Spawn a coroutine pinned to a specific worker thread. The task's affinity is set so it cannot be stolen by other workers; if a steal occurs, the task is bounced back to the target worker.
+Spawn a coroutine with affinity to a specific worker thread. The affinity is set before the task first resumes, so the task is not executed on another worker; if a steal attempt observes the task on another queue, the scheduler bounces it back to the target worker.
 
 ```cpp
 template<typename F, typename... Args>
@@ -128,7 +128,7 @@ coro::task<void> main_task() {
 }
 ```
 
-> **Note:** `go_to()` differs from spawning with `go()` + `co_await set_affinity()`. With `go_to()`, the task is pinned *from the start* — it is placed directly on the target worker's queue and marked as non-stealable before it ever runs. With `go()` + `set_affinity()`, the task may briefly run on any worker before migrating.
+> **Note:** `go_to()` differs from spawning with `go()` + `co_await set_affinity()`. With `go_to()`, worker affinity is set before the task is scheduled and before it ever runs. A later steal attempt may briefly remove the task from a queue, but the scheduler checks affinity and requeues it instead of running it on the wrong worker. With `go()` + `set_affinity()`, the task may briefly run on any worker before migrating.
 
 #### `elio::spawn()` - Joinable
 
@@ -490,7 +490,8 @@ public:
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle);
 
     // For go_to(), go_joinable_to(), and spawn_to(), exact placement requires
-    // worker_id in [0, num_threads()). Larger values use fallback scheduling.
+    // worker_id in [0, num_threads()) and an available target worker. Larger
+    // values or unavailable targets use fallback scheduling.
 
     // Get number of worker threads
     size_t num_threads(std::memory_order order = std::memory_order_relaxed) const noexcept;
@@ -801,7 +802,7 @@ coro::task<void> custom_server_loop() {
 
 ## Thread Affinity (`elio::runtime`)
 
-Thread affinity allows you to bind vthreads (coroutines) to specific worker threads, preventing work stealing and ensuring they run on a designated thread.
+Thread affinity allows you to bind vthreads (coroutines) to specific worker threads so they run on a designated worker. Steal attempts that encounter an affinity-bound task are redirected to the bound worker instead of executing the task on the wrong worker.
 
 ### Constants
 
@@ -837,8 +838,8 @@ coro::task<void> pinned_task() {
     // Bind to worker 0 and migrate there
     co_await set_affinity(0);
     
-    // Now all subsequent code runs on worker 0
-    // Work stealing is prevented for this vthread
+    // Now subsequent code runs on worker 0 while affinity remains valid
+    // Steal attempts are bounced back to the affinity worker
     co_return;
 }
 ```

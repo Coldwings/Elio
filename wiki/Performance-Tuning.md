@@ -255,7 +255,7 @@ coro::task<void> pinned_work() {
 When you know the target worker at spawn time, `go_to()` is more efficient than `go()` + `set_affinity()`:
 
 ```cpp
-// Preferred: pinned from the start, no migration window
+// Preferred: affinity is set before first resume, no migration window
 elio::go_to(2, cache_sensitive_work);
 
 // Alternative: task may briefly run on another worker before migrating
@@ -266,7 +266,7 @@ elio::go([]() -> coro::task<void> {
 });
 ```
 
-`go_to()` places the task directly on the target worker's queue with the `Pinned` flag set, so the task is never stolen. This avoids the brief scheduling window where the task could execute on the wrong worker before `set_affinity` takes effect.
+`go_to()` sets the worker affinity before scheduling the task and initially enqueues it to the target worker when that worker is available. If a later steal attempt observes the task on another queue, the scheduler requeues it to the affinity worker instead of executing it on the wrong worker. This avoids the brief scheduling window where the task could execute on the wrong worker before `set_affinity` takes effect.
 
 Use a worker id in `[0, scheduler.num_threads())` when exact placement matters.
 Out-of-range ids are not rejected, but they are fallback behavior rather than a

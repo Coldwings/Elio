@@ -91,8 +91,9 @@ public:
 
 /// Set thread affinity for the current vthread
 /// 
-/// Binds the current vthread to a specific worker thread. The vthread
-/// will not be stolen by other workers when it has affinity set.
+/// Binds the current vthread to a specific worker thread. Workers that steal
+/// it while affinity is set requeue it to the affinity worker instead of
+/// executing it on the wrong worker.
 /// 
 /// @param worker_id Worker ID to bind to
 /// @param migrate If true (default), migrate to target worker immediately

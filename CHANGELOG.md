@@ -63,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transfer lifetime, sync handoff cancellation leaks, object-cache release
   handoff and canceled-construction cleanup, bounded-channel close state, and
   combinator waiter resume ordering. (#290)
+- **Cancellation callback exceptions**: Cancellation now invokes and releases
+  every registered callback before rethrowing the first callback exception,
+  including callbacks registered after cancellation. (#774)
 - **Batch I/O fallback errors**: Synchronous `batch_read()` and `batch_write()`
   fallback paths now report syscall failures as `-errno`, matching io_uring and
   the public I/O result contract. (#763)

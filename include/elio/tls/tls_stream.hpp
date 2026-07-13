@@ -258,6 +258,9 @@ public:
         if (length > static_cast<size_t>(INT32_MAX)) {
             co_return io::io_result{-EOVERFLOW, 0};
         }
+        if (length == 0) {
+            co_return io::io_result{0, 0};
+        }
 
         if (!handshake_complete_) {
             auto hs = co_await handshake();
@@ -308,6 +311,9 @@ public:
                                    coro::cancel_token token) {
         if (length > static_cast<size_t>(INT32_MAX)) {
             co_return io::io_result{-EOVERFLOW, 0};
+        }
+        if (length == 0) {
+            co_return io::io_result{0, 0};
         }
 
         if (!handshake_complete_) {
@@ -370,6 +376,9 @@ public:
         if (length > static_cast<size_t>(INT32_MAX)) {
             co_return io::io_result{-EOVERFLOW, 0};
         }
+        if (length == 0) {
+            co_return io::io_result{0, 0};
+        }
 
         if (!handshake_complete_) {
             auto hs = co_await handshake();
@@ -410,6 +419,9 @@ public:
                                     coro::cancel_token token) {
         if (length > static_cast<size_t>(INT32_MAX)) {
             co_return io::io_result{-EOVERFLOW, 0};
+        }
+        if (length == 0) {
+            co_return io::io_result{0, 0};
         }
 
         if (!handshake_complete_) {

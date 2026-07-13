@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Linux platform validation**: CMake now rejects every non-Linux target at
   configure time instead of allowing unsupported Unix systems to fail later in
   Linux-specific headers. (#770)
+- **CRC32C hardware capability reporting**: `crc32c_hw_available()` now reports
+  true only when a hardware implementation is compiled into the translation
+  unit and supported by the current CPU, matching `crc32c()` dispatch. (#771)
 - **Network stream readiness and socket setup**: TCP and UDS stream operations
   now wait for readiness on transient `EAGAIN`/`EWOULDBLOCK`, preserve readable
   data before HUP/EOF, apply requested `tcp_connect` socket options, and restore

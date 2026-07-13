@@ -106,6 +106,14 @@ TEST_CASE("crc32c basic", "[hash][crc32c]") {
     }
 }
 
+TEST_CASE("crc32c hardware availability matches the compiled path", "[hash][crc32c]") {
+#if defined(ELIO_CRC32_HW_X86) || defined(ELIO_CRC32_HW_ARM64)
+    REQUIRE(crc32c_hw_available() == has_hw_crc32());
+#else
+    REQUIRE_FALSE(crc32c_hw_available());
+#endif
+}
+
 // ============================================================================
 // SHA-1 tests
 // ============================================================================

@@ -2321,7 +2321,8 @@ uint32_t crc32_finalize(uint32_t crc);
 uint32_t crc32c(const void* data, size_t length, uint32_t crc = 0xFFFFFFFF);
 uint32_t crc32c(std::span<const uint8_t> data, uint32_t crc = 0xFFFFFFFF);
 
-// Check whether hardware CRC32C is available at runtime
+// Check whether this translation unit has a compiled hardware CRC32C path
+// supported by the current CPU
 bool crc32c_hw_available() noexcept;
 ```
 

@@ -203,7 +203,9 @@ std::string hex2 = elio::hash::to_hex(data, length);
 ARM64 ACLE CRC intrinsics when supported, then falls back to a slicing-by-8
 lookup table. On x86/x86-64, the SSE4.2 CRC32 instruction implements CRC32C
 (Castagnoli polynomial), exposed through the `crc32c()` function. Hardware
-availability for CRC32C can be checked with `crc32c_hw_available()`.
+availability for CRC32C can be checked with `crc32c_hw_available()`, which is
+true only when the translation unit includes a compiled hardware path and the
+current CPU supports its required instructions.
 
 **SHA-1 and SHA-256** include optional hardware acceleration via SHA-NI (x86) and ARM Crypto Extensions (ARM64), selected at runtime. They do not rely on OpenSSL or any other cryptographic library. SHA-1 is included primarily for WebSocket handshakes (RFC 6455 requires it), while SHA-256 is suitable for data integrity verification and content addressing.
 

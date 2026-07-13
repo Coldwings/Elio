@@ -424,9 +424,15 @@ inline uint32_t crc32c(std::span<const uint8_t> data, uint32_t seed = 0xFFFFFFFF
     return crc32c(data.data(), data.size(), seed);
 }
 
-/// Check if hardware CRC32C is available
+/// Check if hardware CRC32C is available to this translation unit
+/// @return True when a hardware implementation was compiled and the current
+///         CPU supports the required instructions
 inline bool crc32c_hw_available() noexcept {
+#if defined(ELIO_CRC32_HW_X86) || defined(ELIO_CRC32_HW_ARM64)
     return has_hw_crc32();
+#else
+    return false;
+#endif
 }
 
 } // namespace elio::hash

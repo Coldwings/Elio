@@ -88,15 +88,15 @@ public:
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
             {
                 std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
-                this->wake_state_->set_handle(awaiter);
+                this->wake_state_->set_handle_blocked(awaiter);
                 cv_.waiters_.push_back(this);
                 this->suspended_ = true;  // Mark as enqueued
             }
-            // Release cv lock BEFORE unlocking user mutex to avoid self-deadlock
-            // on trampoline path: if mutex_.unlock() schedules a waiter that
-            // immediately calls cv.wait(), it needs to acquire cv_.internal_mutex_.
+            // The waiter is visible before unlocking the user mutex to avoid
+            // lost wakeups, but its wake_state is blocked so notify_* cannot
+            // resume and destroy this awaiter until after unlock() returns.
             mutex_.unlock();
-            return true;
+            return this->wake_state_->unblock_after_publish();
         }
 
         void await_resume() const noexcept {}
@@ -130,15 +130,15 @@ public:
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
             {
                 std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
-                this->wake_state_->set_handle(awaiter);
+                this->wake_state_->set_handle_blocked(awaiter);
                 cv_.waiters_.push_back(this);
                 this->suspended_ = true;  // Mark as enqueued
             }
-            // Release cv lock BEFORE unlocking user lock to avoid self-deadlock
-            // on trampoline path: if lock_.unlock() schedules a waiter that
-            // immediately calls cv.wait(), it needs to acquire cv_.internal_mutex_.
+            // The waiter is visible before unlocking the user lock to avoid
+            // lost wakeups, but its wake_state is blocked so notify_* cannot
+            // resume and destroy this awaiter until after unlock() returns.
             lock_.unlock();
-            return true;
+            return this->wake_state_->unblock_after_publish();
         }
 
         void await_resume() {

@@ -397,7 +397,10 @@ inline uint32_t crc32_finalize(uint32_t crc) noexcept {
 ///             `crc32`, this is **not** a chain state: the result is
 ///             finalized via XOR with 0xFFFFFFFF before returning.
 /// @return Final CRC32C checksum
-inline uint32_t crc32c(const void* data, size_t length, uint32_t seed = 0xFFFFFFFF) noexcept {
+// Internal linkage keeps per-translation-unit ISA paths from producing
+// conflicting external inline definitions in mixed-flag builds.
+static inline uint32_t crc32c(const void* data, size_t length,
+                              uint32_t seed = 0xFFFFFFFF) noexcept {
     if (length == 0) return seed ^ 0xFFFFFFFF;
     uint32_t crc = seed;
     
@@ -420,14 +423,15 @@ inline uint32_t crc32c(const void* data, size_t length, uint32_t seed = 0xFFFFFF
 /// Compute CRC32C checksum of a span
 /// @param seed See `crc32c(const void*, size_t, uint32_t)` — initializer
 ///             only, not a chain state.
-inline uint32_t crc32c(std::span<const uint8_t> data, uint32_t seed = 0xFFFFFFFF) noexcept {
+static inline uint32_t crc32c(std::span<const uint8_t> data,
+                              uint32_t seed = 0xFFFFFFFF) noexcept {
     return crc32c(data.data(), data.size(), seed);
 }
 
 /// Check if hardware CRC32C is available to this translation unit
 /// @return True when a hardware implementation was compiled and the current
 ///         CPU supports the required instructions
-inline bool crc32c_hw_available() noexcept {
+static inline bool crc32c_hw_available() noexcept {
 #if defined(ELIO_CRC32_HW_X86) || defined(ELIO_CRC32_HW_ARM64)
     return has_hw_crc32();
 #else

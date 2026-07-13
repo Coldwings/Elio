@@ -2316,6 +2316,9 @@ uint32_t crc32_finalize(uint32_t crc);
 
 ### CRC32C
 
+The header-only CRC32C entry points use translation-unit-local linkage so
+sources compiled with different ISA flags keep independent dispatch paths.
+
 ```cpp
 // Compute CRC32C (Castagnoli polynomial)
 uint32_t crc32c(const void* data, size_t length, uint32_t crc = 0xFFFFFFFF);

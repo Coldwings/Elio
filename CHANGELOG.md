@@ -696,7 +696,7 @@ complete.
 - HTTP/2 client via nghttp2
 - WebSocket (RFC 6455) and Server-Sent Events
 - TLS via OpenSSL with ALPN
-- RPC framework with zero-copy serialization
+- RPC framework with zero-copy deserialization and buffer_ref support
 - Synchronization primitives: mutex, shared_mutex, semaphore, event, channel,
   condition_variable, spinlock
 - Virtual thread stack with coroutine backtrace support

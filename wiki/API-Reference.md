@@ -2436,7 +2436,10 @@ public:
 
 #### `buffer_ref`
 
-Zero-copy reference to external buffer data.
+Non-owning reference to external buffer data. Deserialization can return a
+`buffer_ref` view into the received payload without copying. Serialization of a
+`buffer_ref` currently copies the referenced bytes into the outgoing
+`buffer_writer`; true send-side zero-copy/iovec-tail support is not implemented.
 
 ```cpp
 class buffer_ref {

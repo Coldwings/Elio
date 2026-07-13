@@ -71,8 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   informational responses, URL authority parsing, client cancellation
   propagation, connect/handshake/read timeout enforcement, failed handshake
   cleanup, outbound header-injection rejection, and forbidden response-body
-  suppression, and HTTP request/response version validation. (#321, #711,
-  #713)
+  suppression, empty request-target rejection, and HTTP request/response
+  version validation. (#321, #711, #713, #746)
 - **HTTP URL authority validation**: The URL parser now rejects unbracketed IPv6
   literals and authorities with multiple port separators instead of treating the
   last colon as a valid port delimiter. (#655)
@@ -168,6 +168,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **HTTP/1 TLS timeout cleanup**: Client read/write timeout paths now mark
   TLS-backed streams as externally shut down after watchdog-driven `shutdown(2)`,
   preventing destructor-time `SSL_shutdown()` on an unusable socket. (#648)
+- **TLS stream zero-length I/O**: Base TLS `read()` and `write()` overloads now
+  return success for zero-length operations without starting a handshake or
+  OpenSSL I/O. (#747)
 
 ## [0.5.2] - 2026-06-30
 

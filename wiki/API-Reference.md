@@ -2648,6 +2648,12 @@ operations.
 using cleanup_callback_t = std::function<void()>;
 ```
 
+Cleanup callbacks returned by `register_method_with_cleanup()` and
+`register_method_with_context_and_cleanup()` run only after the response has
+been successfully sent. They are not failure-path finalizers: disconnects,
+write failures, and `send_response` exceptions skip cleanup, so handlers must
+not rely on the callback for mandatory local failure cleanup.
+
 #### `rpc_server_config`
 
 ```cpp

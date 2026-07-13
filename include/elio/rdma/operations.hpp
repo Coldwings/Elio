@@ -204,7 +204,7 @@ public:
     op_awaiter_base(const op_awaiter_base&) = delete;
     op_awaiter_base& operator=(const op_awaiter_base&) = delete;
     op_awaiter_base(op_awaiter_base&&) noexcept = default;
-    op_awaiter_base& operator=(op_awaiter_base&&) noexcept = default;
+    op_awaiter_base& operator=(op_awaiter_base&&) = delete;
 
     ~op_awaiter_base() noexcept {
         // If we still own a posted `op_`, try to flip pending → orphaned

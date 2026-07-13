@@ -107,6 +107,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **RDMA lazy-operation lifetime**: Destroying an RDMA operation awaitable
   before it is awaited now frees its unstarted completion state instead of
   orphaning it for a CQE that will never arrive. (#786)
+- **RDMA operation awaitable move assignment**: Operation awaitables are no
+  longer move-assignable, preventing replacement of a posted operation from
+  freeing completion state while the backend still holds its `wr_id`. Move
+  construction remains supported. (#787)
 - **RPC cancellation and framing**: Fixed complete protocol writes, transient
   RPC `writev` retries, `rpc_client` timeout-watcher cleanup, member-coroutine
   self lifetime, end-to-end cancellation propagation, server accept wakeups on

@@ -40,6 +40,7 @@ int main() {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -171,8 +172,7 @@ task<bool> send_client(elio::rdma_ibverbs::endpoint& ep,
 
     // Pipeline: keep `depth` sends in flight.
     std::size_t posted = 0, completed = 0;
-    std::vector<decltype(ep.conn().send(tx_mr.view()))> inflight;
-    inflight.reserve(cfg.depth);
+    std::deque<decltype(ep.conn().send(tx_mr.view()))> inflight;
 
     while (completed < cfg.count) {
         // Post up to depth.
@@ -183,7 +183,7 @@ task<bool> send_client(elio::rdma_ibverbs::endpoint& ep,
         // Drain one.
         if (!inflight.empty()) {
             auto wc = co_await std::move(inflight.front());
-            inflight.erase(inflight.begin());
+            inflight.pop_front();
             if (!wc.ok()) {
                 std::fprintf(stderr, "client send error status=%d\n",
                              static_cast<int>(wc.status));
@@ -251,8 +251,7 @@ task<bool> write_client(elio::rdma_ibverbs::endpoint& ep,
     const auto start = std::chrono::steady_clock::now();
 
     std::size_t posted = 0, completed = 0;
-    std::vector<decltype(ep.conn().rdma_write(tx_mr.view(), rb))> inflight;
-    inflight.reserve(cfg.depth);
+    std::deque<decltype(ep.conn().rdma_write(tx_mr.view(), rb))> inflight;
 
     while (completed < cfg.count) {
         while (posted < cfg.count && (posted - completed) < cfg.depth) {
@@ -261,7 +260,7 @@ task<bool> write_client(elio::rdma_ibverbs::endpoint& ep,
         }
         if (!inflight.empty()) {
             auto r = co_await std::move(inflight.front());
-            inflight.erase(inflight.begin());
+            inflight.pop_front();
             if (!r.ok()) {
                 std::fprintf(stderr, "write error status=%d\n",
                              static_cast<int>(r.status));
@@ -332,8 +331,7 @@ task<bool> read_client(elio::rdma_ibverbs::endpoint& ep,
     const auto start = std::chrono::steady_clock::now();
 
     std::size_t posted = 0, completed = 0;
-    std::vector<decltype(ep.conn().rdma_read(rx_mr.view(), rb))> inflight;
-    inflight.reserve(cfg.depth);
+    std::deque<decltype(ep.conn().rdma_read(rx_mr.view(), rb))> inflight;
 
     while (completed < cfg.count) {
         while (posted < cfg.count && (posted - completed) < cfg.depth) {
@@ -342,7 +340,7 @@ task<bool> read_client(elio::rdma_ibverbs::endpoint& ep,
         }
         if (!inflight.empty()) {
             auto r = co_await std::move(inflight.front());
-            inflight.erase(inflight.begin());
+            inflight.pop_front();
             if (!r.ok()) {
                 std::fprintf(stderr, "read error status=%d\n",
                              static_cast<int>(r.status));

@@ -23,6 +23,7 @@
 #include <coroutine>
 #include <cstdint>
 #include <span>
+#include <type_traits>
 
 using elio::rdma::buffer_view;
 using elio::rdma::connection;
@@ -225,6 +226,33 @@ TEST_CASE("unawaited RDMA operations release their unstarted state",
     REQUIRE(st.reads.load() == 0);
     // LeakSanitizer verifies that all four shared op_state allocations
     // were released when their lazy awaitables left scope.
+}
+
+TEST_CASE("RDMA operation awaitables are movable but not move-assignable",
+          "[rdma][lifetime][contract]") {
+    using send_op = elio::rdma::detail::send_awaitable<mock_static_backend>;
+    using recv_op = elio::rdma::detail::recv_awaitable<mock_static_backend>;
+    using write_op = elio::rdma::detail::rdma_write_awaitable<mock_static_backend>;
+    using read_op = elio::rdma::detail::rdma_read_awaitable<mock_static_backend>;
+    using cas_op = elio::rdma::detail::rdma_cas_awaitable<mock_static_backend>;
+    using faa_op = elio::rdma::detail::rdma_faa_awaitable<mock_static_backend>;
+    using srq_recv_op = elio::rdma::detail::srq_recv_awaitable<mock_static_backend>;
+
+    STATIC_REQUIRE(std::is_move_constructible_v<send_op>);
+    STATIC_REQUIRE(std::is_move_constructible_v<recv_op>);
+    STATIC_REQUIRE(std::is_move_constructible_v<write_op>);
+    STATIC_REQUIRE(std::is_move_constructible_v<read_op>);
+    STATIC_REQUIRE(std::is_move_constructible_v<cas_op>);
+    STATIC_REQUIRE(std::is_move_constructible_v<faa_op>);
+    STATIC_REQUIRE(std::is_move_constructible_v<srq_recv_op>);
+
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<send_op>);
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<recv_op>);
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<write_op>);
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<read_op>);
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<cas_op>);
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<faa_op>);
+    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<srq_recv_op>);
 }
 
 TEST_CASE("send: happy path suspends and dispatcher resumes",

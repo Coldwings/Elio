@@ -98,6 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unblocks signals removed from its descriptor, preserving caller-owned masks
   and avoiding premature delivery of pending signals. Newly blocked signals
   are rolled back when the descriptor update fails. (#769)
+- **Signal mask error reporting**: `signal_set` now exposes direct
+  `pthread_sigmask()` error-code helpers, and `signal_fd` reports automatic
+  block failures from that direct error code instead of stale `errno`. (#791)
 - **Batch I/O fallback errors**: Synchronous `batch_read()` and `batch_write()`
   fallback paths now report syscall failures as `-errno`, matching io_uring and
   the public I/O result contract. (#763)

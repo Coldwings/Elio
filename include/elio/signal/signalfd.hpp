@@ -140,21 +140,47 @@ public:
     /// Block these signals for the current thread
     /// Returns the old signal mask
     /// @param old_mask Optional pointer to receive the previous mask
+    /// @return pthread_sigmask's direct error code, or 0 on success
+    int block_error(sigset_t* old_mask = nullptr) const noexcept {
+        return pthread_sigmask(SIG_BLOCK, &mask_, old_mask);
+    }
+
+    /// Block these signals for the current thread
+    /// Returns the old signal mask
+    /// @param old_mask Optional pointer to receive the previous mask
     /// @return true on success
     bool block(sigset_t* old_mask = nullptr) const noexcept {
-        return pthread_sigmask(SIG_BLOCK, &mask_, old_mask) == 0;
+        return block_error(old_mask) == 0;
     }
     
     /// Unblock these signals for the current thread
+    /// @return pthread_sigmask's direct error code, or 0 on success
+    int unblock_error() const noexcept {
+        return pthread_sigmask(SIG_UNBLOCK, &mask_, nullptr);
+    }
+
+    /// Unblock these signals for the current thread
     bool unblock() const noexcept {
-        return pthread_sigmask(SIG_UNBLOCK, &mask_, nullptr) == 0;
+        return unblock_error() == 0;
     }
     
     /// Set the signal mask (replacing the current mask)
+    /// @return pthread_sigmask's direct error code, or 0 on success
+    int set_mask_error(sigset_t* old_mask = nullptr) const noexcept {
+        return pthread_sigmask(SIG_SETMASK, &mask_, old_mask);
+    }
+
+    /// Set the signal mask (replacing the current mask)
     bool set_mask(sigset_t* old_mask = nullptr) const noexcept {
-        return pthread_sigmask(SIG_SETMASK, &mask_, old_mask) == 0;
+        return set_mask_error(old_mask) == 0;
     }
     
+    /// Error-code variant of block_all_threads().
+    /// @return pthread_sigmask's direct error code, or 0 on success
+    int block_all_threads_error() const noexcept {
+        return pthread_sigmask(SIG_BLOCK, &mask_, nullptr);
+    }
+
     /// Sets the signal mask of the CURRENT thread.
     /// Call this once at the very beginning of main(), before any threads
     /// are spawned, so that all subsequent threads inherit the masked set.
@@ -165,7 +191,7 @@ public:
     /// POSIX leaves sigprocmask undefined in multi-threaded programs, so
     /// pthread_sigmask is used unconditionally here.
     bool block_all_threads() const noexcept {
-        return pthread_sigmask(SIG_BLOCK, &mask_, nullptr) == 0;
+        return block_all_threads_error() == 0;
     }
 
 private:
@@ -227,7 +253,7 @@ public:
     /// @param signals The set of signals to handle
     /// @param ctx Optional I/O context (defaults to the current worker's context)
     /// @param auto_block If true (default), automatically block the signals
-    /// @throws std::system_error if signalfd creation fails
+    /// @throws std::system_error if automatic signal blocking or signalfd creation fails
     explicit signal_fd(const signal_set& signals,
                        io::io_context& ctx = io::current_io_context(),
                        bool auto_block = true)
@@ -238,8 +264,9 @@ public:
         
         // Block the signals before creating signalfd
         if (auto_block) {
-            if (!signals_.block(&previous_mask)) {
-                throw std::system_error(errno, std::system_category(),
+            if (const int mask_error = signals_.block_error(&previous_mask);
+                mask_error != 0) {
+                throw std::system_error(mask_error, std::system_category(),
                                        "failed to block signals");
             }
             mask_changed = true;
@@ -334,7 +361,7 @@ public:
 
         sigset_t previous_mask{};
         if (block) {
-            if (!new_signals.block(&previous_mask)) {
+            if (new_signals.block_error(&previous_mask) != 0) {
                 return false;
             }
         }

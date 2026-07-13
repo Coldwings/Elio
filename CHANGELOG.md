@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package consumption flow, HTTP/2 and HTTP/TLS APIs, UDS networking, RDMA
   targets, RPC buffer semantics, scheduler APIs, signal handling, and
   generator-neutral example build commands.
+- **Timeout cancellation documentation**: Clarified that `with_timeout()`
+  cooperatively cancels token-aware work and does not forcibly destroy a losing
+  child suspended in `event::wait()`. (#773)
 - **CI and package validation coverage**: Pull-request CI now keeps required
   checks green for docs-only changes, runs registered CTest/package checks,
   verifies HTTP/2 option dependencies and optional installed targets, compiles

@@ -1944,9 +1944,11 @@ public:
 
 ### Cancellation Safety
 
-All coroutine-aware synchronization primitives (`mutex`, `shared_mutex`, `event`, `semaphore`, `condition_variable`, `channel`) are **cancellation-safe**. Waiting coroutines are tracked via an intrusive linked list embedded in the coroutine frame. If a waiter is destroyed (cancellation, timeout, forced termination) before being woken, it automatically unlinks itself from the primitive's waiter list — preventing use-after-free when the primitive later calls its wake function.
+Coroutine-aware synchronization primitives (`mutex`, `shared_mutex`, `event`, `semaphore`, `condition_variable`, `channel`) track suspended waiters through intrusive nodes embedded in coroutine frames. If a frame is destroyed while its waiter is still linked, the awaiter's destructor unlinks the node from the primitive.
 
-No manual cleanup is required. Destroying a waiting coroutine is always safe.
+This cleanup does not make every operation cancellable. `with_timeout()` requests cooperative cancellation but does not forcibly destroy its losing child. The child must pass the supplied `cancel_token` to a token-aware operation to stop on timeout. For example, `event::wait()` is not token-aware, so a timed-out `with_timeout()` child waiting on an event remains suspended and linked until the event is set.
+
+The event and all objects captured by that child must outlive the pending wait. They must remain alive until the child has resumed past `event::wait()`, including the interval after `set()` dequeues the waiter but before the scheduler resumes it.
 
 ### `mutex`
 

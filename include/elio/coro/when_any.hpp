@@ -59,39 +59,30 @@ struct when_any_state {
     coro::cancel_source cancel_source_;
 
     template<size_t I, typename... Args>
-    void resolve(Args&&... args) {
+    void resolve(Args&&... args) noexcept {
         bool expected = false;
         if (winner_claimed_.compare_exchange_strong(expected, true,
                 std::memory_order_acq_rel)) {
             winner_index_ = I;
-            result_.template emplace<I>(std::forward<Args>(args)...);
-            cancel_source_.cancel();
+            try {
+                result_.template emplace<I>(std::forward<Args>(args)...);
+            } catch (...) {
+                exception_ = std::current_exception();
+            }
+            cancel_losers();
             publish_resolved();
         }
     }
 
-    void resolve_exception(std::exception_ptr ex) {
+    void resolve_exception(std::exception_ptr ex) noexcept {
         bool expected = false;
         if (winner_claimed_.compare_exchange_strong(expected, true,
                 std::memory_order_acq_rel)) {
             exception_ = std::move(ex);
-            cancel_source_.cancel();
+            cancel_losers();
             publish_resolved();
         } else {
-            // Loser exception: winner already resolved, report via scheduler
-            auto* sched = runtime::get_current_scheduler();
-            if (sched) {
-                sched->report_unhandled_exception(std::move(ex));
-            } else {
-                // No scheduler context — log directly
-                try {
-                    std::rethrow_exception(ex);
-                } catch (const std::exception& e) {
-                    ELIO_LOG_ERROR("when_any loser exception (no scheduler): {}", e.what());
-                } catch (...) {
-                    ELIO_LOG_ERROR("when_any loser exception (no scheduler): <unknown>");
-                }
-            }
+            report_unhandled_exception(std::move(ex));
         }
     }
 
@@ -110,6 +101,30 @@ struct when_any_state {
     }
 
 private:
+    static void report_unhandled_exception(std::exception_ptr ex) noexcept {
+        auto* sched = runtime::get_current_scheduler();
+        if (sched) {
+            sched->report_unhandled_exception(std::move(ex));
+            return;
+        }
+
+        try {
+            std::rethrow_exception(ex);
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR("when_any unhandled exception (no scheduler): {}", e.what());
+        } catch (...) {
+            ELIO_LOG_ERROR("when_any unhandled exception (no scheduler): <unknown>");
+        }
+    }
+
+    void cancel_losers() noexcept {
+        try {
+            cancel_source_.cancel();
+        } catch (...) {
+            report_unhandled_exception(std::current_exception());
+        }
+    }
+
     void publish_resolved() noexcept {
         resolved_.store(true, std::memory_order_release);
         resume_waiter_if_ready();

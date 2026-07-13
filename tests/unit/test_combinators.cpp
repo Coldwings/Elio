@@ -48,6 +48,25 @@ struct throwing_move_callable {
     }
 };
 
+struct throwing_result {
+    explicit throwing_result(int value) : value(value) {}
+    throwing_result() = delete;
+    throwing_result(const throwing_result&) = delete;
+    throwing_result& operator=(const throwing_result&) = delete;
+
+    throwing_result(throwing_result&& other) {
+        if (throw_on_move.exchange(false, std::memory_order_relaxed)) {
+            throw std::runtime_error("result transfer failed");
+        }
+        value = other.value;
+    }
+
+    throwing_result& operator=(throwing_result&&) = delete;
+
+    int value;
+    static inline std::atomic<bool> throw_on_move{false};
+};
+
 struct launch_blocker {
     std::atomic<bool> block_moves{false};
     std::atomic<bool> move_started{false};
@@ -482,6 +501,49 @@ TEST_CASE("when_any winner exception propagates", "[sync][combinators]") {
     runtime::scheduler sched(2);
     sched.go(test);
     sched.shutdown();
+}
+
+TEST_CASE("when_any publishes result construction failure",
+          "[sync][combinators][regression]") {
+    auto first = []() -> task<int> { co_return 1; };
+    auto second = []() -> task<throwing_result> {
+        co_return throwing_result{2};
+    };
+    elio::detail::when_any_state<decltype(first), decltype(second)> state;
+    throwing_result result{2};
+    throwing_result::throw_on_move.store(true, std::memory_order_relaxed);
+
+    state.resolve<1>(std::move(result));
+
+    REQUIRE(state.winner_claimed_.load(std::memory_order_acquire));
+    REQUIRE(state.resolved_.load(std::memory_order_acquire));
+    REQUIRE(state.exception_ != nullptr);
+    std::string exception_message;
+    try {
+        std::rethrow_exception(state.exception_);
+    } catch (const std::exception& e) {
+        exception_message = e.what();
+    }
+    REQUIRE(exception_message == "result transfer failed");
+}
+
+TEST_CASE("when_any publishes winner when loser cancellation throws",
+          "[sync][combinators][regression]") {
+    auto first = []() -> task<int> { co_return 1; };
+    auto second = []() -> task<int> { co_return 2; };
+    elio::detail::when_any_state<decltype(first), decltype(second)> state;
+    bool callback_invoked = false;
+    auto registration = state.cancel_source_.get_token().on_cancel([&] {
+        callback_invoked = true;
+        throw std::runtime_error("cancellation callback failed");
+    });
+
+    state.resolve<0>(42);
+
+    REQUIRE(callback_invoked);
+    REQUIRE(state.resolved_.load(std::memory_order_acquire));
+    REQUIRE(state.exception_ == nullptr);
+    REQUIRE(std::get<0>(state.result_) == 42);
 }
 
 TEST_CASE("destroyed when_all waiter is unregistered",

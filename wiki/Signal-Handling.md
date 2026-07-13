@@ -90,6 +90,12 @@ sigset_t old_mask;
 sigs.block(&old_mask);    // Block these signals
 sigs.unblock();           // Unblock these signals
 sigs.set_mask(&old_mask); // Replace signal mask
+
+// Use the *_error variants when callers need the direct pthread error number.
+int rc = sigs.block_error(&old_mask);
+if (rc != 0) {
+    // rc is the pthread_sigmask() error code
+}
 ```
 
 ### signal_fd

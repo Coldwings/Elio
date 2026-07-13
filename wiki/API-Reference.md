@@ -1081,13 +1081,21 @@ public:
     const sigset_t& mask() const;   // Get underlying mask
     
     // Signal mask operations
-    bool block(sigset_t* old_mask = nullptr) const;  // Block for thread
-    bool unblock() const;                             // Unblock for thread
+    int block_error(sigset_t* old_mask = nullptr) const; // Direct pthread error
+    bool block(sigset_t* old_mask = nullptr) const;      // Block for thread
+    int unblock_error() const;                           // Direct pthread error
+    bool unblock() const;                                // Unblock for thread
+    int set_mask_error(sigset_t* old_mask = nullptr) const;
     bool set_mask(sigset_t* old_mask = nullptr) const;
+    int block_all_threads_error() const;
     // Blocks the current thread. Call before creating workers so they inherit it.
     bool block_all_threads() const;
 };
 ```
+
+The `*_error()` variants return the direct `pthread_sigmask()` error number, or
+`0` on success. The boolean wrappers preserve the source-compatible success/fail
+API.
 
 ### `signal_fd`
 

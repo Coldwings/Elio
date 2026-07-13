@@ -151,6 +151,21 @@ TEST_CASE("signal_set block/unblock", "[signal][signal_set]") {
         // Restore old mask
         pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
     }
+
+    SECTION("error-code helpers report pthread results") {
+        sigset_t previous_mask;
+
+        REQUIRE(sigs.block_error(&previous_mask) == 0);
+        REQUIRE(pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr) == 0);
+
+        REQUIRE(sigs.unblock_error() == 0);
+
+        REQUIRE(sigs.set_mask_error(&previous_mask) == 0);
+        REQUIRE(pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr) == 0);
+
+        REQUIRE(sigs.block_all_threads_error() == 0);
+        REQUIRE(pthread_sigmask(SIG_SETMASK, &mask_guard.original(), nullptr) == 0);
+    }
 }
 
 TEST_CASE("signal_fd creation", "[signal][signal_fd]") {

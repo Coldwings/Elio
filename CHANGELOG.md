@@ -76,7 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Synchronization and object-cache lifetime**: Fixed mutex waiter lock
   transfer lifetime, sync handoff cancellation leaks, object-cache release
   handoff and canceled-construction cleanup, bounded-channel close state, and
-  combinator waiter resume ordering. (#290)
+  combinator waiter resume ordering. `when_any()` and `with_timeout()` also no
+  longer require result types to be default-constructible. (#290, #760)
 - **Cancellation callback exceptions**: Cancellation now invokes and releases
   every registered callback before rethrowing the first callback exception,
   including callbacks registered after cancellation. (#774)

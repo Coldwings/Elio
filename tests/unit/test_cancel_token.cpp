@@ -4,10 +4,13 @@
 #include <elio/runtime/scheduler.hpp>
 #include <elio/time/timer.hpp>
 
-#include <thread>
-#include <vector>
 #include <atomic>
 #include <latch>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
 
 using namespace elio::coro;
 using namespace elio::runtime;
@@ -179,6 +182,60 @@ TEST_CASE("cancel_token multiple callbacks all invoked", "[cancel_token][callbac
         
         REQUIRE(callback_count.load(std::memory_order_relaxed) == 3);
     }
+}
+
+TEST_CASE("cancel_token releases all callbacks when one throws",
+          "[cancel_token][callback][regression]") {
+    cancel_source source;
+    cancel_token token = source.get_token();
+    bool later_invoked = false;
+    auto capture = std::make_shared<int>(42);
+    std::weak_ptr<int> weak_capture = capture;
+    auto tail_capture = std::make_shared<int>(7);
+    std::weak_ptr<int> weak_tail_capture = tail_capture;
+
+    auto later_throwing = token.on_cancel(
+        [capture = std::move(tail_capture)] {
+            throw std::runtime_error("later callback failed");
+        });
+    auto later = token.on_cancel([&later_invoked] {
+        later_invoked = true;
+    });
+    auto throwing = token.on_cancel([capture = std::move(capture)] {
+        throw std::runtime_error("callback failed");
+    });
+
+    std::string exception_message;
+    try {
+        source.cancel();
+    } catch (const std::runtime_error& e) {
+        exception_message = e.what();
+    }
+    REQUIRE(exception_message == "callback failed");
+    REQUIRE(later_invoked);
+    REQUIRE(weak_capture.expired());
+    REQUIRE(weak_tail_capture.expired());
+}
+
+TEST_CASE("already-cancelled token releases a throwing callback",
+          "[cancel_token][callback][regression]") {
+    cancel_source source;
+    cancel_token token = source.get_token();
+    source.cancel();
+    auto capture = std::make_shared<int>(42);
+    std::weak_ptr<int> weak_capture = capture;
+
+    std::string exception_message;
+    try {
+        auto registration = token.on_cancel([capture = std::move(capture)] {
+            throw std::runtime_error("immediate callback failed");
+        });
+        (void)registration;
+    } catch (const std::runtime_error& e) {
+        exception_message = e.what();
+    }
+    REQUIRE(exception_message == "immediate callback failed");
+    REQUIRE(weak_capture.expired());
 }
 
 TEST_CASE("cancel_registration destroyed unregisters callback", "[cancel_token][callback]") {

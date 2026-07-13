@@ -4,6 +4,7 @@
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -110,7 +111,7 @@ struct cancel_state {
     uint64_t add_callback(F&& cb) {
         // Allocate the node before taking the lock to keep the critical
         // section short.
-        auto* node = new callback_node;
+        auto node = std::make_unique<callback_node>();
         node->emplace(std::forward<F>(cb));
 
         std::unique_lock<std::mutex> lock(mutex);
@@ -118,13 +119,13 @@ struct cancel_state {
             // Already cancelled: invoke and drop without inserting.
             lock.unlock();
             node->invoke();
-            delete node;
             return 0;
         }
         node->id = next_id++;
         node->next = head;
-        head = node;
-        return node->id;
+        const auto id = node->id;
+        head = node.release();
+        return id;
     }
 
     void remove_callback(uint64_t id) {
@@ -159,11 +160,20 @@ struct cancel_state {
         // outside the lock and free its node. Concurrent remove_callback()
         // calls will simply find no matching id in the (empty) head list,
         // which is the correct no-op semantics.
+        std::exception_ptr first_exception;
         while (list) {
-            auto* next = list->next;
-            list->invoke();
-            delete list;
-            list = next;
+            std::unique_ptr<callback_node> node{list};
+            list = node->next;
+            try {
+                node->invoke();
+            } catch (...) {
+                if (!first_exception) {
+                    first_exception = std::current_exception();
+                }
+            }
+        }
+        if (first_exception) {
+            std::rethrow_exception(first_exception);
         }
     }
 

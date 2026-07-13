@@ -1948,7 +1948,7 @@ Coroutine-aware synchronization primitives (`mutex`, `shared_mutex`, `event`, `s
 
 This cleanup does not make every operation cancellable. `with_timeout()` requests cooperative cancellation but does not forcibly destroy its losing child. The child must pass the supplied `cancel_token` to a token-aware operation to stop on timeout. For example, `event::wait()` is not token-aware, so a timed-out `with_timeout()` child waiting on an event remains suspended and linked until the event is set.
 
-The event and all objects captured by that child must outlive the pending wait. An event must not be destroyed while the losing child remains linked.
+The event and all objects captured by that child must outlive the pending wait. They must remain alive until the child has resumed past `event::wait()`, including the interval after `set()` dequeues the waiter but before the scheduler resumes it.
 
 ### `mutex`
 

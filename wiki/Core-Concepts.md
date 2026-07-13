@@ -503,7 +503,7 @@ This lifetime cleanup is not itself a cancellation API. `with_timeout()` request
 
 In particular, `event::wait()` has no `cancel_token` overload. Wrapping it in `with_timeout()` does not cancel or destroy the event waiter when the timeout wins; that child remains suspended and linked until the event is set.
 
-The event and every object captured by that child must therefore outlive the pending wait. Destroying an event while the losing child is still linked violates the event's no-pending-waiters lifetime requirement.
+The event and every object captured by that child must therefore outlive the pending wait. They must remain alive until the child has resumed past `event::wait()`, including the interval after `set()` dequeues the waiter but before the scheduler resumes it.
 
 **Key guarantees:**
 - Destroying a frame whose waiter is still linked removes that waiter from the primitive's list

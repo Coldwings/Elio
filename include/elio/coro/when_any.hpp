@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <coroutine>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -46,13 +47,46 @@ concept when_any_callable =
 template<typename First, typename... Rest>
 inline constexpr bool all_same_v = (std::is_same_v<First, Rest> && ...);
 
+class when_any_wake_gate {
+public:
+    [[nodiscard]] bool publish_resolved() noexcept {
+        return publish(kResolved);
+    }
+
+    [[nodiscard]] bool finish_launching() noexcept {
+        return publish(kLaunchComplete);
+    }
+
+    [[nodiscard]] bool resolved() const noexcept {
+        return (state_.load(std::memory_order_acquire) & kResolved) != 0;
+    }
+
+private:
+    static constexpr std::uint8_t kResolved = 1U << 0;
+    static constexpr std::uint8_t kLaunchComplete = 1U << 1;
+    static constexpr std::uint8_t kResumeClaimed = 1U << 2;
+    static constexpr std::uint8_t kReady = kResolved | kLaunchComplete;
+
+    [[nodiscard]] bool publish(std::uint8_t flag) noexcept {
+        const auto state = state_.fetch_or(flag, std::memory_order_acq_rel) | flag;
+        if ((state & kReady) != kReady) {
+            return false;
+        }
+
+        const auto previous = state_.fetch_or(
+            kResumeClaimed, std::memory_order_acq_rel);
+        return (previous & kResumeClaimed) == 0;
+    }
+
+    std::atomic<std::uint8_t> state_{0};
+};
+
 template<typename... Fs>
 struct when_any_state {
     using result_type = std::variant<when_all_slot_t<when_any_result_t<Fs>>...>;
 
     std::atomic<bool> winner_claimed_{false};
-    std::atomic<bool> resolved_{false};
-    std::atomic<bool> launch_complete_{false};
+    when_any_wake_gate wake_gate_;
     coro::detail::completion_waiter_slot waiter_;
     std::optional<result_type> result_;
     std::exception_ptr exception_;
@@ -89,8 +123,7 @@ struct when_any_state {
     }
 
     void finish_launching() noexcept {
-        launch_complete_.store(true, std::memory_order_release);
-        if (resolved_.load(std::memory_order_acquire)) {
+        if (wake_gate_.finish_launching()) {
             resume_waiter();
         }
     }
@@ -98,7 +131,7 @@ struct when_any_state {
     bool set_waiter(coro::detail::completion_waiter& waiter,
                     std::coroutine_handle<> handle) noexcept {
         return waiter_.register_waiter(waiter, handle, [this] {
-            return resolved_.load(std::memory_order_acquire);
+            return wake_gate_.resolved();
         });
     }
 
@@ -128,12 +161,7 @@ private:
     }
 
     void publish_resolved() noexcept {
-        resolved_.store(true, std::memory_order_release);
-        resume_waiter_if_ready();
-    }
-
-    void resume_waiter_if_ready() noexcept {
-        if (launch_complete_.load(std::memory_order_acquire)) {
+        if (wake_gate_.publish_resolved()) {
             resume_waiter();
         }
     }
@@ -213,13 +241,12 @@ struct when_any_awaitable {
         state->finish_launching();
 
         // Suspend and rely on resume_waiter() -> schedule_handle() for
-        // resumption. schedule_handle() provides sufficient internal
-        // synchronization (mutex/atomic in the scheduler's mpsc_queue) to
-        // establish happens-before between the winner's data writes
-        // (winner_index_, result_) and the waiter's await_resume reads.
-        // An inline fast-path (returning false when resolved_ is already
-        // true) would not route the waiter through the scheduler queue, so
-        // keep all non-empty resumptions on the scheduled path.
+        // resumption. The wake gate's acq_rel RMW links the winner's data
+        // publication to whichever publisher claims the resume; scheduler
+        // queue synchronization then completes the handoff to await_resume().
+        // An inline fast-path (returning false when the wake gate is already
+        // resolved) would not route the waiter through the scheduler queue,
+        // so keep all non-empty resumptions on the scheduled path.
         return should_suspend;
     }
 

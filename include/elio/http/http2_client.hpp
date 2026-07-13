@@ -155,16 +155,19 @@ public:
     coro::task<std::optional<response>> send(method m, const url& target,
                                              std::string_view body = {},
                                              std::string_view content_type = {}) {
-        if (!target.is_secure()) {
-            ELIO_LOG_ERROR("HTTP/2 requires HTTPS (h2). Use http:// URLs with HTTP/1.1 client.");
-            errno = EPROTONOSUPPORT;
-            co_return std::nullopt;
-        }
-
-        if (!detail::is_valid_url_input(target.host_authority()) ||
-            !detail::is_valid_request_target(target.path_with_query())) {
-            ELIO_LOG_ERROR("Invalid outbound HTTP/2 request target");
-            errno = EINVAL;
+        if (int validation_error =
+                detail::validate_h2_submit_request_fields(
+                    m, target, config_.user_agent, content_type);
+            validation_error != 0) {
+            if (validation_error == EOPNOTSUPP) {
+                ELIO_LOG_ERROR("HTTP/2 CONNECT requests are not supported");
+            } else if (validation_error == EPROTONOSUPPORT) {
+                ELIO_LOG_ERROR(
+                    "HTTP/2 requires HTTPS (h2). Use http:// URLs with HTTP/1.1 client.");
+            } else {
+                ELIO_LOG_ERROR("Invalid outbound HTTP/2 request fields");
+            }
+            errno = validation_error;
             co_return std::nullopt;
         }
 

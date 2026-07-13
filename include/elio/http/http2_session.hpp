@@ -102,9 +102,14 @@ struct h2_session_config {
 namespace detail {
 
 inline int validate_h2_submit_request_fields(
+    method m,
     const url& target,
     std::string_view user_agent,
     std::string_view content_type) noexcept {
+    if (m == method::CONNECT) {
+        return EOPNOTSUPP;
+    }
+
     if (!target.is_secure()) {
         return EPROTONOSUPPORT;
     }
@@ -186,7 +191,7 @@ public:
                            std::string_view content_type = {}) {
         if (int validation_error =
                 detail::validate_h2_submit_request_fields(
-                    target, config_.user_agent, content_type);
+                    m, target, config_.user_agent, content_type);
             validation_error != 0) {
             errno = validation_error;
             return -validation_error;

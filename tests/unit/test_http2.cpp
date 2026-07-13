@@ -335,6 +335,43 @@ TEST_CASE("HTTP/2 custom send rejects invalid request targets",
     REQUIRE(client_errno == EINVAL);
 }
 
+TEST_CASE("HTTP/2 custom send rejects CONNECT before connecting",
+          "[http2][client]") {
+    using elio::coro::task;
+    using elio::runtime::scheduler;
+
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> client_done{false};
+    bool request_failed = false;
+    int client_errno = 0;
+
+    sched.go([&]() -> task<void> {
+        h2_client client;
+        url target;
+        target.scheme = "https";
+        target.host = "127.0.0.1";
+        target.path = "/";
+
+        errno = 0;
+        auto resp = co_await client.send(method::CONNECT, target);
+        request_failed = !resp;
+        client_errno = errno;
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !client_done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(request_failed);
+    REQUIRE(client_errno == EOPNOTSUPP);
+}
+
 TEST_CASE("HTTP/2 session submit validates outbound request fields",
           "[http2][session][security]") {
     url target;
@@ -343,39 +380,48 @@ TEST_CASE("HTTP/2 session submit validates outbound request fields",
     target.path = "/";
 
     REQUIRE(detail::validate_h2_submit_request_fields(
-                target, "elio-test-agent/1.0", "") == 0);
+                method::GET, target, "elio-test-agent/1.0", "") == 0);
     REQUIRE(detail::validate_h2_submit_request_fields(
-                target, "elio-test-agent/1.0", "application/json") == 0);
+                method::POST, target, "elio-test-agent/1.0",
+                "application/json") == 0);
+
+    SECTION("CONNECT is unsupported") {
+        REQUIRE(detail::validate_h2_submit_request_fields(
+                    method::CONNECT, target, "elio-test-agent/1.0", "") ==
+                EOPNOTSUPP);
+    }
 
     SECTION("non-HTTPS target") {
         auto bad = target;
         bad.scheme = "http";
         REQUIRE(detail::validate_h2_submit_request_fields(
-                    bad, "elio-test-agent/1.0", "") == EPROTONOSUPPORT);
+                    method::GET, bad, "elio-test-agent/1.0", "") ==
+                EPROTONOSUPPORT);
     }
 
     SECTION("invalid authority") {
         auto bad = target;
         bad.host = "bad host";
         REQUIRE(detail::validate_h2_submit_request_fields(
-                    bad, "elio-test-agent/1.0", "") == EINVAL);
+                    method::GET, bad, "elio-test-agent/1.0", "") == EINVAL);
     }
 
     SECTION("invalid path") {
         auto bad = target;
         bad.path = "/bad path";
         REQUIRE(detail::validate_h2_submit_request_fields(
-                    bad, "elio-test-agent/1.0", "") == EINVAL);
+                    method::GET, bad, "elio-test-agent/1.0", "") == EINVAL);
     }
 
     SECTION("invalid user-agent") {
         REQUIRE(detail::validate_h2_submit_request_fields(
-                    target, "bad\r\nUser-Agent: injected", "") == EINVAL);
+                    method::GET, target, "bad\r\nUser-Agent: injected", "") ==
+                EINVAL);
     }
 
     SECTION("invalid content-type") {
         REQUIRE(detail::validate_h2_submit_request_fields(
-                    target, "elio-test-agent/1.0",
+                    method::POST, target, "elio-test-agent/1.0",
                     "text/plain\r\nX-Injected: yes") == EINVAL);
     }
 }

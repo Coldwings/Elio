@@ -7,6 +7,7 @@
 #include <elio/coro/cancel_token.hpp>
 #include <elio/runtime/worker_thread.hpp>
 #include <coroutine>
+#include <cerrno>
 #include <span>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -888,8 +889,9 @@ public:
         batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
         for (size_t i = 0; i < segments_.size(); ++i) {
             auto off = segments_[i].offset >= 0 ? segments_[i].offset : 0;
-            batch_st_->results[i] = static_cast<int>(
-                pread(fd_, segments_[i].buffer, segments_[i].length, off));
+            auto result = pread(fd_, segments_[i].buffer, segments_[i].length, off);
+            int error = errno;
+            batch_st_->results[i] = result < 0 ? -error : static_cast<int>(result);
         }
         detail::mark_batch_inline_completed(*batch_st_);
         awaiter.resume();
@@ -966,8 +968,9 @@ public:
         batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
         for (size_t i = 0; i < segments_.size(); ++i) {
             auto off = segments_[i].offset >= 0 ? segments_[i].offset : 0;
-            batch_st_->results[i] = static_cast<int>(
-                pwrite(fd_, segments_[i].buffer, segments_[i].length, off));
+            auto result = pwrite(fd_, segments_[i].buffer, segments_[i].length, off);
+            int error = errno;
+            batch_st_->results[i] = result < 0 ? -error : static_cast<int>(result);
         }
         detail::mark_batch_inline_completed(*batch_st_);
         awaiter.resume();

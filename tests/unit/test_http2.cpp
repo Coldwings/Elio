@@ -231,6 +231,21 @@ TEST_CASE("HTTP/2 response materialization preserves peer headers",
         REQUIRE(resp.header("Content-Type") == "text/plain");
         REQUIRE_FALSE(resp.get_headers().contains("Content-Length"));
     }
+
+    SECTION("Duplicate peer headers remain available individually") {
+        h2_stream stream;
+        stream.response_status = status::ok;
+        stream.response_headers.add("set-cookie", "a=1");
+        stream.response_headers.add("set-cookie", "b=2");
+
+        auto resp = detail::materialize_h2_response(stream);
+
+        auto cookies = resp.get_headers().get_all("Set-Cookie");
+        REQUIRE(cookies.size() == 2);
+        REQUIRE(cookies[0] == "a=1");
+        REQUIRE(cookies[1] == "b=2");
+        REQUIRE(resp.header("Set-Cookie") == "a=1");
+    }
 }
 
 TEST_CASE("HTTP/2 client configuration", "[http2][config]") {
@@ -590,16 +605,17 @@ TEST_CASE("HTTP/2 connect_timeout aborts stalled TLS handshake",
 
 // Regression for the PR #67 / on_header_callback noexcept bug:
 //
-// PR #67 made elio::http::headers::set() throw std::invalid_argument when the
-// name is not an RFC 7230 token or the value contains CR/LF/NUL. That is the
-// right behavior for caller code (it blocks header injection / response
-// smuggling) but the same setter is also invoked from h2_session::
+// PR #67 made elio::http::headers reject invalid names/values with
+// std::invalid_argument when the name is not an RFC 7230 token or the value
+// contains CR/LF/NUL. That is the right behavior for caller code (it blocks
+// header injection / response
+// smuggling) but the same mutation path is also invoked from h2_session::
 // on_header_callback, which is registered with nghttp2 (a C library) and runs
 // inside nghttp2_session_mem_recv(). Throwing across a C frame is undefined
 // behavior — nghttp2 does not unwind, internal HPACK / stream state would be
 // left corrupt.
 //
-// The fix marks on_header_callback noexcept and wraps the headers::set() call
+// The fix marks on_header_callback noexcept and wraps the headers mutation call
 // in try/catch returning NGHTTP2_ERR_CALLBACK_FAILURE. These tests pin the
 // precondition that triggers the bug (set() actually throws on the inputs we
 // care about) so a future relaxation of the validation can't silently restore

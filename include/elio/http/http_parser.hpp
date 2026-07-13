@@ -362,7 +362,7 @@ private:
             auto name = line.substr(0, colon);
             auto value = detail::trim_ows(line.substr(colon + 1));
 
-            // Validate name BEFORE calling headers_.set() (which throws on
+            // Validate name BEFORE calling headers_.add() (which throws on
             // bad input) so we report parser errors uniformly via set_error.
             // RFC 7230 §3.2.4: no whitespace is allowed between field-name
             // and ':' — the validator rejects names with embedded spaces.
@@ -376,10 +376,10 @@ private:
             }
 
             // Detect duplicate Content-Length with conflicting values BEFORE
-            // headers_.set() overwrites the prior value — RFC 7230 §3.3.2.
+            // updating the header collection — RFC 7230 §3.3.2.
             if (detail::ascii_iequals(name, "Content-Length")) {
-                auto existing = headers_.get("Content-Length");
-                if (!existing.empty() && detail::trim_ows(existing) != value) {
+                if (headers_.contains("Content-Length") &&
+                    detail::trim_ows(headers_.get("Content-Length")) != value) {
                     set_error("Conflicting Content-Length headers");
                     return false;
                 }
@@ -394,7 +394,7 @@ private:
             }
 
             ++header_count_;
-            headers_.set(name, value);
+            headers_.add(name, value);
             buffer_.erase(0, line_end + 2);
         }
     }
@@ -868,8 +868,8 @@ private:
                 return false;
             }
             if (detail::ascii_iequals(name, "Content-Length")) {
-                auto existing = headers_.get("Content-Length");
-                if (!existing.empty() && detail::trim_ows(existing) != value) {
+                if (headers_.contains("Content-Length") &&
+                    detail::trim_ows(headers_.get("Content-Length")) != value) {
                     set_error("Conflicting Content-Length headers");
                     return false;
                 }
@@ -884,7 +884,7 @@ private:
             }
 
             ++header_count_;
-            headers_.set(name, value);
+            headers_.add(name, value);
             buffer_.erase(0, line_end + 2);
         }
     }

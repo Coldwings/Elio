@@ -29,7 +29,7 @@
 ///     }
 /// }
 ///
-/// coro::task<int> async_main() {
+/// coro::task<int> async_main(int, char**) {
 ///     ws_router router;
 ///     router.websocket("/ws", handle_websocket);
 ///     router.get("/", [](http::context& ctx) -> coro::task<http::response> {

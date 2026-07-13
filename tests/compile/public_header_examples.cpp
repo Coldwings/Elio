@@ -32,12 +32,16 @@ namespace websocket_header_example {
 using namespace elio;
 using namespace elio::http::websocket;
 
-coro::task<void> server_route() {
+coro::task<int> async_main(int, char**) {
     ws_router router;
     router.get("/", [](http::context&) -> coro::task<http::response> {
         co_return http::response::ok("Hello!");
     });
-    co_return;
+    co_return 0;
+}
+
+int run_entry_point(int argc, char* argv[]) {
+    return elio::run(async_main, argc, argv);
 }
 
 } // namespace websocket_header_example

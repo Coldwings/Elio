@@ -207,12 +207,10 @@ public:
     op_awaiter_base& operator=(op_awaiter_base&&) noexcept = default;
 
     ~op_awaiter_base() noexcept {
-        // If we still own `op_`, try to flip pending → orphaned so the
-        // dispatcher's later CQE arrival frees the heap node instead of
-        // us. If the dispatcher already completed (state == completed),
-        // try_orphan returns false; the unique_ptr's destructor frees
-        // the node — which is exactly the path that lets `await_resume`
-        // return a valid `wc_result` snapshot.
+        // If we still own a posted `op_`, try to flip pending → orphaned
+        // so the dispatcher's later CQE arrival frees the heap node instead
+        // of us. For unstarted and completed operations try_orphan returns
+        // false, so the unique_ptr frees the node directly.
         if (op_) {
             if (dispatcher::try_orphan(op_.get())) {
                 // Dispatcher will take it from here.
@@ -237,8 +235,11 @@ protected:
         op_->handle = h;
         // `posting` blocks an inline CQE from resuming the coroutine
         // until finalize_post_() knows post_* has returned.
-        op_->phase.store(detail::op_phase::posting,
-                         std::memory_order_release);
+        const auto previous = op_->phase.exchange(
+            detail::op_phase::posting,
+            std::memory_order_release);
+        assert(previous == detail::op_phase::unstarted &&
+               "RDMA operation awaitables are single-use");
         return dispatcher::make_wr_id(op_.get());
     }
 

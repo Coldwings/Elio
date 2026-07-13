@@ -147,8 +147,8 @@ public:
     /// the CQE arrives. The awaiter must NOT free `op` itself in this
     /// case (call `.release()` on the unique_ptr).
     ///
-    /// Returns false if the dispatcher already completed (state was
-    /// `completed`); the awaiter retains ownership of `op` and its
+    /// Returns false if the operation was never started or the dispatcher
+    /// already completed it; the awaiter retains ownership of `op` and its
     /// unique_ptr destructor frees it.
     [[nodiscard]] static bool try_orphan(detail::op_state* op) noexcept {
         if (op == nullptr) return false;

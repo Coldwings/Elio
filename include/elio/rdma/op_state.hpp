@@ -8,8 +8,8 @@
 /// low bit for SRQ routing) and races the awaiter's destructor for
 /// ownership of the heap node:
 ///
-///   * Each awaiter (S3+) holds a `std::unique_ptr<op_state>`, arms it
-///     as `posting`, and posts its WR with
+///   * Each awaiter (S3+) holds an `unstarted`
+///     `std::unique_ptr<op_state>`, arms it as `posting`, and posts its WR with
 ///     `wr_id = dispatcher::make_wr_id(state.get())`.
 ///   * Once post_* returns, the awaiter commits `posting → pending`.
 ///     On completion, the dispatcher decodes the wr_id, CASes
@@ -40,24 +40,28 @@
 
 namespace elio::rdma::detail {
 
-/// Four-phase state of an in-flight RDMA operation.
+/// Five-phase state of a lazy RDMA operation.
 ///
-///   * `pending`   — posted and suspended; both the dispatcher and
-///                   the awaiter destructor may transition out.
+///   * `unstarted` — the lazy awaitable has not posted a work request.
+///                   Its unique_ptr remains the sole owner.
 ///   * `posting`   — await_suspend is still inside the backend
 ///                   post_* call. A completion may record the result
 ///                   here, but must not resume the coroutine yet.
+///   * `pending`   — posted and suspended; both the dispatcher and
+///                   the awaiter destructor may transition out.
 ///   * `completed` — dispatcher won the race (CQE arrived first) or
-///                   post failed synchronously. The awaiter still owns
-///                   the heap node and frees it after await_resume.
+///                   submission failed before suspension. The awaiter
+///                   still owns the heap node and frees it after
+///                   await_resume or destruction.
 ///   * `orphaned`  — awaiter destructor won the race (frame went
 ///                   away first). The dispatcher's later CQE will
 ///                   silently drop and free the node.
 enum class op_phase : std::uint8_t {
-    pending   = 0,
+    unstarted = 0,
     posting   = 1,
-    completed = 2,
-    orphaned  = 3,
+    pending   = 2,
+    completed = 3,
+    orphaned  = 4,
 };
 
 /// Heap node owned through the lifetime race described above.
@@ -69,7 +73,7 @@ struct op_state {
     static_assert(std::atomic<op_phase>::is_always_lock_free,
                   "op_phase must be lock-free for the CAS-based lifecycle race");
 
-    std::atomic<op_phase> phase{op_phase::pending};
+    std::atomic<op_phase> phase{op_phase::unstarted};
     std::coroutine_handle<> handle{};
     wc_result result{};
 

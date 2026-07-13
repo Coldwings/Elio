@@ -66,10 +66,17 @@ probe_coroutine make_probe(std::atomic<int>& resume_counter) {
     co_return;
 }
 
+std::unique_ptr<op_state> make_pending_op() {
+    auto op = std::make_unique<op_state>();
+    op->phase.store(op_phase::pending);
+    return op;
+}
+
 }  // namespace
 
 TEST_CASE("dispatcher::make_wr_id is invertible", "[rdma][dispatcher]") {
     auto op = std::make_unique<op_state>();
+    REQUIRE(op->phase.load() == op_phase::unstarted);
     const auto id = dispatcher::make_wr_id(op.get());
     REQUIRE(dispatcher::decode_wr_id(id) == op.get());
 
@@ -85,7 +92,7 @@ TEST_CASE("dispatcher delivers a single completion to the waiting coroutine",
     std::atomic<int> resumes{0};
     auto coro = make_probe(resumes);
 
-    auto op = std::make_unique<op_state>();
+    auto op = make_pending_op();
     op->handle = coro.handle;
 
     const auto id = dispatcher::make_wr_id(op.get());
@@ -113,7 +120,7 @@ TEST_CASE("dispatcher silently drops a CQE for an orphaned op_state",
           "[rdma][dispatcher]") {
     dispatcher disp;
 
-    auto op = std::make_unique<op_state>();
+    auto op = make_pending_op();
     // No handle assigned — this op was never tied to a coroutine; the
     // test only cares about the lifecycle race.
 
@@ -138,7 +145,7 @@ TEST_CASE("dispatcher race: deliver-before-orphan leaves the awaiter to free",
     std::atomic<int> resumes{0};
     auto coro = make_probe(resumes);
 
-    auto op = std::make_unique<op_state>();
+    auto op = make_pending_op();
     op->handle = coro.handle;
 
     // Dispatcher wins.
@@ -157,7 +164,7 @@ TEST_CASE("dispatcher race: orphan-before-deliver hands the free to dispatcher",
           "[rdma][dispatcher]") {
     dispatcher disp;
 
-    auto op = std::make_unique<op_state>();
+    auto op = make_pending_op();
     // Coroutine deliberately absent — awaiter went away first, the
     // dispatcher must not even try to read `handle`.
 
@@ -177,7 +184,7 @@ TEST_CASE("dispatcher race: orphan-before-deliver hands the free to dispatcher",
 TEST_CASE("dispatcher handles a no-handle op_state without crashing",
           "[rdma][dispatcher]") {
     dispatcher disp;
-    auto op = std::make_unique<op_state>();
+    auto op = make_pending_op();
     op->handle = {};  // null handle
 
     disp.deliver(dispatcher::make_wr_id(op.get()),

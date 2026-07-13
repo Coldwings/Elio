@@ -187,7 +187,8 @@ private:
                 "Access-Control-Allow-Origin: *\r\n"
                 "\r\n";
 
-            auto write_result = co_await stream.write(headers.data(), headers.size());
+            auto write_result =
+                co_await stream.write_exactly(headers.data(), headers.size());
             if (write_result.result <= 0) co_return;
 
             // Get Last-Event-ID if present
@@ -223,7 +224,9 @@ private:
             }
 
             auto data = resp.serialize();
-            co_await stream.write(data.data(), data.size());
+            auto write_result =
+                co_await stream.write_exactly(data.data(), data.size());
+            if (write_result.result <= 0) co_return;
         }
     }
 

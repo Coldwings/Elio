@@ -1273,6 +1273,69 @@ TEST_CASE("HTTP client resolves redirect Location references",
     REQUIRE(final_request.find("#ignored-by-http") == std::string::npos);
 }
 
+TEST_CASE("HTTP client preserves HEAD across 303 redirect",
+          "[http][client]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<int> got_status{0};
+    std::string redirected_request;
+
+    sched.go([&]() -> task<void> {
+        auto first = co_await listener->accept();
+        REQUIRE(first.has_value());
+        auto initial_request = co_await read_request_headers(*first);
+        REQUIRE(initial_request.find("HEAD /start HTTP/1.1\r\n") !=
+                std::string::npos);
+
+        std::string redirect =
+            "HTTP/1.1 303 See Other\r\n"
+            "Location: /next\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        co_await first->write(redirect);
+
+        auto second = co_await listener->accept();
+        REQUIRE(second.has_value());
+        redirected_request = co_await read_request_headers(*second);
+        std::string ok =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        co_await second->write(ok);
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::client c;
+        auto resp = co_await c.head(make_url(port, "/start"));
+        if (resp) {
+            got_status = resp->status_code();
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(got_status == 200);
+    REQUIRE(redirected_request.find("HEAD /next HTTP/1.1\r\n") !=
+            std::string::npos);
+}
+
 TEST_CASE("HTTP client does not follow non-redirect 3xx Location",
           "[http][client]") {
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));

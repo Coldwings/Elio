@@ -105,6 +105,132 @@ TEST_CASE("io_result basic operations", "[io][result]") {
     }
 }
 
+TEST_CASE("io_uring short submit keeps excess operations pending",
+          "[io][io_uring][submit][regression]") {
+#if ELIO_HAS_IO_URING
+    REQUIRE_FALSE(elio::io::detail::is_io_uring_short_submit(3, 3));
+    REQUIRE(elio::io::detail::is_io_uring_short_submit(3, 2));
+    REQUIRE(elio::io::detail::is_io_uring_short_submit(3, 0));
+    REQUIRE_FALSE(elio::io::detail::is_io_uring_short_submit(3, -EAGAIN));
+
+    SECTION("poll submit retry drains positive short submits before blocking") {
+        std::vector<size_t> ready_values{3, 1, 1, 0};
+        std::vector<int> submit_values{2, 1};
+        size_t ready_index = 0;
+        size_t submit_index = 0;
+        int short_submit_count = 0;
+        int error_count = 0;
+        int stalled_count = 0;
+
+        bool can_block = elio::io::detail::submit_queued_io_uring_sqes_for_poll(
+            [&]() {
+                REQUIRE(ready_index < ready_values.size());
+                return ready_values[ready_index++];
+            },
+            [&]() {
+                REQUIRE(submit_index < submit_values.size());
+                return submit_values[submit_index++];
+            },
+            [&](int) { ++error_count; },
+            [&](int, size_t) { ++short_submit_count; },
+            [&](size_t) { ++stalled_count; });
+
+        REQUIRE(can_block);
+        REQUIRE(ready_index == ready_values.size());
+        REQUIRE(submit_index == submit_values.size());
+        REQUIRE(short_submit_count == 1);
+        REQUIRE(error_count == 0);
+        REQUIRE(stalled_count == 0);
+    }
+
+    SECTION("poll submit retry refuses to block when submit makes no progress") {
+        std::vector<size_t> ready_values{2, 2};
+        size_t ready_index = 0;
+        int error_count = 0;
+        int short_submit_count = 0;
+        int stalled_count = 0;
+
+        bool can_block = elio::io::detail::submit_queued_io_uring_sqes_for_poll(
+            [&]() {
+                REQUIRE(ready_index < ready_values.size());
+                return ready_values[ready_index++];
+            },
+            []() { return 0; },
+            [&](int) { ++error_count; },
+            [&](int, size_t) { ++short_submit_count; },
+            [&](size_t) { ++stalled_count; });
+
+        REQUIRE_FALSE(can_block);
+        REQUIRE(ready_index == ready_values.size());
+        REQUIRE(error_count == 0);
+        REQUIRE(short_submit_count == 1);
+        REQUIRE(stalled_count == 1);
+    }
+
+    SECTION("poll submit retry refuses to block after submit error") {
+        int error_count = 0;
+        int short_submit_count = 0;
+        int stalled_count = 0;
+
+        bool can_block = elio::io::detail::submit_queued_io_uring_sqes_for_poll(
+            []() { return size_t{2}; },
+            []() { return -EAGAIN; },
+            [&](int error) {
+                REQUIRE(error == -EAGAIN);
+                ++error_count;
+            },
+            [&](int, size_t) { ++short_submit_count; },
+            [&](size_t) { ++stalled_count; });
+
+        REQUIRE_FALSE(can_block);
+        REQUIRE(error_count == 1);
+        REQUIRE(short_submit_count == 0);
+        REQUIRE(stalled_count == 0);
+    }
+
+    SECTION("batch submit path keeps short-submitted segments in flight") {
+        if (!io_uring_backend::is_available()) {
+            SUCCEED("io_uring is not available at runtime");
+            return;
+        }
+
+        io_uring_backend backend;
+        batch_state st(3);
+        int submit_calls = 0;
+
+        bool submitted = elio::io::detail::submit_batch_io_uring_with_submitter(
+            &backend, st, std::coroutine_handle<>{},
+            [](struct io_uring_sqe* sqe, int) {
+                io_uring_prep_nop(sqe);
+            },
+            [&](struct io_uring*) {
+                ++submit_calls;
+                return 1;
+            });
+
+        REQUIRE(submitted);
+        REQUIRE(submit_calls == 1);
+        REQUIRE(backend.pending_count() == 3);
+        REQUIRE(st.completed.load(std::memory_order_acquire) == 0);
+        REQUIRE_FALSE(st.all_done());
+        REQUIRE(std::all_of(st.results.begin(), st.results.end(),
+                            [](int result) { return result == 0; }));
+
+        for (int attempts = 0; backend.pending_count() != 0 && attempts < 20; ++attempts) {
+            backend.poll(std::chrono::milliseconds(10));
+        }
+
+        REQUIRE(backend.pending_count() == 0);
+        REQUIRE(st.completed.load(std::memory_order_acquire) == st.total);
+        REQUIRE(st.all_done());
+        REQUIRE(std::all_of(st.results.begin(), st.results.end(),
+                            [](int result) { return result == 0; }));
+    }
+#else
+    SUCCEED("io_uring backend is not compiled in");
+#endif
+}
+
 TEST_CASE("epoll_backend basic operations", "[io][epoll]") {
     epoll_backend backend;
     

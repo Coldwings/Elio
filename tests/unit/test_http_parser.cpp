@@ -149,6 +149,9 @@ TEST_CASE("HTTP request parser - invalid request", "[http][parser]") {
             "HTTP/.1",
             "HTTP/one.one",
             "HTTP/1.1 extra",
+            "HTTP/11.22",
+            "HTTP/1.10",
+            "HTTP/10.1",
         };
 
         for (auto* version : invalid_versions) {
@@ -239,6 +242,9 @@ TEST_CASE("HTTP response parser rejects malformed versions", "[http][parser]") {
         "HTTP/1.",
         "HTTP/.1",
         "HTTP/one.one",
+        "HTTP/11.22",
+        "HTTP/1.10",
+        "HTTP/10.1",
     };
 
     for (auto* version : invalid_versions) {
@@ -964,6 +970,12 @@ TEST_CASE("HTTP message versions reject invalid serialization bytes",
                       std::invalid_argument);
     REQUIRE_THROWS_AS(req.set_version("HTTP/one.one"),
                       std::invalid_argument);
+    REQUIRE_THROWS_AS(req.set_version("HTTP/11.22"),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(req.set_version("HTTP/1.10"),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(req.set_version("HTTP/10.1"),
+                      std::invalid_argument);
 
     response resp(status::ok);
 
@@ -978,6 +990,12 @@ TEST_CASE("HTTP message versions reject invalid serialization bytes",
     REQUIRE_THROWS_AS(resp.set_version("HTTP/1.1 extra"),
                       std::invalid_argument);
     REQUIRE_THROWS_AS(resp.set_version("HTTP/one.one"),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(resp.set_version("HTTP/11.22"),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(resp.set_version("HTTP/1.10"),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(resp.set_version("HTTP/10.1"),
                       std::invalid_argument);
 }
 

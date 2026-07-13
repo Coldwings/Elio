@@ -5,7 +5,9 @@
 #include <elio/coro/with_timeout.hpp>
 #include <elio/time/timer.hpp>
 #include <atomic>
+#include <barrier>
 #include <chrono>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -264,6 +266,7 @@ TEST_CASE("when_any does not resume while launching children",
           "[sync][combinators][regression]") {
     launch_blocker blocker;
     std::atomic<bool> resumed_during_launch{false};
+    std::atomic<int> resume_count{0};
 
     auto test = [&]() -> task<void> {
         auto ready = []() -> task<int> { co_return 1; };
@@ -276,6 +279,7 @@ TEST_CASE("when_any does not resume while launching children",
             !blocker.allow_move.load(std::memory_order_acquire)) {
             resumed_during_launch.store(true, std::memory_order_release);
         }
+        resume_count.fetch_add(1, std::memory_order_release);
     };
 
     runtime::scheduler sched(4);
@@ -286,6 +290,64 @@ TEST_CASE("when_any does not resume while launching children",
     REQUIRE_FALSE(resumed_during_launch.load(std::memory_order_acquire));
     blocker.allow_move.store(true, std::memory_order_release);
     REQUIRE(sched.shutdown(scaled_ms(2000)));
+    REQUIRE(resume_count.load(std::memory_order_acquire) == 1);
+}
+
+TEST_CASE("when_any wake gate claims one resume in either publication order",
+          "[sync][combinators][regression]") {
+    SECTION("resolution is published first") {
+        elio::detail::when_any_wake_gate gate;
+        REQUIRE_FALSE(gate.publish_resolved());
+        REQUIRE(gate.resolved());
+        REQUIRE(gate.finish_launching());
+        REQUIRE_FALSE(gate.publish_resolved());
+        REQUIRE_FALSE(gate.finish_launching());
+    }
+
+    SECTION("launch completion is published first") {
+        elio::detail::when_any_wake_gate gate;
+        REQUIRE_FALSE(gate.finish_launching());
+        REQUIRE_FALSE(gate.resolved());
+        REQUIRE(gate.publish_resolved());
+        REQUIRE(gate.resolved());
+        REQUIRE_FALSE(gate.finish_launching());
+        REQUIRE_FALSE(gate.publish_resolved());
+    }
+}
+
+TEST_CASE("when_any wake gate synchronizes concurrent publications",
+          "[sync][combinators][regression]") {
+    constexpr std::size_t rounds = 1000;
+    auto gates = std::make_unique<elio::detail::when_any_wake_gate[]>(rounds);
+    auto resolved_claimed = std::make_unique<bool[]>(rounds);
+    auto launch_claimed = std::make_unique<bool[]>(rounds);
+    std::barrier rendezvous(3);
+
+    {
+        std::jthread resolved_thread([&] {
+            for (std::size_t i = 0; i < rounds; ++i) {
+                rendezvous.arrive_and_wait();
+                resolved_claimed[i] = gates[i].publish_resolved();
+                rendezvous.arrive_and_wait();
+            }
+        });
+        std::jthread launch_thread([&] {
+            for (std::size_t i = 0; i < rounds; ++i) {
+                rendezvous.arrive_and_wait();
+                launch_claimed[i] = gates[i].finish_launching();
+                rendezvous.arrive_and_wait();
+            }
+        });
+
+        for (std::size_t i = 0; i < rounds; ++i) {
+            rendezvous.arrive_and_wait();
+            rendezvous.arrive_and_wait();
+        }
+    }
+
+    for (std::size_t i = 0; i < rounds; ++i) {
+        REQUIRE(resolved_claimed[i] != launch_claimed[i]);
+    }
 }
 
 TEST_CASE("when_any second finishes first", "[sync][combinators]") {
@@ -569,7 +631,7 @@ TEST_CASE("when_any publishes result construction failure",
     state.resolve<1>(std::move(result));
 
     REQUIRE(state.winner_claimed_.load(std::memory_order_acquire));
-    REQUIRE(state.resolved_.load(std::memory_order_acquire));
+    REQUIRE(state.wake_gate_.resolved());
     REQUIRE(state.exception_ != nullptr);
     std::string exception_message;
     try {
@@ -594,7 +656,7 @@ TEST_CASE("when_any publishes winner when loser cancellation throws",
     state.resolve<0>(42);
 
     REQUIRE(callback_invoked);
-    REQUIRE(state.resolved_.load(std::memory_order_acquire));
+    REQUIRE(state.wake_gate_.resolved());
     REQUIRE(state.exception_ == nullptr);
     REQUIRE(state.result_.has_value());
     REQUIRE(std::get<0>(*state.result_) == 42);

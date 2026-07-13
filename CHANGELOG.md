@@ -91,6 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`when_any` winner finalization**: Result-transfer and loser-cancellation
   exceptions can no longer leave `when_any()` or `with_timeout()` permanently
   suspended after a winner has been claimed. (#764)
+- **`when_any` launch publication**: Launch completion and winner resolution now
+  use one atomic wake state, preventing their concurrent publication from
+  losing the only waiter resumption. (#775)
 - **Signal masks during descriptor updates**: `signal_fd::update()` no longer
   unblocks signals removed from its descriptor, preserving caller-owned masks
   and avoiding premature delivery of pending signals. Newly blocked signals

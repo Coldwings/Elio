@@ -32,8 +32,8 @@
 /// coro::task<int> async_main() {
 ///     ws_router router;
 ///     router.websocket("/ws", handle_websocket);
-///     router.get("/", [](context& ctx) -> coro::task<response> {
-///         co_return response::ok("Hello!");
+///     router.get("/", [](http::context& ctx) -> coro::task<http::response> {
+///         co_return http::response::ok("Hello!");
 ///     });
 ///     
 ///     ws_server srv(std::move(router));

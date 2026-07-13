@@ -1,6 +1,6 @@
 #include <elio/elio.hpp>
 #include <elio/http/http.hpp>
-#include <elio/http/websocket_server.hpp>
+#include <elio/http/websocket.hpp>
 #include <elio/tls/tls.hpp>
 
 #include <iostream>
@@ -26,6 +26,21 @@ coro::task<int> async_main(int, char**) {
 coro::task<http::response> hello_handler(http::context&) {
     co_return http::response::ok("Hello, World!");
 }
+
+namespace websocket_header_example {
+
+using namespace elio;
+using namespace elio::http::websocket;
+
+coro::task<void> server_route() {
+    ws_router router;
+    router.get("/", [](http::context&) -> coro::task<http::response> {
+        co_return http::response::ok("Hello!");
+    });
+    co_return;
+}
+
+} // namespace websocket_header_example
 
 coro::task<void> http_server() {
     http::router r;

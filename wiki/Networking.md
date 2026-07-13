@@ -145,13 +145,15 @@ Both `tcp_listener::bind()` and `tcp_connect()` accept any of the three address 
 
 For efficient writing of multiple buffers without copying, use `writev()`. Both `tcp_stream` and `uds_stream` support this method.
 
+Like `write()`, `writev()` performs one write attempt and may return a positive short write. If a protocol message must be delivered completely, loop over the remaining bytes or use an exact-length helper where one is available.
+
 ```cpp
 coro::task<void> send_message(tcp_stream& stream) {
     // Prepare header and payload separately
     std::string header = "HEADER:";
     std::string body = "Hello, World!";
 
-    // Write both in a single syscall using scatter-gather I/O
+    // Attempt to write both buffers with scatter-gather I/O
     struct iovec iov[2] = {
         {(void*)header.data(), header.size()},
         {(void*)body.data(), body.size()}
@@ -159,15 +161,15 @@ coro::task<void> send_message(tcp_stream& stream) {
 
     auto result = co_await stream.writev(iov, 2);
     if (result.result > 0) {
-        ELIO_LOG_INFO("Sent {} bytes", result.result);
+        ELIO_LOG_INFO("Wrote {} bytes in this attempt", result.result);
     }
 }
 ```
 
 **Benefits of writev:**
-- Reduces syscall overhead by combining multiple writes into one
+- Reduces syscall overhead by attempting multiple buffers in one call
 - Avoids buffer copying when you have data in separate locations
-- More atomic writes - better behavior under high concurrency
+- Preserves separate buffers in caller code while reporting exact bytes written
 - Used internally by the RPC framework for efficient frame writing
 
 ## Unix Domain Sockets (UDS)

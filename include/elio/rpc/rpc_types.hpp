@@ -303,7 +303,7 @@ inline void deserialize_impl(buffer_view& reader, std::vector<uint8_t>& value) {
     value.assign(span.begin(), span.end());
 }
 
-/// Serialize buffer_ref (zero-copy reference to external data)
+/// Serialize buffer_ref by copying referenced bytes into the writer.
 inline void serialize_impl(buffer_writer& writer, const buffer_ref& ref) {
     writer.write_blob(ref.span());
 }

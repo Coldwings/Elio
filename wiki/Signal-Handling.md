@@ -124,6 +124,14 @@ sigfd.restore_mask();
 sigfd.close();
 ```
 
+With automatic blocking enabled, `update()` blocks the new signal set but does
+not unblock signals removed from the descriptor. This preserves caller-owned
+masks and avoids exposing a removed pending signal before the descriptor update
+commits. Explicitly unblock signals when their process-level disposition is no
+longer needed. If the descriptor update fails, `update()` restores the calling
+thread's prior mask. Passing `false` as the second argument leaves the thread
+mask unchanged.
+
 ### signal_info
 
 Information about a received signal.

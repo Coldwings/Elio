@@ -325,28 +325,28 @@ public:
     
     /// Update the signal set
     /// @param new_signals The new signal set
-    /// @param block If true, block the new signals before updating
+    /// @param block If true, block the new signals before updating. Signals
+    ///              removed from the set are not unblocked by this operation.
+    /// @note If the descriptor update fails, the calling thread's previous
+    ///       mask is restored.
     /// @return true on success
     bool update(const signal_set& new_signals, bool block = true) {
+        if (fd_ < 0) {
+            return false;
+        }
+
+        sigset_t previous_mask{};
         if (block) {
-            // Block any new signals that weren't in the old set
-            if (!new_signals.block()) {
+            if (!new_signals.block(&previous_mask)) {
                 return false;
-            }
-            // Unblock signals that were in the old set but not in the new set
-            // so they revert to default disposition instead of staying blocked.
-            for (int sig = 1; sig < NSIG; ++sig) {
-                if (signals_.contains(sig) && !new_signals.contains(sig)) {
-                    sigset_t unblock_mask;
-                    sigemptyset(&unblock_mask);
-                    sigaddset(&unblock_mask, sig);
-                    pthread_sigmask(SIG_UNBLOCK, &unblock_mask, nullptr);
-                }
             }
         }
 
         int result = signalfd(fd_, &new_signals.mask(), 0);
         if (result < 0) {
+            if (block) {
+                pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr);
+            }
             return false;
         }
 

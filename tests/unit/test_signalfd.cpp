@@ -428,3 +428,82 @@ TEST_CASE("signal_fd update", "[signal][signal_fd]") {
     REQUIRE(info.has_value());
     REQUIRE(info->signo == SIGUSR2);
 }
+
+TEST_CASE("signal_fd update never unblocks removed signals",
+          "[signal][signal_fd][regression]") {
+    sigset_t original_mask;
+    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &original_mask) == 0);
+    struct mask_restore {
+        sigset_t mask;
+        ~mask_restore() { pthread_sigmask(SIG_SETMASK, &mask, nullptr); }
+    } restore{original_mask};
+
+    sigset_t controlled_mask = original_mask;
+    sigaddset(&controlled_mask, SIGUSR1);
+    sigdelset(&controlled_mask, SIGUSR2);
+    REQUIRE(pthread_sigmask(SIG_SETMASK, &controlled_mask, nullptr) == 0);
+
+    signal_fd sigfd(signal_set{SIGUSR1});
+    REQUIRE(sigfd.update(signal_set{SIGUSR2}));
+
+    sigset_t current_mask;
+    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &current_mask) == 0);
+    REQUIRE(sigismember(&current_mask, SIGUSR1) == 1);
+    REQUIRE(sigismember(&current_mask, SIGUSR2) == 1);
+
+    REQUIRE(sigfd.update(signal_set{SIGUSR1}));
+    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &current_mask) == 0);
+    REQUIRE(sigismember(&current_mask, SIGUSR1) == 1);
+    REQUIRE(sigismember(&current_mask, SIGUSR2) == 1);
+}
+
+TEST_CASE("signal_fd update rolls back mask changes on descriptor failure",
+          "[signal][signal_fd][regression]") {
+    sigset_t original_mask;
+    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &original_mask) == 0);
+    struct mask_restore {
+        sigset_t mask;
+        ~mask_restore() { pthread_sigmask(SIG_SETMASK, &mask, nullptr); }
+    } restore{original_mask};
+
+    sigset_t controlled_mask = original_mask;
+    sigdelset(&controlled_mask, SIGUSR1);
+    sigdelset(&controlled_mask, SIGUSR2);
+    REQUIRE(pthread_sigmask(SIG_SETMASK, &controlled_mask, nullptr) == 0);
+
+    signal_fd sigfd(signal_set{SIGUSR1});
+    REQUIRE(::close(sigfd.fd()) == 0);
+    REQUIRE_FALSE(sigfd.update(signal_set{SIGUSR2}));
+
+    sigset_t current_mask;
+    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &current_mask) == 0);
+    REQUIRE(sigismember(&current_mask, SIGUSR1) == 1);
+    REQUIRE(sigismember(&current_mask, SIGUSR2) == 0);
+    sigfd.close();
+}
+
+TEST_CASE("signal_fd update after close leaves masks unchanged",
+          "[signal][signal_fd][regression]") {
+    sigset_t original_mask;
+    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &original_mask) == 0);
+    struct mask_restore {
+        sigset_t mask;
+        ~mask_restore() { pthread_sigmask(SIG_SETMASK, &mask, nullptr); }
+    } restore{original_mask};
+
+    sigset_t controlled_mask = original_mask;
+    sigdelset(&controlled_mask, SIGUSR1);
+    sigdelset(&controlled_mask, SIGUSR2);
+    REQUIRE(pthread_sigmask(SIG_SETMASK, &controlled_mask, nullptr) == 0);
+
+    signal_fd sigfd(signal_set{SIGUSR1});
+    sigfd.close();
+    REQUIRE_FALSE(sigfd.update(signal_set{SIGUSR2}));
+    REQUIRE(sigfd.signals().contains(SIGUSR1));
+    REQUIRE_FALSE(sigfd.signals().contains(SIGUSR2));
+
+    sigset_t current_mask;
+    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &current_mask) == 0);
+    REQUIRE(sigismember(&current_mask, SIGUSR1) == 1);
+    REQUIRE(sigismember(&current_mask, SIGUSR2) == 0);
+}

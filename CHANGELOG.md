@@ -83,6 +83,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`when_any` winner finalization**: Result-transfer and loser-cancellation
   exceptions can no longer leave `when_any()` or `with_timeout()` permanently
   suspended after a winner has been claimed. (#764)
+- **Signal masks during descriptor updates**: `signal_fd::update()` no longer
+  unblocks signals removed from its descriptor, preserving caller-owned masks
+  and avoiding premature delivery of pending signals. Newly blocked signals
+  are rolled back when the descriptor update fails. (#769)
 - **Batch I/O fallback errors**: Synchronous `batch_read()` and `batch_write()`
   fallback paths now report syscall failures as `-errno`, matching io_uring and
   the public I/O result contract. (#763)

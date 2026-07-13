@@ -312,39 +312,48 @@ TEST_CASE("HTTP/2 session submit validates outbound request fields",
     target.path = "/";
 
     REQUIRE(detail::validate_h2_submit_request_fields(
-                target, "elio-test-agent/1.0", "") == 0);
+                method::GET, target, "elio-test-agent/1.0", "") == 0);
     REQUIRE(detail::validate_h2_submit_request_fields(
-                target, "elio-test-agent/1.0", "application/json") == 0);
+                method::POST, target, "elio-test-agent/1.0",
+                "application/json") == 0);
+
+    SECTION("CONNECT is unsupported") {
+        REQUIRE(detail::validate_h2_submit_request_fields(
+                    method::CONNECT, target, "elio-test-agent/1.0", "") ==
+                EOPNOTSUPP);
+    }
 
     SECTION("non-HTTPS target") {
         auto bad = target;
         bad.scheme = "http";
         REQUIRE(detail::validate_h2_submit_request_fields(
-                    bad, "elio-test-agent/1.0", "") == EPROTONOSUPPORT);
+                    method::GET, bad, "elio-test-agent/1.0", "") ==
+                EPROTONOSUPPORT);
     }
 
     SECTION("invalid authority") {
         auto bad = target;
         bad.host = "bad host";
         REQUIRE(detail::validate_h2_submit_request_fields(
-                    bad, "elio-test-agent/1.0", "") == EINVAL);
+                    method::GET, bad, "elio-test-agent/1.0", "") == EINVAL);
     }
 
     SECTION("invalid path") {
         auto bad = target;
         bad.path = "/bad path";
         REQUIRE(detail::validate_h2_submit_request_fields(
-                    bad, "elio-test-agent/1.0", "") == EINVAL);
+                    method::GET, bad, "elio-test-agent/1.0", "") == EINVAL);
     }
 
     SECTION("invalid user-agent") {
         REQUIRE(detail::validate_h2_submit_request_fields(
-                    target, "bad\r\nUser-Agent: injected", "") == EINVAL);
+                    method::GET, target, "bad\r\nUser-Agent: injected", "") ==
+                EINVAL);
     }
 
     SECTION("invalid content-type") {
         REQUIRE(detail::validate_h2_submit_request_fields(
-                    target, "elio-test-agent/1.0",
+                    method::POST, target, "elio-test-agent/1.0",
                     "text/plain\r\nX-Injected: yes") == EINVAL);
     }
 }

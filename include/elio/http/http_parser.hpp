@@ -266,7 +266,7 @@ private:
         
         // Parse version
         version_ = line.substr(space2 + 1);
-        if (!version_.starts_with("HTTP/")) {
+        if (version_.empty() || !detail::is_valid_http_version(version_)) {
             set_error("Invalid HTTP version");
             return false;
         }
@@ -744,7 +744,7 @@ private:
         }
         
         version_ = line.substr(0, space1);
-        if (!version_.starts_with("HTTP/")) {
+        if (version_.empty() || !detail::is_valid_http_version(version_)) {
             set_error("Invalid HTTP version");
             return false;
         }

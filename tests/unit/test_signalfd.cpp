@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <initializer_list>
 #include <thread>
 
 using namespace elio::signal;
@@ -19,6 +20,33 @@ template<typename F>
 void spawn_task(scheduler& sched, F&& f) {
     sched.go(std::forward<F>(f));
 }
+
+class scoped_thread_signal_mask {
+public:
+    scoped_thread_signal_mask() {
+        REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &original_) == 0);
+    }
+
+    explicit scoped_thread_signal_mask(std::initializer_list<int> unblocked_signals)
+        : scoped_thread_signal_mask() {
+        sigset_t normalized = original_;
+        for (const int signo : unblocked_signals) {
+            REQUIRE(sigdelset(&normalized, signo) == 0);
+        }
+        REQUIRE(pthread_sigmask(SIG_SETMASK, &normalized, nullptr) == 0);
+    }
+
+    ~scoped_thread_signal_mask() {
+        pthread_sigmask(SIG_SETMASK, &original_, nullptr);
+    }
+
+    [[nodiscard]] const sigset_t& original() const noexcept {
+        return original_;
+    }
+
+private:
+    sigset_t original_{};
+};
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
@@ -92,6 +120,7 @@ TEST_CASE("signal_set basic operations", "[signal][signal_set]") {
 }
 
 TEST_CASE("signal_set block/unblock", "[signal][signal_set]") {
+    scoped_thread_signal_mask mask_guard({SIGUSR1, SIGUSR2});
     signal_set sigs{SIGUSR1, SIGUSR2};
     sigset_t old_mask;
     
@@ -125,6 +154,8 @@ TEST_CASE("signal_set block/unblock", "[signal][signal_set]") {
 }
 
 TEST_CASE("signal_fd creation", "[signal][signal_fd]") {
+    scoped_thread_signal_mask mask_guard({SIGUSR1, SIGUSR2});
+
     SECTION("create with single signal") {
         signal_set sigs;
         sigs.add(SIGUSR1);
@@ -184,6 +215,7 @@ TEST_CASE("signal_fd creation", "[signal][signal_fd]") {
 }
 
 TEST_CASE("signal_fd synchronous read", "[signal][signal_fd]") {
+    scoped_thread_signal_mask mask_guard({SIGUSR1});
     signal_set sigs{SIGUSR1};
     signal_fd sigfd(sigs);
     
@@ -207,6 +239,7 @@ TEST_CASE("signal_fd synchronous read", "[signal][signal_fd]") {
 }
 
 TEST_CASE("signal_fd async wait", "[signal][signal_fd]") {
+    scoped_thread_signal_mask mask_guard({SIGUSR1});
     std::atomic<bool> received{false};
     std::atomic<int> received_signo{0};
     
@@ -254,6 +287,7 @@ TEST_CASE("signal_fd async wait", "[signal][signal_fd]") {
 }
 
 TEST_CASE("signal_fd multiple signals", "[signal][signal_fd]") {
+    scoped_thread_signal_mask mask_guard({SIGUSR1, SIGUSR2});
     std::atomic<int> count{0};
     std::atomic<bool> got_usr1{false};
     std::atomic<bool> got_usr2{false};
@@ -305,6 +339,7 @@ TEST_CASE("signal_fd multiple signals", "[signal][signal_fd]") {
 }
 
 TEST_CASE("signal_info", "[signal][signal_info]") {
+    scoped_thread_signal_mask mask_guard({SIGUSR1});
     signal_set sigs{SIGUSR1};
     signal_fd sigfd(sigs);
     
@@ -335,6 +370,7 @@ TEST_CASE("signal_info", "[signal][signal_info]") {
 }
 
 TEST_CASE("signal_block_guard", "[signal][guard]") {
+    scoped_thread_signal_mask mask_guard({SIGUSR1});
     sigset_t before, during, after;
     
     // Get current mask
@@ -381,6 +417,7 @@ TEST_CASE("signal utility functions", "[signal][utility]") {
 }
 
 TEST_CASE("wait_signal convenience function", "[signal][wait_signal]") {
+    scoped_thread_signal_mask mask_guard({SIGUSR1});
     std::atomic<bool> received{false};
     
     // Block signals BEFORE creating scheduler threads
@@ -418,6 +455,7 @@ TEST_CASE("wait_signal convenience function", "[signal][wait_signal]") {
 }
 
 TEST_CASE("signal_fd update", "[signal][signal_fd]") {
+    scoped_thread_signal_mask mask_guard({SIGUSR1, SIGUSR2});
     signal_set sigs{SIGUSR1};
     signal_fd sigfd(sigs);
     
@@ -442,14 +480,8 @@ TEST_CASE("signal_fd update", "[signal][signal_fd]") {
 
 TEST_CASE("signal_fd update never unblocks removed signals",
           "[signal][signal_fd][regression]") {
-    sigset_t original_mask;
-    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &original_mask) == 0);
-    struct mask_restore {
-        sigset_t mask;
-        ~mask_restore() { pthread_sigmask(SIG_SETMASK, &mask, nullptr); }
-    } restore{original_mask};
-
-    sigset_t controlled_mask = original_mask;
+    scoped_thread_signal_mask mask_guard;
+    sigset_t controlled_mask = mask_guard.original();
     sigaddset(&controlled_mask, SIGUSR1);
     sigdelset(&controlled_mask, SIGUSR2);
     REQUIRE(pthread_sigmask(SIG_SETMASK, &controlled_mask, nullptr) == 0);
@@ -470,14 +502,8 @@ TEST_CASE("signal_fd update never unblocks removed signals",
 
 TEST_CASE("signal_fd update rolls back mask changes on descriptor failure",
           "[signal][signal_fd][regression]") {
-    sigset_t original_mask;
-    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &original_mask) == 0);
-    struct mask_restore {
-        sigset_t mask;
-        ~mask_restore() { pthread_sigmask(SIG_SETMASK, &mask, nullptr); }
-    } restore{original_mask};
-
-    sigset_t controlled_mask = original_mask;
+    scoped_thread_signal_mask mask_guard;
+    sigset_t controlled_mask = mask_guard.original();
     sigdelset(&controlled_mask, SIGUSR1);
     sigdelset(&controlled_mask, SIGUSR2);
     REQUIRE(pthread_sigmask(SIG_SETMASK, &controlled_mask, nullptr) == 0);
@@ -495,14 +521,8 @@ TEST_CASE("signal_fd update rolls back mask changes on descriptor failure",
 
 TEST_CASE("signal_fd update after close leaves masks unchanged",
           "[signal][signal_fd][regression]") {
-    sigset_t original_mask;
-    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &original_mask) == 0);
-    struct mask_restore {
-        sigset_t mask;
-        ~mask_restore() { pthread_sigmask(SIG_SETMASK, &mask, nullptr); }
-    } restore{original_mask};
-
-    sigset_t controlled_mask = original_mask;
+    scoped_thread_signal_mask mask_guard;
+    sigset_t controlled_mask = mask_guard.original();
     sigdelset(&controlled_mask, SIGUSR1);
     sigdelset(&controlled_mask, SIGUSR2);
     REQUIRE(pthread_sigmask(SIG_SETMASK, &controlled_mask, nullptr) == 0);
@@ -521,14 +541,8 @@ TEST_CASE("signal_fd update after close leaves masks unchanged",
 
 TEST_CASE("signal_fd restoration does not overwrite caller-owned masks",
           "[signal][signal_fd][regression]") {
-    sigset_t original_mask;
-    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &original_mask) == 0);
-    struct mask_restore {
-        sigset_t mask;
-        ~mask_restore() { pthread_sigmask(SIG_SETMASK, &mask, nullptr); }
-    } restore{original_mask};
-
-    sigset_t controlled_mask = original_mask;
+    scoped_thread_signal_mask mask_guard;
+    sigset_t controlled_mask = mask_guard.original();
     sigdelset(&controlled_mask, SIGUSR1);
     sigdelset(&controlled_mask, SIGUSR2);
     sigdelset(&controlled_mask, SIGTERM);

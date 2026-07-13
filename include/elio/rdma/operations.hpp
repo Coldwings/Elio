@@ -235,7 +235,7 @@ protected:
         op_->handle = h;
         // `posting` blocks an inline CQE from resuming the coroutine
         // until finalize_post_() knows post_* has returned.
-        const auto previous = op_->phase.exchange(
+        [[maybe_unused]] const auto previous = op_->phase.exchange(
             detail::op_phase::posting,
             std::memory_order_release);
         assert(previous == detail::op_phase::unstarted &&

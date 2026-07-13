@@ -111,6 +111,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer move-assignable, preventing replacement of a posted operation from
   freeing completion state while the backend still holds its `wr_id`. Move
   construction remains supported. (#787)
+- **RDMA Release warnings-as-errors builds**: `op_awaiter_base::arm_()` no
+  longer fails Release RDMA builds because its debug-only phase check stores an
+  assertion-only state variable. (#793)
 - **RPC cancellation and framing**: Fixed complete protocol writes, transient
   RPC `writev` retries, `rpc_client` timeout-watcher cleanup, member-coroutine
   self lifetime, end-to-end cancellation propagation, server accept wakeups on

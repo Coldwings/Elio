@@ -71,7 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   informational responses, URL authority parsing, client cancellation
   propagation, connect/handshake/read timeout enforcement, failed handshake
   cleanup, outbound header-injection rejection, and forbidden response-body
-  suppression. (#321)
+  suppression, and HTTP request/response version validation. (#321, #711,
+  #713)
 - **HTTP URL authority validation**: The URL parser now rejects unbracketed IPv6
   literals and authorities with multiple port separators instead of treating the
   last colon as a valid port delimiter. (#655)

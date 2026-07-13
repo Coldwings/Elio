@@ -1276,6 +1276,7 @@ public:
     
     // Accept a connection (awaitable, returns std::optional<tcp_stream>)
     /* awaitable */ accept();
+    /* awaitable */ accept(coro::cancel_token token);
     
     // Get file descriptor
     int fd() const noexcept;

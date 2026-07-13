@@ -1647,6 +1647,8 @@ public:
     void set_body(std::string&& body);
     void set_host(std::string_view host);
     void set_content_type(std::string_view type);
+    headers& get_headers() noexcept;
+    const headers& get_headers() const noexcept;
     
     method get_method() const noexcept;
     std::string_view path() const noexcept;
@@ -1665,6 +1667,31 @@ public:
 or a version token of the form `HTTP/<digits>.<digits>`; invalid values throw
 `std::invalid_argument`.
 
+### `headers`
+
+Case-insensitive HTTP header collection used by `request` and `response`.
+
+```cpp
+class headers {
+public:
+    void set(std::string_view name, std::string_view value);
+    void add(std::string_view name, std::string_view value);
+    std::string_view get(std::string_view name) const;
+    std::vector<std::string_view> get_all(std::string_view name) const;
+    bool contains(std::string_view name) const;
+    void remove(std::string_view name);
+    void clear();
+};
+```
+
+`set()` overwrites the named field. `add()` records an additional field line:
+list-valued headers keep the existing `get()` behavior by returning a
+comma-joined value, while `get_all()` returns each field-line value
+individually.
+`Set-Cookie` is not comma-joined; `get()` returns the first cookie value and
+`get_all()` returns every cookie field line. Conflicting duplicate
+`Content-Length` values throw `std::invalid_argument`.
+
 ### `response`
 
 HTTP response message.
@@ -1675,6 +1702,8 @@ public:
     uint16_t status_code() const noexcept;
     status get_status() const noexcept;
     std::string_view version() const noexcept;
+    headers& get_headers() noexcept;
+    const headers& get_headers() const noexcept;
     
     std::string_view header(std::string_view name) const;
     std::string_view content_type() const;

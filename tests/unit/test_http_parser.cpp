@@ -754,6 +754,72 @@ TEST_CASE("Headers collection", "[http][headers]") {
         headers h2;
         REQUIRE_FALSE(h2.is_chunked());
     }
+
+    SECTION("Repeated list headers keep combined and individual values") {
+        h.add("Cache-Control", "no-cache");
+        h.add("cache-control", "private");
+
+        REQUIRE(h.get("CACHE-CONTROL") == "no-cache, private");
+        auto values = h.get_all("cache-control");
+        REQUIRE(values.size() == 2);
+        REQUIRE(values[0] == "no-cache");
+        REQUIRE(values[1] == "private");
+    }
+
+    SECTION("Set-Cookie repeats are not comma joined") {
+        h.add("Set-Cookie", "a=1");
+        h.add("set-cookie", "b=2");
+
+        REQUIRE(h.get("SET-COOKIE") == "a=1");
+        auto values = h.get_all("set-cookie");
+        REQUIRE(values.size() == 2);
+        REQUIRE(values[0] == "a=1");
+        REQUIRE(values[1] == "b=2");
+
+        auto serialized = h.serialize();
+        REQUIRE(serialized.find("Set-Cookie: a=1\r\n") != std::string::npos);
+        REQUIRE(serialized.find("Set-Cookie: b=2\r\n") != std::string::npos);
+        REQUIRE(serialized.find("a=1, b=2") == std::string::npos);
+    }
+
+    SECTION("Matching duplicate Content-Length is stored once") {
+        h.add("Content-Length", "5");
+        h.add("content-length", " 5 ");
+
+        REQUIRE(h.get("CONTENT-LENGTH") == "5");
+        auto values = h.get_all("content-length");
+        REQUIRE(values.size() == 1);
+        REQUIRE(values[0] == "5");
+    }
+}
+
+TEST_CASE("HTTP response parser preserves duplicate header values",
+          "[http][parser][headers]") {
+    response_parser parser;
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Set-Cookie: a=1\r\n"
+        "Set-Cookie: b=2\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Cache-Control: private\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+
+    auto [result, consumed] = parser.parse(response);
+
+    REQUIRE(result == parse_result::complete);
+    REQUIRE(consumed == response.size());
+    auto cookies = parser.get_headers().get_all("set-cookie");
+    REQUIRE(cookies.size() == 2);
+    REQUIRE(cookies[0] == "a=1");
+    REQUIRE(cookies[1] == "b=2");
+    REQUIRE(parser.get_headers().get("Set-Cookie") == "a=1");
+
+    auto cache_control = parser.get_headers().get_all("cache-control");
+    REQUIRE(cache_control.size() == 2);
+    REQUIRE(cache_control[0] == "no-cache");
+    REQUIRE(cache_control[1] == "private");
+    REQUIRE(parser.get_headers().get("Cache-Control") == "no-cache, private");
 }
 
 TEST_CASE("Method to string conversion", "[http][method]") {
@@ -842,6 +908,22 @@ TEST_CASE("HTTP request parser rejects duplicate Content-Length conflict",
 
     auto [result, _] = parser.parse(request);
     REQUIRE(result == parse_result::error);
+}
+
+TEST_CASE("HTTP request parser rejects empty duplicate Content-Length conflict",
+          "[http][parser][security]") {
+    request_parser parser;
+    std::string request =
+        "POST / HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Content-Length:\r\n"
+        "Content-Length: 1\r\n"
+        "\r\n"
+        "x";
+
+    auto [result, _] = parser.parse(request);
+    REQUIRE(result == parse_result::error);
+    REQUIRE(parser.has_error());
 }
 
 TEST_CASE("HTTP request parser accepts duplicate Content-Length when matching",
@@ -1055,6 +1137,21 @@ TEST_CASE("HTTP response parser rejects CL+TE smuggling",
         "Transfer-Encoding: chunked\r\n"
         "\r\n"
         "0\r\n\r\n";
+
+    auto [result, _] = parser.parse(response);
+    REQUIRE(result == parse_result::error);
+    REQUIRE(parser.has_error());
+}
+
+TEST_CASE("HTTP response parser rejects empty duplicate Content-Length conflict",
+          "[http][parser][security]") {
+    response_parser parser;
+    std::string response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length:\r\n"
+        "Content-Length: 1\r\n"
+        "\r\n"
+        "x";
 
     auto [result, _] = parser.parse(response);
     REQUIRE(result == parse_result::error);

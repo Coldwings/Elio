@@ -547,7 +547,7 @@ private:
                         stream->response_status = static_cast<status>(status_code);
                     }
                 } else if (!name_sv.starts_with(":")) {
-                    // headers::set() validates name/value and throws
+                    // headers::add() validates name/value and throws
                     // std::invalid_argument on RFC 7230 token violations or
                     // CR/LF/NUL in the value. We are inside a C callback
                     // invoked from nghttp2_session_mem_recv() — letting an
@@ -557,7 +557,7 @@ private:
                     // offending stream (RST_STREAM) instead of silently
                     // dropping the header.
                     try {
-                        stream->response_headers.set(name_sv, value_sv);
+                        stream->response_headers.add(name_sv, value_sv);
                     } catch (...) {
                         return NGHTTP2_ERR_CALLBACK_FAILURE;
                     }

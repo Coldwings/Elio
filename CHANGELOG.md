@@ -87,8 +87,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   buffering limits, and invalid URL errno reporting. (#320, #658)
 - **HTTP/2 client behavior**: Fixed connect/read timeout enforcement, session
   config application, buffered response-body caps, HTTP/2 option dependency
-  validation, nghttp2 FetchContent cache scoping, and installed nghttp2 target
-  restoration. (#270)
+  validation, duplicate response header preservation, nghttp2 FetchContent
+  cache scoping, and installed nghttp2 target restoration. (#270, #752)
 - **RDMA correctness and optional build support**: Fixed RDMA CM event routing
   and status signs, cancellable CM polling, awaited operation completion
   requests, inline completion awaiter lifetimes, SGE and remote-buffer length

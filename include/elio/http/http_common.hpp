@@ -492,8 +492,8 @@ struct case_insensitive_equal {
 class headers {
 public:
     using map_type = std::unordered_map<std::string, std::string, case_insensitive_hash, case_insensitive_equal>;
-    using iterator = map_type::iterator;
     using const_iterator = map_type::const_iterator;
+    using iterator = const_iterator;
     
     headers() = default;
     
@@ -508,14 +508,18 @@ public:
         if (!detail::is_valid_header_value(value)) {
             throw std::invalid_argument("elio::http::headers: header value contains CR/LF/NUL");
         }
-        headers_[std::string(name)] = std::string(value);
+        auto key = std::string(name);
+        auto stored = std::string(value);
+        headers_[key] = stored;
+        header_values_[std::move(key)] = {std::move(stored)};
     }
 
-    /// Add a header (appends with comma if exists). Validates name/value the
-    /// same way as set(). Per RFC 7230 §3.3.2, a duplicate Content-Length is
-    /// only acceptable if it carries the byte-equal value (after trimming
-    /// OWS); a conflicting duplicate must be rejected to prevent CL/CL
-    /// request smuggling.
+    /// Add a header field line. Repeated list-valued fields keep the legacy
+    /// get() representation by comma-combining values, while get_all() exposes
+    /// the individual field lines. Set-Cookie is intentionally not comma-joined.
+    /// Per RFC 7230 §3.3.2, a duplicate Content-Length is only acceptable if it
+    /// carries the byte-equal value (after trimming OWS); a conflicting
+    /// duplicate must be rejected to prevent CL/CL request smuggling.
     void add(std::string_view name, std::string_view value) {
         if (!detail::is_valid_header_name(name)) {
             throw std::invalid_argument("elio::http::headers: invalid header name");
@@ -523,21 +527,35 @@ public:
         if (!detail::is_valid_header_value(value)) {
             throw std::invalid_argument("elio::http::headers: header value contains CR/LF/NUL");
         }
-        auto it = headers_.find(std::string(name));
+        auto key = std::string(name);
+        auto incoming = std::string(value);
+        auto it = headers_.find(key);
         if (it != headers_.end()) {
             if (detail::ascii_iequals(name, "Content-Length")) {
                 auto existing = detail::trim_ows(it->second);
-                auto incoming = detail::trim_ows(value);
-                if (existing != incoming) {
+                auto incoming_trimmed = detail::trim_ows(incoming);
+                if (existing != incoming_trimmed) {
                     throw std::invalid_argument(
                         "elio::http::headers: conflicting Content-Length values");
                 }
                 return;  // matching duplicate: silently drop
             }
+            auto values_it = header_values_.find(key);
+            if (values_it == header_values_.end()) {
+                values_it = header_values_.emplace(it->first,
+                                                   std::vector<std::string>{it->second}).first;
+            }
+            values_it->second.push_back(incoming);
+            if (detail::ascii_iequals(name, "Set-Cookie")) {
+                return;
+            }
             it->second += ", ";
-            it->second += value;
+            it->second += incoming;
         } else {
-            headers_[std::string(name)] = std::string(value);
+            auto [header_it, inserted] = headers_.emplace(std::move(key), incoming);
+            (void)inserted;
+            header_values_.emplace(header_it->first,
+                                   std::vector<std::string>{std::move(incoming)});
         }
     }
     
@@ -549,6 +567,25 @@ public:
         }
         return {};
     }
+
+    /// Get all field-line values for a header name. The returned string_views
+    /// point into this collection and are invalidated by later mutation.
+    std::vector<std::string_view> get_all(std::string_view name) const {
+        std::vector<std::string_view> result;
+        auto values_it = header_values_.find(std::string(name));
+        if (values_it != header_values_.end()) {
+            result.reserve(values_it->second.size());
+            for (const auto& value : values_it->second) {
+                result.emplace_back(value);
+            }
+            return result;
+        }
+        auto it = headers_.find(std::string(name));
+        if (it != headers_.end()) {
+            result.emplace_back(it->second);
+        }
+        return result;
+    }
     
     /// Check if header exists
     bool contains(std::string_view name) const {
@@ -557,7 +594,9 @@ public:
     
     /// Remove a header
     void remove(std::string_view name) {
-        headers_.erase(std::string(name));
+        auto key = std::string(name);
+        headers_.erase(key);
+        header_values_.erase(key);
     }
     
     /// Get Content-Length header value.
@@ -638,6 +677,7 @@ public:
     /// Clear all headers
     void clear() {
         headers_.clear();
+        header_values_.clear();
     }
     
     /// Get number of headers
@@ -650,11 +690,12 @@ public:
         return headers_.empty();
     }
     
-    /// Iterators
-    iterator begin() { return headers_.begin(); }
-    iterator end() { return headers_.end(); }
-    const_iterator begin() const { return headers_.begin(); }
-    const_iterator end() const { return headers_.end(); }
+    /// Read-only iterators. Mutate through set()/add()/remove()/clear() so the
+    /// duplicate field-line index stays synchronized with the legacy map view.
+    iterator begin() { return headers_.cbegin(); }
+    iterator end() { return headers_.cend(); }
+    const_iterator begin() const { return headers_.cbegin(); }
+    const_iterator end() const { return headers_.cend(); }
     const_iterator cbegin() const { return headers_.cbegin(); }
     const_iterator cend() const { return headers_.cend(); }
     
@@ -662,16 +703,38 @@ public:
     std::string serialize() const {
         std::string result;
         for (const auto& [name, value] : headers_) {
-            result += name;
-            result += ": ";
-            result += value;
-            result += "\r\n";
+            auto values_it = header_values_.find(name);
+            if (detail::ascii_iequals(name, "Set-Cookie") &&
+                values_it != header_values_.end()) {
+                for (const auto& cookie_value : values_it->second) {
+                    result += name;
+                    result += ": ";
+                    result += cookie_value;
+                    result += "\r\n";
+                }
+                continue;
+            }
+            append_serialized_header(result, name, value);
         }
         return result;
     }
     
 private:
+    using values_map_type =
+        std::unordered_map<std::string, std::vector<std::string>,
+                           case_insensitive_hash, case_insensitive_equal>;
+
+    static void append_serialized_header(std::string& out,
+                                         std::string_view name,
+                                         std::string_view value) {
+        out += name;
+        out += ": ";
+        out += value;
+        out += "\r\n";
+    }
+
     map_type headers_;
+    values_map_type header_values_;
 };
 
 /// URL components

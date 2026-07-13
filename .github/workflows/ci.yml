@@ -86,6 +86,7 @@ jobs:
           -DCMAKE_C_COMPILER=gcc-14 \
           -DCMAKE_CXX_COMPILER=g++-14 \
           -DELIO_BUILD_TESTS=ON \
+          -DELIO_BUILD_SANITIZER_TESTS=${{ matrix.build_type == 'Debug' && 'ON' || 'OFF' }} \
           -DELIO_BUILD_EXAMPLES=ON \
           -DELIO_ENABLE_TLS=ON \
           -DELIO_ENABLE_HTTP=ON \

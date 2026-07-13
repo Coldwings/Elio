@@ -12,9 +12,9 @@
 ///
 /// Sequence per wake:
 ///   1. `ibv_get_cq_event` on the channel (acks event count = 1).
-///   2. `ibv_req_notify_cq(cq, 0)` to re-arm before polling so we
+///   2. `ibv_req_notify_cq(ev_cq, 0)` to re-arm before polling so we
 ///      never miss a CQE that lands between poll and re-arm.
-///   3. `ibv_poll_cq` in a loop until empty; each WC translated and
+///   3. `ibv_poll_cq(ev_cq, ...)` in a loop until empty; each WC translated and
 ///      forwarded to `dispatcher.deliver`.
 ///
 /// This matches the canonical libibverbs CQ-pump pattern; users who
@@ -26,8 +26,6 @@
 
 #include <endian.h>
 #include <infiniband/verbs.h>
-
-#include <cassert>
 
 namespace elio::rdma_ibverbs {
 
@@ -61,29 +59,59 @@ translate_status(ibv_wc_status s) noexcept {
     }
 }
 
-/// Returns a callable suitable for `elio::rdma::cq_pump<Drain>` that
-/// drains the given CQ when its comp channel becomes readable. The
-/// lambda captures both pointers by value (cheap; both are non-null
-/// stable handles), so the helper is safe to store / hand off.
-[[nodiscard]] inline auto make_cq_drain(ibv_cq* cq,
-                                        ibv_comp_channel* channel) {
-    return [cq, channel](elio::rdma::dispatcher& disp) noexcept {
+namespace detail {
+
+struct cq_verbs_api {
+    static int get_cq_event(ibv_comp_channel* channel, ibv_cq** cq,
+                            void** context) noexcept {
+        return ::ibv_get_cq_event(channel, cq, context);
+    }
+
+    static void ack_cq_events(ibv_cq* cq, unsigned int count) noexcept {
+        ::ibv_ack_cq_events(cq, count);
+    }
+
+    static int req_notify_cq(ibv_cq* cq, int solicited_only) noexcept {
+        return ::ibv_req_notify_cq(cq, solicited_only);
+    }
+
+    static int poll_cq(ibv_cq* cq, int count, ibv_wc* wc) noexcept {
+        return ::ibv_poll_cq(cq, count, wc);
+    }
+};
+
+template<typename VerbsApi>
+[[nodiscard]] inline auto make_cq_drain_impl(
+        [[maybe_unused]] ibv_cq* cq, ibv_comp_channel* channel) {
+    return [channel](elio::rdma::dispatcher& disp) noexcept {
         ibv_cq* ev_cq    = nullptr;
         void*   ev_ctx   = nullptr;
-        if (::ibv_get_cq_event(channel, &ev_cq, &ev_ctx) != 0) {
+        if (VerbsApi::get_cq_event(channel, &ev_cq, &ev_ctx) != 0) {
             return;  // EAGAIN-ish; just bail and let cq_pump re-poll
         }
-        assert(ev_cq == cq && "CQ event from unexpected CQ");
-        ::ibv_ack_cq_events(ev_cq, 1);
-        (void)::ibv_req_notify_cq(ev_cq, 0);
+        VerbsApi::ack_cq_events(ev_cq, 1);
+        (void)VerbsApi::req_notify_cq(ev_cq, 0);
         ibv_wc wc{};
-        while (::ibv_poll_cq(cq, 1, &wc) > 0) {
+        while (VerbsApi::poll_cq(ev_cq, 1, &wc) > 0) {
             const std::uint32_t imm = (wc.wc_flags & IBV_WC_WITH_IMM)
                 ? be32toh(wc.imm_data) : 0;
             disp.deliver(wc.wr_id, translate_status(wc.status),
                          wc.byte_len, imm, wc.wc_flags);
         }
     };
+}
+
+}  // namespace detail
+
+/// Returns a callable suitable for `elio::rdma::cq_pump<Drain>` that
+/// drains the CQ identified by each event on the completion channel.
+/// Multiple CQs may share the channel, provided every completion carries
+/// an Elio-compatible `wr_id` for the supplied dispatcher. The `cq`
+/// argument is retained for source compatibility; event routing is
+/// determined by `ibv_get_cq_event()`.
+[[nodiscard]] inline auto make_cq_drain(ibv_cq* cq,
+                                        ibv_comp_channel* channel) {
+    return detail::make_cq_drain_impl<detail::cq_verbs_api>(cq, channel);
 }
 
 }  // namespace elio::rdma_ibverbs

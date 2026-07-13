@@ -66,6 +66,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Batch I/O fallback errors**: Synchronous `batch_read()` and `batch_write()`
   fallback paths now report syscall failures as `-errno`, matching io_uring and
   the public I/O result contract. (#763)
+- **RDMA completion-channel routing**: `make_cq_drain()` now polls the CQ
+  returned by each channel event, so shared completion channels cannot strand
+  completions on a different CQ. (#765)
 - **RPC cancellation and framing**: Fixed complete protocol writes, transient
   RPC `writev` retries, `rpc_client` timeout-watcher cleanup, member-coroutine
   self lifetime, end-to-end cancellation propagation, server accept wakeups on

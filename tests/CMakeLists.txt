@@ -309,7 +309,8 @@ if(NOT TARGET elio_rdma_ibverbs)
     target_link_libraries(elio_rdma_ibverbs_backend_stub_tests PRIVATE
         elio Catch2::Catch2WithMain)
     target_compile_definitions(elio_rdma_ibverbs_backend_stub_tests PRIVATE
-        ELIO_DEBUG)
+        ELIO_DEBUG
+        ELIO_HAS_RDMA_IBVERBS=1)
     catch_discover_tests(elio_rdma_ibverbs_backend_stub_tests)
     list(APPEND ELIO_ADDITIONAL_TEST_TARGETS
         elio_rdma_ibverbs_backend_stub_tests)

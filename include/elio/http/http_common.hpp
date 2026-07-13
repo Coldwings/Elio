@@ -82,22 +82,12 @@ inline bool is_valid_http_version(std::string_view version) noexcept {
     }
 
     auto numbers = version.substr(prefix.size());
-    auto dot = numbers.find('.');
-    if (dot == std::string_view::npos || dot == 0 ||
-        dot + 1 == numbers.size()) {
+    if (numbers.size() != 3 || numbers[1] != '.') {
         return false;
     }
 
-    for (size_t i = 0; i < numbers.size(); ++i) {
-        if (i == dot) {
-            continue;
-        }
-        if (!is_http_version_digit(numbers[i])) {
-            return false;
-        }
-    }
-
-    return true;
+    return is_http_version_digit(numbers[0]) &&
+           is_http_version_digit(numbers[2]);
 }
 
 inline void validate_http_version(std::string_view version) {

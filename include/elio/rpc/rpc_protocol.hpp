@@ -372,7 +372,7 @@ read_frame(Stream& stream) {
     return read_frame_bounded(stream, static_cast<uint32_t>(max_message_size));
 }
 
-/// Write a frame to stream using scatter-gather I/O for atomicity
+/// Write a complete frame using scatter-gather I/O with partial-write retries
 /// If the header has the has_checksum flag set, appends CRC32 checksum
 template<rpc_stream Stream>
 coro::task<bool> write_frame(Stream& stream, const frame_header& header,
@@ -390,7 +390,7 @@ coro::task<bool> write_frame(Stream& stream, const frame_header& header,
         endian::write_le<uint32_t>(checksum_bytes.data(), hash::crc32_finalize(crc));
     }
 
-    // Build iovec array for atomic write
+    // Build iovec array for scatter-gather write
     struct iovec iovecs[3];
     size_t iov_count = 0;
 
@@ -413,12 +413,13 @@ coro::task<bool> write_frame(Stream& stream, const frame_header& header,
         ++iov_count;
     }
 
-    // Write all data atomically using scatter-gather I/O
+    // Write all data using scatter-gather I/O with retry handling
     auto result = co_await writev_exact(stream, iovecs, iov_count);
     co_return result.result > 0;
 }
 
-/// Write a frame with raw payload using scatter-gather I/O for atomicity
+/// Write a complete frame with raw payload using scatter-gather I/O
+/// with partial-write retries
 /// If the header has the has_checksum flag set, appends CRC32 checksum
 template<rpc_stream Stream>
 coro::task<bool> write_frame(Stream& stream, const frame_header& header,
@@ -436,7 +437,7 @@ coro::task<bool> write_frame(Stream& stream, const frame_header& header,
         endian::write_le<uint32_t>(checksum_bytes.data(), hash::crc32_finalize(crc));
     }
 
-    // Build iovec array for atomic write
+    // Build iovec array for scatter-gather write
     struct iovec iovecs[3];
     size_t iov_count = 0;
 
@@ -459,7 +460,7 @@ coro::task<bool> write_frame(Stream& stream, const frame_header& header,
         ++iov_count;
     }
 
-    // Write all data atomically using scatter-gather I/O
+    // Write all data using scatter-gather I/O with retry handling
     auto result = co_await writev_exact(stream, iovecs, iov_count);
     co_return result.result > 0;
 }

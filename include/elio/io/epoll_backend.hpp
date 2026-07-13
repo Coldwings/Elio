@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
@@ -79,6 +80,12 @@ public:
     ~epoll_backend() override {
         // Collect handles to resume
         std::vector<deferred_resume_entry> deferred_resumes;
+
+        for (auto& op : ready_ops_) {
+            enqueue_resume(op.req.state, op.awaiter,
+                           io_result{-ECANCELED, 0}, &deferred_resumes);
+        }
+        ready_ops_.clear();
         
         for (auto& [fd, state] : fd_states_) {
             for (auto& op : state.pending_ops) {
@@ -141,10 +148,28 @@ public:
             case io_op::write:
             case io_op::writev:
             case io_op::send:
-            case io_op::connect:
             case io_op::poll_write:
                 events |= EPOLLOUT;
                 break;
+
+            case io_op::connect: {
+                socklen_t addrlen = req.addrlen ? *req.addrlen : 0;
+                if (::connect(req.fd, req.addr, addrlen) == 0) {
+                    return queue_ready_op(std::move(op), io_result{0, 0});
+                }
+
+                int err = errno;
+                if (err == EISCONN) {
+                    return queue_ready_op(std::move(op), io_result{0, 0});
+                }
+                if (err != EINPROGRESS && err != EALREADY &&
+                    err != EAGAIN && err != EWOULDBLOCK) {
+                    return queue_ready_op(std::move(op), io_result{-err, 0});
+                }
+
+                events |= EPOLLOUT;
+                break;
+            }
                 
             case io_op::close:
                 // Close operations are executed synchronously
@@ -287,6 +312,27 @@ public:
     
     /// Poll for completed operations
     int poll(std::chrono::milliseconds timeout) override {
+        int completions = 0;
+
+        // Collect handles to resume after processing all completions
+        std::vector<deferred_resume_entry> deferred_resumes;
+
+        if (!ready_ops_.empty()) {
+            auto ready_ops = std::move(ready_ops_);
+            ready_ops_.clear();
+
+            for (auto& op : ready_ops) {
+                enqueue_resume(op.req.state, op.awaiter,
+                               op.precompleted_result, &deferred_resumes);
+                pending_count_--;
+                completions++;
+            }
+
+            resume_deferred(deferred_resumes);
+            ELIO_LOG_DEBUG("Processed {} ready completions", completions);
+            return completions;
+        }
+
         int timeout_ms = static_cast<int>(timeout.count());
         if (timeout.count() < 0) {
             timeout_ms = -1;  // Block indefinitely
@@ -317,11 +363,6 @@ public:
             ELIO_LOG_ERROR("epoll_wait failed: {}", strerror(errno));
             return -1;
         }
-        
-        int completions = 0;
-        
-        // Collect handles to resume after processing all completions
-        std::vector<deferred_resume_entry> deferred_resumes;
         
         // Process expired timers
         auto now = std::chrono::steady_clock::now();
@@ -447,16 +488,25 @@ public:
     bool cancel(void* user_data) override {
         deferred_resume_entry to_resume{};
         bool found_entry = false;
+
+        auto ready_it = std::find_if(ready_ops_.begin(), ready_ops_.end(),
+                                     [user_data](const pending_operation& op) {
+                                         return cancel_key_for(op) == user_data;
+                                     });
+        if (ready_it != ready_ops_.end()) {
+            found_entry = claim_resume(ready_it->req.state, ready_it->awaiter,
+                                       io_result{-ECANCELED, 0}, to_resume);
+            ready_ops_.erase(ready_it);
+            pending_count_--;
+            goto found;
+        }
         
         // Search in fd_states first
         for (auto& [fd, state] : fd_states_) {
             auto it = std::find_if(state.pending_ops.begin(), 
                                     state.pending_ops.end(),
                                     [user_data](const pending_operation& op) {
-                                        void* cancel_key = op.req.state
-                                            ? tagged_op_state_user_data(op.req.state)
-                                            : op.awaiter.address();
-                                        return cancel_key == user_data;
+                                        return cancel_key_for(op) == user_data;
                                     });
             
             if (it != state.pending_ops.end()) {
@@ -540,6 +590,7 @@ private:
         io_request req;
         std::coroutine_handle<> awaiter;
         bool synchronous = false;
+        io_result precompleted_result{0, 0};
     };
     
     struct fd_state {
@@ -595,6 +646,20 @@ private:
         return true;
     }
 
+    static void* cancel_key_for(const pending_operation& op) noexcept {
+        return op.req.state
+            ? tagged_op_state_user_data(op.req.state)
+            : op.awaiter.address();
+    }
+
+    bool queue_ready_op(pending_operation op, io_result result) {
+        op.precompleted_result = result;
+        ready_ops_.push_back(std::move(op));
+        pending_count_++;
+        notify();
+        return true;
+    }
+
     static void enqueue_resume(op_state* state,
                                std::coroutine_handle<> fallback,
                                io_result result,
@@ -645,6 +710,7 @@ private:
     void execute_async_op(pending_operation& op, uint32_t revents,
                           std::vector<deferred_resume_entry>* deferred_resumes = nullptr) {
         int result = 0;
+        bool syscall_result = false;
         
         auto is_read_data_op = [](io_op op) noexcept {
             switch (op) {
@@ -677,6 +743,7 @@ private:
                         result = static_cast<int>(read(op.req.fd, op.req.buffer, 
                                                        op.req.length));
                     }
+                    syscall_result = true;
                     break;
                     
                 case io_op::write:
@@ -687,31 +754,37 @@ private:
                         result = static_cast<int>(write(op.req.fd, op.req.buffer, 
                                                         op.req.length));
                     }
+                    syscall_result = true;
                     break;
                     
                 case io_op::readv:
                     result = static_cast<int>(readv(op.req.fd, op.req.iovecs, 
                                                     static_cast<int>(op.req.iovec_count)));
+                    syscall_result = true;
                     break;
                     
                 case io_op::writev:
                     result = static_cast<int>(writev(op.req.fd, op.req.iovecs, 
                                                      static_cast<int>(op.req.iovec_count)));
+                    syscall_result = true;
                     break;
                     
                 case io_op::recv:
                     result = static_cast<int>(recv(op.req.fd, op.req.buffer, 
                                                    op.req.length, op.req.socket_flags));
+                    syscall_result = true;
                     break;
                     
                 case io_op::send:
                     result = static_cast<int>(send(op.req.fd, op.req.buffer, 
                                                    op.req.length, op.req.socket_flags));
+                    syscall_result = true;
                     break;
                     
                 case io_op::accept:
                     result = accept4(op.req.fd, op.req.addr, op.req.addrlen, 
                                      op.req.socket_flags | SOCK_CLOEXEC);
+                    syscall_result = true;
                     break;
                     
                 case io_op::connect: {
@@ -737,7 +810,7 @@ private:
                     break;
             }
             
-            if (result < 0 && result != -EAGAIN && result != -EWOULDBLOCK) {
+            if (syscall_result && result < 0) {
                 result = -errno;
             }
         }
@@ -781,6 +854,7 @@ private:
     int epoll_fd_ = -1;                                    ///< epoll file descriptor
     std::vector<struct epoll_event> events_;              ///< Event buffer for epoll_wait
     std::unordered_map<int, fd_state> fd_states_;         ///< Per-fd state
+    std::vector<pending_operation> ready_ops_;            ///< Ops completed during prepare()
     timer_queue_t timer_queue_;                           ///< Timer queue for timeouts
     std::atomic<size_t> pending_count_{0};                ///< Number of pending operations (atomic for cross-thread reads)
     int wake_fd_ = -1;  ///< eventfd for cross-thread wake-up

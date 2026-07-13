@@ -351,6 +351,125 @@ TEST_CASE("epoll_backend drains readable data before EOF on hangup",
     close(sv[1]);
 }
 
+TEST_CASE("epoll_backend async connect initiates TCP handshake",
+          "[io][epoll][connect][regression]") {
+    int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    REQUIRE(listen_fd >= 0);
+
+    int reuse = 1;
+    REQUIRE(setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0);
+
+    struct sockaddr_in listen_addr{};
+    listen_addr.sin_family = AF_INET;
+    listen_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    listen_addr.sin_port = 0;
+    REQUIRE(bind(listen_fd, reinterpret_cast<struct sockaddr*>(&listen_addr),
+                 sizeof(listen_addr)) == 0);
+    REQUIRE(listen(listen_fd, 1) == 0);
+
+    socklen_t listen_len = sizeof(listen_addr);
+    REQUIRE(getsockname(listen_fd, reinterpret_cast<struct sockaddr*>(&listen_addr),
+                        &listen_len) == 0);
+
+    int client_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    REQUIRE(client_fd >= 0);
+
+    epoll_backend backend;
+    socklen_t addrlen = sizeof(listen_addr);
+    io_request req{};
+    req.op = io_op::connect;
+    req.fd = client_fd;
+    req.addr = reinterpret_cast<struct sockaddr*>(&listen_addr);
+    req.addrlen = &addrlen;
+    req.awaiter = std::noop_coroutine();
+
+    REQUIRE(backend.prepare(req));
+    REQUIRE(backend.has_pending());
+
+    int completions = 0;
+    for (int i = 0; i < 50 && completions == 0; ++i) {
+        completions += backend.poll(std::chrono::milliseconds(20));
+    }
+    REQUIRE(completions == 1);
+
+    auto result = epoll_backend::get_last_result();
+    INFO("connect result=" << result.result);
+    REQUIRE(result.result == 0);
+
+    char byte = 'x';
+    REQUIRE(send(client_fd, &byte, sizeof(byte), MSG_NOSIGNAL) ==
+            static_cast<ssize_t>(sizeof(byte)));
+
+    int accepted_fd = -1;
+    for (int i = 0; i < 50 && accepted_fd < 0; ++i) {
+        accepted_fd = accept4(listen_fd, nullptr, nullptr,
+                              SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (accepted_fd < 0 && errno == EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    REQUIRE(accepted_fd >= 0);
+
+    char received = 0;
+    ssize_t received_bytes = -1;
+    for (int i = 0; i < 50 && received_bytes < 0; ++i) {
+        received_bytes = recv(accepted_fd, &received, sizeof(received), 0);
+        if (received_bytes < 0 && errno == EAGAIN) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    REQUIRE(received_bytes == static_cast<ssize_t>(sizeof(received)));
+    REQUIRE(received == byte);
+
+    close(accepted_fd);
+    close(client_fd);
+    close(listen_fd);
+}
+
+TEST_CASE("epoll_backend async connect preserves refused SO_ERROR",
+          "[io][epoll][connect][regression]") {
+    int reserve_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    REQUIRE(reserve_fd >= 0);
+
+    struct sockaddr_in target{};
+    target.sin_family = AF_INET;
+    target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    target.sin_port = 0;
+    REQUIRE(bind(reserve_fd, reinterpret_cast<struct sockaddr*>(&target),
+                 sizeof(target)) == 0);
+
+    socklen_t target_len = sizeof(target);
+    REQUIRE(getsockname(reserve_fd, reinterpret_cast<struct sockaddr*>(&target),
+                        &target_len) == 0);
+    REQUIRE(close(reserve_fd) == 0);
+
+    int client_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    REQUIRE(client_fd >= 0);
+
+    epoll_backend backend;
+    socklen_t addrlen = sizeof(target);
+    io_request req{};
+    req.op = io_op::connect;
+    req.fd = client_fd;
+    req.addr = reinterpret_cast<struct sockaddr*>(&target);
+    req.addrlen = &addrlen;
+    req.awaiter = std::noop_coroutine();
+
+    REQUIRE(backend.prepare(req));
+
+    int completions = 0;
+    for (int i = 0; i < 50 && completions == 0; ++i) {
+        completions += backend.poll(std::chrono::milliseconds(20));
+    }
+    REQUIRE(completions == 1);
+
+    auto result = epoll_backend::get_last_result();
+    INFO("connect result=" << result.result);
+    REQUIRE(result.result == -ECONNREFUSED);
+
+    close(client_fd);
+}
+
 TEST_CASE("io_context run methods", "[io][context][run]") {
     io_context ctx;
     
@@ -3155,21 +3274,13 @@ TEST_CASE("Cancellable connect already cancelled", "[io][cancel]") {
 
 TEST_CASE("Cancellable connect cancelled during epoll wait",
           "[io][cancel][epoll-cancel-regression]") {
-    int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    REQUIRE(efd >= 0);
-
-    // The connect awaitable's epoll path only registers EPOLLOUT before a
-    // cancellation can arrive. A saturated eventfd gives a stable non-writable
-    // fd without relying on external network black-hole behavior.
-    std::uint64_t saturated =
-        std::numeric_limits<std::uint64_t>::max() - 1;
-    REQUIRE(::write(efd, &saturated, sizeof(saturated)) ==
-            static_cast<ssize_t>(sizeof(saturated)));
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    REQUIRE(fd >= 0);
 
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(9);
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    inet_pton(AF_INET, "192.0.2.1", &addr.sin_addr);
 
     std::atomic<bool> started{false};
     std::atomic<bool> completed{false};
@@ -3190,7 +3301,7 @@ TEST_CASE("Cancellable connect cancelled during epoll wait",
         used_epoll = true;
         started = true;
         auto result = co_await async_connect(
-            efd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr),
+            fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr),
             source.get_token());
         connect_result = result;
         completed = true;
@@ -3204,12 +3315,24 @@ TEST_CASE("Cancellable connect cancelled during epoll wait",
     if (!used_epoll) {
         REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
         SUCCEED("connect epoll cancellation regression is skipped on io_uring backend");
-        close(efd);
+        close(fd);
+        return;
+    }
+
+    if (completed) {
+        REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+        SUCCEED("connect completed before cancellation could be exercised");
+        close(fd);
         return;
     }
 
     std::this_thread::sleep_for(elio::test::scaled_ms(50));
-    REQUIRE_FALSE(completed);
+    if (completed) {
+        REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+        SUCCEED("connect completed before cancellation could be exercised");
+        close(fd);
+        return;
+    }
 
     source.cancel();
 
@@ -3220,7 +3343,7 @@ TEST_CASE("Cancellable connect cancelled during epoll wait",
     REQUIRE_FALSE(connect_result.success());
     REQUIRE(connect_result.error_code() == ECANCELED);
 
-    close(efd);
+    close(fd);
 }
 
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS

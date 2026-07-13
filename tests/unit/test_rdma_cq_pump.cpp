@@ -36,6 +36,7 @@ using elio::coro::cancel_source;
 using elio::coro::cancel_token;
 using elio::coro::task;
 using elio::rdma::cq_pump;
+using elio::rdma::detail::op_phase;
 using elio::rdma::detail::op_state;
 using elio::rdma::dispatcher;
 using elio::rdma::wc_status;
@@ -127,6 +128,7 @@ TEST_CASE("cq_pump: drain runs on each fd readiness signal",
     // care that deliver was called).
     for (int i = 0; i < 3; ++i) {
         auto op = std::make_unique<op_state>();
+        op->phase.store(op_phase::pending);
         auto id = dispatcher::make_wr_id(op.get());
         ops.push_back(std::move(op));
         cq.enqueue_and_signal(id);

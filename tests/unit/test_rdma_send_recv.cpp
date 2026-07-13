@@ -44,6 +44,8 @@ namespace {
 struct mock_state {
     std::atomic<int> sends{0};
     std::atomic<int> recvs{0};
+    std::atomic<int> writes{0};
+    std::atomic<int> reads{0};
     wr_id            last_send_id{0};
     wr_id            last_recv_id{0};
     int              send_rc = 0;   // forced rc for post_send
@@ -100,10 +102,12 @@ struct mock_static_backend {
     static int post_rdma_write(void*, std::span<const sge>,
                                remote_buffer, send_flags,
                                std::uint32_t, wr_id) noexcept {
+        if (state) state->writes.fetch_add(1);
         return 0;
     }
     static int post_rdma_read(void*, std::span<const sge>,
                               remote_buffer, wr_id) noexcept {
+        if (state) state->reads.fetch_add(1);
         return 0;
     }
 };
@@ -195,6 +199,33 @@ probe_task run_recv(Conn& c, buffer_view buf,
 }
 
 }  // namespace
+
+TEST_CASE("unawaited RDMA operations release their unstarted state",
+          "[rdma][lifetime]") {
+    mock_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 55;
+    connection<mock_static_backend> c{&qp_value, disp};
+
+    char payload[8] = {};
+    buffer_view local{payload, sizeof(payload), 0x1234};
+    remote_buffer remote{0x1000, sizeof(payload), 0x5678};
+
+    {
+        auto send = c.send(local);
+        auto recv = c.recv(local);
+        auto write = c.rdma_write(local, remote);
+        auto read = c.rdma_read(local, remote);
+    }
+
+    REQUIRE(st.sends.load() == 0);
+    REQUIRE(st.recvs.load() == 0);
+    REQUIRE(st.writes.load() == 0);
+    REQUIRE(st.reads.load() == 0);
+    // LeakSanitizer verifies that all four shared op_state allocations
+    // were released when their lazy awaitables left scope.
+}
 
 TEST_CASE("send: happy path suspends and dispatcher resumes",
           "[rdma][send]") {

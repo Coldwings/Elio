@@ -90,6 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **RDMA completion-channel routing**: `make_cq_drain()` now polls the CQ
   returned by each channel event, so shared completion channels cannot strand
   completions on a different CQ. (#765)
+- **RDMA lazy-operation lifetime**: Destroying an RDMA operation awaitable
+  before it is awaited now frees its unstarted completion state instead of
+  orphaning it for a CQE that will never arrive. (#786)
 - **RPC cancellation and framing**: Fixed complete protocol writes, transient
   RPC `writev` retries, `rpc_client` timeout-watcher cleanup, member-coroutine
   self lifetime, end-to-end cancellation propagation, server accept wakeups on

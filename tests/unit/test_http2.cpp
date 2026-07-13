@@ -304,6 +304,51 @@ TEST_CASE("HTTP/2 custom send rejects invalid request targets",
     REQUIRE(client_errno == EINVAL);
 }
 
+TEST_CASE("HTTP/2 session submit validates outbound request fields",
+          "[http2][session][security]") {
+    url target;
+    target.scheme = "https";
+    target.host = "example.com";
+    target.path = "/";
+
+    REQUIRE(detail::validate_h2_submit_request_fields(
+                target, "elio-test-agent/1.0", "") == 0);
+    REQUIRE(detail::validate_h2_submit_request_fields(
+                target, "elio-test-agent/1.0", "application/json") == 0);
+
+    SECTION("non-HTTPS target") {
+        auto bad = target;
+        bad.scheme = "http";
+        REQUIRE(detail::validate_h2_submit_request_fields(
+                    bad, "elio-test-agent/1.0", "") == EPROTONOSUPPORT);
+    }
+
+    SECTION("invalid authority") {
+        auto bad = target;
+        bad.host = "bad host";
+        REQUIRE(detail::validate_h2_submit_request_fields(
+                    bad, "elio-test-agent/1.0", "") == EINVAL);
+    }
+
+    SECTION("invalid path") {
+        auto bad = target;
+        bad.path = "/bad path";
+        REQUIRE(detail::validate_h2_submit_request_fields(
+                    bad, "elio-test-agent/1.0", "") == EINVAL);
+    }
+
+    SECTION("invalid user-agent") {
+        REQUIRE(detail::validate_h2_submit_request_fields(
+                    target, "bad\r\nUser-Agent: injected", "") == EINVAL);
+    }
+
+    SECTION("invalid content-type") {
+        REQUIRE(detail::validate_h2_submit_request_fields(
+                    target, "elio-test-agent/1.0",
+                    "text/plain\r\nX-Injected: yes") == EINVAL);
+    }
+}
+
 TEST_CASE("nghttp2 library version", "[http2]") {
     // Basic check that nghttp2 is linked and functional
     nghttp2_info* info = nghttp2_version(0);

@@ -1832,6 +1832,10 @@ public:
 };
 ```
 
+`submit_request()` validates HTTPS targets, request-target bytes, authority
+bytes, and generated header values before submitting to nghttp2. Validation
+failures return a negative errno-style value and set `errno`.
+
 ---
 
 ## TLS (`elio::tls`)

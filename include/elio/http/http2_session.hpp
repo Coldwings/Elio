@@ -88,6 +88,31 @@ struct h2_session_config {
     bool enable_push = false;  ///< Advertise SETTINGS_ENABLE_PUSH; pushed responses are not exposed
 };
 
+namespace detail {
+
+inline int validate_h2_submit_request_fields(
+    const url& target,
+    std::string_view user_agent,
+    std::string_view content_type) noexcept {
+    if (!target.is_secure()) {
+        return EPROTONOSUPPORT;
+    }
+
+    if (!is_valid_url_input(target.host_authority()) ||
+        !is_valid_request_target(target.path_with_query())) {
+        return EINVAL;
+    }
+
+    if (!is_valid_header_value(user_agent) ||
+        (!content_type.empty() && !is_valid_header_value(content_type))) {
+        return EINVAL;
+    }
+
+    return 0;
+}
+
+} // namespace detail
+
 /// HTTP/2 session (client-side)
 class h2_session {
 public:
@@ -148,6 +173,14 @@ public:
     /// Submit a request and get stream ID
     int32_t submit_request(method m, const url& target, std::string_view body = {},
                            std::string_view content_type = {}) {
+        if (int validation_error =
+                detail::validate_h2_submit_request_fields(
+                    target, config_.user_agent, content_type);
+            validation_error != 0) {
+            errno = validation_error;
+            return -validation_error;
+        }
+
         // Store header values to ensure they outlive the nghttp2 call
         std::vector<std::string> header_values;
         header_values.reserve(8);

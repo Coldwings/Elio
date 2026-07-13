@@ -1641,6 +1641,7 @@ public:
     void set_method(method m) noexcept;
     void set_path(std::string_view path);
     void set_query(std::string_view query);
+    void set_version(std::string_view version);
     void set_header(std::string_view name, std::string_view value);
     void set_body(std::string_view body);
     void set_body(std::string&& body);
@@ -1660,6 +1661,9 @@ public:
 
 `set_path()` and `set_query()` validate request-target components and throw
 `std::invalid_argument` for invalid control characters or spaces.
+`set_version()` accepts an empty value for the default `HTTP/1.1` serialization
+or a version token of the form `HTTP/<digits>.<digits>`; invalid values throw
+`std::invalid_argument`.
 
 ### `response`
 
@@ -1670,18 +1674,22 @@ class response {
 public:
     uint16_t status_code() const noexcept;
     status get_status() const noexcept;
+    std::string_view version() const noexcept;
     
     std::string_view header(std::string_view name) const;
     std::string_view content_type() const;
     std::string_view body() const noexcept;
     
     void set_status(status s) noexcept;
+    void set_version(std::string_view version);
     void set_header(std::string_view name, std::string_view value);
     void set_body(std::string_view body);
     void set_body(std::string&& body);
     void set_content_type(std::string_view type);
 };
 ```
+
+`set_version()` follows the same validation rules as `request::set_version()`.
 
 ### HTTP Enums
 

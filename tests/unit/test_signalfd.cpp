@@ -20,6 +20,17 @@ void spawn_task(scheduler& sched, F&& f) {
     sched.go(std::forward<F>(f));
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+bool restore_mask_for_test(signal_fd& sigfd) {
+    return sigfd.restore_mask();
+}
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 TEST_CASE("signal_set basic operations", "[signal][signal_set]") {
     SECTION("default constructor creates empty set") {
         signal_set sigs;
@@ -506,4 +517,38 @@ TEST_CASE("signal_fd update after close leaves masks unchanged",
     REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &current_mask) == 0);
     REQUIRE(sigismember(&current_mask, SIGUSR1) == 1);
     REQUIRE(sigismember(&current_mask, SIGUSR2) == 0);
+}
+
+TEST_CASE("signal_fd restoration does not overwrite caller-owned masks",
+          "[signal][signal_fd][regression]") {
+    sigset_t original_mask;
+    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &original_mask) == 0);
+    struct mask_restore {
+        sigset_t mask;
+        ~mask_restore() { pthread_sigmask(SIG_SETMASK, &mask, nullptr); }
+    } restore{original_mask};
+
+    sigset_t controlled_mask = original_mask;
+    sigdelset(&controlled_mask, SIGUSR1);
+    sigdelset(&controlled_mask, SIGUSR2);
+    sigdelset(&controlled_mask, SIGTERM);
+    REQUIRE(pthread_sigmask(SIG_SETMASK, &controlled_mask, nullptr) == 0);
+
+    signal_fd first(signal_set{SIGUSR1});
+    signal_fd second(signal_set{SIGUSR2});
+    signal_fd external(signal_set{SIGTERM}, current_io_context(), false);
+    REQUIRE(signal_set{SIGTERM}.block());
+
+    signal_fd moved(std::move(first));
+    external = std::move(moved);
+
+    REQUIRE_FALSE(restore_mask_for_test(first));
+    REQUIRE_FALSE(restore_mask_for_test(moved));
+    REQUIRE_FALSE(restore_mask_for_test(external));
+
+    sigset_t current_mask;
+    REQUIRE(pthread_sigmask(SIG_SETMASK, nullptr, &current_mask) == 0);
+    REQUIRE(sigismember(&current_mask, SIGUSR1) == 1);
+    REQUIRE(sigismember(&current_mask, SIGUSR2) == 1);
+    REQUIRE(sigismember(&current_mask, SIGTERM) == 1);
 }

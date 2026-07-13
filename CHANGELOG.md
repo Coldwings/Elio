@@ -52,6 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verifies HTTP/2 option dependencies and optional installed targets, compiles
   TCP benchmark targets, and bounds release benchmark runtime.
 
+### Deprecated
+
+- **`signal_fd::restore_mask()`**: `signal_fd` blocking is now explicitly
+  acquire-only. The non-composable whole-thread snapshot API is deprecated and
+  disabled; it returns `false` without changing the mask. Callers release
+  signals explicitly after all mask users are finished. (#784)
+
 ### Fixed
 
 - **Linux platform validation**: CMake now rejects every non-Linux target at

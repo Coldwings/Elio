@@ -33,7 +33,7 @@ if(ELIO_ENABLE_HTTP2 AND NOT ELIO_ENABLE_HTTP)
 endif()
 
 # Platform check - Linux only
-if(NOT UNIX OR APPLE)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR "Elio currently only supports Linux")
 endif()
 

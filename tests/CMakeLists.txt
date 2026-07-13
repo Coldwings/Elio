@@ -287,6 +287,17 @@ add_test(NAME http2_option_requires_http
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_http2_option_dependencies.cmake
 )
 
+add_test(NAME non_linux_platform_rejected
+    COMMAND ${CMAKE_COMMAND}
+        -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+        -DELIO_BINARY_DIR=${CMAKE_BINARY_DIR}/tests/cmake/non_linux_platform
+        -DELIO_FMT_SOURCE_DIR=${fmt_SOURCE_DIR}
+        -DELIO_CMAKE_GENERATOR=${CMAKE_GENERATOR}
+        -DELIO_CMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
+        -DELIO_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_linux_platform.cmake
+)
+
 add_executable(elio_rdma_cuda_lifetime_tests
     unit/test_rdma_cuda_gpu_memory_region.cpp
 )

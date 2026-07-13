@@ -1292,7 +1292,7 @@ public:
     /* awaitable */ write_exactly(const void* data, size_t size);
     /* awaitable */ write_exactly(const void* data, size_t size, coro::cancel_token token);
     
-    // Scatter-gather write (awaitable) - writes multiple buffers atomically
+    // Scatter-gather write attempt (awaitable) - may return a short write
     /* awaitable */ writev(struct iovec* iovecs, size_t count);
     
     // Poll for readability (awaitable)
@@ -1379,7 +1379,7 @@ public:
     /* awaitable */ read_exactly(void* buffer, size_t size);
     /* awaitable */ write_exactly(const void* data, size_t size);
 
-    // Scatter-gather write and readiness polling
+    // Scatter-gather write attempt and readiness polling
     /* awaitable */ writev(struct iovec* iovecs, size_t count);
     /* awaitable */ poll_read();
     /* awaitable */ poll_read(coro::cancel_token token);

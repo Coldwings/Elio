@@ -459,11 +459,8 @@ private:
         }
 
         // Invoke cleanup callback only when the response was successfully
-        // sent. If send_response threw, we still invoke cleanup here (via
-        // the try/catch above the send block) because the handler already
-        // completed and resources need releasing regardless. However, if
-        // the write simply returned false (peer disconnected), skip cleanup
-        // per the documented contract.
+        // sent. Exceptions and false returns from send_response both leave
+        // sent == false, so cleanup is skipped per the documented contract.
         if (cleanup_cb && sent) {
             try {
                 cleanup_cb();

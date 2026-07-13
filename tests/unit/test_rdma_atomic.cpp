@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <utility>
 
 using elio::rdma::atomic_result;
 using elio::rdma::buffer_view;
@@ -221,6 +222,12 @@ struct probe_task {
     ~probe_task() { if (handle) handle.destroy(); }
 };
 
+template <typename Awaiter>
+probe_task run_started_atomic(Awaiter op, atomic_result& out, bool& done) {
+    out  = co_await std::move(op);
+    done = true;
+}
+
 }  // namespace
 
 TEST_CASE("backend_with_atomic concept matches a conforming backend",
@@ -269,6 +276,36 @@ TEST_CASE("cas: backend receives args verbatim; old value round-trips",
     REQUIRE(result.ok());
     REQUIRE(result.old_value_host() == 0xDEADBEEFCAFEBABEull);
     REQUIRE(result.old_value_raw() == htobe64(0xDEADBEEFCAFEBABEull));
+}
+
+TEST_CASE("cas: start posts immediately and can complete before await",
+          "[rdma][atomic][cas][start]") {
+    atomic_state st;
+    st.fake_old_value_host = 0x0102030405060708ull;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 19;
+    connection<atomic_static_backend> c{&qp_value, disp};
+
+    alignas(8) char local[8] = {};
+    buffer_view bv{local, sizeof(local), 0x123};
+    remote_buffer remote{0x1000, 8, 0xABCD};
+
+    auto op = c.cas(bv, remote, 1, 2).start();
+    REQUIRE(st.cas_calls.load() == 1);
+    const auto id = st.last_id;
+    REQUIRE(id != 0);
+
+    disp.deliver(id, wc_status::success, /*byte_len=*/8);
+
+    atomic_result result{};
+    bool done = false;
+    auto task = run_started_atomic(std::move(op), result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.cas_calls.load() == 1);
+    REQUIRE(result.ok());
+    REQUIRE(result.old_value_host() == 0x0102030405060708ull);
 }
 
 TEST_CASE("cas: awaited operation forces completion for unsignaled flags",

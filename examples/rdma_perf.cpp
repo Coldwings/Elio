@@ -42,6 +42,7 @@ int main() {
 #include <cstring>
 #include <deque>
 #include <string>
+#include <utility>
 #include <vector>
 
 using elio::coro::task;
@@ -140,17 +141,31 @@ elio::rdma_ibverbs::endpoint_config make_ep_cfg(const config& cfg) {
 
 task<void> send_server(elio::rdma_ibverbs::endpoint& ep,
                        const config& cfg) {
-    std::vector<char> buf(cfg.msg_size);
+    const auto depth = std::max<std::size_t>(cfg.depth, 1);
+    std::vector<char> buf(cfg.msg_size * depth);
     auto mr = ep.register_buffer(buf.data(), buf.size(),
                                  IBV_ACCESS_LOCAL_WRITE);
 
-    for (std::size_t i = 0; i < cfg.count; ++i) {
-        auto wc = co_await ep.conn().recv(mr.view());
+    std::size_t posted = 0, completed = 0;
+    std::deque<decltype(ep.conn().recv(mr.view(0, cfg.msg_size)).start())>
+        inflight;
+
+    while (completed < cfg.count) {
+        while (posted < cfg.count && (posted - completed) < depth) {
+            const auto offset = (posted % depth) * cfg.msg_size;
+            inflight.push_back(
+                ep.conn().recv(mr.view(offset, cfg.msg_size)).start());
+            ++posted;
+        }
+
+        auto wc = co_await std::move(inflight.front());
+        inflight.pop_front();
         if (!wc.ok()) {
             std::fprintf(stderr, "server recv error #%zu status=%d\n",
-                         i, static_cast<int>(wc.status));
+                         completed, static_cast<int>(wc.status));
             co_return;
         }
+        ++completed;
     }
     // Send a single ACK so client knows we're done.
     co_await ep.conn().send(mr.view(0, 1));
@@ -166,18 +181,19 @@ task<bool> send_client(elio::rdma_ibverbs::endpoint& ep,
                                      IBV_ACCESS_LOCAL_WRITE);
 
     // Pre-post all recv WRs up front (just one for the final ACK).
-    auto ack_aw = ep.conn().recv(ack_mr.view(0, 1));
+    auto ack_aw = ep.conn().recv(ack_mr.view(0, 1)).start();
 
     const auto start = std::chrono::steady_clock::now();
 
     // Pipeline: keep `depth` sends in flight.
+    const auto depth = std::max<std::size_t>(cfg.depth, 1);
     std::size_t posted = 0, completed = 0;
-    std::deque<decltype(ep.conn().send(tx_mr.view()))> inflight;
+    std::deque<decltype(ep.conn().send(tx_mr.view()).start())> inflight;
 
     while (completed < cfg.count) {
         // Post up to depth.
-        while (posted < cfg.count && (posted - completed) < cfg.depth) {
-            inflight.push_back(ep.conn().send(tx_mr.view()));
+        while (posted < cfg.count && (posted - completed) < depth) {
+            inflight.push_back(ep.conn().send(tx_mr.view()).start());
             ++posted;
         }
         // Drain one.
@@ -194,7 +210,7 @@ task<bool> send_client(elio::rdma_ibverbs::endpoint& ep,
     }
 
     // Wait for server ACK.
-    co_await ack_aw;
+    co_await std::move(ack_aw);
 
     const auto end = std::chrono::steady_clock::now();
     print_results(cfg, end - start, cfg.count * cfg.msg_size);
@@ -214,13 +230,29 @@ task<void> write_server(elio::rdma_ibverbs::endpoint& ep,
                                  IBV_ACCESS_REMOTE_WRITE);
     auto remote = mr.remote();
 
+    // Wait until the client has started its metadata receive.
+    std::vector<char> ready_buf(1);
+    auto ready_mr = ep.register_buffer(ready_buf.data(), ready_buf.size(),
+                                       IBV_ACCESS_LOCAL_WRITE);
+    auto ready = co_await ep.conn().recv(ready_mr.view(0, 1));
+    if (!ready.ok()) {
+        std::fprintf(stderr, "server: client-ready recv failed status=%d\n",
+                     static_cast<int>(ready.status));
+        co_return;
+    }
+
     // Send our MR info to the client.
     mr_info info{remote.addr, remote.length, remote.rkey};
     std::vector<char> ctrl(sizeof(info));
     std::memcpy(ctrl.data(), &info, sizeof(info));
     auto ctrl_mr = ep.register_buffer(ctrl.data(), ctrl.size(),
                                       IBV_ACCESS_LOCAL_WRITE);
-    co_await ep.conn().send(ctrl_mr.view(0, sizeof(info)));
+    auto ctrl_wc = co_await ep.conn().send(ctrl_mr.view(0, sizeof(info)));
+    if (!ctrl_wc.ok()) {
+        std::fprintf(stderr, "server: failed to send MR info status=%d\n",
+                     static_cast<int>(ctrl_wc.status));
+        co_return;
+    }
 
     // Wait for client "done" signal (a single SEND).
     std::vector<char> done_buf(4);
@@ -236,7 +268,18 @@ task<bool> write_client(elio::rdma_ibverbs::endpoint& ep,
     std::vector<char> ctrl(sizeof(info));
     auto ctrl_mr = ep.register_buffer(ctrl.data(), ctrl.size(),
                                       IBV_ACCESS_LOCAL_WRITE);
-    auto wc = co_await ep.conn().recv(ctrl_mr.view(0, sizeof(info)));
+    auto ctrl_recv = ep.conn().recv(ctrl_mr.view(0, sizeof(info))).start();
+
+    std::vector<char> ready_buf(1, 'R');
+    auto ready_mr = ep.register_buffer(ready_buf.data(), ready_buf.size(),
+                                       IBV_ACCESS_LOCAL_WRITE);
+    auto ready_wc = co_await ep.conn().send(ready_mr.view(0, 1));
+    if (!ready_wc.ok()) {
+        std::fprintf(stderr, "client: failed to send metadata-ready signal\n");
+        co_return false;
+    }
+
+    auto wc = co_await std::move(ctrl_recv);
     if (!wc.ok()) {
         std::fprintf(stderr, "client: failed to recv MR info\n");
         co_return false;
@@ -250,12 +293,14 @@ task<bool> write_client(elio::rdma_ibverbs::endpoint& ep,
 
     const auto start = std::chrono::steady_clock::now();
 
+    const auto depth = std::max<std::size_t>(cfg.depth, 1);
     std::size_t posted = 0, completed = 0;
-    std::deque<decltype(ep.conn().rdma_write(tx_mr.view(), rb))> inflight;
+    std::deque<decltype(ep.conn().rdma_write(tx_mr.view(), rb).start())>
+        inflight;
 
     while (completed < cfg.count) {
-        while (posted < cfg.count && (posted - completed) < cfg.depth) {
-            inflight.push_back(ep.conn().rdma_write(tx_mr.view(), rb));
+        while (posted < cfg.count && (posted - completed) < depth) {
+            inflight.push_back(ep.conn().rdma_write(tx_mr.view(), rb).start());
             ++posted;
         }
         if (!inflight.empty()) {
@@ -295,12 +340,28 @@ task<void> read_server(elio::rdma_ibverbs::endpoint& ep,
                                  IBV_ACCESS_REMOTE_READ);
     auto remote = mr.remote();
 
+    // Wait until the client has started its metadata receive.
+    std::vector<char> ready_buf(1);
+    auto ready_mr = ep.register_buffer(ready_buf.data(), ready_buf.size(),
+                                       IBV_ACCESS_LOCAL_WRITE);
+    auto ready = co_await ep.conn().recv(ready_mr.view(0, 1));
+    if (!ready.ok()) {
+        std::fprintf(stderr, "server: client-ready recv failed status=%d\n",
+                     static_cast<int>(ready.status));
+        co_return;
+    }
+
     mr_info info{remote.addr, remote.length, remote.rkey};
     std::vector<char> ctrl(sizeof(info));
     std::memcpy(ctrl.data(), &info, sizeof(info));
     auto ctrl_mr = ep.register_buffer(ctrl.data(), ctrl.size(),
                                       IBV_ACCESS_LOCAL_WRITE);
-    co_await ep.conn().send(ctrl_mr.view(0, sizeof(info)));
+    auto ctrl_wc = co_await ep.conn().send(ctrl_mr.view(0, sizeof(info)));
+    if (!ctrl_wc.ok()) {
+        std::fprintf(stderr, "server: failed to send MR info status=%d\n",
+                     static_cast<int>(ctrl_wc.status));
+        co_return;
+    }
 
     // Wait for client "done" signal.
     std::vector<char> done_buf(4);
@@ -316,7 +377,18 @@ task<bool> read_client(elio::rdma_ibverbs::endpoint& ep,
     std::vector<char> ctrl(sizeof(info));
     auto ctrl_mr = ep.register_buffer(ctrl.data(), ctrl.size(),
                                       IBV_ACCESS_LOCAL_WRITE);
-    auto wc = co_await ep.conn().recv(ctrl_mr.view(0, sizeof(info)));
+    auto ctrl_recv = ep.conn().recv(ctrl_mr.view(0, sizeof(info))).start();
+
+    std::vector<char> ready_buf(1, 'R');
+    auto ready_mr = ep.register_buffer(ready_buf.data(), ready_buf.size(),
+                                       IBV_ACCESS_LOCAL_WRITE);
+    auto ready_wc = co_await ep.conn().send(ready_mr.view(0, 1));
+    if (!ready_wc.ok()) {
+        std::fprintf(stderr, "client: failed to send metadata-ready signal\n");
+        co_return false;
+    }
+
+    auto wc = co_await std::move(ctrl_recv);
     if (!wc.ok()) {
         std::fprintf(stderr, "client: failed to recv MR info\n");
         co_return false;
@@ -324,18 +396,24 @@ task<bool> read_client(elio::rdma_ibverbs::endpoint& ep,
     std::memcpy(&info, ctrl.data(), sizeof(info));
     remote_buffer rb{info.addr, info.length, info.rkey};
 
-    std::vector<char> rx_buf(cfg.msg_size);
+    const auto depth = std::max<std::size_t>(cfg.depth, 1);
+    std::vector<char> rx_buf(cfg.msg_size * depth);
     auto rx_mr = ep.register_buffer(rx_buf.data(), rx_buf.size(),
                                     IBV_ACCESS_LOCAL_WRITE);
 
     const auto start = std::chrono::steady_clock::now();
 
     std::size_t posted = 0, completed = 0;
-    std::deque<decltype(ep.conn().rdma_read(rx_mr.view(), rb))> inflight;
+    std::deque<decltype(
+        ep.conn().rdma_read(rx_mr.view(0, cfg.msg_size), rb).start())> inflight;
 
     while (completed < cfg.count) {
-        while (posted < cfg.count && (posted - completed) < cfg.depth) {
-            inflight.push_back(ep.conn().rdma_read(rx_mr.view(), rb));
+        while (posted < cfg.count && (posted - completed) < depth) {
+            const auto offset = (posted % depth) * cfg.msg_size;
+            inflight.push_back(
+                ep.conn()
+                    .rdma_read(rx_mr.view(offset, cfg.msg_size), rb)
+                    .start());
             ++posted;
         }
         if (!inflight.empty()) {

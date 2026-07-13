@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **RDMA ibverbs receive and CUDA package surface**: Added shared receive queue
   support for the ibverbs backend and exported the optional
   `Elio::elio_rdma_cuda` package target for GPUDirect RDMA consumers. (#289)
+- **RDMA started operations**: RDMA awaiters now support explicit `.start()`
+  submission for receive preposting and real send/read/write pipelining while
+  preserving lazy `co_await` semantics. The ibverbs request/response and
+  performance examples now use started handles where ordering or queue depth
+  requires work requests to be posted before awaiting them. (#766)
 
 ### Changed
 

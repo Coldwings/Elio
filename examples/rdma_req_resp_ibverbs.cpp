@@ -34,6 +34,7 @@ int main() { return 0; }
 #include <iostream>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace {
 
@@ -145,7 +146,7 @@ elio::coro::task<void> client(elio::runtime::scheduler& sched) {
 
     // CRITICAL: post the recv for the OOB notify BEFORE sending the
     // request. Otherwise the server's send-with-imm will RNR-retry.
-    auto notify_awaiter = ep.conn().recv(notify_mr.view());
+    auto notify_awaiter = ep.conn().recv(notify_mr.view()).start();
 
     auto* hdr = reinterpret_cast<request_header*>(req_buf.data());
     auto resp_remote = resp_mr.remote();
@@ -162,7 +163,7 @@ elio::coro::task<void> client(elio::runtime::scheduler& sched) {
         co_return;
     }
 
-    auto notify_wc = co_await notify_awaiter;
+    auto notify_wc = co_await std::move(notify_awaiter);
     if (!notify_wc.ok()) {
         std::cerr << "client: notify recv failed status="
                   << static_cast<int>(notify_wc.status) << "\n";

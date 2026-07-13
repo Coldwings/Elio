@@ -11,19 +11,23 @@
 ///   * Each awaiter (S3+) holds an `unstarted`
 ///     `std::unique_ptr<op_state>`, arms it as `posting`, and posts its WR with
 ///     `wr_id = dispatcher::make_wr_id(state.get())`.
-///   * Once post_* returns, the awaiter commits `posting → pending`.
-///     On completion, the dispatcher decodes the wr_id, CASes
-///     `pending → completed`, fills the `wc_result`, and resumes the
-///     coroutine. The awaiter then frees the op_state after
-///     await_resume consumes the result.
+///   * Lazy `co_await` commits `posting → pending` once post_* returns.
+///     Eager `start()` commits `posting → posted` instead, because there
+///     is not yet a coroutine handle to resume.
+///   * On completion, the dispatcher decodes the wr_id, CASes
+///     `pending → completed` and resumes the coroutine, or CASes
+///     `posted → completed` and stores the result for a later await.
+///     The awaiter frees the op_state after await_resume consumes the
+///     result, or on destruction of the completed started handle.
 ///   * If completion arrives inline before post_* returns, the
 ///     dispatcher records the result with `posting → completed` and
 ///     the awaiter resumes inline only after await_suspend returns.
 ///   * If the awaiter is destroyed before the CQE arrives (e.g. its
-///     parent task was cancelled), the awaiter's destructor CASes
-///     `pending → orphaned`. If that CAS wins, the dispatcher's later
-///     CQE arrival sees `orphaned` and frees the state. If that CAS
-///     loses, the dispatcher already completed it and the awaiter's
+///     parent task was cancelled, or an eager started handle is dropped
+///     before being awaited), the awaiter's destructor CASes `pending`
+///     or `posted` to `orphaned`. If that CAS wins, the dispatcher's
+///     later CQE arrival sees `orphaned` and frees the state. If that
+///     CAS loses, the dispatcher already completed it and the awaiter's
 ///     unique_ptr frees the state normally.
 ///
 /// Net invariant: exactly one party (dispatcher or awaiter destructor)
@@ -47,21 +51,25 @@ namespace elio::rdma::detail {
 ///   * `posting`   — await_suspend is still inside the backend
 ///                   post_* call. A completion may record the result
 ///                   here, but must not resume the coroutine yet.
-///   * `pending`   — posted and suspended; both the dispatcher and
-///                   the awaiter destructor may transition out.
+///   * `posted`    — explicitly started, but not yet awaited; completion
+///                   stores a result for a later await.
+///   * `pending`   — posted and suspended with a coroutine handle; both
+///                   the dispatcher and the awaiter destructor may
+///                   transition out.
 ///   * `completed` — dispatcher won the race (CQE arrived first) or
 ///                   submission failed before suspension. The awaiter
 ///                   still owns the heap node and frees it after
 ///                   await_resume or destruction.
-///   * `orphaned`  — awaiter destructor won the race (frame went
-///                   away first). The dispatcher's later CQE will
-///                   silently drop and free the node.
+///   * `orphaned`  — awaiter destructor won the race (frame or started
+///                   handle went away first). The dispatcher's later CQE
+///                   will silently drop and free the node.
 enum class op_phase : std::uint8_t {
     unstarted = 0,
     posting   = 1,
-    pending   = 2,
-    completed = 3,
-    orphaned  = 4,
+    posted    = 2,
+    pending   = 3,
+    completed = 4,
+    orphaned  = 5,
 };
 
 /// Heap node owned through the lifetime race described above.

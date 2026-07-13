@@ -7,6 +7,7 @@
 #include <cassert>
 #include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
+#include "detail/wake_state.hpp"
 
 namespace elio::sync {
 
@@ -31,7 +32,9 @@ public:
     /// Wait awaitable — inherits intrusive_list_node for safe unlinking
     class wait_awaitable : public elio::detail::intrusive_list_node<wait_awaitable> {
     public:
-        explicit wait_awaitable(event& e) : evt_(e) {}
+        explicit wait_awaitable(event& e)
+            : evt_(e)
+            , wake_state_(detail::make_wake_state()) {}
 
         ~wait_awaitable() {
             // Fast path: if we never suspended, we were never enqueued,
@@ -46,6 +49,7 @@ public:
             if (this->is_linked()) {
                 evt_.waiters_.remove(this);
             }
+            detail::cancel_wake_state(wake_state_);
         }
 
         bool await_ready() const noexcept {
@@ -59,7 +63,7 @@ public:
                 return false;  // Already signaled
             }
 
-            handle_ = awaiter;
+            wake_state_->set_handle(awaiter);
             evt_.waiters_.push_back(this);
             suspended_ = true;  // Mark as enqueued
             return true;
@@ -69,7 +73,7 @@ public:
 
     private:
         event& evt_;
-        std::coroutine_handle<> handle_;
+        detail::wake_state_ptr wake_state_;
         bool suspended_ = false;  // True if enqueued in waiters_
 
         friend class event;
@@ -82,7 +86,7 @@ public:
 
     /// Signal the event (wake all waiters)
     void set() {
-        std::vector<std::coroutine_handle<>> to_schedule;
+        std::vector<detail::wake_state_ptr> to_schedule;
         {
             std::lock_guard<std::mutex> guard(mutex_);
             signaled_.store(true, std::memory_order_release);
@@ -91,14 +95,12 @@ public:
             // Popping marks nodes as unlinked, so destructors won't try to remove them.
             while (!waiters_.empty()) {
                 auto* waiter = waiters_.pop_front();
-                to_schedule.push_back(waiter->handle_);
+                to_schedule.push_back(waiter->wake_state_);
             }
         }
         // Schedule outside lock to avoid deadlock if schedule_handle()
         // resumes inline (trampoline path) and destructor re-acquires mutex.
-        for (auto h : to_schedule) {
-            runtime::schedule_handle(h);
-        }
+        detail::schedule_wake_states(to_schedule);
     }
 
     /// Reset the event

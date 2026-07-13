@@ -6,6 +6,7 @@
 #include <cassert>
 #include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
+#include "detail/wake_state.hpp"
 
 namespace elio::sync {
 
@@ -29,27 +30,33 @@ public:
     /// Lock awaitable — inherits intrusive_list_node for safe unlinking
     class lock_awaitable : public elio::detail::intrusive_list_node<lock_awaitable> {
     public:
-        explicit lock_awaitable(mutex& m) : mtx_(m) {}
+        explicit lock_awaitable(mutex& m)
+            : mtx_(m)
+            , wake_state_(detail::make_wake_state()) {}
 
         ~lock_awaitable() {
             // Fast path: if we never suspended, we were never enqueued,
             // so no wake function could hold a reference to us.
             if (!suspended_) return;
 
-            std::coroutine_handle<> to_schedule;
+            detail::wake_state_ptr to_schedule;
             // Slow path: acquire internal_mutex_ to prevent race with unlock()
             {
                 std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
                 if (this->is_linked()) {
                     mtx_.waiters_.remove(this);
+                    detail::cancel_wake_state(wake_state_);
                 } else if (grant_pending_ && !resumed_) {
+                    detail::cancel_wake_state(wake_state_);
                     grant_pending_ = false;
                     to_schedule = mtx_.recover_cancelled_handoff_locked();
+                } else {
+                    detail::cancel_wake_state(wake_state_);
                 }
             }
 
             if (to_schedule) {
-                runtime::schedule_handle(to_schedule);
+                detail::schedule_wake_state(to_schedule);
             }
         }
 
@@ -78,7 +85,7 @@ public:
             }
 
             // Add to wait queue
-            handle_ = awaiter;
+            wake_state_->set_handle(awaiter);
             mtx_.waiters_.push_back(this);
             suspended_ = true;  // Mark as enqueued
             return true; // Suspend
@@ -91,7 +98,7 @@ public:
 
     private:
         mutex& mtx_;
-        std::coroutine_handle<> handle_;
+        detail::wake_state_ptr wake_state_;
         bool suspended_ = false;  // True if enqueued in waiters_
         bool resumed_ = false;    // True after a popped waiter resumes normally
         bool grant_pending_ = false;  // True after unlock() transfers ownership
@@ -121,7 +128,7 @@ public:
     };
 
     /// Lock the mutex (coroutine-aware)
-    [[nodiscard]] lock_awaitable lock() noexcept {
+    [[nodiscard]] lock_awaitable lock() {
         return lock_awaitable(*this);
     }
 
@@ -135,7 +142,7 @@ public:
 
     /// Unlock the mutex and wake one waiter if any
     void unlock() noexcept {
-        std::coroutine_handle<> to_schedule = nullptr;
+        detail::wake_state_ptr to_schedule;
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
 
@@ -150,13 +157,13 @@ public:
                 // Popping marks node as unlinked, so destructor won't try to remove it.
                 auto* waiter = waiters_.pop_front();
                 waiter->grant_pending_ = true;
-                to_schedule = waiter->handle_;
+                to_schedule = waiter->wake_state_;
             }
         }
         // Schedule outside lock to avoid deadlock if schedule_handle()
         // resumes inline (trampoline path) and destructor re-acquires mutex.
         if (to_schedule) {
-            runtime::schedule_handle(to_schedule);
+            detail::schedule_wake_state(to_schedule);
         }
     }
 
@@ -170,7 +177,7 @@ private:
     mutable std::mutex internal_mutex_;
     elio::detail::intrusive_list<lock_awaitable> waiters_;
 
-    std::coroutine_handle<> recover_cancelled_handoff_locked() noexcept {
+    detail::wake_state_ptr recover_cancelled_handoff_locked() noexcept {
         if (waiters_.empty()) {
             state_.store(nullptr, std::memory_order_release);
             return nullptr;
@@ -179,7 +186,7 @@ private:
         state_.store(reinterpret_cast<void*>(1), std::memory_order_release);
         auto* waiter = waiters_.pop_front();
         waiter->grant_pending_ = true;
-        return waiter->handle_;
+        return waiter->wake_state_;
     }
 };
 

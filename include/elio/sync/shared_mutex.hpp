@@ -7,6 +7,7 @@
 #include <vector>
 #include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
+#include "detail/wake_state.hpp"
 
 namespace elio::sync {
 
@@ -44,7 +45,9 @@ public:
     /// Optimized with lock-free fast path for uncontended acquisition
     class lock_shared_awaitable : public elio::detail::intrusive_list_node<lock_shared_awaitable> {
     public:
-        explicit lock_shared_awaitable(shared_mutex& m) : mtx_(m) {}
+        explicit lock_shared_awaitable(shared_mutex& m)
+            : mtx_(m)
+            , wake_state_(detail::make_wake_state()) {}
 
         ~lock_shared_awaitable() {
             // Fast path: if we never suspended, we were never enqueued
@@ -56,9 +59,13 @@ public:
                 std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
                 if (this->is_linked()) {
                     mtx_.reader_waiters_.remove(this);
+                    detail::cancel_wake_state(wake_state_);
                 } else if (grant_pending_ && !resumed_) {
+                    detail::cancel_wake_state(wake_state_);
                     grant_pending_ = false;
                     release_grant = true;
+                } else {
+                    detail::cancel_wake_state(wake_state_);
                 }
             }
 
@@ -102,7 +109,7 @@ public:
             }
 
             // Add to reader wait queue
-            handle_ = awaiter;
+            wake_state_->set_handle(awaiter);
             suspended_ = true;
             mtx_.reader_waiters_.push_back(this);
             return true;  // Suspend
@@ -115,7 +122,7 @@ public:
 
     private:
         shared_mutex& mtx_;
-        std::coroutine_handle<> handle_;
+        detail::wake_state_ptr wake_state_;
         bool suspended_ = false;
         bool resumed_ = false;
         bool grant_pending_ = false;
@@ -126,19 +133,22 @@ public:
     /// Exclusive lock awaitable (for writers)
     class lock_awaitable : public elio::detail::intrusive_list_node<lock_awaitable> {
     public:
-        explicit lock_awaitable(shared_mutex& m) : mtx_(m) {}
+        explicit lock_awaitable(shared_mutex& m)
+            : mtx_(m)
+            , wake_state_(detail::make_wake_state()) {}
 
         ~lock_awaitable() {
             // Fast path: if we never suspended, we were never enqueued
             if (!suspended_) return;
 
             // Slow path: acquire internal_mutex_ to prevent race with unlock
-            std::vector<std::coroutine_handle<>> readers_to_wake;
+            std::vector<detail::wake_state_ptr> readers_to_wake;
             bool release_grant = false;
             {
                 std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
                 if (this->is_linked()) {
                     mtx_.writer_waiters_.remove(this);
+                    detail::cancel_wake_state(wake_state_);
                     // Reverse the bookkeeping from await_suspend: decrement pending_writers_
                     // and clear WRITER_WAITING if no more pending writers
                     --mtx_.pending_writers_;
@@ -156,7 +166,7 @@ public:
                             while (!mtx_.reader_waiters_.empty()) {
                                 auto* reader = mtx_.reader_waiters_.pop_front();
                                 reader->grant_pending_ = true;
-                                readers_to_wake.push_back(reader->handle_);
+                                readers_to_wake.push_back(reader->wake_state_);
                             }
 
                             // Update state: atomically add parked readers count.
@@ -168,14 +178,15 @@ public:
                         }
                     }
                 } else if (grant_pending_ && !resumed_) {
+                    detail::cancel_wake_state(wake_state_);
                     grant_pending_ = false;
                     release_grant = true;
+                } else {
+                    detail::cancel_wake_state(wake_state_);
                 }
             }
             // Schedule readers outside the lock
-            for (auto h : readers_to_wake) {
-                runtime::schedule_handle(h);
-            }
+            detail::schedule_wake_states(readers_to_wake);
             if (release_grant) {
                 mtx_.unlock();
             }
@@ -214,7 +225,7 @@ public:
             }
 
             ++mtx_.pending_writers_;
-            handle_ = awaiter;
+            wake_state_->set_handle(awaiter);
             suspended_ = true;
             mtx_.writer_waiters_.push_back(this);
             return true;  // Suspend
@@ -227,7 +238,7 @@ public:
 
     private:
         shared_mutex& mtx_;
-        std::coroutine_handle<> handle_;
+        detail::wake_state_ptr wake_state_;
         bool suspended_ = false;
         bool resumed_ = false;
         bool grant_pending_ = false;
@@ -291,7 +302,7 @@ public:
         }
 
         // Slow path: might need to wake a writer
-        std::coroutine_handle<> to_resume;
+        detail::wake_state_ptr to_resume;
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
 
@@ -308,12 +319,12 @@ public:
                 }
                 state_.store(new_state, std::memory_order_release);
                 writer->grant_pending_ = true;
-                to_resume = writer->handle_;
+                to_resume = writer->wake_state_;
             }
         }
 
         if (to_resume) {
-            runtime::schedule_handle(to_resume);
+            detail::schedule_wake_state(to_resume);
         }
     }
 
@@ -324,9 +335,9 @@ public:
         // path typically resumes a handful.  Only when reader waiters exceed
         // the inline capacity do we fall back to a heap-allocated vector.
         static constexpr size_t kInlineCapacity = 8;
-        std::array<std::coroutine_handle<>, kInlineCapacity> inline_buf;
+        std::array<detail::wake_state_ptr, kInlineCapacity> inline_buf;
         size_t inline_count = 0;
-        std::vector<std::coroutine_handle<>> overflow;
+        std::vector<detail::wake_state_ptr> overflow;
 
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
@@ -345,7 +356,7 @@ public:
 
                 // Writer path: always exactly one handle — fits in inline buffer
                 writer->grant_pending_ = true;
-                inline_buf[0] = writer->handle_;
+                inline_buf[0] = writer->wake_state_;
                 inline_count = 1;
             } else {
                 // Wake all waiting readers
@@ -354,9 +365,9 @@ public:
                     auto* reader = reader_waiters_.pop_front();
                     reader->grant_pending_ = true;
                     if (inline_count < kInlineCapacity) {
-                        inline_buf[inline_count++] = reader->handle_;
+                        inline_buf[inline_count++] = reader->wake_state_;
                     } else {
-                        overflow.push_back(reader->handle_);
+                        overflow.push_back(reader->wake_state_);
                     }
                 }
                 // Set reader count, preserve WRITER_WAITING if there are pending writers
@@ -369,11 +380,9 @@ public:
         }
 
         for (size_t i = 0; i < inline_count; ++i) {
-            runtime::schedule_handle(inline_buf[i]);
+            detail::schedule_wake_state(inline_buf[i]);
         }
-        for (auto& h : overflow) {
-            runtime::schedule_handle(h);
-        }
+        detail::schedule_wake_states(overflow);
     }
 
     /// Get current reader count

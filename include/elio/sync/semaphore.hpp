@@ -9,6 +9,7 @@
 #include <algorithm>
 #include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
+#include "detail/wake_state.hpp"
 
 namespace elio::sync {
 
@@ -36,27 +37,33 @@ public:
     /// Acquire awaitable — inherits intrusive_list_node for safe unlinking
     class acquire_awaitable : public elio::detail::intrusive_list_node<acquire_awaitable> {
     public:
-        explicit acquire_awaitable(semaphore& s) : sem_(s) {}
+        explicit acquire_awaitable(semaphore& s)
+            : sem_(s)
+            , wake_state_(detail::make_wake_state()) {}
 
         ~acquire_awaitable() {
             // Fast path: if we never suspended, we were never enqueued,
             // so no wake function could hold a reference to us.
             if (!suspended_) return;
 
-            std::coroutine_handle<> to_schedule;
+            detail::wake_state_ptr to_schedule;
             // Slow path: acquire mutex to prevent race with release()
             {
                 std::lock_guard<std::mutex> guard(sem_.mutex_);
                 if (this->is_linked()) {
                     sem_.waiters_.remove(this);
+                    detail::cancel_wake_state(wake_state_);
                 } else if (grant_pending_ && !resumed_) {
+                    detail::cancel_wake_state(wake_state_);
                     grant_pending_ = false;
                     to_schedule = sem_.recover_cancelled_handoff_locked();
+                } else {
+                    detail::cancel_wake_state(wake_state_);
                 }
             }
 
             if (to_schedule) {
-                runtime::schedule_handle(to_schedule);
+                detail::schedule_wake_state(to_schedule);
             }
         }
 
@@ -72,7 +79,7 @@ public:
                 return false;  // Don't suspend
             }
 
-            handle_ = awaiter;
+            wake_state_->set_handle(awaiter);
             sem_.waiters_.push_back(this);
             suspended_ = true;  // Mark as enqueued
             return true;  // Suspend
@@ -85,7 +92,7 @@ public:
 
     private:
         semaphore& sem_;
-        std::coroutine_handle<> handle_;
+        detail::wake_state_ptr wake_state_;
         bool suspended_ = false;  // True if enqueued in waiters_
         bool resumed_ = false;    // True after a popped waiter resumes normally
         bool grant_pending_ = false;  // True after release() transfers a permit
@@ -112,7 +119,7 @@ public:
     void release(int count = 1) {
         assert(count > 0 && "semaphore release count must be positive");
 
-        std::vector<std::coroutine_handle<>> to_schedule;
+        std::vector<detail::wake_state_ptr> to_schedule;
         {
             std::lock_guard<std::mutex> guard(mutex_);
 
@@ -124,7 +131,7 @@ public:
             for (int i = 0; i < to_wake; ++i) {
                 auto* waiter = waiters_.pop_front();
                 waiter->grant_pending_ = true;
-                to_schedule.push_back(waiter->handle_);
+                to_schedule.push_back(waiter->wake_state_);
             }
 
             // Only add permits not consumed by woken waiters
@@ -134,9 +141,7 @@ public:
         }
         // Schedule outside lock to avoid deadlock if schedule_handle()
         // resumes inline (trampoline path) and destructor re-acquires mutex.
-        for (auto h : to_schedule) {
-            runtime::schedule_handle(h);
-        }
+        detail::schedule_wake_states(to_schedule);
     }
 
     /// Get current count
@@ -150,11 +155,11 @@ private:
     int count_;
     elio::detail::intrusive_list<acquire_awaitable> waiters_;
 
-    std::coroutine_handle<> recover_cancelled_handoff_locked() noexcept {
+    detail::wake_state_ptr recover_cancelled_handoff_locked() noexcept {
         if (!waiters_.empty()) {
             auto* waiter = waiters_.pop_front();
             waiter->grant_pending_ = true;
-            return waiter->handle_;
+            return waiter->wake_state_;
         }
 
         assert(count_ < INT_MAX && "semaphore count overflow");

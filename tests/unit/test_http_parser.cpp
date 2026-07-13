@@ -135,6 +135,12 @@ TEST_CASE("HTTP request parser - invalid request", "[http][parser]") {
         REQUIRE(result == parse_result::error);
     }
 
+    SECTION("Empty request target") {
+        request_parser parser;
+        auto [result, consumed] = parser.parse("GET  HTTP/1.1\r\n\r\n");
+        REQUIRE(result == parse_result::error);
+    }
+
     SECTION("Invalid HTTP version") {
         request_parser parser;
         auto [result, consumed] = parser.parse("GET / FTP/1.0\r\n\r\n");

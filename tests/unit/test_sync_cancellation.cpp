@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <coroutine>
+#include <thread>
 
 using namespace elio::sync;
 using namespace elio::coro;
@@ -27,6 +28,227 @@ TEST_CASE("event: destroying waiter does not crash on set()", "[sync][event][can
 
     // This must NOT crash — the waiter was unlinked from the queue
     e.set();
+}
+
+TEST_CASE("event wake does not schedule a waiter destroyed after dequeue",
+          "[sync][event][cancellation][regression]") {
+    event e;
+    std::atomic<bool> destroy_second{false};
+    std::atomic<bool> second_destroyed{false};
+
+    auto first_waiter = [&]() -> task<void> {
+        co_await e.wait();
+        destroy_second.store(true, std::memory_order_release);
+        while (!second_destroyed.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    };
+    auto second_waiter = [&]() -> task<void> {
+        co_await e.wait();
+    };
+
+    auto first_task = first_waiter();
+    auto second_task = second_waiter();
+    auto first = elio::coro::detail::task_access::release(first_task);
+    auto second = elio::coro::detail::task_access::release(second_task);
+    first.resume();
+    second.resume();
+
+    std::thread destroyer([&] {
+        while (!destroy_second.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        second.destroy();
+        second_destroyed.store(true, std::memory_order_release);
+    });
+
+    e.set();
+    destroyer.join();
+}
+
+TEST_CASE("condition_variable notify_all does not schedule a waiter destroyed after dequeue",
+          "[sync][condvar][cancellation][regression]") {
+    condition_variable cv;
+    std::atomic<bool> destroy_second{false};
+    std::atomic<bool> second_destroyed{false};
+
+    auto first_waiter = [&]() -> task<void> {
+        co_await cv.wait_unlocked();
+        destroy_second.store(true, std::memory_order_release);
+        while (!second_destroyed.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    };
+    auto second_waiter = [&]() -> task<void> {
+        co_await cv.wait_unlocked();
+    };
+
+    auto first_task = first_waiter();
+    auto second_task = second_waiter();
+    auto first = elio::coro::detail::task_access::release(first_task);
+    auto second = elio::coro::detail::task_access::release(second_task);
+    first.resume();
+    second.resume();
+
+    std::thread destroyer([&] {
+        while (!destroy_second.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        second.destroy();
+        second_destroyed.store(true, std::memory_order_release);
+    });
+
+    cv.notify_all();
+    destroyer.join();
+}
+
+TEST_CASE("semaphore release does not schedule a waiter destroyed after dequeue",
+          "[sync][semaphore][cancellation][regression]") {
+    semaphore sem(0);
+    std::atomic<bool> destroy_second{false};
+    std::atomic<bool> second_destroyed{false};
+
+    auto first_waiter = [&]() -> task<void> {
+        co_await sem.acquire();
+        destroy_second.store(true, std::memory_order_release);
+        while (!second_destroyed.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    };
+    auto second_waiter = [&]() -> task<void> {
+        co_await sem.acquire();
+    };
+
+    auto first_task = first_waiter();
+    auto second_task = second_waiter();
+    auto first = elio::coro::detail::task_access::release(first_task);
+    auto second = elio::coro::detail::task_access::release(second_task);
+    first.resume();
+    second.resume();
+
+    std::thread destroyer([&] {
+        while (!destroy_second.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        second.destroy();
+        second_destroyed.store(true, std::memory_order_release);
+    });
+
+    sem.release(2);
+    destroyer.join();
+}
+
+TEST_CASE("shared_mutex reader wake does not schedule a waiter destroyed after dequeue",
+          "[sync][shared_mutex][cancellation][regression]") {
+    shared_mutex sm;
+    REQUIRE(sm.try_lock());
+    std::atomic<bool> destroy_second{false};
+    std::atomic<bool> second_destroyed{false};
+
+    auto first_waiter = [&]() -> task<void> {
+        co_await sm.lock_shared();
+        destroy_second.store(true, std::memory_order_release);
+        while (!second_destroyed.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        sm.unlock_shared();
+    };
+    auto second_waiter = [&]() -> task<void> {
+        co_await sm.lock_shared();
+        sm.unlock_shared();
+    };
+
+    auto first_task = first_waiter();
+    auto second_task = second_waiter();
+    auto first = elio::coro::detail::task_access::release(first_task);
+    auto second = elio::coro::detail::task_access::release(second_task);
+    first.resume();
+    second.resume();
+
+    std::thread destroyer([&] {
+        while (!destroy_second.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        second.destroy();
+        second_destroyed.store(true, std::memory_order_release);
+    });
+
+    sm.unlock();
+    destroyer.join();
+    REQUIRE(sm.reader_count() == 0);
+}
+
+TEST_CASE("channel close does not schedule a recv waiter destroyed after dequeue",
+          "[sync][channel][cancellation][regression]") {
+    channel<int> ch(0);
+    std::atomic<bool> destroy_second{false};
+    std::atomic<bool> second_destroyed{false};
+
+    auto first_waiter = [&]() -> task<void> {
+        auto value = co_await ch.recv();
+        REQUIRE_FALSE(value.has_value());
+        destroy_second.store(true, std::memory_order_release);
+        while (!second_destroyed.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    };
+    auto second_waiter = [&]() -> task<void> {
+        (void)co_await ch.recv();
+    };
+
+    auto first_task = first_waiter();
+    auto second_task = second_waiter();
+    auto first = elio::coro::detail::task_access::release(first_task);
+    auto second = elio::coro::detail::task_access::release(second_task);
+    first.resume();
+    second.resume();
+
+    std::thread destroyer([&] {
+        while (!destroy_second.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        second.destroy();
+        second_destroyed.store(true, std::memory_order_release);
+    });
+
+    ch.close();
+    destroyer.join();
+}
+
+TEST_CASE("channel close does not schedule a send waiter destroyed after dequeue",
+          "[sync][channel][cancellation][regression]") {
+    channel<int> ch(0);
+    std::atomic<bool> destroy_second{false};
+    std::atomic<bool> second_destroyed{false};
+
+    auto first_waiter = [&]() -> task<void> {
+        (void)co_await ch.send(1);
+        destroy_second.store(true, std::memory_order_release);
+        while (!second_destroyed.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    };
+    auto second_waiter = [&]() -> task<void> {
+        (void)co_await ch.send(2);
+    };
+
+    auto first_task = first_waiter();
+    auto second_task = second_waiter();
+    auto first = elio::coro::detail::task_access::release(first_task);
+    auto second = elio::coro::detail::task_access::release(second_task);
+    first.resume();
+    second.resume();
+
+    std::thread destroyer([&] {
+        while (!destroy_second.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        second.destroy();
+        second_destroyed.store(true, std::memory_order_release);
+    });
+
+    ch.close();
+    destroyer.join();
 }
 
 TEST_CASE("mutex: destroying waiter does not crash on unlock()", "[sync][mutex][cancellation]") {

@@ -13,6 +13,7 @@
 #include "lockfree_ring.hpp"
 #include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
+#include "detail/wake_state.hpp"
 
 namespace elio::sync {
 
@@ -62,7 +63,10 @@ public:
     /// Stores handle + value. Inherits intrusive_list_node for safe unlinking.
     class send_awaitable : public elio::detail::intrusive_list_node<send_awaitable> {
     public:
-        send_awaitable(channel& ch, T value) : ch_(ch), value_(std::move(value)) {}
+        send_awaitable(channel& ch, T value)
+            : ch_(ch)
+            , value_(std::move(value))
+            , wake_state_(detail::make_wake_state()) {}
 
         ~send_awaitable() {
             // Fast path: if we never suspended, we were never enqueued
@@ -73,12 +77,13 @@ public:
             if (this->is_linked()) {
                 ch_.send_waiters_.remove(this);
             }
+            detail::cancel_wake_state(wake_state_);
         }
 
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> h) noexcept {
-            std::coroutine_handle<> to_schedule = nullptr;
+            detail::wake_state_ptr to_schedule;
             bool should_suspend = true;
 
             {
@@ -92,7 +97,7 @@ public:
                         ch_.queue_.push(std::move(value_));
                         success_ = true;
                         auto* receiver = ch_.recv_waiters_.pop_front();
-                        to_schedule = receiver->handle_;
+                        to_schedule = receiver->wake_state_;
                         should_suspend = false;
                     }
                 } else {
@@ -102,7 +107,7 @@ public:
                             success_ = true;
                             if (!ch_.recv_waiters_.empty()) {
                                 auto* receiver = ch_.recv_waiters_.pop_front();
-                                to_schedule = receiver->handle_;
+                                to_schedule = receiver->wake_state_;
                             }
                             should_suspend = false;
                         }
@@ -111,7 +116,7 @@ public:
 
                 if (should_suspend) {
                     // Cannot send now — suspend
-                    handle_ = h;
+                    wake_state_->set_handle(h);
                     ch_.send_waiters_.push_back(this);
                     suspended_ = true;  // Mark as enqueued
                 }
@@ -119,7 +124,7 @@ public:
 
             // Schedule outside lock to avoid deadlock
             if (to_schedule) {
-                elio::runtime::schedule_handle(to_schedule);
+                ch_.schedule_receiver_or_retry(to_schedule);
             }
 
             return should_suspend;
@@ -130,7 +135,7 @@ public:
     private:
         channel& ch_;
         T value_;
-        std::coroutine_handle<> handle_;
+        detail::wake_state_ptr wake_state_;
         bool success_ = false;
         bool suspended_ = false;  // True if enqueued in send_waiters_
 
@@ -140,7 +145,9 @@ public:
     /// Recv awaitable — handles bounded, unbounded, and rendezvous channels.
     class recv_awaitable : public elio::detail::intrusive_list_node<recv_awaitable> {
     public:
-        explicit recv_awaitable(channel& ch) : ch_(ch) {}
+        explicit recv_awaitable(channel& ch)
+            : ch_(ch)
+            , wake_state_(detail::make_wake_state()) {}
 
         ~recv_awaitable() {
             // Fast path: if we never suspended, we were never enqueued
@@ -151,6 +158,7 @@ public:
             if (this->is_linked()) {
                 ch_.recv_waiters_.remove(this);
             }
+            detail::cancel_wake_state(wake_state_);
         }
 
         bool await_ready() const noexcept { return false; }
@@ -172,7 +180,7 @@ public:
                 }
             }
 
-            handle_ = h;
+            wake_state_->set_handle(h);
             ch_.recv_waiters_.push_back(this);
             suspended_ = true;  // Mark as enqueued
             return true;
@@ -182,7 +190,7 @@ public:
 
     private:
         channel& ch_;
-        std::coroutine_handle<> handle_;
+        detail::wake_state_ptr wake_state_;
         bool suspended_ = false;  // True if enqueued in recv_waiters_
 
         friend class channel;
@@ -195,7 +203,7 @@ public:
         }
 
         if (is_unbounded()) {
-            std::coroutine_handle<> receiver_handle = nullptr;
+            detail::wake_state_ptr receiver_handle;
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 if (closed_) {
@@ -204,11 +212,11 @@ public:
                 queue_.push(std::move(value));
                 if (!recv_waiters_.empty()) {
                     auto* receiver = recv_waiters_.pop_front();
-                    receiver_handle = receiver->handle_;
+                    receiver_handle = receiver->wake_state_;
                 }
             }
             if (receiver_handle) {
-                elio::runtime::schedule_handle(receiver_handle);
+                schedule_receiver_or_retry(receiver_handle);
             }
             co_return true;
         }
@@ -216,7 +224,7 @@ public:
         // Bounded or rendezvous: try fast path, then suspend
         if (is_bounded() && ring_->size() < capacity_) {
             bool pushed = false;
-            std::coroutine_handle<> receiver_handle = nullptr;
+            detail::wake_state_ptr receiver_handle;
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 if (!closed_ && ring_->size() < capacity_) {
@@ -224,13 +232,13 @@ public:
                         pushed = true;
                         if (!recv_waiters_.empty()) {
                             auto* receiver = recv_waiters_.pop_front();
-                            receiver_handle = receiver->handle_;
+                            receiver_handle = receiver->wake_state_;
                         }
                     }
                 }
             }
             if (receiver_handle) {
-                elio::runtime::schedule_handle(receiver_handle);
+                schedule_receiver_or_retry(receiver_handle);
             }
             if (pushed) {
                 co_return true;
@@ -257,7 +265,7 @@ public:
         }
 
         if (is_bounded()) {
-            std::coroutine_handle<> receiver_handle = nullptr;
+            detail::wake_state_ptr receiver_handle;
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 if (closed_) return false;
@@ -265,48 +273,48 @@ public:
                 if (ring_->try_push(value)) {
                     if (!recv_waiters_.empty()) {
                         auto* receiver = recv_waiters_.pop_front();
-                        receiver_handle = receiver->handle_;
+                        receiver_handle = receiver->wake_state_;
                     }
                 } else {
                     return false;
                 }
             }
             if (receiver_handle) {
-                elio::runtime::schedule_handle(receiver_handle);
+                schedule_receiver_or_retry(receiver_handle);
             }
             return true;
         }
 
         if (is_rendezvous()) {
-            std::coroutine_handle<> receiver_handle = nullptr;
+            detail::wake_state_ptr receiver_handle;
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 if (closed_) return false;
                 if (!recv_waiters_.empty()) {
                     queue_.push(std::move(value));
                     auto* receiver = recv_waiters_.pop_front();
-                    receiver_handle = receiver->handle_;
+                    receiver_handle = receiver->wake_state_;
                 } else {
                     return false;
                 }
             }
-            elio::runtime::schedule_handle(receiver_handle);
+            schedule_receiver_or_retry(receiver_handle);
             return true;
         }
 
         // Unbounded
-        std::coroutine_handle<> receiver_handle = nullptr;
+        detail::wake_state_ptr receiver_handle;
         {
             std::lock_guard<std::mutex> guard(mutex_);
             if (closed_) return false;
             queue_.push(std::move(value));
             if (!recv_waiters_.empty()) {
                 auto* receiver = recv_waiters_.pop_front();
-                receiver_handle = receiver->handle_;
+                receiver_handle = receiver->wake_state_;
             }
         }
         if (receiver_handle) {
-            elio::runtime::schedule_handle(receiver_handle);
+            schedule_receiver_or_retry(receiver_handle);
         }
         return true;
     }
@@ -317,25 +325,25 @@ public:
             while (true) {
                 auto val = ring_->try_pop();
                 if (val.has_value()) {
-                    std::coroutine_handle<> sender_handle = nullptr;
+                    detail::wake_state_ptr sender_handle;
                     {
                         std::lock_guard<std::mutex> guard(mutex_);
                         if (!send_waiters_.empty()) {
                             auto* sender = send_waiters_.front();
                             if (ring_->try_push(sender->value_)) {
                                 sender->success_ = true;
-                                sender_handle = sender->handle_;
+                                sender_handle = sender->wake_state_;
                                 send_waiters_.pop_front();
                             }
                         }
                     }
                     if (sender_handle) {
-                        elio::runtime::schedule_handle(sender_handle);
+                        detail::schedule_wake_state(sender_handle);
                     }
                     co_return val;
                 }
 
-                std::coroutine_handle<> sender_handle = nullptr;
+                detail::wake_state_ptr sender_handle;
                 std::optional<T> result;
                 bool should_wait = false;
                 {
@@ -344,7 +352,7 @@ public:
                         auto* sender = send_waiters_.pop_front();
                         result = std::optional<T>(std::move(sender->value_));
                         sender->success_ = true;
-                        sender_handle = sender->handle_;
+                        sender_handle = sender->wake_state_;
                     } else if (closed_.load(std::memory_order_acquire)) {
                         if (!queue_.empty()) {
                             result = std::move(queue_.front());
@@ -357,7 +365,7 @@ public:
                     }
                 }
                 if (sender_handle) {
-                    elio::runtime::schedule_handle(sender_handle);
+                    detail::schedule_wake_state(sender_handle);
                 }
                 if (should_wait) {
                     recv_awaitable awaitable{*this};
@@ -370,7 +378,7 @@ public:
 
         // Unbounded or rendezvous
         while (true) {
-            std::coroutine_handle<> sender_handle = nullptr;
+            detail::wake_state_ptr sender_handle;
             std::optional<T> result;
             bool should_wait = false;
             {
@@ -382,7 +390,7 @@ public:
                     auto* sender = send_waiters_.pop_front();
                     result = std::optional<T>(std::move(sender->value_));
                     sender->success_ = true;
-                    sender_handle = sender->handle_;
+                    sender_handle = sender->wake_state_;
                 } else if (closed_.load(std::memory_order_acquire)) {
                     result = std::nullopt;
                 } else {
@@ -395,7 +403,7 @@ public:
                 continue;
             }
             if (sender_handle) {
-                elio::runtime::schedule_handle(sender_handle);
+                detail::schedule_wake_state(sender_handle);
             }
             co_return result;
         }
@@ -406,20 +414,20 @@ public:
         if (is_bounded()) {
             auto val = ring_->try_pop();
             if (val.has_value()) {
-                std::coroutine_handle<> sender_handle = nullptr;
+                detail::wake_state_ptr sender_handle;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
                     if (!send_waiters_.empty()) {
                         auto* sender = send_waiters_.front();
                         if (ring_->try_push(sender->value_)) {
                             sender->success_ = true;
-                            sender_handle = sender->handle_;
+                            sender_handle = sender->wake_state_;
                             send_waiters_.pop_front();
                         }
                     }
                 }
                 if (sender_handle) {
-                    elio::runtime::schedule_handle(sender_handle);
+                    detail::schedule_wake_state(sender_handle);
                 }
                 return val;
             }
@@ -435,7 +443,7 @@ public:
             return std::nullopt;
         }
 
-        std::coroutine_handle<> sender_handle = nullptr;
+        detail::wake_state_ptr sender_handle;
         std::optional<T> result;
         {
             std::lock_guard<std::mutex> guard(mutex_);
@@ -444,7 +452,7 @@ public:
                     auto* sender = send_waiters_.pop_front();
                     result = std::optional<T>(std::move(sender->value_));
                     sender->success_ = true;
-                    sender_handle = sender->handle_;
+                    sender_handle = sender->wake_state_;
                 } else {
                     return std::nullopt;
                 }
@@ -454,7 +462,7 @@ public:
             }
         }
         if (sender_handle) {
-            elio::runtime::schedule_handle(sender_handle);
+            detail::schedule_wake_state(sender_handle);
         }
         return result;
     }
@@ -466,7 +474,7 @@ public:
             return;
         }
 
-        std::vector<std::coroutine_handle<>> to_schedule;
+        std::vector<detail::wake_state_ptr> to_schedule;
         {
             std::lock_guard<std::mutex> guard(mutex_);
 
@@ -481,7 +489,7 @@ public:
                     auto* sender = send_waiters_.pop_front();
                     queue_.push(std::move(sender->value_));
                     sender->success_ = true;  // Value was delivered to queue
-                    to_schedule.push_back(sender->handle_);
+                    to_schedule.push_back(sender->wake_state_);
                 }
             }
 
@@ -491,21 +499,19 @@ public:
                     auto* sender = send_waiters_.pop_front();
                     queue_.push(std::move(sender->value_));
                     sender->success_ = true;  // Value was delivered to queue
-                    to_schedule.push_back(sender->handle_);
+                    to_schedule.push_back(sender->wake_state_);
                 }
             }
 
             // Wake all waiting receivers
             while (!recv_waiters_.empty()) {
                 auto* receiver = recv_waiters_.pop_front();
-                to_schedule.push_back(receiver->handle_);
+                to_schedule.push_back(receiver->wake_state_);
             }
         }
 
         // Schedule outside lock to avoid deadlock
-        for (auto h : to_schedule) {
-            elio::runtime::schedule_handle(h);
-        }
+        detail::schedule_wake_states(to_schedule);
     }
 
     /// Check if channel is closed
@@ -542,6 +548,21 @@ private:
 
     bool is_rendezvous() const noexcept {
         return capacity_ == 0;
+    }
+
+    void schedule_receiver_or_retry(detail::wake_state_ptr receiver) {
+        while (receiver) {
+            if (detail::schedule_wake_state(receiver)) {
+                return;
+            }
+
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (recv_waiters_.empty()) {
+                return;
+            }
+            auto* next = recv_waiters_.pop_front();
+            receiver = next->wake_state_;
+        }
     }
 
     mutable std::mutex mutex_;

@@ -85,6 +85,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handoff and canceled-construction cleanup, bounded-channel close state, and
   combinator waiter resume ordering. `when_any()` and `with_timeout()` also no
   longer require result types to be default-constructible. (#290, #760)
+- **Sync waiter wake ownership**: `event`, `condition_variable`, `mutex`,
+  `semaphore`, `shared_mutex`, and `channel` wake paths now keep a cancelable
+  wake token after dequeue, preventing a racing waiter-frame destruction from
+  leaving a stale coroutine handle to schedule. (#762)
 - **Cancellation callback exceptions**: Cancellation now invokes and releases
   every registered callback before rethrowing the first callback exception,
   including callbacks registered after cancellation. (#774)

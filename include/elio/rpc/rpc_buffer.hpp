@@ -332,6 +332,9 @@ public:
     
     /// Write raw bytes
     void write_bytes(const void* src, size_t n) {
+        if (n == 0) {
+            return;
+        }
         size_t old_size = data_.size();
         data_.resize(old_size + n);
         std::memcpy(data_.data() + old_size, src, n);

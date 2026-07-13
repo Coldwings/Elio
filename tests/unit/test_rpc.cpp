@@ -755,6 +755,32 @@ TEST_CASE("buffer_ref serialization", "[rpc][buffer_ref]") {
                        original_data.begin(), original_data.end()));
 }
 
+TEST_CASE("empty buffer_ref serialization", "[rpc][buffer_ref]") {
+    buffer_writer writer;
+    buffer_ref original;
+
+    serialize(writer, original);
+
+    REQUIRE(writer.size() == sizeof(uint32_t));
+
+    buffer_view view = writer.view();
+    buffer_ref result;
+    deserialize(view, result);
+
+    REQUIRE(result.empty());
+    REQUIRE(result.size() == 0);
+    REQUIRE(result.data() != nullptr);
+}
+
+TEST_CASE("buffer_writer ignores empty raw byte writes",
+          "[rpc][buffer][zero-length]") {
+    buffer_writer writer;
+
+    writer.write_bytes(nullptr, 0);
+
+    REQUIRE(writer.size() == 0);
+}
+
 // Test struct with buffer_ref field
 struct MessageWithBufferRef {
     int32_t id;

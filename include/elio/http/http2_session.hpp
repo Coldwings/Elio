@@ -79,6 +79,17 @@ struct h2_stream {
     }
 };
 
+namespace detail {
+
+inline response materialize_h2_response(h2_stream& stream) {
+    response resp(stream.response_status);
+    resp.set_body(std::move(stream.response_body));
+    resp.get_headers() = std::move(stream.response_headers);
+    return resp;
+}
+
+} // namespace detail
+
 /// Configuration used when creating an HTTP/2 session.
 struct h2_session_config {
     size_t max_concurrent_streams = 100;
@@ -348,11 +359,7 @@ public:
             co_return std::nullopt;
         }
         
-        response resp(stream.response_status);
-        for (const auto& [name, value] : stream.response_headers) {
-            resp.set_header(name, value);
-        }
-        resp.set_body(std::move(stream.response_body));
+        auto resp = detail::materialize_h2_response(stream);
         
         // Clean up completed stream
         streams_.erase(it);

@@ -1315,9 +1315,11 @@ public:
     
     // Poll for readability (awaitable)
     /* awaitable */ poll_read();
+    /* awaitable */ poll_read(coro::cancel_token token);
     
     // Poll for writability (awaitable)
     /* awaitable */ poll_write();
+    /* awaitable */ poll_write(coro::cancel_token token);
     
     // Get file descriptor
     int fd() const noexcept;

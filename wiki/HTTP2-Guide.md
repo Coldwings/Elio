@@ -196,6 +196,9 @@ coro::task<void> error_handling() {
 
     if (!resp) {
         switch (errno) {
+            case EOPNOTSUPP:
+                std::cerr << "Unsupported HTTP/2 request" << std::endl;
+                break;
             case ECONNREFUSED:
                 std::cerr << "Connection refused" << std::endl;
                 break;
@@ -218,6 +221,10 @@ coro::task<void> error_handling() {
     }
 }
 ```
+
+`h2_client::send()` rejects `method::CONNECT` with `EOPNOTSUPP`. The current
+HTTP/2 client supports ordinary request/response methods over TLS, but it does
+not implement HTTP/2 tunneling.
 
 ## Cancellation
 

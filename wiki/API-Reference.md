@@ -1786,6 +1786,11 @@ coro::task<std::optional<response>> h2_post(
 );
 ```
 
+`h2_client::send()` accepts ordinary request methods for HTTPS targets. HTTP/2
+`CONNECT` is not implemented by the high-level client; passing
+`method::CONNECT` fails before opening a connection, sets `errno` to
+`EOPNOTSUPP`, and returns `std::nullopt`.
+
 ### `h2_client_config`
 
 ```cpp
@@ -1833,8 +1838,9 @@ public:
 ```
 
 `submit_request()` validates HTTPS targets, request-target bytes, authority
-bytes, and generated header values before submitting to nghttp2. Validation
-failures return a negative errno-style value and set `errno`.
+bytes, generated header values, and rejects `method::CONNECT` before submitting
+to nghttp2. Validation failures return a negative errno-style value and set
+`errno`; unsupported `CONNECT` requests return `-EOPNOTSUPP`.
 
 ---
 

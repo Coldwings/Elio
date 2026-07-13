@@ -49,8 +49,6 @@ task<int> client_main(std::string_view host, uint16_t port) {
     
     // Interactive message loop
     std::string line;
-    char recv_buffer[1024];
-    
     while (std::getline(std::cin, line)) {
         if (line.empty()) {
             break;
@@ -60,21 +58,21 @@ task<int> client_main(std::string_view host, uint16_t port) {
         line += '\n';
         
         // Send message
-        auto sent = co_await stream.write(line);
+        auto sent = co_await stream.write_exactly(line);
         if (sent.result <= 0) {
             ELIO_LOG_ERROR("Send error: {} ({})", strerror(-sent.result), sent.result);
             break;
         }
         
         // Receive echo
-        auto received = co_await stream.read(recv_buffer, sizeof(recv_buffer) - 1);
+        std::string echo(line.size(), '\0');
+        auto received = co_await stream.read_exactly(echo.data(), echo.size());
         if (received.result <= 0) {
             ELIO_LOG_ERROR("Receive error: {} ({})", strerror(-received.result), received.result);
             break;
         }
         
-        recv_buffer[received.result] = '\0';
-        std::cout << "Echo: " << recv_buffer;
+        std::cout << "Echo: " << echo;
     }
     
     ELIO_LOG_INFO("Disconnecting...");
@@ -107,22 +105,18 @@ task<int> benchmark_main(std::string_view host, uint16_t port, int iterations) {
     auto start = std::chrono::steady_clock::now();
     
     for (int i = 0; i < iterations; ++i) {
-        auto sent = co_await stream.write(test_message, msg_len);
+        auto sent = co_await stream.write_exactly(test_message, msg_len);
         if (sent.result <= 0) {
             ELIO_LOG_ERROR("Send error at iteration {}: {} ({})", i,
                           strerror(-sent.result), sent.result);
             co_return 1;
         }
         
-        size_t total_received = 0;
-        while (total_received < msg_len) {
-            auto received = co_await stream.read(recv_buffer, sizeof(recv_buffer));
-            if (received.result <= 0) {
-                ELIO_LOG_ERROR("Receive error at iteration {}: {} ({})", i,
-                              strerror(-received.result), received.result);
-                co_return 1;
-            }
-            total_received += received.result;
+        auto received = co_await stream.read_exactly(recv_buffer, msg_len);
+        if (received.result <= 0) {
+            ELIO_LOG_ERROR("Receive error at iteration {}: {} ({})", i,
+                          strerror(-received.result), received.result);
+            co_return 1;
         }
     }
     

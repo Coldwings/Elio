@@ -12,6 +12,7 @@ endif()
 
 # Options - defaults are ON for top-level builds, OFF when used as a dependency
 option(ELIO_BUILD_TESTS "Build Elio tests" ${ELIO_IS_TOP_LEVEL})
+option(ELIO_BUILD_SANITIZER_TESTS "Build ASAN/TSAN test executables" ${ELIO_BUILD_TESTS})
 option(ELIO_BUILD_EXAMPLES "Build Elio examples" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_TLS "Enable TLS support (requires OpenSSL)" ${ELIO_IS_TOP_LEVEL})
 option(ELIO_ENABLE_HTTP "Enable HTTP client/server support (requires TLS)" ${ELIO_IS_TOP_LEVEL})
@@ -30,6 +31,13 @@ if(ELIO_ENABLE_HTTP2 AND NOT ELIO_ENABLE_HTTP)
         "ELIO_ENABLE_HTTP2=ON requires ELIO_ENABLE_HTTP=ON because "
         "HTTP/2 support builds on the HTTP/TLS target. Configure with "
         "-DELIO_ENABLE_HTTP=ON or -DELIO_ENABLE_HTTP2=OFF.")
+endif()
+
+if(ELIO_BUILD_SANITIZER_TESTS AND NOT ELIO_BUILD_TESTS)
+    message(FATAL_ERROR
+        "ELIO_BUILD_SANITIZER_TESTS=ON requires ELIO_BUILD_TESTS=ON because "
+        "the sanitizer executables are built from the test suite. Configure "
+        "with -DELIO_BUILD_TESTS=ON or -DELIO_BUILD_SANITIZER_TESTS=OFF.")
 endif()
 
 # Platform check - Linux only

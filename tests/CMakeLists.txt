@@ -167,49 +167,51 @@ if(TARGET elio_rdma_ibverbs)
 endif()
 target_compile_definitions(elio_tests PRIVATE ELIO_DEBUG)
 
-# ASAN-enabled test executable
-add_executable(elio_tests_asan ${TEST_SOURCES})
-target_link_libraries(elio_tests_asan PRIVATE elio Catch2::Catch2WithMain)
-if(TARGET elio_http)
-    target_link_libraries(elio_tests_asan PRIVATE elio_http)
-endif()
-if(TARGET elio_tls)
-    target_link_libraries(elio_tests_asan PRIVATE elio_tls)
-endif()
-if(TARGET nghttp2_static)
-    target_link_libraries(elio_tests_asan PRIVATE nghttp2_static)
-endif()
-if(TARGET elio_rdma_cm)
-    target_link_libraries(elio_tests_asan PRIVATE elio_rdma_cm)
-endif()
-if(TARGET elio_rdma_ibverbs)
-    target_link_libraries(elio_tests_asan PRIVATE elio_rdma_ibverbs)
-endif()
-target_compile_options(elio_tests_asan PRIVATE -fsanitize=address -g -fno-omit-frame-pointer)
-target_link_options(elio_tests_asan PRIVATE -fsanitize=address)
-target_compile_definitions(elio_tests_asan PRIVATE ELIO_DEBUG)
+if(ELIO_BUILD_SANITIZER_TESTS)
+    # ASAN-enabled test executable
+    add_executable(elio_tests_asan ${TEST_SOURCES})
+    target_link_libraries(elio_tests_asan PRIVATE elio Catch2::Catch2WithMain)
+    if(TARGET elio_http)
+        target_link_libraries(elio_tests_asan PRIVATE elio_http)
+    endif()
+    if(TARGET elio_tls)
+        target_link_libraries(elio_tests_asan PRIVATE elio_tls)
+    endif()
+    if(TARGET nghttp2_static)
+        target_link_libraries(elio_tests_asan PRIVATE nghttp2_static)
+    endif()
+    if(TARGET elio_rdma_cm)
+        target_link_libraries(elio_tests_asan PRIVATE elio_rdma_cm)
+    endif()
+    if(TARGET elio_rdma_ibverbs)
+        target_link_libraries(elio_tests_asan PRIVATE elio_rdma_ibverbs)
+    endif()
+    target_compile_options(elio_tests_asan PRIVATE -fsanitize=address -g -fno-omit-frame-pointer)
+    target_link_options(elio_tests_asan PRIVATE -fsanitize=address)
+    target_compile_definitions(elio_tests_asan PRIVATE ELIO_DEBUG)
 
-# TSAN-enabled test executable
-add_executable(elio_tests_tsan ${TEST_SOURCES})
-target_link_libraries(elio_tests_tsan PRIVATE elio Catch2::Catch2WithMain)
-if(TARGET elio_http)
-    target_link_libraries(elio_tests_tsan PRIVATE elio_http)
+    # TSAN-enabled test executable
+    add_executable(elio_tests_tsan ${TEST_SOURCES})
+    target_link_libraries(elio_tests_tsan PRIVATE elio Catch2::Catch2WithMain)
+    if(TARGET elio_http)
+        target_link_libraries(elio_tests_tsan PRIVATE elio_http)
+    endif()
+    if(TARGET elio_tls)
+        target_link_libraries(elio_tests_tsan PRIVATE elio_tls)
+    endif()
+    if(TARGET nghttp2_static)
+        target_link_libraries(elio_tests_tsan PRIVATE nghttp2_static)
+    endif()
+    if(TARGET elio_rdma_cm)
+        target_link_libraries(elio_tests_tsan PRIVATE elio_rdma_cm)
+    endif()
+    if(TARGET elio_rdma_ibverbs)
+        target_link_libraries(elio_tests_tsan PRIVATE elio_rdma_ibverbs)
+    endif()
+    target_compile_options(elio_tests_tsan PRIVATE -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan)
+    target_link_options(elio_tests_tsan PRIVATE -fsanitize=thread)
+    target_compile_definitions(elio_tests_tsan PRIVATE ELIO_DEBUG)
 endif()
-if(TARGET elio_tls)
-    target_link_libraries(elio_tests_tsan PRIVATE elio_tls)
-endif()
-if(TARGET nghttp2_static)
-    target_link_libraries(elio_tests_tsan PRIVATE nghttp2_static)
-endif()
-if(TARGET elio_rdma_cm)
-    target_link_libraries(elio_tests_tsan PRIVATE elio_rdma_cm)
-endif()
-if(TARGET elio_rdma_ibverbs)
-    target_link_libraries(elio_tests_tsan PRIVATE elio_rdma_ibverbs)
-endif()
-target_compile_options(elio_tests_tsan PRIVATE -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan)
-target_link_options(elio_tests_tsan PRIVATE -fsanitize=thread)
-target_compile_definitions(elio_tests_tsan PRIVATE ELIO_DEBUG)
 
 # Stress test executable for shared_mutex
 add_executable(stress_test_shared_mutex stress_test_shared_mutex.cpp)
@@ -225,12 +227,14 @@ target_compile_definitions(stress_test_shared_mutex PRIVATE ELIO_DEBUG)
 # Register tests with CTest
 include(Catch)
 catch_discover_tests(elio_tests)
-catch_discover_tests(elio_tests_asan
-    TEST_PREFIX "elio_tests_asan."
-)
-catch_discover_tests(elio_tests_tsan
-    TEST_PREFIX "elio_tests_tsan."
-)
+if(ELIO_BUILD_SANITIZER_TESTS)
+    catch_discover_tests(elio_tests_asan
+        TEST_PREFIX "elio_tests_asan."
+    )
+    catch_discover_tests(elio_tests_tsan
+        TEST_PREFIX "elio_tests_tsan."
+    )
+endif()
 
 add_test(NAME package_rdma_cuda_export_metadata
     COMMAND ${CMAKE_COMMAND}
@@ -365,14 +369,16 @@ add_custom_target(test_all
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
-add_custom_target(test_asan
-    COMMAND ${CMAKE_CTEST_COMMAND} -R "^elio_tests_asan\\." --output-on-failure
-    DEPENDS elio_tests_asan
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-)
+if(ELIO_BUILD_SANITIZER_TESTS)
+    add_custom_target(test_asan
+        COMMAND ${CMAKE_CTEST_COMMAND} -R "^elio_tests_asan\\." --output-on-failure
+        DEPENDS elio_tests_asan
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    )
 
-add_custom_target(test_tsan
-    COMMAND ${CMAKE_CTEST_COMMAND} -R "^elio_tests_tsan\\." --output-on-failure
-    DEPENDS elio_tests_tsan
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-)
+    add_custom_target(test_tsan
+        COMMAND ${CMAKE_CTEST_COMMAND} -R "^elio_tests_tsan\\." --output-on-failure
+        DEPENDS elio_tests_tsan
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    )
+endif()

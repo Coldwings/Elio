@@ -1160,35 +1160,67 @@ TEST_CASE("rpc_client create starts receive loop for existing streams",
     using namespace elio::runtime;
     namespace coro = elio::coro;
 
-    int fds[2] = {-1, -1};
-    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-
-    auto read_exact_fd = [](int fd, uint8_t* data, size_t length) {
-        size_t done = 0;
-        while (done < length) {
-            ssize_t n = ::read(fd, data + done, length - done);
-            REQUIRE(n > 0);
-            done += static_cast<size_t>(n);
-        }
-    };
-    auto write_exact_fd = [](int fd, const uint8_t* data, size_t length) {
-        size_t done = 0;
-        while (done < length) {
-            ssize_t n = ::write(fd, data + done, length - done);
-            REQUIRE(n > 0);
-            done += static_cast<size_t>(n);
-        }
-    };
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    int bind_errno = errno;
+    CAPTURE(bind_errno);
+    if (!listener_opt && bind_errno == EPERM) {
+        SKIP("TCP listener creation is denied by this sandbox");
+    }
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
 
     scheduler sched(2);
     sched.start();
 
+    std::promise<bool> server_promise;
+    auto server_future = server_promise.get_future();
     std::promise<std::optional<std::string>> result_promise;
     auto result_future = result_promise.get_future();
 
-    sched.go([client_fd = fds[0], p = std::move(result_promise)]() mutable
+    sched.go([&lst = *listener_opt, p = std::move(server_promise)]() mutable
                  -> coro::task<void> {
-        auto client = tcp_rpc_client::create(tcp_stream(client_fd));
+        auto stream = co_await lst.accept();
+        if (!stream) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto frame = co_await read_frame(*stream);
+        if (!frame) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto& [header, payload] = *frame;
+        if (header.type != message_type::request ||
+            header.method_id != ExistingStreamCreateMethod::id) {
+            p.set_value(false);
+            co_return;
+        }
+
+        buffer_view request_view(payload.data(), payload.size());
+        auto [timeout_ms, request] = parse_request<TestRequest>(
+            request_view, header.flags);
+        if (!timeout_ms.has_value() || request.value != 7) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto response = build_response(
+            header.request_id, TestResponse{"created"});
+        bool sent = co_await write_frame(*stream, response.first, response.second);
+        co_await stream->close();
+        p.set_value(sent);
+    });
+
+    sched.go([port, p = std::move(result_promise)]() mutable -> coro::task<void> {
+        auto stream = co_await tcp_connect(ipv6_address("::1", port));
+        if (!stream) {
+            p.set_value(std::nullopt);
+            co_return;
+        }
+
+        auto client = tcp_rpc_client::create(std::move(*stream));
         auto result = co_await client->call<ExistingStreamCreateMethod>(
             TestRequest{7}, elio::test::scaled_sec(2));
 
@@ -1200,32 +1232,9 @@ TEST_CASE("rpc_client create starts receive loop for existing streams",
         client->close();
     });
 
-    std::array<uint8_t, frame_header_size> request_header_bytes{};
-    read_exact_fd(fds[1], request_header_bytes.data(), request_header_bytes.size());
-
-    auto request_header = frame_header::from_bytes(request_header_bytes.data());
-    REQUIRE(request_header.type == message_type::request);
-    REQUIRE(request_header.method_id == ExistingStreamCreateMethod::id);
-
-    std::vector<uint8_t> request_payload(request_header.payload_length);
-    if (!request_payload.empty()) {
-        read_exact_fd(fds[1], request_payload.data(), request_payload.size());
-    }
-
-    buffer_view request_view(request_payload.data(), request_payload.size());
-    auto [timeout_ms, request] = parse_request<TestRequest>(
-        request_view, request_header.flags);
-    REQUIRE(timeout_ms.has_value());
-    REQUIRE(request.value == 7);
-
-    auto response = build_response(
-        request_header.request_id, TestResponse{"created"});
-    auto response_header_bytes = response.first.to_bytes();
-    write_exact_fd(fds[1], response_header_bytes.data(), response_header_bytes.size());
-    if (response.second.size() > 0) {
-        write_exact_fd(fds[1], response.second.data(), response.second.size());
-    }
-
+    REQUIRE(server_future.wait_for(elio::test::scaled_sec(5)) ==
+            std::future_status::ready);
+    REQUIRE(server_future.get());
     REQUIRE(result_future.wait_for(elio::test::scaled_sec(5)) ==
             std::future_status::ready);
     auto result = result_future.get();
@@ -1233,7 +1242,6 @@ TEST_CASE("rpc_client create starts receive loop for existing streams",
     REQUIRE(*result == "created");
 
     REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
-    ::close(fds[1]);
 }
 
 TEST_CASE("rpc_client start attaches off-scheduler clients once",

@@ -12,7 +12,8 @@
 /// Usage:
 /// @code
 /// auto client = co_await rpc_client<tcp_stream>::connect(addr);
-/// auto result = co_await client->call<MyMethod>(request, 5000ms);
+/// if (!client) co_return;
+/// auto result = co_await (*client)->call<MyMethod>(request, 5000ms);
 /// if (result.ok()) {
 ///     process(result.value());
 /// }

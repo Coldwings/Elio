@@ -111,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Signal mask error reporting**: `signal_set` now exposes direct
   `pthread_sigmask()` error-code helpers, and `signal_fd` reports automatic
   block failures from that direct error code instead of stale `errno`. (#791)
+- **io_uring submit retry accounting**: Public `io_uring_backend::submit()`
+  now keeps staged SQEs accounted for when `io_uring_submit()` returns a
+  negative error, allowing later submit/poll attempts to retry them instead of
+  making `run_until_complete()` believe suspended awaiters have no pending
+  work. (#829)
 - **Batch I/O fallback errors**: Synchronous `batch_read()` and `batch_write()`
   fallback paths now report syscall failures as `-errno`, matching io_uring and
   the public I/O result contract. (#763)

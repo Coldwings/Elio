@@ -70,13 +70,12 @@ namespace elio::io {
 // waits for cancel CQEs as well as the original op's -ECANCELED CQE, which
 // is fine — both arrive promptly.
 //
-// Why not just skip counting the cancel SQE? Because the ``submit()``
-// rollback path (introduced in PR #58 to recover from io_uring_submit
-// failures) rolls back ``io_uring_sq_ready()`` from ``pending_ops_``, which
-// includes every staged SQE. Excluding cancels there would either cause an
-// unsigned underflow on submit failure or require a parallel "internal SQE"
-// counter, both of which add complexity to an error path. The
-// every-SQE-counted scheme keeps the rollback math trivial.
+// Why not just skip counting the cancel SQE? Because queued-but-not-yet
+// submitted SQEs remain retryable after short submits and transient submit
+// failures. Counting every staged SQE uniformly means ``has_pending()`` keeps
+// the poll loop alive until a real CQE arrives, including the CQE for the
+// cancel SQE itself. Excluding cancels would require a parallel "internal SQE"
+// counter for submit retry and completion accounting.
 //
 // Net effect: ``pending_count()`` reports user ops in flight plus any
 // in-flight cancel SQEs. Once a cancel completes, the count returns to
@@ -440,10 +439,9 @@ public:
         int submitted = io_uring_submit(&ring_);
         if (submitted < 0) {
             ELIO_LOG_ERROR("io_uring_submit failed: {}", strerror(-submitted));
-            // Rollback pending_ops for the operations that failed to submit.
-            // Without this rollback, pending_ops_ stays elevated forever and
-            // has_pending() / poll() will spin or block indefinitely.
-            pending_ops_.fetch_sub(pending, std::memory_order_relaxed);
+            // The SQEs are still staged in the submission queue. Keep their
+            // pending_ops_ accounting intact so a later submit()/poll() can
+            // retry them and their eventual CQEs can balance the count.
             return submitted;
         }
 
@@ -601,11 +599,11 @@ public:
         io_uring_prep_cancel(sqe, user_data, 0);
         io_uring_sqe_set_data(sqe, nullptr);  // No awaiter for cancel itself
 
-        // Count the cancel SQE itself in pending_ops_ so the submit()
-        // rollback path can use io_uring_sq_ready() without an extra
-        // "internal SQE" counter (see invariant block at top of file).
-        // The matching CQE arrives with nullptr user_data and is decremented
-        // back out by process_completion, restoring the count.
+        // Count the cancel SQE itself in pending_ops_ so submit retry and
+        // completion accounting can treat it like every other staged SQE
+        // (see invariant block at top of file). The matching CQE arrives
+        // with nullptr user_data and is decremented back out by
+        // process_completion, restoring the count.
         pending_ops_.fetch_add(1, std::memory_order_relaxed);
 
         // Stage only — the next poll() auto-submits. Cancellation latency

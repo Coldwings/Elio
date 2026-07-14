@@ -42,6 +42,36 @@ using namespace elio::io;
 using namespace elio::coro;
 using namespace elio::runtime;
 
+#if ELIO_HAS_IO_URING
+namespace {
+
+template<typename Ring>
+void poison_io_uring_submit_fds(Ring* ring,
+                                int& original_ring_fd,
+                                int& original_enter_ring_fd) {
+    original_ring_fd = ring->ring_fd;
+    ring->ring_fd = -1;
+
+    original_enter_ring_fd = -1;
+    if constexpr (requires(Ring* r) { r->enter_ring_fd; }) {
+        original_enter_ring_fd = ring->enter_ring_fd;
+        ring->enter_ring_fd = -1;
+    }
+}
+
+template<typename Ring>
+void restore_io_uring_submit_fds(Ring* ring,
+                                 int original_ring_fd,
+                                 int original_enter_ring_fd) {
+    ring->ring_fd = original_ring_fd;
+    if constexpr (requires(Ring* r) { r->enter_ring_fd; }) {
+        ring->enter_ring_fd = original_enter_ring_fd;
+    }
+}
+
+} // namespace
+#endif
+
 TEST_CASE("io_context creation", "[io][context]") {
     SECTION("default constructor uses auto-detection") {
         io_context ctx;
@@ -226,6 +256,51 @@ TEST_CASE("io_uring short submit keeps excess operations pending",
         REQUIRE(std::all_of(st.results.begin(), st.results.end(),
                             [](int result) { return result == 0; }));
     }
+#else
+    SUCCEED("io_uring backend is not compiled in");
+#endif
+}
+
+TEST_CASE("io_uring submit failure keeps staged operation pending",
+          "[io][io_uring][submit][regression]") {
+#if ELIO_HAS_IO_URING
+    if (!io_uring_backend::is_available()) {
+        SUCCEED("io_uring is not available at runtime");
+        return;
+    }
+
+    io_uring_backend backend;
+    auto* ring = backend.get_ring();
+    REQUIRE(ring != nullptr);
+
+    char buffer = 0;
+    io_request req{};
+    req.op = io_op::read;
+    req.fd = -1;
+    req.buffer = &buffer;
+    req.length = sizeof(buffer);
+
+    REQUIRE(backend.prepare(req));
+    REQUIRE(backend.pending_count() == 1);
+
+    // Force the public submit() path to see a ring-level failure without
+    // consuming the staged SQE. Restoring ring_fd lets the same SQE retry.
+    int original_ring_fd = -1;
+    int original_enter_ring_fd = -1;
+    poison_io_uring_submit_fds(ring, original_ring_fd, original_enter_ring_fd);
+    REQUIRE(original_ring_fd >= 0);
+    int submitted = backend.submit();
+    restore_io_uring_submit_fds(ring, original_ring_fd, original_enter_ring_fd);
+
+    REQUIRE(submitted < 0);
+    REQUIRE(backend.pending_count() == 1);
+
+    REQUIRE(backend.submit() >= 0);
+    for (int attempts = 0; backend.pending_count() != 0 && attempts < 20; ++attempts) {
+        backend.poll(std::chrono::milliseconds(10));
+    }
+
+    REQUIRE(backend.pending_count() == 0);
 #else
     SUCCEED("io_uring backend is not compiled in");
 #endif

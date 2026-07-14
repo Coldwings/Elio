@@ -87,6 +87,7 @@ enum class message_flags : uint8_t {
     has_checksum = 1 << 1,   ///< Message has CRC32 checksum trailer
     compressed = 1 << 2,     ///< Payload is compressed (reserved)
     streaming = 1 << 3,      ///< Part of a streaming call (reserved)
+    no_response = 1 << 4,    ///< Request does not expect response/error
 };
 
 inline message_flags operator|(message_flags a, message_flags b) {
@@ -550,6 +551,21 @@ std::pair<frame_header, buffer_writer> build_request(
     header.payload_length = static_cast<uint32_t>(payload.size());
     
     return {header, std::move(payload)};
+}
+
+/// Build a one-way request frame. Peers that understand `no_response` must
+/// execute the request without emitting response or error frames for this ID.
+template<typename Request>
+std::pair<frame_header, buffer_writer> build_oneway_request(
+    uint32_t request_id,
+    method_id_t method_id,
+    const Request& request,
+    bool enable_checksum = false)
+{
+    auto frame = build_request(
+        request_id, method_id, request, std::nullopt, enable_checksum);
+    frame.first.flags = frame.first.flags | message_flags::no_response;
+    return frame;
 }
 
 /// Build a response frame

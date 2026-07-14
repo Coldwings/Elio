@@ -27,7 +27,7 @@ Large payloads such as file contents or binary data can be referenced without fi
 
 ### Why cleanup callbacks
 
-When a response references data that must outlive serialization and the send operation (e.g., memory-mapped files, shared buffers), cleanup callbacks ensure that the referenced data is released only after the response is fully transmitted. Without this mechanism, the server could release the backing memory while the RPC layer is still building or sending the response.
+When a response references data that must outlive serialization and the send operation (e.g., memory-mapped files, shared buffers), cleanup callbacks ensure that the referenced data is released only after the response is fully transmitted. For `no_response` one-way requests, there is no send operation; cleanup runs after the handler result has been serialized and the unsent response payload can be discarded. Without this mechanism, the server could release the backing memory while the RPC layer is still building or sending the response.
 
 ## Quick Start
 
@@ -290,7 +290,8 @@ All messages use a binary wire format with little-endian byte order:
 - **magic** (4 bytes): `0x454C494F` ("ELIO")
 - **request_id** (4 bytes): Correlation ID for matching responses
 - **type** (1 byte): Message type (request=0, response=1, error=2, ping=3, pong=4, cancel=5)
-- **flags** (1 byte): Message flags (has_timeout=0x01, has_checksum=0x02)
+- **flags** (1 byte): Message flags (`has_timeout=0x01`,
+  `has_checksum=0x02`, `no_response=0x10` on request frames)
 - **method_id** (4 bytes): Method being called (for requests)
 - **payload_length** (4 bytes): Length of payload in bytes
 - **version** (1 byte): Protocol version, currently `protocol_version` (1)
@@ -469,6 +470,13 @@ Send messages without waiting for response:
 ```cpp
 co_await client->send_oneway<NotifyEvent>(event);
 ```
+
+One-way sends use the protocol `no_response` request flag. Servers that
+understand this flag still run the handler, but they do not emit a response or
+error frame for that request ID, preventing delayed one-way replies from being
+matched with unrelated future calls after request-ID wrap. This guarantee
+requires both peers to understand `no_response`; older or non-compliant servers
+that ignore the flag may still send late replies.
 
 ### Keepalive Ping
 

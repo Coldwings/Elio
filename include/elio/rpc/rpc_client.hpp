@@ -524,7 +524,8 @@ public:
         if (!request_id) {
             co_return false;
         }
-        auto request_frame = build_request(*request_id, Method::id, request);
+        auto request_frame = build_oneway_request(
+            *request_id, Method::id, request);
 
         co_await send_mutex_.lock();
         sync::lock_guard send_guard(send_mutex_);

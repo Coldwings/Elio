@@ -72,6 +72,8 @@ struct TestResponse {
     ELIO_RPC_FIELDS(TestResponse, result)
 };
 
+using OnewayNoResponseMethod = ELIO_RPC_METHOD(305, TestRequest, TestResponse);
+
 // ============================================================================
 // Buffer tests
 // ============================================================================
@@ -850,6 +852,23 @@ TEST_CASE("build request with timeout and checksum", "[rpc][protocol]") {
     REQUIRE(has_flag(header.flags, message_flags::has_timeout));
 }
 
+TEST_CASE("build one-way request marks no response", "[rpc][protocol]") {
+    TestRequest req{100};
+    auto [header, payload] = build_oneway_request(
+        1, OnewayNoResponseMethod::id, req, true);
+
+    REQUIRE(header.type == message_type::request);
+    REQUIRE(header.method_id == OnewayNoResponseMethod::id);
+    REQUIRE(has_flag(header.flags, message_flags::no_response));
+    REQUIRE(has_flag(header.flags, message_flags::has_checksum));
+    REQUIRE_FALSE(has_flag(header.flags, message_flags::has_timeout));
+
+    buffer_view view = payload.view();
+    auto [timeout, parsed] = parse_request<TestRequest>(view, header.flags);
+    REQUIRE_FALSE(timeout.has_value());
+    REQUIRE(parsed.value == 100);
+}
+
 TEST_CASE("build response with checksum", "[rpc][protocol]") {
     TestResponse resp{"ok"};
     auto [header, payload] = build_response(1, resp, true);
@@ -1077,6 +1096,144 @@ TEST_CASE("rpc writev_exact retries transient writev errors",
         REQUIRE(stream.poll_write_calls == 1);
         REQUIRE(stream.written.empty());
     }
+}
+
+TEST_CASE("send_oneway writes a no-response request frame",
+          "[rpc][contract][request_id]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    int fds[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    auto client = tcp_rpc_client::create(tcp_stream(fds[0]));
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> done{false};
+    std::atomic<bool> sent{false};
+    sched.go([client, &done, &sent]() -> coro::task<void> {
+        bool ok = co_await client->send_oneway<OnewayNoResponseMethod>(
+            TestRequest{42});
+        sent.store(ok, std::memory_order_release);
+        done.store(true, std::memory_order_release);
+    });
+
+    std::array<uint8_t, frame_header_size> header_bytes{};
+    size_t got = 0;
+    while (got < header_bytes.size()) {
+        ssize_t n = ::read(
+            fds[1], header_bytes.data() + got, header_bytes.size() - got);
+        REQUIRE(n > 0);
+        got += static_cast<size_t>(n);
+    }
+
+    auto header = frame_header::from_bytes(header_bytes.data());
+    std::vector<uint8_t> payload(header.payload_length);
+    got = 0;
+    while (got < payload.size()) {
+        ssize_t n = ::read(fds[1], payload.data() + got, payload.size() - got);
+        REQUIRE(n > 0);
+        got += static_cast<size_t>(n);
+    }
+
+    for (int i = 0; i < 2000 && !done.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    REQUIRE(done.load(std::memory_order_acquire));
+    REQUIRE(sent.load(std::memory_order_acquire));
+    REQUIRE(header.type == message_type::request);
+    REQUIRE(header.method_id == OnewayNoResponseMethod::id);
+    REQUIRE(has_flag(header.flags, message_flags::no_response));
+
+    client.reset();
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+    ::close(fds[1]);
+}
+
+TEST_CASE("rpc session suppresses replies for no-response requests",
+          "[rpc][contract][request_id]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    rpc_server_config cfg;
+    cfg.frame_read_timeout = std::chrono::seconds(1);
+    auto server = std::make_shared<rpc_server<tcp_stream>>(cfg);
+
+    std::atomic<bool> handler_called{false};
+    std::atomic<bool> cleanup_called{false};
+    server->register_method_with_cleanup<OnewayNoResponseMethod>(
+        [&handler_called, &cleanup_called](const TestRequest& req)
+            -> coro::task<std::pair<TestResponse, cleanup_callback_t>> {
+            handler_called.store(true, std::memory_order_release);
+            co_return std::make_pair(
+                TestResponse{std::to_string(req.value)},
+                [&cleanup_called] {
+                    cleanup_called.store(true, std::memory_order_release);
+                });
+        });
+
+    scheduler sched(2);
+    sched.start();
+
+    sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
+        auto stream = co_await lst.accept();
+        if (!stream) co_return;
+        co_await server->handle_client(std::move(*stream));
+    });
+
+    std::promise<bool> done_promise;
+    auto done = done_promise.get_future();
+
+    sched.go([&, p = std::move(done_promise), port]() mutable -> coro::task<void> {
+        auto client = co_await tcp_connect(ipv6_address("::1", port));
+        if (!client) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto frame = build_oneway_request(
+            77, OnewayNoResponseMethod::id, TestRequest{42});
+        bool sent_ok = co_await write_frame(*client, frame.first, frame.second);
+        if (!sent_ok) {
+            p.set_value(false);
+            co_return;
+        }
+
+        for (int i = 0;
+             i < 2000 &&
+             !(handler_called.load(std::memory_order_acquire) &&
+               cleanup_called.load(std::memory_order_acquire));
+             ++i) {
+            co_await elio::time::sleep_for(elio::test::scaled_ms(1));
+        }
+
+        co_await elio::time::sleep_for(elio::test::scaled_ms(50));
+
+        uint8_t byte = 0;
+        ssize_t n = ::recv(client->fd(), &byte, sizeof(byte), MSG_DONTWAIT);
+        int recv_errno = errno;
+        bool no_reply = n < 0 &&
+            (recv_errno == EAGAIN || recv_errno == EWOULDBLOCK);
+
+        co_await client->close();
+        p.set_value(
+            handler_called.load(std::memory_order_acquire) &&
+            cleanup_called.load(std::memory_order_acquire) &&
+            no_reply);
+    });
+
+    auto status = done.wait_for(std::chrono::seconds(60));
+    REQUIRE(status == std::future_status::ready);
+    REQUIRE(done.get());
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 }
 
 TEST_CASE("rpc_server stop wakes TCP serve blocked in accept",

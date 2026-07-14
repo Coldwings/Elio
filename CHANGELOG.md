@@ -124,6 +124,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collision probing to the current pending-request count plus one, avoiding a
   possible `UINT32_MAX`-probe CPU spin before reporting local reservation
   failure. (#846)
+- **Batch io_uring submit retry accounting**: `batch_read()` and
+  `batch_write()` now keep staged batch SQEs accounted and suspended after a
+  negative direct submit result, so later poll retries cannot submit stale
+  `batch_completion` user data after the awaitable has inline-completed. (#842)
 - **Batch I/O fallback errors**: Synchronous `batch_read()` and `batch_write()`
   fallback paths now report syscall failures as `-errno`, matching io_uring and
   the public I/O result contract. (#763)

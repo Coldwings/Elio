@@ -743,7 +743,9 @@ inline void mark_batch_inline_completed(batch_state& st) noexcept {
 /// Returns true on success (caller must NOT resume; the final CQE will
 /// resume the awaiter via the trampolines). Returns false if the io_uring
 /// backend is unavailable or every SQE allocation failed; the caller should
-/// then either fall back to sequential I/O or resume immediately.
+/// then either fall back to sequential I/O or resume immediately. A negative
+/// submit after at least one SQE is staged still returns true because liburing
+/// keeps those SQEs queued for a later submit/poll retry.
 template<typename PrepFn, typename SubmitFn>
 inline bool submit_batch_io_uring_with_submitter(io_uring_backend* backend,
                                                  batch_state& st,
@@ -794,18 +796,13 @@ inline bool submit_batch_io_uring_with_submitter(io_uring_backend* backend,
     backend->register_pending(in_flight);
     int submitted = submit_ring(ring);
     if (submitted < 0) {
-        // Submit failed entirely: rollback pending_ops_ and mark all
-        // in-flight segments as failed so the awaiter resumes promptly.
         ELIO_LOG_ERROR("submit_batch_io_uring: io_uring_submit failed: {}",
                        strerror(-submitted));
-        backend->unregister_pending(in_flight);
-        st.completed.fetch_add(static_cast<int>(in_flight), std::memory_order_acq_rel);
-        for (size_t i = 0; i < static_cast<size_t>(st.total); ++i) {
-            if (st.results[i] == 0) {
-                st.results[i] = submitted;  // propagate the error
-            }
-        }
-        return false;
+        // The staged SQEs remain in the submission queue, with user_data
+        // pointing at this batch_state's trampolines. Keep them accounted
+        // and suspended so poll()/submit() can retry and real CQEs can
+        // complete the batch.
+        return true;
     }
     if (is_io_uring_short_submit(in_flight, submitted)) {
         // Positive short submit: liburing leaves the unconsumed SQEs queued.

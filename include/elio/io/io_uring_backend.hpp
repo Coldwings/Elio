@@ -644,7 +644,11 @@ public:
         }
     }
 
-    /// Rollback pending_ops_ for SQEs that failed to submit.
+    /// Adjust pending_ops_ for externally accounted work that is proven not to
+    /// have a queued SQE/CQE. Do not use this after a negative
+    /// io_uring_submit() once SQEs have been staged; liburing may keep them
+    /// queued for a later retry, and their eventual CQEs must balance the
+    /// accounting.
     void unregister_pending(size_t n) noexcept {
         if (n) {
             pending_ops_.fetch_sub(n, std::memory_order_relaxed);

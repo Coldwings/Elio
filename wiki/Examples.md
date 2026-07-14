@@ -904,11 +904,11 @@ using elio::rdma::buffer_view;
 elio::coro::task<void> ping_side(connection<mock_backend>& conn) {
     std::vector<char> tx(128), rx(128);
     for (int i = 0; i < 16; ++i) {
-        auto recv_aw = conn.recv(buffer_view{rx.data(), rx.size(), 0});
+        auto recv_aw = conn.recv(buffer_view{rx.data(), rx.size(), 0}).start();
         std::string msg = "ping " + std::to_string(i);
         std::memcpy(tx.data(), msg.data(), msg.size());
         co_await conn.send(buffer_view{tx.data(), msg.size(), 0});
-        auto wc = co_await recv_aw;
+        auto wc = co_await std::move(recv_aw);
         // wc.byte_len tells us how much was echoed
     }
 }
@@ -938,9 +938,9 @@ elio::coro::task<void> client(elio::runtime::scheduler& sched) {
                                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
 
     // Post recv for OOB notify BEFORE sending the request.
-    auto notify_aw = ep.conn().recv(notify_mr.view());
+    auto notify_aw = ep.conn().recv(notify_mr.view()).start();
     co_await ep.conn().send(req_mr.view(0, sizeof(request_header)));
-    auto wc = co_await notify_aw;
+    auto wc = co_await std::move(notify_aw);
     // wc.imm_data carries the response length
 }
 ```

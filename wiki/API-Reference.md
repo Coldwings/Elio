@@ -1394,10 +1394,14 @@ public:
 
     // Write data (awaitable)
     /* awaitable */ write(const void* data, size_t size);
+    /* awaitable */ write(const void* data, size_t size, coro::cancel_token token);
+    /* awaitable */ write(std::string_view data, coro::cancel_token token);
 
     // Exact-length helpers (awaitable)
     /* awaitable */ read_exactly(void* buffer, size_t size);
     /* awaitable */ write_exactly(const void* data, size_t size);
+    /* awaitable */ write_exactly(const void* data, size_t size, coro::cancel_token token);
+    /* awaitable */ write_exactly(std::string_view data, coro::cancel_token token);
 
     // Scatter-gather write attempt and readiness polling
     /* awaitable */ writev(struct iovec* iovecs, size_t count);

@@ -1942,6 +1942,215 @@ TEST_CASE("call timeout watcher is cancelled after completion",
     REQUIRE(drain_elapsed < call_timeout);
 }
 
+TEST_CASE("rpc ping succeeds on pong frame",
+          "[rpc][ping][protocol]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    scheduler sched(3);
+    sched.start();
+
+    std::promise<bool> server_replied_promise;
+    auto server_replied = server_replied_promise.get_future();
+
+    sched.go([&, &lst = *listener_opt,
+              p = std::move(server_replied_promise)]() mutable
+        -> coro::task<void> {
+        auto stream = co_await lst.accept();
+        if (!stream) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto frame = co_await read_frame(*stream);
+        if (!frame || frame->first.type != message_type::ping) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto pong = build_pong(frame->first.request_id);
+        buffer_writer empty;
+        bool sent = co_await write_frame(*stream, pong, empty);
+        p.set_value(sent);
+
+        stream->shutdown_socket();
+        co_await stream->close();
+    });
+
+    std::promise<std::pair<bool, bool>> ping_done_promise;
+    auto ping_done = ping_done_promise.get_future();
+
+    sched.go([&, port, p = std::move(ping_done_promise)]() mutable
+        -> coro::task<void> {
+        auto client_opt = co_await tcp_rpc_client::connect("::1", port);
+        if (!client_opt) {
+            p.set_value({false, false});
+            co_return;
+        }
+
+        auto client = *client_opt;
+        bool ping_ok = co_await client->ping(elio::test::scaled_sec(30));
+        client->close();
+        p.set_value({true, ping_ok});
+    });
+
+    auto reply_status = server_replied.wait_for(std::chrono::seconds(60));
+    REQUIRE(reply_status == std::future_status::ready);
+    REQUIRE(server_replied.get());
+
+    auto ping_status = ping_done.wait_for(elio::test::scaled_sec(5));
+    REQUIRE(ping_status == std::future_status::ready);
+    auto [connected, ping_ok] = ping_done.get();
+    REQUIRE(connected);
+    REQUIRE(ping_ok);
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("rpc ping fails when connection closes before pong",
+          "[rpc][ping][connection]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    scheduler sched(3);
+    sched.start();
+
+    std::promise<bool> server_seen_ping_promise;
+    auto server_seen_ping = server_seen_ping_promise.get_future();
+
+    sched.go([&, &lst = *listener_opt,
+              p = std::move(server_seen_ping_promise)]() mutable
+        -> coro::task<void> {
+        auto stream = co_await lst.accept();
+        if (!stream) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto frame = co_await read_frame(*stream);
+        bool saw_ping = frame && frame->first.type == message_type::ping;
+        p.set_value(saw_ping);
+
+        // Close before sending a pong. The client's receive loop should
+        // complete the pending ping as connection_closed, not success.
+        stream->shutdown_socket();
+        co_await stream->close();
+    });
+
+    std::promise<std::pair<bool, bool>> ping_done_promise;
+    auto ping_done = ping_done_promise.get_future();
+
+    sched.go([&, port, p = std::move(ping_done_promise)]() mutable
+        -> coro::task<void> {
+        auto client_opt = co_await tcp_rpc_client::connect("::1", port);
+        if (!client_opt) {
+            p.set_value({false, false});
+            co_return;
+        }
+
+        auto client = *client_opt;
+        // The test waits far less than this below, so a false result proves
+        // close-before-pong completion rather than timeout completion.
+        bool ping_ok = co_await client->ping(elio::test::scaled_sec(30));
+        client->close();
+        p.set_value({true, ping_ok});
+    });
+
+    auto server_status = server_seen_ping.wait_for(std::chrono::seconds(60));
+    REQUIRE(server_status == std::future_status::ready);
+    REQUIRE(server_seen_ping.get());
+
+    auto ping_status = ping_done.wait_for(elio::test::scaled_sec(5));
+    REQUIRE(ping_status == std::future_status::ready);
+    auto [connected, ping_ok] = ping_done.get();
+    REQUIRE(connected);
+    REQUIRE_FALSE(ping_ok);
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("rpc ping fails on non-pong response frame",
+          "[rpc][ping][protocol]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    scheduler sched(3);
+    sched.start();
+
+    std::promise<bool> server_replied_promise;
+    auto server_replied = server_replied_promise.get_future();
+
+    sched.go([&, &lst = *listener_opt,
+              p = std::move(server_replied_promise)]() mutable
+        -> coro::task<void> {
+        auto stream = co_await lst.accept();
+        if (!stream) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto frame = co_await read_frame(*stream);
+        if (!frame || frame->first.type != message_type::ping) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto error = build_error_response(
+            frame->first.request_id,
+            rpc_error::invalid_message,
+            "pong expected");
+        bool sent = co_await write_frame(*stream, error.first, error.second);
+        p.set_value(sent);
+
+        stream->shutdown_socket();
+        co_await stream->close();
+    });
+
+    std::promise<std::pair<bool, bool>> ping_done_promise;
+    auto ping_done = ping_done_promise.get_future();
+
+    sched.go([&, port, p = std::move(ping_done_promise)]() mutable
+        -> coro::task<void> {
+        auto client_opt = co_await tcp_rpc_client::connect("::1", port);
+        if (!client_opt) {
+            p.set_value({false, false});
+            co_return;
+        }
+
+        auto client = *client_opt;
+        bool ping_ok = co_await client->ping(elio::test::scaled_sec(30));
+        client->close();
+        p.set_value({true, ping_ok});
+    });
+
+    auto reply_status = server_replied.wait_for(std::chrono::seconds(60));
+    REQUIRE(reply_status == std::future_status::ready);
+    REQUIRE(server_replied.get());
+
+    auto ping_status = ping_done.wait_for(elio::test::scaled_sec(5));
+    REQUIRE(ping_status == std::future_status::ready);
+    auto [connected, ping_ok] = ping_done.get();
+    REQUIRE(connected);
+    REQUIRE_FALSE(ping_ok);
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
 TEST_CASE("rpc call cancellation reaches server context token",
           "[rpc][cancel][regression]") {
     using namespace elio::net;

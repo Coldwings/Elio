@@ -72,6 +72,7 @@ struct TestResponse {
     ELIO_RPC_FIELDS(TestResponse, result)
 };
 
+using ExistingStreamCreateMethod = ELIO_RPC_METHOD(306, TestRequest, TestResponse);
 using OnewayNoResponseMethod = ELIO_RPC_METHOD(305, TestRequest, TestResponse);
 
 // ============================================================================
@@ -1150,6 +1151,125 @@ TEST_CASE("send_oneway writes a no-response request frame",
 
     client.reset();
     REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+    ::close(fds[1]);
+}
+
+TEST_CASE("rpc_client create starts receive loop for existing streams",
+          "[rpc][client][contract]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    int fds[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    auto read_exact_fd = [](int fd, uint8_t* data, size_t length) {
+        size_t done = 0;
+        while (done < length) {
+            ssize_t n = ::read(fd, data + done, length - done);
+            REQUIRE(n > 0);
+            done += static_cast<size_t>(n);
+        }
+    };
+    auto write_exact_fd = [](int fd, const uint8_t* data, size_t length) {
+        size_t done = 0;
+        while (done < length) {
+            ssize_t n = ::write(fd, data + done, length - done);
+            REQUIRE(n > 0);
+            done += static_cast<size_t>(n);
+        }
+    };
+
+    scheduler sched(2);
+    sched.start();
+
+    std::promise<std::optional<std::string>> result_promise;
+    auto result_future = result_promise.get_future();
+
+    sched.go([client_fd = fds[0], p = std::move(result_promise)]() mutable
+                 -> coro::task<void> {
+        auto client = tcp_rpc_client::create(tcp_stream(client_fd));
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{7}, elio::test::scaled_sec(2));
+
+        if (result.ok()) {
+            p.set_value(result->result);
+        } else {
+            p.set_value(std::nullopt);
+        }
+        client->close();
+    });
+
+    std::array<uint8_t, frame_header_size> request_header_bytes{};
+    read_exact_fd(fds[1], request_header_bytes.data(), request_header_bytes.size());
+
+    auto request_header = frame_header::from_bytes(request_header_bytes.data());
+    REQUIRE(request_header.type == message_type::request);
+    REQUIRE(request_header.method_id == ExistingStreamCreateMethod::id);
+
+    std::vector<uint8_t> request_payload(request_header.payload_length);
+    if (!request_payload.empty()) {
+        read_exact_fd(fds[1], request_payload.data(), request_payload.size());
+    }
+
+    buffer_view request_view(request_payload.data(), request_payload.size());
+    auto [timeout_ms, request] = parse_request<TestRequest>(
+        request_view, request_header.flags);
+    REQUIRE(timeout_ms.has_value());
+    REQUIRE(request.value == 7);
+
+    auto response = build_response(
+        request_header.request_id, TestResponse{"created"});
+    auto response_header_bytes = response.first.to_bytes();
+    write_exact_fd(fds[1], response_header_bytes.data(), response_header_bytes.size());
+    if (response.second.size() > 0) {
+        write_exact_fd(fds[1], response.second.data(), response.second.size());
+    }
+
+    REQUIRE(result_future.wait_for(elio::test::scaled_sec(5)) ==
+            std::future_status::ready);
+    auto result = result_future.get();
+    REQUIRE(result.has_value());
+    REQUIRE(*result == "created");
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+    ::close(fds[1]);
+}
+
+TEST_CASE("rpc_client start attaches off-scheduler clients once",
+          "[rpc][client][contract]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    int fds[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    auto client = tcp_rpc_client::create(tcp_stream(fds[0]));
+    REQUIRE_FALSE(client->start());
+
+    scheduler sched(2);
+    sched.start();
+
+    std::promise<std::pair<bool, bool>> start_promise;
+    auto start_future = start_promise.get_future();
+
+    sched.go([client, p = std::move(start_promise)]() mutable -> coro::task<void> {
+        bool first = client->start();
+        bool second = client->start();
+        p.set_value({first, second});
+        client->close();
+        co_return;
+    });
+
+    REQUIRE(start_future.wait_for(elio::test::scaled_sec(5)) ==
+            std::future_status::ready);
+    auto [first, second] = start_future.get();
+    REQUIRE(first);
+    REQUIRE(second);
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+    client.reset();
     ::close(fds[1]);
 }
 

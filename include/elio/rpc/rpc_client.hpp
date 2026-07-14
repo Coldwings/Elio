@@ -106,9 +106,14 @@ public:
 
     static constexpr size_t pending_shard_count = 16;
     
-    /// Create a new RPC client from an existing stream
+    /// Create a new RPC client from an existing stream.
+    /// Starts the receive loop immediately when called from a scheduler.
+    /// If constructed off-scheduler, call start() from a scheduler before
+    /// issuing response-bearing operations such as call() or ping().
     static ptr create(Stream stream) {
-        return ptr(new rpc_client(std::move(stream)));
+        auto client = ptr(new rpc_client(std::move(stream)));
+        client->start();
+        return client;
     }
     
     /// Connect to a TCP server and create client
@@ -122,7 +127,6 @@ public:
                 co_return std::nullopt;
             }
             auto client = create(std::move(*stream));
-            client->start_receive_loop();
             co_return client;
         } else if constexpr (
             sizeof...(Args) == 2 &&
@@ -137,7 +141,6 @@ public:
                 auto stream = co_await net::tcp_connect(addr);
                 if (stream) {
                     auto client = create(std::move(*stream));
-                    client->start_receive_loop();
                     co_return client;
                 }
             }
@@ -159,7 +162,6 @@ public:
             auto stream = co_await net::tcp_connect(addr);
             if (stream) {
                 auto client = create(std::move(*stream));
-                client->start_receive_loop();
                 co_return client;
             }
         }
@@ -176,7 +178,6 @@ public:
             co_return std::nullopt;
         }
         auto client = create(std::move(*stream));
-        client->start_receive_loop();
         co_return client;
     }
     
@@ -192,6 +193,13 @@ public:
     /// Check if client is connected
     bool is_connected() const noexcept {
         return stream_.is_valid() && !closed_.load(std::memory_order_acquire);
+    }
+
+    /// Start the background receive loop on the current scheduler.
+    /// Idempotent; returns false when no scheduler is current or the client is
+    /// already closed.
+    bool start() {
+        return start_receive_loop();
     }
     
     /// Close the client connection.
@@ -608,19 +616,29 @@ private:
         : stream_(std::move(stream)) {}
     
     /// Start the background receive loop
-    void start_receive_loop() {
-        auto self = this->shared_from_this();
+    bool start_receive_loop() {
         auto* sched = runtime::scheduler::current();
-        if (sched) {
-            // Capture a weak_ptr so the receive loop does not keep the
-            // client alive when all external owners have dropped their
-            // references.  Without this, dropping the shared_ptr returned
-            // by connect() would leak the stream fd and coroutine frame
-            // forever because the receive loop's strong ref prevents
-            // destruction (and therefore close()).
-            std::weak_ptr<rpc_client> weak_self = self;
-            sched->go([w = std::move(weak_self)]() { return receive_loop(w); });
+        if (!sched || !is_connected()) {
+            return false;
         }
+
+        bool expected = false;
+        if (!receive_loop_started_.compare_exchange_strong(
+                expected, true,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return true;
+        }
+
+        // Capture a weak_ptr so the receive loop does not keep the
+        // client alive when all external owners have dropped their
+        // references.  Without this, dropping the shared_ptr returned
+        // by connect() would leak the stream fd and coroutine frame
+        // forever because the receive loop's strong ref prevents
+        // destruction (and therefore close()).
+        std::weak_ptr<rpc_client> weak_self = this->shared_from_this();
+        sched->go([w = std::move(weak_self)]() { return receive_loop(w); });
+        return true;
     }
 
     /// Background task that receives and dispatches responses
@@ -719,6 +737,7 @@ private:
     
     Stream stream_;
     std::atomic<bool> closed_{false};
+    std::atomic<bool> receive_loop_started_{false};
     request_id_generator id_generator_;
 
     struct pending_shard {

@@ -48,6 +48,15 @@ struct when_all_state {
         }
     }
 
+    void complete_unlaunched(size_t count) noexcept {
+        if (count == 0) {
+            return;
+        }
+        if (remaining_.fetch_sub(count, std::memory_order_acq_rel) == count) {
+            resume_waiter_if_ready();
+        }
+    }
+
     void finish_launching() noexcept {
         launch_complete_.store(true, std::memory_order_release);
         if (remaining_.load(std::memory_order_acquire) == 0) {
@@ -74,7 +83,31 @@ struct when_all_state {
         }
     }
 
+    void store_launch_exception(std::exception_ptr ex) noexcept {
+        bool expected = false;
+        if (has_exception_.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel)) {
+            first_exception_ = std::move(ex);
+            cancel_children_noexcept();
+        } else {
+            ELIO_LOG_WARNING("when_all: discarding subsequent exception "
+                             "(only the first is propagated)");
+        }
+    }
+
 private:
+    void cancel_children_noexcept() noexcept {
+        try {
+            cancel_source_.cancel();
+        } catch (const std::exception& e) {
+            ELIO_LOG_WARNING("when_all: cancellation callback threw during "
+                             "launch failure cleanup: {}", e.what());
+        } catch (...) {
+            ELIO_LOG_WARNING("when_all: cancellation callback threw during "
+                             "launch failure cleanup: <unknown>");
+        }
+    }
+
     void resume_waiter_if_ready() noexcept {
         if (launch_complete_.load(std::memory_order_acquire)) {
             resume_waiter();
@@ -118,36 +151,47 @@ struct when_all_awaitable {
 
     bool await_ready() const noexcept { return false; }
 
-    template<size_t... Is>
-    void spawn_all(std::index_sequence<Is...>) {
-        auto token = state_->cancel_source_.get_token();
-        (elio::go([state = this->state_, token,
-                   f = std::move(std::get<Is>(callables_))]() mutable
-                      -> coro::task<void> {
+    template<size_t I>
+    void spawn_one(coro::cancel_token token) {
+        elio::go([state = this->state_, token,
+                  f = std::move(std::get<I>(callables_))]() mutable
+                     -> coro::task<void> {
             if (token.is_cancelled()) {
                 state->complete_one();
                 co_return;
             }
-            using T = callable_result_t<std::tuple_element_t<Is, std::tuple<Fs...>>>;
+            using T = callable_result_t<std::tuple_element_t<I, std::tuple<Fs...>>>;
             try {
                 if constexpr (std::is_void_v<T>) {
                     co_await f();
-                    std::get<Is>(state->values_).emplace(std::monostate{});
+                    std::get<I>(state->values_).emplace(std::monostate{});
                 } else {
-                    std::get<Is>(state->values_).emplace(co_await f());
+                    std::get<I>(state->values_).emplace(co_await f());
                 }
             } catch (...) {
                 state->store_exception(std::current_exception());
             }
             state->complete_one();
-        }), ...);
+        });
+    }
+
+    template<size_t... Is>
+    void spawn_all(std::index_sequence<Is...>, size_t& launched) {
+        auto token = state_->cancel_source_.get_token();
+        ((spawn_one<Is>(token), ++launched), ...);
     }
 
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
         auto state = state_;
         bool should_suspend = state->set_waiter(waiter_, awaiter);
 
-        spawn_all(std::index_sequence_for<Fs...>{});
+        size_t launched = 0;
+        try {
+            spawn_all(std::index_sequence_for<Fs...>{}, launched);
+        } catch (...) {
+            state->store_launch_exception(std::current_exception());
+            state->complete_unlaunched(sizeof...(Fs) - launched);
+        }
         state->finish_launching();
 
         // Non-empty inputs suspend and rely on complete_one() ->

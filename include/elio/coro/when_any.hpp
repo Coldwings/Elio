@@ -90,6 +90,7 @@ struct when_any_state {
     coro::detail::completion_waiter_slot waiter_;
     std::optional<result_type> result_;
     std::exception_ptr exception_;
+    std::exception_ptr launch_exception_;
     size_t winner_index_{0};
     coro::cancel_source cancel_source_;
 
@@ -120,6 +121,15 @@ struct when_any_state {
         } else {
             report_unhandled_exception(std::move(ex));
         }
+    }
+
+    void resolve_launch_exception(std::exception_ptr ex) noexcept {
+        launch_exception_ = std::move(ex);
+        bool expected = false;
+        (void)winner_claimed_.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel);
+        cancel_losers();
+        publish_resolved();
     }
 
     void finish_launching() noexcept {
@@ -203,14 +213,13 @@ struct when_any_awaitable {
 
     bool await_ready() const noexcept { return false; }
 
-    template<size_t... Is>
-    void spawn_all(std::index_sequence<Is...>) {
-        auto token = state_->cancel_source_.get_token();
-        (elio::go([state = this->state_, token,
-                   f = std::move(std::get<Is>(callables_))]() mutable
-                      -> coro::task<void> {
+    template<size_t I>
+    void spawn_one(coro::cancel_token token) {
+        elio::go([state = this->state_, token,
+                  f = std::move(std::get<I>(callables_))]() mutable
+                     -> coro::task<void> {
             if (token.is_cancelled()) co_return;
-            using F = std::tuple_element_t<Is, std::tuple<Fs...>>;
+            using F = std::tuple_element_t<I, std::tuple<Fs...>>;
             using T = when_any_result_t<F>;
             try {
                 if constexpr (std::is_void_v<T>) {
@@ -219,25 +228,35 @@ struct when_any_awaitable {
                     } else {
                         co_await f();
                     }
-                    state->template resolve<Is>(std::monostate{});
+                    state->template resolve<I>(std::monostate{});
                 } else if constexpr (std::invocable<F, coro::cancel_token>) {
                     auto val = co_await f(token);
-                    state->template resolve<Is>(std::move(val));
+                    state->template resolve<I>(std::move(val));
                 } else {
                     auto val = co_await f();
-                    state->template resolve<Is>(std::move(val));
+                    state->template resolve<I>(std::move(val));
                 }
             } catch (...) {
                 state->resolve_exception(std::current_exception());
             }
-        }), ...);
+        });
+    }
+
+    template<size_t... Is>
+    void spawn_all(std::index_sequence<Is...>) {
+        auto token = state_->cancel_source_.get_token();
+        (spawn_one<Is>(token), ...);
     }
 
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
         auto state = state_;
         bool should_suspend = state->set_waiter(waiter_, awaiter);
 
-        spawn_all(std::index_sequence_for<Fs...>{});
+        try {
+            spawn_all(std::index_sequence_for<Fs...>{});
+        } catch (...) {
+            state->resolve_launch_exception(std::current_exception());
+        }
         state->finish_launching();
 
         // Suspend and rely on resume_waiter() -> schedule_handle() for
@@ -251,6 +270,9 @@ struct when_any_awaitable {
     }
 
     auto await_resume() {
+        if (state_->launch_exception_) {
+            std::rethrow_exception(state_->launch_exception_);
+        }
         if (state_->exception_) {
             std::rethrow_exception(state_->exception_);
         }

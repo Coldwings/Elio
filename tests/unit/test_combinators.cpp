@@ -111,6 +111,44 @@ struct blocking_move_callable {
     }
 };
 
+struct launch_throw_control {
+    std::atomic<bool> throw_on_move{false};
+    const std::atomic<bool>* wait_before_throw{nullptr};
+};
+
+struct launch_throwing_move_callable {
+    launch_throw_control* control{};
+
+    explicit launch_throwing_move_callable(launch_throw_control& c)
+        : control(&c) {}
+    launch_throwing_move_callable(const launch_throwing_move_callable&) = delete;
+    launch_throwing_move_callable& operator=(
+        const launch_throwing_move_callable&) = delete;
+
+    launch_throwing_move_callable(launch_throwing_move_callable&& other)
+        noexcept(false)
+        : control(other.control) {
+        if (control && control->throw_on_move.load(std::memory_order_acquire)) {
+            const auto* wait_flag = control->wait_before_throw;
+            const auto deadline =
+                std::chrono::steady_clock::now() + scaled_ms(2000);
+            while (wait_flag && !wait_flag->load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            throw std::runtime_error("launch move failed");
+        }
+        other.control = nullptr;
+    }
+
+    launch_throwing_move_callable& operator=(
+        launch_throwing_move_callable&&) = delete;
+
+    task<int> operator()() {
+        co_return 3;
+    }
+};
+
 } // namespace
 
 // --- when_all tests ---
@@ -239,6 +277,37 @@ TEST_CASE("when_all does not resume while launching children",
     REQUIRE(sched.shutdown(scaled_ms(2000)));
 }
 
+TEST_CASE("when_all propagates launch-time callable move failure",
+          "[sync][combinators][regression]") {
+    launch_throw_control control;
+    std::atomic<bool> caught{false};
+    std::atomic<bool> first_completed{false};
+    control.wait_before_throw = &first_completed;
+
+    auto test = [&]() -> task<void> {
+        auto first = [&]() -> task<int> {
+            first_completed.store(true, std::memory_order_release);
+            co_return 1;
+        };
+        auto combo = when_all(first, launch_throwing_move_callable(control));
+        control.throw_on_move.store(true, std::memory_order_release);
+        try {
+            auto result = co_await combo;
+            (void)result;
+        } catch (const std::runtime_error& e) {
+            caught.store(true, std::memory_order_release);
+            REQUIRE(std::string(e.what()) == "launch move failed");
+        }
+    };
+
+    runtime::scheduler sched(2);
+    sched.start();
+    sched.go(test);
+    REQUIRE(sched.shutdown(scaled_ms(2000)));
+    REQUIRE(caught.load(std::memory_order_acquire));
+    REQUIRE(first_completed.load(std::memory_order_acquire));
+}
+
 // --- when_any tests ---
 
 TEST_CASE("when_any returns first completer", "[sync][combinators]") {
@@ -291,6 +360,37 @@ TEST_CASE("when_any does not resume while launching children",
     blocker.allow_move.store(true, std::memory_order_release);
     REQUIRE(sched.shutdown(scaled_ms(2000)));
     REQUIRE(resume_count.load(std::memory_order_acquire) == 1);
+}
+
+TEST_CASE("when_any propagates launch-time callable move failure",
+          "[sync][combinators][regression]") {
+    launch_throw_control control;
+    std::atomic<bool> caught{false};
+    std::atomic<bool> first_completed{false};
+    control.wait_before_throw = &first_completed;
+
+    auto test = [&]() -> task<void> {
+        auto first = [&]() -> task<int> {
+            first_completed.store(true, std::memory_order_release);
+            co_return 1;
+        };
+        auto combo = when_any(first, launch_throwing_move_callable(control));
+        control.throw_on_move.store(true, std::memory_order_release);
+        try {
+            auto result = co_await combo;
+            (void)result;
+        } catch (const std::runtime_error& e) {
+            caught.store(true, std::memory_order_release);
+            REQUIRE(std::string(e.what()) == "launch move failed");
+        }
+    };
+
+    runtime::scheduler sched(2);
+    sched.start();
+    sched.go(test);
+    REQUIRE(sched.shutdown(scaled_ms(2000)));
+    REQUIRE(caught.load(std::memory_order_acquire));
+    REQUIRE(first_completed.load(std::memory_order_acquire));
 }
 
 TEST_CASE("when_any wake gate claims one resume in either publication order",

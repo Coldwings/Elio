@@ -37,7 +37,8 @@
 ///
 /// // Client side
 /// auto client = co_await elio::rpc::tcp_rpc_client::connect(addr);
-/// auto result = co_await client->call<GetUser>(GetUserRequest{42});
+/// if (!client) co_return;
+/// auto result = co_await (*client)->call<GetUser>(GetUserRequest{42});
 /// if (result.ok()) {
 ///     std::cout << "Name: " << result->name << std::endl;
 /// }

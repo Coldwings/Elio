@@ -130,8 +130,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RPC `writev` retries, `rpc_client` timeout-watcher cleanup, member-coroutine
   self lifetime, end-to-end cancellation propagation, server accept wakeups on
   stop, RPC frame-header documentation, client request-id collision handling
-  after wraparound, and close-safe duplicate active server request-id rejection.
-  (#246, #253, #294, #814, #815)
+  after wraparound, close-safe duplicate active server request-id rejection,
+  and `rpc_client::ping()` success reporting when a connection closes before
+  pong. (#246, #253, #294, #814, #815, #818)
 - **HTTP/1 client and server robustness**: Fixed response-body framing, skipped
   informational responses, URL authority parsing, client cancellation
   propagation, connect/handshake/read timeout enforcement, failed handshake

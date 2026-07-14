@@ -545,7 +545,7 @@ public:
             co_return false;
         }
 
-        auto reserved = reserve_pending_request();
+        auto reserved = reserve_pending_request(rpc_error::invalid_message);
         if (!reserved) {
             co_return false;
         }
@@ -581,6 +581,7 @@ public:
                     auto result = co_await time::sleep_for(ms, tok);
                     if (result == coro::cancel_result::completed && p->try_complete()) {
                         p->timed_out = true;
+                        p->error = rpc_error::timeout;
                         p->completion_event.set();
                     }
                 }(ms, p, std::move(tok));
@@ -593,7 +594,7 @@ public:
         // Cancel the timeout watcher so it doesn't linger after completion.
         ping_cancel.cancel();
 
-        co_return !pending->timed_out;
+        co_return pending->error == rpc_error::success && !pending->timed_out;
     }
     
     /// Get the underlying stream (for advanced usage)
@@ -709,6 +710,7 @@ private:
         }
         
         if (pending->try_complete()) {
+            pending->error = rpc_error::success;
             pending->completion_event.set();
         }
     }
@@ -727,8 +729,10 @@ private:
         std::shared_ptr<pending_request> pending;
     };
 
-    std::optional<reserved_pending_request> reserve_pending_request() {
+    std::optional<reserved_pending_request> reserve_pending_request(
+        rpc_error initial_error = rpc_error::success) {
         auto pending = std::make_shared<pending_request>();
+        pending->error = initial_error;
         auto request_id = detail::reserve_unique_request_id(
             [this]() {
                 return id_generator_.next();

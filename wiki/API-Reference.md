@@ -2627,6 +2627,7 @@ enum class message_flags : uint8_t {
     has_checksum = 1 << 1,
     compressed = 1 << 2,    // reserved
     streaming = 1 << 3,     // reserved
+    no_response = 1 << 4,   // one-way request: suppress response/error
 };
 
 bool has_flag(message_flags flags, message_flags flag);
@@ -2659,6 +2660,14 @@ std::pair<frame_header, buffer_writer> build_request(
     method_id_t method_id,
     const Request& request,
     std::optional<uint32_t> timeout_ms = std::nullopt,
+    bool enable_checksum = false);
+
+// Build one-way request frame
+template<typename Request>
+std::pair<frame_header, buffer_writer> build_oneway_request(
+    uint32_t request_id,
+    method_id_t method_id,
+    const Request& request,
     bool enable_checksum = false);
 
 // Build response frame
@@ -2709,9 +2718,12 @@ using cleanup_callback_t = std::function<void()>;
 
 Cleanup callbacks returned by `register_method_with_cleanup()` and
 `register_method_with_context_and_cleanup()` run only after the response has
-been successfully sent. They are not failure-path finalizers: disconnects,
-write failures, and `send_response` exceptions skip cleanup, so handlers must
-not rely on the callback for mandatory local failure cleanup.
+been successfully sent. For `no_response` one-way requests, no response is sent;
+the callback runs after the handler result has been serialized and the unsent
+payload can be discarded. They are not failure-path finalizers: handler errors,
+serialization errors, disconnects, write failures, and `send_response`
+exceptions skip cleanup, so handlers must not rely on the callback for mandatory
+local failure cleanup.
 
 #### `rpc_server_config`
 

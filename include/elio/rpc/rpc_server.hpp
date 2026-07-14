@@ -76,7 +76,8 @@ struct rpc_server_config {
 // RPC Context
 // ============================================================================
 
-/// Cleanup callback type - invoked after response is sent
+/// Cleanup callback type - invoked after a normal response is sent, or after
+/// serialized no_response one-way payload data can be discarded.
 using cleanup_callback_t = std::function<void()>;
 
 /// Context passed to RPC handlers
@@ -100,7 +101,7 @@ struct rpc_context {
 struct handler_result {
     bool success = false;
     buffer_writer payload;
-    cleanup_callback_t cleanup;  ///< Optional cleanup callback (runs after response sent)
+    cleanup_callback_t cleanup;  ///< Optional cleanup callback for response-owned data
     
     handler_result() = default;
     handler_result(bool s, buffer_writer p, cleanup_callback_t c = nullptr)
@@ -407,11 +408,16 @@ private:
                                     message_buffer payload,
                                     std::shared_ptr<active_request_state> active) {
         active_request_eraser active_guard(this, header.request_id, active);
+        const bool no_response =
+            has_flag(header.flags, message_flags::no_response);
 
         // Find handler
         auto it = handlers_->find(header.method_id);
         if (it == handlers_->end()) {
             ELIO_LOG_WARNING("RPC session: method {} not found", header.method_id);
+            if (no_response) {
+                co_return;
+            }
             auto error_frame = build_error_response(
                 header.request_id,
                 rpc_error::method_not_found,
@@ -470,6 +476,19 @@ private:
             ELIO_LOG_ERROR("RPC session: handler exception: {}", e.what());
             error_code = rpc_error::internal_error;
             error_message = e.what();
+        }
+
+        if (no_response) {
+            // No response frame will reference the serialized payload, so
+            // release response-owned resources as soon as the handler returns.
+            if (cleanup_cb) {
+                try {
+                    cleanup_cb();
+                } catch (const std::exception& e) {
+                    ELIO_LOG_ERROR("RPC session: cleanup callback exception: {}", e.what());
+                }
+            }
+            co_return;
         }
 
         // Send response (outside exception handlers).
@@ -775,7 +794,9 @@ public:
     
     /// Register a method handler with cleanup callback support
     /// Handler should return std::pair<Response, cleanup_callback_t>
-    /// The cleanup callback is invoked after the response is successfully sent
+    /// The cleanup callback is invoked after a normal response is successfully
+    /// sent. For no_response one-way requests, it runs after the handler result
+    /// has been serialized and the unsent payload can be discarded.
     /// @tparam Method The method descriptor type
     /// @tparam Handler A callable returning task<std::pair<Response, cleanup_callback_t>>
     /// @throws std::invalid_argument if Method::id was already registered

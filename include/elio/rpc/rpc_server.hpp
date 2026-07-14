@@ -166,9 +166,7 @@ public:
                 case message_type::ping: {
                     auto pong = build_pong(header.request_id);
                     buffer_writer empty;
-                    co_await send_mutex_.lock();
-                    sync::lock_guard guard(send_mutex_);
-                    co_await write_frame(stream_, pong, empty);
+                    (void)co_await send_frame(pong, empty);
                     break;
                 }
 
@@ -193,13 +191,16 @@ public:
     /// Close the session. Forces the read loop out of any pending recv.
     void close() {
         if (!closed_.exchange(true, std::memory_order_acq_rel)) {
-            // Force any pending recv to return so the run loop wakes up.
+            // Force any pending recv to return so the run loop wakes up. If a
+            // frame write already started, cancel its writable-poll wait and
+            // defer shutdown until that write leaves its guarded section so
+            // shutdown cannot race it.
             // Going through the stream's ``shutdown_socket()`` (instead of
-            // ::shutdown on a raw fd) lets a tls_stream record that its
-            // socket is dead so its destructor can skip the close_notify
-            // write that risks SIGPIPE on OpenSSL builds without
-            // MSG_NOSIGNAL.
-            stream_.shutdown_socket();
+            // ::shutdown on a raw fd) lets a tls_stream record that its socket
+            // is dead so its destructor can skip the close_notify write that
+            // risks SIGPIPE on OpenSSL builds without MSG_NOSIGNAL.
+            frame_write_cancel_.cancel();
+            request_stream_shutdown();
             cancel_all_active_requests();
         }
     }
@@ -212,6 +213,36 @@ public:
 private:
     struct active_request_state {
         coro::cancel_source cancel;
+    };
+
+    class frame_write_guard {
+    public:
+        explicit frame_write_guard(rpc_session* self) noexcept : self_(self) {}
+        ~frame_write_guard() {
+            if (self_) {
+                self_->finish_frame_write();
+            }
+        }
+
+        frame_write_guard(const frame_write_guard&) = delete;
+        frame_write_guard& operator=(const frame_write_guard&) = delete;
+        frame_write_guard(frame_write_guard&& other) noexcept
+            : self_(other.self_) {
+            other.self_ = nullptr;
+        }
+        frame_write_guard& operator=(frame_write_guard&& other) noexcept {
+            if (this != &other) {
+                if (self_) {
+                    self_->finish_frame_write();
+                }
+                self_ = other.self_;
+                other.self_ = nullptr;
+            }
+            return *this;
+        }
+
+    private:
+        rpc_session* self_ = nullptr;
     };
 
     struct active_request_eraser {
@@ -347,9 +378,19 @@ private:
             return;
         }
         auto active = std::make_shared<active_request_state>();
+        bool duplicate = false;
         {
             std::lock_guard<std::mutex> lock(active_requests_mutex_);
-            active_requests_[header.request_id] = active;
+            auto [it, inserted] = active_requests_.emplace(header.request_id, active);
+            (void)it;
+            duplicate = !inserted;
+        }
+        if (duplicate) {
+            ELIO_LOG_WARNING(
+                "RPC session: duplicate active request id {}; closing session",
+                header.request_id);
+            close();
+            return;
         }
         auto self = this->shared_from_this();
         sched->go([self,
@@ -520,9 +561,72 @@ private:
     coro::task<bool> send_response(const frame_header& header,
                                     const buffer_writer& payload)
     {
+        co_return co_await send_frame(header, payload);
+    }
+
+    /// Send a frame unless the session has started closing. close() marks the
+    /// session closed before requesting stream shutdown, so a frame write must
+    /// register itself after taking send_mutex_. If close() races with an
+    /// already-registered write, shutdown is deferred until that write leaves
+    /// this guarded section instead of shutting the stream down underneath it.
+    coro::task<bool> send_frame(const frame_header& header,
+                                const buffer_writer& payload)
+    {
+        if (closed_.load(std::memory_order_acquire)) {
+            co_return false;
+        }
         co_await send_mutex_.lock();
         sync::lock_guard guard(send_mutex_);
-        co_return co_await write_frame(stream_, header, payload);
+        if (!begin_frame_write()) {
+            co_return false;
+        }
+        frame_write_guard write_guard(this);
+        auto write_token = frame_write_cancel_.get_token();
+        if (write_token.is_cancelled()) {
+            co_return false;
+        }
+        co_return co_await write_frame(stream_, header, payload, write_token);
+    }
+
+    bool begin_frame_write() {
+        std::lock_guard<std::mutex> lock(close_mutex_);
+        if (closed_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        ++active_frame_writes_;
+        return true;
+    }
+
+    void finish_frame_write() noexcept {
+        bool shutdown_now = false;
+        {
+            std::lock_guard<std::mutex> lock(close_mutex_);
+            if (active_frame_writes_ > 0) {
+                --active_frame_writes_;
+            }
+            if (active_frame_writes_ == 0 && shutdown_deferred_) {
+                shutdown_deferred_ = false;
+                shutdown_now = true;
+            }
+        }
+        if (shutdown_now) {
+            stream_.shutdown_socket();
+        }
+    }
+
+    void request_stream_shutdown() noexcept {
+        bool shutdown_now = false;
+        {
+            std::lock_guard<std::mutex> lock(close_mutex_);
+            if (active_frame_writes_ == 0) {
+                shutdown_now = true;
+            } else {
+                shutdown_deferred_ = true;
+            }
+        }
+        if (shutdown_now) {
+            stream_.shutdown_socket();
+        }
     }
 
     Stream stream_;
@@ -532,6 +636,10 @@ private:
     rpc_server_config config_;
     std::atomic<bool> closed_{false};
     sync::mutex send_mutex_;
+    coro::cancel_source frame_write_cancel_;
+    std::mutex close_mutex_;
+    size_t active_frame_writes_ = 0;
+    bool shutdown_deferred_ = false;
     std::mutex active_requests_mutex_;
     std::unordered_map<uint32_t, std::shared_ptr<active_request_state>> active_requests_;
 };

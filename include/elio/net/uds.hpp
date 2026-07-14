@@ -2,6 +2,7 @@
 
 #include <elio/io/io_context.hpp>
 #include <elio/io/io_awaitables.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/log/macros.hpp>
 
@@ -261,16 +262,59 @@ public:
             co_return result;
         }
     }
+
+    /// Async write, cancellable by ``token``.
+    coro::task<io::io_result> write(const void* buffer, size_t length,
+                                    coro::cancel_token token) {
+        while (true) {
+            if (token.is_cancelled()) {
+                co_return io::io_result{-ECANCELED, 0};
+            }
+
+            auto result = co_await io::async_send(fd_, buffer, length, 0, token);
+            if (result.was_cancelled() || result.io.result == -ECANCELED) {
+                co_return io::io_result{-ECANCELED, 0};
+            }
+            if (result.io.result == -EAGAIN ||
+                result.io.result == -EWOULDBLOCK) {
+                auto ready = co_await io::async_poll_write(fd_, token);
+                if (ready.was_cancelled() || ready.io.result == -ECANCELED) {
+                    co_return io::io_result{-ECANCELED, 0};
+                }
+                if (ready.io.result < 0) {
+                    co_return ready.io;
+                }
+                continue;
+            }
+            if (result.io.result == -EINTR) {
+                continue;
+            }
+            co_return result.io;
+        }
+    }
     
     /// Async write from span
     template<typename T>
     coro::task<io::io_result> write(std::span<const T> buffer) {
         return write(buffer.data(), buffer.size_bytes());
     }
+
+    /// Async write from span, cancellable by ``token``.
+    template<typename T>
+    coro::task<io::io_result> write(std::span<const T> buffer,
+                                    coro::cancel_token token) {
+        return write(buffer.data(), buffer.size_bytes(), std::move(token));
+    }
     
     /// Async write string
     coro::task<io::io_result> write(std::string_view str) {
         return write(str.data(), str.size());
+    }
+
+    /// Async write string, cancellable by ``token``.
+    coro::task<io::io_result> write(std::string_view str,
+                                    coro::cancel_token token) {
+        return write(str.data(), str.size(), std::move(token));
     }
     
     /// Async writev (scatter-gather write)
@@ -391,15 +435,54 @@ public:
         co_return io::io_result{static_cast<int32_t>(length), 0};
     }
 
+    /// Write exactly ``length`` bytes from ``buffer``, cancellable by ``token``.
+    coro::task<io::io_result> write_exactly(const void* buffer, size_t length,
+                                            coro::cancel_token token) {
+        if (length > static_cast<size_t>(INT32_MAX)) {
+            co_return io::io_result{-EOVERFLOW, 0};
+        }
+
+        const auto* ptr = static_cast<const char*>(buffer);
+        size_t remaining = length;
+
+        while (remaining > 0) {
+            if (token.is_cancelled()) {
+                co_return io::io_result{-ECANCELED, 0};
+            }
+
+            auto result = co_await write(ptr, remaining, token);
+            if (result.result > 0) {
+                ptr += result.result;
+                remaining -= static_cast<size_t>(result.result);
+            } else {
+                co_return result;
+            }
+        }
+        co_return io::io_result{static_cast<int32_t>(length), 0};
+    }
+
     /// Write exactly all bytes from ``buffer``.
     template<typename T>
     coro::task<io::io_result> write_exactly(std::span<const T> buffer) {
         return write_exactly(buffer.data(), buffer.size_bytes());
     }
 
+    /// Write exactly all bytes from ``buffer``, cancellable by ``token``.
+    template<typename T>
+    coro::task<io::io_result> write_exactly(std::span<const T> buffer,
+                                            coro::cancel_token token) {
+        return write_exactly(buffer.data(), buffer.size_bytes(), std::move(token));
+    }
+
     /// Write exactly all bytes from ``str``.
     coro::task<io::io_result> write_exactly(std::string_view str) {
         return write_exactly(str.data(), str.size());
+    }
+
+    /// Write exactly all bytes from ``str``, cancellable by ``token``.
+    coro::task<io::io_result> write_exactly(std::string_view str,
+                                            coro::cancel_token token) {
+        return write_exactly(str.data(), str.size(), std::move(token));
     }
 
     /// Async close

@@ -6,9 +6,14 @@
 /// This header provides HTTP/2 client functionality with:
 /// - Full HTTP/2 protocol support via nghttp2
 /// - TLS/ALPN negotiation (h2)
-/// - Multiplexed streams over a single connection
+/// - HTTP/2 stream support in the session layer
 /// - Header compression (HPACK)
 /// - Flow control
+/// - Sequential pooled connection reuse in the high-level client
+///
+/// The high-level h2_client facade does not coordinate multiple in-flight
+/// requests over one shared connection. Use separate clients or serialize
+/// calls until shared-session multiplexing is implemented.
 /// 
 /// Requirements:
 /// - OpenSSL with ALPN support

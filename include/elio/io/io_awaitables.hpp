@@ -715,14 +715,14 @@ inline auto async_poll_write(int fd) {
 
 /// Segment descriptor for batch read operations
 struct batch_read_segment {
-    int64_t offset;   ///< File offset (-1 for current position → uses pread with offset 0)
+    int64_t offset;   ///< File offset; negative values use current position
     void* buffer;     ///< Destination buffer
     size_t length;    ///< Bytes to read
 };
 
 /// Segment descriptor for batch write operations
 struct batch_write_segment {
-    int64_t offset;      ///< File offset (-1 for current position → uses pwrite with offset 0)
+    int64_t offset;      ///< File offset; negative values use current position
     const void* buffer;  ///< Source data
     size_t length;       ///< Bytes to write
 };
@@ -831,11 +831,38 @@ inline bool submit_batch_io_uring(io_uring_backend* backend,
 }
 #endif
 
+template<typename Segment>
+inline bool has_current_position_segment(const std::vector<Segment>& segments) noexcept {
+    for (const auto& segment : segments) {
+        if (segment.offset < 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline int run_batch_read_segment(int fd, const batch_read_segment& segment) noexcept {
+    ssize_t result = segment.offset >= 0
+        ? ::pread(fd, segment.buffer, segment.length, segment.offset)
+        : ::read(fd, segment.buffer, segment.length);
+    int error = errno;
+    return result < 0 ? -error : static_cast<int>(result);
+}
+
+inline int run_batch_write_segment(int fd, const batch_write_segment& segment) noexcept {
+    ssize_t result = segment.offset >= 0
+        ? ::pwrite(fd, segment.buffer, segment.length, segment.offset)
+        : ::write(fd, segment.buffer, segment.length);
+    int error = errno;
+    return result < 0 ? -error : static_cast<int>(result);
+}
+
 } // namespace detail
 
 /// Awaitable for batch read operations
-/// Submits multiple pread operations in a single io_uring syscall.
-/// Falls back to sequential synchronous reads for epoll backend.
+/// Submits positioned reads in a single io_uring syscall.
+/// Falls back to sequential synchronous reads for epoll backend and for
+/// current-position segments.
 class batch_read_awaitable : public io_awaitable_base {
 public:
     batch_read_awaitable(int fd, std::span<const batch_read_segment> segments) noexcept
@@ -877,17 +904,15 @@ public:
         auto* backend = ctx.is_io_uring()
             ? static_cast<io_uring_backend*>(ctx.get_backend())
             : nullptr;
-        if (backend && backend->get_ring()) {
+        if (backend && backend->get_ring() &&
+            !detail::has_current_position_segment(segments_)) {
             batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
-            const int n = batch_st_->total;
             bool submitted = detail::submit_batch_io_uring(
                 backend, *batch_st_, awaiter,
-                [this, n](struct io_uring_sqe* sqe, int i) {
-                    auto off = static_cast<__u64>(
-                        segments_[i].offset >= 0 ? segments_[i].offset : 0);
+                [this](struct io_uring_sqe* sqe, int i) {
+                    auto off = static_cast<__u64>(segments_[i].offset);
                     io_uring_prep_read(sqe, fd_, segments_[i].buffer,
                         static_cast<unsigned>(segments_[i].length), off);
-                    (void)n;
                 });
             if (!submitted) {
                 // No SQEs made it onto the ring: every result is already
@@ -899,13 +924,10 @@ public:
             return;
         }
 #endif
-        // Fallback: sequential synchronous reads (no io_uring available).
+        // Fallback or current-position segments: sequential synchronous reads.
         batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
         for (size_t i = 0; i < segments_.size(); ++i) {
-            auto off = segments_[i].offset >= 0 ? segments_[i].offset : 0;
-            auto result = pread(fd_, segments_[i].buffer, segments_[i].length, off);
-            int error = errno;
-            batch_st_->results[i] = result < 0 ? -error : static_cast<int>(result);
+            batch_st_->results[i] = detail::run_batch_read_segment(fd_, segments_[i]);
         }
         detail::mark_batch_inline_completed(*batch_st_);
         awaiter.resume();
@@ -926,8 +948,9 @@ private:
 };
 
 /// Awaitable for batch write operations
-/// Submits multiple pwrite operations in a single io_uring syscall.
-/// Falls back to sequential synchronous writes for epoll backend.
+/// Submits positioned writes in a single io_uring syscall.
+/// Falls back to sequential synchronous writes for epoll backend and for
+/// current-position segments.
 class batch_write_awaitable : public io_awaitable_base {
 public:
     batch_write_awaitable(int fd, std::span<const batch_write_segment> segments) noexcept
@@ -961,13 +984,13 @@ public:
         auto* backend = ctx.is_io_uring()
             ? static_cast<io_uring_backend*>(ctx.get_backend())
             : nullptr;
-        if (backend && backend->get_ring()) {
+        if (backend && backend->get_ring() &&
+            !detail::has_current_position_segment(segments_)) {
             batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
             bool submitted = detail::submit_batch_io_uring(
                 backend, *batch_st_, awaiter,
                 [this](struct io_uring_sqe* sqe, int i) {
-                    auto off = static_cast<__u64>(
-                        segments_[i].offset >= 0 ? segments_[i].offset : 0);
+                    auto off = static_cast<__u64>(segments_[i].offset);
                     io_uring_prep_write(sqe, fd_, segments_[i].buffer,
                         static_cast<unsigned>(segments_[i].length), off);
                 });
@@ -978,13 +1001,10 @@ public:
             return;
         }
 #endif
-        // Fallback: sequential synchronous writes.
+        // Fallback or current-position segments: sequential synchronous writes.
         batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
         for (size_t i = 0; i < segments_.size(); ++i) {
-            auto off = segments_[i].offset >= 0 ? segments_[i].offset : 0;
-            auto result = pwrite(fd_, segments_[i].buffer, segments_[i].length, off);
-            int error = errno;
-            batch_st_->results[i] = result < 0 ? -error : static_cast<int>(result);
+            batch_st_->results[i] = detail::run_batch_write_segment(fd_, segments_[i]);
         }
         detail::mark_batch_inline_completed(*batch_st_);
         awaiter.resume();
@@ -1004,12 +1024,16 @@ private:
     std::unique_ptr<batch_state> batch_st_;
 };
 
-/// Batch read from file at multiple offsets in a single syscall (io_uring)
+/// Batch read from file segments.
+/// All-positioned batches use a single io_uring submission; current-position
+/// segments are executed in order.
 inline auto batch_read(int fd, std::span<const batch_read_segment> segments) {
     return batch_read_awaitable(fd, segments);
 }
 
-/// Batch write to file at multiple offsets in a single syscall (io_uring)
+/// Batch write to file segments.
+/// All-positioned batches use a single io_uring submission; current-position
+/// segments are executed in order.
 inline auto batch_write(int fd, std::span<const batch_write_segment> segments) {
     return batch_write_awaitable(fd, segments);
 }

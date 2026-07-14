@@ -992,12 +992,15 @@ auto result = co_await async_poll_write(fd);
 
 ### Batch I/O
 
-Submit multiple file operations in a single `io_uring_submit()` syscall.
+Submit multiple file operations. Segments with non-negative offsets are
+positioned operations that can be submitted together with io_uring. Segments
+with negative offsets use the file descriptor's current position and are
+executed in segment order to preserve file-position semantics.
 
 ```cpp
 // Batch read: read multiple file regions at once
 struct batch_read_segment {
-    int64_t offset;   // File offset (-1 for current position)
+    int64_t offset;   // File offset (negative for current position)
     void* buffer;     // Destination buffer
     size_t length;    // Bytes to read
 };
@@ -1008,7 +1011,7 @@ auto results = co_await batch_read(fd, segments);
 
 // Batch write: write multiple file regions at once
 struct batch_write_segment {
-    int64_t offset;      // File offset (-1 for current position)
+    int64_t offset;      // File offset (negative for current position)
     const void* buffer;  // Source data
     size_t length;       // Bytes to write
 };
@@ -1018,12 +1021,15 @@ auto results = co_await batch_write(fd, segments);
 ```
 
 **How it works:**
-1. All SQEs are prepared in the io_uring submission queue
-2. Single `io_uring_submit()` syscall dispatches all operations
-3. Each completion is tracked via tagged `user_data` encoding
-4. Results are returned in a `std::vector<int>` matching segment order
+1. Positioned segments are prepared in the io_uring submission queue
+2. Single `io_uring_submit()` syscall dispatches positioned operations
+3. Current-position segments fall back to ordered `read()` / `write()` calls
+4. Each io_uring completion is tracked via tagged `user_data` encoding
+5. Results are returned in a `std::vector<int>` matching segment order
 
-**Fallback:** When io_uring is unavailable (epoll backend), falls back to sequential synchronous `pread`/`pwrite`.
+**Fallback:** When io_uring is unavailable (epoll backend), positioned
+segments fall back to sequential synchronous `pread`/`pwrite`.
+Current-position segments use ordered `read()` / `write()` calls.
 
 ### File Helpers
 

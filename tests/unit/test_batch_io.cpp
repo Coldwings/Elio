@@ -74,6 +74,41 @@ TEST_CASE("batch_read: read multiple segments from file", "[io][batch][read]") {
     unlink(tmpfile);
 }
 
+TEST_CASE("batch_read: negative offset uses current file position",
+          "[io][batch][read][regression]") {
+    char tmpfile[] = "/tmp/elio_batch_read_current_XXXXXX";
+    int fd = mkstemp(tmpfile);
+    REQUIRE(fd >= 0);
+
+    const char* content = "0123456789ABCDEFGHIJ";
+    ssize_t written = write(fd, content, strlen(content));
+    REQUIRE(written == static_cast<ssize_t>(strlen(content)));
+    REQUIRE(lseek(fd, 10, SEEK_SET) == 10);
+
+    run_on_scheduler([&]() -> task<void> {
+        char explicit_buf[8] = {0};
+        char current_buf1[8] = {0};
+        char current_buf2[8] = {0};
+
+        std::array<batch_read_segment, 3> segments;
+        segments[0] = batch_read_segment{0, explicit_buf, 2};
+        segments[1] = batch_read_segment{-1, current_buf1, 3};
+        segments[2] = batch_read_segment{-1, current_buf2, 3};
+
+        auto results = co_await batch_read(fd, std::span<const batch_read_segment>(segments));
+
+        const std::vector<int> expected{2, 3, 3};
+        REQUIRE(results == expected);
+        REQUIRE(std::string(explicit_buf, 2) == "01");
+        REQUIRE(std::string(current_buf1, 3) == "ABC");
+        REQUIRE(std::string(current_buf2, 3) == "DEF");
+        REQUIRE(lseek(fd, 0, SEEK_CUR) == 16);
+    });
+
+    close(fd);
+    unlink(tmpfile);
+}
+
 TEST_CASE("batch_write: write multiple segments to file", "[io][batch][write]") {
     // Create a temp file (pre-sized to hold all segments)
     char tmpfile[] = "/tmp/elio_batch_write_XXXXXX";
@@ -111,6 +146,36 @@ TEST_CASE("batch_write: write multiple segments to file", "[io][batch][write]") 
     REQUIRE(std::string(buffer, 5) == "Hello");
     REQUIRE(std::string(buffer + 10, 5) == "World");
     REQUIRE(std::string(buffer + 20, 4) == "Test");
+
+    close(fd);
+    unlink(tmpfile);
+}
+
+TEST_CASE("batch_write: negative offset uses current file position",
+          "[io][batch][write][regression]") {
+    char tmpfile[] = "/tmp/elio_batch_write_current_XXXXXX";
+    int fd = mkstemp(tmpfile);
+    REQUIRE(fd >= 0);
+
+    const char* content = "0123456789";
+    REQUIRE(write(fd, content, strlen(content)) == static_cast<ssize_t>(strlen(content)));
+    REQUIRE(lseek(fd, 5, SEEK_SET) == 5);
+
+    run_on_scheduler([&]() -> task<void> {
+        const char* replacement = "XYZ";
+        batch_write_segment segment{-1, replacement, 3};
+
+        auto results = co_await batch_write(
+            fd, std::span<const batch_write_segment>(&segment, 1));
+
+        REQUIRE(results == std::vector<int>{3});
+        REQUIRE(lseek(fd, 0, SEEK_CUR) == 8);
+    });
+
+    char buffer[16] = {0};
+    REQUIRE(lseek(fd, 0, SEEK_SET) == 0);
+    REQUIRE(read(fd, buffer, 10) == 10);
+    REQUIRE(std::string(buffer, 10) == "01234XYZ89");
 
     close(fd);
     unlink(tmpfile);

@@ -749,7 +749,8 @@ coro::task<void> file_operations() {
 
 ### Batch I/O
 
-Read multiple file regions in a single syscall:
+Read multiple file regions. Explicit offsets can be batched through io_uring;
+negative offsets read from the descriptor's current position in segment order:
 
 ```cpp
 coro::task<void> batch_read_example(int fd) {
@@ -774,7 +775,7 @@ coro::task<void> batch_read_example(int fd) {
 }
 ```
 
-Write multiple file regions simultaneously:
+Write multiple positioned file regions simultaneously:
 
 ```cpp
 coro::task<void> batch_write_example(int fd) {

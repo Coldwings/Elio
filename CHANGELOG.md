@@ -114,6 +114,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Batch I/O fallback errors**: Synchronous `batch_read()` and `batch_write()`
   fallback paths now report syscall failures as `-errno`, matching io_uring and
   the public I/O result contract. (#763)
+- **Batch I/O current-position offsets**: `batch_read()` and `batch_write()`
+  now honor negative segment offsets as current file position operations
+  instead of mapping them to absolute offset 0. (#830)
 - **RDMA completion-channel routing**: `make_cq_drain()` now polls the CQ
   returned by each channel event, so shared completion channels cannot strand
   completions on a different CQ. (#765)

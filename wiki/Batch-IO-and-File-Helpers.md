@@ -4,7 +4,11 @@ Elio provides high-level file I/O abstractions built on top of io_uring for maxi
 
 ## Batch I/O
 
-Batch I/O allows you to submit multiple `pread`/`pwrite` operations in a **single syscall** (`io_uring_submit()`), reducing kernel round-trip overhead and improving throughput for scattered reads/writes.
+Batch I/O allows positioned segments to be submitted as multiple
+`pread`/`pwrite` operations in a **single syscall** (`io_uring_submit()`),
+reducing kernel round-trip overhead and improving throughput for scattered
+reads/writes. Segments with negative offsets use the file descriptor's current
+position and are executed in segment order to preserve file-position semantics.
 
 ### Batch Read
 
@@ -52,7 +56,8 @@ coro::task<void> write_multiple_segments(int fd) {
 
 ### Design
 
-- **Single syscall submission**: All segments are prepared in the SQ ring and submitted together
+- **Single syscall submission**: Positioned segments are prepared in the SQ ring and submitted together
+- **Current-position support**: Negative offsets use ordered `read()` / `write()` calls so file-position updates are deterministic
 - **Per-segment completion tracking**: Each segment gets its own result (bytes read/written, or negative errno)
 - **Tagged user_data**: The completion queue encodes both the batch state pointer and segment index, allowing out-of-order CQEs to be matched correctly
 - **Epoll fallback**: When io_uring is unavailable, falls back to sequential synchronous `pread`/`pwrite`

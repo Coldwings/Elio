@@ -33,9 +33,12 @@
 #include <mutex>
 #include <unordered_map>
 #include <chrono>
+#include <limits>
+#include <optional>
 #include <tuple>
 #include <type_traits>
 #include <string_view>
+#include <utility>
 
 namespace elio::rpc {
 
@@ -66,6 +69,27 @@ struct pending_request {
         return completed.load(std::memory_order_acquire);
     }
 };
+
+namespace detail {
+
+/// Reserve a request ID by trying generated IDs until one can be inserted.
+/// The try_reserve callback must perform the contains+insert step atomically
+/// for the relevant pending-request shard.
+template<typename NextIdFn, typename TryReserveFn>
+inline std::optional<uint32_t> reserve_unique_request_id(
+    NextIdFn&& next_id,
+    TryReserveFn&& try_reserve,
+    size_t max_attempts = static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    for (size_t attempt = 0; attempt < max_attempts; ++attempt) {
+        uint32_t candidate = next_id();
+        if (try_reserve(candidate)) {
+            return candidate;
+        }
+    }
+    return std::nullopt;
+}
+
+} // namespace detail
 
 // ============================================================================
 // RPC Client
@@ -321,15 +345,15 @@ private:
             co_return rpc_result<Response>(rpc_error::connection_closed);
         }
 
-        // Generate request ID and create pending request
-        uint32_t request_id = id_generator_.next();
-        auto pending = std::make_shared<pending_request>();
-
-        {
-            auto& shard = pending_shard_for(request_id);
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            shard.requests[request_id] = pending;
+        // Reserve a request ID before sending. The wire ID is uint32_t and
+        // wraps, so skip IDs that are still in-flight instead of overwriting
+        // the pending entry for an older call.
+        auto reserved = reserve_pending_request();
+        if (!reserved) {
+            co_return rpc_result<Response>(rpc_error::internal_error);
         }
+        uint32_t request_id = reserved->request_id;
+        auto pending = std::move(reserved->pending);
 
         // From here on, the shard entry is guaranteed to be cleaned up no
         // matter how this coroutine exits (normal return, exception, or
@@ -492,8 +516,15 @@ public:
             co_return false;
         }
 
-        uint32_t request_id = id_generator_.next();
-        auto request_frame = build_request(request_id, Method::id, request);
+        // One-way calls do not create a pending entry, but the server may
+        // still emit a response/error frame for the request. Avoid reusing a
+        // currently pending ID so such a late frame cannot complete another
+        // in-flight call or ping.
+        auto request_id = next_unoccupied_request_id();
+        if (!request_id) {
+            co_return false;
+        }
+        auto request_frame = build_request(*request_id, Method::id, request);
 
         co_await send_mutex_.lock();
         sync::lock_guard send_guard(send_mutex_);
@@ -514,14 +545,12 @@ public:
             co_return false;
         }
 
-        uint32_t ping_id = id_generator_.next();
-        auto pending = std::make_shared<pending_request>();
-
-        {
-            auto& shard = pending_shard_for(ping_id);
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            shard.requests[ping_id] = pending;
+        auto reserved = reserve_pending_request();
+        if (!reserved) {
+            co_return false;
         }
+        uint32_t ping_id = reserved->request_id;
+        auto pending = std::move(reserved->pending);
 
         // Guaranteed cleanup of the shard entry on every exit path.
         pending_eraser eraser(this, ping_id);
@@ -692,6 +721,41 @@ private:
         std::mutex mutex;
         std::unordered_map<uint32_t, std::shared_ptr<pending_request>> requests;
     };
+
+    struct reserved_pending_request {
+        uint32_t request_id = 0;
+        std::shared_ptr<pending_request> pending;
+    };
+
+    std::optional<reserved_pending_request> reserve_pending_request() {
+        auto pending = std::make_shared<pending_request>();
+        auto request_id = detail::reserve_unique_request_id(
+            [this]() {
+                return id_generator_.next();
+            },
+            [this, &pending](uint32_t candidate) {
+                auto& shard = pending_shard_for(candidate);
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                return shard.requests.emplace(candidate, pending).second;
+            });
+
+        if (!request_id) {
+            return std::nullopt;
+        }
+        return reserved_pending_request{*request_id, std::move(pending)};
+    }
+
+    std::optional<uint32_t> next_unoccupied_request_id() {
+        return detail::reserve_unique_request_id(
+            [this]() {
+                return id_generator_.next();
+            },
+            [this](uint32_t candidate) {
+                auto& shard = pending_shard_for(candidate);
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                return shard.requests.find(candidate) == shard.requests.end();
+            });
+    }
 
     pending_shard& pending_shard_for(uint32_t request_id) noexcept {
         return pending_shards_[request_id % pending_shard_count];

@@ -129,7 +129,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **RPC cancellation and framing**: Fixed complete protocol writes, transient
   RPC `writev` retries, `rpc_client` timeout-watcher cleanup, member-coroutine
   self lifetime, end-to-end cancellation propagation, server accept wakeups on
-  stop, and RPC frame-header documentation. (#246, #253, #294)
+  stop, RPC frame-header documentation, and client request-id collision
+  handling after wraparound. (#246, #253, #294, #814)
 - **HTTP/1 client and server robustness**: Fixed response-body framing, skipped
   informational responses, URL authority parsing, client cancellation
   propagation, connect/handshake/read timeout enforcement, failed handshake

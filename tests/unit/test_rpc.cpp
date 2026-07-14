@@ -883,14 +883,84 @@ TEST_CASE("buffer_ref type traits", "[rpc][buffer_ref]") {
 #include <elio/runtime/scheduler.hpp>
 #include <elio/time/timer.hpp>
 #include "../test_main.cpp"  // scaled_ms / scaled_sec timeout helpers
+#include <array>
 #include <thread>
 #include <atomic>
 #include <chrono>
 #include <future>
 #include <memory>
+#include <unordered_set>
 #include <utility>
 #include <sys/socket.h>
 #include <unistd.h>
+
+TEST_CASE("request id reservation skips occupied pending ids",
+          "[rpc][contract][request_id]") {
+    SECTION("skips occupied ids instead of overwriting them") {
+        std::array<uint32_t, 3> generated{7, 8, 9};
+        std::unordered_set<uint32_t> occupied{7, 8};
+        size_t index = 0;
+
+        auto reserved = detail::reserve_unique_request_id(
+            [&]() {
+                REQUIRE(index < generated.size());
+                return generated[index++];
+            },
+            [&](uint32_t candidate) {
+                return occupied.insert(candidate).second;
+            },
+            generated.size());
+
+        REQUIRE(reserved.has_value());
+        REQUIRE(*reserved == 9);
+        REQUIRE(index == generated.size());
+        REQUIRE(occupied.contains(7));
+        REQUIRE(occupied.contains(8));
+        REQUIRE(occupied.contains(9));
+    }
+
+    SECTION("reports exhaustion when no generated id can be reserved") {
+        std::array<uint32_t, 3> generated{3, 4, 5};
+        std::unordered_set<uint32_t> occupied{3, 4, 5};
+        size_t index = 0;
+
+        auto reserved = detail::reserve_unique_request_id(
+            [&]() {
+                REQUIRE(index < generated.size());
+                return generated[index++];
+            },
+            [&](uint32_t candidate) {
+                return occupied.insert(candidate).second;
+            },
+            generated.size());
+
+        REQUIRE_FALSE(reserved.has_value());
+        REQUIRE(index == generated.size());
+        REQUIRE(occupied.size() == generated.size());
+    }
+
+    SECTION("supports one-way id selection without inserting pending state") {
+        std::array<uint32_t, 3> generated{11, 12, 13};
+        std::unordered_set<uint32_t> occupied{11, 12};
+        size_t index = 0;
+
+        auto selected = detail::reserve_unique_request_id(
+            [&]() {
+                REQUIRE(index < generated.size());
+                return generated[index++];
+            },
+            [&](uint32_t candidate) {
+                return !occupied.contains(candidate);
+            },
+            generated.size());
+
+        REQUIRE(selected.has_value());
+        REQUIRE(*selected == 13);
+        REQUIRE(index == generated.size());
+        REQUIRE(occupied.size() == 2);
+        REQUIRE_FALSE(occupied.contains(13));
+    }
+}
 
 namespace {
 

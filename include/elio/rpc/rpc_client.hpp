@@ -40,6 +40,7 @@
 #include <type_traits>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace elio::rpc {
 
@@ -218,16 +219,27 @@ public:
         // alive until the peer sends data or TCP keepalive fires (hours).
         stream_.shutdown_socket();
 
-        // Cancel all pending requests
+        // Move pending requests out of the shard maps before waking them.
+        // event::set() may resume a waiter inline when close() is called
+        // outside a scheduler; that waiter destroys pending_eraser, which
+        // re-enters the same shard mutex.
+        std::vector<std::shared_ptr<pending_request>> pending_to_complete;
         for (auto& shard : pending_shards_) {
             std::lock_guard<std::mutex> lock(shard.mutex);
+            pending_to_complete.reserve(
+                pending_to_complete.size() + shard.requests.size());
             for (auto& [id, req] : shard.requests) {
-                if (req->try_complete()) {
-                    req->error = rpc_error::connection_closed;
-                    req->completion_event.set();
-                }
+                (void)id;
+                pending_to_complete.push_back(std::move(req));
             }
             shard.requests.clear();
+        }
+
+        for (auto& req : pending_to_complete) {
+            if (req->try_complete()) {
+                req->error = rpc_error::connection_closed;
+                req->completion_event.set();
+            }
         }
     }
     

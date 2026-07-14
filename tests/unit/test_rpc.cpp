@@ -911,8 +911,133 @@ TEST_CASE("buffer_ref type traits", "[rpc][buffer_ref]") {
 #include <memory>
 #include <unordered_set>
 #include <utility>
+#include <cerrno>
+#include <csignal>
+#include <cstdlib>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+namespace {
+
+constexpr bool rpc_close_test_running_under_tsan() {
+#if defined(__SANITIZE_THREAD__)
+    return true;
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+    return true;
+#else
+    return false;
+#endif
+#else
+    return false;
+#endif
+}
+
+bool read_exact_fd_for_rpc_close_test(int fd, uint8_t* data, size_t length) {
+    size_t done = 0;
+    while (done < length) {
+        ssize_t n = ::read(fd, data + done, length - done);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        done += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+[[noreturn]] void rpc_close_pending_alarm_handler(int) {
+    ::_exit(124);
+}
+
+int run_rpc_close_off_scheduler_pending_child() {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    if (std::signal(SIGALRM, rpc_close_pending_alarm_handler) == SIG_ERR) {
+        return 1;
+    }
+    ::alarm(20);
+
+    int fds[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        return 2;
+    }
+
+    auto client = tcp_rpc_client::create(tcp_stream(fds[0]));
+    if (client->start()) {
+        ::close(fds[1]);
+        return 3;
+    }
+
+    scheduler sched(2);
+    sched.start();
+
+    std::promise<int> result_promise;
+    auto result_future = result_promise.get_future();
+
+    sched.go([client, p = std::move(result_promise)]() mutable
+                 -> coro::task<void> {
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{17}, elio::test::scaled_sec(30));
+        p.set_value(static_cast<int>(result.error()));
+    });
+
+    std::array<uint8_t, frame_header_size> header_bytes{};
+    if (!read_exact_fd_for_rpc_close_test(
+            fds[1], header_bytes.data(), header_bytes.size())) {
+        ::close(fds[1]);
+        return 4;
+    }
+
+    auto header = frame_header::from_bytes(header_bytes.data());
+    if (header.type != message_type::request ||
+        header.method_id != ExistingStreamCreateMethod::id) {
+        ::close(fds[1]);
+        return 5;
+    }
+
+    std::vector<uint8_t> payload(header.payload_length);
+    if (!payload.empty() &&
+        !read_exact_fd_for_rpc_close_test(
+            fds[1], payload.data(), payload.size())) {
+        ::close(fds[1]);
+        return 6;
+    }
+
+    std::thread close_thread([client] {
+        client->close();
+    });
+    close_thread.join();
+
+    if (result_future.wait_for(elio::test::scaled_sec(5)) !=
+        std::future_status::ready) {
+        ::close(fds[1]);
+        return 7;
+    }
+
+    int error = result_future.get();
+    if (error != static_cast<int>(rpc_error::connection_closed)) {
+        ::close(fds[1]);
+        return 8;
+    }
+
+    client.reset();
+    if (!sched.shutdown(elio::test::scaled_sec(5))) {
+        ::close(fds[1]);
+        return 9;
+    }
+
+    ::close(fds[1]);
+    ::alarm(0);
+    return 0;
+}
+
+} // namespace
 
 TEST_CASE("request id reservation skips occupied pending ids",
           "[rpc][contract][request_id]") {
@@ -1279,6 +1404,36 @@ TEST_CASE("rpc_client start attaches off-scheduler clients once",
     REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
     client.reset();
     ::close(fds[1]);
+}
+
+TEST_CASE("rpc_client close completes pending calls off scheduler",
+          "[rpc][client][close]") {
+    if (rpc_close_test_running_under_tsan()) {
+        SKIP("fork-based deadlock regression is skipped under TSAN");
+    }
+
+    pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+
+    if (pid == 0) {
+        ::_exit(run_rpc_close_off_scheduler_pending_child());
+    }
+
+    int status = 0;
+    pid_t waited = -1;
+    do {
+        waited = ::waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+
+    REQUIRE(waited == pid);
+    CAPTURE(status);
+    if (WIFSIGNALED(status)) {
+        CAPTURE(WTERMSIG(status));
+    }
+    REQUIRE(WIFEXITED(status));
+    int exit_code = WEXITSTATUS(status);
+    CAPTURE(exit_code);
+    REQUIRE(exit_code == 0);
 }
 
 TEST_CASE("rpc session suppresses replies for no-response requests",

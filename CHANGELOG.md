@@ -140,8 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   understand the `no_response` flag so delayed replies cannot be matched to
   unrelated future requests after request-id wrap. Clients created from an
   existing stream now start their receive loop when a scheduler is current, and
-  expose `start()` for off-scheduler construction. (#246, #253, #294, #814,
-  #815, #818, #819, #833)
+  expose `start()` for off-scheduler construction. Closing an RPC client now
+  completes pending calls without waking waiters while holding pending-map
+  locks. (#246, #253, #294, #814, #815, #818, #819, #828, #833)
 - **HTTP/1 client and server robustness**: Fixed response-body framing, skipped
   informational responses, URL authority parsing, client cancellation
   propagation, connect/handshake/read timeout enforcement, failed handshake

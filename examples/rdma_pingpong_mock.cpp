@@ -262,8 +262,10 @@ int main() {
             // Post the recv first so the echoed reply has a buffer.
             // In real RDMA the order matters — recv WRs must be
             // posted before the peer's send completes.
-            auto recv_awaitable = conn_a.recv(
-                buffer_view{rx_buf.data(), rx_buf.size(), /*lkey=*/0});
+            auto recv_awaitable =
+                conn_a.recv(buffer_view{rx_buf.data(), rx_buf.size(),
+                                        /*lkey=*/0})
+                    .start();
 
             std::string msg = "ping " + std::to_string(i);
             std::memcpy(tx_buf.data(), msg.data(), msg.size());
@@ -275,7 +277,7 @@ int main() {
                 co_return;
             }
 
-            auto recv_wc = co_await recv_awaitable;
+            auto recv_wc = co_await std::move(recv_awaitable);
             if (!recv_wc.ok()) {
                 std::cerr << "A recv error\n";
                 co_return;

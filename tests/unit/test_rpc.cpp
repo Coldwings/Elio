@@ -2049,3 +2049,102 @@ TEST_CASE("rpc call cancellation reaches server context token",
     server->stop();
     REQUIRE(sched.shutdown(std::chrono::seconds(30)));
 }
+
+TEST_CASE("rpc session rejects duplicate active request ids",
+          "[rpc][contract][request_id]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    auto server = std::make_shared<rpc_server<tcp_stream>>();
+    std::atomic<int> handler_started{0};
+    std::atomic<bool> handler_cancelled{false};
+    std::atomic<bool> client_sent_duplicate{false};
+    std::atomic<bool> release_client{false};
+    std::atomic<bool> server_done{false};
+
+    server->register_method_with_context<CancelProbeMethod>(
+        [&handler_started, &handler_cancelled](
+            const rpc_context& ctx,
+            const CancelProbeReq& req) -> coro::task<CancelProbeResp> {
+            handler_started.fetch_add(1, std::memory_order_acq_rel);
+
+            for (int i = 0; i < 2000; ++i) {
+                if (ctx.cancel_token.is_cancelled()) {
+                    handler_cancelled.store(true, std::memory_order_release);
+                    co_return CancelProbeResp{-1};
+                }
+                auto result = co_await elio::time::sleep_for(
+                    elio::test::scaled_ms(1),
+                    ctx.cancel_token);
+                if (result == coro::cancel_result::cancelled ||
+                    ctx.cancel_token.is_cancelled()) {
+                    handler_cancelled.store(true, std::memory_order_release);
+                    co_return CancelProbeResp{-1};
+                }
+            }
+
+            co_return CancelProbeResp{req.value};
+        });
+
+    scheduler sched(3);
+    sched.start();
+
+    sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
+        auto s = co_await lst.accept();
+        if (!s) co_return;
+        co_await server->handle_client(std::move(*s));
+        server_done.store(true, std::memory_order_release);
+    });
+
+    sched.go([&, port]() -> coro::task<void> {
+        auto client = co_await tcp_connect(ipv6_address("::1", port));
+        if (!client) co_return;
+
+        constexpr uint32_t duplicate_id = 77;
+        auto first = build_request<CancelProbeReq>(
+            duplicate_id, CancelProbeMethod::id, CancelProbeReq{1});
+        (void)co_await write_frame(*client, first.first, first.second);
+
+        for (int i = 0;
+             i < 2000 && handler_started.load(std::memory_order_acquire) == 0;
+             ++i) {
+            co_await elio::time::sleep_for(elio::test::scaled_ms(1));
+        }
+
+        auto second = build_request<CancelProbeReq>(
+            duplicate_id, CancelProbeMethod::id, CancelProbeReq{2});
+        (void)co_await write_frame(*client, second.first, second.second);
+        client_sent_duplicate.store(true, std::memory_order_release);
+
+        for (int i = 0;
+             i < 10000 && !release_client.load(std::memory_order_acquire);
+             ++i) {
+            co_await elio::time::sleep_for(elio::test::scaled_ms(1));
+        }
+    });
+
+    for (int i = 0;
+         i < 5000 &&
+             !(handler_cancelled.load(std::memory_order_acquire) &&
+               server_done.load(std::memory_order_acquire));
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    bool cancelled_before_stop = handler_cancelled.load(std::memory_order_acquire);
+    bool server_done_before_stop = server_done.load(std::memory_order_acquire);
+    release_client.store(true, std::memory_order_release);
+    server->stop();
+    bool drained = sched.shutdown(elio::test::scaled_sec(5));
+
+    REQUIRE(drained);
+    REQUIRE(client_sent_duplicate.load(std::memory_order_acquire));
+    REQUIRE(server_done_before_stop);
+    REQUIRE(handler_started.load(std::memory_order_acquire) == 1);
+    REQUIRE(cancelled_before_stop);
+}

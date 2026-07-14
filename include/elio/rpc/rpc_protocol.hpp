@@ -27,6 +27,7 @@
 #include "rpc_types.hpp"
 
 #include <elio/coro/task.hpp>
+#include <elio/coro/cancel_token.hpp>
 #include <elio/hash/crc32.hpp>
 
 #include <algorithm>
@@ -237,6 +238,12 @@ concept rpc_stream = requires(T& stream, void* buf, const void* cbuf, size_t len
     { stream.is_valid() } -> std::same_as<bool>;
 };
 
+template<typename T>
+concept cancellable_rpc_stream = rpc_stream<T> &&
+    requires(T& stream, const void* cbuf, size_t len, coro::cancel_token token) {
+        { stream.write_exactly(cbuf, len, token) };
+    };
+
 /// Write all data from iovec array to stream (scatter-gather write)
 /// Handles partial writes by adjusting iovec entries
 template<rpc_stream Stream>
@@ -247,8 +254,6 @@ coro::task<io::io_result> writev_exact(Stream& stream, struct iovec* iovecs, siz
     }
     
     size_t current_iov = 0;
-    size_t bytes_written = 0;
-
     while (current_iov < iov_count) {
         // Batch writes to respect IOV_MAX limit (typically 1024 on Linux)
         size_t batch_size = std::min(
@@ -271,7 +276,6 @@ coro::task<io::io_result> writev_exact(Stream& stream, struct iovec* iovecs, siz
             co_return result;
         }
 
-        bytes_written += result.result;
         size_t written = static_cast<size_t>(result.result);
 
         // Advance through iovecs based on how much was written
@@ -415,6 +419,38 @@ coro::task<bool> write_frame(Stream& stream, const frame_header& header,
 
     // Write all data using scatter-gather I/O with retry handling
     auto result = co_await writev_exact(stream, iovecs, iov_count);
+    co_return result.result > 0;
+}
+
+/// Write a complete frame through a cancellable exact write.
+template<cancellable_rpc_stream Stream>
+coro::task<bool> write_frame(Stream& stream,
+                              const frame_header& header,
+                              const buffer_writer& payload,
+                              coro::cancel_token token) {
+    auto header_bytes = header.to_bytes();
+
+    size_t frame_size = frame_header_size + payload.size();
+    std::array<uint8_t, checksum_size> checksum_bytes{};
+    if (has_flag(header.flags, message_flags::has_checksum)) {
+        frame_size += checksum_size;
+        uint32_t crc = hash::crc32_update(header_bytes.data(), frame_header_size, 0xFFFFFFFF);
+        if (payload.size() > 0) {
+            crc = hash::crc32_update(payload.data(), payload.size(), crc);
+        }
+        endian::write_le<uint32_t>(checksum_bytes.data(), hash::crc32_finalize(crc));
+    }
+
+    buffer_writer frame(frame_size);
+    frame.write_bytes(header_bytes.data(), frame_header_size);
+    if (payload.size() > 0) {
+        frame.write_bytes(payload.data(), payload.size());
+    }
+    if (has_flag(header.flags, message_flags::has_checksum)) {
+        frame.write_bytes(checksum_bytes.data(), checksum_size);
+    }
+
+    auto result = co_await stream.write_exactly(frame.data(), frame.size(), token);
     co_return result.result > 0;
 }
 

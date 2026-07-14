@@ -112,6 +112,56 @@ inline void* tagged_op_state_user_data(op_state* st) noexcept {
         reinterpret_cast<uintptr_t>(st) | USER_DATA_OP_STATE_TAG);
 }
 
+namespace detail {
+
+/// Positive short submits mean the kernel consumed only part of the SQ ring.
+/// liburing keeps the unconsumed SQEs visible via io_uring_sq_ready(), so they
+/// must remain pending and be retried by the next submit/poll cycle.
+inline bool is_io_uring_short_submit(size_t staged, int submitted) noexcept {
+    return submitted >= 0 && static_cast<size_t>(submitted) < staged;
+}
+
+inline bool io_uring_submit_made_progress(size_t ready_before,
+                                          size_t ready_after) noexcept {
+    return ready_after < ready_before;
+}
+
+template<typename ReadyFn, typename SubmitFn, typename ErrorFn,
+         typename ShortFn, typename StalledFn>
+inline bool submit_queued_io_uring_sqes_for_poll(ReadyFn&& ready,
+                                                 SubmitFn&& submit,
+                                                 ErrorFn&& on_error,
+                                                 ShortFn&& on_short,
+                                                 StalledFn&& on_stalled) {
+    while (true) {
+        const size_t ready_before = ready();
+        if (ready_before == 0) {
+            return true;
+        }
+
+        int submitted = submit();
+        if (submitted < 0) {
+            on_error(submitted);
+            return false;
+        }
+
+        const size_t ready_after = ready();
+        if (is_io_uring_short_submit(ready_before, submitted)) {
+            on_short(submitted, ready_before);
+        }
+
+        if (ready_after == 0) {
+            return true;
+        }
+        if (!io_uring_submit_made_progress(ready_before, ready_after)) {
+            on_stalled(ready_after);
+            return false;
+        }
+    }
+}
+
+} // namespace detail
+
 /// Shared state for a batch I/O operation.
 /// Kept here so both the io_uring backend (which dispatches CQEs) and the
 /// batch awaitables in ``io_awaitables.hpp`` (which build trampolines) can
@@ -397,12 +447,12 @@ public:
             return submitted;
         }
 
-        // If we submitted fewer than prepared (shouldn't happen with
-        // io_uring_submit), rollback the excess.
-        if (static_cast<size_t>(submitted) < pending) {
-            size_t rollback = pending - static_cast<size_t>(submitted);
-            pending_ops_.fetch_sub(rollback, std::memory_order_relaxed);
-            ELIO_LOG_WARNING("io_uring_submit submitted {}/{} SQEs", submitted, pending);
+        // Positive short submits leave the excess SQEs in the SQ ring. Keep
+        // their pending_ops_ accounting intact so poll()/submit() can retry
+        // them and their eventual CQEs can balance the count.
+        if (detail::is_io_uring_short_submit(pending, submitted)) {
+            ELIO_LOG_WARNING("io_uring_submit submitted {}/{} SQEs; retrying remaining SQEs",
+                             submitted, pending);
         }
 
         ELIO_LOG_DEBUG("Submitted {} operations", submitted);
@@ -411,24 +461,17 @@ public:
     
     /// Poll for completed operations
     int poll(std::chrono::milliseconds timeout) override {
-        // Auto-submit any pending operations before polling
-        // This enables batching: multiple prepares followed by one submit
-        if (io_uring_sq_ready(&ring_) > 0) {
-            int ret = io_uring_submit(&ring_);
-            if (ret < 0) {
-                // Log but do NOT rollback pending_ops_: poll() will retry
-                // on the next iteration and a rollback here would cause
-                // underflow when the retried SQEs succeed and their CQEs
-                // decrement pending_ops_.
-                ELIO_LOG_ERROR("io_uring_submit in poll() failed: {}", strerror(-ret));
-            }
-        }
+        // Auto-submit any pending operations before polling. This enables
+        // batching: multiple prepares followed by one submit. If a short
+        // submit leaves SQEs queued, retry before any blocking CQE wait so a
+        // queued cancel/timeout SQE is not left invisible to the kernel.
+        const bool can_block_for_cqe = submit_pending_for_poll();
 
         struct io_uring_cqe* cqe = nullptr;
         int completions = 0;
         std::vector<deferred_resume_entry> deferred_resumes;
         
-        if (timeout.count() == 0) {
+        if (timeout.count() == 0 || !can_block_for_cqe) {
             // Non-blocking: peek for available CQEs
             while (io_uring_peek_cqe(&ring_, &cqe) == 0 && cqe) {
                 process_completion(cqe, &deferred_resumes);
@@ -639,6 +682,29 @@ private:
         std::coroutine_handle<> handle;
         io_result result;
     };
+
+    bool submit_pending_for_poll() {
+        return detail::submit_queued_io_uring_sqes_for_poll(
+            [this]() { return static_cast<size_t>(io_uring_sq_ready(&ring_)); },
+            [this]() { return io_uring_submit(&ring_); },
+            [](int ret) {
+                // Log but do NOT rollback pending_ops_: poll() will retry on
+                // the next iteration and a rollback here would cause underflow
+                // when the retried SQEs succeed and their CQEs decrement
+                // pending_ops_.
+                ELIO_LOG_ERROR("io_uring_submit in poll() failed: {}", strerror(-ret));
+            },
+            [](int submitted, size_t ready) {
+                ELIO_LOG_WARNING(
+                    "io_uring_submit in poll() submitted {}/{} SQEs; retrying remaining SQEs",
+                    submitted, ready);
+            },
+            [](size_t remaining) {
+                ELIO_LOG_WARNING(
+                    "io_uring_submit in poll() left {} SQEs queued without progress",
+                    remaining);
+            });
+    }
     
     void process_completion(struct io_uring_cqe* cqe,
                            std::vector<deferred_resume_entry>* deferred_resumes = nullptr) {

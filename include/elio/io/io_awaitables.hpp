@@ -15,6 +15,7 @@
 #include <thread>
 #include <atomic>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace elio::io {
@@ -743,11 +744,12 @@ inline void mark_batch_inline_completed(batch_state& st) noexcept {
 /// resume the awaiter via the trampolines). Returns false if the io_uring
 /// backend is unavailable or every SQE allocation failed; the caller should
 /// then either fall back to sequential I/O or resume immediately.
-template<typename PrepFn>
-inline bool submit_batch_io_uring(io_uring_backend* backend,
-                                  batch_state& st,
-                                  std::coroutine_handle<> awaiter,
-                                  PrepFn&& prep_one) {
+template<typename PrepFn, typename SubmitFn>
+inline bool submit_batch_io_uring_with_submitter(io_uring_backend* backend,
+                                                 batch_state& st,
+                                                 std::coroutine_handle<> awaiter,
+                                                 PrepFn&& prep_one,
+                                                 SubmitFn&& submit_ring) {
     struct io_uring* ring = backend->get_ring();
     if (!ring) {
         return false;
@@ -790,7 +792,7 @@ inline bool submit_batch_io_uring(io_uring_backend* backend,
     }
 
     backend->register_pending(in_flight);
-    int submitted = io_uring_submit(ring);
+    int submitted = submit_ring(ring);
     if (submitted < 0) {
         // Submit failed entirely: rollback pending_ops_ and mark all
         // in-flight segments as failed so the awaiter resumes promptly.
@@ -805,15 +807,27 @@ inline bool submit_batch_io_uring(io_uring_backend* backend,
         }
         return false;
     }
-    if (static_cast<size_t>(submitted) < in_flight) {
-        // Partial submit: rollback the excess and mark un-submitted segments.
-        size_t excess = in_flight - static_cast<size_t>(submitted);
-        backend->unregister_pending(excess);
-        st.completed.fetch_add(static_cast<int>(excess), std::memory_order_acq_rel);
+    if (is_io_uring_short_submit(in_flight, submitted)) {
+        // Positive short submit: liburing leaves the unconsumed SQEs queued.
+        // Keep them accounted for and do not synthesize segment completions;
+        // the next submit/poll cycle will retry them and real CQEs will fill
+        // the per-segment results.
         ELIO_LOG_WARNING("submit_batch_io_uring: submitted {}/{} SQEs",
                          submitted, in_flight);
     }
     return true;
+}
+
+template<typename PrepFn>
+inline bool submit_batch_io_uring(io_uring_backend* backend,
+                                  batch_state& st,
+                                  std::coroutine_handle<> awaiter,
+                                  PrepFn&& prep_one) {
+    return submit_batch_io_uring_with_submitter(
+        backend, st, awaiter, std::forward<PrepFn>(prep_one),
+        [](struct io_uring* ring) {
+            return io_uring_submit(ring);
+        });
 }
 #endif
 

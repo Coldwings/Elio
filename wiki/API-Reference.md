@@ -2823,6 +2823,8 @@ struct rpc_client_config {
 template<typename Stream>
 class rpc_client {
 public:
+    using ptr = std::shared_ptr<rpc_client>;
+
     static std::shared_ptr<rpc_client> create(
         Stream stream,
         rpc_client_config config = {});
@@ -2835,12 +2837,58 @@ public:
     static coro::task<std::optional<std::shared_ptr<rpc_client>>>
         connect_with_config(rpc_client_config config, Args&&... args);
 
+    bool is_connected() const noexcept;
+    bool start();
+    void close();
+
+    template<typename Method>
+    coro::task<rpc_result<typename Method::response_type>>
+        call(const typename Method::request_type& request);
+
+    template<typename Method, typename Rep, typename Period>
+    coro::task<rpc_result<typename Method::response_type>>
+        call(const typename Method::request_type& request,
+             std::chrono::duration<Rep, Period> timeout);
+
+    template<typename Method>
+    coro::task<rpc_result<typename Method::response_type>>
+        call(const typename Method::request_type& request,
+             coro::cancel_token token);
+
+    template<typename Method, typename Rep, typename Period>
+    coro::task<rpc_result<typename Method::response_type>>
+        call(const typename Method::request_type& request,
+             std::chrono::duration<Rep, Period> timeout,
+             coro::cancel_token token);
+
+    template<typename Method>
+    coro::task<bool> send_oneway(
+        const typename Method::request_type& request);
+
+    coro::task<bool> ping(
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(5000));
+
+    Stream& stream() noexcept;
+    const Stream& stream() const noexcept;
     const rpc_client_config& config() const noexcept;
 };
 
 using tcp_rpc_client = rpc_client<net::tcp_stream>;
 using uds_rpc_client = rpc_client<net::uds_stream>;
 ```
+
+`create()` constructs a client from an existing stream and attempts to start the
+background receive loop immediately. If it is called outside a scheduler,
+`start()` returns `false`; call `start()` from a scheduler before issuing
+response-bearing operations such as `call()` or `ping()`.
+
+`connect()` and `connect_with_config()` perform the transport connection from a
+scheduler context and return a client with its receive loop started on success.
+
+Call `close()` explicitly when the client is no longer needed. The receive loop
+can hold a strong reference while blocked in a read, so dropping the last
+external `shared_ptr` is not a substitute for closing the underlying stream and
+waking pending calls.
 
 #### `rpc_result<T>`
 

@@ -126,6 +126,29 @@ inline bool has_only_supported_message_flags(message_flags flags) noexcept {
     return (raw_flags & supported_flags) == raw_flags;
 }
 
+inline bool has_allowed_flags_for_type(message_type type,
+                                       message_flags flags) noexcept {
+    const auto raw_flags = static_cast<uint8_t>(flags);
+    constexpr uint8_t checksum_flag =
+        static_cast<uint8_t>(message_flags::has_checksum);
+    constexpr uint8_t request_flags =
+        static_cast<uint8_t>(message_flags::has_timeout) |
+        checksum_flag |
+        static_cast<uint8_t>(message_flags::no_response);
+
+    switch (type) {
+        case message_type::request:
+            return (raw_flags & request_flags) == raw_flags;
+        case message_type::response:
+        case message_type::error:
+        case message_type::ping:
+        case message_type::pong:
+        case message_type::cancel:
+            return (raw_flags & checksum_flag) == raw_flags;
+    }
+    return false;
+}
+
 // ============================================================================
 // Frame header
 // ============================================================================
@@ -146,7 +169,26 @@ struct frame_header {
                version == protocol_version &&
                is_valid_message_type(type) &&
                has_only_supported_message_flags(flags) &&
+               has_allowed_flags_for_type(type, flags) &&
+               has_valid_shape() &&
                payload_length <= max_message_size;
+    }
+
+    /// Validate per-message-type method and payload invariants.
+    bool has_valid_shape() const noexcept {
+        switch (type) {
+            case message_type::request:
+                return !has_flag(flags, message_flags::has_timeout) ||
+                       payload_length >= sizeof(uint32_t);
+            case message_type::response:
+            case message_type::error:
+                return method_id == 0;
+            case message_type::ping:
+            case message_type::pong:
+            case message_type::cancel:
+                return method_id == 0 && payload_length == 0;
+        }
+        return false;
     }
 
     /// Serialize header to buffer

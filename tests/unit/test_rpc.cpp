@@ -845,8 +845,23 @@ TEST_CASE("frame header rejects unsupported RPC wire contract bits",
         header.flags = message_flags::has_timeout |
                        message_flags::has_checksum |
                        message_flags::no_response;
+        header.payload_length = sizeof(uint32_t);
 
         REQUIRE(header.is_valid());
+    }
+
+    SECTION("accepts checksum on non-request frames") {
+        for (auto type : {message_type::response,
+                          message_type::error,
+                          message_type::ping,
+                          message_type::pong,
+                          message_type::cancel}) {
+            frame_header header;
+            header.type = type;
+            header.flags = message_flags::has_checksum;
+
+            REQUIRE(header.is_valid());
+        }
     }
 
     SECTION("rejects compressed reserved flag") {
@@ -871,6 +886,61 @@ TEST_CASE("frame header rejects unsupported RPC wire contract bits",
         header.flags = static_cast<message_flags>(0x80);
 
         REQUIRE_FALSE(header.is_valid());
+    }
+
+    SECTION("rejects request-only flags on non-request frames") {
+        for (auto type : {message_type::response,
+                          message_type::error,
+                          message_type::ping,
+                          message_type::pong,
+                          message_type::cancel}) {
+            frame_header timeout_header;
+            timeout_header.type = type;
+            timeout_header.flags = message_flags::has_timeout;
+
+            REQUIRE_FALSE(timeout_header.is_valid());
+
+            frame_header no_response_header;
+            no_response_header.type = type;
+            no_response_header.flags = message_flags::no_response;
+
+            REQUIRE_FALSE(no_response_header.is_valid());
+        }
+    }
+
+    SECTION("rejects timeout requests with payload too short for timeout") {
+        frame_header header;
+        header.type = message_type::request;
+        header.flags = message_flags::has_timeout;
+        header.payload_length = sizeof(uint32_t) - 1;
+
+        REQUIRE_FALSE(header.is_valid());
+    }
+
+    SECTION("rejects method ids on non-request frames") {
+        for (auto type : {message_type::response,
+                          message_type::error,
+                          message_type::ping,
+                          message_type::pong,
+                          message_type::cancel}) {
+            frame_header header;
+            header.type = type;
+            header.method_id = 42;
+
+            REQUIRE_FALSE(header.is_valid());
+        }
+    }
+
+    SECTION("rejects payload on control frames") {
+        for (auto type : {message_type::ping,
+                          message_type::pong,
+                          message_type::cancel}) {
+            frame_header header;
+            header.type = type;
+            header.payload_length = 1;
+
+            REQUIRE_FALSE(header.is_valid());
+        }
     }
 
     SECTION("rejects unknown message types") {

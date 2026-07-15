@@ -178,6 +178,60 @@ void require_websocket_handshake_response_rejected(
     REQUIRE(client_errno == EBADMSG);
 }
 
+void require_websocket_handshake_response_accepted(
+    const std::function<std::string(std::string_view)>& make_response) {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_connected{false};
+    std::atomic<int> client_errno{0};
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        REQUIRE(stream.has_value());
+        auto headers = co_await read_request_headers(*stream);
+        auto key = request_header_value(headers, "Sec-WebSocket-Key");
+        REQUIRE_FALSE(key.empty());
+
+        auto accept = elio::http::websocket::compute_websocket_accept(key);
+        auto response = make_response(accept);
+        co_await stream->write(response);
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        stream->shutdown_socket();
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::websocket::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(2);
+        elio::http::websocket::ws_client client(cfg);
+
+        bool ok = co_await client.connect(make_ws_url(port));
+        client_connected = ok;
+        if (!ok) {
+            client_errno = errno;
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(client_connected);
+    REQUIRE(client_errno == 0);
+}
+
 task<std::string> read_request_message(elio::net::tcp_stream& s) {
     std::string accum;
     char buf[1024];
@@ -660,6 +714,17 @@ TEST_CASE("WebSocket client rejects unoffered server subprotocol",
 
 TEST_CASE("WebSocket client validates server upgrade response tokens",
           "[websocket][client][handshake][regression]") {
+    SECTION("accepts mixed-case comma-separated tokens") {
+        require_websocket_handshake_response_accepted(
+            [](std::string_view accept) {
+                return std::string(
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: WebSocket\r\n"
+                    "Connection: keep-alive, Upgrade\r\n"
+                    "Sec-WebSocket-Accept: ") + std::string(accept) + "\r\n\r\n";
+            });
+    }
+
     SECTION("missing Upgrade header") {
         require_websocket_handshake_response_rejected(
             [](std::string_view accept) {

@@ -128,6 +128,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `batch_write()` now keep staged batch SQEs accounted and suspended after a
   negative direct submit result, so later poll retries cannot submit stale
   `batch_completion` user data after the awaitable has inline-completed. (#842)
+- **io_uring prepare rejection contract**: `io_uring_backend::prepare()` now
+  validates unsupported operations and malformed timeout requests before
+  consuming an SQE, keeping rejected requests side-effect free. (#849)
 - **Batch I/O fallback errors**: Synchronous `batch_read()` and `batch_write()`
   fallback paths now report syscall failures as `-errno`, matching io_uring and
   the public I/O result contract. (#763)

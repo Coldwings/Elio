@@ -126,7 +126,8 @@ public:
 
     /// Prepare an I/O operation (does not submit yet)
     /// @param req The I/O request to prepare
-    /// @return true if prepared successfully, false if queue is full
+    /// @return true if prepared successfully, false if no operation was staged
+    ///         because the queue is full or the backend rejected the request
     virtual bool prepare(const io_request& req) = 0;
 
     /// Submit all prepared I/O operations

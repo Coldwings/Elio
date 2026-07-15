@@ -256,6 +256,45 @@ TEST_CASE("io_uring short submit keeps excess operations pending",
         REQUIRE(std::all_of(st.results.begin(), st.results.end(),
                             [](int result) { return result == 0; }));
     }
+
+    SECTION("batch submit path keeps negative-submit segments retryable") {
+        if (!io_uring_backend::is_available()) {
+            SUCCEED("io_uring is not available at runtime");
+            return;
+        }
+
+        io_uring_backend backend;
+        batch_state st(2);
+        int submit_calls = 0;
+
+        bool submitted = elio::io::detail::submit_batch_io_uring_with_submitter(
+            &backend, st, std::coroutine_handle<>{},
+            [](struct io_uring_sqe* sqe, int) {
+                io_uring_prep_nop(sqe);
+            },
+            [&](struct io_uring*) {
+                ++submit_calls;
+                return -EAGAIN;
+            });
+
+        REQUIRE(submitted);
+        REQUIRE(submit_calls == 1);
+        REQUIRE(backend.pending_count() == 2);
+        REQUIRE(st.completed.load(std::memory_order_acquire) == 0);
+        REQUIRE_FALSE(st.all_done());
+        REQUIRE(std::all_of(st.results.begin(), st.results.end(),
+                            [](int result) { return result == 0; }));
+
+        for (int attempts = 0; backend.pending_count() != 0 && attempts < 20; ++attempts) {
+            backend.poll(std::chrono::milliseconds(10));
+        }
+
+        REQUIRE(backend.pending_count() == 0);
+        REQUIRE(st.completed.load(std::memory_order_acquire) == st.total);
+        REQUIRE(st.all_done());
+        REQUIRE(std::all_of(st.results.begin(), st.results.end(),
+                            [](int result) { return result == 0; }));
+    }
 #else
     SUCCEED("io_uring backend is not compiled in");
 #endif

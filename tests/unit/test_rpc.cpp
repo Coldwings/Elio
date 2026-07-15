@@ -1533,6 +1533,7 @@ struct fast_response_stream_state {
     std::atomic<bool> request_seen{false};
     std::atomic<bool> next_header_read_started{false};
     std::atomic<bool> writev_returned_after_dispatch{false};
+    bool fail_write_after_dispatch = false;
     int32_t request_value = 0;
 };
 
@@ -1636,6 +1637,10 @@ struct fast_response_stream {
             state->next_header_read_started.load(std::memory_order_acquire),
             std::memory_order_release);
 
+        if (state->fail_write_after_dispatch) {
+            co_return elio::io::io_result{-ECONNRESET, 0};
+        }
+
         if (total > static_cast<size_t>(INT32_MAX)) {
             co_return elio::io::io_result{-EOVERFLOW, 0};
         }
@@ -1658,6 +1663,135 @@ struct fast_response_stream {
         state->response_available.set();
         state->response_dispatched.set();
         state->shutdown_event.set();
+    }
+};
+
+struct stalled_send_stream_state {
+    std::atomic<bool> shutdown{false};
+    std::atomic<size_t> cancellable_write_calls{0};
+    std::atomic<size_t> cancellable_write_cancelled{0};
+    std::atomic<size_t> writev_calls{0};
+    std::atomic<bool> first_write_started{false};
+    std::atomic<bool> accepted_partial_frame{false};
+};
+
+struct stalled_send_stream {
+    std::shared_ptr<stalled_send_stream_state> state;
+
+    explicit stalled_send_stream(std::shared_ptr<stalled_send_stream_state> s)
+        : state(std::move(s)) {}
+
+    elio::coro::task<elio::io::io_result> read_exactly(void*, size_t) {
+        while (!state->shutdown.load(std::memory_order_acquire)) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+        co_return elio::io::io_result{-ECANCELED, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> write_exactly(const void*, size_t) {
+        co_return elio::io::io_result{-ENOSYS, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> write_exactly(
+        const void*, size_t, elio::coro::cancel_token token) {
+        auto call_index = state->cancellable_write_calls.fetch_add(
+            1, std::memory_order_acq_rel);
+        if (call_index == 0) {
+            state->first_write_started.store(true, std::memory_order_release);
+        }
+        state->accepted_partial_frame.store(true, std::memory_order_release);
+
+        while (!state->shutdown.load(std::memory_order_acquire)) {
+            if (token.is_cancelled()) {
+                state->cancellable_write_cancelled.fetch_add(
+                    1, std::memory_order_acq_rel);
+                co_return elio::io::io_result{-ECANCELED, 0};
+            }
+
+            auto result = co_await elio::time::sleep_for(
+                std::chrono::milliseconds(1), token);
+            if (result == elio::coro::cancel_result::cancelled) {
+                state->cancellable_write_cancelled.fetch_add(
+                    1, std::memory_order_acq_rel);
+                co_return elio::io::io_result{-ECANCELED, 0};
+            }
+        }
+
+        co_return elio::io::io_result{-ECONNRESET, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> writev(struct iovec*, size_t) {
+        state->writev_calls.fetch_add(1, std::memory_order_acq_rel);
+        co_return elio::io::io_result{-ENOSYS, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> poll_write() {
+        co_return elio::io::io_result{0, 0};
+    }
+
+    bool is_valid() const noexcept {
+        return !state->shutdown.load(std::memory_order_acquire);
+    }
+
+    void shutdown_socket() noexcept {
+        state->shutdown.store(true, std::memory_order_release);
+    }
+};
+
+struct disconnect_after_first_valid_stream_state {
+    std::atomic<size_t> is_valid_calls{0};
+    std::atomic<size_t> cancellable_write_calls{0};
+    std::atomic<size_t> writev_calls{0};
+    std::atomic<bool> shutdown{false};
+};
+
+struct disconnect_after_first_valid_stream {
+    std::shared_ptr<disconnect_after_first_valid_stream_state> state;
+
+    explicit disconnect_after_first_valid_stream(
+        std::shared_ptr<disconnect_after_first_valid_stream_state> s)
+        : state(std::move(s)) {}
+
+    elio::coro::task<elio::io::io_result> read_exactly(void*, size_t) {
+        co_return elio::io::io_result{-ECONNRESET, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> write_exactly(const void*, size_t) {
+        co_return elio::io::io_result{-ENOSYS, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> write_exactly(
+        const void*, size_t, elio::coro::cancel_token token) {
+        state->cancellable_write_calls.fetch_add(1, std::memory_order_acq_rel);
+        while (!state->shutdown.load(std::memory_order_acquire)) {
+            if (token.is_cancelled()) {
+                co_return elio::io::io_result{-ECANCELED, 0};
+            }
+            auto result = co_await elio::time::sleep_for(
+                std::chrono::milliseconds(1), token);
+            if (result == elio::coro::cancel_result::cancelled) {
+                co_return elio::io::io_result{-ECANCELED, 0};
+            }
+        }
+        co_return elio::io::io_result{-ECONNRESET, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> writev(struct iovec*, size_t) {
+        state->writev_calls.fetch_add(1, std::memory_order_acq_rel);
+        co_return elio::io::io_result{-ENOSYS, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> poll_write() {
+        co_return elio::io::io_result{0, 0};
+    }
+
+    bool is_valid() const noexcept {
+        auto call = state->is_valid_calls.fetch_add(1, std::memory_order_acq_rel);
+        return call == 0;
+    }
+
+    void shutdown_socket() noexcept {
+        state->shutdown.store(true, std::memory_order_release);
     }
 };
 
@@ -1743,6 +1877,47 @@ TEST_CASE("rpc call observes response published before wait path",
     REQUIRE(state->request_value == 17);
     REQUIRE(state->next_header_read_started.load(std::memory_order_acquire));
     REQUIRE(state->writev_returned_after_dispatch.load(std::memory_order_acquire));
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("rpc call parses response published before failed send returns",
+          "[rpc][client][contract]") {
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    scheduler sched(2);
+    sched.start();
+
+    auto state = std::make_shared<fast_response_stream_state>();
+    state->fail_write_after_dispatch = true;
+    std::promise<std::pair<rpc_error, std::string>> result_promise;
+    auto result_future = result_promise.get_future();
+
+    sched.go([state, p = std::move(result_promise)]() mutable -> coro::task<void> {
+        auto client = rpc_client<fast_response_stream>::create(
+            fast_response_stream{state});
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{23}, elio::test::scaled_sec(30));
+
+        std::pair<rpc_error, std::string> observed{result.error(), {}};
+        if (result.ok()) {
+            observed.second = result->result;
+        }
+        p.set_value(std::move(observed));
+    });
+
+    REQUIRE(result_future.wait_for(elio::test::scaled_sec(5)) ==
+            std::future_status::ready);
+
+    auto [error, value] = result_future.get();
+    REQUIRE(error == rpc_error::success);
+    REQUIRE(value == "published-before-wait");
+    REQUIRE(state->request_seen.load(std::memory_order_acquire));
+    REQUIRE(state->request_value == 23);
+    REQUIRE(state->next_header_read_started.load(std::memory_order_acquire));
+    REQUIRE(state->writev_returned_after_dispatch.load(std::memory_order_acquire));
+    REQUIRE(state->shutdown.load(std::memory_order_acquire));
 
     REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 }
@@ -2984,6 +3159,172 @@ TEST_CASE("call timeout watcher is cancelled after completion",
     // Sanity: draining must be far quicker than the per-call timeout, proving
     // we did not simply wait out the watcher's sleep.
     REQUIRE(drain_elapsed < call_timeout);
+}
+
+TEST_CASE("rpc call timeout cancels a stalled request-frame write",
+          "[rpc][timeout][cancel]") {
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto state = std::make_shared<stalled_send_stream_state>();
+    auto client = rpc_client<stalled_send_stream>::create(
+        stalled_send_stream{state});
+
+    scheduler sched(2);
+    sched.start();
+
+    std::promise<int> done_promise;
+    auto done = done_promise.get_future();
+
+    sched.go([client, p = std::move(done_promise)]() mutable -> coro::task<void> {
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{7}, elio::test::scaled_ms(100));
+        p.set_value(static_cast<int>(result.error()));
+    });
+
+    auto status = done.wait_for(elio::test::scaled_sec(5));
+    REQUIRE(status == std::future_status::ready);
+    REQUIRE(done.get() == static_cast<int>(rpc_error::timeout));
+    REQUIRE(state->cancellable_write_calls.load(std::memory_order_acquire) == 1);
+    REQUIRE(state->cancellable_write_cancelled.load(std::memory_order_acquire) == 1);
+    REQUIRE(state->writev_calls.load(std::memory_order_acquire) == 0);
+    REQUIRE(state->accepted_partial_frame.load(std::memory_order_acquire));
+    REQUIRE(state->shutdown.load(std::memory_order_acquire));
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("rpc call timeout covers waiting for the request send mutex",
+          "[rpc][timeout][cancel]") {
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto state = std::make_shared<stalled_send_stream_state>();
+    auto client = rpc_client<stalled_send_stream>::create(
+        stalled_send_stream{state});
+
+    scheduler sched(2);
+    sched.start();
+
+    std::promise<int> first_done_promise;
+    auto first_done = first_done_promise.get_future();
+    sched.go([client, p = std::move(first_done_promise)]() mutable -> coro::task<void> {
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{1}, elio::test::scaled_sec(30));
+        p.set_value(static_cast<int>(result.error()));
+    });
+
+    for (int i = 0;
+         i < 2000 && !state->first_write_started.load(std::memory_order_acquire);
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(state->first_write_started.load(std::memory_order_acquire));
+
+    std::promise<int> second_done_promise;
+    auto second_done = second_done_promise.get_future();
+    sched.go([client, p = std::move(second_done_promise)]() mutable -> coro::task<void> {
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{2}, elio::test::scaled_ms(100));
+        p.set_value(static_cast<int>(result.error()));
+    });
+
+    auto second_status = second_done.wait_for(elio::test::scaled_sec(5));
+    REQUIRE(second_status == std::future_status::ready);
+    REQUIRE(second_done.get() == static_cast<int>(rpc_error::timeout));
+    REQUIRE(state->cancellable_write_calls.load(std::memory_order_acquire) == 1);
+    REQUIRE(state->writev_calls.load(std::memory_order_acquire) == 0);
+    REQUIRE_FALSE(state->shutdown.load(std::memory_order_acquire));
+
+    client->close();
+
+    auto first_status = first_done.wait_for(elio::test::scaled_sec(5));
+    REQUIRE(first_status == std::future_status::ready);
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("rpc call failed send closes before queued senders run",
+          "[rpc][timeout][cancel]") {
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto state = std::make_shared<stalled_send_stream_state>();
+    auto client = rpc_client<stalled_send_stream>::create(
+        stalled_send_stream{state});
+
+    scheduler sched(2);
+    sched.start();
+
+    std::promise<int> first_done_promise;
+    auto first_done = first_done_promise.get_future();
+    sched.go([client, p = std::move(first_done_promise)]() mutable -> coro::task<void> {
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{1}, elio::test::scaled_ms(200));
+        p.set_value(static_cast<int>(result.error()));
+    });
+
+    for (int i = 0;
+         i < 2000 && !state->first_write_started.load(std::memory_order_acquire);
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(state->first_write_started.load(std::memory_order_acquire));
+
+    std::promise<int> second_done_promise;
+    auto second_done = second_done_promise.get_future();
+    sched.go([client, p = std::move(second_done_promise)]() mutable -> coro::task<void> {
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{2}, elio::test::scaled_sec(30));
+        p.set_value(static_cast<int>(result.error()));
+    });
+
+    auto first_status = first_done.wait_for(elio::test::scaled_sec(5));
+    REQUIRE(first_status == std::future_status::ready);
+    REQUIRE(first_done.get() == static_cast<int>(rpc_error::timeout));
+
+    auto second_status = second_done.wait_for(elio::test::scaled_sec(5));
+    REQUIRE(second_status == std::future_status::ready);
+    REQUIRE(second_done.get() == static_cast<int>(rpc_error::connection_closed));
+
+    REQUIRE(state->cancellable_write_calls.load(std::memory_order_acquire) == 1);
+    REQUIRE(state->writev_calls.load(std::memory_order_acquire) == 0);
+    REQUIRE(state->shutdown.load(std::memory_order_acquire));
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("rpc call observes disconnect after reservation before writing",
+          "[rpc][timeout][cancel]") {
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto state = std::make_shared<disconnect_after_first_valid_stream_state>();
+    auto client = rpc_client<disconnect_after_first_valid_stream>::create(
+        disconnect_after_first_valid_stream{state});
+    REQUIRE(state->is_valid_calls.load(std::memory_order_acquire) == 0);
+
+    scheduler sched(2);
+    sched.start();
+
+    std::promise<int> done_promise;
+    auto done = done_promise.get_future();
+    sched.go([client, p = std::move(done_promise)]() mutable -> coro::task<void> {
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{3}, elio::test::scaled_ms(200));
+        p.set_value(static_cast<int>(result.error()));
+    });
+
+    auto status = done.wait_for(elio::test::scaled_sec(5));
+    REQUIRE(status == std::future_status::ready);
+    REQUIRE(done.get() == static_cast<int>(rpc_error::connection_closed));
+
+    REQUIRE(state->is_valid_calls.load(std::memory_order_acquire) >= 2);
+    REQUIRE(state->cancellable_write_calls.load(std::memory_order_acquire) == 0);
+    REQUIRE(state->writev_calls.load(std::memory_order_acquire) == 0);
+
+    client->close();
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 }
 
 TEST_CASE("rpc ping succeeds on pong frame",

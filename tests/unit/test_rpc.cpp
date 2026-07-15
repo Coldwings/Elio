@@ -929,6 +929,50 @@ TEST_CASE("build error response with checksum", "[rpc][protocol]") {
     REQUIRE(header.type == message_type::error);
 }
 
+TEST_CASE("typed RPC payload parsers reject trailing bytes",
+          "[rpc][protocol][contract]") {
+    SECTION("request payload") {
+        TestRequest req{100};
+        auto [header, payload] = build_request(1, 1, req);
+        payload.write<uint8_t>(0xAA);
+
+        buffer_view view = payload.view();
+        REQUIRE_THROWS_AS(
+            (parse_request<TestRequest>(view, header.flags)),
+            serialization_error);
+    }
+
+    SECTION("request payload with timeout prefix") {
+        TestRequest req{100};
+        auto [header, payload] = build_request(1, 1, req, 5000);
+        payload.write<uint8_t>(0xAA);
+
+        buffer_view view = payload.view();
+        REQUIRE_THROWS_AS(
+            (parse_request<TestRequest>(view, header.flags)),
+            serialization_error);
+    }
+
+    SECTION("response payload") {
+        TestResponse resp{"ok"};
+        auto frame = build_response(1, resp);
+        frame.second.write<uint8_t>(0xAA);
+
+        buffer_view view = frame.second.view();
+        REQUIRE_THROWS_AS(
+            (parse_response<TestResponse>(view)),
+            serialization_error);
+    }
+
+    SECTION("error payload") {
+        auto frame = build_error_response(1, rpc_error::timeout, "timed out");
+        frame.second.write<uint8_t>(0xAA);
+
+        buffer_view view = frame.second.view();
+        REQUIRE_THROWS_AS(parse_error(view), serialization_error);
+    }
+}
+
 // ============================================================================
 // buffer_ref type trait tests
 // ============================================================================
@@ -1921,6 +1965,87 @@ TEST_CASE("malformed has_timeout flag does not crash session", "[rpc][security]"
     REQUIRE_THROWS_AS(
         (parse_request<TestRequest>(v, message_flags::has_timeout)),
         serialization_error);
+}
+
+TEST_CASE("rpc server rejects typed request trailing bytes before handler",
+          "[rpc][server][contract]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    using Method = ELIO_RPC_METHOD(100, TestRequest, TestResponse);
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    int bind_errno = errno;
+    CAPTURE(bind_errno);
+    if (!listener_opt && bind_errno == EPERM) {
+        SKIP("TCP listener creation is denied by this sandbox");
+    }
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    rpc_server_config cfg;
+    cfg.frame_read_timeout = std::chrono::seconds(1);
+    auto server = std::make_shared<rpc_server<tcp_stream>>(cfg);
+
+    std::atomic<bool> handler_called{false};
+    server->register_method<Method>(
+        [&handler_called](const TestRequest& req)
+            -> coro::task<TestResponse> {
+            handler_called.store(true, std::memory_order_release);
+            co_return TestResponse{std::to_string(req.value)};
+        });
+
+    scheduler sched(2);
+    sched.start();
+
+    sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
+        auto stream = co_await lst.accept();
+        if (!stream) co_return;
+        co_await server->handle_client(std::move(*stream));
+    });
+
+    std::promise<bool> done_promise;
+    auto done = done_promise.get_future();
+
+    sched.go([&, port, p = std::move(done_promise)]() mutable
+        -> coro::task<void> {
+        auto client = co_await tcp_connect(ipv6_address("::1", port));
+        if (!client) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto frame = build_request(11, Method::id, TestRequest{7});
+        frame.second.write<uint8_t>(0xAA);
+        frame.first.payload_length = static_cast<uint32_t>(frame.second.size());
+
+        bool sent = co_await write_frame(*client, frame.first, frame.second);
+        if (!sent) {
+            co_await client->close();
+            p.set_value(false);
+            co_return;
+        }
+
+        auto response = co_await read_frame(*client);
+        bool rejected = false;
+        if (response && response->first.type == message_type::error) {
+            buffer_view view = response->second.view();
+            auto err = parse_error(view);
+            rejected = err.code == rpc_error::serialization_error;
+        }
+
+        co_await client->close();
+        p.set_value(
+            rejected &&
+            !handler_called.load(std::memory_order_acquire));
+    });
+
+    auto status = done.wait_for(std::chrono::seconds(60));
+    REQUIRE(status == std::future_status::ready);
+    REQUIRE(done.get());
+    REQUIRE_FALSE(handler_called.load(std::memory_order_acquire));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 }
 
 TEST_CASE("read_frame_bounded rejects oversized payload header",

@@ -677,7 +677,21 @@ inline frame_header build_cancel(uint32_t request_id) {
 // Response parsing helpers
 // ============================================================================
 
-/// Parse request payload
+/// Require that typed payload deserialization consumed the full frame payload.
+inline void require_typed_payload_consumed(const buffer_view& payload) {
+    if (payload.remaining() != 0) {
+        throw serialization_error("rpc: trailing bytes after typed payload");
+    }
+}
+
+template<typename Payload>
+Payload parse_typed_payload(buffer_view& payload) {
+    Payload parsed;
+    deserialize(payload, parsed);
+    require_typed_payload_consumed(payload);
+    return parsed;
+}
+
 template<typename Request>
 std::pair<std::optional<uint32_t>, Request> parse_request(
     buffer_view& payload, message_flags flags)
@@ -687,8 +701,7 @@ std::pair<std::optional<uint32_t>, Request> parse_request(
         timeout_ms = payload.read<uint32_t>();
     }
     
-    Request request;
-    deserialize(payload, request);
+    Request request = parse_typed_payload<Request>(payload);
     
     return {timeout_ms, std::move(request)};
 }
@@ -696,16 +709,12 @@ std::pair<std::optional<uint32_t>, Request> parse_request(
 /// Parse response payload
 template<typename Response>
 Response parse_response(buffer_view& payload) {
-    Response response;
-    deserialize(payload, response);
-    return response;
+    return parse_typed_payload<Response>(payload);
 }
 
 /// Parse error payload
 inline error_payload parse_error(buffer_view& payload) {
-    error_payload err;
-    deserialize(payload, err);
-    return err;
+    return parse_typed_payload<error_payload>(payload);
 }
 
 } // namespace elio::rpc

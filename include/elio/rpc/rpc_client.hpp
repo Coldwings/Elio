@@ -369,6 +369,42 @@ private:
         }
     };
 
+    coro::task<bool> lock_send_mutex_for_call(coro::cancel_token token) {
+        while (!token.is_cancelled()) {
+            if (send_mutex_.try_lock()) {
+                co_return true;
+            }
+
+            auto result = co_await time::sleep_for(
+                std::chrono::milliseconds(1), token);
+            if (result == coro::cancel_result::cancelled) {
+                co_return false;
+            }
+        }
+
+        co_return false;
+    }
+
+    coro::task<bool> write_call_frame(const frame_header& header,
+                                      const buffer_writer& payload,
+                                      coro::cancel_token token) {
+        if constexpr (cancellable_rpc_stream<Stream>) {
+            co_return co_await write_frame(stream_, header, payload, std::move(token));
+        } else {
+            (void)token;
+            co_return co_await write_frame(stream_, header, payload);
+        }
+    }
+
+    static void complete_pending_with_error(
+        const std::shared_ptr<pending_request>& pending,
+        rpc_error error) {
+        if (pending->try_complete()) {
+            pending->error = error;
+            pending->publish_completion();
+        }
+    }
+
     /// Internal implementation of call with cancellation support
     template<typename Method, typename Rep, typename Period>
     coro::task<rpc_result<typename Method::response_type>> call_impl(
@@ -413,14 +449,31 @@ private:
         // caller-driven destruction while awaiting completion_event).
         pending_eraser eraser(this, request_id);
 
+        // close() can race between the optimistic pre-reservation connection
+        // check and the shard insertion above. In that case this call inserted
+        // its pending entry after close() drained the maps, so it must not wait
+        // for another close to complete it.
+        if (!is_connected()) {
+            co_return rpc_result<Response>(rpc_error::connection_closed);
+        }
+
+        // One operation-level cancellation source covers the entire call
+        // lifecycle after reservation: waiting behind the send mutex, writing
+        // the request frame, and the timeout watcher. The public caller token
+        // and the per-call timeout both complete `pending` first, then cancel
+        // this source to wake any cancellable local await.
+        auto operation_cancel = std::make_shared<coro::cancel_source>();
+        auto operation_token = operation_cancel->get_token();
+
         // Register cancellation callback. The callback completes the local
         // pending request; the coroutine starts the wire-level cancel send
         // after it resumes so callbacks never block on socket I/O.
-        auto cancel_registration = token.on_cancel([this, pending, request_id]() {
+        auto cancel_registration = token.on_cancel([pending, operation_cancel]() {
             if (pending->try_complete()) {
                 pending->error = rpc_error::cancelled;
                 pending->publish_completion();
             }
+            operation_cancel->cancel();
         });
 
         // Build and send request
@@ -429,66 +482,61 @@ private:
         auto request_frame = build_request(request_id, Method::id, request, timeout_ms);
         bool request_sent = false;
 
-        bool completed_before_send = false;
-        {
-            co_await send_mutex_.lock();
-            sync::lock_guard send_guard(send_mutex_);
-
-            if (pending->is_completed()) {
-                completed_before_send = true;
-            } else {
-                bool sent = co_await write_frame(stream_, request_frame.first, request_frame.second);
-                if (!sent) {
-                    co_return rpc_result<Response>(rpc_error::connection_closed);
-                }
-                request_sent = true;
-            }
-        }
-
-        if (completed_before_send) {
-            co_await pending->completion_event.wait();
-            (void)pending->is_published();
-            co_return rpc_result<Response>(pending->error);
-        }
-
-        // Wait for response with timeout
-        // Spawn timeout watcher. Use a per-call local cancellation source
-        // (rather than the caller-supplied token) so the watcher can be
-        // cancelled promptly whenever the request completes for ANY reason —
-        // response, error, caller cancellation, or connection close — not
-        // only when the caller cancels. Without this the sleeping watcher
-        // would linger for the full timeout on every fast/normal completion,
-        // retaining the pending_request and an idle background task (mirrors
-        // the pattern already used by ping()).
-        coro::cancel_source timeout_cancel;
+        // Start the per-call deadline before the send path. Otherwise a call
+        // stalled behind the send mutex or inside the request-frame write can
+        // outlive its documented timeout.
         auto* sched = runtime::scheduler::current();
         if (sched) {
             sched->go([ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout),
-                       p = pending, tok = timeout_cancel.get_token()]() mutable {
+                       p = pending,
+                       op_cancel = operation_cancel,
+                       tok = operation_token]() mutable {
                 return [](std::chrono::milliseconds ms,
                           std::shared_ptr<pending_request> pending,
+                          std::shared_ptr<coro::cancel_source> operation_cancel,
                           coro::cancel_token tok)
                     -> coro::task<void>
                 {
                     auto result = co_await time::sleep_for(ms, tok);
 
-                    // Only timeout if sleep completed normally (not cancelled)
-                    if (result == coro::cancel_result::completed && pending->try_complete()) {
-                        pending->timed_out = true;
-                        pending->error = rpc_error::timeout;
-                        pending->publish_completion();
+                    if (result == coro::cancel_result::completed) {
+                        if (pending->try_complete()) {
+                            pending->timed_out = true;
+                            pending->error = rpc_error::timeout;
+                            pending->publish_completion();
+                        }
+                        operation_cancel->cancel();
                     }
-                }(ms, p, std::move(tok));
+                }(ms, p, std::move(op_cancel), std::move(tok));
             });
+        }
+
+        {
+            bool locked = co_await lock_send_mutex_for_call(operation_token);
+            if (locked) {
+                sync::lock_guard send_guard(send_mutex_);
+
+                if (!pending->is_completed() && !operation_token.is_cancelled()) {
+                    bool sent = co_await write_call_frame(
+                        request_frame.first, request_frame.second, operation_token);
+                    if (!sent) {
+                        close();
+                        complete_pending_with_error(
+                            pending, rpc_error::connection_closed);
+                    } else {
+                        request_sent = true;
+                    }
+                }
+            }
         }
 
         // Wait for completion (either response, timeout, or cancellation)
         co_await pending->completion_event.wait();
         (void)pending->is_published();
 
-        // Cancel the timeout watcher so it stops sleeping immediately once
-        // the request has completed, regardless of how completion happened.
-        timeout_cancel.cancel();
+        // Cancel the watcher and any cancellable local send await once the
+        // request has completed, regardless of how completion happened.
+        operation_cancel->cancel();
 
         // Unregister cancellation callback
         cancel_registration.unregister();

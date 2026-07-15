@@ -808,6 +808,11 @@ TEST_CASE("SSE JSON data", "[sse][json]") {
 //      connect-time token.  The previous selection logic was inverted and
 //      silently dropped one of the two; the loop now checks both at every
 //      iteration.
+//
+//   4. SSE response header buffering must enforce the configured parser
+//      limits before the final header delimiter arrives, and must not retain
+//      the old fixed 8192-byte aggregate cap when callers configure larger
+//      valid header lines.
 
 namespace {
 
@@ -1064,6 +1069,139 @@ TEST_CASE("sse_client does not eat events into HTTP body even when the "
     REQUIRE(got[1].data == "1");
     REQUIRE(got[2].type == "tick");
     REQUIRE(got[2].data == "2");
+}
+
+TEST_CASE("sse_client enforces configured response header limits before "
+          "delimiter",
+          "[sse][client][security][regression]") {
+    using namespace elio;
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    bool connected = true;
+    int connect_errno = 0;
+
+    sched.go([&]() -> coro::task<void> {
+        auto server_stream = co_await listener_opt->accept();
+        REQUIRE(server_stream.has_value());
+
+        auto req = co_await read_request_headers(*server_stream);
+        REQUIRE(!req.empty());
+
+        std::string response =
+            "HTTP/1.1 200 OK\r\n"
+            "X-Too-Long: " + std::string(64, 'a');
+        REQUIRE(co_await write_all(*server_stream, response));
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        co_await server_stream->close();
+        server_done = true;
+    });
+
+    sched.go([&]() -> coro::task<void> {
+        client_config cfg;
+        cfg.auto_reconnect = false;
+        cfg.max_header_size = 16;
+        sse_client client(cfg);
+        std::string url =
+            "http://127.0.0.1:" + std::to_string(port) + "/events";
+
+        errno = 0;
+        connected = co_await client.connect(url);
+        connect_errno = errno;
+        client_done = true;
+        co_await client.close();
+    });
+
+    REQUIRE(wait_for([&] { return client_done.load() && server_done.load(); }));
+    sched.shutdown();
+
+    REQUIRE_FALSE(connected);
+    REQUIRE(connect_errno == EMSGSIZE);
+}
+
+TEST_CASE("sse_client honors configured response header limits above 8192",
+          "[sse][client][regression]") {
+    using namespace elio;
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    bool connected = false;
+    bool got_event = false;
+    std::string event_data;
+
+    sched.go([&]() -> coro::task<void> {
+        auto server_stream = co_await listener_opt->accept();
+        REQUIRE(server_stream.has_value());
+
+        auto req = co_await read_request_headers(*server_stream);
+        REQUIRE(!req.empty());
+
+        std::string response_prefix =
+            "HTTP/1.1 200 OK\r\n"
+            "X-Pad: " + std::string(8300, 'a');
+        REQUIRE(co_await write_all(*server_stream, response_prefix));
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+
+        std::string response_suffix =
+            "\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "\r\n"
+            "event: ready\n"
+            "data: ok\n"
+            "\n";
+        REQUIRE(co_await write_all(*server_stream, response_suffix));
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        co_await server_stream->close();
+        server_done = true;
+    });
+
+    sched.go([&]() -> coro::task<void> {
+        client_config cfg;
+        cfg.auto_reconnect = false;
+        cfg.max_header_size = 9000;
+        sse_client client(cfg);
+        std::string url =
+            "http://127.0.0.1:" + std::to_string(port) + "/events";
+
+        connected = co_await client.connect(url);
+        if (connected) {
+            auto evt = co_await client.receive();
+            got_event = evt.has_value();
+            if (evt) {
+                event_data = evt->data;
+            }
+        }
+        client_done = true;
+        co_await client.close();
+    });
+
+    REQUIRE(wait_for([&] { return client_done.load() && server_done.load(); }));
+    sched.shutdown();
+
+    REQUIRE(connected);
+    REQUIRE(got_event);
+    REQUIRE(event_data == "ok");
 }
 
 TEST_CASE("sse_client syncs id-only and empty Last-Event-ID updates",

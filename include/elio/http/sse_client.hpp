@@ -83,6 +83,7 @@ public:
 
             size_t line_end = std::string::npos;
             size_t consume = 0;
+            bool terminal_cr_at_input_end = false;
             if (lf_pos == std::string::npos && cr_pos == std::string::npos) {
                 if (append_would_exceed_limit(buffer_.size(), data.size(), 0)) {
                     fail("SSE line exceeds configured buffer limit");
@@ -96,6 +97,8 @@ public:
                 consume = (cr_pos + 1 < data.size() && data[cr_pos + 1] == '\n')
                         ? cr_pos + 2
                         : cr_pos + 1;
+                terminal_cr_at_input_end = consume == data.size() &&
+                                           data[consume - 1] == '\r';
             } else {
                 line_end = lf_pos;
                 consume = lf_pos + 1;
@@ -109,7 +112,7 @@ public:
             }
             buffer_.append(data.substr(0, consume));
             data.remove_prefix(consume);
-            events_found += process_buffer();
+            events_found += process_buffer(terminal_cr_at_input_end);
         }
 
         return failed_ ? 0 : events_found;
@@ -150,7 +153,7 @@ public:
     }
     
 private:
-    size_t process_buffer() {
+    size_t process_buffer(bool terminal_cr_at_input_end) {
         size_t events_found = 0;
 
         while (true) {
@@ -178,11 +181,12 @@ private:
                     }
                 } else {
                     // \r at end of buffer is provisionally processed as
-                    // standalone, but a leading \n in the next chunk belongs
-                    // to this same CRLF terminator and must not create an
-                    // extra blank line.
+                    // standalone only when it also ended the caller's input
+                    // chunk.  A leading \n in the next chunk then belongs to
+                    // this same CRLF terminator and must not create an extra
+                    // blank line.
                     consume = cr_pos + 1;
-                    skip_lf_after_terminal_cr_ = true;
+                    skip_lf_after_terminal_cr_ = terminal_cr_at_input_end;
                 }
             } else {
                 // \n found first (no preceding \r — that case is handled above)

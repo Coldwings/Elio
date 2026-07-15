@@ -472,6 +472,20 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
         REQUIRE(parser.last_event_id() == "42");
     }
 
+    SECTION("same-chunk standalone CR does not suppress next chunk LF") {
+        event_parser parser;
+
+        REQUIRE(parser.parse("id: 42\rdata: World\n") == 0);
+        REQUIRE_FALSE(parser.has_event());
+
+        REQUIRE(parser.parse("\n") == 1);
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt->id == "42");
+        REQUIRE(evt->data == "World");
+        REQUIRE(parser.last_event_id() == "42");
+    }
+
     SECTION("CR at buffer boundary followed by non-LF") {
         event_parser parser;
 

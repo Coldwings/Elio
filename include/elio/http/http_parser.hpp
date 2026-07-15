@@ -473,6 +473,14 @@ private:
                     return false;
                 }
 
+                if (version_ == "HTTP/1.1") {
+                    auto host_values = headers_.get_all("Host");
+                    if (host_values.size() != 1) {
+                        set_error("HTTP/1.1 requests require exactly one Host header");
+                        return false;
+                    }
+                }
+
                 // Transfer-Encoding takes precedence over (a missing)
                 // Content-Length per RFC 7230 §3.3.3. Check chunked FIRST
                 // so a malformed/extension-only TE doesn't silently fall

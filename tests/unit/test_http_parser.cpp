@@ -895,6 +895,35 @@ TEST_CASE("HTTP request parser rejects CL+TE smuggling", "[http][parser][securit
     REQUIRE(parser.has_error());
 }
 
+TEST_CASE("HTTP request parser enforces HTTP/1.1 Host header count",
+          "[http][parser][security]") {
+    SECTION("rejects missing Host on HTTP/1.1") {
+        request_parser parser;
+        auto [result, _] = parser.parse("GET / HTTP/1.1\r\n\r\n");
+        REQUIRE(result == parse_result::error);
+        REQUIRE(parser.has_error());
+    }
+
+    SECTION("rejects duplicate Host on HTTP/1.1") {
+        request_parser parser;
+        std::string request =
+            "GET / HTTP/1.1\r\n"
+            "Host: example.com\r\n"
+            "Host: example.com\r\n"
+            "\r\n";
+
+        auto [result, _] = parser.parse(request);
+        REQUIRE(result == parse_result::error);
+        REQUIRE(parser.has_error());
+    }
+
+    SECTION("does not require Host on HTTP/1.0") {
+        request_parser parser;
+        auto [result, _] = parser.parse("GET / HTTP/1.0\r\n\r\n");
+        REQUIRE(result == parse_result::complete);
+    }
+}
+
 TEST_CASE("HTTP request parser rejects duplicate Content-Length conflict",
           "[http][parser][security]") {
     request_parser parser;
@@ -1802,7 +1831,7 @@ TEST_CASE("HTTP request parser rejects oversized unterminated header line",
 TEST_CASE("HTTP request parser accepts a boundary header with split CRLF",
           "[http][parser][security]") {
     std::string first_chunk =
-        "GET / HTTP/1.1\r\nX: " + std::string(8189, 'x') + "\r";
+        "GET / HTTP/1.1\r\nHost: a\r\nX: " + std::string(8189, 'x') + "\r";
 
     request_parser parser;
     auto [partial, _1] = parser.parse(first_chunk);

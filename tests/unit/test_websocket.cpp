@@ -324,6 +324,32 @@ TEST_CASE("WebSocket frame parsing", "[websocket][frame]") {
         REQUIRE(result.header_size == 4);  // 2 base + 2 extended
     }
 
+    SECTION("parse minimum 16-bit extended length boundary") {
+        std::string data(126, 'x');
+        auto encoded = encode_binary_frame(data, false);
+
+        frame_header header;
+        auto result = parse_frame_header(encoded.data(), encoded.size(), header);
+
+        REQUIRE(result.complete);
+        REQUIRE_FALSE(result.error);
+        REQUIRE(header.payload_len == data.size());
+        REQUIRE(result.header_size == 4);  // 2 base + 2 extended
+    }
+
+    SECTION("parse maximum 16-bit extended length boundary") {
+        std::string data(65535, 'x');
+        auto encoded = encode_binary_frame(data, false);
+
+        frame_header header;
+        auto result = parse_frame_header(encoded.data(), encoded.size(), header);
+
+        REQUIRE(result.complete);
+        REQUIRE_FALSE(result.error);
+        REQUIRE(header.payload_len == data.size());
+        REQUIRE(result.header_size == 4);  // 2 base + 2 extended
+    }
+
     SECTION("parse extended length frame (64-bit)") {
         std::string data(65536, 'x');
         auto encoded = encode_binary_frame(data, false);

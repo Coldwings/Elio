@@ -17,6 +17,174 @@ namespace elio::http {
 /// parse_chunk_size against pathological inputs.
 inline constexpr size_t kMaxChunkSize = static_cast<size_t>(1) << 30;
 
+namespace detail {
+
+inline constexpr bool is_ows(char c) noexcept {
+    return c == ' ' || c == '\t';
+}
+
+inline constexpr bool is_hex_digit(char c) noexcept {
+    return (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'f') ||
+           (c >= 'A' && c <= 'F');
+}
+
+inline constexpr size_t hex_digit_value(char c) noexcept {
+    if (c >= '0' && c <= '9') return static_cast<size_t>(c - '0');
+    if (c >= 'a' && c <= 'f') return static_cast<size_t>(c - 'a' + 10);
+    return static_cast<size_t>(c - 'A' + 10);
+}
+
+inline bool is_quoted_chunk_ext_char(unsigned char c) noexcept {
+    return c == '\t' || c == ' ' || (c >= 0x21 && c <= 0x7E) || c >= 0x80;
+}
+
+inline bool parse_chunk_ext_quoted_string(std::string_view value, size_t& pos) noexcept {
+    if (pos >= value.size() || value[pos] != '"') {
+        return false;
+    }
+    ++pos;
+
+    while (pos < value.size()) {
+        unsigned char c = static_cast<unsigned char>(value[pos]);
+        if (c == '"') {
+            ++pos;
+            return true;
+        }
+        if (c == '\\') {
+            ++pos;
+            if (pos >= value.size()) {
+                return false;
+            }
+            c = static_cast<unsigned char>(value[pos]);
+            if (!(c == '\t' || c == ' ' || (c >= 0x21 && c <= 0x7E) || c >= 0x80)) {
+                return false;
+            }
+            ++pos;
+            continue;
+        }
+        if (!is_quoted_chunk_ext_char(c)) {
+            return false;
+        }
+        ++pos;
+    }
+
+    return false;
+}
+
+inline bool validate_chunk_extensions(std::string_view value) noexcept {
+    size_t pos = 0;
+
+    while (true) {
+        while (pos < value.size() && is_ows(value[pos])) {
+            ++pos;
+        }
+        if (pos == value.size()) {
+            return true;
+        }
+        if (value[pos] != ';') {
+            return false;
+        }
+        ++pos;
+
+        while (pos < value.size() && is_ows(value[pos])) {
+            ++pos;
+        }
+
+        size_t name_start = pos;
+        while (pos < value.size() &&
+               is_tchar(static_cast<unsigned char>(value[pos]))) {
+            ++pos;
+        }
+        if (pos == name_start) {
+            return false;
+        }
+
+        while (pos < value.size() && is_ows(value[pos])) {
+            ++pos;
+        }
+
+        if (pos < value.size() && value[pos] == '=') {
+            ++pos;
+            while (pos < value.size() && is_ows(value[pos])) {
+                ++pos;
+            }
+            if (pos == value.size()) {
+                return false;
+            }
+            if (value[pos] == '"') {
+                if (!parse_chunk_ext_quoted_string(value, pos)) {
+                    return false;
+                }
+            } else {
+                size_t token_start = pos;
+                while (pos < value.size() &&
+                       is_tchar(static_cast<unsigned char>(value[pos]))) {
+                    ++pos;
+                }
+                if (pos == token_start) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+inline bool parse_chunk_size_line(std::string_view line,
+                                  size_t& chunk_size,
+                                  std::string_view& error) noexcept {
+    chunk_size = 0;
+    size_t pos = 0;
+
+    while (pos < line.size() && is_hex_digit(line[pos])) {
+        size_t d = hex_digit_value(line[pos]);
+        if (chunk_size > (SIZE_MAX - d) / 16) {
+            error = "Chunk size overflow";
+            return false;
+        }
+        chunk_size = chunk_size * 16 + d;
+        ++pos;
+    }
+
+    if (pos == 0) {
+        error = "Empty chunk size";
+        return false;
+    }
+    if (chunk_size > kMaxChunkSize) {
+        error = "Chunk size exceeds maximum";
+        return false;
+    }
+
+    auto rest = trim_ows(line.substr(pos));
+    if (!rest.empty() && !validate_chunk_extensions(rest)) {
+        error = "Invalid chunk extension";
+        return false;
+    }
+
+    return true;
+}
+
+inline bool validate_chunk_trailer_line(std::string_view line) noexcept {
+    auto colon = line.find(':');
+    if (colon == std::string_view::npos) {
+        return false;
+    }
+
+    auto name = line.substr(0, colon);
+    auto value = trim_ows(line.substr(colon + 1));
+    return is_valid_header_name(name) && is_valid_header_value(value);
+}
+
+inline size_t buffered_line_size(std::string_view buffer) noexcept {
+    size_t size = buffer.size();
+    if (size > 0 && buffer.back() == '\r') {
+        --size;
+    }
+    return size;
+}
+
+} // namespace detail
+
 /// HTTP parser state
 enum class parse_state {
     start,
@@ -284,11 +452,7 @@ private:
         while (true) {
             auto line_end = buffer_.find("\r\n");
             if (line_end == std::string::npos) {
-                size_t buffered_line_size = buffer_.size();
-                if (buffered_line_size > 0 && buffer_.back() == '\r') {
-                    --buffered_line_size;
-                }
-                if (buffered_line_size > max_header_size_) {
+                if (detail::buffered_line_size(buffer_) > max_header_size_) {
                     set_error("Header line too long");
                 }
                 return false;
@@ -418,7 +582,15 @@ private:
     bool parse_chunk_size() {
         auto line_end = buffer_.find("\r\n");
         if (line_end == std::string::npos) {
+            if (detail::buffered_line_size(buffer_) > max_header_size_) {
+                set_error("Chunk size line too long");
+                return true;
+            }
             return false;
+        }
+        if (line_end > max_header_size_) {
+            set_error("Chunk size line too long");
+            return true;
         }
 
         std::string_view line(buffer_.data(), line_end);
@@ -430,36 +602,9 @@ private:
         // body or trick parse_chunk_data() into appending an attacker-chosen
         // count of bytes. We additionally clamp by kMaxChunkSize so a single
         // chunk cannot OOM the process.
-        chunk_size_ = 0;
-        bool any_digit = false;
-        for (char c : line) {
-            size_t d;
-            if (c >= '0' && c <= '9') {
-                d = static_cast<size_t>(c - '0');
-            } else if (c >= 'a' && c <= 'f') {
-                d = static_cast<size_t>(c - 'a' + 10);
-            } else if (c >= 'A' && c <= 'F') {
-                d = static_cast<size_t>(c - 'A' + 10);
-            } else if (c == ';' || c == ' ' || c == '\t') {
-                // Chunk extension or trailing OWS - rest is ignored.
-                break;
-            } else {
-                set_error("Invalid character in chunk size");
-                return true;
-            }
-            if (chunk_size_ > (SIZE_MAX - d) / 16) {
-                set_error("Chunk size overflow");
-                return true;
-            }
-            chunk_size_ = chunk_size_ * 16 + d;
-            any_digit = true;
-        }
-        if (!any_digit) {
-            set_error("Empty chunk size");
-            return true;
-        }
-        if (chunk_size_ > kMaxChunkSize) {
-            set_error("Chunk size exceeds maximum");
+        std::string_view error;
+        if (!detail::parse_chunk_size_line(line, chunk_size_, error)) {
+            set_error(error);
             return true;
         }
 
@@ -496,6 +641,10 @@ private:
         // Parse trailer headers (usually empty)
         auto line_end = buffer_.find("\r\n");
         if (line_end == std::string::npos) {
+            if (detail::buffered_line_size(buffer_) > max_header_size_) {
+                set_error("Trailer line too long");
+                return true;
+            }
             return false;
         }
 
@@ -506,7 +655,22 @@ private:
             return true;
         }
 
-        // Skip trailer header
+        if (line_end > max_header_size_) {
+            set_error("Trailer line too long");
+            return true;
+        }
+        if (header_count_ >= max_headers_) {
+            set_error("Too many headers");
+            return true;
+        }
+
+        std::string_view line(buffer_.data(), line_end);
+        if (!detail::validate_chunk_trailer_line(line)) {
+            set_error("Invalid trailer header");
+            return true;
+        }
+
+        ++header_count_;
         buffer_.erase(0, line_end + 2);
         return true;
     }
@@ -783,11 +947,7 @@ private:
         while (true) {
             auto line_end = buffer_.find("\r\n");
             if (line_end == std::string::npos) {
-                size_t buffered_line_size = buffer_.size();
-                if (buffered_line_size > 0 && buffer_.back() == '\r') {
-                    --buffered_line_size;
-                }
-                if (buffered_line_size > max_header_size_) {
+                if (detail::buffered_line_size(buffer_) > max_header_size_) {
                     set_error("Header line too long");
                 }
                 return false;
@@ -915,42 +1075,24 @@ private:
     bool parse_chunk_size() {
         auto line_end = buffer_.find("\r\n");
         if (line_end == std::string::npos) {
+            if (detail::buffered_line_size(buffer_) > max_header_size_) {
+                set_error("Chunk size line too long");
+                return true;
+            }
             return false;
+        }
+        if (line_end > max_header_size_) {
+            set_error("Chunk size line too long");
+            return true;
         }
 
         std::string_view line(buffer_.data(), line_end);
 
         // See request_parser::parse_chunk_size for the full rationale on
         // the overflow guard and kMaxChunkSize clamp.
-        chunk_size_ = 0;
-        bool any_digit = false;
-        for (char c : line) {
-            size_t d;
-            if (c >= '0' && c <= '9') {
-                d = static_cast<size_t>(c - '0');
-            } else if (c >= 'a' && c <= 'f') {
-                d = static_cast<size_t>(c - 'a' + 10);
-            } else if (c >= 'A' && c <= 'F') {
-                d = static_cast<size_t>(c - 'A' + 10);
-            } else if (c == ';' || c == ' ' || c == '\t') {
-                break;
-            } else {
-                set_error("Invalid character in chunk size");
-                return true;
-            }
-            if (chunk_size_ > (SIZE_MAX - d) / 16) {
-                set_error("Chunk size overflow");
-                return true;
-            }
-            chunk_size_ = chunk_size_ * 16 + d;
-            any_digit = true;
-        }
-        if (!any_digit) {
-            set_error("Empty chunk size");
-            return true;
-        }
-        if (chunk_size_ > kMaxChunkSize) {
-            set_error("Chunk size exceeds maximum");
+        std::string_view error;
+        if (!detail::parse_chunk_size_line(line, chunk_size_, error)) {
+            set_error(error);
             return true;
         }
 
@@ -986,6 +1128,10 @@ private:
     bool parse_chunk_trailer() {
         auto line_end = buffer_.find("\r\n");
         if (line_end == std::string::npos) {
+            if (detail::buffered_line_size(buffer_) > max_header_size_) {
+                set_error("Trailer line too long");
+                return true;
+            }
             return false;
         }
         
@@ -994,7 +1140,23 @@ private:
             state_ = parse_state::complete;
             return true;
         }
-        
+
+        if (line_end > max_header_size_) {
+            set_error("Trailer line too long");
+            return true;
+        }
+        if (header_count_ >= max_headers_) {
+            set_error("Too many headers");
+            return true;
+        }
+
+        std::string_view line(buffer_.data(), line_end);
+        if (!detail::validate_chunk_trailer_line(line)) {
+            set_error("Invalid trailer header");
+            return true;
+        }
+
+        ++header_count_;
         buffer_.erase(0, line_end + 2);
         return true;
     }

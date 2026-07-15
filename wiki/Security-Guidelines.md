@@ -1,7 +1,8 @@
 # Security Guidelines
 
 This page summarizes secure configuration practices for applications that use
-Elio. It complements the vulnerability reporting policy in `SECURITY.md`.
+Elio. It complements the vulnerability reporting policy in
+[SECURITY.md](https://github.com/Coldwings/Elio/blob/main/SECURITY.md).
 
 ## Library Guarantees vs Caller Responsibilities
 
@@ -11,7 +12,7 @@ rules; when it does, the more specific contract wins.
 
 ### Elio Library Guarantees
 
-Elio should enforce these properties inside the library:
+Elio is responsible for enforcing these properties inside the library:
 
 - Validate transport and protocol frames received from peers before exposing
   them as higher-level messages. This includes HTTP, WebSocket, SSE, RPC, TLS
@@ -64,8 +65,10 @@ Applications using Elio are responsible for these conditions:
 If a safety concern is not clearly assigned to Elio or to the caller, clarify
 the contract before broadening the library's responsibilities:
 
-- File or fix a contract/documentation issue when the public boundary is
-  ambiguous, inconsistent, or only discoverable from implementation details.
+- File or fix a public contract/documentation issue for non-sensitive boundary
+  ambiguities. Suspected vulnerabilities should be reported privately through
+  [SECURITY.md](https://github.com/Coldwings/Elio/blob/main/SECURITY.md)
+  instead of a public GitHub issue.
 - Classify the concern as a library bug when Elio violates a documented
   guarantee, exposes malformed peer input past a protocol boundary, ignores a
   configured limit, or requires callers to prevent an internal protocol safety
@@ -123,4 +126,4 @@ the contract before broadening the library's responsibilities:
   endpoints before deploying.
 
 Report suspected vulnerabilities privately through the process in
-`SECURITY.md`.
+[SECURITY.md](https://github.com/Coldwings/Elio/blob/main/SECURITY.md).

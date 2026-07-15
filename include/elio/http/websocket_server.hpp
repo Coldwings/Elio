@@ -785,6 +785,7 @@ private:
         };
 
         // Read HTTP request
+        size_t current_request_size = 0;
         while (!parser.is_complete() && !parser.has_error()) {
             auto result = co_await stream.read(buffer.data(), buffer.size());
 
@@ -797,9 +798,18 @@ private:
                 co_return;
             }
 
-            // Enforce max_request_size to prevent DoS via large upgrade requests
-            size_t incoming = static_cast<size_t>(result.result);
-            if (parser.bytes_buffered() + incoming > http_config_.max_request_size) {
+            auto [parse_result, consumed] = parser.parse(
+                std::string_view(buffer.data(),
+                                 static_cast<size_t>(result.result)));
+            current_request_size += consumed;
+
+            size_t effective_request_size = current_request_size;
+            if (!parser.is_complete()) {
+                effective_request_size += parser.buffered_input_size();
+            }
+
+            if (effective_request_size > http_config_.max_request_size ||
+                parser.body().size() > http_config_.max_request_size) {
                 ELIO_LOG_WARNING("WebSocket upgrade request exceeds max_request_size");
                 co_await stop_watchdog();
                 auto resp = response(status::payload_too_large, "Payload Too Large");
@@ -807,9 +817,6 @@ private:
                 co_await send_response(stream, resp, parser.get_method());
                 co_return;
             }
-
-            auto [parse_result, consumed] = parser.parse(
-                std::string_view(buffer.data(), result.result));
 
             if (parse_result == parse_result::error) {
                 co_await stop_watchdog();

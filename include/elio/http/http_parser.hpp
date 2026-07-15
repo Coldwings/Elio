@@ -247,6 +247,7 @@ public:
             switch (state_) {
                 case parse_state::request_line:
                     if (!parse_request_line()) {
+                        consumed += before - buffer_.size();
                         if (state_ == parse_state::error) {
                             return {parse_result::error, consumed};
                         }
@@ -256,6 +257,7 @@ public:
 
                 case parse_state::headers:
                     if (!parse_headers()) {
+                        consumed += before - buffer_.size();
                         if (state_ == parse_state::error) {
                             return {parse_result::error, consumed};
                         }
@@ -265,24 +267,28 @@ public:
 
                 case parse_state::body:
                     if (!parse_body()) {
+                        consumed += before - buffer_.size();
                         return {parse_result::need_more, consumed};
                     }
                     break;
 
                 case parse_state::chunk_size:
                     if (!parse_chunk_size()) {
+                        consumed += before - buffer_.size();
                         return {parse_result::need_more, consumed};
                     }
                     break;
 
                 case parse_state::chunk_data:
                     if (!parse_chunk_data()) {
+                        consumed += before - buffer_.size();
                         return {parse_result::need_more, consumed};
                     }
                     break;
 
                 case parse_state::chunk_trailer:
                     if (!parse_chunk_trailer()) {
+                        consumed += before - buffer_.size();
                         return {parse_result::need_more, consumed};
                     }
                     break;

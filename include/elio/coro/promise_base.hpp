@@ -137,14 +137,13 @@ public:
             current_frame_ = parent_;
         }
         if (owns_vstack_) {
-            // Clear current_ before deleting vstack. When operator delete later
-            // calls tagged_dealloc() -> vthread_stack::deallocate(), it will find
-            // current_ is nullptr and correctly no-op (memory already freed by vstack).
+            // The owning coroutine frame is allocated from this vstack, so defer
+            // deleting segment storage until the frame's operator delete runs.
             auto* vs = vstack_.exchange(nullptr, std::memory_order_acq_rel);
             if (vthread_stack::current() == vs) {
                 vthread_stack::set_current(nullptr);
             }
-            delete vs;
+            vthread_stack::delete_after_current_deallocation(vs);
         }
     }
 

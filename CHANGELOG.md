@@ -95,6 +95,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `semaphore`, `shared_mutex`, and `channel` wake paths now keep a cancelable
   wake token after dequeue, preventing a racing waiter-frame destruction from
   leaving a stale coroutine handle to schedule. (#762)
+- **vthread stack fallback ownership**: Coroutine frames allocated outside a
+  current `vthread_stack` now release their global fallback allocation on
+  destruction and avoid popping memory from an unrelated current stack. (#848)
 - **Cancellation callback exceptions**: Cancellation now invokes and releases
   every registered callback before rethrowing the first callback exception,
   including callbacks registered after cancellation. (#774)

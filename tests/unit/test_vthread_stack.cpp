@@ -155,6 +155,33 @@ TEST_CASE("vthread_stack thread-local isolation", "[vthread_stack]") {
     vthread_stack::set_current(nullptr);
 }
 
+namespace {
+task<void> immediate_void_task() {
+    co_return;
+}
+}
+
+TEST_CASE("task frame allocated without vthread deallocates with unrelated current stack",
+          "[vthread_stack][task]") {
+    auto* previous = vthread_stack::current();
+
+    struct current_stack_restore {
+        vthread_stack* previous;
+
+        ~current_stack_restore() {
+            vthread_stack::set_current(previous);
+        }
+    } restore{previous};
+
+    vthread_stack unrelated;
+    vthread_stack::set_current(nullptr);
+    {
+        auto task = immediate_void_task();
+        vthread_stack::set_current(&unrelated);
+    }
+    vthread_stack::set_current(previous);
+}
+
 // ============================================================================
 // task<T> on-site co_await evaluation
 // ============================================================================

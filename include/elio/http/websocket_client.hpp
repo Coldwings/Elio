@@ -540,6 +540,20 @@ private:
             co_return false;
         }
 
+        auto upgrade = parser.get_headers().get("Upgrade");
+        if (!detail::header_has_token(upgrade, "websocket")) {
+            ELIO_LOG_ERROR("WebSocket handshake missing Upgrade: websocket");
+            errno = EBADMSG;
+            co_return false;
+        }
+
+        auto connection = parser.get_headers().get("Connection");
+        if (!detail::header_has_token(connection, "upgrade")) {
+            ELIO_LOG_ERROR("WebSocket handshake missing Connection: Upgrade");
+            errno = EBADMSG;
+            co_return false;
+        }
+
         // Verify Sec-WebSocket-Accept
         auto accept = parser.get_headers().get("Sec-WebSocket-Accept");
         if (!verify_websocket_accept(accept, ws_key_)) {

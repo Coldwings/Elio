@@ -215,6 +215,61 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
         // Last event ID should be updated
         REQUIRE(parser.last_event_id() == "123");
     }
+
+    SECTION("id-only block updates last_event_id without dispatch") {
+        event_parser parser;
+
+        REQUIRE(parser.parse("id: 42\n\n") == 0);
+
+        REQUIRE_FALSE(parser.has_event());
+        REQUIRE(parser.last_event_id() == "42");
+    }
+
+    SECTION("empty id clears last_event_id without dispatch") {
+        event_parser parser;
+
+        REQUIRE(parser.parse("id: 123\ndata: first\n\n") == 1);
+        REQUIRE(parser.has_event());
+        parser.get_event();
+        REQUIRE(parser.last_event_id() == "123");
+
+        REQUIRE(parser.parse("id:\n\n") == 0);
+
+        REQUIRE_FALSE(parser.has_event());
+        REQUIRE(parser.last_event_id().empty());
+    }
+
+    SECTION("empty id on dispatched event clears last_event_id") {
+        event_parser parser;
+
+        REQUIRE(parser.parse("id: 123\ndata: first\n\n") == 1);
+        REQUIRE(parser.has_event());
+        parser.get_event();
+        REQUIRE(parser.last_event_id() == "123");
+
+        REQUIRE(parser.parse("id:\ndata: second\n\n") == 1);
+
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt.has_value());
+        REQUIRE(evt->id.empty());
+        REQUIRE(evt->data == "second");
+        REQUIRE(parser.last_event_id().empty());
+    }
+
+    SECTION("initial last_event_id persists until an id field changes it") {
+        event_parser parser(event_parser::default_max_buffer_size, "seed");
+
+        REQUIRE(parser.parse("data: no id\n\n") == 1);
+        REQUIRE(parser.has_event());
+        parser.get_event();
+        REQUIRE(parser.last_event_id() == "seed");
+
+        REQUIRE(parser.parse("id:\n\n") == 0);
+
+        REQUIRE_FALSE(parser.has_event());
+        REQUIRE(parser.last_event_id().empty());
+    }
     
     SECTION("parse event with retry") {
         event_parser parser;
@@ -1009,6 +1064,124 @@ TEST_CASE("sse_client does not eat events into HTTP body even when the "
     REQUIRE(got[1].data == "1");
     REQUIRE(got[2].type == "tick");
     REQUIRE(got[2].data == "2");
+}
+
+TEST_CASE("sse_client syncs id-only and empty Last-Event-ID updates",
+          "[sse][client][regression]") {
+    using namespace elio;
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    struct session_result {
+        bool server_done = false;
+        bool client_done = false;
+        bool server_failed = false;
+        bool client_failed = false;
+        bool connected = false;
+        bool received_event = false;
+        std::string request;
+        std::string client_last_id = "unset";
+    };
+
+    auto run_session = [](std::string initial_last_id,
+                          std::string body) -> session_result {
+        auto listener_opt = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+        REQUIRE(listener_opt.has_value());
+        uint16_t port = listener_opt->local_address().port();
+
+        scheduler sched(2);
+        sched.start();
+
+        std::atomic<bool> server_done{false};
+        std::atomic<bool> client_done{false};
+        std::atomic<bool> server_failed{false};
+        std::atomic<bool> client_failed{false};
+        session_result result;
+
+        sched.go([&]() -> coro::task<void> {
+            auto stream = co_await listener_opt->accept();
+            if (!stream) {
+                server_failed = true;
+                co_return;
+            }
+
+            result.request = co_await read_request_headers(*stream);
+            if (result.request.empty()) {
+                server_failed = true;
+                co_return;
+            }
+
+            std::string response =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/event-stream\r\n"
+                "Cache-Control: no-cache\r\n"
+                "\r\n";
+            response += body;
+            if (!co_await write_all(*stream, response)) {
+                server_failed = true;
+                co_return;
+            }
+
+            co_await stream->close();
+            server_done = true;
+        });
+
+        sched.go([&]() -> coro::task<void> {
+            client_config cfg;
+            cfg.auto_reconnect = false;
+            cfg.last_event_id = std::move(initial_last_id);
+            sse_client client(cfg);
+            std::string url =
+                "http://127.0.0.1:" + std::to_string(port) + "/events";
+
+            result.connected = co_await client.connect(url);
+            if (!result.connected) {
+                client_failed = true;
+                client_done = true;
+                co_return;
+            }
+
+            auto evt = co_await client.receive();
+            result.received_event = evt.has_value();
+            result.client_last_id = std::string(client.last_event_id());
+            client_done = true;
+            co_await client.close();
+        });
+
+        REQUIRE(wait_for([&] {
+            return (client_done.load() && server_done.load()) ||
+                   server_failed.load() || client_failed.load();
+        }));
+        sched.shutdown();
+
+        result.server_done = server_done.load();
+        result.client_done = client_done.load();
+        result.server_failed = server_failed.load();
+        result.client_failed = client_failed.load();
+        return result;
+    };
+
+    auto id_only = run_session("", "id: 42\n\n");
+    REQUIRE_FALSE(id_only.server_failed);
+    REQUIRE_FALSE(id_only.client_failed);
+    REQUIRE(id_only.server_done);
+    REQUIRE(id_only.client_done);
+    REQUIRE(id_only.connected);
+    REQUIRE_FALSE(id_only.received_event);
+    REQUIRE(id_only.request.find("Last-Event-ID:") == std::string::npos);
+    REQUIRE(id_only.client_last_id == "42");
+
+    auto empty_id = run_session("42", "id:\n\n");
+    REQUIRE_FALSE(empty_id.server_failed);
+    REQUIRE_FALSE(empty_id.client_failed);
+    REQUIRE(empty_id.server_done);
+    REQUIRE(empty_id.client_done);
+    REQUIRE(empty_id.connected);
+    REQUIRE_FALSE(empty_id.received_event);
+    REQUIRE(empty_id.request.find("Last-Event-ID: 42\r\n") !=
+            std::string::npos);
+    REQUIRE(empty_id.client_last_id.empty());
 }
 
 TEST_CASE("sse_client rejects non-event-stream responses",

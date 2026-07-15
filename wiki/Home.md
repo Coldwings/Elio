@@ -82,7 +82,8 @@ Elio is built around a few key technical decisions:
 - [[Networking]] - TCP, HTTP/1.1, and connections
 - [[HTTP2 Guide]] - HTTP/2 client usage and multiplexing
 - [[TLS Configuration]] - TLS/SSL setup and certificate management
-- [[Security Guidelines]] - Secure configuration and vulnerability reporting guidance
+- [[Security Guidelines]] - Library/caller responsibility boundaries, secure
+  configuration, and vulnerability reporting guidance
 - [[WebSocket SSE]] - WebSocket and Server-Sent Events
 - [[Batch IO and File Helpers]] - Batch I/O operations and file utilities
 - [[RPC Framework]] - High-performance RPC with buffer views and checksums

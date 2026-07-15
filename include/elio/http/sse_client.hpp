@@ -70,6 +70,13 @@ public:
         }
 
         size_t events_found = 0;
+        if (skip_lf_after_terminal_cr_ && !data.empty()) {
+            if (data.front() == '\n') {
+                data.remove_prefix(1);
+            }
+            skip_lf_after_terminal_cr_ = false;
+        }
+
         while (!data.empty() && !failed_) {
             auto lf_pos = data.find('\n');
             auto cr_pos = data.find('\r');
@@ -138,6 +145,7 @@ public:
         events_.clear();
         failed_ = false;
         error_message_.clear();
+        skip_lf_after_terminal_cr_ = false;
         // Don't reset last_event_id_ or retry_ms_ - these persist
     }
     
@@ -169,11 +177,12 @@ private:
                         consume = cr_pos + 1;  // standalone \r
                     }
                 } else {
-                    // \r at end of buffer — process as standalone \r.
-                    // If the next chunk starts with \n, that \n will be
-                    // treated as a separate (empty) line, which only
-                    // resets state without dispatching a spurious event.
+                    // \r at end of buffer is provisionally processed as
+                    // standalone, but a leading \n in the next chunk belongs
+                    // to this same CRLF terminator and must not create an
+                    // extra blank line.
                     consume = cr_pos + 1;
+                    skip_lf_after_terminal_cr_ = true;
                 }
             } else {
                 // \n found first (no preceding \r — that case is handled above)
@@ -300,6 +309,7 @@ private:
         buffer_.clear();
         current_event_ = event{};
         events_.clear();
+        skip_lf_after_terminal_cr_ = false;
     }
     
     std::string buffer_;
@@ -309,6 +319,7 @@ private:
     int retry_ms_ = 3000;
     size_t max_buffer_size_ = default_max_buffer_size;
     bool failed_ = false;
+    bool skip_lf_after_terminal_cr_ = false;
     std::string error_message_;
 };
 

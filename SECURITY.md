@@ -67,7 +67,11 @@ When using Elio in production:
 2. **Monitor Advisories**: Watch this repository for security advisories
 3. **Review Dependencies**: Regularly audit dependencies for known vulnerabilities
 4. **Secure Configuration**: Follow our [security guidelines](wiki/Security-Guidelines.md)
-5. **Input Validation**: Validate all inputs when using Elio in security-sensitive contexts
+5. **Application Input Validation**: Validate application-level payloads,
+   authorization decisions, business invariants, and deployment secrets in
+   security-sensitive contexts. Elio validates documented transport and protocol
+   boundaries; see the [security guidelines](wiki/Security-Guidelines.md) for
+   the library/caller responsibility split.
 
 ## Security Features
 

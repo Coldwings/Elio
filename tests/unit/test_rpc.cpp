@@ -1,5 +1,20 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/rpc/rpc.hpp>
+#include <elio/runtime/scheduler.hpp>
+#include <elio/time/timer.hpp>
+
+#include "../test_main.cpp"
+
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <sys/uio.h>
+#include <thread>
+#include <vector>
 
 using namespace elio::rpc;
 
@@ -74,6 +89,126 @@ struct TestResponse {
 
 using ExistingStreamCreateMethod = ELIO_RPC_METHOD(306, TestRequest, TestResponse);
 using OnewayNoResponseMethod = ELIO_RPC_METHOD(305, TestRequest, TestResponse);
+
+namespace {
+
+struct scripted_client_rpc_stream_state {
+    std::mutex mutex;
+    std::deque<uint8_t> inbound;
+    bool valid = true;
+};
+
+void enqueue_client_frame(scripted_client_rpc_stream_state& state,
+                          const frame_header& header,
+                          const buffer_writer& payload) {
+    auto header_bytes = header.to_bytes();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    for (uint8_t byte : header_bytes) {
+        state.inbound.push_back(byte);
+    }
+    for (size_t i = 0; i < payload.size(); ++i) {
+        state.inbound.push_back(payload.data()[i]);
+    }
+}
+
+void enqueue_client_frame(scripted_client_rpc_stream_state& state,
+                          const frame_header& header) {
+    buffer_writer empty;
+    enqueue_client_frame(state, header, empty);
+}
+
+class scripted_client_rpc_stream {
+public:
+    scripted_client_rpc_stream()
+        : state_(std::make_shared<scripted_client_rpc_stream_state>()) {}
+
+    explicit scripted_client_rpc_stream(
+        std::shared_ptr<scripted_client_rpc_stream_state> state)
+        : state_(std::move(state)) {}
+
+    bool is_valid() const noexcept {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        return state_->valid;
+    }
+
+    void shutdown_socket() noexcept {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->valid = false;
+    }
+
+    elio::coro::task<elio::io::io_result> read_exactly(void* buffer, size_t length) {
+        auto* out = static_cast<uint8_t*>(buffer);
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lock(state_->mutex);
+                if (!state_->valid) {
+                    co_return elio::io::io_result{-ECONNRESET, 0};
+                }
+                if (state_->inbound.size() >= length) {
+                    for (size_t i = 0; i < length; ++i) {
+                        out[i] = state_->inbound.front();
+                        state_->inbound.pop_front();
+                    }
+                    co_return elio::io::io_result{static_cast<int32_t>(length), 0};
+                }
+            }
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    elio::coro::task<elio::io::io_result> write_exactly(const void* buffer,
+                                                        size_t length) {
+        std::vector<uint8_t> bytes(length);
+        std::memcpy(bytes.data(), buffer, length);
+        handle_written_frame(bytes);
+        co_return elio::io::io_result{static_cast<int32_t>(length), 0};
+    }
+
+    elio::coro::task<elio::io::io_result> writev(struct iovec* iovecs,
+                                                 size_t iov_count) {
+        size_t total = 0;
+        for (size_t i = 0; i < iov_count; ++i) {
+            total += iovecs[i].iov_len;
+        }
+
+        std::vector<uint8_t> bytes;
+        bytes.reserve(total);
+        for (size_t i = 0; i < iov_count; ++i) {
+            const auto* data = static_cast<const uint8_t*>(iovecs[i].iov_base);
+            bytes.insert(bytes.end(), data, data + iovecs[i].iov_len);
+        }
+
+        handle_written_frame(bytes);
+        co_return elio::io::io_result{static_cast<int32_t>(total), 0};
+    }
+
+    elio::coro::task<elio::io::io_result> poll_write() {
+        co_return elio::io::io_result{0, 0};
+    }
+
+private:
+    void handle_written_frame(const std::vector<uint8_t>& bytes) {
+        if (bytes.size() < frame_header_size) {
+            return;
+        }
+
+        auto header = frame_header::from_bytes(bytes.data());
+        if (header.type != message_type::request) {
+            return;
+        }
+
+        enqueue_client_frame(*state_, build_pong(header.request_id));
+
+        TestResponse response{"ok"};
+        auto [response_header, response_payload] =
+            build_response(header.request_id, response);
+        enqueue_client_frame(*state_, response_header, response_payload);
+    }
+
+    std::shared_ptr<scripted_client_rpc_stream_state> state_;
+};
+
+} // namespace
 
 // ============================================================================
 // Buffer tests
@@ -583,6 +718,44 @@ TEST_CASE("ping/pong", "[rpc][protocol]") {
     REQUIRE(pong.payload_length == 0);
 }
 
+TEST_CASE("RPC client ignores pong frames for normal calls", "[rpc][client]") {
+    elio::runtime::scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> completed{false};
+    std::atomic<bool> ok{false};
+
+    auto state = std::make_shared<scripted_client_rpc_stream_state>();
+
+    auto driver = [&]() -> elio::coro::task<void> {
+        auto client = rpc_client<scripted_client_rpc_stream>::create(
+            scripted_client_rpc_stream{state});
+
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{42}, std::chrono::milliseconds(500));
+
+        if (result.ok()) {
+            ok.store(result.value().result == "ok", std::memory_order_release);
+        }
+
+        client->close();
+        completed.store(true, std::memory_order_release);
+    };
+
+    sched.go(driver);
+
+    auto deadline = std::chrono::steady_clock::now() + elio::test::scaled_ms(1000);
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(1000)));
+
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(ok.load(std::memory_order_acquire));
+}
+
 // ============================================================================
 // rpc_result tests
 // ============================================================================
@@ -1061,7 +1234,6 @@ TEST_CASE("buffer_ref type traits", "[rpc][buffer_ref]") {
 #include <elio/net/tcp.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/time/timer.hpp>
-#include "../test_main.cpp"  // scaled_ms / scaled_sec timeout helpers
 #include <array>
 #include <thread>
 #include <atomic>
@@ -3019,6 +3191,81 @@ TEST_CASE("rpc ping fails on non-pong response frame",
     auto [connected, ping_ok] = ping_done.get();
     REQUIRE(connected);
     REQUIRE_FALSE(ping_ok);
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("rpc ping ignores non-pong response before pong",
+          "[rpc][ping][protocol]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    scheduler sched(3);
+    sched.start();
+
+    std::promise<bool> server_replied_promise;
+    auto server_replied = server_replied_promise.get_future();
+
+    sched.go([&, &lst = *listener_opt,
+              p = std::move(server_replied_promise)]() mutable
+        -> coro::task<void> {
+        auto stream = co_await lst.accept();
+        if (!stream) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto frame = co_await read_frame(*stream);
+        if (!frame || frame->first.type != message_type::ping) {
+            p.set_value(false);
+            co_return;
+        }
+
+        TestResponse response{"not a pong"};
+        auto response_frame = build_response(frame->first.request_id, response);
+        bool response_sent = co_await write_frame(
+            *stream, response_frame.first, response_frame.second);
+
+        auto pong = build_pong(frame->first.request_id);
+        buffer_writer empty;
+        bool pong_sent = co_await write_frame(*stream, pong, empty);
+        p.set_value(response_sent && pong_sent);
+
+        stream->shutdown_socket();
+        co_await stream->close();
+    });
+
+    std::promise<std::pair<bool, bool>> ping_done_promise;
+    auto ping_done = ping_done_promise.get_future();
+
+    sched.go([&, port, p = std::move(ping_done_promise)]() mutable
+        -> coro::task<void> {
+        auto client_opt = co_await tcp_rpc_client::connect("::1", port);
+        if (!client_opt) {
+            p.set_value({false, false});
+            co_return;
+        }
+
+        auto client = *client_opt;
+        bool ping_ok = co_await client->ping(elio::test::scaled_sec(30));
+        client->close();
+        p.set_value({true, ping_ok});
+    });
+
+    auto reply_status = server_replied.wait_for(std::chrono::seconds(60));
+    REQUIRE(reply_status == std::future_status::ready);
+    REQUIRE(server_replied.get());
+
+    auto ping_status = ping_done.wait_for(elio::test::scaled_sec(5));
+    REQUIRE(ping_status == std::future_status::ready);
+    auto [connected, ping_ok] = ping_done.get();
+    REQUIRE(connected);
+    REQUIRE(ping_ok);
 
     REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 }

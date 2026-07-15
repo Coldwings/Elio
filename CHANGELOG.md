@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserving lazy `co_await` semantics. The ibverbs request/response and
   performance examples now use started handles where ordering or queue depth
   requires work requests to be posted before awaiting them. (#766)
+- **RPC fast-response regression coverage**: Added a deterministic client test
+  that publishes a response before `call()` reaches its wait path, preserving
+  coverage for the pending-response release/acquire contract. (#850)
 
 ### Changed
 

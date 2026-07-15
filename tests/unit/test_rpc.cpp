@@ -913,6 +913,7 @@ TEST_CASE("buffer_ref type traits", "[rpc][buffer_ref]") {
 #include <utility>
 #include <cerrno>
 #include <csignal>
+#include <cstring>
 #include <cstdlib>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -1189,6 +1190,146 @@ elio::io::io_result run_scripted_writev(scripted_rpc_stream& stream,
     return observed;
 }
 
+struct fast_response_stream_state {
+    std::mutex mutex;
+    elio::sync::event response_available;
+    elio::sync::event response_dispatched;
+    elio::sync::event shutdown_event;
+    std::vector<uint8_t> inbound;
+    size_t read_offset = 0;
+    bool response_loaded = false;
+    std::atomic<bool> shutdown{false};
+    std::atomic<bool> request_seen{false};
+    std::atomic<bool> next_header_read_started{false};
+    std::atomic<bool> writev_returned_after_dispatch{false};
+    int32_t request_value = 0;
+};
+
+struct fast_response_stream {
+    std::shared_ptr<fast_response_stream_state> state;
+
+    explicit fast_response_stream(std::shared_ptr<fast_response_stream_state> s)
+        : state(std::move(s)) {}
+
+    elio::coro::task<elio::io::io_result> read_exactly(void* data, size_t len) {
+        while (true) {
+            bool signal_dispatched = false;
+            bool wait_for_shutdown = false;
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->shutdown.load(std::memory_order_acquire)) {
+                    co_return elio::io::io_result{-ECANCELED, 0};
+                }
+
+                if (state->read_offset + len <= state->inbound.size()) {
+                    std::memcpy(data, state->inbound.data() + state->read_offset, len);
+                    state->read_offset += len;
+                    co_return elio::io::io_result{static_cast<int32_t>(len), 0};
+                }
+
+                if (state->response_loaded &&
+                    state->read_offset == state->inbound.size() &&
+                    len == frame_header_size) {
+                    signal_dispatched =
+                        !state->next_header_read_started.exchange(
+                            true, std::memory_order_acq_rel);
+                    wait_for_shutdown = true;
+                }
+            }
+
+            if (signal_dispatched) {
+                state->response_dispatched.set();
+            }
+            if (wait_for_shutdown) {
+                co_await state->shutdown_event.wait();
+                continue;
+            }
+
+            co_await state->response_available.wait();
+        }
+    }
+
+    elio::coro::task<elio::io::io_result> write_exactly(const void*, size_t) {
+        co_return elio::io::io_result{-ENOSYS, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> writev(struct iovec* iovecs, size_t iov_count) {
+        std::vector<uint8_t> written;
+        size_t total = 0;
+        for (size_t i = 0; i < iov_count; ++i) {
+            auto* bytes = static_cast<const uint8_t*>(iovecs[i].iov_base);
+            written.insert(written.end(), bytes, bytes + iovecs[i].iov_len);
+            total += iovecs[i].iov_len;
+        }
+
+        if (written.size() < frame_header_size) {
+            co_return elio::io::io_result{-EINVAL, 0};
+        }
+
+        auto request_header = frame_header::from_bytes(written.data());
+        if (request_header.type != message_type::request ||
+            request_header.method_id != ExistingStreamCreateMethod::id ||
+            written.size() < frame_header_size + request_header.payload_length) {
+            co_return elio::io::io_result{-EINVAL, 0};
+        }
+
+        buffer_view request_view(written.data() + frame_header_size,
+                                 request_header.payload_length);
+        auto [timeout_ms, request] =
+            parse_request<TestRequest>(request_view, request_header.flags);
+        if (!timeout_ms.has_value()) {
+            co_return elio::io::io_result{-EINVAL, 0};
+        }
+
+        auto response = build_response(
+            request_header.request_id, TestResponse{"published-before-wait"});
+        auto response_header = response.first.to_bytes();
+
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->request_value = request.value;
+            state->inbound.assign(response_header.begin(), response_header.end());
+            state->inbound.insert(state->inbound.end(),
+                                  response.second.data(),
+                                  response.second.data() + response.second.size());
+            state->response_loaded = true;
+            state->request_seen.store(true, std::memory_order_release);
+        }
+
+        state->response_available.set();
+
+        // Keep call_impl suspended inside write_frame until receive_loop has
+        // dispatched the response and returned to the next header read.
+        co_await state->response_dispatched.wait();
+        state->writev_returned_after_dispatch.store(
+            state->next_header_read_started.load(std::memory_order_acquire),
+            std::memory_order_release);
+
+        if (total > static_cast<size_t>(INT32_MAX)) {
+            co_return elio::io::io_result{-EOVERFLOW, 0};
+        }
+        co_return elio::io::io_result{static_cast<int32_t>(total), 0};
+    }
+
+    elio::coro::task<elio::io::io_result> poll_write() {
+        co_return elio::io::io_result{0, 0};
+    }
+
+    bool is_valid() const noexcept {
+        return !state->shutdown.load(std::memory_order_acquire);
+    }
+
+    void shutdown_socket() {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->shutdown.store(true, std::memory_order_release);
+        }
+        state->response_available.set();
+        state->response_dispatched.set();
+        state->shutdown_event.set();
+    }
+};
+
 } // namespace
 
 TEST_CASE("rpc writev_exact retries transient writev errors",
@@ -1233,6 +1374,46 @@ TEST_CASE("rpc writev_exact retries transient writev errors",
         REQUIRE(stream.poll_write_calls == 1);
         REQUIRE(stream.written.empty());
     }
+}
+
+TEST_CASE("rpc call observes response published before wait path",
+          "[rpc][client][contract]") {
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    scheduler sched(2);
+    sched.start();
+
+    auto state = std::make_shared<fast_response_stream_state>();
+    std::promise<std::pair<rpc_error, std::string>> result_promise;
+    auto result_future = result_promise.get_future();
+
+    sched.go([state, p = std::move(result_promise)]() mutable -> coro::task<void> {
+        auto client = rpc_client<fast_response_stream>::create(
+            fast_response_stream{state});
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{17}, elio::test::scaled_sec(30));
+
+        std::pair<rpc_error, std::string> observed{result.error(), {}};
+        if (result.ok()) {
+            observed.second = result->result;
+        }
+        client->close();
+        p.set_value(std::move(observed));
+    });
+
+    REQUIRE(result_future.wait_for(elio::test::scaled_sec(5)) ==
+            std::future_status::ready);
+
+    auto [error, value] = result_future.get();
+    REQUIRE(error == rpc_error::success);
+    REQUIRE(value == "published-before-wait");
+    REQUIRE(state->request_seen.load(std::memory_order_acquire));
+    REQUIRE(state->request_value == 17);
+    REQUIRE(state->next_header_read_started.load(std::memory_order_acquire));
+    REQUIRE(state->writev_returned_after_dispatch.load(std::memory_order_acquire));
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 }
 
 TEST_CASE("send_oneway writes a no-response request frame",

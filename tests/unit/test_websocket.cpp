@@ -1215,7 +1215,7 @@ TEST_CASE("ws_connection processes queued ping before later data",
         return (server_done.load() && client_done.load()) ||
                server_failed.load() || client_failed.load();
     }));
-    sched.shutdown();
+    REQUIRE(sched.shutdown(std::chrono::seconds(2)));
 
     REQUIRE_FALSE(server_failed.load());
     REQUIRE_FALSE(client_failed.load());
@@ -1297,7 +1297,7 @@ TEST_CASE("ws_connection processes queued close before later data",
         return (server_done.load() && client_done.load()) ||
                server_failed.load() || client_failed.load();
     }));
-    sched.shutdown();
+    REQUIRE(sched.shutdown(std::chrono::seconds(2)));
 
     REQUIRE_FALSE(server_failed.load());
     REQUIRE_FALSE(client_failed.load());

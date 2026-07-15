@@ -184,18 +184,21 @@ public:
     /// Receive next message (blocks until message available or connection closed)
     coro::task<std::optional<message>> receive() {
         while (state_ == connection_state::open || state_ == connection_state::closing) {
-            // Check for already-parsed messages
-            if (parser_.has_message()) {
-                co_return parser_.get_message();
-            }
-
-            // Process control frames
-            while (parser_.has_control_frame()) {
-                auto control_frame = parser_.get_control_frame();
+            // Process already-parsed frames in wire order.
+            while (parser_.next_frame_is_control_frame()) {
+                auto control_frame = parser_.get_next_control_frame();
                 if (!control_frame) {
                     break;
                 }
                 co_await handle_control_frame(control_frame->first, control_frame->second);
+            }
+
+            if (state_ == connection_state::closed) {
+                co_return std::nullopt;
+            }
+
+            if (parser_.next_frame_is_message()) {
+                co_return parser_.get_next_message();
             }
 
             // Check for errors (RFC 6455 §5.1: emit a close frame before

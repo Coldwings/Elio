@@ -1,11 +1,14 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/http/websocket.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <new>
 #include <string>
 #include <string_view>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -32,6 +35,40 @@ inline void* ws_tracked_alloc(std::size_t n) {
     void* p = std::malloc(n ? n : 1);
     if (!p) throw std::bad_alloc();
     return p;
+}
+
+template <typename Pred>
+bool ws_wait_for(Pred pred, std::chrono::milliseconds timeout =
+                                std::chrono::seconds(5)) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return pred();
+}
+
+elio::coro::task<bool> ws_write_all(elio::net::tcp_stream& s,
+                                    std::string_view data) {
+    size_t sent = 0;
+    while (sent < data.size()) {
+        auto r = co_await s.write(data.data() + sent, data.size() - sent);
+        if (r.result <= 0) co_return false;
+        sent += static_cast<size_t>(r.result);
+    }
+    co_return true;
+}
+
+elio::coro::task<std::string> ws_read_until_close(elio::net::tcp_stream& s,
+                                                  size_t cap = 65536) {
+    std::string out;
+    char buf[1024];
+    while (out.size() < cap) {
+        auto r = co_await s.read(buf, sizeof(buf));
+        if (r.result <= 0) break;
+        out.append(buf, static_cast<size_t>(r.result));
+    }
+    co_return out;
 }
 } // namespace
 
@@ -414,6 +451,55 @@ TEST_CASE("WebSocket frame parser", "[websocket][parser]") {
         REQUIRE(msg2->data == "Second");
         
         REQUIRE_FALSE(parser.has_message());
+    }
+
+    SECTION("queued frame order preserves control before later message") {
+        frame_parser parser;
+
+        auto ping = encode_ping_frame("hb", false);
+        auto text = encode_text_frame("after", false);
+        std::vector<uint8_t> combined;
+        combined.insert(combined.end(), ping.begin(), ping.end());
+        combined.insert(combined.end(), text.begin(), text.end());
+
+        auto consumed = parser.parse(combined.data(), combined.size());
+
+        REQUIRE(consumed == static_cast<ssize_t>(combined.size()));
+        REQUIRE(parser.next_frame_is_control_frame());
+        auto ctrl = parser.get_next_control_frame();
+        REQUIRE(ctrl.has_value());
+        REQUIRE(ctrl->first == opcode::ping);
+        REQUIRE(ctrl->second == "hb");
+
+        REQUIRE(parser.next_frame_is_message());
+        auto msg = parser.get_next_message();
+        REQUIRE(msg.has_value());
+        REQUIRE(msg->type == opcode::text);
+        REQUIRE(msg->data == "after");
+    }
+
+    SECTION("queued frame order preserves message before later control") {
+        frame_parser parser;
+
+        auto text = encode_text_frame("before", false);
+        auto close = encode_close_frame(close_code::normal, "", false);
+        std::vector<uint8_t> combined;
+        combined.insert(combined.end(), text.begin(), text.end());
+        combined.insert(combined.end(), close.begin(), close.end());
+
+        auto consumed = parser.parse(combined.data(), combined.size());
+
+        REQUIRE(consumed == static_cast<ssize_t>(combined.size()));
+        REQUIRE(parser.next_frame_is_message());
+        auto msg = parser.get_next_message();
+        REQUIRE(msg.has_value());
+        REQUIRE(msg->type == opcode::text);
+        REQUIRE(msg->data == "before");
+
+        REQUIRE(parser.next_frame_is_control_frame());
+        auto ctrl = parser.get_next_control_frame();
+        REQUIRE(ctrl.has_value());
+        REQUIRE(ctrl->first == opcode::close);
     }
     
     SECTION("handle incremental parsing") {
@@ -1060,4 +1146,169 @@ TEST_CASE("WebSocket route parameters are exposed to connections",
     REQUIRE(conn.param("user") == "alice");
     REQUIRE(conn.param("missing").empty());
     REQUIRE(conn.params().size() == 2);
+}
+
+TEST_CASE("ws_connection processes queued ping before later data",
+          "[websocket][server][regression]") {
+    using namespace elio;
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> server_failed{false};
+    std::atomic<bool> client_failed{false};
+    bool got_message = false;
+    std::string received_data;
+    std::string client_bytes;
+
+    sched.go([&]() -> coro::task<void> {
+        auto accepted = co_await listener_opt->accept();
+        if (!accepted) {
+            server_failed = true;
+            co_return;
+        }
+
+        ws_connection conn(&*accepted);
+        conn.set_open();
+        auto msg = co_await conn.receive();
+        if (msg) {
+            got_message = true;
+            received_data = msg->data;
+        }
+
+        co_await accepted->close();
+        server_done = true;
+    });
+
+    sched.go([&]() -> coro::task<void> {
+        auto stream = co_await tcp_connect(ipv4_address("127.0.0.1", port));
+        if (!stream) {
+            client_failed = true;
+            co_return;
+        }
+
+        auto ping = encode_ping_frame("hb", true);
+        auto text = encode_text_frame("after", true);
+        std::string combined;
+        combined.append(reinterpret_cast<const char*>(ping.data()), ping.size());
+        combined.append(reinterpret_cast<const char*>(text.data()), text.size());
+
+        if (!co_await ws_write_all(*stream, combined)) {
+            client_failed = true;
+            co_return;
+        }
+        client_bytes = co_await ws_read_until_close(*stream);
+        co_await stream->close();
+        client_done = true;
+    });
+
+    REQUIRE(ws_wait_for([&] {
+        return (server_done.load() && client_done.load()) ||
+               server_failed.load() || client_failed.load();
+    }));
+    sched.shutdown();
+
+    REQUIRE_FALSE(server_failed.load());
+    REQUIRE_FALSE(client_failed.load());
+    REQUIRE(got_message);
+    REQUIRE(received_data == "after");
+
+    frame_parser parser;
+    parser.set_role(endpoint_role::client);
+    REQUIRE(parser.parse(reinterpret_cast<const uint8_t*>(client_bytes.data()),
+                         client_bytes.size()) > 0);
+    REQUIRE(parser.next_frame_is_control_frame());
+    auto ctrl = parser.get_next_control_frame();
+    REQUIRE(ctrl.has_value());
+    REQUIRE(ctrl->first == opcode::pong);
+    REQUIRE(ctrl->second == "hb");
+    REQUIRE_FALSE(parser.has_message());
+}
+
+TEST_CASE("ws_connection processes queued close before later data",
+          "[websocket][server][regression]") {
+    using namespace elio;
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> server_failed{false};
+    std::atomic<bool> client_failed{false};
+    bool got_message = false;
+    std::string client_bytes;
+
+    sched.go([&]() -> coro::task<void> {
+        auto accepted = co_await listener_opt->accept();
+        if (!accepted) {
+            server_failed = true;
+            co_return;
+        }
+
+        ws_connection conn(&*accepted);
+        conn.set_open();
+        auto msg = co_await conn.receive();
+        got_message = msg.has_value();
+
+        co_await accepted->close();
+        server_done = true;
+    });
+
+    sched.go([&]() -> coro::task<void> {
+        auto stream = co_await tcp_connect(ipv4_address("127.0.0.1", port));
+        if (!stream) {
+            client_failed = true;
+            co_return;
+        }
+
+        auto close = encode_close_frame(close_code::normal, "", true);
+        auto text = encode_text_frame("after", true);
+        std::string combined;
+        combined.append(reinterpret_cast<const char*>(close.data()), close.size());
+        combined.append(reinterpret_cast<const char*>(text.data()), text.size());
+
+        if (!co_await ws_write_all(*stream, combined)) {
+            client_failed = true;
+            co_return;
+        }
+        client_bytes = co_await ws_read_until_close(*stream);
+        co_await stream->close();
+        client_done = true;
+    });
+
+    REQUIRE(ws_wait_for([&] {
+        return (server_done.load() && client_done.load()) ||
+               server_failed.load() || client_failed.load();
+    }));
+    sched.shutdown();
+
+    REQUIRE_FALSE(server_failed.load());
+    REQUIRE_FALSE(client_failed.load());
+    REQUIRE_FALSE(got_message);
+
+    frame_parser parser;
+    parser.set_role(endpoint_role::client);
+    REQUIRE(parser.parse(reinterpret_cast<const uint8_t*>(client_bytes.data()),
+                         client_bytes.size()) > 0);
+    REQUIRE(parser.next_frame_is_control_frame());
+    auto ctrl = parser.get_next_control_frame();
+    REQUIRE(ctrl.has_value());
+    REQUIRE(ctrl->first == opcode::close);
 }

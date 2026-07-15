@@ -75,6 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WebSocket mask-direction validation**: WebSocket frame parsing now rejects
   role-invalid masking as soon as the complete frame header is available instead
   of waiting for the payload body. (#861)
+- **WebSocket control-frame ordering**: WebSocket receive loops now handle
+  already-parsed control frames before delivering later data messages from the
+  same read batch, preserving wire-order semantics for ping/pong/close. (#862)
 - **RPC frame contract validation**: Inbound RPC frames now reject unknown
   message types, reserved `compressed`/`streaming` flags, and unknown flag bits
   at the frame-header validation boundary instead of dispatching them as normal

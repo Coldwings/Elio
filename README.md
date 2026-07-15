@@ -197,6 +197,14 @@ int main() {
 }
 ```
 
+## Documentation
+
+Detailed guides live in the repository `wiki/` directory and are synced to the
+GitHub Wiki. Start with [Getting Started](wiki/Getting-Started.md) for setup,
+[API Reference](wiki/API-Reference.md) for the public surface, and
+[Security Guidelines](wiki/Security-Guidelines.md) for the boundary between
+Elio's library guarantees and caller responsibilities.
+
 ## Architecture Overview
 
 ### Core Components

@@ -1,6 +1,7 @@
 #include <elio/elio.hpp>
 #include <elio/http/http.hpp>
 #include <elio/http/websocket.hpp>
+#include <elio/rpc/rpc.hpp>
 #include <elio/tls/tls.hpp>
 
 #include <iostream>
@@ -100,6 +101,14 @@ coro::task<void> tls_server() {
 
     auto stream = co_await listener->accept();
     (void)stream;
+}
+
+coro::task<void> rpc_client_with_resolve_options() {
+    rpc::rpc_client_config cfg;
+    net::resolve_options resolve_opts;
+    auto client = co_await rpc::tcp_rpc_client::connect_with_config(
+        cfg, "localhost", 9000, resolve_opts);
+    (void)client;
 }
 
 coro::task<void> vectored_io(int fd) {

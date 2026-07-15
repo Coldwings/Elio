@@ -588,6 +588,30 @@ uint32_t checksum = elio::hash::crc32_iovec(iov, 2);
 uint32_t checksum = elio::rpc::crc32(data, length);
 ```
 
+### Client Configuration
+
+`rpc_client_config` controls client-side receive-loop limits:
+
+```cpp
+rpc_client_config config;
+config.frame_read_timeout = std::chrono::seconds(30); // 0s = disabled
+config.max_message_size = elio::rpc::max_message_size; // 16 MiB default
+
+auto client = co_await tcp_rpc_client::connect_with_config(
+    config, "127.0.0.1", 9000);
+```
+
+- **frame_read_timeout**: Inactivity deadline for each receive-loop frame read.
+  The timer starts while waiting for the next frame header and continues until
+  the complete response/control frame, including payload and optional checksum,
+  is read. This mitigates peers that send only part of a frame and keep the
+  connection open, and also closes idle/no-response connections after the
+  configured interval. Use a larger value or `0s` for long-lived idle clients or
+  calls whose server may be silent longer than the default.
+- **max_message_size**: Maximum payload bytes accepted per frame. The default
+  is the protocol-wide 16 MiB limit; reduce it when an application has smaller
+  messages.
+
 ### Server Configuration
 
 `rpc_server_config` controls the per-server operational limits:

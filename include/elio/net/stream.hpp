@@ -29,6 +29,14 @@ namespace elio::net {
 
 /// Stream type that can be plain TCP, or TLS encrypted when ELIO_HAS_TLS is set.
 /// Provides a common interface for read/write operations.
+///
+/// **Thread safety:** a `stream` follows the contract of its active transport.
+/// TCP-backed streams allow one reader and one writer concurrently, matching
+/// `tcp_stream`. TLS-backed streams require external serialization for
+/// `read`/`write`/`close` because they wrap `tls_stream` and OpenSSL `SSL*`
+/// state. Code that does not branch on the active variant should use the
+/// stricter TLS rule. Concurrent `close()` with any read/write operation
+/// requires external serialization for all variants.
 class stream {
 public:
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS

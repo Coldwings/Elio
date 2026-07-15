@@ -1437,6 +1437,14 @@ serialization.
 Type-erased wrapper over `tcp_stream` and, when TLS support is enabled,
 `tls_stream`. It delegates I/O to the active underlying stream.
 
+`net::stream` follows the concurrency contract of its active transport.
+TCP-backed streams allow one reader and one writer concurrently, matching
+`tcp_stream`. TLS-backed streams require external serialization for
+`read`/`write`/`close` because they wrap `tls_stream` and OpenSSL `SSL*` state.
+Code that does not branch on the active variant should use the stricter TLS
+rule. Concurrent `close()` with any read/write operation requires external
+serialization for all variants.
+
 ```cpp
 class stream {
 public:

@@ -70,8 +70,27 @@ jobs:
     - name: Install dependencies
       if: needs.changes.outputs.code == 'true'
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
+        sudo tee /etc/apt/apt.conf.d/99-elio-ci-network >/dev/null <<'APT'
+        Acquire::Retries "5";
+        Acquire::http::Timeout "30";
+        Acquire::https::Timeout "30";
+        Acquire::ForceIPv4 "true";
+        APT
+
+        retry_sudo() {
+          for attempt in 1 2 3 4 5; do
+            if sudo "$@"; then
+              return 0
+            fi
+            if [[ "${attempt}" == 5 ]]; then
+              return 1
+            fi
+            sleep $((attempt * 5))
+          done
+        }
+
+        retry_sudo apt-get update
+        retry_sudo apt-get install -y \
           cmake \
           ninja-build \
           liburing-dev \
@@ -174,8 +193,27 @@ jobs:
     - name: Install dependencies
       if: needs.changes.outputs.code == 'true'
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
+        sudo tee /etc/apt/apt.conf.d/99-elio-ci-network >/dev/null <<'APT'
+        Acquire::Retries "5";
+        Acquire::http::Timeout "30";
+        Acquire::https::Timeout "30";
+        Acquire::ForceIPv4 "true";
+        APT
+
+        retry_sudo() {
+          for attempt in 1 2 3 4 5; do
+            if sudo "$@"; then
+              return 0
+            fi
+            if [[ "${attempt}" == 5 ]]; then
+              return 1
+            fi
+            sleep $((attempt * 5))
+          done
+        }
+
+        retry_sudo apt-get update
+        retry_sudo apt-get install -y \
           cmake \
           ninja-build \
           liburing-dev \
@@ -281,8 +319,27 @@ jobs:
     - name: Install dependencies
       if: needs.changes.outputs.tcp_benchmark == 'true'
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
+        sudo tee /etc/apt/apt.conf.d/99-elio-ci-network >/dev/null <<'APT'
+        Acquire::Retries "5";
+        Acquire::http::Timeout "30";
+        Acquire::https::Timeout "30";
+        Acquire::ForceIPv4 "true";
+        APT
+
+        retry_sudo() {
+          for attempt in 1 2 3 4 5; do
+            if sudo "$@"; then
+              return 0
+            fi
+            if [[ "${attempt}" == 5 ]]; then
+              return 1
+            fi
+            sleep $((attempt * 5))
+          done
+        }
+
+        retry_sudo apt-get update
+        retry_sudo apt-get install -y \
           cmake \
           ninja-build \
           liburing-dev \

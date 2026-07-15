@@ -39,8 +39,27 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libuv1-dev liburing-dev g++-14
+          sudo tee /etc/apt/apt.conf.d/99-elio-ci-network >/dev/null <<'APT'
+          Acquire::Retries "5";
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+          Acquire::ForceIPv4 "true";
+          APT
+
+          retry_sudo() {
+            for attempt in 1 2 3 4 5; do
+              if sudo "$@"; then
+                return 0
+              fi
+              if [[ "${attempt}" == 5 ]]; then
+                return 1
+              fi
+              sleep $((attempt * 5))
+            done
+          }
+
+          retry_sudo apt-get update
+          retry_sudo apt-get install -y libuv1-dev liburing-dev g++-14
 
       - name: Configure
         run: |

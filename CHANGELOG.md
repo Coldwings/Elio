@@ -73,6 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message types, reserved `compressed`/`streaming` flags, and unknown flag bits
   at the frame-header validation boundary instead of dispatching them as normal
   uncompressed requests or responses. (#854)
+- **SSE parser chunk-boundary CRLF handling**: The SSE client parser now treats
+  `\r` at the end of one input chunk plus `\n` at the start of the next chunk as
+  a single CRLF line ending, preserving pending event metadata across transport
+  splits. (#857)
 - **SSE event serialization safety**: Server-side SSE serialization now treats
   LF, CRLF, and standalone CR as data line separators, suppresses unsafe
   line-break-bearing `id`/`event` fields, and serializes multi-line comments as

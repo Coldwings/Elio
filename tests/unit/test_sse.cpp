@@ -444,11 +444,46 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
         REQUIRE_FALSE(parser.has_event());
 
         parser.parse("\n\r\n");
-        // The leading \n is an empty line → dispatches event with "Hello".
-        // The \r\n is another empty line → no dispatch (data already reset).
+        // The leading \n belongs to the previous chunk's terminal \r, so it
+        // must not create an empty line. The following \r\n is the blank line
+        // that dispatches the event.
         REQUIRE(parser.has_event());
         auto evt = parser.get_event();
         REQUIRE(evt->data == "Hello");
+    }
+
+    SECTION("CRLF split across chunks preserves event metadata") {
+        event_parser parser;
+
+        REQUIRE(parser.parse("id: 42\r") == 0);
+        REQUIRE_FALSE(parser.has_event());
+        REQUIRE(parser.parse("") == 0);
+        REQUIRE_FALSE(parser.has_event());
+
+        REQUIRE(parser.parse("\nevent: update\r") == 0);
+        REQUIRE_FALSE(parser.has_event());
+
+        REQUIRE(parser.parse("\ndata: World\r\n\r\n") == 1);
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt->id == "42");
+        REQUIRE(evt->type == "update");
+        REQUIRE(evt->data == "World");
+        REQUIRE(parser.last_event_id() == "42");
+    }
+
+    SECTION("same-chunk standalone CR does not suppress next chunk LF") {
+        event_parser parser;
+
+        REQUIRE(parser.parse("id: 42\rdata: World\n") == 0);
+        REQUIRE_FALSE(parser.has_event());
+
+        REQUIRE(parser.parse("\n") == 1);
+        REQUIRE(parser.has_event());
+        auto evt = parser.get_event();
+        REQUIRE(evt->id == "42");
+        REQUIRE(evt->data == "World");
+        REQUIRE(parser.last_event_id() == "42");
     }
 
     SECTION("CR at buffer boundary followed by non-LF") {

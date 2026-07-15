@@ -60,6 +60,10 @@ public:
 
     explicit event_parser(size_t max_buffer_size = default_max_buffer_size) noexcept
         : max_buffer_size_(max_buffer_size) {}
+
+    event_parser(size_t max_buffer_size, std::string_view last_event_id)
+        : last_event_id_(last_event_id)
+        , max_buffer_size_(max_buffer_size) {}
     
     /// Parse incoming data and extract events
     /// @param data Input data
@@ -145,6 +149,7 @@ public:
     void reset() {
         buffer_.clear();
         current_event_ = event{};
+        current_event_has_id_ = false;
         events_.clear();
         failed_ = false;
         error_message_.clear();
@@ -208,15 +213,14 @@ private:
                 // data buffer is non-empty.  Events carrying only `event:`
                 // (no data) reset state without producing a user-visible
                 // event.
+                if (current_event_has_id_) {
+                    last_event_id_ = current_event_.id;
+                }
+
                 if (!current_event_.data.empty()) {
                     // Remove trailing newline from data
                     if (current_event_.data.back() == '\n') {
                         current_event_.data.pop_back();
-                    }
-
-                    // Update last event ID
-                    if (!current_event_.id.empty()) {
-                        last_event_id_ = current_event_.id;
                     }
 
                     events_.push_back(std::move(current_event_));
@@ -224,6 +228,7 @@ private:
                 }
                 // Always reset state on blank line (spec requirement)
                 current_event_ = event{};
+                current_event_has_id_ = false;
                 continue;
             }
             
@@ -265,6 +270,7 @@ private:
                 // ID cannot contain null
                 if (value.find('\0') == std::string::npos) {
                     current_event_.id = value;
+                    current_event_has_id_ = true;
                 }
             } else if (field == "retry") {
                 // Parse retry as integer with overflow protection.
@@ -312,12 +318,14 @@ private:
         error_message_ = std::string(message);
         buffer_.clear();
         current_event_ = event{};
+        current_event_has_id_ = false;
         events_.clear();
         skip_lf_after_terminal_cr_ = false;
     }
     
     std::string buffer_;
     event current_event_;
+    bool current_event_has_id_ = false;
     std::vector<event> events_;
     std::string last_event_id_;
     int retry_ms_ = 3000;
@@ -337,15 +345,12 @@ public:
     explicit sse_client(client_config config)
         : config_(config)
         , tls_ctx_(tls::tls_mode::client)
-        , parser_(config_.max_event_buffer_size) {
+        , last_event_id_(config.last_event_id)
+        , parser_(config.max_event_buffer_size, config.last_event_id) {
         // Setup TLS context using shared utility
         http::init_client_tls_context(tls_ctx_, config_.verify_certificate);
 
         buffer_.resize(config_.read_buffer_size);
-
-        if (!config_.last_event_id.empty()) {
-            last_event_id_ = config_.last_event_id;
-        }
     }
     
     /// Destructor
@@ -456,9 +461,6 @@ private:
             // Check for already-parsed events
             if (parser_.has_event()) {
                 auto evt = parser_.get_event();
-                if (evt && !evt->id.empty()) {
-                    last_event_id_ = evt->id;
-                }
                 co_return evt;
             }
 
@@ -513,6 +515,7 @@ private:
                 state_ = client_state::disconnected;
                 co_return std::nullopt;
             }
+            sync_last_event_id_from_parser();
         }
 
         co_return std::nullopt;
@@ -727,6 +730,7 @@ private:
                         errno = EBADMSG;
                         co_return fail_connect();
                     }
+                    sync_last_event_id_from_parser();
                 }
 
                 break;
@@ -810,6 +814,11 @@ private:
         }
         
         co_return false;
+    }
+
+    void sync_last_event_id_from_parser() {
+        auto id = parser_.last_event_id();
+        last_event_id_.assign(id.begin(), id.end());
     }
     
     coro::task<io::io_result> read(void* buf, size_t len) {

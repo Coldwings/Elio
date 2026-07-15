@@ -321,6 +321,11 @@ Checksum trailer: 4 bytes (optional)
 - **Optionals**: 1-byte has_value flag + value (if present)
 - **Structs**: Fields serialized in declaration order
 
+Typed request, response, and error payloads must be fully consumed after the
+declared fields are deserialized. The RPC wire format does not reserve trailing
+extension bytes inside typed payloads; future extensions require an explicit
+flag or versioned negotiation before receivers may accept additional bytes.
+
 ## Error Handling
 
 ### Error Codes

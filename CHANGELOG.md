@@ -88,6 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message types, reserved `compressed`/`streaming` flags, and unknown flag bits
   at the frame-header validation boundary instead of dispatching them as normal
   uncompressed requests or responses. (#854)
+- **RPC typed payload canonicalization**: Typed RPC request, response, and
+  error payload parsing now rejects trailing bytes after the declared typed
+  fields instead of silently accepting undocumented extension data. (#873)
 - **SSE parser chunk-boundary CRLF handling**: The SSE client parser now treats
   `\r` at the end of one input chunk plus `\n` at the start of the next chunk as
   a single CRLF line ending, preserving pending event metadata across transport

@@ -716,8 +716,7 @@ public:
             buffer_view payload
         ) -> coro::task<handler_result> {
             // Deserialize request
-            Request request;
-            deserialize(payload, request);
+            Request request = parse_typed_payload<Request>(payload);
 
             // Call handler
             Response response = co_await h(request);
@@ -747,8 +746,7 @@ public:
             buffer_view payload
         ) -> coro::task<handler_result> {
             // Deserialize request
-            Request request;
-            deserialize(payload, request);
+            Request request = parse_typed_payload<Request>(payload);
 
             // Call handler with context
             Response response = co_await h(ctx, request);
@@ -776,8 +774,7 @@ public:
             buffer_view payload
         ) -> coro::task<handler_result> {
             // Deserialize request
-            Request request;
-            deserialize(payload, request);
+            Request request = parse_typed_payload<Request>(payload);
 
             // Call synchronous handler
             Response response = h(request);
@@ -810,8 +807,7 @@ public:
             buffer_view payload
         ) -> coro::task<handler_result> {
             // Deserialize request
-            Request request;
-            deserialize(payload, request);
+            Request request = parse_typed_payload<Request>(payload);
 
             // Call handler - returns (response, cleanup_callback)
             auto [response, cleanup] = co_await h(request);
@@ -841,8 +837,7 @@ public:
             buffer_view payload
         ) -> coro::task<handler_result> {
             // Deserialize request
-            Request request;
-            deserialize(payload, request);
+            Request request = parse_typed_payload<Request>(payload);
 
             // Call handler with context - returns (response, cleanup_callback)
             auto [response, cleanup] = co_await h(ctx, request);

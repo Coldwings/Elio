@@ -101,6 +101,26 @@ TEST_CASE("HTTP request parser - incremental parsing", "[http][parser]") {
     REQUIRE(parser.is_complete());
 }
 
+TEST_CASE("HTTP request parser reports consumed bytes before need_more",
+          "[http][parser][regression]") {
+    request_parser parser;
+
+    const std::string consumed_prefix =
+        "GET /test HTTP/1.1\r\n"
+        "Host: example.com\r\n";
+    const std::string partial_header = "User-Agent: test";
+    auto [r1, c1] = parser.parse(consumed_prefix + partial_header);
+
+    REQUIRE(r1 == parse_result::need_more);
+    REQUIRE(c1 == consumed_prefix.size());
+
+    auto [r2, c2] = parser.parse("/1.0\r\n\r\n");
+
+    REQUIRE(r2 == parse_result::complete);
+    REQUIRE(c2 == partial_header.size() + std::string_view("/1.0\r\n\r\n").size());
+    REQUIRE(parser.get_headers().get("User-Agent") == "test/1.0");
+}
+
 TEST_CASE("HTTP request parser - all methods", "[http][parser]") {
     auto test_method = [](const char* method_str, method expected) {
         request_parser parser;

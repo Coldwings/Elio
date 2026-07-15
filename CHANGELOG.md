@@ -72,6 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SSE Last-Event-ID contract handling**: SSE parsing now applies valid `id`
   fields to the Last-Event-ID buffer even when no event is dispatched, and
   honors empty `id:` fields as cursor resets for reconnects. (#860)
+- **WebSocket mask-direction validation**: WebSocket frame parsing now rejects
+  role-invalid masking as soon as the complete frame header is available instead
+  of waiting for the payload body. (#861)
 - **RPC frame contract validation**: Inbound RPC frames now reject unknown
   message types, reserved `compressed`/`streaming` flags, and unknown flag bits
   at the frame-header validation boundary instead of dispatching them as normal

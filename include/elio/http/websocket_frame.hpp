@@ -528,6 +528,23 @@ private:
                 break;
             }
 
+            // RFC 6455 §5.1: enforce mask direction as soon as the full
+            // header is known. Servers MUST tear down a connection that
+            // delivers an unmasked client frame; clients MUST tear down on a
+            // masked server frame.
+            if (role_ == endpoint_role::server && !header.masked) {
+                has_error_ = true;
+                error_msg_ = "Unmasked frame received from client";
+                error_close_code_ = close_code::protocol_error;
+                return -1;
+            }
+            if (role_ == endpoint_role::client && header.masked) {
+                has_error_ = true;
+                error_msg_ = "Masked frame received from server";
+                error_close_code_ = close_code::protocol_error;
+                return -1;
+            }
+
             // Validate fragmentation state as soon as the complete header is
             // known — before the full payload arrives — so that protocol errors
             // are caught early regardless of whether a size limit is configured.
@@ -568,22 +585,6 @@ private:
             if (buffer_.size() < result.frame_size) {
                 // Need more payload data
                 break;
-            }
-
-            // RFC 6455 §5.1: enforce mask direction once we know our role.
-            // Servers MUST tear down a connection that delivers an unmasked
-            // client frame; clients MUST tear down on a masked server frame.
-            if (role_ == endpoint_role::server && !header.masked) {
-                has_error_ = true;
-                error_msg_ = "Unmasked frame received from client";
-                error_close_code_ = close_code::protocol_error;
-                return -1;
-            }
-            if (role_ == endpoint_role::client && header.masked) {
-                has_error_ = true;
-                error_msg_ = "Masked frame received from server";
-                error_close_code_ = close_code::protocol_error;
-                return -1;
             }
             
             // Helper to extract (and unmask) the frame payload from the buffer.

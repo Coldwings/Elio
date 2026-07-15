@@ -37,11 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **RPC framing reuses the stream exact-length helpers**: `read_frame_bounded()`
   now calls the stream's `read_exactly()` instead of a private `read_exact()`
-  loop, and the `rpc::rpc_stream` concept now requires
-  `read_exactly()`/`write_exactly()`. A partial read/write of a frame means the
-  message is corrupt regardless, so there is no behavioral reason for RPC to
-  carry its own duplicate loop. The unused `rpc::read_exact()`/`rpc::write_exact()`
-  helpers were removed.
+  loop, and the existing `rpc::rpc_stream` concept now also requires
+  `read_exactly()`/`write_exactly()` alongside its scatter-gather write,
+  readiness-poll, and validity requirements. A partial read/write of a frame
+  means the message is corrupt regardless, so there is no behavioral reason for
+  RPC to carry its own duplicate loop. The unused `rpc::read_exact()`/
+  `rpc::write_exact()` helpers were removed.
 - **0.5.3 development metadata**: The in-tree development version is now 0.5.3,
   with README, public header, and CMake release metadata aligned after v0.5.2.
 - **Documentation and examples**: README/wiki/API snippets now reflect the

@@ -534,6 +534,12 @@ The RPC framework uses scatter-gather I/O (`writev`) plus retry handling to writ
 
 This is handled automatically by `write_frame()` - no special configuration needed.
 
+Custom stream types used with `rpc::rpc_stream` must still provide the full RPC
+stream surface: `read_exactly()`, `write_exactly()`, `writev()`, `poll_write()`,
+and `is_valid()`. The exact-length helpers are used for full-frame reads and
+cancellable contiguous writes; `writev()` and `poll_write()` remain required for
+the scatter-gather fast path and its readiness retry loop.
+
 ### Zero-Copy Deserialization
 
 For read-only access, use `buffer_view` directly:

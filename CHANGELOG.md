@@ -81,6 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WebSocket payload length canonicalization**: WebSocket frame parsing now
   rejects non-minimal extended payload length encodings at the frame-header
   boundary, matching the canonical encoding emitted by the frame encoder. (#863)
+- **HTTP/2 response status validation**: HTTP/2 response parsing now rejects
+  missing, malformed, duplicate, or out-of-range `:status` pseudo-headers
+  instead of exposing them to callers as `200 OK`. (#872)
 - **RPC frame contract validation**: Inbound RPC frames now reject unknown
   message types, reserved `compressed`/`streaming` flags, and unknown flag bits
   at the frame-header validation boundary instead of dispatching them as normal

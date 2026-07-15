@@ -147,6 +147,9 @@ TEST_CASE("HTTP/2 stream state", "[http2]") {
         REQUIRE_FALSE(stream.body_complete);
         REQUIRE_FALSE(stream.closed);
         REQUIRE(stream.error == h2_error::none);
+        REQUIRE_FALSE(stream.response_status_seen);
+        REQUIRE_FALSE(stream.current_header_status_seen);
+        REQUIRE_FALSE(stream.current_header_status_required);
         REQUIRE_FALSE(stream.is_complete());
     }
 
@@ -169,6 +172,7 @@ TEST_CASE("HTTP/2 stream state", "[http2]") {
     SECTION("Stream with data") {
         stream.stream_id = 1;
         stream.response_status = status::ok;
+        stream.response_status_seen = true;
         stream.response_body = "Hello, World!";
         stream.response_headers.set("Content-Type", "text/plain");
         stream.headers_complete = true;
@@ -179,6 +183,116 @@ TEST_CASE("HTTP/2 stream state", "[http2]") {
         REQUIRE(stream.response_body == "Hello, World!");
         REQUIRE(stream.response_headers.get("Content-Type") == "text/plain");
         REQUIRE(stream.is_complete());
+    }
+}
+
+TEST_CASE("HTTP/2 response status pseudo-header validation",
+          "[http2][security]") {
+    status parsed = status::ok;
+
+    SECTION("accepts canonical three-digit statuses") {
+        REQUIRE(detail::parse_h2_response_status("200", parsed));
+        REQUIRE(parsed == status::ok);
+
+        REQUIRE(detail::parse_h2_response_status("599", parsed));
+        REQUIRE(static_cast<uint16_t>(parsed) == 599);
+    }
+
+    SECTION("rejects malformed status values") {
+        REQUIRE_FALSE(detail::parse_h2_response_status("", parsed));
+        REQUIRE_FALSE(detail::parse_h2_response_status("20", parsed));
+        REQUIRE_FALSE(detail::parse_h2_response_status("2000", parsed));
+        REQUIRE_FALSE(detail::parse_h2_response_status("200junk", parsed));
+        REQUIRE_FALSE(detail::parse_h2_response_status("2 0", parsed));
+        REQUIRE_FALSE(detail::parse_h2_response_status("abc", parsed));
+    }
+
+    SECTION("rejects out-of-range status values") {
+        REQUIRE_FALSE(detail::parse_h2_response_status("099", parsed));
+        REQUIRE_FALSE(detail::parse_h2_response_status("600", parsed));
+    }
+}
+
+TEST_CASE("HTTP/2 response status tracking handles informational headers",
+          "[http2][security]") {
+    SECTION("accepts informational status before final status") {
+        h2_stream stream;
+
+        detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_RESPONSE);
+        REQUIRE(stream.current_header_status_required);
+        REQUIRE(detail::record_h2_response_status(stream, "103"));
+        REQUIRE(stream.current_header_status_seen);
+        REQUIRE_FALSE(stream.response_status_seen);
+        REQUIRE(detail::finish_h2_response_header_block(stream));
+        REQUIRE(stream.error == h2_error::none);
+
+        stream.response_headers.set("link", "</style.css>; rel=preload");
+
+        detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_HEADERS);
+        REQUIRE(stream.current_header_status_required);
+        REQUIRE_FALSE(stream.response_headers.contains("link"));
+        REQUIRE(detail::record_h2_response_status(stream, "200"));
+        REQUIRE(stream.response_status_seen);
+        REQUIRE(stream.response_status == status::ok);
+        REQUIRE(detail::finish_h2_response_header_block(stream));
+        REQUIRE(stream.error == h2_error::none);
+    }
+
+    SECTION("rejects missing final status after informational status") {
+        h2_stream stream;
+
+        detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_RESPONSE);
+        REQUIRE(detail::record_h2_response_status(stream, "103"));
+        REQUIRE(detail::finish_h2_response_header_block(stream));
+
+        detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_HEADERS);
+        REQUIRE(stream.current_header_status_required);
+        REQUIRE_FALSE(detail::finish_h2_response_header_block(stream));
+        REQUIRE(stream.error == h2_error::protocol_error);
+        REQUIRE_FALSE(stream.response_status_seen);
+    }
+
+    SECTION("rejects 101 switching protocols") {
+        h2_stream stream;
+
+        detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_RESPONSE);
+        REQUIRE_FALSE(detail::record_h2_response_status(stream, "101"));
+        REQUIRE(stream.error == h2_error::protocol_error);
+        REQUIRE_FALSE(stream.response_status_seen);
+    }
+
+    SECTION("does not require status in trailers after final status") {
+        h2_stream stream;
+
+        detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_RESPONSE);
+        REQUIRE(detail::record_h2_response_status(stream, "200"));
+        REQUIRE(detail::finish_h2_response_header_block(stream));
+
+        detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_HEADERS);
+        REQUIRE_FALSE(stream.current_header_status_required);
+        REQUIRE(detail::finish_h2_response_header_block(stream));
+        REQUIRE(stream.error == h2_error::none);
+    }
+
+    SECTION("rejects status in trailers after final status") {
+        h2_stream stream;
+
+        detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_RESPONSE);
+        REQUIRE(detail::record_h2_response_status(stream, "200"));
+        REQUIRE(detail::finish_h2_response_header_block(stream));
+
+        detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_HEADERS);
+        REQUIRE_FALSE(detail::record_h2_response_status(stream, "204"));
+        REQUIRE(stream.error == h2_error::protocol_error);
+    }
+
+    SECTION("rejects duplicate status in one header block") {
+        h2_stream stream;
+
+        detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_RESPONSE);
+        REQUIRE(detail::record_h2_response_status(stream, "200"));
+        REQUIRE_FALSE(detail::record_h2_response_status(stream, "204"));
+        REQUIRE(stream.error == h2_error::protocol_error);
     }
 }
 
@@ -207,6 +321,7 @@ TEST_CASE("HTTP/2 response materialization preserves peer headers",
     SECTION("Peer Content-Length is not rewritten") {
         h2_stream stream;
         stream.response_status = status::ok;
+        stream.response_status_seen = true;
         stream.response_body = "hello";
         stream.response_headers.set("content-type", "text/plain");
         stream.response_headers.set("content-length", "999");
@@ -222,6 +337,7 @@ TEST_CASE("HTTP/2 response materialization preserves peer headers",
     SECTION("Missing peer Content-Length stays missing") {
         h2_stream stream;
         stream.response_status = status::ok;
+        stream.response_status_seen = true;
         stream.response_body = "hello";
         stream.response_headers.set("content-type", "text/plain");
 
@@ -235,6 +351,7 @@ TEST_CASE("HTTP/2 response materialization preserves peer headers",
     SECTION("Duplicate peer headers remain available individually") {
         h2_stream stream;
         stream.response_status = status::ok;
+        stream.response_status_seen = true;
         stream.response_headers.add("set-cookie", "a=1");
         stream.response_headers.add("set-cookie", "b=2");
 

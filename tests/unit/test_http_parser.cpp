@@ -1124,6 +1124,72 @@ TEST_CASE("HTTP chunk size beyond max is rejected", "[http][parser][security]") 
     REQUIRE(result == parse_result::error);
 }
 
+TEST_CASE("HTTP request parser validates chunk metadata and trailers",
+          "[http][parser][security]") {
+    SECTION("accepts valid chunk extensions and trailers") {
+        request_parser parser;
+        std::string request =
+            "POST / HTTP/1.1\r\n"
+            "Host: a\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "4;foo=bar; quoted=\"a b\"\r\n"
+            "Wiki\r\n"
+            "0\r\n"
+            "X-Trailer: ok\r\n"
+            "\r\n";
+
+        auto [result, _] = parser.parse(request);
+        REQUIRE(result == parse_result::complete);
+        REQUIRE(parser.body() == "Wiki");
+    }
+
+    SECTION("rejects garbage after chunk-size whitespace") {
+        request_parser parser;
+        std::string request =
+            "POST / HTTP/1.1\r\n"
+            "Host: a\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "4 garbage\r\n"
+            "Wiki\r\n"
+            "0\r\n\r\n";
+
+        auto [result, _] = parser.parse(request);
+        REQUIRE(result == parse_result::error);
+    }
+
+    SECTION("rejects malformed chunk extension syntax") {
+        request_parser parser;
+        std::string request =
+            "POST / HTTP/1.1\r\n"
+            "Host: a\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "4; @bad\r\n"
+            "Wiki\r\n"
+            "0\r\n\r\n";
+
+        auto [result, _] = parser.parse(request);
+        REQUIRE(result == parse_result::error);
+    }
+
+    SECTION("rejects malformed trailer header syntax") {
+        request_parser parser;
+        std::string request =
+            "POST / HTTP/1.1\r\n"
+            "Host: a\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "0\r\n"
+            "Bad Trailer: nope\r\n"
+            "\r\n";
+
+        auto [result, _] = parser.parse(request);
+        REQUIRE(result == parse_result::error);
+    }
+}
+
 // Mirror of the request-side hardening tests on the response parser. These
 // guard against a regression where a hostile *server* — typically reachable
 // through a proxy — exploits the same RFC 7230 §3.3.3 ambiguity to smuggle
@@ -1184,6 +1250,68 @@ TEST_CASE("HTTP response parser rejects chunk size beyond max",
 
     auto [result, _] = parser.parse(response);
     REQUIRE(result == parse_result::error);
+}
+
+TEST_CASE("HTTP response parser validates chunk metadata and trailers",
+          "[http][parser][security]") {
+    SECTION("accepts valid chunk extensions and trailers") {
+        response_parser parser;
+        std::string response =
+            "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "4;foo=bar; quoted=\"a b\"\r\n"
+            "Wiki\r\n"
+            "0\r\n"
+            "X-Trailer: ok\r\n"
+            "\r\n";
+
+        auto [result, _] = parser.parse(response);
+        REQUIRE(result == parse_result::complete);
+        REQUIRE(parser.body() == "Wiki");
+    }
+
+    SECTION("rejects garbage after chunk-size whitespace") {
+        response_parser parser;
+        std::string response =
+            "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "4 garbage\r\n"
+            "Wiki\r\n"
+            "0\r\n\r\n";
+
+        auto [result, _] = parser.parse(response);
+        REQUIRE(result == parse_result::error);
+    }
+
+    SECTION("rejects malformed chunk extension syntax") {
+        response_parser parser;
+        std::string response =
+            "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "4; @bad\r\n"
+            "Wiki\r\n"
+            "0\r\n\r\n";
+
+        auto [result, _] = parser.parse(response);
+        REQUIRE(result == parse_result::error);
+    }
+
+    SECTION("rejects malformed trailer header syntax") {
+        response_parser parser;
+        std::string response =
+            "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "0\r\n"
+            "Bad Trailer: nope\r\n"
+            "\r\n";
+
+        auto [result, _] = parser.parse(response);
+        REQUIRE(result == parse_result::error);
+    }
 }
 
 TEST_CASE("HTTP response parser bytes_remaining flags pipelined trailers",

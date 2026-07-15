@@ -2573,6 +2573,177 @@ TEST_CASE("rpc_session frame_read_timeout fires on slow-loris peer",
     REQUIRE(server_done);
 }
 
+TEST_CASE("rpc_client frame_read_timeout fires on partial response frame",
+          "[rpc][client][security][slow_loris]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    rpc_client_config cfg;
+    cfg.frame_read_timeout = std::chrono::seconds(1);
+    cfg.max_message_size = 1024;
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> allow_server_close{false};
+    std::promise<bool> server_done_promise;
+    auto server_done = server_done_promise.get_future();
+    sched.go([&, &lst = *listener_opt,
+              p = std::move(server_done_promise)]() mutable -> coro::task<void> {
+        auto stream = co_await lst.accept();
+        if (!stream) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto request_frame = co_await read_frame(*stream);
+        if (!request_frame ||
+            request_frame->first.type != message_type::request) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto [response_header, response_payload] = build_response(
+            request_frame->first.request_id, TestResponse{"late"});
+        (void)response_payload;
+        auto bytes = response_header.to_bytes();
+        co_await stream->write(bytes.data(), 4);
+
+        while (!allow_server_close.load(std::memory_order_acquire)) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(10));
+        }
+        stream->shutdown_socket();
+        co_await stream->close();
+        p.set_value(true);
+    });
+
+    std::promise<int> call_done_promise;
+    auto call_done = call_done_promise.get_future();
+    sched.go([cfg, port, p = std::move(call_done_promise)]()
+                 mutable -> coro::task<void> {
+        auto client_opt = co_await tcp_rpc_client::connect_with_config(
+            cfg, "::1", port);
+        if (!client_opt) {
+            p.set_value(static_cast<int>(rpc_error::connection_closed));
+            co_return;
+        }
+
+        auto client = *client_opt;
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{9}, elio::test::scaled_sec(30));
+        p.set_value(static_cast<int>(result.error()));
+        client->close();
+    });
+
+    auto call_status = call_done.wait_for(elio::test::scaled_sec(5));
+    allow_server_close.store(true, std::memory_order_release);
+    if (call_status != std::future_status::ready) {
+        (void)call_done.wait_for(elio::test::scaled_sec(5));
+        (void)server_done.wait_for(elio::test::scaled_sec(5));
+        (void)sched.shutdown(elio::test::scaled_sec(5));
+        FAIL("client call did not finish before peer close was allowed");
+    }
+    REQUIRE(call_status == std::future_status::ready);
+    REQUIRE(call_done.get() == static_cast<int>(rpc_error::connection_closed));
+
+    auto server_status = server_done.wait_for(elio::test::scaled_sec(5));
+    REQUIRE(server_status == std::future_status::ready);
+    REQUIRE(server_done.get());
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("rpc_client max_message_size rejects oversized response header",
+          "[rpc][client][security]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    rpc_client_config cfg;
+    cfg.frame_read_timeout = std::chrono::seconds(0);
+    cfg.max_message_size = 16;
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> allow_server_close{false};
+    std::promise<bool> server_done_promise;
+    auto server_done = server_done_promise.get_future();
+    sched.go([&, &lst = *listener_opt,
+              p = std::move(server_done_promise)]() mutable -> coro::task<void> {
+        auto stream = co_await lst.accept();
+        if (!stream) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto request_frame = co_await read_frame(*stream);
+        if (!request_frame ||
+            request_frame->first.type != message_type::request) {
+            p.set_value(false);
+            co_return;
+        }
+
+        auto [response_header, response_payload] = build_response(
+            request_frame->first.request_id, TestResponse{"too large"});
+        (void)response_payload;
+        response_header.payload_length = cfg.max_message_size + 1;
+        auto bytes = response_header.to_bytes();
+        co_await stream->write(bytes.data(), bytes.size());
+
+        while (!allow_server_close.load(std::memory_order_acquire)) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(10));
+        }
+        stream->shutdown_socket();
+        co_await stream->close();
+        p.set_value(true);
+    });
+
+    std::promise<int> call_done_promise;
+    auto call_done = call_done_promise.get_future();
+    sched.go([cfg, port, p = std::move(call_done_promise)]()
+                 mutable -> coro::task<void> {
+        auto client_opt = co_await tcp_rpc_client::connect_with_config(
+            cfg, "::1", port);
+        if (!client_opt) {
+            p.set_value(static_cast<int>(rpc_error::connection_closed));
+            co_return;
+        }
+
+        auto client = *client_opt;
+        auto result = co_await client->call<ExistingStreamCreateMethod>(
+            TestRequest{10}, elio::test::scaled_sec(30));
+        p.set_value(static_cast<int>(result.error()));
+        client->close();
+    });
+
+    auto call_status = call_done.wait_for(elio::test::scaled_sec(5));
+    allow_server_close.store(true, std::memory_order_release);
+    if (call_status != std::future_status::ready) {
+        (void)call_done.wait_for(elio::test::scaled_sec(5));
+        (void)server_done.wait_for(elio::test::scaled_sec(5));
+        (void)sched.shutdown(elio::test::scaled_sec(5));
+        FAIL("client call did not finish before peer close was allowed");
+    }
+    REQUIRE(call_status == std::future_status::ready);
+    REQUIRE(call_done.get() == static_cast<int>(rpc_error::connection_closed));
+
+    auto server_status = server_done.wait_for(elio::test::scaled_sec(5));
+    REQUIRE(server_status == std::future_status::ready);
+    REQUIRE(server_done.get());
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
 TEST_CASE("frame arriving near deadline is delivered, not discarded as timeout",
           "[rpc][security][slow_loris]") {
     // Regression test for the watchdog-vs-frame race: when the timer CQE

@@ -26,11 +26,13 @@
 #include <elio/sync/primitives.hpp>
 #include <elio/time/timer.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/runtime/worker_thread.hpp>
 #include <elio/log/macros.hpp>
 #include <elio/net/resolve.hpp>
 
 #include <memory>
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <chrono>
@@ -43,6 +45,19 @@
 #include <vector>
 
 namespace elio::rpc {
+
+/// Operational limits for an RPC client connection.
+struct rpc_client_config {
+    /// Inactivity deadline for each background receive-loop frame read. If a
+    /// peer takes longer than this to send the next complete frame (header,
+    /// payload, and optional checksum), the client closes the connection. This
+    /// includes waiting for the first header byte on an otherwise idle
+    /// connection. 0s disables the deadline.
+    std::chrono::seconds frame_read_timeout{30};
+
+    /// Maximum payload bytes (header excluded) accepted per frame.
+    uint32_t max_message_size = elio::rpc::max_message_size;
+};
 
 // ============================================================================
 // Pending request tracking
@@ -102,6 +117,30 @@ inline size_t request_id_reservation_attempt_limit(size_t occupied_count) noexce
     return occupied_count + 1;
 }
 
+template<typename... Args>
+struct tcp_host_port_args : std::false_type {};
+
+template<typename Host, typename Port>
+struct tcp_host_port_args<Host, Port> : std::bool_constant<
+    std::is_convertible_v<Host, std::string_view> &&
+    std::is_integral_v<Port>> {};
+
+template<typename... Args>
+inline constexpr bool tcp_host_port_args_v = tcp_host_port_args<Args...>::value;
+
+template<typename... Args>
+struct tcp_host_port_resolve_args : std::false_type {};
+
+template<typename Host, typename Port, typename ResolveOptions>
+struct tcp_host_port_resolve_args<Host, Port, ResolveOptions> : std::bool_constant<
+    std::is_convertible_v<Host, std::string_view> &&
+    std::is_integral_v<Port> &&
+    std::is_same_v<ResolveOptions, net::resolve_options>> {};
+
+template<typename... Args>
+inline constexpr bool tcp_host_port_resolve_args_v =
+    tcp_host_port_resolve_args<Args...>::value;
+
 /// Reserve a request ID by trying generated IDs until one can be inserted.
 /// The try_reserve callback must perform the contains+insert step atomically
 /// for the relevant pending-request shard.
@@ -139,15 +178,26 @@ public:
     /// Starts the receive loop immediately when called from a scheduler.
     /// If constructed off-scheduler, call start() from a scheduler before
     /// issuing response-bearing operations such as call() or ping().
-    static ptr create(Stream stream) {
-        auto client = ptr(new rpc_client(std::move(stream)));
+    static ptr create(Stream stream, rpc_client_config config = {}) {
+        auto client = ptr(new rpc_client(std::move(stream), config));
         client->start();
         return client;
     }
     
-    /// Connect to a TCP server and create client
+    /// Connect to a TCP server and create client with default config.
     template<typename... Args>
     static coro::task<std::optional<ptr>> connect(Args&&... args)
+    requires std::is_same_v<Stream, net::tcp_stream>
+    {
+        co_return co_await connect_with_config(
+            rpc_client_config{}, std::forward<Args>(args)...);
+    }
+
+    /// Connect to a TCP server and create client with explicit config.
+    template<typename... Args>
+    static coro::task<std::optional<ptr>> connect_with_config(
+        rpc_client_config config,
+        Args&&... args)
     requires std::is_same_v<Stream, net::tcp_stream>
     {
         if constexpr (requires { net::tcp_connect(std::forward<Args>(args)...); }) {
@@ -155,12 +205,26 @@ public:
             if (!stream) {
                 co_return std::nullopt;
             }
-            auto client = create(std::move(*stream));
+            auto client = create(std::move(*stream), config);
             co_return client;
         } else if constexpr (
-            sizeof...(Args) == 2 &&
-            std::is_convertible_v<std::tuple_element_t<0, std::tuple<std::decay_t<Args>...>>, std::string_view> &&
-            std::is_integral_v<std::tuple_element_t<1, std::tuple<std::decay_t<Args>...>>>) {
+            detail::tcp_host_port_resolve_args_v<std::decay_t<Args>...>) {
+            auto forwarded = std::forward_as_tuple(std::forward<Args>(args)...);
+            std::string_view host = std::get<0>(forwarded);
+            uint16_t port = static_cast<uint16_t>(std::get<1>(forwarded));
+            net::resolve_options resolve_opts = std::get<2>(forwarded);
+
+            auto addresses = co_await net::resolve_all(host, port, resolve_opts);
+            for (const auto& addr : addresses) {
+                auto stream = co_await net::tcp_connect(addr);
+                if (stream) {
+                    auto client = create(std::move(*stream), config);
+                    co_return client;
+                }
+            }
+            co_return std::nullopt;
+        } else if constexpr (
+            detail::tcp_host_port_args_v<std::decay_t<Args>...>) {
             auto forwarded = std::forward_as_tuple(std::forward<Args>(args)...);
             std::string_view host = std::get<0>(forwarded);
             uint16_t port = static_cast<uint16_t>(std::get<1>(forwarded));
@@ -169,7 +233,7 @@ public:
             for (const auto& addr : addresses) {
                 auto stream = co_await net::tcp_connect(addr);
                 if (stream) {
-                    auto client = create(std::move(*stream));
+                    auto client = create(std::move(*stream), config);
                     co_return client;
                 }
             }
@@ -186,27 +250,50 @@ public:
                                                   net::resolve_options resolve_opts)
     requires std::is_same_v<Stream, net::tcp_stream>
     {
+        co_return co_await connect_with_config(
+            rpc_client_config{}, host, port, resolve_opts);
+    }
+
+    /// Connect to a TCP server with explicit resolve options and client config.
+    static coro::task<std::optional<ptr>> connect_with_config(
+        rpc_client_config config,
+        std::string_view host,
+        uint16_t port,
+        net::resolve_options resolve_opts)
+    requires std::is_same_v<Stream, net::tcp_stream>
+    {
         auto addresses = co_await net::resolve_all(host, port, resolve_opts);
         for (const auto& addr : addresses) {
             auto stream = co_await net::tcp_connect(addr);
             if (stream) {
-                auto client = create(std::move(*stream));
+                auto client = create(std::move(*stream), config);
                 co_return client;
             }
         }
         co_return std::nullopt;
     }
     
-    /// Connect to a UDS server and create client
+    /// Connect to a UDS server and create client with default config.
     template<typename... Args>
     static coro::task<std::optional<ptr>> connect(Args&&... args)
+    requires std::is_same_v<Stream, net::uds_stream>
+    {
+        co_return co_await connect_with_config(
+            rpc_client_config{}, std::forward<Args>(args)...);
+    }
+
+    /// Connect to a UDS server and create client with explicit config.
+    template<typename... Args>
+    static coro::task<std::optional<ptr>> connect_with_config(
+        rpc_client_config config,
+        Args&&... args)
     requires std::is_same_v<Stream, net::uds_stream>
     {
         auto stream = co_await net::uds_connect(std::forward<Args>(args)...);
         if (!stream) {
             co_return std::nullopt;
         }
-        auto client = create(std::move(*stream));
+        auto client = create(std::move(*stream), config);
         co_return client;
     }
     
@@ -703,10 +790,63 @@ public:
     /// Get the underlying stream (for advanced usage)
     Stream& stream() noexcept { return stream_; }
     const Stream& stream() const noexcept { return stream_; }
+
+    /// Get the client operational limits.
+    const rpc_client_config& config() const noexcept { return config_; }
     
 private:
-    explicit rpc_client(Stream stream)
-        : stream_(std::move(stream)) {}
+    explicit rpc_client(Stream stream, rpc_client_config config)
+        : stream_(std::move(stream))
+        , config_(config) {}
+
+    coro::task<std::optional<std::pair<frame_header, message_buffer>>>
+    read_frame_with_deadline() {
+        if (config_.frame_read_timeout.count() <= 0) {
+            co_return co_await read_frame_bounded(
+                stream_, config_.max_message_size);
+        }
+
+        auto* sched = runtime::scheduler::current();
+        if (!sched) {
+            co_return co_await read_frame_bounded(
+                stream_, config_.max_message_size);
+        }
+
+        auto timed_out = std::make_shared<std::atomic<bool>>(false);
+        auto* stream_ptr = &stream_;
+        auto timeout = config_.frame_read_timeout;
+        coro::cancel_source watchdog_cancel;
+        auto wd_token = watchdog_cancel.get_token();
+
+        auto* current_worker = runtime::worker_thread::current();
+        auto watchdog_body = [stream_ptr, timed_out, timeout, wd_token]()
+                                 -> coro::task<void> {
+            auto result = co_await elio::time::sleep_for(timeout, wd_token);
+            if (result == coro::cancel_result::completed) {
+                timed_out->store(true, std::memory_order_release);
+                stream_ptr->shutdown_socket();
+            }
+            co_return;
+        };
+        auto watchdog = current_worker
+            ? sched->go_joinable_to(current_worker->worker_id(), watchdog_body)
+            : sched->go_joinable(watchdog_body);
+
+        auto frame = co_await read_frame_bounded(
+            stream_, config_.max_message_size);
+
+        watchdog_cancel.cancel();
+        co_await std::move(watchdog);
+
+        if (frame) {
+            co_return frame;
+        }
+        if (timed_out->load(std::memory_order_acquire)) {
+            ELIO_LOG_WARNING("RPC client: frame read timed out after {}s",
+                             timeout.count());
+        }
+        co_return std::nullopt;
+    }
     
     /// Start the background receive loop
     bool start_receive_loop() {
@@ -744,7 +884,7 @@ private:
                 break;
             }
 
-            auto frame = co_await read_frame(self->stream_);
+            auto frame = co_await self->read_frame_with_deadline();
             if (!frame) {
                 ELIO_LOG_DEBUG("RPC client receive loop: connection closed");
                 self->close();
@@ -839,6 +979,7 @@ private:
     }
     
     Stream stream_;
+    rpc_client_config config_;
     std::atomic<bool> closed_{false};
     std::atomic<bool> receive_loop_started_{false};
     request_id_generator id_generator_;

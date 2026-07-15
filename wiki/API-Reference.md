@@ -2798,6 +2798,50 @@ using uds_rpc_server = rpc_server<net::uds_stream>;
 
 ### Client Types
 
+#### `rpc_client_config`
+
+```cpp
+struct rpc_client_config {
+    std::chrono::seconds frame_read_timeout{30};
+    uint32_t max_message_size = elio::rpc::max_message_size;
+};
+```
+
+- `frame_read_timeout`: Inactivity deadline for each client receive-loop frame
+  read. The timer starts while waiting for the next frame header and continues
+  until the complete response/control frame, including payload and optional
+  checksum, is read. Expiry closes the client connection and completes pending
+  calls as `rpc_error::connection_closed`. `0s` disables the deadline; use a
+  larger value or `0s` for long-lived idle clients or calls whose server may be
+  silent longer than the default.
+- `max_message_size`: Maximum payload bytes accepted per frame. The default is
+  the protocol-wide 16 MiB limit.
+
+#### `rpc_client<Stream>`
+
+```cpp
+template<typename Stream>
+class rpc_client {
+public:
+    static std::shared_ptr<rpc_client> create(
+        Stream stream,
+        rpc_client_config config = {});
+
+    template<typename... Args>
+    static coro::task<std::optional<std::shared_ptr<rpc_client>>>
+        connect(Args&&... args);
+
+    template<typename... Args>
+    static coro::task<std::optional<std::shared_ptr<rpc_client>>>
+        connect_with_config(rpc_client_config config, Args&&... args);
+
+    const rpc_client_config& config() const noexcept;
+};
+
+using tcp_rpc_client = rpc_client<net::tcp_stream>;
+using uds_rpc_client = rpc_client<net::uds_stream>;
+```
+
 #### `rpc_result<T>`
 
 ```cpp

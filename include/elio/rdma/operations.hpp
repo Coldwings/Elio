@@ -187,6 +187,11 @@ struct backend_invoker<polymorphic_backend> {
     return bytes > max ? max : static_cast<std::uint32_t>(bytes);
 }
 
+[[nodiscard]] constexpr bool atomic_local_length_valid_(
+    buffer_view local) noexcept {
+    return local.length == sizeof(std::uint64_t);
+}
+
 /// Shared awaiter machinery — owns the op_state, runs the orphan race
 /// in the destructor, exposes a typed `await_resume` returning the
 /// `wc_result` filled in by the dispatcher.
@@ -415,10 +420,12 @@ private:
 class sge_holder {
 public:
     explicit sge_holder(buffer_view buf) noexcept
-        : inline_sge_(sge::from(buf)), external_sges_(),
+        : inline_sge_(make_inline_sge_(buf)), inline_length_(buf.length),
+          external_sges_(),
           using_inline_(true) {}
     explicit sge_holder(std::span<const sge> sges) noexcept
-        : inline_sge_{}, external_sges_(sges), using_inline_(false) {}
+        : inline_sge_{}, inline_length_(0), external_sges_(sges),
+          using_inline_(false) {}
 
 protected:
     [[nodiscard]] std::span<const sge> effective_sges_() const noexcept {
@@ -427,18 +434,45 @@ protected:
             : external_sges_;
     }
 
-    /// Total bytes across the resolved SGE list. Used by S5b's inline
-    /// send precondition check.
+    [[nodiscard]] bool inline_length_exceeds_sge_limit_() const noexcept {
+        return using_inline_ && inline_length_ > max_sge_length_;
+    }
+
+    [[nodiscard]] std::uint32_t inline_length_hint_() const noexcept {
+        return byte_count_hint_(static_cast<std::uint64_t>(inline_length_));
+    }
+
+    /// Total bytes across the resolved SGE list. Used by pre-post size checks.
     [[nodiscard]] std::uint64_t total_bytes_() const noexcept {
+        if (using_inline_) {
+            return static_cast<std::uint64_t>(inline_length_);
+        }
         std::uint64_t total = 0;
         for (const auto& s : effective_sges_()) {
+            if (total > std::numeric_limits<std::uint64_t>::max() - s.length) {
+                return std::numeric_limits<std::uint64_t>::max();
+            }
             total += s.length;
         }
         return total;
     }
 
 private:
+    static constexpr std::size_t max_sge_length_ =
+        std::numeric_limits<std::uint32_t>::max();
+
+    [[nodiscard]] static sge make_inline_sge_(buffer_view buf) noexcept {
+        return sge{
+            buf.addr,
+            buf.length > max_sge_length_
+                ? std::numeric_limits<std::uint32_t>::max()
+                : static_cast<std::uint32_t>(buf.length),
+            buf.lkey,
+        };
+    }
+
     sge                  inline_sge_;
+    std::size_t          inline_length_;
     std::span<const sge> external_sges_;
     bool                 using_inline_;
 };
@@ -498,6 +532,11 @@ public:
         }
         const auto id = arm_(h);
         const auto total = total_bytes_();
+        if (inline_length_exceeds_sge_limit_()) {
+            return fail_pre_post_(
+                wc_status::local_length_error,
+                inline_length_hint_());
+        }
         if (flags_.inline_send && total > max_inline_) {
             // Pass the offending byte count back via imm_data so the
             // caller can log it without re-walking the SGE list.
@@ -517,6 +556,12 @@ private:
             return;
         }
         const auto total = total_bytes_();
+        if (inline_length_exceeds_sge_limit_()) {
+            (void)fail_pre_post_(
+                wc_status::local_length_error,
+                inline_length_hint_());
+            return;
+        }
         if (flags_.inline_send && total > max_inline_) {
             (void)fail_pre_post_(
                 wc_status::local_length_error,
@@ -571,6 +616,11 @@ public:
                 return false;
         }
         const auto id = arm_(h);
+        if (inline_length_exceeds_sge_limit_()) {
+            return fail_pre_post_(
+                wc_status::local_length_error,
+                inline_length_hint_());
+        }
         const int rc = backend_invoker<Backend>::post_recv(
             qp_, effective_sges_(), id, backend_);
         return finalize_post_(rc);
@@ -580,6 +630,12 @@ private:
     void start_() noexcept {
         const auto id = begin_start_();
         if (id == 0) {
+            return;
+        }
+        if (inline_length_exceeds_sge_limit_()) {
+            (void)fail_pre_post_(
+                wc_status::local_length_error,
+                inline_length_hint_());
             return;
         }
         const int rc = backend_invoker<Backend>::post_recv(
@@ -645,6 +701,11 @@ public:
         }
         const auto id = arm_(h);
         const auto total = total_bytes_();
+        if (inline_length_exceeds_sge_limit_()) {
+            return fail_pre_post_(
+                wc_status::local_length_error,
+                inline_length_hint_());
+        }
         if (total > remote_.length) {
             return fail_pre_post_(
                 wc_status::local_length_error,
@@ -667,6 +728,12 @@ private:
             return;
         }
         const auto total = total_bytes_();
+        if (inline_length_exceeds_sge_limit_()) {
+            (void)fail_pre_post_(
+                wc_status::local_length_error,
+                inline_length_hint_());
+            return;
+        }
         if (total > remote_.length) {
             (void)fail_pre_post_(
                 wc_status::local_length_error,
@@ -734,6 +801,11 @@ public:
         }
         const auto id = arm_(h);
         const auto total = total_bytes_();
+        if (inline_length_exceeds_sge_limit_()) {
+            return fail_pre_post_(
+                wc_status::local_length_error,
+                inline_length_hint_());
+        }
         if (total > remote_.length) {
             return fail_pre_post_(
                 wc_status::local_length_error,
@@ -751,6 +823,12 @@ private:
             return;
         }
         const auto total = total_bytes_();
+        if (inline_length_exceeds_sge_limit_()) {
+            (void)fail_pre_post_(
+                wc_status::local_length_error,
+                inline_length_hint_());
+            return;
+        }
         if (total > remote_.length) {
             (void)fail_pre_post_(
                 wc_status::local_length_error,
@@ -806,9 +884,14 @@ public:
             case await_action::resume_inline:
                 return false;
         }
+        const auto id = arm_(h);
+        if (!atomic_local_length_valid_(local_)) {
+            return fail_pre_post_(
+                wc_status::local_length_error,
+                byte_count_hint_(static_cast<std::uint64_t>(local_.length)));
+        }
         const auto sge_val = sge::from(local_);
         auto sges = std::span<const sge>(&sge_val, 1);
-        const auto id = arm_(h);
         const int rc = backend_invoker<Backend>::post_atomic_cas(
             qp_, sges, remote_, compare_, swap_, flags_, id, backend_);
         return finalize_post_(rc);
@@ -825,6 +908,12 @@ private:
     void start_() noexcept {
         const auto id = begin_start_();
         if (id == 0) {
+            return;
+        }
+        if (!atomic_local_length_valid_(local_)) {
+            (void)fail_pre_post_(
+                wc_status::local_length_error,
+                byte_count_hint_(static_cast<std::uint64_t>(local_.length)));
             return;
         }
         const auto sge_val = sge::from(local_);
@@ -879,9 +968,14 @@ public:
             case await_action::resume_inline:
                 return false;
         }
+        const auto id = arm_(h);
+        if (!atomic_local_length_valid_(local_)) {
+            return fail_pre_post_(
+                wc_status::local_length_error,
+                byte_count_hint_(static_cast<std::uint64_t>(local_.length)));
+        }
         const auto sge_val = sge::from(local_);
         auto sges = std::span<const sge>(&sge_val, 1);
-        const auto id = arm_(h);
         const int rc = backend_invoker<Backend>::post_atomic_fetch_add(
             qp_, sges, remote_, add_, flags_, id, backend_);
         return finalize_post_(rc);
@@ -898,6 +992,12 @@ private:
     void start_() noexcept {
         const auto id = begin_start_();
         if (id == 0) {
+            return;
+        }
+        if (!atomic_local_length_valid_(local_)) {
+            (void)fail_pre_post_(
+                wc_status::local_length_error,
+                byte_count_hint_(static_cast<std::uint64_t>(local_.length)));
             return;
         }
         const auto sge_val = sge::from(local_);
@@ -953,6 +1053,11 @@ public:
                 return false;
         }
         const auto id = arm_(h);
+        if (inline_length_exceeds_sge_limit_()) {
+            return fail_pre_post_(
+                wc_status::local_length_error,
+                inline_length_hint_());
+        }
         const int rc = backend_invoker<Backend>::post_srq_recv(
             srq_, effective_sges_(), id, backend_);
         return finalize_post_(rc);
@@ -962,6 +1067,12 @@ private:
     void start_() noexcept {
         const auto id = begin_start_();
         if (id == 0) {
+            return;
+        }
+        if (inline_length_exceeds_sge_limit_()) {
+            (void)fail_pre_post_(
+                wc_status::local_length_error,
+                inline_length_hint_());
             return;
         }
         const int rc = backend_invoker<Backend>::post_srq_recv(

@@ -22,6 +22,7 @@
 #include <atomic>
 #include <coroutine>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -433,6 +434,58 @@ TEST_CASE("send: happy path suspends and dispatcher resumes",
     REQUIRE(result.wc_flags == 0x2u);
 }
 
+TEST_CASE("send: oversized single-buffer length is rejected pre-post",
+          "[rdma][send][length]") {
+    mock_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 103;
+    connection<mock_static_backend> c{&qp_value, disp};
+
+    char payload = 0;
+    constexpr auto too_large =
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) +
+        1u;
+    buffer_view bv{&payload, too_large, 0xCAFE};
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_send(c, bv, send_flags{}, result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.sends.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == std::numeric_limits<std::uint32_t>::max());
+}
+
+TEST_CASE("send: started oversized single-buffer length is returned on await",
+          "[rdma][send][length][start]") {
+    mock_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 105;
+    connection<mock_static_backend> c{&qp_value, disp};
+
+    char payload = 0;
+    constexpr auto too_large =
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) +
+        1u;
+    buffer_view bv{&payload, too_large, 0xCAFE};
+
+    auto op = c.send(bv).start();
+    REQUIRE(st.sends.load() == 0);
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_started(std::move(op), result, done);
+
+    REQUIRE(done);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == std::numeric_limits<std::uint32_t>::max());
+}
+
 TEST_CASE("send: inline successful completion resumes after post returns",
           "[rdma][send][inline-completion]") {
     mock_state st;
@@ -514,6 +567,31 @@ TEST_CASE("recv: happy path suspends and dispatcher resumes",
     REQUIRE(done);
     REQUIRE(result.ok());
     REQUIRE(result.byte_len == 40u);
+}
+
+TEST_CASE("recv: oversized single-buffer length is rejected pre-post",
+          "[rdma][recv][length]") {
+    mock_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 104;
+    connection<mock_static_backend> c{&qp_value, disp};
+
+    char payload = 0;
+    constexpr auto too_large =
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) +
+        1u;
+    buffer_view bv{&payload, too_large, 0xBEEF};
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_recv(c, bv, result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.recvs.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == std::numeric_limits<std::uint32_t>::max());
 }
 
 TEST_CASE("send: post failure resumes inline with synthesised flush error",

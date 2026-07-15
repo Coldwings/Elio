@@ -503,6 +503,56 @@ TEST_CASE("rdma_read: remote length check uses a wide multi-SGE total",
     REQUIRE(result.imm_data == max_u32);
 }
 
+TEST_CASE("rdma_write: oversized single-buffer length is rejected pre-post",
+          "[rdma][write][length]") {
+    one_sided_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 27;
+    connection<one_sided_static_backend> c{&qp_value, disp};
+
+    char payload = 0;
+    constexpr auto max_u32 = std::numeric_limits<std::uint32_t>::max();
+    constexpr auto too_large = static_cast<std::size_t>(max_u32) + 1u;
+    buffer_view local{&payload, too_large, 0x1111};
+    remote_buffer remote{0xCAFE, max_u32, 0x2222};
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_write(c, local, remote, send_flags{}, result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.writes.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == max_u32);
+}
+
+TEST_CASE("rdma_read: oversized single-buffer length is rejected pre-post",
+          "[rdma][read][length]") {
+    one_sided_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 28;
+    connection<one_sided_static_backend> c{&qp_value, disp};
+
+    char payload = 0;
+    constexpr auto max_u32 = std::numeric_limits<std::uint32_t>::max();
+    constexpr auto too_large = static_cast<std::size_t>(max_u32) + 1u;
+    buffer_view local{&payload, too_large, 0x3333};
+    remote_buffer remote{0xBEEF, max_u32, 0x4444};
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_read(c, local, remote, result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.reads.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == max_u32);
+}
+
 TEST_CASE("rdma_write: post failure resumes inline with flush error",
           "[rdma][write][error]") {
     one_sided_state st;

@@ -27,6 +27,12 @@
 /// the `memory_region`. The MR registration pins the pages, but the
 /// allocation itself is the user's. The protection domain (`pd`)
 /// argument must also outlive the MR.
+///
+/// **Length contract**: `remote_buffer::length` is 32-bit because it mirrors
+/// the verbs work request field. `remote()` and `remote(offset, length)` are
+/// verbs-adjacent fast paths; callers must pass MR lengths/sub-lengths that fit
+/// in `uint32_t`. Use explicit sub-ranges when advertising larger registered
+/// regions to a peer.
 
 #include <elio/rdma/backend_traits.hpp>
 #include <elio/rdma/types.hpp>
@@ -106,6 +112,7 @@ public:
     }
 
     /// `remote_buffer` describing the entire MR for peer one-sided ops.
+    /// Precondition: `length() <= UINT32_MAX`.
     [[nodiscard]] remote_buffer remote() const noexcept {
         assert(length_ <= std::uint32_t(-1) &&
                "MR length exceeds uint32_t range for remote_buffer");
@@ -117,6 +124,7 @@ public:
     }
 
     /// Sub-range `remote_buffer`.
+    /// Precondition: `sub_length <= UINT32_MAX`; range bounds are caller-owned.
     [[nodiscard]] remote_buffer remote(std::size_t offset,
                                        std::size_t sub_length) const noexcept {
         assert(sub_length <= std::uint32_t(-1) &&
@@ -191,6 +199,8 @@ public:
                            sub_length, lkey()};
     }
 
+    /// `remote_buffer` describing the entire MR for peer one-sided ops.
+    /// Precondition: `length() <= UINT32_MAX`.
     [[nodiscard]] remote_buffer remote() const noexcept {
         assert(length_ <= std::uint32_t(-1) &&
                "MR length exceeds uint32_t range for remote_buffer");
@@ -200,6 +210,8 @@ public:
             .rkey = rkey(),
         };
     }
+    /// Sub-range `remote_buffer`.
+    /// Precondition: `sub_length <= UINT32_MAX`; range bounds are caller-owned.
     [[nodiscard]] remote_buffer remote(std::size_t offset,
                                        std::size_t sub_length) const noexcept {
         assert(sub_length <= std::uint32_t(-1) &&

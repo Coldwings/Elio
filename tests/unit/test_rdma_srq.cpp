@@ -23,6 +23,7 @@
 #include <array>
 #include <coroutine>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <utility>
 #include <vector>
@@ -290,6 +291,32 @@ TEST_CASE("srq<Backend>::recv multi-SGE scatter list",
     disp.deliver(st.last_id, wc_status::success, 32);
     REQUIRE(done);
     REQUIRE(result.byte_len == 32u);
+}
+
+TEST_CASE("srq<Backend>::recv oversized single-buffer length is rejected "
+          "pre-post",
+          "[rdma][srq][length]") {
+    srq_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int srq_handle = 0xDA7A;
+    srq<srq_static_backend> q{&srq_handle, disp};
+
+    char payload = 0;
+    constexpr auto too_large =
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) +
+        1u;
+    buffer_view bv{&payload, too_large, 0x55};
+
+    wc_result result{};
+    bool done = false;
+    auto task = run_srq_recv(q, bv, result, done);
+
+    REQUIRE(done);
+    REQUIRE(st.posts.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.status == wc_status::local_length_error);
+    REQUIRE(result.imm_data == std::numeric_limits<std::uint32_t>::max());
 }
 
 TEST_CASE("srq<Backend>::recv post failure resumes inline with flush error",

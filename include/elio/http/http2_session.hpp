@@ -49,6 +49,8 @@ struct h2_stream {
     std::string response_body;
     status response_status = status::ok;
     bool response_status_seen = false;
+    bool current_header_status_seen = false;
+    bool current_header_status_required = false;
     bool headers_complete = false;
     bool body_complete = false;
     bool closed = false;
@@ -104,6 +106,62 @@ inline bool parse_h2_response_status(std::string_view value,
     }
 
     parsed = static_cast<status>(status_code);
+    return true;
+}
+
+inline bool h2_status_is_informational(status parsed) noexcept {
+    auto code = static_cast<uint16_t>(parsed);
+    return code >= 100 && code < 200;
+}
+
+inline bool h2_header_block_requires_status(const h2_stream& stream,
+                                            nghttp2_headers_category category) noexcept {
+    return category == NGHTTP2_HCAT_RESPONSE ||
+           (category == NGHTTP2_HCAT_HEADERS && !stream.response_status_seen);
+}
+
+inline void begin_h2_response_header_block(h2_stream& stream,
+                                           nghttp2_headers_category category) {
+    stream.current_header_status_seen = false;
+    stream.current_header_status_required =
+        h2_header_block_requires_status(stream, category);
+
+    if (stream.current_header_status_required) {
+        stream.response_headers.clear();
+    }
+}
+
+inline bool record_h2_response_status(h2_stream& stream,
+                                      std::string_view value) noexcept {
+    status parsed_status = status::ok;
+    if (!stream.current_header_status_required ||
+        stream.current_header_status_seen ||
+        !parse_h2_response_status(value, parsed_status)) {
+        stream.error = h2_error::protocol_error;
+        return false;
+    }
+
+    stream.current_header_status_seen = true;
+    if (h2_status_is_informational(parsed_status)) {
+        return true;
+    }
+
+    if (stream.response_status_seen) {
+        stream.error = h2_error::protocol_error;
+        return false;
+    }
+
+    stream.response_status = parsed_status;
+    stream.response_status_seen = true;
+    return true;
+}
+
+inline bool finish_h2_response_header_block(h2_stream& stream) noexcept {
+    if (stream.current_header_status_required &&
+        !stream.current_header_status_seen) {
+        stream.error = h2_error::protocol_error;
+        return false;
+    }
     return true;
 }
 
@@ -294,6 +352,8 @@ public:
                 .response_body = {},
                 .response_status = status::ok,
                 .response_status_seen = false,
+                .current_header_status_seen = false,
+                .current_header_status_required = false,
                 .headers_complete = false,
                 .body_complete = false,
                 .closed = false,
@@ -373,6 +433,16 @@ public:
         
         while (!it->second.is_complete() && !it->second.closed) {
             if (!co_await process()) {
+                it = streams_.find(stream_id);
+                if (it != streams_.end() &&
+                    it->second.error != h2_error::none) {
+                    if (it->second.response_size_exceeded) {
+                        errno = EMSGSIZE;
+                    } else if (it->second.error == h2_error::protocol_error) {
+                        errno = EPROTO;
+                    }
+                    streams_.erase(it);
+                }
                 co_return std::nullopt;
             }
             it = streams_.find(stream_id);
@@ -473,9 +543,7 @@ private:
                 if (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS) {
                     auto* stream = self->get_stream(frame->hd.stream_id);
                     if (stream) {
-                        if (frame->headers.cat == NGHTTP2_HCAT_RESPONSE &&
-                            !stream->response_status_seen) {
-                            stream->error = h2_error::protocol_error;
+                        if (!detail::finish_h2_response_header_block(*stream)) {
                             return NGHTTP2_ERR_CALLBACK_FAILURE;
                         }
                         stream->headers_complete = true;
@@ -554,13 +622,12 @@ private:
                                           void* user_data) {
         auto* self = static_cast<h2_session*>(user_data);
         if (frame->hd.type == NGHTTP2_HEADERS) {
-            if (frame->headers.cat == NGHTTP2_HCAT_RESPONSE) {
-                // New response headers
+            if (frame->headers.cat == NGHTTP2_HCAT_RESPONSE ||
+                frame->headers.cat == NGHTTP2_HCAT_HEADERS) {
                 auto* stream = self->get_stream(frame->hd.stream_id);
                 if (stream) {
-                    stream->response_headers.clear();
-                    stream->response_status = status::ok;
-                    stream->response_status_seen = false;
+                    detail::begin_h2_response_header_block(
+                        *stream, frame->headers.cat);
                 }
             }
         }
@@ -580,14 +647,9 @@ private:
                 std::string_view value_sv(reinterpret_cast<const char*>(value), valuelen);
 
                 if (name_sv == ":status") {
-                    status parsed_status = status::ok;
-                    if (stream->response_status_seen ||
-                        !detail::parse_h2_response_status(value_sv, parsed_status)) {
-                        stream->error = h2_error::protocol_error;
+                    if (!detail::record_h2_response_status(*stream, value_sv)) {
                         return NGHTTP2_ERR_CALLBACK_FAILURE;
                     }
-                    stream->response_status = parsed_status;
-                    stream->response_status_seen = true;
                 } else if (!name_sv.starts_with(":")) {
                     // headers::add() validates name/value and throws
                     // std::invalid_argument on RFC 7230 token violations or

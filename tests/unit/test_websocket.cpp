@@ -639,6 +639,18 @@ TEST_CASE("WebSocket frame parser", "[websocket][parser]") {
         REQUIRE(consumed < 0);
     }
 
+    SECTION("non-minimal payload length reports protocol_error close code") {
+        frame_parser parser;
+        uint8_t non_minimal[] = {0x82, 0x7E, 0x00, 0x7D};
+
+        auto consumed = parser.parse(non_minimal, sizeof(non_minimal));
+
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::protocol_error);
+        REQUIRE(parser.error().find("Non-minimal") != std::string::npos);
+        REQUIRE(consumed < 0);
+    }
+
     SECTION("oversized frame rejected after header before payload arrives") {
         frame_parser parser;
         parser.set_max_message_size(10);

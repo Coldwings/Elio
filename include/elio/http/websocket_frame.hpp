@@ -144,6 +144,11 @@ inline frame_parse_result parse_frame_header(const uint8_t* data, size_t len, fr
         }
         header.payload_len = (static_cast<uint64_t>(data[2]) << 8) |
                              static_cast<uint64_t>(data[3]);
+        if (header.payload_len < 126) {
+            result.error = true;
+            result.error_msg = "Non-minimal payload length encoding";
+            return result;
+        }
         header_size = 4;
     } else if (payload_len_7 == 127) {
         // Extended 64-bit length
@@ -165,6 +170,11 @@ inline frame_parse_result parse_frame_header(const uint8_t* data, size_t len, fr
         if (header.payload_len & 0x8000000000000000ULL) {
             result.error = true;
             result.error_msg = "Invalid payload length";
+            return result;
+        }
+        if (header.payload_len <= 65535) {
+            result.error = true;
+            result.error_msg = "Non-minimal payload length encoding";
             return result;
         }
     } else {

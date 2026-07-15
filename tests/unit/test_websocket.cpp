@@ -323,6 +323,83 @@ TEST_CASE("WebSocket frame parsing", "[websocket][frame]") {
         REQUIRE(header.payload_len == 200);
         REQUIRE(result.header_size == 4);  // 2 base + 2 extended
     }
+
+    SECTION("parse minimum 16-bit extended length boundary") {
+        std::string data(126, 'x');
+        auto encoded = encode_binary_frame(data, false);
+
+        frame_header header;
+        auto result = parse_frame_header(encoded.data(), encoded.size(), header);
+
+        REQUIRE(result.complete);
+        REQUIRE_FALSE(result.error);
+        REQUIRE(header.payload_len == data.size());
+        REQUIRE(result.header_size == 4);  // 2 base + 2 extended
+    }
+
+    SECTION("parse maximum 16-bit extended length boundary") {
+        std::string data(65535, 'x');
+        auto encoded = encode_binary_frame(data, false);
+
+        frame_header header;
+        auto result = parse_frame_header(encoded.data(), encoded.size(), header);
+
+        REQUIRE(result.complete);
+        REQUIRE_FALSE(result.error);
+        REQUIRE(header.payload_len == data.size());
+        REQUIRE(result.header_size == 4);  // 2 base + 2 extended
+    }
+
+    SECTION("parse extended length frame (64-bit)") {
+        std::string data(65536, 'x');
+        auto encoded = encode_binary_frame(data, false);
+
+        frame_header header;
+        auto result = parse_frame_header(encoded.data(), encoded.size(), header);
+
+        REQUIRE(result.complete);
+        REQUIRE_FALSE(result.error);
+        REQUIRE(header.payload_len == data.size());
+        REQUIRE(result.header_size == 10);  // 2 base + 8 extended
+    }
+
+    SECTION("reject non-minimal 16-bit extended payload length") {
+        uint8_t non_minimal[] = {0x82, 0x7E, 0x00, 0x7D};
+
+        frame_header header;
+        auto result = parse_frame_header(non_minimal, sizeof(non_minimal), header);
+
+        REQUIRE(result.error);
+        REQUIRE(result.error_msg.find("Non-minimal") != std::string::npos);
+    }
+
+    SECTION("reject non-minimal 64-bit extended payload length below 126") {
+        uint8_t non_minimal[] = {
+            0x82, 0x7F,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x7D
+        };
+
+        frame_header header;
+        auto result = parse_frame_header(non_minimal, sizeof(non_minimal), header);
+
+        REQUIRE(result.error);
+        REQUIRE(result.error_msg.find("Non-minimal") != std::string::npos);
+    }
+
+    SECTION("reject non-minimal 64-bit extended payload length at 65535") {
+        uint8_t non_minimal[] = {
+            0x82, 0x7F,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0xFF, 0xFF
+        };
+
+        frame_header header;
+        auto result = parse_frame_header(non_minimal, sizeof(non_minimal), header);
+
+        REQUIRE(result.error);
+        REQUIRE(result.error_msg.find("Non-minimal") != std::string::npos);
+    }
     
     SECTION("parse incomplete header") {
         uint8_t partial[] = {0x81};  // Only first byte
@@ -559,6 +636,18 @@ TEST_CASE("WebSocket frame parser", "[websocket][parser]") {
 
         REQUIRE(parser.has_error());
         REQUIRE(parser.error_close_code() == close_code::too_large);
+        REQUIRE(consumed < 0);
+    }
+
+    SECTION("non-minimal payload length reports protocol_error close code") {
+        frame_parser parser;
+        uint8_t non_minimal[] = {0x82, 0x7E, 0x00, 0x7D};
+
+        auto consumed = parser.parse(non_minimal, sizeof(non_minimal));
+
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::protocol_error);
+        REQUIRE(parser.error().find("Non-minimal") != std::string::npos);
         REQUIRE(consumed < 0);
     }
 

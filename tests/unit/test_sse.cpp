@@ -113,6 +113,57 @@ TEST_CASE("SSE event serialization", "[sse][serialize]") {
         
         REQUIRE(result == "data: line1\ndata: line2\ndata: line3\n\n");
     }
+
+    SECTION("data is split on every SSE line ending") {
+        event evt;
+        evt.data = "line1\rline2\r\nline3\nline4";
+
+        auto result = serialize_event(evt);
+
+        REQUIRE(result ==
+                "data: line1\ndata: line2\ndata: line3\ndata: line4\n\n");
+    }
+
+    SECTION("data preserves terminal SSE line endings") {
+        struct test_case {
+            std::string input;
+            std::string expected_serialized;
+        };
+
+        const std::vector<test_case> cases = {
+            {"\n", "data: \ndata: \n\n"},
+            {"tail\n", "data: tail\ndata: \n\n"},
+            {"tail\r", "data: tail\ndata: \n\n"},
+            {"tail\r\n", "data: tail\ndata: \n\n"},
+            {"tail\n\n", "data: tail\ndata: \ndata: \n\n"},
+        };
+
+        for (const auto& test : cases) {
+            CAPTURE(test.input);
+
+            event evt;
+            evt.data = test.input;
+
+            REQUIRE(serialize_event(evt) == test.expected_serialized);
+        }
+    }
+
+    SECTION("control fields with line breaks are not serialized") {
+        event evt;
+        evt.id = "safe\rid: injected";
+        evt.type = "update\ndata: injected";
+        evt.data = "payload";
+
+        auto result = serialize_event(evt);
+
+        REQUIRE(result == "data: payload\n\n");
+    }
+
+    SECTION("comments with line breaks remain comments") {
+        auto result = detail::serialize_comment("first\rdata: injected\nid: bad");
+
+        REQUIRE(result == ": first\n: data: injected\n: id: bad\n\n");
+    }
     
     SECTION("empty data") {
         event evt;
@@ -530,6 +581,53 @@ TEST_CASE("SSE round-trip serialization", "[sse][integration]") {
         REQUIRE(parsed->id == original.id);
         REQUIRE(parsed->type == original.type);
         REQUIRE(parsed->data == original.data);
+    }
+
+    SECTION("serialize and parse CR-delimited data without field injection") {
+        event original;
+        original.data = "Line 1\rid: injected\r\nevent: injected\ndata: real";
+
+        auto serialized = serialize_event(original);
+
+        event_parser parser;
+        parser.parse(serialized);
+
+        REQUIRE(parser.has_event());
+        auto parsed = parser.get_event();
+        REQUIRE(parsed->id.empty());
+        REQUIRE(parsed->type.empty());
+        REQUIRE(parsed->data == "Line 1\nid: injected\nevent: injected\ndata: real");
+    }
+
+    SECTION("serialize and parse data with terminal line endings") {
+        struct test_case {
+            std::string input;
+            std::string expected_data;
+        };
+
+        const std::vector<test_case> cases = {
+            {"\n", "\n"},
+            {"tail\n", "tail\n"},
+            {"tail\r", "tail\n"},
+            {"tail\r\n", "tail\n"},
+            {"tail\n\n", "tail\n\n"},
+        };
+
+        for (const auto& test : cases) {
+            CAPTURE(test.input);
+
+            event original;
+            original.data = test.input;
+
+            auto serialized = serialize_event(original);
+
+            event_parser parser;
+            parser.parse(serialized);
+
+            REQUIRE(parser.has_event());
+            auto parsed = parser.get_event();
+            REQUIRE(parsed->data == test.expected_data);
+        }
     }
     
     SECTION("stream of events") {

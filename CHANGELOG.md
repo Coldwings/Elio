@@ -69,6 +69,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SSE event serialization safety**: Server-side SSE serialization now treats
+  LF, CRLF, and standalone CR as data line separators, suppresses unsafe
+  line-break-bearing `id`/`event` fields, and serializes multi-line comments as
+  comments on every line to prevent control-field injection. (#855)
 - **Linux platform validation**: CMake now rejects every non-Linux target at
   configure time instead of allowing unsupported Unix systems to fail later in
   Linux-specific headers. (#770)

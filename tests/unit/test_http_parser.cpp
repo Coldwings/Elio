@@ -917,6 +917,19 @@ TEST_CASE("HTTP request parser enforces HTTP/1.1 Host header count",
         REQUIRE(parser.has_error());
     }
 
+    SECTION("rejects mixed-case duplicate Host on HTTP/1.1") {
+        request_parser parser;
+        std::string request =
+            "GET / HTTP/1.1\r\n"
+            "Host: example.com\r\n"
+            "hOsT: other.example\r\n"
+            "\r\n";
+
+        auto [result, _] = parser.parse(request);
+        REQUIRE(result == parse_result::error);
+        REQUIRE(parser.has_error());
+    }
+
     SECTION("does not require Host on HTTP/1.0") {
         request_parser parser;
         auto [result, _] = parser.parse("GET / HTTP/1.0\r\n\r\n");

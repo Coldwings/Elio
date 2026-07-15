@@ -436,6 +436,11 @@ inline bool is_valid_utf8(std::string_view s) {
 
 /// WebSocket frame parser with message assembly
 class frame_parser {
+    enum class queued_frame_kind {
+        message,
+        control,
+    };
+
 public:
     frame_parser() = default;
 
@@ -476,6 +481,7 @@ public:
         if (messages_.empty()) return std::nullopt;
         auto msg = std::move(messages_.front());
         messages_.erase(messages_.begin());
+        remove_first_queued_kind(queued_frame_kind::message);
         return msg;
     }
     
@@ -485,6 +491,41 @@ public:
     /// Get next control frame (removes from queue)
     std::optional<std::pair<opcode, std::string>> get_control_frame() {
         if (control_frames_.empty()) return std::nullopt;
+        auto frame = std::move(control_frames_.front());
+        control_frames_.erase(control_frames_.begin());
+        remove_first_queued_kind(queued_frame_kind::control);
+        return frame;
+    }
+
+    /// Check whether the oldest queued frame is an application message.
+    bool next_frame_is_message() const {
+        return !queued_frames_.empty() &&
+               queued_frames_.front() == queued_frame_kind::message;
+    }
+
+    /// Check whether the oldest queued frame is a control frame.
+    bool next_frame_is_control_frame() const {
+        return !queued_frames_.empty() &&
+               queued_frames_.front() == queued_frame_kind::control;
+    }
+
+    /// Get the oldest queued application message, preserving wire order.
+    std::optional<message> get_next_message() {
+        if (!next_frame_is_message() || messages_.empty()) {
+            return std::nullopt;
+        }
+        queued_frames_.erase(queued_frames_.begin());
+        auto msg = std::move(messages_.front());
+        messages_.erase(messages_.begin());
+        return msg;
+    }
+
+    /// Get the oldest queued control frame, preserving wire order.
+    std::optional<std::pair<opcode, std::string>> get_next_control_frame() {
+        if (!next_frame_is_control_frame() || control_frames_.empty()) {
+            return std::nullopt;
+        }
+        queued_frames_.erase(queued_frames_.begin());
         auto frame = std::move(control_frames_.front());
         control_frames_.erase(control_frames_.begin());
         return frame;
@@ -502,6 +543,7 @@ public:
         current_message_ = message{};
         messages_.clear();
         control_frames_.clear();
+        queued_frames_.clear();
         has_error_ = false;
         has_initial_frame_ = false;
         error_msg_.clear();
@@ -509,6 +551,15 @@ public:
     }
     
 private:
+    void remove_first_queued_kind(queued_frame_kind kind) {
+        for (auto it = queued_frames_.begin(); it != queued_frames_.end(); ++it) {
+            if (*it == kind) {
+                queued_frames_.erase(it);
+                return;
+            }
+        }
+    }
+
     ssize_t process_buffer() {
         size_t total_consumed = 0;
         
@@ -607,6 +658,7 @@ private:
                 // Control frames can be interleaved.  Their payload is capped at
                 // 125 bytes by parse_frame_header(), so no size check is needed.
                 control_frames_.emplace_back(header.op, extract_payload());
+                queued_frames_.push_back(queued_frame_kind::control);
             } else {
                 // Data frame — fragmentation-state and size checks were already
                 // applied in the early-validation block above, so start
@@ -634,6 +686,7 @@ private:
                     }
                     current_message_.complete = true;
                     messages_.push_back(std::move(current_message_));
+                    queued_frames_.push_back(queued_frame_kind::message);
                     current_message_ = message{};
                     has_initial_frame_ = false;
                 }
@@ -651,6 +704,7 @@ private:
     message current_message_;
     std::vector<message> messages_;
     std::vector<std::pair<opcode, std::string>> control_frames_;
+    std::vector<queued_frame_kind> queued_frames_;
     size_t max_message_size_ = 0;
     bool has_error_ = false;
     bool has_initial_frame_ = false;  ///< Tracks whether a non-continuation frame started the current message

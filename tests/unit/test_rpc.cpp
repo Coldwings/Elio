@@ -837,6 +837,51 @@ TEST_CASE("message flags operations", "[rpc][protocol]") {
     }
 }
 
+TEST_CASE("frame header rejects unsupported RPC wire contract bits",
+          "[rpc][protocol][contract]") {
+    SECTION("accepts supported request flags") {
+        frame_header header;
+        header.type = message_type::request;
+        header.flags = message_flags::has_timeout |
+                       message_flags::has_checksum |
+                       message_flags::no_response;
+
+        REQUIRE(header.is_valid());
+    }
+
+    SECTION("rejects compressed reserved flag") {
+        frame_header header;
+        header.type = message_type::request;
+        header.flags = message_flags::compressed;
+
+        REQUIRE_FALSE(header.is_valid());
+    }
+
+    SECTION("rejects streaming reserved flag") {
+        frame_header header;
+        header.type = message_type::response;
+        header.flags = message_flags::streaming | message_flags::has_checksum;
+
+        REQUIRE_FALSE(header.is_valid());
+    }
+
+    SECTION("rejects unknown flag bits") {
+        frame_header header;
+        header.type = message_type::request;
+        header.flags = static_cast<message_flags>(0x80);
+
+        REQUIRE_FALSE(header.is_valid());
+    }
+
+    SECTION("rejects unknown message types") {
+        frame_header header;
+        header.type = static_cast<message_type>(0x80);
+        header.flags = message_flags::none;
+
+        REQUIRE_FALSE(header.is_valid());
+    }
+}
+
 TEST_CASE("build request with checksum", "[rpc][protocol]") {
     TestRequest req{100};
     auto [header, payload] = build_request(1, 1, req, std::nullopt, true);

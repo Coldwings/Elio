@@ -104,6 +104,28 @@ inline bool has_flag(message_flags flags, message_flags flag) {
     return (static_cast<uint8_t>(flags) & static_cast<uint8_t>(flag)) != 0;
 }
 
+inline bool is_valid_message_type(message_type type) noexcept {
+    switch (type) {
+        case message_type::request:
+        case message_type::response:
+        case message_type::error:
+        case message_type::ping:
+        case message_type::pong:
+        case message_type::cancel:
+            return true;
+    }
+    return false;
+}
+
+inline bool has_only_supported_message_flags(message_flags flags) noexcept {
+    constexpr uint8_t supported_flags =
+        static_cast<uint8_t>(message_flags::has_timeout) |
+        static_cast<uint8_t>(message_flags::has_checksum) |
+        static_cast<uint8_t>(message_flags::no_response);
+    const auto raw_flags = static_cast<uint8_t>(flags);
+    return (raw_flags & supported_flags) == raw_flags;
+}
+
 // ============================================================================
 // Frame header
 // ============================================================================
@@ -122,6 +144,8 @@ struct frame_header {
     bool is_valid() const noexcept {
         return magic == protocol_magic &&
                version == protocol_version &&
+               is_valid_message_type(type) &&
+               has_only_supported_message_flags(flags) &&
                payload_length <= max_message_size;
     }
 
@@ -320,8 +344,13 @@ read_frame_bounded(Stream& stream, uint32_t max_payload) {
     // Parse header
     frame_header header = frame_header::from_bytes(header_buf.data());
     if (!header.is_valid()) {
-        ELIO_LOG_ERROR("Invalid frame header: magic={:08x}, len={}",
-                      header.magic, header.payload_length);
+        ELIO_LOG_ERROR(
+            "Invalid frame header: magic={:08x}, version={}, type={}, flags=0x{:02x}, len={}",
+            header.magic,
+            static_cast<unsigned>(header.version),
+            static_cast<unsigned>(header.type),
+            static_cast<unsigned>(header.flags),
+            header.payload_length);
         co_return std::nullopt;
     }
 

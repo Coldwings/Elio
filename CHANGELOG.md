@@ -69,6 +69,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **RPC frame contract validation**: Inbound RPC frames now reject unknown
+  message types, reserved `compressed`/`streaming` flags, and unknown flag bits
+  at the frame-header validation boundary instead of dispatching them as normal
+  uncompressed requests or responses. (#854)
 - **SSE event serialization safety**: Server-side SSE serialization now treats
   LF, CRLF, and standalone CR as data line separators, suppresses unsafe
   line-break-bearing `id`/`event` fields, and serializes multi-line comments as

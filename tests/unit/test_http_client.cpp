@@ -796,6 +796,142 @@ TEST_CASE("WebSocket client rejects response headers above configured limits",
         cfg);
 }
 
+TEST_CASE("WebSocket client rejects invalid pipelined first frame after handshake",
+          "[websocket][client][handshake][security][regression]") {
+    SECTION("complete masked server frame") {
+        require_websocket_handshake_response_rejected(
+            [](std::string_view accept) {
+                auto masked_server_frame =
+                    elio::http::websocket::encode_text_frame("hello", true);
+                std::string response =
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Accept: ";
+                response += accept;
+                response += "\r\n\r\n";
+                response.append(
+                    reinterpret_cast<const char*>(masked_server_frame.data()),
+                    masked_server_frame.size());
+                return response;
+            });
+    }
+
+    SECTION("partial invalid opcode") {
+        require_websocket_handshake_response_rejected(
+            [](std::string_view accept) {
+                std::string response =
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Accept: ";
+                response += accept;
+                response += "\r\n\r\n";
+                response.push_back(static_cast<char>(0x83));
+                return response;
+            });
+    }
+}
+
+TEST_CASE("WebSocket client clears parser state between connection attempts",
+          "[websocket][client][handshake][regression]") {
+    auto first_listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(first_listener.has_value());
+    uint16_t first_port = first_listener->local_address().port();
+
+    auto second_listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(second_listener.has_value());
+    uint16_t second_port = second_listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> first_server_done{false};
+    std::atomic<bool> second_server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> first_failed{false};
+    std::atomic<bool> second_connected{false};
+    std::atomic<int> first_errno{0};
+    std::atomic<int> second_errno{0};
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await first_listener->accept();
+        REQUIRE(stream.has_value());
+        auto headers = co_await read_request_headers(*stream);
+        auto key = request_header_value(headers, "Sec-WebSocket-Key");
+        REQUIRE_FALSE(key.empty());
+
+        auto accept = elio::http::websocket::compute_websocket_accept(key);
+        auto masked_server_frame =
+            elio::http::websocket::encode_text_frame("hello", true);
+        std::string response =
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: ";
+        response += accept;
+        response += "\r\n\r\n";
+        response.append(reinterpret_cast<const char*>(masked_server_frame.data()),
+                        masked_server_frame.size());
+        co_await stream->write(response);
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        stream->shutdown_socket();
+        first_server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await second_listener->accept();
+        REQUIRE(stream.has_value());
+        auto headers = co_await read_request_headers(*stream);
+        auto key = request_header_value(headers, "Sec-WebSocket-Key");
+        REQUIRE_FALSE(key.empty());
+
+        auto accept = elio::http::websocket::compute_websocket_accept(key);
+        auto response = elio::http::websocket::build_server_handshake(accept);
+        co_await stream->write(response);
+        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        stream->shutdown_socket();
+        second_server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::websocket::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(2);
+        elio::http::websocket::ws_client client(cfg);
+
+        errno = 0;
+        bool first_ok = co_await client.connect(make_ws_url(first_port));
+        first_failed = !first_ok;
+        first_errno = errno;
+
+        errno = 0;
+        bool second_ok = co_await client.connect(make_ws_url(second_port));
+        second_connected = second_ok;
+        if (!second_ok) {
+            second_errno = errno;
+        }
+        if (second_ok) {
+            co_await client.close();
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && first_server_done &&
+                                 second_server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(first_server_done);
+    REQUIRE(second_server_done);
+    REQUIRE(first_failed);
+    REQUIRE(first_errno == EBADMSG);
+    REQUIRE(second_connected);
+    REQUIRE(second_errno == 0);
+}
+
 TEST_CASE("SSE client read_timeout fires on stalled response headers",
           "[sse][client][timeout][regression]") {
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));

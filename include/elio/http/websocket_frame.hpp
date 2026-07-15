@@ -104,11 +104,11 @@ struct frame_parse_result {
 inline frame_parse_result parse_frame_header(const uint8_t* data, size_t len, frame_header& header) {
     frame_parse_result result;
     
-    if (len < 2) {
+    if (len < 1) {
         result.complete = false;
         return result;
     }
-    
+
     // First byte: FIN, RSV1-3, opcode
     header.fin = (data[0] & 0x80) != 0;
     header.rsv1 = (data[0] & 0x40) != 0;
@@ -129,7 +129,12 @@ inline frame_parse_result parse_frame_header(const uint8_t* data, size_t len, fr
         result.error_msg = "Reserved bits must be 0";
         return result;
     }
-    
+
+    if (len < 2) {
+        result.complete = false;
+        return result;
+    }
+
     // Second byte: MASK, payload length
     header.masked = (data[1] & 0x80) != 0;
     uint8_t payload_len_7 = data[1] & 0x7F;
@@ -573,7 +578,7 @@ private:
     ssize_t process_buffer() {
         size_t total_consumed = 0;
         
-        while (buffer_.size() >= 2) {
+        while (!buffer_.empty()) {
             frame_header header;
             auto result = parse_frame_header(buffer_.data(), buffer_.size(), header);
             

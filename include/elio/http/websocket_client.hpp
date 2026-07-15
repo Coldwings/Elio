@@ -239,6 +239,7 @@ private:
     /// Internal connect implementation
     coro::task<bool> connect_impl(std::string_view url_str, coro::cancel_token token) {
         state_ = connection_state::connecting;
+        parser_.reset();
 
         // Check if already cancelled
         if (token.is_cancelled()) {
@@ -590,8 +591,16 @@ private:
         // the very first WebSocket frame is recognized.
         std::string pipelined = parser.take_remaining();
         if (!pipelined.empty()) {
-            parser_.parse(reinterpret_cast<const uint8_t*>(pipelined.data()),
-                          pipelined.size());
+            ssize_t parsed = parser_.parse(
+                reinterpret_cast<const uint8_t*>(pipelined.data()),
+                pipelined.size());
+            if (parsed < 0 || parser_.has_error()) {
+                ELIO_LOG_ERROR("WebSocket parse error: {}", parser_.error());
+                state_ = connection_state::open;
+                co_await fail_connection(parser_.error_close_code());
+                errno = EBADMSG;
+                co_return false;
+            }
         }
 
         ELIO_LOG_DEBUG("WebSocket handshake successful");

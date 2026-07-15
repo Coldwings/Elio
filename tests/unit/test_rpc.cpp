@@ -1041,6 +1041,17 @@ int run_rpc_close_off_scheduler_pending_child() {
 
 TEST_CASE("request id reservation skips occupied pending ids",
           "[rpc][contract][request_id]") {
+    SECTION("derives a finite probe bound from occupied pending ids") {
+        REQUIRE(detail::request_id_reservation_attempt_limit(0) == 1);
+        REQUIRE(detail::request_id_reservation_attempt_limit(3) == 4);
+        REQUIRE(detail::request_id_reservation_attempt_limit(
+                    detail::request_id_space_size - 1) ==
+                detail::request_id_space_size);
+        REQUIRE(detail::request_id_reservation_attempt_limit(
+                    detail::request_id_space_size) ==
+                detail::request_id_space_size);
+    }
+
     SECTION("skips occupied ids instead of overwriting them") {
         std::array<uint32_t, 3> generated{7, 8, 9};
         std::unordered_set<uint32_t> occupied{7, 8};

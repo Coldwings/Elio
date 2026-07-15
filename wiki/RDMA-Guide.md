@@ -140,6 +140,14 @@ that posts the WR: either the `co_await` for lazy operations or `.start()` for
 eager operations. The underlying payload buffers must outlive the hardware
 operation itself.
 
+`buffer_view::length` is `std::size_t`, but one verbs SGE can only carry a
+32-bit length. The single-buffer `buffer_view` convenience overloads fail
+before posting with `wc_status::local_length_error` when the length is above
+`UINT32_MAX`. Split larger local transfers into an explicit
+`std::span<const sge>` scatter list. Low-level helpers such as `sge::from()`
+remain verbs-adjacent conversions and require callers to pass a representable
+length.
+
 ### Shared receive queues
 
 ```cpp
@@ -213,8 +221,9 @@ conversion; `old_value_raw()` returns the raw bytes verbatim for
 backends that don't follow the canonical byte order (mlx5's
 `IBV_EXP_ATOMIC_HCA_REPLY_BE`, vendor-specific reply ordering).
 
-Constraints (enforced by ibverbs, not by Elio):
-- Local SGE must point at exactly 8 bytes.
+Constraints:
+- The local `buffer_view` must point at exactly 8 bytes; Elio validates this
+  before posting and returns `wc_status::local_length_error` otherwise.
 - Remote `addr` must be 8-byte aligned.
 - Only valid on RC QPs; UD has no atomics.
 
@@ -260,6 +269,10 @@ auto remote = mr.remote();                       // for peer to RDMA WRITE at us
 
 `view(offset, length)` carves a sub-range with the same lkey;
 `remote(offset, length)` does the same for the peer-visible side.
+`remote_buffer::length` is also 32-bit; `memory_region::remote()` and
+`remote(offset, length)` are fast-path helpers, so callers must advertise only
+lengths that fit in `uint32_t`. For larger registered regions, advertise
+explicit sub-ranges or another application-level segmentation scheme.
 
 ## Driving completion: dispatcher + cq_pump
 

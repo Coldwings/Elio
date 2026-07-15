@@ -25,7 +25,11 @@ using wr_id = std::uint64_t;
 /// Thinnest WR-friendly description of a local buffer: a pointer, length,
 /// and L_Key. Users who manage MRs themselves (the most common case)
 /// build `buffer_view`s directly; the optional `memory_region<Backend>`
-/// RAII helper (S6) yields `buffer_view` from `.view()`.
+/// RAII helper (S6) yields `buffer_view` from `.view()`. Single-buffer
+/// connection/SRQ convenience overloads reject lengths above the 32-bit SGE
+/// range before posting; lower-level SGE helpers require callers to satisfy
+/// that range precondition explicitly. Atomic connection operations validate
+/// their stricter 8-byte local-buffer requirement before posting.
 struct buffer_view {
     void*       addr = nullptr;
     std::size_t length = 0;
@@ -40,7 +44,10 @@ struct sge {
     std::uint32_t length = 0;
     std::uint32_t lkey = 0;
 
-    /// Convenience: build an sge from a buffer_view.
+    /// Low-level convenience: build an SGE from a buffer_view.
+    /// Precondition: `v.length <= UINT32_MAX`. High-level connection/SRQ
+    /// single-buffer awaiters enforce this before posting; this helper remains
+    /// a verbs-adjacent conversion for callers that already validated input.
     [[nodiscard]] static sge from(buffer_view v) noexcept {
         assert(v.length <= std::uint32_t(-1) &&
                "buffer_view::length exceeds uint32_t range for sge");

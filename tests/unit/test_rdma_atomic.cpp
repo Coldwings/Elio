@@ -29,6 +29,7 @@
 #include <coroutine>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <utility>
 
@@ -308,6 +309,35 @@ TEST_CASE("cas: start posts immediately and can complete before await",
     REQUIRE(result.old_value_host() == 0x0102030405060708ull);
 }
 
+TEST_CASE("cas: oversized local buffer length is rejected pre-post",
+          "[rdma][atomic][cas][length]") {
+    atomic_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 20;
+    connection<atomic_static_backend> c{&qp_value, disp};
+
+    char local = 0;
+    constexpr auto max_u32 = std::numeric_limits<std::uint32_t>::max();
+    constexpr auto too_large = static_cast<std::size_t>(max_u32) + 1u;
+    buffer_view bv{&local, too_large, 0x123};
+    remote_buffer remote{0x1000, 8, 0xABCD};
+
+    atomic_result result{};
+    bool done = false;
+    auto run = [&]() -> probe_task {
+        result = co_await c.cas(bv, remote, 1, 2);
+        done   = true;
+    };
+    auto task = run();
+
+    REQUIRE(done);
+    REQUIRE(st.cas_calls.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.wc.status == wc_status::local_length_error);
+    REQUIRE(result.wc.imm_data == max_u32);
+}
+
 TEST_CASE("cas: awaited operation forces completion for unsignaled flags",
           "[rdma][atomic][cas][signaled]") {
     atomic_state st;
@@ -370,6 +400,60 @@ TEST_CASE("fetch_add: backend receives add operand; old value round-trips",
     REQUIRE(done);
     REQUIRE(result.ok());
     REQUIRE(result.old_value_host() == 0xAABBCCDD00112233ull);
+}
+
+TEST_CASE("fetch_add: short local buffer length is rejected pre-post",
+          "[rdma][atomic][faa][length]") {
+    atomic_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 21;
+    connection<atomic_static_backend> c{&qp_value, disp};
+
+    char local[4] = {};
+    buffer_view bv{local, sizeof(local), 0};
+    remote_buffer remote{0xDEAD, 8, 0xBEEF};
+
+    atomic_result result{};
+    bool done = false;
+    auto run = [&]() -> probe_task {
+        result = co_await c.fetch_add(bv, remote, 7);
+        done   = true;
+    };
+    auto task = run();
+
+    REQUIRE(done);
+    REQUIRE(st.faa_calls.load() == 0);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.wc.status == wc_status::local_length_error);
+    REQUIRE(result.wc.imm_data == sizeof(local));
+}
+
+TEST_CASE("fetch_add: started oversized local buffer length is returned on await",
+          "[rdma][atomic][faa][length][start]") {
+    atomic_state st;
+    state_guard guard{&st};
+    dispatcher disp;
+    int qp_value = 22;
+    connection<atomic_static_backend> c{&qp_value, disp};
+
+    char local = 0;
+    constexpr auto max_u32 = std::numeric_limits<std::uint32_t>::max();
+    constexpr auto too_large = static_cast<std::size_t>(max_u32) + 1u;
+    buffer_view bv{&local, too_large, 0};
+    remote_buffer remote{0xDEAD, 8, 0xBEEF};
+
+    auto op = c.fetch_add(bv, remote, 7).start();
+    REQUIRE(st.faa_calls.load() == 0);
+
+    atomic_result result{};
+    bool done = false;
+    auto task = run_started_atomic(std::move(op), result, done);
+
+    REQUIRE(done);
+    REQUIRE_FALSE(result.ok());
+    REQUIRE(result.wc.status == wc_status::local_length_error);
+    REQUIRE(result.wc.imm_data == max_u32);
 }
 
 TEST_CASE("fetch_add: awaited operation forces completion for unsignaled flags",

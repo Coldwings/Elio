@@ -22,7 +22,9 @@
 
 #include <atomic>
 #include <string>
+#include <string_view>
 #include <chrono>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -80,6 +82,83 @@ inline void abort_stream_io(net::stream& stream) noexcept {
         ::shutdown(fd, SHUT_RDWR);
         stream.mark_externally_shut_down();
     }
+}
+
+inline size_t saturated_response_header_buffer_limit(
+    size_t max_headers, size_t max_header_size) noexcept {
+    constexpr size_t status_line_count = 1;
+    constexpr size_t line_ending_size = 2;
+    constexpr size_t terminal_header_ending_size = 2;
+    constexpr size_t max_size = std::numeric_limits<size_t>::max();
+
+    if (max_headers > max_size - status_line_count) {
+        return max_size;
+    }
+    const size_t line_count = max_headers + status_line_count;
+
+    if (max_header_size > max_size - line_ending_size) {
+        return max_size;
+    }
+    const size_t max_line_with_ending = max_header_size + line_ending_size;
+
+    if (line_count >
+        (max_size - terminal_header_ending_size) / max_line_with_ending) {
+        return max_size;
+    }
+
+    return line_count * max_line_with_ending + terminal_header_ending_size;
+}
+
+inline size_t buffered_response_header_line_size(
+    std::string_view buffer) noexcept {
+    size_t size = buffer.size();
+    if (size > 0 && buffer.back() == '\r') {
+        --size;
+    }
+    return size;
+}
+
+inline bool response_header_limits_exceeded(
+    std::string_view buffer, size_t max_headers,
+    size_t max_header_size) noexcept {
+    if (buffer.size() >
+        saturated_response_header_buffer_limit(max_headers, max_header_size)) {
+        return true;
+    }
+
+    size_t line_start = 0;
+    size_t line_index = 0;
+    size_t header_count = 0;
+    while (line_start < buffer.size()) {
+        auto line_end = buffer.find("\r\n", line_start);
+        if (line_end == std::string_view::npos) {
+            if (line_index > 0 &&
+                buffered_response_header_line_size(buffer.substr(line_start)) >
+                    max_header_size) {
+                return true;
+            }
+            return false;
+        }
+
+        const size_t line_size = line_end - line_start;
+        if (line_index > 0) {
+            if (line_size == 0) {
+                return false;
+            }
+            if (line_size > max_header_size) {
+                return true;
+            }
+            if (header_count >= max_headers) {
+                return true;
+            }
+            ++header_count;
+        }
+
+        line_start = line_end + 2;
+        ++line_index;
+    }
+
+    return false;
 }
 
 } // namespace detail

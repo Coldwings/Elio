@@ -125,7 +125,9 @@ size_t request_content_length(std::string_view headers) {
 }
 
 void require_websocket_handshake_response_rejected(
-    const std::function<std::string(std::string_view)>& make_response) {
+    const std::function<std::string(std::string_view)>& make_response,
+    int expected_errno = EBADMSG,
+    elio::http::websocket::client_config cfg = {}) {
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
     REQUIRE(listener.has_value());
     uint16_t port = listener->local_address().port();
@@ -154,7 +156,6 @@ void require_websocket_handshake_response_rejected(
     });
 
     sched.go([&]() -> task<void> {
-        elio::http::websocket::client_config cfg;
         cfg.read_timeout = std::chrono::seconds(2);
         elio::http::websocket::ws_client client(cfg);
 
@@ -175,11 +176,12 @@ void require_websocket_handshake_response_rejected(
     REQUIRE(client_done);
     REQUIRE(server_done);
     REQUIRE(client_failed);
-    REQUIRE(client_errno == EBADMSG);
+    REQUIRE(client_errno == expected_errno);
 }
 
 void require_websocket_handshake_response_accepted(
-    const std::function<std::string(std::string_view)>& make_response) {
+    const std::function<std::string(std::string_view)>& make_response,
+    elio::http::websocket::client_config cfg = {}) {
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
     REQUIRE(listener.has_value());
     uint16_t port = listener->local_address().port();
@@ -208,7 +210,6 @@ void require_websocket_handshake_response_accepted(
     });
 
     sched.go([&]() -> task<void> {
-        elio::http::websocket::client_config cfg;
         cfg.read_timeout = std::chrono::seconds(2);
         elio::http::websocket::ws_client client(cfg);
 
@@ -755,6 +756,44 @@ TEST_CASE("WebSocket client validates server upgrade response tokens",
                     "Sec-WebSocket-Accept: ") + std::string(accept) + "\r\n\r\n";
             });
     }
+}
+
+TEST_CASE("WebSocket client honors configured response header limits above 8 KiB",
+          "[websocket][client][handshake][limits][regression]") {
+    elio::http::websocket::client_config cfg;
+    cfg.read_buffer_size = 4096;
+    cfg.max_headers = 8;
+    cfg.max_header_size = 13 * 1024;
+
+    const std::string padding(12 * 1024, 'a');
+    require_websocket_handshake_response_accepted(
+        [padding](std::string_view accept) {
+            return std::string(
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "X-Padding: ") + padding + "\r\n"
+                "Sec-WebSocket-Accept: " + std::string(accept) + "\r\n\r\n";
+        },
+        cfg);
+}
+
+TEST_CASE("WebSocket client rejects response headers above configured limits",
+          "[websocket][client][handshake][limits][regression]") {
+    elio::http::websocket::client_config cfg;
+    cfg.max_header_size = 32;
+
+    require_websocket_handshake_response_rejected(
+        [](std::string_view accept) {
+            return std::string(
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "X-Too-Large: ") + std::string(48, 'x') + "\r\n"
+                "Sec-WebSocket-Accept: " + std::string(accept) + "\r\n\r\n";
+        },
+        EBADMSG,
+        cfg);
 }
 
 TEST_CASE("SSE client read_timeout fires on stalled response headers",

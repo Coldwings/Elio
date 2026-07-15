@@ -451,6 +451,9 @@ private:
         parser.set_max_headers(config_.max_headers);
         parser.set_max_header_size(config_.max_header_size);
         size_t total_read = 0;
+        const size_t header_buffer_limit =
+            http::detail::saturated_response_header_buffer_limit(
+                config_.max_headers, config_.max_header_size);
         auto* sched = runtime::scheduler::current();
         const bool deadline_enforced =
             sched != nullptr && config_.read_timeout.count() > 0;
@@ -519,7 +522,7 @@ private:
             }
 
             total_read += static_cast<size_t>(read_result.result);
-            if (total_read > 8192 && !parser.is_complete()) {
+            if (total_read > header_buffer_limit && !parser.is_complete()) {
                 ELIO_LOG_ERROR("WebSocket handshake response too large");
                 errno = EMSGSIZE;
                 co_return false;

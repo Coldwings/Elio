@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <new>
 
 #include <functional>
@@ -53,6 +54,27 @@ namespace elio::coro {
 /// general-purpose allocation for coroutines that follow strict LIFO
 /// allocation/deallocation patterns (which is natural for nested coroutines).
 class vthread_stack {
+    static inline thread_local vthread_stack* deferred_delete_ = nullptr;
+
+#ifndef ELIO_SANITIZER_ACTIVE
+    struct alignas(std::max_align_t) allocation_header {
+        uint64_t magic;
+        vthread_stack* owner;
+        size_t total_size;
+    };
+
+    static constexpr uint64_t ALLOCATION_MAGIC = 0x454C494F5653544BULL; // "ELIOVSTK"
+
+    static size_t allocation_size_with_header(size_t size) {
+        if (size > std::numeric_limits<size_t>::max() - sizeof(allocation_header)) {
+            throw std::bad_alloc();
+        }
+        return size + sizeof(allocation_header);
+    }
+#endif
+
+    static void delete_deferred_stack() noexcept;
+
 public:
     // Static interface — for promise_type::operator new/delete
 #ifdef ELIO_SANITIZER_ACTIVE
@@ -65,39 +87,62 @@ public:
     static void deallocate(void* ptr, [[maybe_unused]] size_t size) noexcept {
         ELIO_TSAN_RELEASE(ptr);  // Mark deallocation as happening-before any subsequent allocation
         ::operator delete(ptr);
+        delete_deferred_stack();
     }
 #else
     static void* allocate(size_t size) {
-        if (current_ != nullptr) {
-            return current_->push(size);
+        const size_t total_size = allocation_size_with_header(size);
+        auto* owner = current_;
+        allocation_header* header = nullptr;
+        if (owner != nullptr) {
+            header = static_cast<allocation_header*>(owner->push(total_size));
+        } else {
+            header = static_cast<allocation_header*>(::operator new(total_size));
         }
-        // No vthread context, use global new directly
-        return ::operator new(size);
+        header->magic = ALLOCATION_MAGIC;
+        header->owner = owner;
+        header->total_size = total_size;
+        return header + 1;
     }
 
     static void deallocate(void* ptr, size_t size) noexcept {
-        if (current_ != nullptr) {
-            current_->pop(ptr, size);
+        if (ptr == nullptr) {
+            return;
+        }
+
+        auto* header = static_cast<allocation_header*>(ptr) - 1;
+        if (header->magic != ALLOCATION_MAGIC) [[unlikely]] {
+            if (current_ != nullptr) {
+                current_->pop(ptr, size);
+            }
+            return;
+        }
+
+        auto* owner = header->owner;
+        if (owner == nullptr) {
+            header->magic = 0;
+            ::operator delete(header);
+            delete_deferred_stack();
+        } else if (owner == deferred_delete_) {
+            header->magic = 0;
+            delete_deferred_stack();
+        } else if (owner == current_) {
+            const size_t total_size = header->total_size;
+            header->magic = 0;
+            owner->pop(header, total_size);
         } else {
-            // When current_ is nullptr and we get here via tagged_dealloc() with
-            // a vstack tag, it means the vstack that owned this memory has been
-            // deleted (its destructor clears current_ and frees all segments).
-            // The memory pointed to by ptr is now invalid (already freed by vstack's
-            // destructor), so we must NOT try to free it again.
-            //
-            // This is a no-op: the memory was already freed when the vstack was deleted.
-            // Note: calling ::operator delete(ptr) here would be wrong
-            // because the memory was already freed by the owning vthread_stack.
-            //
-            // This situation occurs when:
-            // 1. A coroutine owns its vstack (owns_vstack_ = true)
-            // 2. The coroutine completes and its promise destructor runs
-            // 3. Promise destructor deletes the vstack (freeing all segment memory)
-            // 4. Then operator delete calls tagged_dealloc() -> vthread_stack::deallocate()
-            // 5. But current_ is now nullptr because the vstack was just deleted
+            // The memory belongs to another vthread_stack. Its owner will release
+            // the segment storage; do not pop an unrelated current stack.
         }
     }
 #endif
+
+    static void delete_after_current_deallocation(vthread_stack* stack) noexcept {
+        if (stack == nullptr) {
+            return;
+        }
+        deferred_delete_ = stack;
+    }
 
     // thread-local current vthread_stack management
     static vthread_stack* current() noexcept {
@@ -231,6 +276,12 @@ private:
 
     static inline thread_local vthread_stack* current_ = nullptr;
 };
+
+inline void vthread_stack::delete_deferred_stack() noexcept {
+    auto* stack = deferred_delete_;
+    deferred_delete_ = nullptr;
+    delete stack;
+}
 
 class vthread_stack_scope {
 public:

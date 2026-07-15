@@ -1188,6 +1188,61 @@ TEST_CASE("HTTP request parser validates chunk metadata and trailers",
         auto [result, _] = parser.parse(request);
         REQUIRE(result == parse_result::error);
     }
+
+    SECTION("accepts split chunk extensions, quoted-pairs, and zero-size extensions") {
+        request_parser parser;
+        std::string first =
+            "POST / HTTP/1.1\r\n"
+            "Host: a\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "4;foo=\"";
+
+        auto [partial, _1] = parser.parse(first);
+        REQUIRE(partial == parse_result::need_more);
+        REQUIRE_FALSE(parser.has_error());
+
+        auto [result, _2] = parser.parse(
+            "a\\\"b\\\\c\"\r\n"
+            "Wiki\r\n"
+            "0;done=true\r\n"
+            "X-Trailer: ok\r\n"
+            "\r\n");
+        REQUIRE(result == parse_result::complete);
+        REQUIRE(parser.body() == "Wiki");
+    }
+
+    SECTION("rejects trailers beyond max header count") {
+        request_parser parser;
+        parser.set_max_headers(2);
+        std::string request =
+            "POST / HTTP/1.1\r\n"
+            "Host: a\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "0\r\n"
+            "X-Trailer: ok\r\n"
+            "\r\n";
+
+        auto [result, _] = parser.parse(request);
+        REQUIRE(result == parse_result::error);
+    }
+
+    SECTION("rejects oversized trailer lines") {
+        request_parser parser;
+        parser.set_max_header_size(32);
+        std::string request =
+            "POST / HTTP/1.1\r\n"
+            "Host: a\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "0\r\n"
+            "X-Trailer: " + std::string(40, 'x') + "\r\n"
+            "\r\n";
+
+        auto [result, _] = parser.parse(request);
+        REQUIRE(result == parse_result::error);
+    }
 }
 
 // Mirror of the request-side hardening tests on the response parser. These
@@ -1307,6 +1362,58 @@ TEST_CASE("HTTP response parser validates chunk metadata and trailers",
             "\r\n"
             "0\r\n"
             "Bad Trailer: nope\r\n"
+            "\r\n";
+
+        auto [result, _] = parser.parse(response);
+        REQUIRE(result == parse_result::error);
+    }
+
+    SECTION("accepts split chunk extensions, quoted-pairs, and zero-size extensions") {
+        response_parser parser;
+        std::string first =
+            "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "4;foo=\"";
+
+        auto [partial, _1] = parser.parse(first);
+        REQUIRE(partial == parse_result::need_more);
+        REQUIRE_FALSE(parser.has_error());
+
+        auto [result, _2] = parser.parse(
+            "a\\\"b\\\\c\"\r\n"
+            "Wiki\r\n"
+            "0;done=true\r\n"
+            "X-Trailer: ok\r\n"
+            "\r\n");
+        REQUIRE(result == parse_result::complete);
+        REQUIRE(parser.body() == "Wiki");
+    }
+
+    SECTION("rejects trailers beyond max header count") {
+        response_parser parser;
+        parser.set_max_headers(1);
+        std::string response =
+            "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "0\r\n"
+            "X-Trailer: ok\r\n"
+            "\r\n";
+
+        auto [result, _] = parser.parse(response);
+        REQUIRE(result == parse_result::error);
+    }
+
+    SECTION("rejects oversized trailer lines") {
+        response_parser parser;
+        parser.set_max_header_size(32);
+        std::string response =
+            "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "0\r\n"
+            "X-Trailer: " + std::string(40, 'x') + "\r\n"
             "\r\n";
 
         auto [result, _] = parser.parse(response);

@@ -114,6 +114,10 @@ inline bool h2_status_is_informational(status parsed) noexcept {
     return code >= 100 && code < 200;
 }
 
+inline bool h2_status_is_forbidden_in_http2(status parsed) noexcept {
+    return parsed == status::switching_protocols;
+}
+
 inline bool h2_header_block_requires_status(const h2_stream& stream,
                                             nghttp2_headers_category category) noexcept {
     return category == NGHTTP2_HCAT_RESPONSE ||
@@ -136,7 +140,8 @@ inline bool record_h2_response_status(h2_stream& stream,
     status parsed_status = status::ok;
     if (!stream.current_header_status_required ||
         stream.current_header_status_seen ||
-        !parse_h2_response_status(value, parsed_status)) {
+        !parse_h2_response_status(value, parsed_status) ||
+        h2_status_is_forbidden_in_http2(parsed_status)) {
         stream.error = h2_error::protocol_error;
         return false;
     }

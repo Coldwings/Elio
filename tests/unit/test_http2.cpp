@@ -252,6 +252,15 @@ TEST_CASE("HTTP/2 response status tracking handles informational headers",
         REQUIRE_FALSE(stream.response_status_seen);
     }
 
+    SECTION("rejects 101 switching protocols") {
+        h2_stream stream;
+
+        detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_RESPONSE);
+        REQUIRE_FALSE(detail::record_h2_response_status(stream, "101"));
+        REQUIRE(stream.error == h2_error::protocol_error);
+        REQUIRE_FALSE(stream.response_status_seen);
+    }
+
     SECTION("does not require status in trailers after final status") {
         h2_stream stream;
 

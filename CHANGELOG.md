@@ -91,6 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **RPC typed payload canonicalization**: Typed RPC request, response, and
   error payload parsing now rejects trailing bytes after the declared typed
   fields instead of silently accepting undocumented extension data. (#873)
+- **RPC frame type/flag validation**: RPC frame headers now reject request-only
+  flags on non-request frames, nonzero method IDs on non-request frames, control
+  frame payloads, and timeout-flagged requests that are too short to contain
+  the timeout prefix. (#874)
 - **SSE parser chunk-boundary CRLF handling**: The SSE client parser now treats
   `\r` at the end of one input chunk plus `\n` at the start of the next chunk as
   a single CRLF line ending, preserving pending event metadata across transport

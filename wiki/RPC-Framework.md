@@ -291,7 +291,7 @@ All messages use a binary wire format with little-endian byte order:
 - **request_id** (4 bytes): Correlation ID for matching responses
 - **type** (1 byte): Message type (request=0, response=1, error=2, ping=3, pong=4, cancel=5)
 - **flags** (1 byte): Message flags (`has_timeout=0x01`,
-  `has_checksum=0x02`, `no_response=0x10` on request frames)
+  `has_checksum=0x02`, `no_response=0x10`)
 - **method_id** (4 bytes): Method being called (for requests)
 - **payload_length** (4 bytes): Length of payload in bytes
 - **version** (1 byte): Protocol version, currently `protocol_version` (1)
@@ -299,6 +299,13 @@ All messages use a binary wire format with little-endian byte order:
 
 Total header size: 19 bytes, including the final version byte
 Checksum trailer: 4 bytes (optional)
+
+Frame headers are validated by message type before dispatch. Request frames may
+use `has_timeout`, `has_checksum`, and `no_response`; all other frame types may
+only use `has_checksum`. Response, error, ping, pong, and cancel frames must use
+`method_id=0`. Ping, pong, and cancel frames also have no payload. A request
+with `has_timeout` must include at least the 4-byte timeout prefix before the
+typed request payload.
 
 ### Message Types
 

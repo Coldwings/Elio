@@ -323,6 +323,57 @@ TEST_CASE("WebSocket frame parsing", "[websocket][frame]") {
         REQUIRE(header.payload_len == 200);
         REQUIRE(result.header_size == 4);  // 2 base + 2 extended
     }
+
+    SECTION("parse extended length frame (64-bit)") {
+        std::string data(65536, 'x');
+        auto encoded = encode_binary_frame(data, false);
+
+        frame_header header;
+        auto result = parse_frame_header(encoded.data(), encoded.size(), header);
+
+        REQUIRE(result.complete);
+        REQUIRE_FALSE(result.error);
+        REQUIRE(header.payload_len == data.size());
+        REQUIRE(result.header_size == 10);  // 2 base + 8 extended
+    }
+
+    SECTION("reject non-minimal 16-bit extended payload length") {
+        uint8_t non_minimal[] = {0x82, 0x7E, 0x00, 0x7D};
+
+        frame_header header;
+        auto result = parse_frame_header(non_minimal, sizeof(non_minimal), header);
+
+        REQUIRE(result.error);
+        REQUIRE(result.error_msg.find("Non-minimal") != std::string::npos);
+    }
+
+    SECTION("reject non-minimal 64-bit extended payload length below 126") {
+        uint8_t non_minimal[] = {
+            0x82, 0x7F,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x7D
+        };
+
+        frame_header header;
+        auto result = parse_frame_header(non_minimal, sizeof(non_minimal), header);
+
+        REQUIRE(result.error);
+        REQUIRE(result.error_msg.find("Non-minimal") != std::string::npos);
+    }
+
+    SECTION("reject non-minimal 64-bit extended payload length at 65535") {
+        uint8_t non_minimal[] = {
+            0x82, 0x7F,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0xFF, 0xFF
+        };
+
+        frame_header header;
+        auto result = parse_frame_header(non_minimal, sizeof(non_minimal), header);
+
+        REQUIRE(result.error);
+        REQUIRE(result.error_msg.find("Non-minimal") != std::string::npos);
+    }
     
     SECTION("parse incomplete header") {
         uint8_t partial[] = {0x81};  // Only first byte

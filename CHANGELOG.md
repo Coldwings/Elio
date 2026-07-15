@@ -78,6 +78,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WebSocket control-frame ordering**: WebSocket receive loops now handle
   already-parsed control frames before delivering later data messages from the
   same read batch, preserving wire-order semantics for ping/pong/close. (#862)
+- **WebSocket payload length canonicalization**: WebSocket frame parsing now
+  rejects non-minimal extended payload length encodings at the frame-header
+  boundary, matching the canonical encoding emitted by the frame encoder. (#863)
 - **RPC frame contract validation**: Inbound RPC frames now reject unknown
   message types, reserved `compressed`/`streaming` flags, and unknown flag bits
   at the frame-header validation boundary instead of dispatching them as normal

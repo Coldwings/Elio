@@ -342,6 +342,47 @@ TEST_CASE("HTTP response parser - incremental parsing", "[http][parser]") {
     REQUIRE(parser.body() == "Hello");
 }
 
+TEST_CASE("HTTP response parser reports consumed bytes before need_more",
+          "[http][parser][regression]") {
+    SECTION("headers") {
+        response_parser parser;
+
+        const std::string consumed_prefix =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n";
+        const std::string partial_header = "Content-Length: ";
+        auto [r1, c1] = parser.parse(consumed_prefix + partial_header);
+
+        REQUIRE(r1 == parse_result::need_more);
+        REQUIRE(c1 == consumed_prefix.size());
+
+        auto [r2, c2] = parser.parse("5\r\n\r\nHello");
+
+        REQUIRE(r2 == parse_result::complete);
+        REQUIRE(c2 == partial_header.size() + std::string_view("5\r\n\r\nHello").size());
+        REQUIRE(parser.body() == "Hello");
+    }
+
+    SECTION("body") {
+        response_parser parser;
+        const std::string headers =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 5\r\n"
+            "\r\n";
+        auto [r1, c1] = parser.parse(headers + "He");
+
+        REQUIRE(r1 == parse_result::need_more);
+        REQUIRE(c1 == headers.size() + 2);
+        REQUIRE(parser.body() == "He");
+
+        auto [r2, c2] = parser.parse("llo");
+
+        REQUIRE(r2 == parse_result::complete);
+        REQUIRE(c2 == 3);
+        REQUIRE(parser.body() == "Hello");
+    }
+}
+
 TEST_CASE("HTTP response parser - no body", "[http][parser]") {
     response_parser parser;
 

@@ -86,6 +86,16 @@ struct pending_request {
 
 namespace detail {
 
+constexpr size_t request_id_space_size =
+    static_cast<size_t>(std::numeric_limits<uint32_t>::max());
+
+inline size_t request_id_reservation_attempt_limit(size_t occupied_count) noexcept {
+    if (occupied_count >= request_id_space_size) {
+        return request_id_space_size;
+    }
+    return occupied_count + 1;
+}
+
 /// Reserve a request ID by trying generated IDs until one can be inserted.
 /// The try_reserve callback must perform the contains+insert step atomically
 /// for the relevant pending-request shard.
@@ -93,7 +103,7 @@ template<typename NextIdFn, typename TryReserveFn>
 inline std::optional<uint32_t> reserve_unique_request_id(
     NextIdFn&& next_id,
     TryReserveFn&& try_reserve,
-    size_t max_attempts = static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+    size_t max_attempts) {
     for (size_t attempt = 0; attempt < max_attempts; ++attempt) {
         uint32_t candidate = next_id();
         if (try_reserve(candidate)) {
@@ -246,6 +256,11 @@ public:
             }
             shard.requests.clear();
         }
+        if (!pending_to_complete.empty()) {
+            pending_request_count_.fetch_sub(
+                pending_to_complete.size(),
+                std::memory_order_acq_rel);
+        }
 
         for (auto& req : pending_to_complete) {
             if (req->try_complete()) {
@@ -341,9 +356,7 @@ private:
             if (!active || !self) return;
             active = false;
             try {
-                auto& shard = self->pending_shard_for(request_id);
-                std::lock_guard<std::mutex> lock(shard.mutex);
-                shard.requests.erase(request_id);
+                self->erase_pending_request(request_id);
             } catch (...) {
                 // Erase from a noexcept context must not propagate.
             }
@@ -763,6 +776,10 @@ private:
     std::atomic<bool> closed_{false};
     std::atomic<bool> receive_loop_started_{false};
     request_id_generator id_generator_;
+    // Serializes ID generation with the pending-count snapshot used as the
+    // collision-probe bound.
+    std::mutex request_id_mutex_;
+    std::atomic<size_t> pending_request_count_{0};
 
     struct pending_shard {
         std::mutex mutex;
@@ -778,6 +795,7 @@ private:
         rpc_error initial_error = rpc_error::success) {
         auto pending = std::make_shared<pending_request>();
         pending->error = initial_error;
+        std::lock_guard<std::mutex> reservation_lock(request_id_mutex_);
         auto request_id = detail::reserve_unique_request_id(
             [this]() {
                 return id_generator_.next();
@@ -785,8 +803,14 @@ private:
             [this, &pending](uint32_t candidate) {
                 auto& shard = pending_shard_for(candidate);
                 std::lock_guard<std::mutex> lock(shard.mutex);
-                return shard.requests.emplace(candidate, pending).second;
-            });
+                auto [it, inserted] = shard.requests.emplace(candidate, pending);
+                (void)it;
+                if (inserted) {
+                    pending_request_count_.fetch_add(1, std::memory_order_acq_rel);
+                }
+                return inserted;
+            },
+            request_id_reservation_attempt_limit());
 
         if (!request_id) {
             return std::nullopt;
@@ -795,6 +819,7 @@ private:
     }
 
     std::optional<uint32_t> next_unoccupied_request_id() {
+        std::lock_guard<std::mutex> reservation_lock(request_id_mutex_);
         return detail::reserve_unique_request_id(
             [this]() {
                 return id_generator_.next();
@@ -803,7 +828,23 @@ private:
                 auto& shard = pending_shard_for(candidate);
                 std::lock_guard<std::mutex> lock(shard.mutex);
                 return shard.requests.find(candidate) == shard.requests.end();
-            });
+            },
+            request_id_reservation_attempt_limit());
+    }
+
+    size_t request_id_reservation_attempt_limit() const noexcept {
+        return detail::request_id_reservation_attempt_limit(
+            pending_request_count_.load(std::memory_order_acquire));
+    }
+
+    bool erase_pending_request(uint32_t request_id) noexcept {
+        auto& shard = pending_shard_for(request_id);
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        if (shard.requests.erase(request_id) == 0) {
+            return false;
+        }
+        pending_request_count_.fetch_sub(1, std::memory_order_acq_rel);
+        return true;
     }
 
     pending_shard& pending_shard_for(uint32_t request_id) noexcept {

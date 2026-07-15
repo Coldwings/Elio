@@ -50,10 +50,16 @@ namespace elio::rpc {
 
 /// State for a pending RPC request
 struct pending_request {
+    enum class operation_kind {
+        call,
+        ping
+    };
+
     sync::event completion_event;
     message_buffer response_data;
     frame_header response_header;
     rpc_error error = rpc_error::success;
+    operation_kind operation = operation_kind::call;
     std::atomic<bool> completed{false};
     std::atomic<bool> published{false};
     bool timed_out = false;
@@ -394,7 +400,8 @@ private:
         // Reserve a request ID before sending. The wire ID is uint32_t and
         // wraps, so skip IDs that are still in-flight instead of overwriting
         // the pending entry for an older call.
-        auto reserved = reserve_pending_request();
+        auto reserved = reserve_pending_request(
+            pending_request::operation_kind::call, rpc_error::success);
         if (!reserved) {
             co_return rpc_result<Response>(rpc_error::internal_error);
         }
@@ -591,7 +598,8 @@ public:
             co_return false;
         }
 
-        auto reserved = reserve_pending_request(rpc_error::invalid_message);
+        auto reserved = reserve_pending_request(
+            pending_request::operation_kind::ping, rpc_error::invalid_message);
         if (!reserved) {
             co_return false;
         }
@@ -742,6 +750,11 @@ private:
                 return;
             }
             pending = it->second;
+            if (pending->operation != pending_request::operation_kind::call) {
+                ELIO_LOG_WARNING("RPC client: received response for non-call request {}",
+                                header.request_id);
+                return;
+            }
         }
         
         // Use atomic try_complete to ensure only one thread sets the response
@@ -764,6 +777,11 @@ private:
                 return;
             }
             pending = it->second;
+            if (pending->operation != pending_request::operation_kind::ping) {
+                ELIO_LOG_WARNING("RPC client: received pong for non-ping request {}",
+                                request_id);
+                return;
+            }
         }
         
         if (pending->try_complete()) {
@@ -792,8 +810,11 @@ private:
     };
 
     std::optional<reserved_pending_request> reserve_pending_request(
+        pending_request::operation_kind operation =
+            pending_request::operation_kind::call,
         rpc_error initial_error = rpc_error::success) {
         auto pending = std::make_shared<pending_request>();
+        pending->operation = operation;
         pending->error = initial_error;
         std::lock_guard<std::mutex> reservation_lock(request_id_mutex_);
         auto request_id = detail::reserve_unique_request_id(

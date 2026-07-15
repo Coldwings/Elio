@@ -34,6 +34,70 @@ namespace elio::http::sse {
 /// MIME type for SSE
 inline constexpr std::string_view SSE_CONTENT_TYPE = "text/event-stream";
 
+namespace detail {
+
+inline bool has_sse_line_break(std::string_view value) noexcept {
+    return value.find_first_of("\r\n") != std::string_view::npos;
+}
+
+template <typename AppendLine>
+inline void append_lines_for_sse_field(std::ostringstream& ss,
+                                       std::string_view value,
+                                       AppendLine append_line) {
+    size_t start = 0;
+    while (true) {
+        size_t end = start;
+        while (end < value.size() && value[end] != '\r' && value[end] != '\n') {
+            ++end;
+        }
+
+        append_line(ss, value.substr(start, end - start));
+        if (end == value.size()) {
+            break;
+        }
+
+        if (value[end] == '\r' && end + 1 < value.size() &&
+            value[end + 1] == '\n') {
+            start = end + 2;
+        } else {
+            start = end + 1;
+        }
+
+        if (start == value.size()) {
+            append_line(ss, std::string_view{});
+            break;
+        }
+    }
+}
+
+inline void append_data_lines(std::ostringstream& ss, std::string_view data) {
+    append_lines_for_sse_field(
+        ss,
+        data,
+        [](std::ostringstream& out, std::string_view line) {
+            out << "data: " << line << "\n";
+        });
+}
+
+inline std::string serialize_comment(std::string_view comment) {
+    std::ostringstream ss;
+    if (comment.empty()) {
+        ss << ": \n\n";
+        return ss.str();
+    }
+
+    append_lines_for_sse_field(
+        ss,
+        comment,
+        [](std::ostringstream& out, std::string_view line) {
+            out << ": " << line << "\n";
+        });
+    ss << "\n";
+    return ss.str();
+}
+
+} // namespace detail
+
 /// SSE event structure
 struct event {
     std::string id;       ///< Event ID (optional)
@@ -68,12 +132,12 @@ inline std::string serialize_event(const event& evt) {
     std::ostringstream ss;
     
     // ID field
-    if (!evt.id.empty()) {
+    if (!evt.id.empty() && !detail::has_sse_line_break(evt.id)) {
         ss << "id: " << evt.id << "\n";
     }
     
     // Event type field
-    if (!evt.type.empty()) {
+    if (!evt.type.empty() && !detail::has_sse_line_break(evt.type)) {
         ss << "event: " << evt.type << "\n";
     }
     
@@ -84,18 +148,7 @@ inline std::string serialize_event(const event& evt) {
     
     // Data field (may span multiple lines)
     if (!evt.data.empty()) {
-        std::string_view data = evt.data;
-        size_t start = 0;
-        while (start < data.size()) {
-            auto end = data.find('\n', start);
-            if (end == std::string_view::npos) {
-                ss << "data: " << data.substr(start) << "\n";
-                break;
-            } else {
-                ss << "data: " << data.substr(start, end - start) << "\n";
-                start = end + 1;
-            }
-        }
+        detail::append_data_lines(ss, evt.data);
     } else {
         ss << "data: \n";
     }
@@ -182,11 +235,7 @@ public:
             co_return false;
         }
         
-        std::string data = ": ";
-        data += comment;
-        data += "\n\n";
-        
-        co_return co_await send_raw(data);
+        co_return co_await send_raw(detail::serialize_comment(comment));
     }
     
     /// Send retry interval

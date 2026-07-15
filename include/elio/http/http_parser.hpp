@@ -175,6 +175,14 @@ inline bool validate_chunk_trailer_line(std::string_view line) noexcept {
     return is_valid_header_name(name) && is_valid_header_value(value);
 }
 
+inline size_t buffered_line_size(std::string_view buffer) noexcept {
+    size_t size = buffer.size();
+    if (size > 0 && buffer.back() == '\r') {
+        --size;
+    }
+    return size;
+}
+
 } // namespace detail
 
 /// HTTP parser state
@@ -444,11 +452,7 @@ private:
         while (true) {
             auto line_end = buffer_.find("\r\n");
             if (line_end == std::string::npos) {
-                size_t buffered_line_size = buffer_.size();
-                if (buffered_line_size > 0 && buffer_.back() == '\r') {
-                    --buffered_line_size;
-                }
-                if (buffered_line_size > max_header_size_) {
+                if (detail::buffered_line_size(buffer_) > max_header_size_) {
                     set_error("Header line too long");
                 }
                 return false;
@@ -578,7 +582,15 @@ private:
     bool parse_chunk_size() {
         auto line_end = buffer_.find("\r\n");
         if (line_end == std::string::npos) {
+            if (detail::buffered_line_size(buffer_) > max_header_size_) {
+                set_error("Chunk size line too long");
+                return true;
+            }
             return false;
+        }
+        if (line_end > max_header_size_) {
+            set_error("Chunk size line too long");
+            return true;
         }
 
         std::string_view line(buffer_.data(), line_end);
@@ -629,6 +641,10 @@ private:
         // Parse trailer headers (usually empty)
         auto line_end = buffer_.find("\r\n");
         if (line_end == std::string::npos) {
+            if (detail::buffered_line_size(buffer_) > max_header_size_) {
+                set_error("Trailer line too long");
+                return true;
+            }
             return false;
         }
 
@@ -931,11 +947,7 @@ private:
         while (true) {
             auto line_end = buffer_.find("\r\n");
             if (line_end == std::string::npos) {
-                size_t buffered_line_size = buffer_.size();
-                if (buffered_line_size > 0 && buffer_.back() == '\r') {
-                    --buffered_line_size;
-                }
-                if (buffered_line_size > max_header_size_) {
+                if (detail::buffered_line_size(buffer_) > max_header_size_) {
                     set_error("Header line too long");
                 }
                 return false;
@@ -1063,7 +1075,15 @@ private:
     bool parse_chunk_size() {
         auto line_end = buffer_.find("\r\n");
         if (line_end == std::string::npos) {
+            if (detail::buffered_line_size(buffer_) > max_header_size_) {
+                set_error("Chunk size line too long");
+                return true;
+            }
             return false;
+        }
+        if (line_end > max_header_size_) {
+            set_error("Chunk size line too long");
+            return true;
         }
 
         std::string_view line(buffer_.data(), line_end);
@@ -1108,6 +1128,10 @@ private:
     bool parse_chunk_trailer() {
         auto line_end = buffer_.find("\r\n");
         if (line_end == std::string::npos) {
+            if (detail::buffered_line_size(buffer_) > max_header_size_) {
+                set_error("Trailer line too long");
+                return true;
+            }
             return false;
         }
         

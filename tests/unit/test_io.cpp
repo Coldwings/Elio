@@ -345,6 +345,48 @@ TEST_CASE("io_uring submit failure keeps staged operation pending",
 #endif
 }
 
+TEST_CASE("io_uring prepare rejection is side-effect free",
+          "[io][io_uring][contract][regression]") {
+#if ELIO_HAS_IO_URING
+    io_request none{};
+    none.op = io_op::none;
+    REQUIRE_FALSE(elio::io::detail::io_uring_prepare_request_is_valid(none));
+
+    io_request unknown{};
+    unknown.op = static_cast<io_op>(255);
+    REQUIRE_FALSE(elio::io::detail::io_uring_prepare_request_is_valid(unknown));
+
+    io_request missing_timeout_ts{};
+    missing_timeout_ts.op = io_op::timeout;
+    missing_timeout_ts.length = 1;
+    REQUIRE_FALSE(elio::io::detail::io_uring_prepare_request_is_valid(
+        missing_timeout_ts));
+
+    if (!io_uring_backend::is_available()) {
+        SUCCEED("io_uring is not available at runtime");
+        return;
+    }
+
+    io_uring_backend backend;
+    auto* ring = backend.get_ring();
+    REQUIRE(ring != nullptr);
+    REQUIRE(io_uring_sq_ready(ring) == 0);
+    REQUIRE(backend.pending_count() == 0);
+
+    auto assert_rejected_without_side_effects = [&](io_request req) {
+        REQUIRE_FALSE(backend.prepare(req));
+        REQUIRE(io_uring_sq_ready(ring) == 0);
+        REQUIRE(backend.pending_count() == 0);
+    };
+
+    assert_rejected_without_side_effects(none);
+    assert_rejected_without_side_effects(unknown);
+    assert_rejected_without_side_effects(missing_timeout_ts);
+#else
+    SUCCEED("io_uring backend is not compiled in");
+#endif
+}
+
 TEST_CASE("epoll_backend basic operations", "[io][epoll]") {
     epoll_backend backend;
     

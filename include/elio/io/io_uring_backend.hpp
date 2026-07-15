@@ -125,6 +125,29 @@ inline bool io_uring_submit_made_progress(size_t ready_before,
     return ready_after < ready_before;
 }
 
+inline bool io_uring_prepare_request_is_valid(const io_request& req) noexcept {
+    switch (req.op) {
+        case io_op::none:
+            return false;
+        case io_op::timeout:
+            return req.timeout_ts != nullptr;
+        case io_op::read:
+        case io_op::write:
+        case io_op::readv:
+        case io_op::writev:
+        case io_op::accept:
+        case io_op::connect:
+        case io_op::recv:
+        case io_op::send:
+        case io_op::close:
+        case io_op::cancel:
+        case io_op::poll_read:
+        case io_op::poll_write:
+            return true;
+    }
+    return false;
+}
+
 template<typename ReadyFn, typename SubmitFn, typename ErrorFn,
          typename ShortFn, typename StalledFn>
 inline bool submit_queued_io_uring_sqes_for_poll(ReadyFn&& ready,
@@ -308,6 +331,12 @@ public:
     
     /// Prepare an I/O operation
     bool prepare(const io_request& req) override {
+        if (!detail::io_uring_prepare_request_is_valid(req)) {
+            ELIO_LOG_ERROR("Invalid io_uring prepare request: {}",
+                           static_cast<int>(req.op));
+            return false;
+        }
+
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (!sqe) {
             // SQ full: try to drain by submitting whatever is queued, then
@@ -397,11 +426,9 @@ public:
                 // The awaiter must have a ts_ member for this to work
                 auto ns = static_cast<int64_t>(req.length);
                 auto* ts = static_cast<__kernel_timespec*>(req.timeout_ts);
-                if (ts) {
-                    ts->tv_sec = ns / 1000000000LL;
-                    ts->tv_nsec = ns % 1000000000LL;
-                    io_uring_prep_timeout(sqe, ts, 0, 0);
-                }
+                ts->tv_sec = ns / 1000000000LL;
+                ts->tv_nsec = ns % 1000000000LL;
+                io_uring_prep_timeout(sqe, ts, 0, 0);
                 break;
             }
                 

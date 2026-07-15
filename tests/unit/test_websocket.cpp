@@ -576,6 +576,49 @@ TEST_CASE("WebSocket frame parser", "[websocket][parser]") {
         REQUIRE(consumed < 0);
     }
 
+    SECTION("server rejects unmasked frame after header before payload arrives") {
+        frame_parser parser;
+        parser.set_role(endpoint_role::server);
+
+        auto frame = encode_binary_frame(std::string(200, 'x'), false);
+        const auto header_size = frame.size() - 200;
+        auto consumed = parser.parse(frame.data(), header_size);
+
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::protocol_error);
+        REQUIRE(parser.error().find("Unmasked frame") != std::string::npos);
+        REQUIRE(consumed < 0);
+    }
+
+    SECTION("client rejects masked frame after header before payload arrives") {
+        frame_parser parser;
+        parser.set_role(endpoint_role::client);
+
+        auto frame = encode_binary_frame(std::string(200, 'x'), true);
+        const auto header_size = frame.size() - 200;
+        auto consumed = parser.parse(frame.data(), header_size);
+
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::protocol_error);
+        REQUIRE(parser.error().find("Masked frame") != std::string::npos);
+        REQUIRE(consumed < 0);
+    }
+
+    SECTION("mask direction is rejected before size-limit checks") {
+        frame_parser parser;
+        parser.set_role(endpoint_role::server);
+        parser.set_max_message_size(10);
+
+        auto frame = encode_binary_frame(std::string(200, 'x'), false);
+        const auto header_size = frame.size() - 200;
+        auto consumed = parser.parse(frame.data(), header_size);
+
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::protocol_error);
+        REQUIRE(parser.error().find("Unmasked frame") != std::string::npos);
+        REQUIRE(consumed < 0);
+    }
+
     SECTION("payload exactly at the limit is accepted") {
         frame_parser parser;
         parser.set_max_message_size(5);

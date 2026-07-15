@@ -310,7 +310,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return success for zero-length operations without starting a handshake or
   OpenSSL I/O. (#747)
 
-## [0.5.2] - 2026-06-30
+## [0.5.2] - 2026-07-01
 
 Focus: **stability and security hardening**. 21 critical bug fixes addressing
 use-after-free vulnerabilities, deadlocks, race conditions, and security issues

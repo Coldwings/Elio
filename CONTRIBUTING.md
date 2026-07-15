@@ -166,21 +166,30 @@ perf(runtime): add alignas(64) to worker_thread hot fields
 
 ### Branch Strategy
 
-- **`main`** — development mainline. Always builds and passes tests.
-- **`release/X.Y`** — long-lived branch for a minor version series (e.g.,
-  `release/0.4` covers all 0.4.x releases). Created from the initial `vX.Y.0`
-  tag. Patch releases (vX.Y.1, vX.Y.2, …) are tagged on this branch.
+- **`main`** — development mainline and the default source for new releases.
+  Always builds and passes tests.
+- **`release/X.Y`** — maintenance branch for a minor version series when that
+  series is actively receiving backports. It may be created from the initial
+  `vX.Y.0` tag or from the latest patch tag when maintenance starts after the
+  initial release. Patch releases are tagged on this branch only when the fix
+  was backported there; otherwise patch releases can be tagged directly on
+  `main`.
 - **Feature branches** — short-lived branches for individual changes, merged
   to `main` via PR.
 
 ### Release Process
 
 1. All changes land on `main` first.
-2. When cutting a new minor version, tag `vX.Y.0` on `main` and create a
-   `release/X.Y` branch from that tag.
-3. Bug fixes for a released version are cherry-picked from `main` to the
-   `release/X.Y` branch, then tagged as `vX.Y.Z` on that branch.
-4. The project aims to maintain the last two minor versions.
+2. When cutting a new minor version, tag `vX.Y.0` on `main`.
+3. For a patch release on the current line, tag `vX.Y.Z` on `main` after the
+   release fix has landed and CI is green.
+4. When maintaining an older minor line, cherry-pick the fix from `main` to the
+   appropriate `release/X.Y` branch, validate that branch, and tag `vX.Y.Z`
+   there.
+5. Keep README release status, changelog release headings, GitHub release
+   target, and tag metadata aligned with the published release.
+6. The project aims to maintain the last two minor versions when backport
+   capacity is available.
 
 ### Backporting
 

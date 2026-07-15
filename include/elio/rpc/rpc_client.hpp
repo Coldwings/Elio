@@ -55,6 +55,7 @@ struct pending_request {
     frame_header response_header;
     rpc_error error = rpc_error::success;
     std::atomic<bool> completed{false};
+    std::atomic<bool> published{false};
     bool timed_out = false;
     
     pending_request() = default;
@@ -65,10 +66,21 @@ struct pending_request {
         return completed.compare_exchange_strong(expected, true, 
             std::memory_order_acq_rel);
     }
+
+    /// Publish the completed state after response/error fields are written.
+    void publish_completion() noexcept {
+        published.store(true, std::memory_order_release);
+        completion_event.set();
+    }
     
     /// Check if completed (read-only)
     bool is_completed() const noexcept {
         return completed.load(std::memory_order_acquire);
+    }
+
+    /// Acquire response/error fields written before publish_completion().
+    bool is_published() const noexcept {
+        return published.load(std::memory_order_acquire);
     }
 };
 
@@ -238,7 +250,7 @@ public:
         for (auto& req : pending_to_complete) {
             if (req->try_complete()) {
                 req->error = rpc_error::connection_closed;
-                req->completion_event.set();
+                req->publish_completion();
             }
         }
     }
@@ -387,7 +399,7 @@ private:
         auto cancel_registration = token.on_cancel([this, pending, request_id]() {
             if (pending->try_complete()) {
                 pending->error = rpc_error::cancelled;
-                pending->completion_event.set();
+                pending->publish_completion();
             }
         });
 
@@ -397,27 +409,25 @@ private:
         auto request_frame = build_request(request_id, Method::id, request, timeout_ms);
         bool request_sent = false;
 
+        bool completed_before_send = false;
         {
             co_await send_mutex_.lock();
             sync::lock_guard send_guard(send_mutex_);
 
             if (pending->is_completed()) {
-                co_return rpc_result<Response>(pending->error);
+                completed_before_send = true;
+            } else {
+                bool sent = co_await write_frame(stream_, request_frame.first, request_frame.second);
+                if (!sent) {
+                    co_return rpc_result<Response>(rpc_error::connection_closed);
+                }
+                request_sent = true;
             }
-
-            bool sent = co_await write_frame(stream_, request_frame.first, request_frame.second);
-            if (!sent) {
-                co_return rpc_result<Response>(rpc_error::connection_closed);
-            }
-            request_sent = true;
         }
 
-        if (pending->is_completed()) {
-            if (pending->error == rpc_error::cancelled && request_sent) {
-                if (!start_cancel_frame(request_id)) {
-                    co_await send_cancel_frame(request_id);
-                }
-            }
+        if (completed_before_send) {
+            co_await pending->completion_event.wait();
+            (void)pending->is_published();
             co_return rpc_result<Response>(pending->error);
         }
 
@@ -446,7 +456,7 @@ private:
                     if (result == coro::cancel_result::completed && pending->try_complete()) {
                         pending->timed_out = true;
                         pending->error = rpc_error::timeout;
-                        pending->completion_event.set();
+                        pending->publish_completion();
                     }
                 }(ms, p, std::move(tok));
             });
@@ -454,6 +464,7 @@ private:
 
         // Wait for completion (either response, timeout, or cancellation)
         co_await pending->completion_event.wait();
+        (void)pending->is_published();
 
         // Cancel the timeout watcher so it stops sleeping immediately once
         // the request has completed, regardless of how completion happened.
@@ -604,7 +615,7 @@ public:
                     if (result == coro::cancel_result::completed && p->try_complete()) {
                         p->timed_out = true;
                         p->error = rpc_error::timeout;
-                        p->completion_event.set();
+                        p->publish_completion();
                     }
                 }(ms, p, std::move(tok));
             });
@@ -612,6 +623,7 @@ public:
 
         // Wait for pong
         co_await pending->completion_event.wait();
+        (void)pending->is_published();
 
         // Cancel the timeout watcher so it doesn't linger after completion.
         ping_cancel.cancel();
@@ -723,7 +735,7 @@ private:
         if (pending->try_complete()) {
             pending->response_header = header;
             pending->response_data = std::move(payload);
-            pending->completion_event.set();
+            pending->publish_completion();
         }
     }
     
@@ -743,7 +755,7 @@ private:
         
         if (pending->try_complete()) {
             pending->error = rpc_error::success;
-            pending->completion_event.set();
+            pending->publish_completion();
         }
     }
     

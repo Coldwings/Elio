@@ -116,6 +116,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   negative error, allowing later submit/poll attempts to retry them instead of
   making `run_until_complete()` believe suspended awaiters have no pending
   work. (#829)
+- **RPC fast-response completion race**: `rpc_client::call()` now waits for a
+  pending request's response/error fields to be published before parsing the
+  result, avoiding intermittent default-valued successful responses when a peer
+  replies before the caller reaches the normal completion wait. (#844)
 - **Batch I/O fallback errors**: Synchronous `batch_read()` and `batch_write()`
   fallback paths now report syscall failures as `-errno`, matching io_uring and
   the public I/O result contract. (#763)

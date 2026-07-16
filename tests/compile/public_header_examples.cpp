@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <span>
 #include <string_view>
 #include <sys/uio.h>
 #include <tuple>
@@ -124,15 +125,24 @@ void rpc_server_config_aggregate_compat() {
 coro::task<void> uds_cancellable_api(coro::cancel_token token) {
     auto stream = co_await net::uds_connect(
         net::unix_address::abstract("public_header_uds_cancel"), token);
+    auto path_stream = co_await net::uds_connect(
+        std::string_view("/tmp/public_header_uds_cancel.sock"), token);
+    (void)path_stream;
+
     if (!stream) co_return;
 
     char buffer[16]{};
     auto read_result = co_await stream->read(buffer, sizeof(buffer), token);
     (void)read_result;
+    auto span_read_result = co_await stream->read(std::span<char>(buffer), token);
+    (void)span_read_result;
 
     auto exact_result = co_await stream->read_exactly(
         buffer, sizeof(buffer), token);
     (void)exact_result;
+    auto span_exact_result = co_await stream->read_exactly(
+        std::span<char>(buffer), token);
+    (void)span_exact_result;
 }
 
 coro::task<void> vectored_io(int fd) {

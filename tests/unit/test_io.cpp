@@ -1434,6 +1434,16 @@ TEST_CASE("uds_connect observes already-cancelled token",
     REQUIRE(observed_errno == ECANCELED);
 }
 
+TEST_CASE("uds_connect braced options remain source-compatible",
+          "[uds][connect][api]") {
+    auto addr = unix_address::abstract(
+        "elio_test_braced_options_" + std::to_string(getpid()));
+    [[maybe_unused]] auto by_addr = uds_connect(addr, {});
+    [[maybe_unused]] auto by_path = uds_connect(
+        std::string_view("/tmp/elio_test_braced_options.sock"), {});
+    SUCCEED("braced uds_options overloads remain unambiguous");
+}
+
 TEST_CASE("UDS stream read/write", "[uds][stream]") {
     auto addr = unix_address::abstract("elio_test_rw_" + std::to_string(getpid()));
 

@@ -19,6 +19,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <filesystem>
 
@@ -985,7 +986,8 @@ public:
             return false;  // Don't suspend, resume immediately
         }
 
-        if (errno != EINPROGRESS) {
+        if (errno != EINPROGRESS && errno != EAGAIN &&
+            errno != EWOULDBLOCK) {
             // Connection failed
             result_ = io::io_result{-errno, 0};
             ::close(fd_);
@@ -1115,10 +1117,12 @@ inline auto uds_connect(const unix_address& addr,
 /// sockaddr_un::sun_path before the connect syscall is attempted. Socket
 /// creation/connect failures return std::nullopt and set errno. Cancellation
 /// returns std::nullopt with errno set to ECANCELED.
+template<typename Token>
+    requires std::is_same_v<std::remove_cvref_t<Token>, coro::cancel_token>
 inline auto uds_connect(const unix_address& addr,
-                        coro::cancel_token token,
+                        Token&& token,
                         const uds_options& opts = {}) {
-    return uds_connect_awaitable(addr, opts, std::move(token));
+    return uds_connect_awaitable(addr, opts, std::forward<Token>(token));
 }
 
 /// Connect to a Unix Domain Socket server by path.
@@ -1137,10 +1141,13 @@ inline auto uds_connect(std::string_view path,
 /// sockaddr_un::sun_path before the connect syscall is attempted. Socket
 /// creation/connect failures return std::nullopt and set errno. Cancellation
 /// returns std::nullopt with errno set to ECANCELED.
+template<typename Token>
+    requires std::is_same_v<std::remove_cvref_t<Token>, coro::cancel_token>
 inline auto uds_connect(std::string_view path,
-                        coro::cancel_token token,
+                        Token&& token,
                         const uds_options& opts = {}) {
-    return uds_connect_awaitable(unix_address(path), opts, std::move(token));
+    return uds_connect_awaitable(
+        unix_address(path), opts, std::forward<Token>(token));
 }
 
 } // namespace elio::net

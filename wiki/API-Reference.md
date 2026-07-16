@@ -5,7 +5,7 @@ This page provides a reference for Elio's public API.
 For responsibility boundaries, thread-safety defaults, lifetime preconditions,
 and audit triage rules, see [[API Contracts]]. The reference below describes
 surface area and usage; the contract page defines what Elio guarantees and
-what callers must provide for each interface family.
+what callers must provide for each public interface.
 
 ## Namespaces
 
@@ -18,6 +18,8 @@ what callers must provide for each interface family.
 | `elio::signal` | Signal handling with signalfd |
 | `elio::net` | TCP networking |
 | `elio::http` | HTTP client/server |
+| `elio::websocket` | Convenience re-export of WebSocket support |
+| `elio::sse` | Convenience re-export of Server-Sent Events support |
 | `elio::tls` | TLS/SSL support |
 | `elio::sync` | Synchronization primitives |
 | `elio::time` | Timers |
@@ -1265,6 +1267,62 @@ struct ipv4_address {
 };
 ```
 
+`ipv4_address(std::string_view, uint16_t)` accepts numeric IPv4 literals.
+Invalid text logs an error and falls back to `INADDR_ANY`; callers that need
+strict address validation should resolve or validate host strings before
+construction.
+
+### `ipv6_address`
+
+IPv6 address with port and optional scope ID.
+
+```cpp
+struct ipv6_address {
+    struct in6_addr addr = IN6ADDR_ANY_INIT;
+    uint16_t port = 0;
+    uint32_t scope_id = 0;
+
+    ipv6_address() = default;
+    explicit ipv6_address(uint16_t p);
+    ipv6_address(std::string_view ip, uint16_t p);
+
+    int family() const noexcept;
+    std::string to_string() const;
+    bool is_v4_mapped() const;
+};
+```
+
+`ipv6_address(std::string_view, uint16_t)` accepts numeric IPv6 literals. A
+link-local scope suffix such as `%eth0` is converted with `if_nametoindex()`.
+Invalid text logs an error and falls back to the IPv6 any address.
+
+### `socket_address`
+
+Generic TCP socket address wrapper for IPv4 or IPv6 endpoints.
+
+```cpp
+class socket_address {
+public:
+    socket_address();
+    socket_address(const ipv4_address& addr);
+    socket_address(const ipv6_address& addr);
+    explicit socket_address(uint16_t port);
+    socket_address(std::string_view host, uint16_t port);
+
+    int family() const;
+    uint16_t port() const;
+    bool is_v4() const;
+    bool is_v6() const;
+    const ipv4_address& as_v4() const;
+    const ipv6_address& as_v6() const;
+    std::string to_string() const;
+};
+```
+
+`socket_address(std::string_view, uint16_t)` auto-selects IPv6 when the host
+contains `:` and IPv4 otherwise. Empty, `"::"`, and `"0.0.0.0"` select the
+IPv6-any dual-stack address, which listeners use for all-interface binds.
+
 ### `tcp_listener`
 
 TCP server socket.
@@ -1810,6 +1868,290 @@ const char* status_reason(status s);
 
 ---
 
+## WebSocket (`elio::websocket`)
+
+WebSocket support is declared in `elio::http::websocket` and re-exported as
+`elio::websocket` by `<elio/http/websocket.hpp>`.
+
+### `websocket::client_config`
+
+```cpp
+struct client_config : http::base_client_config {
+    size_t max_message_size = 16 * 1024 * 1024;
+    std::vector<std::string> subprotocols;
+    std::string origin;
+};
+```
+
+`websocket::client_config` inherits the shared HTTP client timeout, buffer, TLS
+verification, DNS, and response-header limit settings. It does not define an
+automatic reconnect loop.
+
+### `websocket::ws_client`
+
+```cpp
+class ws_client {
+public:
+    ws_client();
+    explicit ws_client(client_config config);
+
+    /* awaitable */ connect(std::string_view url);
+    /* awaitable */ connect(std::string_view url, coro::cancel_token token);
+
+    connection_state state() const noexcept;
+    bool is_open() const noexcept;
+    std::string_view subprotocol() const noexcept;
+
+    /* awaitable */ send_text(std::string_view message);
+    /* awaitable */ send_binary(std::string_view data);
+    /* awaitable */ send_ping(std::string_view payload = "");
+    /* awaitable */ send_pong(std::string_view payload = "");
+    /* awaitable */ close(close_code code = close_code::normal,
+                          std::string_view reason = "");
+    /* awaitable */ receive();
+    /* awaitable */ receive(coro::cancel_token token);
+
+    tls::tls_context& tls_context() noexcept;
+    client_config& config() noexcept;
+    const client_config& config() const noexcept;
+};
+```
+
+`connect()` is one connection attempt. If it fails or a later operation observes
+a closed/failed connection, callers choose retry, backoff, replay, and
+application session restoration policy.
+
+### `websocket::ws_connection`
+
+Server-side WebSocket connection passed to route handlers.
+
+```cpp
+class ws_connection {
+public:
+    connection_state state() const noexcept;
+    bool is_open() const noexcept;
+    std::string_view subprotocol() const noexcept;
+
+    std::string_view param(std::string_view name) const;
+    const std::unordered_map<std::string, std::string>& params() const noexcept;
+
+    /* awaitable */ send_text(std::string_view message);
+    /* awaitable */ send_binary(std::string_view data);
+    /* awaitable */ send_ping(std::string_view payload = "");
+    /* awaitable */ send_pong(std::string_view payload = "");
+    /* awaitable */ close(close_code code = close_code::normal,
+                          std::string_view reason = "");
+    /* awaitable */ receive();
+};
+```
+
+Only one coroutine should receive from a connection at a time. Send helpers are
+serialized so concurrent senders do not interleave WebSocket frames.
+
+### `websocket::ws_router` and `ws_server`
+
+```cpp
+using ws_handler_func = std::function<coro::task<void>(ws_connection&)>;
+
+class ws_router : public http::router {
+public:
+    void websocket(std::string_view pattern,
+                   ws_handler_func handler,
+                   server_config config = {});
+};
+
+class ws_server {
+public:
+    explicit ws_server(ws_router router,
+                       http::server_config http_config = {});
+
+    /* awaitable */ listen(const net::socket_address& addr,
+                           const net::tcp_options& opts = {});
+    /* awaitable */ listen_tls(const net::socket_address& addr,
+                               tls::tls_context& tls_ctx,
+                               const net::tcp_options& opts = {});
+    void stop();
+    bool is_running() const noexcept;
+    size_t active_connections() const noexcept;
+};
+```
+
+Route pattern syntax matches the HTTP router: literal components, `:name`
+parameters, and trailing `*` wildcards.
+
+### Frame Types and Helpers
+
+```cpp
+enum class opcode : uint8_t;
+enum class close_code : uint16_t;
+enum class connection_state {
+    connecting, open, closing, closed
+};
+
+enum class endpoint_role {
+    unspecified, server, client
+};
+
+std::vector<uint8_t> encode_text_frame(std::string_view text, bool mask = false);
+std::vector<uint8_t> encode_binary_frame(std::string_view data, bool mask = false);
+std::pair<close_code, std::string> parse_close_payload(std::string_view payload);
+
+class frame_parser {
+public:
+    void set_max_message_size(size_t max_size);
+    void set_role(endpoint_role role);
+    close_code error_close_code() const noexcept;
+};
+```
+
+The raw frame parser is a protocol helper. It enforces masking direction only
+after callers configure an endpoint role (`server` or `client`). Applications
+still validate message payload schemas after a frame has been accepted.
+
+### `websocket::ws_connect`
+
+```cpp
+/* awaitable */ ws_connect(std::string_view url,
+                           client_config config = {});
+```
+
+Returns an optional connected `ws_client`. It performs one connection attempt;
+callers own retry and backoff policy.
+
+---
+
+## Server-Sent Events (`elio::sse`)
+
+SSE support is declared in `elio::http::sse` and re-exported as `elio::sse` by
+`<elio/http/sse.hpp>`.
+
+### `sse::event`
+
+```cpp
+struct event {
+    std::string id;
+    std::string type;
+    std::string data;
+    int retry = -1;
+
+    static event message(std::string_view data);
+    static event typed(std::string_view type, std::string_view data);
+    static event with_id(std::string_view id, std::string_view data);
+    static event full(std::string_view id, std::string_view type,
+                      std::string_view data, int retry = -1);
+};
+```
+
+### `sse::sse_connection`
+
+Server-side SSE connection passed to handlers.
+
+```cpp
+enum class connection_state {
+    active, closed
+};
+
+class sse_connection {
+public:
+    connection_state state() const noexcept;
+    bool is_active() const noexcept;
+    std::string_view last_event_id() const noexcept;
+
+    /* awaitable */ send(const event& evt);
+    /* awaitable */ send_data(std::string_view data);
+    /* awaitable */ send_event(std::string_view type, std::string_view data);
+    /* awaitable */ send_comment(std::string_view comment = "");
+    /* awaitable */ send_retry(int retry_ms);
+    void close();
+    void set_active();
+    /* awaitable */ run_heartbeat(
+        std::chrono::milliseconds interval = std::chrono::seconds(30),
+        coro::cancel_token token = {},
+        std::string_view comment = "ping");
+};
+```
+
+SSE sends are serialized by the connection object. Application code owns event
+schema, authorization, replay, and duplicate-handling policy.
+
+### `sse::sse_endpoint` and Response Helpers
+
+```cpp
+using sse_handler_func = std::function<coro::task<void>(sse_connection&)>;
+
+class sse_endpoint {
+public:
+    explicit sse_endpoint(sse_handler_func handler);
+    const sse_handler_func& handler() const;
+};
+
+http::response build_sse_response();
+```
+
+`build_sse_response()` prepares the HTTP headers for an SSE stream. Applications
+still own routing and handler lifetime.
+
+### `sse::client_config`
+
+```cpp
+struct client_config : http::base_client_config {
+    int default_retry_ms = 3000;
+    bool auto_reconnect = true;
+    size_t max_reconnect_attempts = 0;
+    size_t max_event_buffer_size = 1024 * 1024;
+    std::string last_event_id;
+};
+```
+
+### `sse::sse_client`
+
+```cpp
+enum class client_state {
+    disconnected, connecting, connected, reconnecting, closed
+};
+
+class sse_client {
+public:
+    sse_client();
+    explicit sse_client(client_config config);
+
+    /* awaitable */ connect(std::string_view url);
+    /* awaitable */ connect(std::string_view url, coro::cancel_token token);
+
+    client_state state() const noexcept;
+    bool is_connected() const noexcept;
+    std::string_view last_event_id() const noexcept;
+
+    /* awaitable */ receive();
+    /* awaitable */ receive(coro::cancel_token token);
+    /* awaitable */ close();
+
+    tls::tls_context& tls_context() noexcept;
+    client_config& config() noexcept;
+    const client_config& config() const noexcept;
+};
+```
+
+The client tracks `Last-Event-ID`, applies configured event-buffer limits, and
+uses `client_config::auto_reconnect` / `max_reconnect_attempts` for
+receive-driven reconnect behavior after an established stream fails while not
+closed. Initial `connect()` failures are single attempts; callers own retry and
+background reconnect policy for initial connection establishment.
+
+### `sse::sse_connect`
+
+```cpp
+/* awaitable */ sse_connect(std::string_view url,
+                            client_config config = {});
+/* awaitable */ sse_connect(std::string_view url,
+                            coro::cancel_token token,
+                            client_config config = {});
+```
+
+Returns an optional connected `sse_client`.
+
+---
+
 ## HTTP/2 (`elio::http`)
 
 HTTP/2 support requires linking with `elio_http2`.
@@ -2070,7 +2412,8 @@ public:
 
 ### `shared_lock_guard`
 
-RAII guard for shared (reader) locks.
+RAII unlock guard for an already-held shared (reader) lock. Callers must
+`co_await lock_shared()` before constructing the guard.
 
 ```cpp
 class shared_lock_guard {
@@ -2084,7 +2427,8 @@ public:
 
 ### `unique_lock_guard`
 
-RAII guard for exclusive (writer) locks.
+RAII unlock guard for an already-held exclusive (writer) lock. Callers must
+`co_await lock()` before constructing the guard.
 
 ```cpp
 class unique_lock_guard {

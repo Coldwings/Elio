@@ -289,6 +289,18 @@ TEST_CASE("when_all single task", "[sync][combinators]") {
     sched.shutdown();
 }
 
+TEST_CASE("when_all with no tasks completes immediately",
+          "[sync][combinators][regression]") {
+    auto test = []() -> task<void> {
+        auto result = co_await when_all();
+        static_assert(std::tuple_size_v<decltype(result)> == 0);
+    };
+
+    runtime::scheduler sched(1);
+    sched.go(test);
+    sched.shutdown();
+}
+
 TEST_CASE("when_all does not resume while launching children",
           "[sync][combinators][regression]") {
     launch_blocker blocker;

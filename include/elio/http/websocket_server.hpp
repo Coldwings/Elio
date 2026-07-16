@@ -23,6 +23,7 @@
 #include <elio/sync/primitives.hpp>
 #include <elio/log/macros.hpp>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -60,8 +61,8 @@ enum class connection_state {
 struct server_config {
     size_t max_message_size = 16 * 1024 * 1024;     ///< Max message size (16MB)
     size_t read_buffer_size = 8192;                  ///< Read buffer size
-    std::chrono::milliseconds ping_interval{std::chrono::seconds(30)}; ///< 0 = disabled
-    std::chrono::milliseconds ping_timeout{std::chrono::seconds(10)};  ///< <=0 = no timeout close
+    std::chrono::seconds ping_interval{30};             ///< 0 = disabled
+    std::chrono::seconds ping_timeout{10};              ///< <=0 = no timeout close
     std::vector<std::string> subprotocols;           ///< Supported subprotocols
     bool enable_logging = true;                      ///< Log connections
 };
@@ -278,8 +279,10 @@ public:
     /// Server-side heartbeat loop.
     ///
     /// Sends a ping after each interval and expects receive() to observe at
-    /// least one pong before the timeout expires. The heartbeat never reads from
-    /// the stream, preserving the single-reader contract for route handlers.
+    /// least one pong before the timeout expires. With timeout enabled, the
+    /// window covers both acquiring the serialized send path and writing the
+    /// ping frame. The heartbeat never reads from the stream, preserving the
+    /// single-reader contract for route handlers.
     coro::task<void> run_heartbeat(
         std::chrono::milliseconds ping_interval,
         std::chrono::milliseconds ping_timeout,
@@ -295,20 +298,36 @@ public:
                 co_return;
             }
 
-            const auto observed_pongs =
-                pong_sequence_.load(std::memory_order_acquire);
-            if (!co_await send_ping()) {
-                co_return;
-            }
-
             if (ping_timeout.count() <= 0) {
+                if (!co_await send_ping()) {
+                    co_return;
+                }
                 continue;
             }
 
-            auto timeout_result = co_await elio::time::sleep_for(
-                ping_timeout, token);
-            if (timeout_result == coro::cancel_result::cancelled || !is_open()) {
+            const auto deadline = std::chrono::steady_clock::now() + ping_timeout;
+            const auto observed_pongs =
+                pong_sequence_.load(std::memory_order_acquire);
+            if (!co_await send_heartbeat_ping_until(deadline, token)) {
+                if (token.is_cancelled() || !is_open()) {
+                    co_return;
+                }
+                ELIO_LOG_WARNING(
+                    "WebSocket heartbeat ping could not be sent within {}ms",
+                    ping_timeout.count());
+                state_.store(connection_state::closed, std::memory_order_release);
+                shutdown_socket();
                 co_return;
+            }
+
+            auto remaining = remaining_until(deadline);
+            if (remaining.count() > 0) {
+                auto timeout_result = co_await elio::time::sleep_for(
+                    remaining, token);
+                if (timeout_result == coro::cancel_result::cancelled ||
+                    !is_open()) {
+                    co_return;
+                }
             }
 
             if (pong_sequence_.load(std::memory_order_acquire) == observed_pongs) {
@@ -340,6 +359,18 @@ private:
         }
         co_return io::io_result{-ENOTCONN, 0};
     }
+
+    coro::task<io::io_result> write(const void* buf, size_t len,
+                                    coro::cancel_token token) {
+        if (std::holds_alternative<net::tcp_stream*>(stream_)) {
+            co_return co_await std::get<net::tcp_stream*>(stream_)->write(
+                buf, len, std::move(token));
+        } else if (std::holds_alternative<tls::tls_stream*>(stream_)) {
+            co_return co_await std::get<tls::tls_stream*>(stream_)->write(
+                buf, len, std::move(token));
+        }
+        co_return io::io_result{-ENOTCONN, 0};
+    }
     
     /// Serialize an entire frame onto the wire.  The per-connection send mutex
     /// guarantees that frames produced by concurrent senders never interleave
@@ -359,6 +390,111 @@ private:
             sent += static_cast<size_t>(result.result);
         }
         co_return true;
+    }
+
+    static std::chrono::milliseconds remaining_until(
+        std::chrono::steady_clock::time_point deadline) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return std::chrono::milliseconds(0);
+        }
+        auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now);
+        if (remaining.count() <= 0) {
+            return std::chrono::milliseconds(1);
+        }
+        return remaining;
+    }
+
+    coro::task<bool> send_heartbeat_ping_until(
+        std::chrono::steady_clock::time_point deadline,
+        coro::cancel_token token) {
+        if (!is_open()) {
+            co_return false;
+        }
+        auto frame = encode_ping_frame("", !is_server_);
+        co_return co_await send_raw_until(frame, deadline, std::move(token));
+    }
+
+    coro::task<bool> send_raw_until(
+        const std::vector<uint8_t>& data,
+        std::chrono::steady_clock::time_point deadline,
+        coro::cancel_token token) {
+        while (!send_mutex_.try_lock()) {
+            if (token.is_cancelled() || !is_open() ||
+                remaining_until(deadline).count() <= 0) {
+                co_return false;
+            }
+
+            auto delay = remaining_until(deadline);
+            if (delay > std::chrono::milliseconds(10)) {
+                delay = std::chrono::milliseconds(10);
+            }
+            auto result = co_await elio::time::sleep_for(delay, token);
+            if (result == coro::cancel_result::cancelled) {
+                co_return false;
+            }
+        }
+
+        sync::lock_guard send_guard(send_mutex_);
+        size_t sent = 0;
+        while (sent < data.size()) {
+            if (token.is_cancelled() || !is_open() ||
+                remaining_until(deadline).count() <= 0) {
+                co_return false;
+            }
+            auto result = co_await write_until(
+                data.data() + sent, data.size() - sent, deadline, token);
+            if (result.result <= 0) {
+                co_return false;
+            }
+            sent += static_cast<size_t>(result.result);
+        }
+        co_return true;
+    }
+
+    coro::task<io::io_result> write_until(
+        const void* buf,
+        size_t len,
+        std::chrono::steady_clock::time_point deadline,
+        coro::cancel_token parent_token) {
+        auto remaining = remaining_until(deadline);
+        if (parent_token.is_cancelled()) {
+            co_return io::io_result{-ECANCELED, 0};
+        }
+        if (remaining.count() <= 0) {
+            co_return io::io_result{-ETIMEDOUT, 0};
+        }
+
+        auto write_cancel = std::make_shared<coro::cancel_source>();
+        auto parent_registration = parent_token.on_cancel([write_cancel]() {
+            write_cancel->cancel();
+        });
+
+        std::optional<coro::join_handle<void>> timer;
+        auto timer_cancel = std::make_shared<coro::cancel_source>();
+        if (auto* sched = runtime::scheduler::current()) {
+            timer.emplace(sched->go_joinable(
+                [write_cancel, timer_cancel, remaining]() -> coro::task<void> {
+                    auto result = co_await elio::time::sleep_for(
+                        remaining, timer_cancel->get_token());
+                    if (result == coro::cancel_result::completed) {
+                        write_cancel->cancel();
+                    }
+                }));
+        }
+
+        auto result = co_await write(buf, len, write_cancel->get_token());
+        parent_registration.unregister();
+        if (timer) {
+            timer_cancel->cancel();
+            auto handle = std::move(*timer);
+            timer.reset();
+            co_await std::move(handle);
+        }
+
+        co_return result;
     }
 
     /// Emit a close frame with the given code and tear the connection down.
@@ -958,8 +1094,12 @@ private:
             std::optional<coro::join_handle<void>> heartbeat;
             auto heartbeat_cancel = std::make_shared<coro::cancel_source>();
             if (sched && ws_route->config.ping_interval.count() > 0) {
-                auto ping_interval = ws_route->config.ping_interval;
-                auto ping_timeout = ws_route->config.ping_timeout;
+                auto ping_interval =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        ws_route->config.ping_interval);
+                auto ping_timeout =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        ws_route->config.ping_timeout);
                 heartbeat.emplace(sched->go_joinable(
                     [&conn,
                      heartbeat_cancel,

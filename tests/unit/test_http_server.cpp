@@ -987,8 +987,8 @@ TEST_CASE("WebSocket server enforces configured heartbeat timeout",
     config.keep_alive_timeout = elio::test::scaled_sec(1);
 
     elio::http::websocket::server_config ws_config;
-    ws_config.ping_interval = elio::test::scaled_ms(50);
-    ws_config.ping_timeout = elio::test::scaled_ms(50);
+    ws_config.ping_interval = std::chrono::seconds(1);
+    ws_config.ping_timeout = std::chrono::seconds(1);
 
     std::atomic<bool> handler_started{false};
     std::atomic<bool> handler_done{false};
@@ -1026,7 +1026,7 @@ TEST_CASE("WebSocket server enforces configured heartbeat timeout",
     REQUIRE(wait_until([&] {
         return handler_started.load(std::memory_order_acquire) &&
                handler_done.load(std::memory_order_acquire);
-    }, elio::test::scaled_sec(2)));
+    }, elio::test::scaled_sec(4)));
 
     const auto header_end = response.find("\r\n\r\n");
     REQUIRE(header_end != std::string::npos);
@@ -1048,6 +1048,119 @@ TEST_CASE("WebSocket server enforces configured heartbeat timeout",
     }
 
     CHECK(saw_ping);
+
+    srv.stop();
+    try_wake_listener(port);
+
+    REQUIRE(wait_until([&] { return listen_done.load(std::memory_order_acquire); },
+                       elio::test::scaled_sec(2)));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("WebSocket server heartbeat accepts observed pong",
+          "[websocket][server][heartbeat][regression]") {
+    const std::string upgrade_request =
+        "GET /ws HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n";
+
+    elio::http::websocket::ws_router routes;
+    server_config config;
+    config.enable_logging = false;
+    config.keep_alive_timeout = elio::test::scaled_sec(1);
+
+    elio::http::websocket::server_config ws_config;
+    ws_config.ping_interval = std::chrono::seconds(1);
+    ws_config.ping_timeout = std::chrono::seconds(1);
+
+    std::atomic<bool> handler_started{false};
+    std::atomic<bool> handler_done{false};
+    routes.websocket("/ws", [&](elio::http::websocket::ws_connection& conn)
+                              -> task<void> {
+        handler_started.store(true, std::memory_order_release);
+        while (co_await conn.receive()) {
+        }
+        handler_done.store(true, std::memory_order_release);
+        co_return;
+    }, ws_config);
+
+    elio::http::websocket::ws_server srv(std::move(routes), config);
+    const uint16_t port = reserve_loopback_port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] { return srv.is_running(); },
+                       elio::test::scaled_sec(2)));
+
+    auto client = connect_loopback(port);
+    send_all(client.get(), upgrade_request);
+
+    std::string response;
+    std::string ping_payload;
+    bool saw_ping = false;
+    char buffer[512];
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!saw_ping && std::chrono::steady_clock::now() < deadline) {
+        ssize_t n = ::recv(client.get(), buffer, sizeof(buffer), 0);
+        if (n > 0) {
+            response.append(buffer, static_cast<size_t>(n));
+        } else if (n == 0) {
+            break;
+        } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+            INFO("recv failed: " << std::strerror(errno));
+            REQUIRE(false);
+        }
+
+        const auto header_end = response.find("\r\n\r\n");
+        if (header_end == std::string::npos) {
+            continue;
+        }
+
+        auto ws_bytes = std::string_view(response).substr(header_end + 4);
+        elio::http::websocket::frame_parser parser;
+        parser.set_role(elio::http::websocket::endpoint_role::client);
+        auto parsed = parser.parse(
+            reinterpret_cast<const uint8_t*>(ws_bytes.data()), ws_bytes.size());
+        REQUIRE(parsed >= 0);
+        while (parser.next_frame_is_control_frame()) {
+            auto frame = parser.get_next_control_frame();
+            REQUIRE(frame.has_value());
+            if (frame->first == elio::http::websocket::opcode::ping) {
+                saw_ping = true;
+                ping_payload = frame->second;
+                break;
+            }
+        }
+    }
+
+    CHECK(response.find("HTTP/1.1 101 Switching Protocols") !=
+          std::string::npos);
+    REQUIRE(saw_ping);
+    REQUIRE(handler_started.load(std::memory_order_acquire));
+
+    auto pong = elio::http::websocket::encode_pong_frame(ping_payload, true);
+    send_all(client.get(), std::string_view(
+        reinterpret_cast<const char*>(pong.data()), pong.size()));
+
+    REQUIRE_FALSE(wait_for_peer_close(client.get(),
+                                      std::chrono::milliseconds(1200)));
+
+    client.reset();
+    REQUIRE(wait_until([&] { return handler_done.load(std::memory_order_acquire); },
+                       elio::test::scaled_sec(2)));
 
     srv.stop();
     try_wake_listener(port);

@@ -1927,17 +1927,18 @@ automatic reconnect loop.
 struct server_config {
     size_t max_message_size = 16 * 1024 * 1024;
     size_t read_buffer_size = 8192;
-    std::chrono::milliseconds ping_interval{std::chrono::seconds(30)};
-    std::chrono::milliseconds ping_timeout{std::chrono::seconds(10)};
+    std::chrono::seconds ping_interval{30};
+    std::chrono::seconds ping_timeout{10};
     std::vector<std::string> subprotocols;
     bool enable_logging = true;
 };
 ```
 
 `ping_interval <= 0` disables the automatic server heartbeat. When enabled,
-`ws_server` starts a heartbeat task after a successful upgrade. The task sends a
-server ping, waits up to `ping_timeout` for a pong observed by the route
-handler's receive loop, and fails the connection closed on timeout.
+`ws_server` starts a heartbeat task after a successful upgrade. The task has up
+to `ping_timeout` to send a server ping and observe a pong from the route
+handler's receive loop; if either step misses that window, the connection fails
+closed.
 `ping_timeout <= 0` keeps periodic pings but disables timeout closure. A
 heartbeat timeout may close the transport without delivering a WebSocket close
 frame. The heartbeat does not read from the stream; route handlers remain

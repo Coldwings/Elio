@@ -95,7 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **WebSocket server heartbeat enforcement**: `ws_server` now starts the
   configured route heartbeat after a successful upgrade, sends server pings,
   records pongs observed by the route handler receive loop, and closes stale
-  connections that miss `ping_timeout`. (#937)
+  connections that cannot send the heartbeat ping or observe a pong within
+  `ping_timeout`. (#937)
 - **HTTP parser consumed-byte accounting**: Request and response parsers now
   report consumed input bytes on `need_more` paths, preserving correct buffered
   data accounting for pipelined keep-alive requests and partial response-header

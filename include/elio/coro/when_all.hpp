@@ -1,10 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <coroutine>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -32,34 +35,31 @@ using when_all_slot_t = typename when_all_slot<T>::type;
 
 template<typename... Fs>
 struct when_all_state {
-    std::atomic<size_t> remaining_;
-    std::atomic<bool> launch_complete_{false};
     coro::detail::completion_waiter_slot waiter_;
     std::tuple<std::optional<when_all_slot_t<callable_result_t<Fs>>>...> values_;
     std::exception_ptr first_exception_;
     std::atomic<bool> has_exception_{false};
     coro::cancel_source cancel_source_;
 
-    explicit when_all_state(size_t count) : remaining_(count) {}
+    explicit when_all_state(size_t count) : state_(count) {
+        assert(count <= kRemainingMask);
+    }
 
     void complete_one() {
-        if (remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            resume_waiter_if_ready();
-        }
+        complete_count(1);
     }
 
     void complete_unlaunched(size_t count) noexcept {
         if (count == 0) {
             return;
         }
-        if (remaining_.fetch_sub(count, std::memory_order_acq_rel) == count) {
-            resume_waiter_if_ready();
-        }
+        complete_count(count);
     }
 
     void finish_launching() noexcept {
-        launch_complete_.store(true, std::memory_order_release);
-        if (remaining_.load(std::memory_order_acquire) == 0) {
+        const auto previous =
+            state_.fetch_or(kLaunchComplete, std::memory_order_acq_rel);
+        if (try_claim_resume(previous | kLaunchComplete)) {
             resume_waiter();
         }
     }
@@ -67,7 +67,7 @@ struct when_all_state {
     bool set_waiter(coro::detail::completion_waiter& waiter,
                     std::coroutine_handle<> handle) noexcept {
         return waiter_.register_waiter(waiter, handle, [this] {
-            return remaining_.load(std::memory_order_acquire) == 0;
+            return ready(state_.load(std::memory_order_acquire));
         });
     }
 
@@ -96,6 +96,23 @@ struct when_all_state {
     }
 
 private:
+    static constexpr size_t kLaunchComplete =
+        size_t{1} << (std::numeric_limits<size_t>::digits - 1);
+    static constexpr size_t kResumeClaimed =
+        size_t{1} << (std::numeric_limits<size_t>::digits - 2);
+    static constexpr size_t kControlMask = kLaunchComplete | kResumeClaimed;
+    static constexpr size_t kRemainingMask = ~kControlMask;
+
+    std::atomic<size_t> state_;
+
+    static constexpr size_t remaining(size_t state) noexcept {
+        return state & kRemainingMask;
+    }
+
+    static constexpr bool ready(size_t state) noexcept {
+        return (state & kLaunchComplete) != 0 && remaining(state) == 0;
+    }
+
     void cancel_children_noexcept() noexcept {
         try {
             cancel_source_.cancel();
@@ -108,10 +125,28 @@ private:
         }
     }
 
-    void resume_waiter_if_ready() noexcept {
-        if (launch_complete_.load(std::memory_order_acquire)) {
+    void complete_count(size_t count) noexcept {
+        const auto previous =
+            state_.fetch_sub(count, std::memory_order_acq_rel);
+        assert(remaining(previous) >= count);
+        if (try_claim_resume(previous - count)) {
             resume_waiter();
         }
+    }
+
+    bool try_claim_resume(size_t state) noexcept {
+        while (ready(state)) {
+            if ((state & kResumeClaimed) != 0) {
+                return false;
+            }
+            if (state_.compare_exchange_weak(
+                    state, state | kResumeClaimed,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void resume_waiter() noexcept {
@@ -149,7 +184,7 @@ struct when_all_awaitable {
         return *this;
     }
 
-    bool await_ready() const noexcept { return false; }
+    bool await_ready() const noexcept { return sizeof...(Fs) == 0; }
 
     template<size_t I>
     void spawn_one(coro::cancel_token token) {
@@ -195,14 +230,13 @@ struct when_all_awaitable {
         state->finish_launching();
 
         // Non-empty inputs suspend and rely on complete_one() ->
-        // schedule_handle() for resumption. An empty input is already complete.
+        // schedule_handle() for resumption. Empty input is handled by
+        // await_ready().
         // schedule_handle() provides sufficient internal
         // synchronization (mutex/atomic in the scheduler's mpsc_queue) to
         // establish happens-before between sub-task data writes and the
-        // waiter's await_resume reads.  An inline fast-path (returning
-        // false when remaining_ is already 0) would lack this synchronization:
-        // the waiter's acquire load on remaining_ only synchronizes with
-        // the decrement, not the subsequent data stores in complete_one().
+        // waiter's await_resume reads. Keep non-empty completions on the
+        // scheduled path instead of mixing inline and scheduled publication.
         return should_suspend;
     }
 

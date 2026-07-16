@@ -2,6 +2,11 @@
 
 This page provides a reference for Elio's public API.
 
+For responsibility boundaries, thread-safety defaults, lifetime preconditions,
+and audit triage rules, see [[API Contracts]]. The reference below describes
+surface area and usage; the contract page defines what Elio guarantees and
+what callers must provide for each interface family.
+
 ## Namespaces
 
 | Namespace | Description |

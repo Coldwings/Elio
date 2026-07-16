@@ -78,6 +78,8 @@ Elio is built around a few key technical decisions:
 
 - [[Getting Started]] - Installation and first steps
 - [[Core Concepts]] - Coroutines, tasks, and scheduler
+- [[API Contracts]] - Per-interface library guarantees and caller
+  responsibilities for audit and triage
 - [[Signal Handling]] - Safe signal handling with signalfd
 - [[Networking]] - TCP, HTTP/1.1, and connections
 - [[HTTP2 Guide]] - HTTP/2 client usage and multiplexing

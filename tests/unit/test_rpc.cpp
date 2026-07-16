@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <sys/uio.h>
@@ -1738,6 +1739,130 @@ struct stalled_send_stream {
     }
 };
 
+struct bounded_reject_stream_state {
+    std::mutex mutex;
+    std::deque<uint8_t> inbound;
+    std::atomic<bool> shutdown{false};
+    std::atomic<bool> allow_writes{false};
+    std::atomic<size_t> total_writes_started{0};
+    std::atomic<size_t> error_writes_started{0};
+    std::atomic<size_t> error_writes_completed{0};
+    std::atomic<size_t> pong_writes_started{0};
+    std::atomic<size_t> pong_writes_completed{0};
+    std::atomic<bool> first_write_started{false};
+};
+
+void enqueue_bounded_reject_frame(bounded_reject_stream_state& state,
+                                  const frame_header& header,
+                                  const buffer_writer& payload) {
+    auto header_bytes = header.to_bytes();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    for (uint8_t byte : header_bytes) {
+        state.inbound.push_back(byte);
+    }
+    for (size_t i = 0; i < payload.size(); ++i) {
+        state.inbound.push_back(payload.data()[i]);
+    }
+}
+
+void enqueue_bounded_reject_frame(bounded_reject_stream_state& state,
+                                  const frame_header& header) {
+    buffer_writer empty;
+    enqueue_bounded_reject_frame(state, header, empty);
+}
+
+struct bounded_reject_stream {
+    std::shared_ptr<bounded_reject_stream_state> state;
+
+    explicit bounded_reject_stream(std::shared_ptr<bounded_reject_stream_state> s)
+        : state(std::move(s)) {}
+
+    elio::coro::task<elio::io::io_result> read_exactly(void* data, size_t len) {
+        auto* out = static_cast<uint8_t*>(data);
+        while (!state->shutdown.load(std::memory_order_acquire)) {
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (state->inbound.size() >= len) {
+                    for (size_t i = 0; i < len; ++i) {
+                        out[i] = state->inbound.front();
+                        state->inbound.pop_front();
+                    }
+                    co_return elio::io::io_result{static_cast<int32_t>(len), 0};
+                }
+            }
+            co_await elio::time::sleep_for(elio::test::scaled_ms(1));
+        }
+        co_return elio::io::io_result{-ECANCELED, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> write_exactly(const void*, size_t) {
+        co_return elio::io::io_result{-ENOSYS, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> write_exactly(
+        const void* data, size_t length, elio::coro::cancel_token token) {
+        auto call_index = state->total_writes_started.fetch_add(
+            1, std::memory_order_acq_rel);
+        if (call_index == 0) {
+            state->first_write_started.store(true, std::memory_order_release);
+        }
+
+        message_type type = message_type::request;
+        if (length >= frame_header_size) {
+            auto header = frame_header::from_bytes(
+                static_cast<const uint8_t*>(data));
+            type = header.type;
+            if (type == message_type::error) {
+                state->error_writes_started.fetch_add(
+                    1, std::memory_order_acq_rel);
+            } else if (type == message_type::pong) {
+                state->pong_writes_started.fetch_add(
+                    1, std::memory_order_acq_rel);
+            }
+        }
+
+        while (!state->shutdown.load(std::memory_order_acquire)) {
+            if (token.is_cancelled()) {
+                co_return elio::io::io_result{-ECANCELED, 0};
+            }
+            if (state->allow_writes.load(std::memory_order_acquire)) {
+                if (type == message_type::error) {
+                    state->error_writes_completed.fetch_add(
+                        1, std::memory_order_acq_rel);
+                } else if (type == message_type::pong) {
+                    state->pong_writes_completed.fetch_add(
+                        1, std::memory_order_acq_rel);
+                }
+                co_return elio::io::io_result{static_cast<int32_t>(length), 0};
+            }
+            auto result = co_await elio::time::sleep_for(
+                elio::test::scaled_ms(1), token);
+            if (result == elio::coro::cancel_result::cancelled) {
+                co_return elio::io::io_result{-ECANCELED, 0};
+            }
+        }
+
+        co_return elio::io::io_result{-ECONNRESET, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> writev(struct iovec*, size_t) {
+        co_return elio::io::io_result{-ENOSYS, 0};
+    }
+
+    elio::coro::task<elio::io::io_result> poll_write() {
+        co_return elio::io::io_result{0, 0};
+    }
+
+    bool is_valid() const noexcept {
+        return !state->shutdown.load(std::memory_order_acquire);
+    }
+
+    void shutdown_socket() noexcept {
+        state->shutdown.store(true, std::memory_order_release);
+        state->allow_writes.store(true, std::memory_order_release);
+    }
+};
+
 struct disconnect_after_first_valid_stream_state {
     std::atomic<size_t> is_valid_calls{0};
     std::atomic<size_t> cancellable_write_calls{0};
@@ -3104,6 +3229,321 @@ TEST_CASE("server out-of-order dispatch does not head-of-line block",
 
     // Drain naturally so any in-flight dispatched handler completes
     // before the scheduler tears down its workers — keeps ASAN clean.
+    server->stop();
+    sched.shutdown(std::chrono::seconds(30));
+}
+
+TEST_CASE("server per-session in-flight limit rejects excess request",
+          "[rpc][security][concurrent]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    using DelayReq = ConcurrencyDelayReq;
+    using DelayResp = ConcurrencyDelayResp;
+    using DelayMethod = ConcurrencyDelayMethod;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    rpc_server_config cfg;
+    cfg.max_in_flight_requests_per_session = 1;
+    cfg.request_overload_policy = rpc_request_overload_policy::reject_request;
+    cfg.frame_read_timeout = std::chrono::seconds(0);
+    auto server = std::make_shared<rpc_server<tcp_stream>>(cfg);
+
+    elio::sync::event release_first;
+    std::atomic<int> handler_started{0};
+    std::atomic<int> handler_finished{0};
+    server->register_method<DelayMethod>(
+        [&release_first, &handler_started, &handler_finished](const DelayReq& r)
+            -> coro::task<DelayResp> {
+            handler_started.fetch_add(1, std::memory_order_acq_rel);
+            co_await release_first.wait();
+            handler_finished.fetch_add(1, std::memory_order_acq_rel);
+            co_return DelayResp{r.ms};
+        });
+
+    scheduler sched(4);
+    sched.start();
+
+    sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
+        auto s = co_await lst.accept();
+        if (!s) co_return;
+        co_await server->handle_client(std::move(*s));
+    });
+
+    std::promise<void> client_done_promise;
+    auto client_done = client_done_promise.get_future();
+    std::atomic<int> second_error{static_cast<int>(rpc_error::success)};
+    std::atomic<int64_t> second_elapsed_ms{-1};
+    std::atomic<bool> first_sent{false};
+    std::atomic<bool> overlimit_oneway_sent{false};
+    std::atomic<bool> ping_ok{false};
+
+    sched.go([&, p = std::move(client_done_promise)]() mutable -> coro::task<void> {
+        auto client_opt = co_await tcp_rpc_client::connect("::1", port);
+        REQUIRE(client_opt.has_value());
+        auto client = *client_opt;
+
+        auto call_timeout = elio::test::scaled_sec(30);
+        first_sent.store(co_await client->send_oneway<DelayMethod>(DelayReq{111}),
+                         std::memory_order_release);
+        REQUIRE(first_sent.load(std::memory_order_acquire));
+
+        for (int i = 0;
+             i < 200 && handler_started.load(std::memory_order_acquire) == 0;
+             ++i) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(5));
+        }
+        REQUIRE(handler_started.load(std::memory_order_acquire) == 1);
+
+        overlimit_oneway_sent.store(
+            co_await client->send_oneway<DelayMethod>(DelayReq{222}),
+            std::memory_order_release);
+        REQUIRE(overlimit_oneway_sent.load(std::memory_order_acquire));
+
+        ping_ok.store(co_await client->ping(elio::test::scaled_sec(30)),
+                      std::memory_order_release);
+        REQUIRE(ping_ok.load(std::memory_order_acquire));
+
+        auto second_start = std::chrono::steady_clock::now();
+        auto second = co_await client->call<DelayMethod>(
+            DelayReq{333}, call_timeout);
+        auto second_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - second_start);
+        second_elapsed_ms.store(second_elapsed.count(), std::memory_order_release);
+        second_error.store(
+            static_cast<int>(second.error()), std::memory_order_release);
+
+        release_first.set();
+        for (int i = 0;
+             i < 200 && handler_finished.load(std::memory_order_acquire) == 0;
+             ++i) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(5));
+        }
+        p.set_value();
+    });
+
+    auto status = client_done.wait_for(std::chrono::seconds(60));
+    REQUIRE(status == std::future_status::ready);
+    REQUIRE(second_error.load(std::memory_order_acquire) ==
+            static_cast<int>(rpc_error::resource_exhausted));
+    REQUIRE(first_sent.load(std::memory_order_acquire));
+    REQUIRE(overlimit_oneway_sent.load(std::memory_order_acquire));
+    REQUIRE(ping_ok.load(std::memory_order_acquire));
+    REQUIRE(second_elapsed_ms.load(std::memory_order_acquire) >= 0);
+    REQUIRE(second_elapsed_ms.load(std::memory_order_acquire) <
+            elio::test::scaled_ms(500).count());
+    REQUIRE(handler_started.load(std::memory_order_acquire) == 1);
+    REQUIRE(handler_finished.load(std::memory_order_acquire) == 1);
+
+    server->stop();
+    sched.shutdown(std::chrono::seconds(30));
+}
+
+TEST_CASE("server per-session overload rejection is single-flight",
+          "[rpc][security][concurrent]") {
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    using DelayReq = ConcurrencyDelayReq;
+    using DelayResp = ConcurrencyDelayResp;
+    using DelayMethod = ConcurrencyDelayMethod;
+
+    rpc_server_config cfg;
+    cfg.max_in_flight_requests_per_session = 1;
+    cfg.request_overload_policy = rpc_request_overload_policy::reject_request;
+    cfg.frame_read_timeout = std::chrono::seconds(0);
+
+    auto server = std::make_shared<rpc_server<bounded_reject_stream>>(cfg);
+    elio::sync::event release_handler;
+    std::atomic<bool> handler_started{false};
+    std::atomic<bool> handler_cancelled{false};
+    server->register_method_with_context<DelayMethod>(
+        [&release_handler, &handler_started, &handler_cancelled](
+            const rpc_context& ctx,
+            const DelayReq& req) -> coro::task<DelayResp> {
+            handler_started.store(true, std::memory_order_release);
+
+            for (int i = 0; i < 2000; ++i) {
+                if (ctx.cancel_token.is_cancelled()) {
+                    handler_cancelled.store(true, std::memory_order_release);
+                    break;
+                }
+                co_await elio::time::sleep_for(elio::test::scaled_ms(1));
+            }
+
+            co_await release_handler.wait();
+            co_return DelayResp{req.ms};
+        });
+
+    auto state = std::make_shared<bounded_reject_stream_state>();
+    auto first = build_oneway_request(
+        1, DelayMethod::id, DelayReq{1});
+    enqueue_bounded_reject_frame(*state, first.first, first.second);
+
+    for (uint32_t request_id = 2; request_id <= 4; ++request_id) {
+        auto over_limit = build_request<DelayReq>(
+            request_id, DelayMethod::id,
+            DelayReq{static_cast<int32_t>(request_id)});
+        enqueue_bounded_reject_frame(
+            *state, over_limit.first, over_limit.second);
+    }
+
+    scheduler sched(4);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    sched.go([&, state]() -> coro::task<void> {
+        co_await server->handle_client(bounded_reject_stream{state});
+        server_done.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0;
+         i < 2000 &&
+             state->error_writes_started.load(std::memory_order_acquire) == 0;
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+
+    REQUIRE(handler_started.load(std::memory_order_acquire));
+    REQUIRE(state->error_writes_started.load(std::memory_order_acquire) == 1);
+    REQUIRE(state->error_writes_completed.load(std::memory_order_acquire) == 0);
+
+    enqueue_bounded_reject_frame(*state, build_ping(99));
+    enqueue_bounded_reject_frame(*state, build_cancel(1));
+
+    for (int i = 0;
+         i < 2000 && !handler_cancelled.load(std::memory_order_acquire);
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+
+    REQUIRE(handler_cancelled.load(std::memory_order_acquire));
+    REQUIRE(state->error_writes_started.load(std::memory_order_acquire) == 1);
+    REQUIRE(state->pong_writes_started.load(std::memory_order_acquire) == 0);
+
+    state->allow_writes.store(true, std::memory_order_release);
+    for (int i = 0;
+         i < 2000 &&
+             (state->error_writes_completed.load(std::memory_order_acquire) < 1 ||
+              state->pong_writes_completed.load(std::memory_order_acquire) < 1);
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+
+    REQUIRE(state->error_writes_completed.load(std::memory_order_acquire) == 1);
+    REQUIRE(state->pong_writes_completed.load(std::memory_order_acquire) == 1);
+
+    auto after_reset = build_request<DelayReq>(
+        5, DelayMethod::id, DelayReq{5});
+    enqueue_bounded_reject_frame(
+        *state, after_reset.first, after_reset.second);
+    for (int i = 0;
+         i < 2000 &&
+             state->error_writes_completed.load(std::memory_order_acquire) < 2;
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+    REQUIRE(state->error_writes_started.load(std::memory_order_acquire) == 2);
+    REQUIRE(state->error_writes_completed.load(std::memory_order_acquire) == 2);
+
+    release_handler.set();
+    server->stop();
+    for (int i = 0;
+         i < 2000 && !server_done.load(std::memory_order_acquire);
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+    REQUIRE(server_done.load(std::memory_order_acquire));
+    REQUIRE(sched.shutdown(std::chrono::seconds(30)));
+}
+
+TEST_CASE("server per-session in-flight limit can close the session",
+          "[rpc][security][concurrent]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    using DelayReq = ConcurrencyDelayReq;
+    using DelayResp = ConcurrencyDelayResp;
+    using DelayMethod = ConcurrencyDelayMethod;
+
+    auto listener_opt = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener_opt.has_value());
+    uint16_t port = listener_opt->local_address().port();
+
+    rpc_server_config cfg;
+    cfg.max_in_flight_requests_per_session = 1;
+    cfg.request_overload_policy = rpc_request_overload_policy::close_session;
+    cfg.frame_read_timeout = std::chrono::seconds(0);
+    auto server = std::make_shared<rpc_server<tcp_stream>>(cfg);
+
+    elio::sync::event release_first;
+    std::atomic<int> handler_started{0};
+    server->register_method<DelayMethod>(
+        [&release_first, &handler_started](const DelayReq& r)
+            -> coro::task<DelayResp> {
+            handler_started.fetch_add(1, std::memory_order_acq_rel);
+            co_await release_first.wait();
+            co_return DelayResp{r.ms};
+        });
+
+    scheduler sched(4);
+    sched.start();
+
+    sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
+        auto s = co_await lst.accept();
+        if (!s) co_return;
+        co_await server->handle_client(std::move(*s));
+    });
+
+    std::promise<void> client_done_promise;
+    auto client_done = client_done_promise.get_future();
+    std::atomic<int> second_error{static_cast<int>(rpc_error::success)};
+    std::atomic<int> first_error{static_cast<int>(rpc_error::success)};
+
+    sched.go([&, p = std::move(client_done_promise)]() mutable -> coro::task<void> {
+        auto client_opt = co_await tcp_rpc_client::connect("::1", port);
+        REQUIRE(client_opt.has_value());
+        auto client = *client_opt;
+        auto* current_sched = elio::runtime::scheduler::current();
+        REQUIRE(current_sched != nullptr);
+
+        auto call_timeout = std::chrono::seconds(5);
+        auto first = current_sched->go_joinable(
+            [c = client, call_timeout]() -> coro::task<int> {
+                auto r = co_await c->call<DelayMethod>(DelayReq{111}, call_timeout);
+                co_return static_cast<int>(r.error());
+            });
+
+        for (int i = 0;
+             i < 200 && handler_started.load(std::memory_order_acquire) == 0;
+             ++i) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(5));
+        }
+        REQUIRE(handler_started.load(std::memory_order_acquire) == 1);
+
+        auto second = co_await client->call<DelayMethod>(
+            DelayReq{222}, call_timeout);
+        second_error.store(
+            static_cast<int>(second.error()), std::memory_order_release);
+
+        release_first.set();
+        first_error.store(co_await std::move(first), std::memory_order_release);
+        p.set_value();
+    });
+
+    auto status = client_done.wait_for(std::chrono::seconds(60));
+    REQUIRE(status == std::future_status::ready);
+    REQUIRE(second_error.load(std::memory_order_acquire) ==
+            static_cast<int>(rpc_error::connection_closed));
+    REQUIRE(first_error.load(std::memory_order_acquire) ==
+            static_cast<int>(rpc_error::connection_closed));
+    REQUIRE(handler_started.load(std::memory_order_acquire) == 1);
+
     server->stop();
     sched.shutdown(std::chrono::seconds(30));
 }

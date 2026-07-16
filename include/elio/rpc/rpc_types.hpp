@@ -573,6 +573,7 @@ enum class rpc_error : uint32_t {
     serialization_error = 5,
     internal_error = 6,
     cancelled = 7,
+    resource_exhausted = 8,
 };
 
 /// Convert error code to string
@@ -586,6 +587,7 @@ inline const char* rpc_error_str(rpc_error err) {
         case rpc_error::serialization_error: return "serialization error";
         case rpc_error::internal_error: return "internal error";
         case rpc_error::cancelled: return "cancelled";
+        case rpc_error::resource_exhausted: return "resource exhausted";
         default: return "unknown error";
     }
 }

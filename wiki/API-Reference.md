@@ -2384,10 +2384,10 @@ at the protocol layer.
 ```cpp
 class tls_stream {
 public:
-    tls_stream(tcp_stream tcp, tls_context& ctx);
+    tls_stream(net::tcp_stream tcp, tls_context& ctx);
     
     // Set SNI hostname
-    void set_hostname(const std::string& hostname);
+    void set_hostname(std::string_view hostname);
     
     // Perform TLS handshake (awaitable)
     /* awaitable */ handshake();
@@ -2409,7 +2409,7 @@ public:
     /* awaitable */ write_exactly(std::string_view data, coro::cancel_token token);
     
     // Get negotiated ALPN protocol
-    std::string alpn_protocol() const;
+    std::string_view alpn_protocol() const;
 };
 ```
 

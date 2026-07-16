@@ -1500,11 +1500,13 @@ public:
 };
 
 // Connect to UDS address/path (awaitable, returns std::optional<uds_stream>)
-/* awaitable */ uds_connect(const unix_address& addr);
+/* awaitable */ uds_connect(const unix_address& addr,
+                            const uds_options& opts = {});
 /* awaitable */ uds_connect(const unix_address& addr,
                             coro::cancel_token token,
                             const uds_options& opts = {});
-/* awaitable */ uds_connect(std::string_view path);
+/* awaitable */ uds_connect(std::string_view path,
+                            const uds_options& opts = {});
 /* awaitable */ uds_connect(std::string_view path,
                             coro::cancel_token token,
                             const uds_options& opts = {});

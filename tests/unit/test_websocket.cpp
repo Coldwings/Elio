@@ -419,6 +419,26 @@ TEST_CASE("WebSocket frame parsing", "[websocket][frame]") {
         
         REQUIRE(result.error);
     }
+
+    SECTION("reject invalid opcode from first byte before header completes") {
+        uint8_t invalid[] = {0x83};  // opcode 3 is reserved
+
+        frame_header header;
+        auto result = parse_frame_header(invalid, 1, header);
+
+        REQUIRE(result.error);
+        REQUIRE(result.error_msg.find("Invalid opcode") != std::string::npos);
+    }
+
+    SECTION("reject reserved bit from first byte before header completes") {
+        uint8_t invalid[] = {0xC1};  // FIN + RSV1 + text
+
+        frame_header header;
+        auto result = parse_frame_header(invalid, 1, header);
+
+        REQUIRE(result.error);
+        REQUIRE(result.error_msg.find("Reserved bits") != std::string::npos);
+    }
     
     SECTION("reject control frame with payload > 125") {
         // Manually construct invalid close frame
@@ -1235,6 +1255,20 @@ TEST_CASE("WebSocket route parameters are exposed to connections",
     REQUIRE(conn.param("user") == "alice");
     REQUIRE(conn.param("missing").empty());
     REQUIRE(conn.params().size() == 2);
+}
+
+TEST_CASE("ws_connection rejects invalid partial pipelined first frame",
+          "[websocket][server][regression]") {
+    ws_connection conn(static_cast<elio::net::tcp_stream*>(nullptr));
+    conn.set_open();
+
+    std::string invalid;
+    invalid.push_back(static_cast<char>(0x83));
+
+    auto code = conn.seed_pipelined_bytes(invalid);
+
+    REQUIRE(code.has_value());
+    REQUIRE(*code == close_code::protocol_error);
 }
 
 TEST_CASE("ws_connection processes queued ping before later data",

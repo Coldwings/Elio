@@ -256,10 +256,16 @@ public:
 
     /// Hand the parser any bytes that arrived in the same TCP segment as the
     /// HTTP upgrade request (pipelined first frame).  Must be called before
-    /// the receive loop starts.  No-op if the buffer is empty.
-    void seed_pipelined_bytes(std::string_view bytes) {
-        if (bytes.empty()) return;
-        parser_.parse(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+    /// the receive loop starts.  Returns the close code if those bytes already
+    /// violate the WebSocket framing contract.
+    std::optional<close_code> seed_pipelined_bytes(std::string_view bytes) {
+        if (bytes.empty()) return std::nullopt;
+        ssize_t parsed = parser_.parse(
+            reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+        if (parsed < 0 || parser_.has_error()) {
+            return parser_.error_close_code();
+        }
+        return std::nullopt;
     }
 
 private:
@@ -867,7 +873,11 @@ private:
             conn.set_open(upgrade.accepted_protocol);
             conn.set_max_message_size(ws_route->config.max_message_size);
             conn.set_buffer_size(ws_route->config.read_buffer_size);
-            conn.seed_pipelined_bytes(pipelined);
+            if (auto close_code = conn.seed_pipelined_bytes(pipelined)) {
+                ELIO_LOG_ERROR("WebSocket pipelined first frame is invalid");
+                co_await conn.close(*close_code);
+                co_return;
+            }
             for (const auto& [name, value] : ws_params) {
                 conn.set_param(name, value);
             }

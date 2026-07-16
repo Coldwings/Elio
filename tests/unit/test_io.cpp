@@ -1029,6 +1029,31 @@ TEST_CASE("epoll_backend write operation registration", "[io][epoll][write]") {
 
 using namespace elio::net;
 
+namespace {
+
+int count_open_fds_for_uds_test() {
+#ifdef __linux__
+    DIR* dir = ::opendir("/proc/self/fd");
+    if (!dir) {
+        return -1;
+    }
+
+    int count = 0;
+    while (auto* entry = ::readdir(dir)) {
+        if (std::strcmp(entry->d_name, ".") != 0 &&
+            std::strcmp(entry->d_name, "..") != 0) {
+            ++count;
+        }
+    }
+    ::closedir(dir);
+    return count;
+#else
+    return -1;
+#endif
+}
+
+} // namespace
+
 TEST_CASE("unix_address basic operations", "[uds][address]") {
     SECTION("default constructor") {
         unix_address addr;
@@ -1137,6 +1162,36 @@ TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
         
         client_thread.join();
     }
+}
+
+TEST_CASE("UDS bind validates address before side effects",
+          "[uds][listener][contract]") {
+    std::string dir = "/tmp/elio_uds_overlong_" + std::to_string(getpid());
+    REQUIRE((::mkdir(dir.c_str(), 0700) == 0 || errno == EEXIST));
+
+    std::string path = dir + "/" + std::string(120, 'x');
+    struct sockaddr_un sample_addr {};
+    REQUIRE(path.size() > sizeof(sample_addr.sun_path) - 1);
+
+    int fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    REQUIRE(fd >= 0);
+    REQUIRE(::write(fd, "sentinel", 8) == 8);
+    REQUIRE(::close(fd) == 0);
+
+    const int before_fds = count_open_fds_for_uds_test();
+
+    REQUIRE_THROWS_AS(uds_listener::bind(unix_address(path)), std::invalid_argument);
+
+    struct stat st {};
+    REQUIRE(::stat(path.c_str(), &st) == 0);
+
+    const int after_fds = count_open_fds_for_uds_test();
+    if (before_fds >= 0 && after_fds >= 0) {
+        REQUIRE(after_fds == before_fds);
+    }
+
+    REQUIRE(::unlink(path.c_str()) == 0);
+    REQUIRE(::rmdir(dir.c_str()) == 0);
 }
 
 TEST_CASE("UDS connect", "[uds][connect]") {

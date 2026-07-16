@@ -559,6 +559,11 @@ public:
         const unix_address& addr,
         const uds_options& opts = {}) 
     {
+        // Validate and materialize the address before creating sockets or
+        // unlinking filesystem paths. Overlong UDS addresses throw here.
+        auto sa = addr.to_sockaddr();
+        socklen_t sa_len = addr.sockaddr_len();
+
         int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) {
             return std::nullopt;
@@ -587,8 +592,6 @@ public:
         }
         
         // Bind
-        auto sa = addr.to_sockaddr();
-        socklen_t sa_len = addr.sockaddr_len();
         if (::bind(fd, reinterpret_cast<struct sockaddr*>(&sa), sa_len) < 0) {
             int err = errno;
             ::close(fd);

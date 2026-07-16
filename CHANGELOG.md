@@ -59,7 +59,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI and package validation coverage**: Pull-request CI now keeps required
   checks green for docs-only changes, runs registered CTest/package checks,
   verifies HTTP/2 option dependencies and optional installed targets, compiles
-  TCP benchmark targets, and bounds release benchmark runtime.
+  TCP benchmark targets, bounds release benchmark runtime, and retries apt
+  dependency installs on arm64 runners. (#895)
+- **API responsibility boundaries**: Added wiki/API-reference guidance that
+  separates Elio library guarantees from caller responsibilities across
+  runtime, networking, TLS, HTTP, WebSocket, SSE, RPC, synchronization, file,
+  hash, RDMA, logging, and debug APIs. Security guidance now points audits at
+  those boundaries before expanding library responsibility. (#870, #889, #921)
+- **Documented HTTP/WebSocket/RPC package contracts**: Clarified
+  `server_config::max_request_size` as an aggregate HTTP request-byte cap,
+  documented WebSocket reconnects as caller-managed, defined `net::stream`
+  concurrency and RPC stream/client lifecycle contracts, described RPC CRC32 as
+  non-cryptographic corruption detection rather than a security boundary, and
+  distinguished HTTP/2 nghttp2 FetchContent source builds from installed-package
+  dependency discovery. (#888, #902, #903, #922, #923, #924, #926)
 
 ### Deprecated
 
@@ -70,6 +83,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HTTP parser consumed-byte accounting**: Request and response parsers now
+  report consumed input bytes on `need_more` paths, preserving correct buffered
+  data accounting for pipelined keep-alive requests and partial response-header
+  reads. (#908, #911)
+- **WebSocket upgrade and client-handshake hardening**: WebSocket upgrade
+  request size accounting now counts the HTTP upgrade request but excludes
+  post-upgrade frame bytes, client upgrade responses validate mandatory
+  `Upgrade`/`Connection` semantics and enforce configured header count/line
+  limits, and invalid pipelined server frames are rejected during handshake
+  instead of leaking parser state into a later connection attempt. (#890, #908,
+  #909, #919)
+- **SSE and HTTP/1.1 boundary validation**: SSE response parsing now enforces
+  configured response-header limits, HTTP/1.1 requests reject missing or
+  duplicate `Host` headers where required, and chunked transfer parsing rejects
+  malformed chunk metadata and trailers at the parser boundary. (#904, #891,
+  #892)
+- **RPC client timeout and control-frame routing**: RPC calls now cover the
+  send and frame-read paths with configured timeouts, and pong completions route
+  to the pending ping operation instead of being confused with call responses.
+  (#893, #896, #897)
+- **RDMA single-buffer length bounds**: High-level RDMA single-buffer
+  send/receive/read/write operations now fail before posting when the local
+  buffer length cannot fit the 32-bit SGE length field. (#905)
 - **SSE Last-Event-ID contract handling**: SSE parsing now applies valid `id`
   fields to the Last-Event-ID buffer even when no event is dispatched, and
   honors empty `id:` fields as cursor resets for reconnects. (#860)

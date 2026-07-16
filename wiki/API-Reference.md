@@ -1666,6 +1666,17 @@ struct server_config {
 };
 ```
 
+`max_request_size` is an aggregate HTTP request-byte cap. It includes the
+request line, headers, and body for the request currently being parsed. The
+server rejects a request with `413 Payload Too Large` when parsed request bytes,
+buffered request bytes, or the accumulated body exceed the configured cap.
+`http::server` can also reject an oversized declared `Content-Length` before
+allocating the body. For WebSocket upgrades, only the HTTP upgrade request is
+counted; bytes buffered after the completed upgrade belong to the WebSocket
+stream and are governed by WebSocket frame/message limits instead. Callers must
+choose a value that covers the largest accepted combination of request line,
+headers, and body, rather than treating the setting as a body-only limit.
+
 `keep_alive_timeout` bounds each incoming request handled by `http::server`
 and the HTTP upgrade request read handled by `websocket::ws_server`. For
 `server::listen_tls()` and `websocket::ws_server::listen_tls()`, it also bounds

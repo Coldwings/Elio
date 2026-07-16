@@ -8,7 +8,7 @@
 /// - Automatic upgrade handshake
 /// - Message send/receive with async I/O
 /// - Ping/pong heartbeat support
-/// - Reconnection support
+/// - Explicit caller-managed reconnects via a new connect() attempt
 
 #include <elio/http/websocket_frame.hpp>
 #include <elio/http/websocket_handshake.hpp>
@@ -78,6 +78,10 @@ public:
     /// Connect to a WebSocket server
     /// @param url WebSocket URL (ws:// or wss://)
     /// @return true on success, false on failure
+    ///
+    /// This is a single connection attempt. The client does not automatically
+    /// reconnect after failure or disconnect; callers choose retry/backoff
+    /// policy and may call connect() again when the client is closed.
     coro::task<bool> connect(std::string_view url_str) {
         return connect_impl(url_str, coro::cancel_token{});
     }
@@ -86,6 +90,10 @@ public:
     /// @param url WebSocket URL (ws:// or wss://)
     /// @param token Cancellation token
     /// @return true on success, false on failure
+    ///
+    /// This is a single connection attempt. The client does not automatically
+    /// reconnect after failure or disconnect; callers choose retry/backoff
+    /// policy and may call connect() again when the client is closed.
     coro::task<bool> connect(std::string_view url_str, coro::cancel_token token) {
         return connect_impl(url_str, std::move(token));
     }

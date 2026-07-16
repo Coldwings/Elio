@@ -143,6 +143,13 @@ coro::task<void> connect_example() {
 }
 ```
 
+`ws_client::connect()` performs one connection attempt and does not install an
+automatic reconnect loop. If `connect()` fails, or a later operation observes a
+closed or failed connection, the caller decides whether to retry, how long to
+back off, whether application messages are safe to replay, and which connection
+state should be restored. A caller-managed reconnect can call `connect()` again
+once the client is closed.
+
 ### WebSocket Frame Types
 
 | Opcode | Name | Description |
@@ -309,7 +316,7 @@ data: This is line 2
 |---------|-----|-----------|
 | Direction | Server → Client only | Bidirectional |
 | Protocol | HTTP | Custom over TCP |
-| Reconnection | Automatic | Manual |
+| Reconnection | Automatic in browser `EventSource`; configurable in `sse_client` | Caller-managed; no automatic `ws_client` loop |
 | Browser support | EventSource API | WebSocket API |
 | Complexity | Simple | More complex |
 | Best for | Notifications, feeds | Chat, games, real-time |

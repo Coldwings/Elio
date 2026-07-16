@@ -9,6 +9,7 @@
 #include <span>
 #include <string_view>
 #include <sys/uio.h>
+#include <type_traits>
 #include <tuple>
 #include <utility>
 
@@ -40,6 +41,17 @@ coro::task<int> async_main(int, char**) {
     router.get("/", [](http::context&) -> coro::task<http::response> {
         co_return http::response::ok("Hello!");
     });
+    server_config ws_config;
+    static_assert(std::is_same_v<decltype(ws_config.ping_interval),
+                                 std::chrono::seconds>);
+    static_assert(std::is_same_v<decltype(ws_config.ping_timeout),
+                                 std::chrono::seconds>);
+    ws_config.ping_interval = std::chrono::seconds(30);
+    ws_config.ping_timeout = std::chrono::seconds(10);
+    router.websocket("/ws", [](ws_connection& conn) -> coro::task<void> {
+        while (co_await conn.receive()) {
+        }
+    }, ws_config);
     co_return 0;
 }
 

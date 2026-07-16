@@ -1536,11 +1536,12 @@ Type-erased wrapper over `tcp_stream` and, when TLS support is enabled,
 
 `net::stream` follows the concurrency contract of its active transport.
 TCP-backed streams allow one reader and one writer concurrently, matching
-`tcp_stream`. TLS-backed streams require external serialization for
-`read`/`write`/`close` because they wrap `tls_stream` and OpenSSL `SSL*` state.
-Code that does not branch on the active variant should use the stricter TLS
-rule. Concurrent `close()` with any read/write operation requires external
-serialization for all variants.
+`tcp_stream`. After the handshake completes, TLS-backed streams also allow one
+read-side operation and one write-side operation to overlap while waiting for
+socket readiness; `tls_stream` serializes direct OpenSSL `SSL*` state access
+internally. Multiple concurrent reads, multiple concurrent writes,
+handshake-starting operations, or `close()` racing with any read/write operation
+require external serialization for all variants.
 
 ```cpp
 class stream {
@@ -1921,6 +1922,30 @@ struct client_config : http::base_client_config {
 verification, DNS, and response-header limit settings. It does not define an
 automatic reconnect loop.
 
+### `websocket::server_config`
+
+```cpp
+struct server_config {
+    size_t max_message_size = 16 * 1024 * 1024;
+    size_t read_buffer_size = 8192;
+    std::chrono::seconds ping_interval{30};
+    std::chrono::seconds ping_timeout{10};
+    std::vector<std::string> subprotocols;
+    bool enable_logging = true;
+};
+```
+
+`ping_interval <= 0` disables the automatic server heartbeat. When enabled,
+`ws_server` starts a heartbeat task after a successful upgrade. The task has up
+to `ping_timeout` to send a server ping and observe a pong from the route
+handler's receive loop; if either step misses that window, the connection fails
+closed.
+`ping_timeout <= 0` keeps periodic pings but disables timeout closure. A
+heartbeat timeout may close the transport without delivering a WebSocket close
+frame. The heartbeat does not read from the stream; route handlers remain
+responsible for running the single `receive()` loop that processes peer frames
+and records pongs.
+
 ### `websocket::ws_client`
 
 ```cpp
@@ -1976,11 +2001,15 @@ public:
     /* awaitable */ close(close_code code = close_code::normal,
                           std::string_view reason = "");
     /* awaitable */ receive();
+    /* awaitable */ run_heartbeat(std::chrono::milliseconds ping_interval,
+                                  std::chrono::milliseconds ping_timeout,
+                                  coro::cancel_token token = {});
 };
 ```
 
-Only one coroutine should receive from a connection at a time. Send helpers are
-serialized so concurrent senders do not interleave WebSocket frames.
+Only one coroutine should receive from a connection at a time. Send helpers,
+including heartbeat pings and automatic pong/close responses, are serialized so
+concurrent senders do not interleave WebSocket frames.
 
 ### `websocket::ws_router` and `ws_server`
 
@@ -2344,6 +2373,13 @@ enum class tls_mode {
 ### `tls_stream`
 
 TLS-wrapped TCP stream.
+
+After the TLS handshake completes, `tls_stream` serializes direct OpenSSL
+`SSL*` state access internally. One read-side operation and one write-side
+operation may overlap while either side is suspended on socket readiness.
+Callers must still serialize handshake-starting operations, multiple concurrent
+reads, multiple concurrent writes, and shutdown/destruction against active I/O
+at the protocol layer.
 
 ```cpp
 class tls_stream {

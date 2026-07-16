@@ -1648,6 +1648,15 @@ HTTP downgrades.
 `base_client_config`, including timeout, read-buffer, TLS verification, DNS
 resolution/cache, address rotation, and response-header limit settings.
 
+`websocket::client_config` does not define automatic reconnect settings.
+`websocket::ws_client::connect()` is a single connection attempt. On connect
+failure, close, or read error, Elio reports the result through the operation
+return value, `errno` where applicable, and connection state. Cancelling an
+operation reports cancellation for that operation, but it is not an automatic
+reconnect trigger. The caller owns retry/backoff policy, idempotency, message
+replay, and any application session restoration. Callers may explicitly call
+`connect()` again after the client is closed.
+
 Cancellation tokens are independent from configured deadlines. Passing a token
 to HTTP, WebSocket, or SSE client operations cancels the underlying pending I/O
 instead of only checking the token between I/O calls.

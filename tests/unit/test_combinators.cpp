@@ -149,6 +149,46 @@ struct launch_throwing_move_callable {
     }
 };
 
+struct resume_probe {
+    struct promise_type {
+        resume_probe get_return_object() noexcept {
+            return resume_probe{
+                std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_never initial_suspend() noexcept { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        void return_void() noexcept {}
+        void unhandled_exception() noexcept { std::terminate(); }
+    };
+
+    explicit resume_probe(std::coroutine_handle<promise_type> handle) noexcept
+        : handle_(handle) {}
+
+    resume_probe(resume_probe&& other) noexcept
+        : handle_(other.handle_) {
+        other.handle_ = {};
+    }
+
+    resume_probe(const resume_probe&) = delete;
+    resume_probe& operator=(const resume_probe&) = delete;
+
+    ~resume_probe() {
+        if (handle_) {
+            handle_.destroy();
+        }
+    }
+
+    std::coroutine_handle<> handle() const noexcept { return handle_; }
+
+private:
+    std::coroutine_handle<promise_type> handle_;
+};
+
+resume_probe make_resume_probe(std::atomic<int>& resumes) {
+    co_await std::suspend_always{};
+    resumes.fetch_add(1, std::memory_order_release);
+}
+
 } // namespace
 
 // --- when_all tests ---
@@ -249,6 +289,18 @@ TEST_CASE("when_all single task", "[sync][combinators]") {
     sched.shutdown();
 }
 
+TEST_CASE("when_all with no tasks completes immediately",
+          "[sync][combinators][regression]") {
+    auto test = []() -> task<void> {
+        auto result = co_await when_all();
+        static_assert(std::tuple_size_v<decltype(result)> == 0);
+    };
+
+    runtime::scheduler sched(1);
+    sched.go(test);
+    sched.shutdown();
+}
+
 TEST_CASE("when_all does not resume while launching children",
           "[sync][combinators][regression]") {
     launch_blocker blocker;
@@ -306,6 +358,62 @@ TEST_CASE("when_all propagates launch-time callable move failure",
     REQUIRE(sched.shutdown(scaled_ms(2000)));
     REQUIRE(caught.load(std::memory_order_acquire));
     REQUIRE(first_completed.load(std::memory_order_acquire));
+}
+
+TEST_CASE("when_all state wakes when completion follows launch",
+          "[sync][combinators][regression]") {
+    auto child = []() -> task<int> { co_return 1; };
+    using state_t = elio::detail::when_all_state<decltype(child)>;
+
+    state_t state(1);
+    coro::detail::completion_waiter waiter(state.waiter_);
+    std::atomic<int> resumes{0};
+    auto probe = make_resume_probe(resumes);
+
+    REQUIRE(state.set_waiter(waiter, probe.handle()));
+    state.finish_launching();
+    REQUIRE(resumes.load(std::memory_order_acquire) == 0);
+
+    state.complete_one();
+    REQUIRE(resumes.load(std::memory_order_acquire) == 1);
+}
+
+TEST_CASE("when_all state wakes when launch follows completion",
+          "[sync][combinators][regression]") {
+    auto child = []() -> task<int> { co_return 1; };
+    using state_t = elio::detail::when_all_state<decltype(child)>;
+
+    state_t state(1);
+    coro::detail::completion_waiter waiter(state.waiter_);
+    std::atomic<int> resumes{0};
+    auto probe = make_resume_probe(resumes);
+
+    REQUIRE(state.set_waiter(waiter, probe.handle()));
+    state.complete_one();
+    REQUIRE(resumes.load(std::memory_order_acquire) == 0);
+
+    state.finish_launching();
+    REQUIRE(resumes.load(std::memory_order_acquire) == 1);
+}
+
+TEST_CASE("when_all state wakes after unlaunched children are accounted",
+          "[sync][combinators][regression]") {
+    auto child = []() -> task<int> { co_return 1; };
+    using state_t =
+        elio::detail::when_all_state<decltype(child), decltype(child)>;
+
+    state_t state(2);
+    coro::detail::completion_waiter waiter(state.waiter_);
+    std::atomic<int> resumes{0};
+    auto probe = make_resume_probe(resumes);
+
+    REQUIRE(state.set_waiter(waiter, probe.handle()));
+    state.complete_one();
+    state.complete_unlaunched(1);
+    REQUIRE(resumes.load(std::memory_order_acquire) == 0);
+
+    state.finish_launching();
+    REQUIRE(resumes.load(std::memory_order_acquire) == 1);
 }
 
 // --- when_any tests ---

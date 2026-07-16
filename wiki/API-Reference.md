@@ -1371,20 +1371,41 @@ TCP connection.
 class tcp_stream {
 public:
     tcp_stream(tcp_stream&& other) noexcept;
+    bool is_valid() const noexcept;
     
     // Read data (awaitable)
     /* awaitable */ read(void* buffer, size_t size);
     /* awaitable */ read(void* buffer, size_t size, coro::cancel_token token);
+    template<typename T>
+    /* awaitable */ read(std::span<T> buffer);
+    template<typename T>
+    /* awaitable */ read(std::span<T> buffer, coro::cancel_token token);
     
     // Write data (awaitable)
     /* awaitable */ write(const void* data, size_t size);
     /* awaitable */ write(const void* data, size_t size, coro::cancel_token token);
+    template<typename T>
+    /* awaitable */ write(std::span<const T> buffer);
+    template<typename T>
+    /* awaitable */ write(std::span<const T> buffer, coro::cancel_token token);
+    /* awaitable */ write(std::string_view data);
+    /* awaitable */ write(std::string_view data, coro::cancel_token token);
 
     // Exact-length helpers (awaitable)
     /* awaitable */ read_exactly(void* buffer, size_t size);
     /* awaitable */ read_exactly(void* buffer, size_t size, coro::cancel_token token);
+    template<typename T>
+    /* awaitable */ read_exactly(std::span<T> buffer);
+    template<typename T>
+    /* awaitable */ read_exactly(std::span<T> buffer, coro::cancel_token token);
     /* awaitable */ write_exactly(const void* data, size_t size);
     /* awaitable */ write_exactly(const void* data, size_t size, coro::cancel_token token);
+    template<typename T>
+    /* awaitable */ write_exactly(std::span<const T> buffer);
+    template<typename T>
+    /* awaitable */ write_exactly(std::span<const T> buffer, coro::cancel_token token);
+    /* awaitable */ write_exactly(std::string_view data);
+    /* awaitable */ write_exactly(std::string_view data, coro::cancel_token token);
     
     // Scatter-gather socket write attempt (awaitable) - may return a short write
     /* awaitable */ writev(struct iovec* iovecs, size_t count);
@@ -1402,10 +1423,22 @@ public:
     
     // Get peer address
     std::optional<socket_address> peer_address() const;
+
+    // Lifecycle and socket options
+    /* awaitable */ close();
+    void shutdown_socket() noexcept;
+    bool shutdown(int how) noexcept;
+    bool set_no_delay(bool enable);
+    bool set_keep_alive(bool enable);
 };
 
 // peer_address() returns the generic socket_address wrapper so callers can
 // inspect IPv4 or IPv6 peers.
+// close() transfers the descriptor to the async close operation and invalidates
+// the stream object. shutdown_socket() interrupts both socket directions without
+// releasing the descriptor; shutdown(int) is the direct half-close wrapper.
+// Multiple reads, multiple writes, and close/shutdown racing with I/O require
+// external serialization.
 
 // Connect to address (awaitable, returns std::optional<tcp_stream>)
 /* awaitable */ tcp_connect(const ipv4_address& addr, const tcp_options& opts = {});
@@ -1469,21 +1502,40 @@ public:
 class uds_stream {
 public:
     uds_stream(uds_stream&& other) noexcept;
+    bool is_valid() const noexcept;
 
     // Read data (awaitable)
     /* awaitable */ read(void* buffer, size_t size);
     /* awaitable */ read(void* buffer, size_t size, coro::cancel_token token);
+    template<typename T>
+    /* awaitable */ read(std::span<T> buffer);
+    template<typename T>
+    /* awaitable */ read(std::span<T> buffer, coro::cancel_token token);
 
     // Write data (awaitable)
     /* awaitable */ write(const void* data, size_t size);
     /* awaitable */ write(const void* data, size_t size, coro::cancel_token token);
+    template<typename T>
+    /* awaitable */ write(std::span<const T> buffer);
+    template<typename T>
+    /* awaitable */ write(std::span<const T> buffer, coro::cancel_token token);
+    /* awaitable */ write(std::string_view data);
     /* awaitable */ write(std::string_view data, coro::cancel_token token);
 
     // Exact-length helpers (awaitable)
     /* awaitable */ read_exactly(void* buffer, size_t size);
     /* awaitable */ read_exactly(void* buffer, size_t size, coro::cancel_token token);
+    template<typename T>
+    /* awaitable */ read_exactly(std::span<T> buffer);
+    template<typename T>
+    /* awaitable */ read_exactly(std::span<T> buffer, coro::cancel_token token);
     /* awaitable */ write_exactly(const void* data, size_t size);
     /* awaitable */ write_exactly(const void* data, size_t size, coro::cancel_token token);
+    template<typename T>
+    /* awaitable */ write_exactly(std::span<const T> buffer);
+    template<typename T>
+    /* awaitable */ write_exactly(std::span<const T> buffer, coro::cancel_token token);
+    /* awaitable */ write_exactly(std::string_view data);
     /* awaitable */ write_exactly(std::string_view data, coro::cancel_token token);
 
     // Scatter-gather socket write attempt and readiness polling
@@ -1496,6 +1548,11 @@ public:
     // Socket metadata and Linux credential passing
     int fd() const noexcept;
     std::optional<unix_address> peer_address() const;
+    /* awaitable */ close();
+    void shutdown_socket() noexcept;
+    bool shutdown(int how) noexcept;
+    bool set_recv_buffer(int size);
+    bool set_send_buffer(int size);
     bool set_pass_credentials(bool enable);
 };
 
@@ -1527,7 +1584,10 @@ failures after address conversion succeeds, as `std::nullopt` with `errno` set;
 UDS streams share the same concurrency contract as TCP streams: one reader and
 one writer may operate concurrently, but multiple concurrent reads, multiple
 concurrent writes, or a read racing with `close()` require external
-serialization.
+serialization. `shutdown_socket()` interrupts both directions without releasing
+the descriptor; `shutdown(int)` is the direct half-close wrapper. Buffer setters
+wrap `SO_RCVBUF` and `SO_SNDBUF`, while `set_pass_credentials()` wraps
+`SO_PASSCRED`.
 
 ### `net::stream`
 

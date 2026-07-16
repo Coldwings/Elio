@@ -310,7 +310,10 @@ private:
 
 /// HTTP server configuration
 struct server_config {
-    size_t max_request_size = 10 * 1024 * 1024;  ///< Max request body size (10MB)
+    /// Max aggregate HTTP request bytes: request line, headers, and body.
+    /// For WebSocket upgrades, bytes after the completed HTTP upgrade request
+    /// belong to the WebSocket stream and are not counted here.
+    size_t max_request_size = 10 * 1024 * 1024;
     size_t read_buffer_size = 8192;               ///< Read buffer size
     std::chrono::seconds keep_alive_timeout{30};  ///< Request and inbound TLS handshake timeout
     size_t max_keep_alive_requests = 100;         ///< Max requests per connection

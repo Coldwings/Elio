@@ -90,6 +90,12 @@ Named `:param` captures are stored on the `ws_connection` passed to the
 handler. Use `conn.param("name")` for one value or `conn.params()` to inspect
 all captured path parameters.
 
+The HTTP upgrade request is governed by `http::server_config::max_request_size`.
+That limit counts the upgrade request line, headers, and body, but does not
+count bytes after the upgrade request has completed. Post-upgrade WebSocket
+frame and message bytes are governed by `websocket::server_config` limits such
+as `max_message_size`.
+
 ### WebSocket Client
 
 ```cpp

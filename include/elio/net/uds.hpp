@@ -239,6 +239,43 @@ public:
     coro::task<io::io_result> read(std::span<T> buffer) {
         return read(buffer.data(), buffer.size_bytes());
     }
+
+    /// Async read, cancellable by ``token``.
+    coro::task<io::io_result> read(void* buffer, size_t length,
+                                   coro::cancel_token token) {
+        while (true) {
+            if (token.is_cancelled()) {
+                co_return io::io_result{-ECANCELED, 0};
+            }
+
+            auto result = co_await io::async_recv(fd_, buffer, length, 0, token);
+            if (result.was_cancelled() || result.io.result == -ECANCELED) {
+                co_return io::io_result{-ECANCELED, 0};
+            }
+            if (result.io.result == -EAGAIN ||
+                result.io.result == -EWOULDBLOCK) {
+                auto ready = co_await io::async_poll_read(fd_, token);
+                if (ready.was_cancelled() || ready.io.result == -ECANCELED) {
+                    co_return io::io_result{-ECANCELED, 0};
+                }
+                if (ready.io.result < 0) {
+                    co_return ready.io;
+                }
+                continue;
+            }
+            if (result.io.result == -EINTR) {
+                continue;
+            }
+            co_return result.io;
+        }
+    }
+
+    /// Async read into span, cancellable by ``token``.
+    template<typename T>
+    coro::task<io::io_result> read(std::span<T> buffer,
+                                   coro::cancel_token token) {
+        return read(buffer.data(), buffer.size_bytes(), std::move(token));
+    }
     
     /// Async write.
     ///
@@ -391,6 +428,41 @@ public:
     template<typename T>
     coro::task<io::io_result> read_exactly(std::span<T> buffer) {
         return read_exactly(buffer.data(), buffer.size_bytes());
+    }
+
+    /// Read exactly ``length`` bytes into ``buffer``, cancellable by ``token``.
+    coro::task<io::io_result> read_exactly(void* buffer, size_t length,
+                                           coro::cancel_token token) {
+        if (length > static_cast<size_t>(INT32_MAX)) {
+            co_return io::io_result{-EOVERFLOW, 0};
+        }
+
+        auto* ptr = static_cast<char*>(buffer);
+        size_t remaining = length;
+
+        while (remaining > 0) {
+            if (token.is_cancelled()) {
+                co_return io::io_result{-ECANCELED, 0};
+            }
+
+            auto result = co_await read(ptr, remaining, token);
+            if (result.result > 0) {
+                ptr += result.result;
+                remaining -= static_cast<size_t>(result.result);
+            } else if (result.result == 0) {
+                co_return io::io_result{-ENODATA, 0};
+            } else {
+                co_return result;
+            }
+        }
+        co_return io::io_result{static_cast<int32_t>(length), 0};
+    }
+
+    /// Read exactly enough bytes to fill ``buffer``, cancellable by ``token``.
+    template<typename T>
+    coro::task<io::io_result> read_exactly(std::span<T> buffer,
+                                           coro::cancel_token token) {
+        return read_exactly(buffer.data(), buffer.size_bytes(), std::move(token));
     }
 
     /// Write exactly ``length`` bytes from ``buffer``.
@@ -824,6 +896,15 @@ public:
         : io::io_awaitable_base()
         , addr_(addr), opts_(opts) {}
 
+    uds_connect_awaitable(const unix_address& addr,
+                          const uds_options& opts,
+                          coro::cancel_token token)
+        : io::io_awaitable_base()
+        , addr_(addr)
+        , opts_(opts)
+        , token_(std::move(token))
+        , cancellable_(true) {}
+
     ~uds_connect_awaitable() {
         if (fd_ >= 0) {
             io::close_fd_for_destructor(fd_);
@@ -835,7 +916,50 @@ public:
 
     template<typename Promise>
     bool await_suspend(std::coroutine_handle<Promise> awaiter) {
+        // Validate and materialize the address before registering cancellation
+        // or creating a socket so synchronous address errors have no I/O
+        // side effects.
+        sa_ = addr_.to_sockaddr();
+        sa_len_ = addr_.sockaddr_len();
+
+        if (is_cancellable() && token_.is_cancelled()) {
+            already_cancelled_before_setup_ = true;
+            result_ = io::io_result{-ECANCELED, 0};
+            return false;
+        }
+
         bind_to_worker(awaiter);
+        auto& ctx = io::current_io_context();
+
+        if (is_cancellable()) {
+            auto state = std::make_shared<io::detail::io_cancel_state>();
+            state->ctx = &ctx;
+            state->awaiter = awaiter;
+            state->worker = runtime::worker_thread::current();
+            cancel_state_ = state;
+
+            cancel_registration_ = token_.on_cancel([state]() {
+                state->cancelled.store(true, std::memory_order_release);
+                if (!state->worker) {
+                    return;
+                }
+                auto exec = io::detail::make_io_cancel_executor(state, true);
+                if (auto* promise = coro::get_promise_base(exec.handle.address())) {
+                    promise->set_affinity(state->worker->worker_id());
+                    promise->set_worker_local();
+                    promise->detach_from_parent();
+                }
+                state->worker->schedule_or_destroy(exec.handle);
+            });
+
+            if (token_.is_cancelled()) {
+                cancel_registration_.unregister();
+                state->resumed.store(true, std::memory_order_release);
+                already_cancelled_before_setup_ = true;
+                result_ = io::io_result{-ECANCELED, 0};
+                return false;
+            }
+        }
 
         // Create socket
         fd_ = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -853,9 +977,6 @@ public:
         }
 
         // Initiate non-blocking connect
-        sa_ = addr_.to_sockaddr();
-        sa_len_ = addr_.sockaddr_len();
-
         int ret = ::connect(fd_, reinterpret_cast<struct sockaddr*>(&sa_), sa_len_);
         if (ret == 0) {
             // Connected immediately (common for UDS)
@@ -874,7 +995,6 @@ public:
 
         // Connection in progress, wait for socket to become writable
         connect_in_progress_ = true;
-        auto& ctx = io::current_io_context();
 
         io::io_request req{};
         req.op = io::io_op::poll_write;
@@ -884,18 +1004,46 @@ public:
         req.awaiter = awaiter;
         req.state = setup_op_state(awaiter);
 
+        if (cancel_state_) {
+            cancel_state_->op = req.state;
+            if (cancel_state_->cancelled.load(std::memory_order_acquire)) {
+                clear_op_state();
+                cancel_state_->op = nullptr;
+                cancel_registration_.unregister();
+                ::close(fd_);
+                fd_ = -1;
+                result_ = io::io_result{-ECANCELED, 0};
+                return false;
+            }
+        }
+
         if (!ctx.prepare(req)) {
             clear_op_state();
+            if (cancel_state_) {
+                cancel_state_->op = nullptr;
+            }
+            cancel_registration_.unregister();
             ::close(fd_);
             fd_ = -1;
             result_ = io::io_result{-EAGAIN, 0};
             return false;  // Don't suspend, resume immediately
+        }
+        if (cancel_state_ &&
+            cancel_state_->cancelled.load(std::memory_order_acquire)) {
+            ctx.cancel(io::tagged_op_state_user_data(req.state));
         }
         // No explicit submit: poll() auto-submits at the top of its loop
         return true;  // Suspend, will be resumed by completion handler
     }
     
     std::optional<uds_stream> await_resume() {
+        cancel_registration_.unregister();
+        const bool cancelled_without_backend_completion =
+            already_cancelled_before_setup_;
+        if (cancel_state_) {
+            cancel_state_->resumed.store(true, std::memory_order_release);
+        }
+
         restore_affinity();
 
         // Async path completion result comes from op_state.
@@ -914,6 +1062,8 @@ public:
                 result_ = io::io_result{-so_error, 0};
             }
         }
+        result_ = io::detail::finalize_cancellable_io_result(
+            cancelled_without_backend_completion, result_);
 
         if (!result_.success()) {
             if (fd_ >= 0) {
@@ -940,6 +1090,13 @@ private:
     socklen_t sa_len_ = 0;
     int fd_ = -1;
     bool connect_in_progress_ = false;
+    coro::cancel_token token_;
+    coro::cancel_token::registration cancel_registration_;
+    std::shared_ptr<io::detail::io_cancel_state> cancel_state_;
+    bool cancellable_ = false;
+    bool already_cancelled_before_setup_ = false;
+
+    bool is_cancellable() const noexcept { return cancellable_; }
 };
 
 /// Connect to a Unix Domain Socket server.
@@ -952,6 +1109,18 @@ inline auto uds_connect(const unix_address& addr,
     return uds_connect_awaitable(addr, opts);
 }
 
+/// Connect to a Unix Domain Socket server, cancellable by token.
+///
+/// When awaited, throws std::invalid_argument if addr does not fit in
+/// sockaddr_un::sun_path before the connect syscall is attempted. Socket
+/// creation/connect failures return std::nullopt and set errno. Cancellation
+/// returns std::nullopt with errno set to ECANCELED.
+inline auto uds_connect(const unix_address& addr,
+                        coro::cancel_token token,
+                        const uds_options& opts = {}) {
+    return uds_connect_awaitable(addr, opts, std::move(token));
+}
+
 /// Connect to a Unix Domain Socket server by path.
 ///
 /// When awaited, throws std::invalid_argument if path does not fit in
@@ -960,6 +1129,18 @@ inline auto uds_connect(const unix_address& addr,
 inline auto uds_connect(std::string_view path,
                         const uds_options& opts = {}) {
     return uds_connect_awaitable(unix_address(path), opts);
+}
+
+/// Connect to a Unix Domain Socket server by path, cancellable by token.
+///
+/// When awaited, throws std::invalid_argument if path does not fit in
+/// sockaddr_un::sun_path before the connect syscall is attempted. Socket
+/// creation/connect failures return std::nullopt and set errno. Cancellation
+/// returns std::nullopt with errno set to ECANCELED.
+inline auto uds_connect(std::string_view path,
+                        coro::cancel_token token,
+                        const uds_options& opts = {}) {
+    return uds_connect_awaitable(unix_address(path), opts, std::move(token));
 }
 
 } // namespace elio::net

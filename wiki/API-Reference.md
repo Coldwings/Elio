@@ -1472,6 +1472,7 @@ public:
 
     // Read data (awaitable)
     /* awaitable */ read(void* buffer, size_t size);
+    /* awaitable */ read(void* buffer, size_t size, coro::cancel_token token);
 
     // Write data (awaitable)
     /* awaitable */ write(const void* data, size_t size);
@@ -1480,6 +1481,7 @@ public:
 
     // Exact-length helpers (awaitable)
     /* awaitable */ read_exactly(void* buffer, size_t size);
+    /* awaitable */ read_exactly(void* buffer, size_t size, coro::cancel_token token);
     /* awaitable */ write_exactly(const void* data, size_t size);
     /* awaitable */ write_exactly(const void* data, size_t size, coro::cancel_token token);
     /* awaitable */ write_exactly(std::string_view data, coro::cancel_token token);
@@ -1499,7 +1501,13 @@ public:
 
 // Connect to UDS address/path (awaitable, returns std::optional<uds_stream>)
 /* awaitable */ uds_connect(const unix_address& addr);
+/* awaitable */ uds_connect(const unix_address& addr,
+                            coro::cancel_token token,
+                            const uds_options& opts = {});
 /* awaitable */ uds_connect(std::string_view path);
+/* awaitable */ uds_connect(std::string_view path,
+                            coro::cancel_token token,
+                            const uds_options& opts = {});
 ```
 
 `unix_address` stores the supplied path or Linux abstract name without doing a
@@ -1511,7 +1519,8 @@ address is too long, `unix_address::to_sockaddr()` throws
 `uds_listener::bind()` reports socket creation failures, and bind/listen
 failures after address conversion succeeds, as `std::nullopt` with `errno` set;
 `uds_connect()` reports socket creation/connect failures as `std::nullopt` with
-`errno` set from the awaited operation.
+`errno` set from the awaited operation. Cancellable overloads return
+`std::nullopt` with `errno == ECANCELED` when the token wins the connect wait.
 
 UDS streams share the same concurrency contract as TCP streams: one reader and
 one writer may operate concurrently, but multiple concurrent reads, multiple

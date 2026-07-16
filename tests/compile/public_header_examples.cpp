@@ -121,6 +121,20 @@ void rpc_server_config_aggregate_compat() {
     (void)legacy_order;
 }
 
+coro::task<void> uds_cancellable_api(coro::cancel_token token) {
+    auto stream = co_await net::uds_connect(
+        net::unix_address::abstract("public_header_uds_cancel"), token);
+    if (!stream) co_return;
+
+    char buffer[16]{};
+    auto read_result = co_await stream->read(buffer, sizeof(buffer), token);
+    (void)read_result;
+
+    auto exact_result = co_await stream->read_exactly(
+        buffer, sizeof(buffer), token);
+    (void)exact_result;
+}
+
 coro::task<void> vectored_io(int fd) {
     char first[8]{};
     char second[8]{};

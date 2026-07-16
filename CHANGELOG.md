@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rpc_server_config`, plus `rpc_error::resource_exhausted`, so servers can
   reject excess requests on a bounded best-effort path or close a session when
   one client exhausts its configured active-request budget. (#941)
+- **UDS cancellable API parity**: Added cancellation-aware
+  `uds_stream::read()`/`read_exactly()` overloads and `uds_connect()` overloads
+  so Unix-domain sockets expose the same cancellation boundary as TCP streams
+  and connects. (#943)
 
 ### Changed
 

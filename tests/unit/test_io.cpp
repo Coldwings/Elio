@@ -1402,6 +1402,38 @@ TEST_CASE("UDS connect", "[uds][connect]") {
     REQUIRE(client_stream->is_valid());
 }
 
+TEST_CASE("uds_connect observes already-cancelled token",
+          "[uds][connect][cancel]") {
+    auto addr = unix_address::abstract(
+        "elio_test_cancelled_connect_" + std::to_string(getpid()));
+    std::optional<uds_stream> stream;
+    std::atomic<bool> done{false};
+    int observed_errno = 0;
+
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+    source.cancel();
+
+    sched.go([&]() -> task<void> {
+        errno = 0;
+        stream = co_await uds_connect(addr, source.get_token());
+        observed_errno = errno;
+        done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    for (int i = 0; i < 200 && !done.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(10));
+    }
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+
+    REQUIRE(done.load(std::memory_order_acquire));
+    REQUIRE_FALSE(stream.has_value());
+    REQUIRE(observed_errno == ECANCELED);
+}
+
 TEST_CASE("UDS stream read/write", "[uds][stream]") {
     auto addr = unix_address::abstract("elio_test_rw_" + std::to_string(getpid()));
 
@@ -1721,6 +1753,17 @@ uds_pair make_small_buffer_uds_pair() {
     return pair;
 }
 
+template<typename Predicate>
+bool wait_for_uds_stream_test(Predicate&& predicate,
+                              std::chrono::milliseconds timeout =
+                                  elio::test::scaled_ms(2000)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(10));
+    }
+    return predicate();
+}
+
 } // namespace
 
 TEST_CASE("uds_stream write awaits writability under backpressure",
@@ -1857,6 +1900,74 @@ TEST_CASE("uds_stream read awaits readability for deferred data",
     REQUIRE(read_result.success());
     REQUIRE(read_result.bytes_transferred() == static_cast<int>(msg_len));
     REQUIRE(std::string(buffer) == msg);
+}
+
+TEST_CASE("uds_stream read observes cancellation while waiting",
+          "[uds][stream][cancel]") {
+    scheduler sched(1);
+    sched.start();
+
+    auto pair = make_small_buffer_uds_pair();
+    cancel_source source;
+    std::atomic<bool> started{false};
+    std::atomic<bool> completed{false};
+    io_result read_result{};
+    char buffer[16] = {};
+
+    sched.go([&]() -> task<void> {
+        started.store(true, std::memory_order_release);
+        read_result = co_await pair.server->read(
+            buffer, sizeof(buffer), source.get_token());
+        completed.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_for_uds_stream_test(
+        [&] { return started.load(std::memory_order_acquire); }));
+
+    std::this_thread::sleep_for(elio::test::scaled_ms(50));
+    source.cancel();
+
+    REQUIRE(wait_for_uds_stream_test(
+        [&] { return completed.load(std::memory_order_acquire); }));
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+    REQUIRE(read_result.result == -ECANCELED);
+}
+
+TEST_CASE("uds_stream read_exactly observes cancellation while waiting",
+          "[uds][stream][exact][cancel]") {
+    scheduler sched(1);
+    sched.start();
+
+    auto pair = make_small_buffer_uds_pair();
+    const char first = 'x';
+    REQUIRE(::send(pair.client->fd(), &first, 1, MSG_DONTWAIT) == 1);
+
+    cancel_source source;
+    std::atomic<bool> started{false};
+    std::atomic<bool> completed{false};
+    io_result read_result{};
+    char buffer[4] = {};
+
+    sched.go([&]() -> task<void> {
+        started.store(true, std::memory_order_release);
+        read_result = co_await pair.server->read_exactly(
+            buffer, sizeof(buffer), source.get_token());
+        completed.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_for_uds_stream_test(
+        [&] { return started.load(std::memory_order_acquire); }));
+
+    std::this_thread::sleep_for(elio::test::scaled_ms(50));
+    source.cancel();
+
+    REQUIRE(wait_for_uds_stream_test(
+        [&] { return completed.load(std::memory_order_acquire); }));
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+    REQUIRE(read_result.result == -ECANCELED);
+    REQUIRE(buffer[0] == first);
 }
 
 TEST_CASE("UDS multiple concurrent connections", "[uds][concurrent]") {

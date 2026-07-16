@@ -1194,6 +1194,23 @@ TEST_CASE("UDS bind validates address before side effects",
     REQUIRE(::rmdir(dir.c_str()) == 0);
 }
 
+TEST_CASE("UDS bind rejects overlong abstract address before opening socket",
+          "[uds][listener][contract]") {
+    struct sockaddr_un sample_addr {};
+    auto addr = unix_address::abstract(
+        std::string(sizeof(sample_addr.sun_path), 'a'));
+    REQUIRE(addr.path.size() > sizeof(sample_addr.sun_path));
+
+    const int before_fds = count_open_fds_for_uds_test();
+
+    REQUIRE_THROWS_AS(uds_listener::bind(addr), std::invalid_argument);
+
+    const int after_fds = count_open_fds_for_uds_test();
+    if (before_fds >= 0 && after_fds >= 0) {
+        REQUIRE(after_fds == before_fds);
+    }
+}
+
 TEST_CASE("UDS connect", "[uds][connect]") {
     auto addr = unix_address::abstract("elio_test_connect_" + std::to_string(getpid()));
 

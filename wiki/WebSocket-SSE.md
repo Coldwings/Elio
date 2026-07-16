@@ -104,7 +104,9 @@ that window expires, the connection fails closed. A heartbeat timeout may close
 the transport without delivering a WebSocket close frame. The heartbeat task does
 not read from the stream, so route handlers remain the single reader for the
 connection. Set `ping_interval <= 0` to disable the heartbeat, or
-`ping_timeout <= 0` to send periodic pings without timeout closure.
+`ping_timeout <= 0` to send periodic pings without timeout closure. On WSS
+connections, the underlying TLS stream serializes direct OpenSSL state access so
+the receive loop can wait for inbound frames while the heartbeat writes pings.
 
 ### WebSocket Client
 

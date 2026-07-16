@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/http/http_server.hpp>
 #include <elio/http/websocket_server.hpp>
+#include <elio/http/websocket_client.hpp>
 #include <elio/runtime/serve.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/sync/primitives.hpp>
@@ -107,6 +108,10 @@ uint16_t reserve_loopback_port() {
     REQUIRE(::getsockname(fd.get(), reinterpret_cast<sockaddr*>(&bound),
                           &len) == 0);
     return ntohs(bound.sin_port);
+}
+
+std::string make_wss_url(uint16_t port, std::string_view path = "/ws") {
+    return "wss://127.0.0.1:" + std::to_string(port) + std::string(path);
 }
 
 unique_fd connect_loopback(uint16_t port) {
@@ -1169,6 +1174,115 @@ TEST_CASE("WebSocket server heartbeat accepts observed pong",
                        elio::test::scaled_sec(2)));
     REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 }
+
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+TEST_CASE("WSS server heartbeat pings while handler is receiving",
+          "[websocket][server][heartbeat][tls][regression]") {
+    elio::http::websocket::ws_router routes;
+    server_config config;
+    config.enable_logging = false;
+    config.keep_alive_timeout = elio::test::scaled_sec(1);
+
+    elio::http::websocket::server_config ws_config;
+    ws_config.ping_interval = std::chrono::seconds(1);
+    ws_config.ping_timeout = std::chrono::seconds(1);
+
+    std::atomic<bool> handler_started{false};
+    std::atomic<bool> handler_done{false};
+    routes.websocket("/ws", [&](elio::http::websocket::ws_connection& conn)
+                              -> task<void> {
+        handler_started.store(true, std::memory_order_release);
+        while (co_await conn.receive()) {
+        }
+        handler_done.store(true, std::memory_order_release);
+        co_return;
+    }, ws_config);
+
+    elio::http::websocket::ws_server srv(std::move(routes), config);
+    elio::tls::tls_context tls_ctx(elio::tls::tls_mode::server);
+    REQUIRE(install_test_certificate(tls_ctx));
+
+    const uint16_t port = reserve_loopback_port();
+    scheduler sched(4);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen_tls(elio::net::ipv4_address("127.0.0.1", port),
+                                tls_ctx);
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] { return srv.is_running(); },
+                       elio::test::scaled_sec(2)));
+
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_connected{false};
+    std::atomic<bool> receive_returned{false};
+    std::atomic<bool> connection_open_after_heartbeat_window{false};
+    std::atomic<bool> handler_running_before_client_close{false};
+    std::atomic<int> client_errno{0};
+
+    sched.go([&]() -> task<void> {
+        elio::http::websocket::client_config cfg;
+        cfg.verify_certificate = false;
+        cfg.read_timeout = std::chrono::seconds(5);
+        elio::http::websocket::ws_client client(cfg);
+
+        bool ok = co_await client.connect(make_wss_url(port));
+        client_connected.store(ok, std::memory_order_release);
+        if (!ok) {
+            client_errno.store(errno, std::memory_order_release);
+            client_done.store(true, std::memory_order_release);
+            co_return;
+        }
+
+        auto* current_sched = elio::runtime::scheduler::current();
+        REQUIRE(current_sched != nullptr);
+        elio::coro::cancel_source receive_cancel;
+        current_sched->go([&receive_cancel]() -> task<void> {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(2500));
+            receive_cancel.cancel();
+            co_return;
+        });
+
+        auto msg = co_await client.receive(receive_cancel.get_token());
+        (void)msg;
+        receive_returned.store(true, std::memory_order_release);
+        client_errno.store(errno, std::memory_order_release);
+        connection_open_after_heartbeat_window.store(
+            client.is_open(), std::memory_order_release);
+        handler_running_before_client_close.store(
+            !handler_done.load(std::memory_order_acquire),
+            std::memory_order_release);
+
+        co_await client.close();
+        client_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] { return client_done.load(std::memory_order_acquire); },
+                       elio::test::scaled_sec(8)));
+
+    REQUIRE(client_connected.load(std::memory_order_acquire));
+    REQUIRE(handler_started.load(std::memory_order_acquire));
+    REQUIRE(receive_returned.load(std::memory_order_acquire));
+    REQUIRE(client_errno.load(std::memory_order_acquire) == ECANCELED);
+    REQUIRE(connection_open_after_heartbeat_window.load(std::memory_order_acquire));
+    REQUIRE(handler_running_before_client_close.load(std::memory_order_acquire));
+
+    REQUIRE(wait_until([&] { return handler_done.load(std::memory_order_acquire); },
+                       elio::test::scaled_sec(2)));
+
+    srv.stop();
+    try_wake_listener(port);
+
+    REQUIRE(wait_until([&] { return listen_done.load(std::memory_order_acquire); },
+                       elio::test::scaled_sec(2)));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+#endif
 
 TEST_CASE("WebSocket server stops heartbeat after non-standard handler exception",
           "[websocket][server][heartbeat][regression]") {

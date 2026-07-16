@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 
@@ -36,13 +37,11 @@ enum class handshake_result {
 
 /// TLS stream wrapping a TCP connection with SSL/TLS encryption
 ///
-/// **Thread safety:** like the underlying ``SSL*``, a ``tls_stream`` is **not**
-/// safe for concurrent use from multiple coroutines/threads. Issuing
-/// ``read``/``write``/``shutdown`` on the same instance from different
-/// coroutines simultaneously is undefined behavior — OpenSSL does not protect
-/// SSL state against concurrent operations. Callers that need concurrent
-/// writes must serialize them externally (for example with a ``sync::mutex``,
-/// as done in the WebSocket layer's ``send_mutex_``).
+/// **Thread safety:** direct ``SSL*`` state access is serialized internally so
+/// one read-side operation and one write-side operation may overlap while they
+/// are suspended on socket readiness. Callers must still serialize multiple
+/// concurrent readers, multiple concurrent writers, and shutdown/destruction
+/// against active I/O according to the higher-level protocol contract.
 class tls_stream {
 public:
     /// Create a TLS stream from an existing TCP stream
@@ -69,33 +68,7 @@ public:
     }
     
     /// Destructor
-    ~tls_stream() {
-        if (ssl_) {
-            // If the user forgot to ``co_await stream.shutdown()``, at least
-            // queue our close_notify alert so the peer can distinguish a
-            // clean close from a MITM truncation. The underlying fd is
-            // non-blocking, so a single ``SSL_shutdown`` call is bounded:
-            // it serializes the alert and tries to write it; if the kernel
-            // buffer is full we accept the loss rather than block here.
-            // We never wait for the peer's close_notify in the destructor,
-            // since that would require async I/O.
-            //
-            // Skip SSL_shutdown when the underlying socket is already known
-            // to be unusable. SSL_shutdown's BIO writes via send(2); on a
-            // half-closed socket that produces EPIPE and, on OpenSSL builds
-            // that don't set MSG_NOSIGNAL (older OpenSSL, musl, etc.),
-            // delivers SIGPIPE to the process. We avoid the write entirely
-            // when (a) somebody else (e.g. a slow-loris watchdog) called
-            // ``shutdown_socket()`` / ``mark_externally_shut_down()`` on us,
-            // or (b) the kernel reports a pending socket error.
-            if (handshake_complete_ && !shutdown_sent_ &&
-                !is_socket_closed_or_dead()) {
-                ERR_clear_error();
-                (void)SSL_shutdown(ssl_);
-            }
-            SSL_free(ssl_);
-        }
-    }
+    ~tls_stream() { release_ssl(); }
 
     // Non-copyable
     tls_stream(const tls_stream&) = delete;
@@ -105,12 +78,17 @@ public:
     tls_stream(tls_stream&& other) noexcept
         : tcp_(std::move(other.tcp_))
         , ssl_(other.ssl_)
+        , ssl_mutex_(std::move(other.ssl_mutex_))
         , mode_(other.mode_)
         , handshake_complete_(other.handshake_complete_)
         , shutdown_sent_(other.shutdown_sent_)
         , externally_shut_down_(
               other.externally_shut_down_.load(std::memory_order_acquire)) {
+        if (!ssl_mutex_) {
+            ssl_mutex_ = std::make_shared<std::mutex>();
+        }
         other.ssl_ = nullptr;
+        other.ssl_mutex_ = std::make_shared<std::mutex>();
         other.handshake_complete_ = false;
         other.shutdown_sent_ = false;
         other.externally_shut_down_.store(false, std::memory_order_release);
@@ -118,16 +96,13 @@ public:
 
     tls_stream& operator=(tls_stream&& other) noexcept {
         if (this != &other) {
-            if (ssl_) {
-                if (handshake_complete_ && !shutdown_sent_ &&
-                    !is_socket_closed_or_dead()) {
-                    ERR_clear_error();
-                    (void)SSL_shutdown(ssl_);
-                }
-                SSL_free(ssl_);
-            }
+            release_ssl();
             tcp_ = std::move(other.tcp_);
             ssl_ = other.ssl_;
+            ssl_mutex_ = std::move(other.ssl_mutex_);
+            if (!ssl_mutex_) {
+                ssl_mutex_ = std::make_shared<std::mutex>();
+            }
             mode_ = other.mode_;
             handshake_complete_ = other.handshake_complete_;
             shutdown_sent_ = other.shutdown_sent_;
@@ -135,6 +110,7 @@ public:
                 other.externally_shut_down_.load(std::memory_order_acquire),
                 std::memory_order_release);
             other.ssl_ = nullptr;
+            other.ssl_mutex_ = std::make_shared<std::mutex>();
             other.handshake_complete_ = false;
             other.shutdown_sent_ = false;
             other.externally_shut_down_.store(false, std::memory_order_release);
@@ -145,9 +121,10 @@ public:
     /// Set SNI hostname (for client connections)
     void set_hostname(std::string_view hostname) {
         hostname_ = std::string(hostname);
+        auto lock = lock_ssl_state();
         // Set SNI extension
         SSL_set_tlsext_host_name(ssl_, hostname_.c_str());
-        
+
         // Configure hostname verification for OpenSSL 1.1.0+
         X509_VERIFY_PARAM* param = SSL_get0_param(ssl_);
         X509_VERIFY_PARAM_set1_host(param, hostname_.c_str(), hostname_.size());
@@ -157,8 +134,11 @@ public:
     /// @return true on success, false on error (check errno)
     coro::task<bool> handshake() {
         while (true) {
-            ERR_clear_error();
-            int ret = (mode_ == tls_mode::client) ? SSL_connect(ssl_) : SSL_accept(ssl_);
+            auto step = call_ssl([&]() {
+                return (mode_ == tls_mode::client) ? SSL_connect(ssl_)
+                                                   : SSL_accept(ssl_);
+            });
+            int ret = step.ret;
             
             if (ret == 1) {
                 handshake_complete_ = true;
@@ -167,7 +147,7 @@ public:
                 co_return true;
             }
             
-            int err = SSL_get_error(ssl_, ret);
+            int err = step.err;
             
             if (err == SSL_ERROR_WANT_READ) {
                 auto result = co_await tcp_.poll_read();
@@ -204,8 +184,11 @@ public:
                 co_return false;
             }
 
-            ERR_clear_error();
-            int ret = (mode_ == tls_mode::client) ? SSL_connect(ssl_) : SSL_accept(ssl_);
+            auto step = call_ssl([&]() {
+                return (mode_ == tls_mode::client) ? SSL_connect(ssl_)
+                                                   : SSL_accept(ssl_);
+            });
+            int ret = step.ret;
 
             if (ret == 1) {
                 handshake_complete_ = true;
@@ -214,7 +197,7 @@ public:
                 co_return true;
             }
 
-            int err = SSL_get_error(ssl_, ret);
+            int err = step.err;
 
             if (err == SSL_ERROR_WANT_READ) {
                 auto result = co_await tcp_.poll_read(token);
@@ -270,8 +253,10 @@ public:
         }
         
         while (true) {
-            ERR_clear_error();
-            int ret = SSL_read(ssl_, buffer, static_cast<int>(length));
+            auto step = call_ssl([&]() {
+                return SSL_read(ssl_, buffer, static_cast<int>(length));
+            });
+            int ret = step.ret;
             
             if (ret > 0) {
                 co_return io::io_result{ret, 0};
@@ -279,7 +264,7 @@ public:
             
             if (ret == 0) {
                 // Connection closed
-                int err = SSL_get_error(ssl_, ret);
+                int err = step.err;
                 if (err == SSL_ERROR_ZERO_RETURN) {
                     // Clean shutdown
                     co_return io::io_result{0, 0};
@@ -287,7 +272,7 @@ public:
                 co_return io::io_result{-EIO, 0};
             }
             
-            int err = SSL_get_error(ssl_, ret);
+            int err = step.err;
             
             if (err == SSL_ERROR_WANT_READ) {
                 auto result = co_await tcp_.poll_read();
@@ -328,22 +313,24 @@ public:
                 co_return io::io_result{-ECANCELED, 0};
             }
 
-            ERR_clear_error();
-            int ret = SSL_read(ssl_, buffer, static_cast<int>(length));
+            auto step = call_ssl([&]() {
+                return SSL_read(ssl_, buffer, static_cast<int>(length));
+            });
+            int ret = step.ret;
 
             if (ret > 0) {
                 co_return io::io_result{ret, 0};
             }
 
             if (ret == 0) {
-                int err = SSL_get_error(ssl_, ret);
+                int err = step.err;
                 if (err == SSL_ERROR_ZERO_RETURN) {
                     co_return io::io_result{0, 0};
                 }
                 co_return io::io_result{-EIO, 0};
             }
 
-            int err = SSL_get_error(ssl_, ret);
+            int err = step.err;
 
             if (err == SSL_ERROR_WANT_READ) {
                 auto result = co_await tcp_.poll_read(token);
@@ -388,14 +375,16 @@ public:
         }
         
         while (true) {
-            ERR_clear_error();
-            int ret = SSL_write(ssl_, buffer, static_cast<int>(length));
+            auto step = call_ssl([&]() {
+                return SSL_write(ssl_, buffer, static_cast<int>(length));
+            });
+            int ret = step.ret;
             
             if (ret > 0) {
                 co_return io::io_result{ret, 0};
             }
             
-            int err = SSL_get_error(ssl_, ret);
+            int err = step.err;
             
             if (err == SSL_ERROR_WANT_READ) {
                 auto result = co_await tcp_.poll_read();
@@ -436,14 +425,16 @@ public:
                 co_return io::io_result{-ECANCELED, 0};
             }
 
-            ERR_clear_error();
-            int ret = SSL_write(ssl_, buffer, static_cast<int>(length));
+            auto step = call_ssl([&]() {
+                return SSL_write(ssl_, buffer, static_cast<int>(length));
+            });
+            int ret = step.ret;
 
             if (ret > 0) {
                 co_return io::io_result{ret, 0};
             }
 
-            int err = SSL_get_error(ssl_, ret);
+            int err = step.err;
 
             if (err == SSL_ERROR_WANT_READ) {
                 auto result = co_await tcp_.poll_read(token);
@@ -700,8 +691,10 @@ public:
         // retry. WANT_READ at this stage is unusual but possible when there
         // is still inbound data buffered to drain.
         while (remaining()) {
-            ERR_clear_error();
-            int ret = SSL_shutdown(ssl_);
+            auto step = call_ssl([&]() {
+                return SSL_shutdown(ssl_);
+            }, false);
+            int ret = step.ret;
             if (ret >= 0) {
                 shutdown_sent_ = true;
                 if (ret == 1) {
@@ -710,7 +703,7 @@ public:
                 }
                 break;  // ret == 0: our close_notify is out, fall through to phase 2
             }
-            int err = SSL_get_error(ssl_, ret);
+            int err = step.err;
             if (err == SSL_ERROR_WANT_WRITE) {
                 auto poll = co_await poll_until_deadline(false);
                 if (poll.result < 0) {
@@ -741,8 +734,10 @@ public:
         // chatty peer that keeps producing WANT_READ/WANT_WRITE cycles
         // can't keep us here forever.
         while (remaining()) {
-            ERR_clear_error();
-            int ret = SSL_shutdown(ssl_);
+            auto step = call_ssl([&]() {
+                return SSL_shutdown(ssl_);
+            }, false);
+            int ret = step.ret;
             if (ret == 1) {
                 break;
             }
@@ -752,7 +747,7 @@ public:
                 if (poll.result < 0) break;
                 continue;
             }
-            int err = SSL_get_error(ssl_, ret);
+            int err = step.err;
             if (err == SSL_ERROR_WANT_READ) {
                 auto poll = co_await poll_until_deadline(true);
                 if (poll.result < 0) break;
@@ -771,6 +766,7 @@ public:
     std::string_view alpn_protocol() const {
         const unsigned char* proto = nullptr;
         unsigned int len = 0;
+        auto lock = lock_ssl_state();
         SSL_get0_alpn_selected(ssl_, &proto, &len);
         if (proto && len > 0) {
             return std::string_view(reinterpret_cast<const char*>(proto), len);
@@ -780,11 +776,13 @@ public:
     
     /// Get TLS version string
     const char* version() const {
+        auto lock = lock_ssl_state();
         return SSL_get_version(ssl_);
     }
     
     /// Get cipher name
     const char* cipher() const {
+        auto lock = lock_ssl_state();
         return SSL_get_cipher_name(ssl_);
     }
     
@@ -825,15 +823,69 @@ public:
     
     /// Get peer certificate (if any)
     X509* peer_certificate() const {
+        auto lock = lock_ssl_state();
         return SSL_get_peer_certificate(ssl_);
     }
     
     /// Verify peer certificate result
     long verify_result() const {
+        auto lock = lock_ssl_state();
         return SSL_get_verify_result(ssl_);
     }
     
 private:
+    struct ssl_call_result {
+        int ret = 0;
+        int err = SSL_ERROR_NONE;
+    };
+
+    std::unique_lock<std::mutex> lock_ssl_state() const {
+        return std::unique_lock<std::mutex>(*ssl_mutex_);
+    }
+
+    template<typename F>
+    ssl_call_result call_ssl(F&& fn, bool zero_is_error = true) {
+        auto lock = lock_ssl_state();
+        ERR_clear_error();
+        int ret = fn();
+        int err = (ret < 0 || (ret == 0 && zero_is_error))
+            ? SSL_get_error(ssl_, ret)
+            : SSL_ERROR_NONE;
+        return {ret, err};
+    }
+
+    void release_ssl() noexcept {
+        if (!ssl_) {
+            return;
+        }
+
+        auto lock = lock_ssl_state();
+        // If the user forgot to ``co_await stream.shutdown()``, at least
+        // queue our close_notify alert so the peer can distinguish a
+        // clean close from a MITM truncation. The underlying fd is
+        // non-blocking, so a single ``SSL_shutdown`` call is bounded:
+        // it serializes the alert and tries to write it; if the kernel
+        // buffer is full we accept the loss rather than block here.
+        // We never wait for the peer's close_notify in the destructor,
+        // since that would require async I/O.
+        //
+        // Skip SSL_shutdown when the underlying socket is already known
+        // to be unusable. SSL_shutdown's BIO writes via send(2); on a
+        // half-closed socket that produces EPIPE and, on OpenSSL builds
+        // that don't set MSG_NOSIGNAL (older OpenSSL, musl, etc.),
+        // delivers SIGPIPE to the process. We avoid the write entirely
+        // when (a) somebody else (e.g. a slow-loris watchdog) called
+        // ``shutdown_socket()`` / ``mark_externally_shut_down()`` on us,
+        // or (b) the kernel reports a pending socket error.
+        if (handshake_complete_ && !shutdown_sent_ &&
+            !is_socket_closed_or_dead()) {
+            ERR_clear_error();
+            (void)SSL_shutdown(ssl_);
+        }
+        SSL_free(ssl_);
+        ssl_ = nullptr;
+    }
+
     /// Cheap probe that returns true when the underlying socket is either
     /// already known (via the externally_shut_down_ flag) to be unusable,
     /// or when the kernel reports a pending error such as ECONNRESET/EPIPE.
@@ -877,6 +929,7 @@ private:
     
     net::tcp_stream tcp_;
     SSL* ssl_ = nullptr;
+    std::shared_ptr<std::mutex> ssl_mutex_{std::make_shared<std::mutex>()};
     tls_mode mode_ = tls_mode::client;
     bool handshake_complete_ = false;
     bool shutdown_sent_ = false;  ///< True once our close_notify has been queued.

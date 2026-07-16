@@ -77,6 +77,9 @@ struct server_config {
 ///     auto-pong / close-response paths inside the receive loop) are serialized by
 ///     a per-connection coroutine mutex so that frames from concurrent senders never
 ///     interleave at the byte level.
+///   - TLS-backed connections rely on `tls_stream`'s internal SSL-state
+///     serialization so the single receive loop may be suspended on socket
+///     readiness while a serialized send, including heartbeat pings, writes.
 class ws_connection {
 public:
     /// Stream type variant

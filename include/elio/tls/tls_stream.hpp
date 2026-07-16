@@ -37,11 +37,13 @@ enum class handshake_result {
 
 /// TLS stream wrapping a TCP connection with SSL/TLS encryption
 ///
-/// **Thread safety:** direct ``SSL*`` state access is serialized internally so
-/// one read-side operation and one write-side operation may overlap while they
-/// are suspended on socket readiness. Callers must still serialize multiple
-/// concurrent readers, multiple concurrent writers, and shutdown/destruction
-/// against active I/O according to the higher-level protocol contract.
+/// **Thread safety:** after the TLS handshake completes, direct ``SSL*`` state
+/// access is serialized internally so one read-side operation and one
+/// write-side operation may overlap while they are suspended on socket
+/// readiness. Callers must still serialize handshake-starting operations,
+/// multiple concurrent readers, multiple concurrent writers, and
+/// shutdown/destruction against active I/O according to the higher-level
+/// protocol contract.
 class tls_stream {
 public:
     /// Create a TLS stream from an existing TCP stream
@@ -636,9 +638,21 @@ public:
     /// A wall-clock budget bounds the wait so a misbehaving peer cannot stall
     /// the caller indefinitely. The default budget of 2 seconds matches the
     /// guidance in TLS implementations; pass a longer duration if needed.
+    /// If the underlying socket was already shut down externally, shutdown()
+    /// abandons close_notify instead of writing to a half-closed socket.
     coro::task<void> shutdown(std::chrono::milliseconds timeout =
                                   std::chrono::milliseconds(2000)) {
         if (!ssl_ || !handshake_complete_) {
+            co_return;
+        }
+        auto abandon_if_socket_dead = [&]() noexcept {
+            if (!is_socket_closed_or_dead()) {
+                return false;
+            }
+            handshake_complete_ = false;
+            return true;
+        };
+        if (abandon_if_socket_dead()) {
             co_return;
         }
 
@@ -691,6 +705,9 @@ public:
         // retry. WANT_READ at this stage is unusual but possible when there
         // is still inbound data buffered to drain.
         while (remaining()) {
+            if (abandon_if_socket_dead()) {
+                co_return;
+            }
             auto step = call_ssl([&]() {
                 return SSL_shutdown(ssl_);
             }, false);
@@ -734,6 +751,9 @@ public:
         // chatty peer that keeps producing WANT_READ/WANT_WRITE cycles
         // can't keep us here forever.
         while (remaining()) {
+            if (abandon_if_socket_dead()) {
+                co_return;
+            }
             auto step = call_ssl([&]() {
                 return SSL_shutdown(ssl_);
             }, false);

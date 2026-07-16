@@ -1536,11 +1536,12 @@ Type-erased wrapper over `tcp_stream` and, when TLS support is enabled,
 
 `net::stream` follows the concurrency contract of its active transport.
 TCP-backed streams allow one reader and one writer concurrently, matching
-`tcp_stream`. TLS-backed streams also allow one read-side operation and one
-write-side operation to overlap while waiting for socket readiness; `tls_stream`
-serializes direct OpenSSL `SSL*` state access internally. Multiple concurrent
-reads, multiple concurrent writes, or `close()` racing with any read/write
-operation require external serialization for all variants.
+`tcp_stream`. After the handshake completes, TLS-backed streams also allow one
+read-side operation and one write-side operation to overlap while waiting for
+socket readiness; `tls_stream` serializes direct OpenSSL `SSL*` state access
+internally. Multiple concurrent reads, multiple concurrent writes,
+handshake-starting operations, or `close()` racing with any read/write operation
+require external serialization for all variants.
 
 ```cpp
 class stream {
@@ -2373,11 +2374,12 @@ enum class tls_mode {
 
 TLS-wrapped TCP stream.
 
-`tls_stream` serializes direct OpenSSL `SSL*` state access internally. One
-read-side operation and one write-side operation may overlap while either side
-is suspended on socket readiness. Callers must still serialize multiple
-concurrent reads, multiple concurrent writes, and shutdown/destruction against
-active I/O at the protocol layer.
+After the TLS handshake completes, `tls_stream` serializes direct OpenSSL
+`SSL*` state access internally. One read-side operation and one write-side
+operation may overlap while either side is suspended on socket readiness.
+Callers must still serialize handshake-starting operations, multiple concurrent
+reads, multiple concurrent writes, and shutdown/destruction against active I/O
+at the protocol layer.
 
 ```cpp
 class tls_stream {

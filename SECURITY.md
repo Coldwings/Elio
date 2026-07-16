@@ -110,4 +110,4 @@ For general security questions (not vulnerability reports):
 
 ---
 
-**Last Updated**: 2026-06-18
+**Last Updated**: 2026-07-16

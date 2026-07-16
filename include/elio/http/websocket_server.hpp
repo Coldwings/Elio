@@ -299,7 +299,7 @@ public:
             }
 
             if (ping_timeout.count() <= 0) {
-                if (!co_await send_ping()) {
+                if (!co_await send_heartbeat_ping(token)) {
                     co_return;
                 }
                 continue;
@@ -415,6 +415,44 @@ private:
         }
         auto frame = encode_ping_frame("", !is_server_);
         co_return co_await send_raw_until(frame, deadline, std::move(token));
+    }
+
+    coro::task<bool> send_heartbeat_ping(coro::cancel_token token) {
+        if (!is_open()) {
+            co_return false;
+        }
+        auto frame = encode_ping_frame("", !is_server_);
+        co_return co_await send_raw_cancellable(frame, std::move(token));
+    }
+
+    coro::task<bool> send_raw_cancellable(
+        const std::vector<uint8_t>& data,
+        coro::cancel_token token) {
+        while (!send_mutex_.try_lock()) {
+            if (token.is_cancelled() || !is_open()) {
+                co_return false;
+            }
+            auto result = co_await elio::time::sleep_for(
+                std::chrono::milliseconds(10), token);
+            if (result == coro::cancel_result::cancelled) {
+                co_return false;
+            }
+        }
+
+        sync::lock_guard send_guard(send_mutex_);
+        size_t sent = 0;
+        while (sent < data.size()) {
+            if (token.is_cancelled() || !is_open()) {
+                co_return false;
+            }
+            auto result = co_await write(
+                data.data() + sent, data.size() - sent, token);
+            if (result.result <= 0) {
+                co_return false;
+            }
+            sent += static_cast<size_t>(result.result);
+        }
+        co_return true;
     }
 
     coro::task<bool> send_raw_until(
@@ -1126,6 +1164,8 @@ private:
                 co_await ws_route->handler(conn);
             } catch (const std::exception& e) {
                 ELIO_LOG_ERROR("WebSocket handler exception: {}", e.what());
+            } catch (...) {
+                ELIO_LOG_ERROR("WebSocket handler unknown exception");
             }
 
             co_await stop_heartbeat();

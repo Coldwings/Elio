@@ -1170,6 +1170,133 @@ TEST_CASE("WebSocket server heartbeat accepts observed pong",
     REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 }
 
+TEST_CASE("WebSocket server stops heartbeat after non-standard handler exception",
+          "[websocket][server][heartbeat][regression]") {
+    const std::string upgrade_request =
+        "GET /ws HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n";
+
+    elio::http::websocket::ws_router routes;
+    server_config config;
+    config.enable_logging = false;
+    config.keep_alive_timeout = elio::test::scaled_sec(1);
+
+    elio::http::websocket::server_config ws_config;
+    ws_config.ping_interval = std::chrono::seconds(1);
+    ws_config.ping_timeout = std::chrono::seconds(1);
+
+    std::atomic<bool> handler_started{false};
+    routes.websocket("/ws", [&](elio::http::websocket::ws_connection&)
+                              -> task<void> {
+        handler_started.store(true, std::memory_order_release);
+        throw 7;
+        co_return;
+    }, ws_config);
+
+    elio::http::websocket::ws_server srv(std::move(routes), config);
+    const uint16_t port = reserve_loopback_port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] { return srv.is_running(); },
+                       elio::test::scaled_sec(2)));
+
+    auto client = connect_loopback(port);
+    send_all(client.get(), upgrade_request);
+
+    const auto response = read_until_close(client.get());
+    CHECK(response.find("HTTP/1.1 101 Switching Protocols") !=
+          std::string::npos);
+    REQUIRE(handler_started.load(std::memory_order_acquire));
+    REQUIRE(wait_until([&] { return srv.active_connections() == 0; },
+                       elio::test::scaled_sec(2)));
+
+    srv.stop();
+    try_wake_listener(port);
+
+    REQUIRE(wait_until([&] { return listen_done.load(std::memory_order_acquire); },
+                       elio::test::scaled_sec(2)));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("WebSocket server cancels no-timeout heartbeat on handler exit",
+          "[websocket][server][heartbeat][regression]") {
+    const std::string upgrade_request =
+        "GET /ws HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n";
+
+    elio::http::websocket::ws_router routes;
+    server_config config;
+    config.enable_logging = false;
+    config.keep_alive_timeout = elio::test::scaled_sec(1);
+
+    elio::http::websocket::server_config ws_config;
+    ws_config.ping_interval = std::chrono::seconds(1);
+    ws_config.ping_timeout = std::chrono::seconds(0);
+
+    std::atomic<bool> handler_started{false};
+    std::atomic<bool> handler_done{false};
+    routes.websocket("/ws", [&](elio::http::websocket::ws_connection&)
+                              -> task<void> {
+        handler_started.store(true, std::memory_order_release);
+        co_await elio::time::sleep_for(std::chrono::milliseconds(1200));
+        handler_done.store(true, std::memory_order_release);
+        co_return;
+    }, ws_config);
+
+    elio::http::websocket::ws_server srv(std::move(routes), config);
+    const uint16_t port = reserve_loopback_port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] { return srv.is_running(); },
+                       elio::test::scaled_sec(2)));
+
+    auto client = connect_loopback(port);
+    send_all(client.get(), upgrade_request);
+
+    const auto response = read_until_close(client.get());
+    CHECK(response.find("HTTP/1.1 101 Switching Protocols") !=
+          std::string::npos);
+    REQUIRE(handler_started.load(std::memory_order_acquire));
+    REQUIRE(handler_done.load(std::memory_order_acquire));
+    REQUIRE(wait_until([&] { return srv.active_connections() == 0; },
+                       elio::test::scaled_sec(2)));
+
+    srv.stop();
+    try_wake_listener(port);
+
+    REQUIRE(wait_until([&] { return listen_done.load(std::memory_order_acquire); },
+                       elio::test::scaled_sec(2)));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
 TEST_CASE("WebSocket server enforces max_request_size across consumed upgrade bytes",
           "[websocket][server][limits][regression]") {
     elio::http::websocket::ws_router routes;

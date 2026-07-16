@@ -551,7 +551,9 @@ public:
     /// Create and bind a Unix Domain Socket listener
     /// @param addr Address (path) to bind to
     /// @param opts Socket options
-    /// @return UDS listener on success, std::nullopt on error (check errno)
+    /// @return UDS listener on success; std::nullopt on socket/bind/listen
+    ///         error after address conversion succeeds (check errno)
+    /// @throws std::invalid_argument if addr does not fit in sockaddr_un::sun_path
     static std::optional<uds_listener> bind(
         const unix_address& addr,
         const uds_options& opts = {}) 
@@ -936,13 +938,21 @@ private:
     bool connect_in_progress_ = false;
 };
 
-/// Connect to a Unix Domain Socket server
+/// Connect to a Unix Domain Socket server.
+///
+/// When awaited, throws std::invalid_argument if addr does not fit in
+/// sockaddr_un::sun_path. Socket/connect failures after address conversion
+/// return std::nullopt and set errno.
 inline auto uds_connect(const unix_address& addr,
                         const uds_options& opts = {}) {
     return uds_connect_awaitable(addr, opts);
 }
 
-/// Connect to a Unix Domain Socket server by path
+/// Connect to a Unix Domain Socket server by path.
+///
+/// When awaited, throws std::invalid_argument if path does not fit in
+/// sockaddr_un::sun_path. Socket/connect failures after address conversion
+/// return std::nullopt and set errno.
 inline auto uds_connect(std::string_view path,
                         const uds_options& opts = {}) {
     return uds_connect_awaitable(unix_address(path), opts);

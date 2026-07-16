@@ -1434,6 +1434,11 @@ struct unix_address {
     // Linux abstract socket address (does not create a filesystem entry)
     static unix_address abstract(std::string_view name);
 
+    // Convert to sockaddr_un for bind/connect.
+    // Throws std::invalid_argument if path is too long for sun_path.
+    struct sockaddr_un to_sockaddr() const;
+    socklen_t sockaddr_len() const;
+
     bool is_abstract() const;
     std::string to_string() const;
 };
@@ -1489,6 +1494,17 @@ public:
 /* awaitable */ uds_connect(const unix_address& addr);
 /* awaitable */ uds_connect(std::string_view path);
 ```
+
+`unix_address` stores the supplied path or Linux abstract name without doing a
+syscall. Conversion for `bind()` or `uds_connect()` requires the address to fit
+in `sockaddr_un::sun_path`: filesystem paths need room for a trailing NUL, while
+abstract addresses include the leading NUL byte in their stored length. If the
+address is too long, `unix_address::to_sockaddr()` throws
+`std::invalid_argument` before the bind or connect syscall is attempted.
+`uds_listener::bind()` reports socket creation failures, and bind/listen
+failures after address conversion succeeds, as `std::nullopt` with `errno` set;
+`uds_connect()` reports socket creation/connect failures as `std::nullopt` with
+`errno` set from the awaited operation.
 
 UDS streams share the same concurrency contract as TCP streams: one reader and
 one writer may operate concurrently, but multiple concurrent reads, multiple

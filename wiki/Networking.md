@@ -263,6 +263,15 @@ if (addr.is_abstract()) {
 ELIO_LOG_INFO("Address: {}", addr.to_string());
 ```
 
+Callers must choose filesystem paths and abstract names that fit in
+`sockaddr_un::sun_path`. Filesystem socket paths need one extra byte for the
+terminating NUL; Linux abstract socket names include the leading NUL byte used
+to mark the abstract namespace. Elio stores the address as supplied, and rejects
+an overlong address with `std::invalid_argument` when it is converted for
+`uds_listener::bind()` or `uds_connect()`. Socket creation failures use the
+documented `std::nullopt` plus `errno` result shape. Once conversion succeeds,
+normal bind, listen, or connect failures use the same result shape.
+
 Abstract sockets are useful when you want IPC without creating files on the filesystem. They are automatically cleaned up when all references are closed:
 
 ```cpp

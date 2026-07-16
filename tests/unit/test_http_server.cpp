@@ -1264,14 +1264,21 @@ TEST_CASE("WSS server heartbeat pings while handler is receiving",
 
         auto* current_sched = elio::runtime::scheduler::current();
         REQUIRE(current_sched != nullptr);
-        elio::coro::cancel_source receive_cancel;
-        current_sched->go([&receive_cancel]() -> task<void> {
-            co_await elio::time::sleep_for(std::chrono::milliseconds(2500));
-            receive_cancel.cancel();
-            co_return;
-        });
+        auto receive_cancel = std::make_shared<elio::coro::cancel_source>();
+        auto receive_watchdog = current_sched->go_joinable(
+            [receive_cancel]() -> task<void> {
+                auto result = co_await elio::time::sleep_for(
+                    std::chrono::milliseconds(2500),
+                    receive_cancel->get_token());
+                if (result == elio::coro::cancel_result::completed) {
+                    receive_cancel->cancel();
+                }
+                co_return;
+            });
 
-        auto msg = co_await client.receive(receive_cancel.get_token());
+        auto msg = co_await client.receive(receive_cancel->get_token());
+        receive_cancel->cancel();
+        co_await receive_watchdog;
         (void)msg;
         receive_returned.store(true, std::memory_order_release);
         client_errno.store(errno, std::memory_order_release);
@@ -1307,7 +1314,7 @@ TEST_CASE("WSS server heartbeat pings while handler is receiving",
     REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 }
 
-TEST_CASE("WSS server heartbeat timeout skips graceful TLS shutdown",
+TEST_CASE("WSS server heartbeat timeout closes raw TLS client",
           "[websocket][server][heartbeat][tls][regression]") {
     scoped_sigpipe_ignore ignore_sigpipe;
 

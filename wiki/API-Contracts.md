@@ -9,6 +9,10 @@ page or header gives a more specific contract, the more specific contract wins.
 If no page says an object is safe for concurrent use, callers must serialize
 mutable access to that object.
 
+The tables below intentionally name concrete public interfaces. They are a
+calling-contract inventory, not a full overload reference. See [[API Reference]]
+for signatures and examples.
+
 ## How To Use This Page
 
 - Treat "Elio guarantees" as library-side behavior. A regression against those
@@ -20,6 +24,8 @@ mutable access to that object.
   changes are still required.
 - Protocol input from peers is a library boundary. Application payload meaning
   after protocol parsing is an application boundary.
+- Low-level parser, buffer-view, and verbs-adjacent interfaces can have stricter
+  caller preconditions than high-level helpers.
 
 ## Cross-Cutting Defaults
 
@@ -30,130 +36,209 @@ mutable access to that object.
 | Cancellation and timeouts | APIs with `cancel_token` or timeout parameters honor the documented cancellation point or deadline and return the documented cancellation or timeout result. | Pass tokens into operations that support cancellation. A wrapper timeout does not forcibly destroy a child operation that has no cancellation-aware wait point. |
 | Results and terminal states | Operations report errors through their documented result type, optional return, `errno`, or exception path. Protocol objects transition to closed/error states as documented. | Check operation results before using returned values. Do not continue using an object after a documented terminal state unless the API documents reuse. |
 | Resource limits | Configured size limits, session limits, queue limits, and deadlines are enforced at the documented layer. | Choose limits and timeouts that fit the application's threat model. Unlimited or zero-disabled limits are an application policy choice. |
-| Low-level fast paths | High-level helpers validate protocol and transport boundaries before dispatching to application handlers. | Raw parser, RDMA, SGE, buffer-view, and verbs-adjacent helpers may require valid caller inputs for performance. Use them only with documented preconditions satisfied. |
+| Application callbacks | Elio invokes registered callbacks at documented points and preserves protocol/resource invariants around them. | Callback code must be exception-safe for the documented callback path, must not outlive captured state, and must avoid recursively calling APIs that forbid reentry. |
+| Input ownership | Elio copies or consumes data only when the API documents copying or ownership transfer. | Keep spans, `std::string_view`, iovec arrays, SGE arrays, and external buffers alive until the operation that references them has completed or cleanup has run. |
 
 ## Runtime, Coroutines, And Timers
 
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| `coro::task<T>` and direct `co_await` | Task awaiters resume the awaiting coroutine and deliver returned values or rethrow stored exceptions through the documented await path. Destroying an uncompleted task destroys its coroutine frame. | Do not copy or move task objects except where a type explicitly supports it. Keep referenced objects alive across suspension points. |
-| `coro::generator<T>` | Generator awaiters deliver yielded values in producer order and surface completion through the documented `next()` result. | Consume the generator according to its single-consumer contract unless a specific generator API documents sharing. Keep yielded references or views alive only for their documented lifetime. |
-| `coro::cancel_source` and `coro::cancel_token` | Cancellation state is shared safely across registered callbacks and cancellation-aware operations observe cancellation according to their own API contract. | Cancellation is cooperative. Pass tokens into operations that support them, keep callback captures valid, and do not assume an operation without token support will stop. |
-| `elio::when_all`, `elio::when_any`, `elio::with_timeout` | Coroutine composition helpers launch the supplied task-producing callables, collect documented results, propagate exceptions through the await path, and request cooperative cancellation of losing or timed-out branches where supported. | Supply callables that return Elio tasks and keep captured state valid until all launched branches finish or observe cancellation. Treat `with_timeout` as cooperative; it cannot forcibly destroy a child task that ignores cancellation. |
-| `runtime::scheduler`, `run()`, `async_main` | Scheduler workers run submitted coroutine tasks and perform orderly shutdown according to the scheduler API. Per-worker I/O contexts route operations through the active worker backend. | Start the scheduler before submitting work that requires it, shut it down intentionally, and keep scheduler-owned objects alive while tasks use them. |
-| `runtime::autoscaler` | The autoscaler samples scheduler state, applies configured triggers/actions, and serializes its own config updates according to the runtime autoscaler API. | Keep the scheduler alive while the autoscaler is running. Choose min/max worker bounds and trigger thresholds that fit the workload. Ensure custom actions and callbacks are safe under scheduler resizing. |
-| `elio::go()`, `elio::spawn()`, `join_handle` | Spawn helpers store callable arguments in the coroutine frame and return results or exceptions through the documented await path. | Keep referenced external objects alive for detached work. Prefer explicit value captures for background tasks that outlive the calling scope. |
-| `spawn_blocking()` and blocking pool | Blocking work submitted through the helper is run outside scheduler worker execution and resumes the awaiting coroutine with the callable result or exception. | Use it only for work that may block or consume CPU outside the event loop. Keep callable captures alive according to normal C++ value/reference rules. |
-| `ELIO_GO`, `ELIO_GO_TO`, `ELIO_SPAWN` | Macros provide inline spawn syntax. | Because the macros use reference captures, every referenced object must outlive the spawned coroutine. |
-| `go_to()` and affinity helpers | Affinity requests are respected according to the scheduler's documented placement behavior. | Use valid worker IDs when deterministic pinning matters and handle resizing or fallback behavior documented by the scheduler. |
-| `time::sleep_for`, `sleep_until`, `yield` | Timer awaiters wake at the requested time or cancellation point supported by the operation. | Pass cancellation tokens into timer operations that support cancellation. Do not assume an unrelated wait primitive is cancellable unless it accepts a token. |
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| `coro::task<T>` | Awaiting a task resumes the awaiting coroutine and returns the result or rethrows the stored exception. Destroying an uncompleted task destroys its coroutine frame. | Treat `task<T>` as move/copy disabled unless the concrete type says otherwise. Keep objects referenced by the coroutine alive across suspension points. |
+| Direct `co_await` on Elio awaitables | Awaitables resume through the scheduler or backend path documented by that awaitable. | Do not destroy the awaited object, scheduler, stream, buffer, or synchronization primitive while an await is still registered unless the API documents safe teardown. |
+| `join_handle<T>` | Awaiting a join handle returns the spawned task result or rethrows its exception. `is_ready()` is a non-blocking readiness check. | Await or intentionally discard join handles according to the task lifetime you need. Do not use a moved-from handle. |
+| `coro::generator<T>` | `next()` delivers yielded values in producer order and returns completion through the documented optional result. | Use it as a single-consumer stream unless a future generator API documents sharing. Do not retain yielded references or views beyond their documented lifetime. |
+| `coro::cancel_source` | Calling `cancel()` publishes cooperative cancellation to tokens and registered callbacks. | Keep callback captures valid. Do not assume cancellation forcibly destroys operations that do not observe the token. |
+| `coro::cancel_token` | Cancellation-aware operations observe the token at their documented wait or poll points. | Pass the token into every operation that should stop. An outer wrapper cannot cancel waits that never receive or check the token. |
+| `elio::when_all()` | Launches supplied task-producing callables and collects all documented results or exceptions. | Supply callables that return Elio tasks and keep captures alive until all branches finish. |
+| `elio::when_any()` | Reports the first completed branch according to the helper's result contract and requests cooperative cancellation where supported. | Treat losing branches as cooperative work that may continue until they observe cancellation. Keep their captures valid. |
+| `elio::with_timeout()` | Enforces a deadline at supported cancellation points and reports timeout through the documented result. | Treat it as cooperative timeout control. Pass tokens into child operations that should stop promptly. |
+| `elio::go()` | Stores callable arguments in the spawned coroutine frame and runs the task independently until completion. | Use value captures for detached work that can outlive the caller. Keep referenced external objects alive. |
+| `elio::go_to()` | Sets task affinity before the first resume and requests execution on the selected worker when the scheduler can honor it. | Pass a valid worker ID when deterministic pinning matters. Handle fallback/resizing behavior for out-of-range or retired workers. |
+| `elio::spawn()` | Stores callable arguments in the coroutine frame and returns a join handle for result or exception delivery. | Await the handle when the result, exception, or completion ordering matters. Keep referenced captures alive until the task completes. |
+| `ELIO_GO`, `ELIO_GO_TO`, `ELIO_SPAWN` | Provide inline spawn syntax. | These macros use reference captures; every referenced object must outlive the spawned coroutine. Prefer explicit captures for detached work. |
+| `runtime::scheduler` | Starts worker threads, runs submitted coroutine tasks, routes per-worker I/O, and performs orderly shutdown according to its API. | Start it before submitting work that requires runtime or I/O services. Keep it alive while scheduler-owned objects and tasks can use it. |
+| `runtime::worker_thread` | Owns a worker queue and I/O context used by the scheduler. | Treat worker objects as scheduler-owned unless an API explicitly exposes direct control. |
+| `runtime::wait_strategy` | Controls worker idle waiting behavior according to selected policy. | Choose a strategy that matches latency, CPU, and power goals; it is not a correctness synchronization primitive. |
+| `runtime::run_config` | Configures `run()` and async-main scheduler defaults. | Set thread counts, backend options, and shutdown policy deliberately for the process. |
+| `elio::run()` | Creates and drives a scheduler for the supplied async entry point, returning its result or surfacing failure as documented. | Do not nest independent schedulers unless the involved APIs document that pattern. Keep process-level resources valid for the entry point. |
+| `ELIO_ASYNC_MAIN` | Bridges a coroutine entry point into a process `main`. | Follow the macro's required function shape and avoid owning another incompatible scheduler around it. |
+| `runtime::autoscaler` | Samples scheduler state and applies configured scale actions while serializing its own config updates. | Keep the scheduler alive while the autoscaler runs. Choose min/max bounds, thresholds, and custom actions that are valid for the workload. |
+| `spawn_blocking()` and blocking pool | Runs blocking or CPU-heavy callables outside scheduler worker execution and resumes the awaiting coroutine with result or exception. | Use it for work that would block or starve scheduler workers. Keep callable captures valid by value/reference rules. |
+| `runtime::current_worker_id()` | Reports the current worker ID when running on a scheduler worker. | Handle the no-current-worker case according to the return contract. |
+| `runtime::set_affinity()` | Requests migration or pinning to the target worker according to scheduler affinity rules. | Use valid worker IDs for deterministic placement and account for resizing. |
+| `runtime::clear_affinity()` | Clears the current coroutine's affinity requirement. | Use it only when the coroutine no longer depends on worker-local state. |
+| `runtime::bind_to_current_worker()` | Binds the current coroutine to its current worker when one exists. | Call it only after entering scheduler execution and before relying on worker-local resources. |
+| Promise affinity helpers | Store and report affinity metadata used by the scheduler. | Treat them as coroutine-runtime integration points, not as general synchronization APIs. |
+| `time::sleep_for()` | Wakes after the requested duration or token cancellation for cancellable overloads. | Pass a token if cancellation is required. Do not rely on exact wakeup time under scheduler load. |
+| `time::sleep_until()` | Wakes at or after the requested time point or token cancellation for cancellable overloads. | Use a clock/source appropriate for the application deadline. |
+| `time::yield()` | Reschedules the current coroutine according to scheduler policy. | Use it to cooperate, not to enforce ordering with other tasks. |
 
-## Signal Handling
+## Server Lifecycle And Signals
 
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| `signal::signal_set` and `signalfd` helpers | Signal helpers integrate Linux `signalfd` delivery with coroutine waits and return observed signals through the documented result path. | Block the relevant signals in threads that should route them through `signalfd`. Coordinate process-wide signal masks with other application code and libraries. |
-| `serve()` shutdown helpers | Serve helpers use configured shutdown signals to stop listeners and allow orderly shutdown according to the server API. | Choose the signal set and shutdown deadline appropriate for the process. Ensure application tasks observe shutdown and release resources. |
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| `elio::serve()` | Runs a server with configured shutdown signals and deadlines, then stops accepting new work as documented. | Choose signal sets and shutdown deadlines suitable for the process. Ensure application handlers observe shutdown and release resources. |
+| `elio::serve_all()` | Coordinates multiple serve targets under the documented shared shutdown policy. | Ensure each served object remains alive for the full serve call and can tolerate the shared shutdown behavior. |
+| `elio::wait_shutdown_signal()` | Waits for configured shutdown signals through the signal integration path. | Block/process signals consistently across the application and third-party libraries. |
+| `signal::signal_set` | Stores a set of signal numbers and applies mask operations according to its API. | Use valid signal numbers and coordinate process-wide signal mask policy. |
+| `signal::signal_fd` | Integrates Linux `signalfd` with coroutine waits and returns observed signal information. | Block the same signals in threads that should route them through `signalfd`. Keep the object alive while waits are pending. |
+| `signal::signal_info` | Reports decoded signal metadata from `signalfd`. | Treat it as event data; application shutdown policy remains caller-owned. |
+| `signal::signal_block_guard` | Restores the previous signal mask when destroyed according to RAII semantics. | Keep guard lifetime aligned with the critical section that needs the mask. |
+| Signal utility functions | Apply or query signal mask state and surface platform errors as documented. | Check return values and account for process-wide effects. |
 
-## Networking And Streams
+## I/O, Networking, And Streams
 
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| TCP and UDS listeners | Bind helpers configure sockets according to supplied options and accept connections asynchronously. Listener close/shutdown stops future accepts as documented. | Choose bind addresses, filesystem socket paths, permissions, backlog, and socket options appropriate for the deployment. |
-| `tcp_stream`, `uds_stream` base I/O | `read()`, `write()`, and `writev()` perform one readiness-aware operation and report the actual byte count or error. | Treat positive short reads/writes as normal stream behavior. Loop or use exact-length helpers when a full protocol message must be transferred. |
-| Exact-length stream helpers | `read_exactly()` and `write_exactly()` continue until the requested byte count, EOF, cancellation, or error according to the helper contract. | Use these helpers for fixed-size protocol fields or complete message writes. Keep buffers valid until the operation finishes. |
-| DNS resolution | Resolver helpers return resolved addresses or an empty/error result according to the resolver contract. | Decide address ordering, retries, and application policy when multiple addresses are available. |
-| `io_context` and backends | io_uring and epoll backends submit supported operations and resume awaiters with completion results. | Do not bypass backend ownership rules. Keep operation buffers and file descriptors valid until completion unless an API documents transfer or cancellation behavior. |
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| `io::io_context` | Owns an I/O backend and submits supported operations, resuming awaiters with completion results. | Use it from its documented owner context. Keep file descriptors and buffers valid until completion unless ownership transfer is documented. |
+| `io::io_result` | Carries kernel-style result values and error information without hiding partial progress. | Check negative results before using counts. Treat zero/EOF according to the specific operation. |
+| Async I/O awaitables | Submit the requested read, write, poll, accept, connect, timeout, or file operation through the active backend. | Do not close/reuse file descriptors or mutate buffers in ways that violate the awaited operation's lifetime. |
+| Batch I/O | Submits supported operations and returns per-operation status. | Interpret partial success at the application layer. Do not assume the batch is atomic as a group. |
+| File helper functions | Perform chunked or bounded file I/O according to helper result semantics. | Validate paths, permissions, overwrite policy, expected file size, and trust of file contents. |
+| `net::ipv4_address`, `net::ipv6_address`, `net::socket_address` | Represent IPv4, IPv6, or generic socket address/port values and convert between supported forms. Numeric-literal constructors log invalid text and fall back to an any-address value. | Pass syntactically valid numeric literals or pre-validate/resolve host strings when fallback-to-any is not acceptable. Choose address family and bind/connect policy appropriate for the deployment. |
+| DNS resolver helpers | Return resolved addresses or empty/error results according to resolver behavior. | Decide address ordering, retries, family preference, and failover policy. |
+| `net::tcp_listener` | Binds/listens with supplied options and accepts connections asynchronously. Closing the listener stops future accepts as documented. | Choose bind address, backlog, reuse options, and permissions appropriate for deployment. Keep listener alive while accepts are pending. |
+| `net::tcp_stream` | `read()` and `write()` perform one readiness-aware operation and return actual byte count or error. Transient readiness for these base calls is handled inside the awaitable path. | Treat positive short reads/writes as normal stream behavior. Loop or use exact-length helpers when a full protocol message must be transferred. Keep buffers valid until completion. |
+| `tcp_stream::read_exactly()` | Continues reading until the requested byte count, EOF, cancellation, or error. | Use it only when exactly that many bytes are required. Keep destination buffers valid for the full operation. |
+| `tcp_stream::write_exactly()` | Continues writing until all requested bytes are sent, cancellation occurs, or an error is returned. | Use it for full message writes. Keep source buffers valid for the full operation and handle partial-progress errors. |
+| `tcp_stream::writev()` | Submits one scatter-gather write operation and reports the backend result, including positive short writes or transient readiness errors. | Keep the iovec array and referenced data valid until completion. Handle `EAGAIN`/`EWOULDBLOCK`, polling, retry, and iovec advancement when a complete logical message is required. |
+| `net::unix_address` | Represents filesystem or Linux abstract Unix-domain socket addresses and enforces `sockaddr_un` length limits when converted for binding or connecting. | Choose socket path/namespace, filesystem permissions, abstract-socket naming, and cleanup policy. |
+| UDS listeners | Bind/listen/accept Unix-domain sockets asynchronously. | Keep path ownership and unlink behavior under application control. |
+| `net::uds_stream` | Provides stream I/O semantics matching TCP stream base/exact helpers over Unix-domain sockets. | Apply the same short I/O and buffer-lifetime rules as TCP streams. |
+| `net::stream` concept/helpers | Expose generic stream requirements for APIs that accept stream-like types. | Provide streams that satisfy the expected read/write/close contract for the consuming API. |
+| `io_uring` and epoll backends | Normalize supported backend completions into Elio awaitable results. | Select a backend supported by the kernel and deployment. Do not bypass backend ownership rules. |
 
 ## TLS
 
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| `tls_context` | Context helpers configure OpenSSL state, certificate paths, ALPN, and verification settings according to their return values. | Keep the context alive while TLS streams or listeners use it. Load trusted CA paths and certificates for production deployments. |
-| `tls_stream` | TLS streams perform handshake, encrypted reads/writes, and bounded shutdown according to the TLS stream contract. | Do not issue concurrent operations on one TLS stream unless the API documents that pattern as safe. Keep plaintext buffers valid until operations complete. |
-| Certificate verification | High-level client defaults keep verification enabled where practical. | Disable verification only for controlled tests. Hostname, trust-store, private-key, and certificate-file policy belongs to the application deployment. |
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| `tls::tls_context` | Configures OpenSSL context state, certificates, keys, ALPN, ciphers, protocol versions, and verification mode according to return values. | Keep the context alive while streams/listeners use it. Load trusted CA paths, certificates, and private keys appropriate for deployment. |
+| `tls::tls_stream` | Performs handshake, encrypted reads/writes, exact-length helpers, peer certificate access, and bounded close-notify shutdown according to its API. | Do not issue concurrent operations on one TLS stream unless documented safe. Keep plaintext buffers valid until operations finish. Call `shutdown()` when close-notify semantics matter. |
+| `tls_connect()` | Resolves/connects TCP, applies SNI, performs TLS handshake, and reports failure according to result type. | Provide hostname, port, context, and resolver policy appropriate for the peer. Check the returned stream/result before use. |
+| `tls_listener` | Accepts TCP connections and performs server-side TLS handshake before returning streams. | Keep `tls_context` and listener alive while accepts are pending. Configure certificates and verification policy explicitly. |
+| Certificate verification settings | Applies OpenSSL verification mode and reports verification errors through the documented path. | Disable verification only for controlled tests. Hostname, trust-store, key rotation, and certificate policy belong to the application/deployment. |
 
 ## HTTP/1.1
 
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| HTTP parser and server request intake | Elio parses request lines, headers, bodies, and protocol framing before dispatching a request handler. Malformed HTTP is rejected at the parser/server boundary. | Validate application routes, authorization, allowed methods, content schema, and business rules in handlers. |
-| HTTP server limits | Configured request, header, body, keep-alive, and session limits are enforced at their documented layer. `server_config::max_request_size` is an aggregate HTTP request-byte cap for the request line, headers, and body; for WebSocket upgrades, bytes after the completed HTTP upgrade request are no longer counted as HTTP request bytes. | Pick limits appropriate for exposed services, including enough budget for accepted request targets, headers, and bodies. A disabled limit or unbounded timeout is an application policy choice. |
-| HTTP responses | Response serialization preserves status, headers, and body framing generated through Elio response APIs. | Do not construct invalid application headers or bodies. Avoid exposing secrets or unsafe redirects from handler logic. |
-| HTTP client | Client helpers perform connection setup, optional TLS, request serialization, response parsing, and timeout handling according to config. | Check response status and errors. Decide retry, redirect, authentication, and application payload validation policy. |
-| Raw HTTP helpers | Raw parser/building helpers expose low-level protocol pieces without full server/client policy. | Use raw helpers only with valid inputs and application-level validation around them. |
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| `http::url` | Parses and exposes supported URL components according to HTTP client rules. | Validate application-specific scheme, host, path, query, and credential policy. |
+| `http::headers` | Stores header fields and provides documented lookup/serialization behavior. | Do not rely on it for application authorization or semantic validation. Avoid adding invalid or unsafe header names/values. |
+| `http::request` | Represents parsed or constructed HTTP requests and preserves method, target, headers, and body fields. | Validate routes, methods, authorization, content type, and body schema in application code. |
+| `http::response` | Represents and serializes status, headers, and body framing generated through Elio APIs. | Choose status, redirects, cache headers, and payload content safely. Do not expose secrets through response fields. |
+| HTTP enums | Provide stable names for supported methods, versions, and status codes. | Handle unknown or unsupported peer/application values according to caller policy. |
+| Raw HTTP parser helpers | Validate request/response line grammar, headers, transfer encoding, body framing, and configured byte limits. | Feed bytes in order and respect terminal parser error states. Raw parser use does not replace application policy checks. |
+| `http::server_config` | Applies configured request size, header, body, keep-alive, timeout, and session limits at the documented layer. `max_request_size` caps aggregate HTTP request bytes for line, headers, and body; WebSocket frame bytes after a completed upgrade are outside that HTTP cap. | Choose limits that match deployment risk and expected traffic. A disabled or unlimited setting is caller policy. |
+| HTTP server route registration | Matches routes according to documented literal, parameter, and wildcard rules before invoking handlers. | Register only intended routes. Avoid ambiguous application routing and validate authorization/business rules in handlers. |
+| HTTP server request intake | Rejects malformed HTTP before dispatching a handler. | Treat handler input as syntactically parsed HTTP, not as trusted application data. |
+| `http::client` | Performs connection setup, optional TLS, request serialization, response parsing, redirect behavior, and timeout handling according to config. | Check response status and errors. Decide retries, authentication, idempotency, redirect trust, and payload validation. |
+| `http::base_client_config` | Defines shared timeout, size, and behavior settings for client operations. | Set values appropriate for target endpoints and threat model. |
+| `http::client_config` | Extends base client settings with HTTP/1.1 client-specific options. | Keep configured defaults aligned with application retry/redirect/security policy. |
 
 ## HTTP/2
 
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| `h2_client` | The client negotiates ALPN/TLS, initializes the HTTP/2 session, validates frames through nghttp2, and reports response or error results. | Avoid concurrent use of one high-level `h2_client` unless a future API documents shared-session multiplexing. Use separate clients for parallel application work. |
-| HTTP/2 settings and limits | Configured stream limits, read timeouts, and connection setup timeouts are applied as documented. | Choose settings that match the peer and workload. Validate response status, headers, and body semantics at the application layer. |
-| nghttp2 dependency | Elio maps nghttp2 protocol validation into the client/session result path. | Provide the dependency through the documented build or package mode and handle provider-specific deployment constraints. |
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| `http::h2_client` | Negotiates TLS/ALPN where configured, initializes nghttp2 session state, validates frames through nghttp2, and reports response or error results. | Avoid concurrent use of one high-level client unless a future API documents shared-session multiplexing. Use separate clients for parallel application work. |
+| `http::h2_client_config` | Applies configured connect/read deadlines, body limits, and HTTP/2 settings where supported. | Choose limits/settings that match peer behavior and workload. |
+| `http::h2_session` | Encapsulates nghttp2 session interaction and translates protocol validation to Elio result paths. | Treat direct session use as lower-level than `h2_client`; preserve stream/session ownership and callback lifetimes. |
+| nghttp2 package integration | Uses the configured bundled or system nghttp2 provider for HTTP/2 protocol handling. | Provide the dependency through the documented source, package, or install mode. Handle provider-specific deployment constraints. |
 
-## WebSocket
+## WebSocket And SSE
 
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| WebSocket handshake | Server and client helpers validate HTTP upgrade requirements, selected subprotocols, masking rules, and configured handshake deadlines before opening the connection. | Register only intended routes and subprotocols. Validate origin, authorization, session identity, and application policy in the application layer. |
-| WebSocket frames | Elio validates opcodes, reserved bits, masking direction, control-frame rules, fragmentation state, message size, and close behavior before exposing messages to handlers. | Validate text encoding, JSON/schema, authorization, and business meaning of message payloads after `receive()`. |
-| `ws_connection` send helpers | Server-side send helpers serialize concurrent sends so frames produced by multiple senders do not interleave on the wire. | Keep the connection object alive while operations run and stop sending after close/error results. |
-| `ws_client` | Client connect/receive/send/close operations maintain client protocol state and fail closed on invalid peer frames. Parser state is reset for new connection attempts as documented by client behavior. | Serialize use of one client unless a method documents concurrent safety. Reconnect policy, backoff, idempotency, and replay of application messages belong to the caller. |
-| Raw frame parser | Parser helpers identify WebSocket protocol errors and incomplete input. | Feed bytes in order and respect parser terminal error states. Raw parser use does not replace application payload validation. |
+Names below use the convenience re-exports from `<elio/http/websocket.hpp>` and
+`<elio/http/sse.hpp>`. The concrete declarations live under
+`elio::http::websocket` and `elio::http::sse`.
 
-## Server-Sent Events
-
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| SSE server | Elio serializes events into SSE wire format and prevents concurrent senders from interleaving frames where documented. | Decide event names, ids, retry values, authorization, and payload schema. Stop producing events when the connection is inactive. |
-| SSE client | The client parses SSE response headers and event stream syntax and applies configured connection/read deadlines. | Browser-style reconnection policy, last-event-id persistence, duplicate handling, and application event validation belong to the caller unless a specific API documents otherwise. |
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| WebSocket handshake helpers | Validate HTTP upgrade requirements, selected subprotocols, and configured deadlines before opening the connection. | Register intended routes/subprotocols and validate origin, authorization, session identity, and application policy. |
+| Raw WebSocket frame parser | Validates opcodes, reserved bits, control-frame rules, fragmentation, payload length, UTF-8 requirements where enforced, and close-code legality. It validates masking direction only after the caller configures an endpoint role. | Feed bytes in order, configure `server` or `client` role when masking direction matters, and respect parser terminal error states. Validate application message schema after protocol parsing. |
+| `websocket::ws_connection` | Server-side `send_text()`, `send_binary()`, `send_ping()`, `send_pong()`, close-response, and auto-pong writes are serialized so frames from multiple senders do not interleave on the wire. Receive/close follow documented state transitions. | Keep the connection object alive while operations run. Use only one active receive loop per connection. Stop sending after close/error results and validate payload meaning in handlers. |
+| `websocket::ws_router` and `websocket::ws_server` | Upgrade matching routes into WebSocket handlers, enforce route pattern rules, and apply WebSocket message/read-buffer limits. | Keep handler captures and TLS contexts alive for spawned handlers, authorize connections, and decide application close/retry policy. |
+| `websocket::ws_client` | `connect()`, `receive()`, `send_text()`, `send_binary()`, control-send helpers, and `close()` maintain client protocol state, reset parser state for new connection attempts, and fail closed on invalid peer frames. | Serialize use of one client unless documented safe. Reconnect policy, backoff, idempotency, and replay of application messages belong to the caller. |
+| `sse::sse_connection` | Serializes events, comments, retry fields, and simple data messages into SSE wire format and serializes concurrent sends where documented. | Decide event names, ids, retry values, authorization, and payload schema. Stop producing when the connection is inactive. |
+| `sse::sse_client` | Parses SSE response headers and event stream syntax, enforces configured event-buffer limits, tracks `Last-Event-ID`, applies configured connect/read deadlines, and performs configured receive-driven reconnect/backoff after an established stream fails while not closed. | Decide whether to enable reconnect and how many attempts to allow. Retry initial `connect()` failures, duplicate handling, replay/idempotency, persistence across process restarts, and application event validation remain caller-owned. |
+| `sse::event` objects | Preserve parsed or constructed event type, id, retry, and data fields according to SSE syntax. | Interpret event semantics, durable ordering, and persistence in application code. |
 
 ## RPC
 
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| RPC frame parser | Elio validates frame type, flags, payload length, checksum presence, and configured maximum message size before dispatching frames. | Treat CRC32 as accidental corruption detection, not authentication or tamper resistance. Use TLS, message authentication, or an application security layer for hostile peers. |
-| `rpc_client` | Concurrent calls are correlated by request ID, timeouts are reported through `rpc_result`, and stale timed-out responses are not matched to unrelated future calls. | Keep the client alive for outstanding calls. Check `rpc_result::ok()` before reading values. Bound total in-flight calls according to application resource policy. |
-| `rpc_server` | Registered handlers are dispatched for valid method frames and session limits/timeouts are applied as configured. | Assign stable unique method IDs, version schemas, validate authorization and business invariants inside handlers, and keep handler-captured objects alive. |
-| Serialization buffers | Serialization and deserialization follow declared `ELIO_RPC_FIELDS` order and supported type rules. | Use compatible schemas on both sides. Do not share mutable serializer/buffer objects across threads unless documented safe. Keep `buffer_ref` backing storage alive through the documented send/cleanup point. |
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| `rpc::buffer_view` | Represents a non-owning byte view. | Keep backing storage alive and unchanged for the duration of any operation that reads it. |
+| `rpc::buffer_writer` | Appends serialized bytes and reports allocation/size behavior through normal C++ container semantics. | Do not share a mutable writer across threads or coroutines unless externally synchronized. |
+| `rpc::buffer_ref` | Represents a non-owning external byte reference. Deserialization can expose received payload bytes without copying; current serialization copies referenced bytes into the outgoing writer. | Keep referenced storage valid until the operation that reads or copies it has completed. Use cleanup callback registration, not `buffer_ref` itself, for deferred external ownership release. |
+| `rpc::iovec_buffer` | Builds scatter-gather buffers for frame writes according to the writer contract. | Keep all referenced segments valid until the write operation completes. |
+| RPC CRC32 helpers | Compute non-cryptographic checksums over frames or iovec data. | Use CRC32 only for accidental corruption detection or protocol compatibility, not authentication. |
+| RPC serialization | Serializes/deserializes supported types and `ELIO_RPC_FIELDS` in declared order. | Use compatible schemas on both sides and enforce application-level versioning and validation. |
+| `ELIO_RPC_FIELDS` and schema macros | Declare field order for generated serialization helpers. | Keep declarations stable for wire compatibility or version schemas deliberately. |
+| `rpc::frame_header` | Represents validated frame metadata after parsing or builder construction. | Do not trust unparsed bytes as a header. Check parser/builder results before dispatch. |
+| `rpc::message_type`, `message_flags`, `rpc_error` | Provide protocol enum values and error reporting surface. | Handle unknown or unsupported values according to caller protocol policy. |
+| RPC message builders | Build request, response, error, one-way, and keepalive frames with documented flags, payload length, and checksum handling. | Provide payloads and flags that match the method schema and peer capabilities. |
+| RPC frame parser | Validates frame type, flags, payload length, checksum presence, and configured max message size before dispatching frames. | Configure max message size and close peers that violate application policy. Do not treat CRC32 as security. |
+| `rpc::rpc_context` | Exposes request context and response helpers to handlers. | Keep handler-captured resources valid and enforce authorization/business invariants in handlers. |
+| `rpc::cleanup_callback_t` | Runs cleanup at the documented post-send or post-serialization point for methods registered with cleanup support. | Make cleanup idempotent or safe for the documented call path. Do not assume it runs as a failure-path finalizer. |
+| `rpc::rpc_server_config` | Applies session, message-size, timeout, and checksum settings according to server behavior. | Choose bounds appropriate for exposed services and expected payloads. |
+| `rpc::rpc_server<Stream>` | Dispatches registered handlers for valid method frames and enforces configured session/timeout limits. | Assign stable unique method IDs, maintain schema compatibility, validate caller identity/authorization, and keep handler captures alive. |
+| `rpc::rpc_client_config` | Applies client timeout, checksum, and message-size settings to calls. | Set timeouts and size caps for workload and threat model. |
+| `rpc::rpc_client<Stream>` | Correlates concurrent calls by request ID, reports timeouts through `rpc_result`, and prevents stale timed-out responses from matching unrelated future calls. | Keep the client alive for outstanding calls. Check `rpc_result::ok()` before reading values. Bound total in-flight calls according to application resource policy. |
+| `rpc::rpc_result<T>` | Carries value or error state for RPC calls. | Check success/error state before accessing the value. |
+| RPC type traits | Detect supported message and serialization shapes at compile time. | Keep custom types within supported trait/schema rules. |
 
 ## Synchronization Primitives
 
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| `sync::mutex`, `shared_mutex`, `semaphore`, `event`, `condition_variable` | Awaiters are resumed according to the primitive's documented ordering, cleanup, and cancellation support. | Use the primitive that matches the concurrency invariant. Do not destroy synchronization objects while waiters can still reference them unless the API documents safe teardown. |
-| `sync::channel` | Channel send/receive/close operations follow the documented capacity and close semantics. | Handle closed-channel results. Keep message values and channel objects alive according to move/lifetime rules. |
-| `sync::object_cache` | Cache lookups coalesce construction per key, return move-only borrows with reference-counted lifetime tracking, and apply explicit eviction, TTL, and reclaim behavior according to the cache configuration. | Keep constructor callables and captured state valid while construction runs. Release borrows promptly, choose TTL/reclaim settings for the workload, and treat cached object contents and eviction policy as application-level state. |
-| `sync::spinlock` | The spinlock provides a thread-blocking atomic lock for very short critical sections. | Do not hold a spinlock across `co_await` or long-running work. Prefer coroutine-aware primitives for code that may suspend or contend. |
-| Low-level lock-free primitives | Lock-free queues/rings provide the documented producer/consumer shape and memory-ordering guarantees. | Respect the declared producer/consumer cardinality. Do not use internal runtime primitives as general-purpose synchronization unless documented public. |
-
-## File Helpers And Batch I/O
-
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| File read/write helpers | Helpers perform chunked or batch I/O according to the documented result semantics and avoid single unbounded kernel requests where documented. | Validate paths, permissions, expected file size, overwrite policy, and trust of file contents. Keep buffers and paths valid until the operation completes. |
-| Batch operations | Batch helpers submit supported operations and return per-operation results. | Interpret partial success and retry policy at the application layer. Do not assume all operations are atomic as a group unless a helper documents that behavior. |
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| `sync::mutex` | `lock()` awaiters are resumed according to mutex ordering and cleanup rules; `unlock()` wakes a waiter when present. | Do not destroy the mutex while waiters can still reference it. Release the lock on every path. |
+| `sync::shared_mutex` | Provides documented shared/exclusive lock admission and waiter cleanup behavior. | Match lock mode to the protected invariant and avoid upgrades/downgrades unless an API documents them. Keep the object alive while waiters exist. |
+| `sync::shared_lock_guard` | Releases an already-held shared lock on destruction or explicit `unlock()`. | Acquire the shared lock before constructing the guard. Keep the referenced shared mutex alive for the guard lifetime. |
+| `sync::unique_lock_guard` | Releases an already-held exclusive lock on destruction or explicit `unlock()`. | Acquire the exclusive lock before constructing the guard. Keep the referenced shared mutex alive for the guard lifetime and avoid suspending in unsafe critical sections. |
+| `sync::semaphore` | `acquire()` and `release()` manage permits and waiter wakeups according to the semaphore contract. | Release only permits that match the intended concurrency invariant. Keep the semaphore alive while waiters exist. |
+| `sync::event` | Waiters resume when the event is set according to event semantics and cleanup rules. | Keep waited objects/captures alive until the waiter resumes or is destroyed. |
+| `sync::condition_variable` | Wait operations release/reacquire the associated lock according to documented coroutine-aware semantics. | Protect predicates with the correct lock and re-check predicates after wakeup. Keep CV and lock alive while waiters exist. |
+| `sync::channel<T>` | Send/receive/close operations follow documented capacity, rendezvous, and closed-channel semantics. | Handle closed-channel results. Keep channel and moved message values valid according to the send/receive path. |
+| `sync::object_cache` | Coalesces construction per key, returns move-only borrows with reference-counted lifetime tracking, and applies TTL/eviction/reclaim behavior by config. | Keep constructor callables and captures valid while construction runs. Release borrows promptly and treat cached object state/eviction as application policy. |
+| `sync::spinlock` | Provides a thread-blocking atomic lock for short critical sections. | Do not hold it across `co_await` or long-running work. Prefer coroutine-aware primitives for suspending code. |
+| `sync::spinlock_guard` | Releases the spinlock on guard destruction. | Keep the spinlock alive for the guard lifetime and keep the critical section short. |
+| Low-level lock-free queues/rings | Provide documented producer/consumer cardinality and memory-ordering guarantees. | Respect the declared producer/consumer shape. Do not use internal runtime primitives as general-purpose synchronization unless documented public. |
 
 ## Hash Functions
 
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| CRC32 | CRC32 helpers compute the documented checksum over supplied bytes and iovecs. | Use CRC32 only for accidental error detection or protocol compatibility. Do not use it as a security boundary. |
-| SHA-1 and SHA-256 | Hash helpers compute the documented digest over supplied bytes and incremental updates. | Choose a hash that matches the security goal. SHA-1 is not collision-resistant for new security designs. Keep input spans valid for the call. |
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| CRC32 helpers | Compute the documented CRC32 value over supplied bytes and scatter-gather inputs. | Use CRC32 only for accidental error detection or compatibility, not as a security boundary. Keep inputs valid for the call. |
+| CRC32C helpers | Compute the documented CRC32C value where available. | Use it only for protocols that require CRC32C or non-cryptographic checks. |
+| SHA-1 helpers | Compute SHA-1 over supplied or incremental input. | Do not use SHA-1 for new collision-resistant security designs. Keep input spans valid. |
+| SHA-256 helpers | Compute SHA-256 over supplied or incremental input. | Choose SHA-256 only when a hash, not authentication or encryption, satisfies the security goal. Keep input spans valid. |
+| Hash hex utilities | Convert digest bytes to documented textual forms. | Treat output formatting as representation only; compare/authenticate according to application security requirements. |
 
 ## RDMA, RDMA-CM, And CUDA RDMA
 
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| RDMA backend traits | Awaiters normalize backend post failures into documented completion results without throwing. | Backend `post_*` methods must be `noexcept`, follow the required return convention, and keep QP/CQ/backend objects alive while operations can complete. |
-| RDMA `connection` operations | High-level single-buffer operations fail before posting when a 32-bit SGE length precondition is not met. Started operations preserve synchronous post failures until awaited. | Keep SGE arrays and payload buffers alive for the hardware operation. Split oversized local buffers into valid SGEs. Ensure remote keys, addresses, and access rights are valid. |
-| Memory regions and remote buffers | RAII wrappers deregister memory according to their ownership contract. | Keep registered memory alive while any local or remote operation can access it. Bounds for fast-path subviews and remote offsets are caller-owned where documented. |
-| RDMA-CM helpers | CM wrappers expose lifecycle and event handling in coroutine-friendly form. | Follow RDMA-CM state-machine requirements, close/destroy IDs in valid states, and keep event channels/listeners alive while operations reference them. |
-| CUDA RDMA helpers | CUDA-specific wrappers expose GPU buffer and memory-region helpers when the feature is enabled. | Ensure CUDA context, device pointer validity, registration support, peer access, and driver/runtime compatibility. |
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| `rdma::backend_traits` | Defines the backend posting contract and normalizes synchronous post failures into awaiter result paths. | Backend `post_*` methods must be `noexcept`, follow the return convention, and keep QP/CQ/backend objects alive while operations can complete. |
+| `rdma::polymorphic_backend` | Routes operation posts through runtime-dispatched backend functions according to the same backend contract. | Keep backend implementation and user data alive for outstanding operations. |
+| `rdma::buffer_view` and `remote_buffer` | Represent local and remote memory ranges used by RDMA operations. | Keep local memory registered/alive, ensure remote address/rkey/access rights are valid, and respect 32-bit length preconditions where documented. |
+| `rdma::sge` arrays | Describe scatter-gather entries for verbs-adjacent operations. | Keep SGE arrays and all pointed-to payload buffers alive until hardware completion. Split oversized buffers into valid SGEs. |
+| `rdma::connection<Backend>::send/recv` | Posts send/receive work requests and reports completions or synchronous post failures through awaiter results. | Keep connection/backend and buffers alive until completion. Post receives according to peer protocol needs. |
+| `rdma::connection<Backend>::rdma_write/rdma_read` | Posts RDMA read/write operations and fail-fast checks documented high-level length preconditions. | Ensure remote keys, addresses, access permissions, and local buffer registration are valid. |
+| `rdma::connection<Backend>::cas/fetch_add` | Posts supported 8-byte atomic operations through backends that implement atomic traits. | Use aligned 8-byte local/remote buffers and valid atomic-capable remote access. |
+| Inline send options | Fail before posting when inline size or SGE preconditions are not satisfied at documented high-level entry points. | Configure inline thresholds that match hardware/provider capabilities. |
+| Shared receive queue helpers | Post/receive through SRQ-capable backends and map failures to completion results. | Use only with backends and QPs configured for SRQ. Keep SRQ objects alive for outstanding receives. |
+| Memory region RAII | Registers/deregisters memory according to ownership contract. | Keep underlying memory and protection domain/context alive for the memory-region lifetime and for all operations using it. |
+| Memory-region subviews | Produce verbs-adjacent local/remote views. | Bounds and 32-bit sub-length preconditions are caller-owned where documented. |
+| Completion dispatcher and CQ pump | Deliver completions to awaiting operations according to wr_id/op_state lifecycle rules. | Drive the dispatcher/cq pump until all outstanding operations complete or are intentionally drained. |
+| RDMA-CM event channel and IDs | Wrap CM event/channel and ID lifecycle in coroutine-friendly forms. | Follow RDMA-CM state-machine requirements and keep channels/IDs/listeners alive while operations reference them. |
+| RDMA-CM connect/listen helpers | Drive connection bootstrap according to CM helper contracts. | Configure addresses, routes, QP attributes, and teardown policy valid for the provider. |
+| libibverbs endpoint/backend helpers | Provide a reference provider-backed endpoint path when enabled. | Deploy with compatible libibverbs/RDMA-Core provider, permissions, and device configuration. |
+| CUDA RDMA GPU buffers and memory regions | Expose CUDA-specific buffer and registration helpers when the feature is enabled. | Ensure CUDA context, device pointer validity, registration support, peer access, and driver/runtime compatibility. |
 
 ## Logging And Debugging
 
-| Interface family | Elio guarantees | Caller must guarantee |
-|------------------|-----------------|-----------------------|
-| Logging macros and logger | Logger internals serialize writes according to the logging implementation. | Avoid logging secrets. Configure log level and sinks according to deployment requirements. |
-| Virtual stack/debug helpers | Debug helpers expose Elio coroutine-frame metadata best effort. | Treat debug output as diagnostic data, not a stable application protocol or security boundary. |
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| Logging macros | Format and dispatch log messages through the configured logger path. | Avoid logging secrets and keep format arguments valid for the call. |
+| `log::logger` | Serializes writes according to the logger implementation and honors configured level. | Configure level/sinks for deployment and avoid relying on logging for synchronization. |
+| `elio::version()` and version macros | Report the library version compiled into the headers. | Do not use version strings as feature detection when compile-time feature macros or CMake options are the real contract. |
+| Virtual stack/debug helpers | Expose coroutine-frame metadata on a best-effort diagnostic basis. | Treat debug output as diagnostic data, not a stable application protocol or security boundary. |
+| `elio-pstack`, GDB, and LLDB helpers | Interpret Elio debug metadata when available. | Use them for debugging only; handle missing symbols, optimized builds, and stale process state. |

@@ -50,6 +50,7 @@ struct op_state {
     std::atomic<uint8_t> phase{phase_pending};
     int32_t result = 0;
     uint32_t flags = 0;
+    ::msghdr msg{};
 };
 
 /// I/O operation types
@@ -59,7 +60,6 @@ enum class io_op : uint8_t {
     write,
     readv,
     writev,
-    sendmsg,
     accept,
     connect,
     recv,
@@ -68,7 +68,8 @@ enum class io_op : uint8_t {
     timeout,
     cancel,
     poll_read,    ///< Wait for socket to be readable
-    poll_write    ///< Wait for socket to be writable
+    poll_write,   ///< Wait for socket to be writable
+    sendmsg       ///< Scatter-gather socket send
 };
 
 /// I/O operation result

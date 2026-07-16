@@ -147,9 +147,15 @@ public:
                 
             case io_op::write:
             case io_op::writev:
-            case io_op::sendmsg:
             case io_op::send:
             case io_op::poll_write:
+                events |= EPOLLOUT;
+                break;
+
+            case io_op::sendmsg:
+                if (!req.msg) {
+                    return false;
+                }
                 events |= EPOLLOUT;
                 break;
 

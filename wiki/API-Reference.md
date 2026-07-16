@@ -998,7 +998,9 @@ auto result = co_await async_poll_read(fd);
 auto result = co_await async_poll_write(fd);
 ```
 
-`async_send()` and `async_sendmsg()` are socket operations. On platforms with
+`async_send()` and `async_sendmsg()` are socket operations. `async_sendmsg()`
+is a scatter-gather send over an `iovec` array, not a general `sendmsg(2)`
+wrapper for destination addresses or ancillary/control data. On platforms with
 per-call `SIGPIPE` suppression, they apply it so peer-close failures are
 reported through `io_result` rather than process-level signal delivery.
 

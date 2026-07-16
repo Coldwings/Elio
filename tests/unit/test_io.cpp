@@ -5,6 +5,7 @@
 #include <elio/coro/cancel_token.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/net/resolve.hpp>
+#include <elio/net/tcp.hpp>
 #include <elio/time/timer.hpp>
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
 #include <elio/tls/tls_stream.hpp>
@@ -1184,7 +1185,7 @@ TEST_CASE("socket stream writes report errors without SIGPIPE",
                 });
 
         REQUIRE_FALSE(result.success());
-        REQUIRE(result.error_code() != 0);
+        REQUIRE(result.error_code() == EPIPE);
         REQUIRE_FALSE(probe.saw_sigpipe());
     }
 
@@ -1197,7 +1198,7 @@ TEST_CASE("socket stream writes report errors without SIGPIPE",
                 });
 
         REQUIRE_FALSE(result.success());
-        REQUIRE(result.error_code() != 0);
+        REQUIRE(result.error_code() == EPIPE);
         REQUIRE_FALSE(probe.saw_sigpipe());
     }
 
@@ -1215,7 +1216,7 @@ TEST_CASE("socket stream writes report errors without SIGPIPE",
                 });
 
         REQUIRE_FALSE(result.success());
-        REQUIRE(result.error_code() != 0);
+        REQUIRE(result.error_code() == EPIPE);
         REQUIRE_FALSE(probe.saw_sigpipe());
     }
 
@@ -1233,7 +1234,7 @@ TEST_CASE("socket stream writes report errors without SIGPIPE",
                 });
 
         REQUIRE_FALSE(result.success());
-        REQUIRE(result.error_code() != 0);
+        REQUIRE(result.error_code() == EPIPE);
         REQUIRE_FALSE(probe.saw_sigpipe());
     }
 }

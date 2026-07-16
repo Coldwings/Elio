@@ -135,7 +135,6 @@ inline bool io_uring_prepare_request_is_valid(const io_request& req) noexcept {
         case io_op::write:
         case io_op::readv:
         case io_op::writev:
-        case io_op::sendmsg:
         case io_op::accept:
         case io_op::connect:
         case io_op::recv:
@@ -145,6 +144,8 @@ inline bool io_uring_prepare_request_is_valid(const io_request& req) noexcept {
         case io_op::poll_read:
         case io_op::poll_write:
             return true;
+        case io_op::sendmsg:
+            return req.msg != nullptr;
     }
     return false;
 }

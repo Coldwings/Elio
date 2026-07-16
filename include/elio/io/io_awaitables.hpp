@@ -570,6 +570,7 @@ private:
 };
 
 /// Awaitable for socket scatter-gather send operations.
+/// This is not a general sendmsg(2) wrapper: only msg_iov/msg_iovlen are set.
 class async_sendmsg_awaitable : public io_awaitable_base {
 public:
     async_sendmsg_awaitable(int fd, struct iovec* iovecs,
@@ -578,10 +579,7 @@ public:
         , fd_(fd)
         , iovecs_(iovecs)
         , iovec_count_(iovec_count)
-        , flags_(detail::with_socket_no_sigpipe(flags)) {
-        msg_.msg_iov = iovecs_;
-        msg_.msg_iovlen = iovec_count_;
-    }
+        , flags_(detail::with_socket_no_sigpipe(flags)) {}
 
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
@@ -591,12 +589,14 @@ public:
         io_request req{};
         req.op = io_op::sendmsg;
         req.fd = fd_;
-        req.msg = &msg_;
         req.iovecs = iovecs_;
         req.iovec_count = iovec_count_;
         req.socket_flags = flags_;
         req.awaiter = awaiter;
         req.state = setup_op_state(awaiter);
+        req.state->msg.msg_iov = iovecs_;
+        req.state->msg.msg_iovlen = iovec_count_;
+        req.msg = &req.state->msg;
 
         if (!ctx.prepare(req)) {
             clear_op_state();
@@ -617,7 +617,6 @@ private:
     struct iovec* iovecs_;
     size_t iovec_count_;
     int flags_;
-    struct msghdr msg_{};
 };
 
 /// Awaitable for poll (wait for socket readable/writable)

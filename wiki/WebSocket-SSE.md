@@ -96,6 +96,15 @@ count bytes after the upgrade request has completed. Post-upgrade WebSocket
 frame and message bytes are governed by `websocket::server_config` limits such
 as `max_message_size`.
 
+`websocket::server_config::ping_interval` enables an automatic server heartbeat
+for upgraded connections on that route. The server sends ping frames, records
+pongs processed by the handler's `conn.receive()` loop, and closes the
+connection if no pong is observed before `ping_timeout`. A heartbeat timeout may
+close the transport without delivering a WebSocket close frame. The heartbeat
+task does not read from the stream, so route handlers remain the single reader
+for the connection. Set `ping_interval <= 0` to disable the heartbeat, or
+`ping_timeout <= 0` to send periodic pings without timeout closure.
+
 ### WebSocket Client
 
 ```cpp

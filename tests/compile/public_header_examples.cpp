@@ -40,6 +40,13 @@ coro::task<int> async_main(int, char**) {
     router.get("/", [](http::context&) -> coro::task<http::response> {
         co_return http::response::ok("Hello!");
     });
+    server_config ws_config;
+    ws_config.ping_interval = std::chrono::milliseconds(100);
+    ws_config.ping_timeout = std::chrono::milliseconds(100);
+    router.websocket("/ws", [](ws_connection& conn) -> coro::task<void> {
+        while (co_await conn.receive()) {
+        }
+    }, ws_config);
     co_return 0;
 }
 

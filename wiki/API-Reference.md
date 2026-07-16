@@ -1921,6 +1921,29 @@ struct client_config : http::base_client_config {
 verification, DNS, and response-header limit settings. It does not define an
 automatic reconnect loop.
 
+### `websocket::server_config`
+
+```cpp
+struct server_config {
+    size_t max_message_size = 16 * 1024 * 1024;
+    size_t read_buffer_size = 8192;
+    std::chrono::milliseconds ping_interval{std::chrono::seconds(30)};
+    std::chrono::milliseconds ping_timeout{std::chrono::seconds(10)};
+    std::vector<std::string> subprotocols;
+    bool enable_logging = true;
+};
+```
+
+`ping_interval <= 0` disables the automatic server heartbeat. When enabled,
+`ws_server` starts a heartbeat task after a successful upgrade. The task sends a
+server ping, waits up to `ping_timeout` for a pong observed by the route
+handler's receive loop, and fails the connection closed on timeout.
+`ping_timeout <= 0` keeps periodic pings but disables timeout closure. A
+heartbeat timeout may close the transport without delivering a WebSocket close
+frame. The heartbeat does not read from the stream; route handlers remain
+responsible for running the single `receive()` loop that processes peer frames
+and records pongs.
+
 ### `websocket::ws_client`
 
 ```cpp
@@ -1976,11 +1999,15 @@ public:
     /* awaitable */ close(close_code code = close_code::normal,
                           std::string_view reason = "");
     /* awaitable */ receive();
+    /* awaitable */ run_heartbeat(std::chrono::milliseconds ping_interval,
+                                  std::chrono::milliseconds ping_timeout,
+                                  coro::cancel_token token = {});
 };
 ```
 
-Only one coroutine should receive from a connection at a time. Send helpers are
-serialized so concurrent senders do not interleave WebSocket frames.
+Only one coroutine should receive from a connection at a time. Send helpers,
+including heartbeat pings and automatic pong/close responses, are serialized so
+concurrent senders do not interleave WebSocket frames.
 
 ### `websocket::ws_router` and `ws_server`
 

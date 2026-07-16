@@ -23,6 +23,8 @@
 #include <elio/sync/primitives.hpp>
 #include <elio/log/macros.hpp>
 
+#include <chrono>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <functional>
@@ -56,12 +58,12 @@ enum class connection_state {
 
 /// WebSocket server configuration
 struct server_config {
-    size_t max_message_size = 16 * 1024 * 1024;  ///< Max message size (16MB)
-    size_t read_buffer_size = 8192;               ///< Read buffer size
-    std::chrono::seconds ping_interval{30};       ///< Ping interval (0 = disabled)
-    std::chrono::seconds ping_timeout{10};        ///< Pong timeout
-    std::vector<std::string> subprotocols;        ///< Supported subprotocols
-    bool enable_logging = true;                   ///< Log connections
+    size_t max_message_size = 16 * 1024 * 1024;     ///< Max message size (16MB)
+    size_t read_buffer_size = 8192;                  ///< Read buffer size
+    std::chrono::milliseconds ping_interval{std::chrono::seconds(30)}; ///< 0 = disabled
+    std::chrono::milliseconds ping_timeout{std::chrono::seconds(10)};  ///< <=0 = no timeout close
+    std::vector<std::string> subprotocols;           ///< Supported subprotocols
+    bool enable_logging = true;                      ///< Log connections
 };
 
 /// WebSocket connection wrapper.
@@ -102,10 +104,12 @@ public:
     ws_connection& operator=(const ws_connection&) = delete;
     
     /// Get connection state
-    connection_state state() const noexcept { return state_; }
+    connection_state state() const noexcept {
+        return state_.load(std::memory_order_acquire);
+    }
     
     /// Check if connection is open
-    bool is_open() const noexcept { return state_ == connection_state::open; }
+    bool is_open() const noexcept { return state() == connection_state::open; }
     
     /// Get negotiated subprotocol
     std::string_view subprotocol() const noexcept { return subprotocol_; }
@@ -131,7 +135,7 @@ public:
     
     /// Send a text message
     coro::task<bool> send_text(std::string_view message) {
-        if (state_ != connection_state::open) {
+        if (!is_open()) {
             co_return false;
         }
         auto frame = encode_text_frame(message, !is_server_);
@@ -140,7 +144,7 @@ public:
     
     /// Send a binary message
     coro::task<bool> send_binary(std::string_view data) {
-        if (state_ != connection_state::open) {
+        if (!is_open()) {
             co_return false;
         }
         auto frame = encode_binary_frame(data, !is_server_);
@@ -149,7 +153,7 @@ public:
     
     /// Send a ping
     coro::task<bool> send_ping(std::string_view payload = "") {
-        if (state_ != connection_state::open) {
+        if (!is_open()) {
             co_return false;
         }
         auto frame = encode_ping_frame(payload, !is_server_);
@@ -158,7 +162,7 @@ public:
     
     /// Send a pong
     coro::task<bool> send_pong(std::string_view payload = "") {
-        if (state_ != connection_state::open) {
+        if (!is_open()) {
             co_return false;
         }
         auto frame = encode_pong_frame(payload, !is_server_);
@@ -168,22 +172,25 @@ public:
     /// Close the connection
     coro::task<void> close(close_code code = close_code::normal, 
                           std::string_view reason = "") {
-        if (state_ != connection_state::open) {
+        connection_state expected = connection_state::open;
+        if (!state_.compare_exchange_strong(expected, connection_state::closing,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_acquire)) {
             co_return;
         }
 
         auto frame = encode_close_frame(code, reason, !is_server_);
-        state_ = connection_state::closing;
         co_await send_raw(frame);
         
         // Wait briefly for close acknowledgment
         // In a full implementation, we'd wait for the peer's close frame
-        state_ = connection_state::closed;
+        state_.store(connection_state::closed, std::memory_order_release);
     }
     
     /// Receive next message (blocks until message available or connection closed)
     coro::task<std::optional<message>> receive() {
-        while (state_ == connection_state::open || state_ == connection_state::closing) {
+        while (state() == connection_state::open ||
+               state() == connection_state::closing) {
             // Process already-parsed frames in wire order.
             while (parser_.next_frame_is_control_frame()) {
                 auto control_frame = parser_.get_next_control_frame();
@@ -193,7 +200,7 @@ public:
                 co_await handle_control_frame(control_frame->first, control_frame->second);
             }
 
-            if (state_ == connection_state::closed) {
+            if (state() == connection_state::closed) {
                 co_return std::nullopt;
             }
 
@@ -219,7 +226,7 @@ public:
                 } else {
                     ELIO_LOG_ERROR("WebSocket read error: {}", strerror(-result.result));
                 }
-                state_ = connection_state::closed;
+                state_.store(connection_state::closed, std::memory_order_release);
                 co_return std::nullopt;
             }
 
@@ -240,7 +247,7 @@ public:
     
     /// Set connection as open (after successful handshake)
     void set_open(std::string_view protocol = "") {
-        state_ = connection_state::open;
+        state_.store(connection_state::open, std::memory_order_release);
         subprotocol_ = protocol;
     }
     
@@ -266,6 +273,53 @@ public:
             return parser_.error_close_code();
         }
         return std::nullopt;
+    }
+
+    /// Server-side heartbeat loop.
+    ///
+    /// Sends a ping after each interval and expects receive() to observe at
+    /// least one pong before the timeout expires. The heartbeat never reads from
+    /// the stream, preserving the single-reader contract for route handlers.
+    coro::task<void> run_heartbeat(
+        std::chrono::milliseconds ping_interval,
+        std::chrono::milliseconds ping_timeout,
+        coro::cancel_token token = {}) {
+        if (ping_interval.count() <= 0) {
+            co_return;
+        }
+
+        while (is_open()) {
+            auto interval_result = co_await elio::time::sleep_for(
+                ping_interval, token);
+            if (interval_result == coro::cancel_result::cancelled || !is_open()) {
+                co_return;
+            }
+
+            const auto observed_pongs =
+                pong_sequence_.load(std::memory_order_acquire);
+            if (!co_await send_ping()) {
+                co_return;
+            }
+
+            if (ping_timeout.count() <= 0) {
+                continue;
+            }
+
+            auto timeout_result = co_await elio::time::sleep_for(
+                ping_timeout, token);
+            if (timeout_result == coro::cancel_result::cancelled || !is_open()) {
+                co_return;
+            }
+
+            if (pong_sequence_.load(std::memory_order_acquire) == observed_pongs) {
+                ELIO_LOG_WARNING(
+                    "WebSocket heartbeat timed out after {}ms",
+                    ping_timeout.count());
+                state_.store(connection_state::closed, std::memory_order_release);
+                shutdown_socket();
+                co_return;
+            }
+        }
     }
 
 private:
@@ -310,12 +364,14 @@ private:
     /// Emit a close frame with the given code and tear the connection down.
     /// Used when the parser detects a protocol violation.
     coro::task<void> fail_connection(close_code code) {
-        if (state_ == connection_state::open) {
-            state_ = connection_state::closing;
+        connection_state expected = connection_state::open;
+        if (state_.compare_exchange_strong(expected, connection_state::closing,
+                                           std::memory_order_acq_rel,
+                                           std::memory_order_acquire)) {
             auto frame = encode_close_frame(code, "", !is_server_);
             co_await send_raw(frame);
         }
-        state_ = connection_state::closed;
+        state_.store(connection_state::closed, std::memory_order_release);
     }
 
     coro::task<void> handle_control_frame(opcode op, const std::string& payload) {
@@ -325,7 +381,8 @@ private:
                 break;
                 
             case opcode::pong:
-                // Handle pong (for ping timeout tracking)
+                pong_sequence_.fetch_add(1, std::memory_order_acq_rel);
+                ELIO_LOG_DEBUG("Received pong");
                 break;
                 
             case opcode::close: {
@@ -335,17 +392,20 @@ private:
                 ELIO_LOG_DEBUG("WebSocket close received: {} {}",
                               static_cast<uint16_t>(code), reason);
 
-                if (state_ == connection_state::open) {
+                connection_state expected = connection_state::open;
+                if (state_.compare_exchange_strong(
+                        expected, connection_state::closing,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
                     // Send close response.  RFC 6455 §7.4.1 forbids sending
                     // no_status (1005) on the wire; map it to normal (1000).
-                    state_ = connection_state::closing;
                     auto resp_code = (code == close_code::no_status)
                                          ? close_code::normal
                                          : code;
                     auto frame = encode_close_frame(resp_code, "", !is_server_);
                     co_await send_raw(frame);
                 }
-                state_ = connection_state::closed;
+                state_.store(connection_state::closed, std::memory_order_release);
                 break;
             }
             
@@ -353,15 +413,28 @@ private:
                 break;
         }
     }
+
+    void shutdown_socket() noexcept {
+        if (std::holds_alternative<net::tcp_stream*>(stream_)) {
+            if (auto* tcp = std::get<net::tcp_stream*>(stream_)) {
+                tcp->shutdown_socket();
+            }
+        } else if (std::holds_alternative<tls::tls_stream*>(stream_)) {
+            if (auto* tls = std::get<tls::tls_stream*>(stream_)) {
+                tls->shutdown_socket();
+            }
+        }
+    }
     
     stream_type stream_;
-    connection_state state_ = connection_state::connecting;
+    std::atomic<connection_state> state_{connection_state::connecting};
     bool is_server_ = true;
     std::string subprotocol_;
     std::unordered_map<std::string, std::string> params_;
     frame_parser parser_;
     std::vector<char> buffer_ = std::vector<char>(8192);
     sync::mutex send_mutex_;  ///< Serializes frame writes; see class comment.
+    std::atomic<uint64_t> pong_sequence_{0};
 };
 
 /// WebSocket upgrade handler result
@@ -881,12 +954,41 @@ private:
             for (const auto& [name, value] : ws_params) {
                 conn.set_param(name, value);
             }
+
+            std::optional<coro::join_handle<void>> heartbeat;
+            auto heartbeat_cancel = std::make_shared<coro::cancel_source>();
+            if (sched && ws_route->config.ping_interval.count() > 0) {
+                auto ping_interval = ws_route->config.ping_interval;
+                auto ping_timeout = ws_route->config.ping_timeout;
+                heartbeat.emplace(sched->go_joinable(
+                    [&conn,
+                     heartbeat_cancel,
+                     ping_interval,
+                     ping_timeout]() -> coro::task<void> {
+                        co_await conn.run_heartbeat(
+                            ping_interval,
+                            ping_timeout,
+                            heartbeat_cancel->get_token());
+                    }));
+            }
+
+            auto stop_heartbeat = [&]() -> coro::task<void> {
+                if (heartbeat) {
+                    heartbeat_cancel->cancel();
+                    auto hb = std::move(*heartbeat);
+                    heartbeat.reset();
+                    co_await std::move(hb);
+                }
+                co_return;
+            };
             
             try {
                 co_await ws_route->handler(conn);
             } catch (const std::exception& e) {
                 ELIO_LOG_ERROR("WebSocket handler exception: {}", e.what());
             }
+
+            co_await stop_heartbeat();
             
             // Ensure connection is closed
             if (conn.is_open()) {

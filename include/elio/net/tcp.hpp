@@ -503,7 +503,7 @@ public:
 
     /// Async writev (scatter-gather write)
     auto writev(struct iovec* iovecs, size_t count) {
-        return io::async_writev(fd_, iovecs, count);
+        return io::async_sendmsg(fd_, iovecs, count);
     }
 
     /// Wait for socket to be readable

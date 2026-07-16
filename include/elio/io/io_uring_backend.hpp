@@ -144,6 +144,8 @@ inline bool io_uring_prepare_request_is_valid(const io_request& req) noexcept {
         case io_op::poll_read:
         case io_op::poll_write:
             return true;
+        case io_op::sendmsg:
+            return req.msg != nullptr;
     }
     return false;
 }
@@ -394,6 +396,10 @@ public:
                 io_uring_prep_writev(sqe, req.fd, req.iovecs,
                                      static_cast<unsigned>(req.iovec_count),
                                      static_cast<__u64>(req.offset >= 0 ? req.offset : -1));
+                break;
+
+            case io_op::sendmsg:
+                io_uring_prep_sendmsg(sqe, req.fd, req.msg, req.socket_flags);
                 break;
                 
             case io_op::accept:

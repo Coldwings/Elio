@@ -972,6 +972,7 @@ auto result = co_await async_writev(fd, iovecs, count);
 // Recv/Send (sockets)
 auto result = co_await async_recv(fd, buffer, length, flags);
 auto result = co_await async_send(fd, buffer, length, flags);
+auto result = co_await async_sendmsg(fd, iovecs, count, flags);
 
 // Accept. The accepted fd is returned in io_result::result; peer storage is
 // populated through the addr/addrlen pointers when provided.
@@ -996,6 +997,12 @@ auto result = co_await async_close(fd);
 auto result = co_await async_poll_read(fd);
 auto result = co_await async_poll_write(fd);
 ```
+
+`async_send()` and `async_sendmsg()` are socket operations. `async_sendmsg()`
+is a scatter-gather send over an `iovec` array, not a general `sendmsg(2)`
+wrapper for destination addresses or ancillary/control data. On platforms with
+per-call `SIGPIPE` suppression, they apply it so peer-close failures are
+reported through `io_result` rather than process-level signal delivery.
 
 ### Batch I/O
 
@@ -1379,7 +1386,7 @@ public:
     /* awaitable */ write_exactly(const void* data, size_t size);
     /* awaitable */ write_exactly(const void* data, size_t size, coro::cancel_token token);
     
-    // Scatter-gather write attempt (awaitable) - may return a short write
+    // Scatter-gather socket write attempt (awaitable) - may return a short write
     /* awaitable */ writev(struct iovec* iovecs, size_t count);
     
     // Poll for readability (awaitable)
@@ -1477,7 +1484,7 @@ public:
     /* awaitable */ write_exactly(const void* data, size_t size, coro::cancel_token token);
     /* awaitable */ write_exactly(std::string_view data, coro::cancel_token token);
 
-    // Scatter-gather write attempt and readiness polling
+    // Scatter-gather socket write attempt and readiness polling
     /* awaitable */ writev(struct iovec* iovecs, size_t count);
     /* awaitable */ poll_read();
     /* awaitable */ poll_read(coro::cancel_token token);

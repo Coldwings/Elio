@@ -11,7 +11,8 @@ Elio's RPC framework provides high-performance remote procedure calls over TCP a
 - **Variable-length data**: Strings, arrays, maps, and optionals
 - **TCP and UDS**: Works over TCP sockets or Unix domain sockets
 - **C++ templates**: No code generation needed - define schemas with C++ structs
-- **Message integrity**: Optional CRC32 checksum for data verification
+- **Corruption detection**: Optional non-cryptographic CRC32 checksum for
+  accidental transport/storage error detection
 - **External binary references**: `buffer_ref` type for referencing external buffers while building messages
 - **Resource cleanup**: Cleanup callbacks for releasing resources after response is sent
 
@@ -19,7 +20,7 @@ Elio's RPC framework provides high-performance remote procedure calls over TCP a
 
 ### Why a custom wire format instead of protobuf/gRPC
 
-The RPC framework uses a custom binary wire format to maintain zero external dependencies for the core protocol. The 19-byte fixed header enables fast parsing without schema negotiation -- the receiver always knows exactly how many bytes to read before it can dispatch a message. CRC32 checksums provide integrity verification without the overhead of a full serialization framework. This keeps the library header-only and avoids pulling in protobuf's code generator toolchain or gRPC's runtime.
+The RPC framework uses a custom binary wire format to maintain zero external dependencies for the core protocol. The 19-byte fixed header enables fast parsing without schema negotiation -- the receiver always knows exactly how many bytes to read before it can dispatch a message. Optional CRC32 checksums provide fast non-cryptographic corruption detection without the overhead of a full serialization framework. This keeps the library header-only and avoids pulling in protobuf's code generator toolchain or gRPC's runtime.
 
 ### Why buffer_ref
 
@@ -452,9 +453,9 @@ server.register_method_with_context_and_cleanup<ReadFile>(
     });
 ```
 
-### Message Integrity with CRC32 Checksum
+### Non-Cryptographic CRC32 Checksum
 
-Enable CRC32 checksums for message integrity verification:
+Enable CRC32 checksums to detect accidental corruption of RPC frame bytes:
 
 ```cpp
 // Client: enable checksum for a specific call
@@ -473,7 +474,13 @@ auto [header, payload] = build_error_response(
     request_id, rpc_error::internal_error, "message", true);
 ```
 
-The checksum covers both header and payload. If verification fails on receive, the frame is rejected and `read_frame()` returns `std::nullopt`.
+The checksum covers both header and payload. If verification fails on receive,
+the frame is rejected and `read_frame()` returns `std::nullopt`.
+
+CRC32 is not a security boundary. It does not authenticate the peer, authorize
+methods, or protect against intentional tampering by an adversary who can modify
+traffic. Use TLS/mTLS, an application authentication layer, or a MAC/signature
+scheme when adversarial integrity or peer authentication is required.
 
 ### One-way Messages
 
@@ -569,7 +576,8 @@ msg.msg_iovlen = iov.count();
 
 ### CRC32 Checksum Utilities
 
-The RPC framework uses the hash module for checksums. See [[Hash Functions]] for full documentation.
+The RPC framework uses the hash module for non-cryptographic checksums. See
+[[Hash Functions]] for full documentation.
 
 ```cpp
 #include <elio/hash/crc32.hpp>

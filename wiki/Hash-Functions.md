@@ -226,7 +226,9 @@ All implementations are optimized for clarity and correctness. For maximum perfo
 
 ## Integration with RPC
 
-The hash module is used by the RPC framework for message integrity:
+The RPC framework uses the hash module for optional non-cryptographic CRC32
+checksums. These checksums detect accidental frame corruption; they do not
+authenticate peers or protect against adversarial tampering.
 
 ```cpp
 #include <elio/rpc/rpc.hpp>

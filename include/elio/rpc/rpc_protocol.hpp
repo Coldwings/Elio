@@ -6,8 +6,12 @@
 /// This module defines the binary wire format for RPC messages:
 /// - Frame header with request ID, method ID, flags, and payload length
 /// - Message types (request, response, error)
-/// - Optional CRC32 checksum for message integrity
+/// - Optional CRC32 checksum for non-cryptographic corruption detection
 /// - Stream-based framing for TCP/UDS sockets
+///
+/// The CRC32 trailer is not authentication, authorization, or adversarial
+/// tamper protection. Use TLS/mTLS or an application MAC/signature layer when
+/// hostile peers or on-path modification are in scope.
 ///
 /// Wire Format (every multi-byte field is little-endian on the wire,
 /// regardless of host byte order — see rpc_endian.hpp):
@@ -372,7 +376,8 @@ coro::task<io::io_result> writev_exact(Stream& stream, struct iovec* iovecs, siz
 /// (so a peer cannot trick us into a large allocation), and the underlying
 /// connection is closed (caller-side) when the cap is exceeded.
 ///
-/// If the frame has the has_checksum flag set, verifies the CRC32 checksum.
+/// If the frame has the has_checksum flag set, verifies the CRC32 checksum for
+/// non-cryptographic corruption detection.
 template<rpc_stream Stream>
 coro::task<std::optional<std::pair<frame_header, message_buffer>>>
 read_frame_bounded(Stream& stream, uint32_t max_payload) {
@@ -449,7 +454,8 @@ read_frame(Stream& stream) {
 }
 
 /// Write a complete frame using scatter-gather I/O with partial-write retries
-/// If the header has the has_checksum flag set, appends CRC32 checksum
+/// If the header has the has_checksum flag set, appends a non-cryptographic
+/// CRC32 checksum.
 template<rpc_stream Stream>
 coro::task<bool> write_frame(Stream& stream, const frame_header& header,
                               const buffer_writer& payload) {
@@ -528,7 +534,8 @@ coro::task<bool> write_frame(Stream& stream,
 
 /// Write a complete frame with raw payload using scatter-gather I/O
 /// with partial-write retries
-/// If the header has the has_checksum flag set, appends CRC32 checksum
+/// If the header has the has_checksum flag set, appends a non-cryptographic
+/// CRC32 checksum.
 template<rpc_stream Stream>
 coro::task<bool> write_frame(Stream& stream, const frame_header& header,
                               const void* payload_data, size_t payload_size) {

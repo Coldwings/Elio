@@ -2559,6 +2559,11 @@ public:
 
 ### CRC32 Checksum
 
+RPC CRC32 checksums are non-cryptographic corruption checks. They are not
+authentication, authorization, or tamper protection against adversarial peers.
+Use TLS/mTLS or an application MAC/signature layer when the protocol needs a
+security boundary.
+
 ```cpp
 // Compute CRC32 checksum
 uint32_t crc32(const void* data, size_t length, uint32_t crc = 0xFFFFFFFF);

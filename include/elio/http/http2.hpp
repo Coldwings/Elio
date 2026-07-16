@@ -17,7 +17,9 @@
 /// 
 /// Requirements:
 /// - OpenSSL with ALPN support
-/// - nghttp2 library (fetched automatically via CMake FetchContent)
+/// - nghttp2 library. Source builds can fetch it via CMake FetchContent;
+///   installed-package consumers must provide the bundled export or a
+///   discoverable system nghttp2 library/header.
 /// 
 /// Note: HTTP/2 requires HTTPS (h2 over TLS). For plaintext HTTP, use the
 /// HTTP/1.1 client instead. While h2c (HTTP/2 cleartext) exists, it is

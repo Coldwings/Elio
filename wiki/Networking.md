@@ -418,7 +418,11 @@ TLS support is built on OpenSSL.
 
 ### HTTP/2
 
-HTTP/2 support requires linking with `elio_http2`, OpenSSL, and nghttp2 (fetched automatically).
+HTTP/2 support requires linking with `elio_http2`, OpenSSL, and nghttp2. Source
+builds can fetch nghttp2 through Elio's CMake configuration; installed-package
+consumers must use the bundled nghttp2 export from the Elio install or make a
+system nghttp2 library/header discoverable to CMake before
+`find_package(Elio)`.
 
 > **Note**: HTTP/2 requires HTTPS (TLS with ALPN h2 negotiation). For plaintext HTTP, use the HTTP/1.1 client.
 

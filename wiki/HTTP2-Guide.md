@@ -18,10 +18,18 @@ Elio uses the nghttp2 library for HTTP/2 support. nghttp2 is the reference imple
 
 HTTP/2 support requires:
 - OpenSSL with ALPN support
-- nghttp2 library (fetched automatically by CMake)
+- nghttp2 library
 - CMake option: `-DELIO_ENABLE_HTTP2=ON`
 
 Note: HTTP/2 requires HTTPS (h2 over TLS). For plaintext HTTP, use the HTTP/1.1 client.
+
+When building Elio from source with `FetchContent` or `add_subdirectory`, the
+repository CMake configuration can fetch and build nghttp2 for the
+`elio_http2` target. Installed-package consumers do not fetch nghttp2 during
+`find_package(Elio)`: the installed package must contain the bundled nghttp2
+export, or CMake must be able to find a system nghttp2 library and
+`nghttp2/nghttp2.h` through normal package-manager installs, `CMAKE_PREFIX_PATH`,
+or equivalent CMake hints.
 
 Link the HTTP/2 feature target so nghttp2 headers and libraries propagate to
 your application:

@@ -150,10 +150,12 @@ Enable them at configure time:
 cmake -B build -DELIO_ENABLE_TLS=ON -DELIO_ENABLE_HTTP=ON -DELIO_ENABLE_HTTP2=ON
 ```
 
-When `ELIO_ENABLE_HTTP2` is set, Elio fetches nghttp2 automatically via
-CMake's `FetchContent`. OpenSSL must be installed separately for the default
-TLS/HTTP/HTTP2 targets. liburing is optional; install it only when you want the
-io_uring backend, otherwise Elio builds with the epoll fallback.
+When building Elio from source with `ELIO_ENABLE_HTTP2` set, Elio can fetch
+nghttp2 automatically via CMake's `FetchContent`. Installed-package consumers
+must make nghttp2 discoverable to CMake as described above. OpenSSL must be
+installed separately for the default TLS/HTTP/HTTP2 targets. liburing is
+optional; install it only when you want the io_uring backend, otherwise Elio
+builds with the epoll fallback.
 
 Additional options include RDMA support (`ELIO_ENABLE_RDMA`,
 `ELIO_ENABLE_RDMA_CM`, `ELIO_ENABLE_RDMA_IBVERBS`,

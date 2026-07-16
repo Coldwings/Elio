@@ -3056,6 +3056,7 @@ enum class rpc_error : uint32_t {
     serialization_error = 5,
     internal_error = 6,
     cancelled = 7,
+    resource_exhausted = 8,
 };
 
 const char* rpc_error_str(rpc_error err);
@@ -3139,10 +3140,20 @@ local failure cleanup.
 #### `rpc_server_config`
 
 ```cpp
+enum class rpc_request_overload_policy {
+    reject_request,
+    close_session,
+};
+```
+
+```cpp
 struct rpc_server_config {
     size_t max_sessions = 1024;
     std::chrono::seconds frame_read_timeout{30};
     uint32_t max_message_size = elio::rpc::max_message_size;
+    size_t max_in_flight_requests_per_session = 0;
+    rpc_request_overload_policy request_overload_policy =
+        rpc_request_overload_policy::reject_request;
 };
 ```
 
@@ -3152,6 +3163,27 @@ struct rpc_server_config {
   payload, and optional checksum. `0s` disables the deadline.
 - `max_message_size`: Maximum payload bytes accepted per frame. The
   default is the protocol-wide 16 MiB limit.
+- `max_in_flight_requests_per_session`: Maximum active request slots for one
+  client session. A response-capable request holds its slot until its handler
+  has produced a result and the response/error send path has completed or
+  failed; a `no_response` request holds its slot until its handler finishes.
+  `0` preserves legacy unlimited concurrency.
+- `request_overload_policy`: Strategy after the per-session in-flight cap is
+  reached. `reject_request` sends `rpc_error::resource_exhausted` for a
+  response-capable excess request when no previous overload rejection is still
+  being written, and drops over-limit `no_response` requests. If the peer is not
+  draining responses and an overload rejection is already in flight, additional
+  excess requests may also be dropped; a waiting client call for such a dropped
+  request completes only through its own timeout or connection close.
+  `close_session` closes the session.
+  Accepted `no_response` requests still count against the cap until their
+  handlers finish. Duplicate active request IDs close the session and do not
+  consume capacity.
+
+Server pong writes are bounded to one in-flight pong per session. If a peer
+sends more pings while a previous pong is still being written, later pings may
+not receive a pong; clients should rely on their own ping timeout and connection
+policy.
 
 #### `rpc_server<Stream>`
 

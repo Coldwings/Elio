@@ -54,6 +54,9 @@
 /// - **Out-of-order calls**: Responses matched by request ID; the server
 ///   dispatches each request to a separate coroutine so a slow handler
 ///   does not block subsequent requests on the same connection.
+/// - **Per-session request limits**: Servers can cap handler concurrency per
+///   client session and choose whether overload rejects excess requests or
+///   closes the session.
 /// - **Per-call timeouts**: Individual timeout per RPC call
 /// - **Nested types**: Support for complex nested structures
 /// - **Variable-length data**: Strings, arrays, maps, and optionals

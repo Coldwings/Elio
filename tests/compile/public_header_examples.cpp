@@ -4,6 +4,7 @@
 #include <elio/rpc/rpc.hpp>
 #include <elio/tls/tls.hpp>
 
+#include <chrono>
 #include <iostream>
 #include <string_view>
 #include <sys/uio.h>
@@ -109,6 +110,15 @@ coro::task<void> rpc_client_with_resolve_options() {
     auto client = co_await rpc::tcp_rpc_client::connect_with_config(
         cfg, "localhost", 9000, resolve_opts);
     (void)client;
+}
+
+void rpc_server_config_aggregate_compat() {
+    rpc::rpc_server_config legacy_order{
+        1024,
+        std::chrono::seconds(30),
+        rpc::max_message_size,
+    };
+    (void)legacy_order;
 }
 
 coro::task<void> vectored_io(int fd) {

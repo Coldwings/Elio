@@ -49,6 +49,18 @@ namespace elio::rpc {
 // Server configuration
 // ============================================================================
 
+/// Policy applied when one session reaches its in-flight request cap.
+enum class rpc_request_overload_policy {
+    /// Reject the excess request with rpc_error::resource_exhausted when a
+    /// response is allowed and no previous overload rejection is still being
+    /// written. no_response requests, and further response-capable requests
+    /// while an overload rejection is already in flight, are dropped so the
+    /// overload path itself cannot grow without bound.
+    reject_request,
+    /// Close the session immediately.
+    close_session,
+};
+
 /// Configuration for an RPC server. All limits are enforced per-connection
 /// except where noted. The defaults are tuned to mitigate the "slow loris"
 /// class of attacks (peer trickling bytes to consume sockets indefinitely)
@@ -70,6 +82,18 @@ struct rpc_server_config {
     /// know your application's largest expected message — reducing this is
     /// the most effective defence against memory-exhaustion DoS.
     uint32_t max_message_size = elio::rpc::max_message_size;
+
+    /// Maximum active request slots for one client session. A response-capable
+    /// request holds its slot until its handler has produced a result and the
+    /// response/error send path has completed or failed; a no_response request
+    /// holds its slot until its handler finishes. 0 means "unlimited" (legacy
+    /// behaviour). Set this for exposed services so one well-formed client
+    /// cannot consume unbounded request lifecycle concurrency.
+    size_t max_in_flight_requests_per_session = 0;
+
+    /// Strategy for requests that arrive after the per-session in-flight cap.
+    rpc_request_overload_policy request_overload_policy =
+        rpc_request_overload_policy::reject_request;
 };
 
 // ============================================================================
@@ -123,6 +147,8 @@ using raw_handler_t = std::function<coro::task<handler_result>(
 /// Concurrency model: the read loop streams in one frame at a time and
 /// dispatches each request via `runtime::scheduler::current()->go(...)` so
 /// out-of-order completion is possible (matching what the client promises).
+/// `rpc_server_config::max_in_flight_requests_per_session` can bound that
+/// per-session active request lifecycle and choose the overload strategy.
 /// Writes are serialised by `send_mutex_` so concurrent handlers cannot
 /// interleave bytes on the wire.
 ///
@@ -164,12 +190,9 @@ public:
                     dispatch_request(header, std::move(payload));
                     break;
 
-                case message_type::ping: {
-                    auto pong = build_pong(header.request_id);
-                    buffer_writer empty;
-                    (void)co_await send_frame(pong, empty);
+                case message_type::ping:
+                    schedule_pong(header.request_id);
                     break;
-                }
 
                 case message_type::cancel:
                     ELIO_LOG_DEBUG("RPC session: received cancel for request {}",
@@ -214,6 +237,12 @@ public:
 private:
     struct active_request_state {
         coro::cancel_source cancel;
+    };
+
+    enum class active_request_reservation {
+        reserved,
+        duplicate,
+        limited,
     };
 
     class frame_write_guard {
@@ -379,20 +408,32 @@ private:
             return;
         }
         auto active = std::make_shared<active_request_state>();
-        bool duplicate = false;
-        {
-            std::lock_guard<std::mutex> lock(active_requests_mutex_);
-            auto [it, inserted] = active_requests_.emplace(header.request_id, active);
-            (void)it;
-            duplicate = !inserted;
+
+        switch (reserve_active_request(header.request_id, active)) {
+            case active_request_reservation::reserved:
+                break;
+
+            case active_request_reservation::duplicate:
+                ELIO_LOG_WARNING(
+                    "RPC session: duplicate active request id {}; closing session",
+                    header.request_id);
+                close();
+                return;
+
+            case active_request_reservation::limited:
+                if (config_.request_overload_policy ==
+                    rpc_request_overload_policy::reject_request) {
+                    reject_overloaded_request(header, *sched);
+                    return;
+                }
+
+                ELIO_LOG_WARNING(
+                    "RPC session: max_in_flight_requests_per_session={} reached; closing session",
+                    config_.max_in_flight_requests_per_session);
+                close();
+                return;
         }
-        if (duplicate) {
-            ELIO_LOG_WARNING(
-                "RPC session: duplicate active request id {}; closing session",
-                header.request_id);
-            close();
-            return;
-        }
+
         auto self = this->shared_from_this();
         sched->go([self,
                    hdr = header,
@@ -574,6 +615,116 @@ private:
         }
     }
 
+    active_request_reservation reserve_active_request(
+        uint32_t request_id,
+        const std::shared_ptr<active_request_state>& active) {
+        std::lock_guard<std::mutex> lock(active_requests_mutex_);
+        if (active_requests_.find(request_id) != active_requests_.end()) {
+            return active_request_reservation::duplicate;
+        }
+        if (has_in_flight_limit() &&
+            active_requests_.size() >=
+                config_.max_in_flight_requests_per_session) {
+            return active_request_reservation::limited;
+        }
+        active_requests_.emplace(request_id, active);
+        return active_request_reservation::reserved;
+    }
+
+    void schedule_pong(uint32_t request_id) {
+        auto* sched = runtime::scheduler::current();
+        if (!sched) {
+            ELIO_LOG_ERROR("RPC session: no current scheduler; dropping pong {}",
+                           request_id);
+            return;
+        }
+
+        bool expected = false;
+        if (!pong_in_flight_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            ELIO_LOG_WARNING(
+                "RPC session: dropping pong {} because another pong is in flight",
+                request_id);
+            return;
+        }
+
+        auto self = this->shared_from_this();
+        sched->go([self, request_id]() -> coro::task<void> {
+            try {
+                co_await self->send_pong_response(request_id);
+            } catch (const std::exception& e) {
+                ELIO_LOG_ERROR(
+                    "RPC session: pong send exception: {}",
+                    e.what());
+            } catch (...) {
+                ELIO_LOG_ERROR("RPC session: pong send unknown exception");
+            }
+            self->pong_in_flight_.store(false, std::memory_order_release);
+        });
+    }
+
+    coro::task<void> send_pong_response(uint32_t request_id) {
+        auto pong = build_pong(request_id);
+        buffer_writer empty;
+        (void)co_await send_frame(pong, empty);
+    }
+
+    void reject_overloaded_request(const frame_header& header,
+                                   runtime::scheduler& sched) {
+        if (has_flag(header.flags, message_flags::no_response)) {
+            ELIO_LOG_WARNING(
+                "RPC session: max_in_flight_requests_per_session={} reached; dropping no_response request {}",
+                config_.max_in_flight_requests_per_session,
+                header.request_id);
+            return;
+        }
+
+        bool expected = false;
+        if (!overload_reject_in_flight_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            ELIO_LOG_WARNING(
+                "RPC session: max_in_flight_requests_per_session={} reached; dropping reject response for request {} because another overload rejection is in flight",
+                config_.max_in_flight_requests_per_session,
+                header.request_id);
+            return;
+        }
+
+        ELIO_LOG_WARNING(
+            "RPC session: max_in_flight_requests_per_session={} reached; rejecting request {}",
+            config_.max_in_flight_requests_per_session,
+            header.request_id);
+
+        auto self = this->shared_from_this();
+        sched.go([self, hdr = header]() -> coro::task<void> {
+            try {
+                co_await self->send_overloaded_rejection(hdr);
+            } catch (const std::exception& e) {
+                ELIO_LOG_ERROR(
+                    "RPC session: overload rejection send exception: {}",
+                    e.what());
+            } catch (...) {
+                ELIO_LOG_ERROR(
+                    "RPC session: overload rejection send unknown exception");
+            }
+            self->overload_reject_in_flight_.store(
+                false, std::memory_order_release);
+        });
+    }
+
+    coro::task<void> send_overloaded_rejection(const frame_header& header) {
+        auto error_frame = build_error_response(
+            header.request_id,
+            rpc_error::resource_exhausted,
+            "Too many in-flight requests for this session");
+        co_await send_response(error_frame.first, error_frame.second);
+    }
+
+    bool has_in_flight_limit() const noexcept {
+        return config_.max_in_flight_requests_per_session != 0;
+    }
+
     /// Send a response frame; serialised against other concurrent handlers
     /// on the same connection by `send_mutex_`.
     /// @return true if the frame was written successfully, false otherwise.
@@ -661,6 +812,8 @@ private:
     bool shutdown_deferred_ = false;
     std::mutex active_requests_mutex_;
     std::unordered_map<uint32_t, std::shared_ptr<active_request_state>> active_requests_;
+    std::atomic<bool> overload_reject_in_flight_{false};
+    std::atomic<bool> pong_in_flight_{false};
 };
 
 // ============================================================================

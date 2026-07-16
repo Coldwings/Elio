@@ -348,6 +348,7 @@ enum class rpc_error : uint32_t {
     serialization_error = 5,
     internal_error = 6,
     cancelled = 7,
+    resource_exhausted = 8,
 };
 ```
 
@@ -629,6 +630,9 @@ rpc_server_config config;
 config.max_sessions = 1024;                         // 0 = unlimited
 config.frame_read_timeout = std::chrono::seconds(30); // 0s = disabled
 config.max_message_size = elio::rpc::max_message_size; // 16 MiB default
+config.max_in_flight_requests_per_session = 64;      // 0 = unlimited
+config.request_overload_policy =
+    rpc_request_overload_policy::reject_request;
 
 tcp_rpc_server server(config);
 ```
@@ -636,12 +640,37 @@ tcp_rpc_server server(config);
 - **max_sessions**: Maximum concurrent sessions accepted by `serve()`.
   Connections beyond the cap are accepted and immediately closed so the
   kernel listen backlog does not fill.
+- **max_in_flight_requests_per_session**: Maximum active request slots for one
+  client session. `0` preserves legacy unlimited concurrency. A response-capable
+  request holds its slot until its handler has produced a result and the
+  response/error send path has completed or failed; a `no_response` request
+  holds its slot until its handler finishes. Exposed services should choose a
+  finite value that matches handler cost, response size, and downstream resource
+  limits.
+- **request_overload_policy**: Strategy when one session reaches its in-flight
+  request cap:
+  - `reject_request`: send `rpc_error::resource_exhausted` for a
+    response-capable excess request when no previous overload rejection is still
+    being written. Over-limit `no_response` requests are dropped because the
+    protocol forbids a response/error frame for them. If the peer is not
+    draining responses and an overload rejection is already in flight, further
+    excess requests may also be dropped so the rejection path remains bounded;
+    a waiting client call for such a dropped request completes only through its
+    own timeout or connection close.
+  - `close_session`: close the session immediately.
+  Accepted `no_response` requests count against the cap until their handlers
+  finish. Duplicate active request IDs close the session and do not consume
+  capacity.
 - **frame_read_timeout**: Deadline for receiving one complete frame
   (header, payload, and optional checksum). This mitigates peers that
   trickle bytes indefinitely.
 - **max_message_size**: Maximum payload bytes accepted per frame. The
   default is the protocol-wide 16 MiB limit defined by `max_message_size`
   in `rpc_buffer.hpp`; reduce it when an application has smaller messages.
+- Server pong writes are also bounded: each session has at most one in-flight
+  pong write. If a peer sends more pings while that pong is still being written,
+  later pings may not receive a pong; clients should rely on their own ping
+  timeout and connection policy.
 
 ## Thread Safety
 

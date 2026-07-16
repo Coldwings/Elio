@@ -59,6 +59,7 @@ enum class io_op : uint8_t {
     write,
     readv,
     writev,
+    sendmsg,
     accept,
     connect,
     recv,
@@ -107,6 +108,7 @@ struct io_request {
     // For vectored I/O
     ::iovec* iovecs;
     size_t iovec_count;
+    ::msghdr* msg;
 
     // For socket operations
     ::sockaddr* addr;

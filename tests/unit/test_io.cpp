@@ -27,6 +27,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <thread>
@@ -41,6 +42,76 @@
 using namespace elio::io;
 using namespace elio::coro;
 using namespace elio::runtime;
+
+#ifdef SIGPIPE
+namespace {
+
+volatile std::sig_atomic_t observed_sigpipe = 0;
+
+void record_sigpipe(int) {
+    observed_sigpipe = 1;
+}
+
+class scoped_sigpipe_probe {
+public:
+    scoped_sigpipe_probe() {
+        observed_sigpipe = 0;
+        struct sigaction action {};
+        action.sa_handler = record_sigpipe;
+        sigemptyset(&action.sa_mask);
+        installed_ = sigaction(SIGPIPE, &action, &old_) == 0;
+    }
+
+    ~scoped_sigpipe_probe() {
+        if (installed_) {
+            sigaction(SIGPIPE, &old_, nullptr);
+        }
+    }
+
+    scoped_sigpipe_probe(const scoped_sigpipe_probe&) = delete;
+    scoped_sigpipe_probe& operator=(const scoped_sigpipe_probe&) = delete;
+
+    bool installed() const noexcept { return installed_; }
+    bool saw_sigpipe() const noexcept { return observed_sigpipe != 0; }
+
+private:
+    struct sigaction old_ {};
+    bool installed_ = false;
+};
+
+template<typename Stream, typename WriteFn>
+io_result run_socket_write_after_peer_read_shutdown(WriteFn&& write_fn) {
+    int sv[2] = {-1, -1};
+    REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
+    REQUIRE(shutdown(sv[1], SHUT_RD) == 0);
+
+    std::optional<Stream> stream(std::in_place, sv[0]);
+    sv[0] = -1;
+    io_result write_result{};
+    std::atomic<bool> completed{false};
+
+    scheduler sched(1);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        write_result = co_await write_fn(*stream);
+        completed.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0; i < 200 &&
+                    !completed.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(sched.shutdown(elio::test::scaled_ms(2000)));
+
+    stream.reset();
+    close(sv[1]);
+    return write_result;
+}
+
+} // namespace
+#endif
 
 #if ELIO_HAS_IO_URING
 namespace {
@@ -1097,6 +1168,76 @@ TEST_CASE("unix_address basic operations", "[uds][address]") {
             offsetof(struct sockaddr_un, sun_path) + abstract.path.size()));
     }
 }
+
+#ifdef SIGPIPE
+TEST_CASE("socket stream writes report errors without SIGPIPE",
+          "[io][sigpipe][regression]") {
+    scoped_sigpipe_probe probe;
+    REQUIRE(probe.installed());
+
+    SECTION("tcp_stream write") {
+        char byte = 'x';
+        auto result =
+            run_socket_write_after_peer_read_shutdown<tcp_stream>(
+                [&](tcp_stream& stream) -> task<io_result> {
+                    co_return co_await stream.write(&byte, sizeof(byte));
+                });
+
+        REQUIRE_FALSE(result.success());
+        REQUIRE(result.error_code() != 0);
+        REQUIRE_FALSE(probe.saw_sigpipe());
+    }
+
+    SECTION("uds_stream write") {
+        char byte = 'x';
+        auto result =
+            run_socket_write_after_peer_read_shutdown<uds_stream>(
+                [&](uds_stream& stream) -> task<io_result> {
+                    co_return co_await stream.write(&byte, sizeof(byte));
+                });
+
+        REQUIRE_FALSE(result.success());
+        REQUIRE(result.error_code() != 0);
+        REQUIRE_FALSE(probe.saw_sigpipe());
+    }
+
+    SECTION("tcp_stream writev") {
+        auto result =
+            run_socket_write_after_peer_read_shutdown<tcp_stream>(
+                [](tcp_stream& stream) -> task<io_result> {
+                    char first = 'a';
+                    char second = 'b';
+                    struct iovec iov[2] = {
+                        {&first, sizeof(first)},
+                        {&second, sizeof(second)}
+                    };
+                    co_return co_await stream.writev(iov, 2);
+                });
+
+        REQUIRE_FALSE(result.success());
+        REQUIRE(result.error_code() != 0);
+        REQUIRE_FALSE(probe.saw_sigpipe());
+    }
+
+    SECTION("uds_stream writev") {
+        auto result =
+            run_socket_write_after_peer_read_shutdown<uds_stream>(
+                [](uds_stream& stream) -> task<io_result> {
+                    char first = 'a';
+                    char second = 'b';
+                    struct iovec iov[2] = {
+                        {&first, sizeof(first)},
+                        {&second, sizeof(second)}
+                    };
+                    co_return co_await stream.writev(iov, 2);
+                });
+
+        REQUIRE_FALSE(result.success());
+        REQUIRE(result.error_code() != 0);
+        REQUIRE_FALSE(probe.saw_sigpipe());
+    }
+}
+#endif
 
 TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
     // Use abstract socket to avoid filesystem cleanup issues

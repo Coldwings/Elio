@@ -147,6 +147,7 @@ public:
                 
             case io_op::write:
             case io_op::writev:
+            case io_op::sendmsg:
             case io_op::send:
             case io_op::poll_write:
                 events |= EPOLLOUT;
@@ -424,6 +425,7 @@ public:
 
                         case io_op::write:
                         case io_op::writev:
+                        case io_op::sendmsg:
                         case io_op::send:
                         case io_op::connect:
                         case io_op::poll_write:
@@ -766,6 +768,12 @@ private:
                 case io_op::writev:
                     result = static_cast<int>(writev(op.req.fd, op.req.iovecs, 
                                                      static_cast<int>(op.req.iovec_count)));
+                    syscall_result = true;
+                    break;
+
+                case io_op::sendmsg:
+                    result = static_cast<int>(sendmsg(op.req.fd, op.req.msg,
+                                                      op.req.socket_flags));
                     syscall_result = true;
                     break;
                     

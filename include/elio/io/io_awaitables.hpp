@@ -30,6 +30,21 @@ inline io_context& current_io_context() noexcept {
     return default_io_context();
 }
 
+namespace detail {
+
+inline constexpr int socket_no_sigpipe_flag =
+#ifdef MSG_NOSIGNAL
+    MSG_NOSIGNAL;
+#else
+    0;
+#endif
+
+inline constexpr int with_socket_no_sigpipe(int flags) noexcept {
+    return flags | socket_no_sigpipe_flag;
+}
+
+} // namespace detail
+
 /// Base class for I/O awaitables
 /// Provides common functionality for all async I/O operations.
 ///
@@ -296,7 +311,7 @@ public:
         , fd_(fd)
         , buffer_(buffer)
         , length_(length)
-        , flags_(flags) {}
+        , flags_(detail::with_socket_no_sigpipe(flags)) {}
     
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
@@ -554,6 +569,57 @@ private:
     size_t iovec_count_;
 };
 
+/// Awaitable for socket scatter-gather send operations.
+class async_sendmsg_awaitable : public io_awaitable_base {
+public:
+    async_sendmsg_awaitable(int fd, struct iovec* iovecs,
+                            size_t iovec_count, int flags = 0) noexcept
+        : io_awaitable_base()
+        , fd_(fd)
+        , iovecs_(iovecs)
+        , iovec_count_(iovec_count)
+        , flags_(detail::with_socket_no_sigpipe(flags)) {
+        msg_.msg_iov = iovecs_;
+        msg_.msg_iovlen = iovec_count_;
+    }
+
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        bind_to_worker(awaiter);
+        auto& ctx = current_io_context();
+
+        io_request req{};
+        req.op = io_op::sendmsg;
+        req.fd = fd_;
+        req.msg = &msg_;
+        req.iovecs = iovecs_;
+        req.iovec_count = iovec_count_;
+        req.socket_flags = flags_;
+        req.awaiter = awaiter;
+        req.state = setup_op_state(awaiter);
+
+        if (!ctx.prepare(req)) {
+            clear_op_state();
+            result_ = io_result{-EAGAIN, 0};
+            awaiter.resume();
+            return;
+        }
+    }
+
+    io_result await_resume() noexcept {
+        result_ = read_result_from_op_state();
+        restore_affinity();
+        return result_;
+    }
+
+private:
+    int fd_;
+    struct iovec* iovecs_;
+    size_t iovec_count_;
+    int flags_;
+    struct msghdr msg_{};
+};
+
 /// Awaitable for poll (wait for socket readable/writable)
 class async_poll_awaitable : public io_awaitable_base {
 public:
@@ -648,6 +714,12 @@ inline auto async_readv(int fd, struct iovec* iovecs,
 inline auto async_writev(int fd, struct iovec* iovecs,
                          size_t iovec_count) {
     return async_writev_awaitable(fd, iovecs, iovec_count);
+}
+
+/// Create an async socket scatter-gather send awaitable
+inline auto async_sendmsg(int fd, struct iovec* iovecs,
+                          size_t iovec_count, int flags = 0) {
+    return async_sendmsg_awaitable(fd, iovecs, iovec_count, flags);
 }
 
 /// Create an async accept awaitable
@@ -1259,7 +1331,7 @@ public:
         , fd_(fd)
         , buffer_(buffer)
         , length_(length)
-        , flags_(flags)
+        , flags_(detail::with_socket_no_sigpipe(flags))
         , token_(std::move(token)) {}
 
     bool await_ready() const noexcept {

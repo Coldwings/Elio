@@ -2348,25 +2348,51 @@ to nghttp2. Validation failures return a negative errno-style value and set
 TLS configuration context.
 
 ```cpp
-class tls_context {
-public:
-    explicit tls_context(tls_mode mode, tls_version version = tls_version::tls_1_2_or_higher);
-    
-    // Load certificate and key
-    bool load_certificate(std::string_view path);
-    bool load_private_key(std::string_view path);
-    
-    // Certificate verification
-    bool use_default_verify_paths();
-    void set_verify_mode(verify_mode mode);
-    
-    // ALPN protocol negotiation
-    bool set_alpn_protocols(std::string_view protocols);
+enum class tls_version {
+    tls_1_2,
+    tls_1_3,
+    tls_1_2_or_higher,
+    tls_1_3_only
 };
 
 enum class tls_mode {
     client,
     server
+};
+
+enum class verify_mode {
+    none,
+    peer,
+    fail_if_no_cert
+};
+
+class tls_context {
+public:
+    explicit tls_context(tls_mode mode, tls_version version = tls_version::tls_1_2_or_higher);
+    
+    // Load certificate, key, and trust material
+    bool load_certificate(std::string_view cert_file);
+    bool load_private_key(std::string_view key_file,
+                          std::string_view password = "");
+    bool load_verify_locations(std::string_view ca_file = "",
+                               std::string_view ca_path = "");
+    bool use_default_verify_paths();
+    
+    // Certificate verification
+    void set_verify_mode(verify_mode mode);
+    
+    // ALPN and cipher configuration
+    bool set_alpn_protocols(std::string_view protocols);
+    bool set_ciphers(std::string_view ciphers);
+    bool set_ciphersuites(std::string_view ciphersuites);
+
+    SSL_CTX* native_handle() noexcept;
+    const SSL_CTX* native_handle() const noexcept;
+    tls_mode mode() const noexcept;
+
+    static tls_context make_client();
+    static tls_context make_server(std::string_view cert_file,
+                                   std::string_view key_file);
 };
 ```
 
@@ -2391,6 +2417,11 @@ public:
     
     // Perform TLS handshake (awaitable)
     /* awaitable */ handshake();
+    /* awaitable */ handshake(coro::cancel_token token);
+
+    // Graceful TLS close_notify with a bounded wait (awaitable)
+    /* awaitable */ shutdown(std::chrono::milliseconds timeout =
+                                 std::chrono::milliseconds(2000));
     
     // Read decrypted data (awaitable)
     /* awaitable */ read(void* buffer, size_t size);
@@ -2399,19 +2430,92 @@ public:
     // Write data to encrypt (awaitable)
     /* awaitable */ write(const void* data, size_t size);
     /* awaitable */ write(const void* data, size_t size, coro::cancel_token token);
+    /* awaitable */ write(std::string_view data);
+    /* awaitable */ write(std::string_view data, coro::cancel_token token);
 
     // Exact-length helpers (awaitable)
     /* awaitable */ read_exactly(void* buffer, size_t size);
     /* awaitable */ read_exactly(void* buffer, size_t size, coro::cancel_token token);
+    template<typename T>
+    /* awaitable */ read_exactly(std::span<T> buffer);
+    template<typename T>
+    /* awaitable */ read_exactly(std::span<T> buffer, coro::cancel_token token);
     /* awaitable */ write_exactly(const void* data, size_t size);
     /* awaitable */ write_exactly(const void* data, size_t size, coro::cancel_token token);
+    template<typename T>
+    /* awaitable */ write_exactly(std::span<const T> buffer);
+    template<typename T>
+    /* awaitable */ write_exactly(std::span<const T> buffer, coro::cancel_token token);
     /* awaitable */ write_exactly(std::string_view data);
     /* awaitable */ write_exactly(std::string_view data, coro::cancel_token token);
     
     // Get negotiated ALPN protocol
     std::string_view alpn_protocol() const;
+    const char* version() const;
+    const char* cipher() const;
+
+    int fd() const noexcept;
+    const net::tcp_stream& tcp() const noexcept;
+    bool is_handshake_complete() const noexcept;
+
+    // Watchdog helpers for externally interrupted sockets
+    void mark_externally_shut_down() noexcept;
+    void shutdown_socket() noexcept;
+
+    X509* peer_certificate() const;
+    long verify_result() const;
 };
 ```
+
+`shutdown()` is the graceful TLS close path. It sends `close_notify` and waits
+for the peer's `close_notify` within the supplied wall-clock budget. Callers
+must still serialize shutdown and destruction against active reads/writes.
+`shutdown_socket()` and `mark_externally_shut_down()` are watchdog-oriented
+helpers for code that has already interrupted the underlying TCP socket and
+needs the stream to skip a later `SSL_shutdown()` write.
+
+`peer_certificate()` returns a caller-owned `X509*` when a peer certificate is
+available; callers must release each non-null result with `X509_free()` when
+done.
+
+### `tls_connect()`
+
+```cpp
+coro::task<std::optional<tls_stream>>
+tls_connect(tls_context& ctx,
+            std::string_view host,
+            uint16_t port,
+            net::resolve_options resolve_opts =
+                net::default_cached_resolve_options());
+```
+
+`tls_connect()` resolves the host, connects TCP, applies SNI from `host`, and
+performs the TLS handshake. It returns `std::optional<tls_stream>`; an empty
+optional means resolution, TCP connect, or TLS handshake failed.
+
+### `tls_listener`
+
+```cpp
+class tls_listener {
+public:
+    tls_listener(net::tcp_listener tcp, tls_context& ctx);
+
+    // Accept TCP and complete the server-side TLS handshake
+    coro::task<std::optional<tls_stream>> accept();
+
+    int fd() const noexcept;
+
+    static std::optional<tls_listener>
+    bind(const net::ipv4_address& addr, tls_context& ctx);
+    static std::optional<tls_listener>
+    bind(const net::ipv6_address& addr, tls_context& ctx);
+    static std::optional<tls_listener>
+    bind(const net::socket_address& addr, tls_context& ctx);
+};
+```
+
+`tls_listener` keeps a pointer to the supplied `tls_context`; callers must keep
+that context alive while accepts are pending and while accepted streams use it.
 
 ---
 

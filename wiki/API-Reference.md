@@ -1500,10 +1500,11 @@ syscall. Conversion for `bind()` or `uds_connect()` requires the address to fit
 in `sockaddr_un::sun_path`: filesystem paths need room for a trailing NUL, while
 abstract addresses include the leading NUL byte in their stored length. If the
 address is too long, `unix_address::to_sockaddr()` throws
-`std::invalid_argument` before the socket operation starts. After address
-conversion succeeds, `uds_listener::bind()` reports socket, bind, and listen
-failures as `std::nullopt` with `errno` set; `uds_connect()` reports connect
-failures as `std::nullopt` with `errno` set from the awaited operation.
+`std::invalid_argument` before the bind or connect syscall is attempted.
+`uds_listener::bind()` reports socket creation failures, and bind/listen
+failures after address conversion succeeds, as `std::nullopt` with `errno` set;
+`uds_connect()` reports socket creation/connect failures as `std::nullopt` with
+`errno` set from the awaited operation.
 
 UDS streams share the same concurrency contract as TCP streams: one reader and
 one writer may operate concurrently, but multiple concurrent reads, multiple

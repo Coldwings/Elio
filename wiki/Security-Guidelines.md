@@ -10,6 +10,11 @@ This section defines the default responsibility boundary used for Elio issue
 triage and API review. API-specific documentation can narrow or extend these
 rules; when it does, the more specific contract wins.
 
+For per-interface calling contracts, see [[API Contracts]]. That page records
+the library guarantees and caller responsibilities for each major public API
+family and should be checked before expanding Elio's responsibility during an
+audit.
+
 ### Elio Library Guarantees
 
 Elio is responsible for enforcing these properties inside the library:

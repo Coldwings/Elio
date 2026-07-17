@@ -53,8 +53,6 @@ TEST_CASE("mutex with coroutines", "[sync][mutex][coro]") {
     std::atomic<int> counter{0};
     std::atomic<int> completed{0};
     
-    // TSAN annotations in vthread_stack.hpp now handle coroutine frame reuse
-    // correctly, so multi-threaded scheduler is safe.
     scheduler sched(2);
     sched.start();
     
@@ -181,8 +179,6 @@ TEST_CASE("semaphore release does not leak permits when waking waiters", "[sync]
     event* gate_ptr = &gate;
     event* waiter_gate_ptr = &waiter_gate;
 
-    // TSAN annotations in vthread_stack.hpp now handle coroutine frame reuse
-    // correctly, so multi-threaded scheduler is safe.
     scheduler sched(2);
     sched.start();
 
@@ -374,8 +370,6 @@ TEST_CASE("channel with coroutines", "[sync][channel][coro]") {
         co_return;
     };
     
-    // TSAN annotations in vthread_stack.hpp now handle coroutine frame reuse
-    // correctly, so multi-threaded scheduler is safe.
     scheduler sched(2);
     sched.start();
     
@@ -566,8 +560,6 @@ TEST_CASE("shared_mutex with coroutines", "[sync][shared_mutex][coro]") {
     std::atomic<int> write_count{0};
     std::atomic<int> completed{0};
     
-    // TSAN annotations in vthread_stack.hpp now handle coroutine frame reuse
-    // correctly, so multi-threaded scheduler is safe.
     scheduler sched(2);
     sched.start();
     
@@ -684,8 +676,6 @@ TEST_CASE("spinlock with coroutines", "[sync][spinlock][coro]") {
     int counter = 0;
     std::atomic<int> completed{0};
 
-    // TSAN annotations in vthread_stack.hpp now handle coroutine frame reuse
-    // correctly, so multi-threaded scheduler is safe.
     scheduler sched(2);
     sched.start();
 
@@ -768,8 +758,6 @@ TEST_CASE("condition_variable with mutex notify_one", "[sync][condvar][coro]") {
     std::atomic<bool> ready{false};
     std::atomic<int> completed{0};
 
-    // TSAN annotations in vthread_stack.hpp now handle coroutine frame reuse
-    // correctly, so multi-threaded scheduler is safe.
     scheduler sched(2);
     sched.start();
 
@@ -929,8 +917,6 @@ TEST_CASE("condition_variable with spinlock", "[sync][condvar][coro]") {
     std::atomic<bool> ready{false};
     std::atomic<int> completed{0};
 
-    // TSAN annotations in vthread_stack.hpp now handle coroutine frame reuse
-    // correctly, so multi-threaded scheduler is safe.
     scheduler sched(2);
     sched.start();
 
@@ -1094,8 +1080,6 @@ TEST_CASE("condition_variable producer-consumer", "[sync][condvar][coro]") {
     std::atomic<int> sum{0};
     std::atomic<int> completed{0};
 
-    // TSAN annotations in vthread_stack.hpp now handle coroutine frame reuse
-    // correctly, so multi-threaded scheduler is safe.
     scheduler sched(2);
     sched.start();
 

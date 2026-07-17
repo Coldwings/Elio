@@ -1,7 +1,6 @@
 #pragma once
 
 #include "promise_base.hpp"
-#include "vthread_stack.hpp"
 #include <coroutine>
 #include <optional>
 #include <exception>
@@ -154,7 +153,8 @@ public:
         std::exception_ptr exception_;
         std::coroutine_handle<> consumer_;
 
-        // Use global heap for producer frames (not vstack)
+        // Keep generator allocation explicit because its frame lifetime is
+        // independent from the consuming task.
         void* operator new(size_t size) {
             return ::operator new(size);
         }

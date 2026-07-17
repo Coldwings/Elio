@@ -49,6 +49,23 @@ task<int> nested_outer() {
     co_return value * 2;
 }
 
+task<void> macro_go_work(std::atomic<bool>* done) {
+    done->store(true, std::memory_order_release);
+    done->notify_one();
+    co_return;
+}
+
+task<int> macro_compute(int value) {
+    co_return value * 2;
+}
+
+task<void> macro_spawn_driver(std::atomic<bool>* completed) {
+    auto handle = ELIO_SPAWN(macro_compute(21));
+    REQUIRE(co_await handle == 42);
+    completed->store(true, std::memory_order_release);
+    completed->notify_one();
+}
+
 TEST_CASE("task construction and destruction", "[task]") {
     {
         auto t = simple_return_value();
@@ -303,6 +320,31 @@ TEST_CASE("elio::go() spawns fire-and-forget task with value", "[task][spawn]") 
     
     REQUIRE(result.load() == 42);
     
+    sched.shutdown();
+}
+
+TEST_CASE("ELIO_GO macro spawns a task", "[task][spawn][macro]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> done{false};
+    ELIO_GO(macro_go_work(&done));
+    done.wait(false, std::memory_order_acquire);
+
+    REQUIRE(done.load(std::memory_order_acquire));
+    sched.shutdown();
+}
+
+TEST_CASE("ELIO_SPAWN macro returns a joinable handle",
+          "[task][spawn][join_handle][macro]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> completed{false};
+    elio::go(macro_spawn_driver, &completed);
+    completed.wait(false, std::memory_order_acquire);
+
+    REQUIRE(completed.load(std::memory_order_acquire));
     sched.shutdown();
 }
 

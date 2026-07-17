@@ -12,7 +12,7 @@ set(TEST_SOURCES
     unit/test_bench_tcp_common.cpp
     unit/test_logger.cpp
     unit/test_virtual_stack.cpp
-    unit/test_vthread_stack.cpp
+    unit/test_frame_allocation.cpp
     unit/test_task.cpp
     unit/test_awaitable_base.cpp
     unit/test_chase_lev_deque.cpp
@@ -313,6 +313,14 @@ add_test(NAME non_linux_platform_rejected
         -DELIO_CXX_COMPILER=${CMAKE_CXX_COMPILER}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_linux_platform.cmake
 )
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME debugger_script_helpers
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/test_debugger_scripts.py
+    )
+endif()
 
 add_executable(elio_rdma_cuda_lifetime_tests
     unit/test_rdma_cuda_gpu_memory_region.cpp

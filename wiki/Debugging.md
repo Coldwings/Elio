@@ -242,7 +242,7 @@ elio::coro::task<void> my_coroutine() {
 
 ## Sanitizer Support
 
-Elio's test suite builds with both AddressSanitizer (ASAN) and ThreadSanitizer (TSAN). When either sanitizer is active, the custom frame allocator is automatically disabled and coroutine frames are allocated with standard `new`/`delete` instead. This ensures that sanitizers can properly track all allocations, detect use-after-free errors, and report accurate stack traces for memory and threading issues.
+Elio's test suite builds with both AddressSanitizer (ASAN) and ThreadSanitizer (TSAN). Task coroutine frames use the standard heap allocation path in sanitizer and normal builds alike, allowing sanitizers to track the same allocation, cross-thread destruction, and lifetime behavior used in production.
 
 No source changes or build flags are needed beyond enabling the sanitizer itself:
 

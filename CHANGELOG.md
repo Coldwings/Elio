@@ -9,8 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Coroutine frame allocation**: `task<T>` frames now use the standard heap
+  allocation path in every build, without allocator-owned LIFO lifetime rules.
+  Logical coroutine ancestry remains available through the `promise_base`
+  frame chain, and frames may be destroyed on a different worker from the one
+  that created them when ownership is transferred safely. The vthread
+  abstraction, virtual stack tracking, and virtual-stack debugging APIs remain
+  unchanged.
+- **Scheduler accounting hooks**: The promise-level spawn-completion callback
+  is now an internal scheduler detail rather than a public `promise_base`
+  field. It was never a supported application extension point.
 - **0.6.0 development metadata**: The in-tree development version is now 0.6.0,
   with README, public header, and CMake release metadata aligned after v0.5.3.
+
+### Removed
+
+- **Vthread frame allocator**: The public `elio/coro/vthread_stack.hpp` header,
+  segmented `vthread_stack` bump allocator, and its ownership/deferred-deletion
+  protocol have been removed. Direct allocator users must migrate to an
+  allocator whose lifetime and destruction-order contract fits their objects;
+  normal `task<T>` users do not need a replacement.
+- **Allocator-bound helper APIs**: The `promise_base` vstack ownership accessors
+  and `io_uring_backend::resume_with_vstack()` have been removed with the
+  allocator. Code that used them for logical coroutine ancestry should use the
+  virtual-stack inspection APIs instead; custom allocation is now independent
+  of Elio runtime state.
 
 ## [0.5.3] - 2026-07-17
 

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "promise_base.hpp"
-#include "vthread_stack.hpp"
 #include "detail/completion_waiter.hpp"
 #include <coroutine>
 #include <optional>
@@ -53,15 +52,7 @@ struct final_awaiter {
             if (auto ex = h.promise().exception()) {
                 runtime::report_detached_exception(std::move(ex));
             }
-            // IMPORTANT: If this coroutine owns its vstack, we must release ownership
-            // BEFORE destroying the coroutine frame, because the frame itself is allocated
-            // on the vstack. Destroying the frame triggers ~promise_base() which would
-            // delete the vstack, causing the frame (and its members) to become invalid
-            // while still being accessed.
-            auto* vstack_to_delete = h.promise().release_vstack_ownership();
             h.destroy();
-            // Now safe to delete vstack - the coroutine frame is fully destroyed
-            delete vstack_to_delete;
             return std::noop_coroutine();
         } else {
             // Owned task with no continuation - stay suspended for owner to destroy
@@ -328,13 +319,6 @@ public:
             }
         }
 
-        void* operator new(size_t size) {
-            return vthread_stack::allocate(size);
-        }
-        void operator delete(void* ptr, size_t size) noexcept {
-            vthread_stack::deallocate(ptr, size);
-        }
-
         [[nodiscard]] task get_return_object() noexcept {
             return task{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
@@ -406,13 +390,6 @@ public:
             if (join_state_) {
                 join_state_->mark_destroyed();
             }
-        }
-
-        void* operator new(size_t size) {
-            return vthread_stack::allocate(size);
-        }
-        void operator delete(void* ptr, size_t size) noexcept {
-            vthread_stack::deallocate(ptr, size);
         }
 
         [[nodiscard]] task get_return_object() noexcept {

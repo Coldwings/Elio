@@ -34,6 +34,13 @@ COROUTINE_STATES = {
 }
 
 
+def frame_display_identity(info):
+    """Return printable identity fields without inventing debug metadata."""
+    frame_id = info.get("id")
+    state = info.get("state")
+    return ("?" if frame_id is None else str(frame_id), state or "unknown")
+
+
 def read_cstring(process, addr):
     """Read a null-terminated string from memory."""
     if addr == 0:
@@ -75,6 +82,36 @@ def read_pointer(process, addr):
     error = lldb.SBError()
     ptr_size = process.GetAddressByteSize()
     return process.ReadUnsignedFromMemory(addr, ptr_size, error)
+
+
+def get_promise_layout(process, _ptr_size):
+    """Resolve promise_base field offsets, with a stripped-binary fallback."""
+    fallback = {
+        "frame_magic_": 0,
+        "parent_": 8,
+        "has_debug_metadata": False,
+    }
+
+    try:
+        promise_type = process.GetTarget().FindFirstType(
+            "elio::coro::promise_base")
+        if not promise_type.IsValid():
+            return fallback
+
+        offsets = {}
+        for index in range(promise_type.GetNumberOfFields()):
+            field = promise_type.GetFieldAtIndex(index)
+            offsets[field.GetName()] = field.GetOffsetInBytes()
+
+        if "frame_magic_" not in offsets or "parent_" not in offsets:
+            return fallback
+
+        has_debug_metadata = all(name in offsets for name in (
+            "debug_location_", "debug_state_", "debug_worker_id_", "debug_id_"))
+        offsets["has_debug_metadata"] = has_debug_metadata
+        return offsets
+    except Exception:
+        return fallback
 
 
 def get_scheduler(target, process):
@@ -128,55 +165,54 @@ def get_frame_from_handle(process, handle_addr):
 
         # Promise is typically at offset 2*ptr_size (after resume and destroy)
         promise_addr = handle_addr + 2 * ptr_size
+        layout = get_promise_layout(process, ptr_size)
 
         # Read magic to validate
-        magic = read_uint64(process, promise_addr)
+        magic = read_uint64(process, promise_addr + layout["frame_magic_"])
         if magic != FRAME_MAGIC:
             return None
 
-        # Read promise_base fields (layout varies based on ELIO_ENABLE_DEBUG_METADATA)
-        # Base layout (always present): magic(8) + parent(8) + exception(16)
-        # Debug layout (when enabled): + debug_location(24) + state(1) + pad(3) + worker_id(4) + debug_id(8)
-        # Affinity: size_t (8 bytes on 64-bit)
+        # Resolve field offsets from debug information when available. Without
+        # type information, only the stable magic/parent prefix is safe to
+        # inspect. Optional metadata may not be compiled in.
 
         # Read parent pointer (always present)
-        parent = read_pointer(process, promise_addr + 8)
+        parent = read_pointer(process, promise_addr + layout["parent_"])
 
-        # Try to detect if debug metadata is present
-        # We'll try to read the debug fields and gracefully handle failures
-
-        # First, try to read debug metadata (assume enabled by default)
-        has_debug_metadata = True
-        debug_location_offset = 8 + ptr_size + 16  # magic + parent + exception_ptr
+        has_debug_metadata = layout["has_debug_metadata"]
+        file_ptr = 0
+        func_ptr = 0
+        line = 0
+        state = None
+        worker_id = None
+        debug_id = None
 
         try:
+            if not has_debug_metadata:
+                raise ValueError("debug metadata is disabled")
+
+            debug_location_offset = layout["debug_location_"]
             # Try reading debug_location.file pointer
             file_ptr = read_pointer(process, promise_addr + debug_location_offset)
             func_ptr = read_pointer(process, promise_addr + debug_location_offset + ptr_size)
             line = read_uint32(process, promise_addr + debug_location_offset + 2 * ptr_size)
 
-            # state at debug_location_offset + 24
-            state_offset = debug_location_offset + 2 * ptr_size + 4
-            state = read_uint8(process, promise_addr + state_offset)
+            state = read_uint8(
+                process, promise_addr + layout["debug_state_"])
 
-            # worker_id at state_offset + 4 (after 3 bytes padding)
-            worker_id = read_uint32(process, promise_addr + state_offset + 4)
+            worker_id = read_uint32(
+                process, promise_addr + layout["debug_worker_id_"])
 
-            # debug_id at worker_id + 4
-            debug_id = read_uint64(process, promise_addr + state_offset + 8)
-        except Exception as e:
-            # Debug metadata not available - use defaults
+            debug_id = read_uint64(
+                process, promise_addr + layout["debug_id_"])
+        except Exception:
+            # Debug metadata is unavailable; retain explicit unknown values.
             has_debug_metadata = False
-            file_ptr = 0
-            func_ptr = 0
-            line = 0
-            state = 1  # running
-            worker_id = 0xFFFFFFFF  # Unknown
-            debug_id = 0
 
         return {
             "id": debug_id,
-            "state": COROUTINE_STATES.get(state, "unknown"),
+            "state": (COROUTINE_STATES.get(state, "unknown")
+                      if state is not None else None),
             "worker_id": worker_id,
             "parent": parent,
             "file": read_cstring(process, file_ptr) if has_debug_metadata else None,
@@ -472,11 +508,14 @@ def elio_list(debugger, command, result, internal_dict):
 
         worker = str(info.get("queue_worker_id", info["worker_id"]))
 
-        result.AppendMessage(f"{info['id']:<8} {info['state']:<12} {worker:<8} {func:<30} {loc}")
+        display_id, display_state = frame_display_identity(info)
+        result.AppendMessage(
+            f"{display_id:<8} {display_state:<12} {worker:<8} {func:<30} {loc}")
 
     result.AppendMessage(f"\nTotal queued coroutines: {count}")
     if has_debug_metadata_warning:
-        result.AppendMessage("(Note: Debug metadata is disabled - location info not available)")
+        result.AppendMessage(
+            "(Note: Debug metadata is unavailable - identity and location are unknown)")
     result.AppendMessage("Note: Only queued (not currently executing) coroutines are shown.")
 
 
@@ -509,7 +548,9 @@ def elio_bt(debugger, command, result, internal_dict):
 
         found = True
         worker_id = info.get("queue_worker_id", info["worker_id"])
-        result.AppendMessage(f"vthread #{info['id']} [{info['state']}] (worker {worker_id})")
+        display_id, display_state = frame_display_identity(info)
+        result.AppendMessage(
+            f"vthread #{display_id} [{display_state}] (worker {worker_id})")
 
         stack = walk_virtual_stack(process, task_addr)
         for i, frame in enumerate(stack):
@@ -554,8 +595,9 @@ def elio_info(debugger, command, result, internal_dict):
         if info["id"] != target_id:
             continue
         
-        result.AppendMessage(f"vthread #{info['id']}")
-        result.AppendMessage(f"  State:    {info['state']}")
+        display_id, display_state = frame_display_identity(info)
+        result.AppendMessage(f"vthread #{display_id}")
+        result.AppendMessage(f"  State:    {display_state}")
         worker = info.get('queue_worker_id', info['worker_id'])
         result.AppendMessage(f"  Worker:   {worker}")
         result.AppendMessage(f"  Handle:   0x{info['address']:016x}")

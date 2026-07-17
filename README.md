@@ -500,7 +500,7 @@ Elio achieves competitive performance through careful optimization:
 
 | Metric | Typical Value | Best Case |
 |--------|---------------|-----------|
-| Task Spawn | ~1300 ns | ~570 ns (pre-allocated) |
+| Task Spawn | Benchmark-dependent | Standard heap frames |
 | Context Switch | ~230 ns | ~212 ns |
 | Yield (1000 vthreads) | ~30 ns | ~16 ns |
 | File I/O (single thread) | 1.46 μs/read | 685K IOPS |
@@ -510,7 +510,6 @@ Elio achieves competitive performance through careful optimization:
 
 - **Unconditional Wake**: Cross-thread submissions always wake the target worker; eventfd deduplication prevents lost wakes
 - **io_uring Batch Submit**: Automatic batching of I/O operations
-- **Coroutine Frame Pooling**: Hot path allocation ~72 ns vs cold ~250 ns
 - **Lock-free Scheduling**: MPSC inbox (~5 ns) + Chase-Lev deque (~13 ns)
 
 ### Scalability

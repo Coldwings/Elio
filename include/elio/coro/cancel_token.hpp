@@ -15,7 +15,7 @@ namespace elio::runtime {
 class scheduler;  // Forward declaration
 
 // Defined in scheduler.hpp; cross-thread-safe handle dispatch that restores
-// vthread_stack/promise frame context before resuming.
+// the virtual-stack frame context before resuming.
 void schedule_handle(std::coroutine_handle<> handle) noexcept;
 }
 
@@ -318,7 +318,7 @@ public:
     /// ``condition_variable``.
     ///
     /// The implementation is retained (and routes through
-    /// ``runtime::schedule_handle`` so that vthread_stack / promise context is
+    /// ``runtime::schedule_handle`` so that virtual-stack frame context is
     /// restored before resume) for callers who can prove their handle is
     /// **not** suspended on an io awaitable. Otherwise this is a footgun.
     /// @param handle Coroutine to resume on cancellation

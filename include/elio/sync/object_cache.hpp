@@ -521,20 +521,15 @@ private:
             }
         } started_guard{state_.get()};
 
-        auto vstack_owner = std::make_unique<coro::vthread_stack>();
-        auto* new_vstack = vstack_owner.get();
-
-        auto t = [&] {
-            coro::vthread_stack_scope vstack_scope(new_vstack);
-            return sweep_coroutine(
-                std::weak_ptr<internals>(state_), state_->cfg_.sweep_interval,
-                sweep_cancel_.get_token());
-        }();
+        auto* old_frame = coro::promise_base::current_frame();
+        auto t = sweep_coroutine(
+            std::weak_ptr<internals>(state_), state_->cfg_.sweep_interval,
+            sweep_cancel_.get_token());
 
         auto handle = coro::detail::task_access::release(t);
         handle.promise().detached_ = true;
-        handle.promise().set_vstack_owner(vstack_owner.release());
         handle.promise().detach_from_parent();
+        coro::promise_base::set_current_frame(old_frame);
         if (sched->try_spawn(handle)) {
             started_guard.committed = true;
         } else {

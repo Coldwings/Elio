@@ -7,7 +7,6 @@
 #include <type_traits>
 #include <utility>
 #include "../coro/traits.hpp"
-#include "../coro/vthread_stack.hpp"
 #include "../log/macros.hpp"
 #include "scheduler.hpp"
 

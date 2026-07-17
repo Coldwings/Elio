@@ -4,8 +4,11 @@
 #include <atomic>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
-#include "vthread_stack.hpp"
+namespace elio::runtime {
+class scheduler;
+}
 
 namespace elio::coro {
 
@@ -72,7 +75,7 @@ private:
 };
 
 /// Base class for all coroutine promise types
-/// Implements lightweight virtual stack tracking via thread-local intrusive list
+/// Implements lightweight virtual stack tracking via a thread-local pointer.
 ///
 /// Debug support (when ELIO_ENABLE_DEBUG_METADATA=1):
 /// - Each frame has a unique ID for identification
@@ -96,28 +99,9 @@ public:
         , debug_id_(0)  // Lazy allocation - only allocated when id() is called
 #endif
         , affinity_(NO_AFFINITY)
-        , vstack_(vthread_stack::current())  // Use current vstack from thread-local
-        , owns_vstack_(false)
     {
         current_frame_ = this;
     }
-
-    /// Optional callback invoked from the promise destructor to notify a
-    /// scheduler that a tracked task is going away. Set by
-    /// ``scheduler::go``/``go_to``/``go_joinable`` immediately after the
-    /// matching ``on_task_spawned()`` call; cleared on no-op promises
-    /// (e.g. tasks ``co_await``-ed inline by user code).
-    ///
-    /// Living in the promise (not in a body-local guard) is the key:
-    /// the promise is constructed when the coroutine *frame* is allocated
-    /// (i.e. at ``sched.go``-time, before the wrapper body has had a
-    /// chance to run) and destructed when the frame is freed — including
-    /// the corner case where ``handle.destroy()`` runs on a handle whose
-    /// body never executed (e.g. drained out of an inbox during shutdown).
-    /// A body-local guard misses both endpoints in that corner case.
-    using spawn_completion_fn = void (*)(void*) noexcept;
-    spawn_completion_fn on_spawn_completion_ = nullptr;
-    void* on_spawn_completion_data_ = nullptr;
 
     ~promise_base() noexcept {
         // Invoke spawn-completion callback first. This is the universal
@@ -135,15 +119,6 @@ public:
         // detach) would clobber an unrelated active frame chain.
         if (current_frame_ == this) {
             current_frame_ = parent_;
-        }
-        if (owns_vstack_) {
-            // The owning coroutine frame is allocated from this vstack, so defer
-            // deleting segment storage until the frame's operator delete runs.
-            auto* vs = vstack_.exchange(nullptr, std::memory_order_acq_rel);
-            if (vthread_stack::current() == vs) {
-                vthread_stack::set_current(nullptr);
-            }
-            vthread_stack::delete_after_current_deallocation(vs);
         }
     }
 
@@ -267,38 +242,19 @@ public:
         return worker_local_.load(std::memory_order_acquire);
     }
 
-    // vthread_stack accessors
-    [[nodiscard]] vthread_stack* vstack() const noexcept { 
-        return vstack_.load(std::memory_order_acquire); 
-    }
-
-    void set_vstack(vthread_stack* vs) noexcept { 
-        vstack_.store(vs, std::memory_order_release); 
-    }
-
-    void set_vstack_owner(vthread_stack* vs) noexcept {
-        vstack_.store(vs, std::memory_order_release);
-        owns_vstack_ = true;
-    }
-
-    [[nodiscard]] bool owns_vstack() const noexcept { return owns_vstack_; }
-
-    /// Release ownership of vstack without deleting it.
-    /// Returns the vstack pointer for caller to delete after coroutine frame is destroyed.
-    /// Used by final_awaiter to avoid use-after-free when self-destructing.
-    vthread_stack* release_vstack_ownership() noexcept {
-        if (owns_vstack_) {
-            owns_vstack_ = false;
-            auto* vs = vstack_.exchange(nullptr, std::memory_order_acq_rel);
-            if (vthread_stack::current() == vs) {
-                vthread_stack::set_current(nullptr);
-            }
-            return vs;
-        }
-        return nullptr;
-    }
-
 private:
+    friend class runtime::scheduler;
+
+    /// Optional callback invoked from the promise destructor to notify a
+    /// scheduler that a tracked task is going away. Living in the promise
+    /// covers frames destroyed before their coroutine body starts.
+    using spawn_completion_fn = void (*)(void*) noexcept;
+
+    void set_spawn_completion(spawn_completion_fn callback, void* data) noexcept {
+        on_spawn_completion_data_ = data;
+        on_spawn_completion_ = callback;
+    }
+
     // Magic number at start for debugger validation
     uint64_t frame_magic_;
 
@@ -322,11 +278,42 @@ private:
     // must not be migrated when their affinity owner is retired.
     std::atomic<bool> worker_local_{false};
 
-    // vthread_stack support
-    std::atomic<vthread_stack*> vstack_{nullptr};
-    bool owns_vstack_ = false;
+    // Keep scheduler accounting after the debugger-visible frame fields so the
+    // stable magic/parent prefix remains at the start of promise_base.
+    spawn_completion_fn on_spawn_completion_ = nullptr;
+    void* on_spawn_completion_data_ = nullptr;
 
     static inline thread_local promise_base* current_frame_ = nullptr;
 };
+
+static_assert(std::is_standard_layout_v<promise_base>,
+              "promise_base must retain a debugger-readable member layout");
+
+/// Install a coroutine as the current virtual-stack frame for one resume call.
+/// The previous virtual-stack frame is restored when control returns to the
+/// resumer.
+namespace detail {
+
+class frame_context_scope {
+public:
+    explicit frame_context_scope(promise_base* frame) noexcept
+        : previous_(promise_base::current_frame()) {
+        if (frame) {
+            promise_base::set_current_frame(frame);
+        }
+    }
+
+    ~frame_context_scope() {
+        promise_base::set_current_frame(previous_);
+    }
+
+    frame_context_scope(const frame_context_scope&) = delete;
+    frame_context_scope& operator=(const frame_context_scope&) = delete;
+
+private:
+    promise_base* previous_;
+};
+
+} // namespace detail
 
 } // namespace elio::coro

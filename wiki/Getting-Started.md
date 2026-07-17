@@ -304,7 +304,6 @@ include/elio/
 │   ├── awaitable_base.hpp # Awaitable interface
 │   ├── task_handle.hpp   # Task handle utilities
 │   ├── traits.hpp        # Type traits for coroutines
-│   ├── vthread_stack.hpp # Segmented bump allocator
 │   ├── when_all.hpp      # Wait for all tasks
 │   ├── when_any.hpp      # Wait for any task
 │   └── with_timeout.hpp  # Timeout wrapper

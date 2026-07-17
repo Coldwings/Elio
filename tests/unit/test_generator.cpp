@@ -367,7 +367,7 @@ TEST_CASE("generator with large values", "[generator]") {
 // Virtual stack integration
 // ============================================================================
 
-TEST_CASE("generator virtual stack allocation", "[generator][vstack]") {
+TEST_CASE("generator virtual stack integration", "[generator][vstack]") {
     scheduler sched(2);
     sched.start();
     

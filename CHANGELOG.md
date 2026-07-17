@@ -22,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses a per-worker overflow queue for rare full-inbox bursts so worker-bound
   tasks are not resumed on submitting threads. Overflow batches remain visible
   to scheduler idle accounting while they move into a worker's local deque, so
-  shutdown cannot mistake accepted work for an idle runtime. Scheduler-bound
+  shutdown cannot mistake accepted work for an idle runtime. Generator and
+  cancellation-executor creation now restore the creator's virtual-stack TLS
+  before independent handoff. Scheduler-bound
   `spawn_blocking()` calls now report an unavailable blocking pool on the
   current worker instead of falling back to a detached thread.
 - **Coroutine frame allocation**: `task<T>` frames now use the standard heap

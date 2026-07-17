@@ -24,6 +24,18 @@ generator<int> simple_producer() {
     co_yield 3;
 }
 
+TEST_CASE("generator construction preserves creator virtual stack",
+          "[generator][virtual_stack][ownership]") {
+    promise_base caller;
+
+    {
+        auto gen = simple_producer();
+        REQUIRE(promise_base::current_frame() == &caller);
+    }
+
+    REQUIRE(promise_base::current_frame() == &caller);
+}
+
 TEST_CASE("generator basic usage", "[generator]") {
     scheduler sched(2);
     sched.start();

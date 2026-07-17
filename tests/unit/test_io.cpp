@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -3348,6 +3349,22 @@ TEST_CASE("resolve_options ttl controls cache expiry", "[tcp][dns][cache][config
 // ============================================================================
 // Cancellable I/O tests
 // ============================================================================
+
+TEST_CASE("I/O cancel executor construction preserves creator virtual stack",
+          "[io][cancel][virtual_stack][ownership]") {
+    promise_base caller;
+    auto state = std::make_shared<elio::io::detail::io_cancel_state>();
+    auto exec = elio::io::detail::make_io_cancel_executor(state, true);
+    auto* promise = elio::coro::get_promise_base(exec.handle.address());
+
+    REQUIRE(promise != nullptr);
+    promise->detach_from_parent();
+    REQUIRE(promise->parent() == nullptr);
+    REQUIRE(promise_base::current_frame() == &caller);
+
+    exec.handle.destroy();
+    REQUIRE(promise_base::current_frame() == &caller);
+}
 
 namespace {
 

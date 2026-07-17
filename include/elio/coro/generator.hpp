@@ -166,21 +166,10 @@ public:
             return generator{handle_type::from_promise(*this)};
         }
 
-        // Suspend initially and detach from parent frame chain so that
-        // the producer does not pollute the caller's debug frame stack.
-        [[nodiscard]] auto initial_suspend() noexcept {
-            struct initial_awaiter {
-                promise_type* self;
-
-                [[nodiscard]] bool await_ready() const noexcept { return false; }
-
-                void await_suspend(std::coroutine_handle<>) noexcept {
-                    self->detach_from_parent();
-                }
-
-                void await_resume() noexcept {}
-            };
-            return initial_awaiter{this};
+        // The generator return object removes constructor-time ancestry before
+        // this initial suspension, so creation cannot clobber caller TLS.
+        [[nodiscard]] std::suspend_always initial_suspend() noexcept {
+            return {};
         }
 
         // At end of producer: resume consumer so it sees done()=true.
@@ -225,8 +214,8 @@ public:
         void return_void() noexcept {}
 
         void unhandled_exception() noexcept {
-            // Generator detaches from the parent frame chain at initial_suspend
-            // and manages its own exception propagation via this member.
+            // Generator creation removes constructor-time ancestry and manages
+            // its own exception propagation via this member.
             // Do NOT call promise_base::unhandled_exception() — that would
             // store a redundant copy in promise_base::exception_ which is
             // never read by generator consumer code.
@@ -236,7 +225,11 @@ public:
 
     generator() = default;
 
-    explicit generator(handle_type h) noexcept : handle_(h) {}
+    explicit generator(handle_type h) noexcept : handle_(h) {
+        if (handle_) {
+            handle_.promise().leave_creation_context();
+        }
+    }
 
     generator(generator&& other) noexcept
         : handle_(std::exchange(other.handle_, nullptr)) {}

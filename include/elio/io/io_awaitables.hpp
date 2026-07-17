@@ -1131,7 +1131,10 @@ struct io_cancel_state {
 struct io_cancel_executor {
     struct promise_type : public coro::promise_base {
         io_cancel_executor get_return_object() {
-            return {std::coroutine_handle<promise_type>::from_promise(*this)};
+            auto handle =
+                std::coroutine_handle<promise_type>::from_promise(*this);
+            leave_creation_context();
+            return {handle};
         }
         std::suspend_always initial_suspend() noexcept { return {}; }
         std::suspend_never final_suspend() noexcept { return {}; }

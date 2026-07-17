@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **0.6.0 development metadata**: The in-tree development version is now 0.6.0,
+  with README, public header, and CMake release metadata aligned after v0.5.3.
+
 ## [0.5.3] - 2026-07-17
 
 ### Added

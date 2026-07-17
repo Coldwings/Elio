@@ -64,6 +64,11 @@ task<void> probed_lazy_task(task_lifetime_probe probe) {
     co_return;
 }
 
+template<typename T>
+void move_assign(task<T>& destination, task<T>& source) {
+    destination = std::move(source);
+}
+
 task<int> sum_moved_task_vector() {
     std::vector<task<int>> tasks;
     for (int i = 1; i <= 16; ++i) {
@@ -198,7 +203,7 @@ TEST_CASE("task move assignment destroys replaced lazy frame",
         REQUIRE(get_handle(destination) == source_handle);
         REQUIRE(replaced_destructions.load(std::memory_order_relaxed) == 1);
 
-        destination = std::move(destination);
+        move_assign(destination, destination);
         REQUIRE(destination.valid());
     }
 

@@ -108,34 +108,21 @@ def read_cstring(addr):
         return None
 
 
-def align_up(value, alignment):
-    """Round an offset up to the requested ABI alignment."""
-    return (value + alignment - 1) // alignment * alignment
-
-
-def get_promise_layout(ptr_size):
+def get_promise_layout(_ptr_size):
     """Resolve promise_base field offsets, with a stripped-binary fallback."""
-    debug_location_offset = 8 + ptr_size + ptr_size
-    debug_location_size = align_up(2 * ptr_size + 4, ptr_size)
-    state_offset = debug_location_offset + debug_location_size
-    worker_id_offset = align_up(state_offset + 1, 4)
-    debug_id_offset = align_up(worker_id_offset + 4, min(8, ptr_size))
     fallback = {
         "frame_magic_": 0,
         "parent_": 8,
-        "debug_location_": debug_location_offset,
-        "debug_state_": state_offset,
-        "debug_worker_id_": worker_id_offset,
-        "debug_id_": debug_id_offset,
-        "has_debug_metadata": True,
+        "has_debug_metadata": False,
     }
 
     try:
         promise_type = gdb.lookup_type("elio::coro::promise_base").strip_typedefs()
         offsets = {}
         for field in promise_type.fields():
-            if field.name and field.bitpos is not None:
-                offsets[field.name] = int(field.bitpos) // 8
+            bitpos = getattr(field, "bitpos", None)
+            if field.name and bitpos is not None:
+                offsets[field.name] = int(bitpos) // 8
 
         if "frame_magic_" not in offsets or "parent_" not in offsets:
             return fallback
@@ -181,8 +168,8 @@ def get_frame_from_handle(handle_addr):
             return None
 
         # Resolve field offsets from debug information when available. The
-        # fallback matches the stable magic/parent prefix and supported
-        # GCC/Clang standard-library ABIs.
+        # Without type information, only the stable magic/parent prefix is
+        # safe to inspect. Optional metadata may not be compiled in.
 
         # Read parent pointer (always present)
         parent_bytes = inferior.read_memory(

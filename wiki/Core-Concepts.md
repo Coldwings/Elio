@@ -279,7 +279,13 @@ All three functions are also available in the `elio` namespace as convenience al
 
 **Why MPSC inbox for external submissions.** Cross-thread task submissions (e.g., spawning a task onto a specific worker from another thread) go through a bounded MPSC ring buffer rather than directly into the Chase-Lev deque. This separation keeps the deque's invariants simple -- only the owner ever pushes -- and the bounded capacity with cache-line aligned slots (`alignas(64)`) eliminates false sharing between producers and the consumer.
 
-## Virtual Stack
+## Vthreads And The Virtual Stack
+
+An Elio **vthread** is the logical asynchronous execution represented by a
+root task and its chain of awaited coroutine tasks. It is not an operating
+system thread and it is not a coroutine-frame allocation arena. A vthread may
+suspend and resume on scheduler workers, and may migrate between workers when
+its affinity and I/O ownership permit that movement.
 
 C++20 stackless coroutines do not maintain a call stack in the traditional sense. When a coroutine suspends, the compiler-generated frame is stored on the heap, but the chain of callers that led to that suspension point is lost. This makes debugging difficult -- tools like `gdb bt` show the scheduler's dispatch loop rather than the logical call chain of coroutines.
 
@@ -290,7 +296,7 @@ The overhead is minimal -- one pointer per coroutine frame, set during construct
 ### What it enables
 
 - **`elio-pstack`**: A CLI tool that attaches to a running process (or reads a coredump) and walks the virtual stack chains to print coroutine backtraces, similar to `pstack` for threads.
-- **Debugger extensions**: `elio-gdb.py` and `elio_lldb.py` use the same frame linkage to implement `elio bt` (backtrace) and `elio list` (list active coroutines).
+- **Debugger extensions**: `elio-gdb.py` and `elio-lldb.py` use the same frame linkage to implement `elio bt` (backtrace) and `elio list` (list active coroutines).
 - **Exception propagation**: When a coroutine throws, `unhandled_exception()` captures it in the promise. The parent coroutine can then rethrow the exception when it `co_await`s the child's result, propagating errors up the logical call chain.
 
 ### Frame metadata

@@ -162,13 +162,10 @@ public:
     /// drain_remaining_tasks). Use shutdown() for graceful drain.
     void shutdown_force() {
         // Drain the blocking pool BEFORE flipping running_=false. Pool tasks
-        // finishing here resume their callers via the spawn_blocking awaitable;
-        // that path checks scheduler::is_running() to decide whether to route
-        // through scheduler::spawn() (correct) or fall back to caller.resume()
-        // on the pool thread (broken — leaves the coroutine without a worker /
-        // io_context context, breaking subsequent co_awaits). Doing the drain
-        // first keeps running_=true while pool tasks finish, so all resumes
-        // land on a real worker.
+        // finishing here resume their callers through
+        // scheduler::try_schedule(). Doing the drain first keeps running_=true
+        // while accepted work finishes, so every continuation can land on a
+        // real worker instead of being stranded during teardown.
         //
         // blocking_pool::shutdown() is idempotent, so this is safe even on
         // repeated calls or when shutdown_force() is invoked from contexts
@@ -318,8 +315,9 @@ public:
     void pause() { paused_.store(true, std::memory_order_relaxed); }
     void resume() { paused_.store(false, std::memory_order_relaxed); }
 
-    /// Try to enqueue a raw coroutine handle. On failure the handle remains
-    /// live, so the caller must either resume it or destroy it.
+    /// Try to hand an independent coroutine to the scheduler for its first
+    /// execution. This detaches any construction-time virtual-stack ancestry.
+    /// On failure the handle remains live.
     [[nodiscard]] bool try_spawn(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return false;
         if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
@@ -340,7 +338,18 @@ public:
             handle.destroy();
         }
     }
-    
+
+    /// Try to re-enqueue a suspended coroutine while preserving the logical
+    /// parent established by its await chain. On failure the handle remains
+    /// live, so the caller must either resume it or destroy it.
+    [[nodiscard]] bool try_schedule(std::coroutine_handle<> handle) {
+        if (!handle) [[unlikely]] return false;
+        if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
+            return false;
+        }
+        return do_spawn(handle, false);
+    }
+
     /// Spawn a task directly (convenience overload)
     /// Accepts any type with a release() method that returns a coroutine_handle
     template<typename Task>
@@ -392,8 +401,18 @@ public:
 
     /// Spawn an existing coroutine toward worker_id. Exact placement requires
     /// worker_id < num_threads(); otherwise scheduling is best-effort fallback.
+    /// This is an initial ownership handoff and detaches construction-time
+    /// virtual-stack ancestry.
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle) {
         (void)do_spawn_to_(worker_id, handle);
+    }
+
+    /// Try to re-enqueue a suspended coroutine toward worker_id while
+    /// preserving the logical parent established by its await chain. On
+    /// failure the handle remains live.
+    [[nodiscard]] bool try_schedule_to(size_t worker_id,
+                                       std::coroutine_handle<> handle) {
+        return do_schedule_to_(worker_id, handle, false);
     }
 
     [[nodiscard]] size_t num_threads(std::memory_order order = std::memory_order_relaxed) const noexcept {
@@ -704,8 +723,6 @@ private:
         using ResultTask = std::invoke_result_t<F, Args...>;
         using T = detail::task_value_t<ResultTask>;
 
-        auto* old_frame = coro::promise_base::current_frame();
-
         auto wrapper = [&]() {
             if constexpr (Joinable) {
                 return detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
@@ -714,18 +731,12 @@ private:
             }
         }();
 
-        auto handle = coro::detail::task_access::release(wrapper);
+        auto handle = coro::detail::task_access::release(std::move(wrapper));
         handle.promise().detached_ = true;
         if constexpr (Pinned) {
             handle.promise().set_affinity(worker_id);
         }
         handle.promise().detach_from_parent();
-        // Restore caller's frame chain. detach_from_parent() sets current_frame_
-        // to nullptr to avoid UAF when parent_ was spawned to another thread,
-        // but in do_go_ the parent is the caller on the same thread and is safe.
-        // Without this restore, the caller's subsequent coroutines would have
-        // nullptr as parent_, breaking the virtual stack chain.
-        coro::promise_base::set_current_frame(old_frame);
 
         if constexpr (Joinable) {
             auto state = std::make_shared<coro::detail::join_state<T>>();
@@ -781,16 +792,26 @@ private:
 
     bool do_spawn_to_(size_t worker_id, std::coroutine_handle<> handle,
                       bool destroy_on_failure = true) {
+        return do_enqueue_to_(worker_id, handle, destroy_on_failure, true);
+    }
+
+    bool do_schedule_to_(size_t worker_id, std::coroutine_handle<> handle,
+                         bool destroy_on_failure = true) {
+        return do_enqueue_to_(worker_id, handle, destroy_on_failure, false);
+    }
+
+    bool do_enqueue_to_(size_t worker_id, std::coroutine_handle<> handle,
+                        bool destroy_on_failure, bool detach_parent) {
         if (!handle) [[unlikely]] return false;
         if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
             if (destroy_on_failure) handle.destroy();
             return false;
         }
 
-        // Detach from current thread's frame chain before spawning to another thread
-        // to avoid use-after-free when this thread creates another coroutine.
         auto* promise = coro::get_promise_base(handle.address());
-        if (promise) {
+        if (detach_parent && promise) {
+            // Initial ownership handoff must not retain construction-time
+            // ancestry. Suspended-coroutine migration preserves await ancestry.
             promise->detach_from_parent();
         }
 
@@ -955,42 +976,52 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
     if (!handle) return;
 
     auto* sched = scheduler::current();
-    if (sched && sched->is_running()) {
-        sched->spawn(handle);
-    } else {
-        static thread_local std::vector<std::coroutine_handle<>> trampoline_queue;
-        static thread_local bool trampoline_running = false;
+    if (sched) {
+        if (sched->is_running() && sched->try_schedule(handle)) {
+            return;
+        }
+        // This handle may be bound to a worker's I/O backend. Once its
+        // scheduler has stopped, resuming it on this arbitrary caller thread
+        // is unsafe; leave lifetime resolution to its task owner/shutdown.
+        return;
+    }
 
-        trampoline_queue.push_back(handle);
+    static thread_local std::vector<std::coroutine_handle<>> trampoline_queue;
+    static thread_local bool trampoline_running = false;
 
-        if (!trampoline_running) {
-            trampoline_running = true;
-            struct trampoline_guard {
-                std::vector<std::coroutine_handle<>>& q;
-                ~trampoline_guard() {
-                    // Only destroy completed coroutines.  Live (suspended)
-                    // handles are intentionally leaked: there is no scheduler
-                    // to adopt them, and destroying them here would UAF any
-                    // awaitables holding raw coroutine_handle references.
-                    size_t leaked = 0;
-                    for (auto h : q) {
-                        if (h.done()) {
-                            h.destroy();
-                        } else {
-                            ++leaked;
-                        }
+    trampoline_queue.push_back(handle);
+
+    if (!trampoline_running) {
+        trampoline_running = true;
+        struct trampoline_guard {
+            std::vector<std::coroutine_handle<>>& q;
+            ~trampoline_guard() {
+                // Only destroy completed coroutines.  Live (suspended)
+                // handles are intentionally leaked: there is no scheduler
+                // to adopt them, and destroying them here would UAF any
+                // awaitables holding raw coroutine_handle references.
+                size_t leaked = 0;
+                for (auto h : q) {
+                    if (h.done()) {
+                        h.destroy();
+                    } else {
+                        ++leaked;
                     }
-                    if (leaked > 0) {
-                        ELIO_LOG_WARNING("trampoline: {} live coroutine(s) leaked (no scheduler available)", leaked);
-                    }
-                    q.clear();
-                    trampoline_running = false;
                 }
-            } guard{trampoline_queue};
-            while (!trampoline_queue.empty()) {
-                auto h = trampoline_queue.back();
-                trampoline_queue.pop_back();
-                if (!h.done()) h.resume();
+                if (leaked > 0) {
+                    ELIO_LOG_WARNING("trampoline: {} live coroutine(s) leaked (no scheduler available)", leaked);
+                }
+                q.clear();
+                trampoline_running = false;
+            }
+        } guard{trampoline_queue};
+        while (!trampoline_queue.empty()) {
+            auto h = trampoline_queue.back();
+            trampoline_queue.pop_back();
+            if (!h.done()) {
+                auto* promise = coro::get_promise_base(h.address());
+                coro::detail::frame_context_scope frame_scope(promise);
+                h.resume();
             }
         }
     }
@@ -1041,11 +1072,9 @@ inline void worker_thread::stop() {
 /// Final cleanup for any orphaned tasks - only call after ALL workers have stopped.
 /// This is a safety net for edge cases where tasks might still exist after drain phase.
 inline void worker_thread::drain_remaining_tasks() noexcept {
-    // First drain inbox to deque
+    // First drain external queues to the local deque.
+    drain_inbox();
     void* addr;
-    while ((addr = inbox_->pop()) != nullptr) {
-        queue_->push(addr);
-    }
     // Destroy any remaining tasks (should be rare after drain phase in run())
     while ((addr = queue_->pop()) != nullptr) {
         auto handle = std::coroutine_handle<>::from_address(addr);
@@ -1058,31 +1087,45 @@ inline void worker_thread::drain_remaining_tasks() noexcept {
 /// Run worker-local maintenance tasks on this retiring worker; redistribute
 /// normal user tasks to active workers so they cannot start fresh I/O on a
 /// worker whose io_context is about to stop being polled.
-inline void worker_thread::run_or_redistribute_retiring_task(
+inline bool worker_thread::run_or_redistribute_retiring_task(
     scheduler* sched,
     std::coroutine_handle<> handle) noexcept {
     auto* promise = coro::get_promise_base(handle.address());
     if (promise && promise->is_worker_local() && promise->affinity() == worker_id_) {
         needs_sync_ = true;
         run_task(handle);
-        return;
+        return true;
     }
 
-    sched->spawn(handle);
+    if (sched->try_schedule(handle)) {
+        return true;
+    }
+
+    // A concurrent full shutdown may start after this worker entered its
+    // retirement drain. In that case there is no surviving worker to accept
+    // the handle, so finish it on this worker instead of retrying forever.
+    if (!sched->is_running()) {
+        needs_sync_ = true;
+        run_task(handle);
+        return true;
+    }
+
+    return false;
 }
 
 /// Redistribute remaining tasks to active workers - call during thread pool shrink
 inline void worker_thread::redistribute_tasks(scheduler* sched) noexcept {
-    // First drain inbox to deque
+    // First drain external queues to the local deque.
+    drain_inbox();
     void* addr;
-    while ((addr = inbox_->pop()) != nullptr) {
-        queue_->push(addr);
-    }
     // Then redistribute all tasks to active workers
     while ((addr = queue_->pop()) != nullptr) {
         auto handle = std::coroutine_handle<>::from_address(addr);
         if (handle && !handle.done()) {
-            run_or_redistribute_retiring_task(sched, handle);
+            if (!run_or_redistribute_retiring_task(sched, handle)) {
+                queue_->push(handle.address());
+                return;
+            }
         } else if (handle) {
             handle.destroy();
         }
@@ -1090,11 +1133,66 @@ inline void worker_thread::redistribute_tasks(scheduler* sched) noexcept {
 }
 
 inline void worker_thread::drain_inbox() noexcept {
-    // Drain MPSC inbox into local Chase-Lev deque
-    // Drain all available items to ensure tasks aren't stuck in inbox
+    // A producer that arrives after this observation will wake the worker and
+    // be drained on the next pass. Avoid transfer-lock traffic on the normal
+    // local execution path when there is no cross-thread work to transfer.
+    if (inbox_->empty() &&
+        overflow_size_.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (detail::queue_snapshot_paused_for_test.load(
+            std::memory_order_acquire)) {
+        detail::queue_transfer_waiting_for_test.store(
+            true, std::memory_order_release);
+        detail::queue_transfer_waiting_for_test.notify_all();
+    }
+#endif
+    std::lock_guard<std::mutex> transfer_lock(transfer_mutex_);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    detail::queue_transfer_waiting_for_test.store(false,
+                                                  std::memory_order_release);
+#endif
+
+    // Drain the MPSC fast path into the local Chase-Lev deque.
     void* item;
     while ((item = inbox_->pop()) != nullptr) {
         queue_->push(item);
+    }
+
+    // Overflow is used only after bounded inbox retries. Swap under the lock
+    // so producers are never held while the worker updates its local deque.
+    std::deque<void*> overflow;
+    {
+        std::lock_guard<std::mutex> lock(overflow_mutex_);
+        overflow.swap(overflow_);
+    }
+
+    const size_t transfer_size = overflow.size();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (transfer_size > 0 &&
+        detail::pause_overflow_transfer_for_test.load(std::memory_order_acquire)) {
+        detail::overflow_transfer_paused_for_test.store(true,
+                                                        std::memory_order_release);
+        detail::overflow_transfer_paused_for_test.notify_all();
+        while (detail::pause_overflow_transfer_for_test.load(
+            std::memory_order_acquire)) {
+            detail::pause_overflow_transfer_for_test.wait(true,
+                                                          std::memory_order_acquire);
+        }
+        detail::overflow_transfer_paused_for_test.store(false,
+                                                        std::memory_order_release);
+    }
+#endif
+    while (!overflow.empty()) {
+        queue_->push(overflow.front());
+        overflow.pop_front();
+    }
+    if (transfer_size > 0) {
+        // Publish every handle to queue_ before removing the transfer batch
+        // from accounting. Readers may briefly overcount, but never observe a
+        // false idle window between the overflow queue and local deque.
+        overflow_size_.fetch_sub(transfer_size, std::memory_order_release);
     }
 }
 
@@ -1182,7 +1280,10 @@ inline void worker_thread::run() {
                 // before this worker was stopped, so they never land back here).
                 // Worker-local maintenance tasks are the exception: they touch
                 // this worker's io_context and must run here before exit.
-                run_or_redistribute_retiring_task(scheduler_, handle);
+                if (!run_or_redistribute_retiring_task(scheduler_, handle)) {
+                    queue_->push(handle.address());
+                    std::this_thread::yield();
+                }
             } else {
                 needs_sync_ = true;  // Conservatively ensure memory visibility for drained tasks
                 run_task(handle);
@@ -1293,7 +1394,11 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
                     return handle;
                 }
                 if (affinity < num_workers) {
-                    scheduler_->spawn_to(affinity, handle);
+                    if (!scheduler_->try_schedule_to(affinity, handle)) {
+                        // Worker-local maintenance tasks are detached runtime
+                        // work and cannot execute away from their owner.
+                        handle.destroy();
+                    }
                 } else {
                     handle.destroy();
                 }
@@ -1312,7 +1417,15 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
             
             // Task has affinity for another worker - schedule it there
             if (affinity < num_workers) {
-                scheduler_->spawn_to(affinity, handle);
+                if (!scheduler_->try_schedule_to(affinity, handle)) {
+                    // This is a borrowed suspended handle. Keep it live and
+                    // execute locally rather than consuming its owner's frame.
+                    if (promise) {
+                        promise->clear_affinity();
+                    }
+                    steals_executed_.fetch_add(1, std::memory_order_relaxed);
+                    return handle;
+                }
             } else {
                 if (promise) {
                     promise->clear_affinity();
@@ -1343,7 +1456,8 @@ inline void worker_thread::poll_io_when_idle() {
     // Optional spinning phase (if configured via wait_strategy)
     if (strategy_.spin_iterations > 0) {
         for (size_t i = 0; i < strategy_.spin_iterations; ++i) {
-            if (inbox_->size_approx() > 0) {
+            if (inbox_->size_approx() > 0 ||
+                overflow_size_.load(std::memory_order_acquire) > 0) {
                 idle_.store(false, std::memory_order_relaxed);
                 return;
             }

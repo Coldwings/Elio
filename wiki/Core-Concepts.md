@@ -26,6 +26,13 @@ coro::task<void> do_work() {
 }
 ```
 
+`task<T>` is a move-only, single-shot lazy owner. Moving it transfers the
+unstarted coroutine frame and leaves the source empty, which allows lazy tasks
+to be stored in containers or passed through move-only callables. The task
+object does not represent running work: once ownership is transferred to the
+scheduler, use the `join_handle<T>` returned by `spawn()` when the work must be
+observed. Moving a task never migrates a running coroutine or pending I/O.
+
 ### Awaiting Tasks
 
 Use `co_await` to wait for a task to complete:
@@ -277,7 +284,7 @@ All three functions are also available in the `elio` namespace as convenience al
 
 **Why Chase-Lev deque.** The Chase-Lev algorithm gives the owner thread lock-free push and pop operations with no atomic read-modify-write on the fast path. Contention only occurs when the deque has a single element and both the owner and a thief attempt to take it simultaneously. The deque also supports dynamic resizing by replacing the underlying circular buffer, which avoids the need to pre-allocate a fixed upper bound.
 
-**Why MPSC inbox for external submissions.** Cross-thread task submissions (e.g., spawning a task onto a specific worker from another thread) go through a bounded MPSC ring buffer rather than directly into the Chase-Lev deque. This separation keeps the deque's invariants simple -- only the owner ever pushes -- and the bounded capacity with cache-line aligned slots (`alignas(64)`) eliminates false sharing between producers and the consumer.
+**Why MPSC inbox for external submissions.** Cross-thread task submissions (e.g., spawning a task onto a specific worker from another thread) go through a bounded MPSC ring buffer rather than directly into the Chase-Lev deque. This separation keeps the deque's invariants simple -- only the owner ever pushes -- and the bounded capacity with cache-line aligned slots (`alignas(64)`) eliminates false sharing between producers and the consumer. If a sustained burst fills the ring after bounded retries, submissions spill into a locked per-worker overflow queue. This rare slow path preserves worker affinity and borrowed coroutine ownership instead of resuming on the submitting thread.
 
 ## Vthreads And The Virtual Stack
 
@@ -289,9 +296,9 @@ its affinity and I/O ownership permit that movement.
 
 C++20 stackless coroutines do not maintain a call stack in the traditional sense. When a coroutine suspends, the compiler-generated frame is stored on the heap, but the chain of callers that led to that suspension point is lost. This makes debugging difficult -- tools like `gdb bt` show the scheduler's dispatch loop rather than the logical call chain of coroutines.
 
-Elio reconstructs this information through a **virtual stack**: an intrusive linked list of `promise_base` objects connected by `parent_` pointers. Each `promise_base` constructor links itself to the current frame via the `current_frame_` thread-local, and the destructor restores the previous frame. This gives every coroutine a pointer to the coroutine that `co_await`ed it.
+Elio reconstructs this information through a **virtual stack**: an intrusive linked list of `promise_base` objects connected by `parent_` pointers. The `current_frame_` thread-local identifies the frame executing on a thread. A lazy `task<T>` does not remain installed merely because its frame is owned; when it is awaited, its `parent_` is rebound to the actual awaiting coroutine for that execution chain. Scheduler, synchronization, I/O, and affinity-migration resume paths preserve that parent and install the resumed frame for the duration of the resume call. Generator iteration similarly binds the producer to its active consumer and restores the consumer context before transferring a yielded value or completion. Initial scheduler ownership handoff, including targeted spawn, is separate and detaches construction-time ancestry.
 
-The overhead is minimal -- one pointer per coroutine frame, set during construction and cleared during destruction.
+The overhead is minimal -- one pointer per coroutine frame, updated when logical ancestry is established.
 
 ### What it enables
 

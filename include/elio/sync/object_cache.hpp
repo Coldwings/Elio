@@ -521,15 +521,13 @@ private:
             }
         } started_guard{state_.get()};
 
-        auto* old_frame = coro::promise_base::current_frame();
         auto t = sweep_coroutine(
             std::weak_ptr<internals>(state_), state_->cfg_.sweep_interval,
             sweep_cancel_.get_token());
 
-        auto handle = coro::detail::task_access::release(t);
+        auto handle = coro::detail::task_access::release(std::move(t));
         handle.promise().detached_ = true;
         handle.promise().detach_from_parent();
-        coro::promise_base::set_current_frame(old_frame);
         if (sched->try_spawn(handle)) {
             started_guard.committed = true;
         } else {

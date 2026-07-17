@@ -888,7 +888,7 @@ TEST_CASE("destroyed when_all waiter is unregistered",
     runtime::scheduler sched(2);
     sched.start();
     auto outer_task = outer();
-    auto h = elio::coro::detail::task_access::release(outer_task);
+    auto h = elio::coro::detail::task_access::release(std::move(outer_task));
     sched.spawn(h);
 
     REQUIRE(wait_for_count(started, 2));
@@ -920,7 +920,7 @@ TEST_CASE("destroyed when_any waiter is unregistered",
     runtime::scheduler sched(2);
     sched.start();
     auto outer_task = outer();
-    auto h = elio::coro::detail::task_access::release(outer_task);
+    auto h = elio::coro::detail::task_access::release(std::move(outer_task));
     sched.spawn(h);
 
     REQUIRE(wait_for_count(started, 2));

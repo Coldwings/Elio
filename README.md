@@ -510,7 +510,9 @@ Elio achieves competitive performance through careful optimization:
 
 - **Unconditional Wake**: Cross-thread submissions always wake the target worker; eventfd deduplication prevents lost wakes
 - **io_uring Batch Submit**: Automatic batching of I/O operations
-- **Lock-free Scheduling**: MPSC inbox (~5 ns) + Chase-Lev deque (~13 ns)
+- **Queue-based Scheduling Fast Path**: bounded MPSC inbox (~5 ns) +
+  Chase-Lev deque (~13 ns), with a locked overflow queue for rare sustained
+  bursts
 
 ### Scalability
 

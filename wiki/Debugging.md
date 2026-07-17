@@ -11,7 +11,11 @@ Elio coroutines maintain debug metadata in each frame:
 - Worker thread assignment
 - Parent pointer for virtual stack traversal
 
-The debugger extensions find coroutine frames by traversing the scheduler's worker queues (Chase-Lev deque and MPSC inbox). This approach has **zero runtime overhead** - no global registry or synchronization is required.
+The debugger extensions find runnable coroutine frames through each worker's
+Chase-Lev deque. The transient MPSC inbox and rare overflow queue are not walked
+because concurrent producers make a lock-free debugger snapshot unreliable;
+their tasks appear after the worker drains them into the deque. This avoids a
+global frame registry and its always-on synchronization cost.
 
 ## Virtual Stack
 
@@ -19,9 +23,9 @@ C++20 stackless coroutines allocate each frame independently on the heap. When a
 
 ### How It Works
 
-Each coroutine's promise type inherits from `promise_base`, which contains a `parent_` pointer. When coroutine A `co_await`s coroutine B, B's promise stores a pointer back to A's promise. This forms a singly-linked list from the innermost frame to the outermost caller, mirroring what a native call stack would look like if the coroutines were regular functions.
+Each coroutine's promise type inherits from `promise_base`, which contains a `parent_` pointer. When coroutine A `co_await`s coroutine B, B's promise stores a pointer back to A's promise. This forms a singly-linked list from the innermost frame to the outermost caller, mirroring what a native call stack would look like if the coroutines were regular functions. Lazy task ownership alone does not keep a frame installed in thread-local stack state, so moving or destroying an unstarted task cannot leave creator-thread stack pointers behind.
 
-The thread-local `current_frame_` tracks which frame is currently executing. When a new coroutine starts, it reads `current_frame_` to set its `parent_`, then installs itself as the new `current_frame_`. On completion or suspension, the previous frame is restored.
+The thread-local `current_frame_` tracks which frame is currently executing. A task binds its `parent_` to the actual awaiter when `co_await` starts it. Scheduler, synchronization, I/O, and affinity-migration resume paths preserve that ancestry and install the resumed frame while user code runs. Completion restores the logical parent before transferring control to the continuation. Separate initial `spawn` and `spawn_to` paths detach construction-time ancestry when independent work is handed to the scheduler.
 
 ### Frame Validation
 

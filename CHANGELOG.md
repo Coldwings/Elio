@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Move-only lazy tasks**: `coro::task<T>` and `coro::task<void>` now support
+  move construction and move assignment while remaining non-copyable. Moving a
+  task transfers ownership of its unstarted coroutine frame and leaves the
+  source empty. Replacing an owned task destroys the destination's previous
+  lazy frame. Runtime handoff paths now require an explicit rvalue ownership
+  transfer. Lazy ownership no longer installs a frame in creator-thread
+  virtual-stack state; ancestry is bound when the task is actually awaited and
+  preserved when a suspended task is scheduled for resumption, including
+  targeted affinity migration between workers. Resume scheduling borrows the
+  coroutine handle, reports stopped-worker rejection without consuming it, and
+  uses a per-worker overflow queue for rare full-inbox bursts so worker-bound
+  tasks are not resumed on submitting threads. Overflow batches remain visible
+  to scheduler idle accounting while they move into a worker's local deque;
+  non-blocking serialized queue snapshots prevent observers from crossing an
+  entire transfer and mistaking accepted work for an idle runtime. Generator and
+  cancellation-executor creation now restore the creator's virtual-stack TLS
+  before independent handoff. Generator yield and completion transfers restore
+  the active consumer context even after internal asynchronous suspension.
+  Scheduler-bound
+  `spawn_blocking()` calls now report an unavailable blocking pool on the
+  current worker instead of falling back to a detached thread.
 - **Coroutine frame allocation**: `task<T>` frames now use the standard heap
   allocation path in every build, without allocator-owned LIFO lifetime rules.
   Logical coroutine ancestry remains available through the `promise_base`
@@ -19,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Scheduler accounting hooks**: The promise-level spawn-completion callback
   is now an internal scheduler detail rather than a public `promise_base`
   field. It was never a supported application extension point.
+- **Timer fallback rejection**: If a timer cannot be prepared by the I/O
+  backend and the scheduler blocking pool is unavailable, `sleep_for()` and
+  `sleep_until()` now continue on the current worker and throw
+  `std::runtime_error`. They no longer destroy the borrowed awaiting coroutine
+  frame. This applies to both regular and cancellation-aware sleeps.
 - **0.6.0 development metadata**: The in-tree development version is now 0.6.0,
   with README, public header, and CMake release metadata aligned after v0.5.3.
 

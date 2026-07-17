@@ -9,6 +9,7 @@
 #include <coroutine>
 #include <thread>
 #include <atomic>
+#include <deque>
 #include <mutex>
 #include <random>
 #include <chrono>
@@ -17,15 +18,24 @@ namespace elio::runtime {
 
 class scheduler;
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace detail {
+inline std::atomic<bool> pause_overflow_transfer_for_test{false};
+inline std::atomic<bool> overflow_transfer_paused_for_test{false};
+inline std::atomic<bool> pause_queue_snapshot_for_test{false};
+inline std::atomic<bool> queue_snapshot_paused_for_test{false};
+inline std::atomic<bool> queue_transfer_waiting_for_test{false};
+}  // namespace detail
+#endif
+
 /// Worker thread that executes tasks from a local queue
 /// and steals from other workers when idle
 /// 
-/// Uses a two-queue architecture for optimal scalability:
-/// - MPSC inbox: lock-free queue for external task submissions
+/// Uses bounded queues on the scheduling fast path:
+/// - MPSC inbox: lock-free ring used behind the worker lifecycle guard
 /// - Chase-Lev deque: lock-free SPMC for owner ops and work stealing
-/// 
-/// This design eliminates contention between external producers and
-/// the owner thread, enabling linear scaling with thread count.
+/// Rare sustained bursts spill into a mutex-protected overflow queue instead
+/// of rejecting accepted worker-bound resumptions.
 class worker_thread {
     friend class scheduler;
 
@@ -60,9 +70,10 @@ public:
     /// Redistribute remaining tasks to active workers - call during thread pool shrink
     void redistribute_tasks(scheduler* sched) noexcept;
 
-    /// Schedule a task from external thread - pushes to lock-free MPSC inbox.
-    /// Returns false without taking ownership if this worker is stopped or the
-    /// inbox remains full after bounded retries.
+    /// Schedule a task from an external thread. The lock-free MPSC inbox is
+    /// the fast path; sustained bursts spill into a locked overflow queue so
+    /// live workers do not reject borrowed resume handles.
+    /// Returns false without taking ownership only if this worker is stopped.
     [[nodiscard]] bool schedule(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return false;
 
@@ -122,11 +133,40 @@ public:
             std::this_thread::yield();
         }
 
-        ELIO_LOG_ERROR("worker {} schedule(): rejecting handle after {} "
-                      "inbox retries exhausted",
-                      worker_id_, max_total_retries);
-        return false;
+        // Preserve progress without making the hot queue dynamically sized.
+        // schedule_mutex_ closes the race with request_stop(); overflow_mutex_
+        // protects the slow-path queue from its single worker consumer.
+        {
+            std::lock_guard<std::mutex> schedule_lock(schedule_mutex_);
+            if (!running_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> overflow_lock(overflow_mutex_);
+                overflow_.push_back(handle.address());
+                overflow_size_.fetch_add(1, std::memory_order_release);
+            }
+            wake();
+        }
+        return true;
     }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    [[nodiscard]] bool schedule_overflow_for_test(std::coroutine_handle<> handle) {
+        if (!handle) return false;
+        {
+            std::lock_guard<std::mutex> schedule_lock(schedule_mutex_);
+            if (!running_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            std::lock_guard<std::mutex> overflow_lock(overflow_mutex_);
+            overflow_.push_back(handle.address());
+            overflow_size_.fetch_add(1, std::memory_order_release);
+        }
+        wake();
+        return true;
+    }
+#endif
 
     void schedule_or_destroy(std::coroutine_handle<> handle) {
         if (!schedule(handle) && handle) {
@@ -149,7 +189,32 @@ public:
     }
 
     [[nodiscard]] size_t queue_size() const noexcept {
-        return queue_->size() + inbox_->size_approx();
+        std::unique_lock<std::mutex> transfer_lock(transfer_mutex_,
+                                                   std::try_to_lock);
+        if (!transfer_lock.owns_lock()) {
+            // A source-to-deque transfer is in progress. Conservatively
+            // report pending work instead of blocking an accounting reader.
+            return 1;
+        }
+        size_t total = queue_->size();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (detail::pause_queue_snapshot_for_test.load(
+                std::memory_order_acquire)) {
+            detail::queue_snapshot_paused_for_test.store(
+                true, std::memory_order_release);
+            detail::queue_snapshot_paused_for_test.notify_all();
+            while (detail::pause_queue_snapshot_for_test.load(
+                std::memory_order_acquire)) {
+                detail::pause_queue_snapshot_for_test.wait(
+                    true, std::memory_order_acquire);
+            }
+            detail::queue_snapshot_paused_for_test.store(
+                false, std::memory_order_release);
+        }
+#endif
+        total += inbox_->size_approx();
+        total += overflow_size_.load(std::memory_order_acquire);
+        return total;
     }
 
     [[nodiscard]] std::coroutine_handle<> steal_task() noexcept {
@@ -230,8 +295,8 @@ private:
 
     void run();
     void drain_inbox() noexcept;
-    void run_or_redistribute_retiring_task(scheduler* sched,
-                                           std::coroutine_handle<> handle) noexcept;
+    [[nodiscard]] bool run_or_redistribute_retiring_task(
+        scheduler* sched, std::coroutine_handle<> handle) noexcept;
     [[nodiscard]] std::coroutine_handle<> get_next_task() noexcept;
     void run_task(std::coroutine_handle<> handle) noexcept;
     [[nodiscard]] std::coroutine_handle<> try_steal() noexcept;
@@ -241,9 +306,18 @@ private:
     size_t worker_id_;
     std::unique_ptr<chase_lev_deque<void>> queue_;      // Owner's local deque (SPMC)
     std::unique_ptr<mpsc_queue<void>> inbox_;           // External submissions (MPSC)
+    std::deque<void*> overflow_;                        // Rare full-inbox fallback
     std::thread thread_;
     std::atomic<bool> running_;
     std::mutex schedule_mutex_;
+    std::mutex overflow_mutex_;
+    // Serializes external-queue transfers with non-blocking accounting
+    // snapshots. It is not used by the local scheduling fast path.
+    mutable std::mutex transfer_mutex_;
+    // Includes entries swapped into a worker-local transfer batch until every
+    // handle in that batch has been published to queue_. This may briefly
+    // overcount work, but it must never let idle detection miss accepted work.
+    std::atomic<size_t> overflow_size_{0};
     std::atomic<bool> draining_{false};
     // Hot-write fields (owner thread writes per task) — isolated cache line
     alignas(64) std::atomic<size_t> tasks_executed_;

@@ -24,6 +24,8 @@ class mpsc_queue {
     };
     
 public:
+    static constexpr size_t capacity = Capacity;
+
     mpsc_queue() noexcept {
         for (size_t i = 0; i < Capacity; ++i) {
             slots_[i].sequence.store(i, std::memory_order_relaxed);

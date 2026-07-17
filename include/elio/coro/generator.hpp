@@ -166,21 +166,10 @@ public:
             return generator{handle_type::from_promise(*this)};
         }
 
-        // Suspend initially and detach from parent frame chain so that
-        // the producer does not pollute the caller's debug frame stack.
-        [[nodiscard]] auto initial_suspend() noexcept {
-            struct initial_awaiter {
-                promise_type* self;
-
-                [[nodiscard]] bool await_ready() const noexcept { return false; }
-
-                void await_suspend(std::coroutine_handle<>) noexcept {
-                    self->detach_from_parent();
-                }
-
-                void await_resume() noexcept {}
-            };
-            return initial_awaiter{this};
+        // The generator return object removes constructor-time ancestry before
+        // this initial suspension, so creation cannot clobber caller TLS.
+        [[nodiscard]] std::suspend_always initial_suspend() noexcept {
+            return {};
         }
 
         // At end of producer: resume consumer so it sees done()=true.
@@ -190,7 +179,9 @@ public:
 
                 [[nodiscard]] std::coroutine_handle<> await_suspend(
                     std::coroutine_handle<promise_type> h) noexcept {
-                    auto consumer = h.promise().consumer_;
+                    auto& promise = h.promise();
+                    auto consumer = promise.consumer_;
+                    promise.leave_frame_context();
                     if (consumer) {
                         return consumer;  // symmetric transfer → consumer
                     }
@@ -213,7 +204,8 @@ public:
                 [[nodiscard]] bool await_ready() const noexcept { return false; }
 
                 [[nodiscard]] std::coroutine_handle<> await_suspend(
-                    std::coroutine_handle<>) noexcept {
+                    std::coroutine_handle<promise_type> h) noexcept {
+                    h.promise().leave_frame_context();
                     return consumer;  // symmetric transfer → consumer
                 }
 
@@ -225,8 +217,8 @@ public:
         void return_void() noexcept {}
 
         void unhandled_exception() noexcept {
-            // Generator detaches from the parent frame chain at initial_suspend
-            // and manages its own exception propagation via this member.
+            // Generator creation removes constructor-time ancestry and manages
+            // its own exception propagation via this member.
             // Do NOT call promise_base::unhandled_exception() — that would
             // store a redundant copy in promise_base::exception_ which is
             // never read by generator consumer code.
@@ -236,7 +228,11 @@ public:
 
     generator() = default;
 
-    explicit generator(handle_type h) noexcept : handle_(h) {}
+    explicit generator(handle_type h) noexcept : handle_(h) {
+        if (handle_) {
+            handle_.promise().leave_creation_context();
+        }
+    }
 
     generator(generator&& other) noexcept
         : handle_(std::exchange(other.handle_, nullptr)) {}
@@ -272,6 +268,11 @@ public:
                 std::coroutine_handle<> consumer) noexcept {
                 // Tell the producer who to transfer back to.
                 producer.promise().consumer_ = consumer;
+                // Bind the producer to the consumer that actually drives this
+                // iteration. yield/final suspend restore that context before
+                // transferring control back, including after internal I/O.
+                producer.promise().enter_frame_context(
+                    promise_base::current_frame());
                 // Symmetric transfer → producer runs until co_yield / end.
                 return producer;
             }

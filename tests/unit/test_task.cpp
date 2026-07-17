@@ -1,15 +1,20 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/coro/task_handle.hpp>
+#include <elio/coro/when_all.hpp>
 #include <elio/coro/frame.hpp>
+#include <elio/runtime/async_main.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/affinity.hpp>
+#include <elio/sync/event.hpp>
+#include <elio/time/timer.hpp>
 #include <string>
 #include <atomic>
 #include <chrono>
 #include <latch>
 #include <thread>
+#include <utility>
 #include <vector>
 #include "../test_main.cpp"  // For scaled timeouts
 
@@ -17,7 +22,7 @@ using namespace elio::coro;
 using namespace elio::runtime;
 using namespace elio::test;
 
-// Helper: access handle from immovable task (for testing only)
+// Helper: access an owned lazy task handle for lifecycle assertions.
 template<typename T>
 auto get_handle(task<T>& t) {
     return elio::coro::detail::task_access::handle(t);
@@ -32,6 +37,136 @@ task<int> simple_return_value() {
 task<void> simple_void() {
     co_return;
 }
+
+task<int> return_value(int value) {
+    co_return value;
+}
+
+task<size_t> report_virtual_stack_depth() {
+    co_return get_stack_depth();
+}
+
+struct task_lifetime_probe {
+    std::atomic<int>* destructions;
+
+    explicit task_lifetime_probe(std::atomic<int>* counter) noexcept
+        : destructions(counter) {}
+
+    task_lifetime_probe(const task_lifetime_probe&) = delete;
+    task_lifetime_probe& operator=(const task_lifetime_probe&) = delete;
+
+    task_lifetime_probe(task_lifetime_probe&& other) noexcept
+        : destructions(std::exchange(other.destructions, nullptr)) {}
+
+    ~task_lifetime_probe() {
+        if (destructions) {
+            destructions->fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+};
+
+task<void> probed_lazy_task(task_lifetime_probe probe) {
+    (void)probe;
+    co_return;
+}
+
+template<typename T>
+void move_assign(task<T>& destination, task<T>& source) {
+    destination = std::move(source);
+}
+
+task<int> sum_moved_task_vector() {
+    std::vector<task<int>> tasks;
+    for (int i = 1; i <= 16; ++i) {
+        tasks.emplace_back(return_value(i));
+    }
+
+    int total = 0;
+    for (auto& pending : tasks) {
+        total += co_await pending;
+    }
+    co_return total;
+}
+
+task<int> combine_moved_lazy_tasks() {
+    auto first = return_value(20);
+    auto second = return_value(22);
+
+    auto combined = elio::when_all(
+        [owned = std::move(first)]() mutable -> task<int> {
+            return std::move(owned);
+        },
+        [owned = std::move(second)]() mutable -> task<int> {
+            return std::move(owned);
+        });
+
+    if (first.valid() || second.valid()) {
+        co_return -1;
+    }
+
+    auto [a, b] = co_await combined;
+    co_return a + b;
+}
+
+task<size_t> await_moved_task_and_report_depth() {
+    auto child = report_virtual_stack_depth();
+    auto moved = std::move(child);
+    co_return co_await moved;
+}
+
+task<size_t> suspend_then_report_virtual_stack_depth(
+        elio::sync::event& waiting, elio::sync::event& release) {
+    waiting.set();
+    co_await release.wait();
+    co_return get_stack_depth();
+}
+
+task<bool> verify_scheduled_resume_virtual_stack() {
+    elio::sync::event waiting;
+    elio::sync::event release;
+    auto* sched = scheduler::current();
+
+    sched->go([&]() -> task<void> {
+        co_await waiting.wait();
+        release.set();
+    });
+
+    const auto parent_depth = get_stack_depth();
+    auto child = suspend_then_report_virtual_stack_depth(waiting, release);
+    const auto child_depth = co_await child;
+    co_return child_depth == parent_depth + 1 &&
+              get_stack_depth() == parent_depth;
+}
+
+task<bool> migrate_and_verify_virtual_stack(size_t parent_depth) {
+    auto* sched = scheduler::current();
+    const auto source_worker = current_worker_id();
+    if (!sched || sched->num_threads() < 2 || source_worker == NO_AFFINITY) {
+        co_return false;
+    }
+
+    const auto target_worker = (source_worker + 1) % sched->num_threads();
+    co_await set_affinity(target_worker);
+
+    co_return current_worker_id() == target_worker &&
+              get_stack_depth() == parent_depth + 1;
+}
+
+task<bool> verify_affinity_migration_virtual_stack() {
+    const auto parent_depth = get_stack_depth();
+    const auto child_ok = co_await migrate_and_verify_virtual_stack(parent_depth);
+    co_return child_ok && get_stack_depth() == parent_depth;
+}
+
+template<typename Task>
+concept releases_lvalue = requires(Task& value) {
+    elio::coro::detail::task_access::release(value);
+};
+
+template<typename Task>
+concept releases_rvalue = requires(Task& value) {
+    elio::coro::detail::task_access::release(std::move(value));
+};
 
 // Helper: Coroutine that throws
 task<int> throwing_coroutine() {
@@ -74,17 +209,360 @@ TEST_CASE("task construction and destruction", "[task]") {
     // Task should destroy handle in destructor
 }
 
-TEST_CASE("task is non-movable", "[task]") {
-    // Verify task<T> is non-movable and non-copyable
-    STATIC_REQUIRE_FALSE(std::is_move_constructible_v<task<int>>);
-    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<task<int>>);
+TEST_CASE("task is move-only", "[task][ownership]") {
+    STATIC_REQUIRE(std::is_nothrow_move_constructible_v<task<int>>);
+    STATIC_REQUIRE(std::is_nothrow_move_assignable_v<task<int>>);
     STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<task<int>>);
     STATIC_REQUIRE_FALSE(std::is_copy_assignable_v<task<int>>);
-    
-    STATIC_REQUIRE_FALSE(std::is_move_constructible_v<task<void>>);
-    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<task<void>>);
+
+    STATIC_REQUIRE(std::is_nothrow_move_constructible_v<task<void>>);
+    STATIC_REQUIRE(std::is_nothrow_move_assignable_v<task<void>>);
     STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<task<void>>);
     STATIC_REQUIRE_FALSE(std::is_copy_assignable_v<task<void>>);
+
+    STATIC_REQUIRE_FALSE(releases_lvalue<task<int>>);
+    STATIC_REQUIRE(releases_rvalue<task<int>>);
+
+    task<int> empty{task<int>::handle_type{}};
+    REQUIRE_FALSE(empty.valid());
+
+    auto source = simple_return_value();
+    const auto original_handle = get_handle(source);
+    auto destination = std::move(source);
+
+    REQUIRE_FALSE(source.valid());
+    REQUIRE_FALSE(static_cast<bool>(source));
+    REQUIRE(destination.valid());
+    REQUIRE(static_cast<bool>(destination));
+    REQUIRE(get_handle(destination) == original_handle);
+
+    auto released = elio::coro::detail::task_access::release(
+        std::move(destination));
+    REQUIRE_FALSE(destination.valid());
+    REQUIRE(released == original_handle);
+    released.destroy();
+}
+
+TEST_CASE("task move assignment destroys replaced lazy frame",
+          "[task][ownership][lifetime]") {
+    std::atomic<int> source_destructions{0};
+    std::atomic<int> replaced_destructions{0};
+    auto* previous_frame = promise_base::current_frame();
+
+    {
+        auto destination = probed_lazy_task(
+            task_lifetime_probe{&replaced_destructions});
+        auto source = probed_lazy_task(
+            task_lifetime_probe{&source_destructions});
+        const auto source_handle = get_handle(source);
+
+        REQUIRE(promise_base::current_frame() == previous_frame);
+
+        destination = std::move(source);
+
+        REQUIRE_FALSE(source.valid());
+        REQUIRE(destination.valid());
+        REQUIRE(get_handle(destination) == source_handle);
+        REQUIRE(replaced_destructions.load(std::memory_order_relaxed) == 1);
+
+        move_assign(destination, destination);
+        REQUIRE(destination.valid());
+        REQUIRE(promise_base::current_frame() == previous_frame);
+    }
+
+    REQUIRE(source_destructions.load(std::memory_order_relaxed) == 1);
+    REQUIRE(replaced_destructions.load(std::memory_order_relaxed) == 1);
+    REQUIRE(promise_base::current_frame() == previous_frame);
+}
+
+TEST_CASE("unstarted task container destruction preserves virtual stack",
+          "[task][ownership][virtual_stack]") {
+    promise_base caller;
+
+    {
+        std::vector<task<int>> tasks;
+        for (int i = 0; i < 16; ++i) {
+            tasks.emplace_back(return_value(i));
+            REQUIRE(promise_base::current_frame() == &caller);
+        }
+    }
+
+    REQUIRE(promise_base::current_frame() == &caller);
+    REQUIRE(get_stack_depth() == 1);
+}
+
+TEST_CASE("unstarted task may move across threads without corrupting creator stack",
+          "[task][ownership][thread][virtual_stack]") {
+    promise_base caller;
+    auto pending = return_value(42);
+    std::atomic<bool> destroyer_owned_task{false};
+
+    REQUIRE(promise_base::current_frame() == &caller);
+    REQUIRE(get_handle(pending).promise().parent() == nullptr);
+
+    std::thread destroyer([owned = std::move(pending),
+                           &destroyer_owned_task]() mutable {
+        destroyer_owned_task.store(owned.valid(), std::memory_order_release);
+    });
+    destroyer.join();
+
+    REQUIRE_FALSE(pending.valid());
+    REQUIRE(destroyer_owned_task.load(std::memory_order_acquire));
+    REQUIRE(promise_base::current_frame() == &caller);
+    REQUIRE(get_stack_depth() == 1);
+}
+
+TEST_CASE("moved lazy tasks survive vector reallocation and await",
+          "[task][ownership][vector]") {
+    REQUIRE(elio::run([] { return sum_moved_task_vector(); }) == 136);
+}
+
+TEST_CASE("when_all accepts callables owning moved lazy tasks",
+          "[task][ownership][combinator]") {
+    REQUIRE(elio::run([] { return combine_moved_lazy_tasks(); }) == 42);
+}
+
+TEST_CASE("moved task binds virtual stack ancestry when awaited",
+          "[task][ownership][virtual_stack]") {
+    REQUIRE(elio::run([] { return await_moved_task_and_report_depth(); }) >= 2);
+}
+
+TEST_CASE("scheduled task resume preserves await ancestry",
+          "[task][ownership][virtual_stack][scheduler]") {
+    REQUIRE(elio::run([] { return verify_scheduled_resume_virtual_stack(); }));
+}
+
+TEST_CASE("affinity migration preserves await ancestry",
+          "[task][ownership][virtual_stack][scheduler][affinity]") {
+    run_config config;
+    config.num_threads = 2;
+    REQUIRE(elio::run([] { return verify_affinity_migration_virtual_stack(); },
+                      config));
+}
+
+TEST_CASE("rejected resume scheduling preserves task ownership",
+          "[task][ownership][lifetime][scheduler]") {
+    std::atomic<int> destructions{0};
+    scheduler stopped_scheduler(1);
+
+    {
+        auto pending = probed_lazy_task(task_lifetime_probe{&destructions});
+        const auto handle = get_handle(pending);
+
+        REQUIRE_FALSE(stopped_scheduler.try_schedule(handle));
+        REQUIRE_FALSE(stopped_scheduler.try_schedule_to(0, handle));
+        REQUIRE(pending.valid());
+        REQUIRE(get_handle(pending) == handle);
+        REQUIRE(destructions.load(std::memory_order_relaxed) == 0);
+    }
+
+    REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+}
+
+TEST_CASE("resume overflow preserves worker execution context",
+          "[task][ownership][scheduler][overflow][io]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> blocker_started{false};
+    std::atomic<bool> release_blocker{false};
+    auto blocker_fn = [&]() -> task<void> {
+        blocker_started.store(true, std::memory_order_release);
+        blocker_started.notify_one();
+        while (!release_blocker.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        co_return;
+    };
+    auto blocker = blocker_fn();
+    sched.spawn(elio::coro::detail::task_access::release(std::move(blocker)));
+
+    auto start_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!blocker_started.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < start_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!blocker_started.load(std::memory_order_acquire)) {
+        release_blocker.store(true, std::memory_order_release);
+        sched.shutdown_force();
+    }
+    REQUIRE(blocker_started.load(std::memory_order_acquire));
+
+    for (size_t i = 0; i < mpsc_queue<void>::capacity; ++i) {
+        auto filler = simple_void();
+        sched.spawn(elio::coro::detail::task_access::release(std::move(filler)));
+    }
+
+    std::atomic<size_t> first_worker{NO_AFFINITY};
+    std::atomic<size_t> second_worker{NO_AFFINITY};
+    std::atomic<bool> completed{false};
+    auto resumed_fn = [&]() -> task<void> {
+        first_worker.store(current_worker_id(), std::memory_order_release);
+        co_await elio::time::sleep_for(scaled_ms(1));
+        second_worker.store(current_worker_id(), std::memory_order_release);
+        completed.store(true, std::memory_order_release);
+        completed.notify_one();
+    };
+    auto resumed = resumed_fn();
+
+    REQUIRE(sched.try_schedule(get_handle(resumed)));
+    release_blocker.store(true, std::memory_order_release);
+    release_blocker.notify_one();
+
+    auto completion_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < completion_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool did_complete = completed.load(std::memory_order_acquire);
+    const bool drained = sched.wait_for_idle(scaled_sec(5));
+
+    sched.shutdown();
+
+    REQUIRE(did_complete);
+    REQUIRE(first_worker.load(std::memory_order_acquire) == 0);
+    REQUIRE(second_worker.load(std::memory_order_acquire) == 0);
+    REQUIRE(drained);
+}
+
+TEST_CASE("overflow transfer remains visible to scheduler accounting",
+          "[task][ownership][scheduler][overflow][queue_accounting][shutdown]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> completed{false};
+    auto resumed_fn = [&]() -> task<void> {
+        completed.store(true, std::memory_order_release);
+        co_return;
+    };
+    auto resumed = resumed_fn();
+
+    elio::runtime::detail::pause_overflow_transfer_for_test.store(
+        true, std::memory_order_release);
+    REQUIRE(sched.get_worker(0)->schedule_overflow_for_test(get_handle(resumed)));
+
+    const auto pause_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!elio::runtime::detail::overflow_transfer_paused_for_test.load(
+               std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < pause_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    const bool transfer_paused =
+        elio::runtime::detail::overflow_transfer_paused_for_test.load(
+            std::memory_order_acquire);
+    const size_t pending_during_transfer = transfer_paused ? sched.pending_tasks() : 0;
+    const bool idle_during_transfer =
+        transfer_paused && sched.wait_for_idle(std::chrono::milliseconds(0));
+
+    elio::runtime::detail::pause_overflow_transfer_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::pause_overflow_transfer_for_test.notify_all();
+
+    const auto completion_deadline =
+        std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < completion_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool did_complete = completed.load(std::memory_order_acquire);
+    const bool drained = sched.wait_for_idle(scaled_sec(5));
+    sched.shutdown();
+
+    REQUIRE(transfer_paused);
+    REQUIRE(pending_during_transfer == 1);
+    REQUIRE_FALSE(idle_during_transfer);
+    REQUIRE(did_complete);
+    REQUIRE(drained);
+}
+
+TEST_CASE("queue snapshot serializes an inbox transfer",
+          "[task][ownership][scheduler][inbox][queue_accounting][shutdown]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> blocker_started{false};
+    std::atomic<bool> release_blocker{false};
+    auto blocker_fn = [&]() -> task<void> {
+        blocker_started.store(true, std::memory_order_release);
+        while (!release_blocker.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        co_return;
+    };
+    auto blocker = blocker_fn();
+    sched.spawn(elio::coro::detail::task_access::release(std::move(blocker)));
+
+    const auto blocker_deadline =
+        std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!blocker_started.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < blocker_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    std::atomic<size_t> snapshot{0};
+    elio::runtime::detail::pause_queue_snapshot_for_test.store(
+        true, std::memory_order_release);
+    std::thread observer([&]() {
+        snapshot.store(sched.pending_tasks(), std::memory_order_release);
+    });
+
+    const auto snapshot_deadline =
+        std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!elio::runtime::detail::queue_snapshot_paused_for_test.load(
+               std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < snapshot_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool snapshot_paused =
+        elio::runtime::detail::queue_snapshot_paused_for_test.load(
+            std::memory_order_acquire);
+
+    std::atomic<bool> completed{false};
+    auto resumed_fn = [&]() -> task<void> {
+        completed.store(true, std::memory_order_release);
+        co_return;
+    };
+    auto resumed = resumed_fn();
+    const bool accepted = sched.get_worker(0)->schedule(get_handle(resumed));
+
+    release_blocker.store(true, std::memory_order_release);
+    const auto transfer_deadline =
+        std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!elio::runtime::detail::queue_transfer_waiting_for_test.load(
+               std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < transfer_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool transfer_waiting =
+        elio::runtime::detail::queue_transfer_waiting_for_test.load(
+            std::memory_order_acquire);
+    const bool completed_while_paused =
+        completed.load(std::memory_order_acquire);
+
+    elio::runtime::detail::pause_queue_snapshot_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::pause_queue_snapshot_for_test.notify_all();
+    observer.join();
+
+    const auto completion_deadline =
+        std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < completion_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool did_complete = completed.load(std::memory_order_acquire);
+    const bool drained = sched.wait_for_idle(scaled_sec(5));
+    sched.shutdown();
+
+    REQUIRE(blocker_started.load(std::memory_order_acquire));
+    REQUIRE(snapshot_paused);
+    REQUIRE(accepted);
+    REQUIRE(transfer_waiting);
+    REQUIRE_FALSE(completed_while_paused);
+    REQUIRE(did_complete);
+    REQUIRE(snapshot.load(std::memory_order_acquire) > 0);
+    REQUIRE(drained);
 }
 
 TEST_CASE("destroyed task_handle waiter is unregistered",
@@ -98,7 +576,7 @@ TEST_CASE("destroyed task_handle waiter is unregistered",
     };
 
     auto waiter = waiter_task();
-    auto h = elio::coro::detail::task_access::release(waiter);
+    auto h = elio::coro::detail::task_access::release(std::move(waiter));
     h.resume();
     REQUIRE_FALSE(h.done());
 
@@ -116,7 +594,7 @@ TEST_CASE("destroyed join_handle waiter is unregistered",
     };
 
     auto waiter = waiter_task();
-    auto h = elio::coro::detail::task_access::release(waiter);
+    auto h = elio::coro::detail::task_access::release(std::move(waiter));
     h.resume();
     REQUIRE_FALSE(h.done());
 

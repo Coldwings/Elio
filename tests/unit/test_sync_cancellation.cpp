@@ -20,7 +20,7 @@ TEST_CASE("event: destroying waiter does not crash on set()", "[sync][event][can
 
     // Create and start a waiting coroutine
     auto t = waiter_task();
-    auto h = elio::coro::detail::task_access::release(t);
+    auto h = elio::coro::detail::task_access::release(std::move(t));
     h.resume();  // Runs until co_await e.wait() suspends
 
     // Destroy the waiting coroutine (simulates cancellation/timeout)
@@ -49,8 +49,8 @@ TEST_CASE("event wake does not schedule a waiter destroyed after dequeue",
 
     auto first_task = first_waiter();
     auto second_task = second_waiter();
-    auto first = elio::coro::detail::task_access::release(first_task);
-    auto second = elio::coro::detail::task_access::release(second_task);
+    auto first = elio::coro::detail::task_access::release(std::move(first_task));
+    auto second = elio::coro::detail::task_access::release(std::move(second_task));
     first.resume();
     second.resume();
 
@@ -85,8 +85,8 @@ TEST_CASE("condition_variable notify_all does not schedule a waiter destroyed af
 
     auto first_task = first_waiter();
     auto second_task = second_waiter();
-    auto first = elio::coro::detail::task_access::release(first_task);
-    auto second = elio::coro::detail::task_access::release(second_task);
+    auto first = elio::coro::detail::task_access::release(std::move(first_task));
+    auto second = elio::coro::detail::task_access::release(std::move(second_task));
     first.resume();
     second.resume();
 
@@ -121,8 +121,8 @@ TEST_CASE("semaphore release does not schedule a waiter destroyed after dequeue"
 
     auto first_task = first_waiter();
     auto second_task = second_waiter();
-    auto first = elio::coro::detail::task_access::release(first_task);
-    auto second = elio::coro::detail::task_access::release(second_task);
+    auto first = elio::coro::detail::task_access::release(std::move(first_task));
+    auto second = elio::coro::detail::task_access::release(std::move(second_task));
     first.resume();
     second.resume();
 
@@ -160,8 +160,8 @@ TEST_CASE("shared_mutex reader wake does not schedule a waiter destroyed after d
 
     auto first_task = first_waiter();
     auto second_task = second_waiter();
-    auto first = elio::coro::detail::task_access::release(first_task);
-    auto second = elio::coro::detail::task_access::release(second_task);
+    auto first = elio::coro::detail::task_access::release(std::move(first_task));
+    auto second = elio::coro::detail::task_access::release(std::move(second_task));
     first.resume();
     second.resume();
 
@@ -198,8 +198,8 @@ TEST_CASE("channel close does not schedule a recv waiter destroyed after dequeue
 
     auto first_task = first_waiter();
     auto second_task = second_waiter();
-    auto first = elio::coro::detail::task_access::release(first_task);
-    auto second = elio::coro::detail::task_access::release(second_task);
+    auto first = elio::coro::detail::task_access::release(std::move(first_task));
+    auto second = elio::coro::detail::task_access::release(std::move(second_task));
     first.resume();
     second.resume();
 
@@ -234,8 +234,8 @@ TEST_CASE("channel close does not schedule a send waiter destroyed after dequeue
 
     auto first_task = first_waiter();
     auto second_task = second_waiter();
-    auto first = elio::coro::detail::task_access::release(first_task);
-    auto second = elio::coro::detail::task_access::release(second_task);
+    auto first = elio::coro::detail::task_access::release(std::move(first_task));
+    auto second = elio::coro::detail::task_access::release(std::move(second_task));
     first.resume();
     second.resume();
 
@@ -260,7 +260,7 @@ TEST_CASE("mutex: destroying waiter does not crash on unlock()", "[sync][mutex][
     };
 
     auto t = waiter_task();
-    auto h = elio::coro::detail::task_access::release(t);
+    auto h = elio::coro::detail::task_access::release(std::move(t));
     h.resume();  // Runs until co_await m.lock() suspends
 
     h.destroy();
@@ -296,7 +296,7 @@ TEST_CASE("semaphore: destroying waiter does not crash on release()", "[sync][se
     };
 
     auto t = waiter_task();
-    auto h = elio::coro::detail::task_access::release(t);
+    auto h = elio::coro::detail::task_access::release(std::move(t));
     h.resume();
 
     h.destroy();
@@ -333,7 +333,7 @@ TEST_CASE("condition_variable: destroying waiter does not crash on notify()", "[
     };
 
     auto t = waiter_task();
-    auto h = elio::coro::detail::task_access::release(t);
+    auto h = elio::coro::detail::task_access::release(std::move(t));
     h.resume();  // Suspends on cv.wait_unlocked()
 
     h.destroy();
@@ -350,14 +350,14 @@ TEST_CASE("channel: destroying recv waiter does not crash on send()", "[sync][ch
     };
 
     auto t = waiter_task();
-    auto h = elio::coro::detail::task_access::release(t);
+    auto h = elio::coro::detail::task_access::release(std::move(t));
     h.resume();  // Suspends on ch.recv()
 
     h.destroy();
 
     // send() must NOT crash — the destroyed recv waiter was unlinked from the queue
     auto send_task = ch.send(42);
-    auto sh = elio::coro::detail::task_access::release(send_task);
+    auto sh = elio::coro::detail::task_access::release(std::move(send_task));
     sh.resume();  // Runs send to completion (fast path into ring buffer)
     // Coroutine self-destructs in final_awaiter (detached), so no manual destroy needed
 }
@@ -371,7 +371,7 @@ TEST_CASE("channel: destroying send waiter does not crash on close()", "[sync][c
     };
 
     auto t = waiter_task();
-    auto h = elio::coro::detail::task_access::release(t);
+    auto h = elio::coro::detail::task_access::release(std::move(t));
     h.resume();  // Suspends on ch.send() — no receiver waiting
 
     h.destroy();
@@ -387,7 +387,7 @@ TEST_CASE("shared_mutex: destroying reader waiter does not crash on unlock()", "
     };
 
     auto t = waiter_task();
-    auto h = elio::coro::detail::task_access::release(t);
+    auto h = elio::coro::detail::task_access::release(std::move(t));
     h.resume();  // Suspends on lock_shared() because writer holds lock
 
     h.destroy();  // Destroy suspended reader — must unlink from reader_waiters_
@@ -425,7 +425,7 @@ TEST_CASE("shared_mutex: destroying writer waiter does not deadlock subsequent o
     };
 
     auto t = waiter_task();
-    auto h = elio::coro::detail::task_access::release(t);
+    auto h = elio::coro::detail::task_access::release(std::move(t));
     h.resume();  // Suspends on lock() because reader holds lock
 
     h.destroy();  // Destroy suspended writer — must decrement pending_writers_ and clear WRITER_WAITING
@@ -439,7 +439,7 @@ TEST_CASE("shared_mutex: destroying writer waiter does not deadlock subsequent o
         sm.unlock_shared();
     };
     auto rt = reader_task();
-    auto rh = elio::coro::detail::task_access::release(rt);
+    auto rh = elio::coro::detail::task_access::release(std::move(rt));
     rh.resume();  // Should complete without suspending (no writer active/waiting)
 
     // 2. A new writer should be able to acquire (no readers active)
@@ -448,7 +448,7 @@ TEST_CASE("shared_mutex: destroying writer waiter does not deadlock subsequent o
         sm.unlock();
     };
     auto wt = writer_task();
-    auto wh = elio::coro::detail::task_access::release(wt);
+    auto wh = elio::coro::detail::task_access::release(std::move(wt));
     wh.resume();  // Should complete without suspending
 }
 
@@ -482,7 +482,7 @@ TEST_CASE("shared_mutex: destroying writer waiter wakes parked readers", "[sync]
         co_await sm.lock();
     };
     auto wt = writer_task();
-    auto wh = elio::coro::detail::task_access::release(wt);
+    auto wh = elio::coro::detail::task_access::release(std::move(wt));
     wh.resume();  // Suspends on lock() because reader holds lock
 
     // Reader R2 tries to acquire, sees WRITER_WAITING, parks in reader_waiters_
@@ -491,7 +491,7 @@ TEST_CASE("shared_mutex: destroying writer waiter wakes parked readers", "[sync]
         sm.unlock_shared();
     };
     auto rt = reader_task();
-    auto rh = elio::coro::detail::task_access::release(rt);
+    auto rh = elio::coro::detail::task_access::release(std::move(rt));
     rh.resume();  // Suspends on lock_shared() because WRITER_WAITING is set
 
     // Verify R2 is parked
@@ -531,9 +531,9 @@ TEST_CASE("event: multiple waiters, destroy one, set wakes remaining", "[sync][e
     auto t2 = make_waiter();
     auto t3 = make_waiter();
 
-    auto h1 = elio::coro::detail::task_access::release(t1);
-    auto h2 = elio::coro::detail::task_access::release(t2);
-    auto h3 = elio::coro::detail::task_access::release(t3);
+    auto h1 = elio::coro::detail::task_access::release(std::move(t1));
+    auto h2 = elio::coro::detail::task_access::release(std::move(t2));
+    auto h3 = elio::coro::detail::task_access::release(std::move(t3));
 
     h1.resume();  // Suspends on e.wait()
     h2.resume();  // Suspends on e.wait()

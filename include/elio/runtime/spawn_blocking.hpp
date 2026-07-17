@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <type_traits>
 
@@ -52,21 +53,6 @@ public:
 private:
     const void* previous_;
 };
-
-struct scheduler_spawn_test_hook {
-    std::atomic<void (*)(void*)> callback{nullptr};
-    std::atomic<void*> context{nullptr};
-
-    void run() const noexcept {
-        auto* cb = callback.load(std::memory_order_acquire);
-        if (cb) {
-            cb(context.load(std::memory_order_acquire));
-        }
-    }
-};
-
-inline scheduler_spawn_test_hook before_scheduler_spawn_hook;
-inline scheduler_spawn_test_hook after_scheduler_spawn_hook;
 
 // Shared state between the awaiting coroutine and the blocking worker thread.
 // Heap-allocated via shared_ptr so it outlives the coroutine frame if the
@@ -129,7 +115,7 @@ public:
 
     bool await_ready() const noexcept { return false; }
 
-    void await_suspend(std::coroutine_handle<> caller) {
+    bool await_suspend(std::coroutine_handle<> caller) {
         // Allocate shared state on the heap. Both the awaitable (via member)
         // and the work lambda (via capture) hold a shared_ptr, ensuring the
         // state survives even if the coroutine frame is freed first.
@@ -139,11 +125,8 @@ public:
         // Capture scheduler pointer to ensure we resume on the right scheduler,
         // not directly on the blocking pool thread.
         auto* sched = runtime::get_current_scheduler();
-        // Materialize as std::function up front so a rejected submit() leaves
-        // an intact, still-callable object we can hand to a detached thread.
-        // (Passing a lambda directly would move-construct a temporary
-        // std::function for submit's parameter even on the rejection path,
-        // moving-from our captures.)
+        // Materialize as std::function for blocking_pool submission or the
+        // standalone detached-thread path.
         std::function<void()> work = [state, caller, sched, f = std::move(func_)]() mutable {
             // Execute the blocking work.  The shared_ptr keeps state alive
             // regardless of whether the coroutine frame still exists.
@@ -173,42 +156,45 @@ public:
 
             // We claimed resume rights.  The destructor will spin-wait until
             // we store kDone, so the frame stays alive throughout this block.
-            bool ran_scheduler_handoff = false;
-            if (sched && sched->is_running()) {
-                before_scheduler_spawn_hook.run();
-                ran_scheduler_handoff = true;
-                inline_resume_guard guard(state.get());
-                // Scheduler shutdown can race between is_running() and enqueue.
-                // If it rejects without taking ownership, finish the awaiter
-                // inline so the continuation chain can unwind and release.
-                if (!sched->try_spawn(caller) && caller && !caller.done()) {
-                    caller.resume();
+            if (sched) {
+                if (sched->is_running()) {
+                    // A live worker accepts through its bounded inbox or
+                    // overflow queue. shutdown_force() drains accepted pool
+                    // work before stopping workers, so rejection here means
+                    // the scheduler can no longer resume this coroutine.
+                    (void)sched->try_schedule(caller);
                 }
             } else if (caller && !caller.done()) {
                 inline_resume_guard guard(state.get());
+                auto* promise = coro::get_promise_base(caller.address());
+                coro::detail::frame_context_scope frame_scope(promise);
                 caller.resume();
             }
 
             // Signal the destructor that we're done with the handle.
             state->resume_state.store(kDone, std::memory_order_release);
-            if (ran_scheduler_handoff) {
-                after_scheduler_spawn_hook.run();
-            }
         };
 
-        // Try blocking pool first, fallback to detached thread.
-        // submit() may refuse if the pool is already shutting down (e.g.
-        // scheduler shutdown is in progress on another thread); on rejection
-        // it leaves `work` untouched so we can still run it on a detached
-        // thread and resume the awaiter instead of hanging forever.
-        if (sched && sched->is_running()) {
-            if (auto* pool = sched->get_blocking_pool()) {
-                if (pool->submit(std::move(work))) {
-                    return;
+        if (sched) {
+            if (sched->is_running()) {
+                if (auto* pool = sched->get_blocking_pool()) {
+                    if (pool->submit(std::move(work))) {
+                        return true;
+                    }
                 }
             }
+
+            // A scheduler-bound coroutine must not migrate to a detached
+            // thread when its pool is unavailable. Continue on the current
+            // worker and surface a deterministic rejection from await_resume.
+            state->exception = std::make_exception_ptr(std::runtime_error(
+                "spawn_blocking rejected: scheduler blocking pool is unavailable"));
+            return false;
         }
+
+        // Standalone use has no worker/backend affinity to preserve.
         std::thread(std::move(work)).detach();
+        return true;
     }
 
     T await_resume() {
@@ -232,6 +218,8 @@ private:
 /// Spawn a blocking operation on a dedicated thread pool.
 /// The calling coroutine suspends until the operation completes.
 /// Any exception thrown by f() is propagated to the awaiting coroutine.
+/// In scheduler context, an unavailable blocking pool throws runtime_error on
+/// the current worker; it never falls back to a detached thread.
 ///
 /// Example:
 ///   int fd = co_await elio::spawn_blocking([&] {

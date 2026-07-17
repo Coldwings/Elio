@@ -2,6 +2,7 @@
 
 #include "promise_base.hpp"
 #include "detail/completion_waiter.hpp"
+#include <cassert>
 #include <coroutine>
 #include <optional>
 #include <exception>
@@ -38,6 +39,7 @@ struct final_awaiter {
     template<typename Promise>
     [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) noexcept {
         auto continuation = h.promise().continuation_;
+        h.promise().leave_frame_context();
         if (continuation) {
             return continuation;
         } else if (h.promise().detached_) {
@@ -63,13 +65,13 @@ struct final_awaiter {
     void await_resume() const noexcept {}
 };
 
-// Friend accessor: extract handle from immovable task<T>
+// Friend accessor: explicitly transfer lazy task ownership to the runtime.
 struct task_access {
     template<typename TaskT>
-    static auto release(TaskT& t) noexcept {
-        if (t.handle_) {
-            t.handle_.promise().detached_ = true;
-        }
+        requires (!std::is_lvalue_reference_v<TaskT>)
+    static auto release(TaskT&& t) noexcept {
+        assert(t.handle_ && "cannot release an empty task");
+        t.handle_.promise().detached_ = true;
         return std::exchange(t.handle_, nullptr);
     }
     // Get handle without transferring ownership (for testing)
@@ -297,7 +299,8 @@ private:
     detail::completion_waiter waiter_;
 };
 
-/// Primary template for task<T> where T is not void
+/// Move-only, single-shot lazy coroutine owner for a non-void result.
+/// Moving transfers frame ownership and leaves the source empty.
 template<typename T>
 class task {
     friend struct detail::task_access;
@@ -345,25 +348,53 @@ public:
 
     using handle_type = std::coroutine_handle<promise_type>;
 
-    explicit task(handle_type h) noexcept : handle_(h) {}
+    explicit task(handle_type h) noexcept : handle_(h) {
+        if (handle_) {
+            handle_.promise().leave_creation_context();
+        }
+    }
 
-    // Non-copyable, non-movable
+    // Move-only lazy coroutine ownership.
     task(const task&) = delete;
     task& operator=(const task&) = delete;
-    task(task&&) = delete;
-    task& operator=(task&&) = delete;
+    task(task&& other) noexcept
+        : handle_(std::exchange(other.handle_, nullptr)) {}
+    task& operator=(task&& other) noexcept {
+        if (this != &other) {
+            if (handle_) {
+                handle_.destroy();
+            }
+            handle_ = std::exchange(other.handle_, nullptr);
+        }
+        return *this;
+    }
 
     ~task() { if (handle_) handle_.destroy(); }
 
+    [[nodiscard]] bool valid() const noexcept { return handle_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
     // co_await interface
-    [[nodiscard]] bool await_ready() const noexcept { return false; }
+    [[nodiscard]] bool await_ready() const noexcept {
+        assert(handle_ && "cannot await an empty task");
+        assert(!handle_.done() && "task can only be awaited once");
+        return false;
+    }
     [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept {
+        assert(handle_ && "cannot await an empty task");
+        assert(!handle_.done() && "task can only be awaited once");
+        assert(!handle_.promise().continuation_ &&
+               "task cannot have multiple awaiters");
         handle_.promise().continuation_ = awaiter;
+        handle_.promise().enter_frame_context(promise_base::current_frame());
         return handle_;
     }
     T await_resume() {
+        assert(handle_ && "cannot resume an empty task");
         auto& promise = handle_.promise();
-        if (promise.exception()) std::rethrow_exception(promise.exception());
+        auto exception = promise.exception();
+        promise.detach_from_parent();
+        if (exception) std::rethrow_exception(exception);
         return std::move(*promise.value_);
     }
 
@@ -371,7 +402,7 @@ private:
     handle_type handle_;
 };
 
-/// Specialization for task<void>
+/// Move-only, single-shot lazy coroutine owner for a void result.
 template<>
 class task<void> {
     friend struct detail::task_access;
@@ -410,25 +441,53 @@ public:
 
     using handle_type = std::coroutine_handle<promise_type>;
 
-    explicit task(handle_type h) noexcept : handle_(h) {}
+    explicit task(handle_type h) noexcept : handle_(h) {
+        if (handle_) {
+            handle_.promise().leave_creation_context();
+        }
+    }
 
-    // Non-copyable, non-movable
+    // Move-only lazy coroutine ownership.
     task(const task&) = delete;
     task& operator=(const task&) = delete;
-    task(task&&) = delete;
-    task& operator=(task&&) = delete;
+    task(task&& other) noexcept
+        : handle_(std::exchange(other.handle_, nullptr)) {}
+    task& operator=(task&& other) noexcept {
+        if (this != &other) {
+            if (handle_) {
+                handle_.destroy();
+            }
+            handle_ = std::exchange(other.handle_, nullptr);
+        }
+        return *this;
+    }
 
     ~task() { if (handle_) handle_.destroy(); }
 
+    [[nodiscard]] bool valid() const noexcept { return handle_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+
     // co_await interface
-    [[nodiscard]] bool await_ready() const noexcept { return false; }
+    [[nodiscard]] bool await_ready() const noexcept {
+        assert(handle_ && "cannot await an empty task");
+        assert(!handle_.done() && "task can only be awaited once");
+        return false;
+    }
     [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept {
+        assert(handle_ && "cannot await an empty task");
+        assert(!handle_.done() && "task can only be awaited once");
+        assert(!handle_.promise().continuation_ &&
+               "task cannot have multiple awaiters");
         handle_.promise().continuation_ = awaiter;
+        handle_.promise().enter_frame_context(promise_base::current_frame());
         return handle_;
     }
     void await_resume() {
+        assert(handle_ && "cannot resume an empty task");
         auto& promise = handle_.promise();
-        if (promise.exception()) std::rethrow_exception(promise.exception());
+        auto exception = promise.exception();
+        promise.detach_from_parent();
+        if (exception) std::rethrow_exception(exception);
     }
 
 private:

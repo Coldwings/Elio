@@ -181,7 +181,7 @@ TEST_CASE("object_cache constructor destruction clears constructing entry",
         };
 
         auto owner = owner_task();
-        auto h = elio::coro::detail::task_access::release(owner);
+        auto h = elio::coro::detail::task_access::release(std::move(owner));
         h.resume();
 
         REQUIRE(ctor_started.load(std::memory_order_acquire));
@@ -558,7 +558,7 @@ TEST_CASE("object_cache release unregisters waiter when suspended release is des
     };
 
     auto t = waiter_task();
-    auto h = elio::coro::detail::task_access::release(t);
+    auto h = elio::coro::detail::task_access::release(std::move(t));
     h.resume();
 
     REQUIRE(hook_calls.load(std::memory_order_acquire) == 1);

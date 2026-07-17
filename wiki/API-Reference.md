@@ -45,13 +45,16 @@ class task {
 public:
     using promise_type = /* implementation */;
     
-    // Non-copyable, non-movable
+    // Non-copyable, move-only
     task(const task&) = delete;
     task& operator=(const task&) = delete;
-    task(task&&) = delete;
-    task& operator=(task&&) = delete;
+    task(task&&) noexcept;
+    task& operator=(task&&) noexcept;
     
     ~task();  // Destroys the coroutine frame
+
+    bool valid() const noexcept;
+    explicit operator bool() const noexcept;
     
     // Awaitable interface (use with co_await)
     bool await_ready() const noexcept;
@@ -59,6 +62,14 @@ public:
     T await_resume();  // Returns result or rethrows exception
 };
 ```
+
+`task<T>` is a single-shot lazy owner. Moving it transfers only ownership of
+the unstarted coroutine frame and leaves the source empty; it does not migrate
+running work or pending I/O. An unstarted task does not remain in creator-thread
+virtual-stack state; ancestry is bound to the actual awaiter when execution
+starts. Destroying a non-empty task destroys the frame if ownership has not
+been transferred to the runtime. Do not await an empty task or await the same
+task more than once.
 
 **Basic Usage:**
 ```cpp
@@ -477,9 +488,15 @@ public:
     size_t active_tasks() const noexcept;
     bool wait_for_idle(std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
     
-    // Spawn a coroutine for execution
+    // Hand independent work to the scheduler for its first execution.
+    // Construction-time virtual-stack ancestry is detached.
     void spawn(std::coroutine_handle<> handle);
     bool try_spawn(std::coroutine_handle<> handle);
+
+    // Re-enqueue an already-suspended coroutine. Logical await ancestry is
+    // preserved so continuation transfer restores the correct parent frame.
+    // Rejection leaves the borrowed handle live.
+    bool try_schedule(std::coroutine_handle<> handle);
     
     // Spawn a task directly (convenience overload)
     template<typename Task>
@@ -494,9 +511,14 @@ public:
     coro::join_handle</* task value */> go_joinable(F&& f, Args&&... args);
     template<typename F, typename... Args>
     coro::join_handle</* task value */> go_joinable_to(size_t worker_id, F&& f, Args&&... args);
+
+    // Initial ownership handoff toward a worker; detaches construction ancestry.
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle);
 
-    // For go_to(), go_joinable_to(), and spawn_to(), exact placement requires
+    // Re-enqueue suspended work toward a worker; preserves await ancestry.
+    bool try_schedule_to(size_t worker_id, std::coroutine_handle<> handle);
+
+    // For targeted spawn and schedule APIs, exact placement requires
     // worker_id in [0, num_threads()) and an available target worker. Larger
     // values or unavailable targets use fallback scheduling.
 
@@ -544,6 +566,16 @@ public:
 };
 ```
 
+The raw-handle APIs have distinct ownership and virtual-stack contracts.
+`spawn()`/`try_spawn()` and `spawn_to()` are for an independent handle before
+its first execution; they detach construction-time ancestry.
+`try_schedule()` and `try_schedule_to()` are for a coroutine that has already
+suspended and must preserve the logical parent established by its await chain.
+These APIs borrow the handle: rejection leaves it live, and the caller must
+resume, retain, or otherwise resolve it. Internal wake and affinity-migration
+paths handle rejection explicitly; callers must not substitute one family for
+the other.
+
 `shutdown()` is the graceful path: it waits for tasks spawned through
 `go()`, `go_to()`, `go_joinable()`, `go_joinable_to()`, or `elio::run()` to
 finish, including work suspended on scheduler-owned I/O, and returns whether the
@@ -574,8 +606,10 @@ Individual worker that executes tasks. Workers use a unified idle mechanism wher
 ```cpp
 class worker_thread {
 public:
-    // Schedule a task to this worker (thread-safe, wakes worker if sleeping)
-    void schedule(std::coroutine_handle<> handle);
+    // Schedule a task to this worker (thread-safe, wakes worker if sleeping).
+    // A full bounded inbox spills to a locked overflow queue; false means the
+    // worker has stopped and the caller retains the handle.
+    bool schedule(std::coroutine_handle<> handle);
 
     // Schedule from owner thread (faster, no wake needed)
     void schedule_local(std::coroutine_handle<> handle);
@@ -602,6 +636,7 @@ public:
 - Workers block efficiently on I/O poll (with eventfd wake support) when no tasks are available
 - Optional spin phase before blocking (configurable via `wait_strategy`)
 - When a task is scheduled via `schedule()`, the worker is automatically woken
+- The bounded MPSC inbox remains the fast path; a locked overflow queue absorbs rare bursts without resuming worker-bound coroutines on submitter threads
 - Results in near-zero CPU usage (< 1%) when idle with default blocking strategy
 
 ### `wait_strategy`
@@ -2883,6 +2918,12 @@ template<typename Clock, typename Duration>
 // Yield execution to other coroutines
 /* awaitable */ yield();
 ```
+
+`sleep_for()` and `sleep_until()` normally use the current worker's I/O
+backend. If timer preparation fails, they route the wait through the scheduler
+blocking pool while preserving worker affinity. If that pool is unavailable,
+the await continues on its current worker and throws `std::runtime_error`;
+this rejection is not reported as token cancellation.
 
 **Example:**
 ```cpp

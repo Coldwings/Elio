@@ -159,7 +159,7 @@ TEST_CASE("detached task frame can be destroyed on another thread",
     destruction_observation observation;
     auto t = task_with_destruction_probe(
         frame_destruction_probe{&observation});
-    auto handle = elio::coro::detail::task_access::release(t);
+    auto handle = elio::coro::detail::task_access::release(std::move(t));
     handle.promise().detach_from_parent();
     promise_base::set_current_frame(previous_frame);
 

@@ -64,6 +64,12 @@ if (inbox_->push(handle.address())) {
 
 The previous lazy wake optimization was removed due to a race condition that caused 10ms tail latency on weak hardware.
 
+The MPSC ring remains the normal submission path. If it stays full after
+bounded retries, the worker accepts the handle through a locked overflow queue.
+That slow path trades burst-only synchronization for correctness: a borrowed
+resume handle stays assigned to its worker rather than running on the producer
+thread or being destroyed.
+
 ### Unified Wake Mechanism
 
 Each worker's I/O backend (epoll or io_uring) contains an embedded `eventfd`. When a task is submitted to a worker from another thread, the submitter writes to that worker's eventfd. Because the eventfd is registered with the same epoll/io_uring instance that handles I/O completions, both I/O events and task wake-ups unblock the same `poll()` call.

@@ -24,6 +24,18 @@ generator<int> simple_producer() {
     co_yield 3;
 }
 
+TEST_CASE("generator construction preserves creator virtual stack",
+          "[generator][virtual_stack][ownership]") {
+    promise_base caller;
+
+    {
+        auto gen = simple_producer();
+        REQUIRE(promise_base::current_frame() == &caller);
+    }
+
+    REQUIRE(promise_base::current_frame() == &caller);
+}
+
 TEST_CASE("generator basic usage", "[generator]") {
     scheduler sched(2);
     sched.start();
@@ -389,6 +401,62 @@ TEST_CASE("generator virtual stack integration", "[generator][vstack]") {
     REQUIRE(completed.load());
     
     sched.shutdown();
+}
+
+generator<int> suspending_context_producer() {
+    co_await sleep_for(scaled_ms(1));
+    co_yield 7;
+    co_await sleep_for(scaled_ms(1));
+}
+
+TEST_CASE("generator restores consumer context after asynchronous suspension",
+          "[generator][vstack][virtual_stack][ownership]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> yielded_value{false};
+    std::atomic<bool> yield_tls_restored{false};
+    std::atomic<bool> yield_parent_restored{false};
+    std::atomic<bool> completed_value{false};
+    std::atomic<bool> completion_tls_restored{false};
+    std::atomic<bool> completion_parent_restored{false};
+
+    auto consumer = [&]() -> task<void> {
+        auto* consumer_frame = promise_base::current_frame();
+        auto check_parent = [consumer_frame](std::atomic<bool>& result)
+            -> task<void> {
+            auto* frame = promise_base::current_frame();
+            result.store(frame && frame->parent() == consumer_frame,
+                         std::memory_order_release);
+            co_return;
+        };
+
+        auto gen = suspending_context_producer();
+        auto value = co_await gen.next();
+        yielded_value.store(value && *value == 7, std::memory_order_release);
+        yield_tls_restored.store(
+            promise_base::current_frame() == consumer_frame,
+            std::memory_order_release);
+        co_await check_parent(yield_parent_restored);
+
+        auto done = co_await gen.next();
+        completed_value.store(!done.has_value(), std::memory_order_release);
+        completion_tls_restored.store(
+            promise_base::current_frame() == consumer_frame,
+            std::memory_order_release);
+        co_await check_parent(completion_parent_restored);
+    };
+
+    elio::go(consumer);
+    const bool drained = sched.shutdown(scaled_sec(5));
+
+    REQUIRE(yielded_value.load(std::memory_order_acquire));
+    REQUIRE(yield_tls_restored.load(std::memory_order_acquire));
+    REQUIRE(yield_parent_restored.load(std::memory_order_acquire));
+    REQUIRE(completed_value.load(std::memory_order_acquire));
+    REQUIRE(completion_tls_restored.load(std::memory_order_acquire));
+    REQUIRE(completion_parent_restored.load(std::memory_order_acquire));
+    REQUIRE(drained);
 }
 
 // ============================================================================

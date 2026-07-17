@@ -296,9 +296,9 @@ its affinity and I/O ownership permit that movement.
 
 C++20 stackless coroutines do not maintain a call stack in the traditional sense. When a coroutine suspends, the compiler-generated frame is stored on the heap, but the chain of callers that led to that suspension point is lost. This makes debugging difficult -- tools like `gdb bt` show the scheduler's dispatch loop rather than the logical call chain of coroutines.
 
-Elio reconstructs this information through a **virtual stack**: an intrusive linked list of `promise_base` objects connected by `parent_` pointers. Each `promise_base` constructor links itself to the current frame via the `current_frame_` thread-local, and the destructor restores the previous frame. This gives every coroutine a pointer to the coroutine that `co_await`ed it.
+Elio reconstructs this information through a **virtual stack**: an intrusive linked list of `promise_base` objects connected by `parent_` pointers. The `current_frame_` thread-local identifies the frame executing on a thread. A lazy `task<T>` does not remain installed merely because its frame is owned; when it is awaited, its `parent_` is rebound to the actual awaiting coroutine for that execution chain. Scheduler and I/O resume paths install the resumed frame for the duration of the resume call.
 
-The overhead is minimal -- one pointer per coroutine frame, set during construction and cleared during destruction.
+The overhead is minimal -- one pointer per coroutine frame, updated when logical ancestry is established.
 
 ### What it enables
 

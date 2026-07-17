@@ -704,8 +704,6 @@ private:
         using ResultTask = std::invoke_result_t<F, Args...>;
         using T = detail::task_value_t<ResultTask>;
 
-        auto* old_frame = coro::promise_base::current_frame();
-
         auto wrapper = [&]() {
             if constexpr (Joinable) {
                 return detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
@@ -720,12 +718,6 @@ private:
             handle.promise().set_affinity(worker_id);
         }
         handle.promise().detach_from_parent();
-        // Restore caller's frame chain. detach_from_parent() sets current_frame_
-        // to nullptr to avoid UAF when parent_ was spawned to another thread,
-        // but in do_go_ the parent is the caller on the same thread and is safe.
-        // Without this restore, the caller's subsequent coroutines would have
-        // nullptr as parent_, breaking the virtual stack chain.
-        coro::promise_base::set_current_frame(old_frame);
 
         if constexpr (Joinable) {
             auto state = std::make_shared<coro::detail::join_state<T>>();

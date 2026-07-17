@@ -40,6 +40,10 @@ task<int> return_value(int value) {
     co_return value;
 }
 
+task<size_t> report_virtual_stack_depth() {
+    co_return get_stack_depth();
+}
+
 struct task_lifetime_probe {
     std::atomic<int>* destructions;
 
@@ -100,6 +104,12 @@ task<int> combine_moved_lazy_tasks() {
 
     auto [a, b] = co_await combined;
     co_return a + b;
+}
+
+task<size_t> await_moved_task_and_report_depth() {
+    auto child = report_virtual_stack_depth();
+    auto moved = std::move(child);
+    co_return co_await moved;
 }
 
 template<typename Task>
@@ -167,6 +177,9 @@ TEST_CASE("task is move-only", "[task][ownership]") {
     STATIC_REQUIRE_FALSE(releases_lvalue<task<int>>);
     STATIC_REQUIRE(releases_rvalue<task<int>>);
 
+    task<int> empty{task<int>::handle_type{}};
+    REQUIRE_FALSE(empty.valid());
+
     auto source = simple_return_value();
     const auto original_handle = get_handle(source);
     auto destination = std::move(source);
@@ -188,13 +201,16 @@ TEST_CASE("task move assignment destroys replaced lazy frame",
           "[task][ownership][lifetime]") {
     std::atomic<int> source_destructions{0};
     std::atomic<int> replaced_destructions{0};
+    auto* previous_frame = promise_base::current_frame();
 
     {
-        auto source = probed_lazy_task(
-            task_lifetime_probe{&source_destructions});
         auto destination = probed_lazy_task(
             task_lifetime_probe{&replaced_destructions});
+        auto source = probed_lazy_task(
+            task_lifetime_probe{&source_destructions});
         const auto source_handle = get_handle(source);
+
+        REQUIRE(promise_base::current_frame() == previous_frame);
 
         destination = std::move(source);
 
@@ -205,10 +221,49 @@ TEST_CASE("task move assignment destroys replaced lazy frame",
 
         move_assign(destination, destination);
         REQUIRE(destination.valid());
+        REQUIRE(promise_base::current_frame() == previous_frame);
     }
 
     REQUIRE(source_destructions.load(std::memory_order_relaxed) == 1);
     REQUIRE(replaced_destructions.load(std::memory_order_relaxed) == 1);
+    REQUIRE(promise_base::current_frame() == previous_frame);
+}
+
+TEST_CASE("unstarted task container destruction preserves virtual stack",
+          "[task][ownership][virtual_stack]") {
+    promise_base caller;
+
+    {
+        std::vector<task<int>> tasks;
+        for (int i = 0; i < 16; ++i) {
+            tasks.emplace_back(return_value(i));
+            REQUIRE(promise_base::current_frame() == &caller);
+        }
+    }
+
+    REQUIRE(promise_base::current_frame() == &caller);
+    REQUIRE(get_stack_depth() == 1);
+}
+
+TEST_CASE("unstarted task may move across threads without corrupting creator stack",
+          "[task][ownership][thread][virtual_stack]") {
+    promise_base caller;
+    auto pending = return_value(42);
+    std::atomic<bool> destroyer_owned_task{false};
+
+    REQUIRE(promise_base::current_frame() == &caller);
+    REQUIRE(get_handle(pending).promise().parent() == nullptr);
+
+    std::thread destroyer([owned = std::move(pending),
+                           &destroyer_owned_task]() mutable {
+        destroyer_owned_task.store(owned.valid(), std::memory_order_release);
+    });
+    destroyer.join();
+
+    REQUIRE_FALSE(pending.valid());
+    REQUIRE(destroyer_owned_task.load(std::memory_order_acquire));
+    REQUIRE(promise_base::current_frame() == &caller);
+    REQUIRE(get_stack_depth() == 1);
 }
 
 TEST_CASE("moved lazy tasks survive vector reallocation and await",
@@ -219,6 +274,11 @@ TEST_CASE("moved lazy tasks survive vector reallocation and await",
 TEST_CASE("when_all accepts callables owning moved lazy tasks",
           "[task][ownership][combinator]") {
     REQUIRE(elio::run([] { return combine_moved_lazy_tasks(); }) == 42);
+}
+
+TEST_CASE("moved task binds virtual stack ancestry when awaited",
+          "[task][ownership][virtual_stack]") {
+    REQUIRE(elio::run([] { return await_moved_task_and_report_depth(); }) >= 2);
 }
 
 TEST_CASE("destroyed task_handle waiter is unregistered",

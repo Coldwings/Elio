@@ -19,9 +19,9 @@ C++20 stackless coroutines allocate each frame independently on the heap. When a
 
 ### How It Works
 
-Each coroutine's promise type inherits from `promise_base`, which contains a `parent_` pointer. When coroutine A `co_await`s coroutine B, B's promise stores a pointer back to A's promise. This forms a singly-linked list from the innermost frame to the outermost caller, mirroring what a native call stack would look like if the coroutines were regular functions.
+Each coroutine's promise type inherits from `promise_base`, which contains a `parent_` pointer. When coroutine A `co_await`s coroutine B, B's promise stores a pointer back to A's promise. This forms a singly-linked list from the innermost frame to the outermost caller, mirroring what a native call stack would look like if the coroutines were regular functions. Lazy task ownership alone does not keep a frame installed in thread-local stack state, so moving or destroying an unstarted task cannot leave creator-thread stack pointers behind.
 
-The thread-local `current_frame_` tracks which frame is currently executing. When a new coroutine starts, it reads `current_frame_` to set its `parent_`, then installs itself as the new `current_frame_`. On completion or suspension, the previous frame is restored.
+The thread-local `current_frame_` tracks which frame is currently executing. A task binds its `parent_` to the actual awaiter when `co_await` starts it. Scheduler and I/O resume paths install the resumed frame while user code runs, and completion restores the logical parent before transferring control to the continuation.
 
 ### Frame Validation
 

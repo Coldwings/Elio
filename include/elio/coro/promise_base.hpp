@@ -117,9 +117,7 @@ public:
         // foreign thread (e.g., during shutdown drain or failed spawn),
         // unconditionally setting current_frame_ = parent_ (nullptr after
         // detach) would clobber an unrelated active frame chain.
-        if (current_frame_ == this) {
-            current_frame_ = parent_;
-        }
+        leave_frame_context();
     }
 
     /// Detach this frame from the current thread's frame chain.
@@ -134,6 +132,30 @@ public:
         parent_ = nullptr;
         // Ensure all writes before detach are visible to the thread that will execute this coroutine
         std::atomic_thread_fence(std::memory_order_release);
+    }
+
+    /// Install this frame as a child of the coroutine that is actually
+    /// awaiting it. Lazy task creation and ownership order are independent of
+    /// the logical execution stack.
+    void enter_frame_context(promise_base* parent) noexcept {
+        parent_ = parent;
+        current_frame_ = this;
+    }
+
+    /// Remove the temporary constructor-time linkage of a lazy task. Its
+    /// logical parent is unknown until an await operation actually starts it.
+    void leave_creation_context() noexcept {
+        leave_frame_context();
+        parent_ = nullptr;
+    }
+
+    /// Restore the logical caller when this frame is current on this thread.
+    /// This is also used when a lazy task returns from get_return_object(), so
+    /// an unstarted frame never remains installed in creator-thread TLS.
+    void leave_frame_context() noexcept {
+        if (current_frame_ == this) {
+            current_frame_ = parent_;
+        }
     }
 
     promise_base(const promise_base&) = delete;

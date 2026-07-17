@@ -39,6 +39,7 @@ struct final_awaiter {
     template<typename Promise>
     [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) noexcept {
         auto continuation = h.promise().continuation_;
+        h.promise().leave_frame_context();
         if (continuation) {
             return continuation;
         } else if (h.promise().detached_) {
@@ -347,7 +348,11 @@ public:
 
     using handle_type = std::coroutine_handle<promise_type>;
 
-    explicit task(handle_type h) noexcept : handle_(h) {}
+    explicit task(handle_type h) noexcept : handle_(h) {
+        if (handle_) {
+            handle_.promise().leave_creation_context();
+        }
+    }
 
     // Move-only lazy coroutine ownership.
     task(const task&) = delete;
@@ -381,12 +386,15 @@ public:
         assert(!handle_.promise().continuation_ &&
                "task cannot have multiple awaiters");
         handle_.promise().continuation_ = awaiter;
+        handle_.promise().enter_frame_context(promise_base::current_frame());
         return handle_;
     }
     T await_resume() {
         assert(handle_ && "cannot resume an empty task");
         auto& promise = handle_.promise();
-        if (promise.exception()) std::rethrow_exception(promise.exception());
+        auto exception = promise.exception();
+        promise.detach_from_parent();
+        if (exception) std::rethrow_exception(exception);
         return std::move(*promise.value_);
     }
 
@@ -433,7 +441,11 @@ public:
 
     using handle_type = std::coroutine_handle<promise_type>;
 
-    explicit task(handle_type h) noexcept : handle_(h) {}
+    explicit task(handle_type h) noexcept : handle_(h) {
+        if (handle_) {
+            handle_.promise().leave_creation_context();
+        }
+    }
 
     // Move-only lazy coroutine ownership.
     task(const task&) = delete;
@@ -467,12 +479,15 @@ public:
         assert(!handle_.promise().continuation_ &&
                "task cannot have multiple awaiters");
         handle_.promise().continuation_ = awaiter;
+        handle_.promise().enter_frame_context(promise_base::current_frame());
         return handle_;
     }
     void await_resume() {
         assert(handle_ && "cannot resume an empty task");
         auto& promise = handle_.promise();
-        if (promise.exception()) std::rethrow_exception(promise.exception());
+        auto exception = promise.exception();
+        promise.detach_from_parent();
+        if (exception) std::rethrow_exception(exception);
     }
 
 private:

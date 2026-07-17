@@ -192,11 +192,9 @@ auto run(F&& f, const run_config& config = {})
     auto bound = [&f]() { return std::invoke(std::forward<F>(f)); };
 
     {
-        auto* old_frame = coro::promise_base::current_frame();
         auto wrapper = detail::completion_wrapper<T>(std::move(bound), &signal);
         auto handle = coro::detail::task_access::release(std::move(wrapper));
         handle.promise().detach_from_parent();
-        coro::promise_base::set_current_frame(old_frame);
         sched.spawn(handle);
     }
 

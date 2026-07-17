@@ -595,4 +595,4 @@ For questions, issues, or feature requests, please open an issue on the reposito
 
 ---
 
-**Status**: Approaching Stable | **Version**: 0.5.3 | **Last Release**: 0.5.3 (2026-07-17)
+**Status**: Approaching Stable | **Version**: 0.6.0 (unreleased) | **Last Release**: 0.5.3 (2026-07-17)

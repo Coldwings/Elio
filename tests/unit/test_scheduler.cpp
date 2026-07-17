@@ -536,7 +536,7 @@ TEST_CASE("Scheduler accounting includes pending I/O on draining workers",
 
     auto raw_task = gated_io_task(&task_running, &proceed,
                                   scaled_ms(500), &io_done);
-    auto handle = elio::coro::detail::task_access::release(raw_task);
+    auto handle = elio::coro::detail::task_access::release(std::move(raw_task));
     handle.promise().set_affinity(1);
     handle.promise().detach_from_parent();
 
@@ -598,7 +598,7 @@ TEST_CASE("Scheduler shrink runs worker-local maintenance on retiring worker",
     REQUIRE(occupier_running.load(std::memory_order_acquire));
 
     auto worker_local_task = record_current_worker_task(&observed_worker);
-    auto handle = elio::coro::detail::task_access::release(worker_local_task);
+    auto handle = elio::coro::detail::task_access::release(std::move(worker_local_task));
     handle.promise().set_affinity(1);
     handle.promise().set_worker_local();
     handle.promise().detach_from_parent();

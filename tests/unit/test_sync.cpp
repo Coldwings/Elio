@@ -105,7 +105,7 @@ TEST_CASE("mutex waiter keeps transferred lock until explicit unlock", "[sync][m
         co_return;
     };
     auto third_actor = third_actor_task();
-    auto third_actor_handle = elio::coro::detail::task_access::release(third_actor);
+    auto third_actor_handle = elio::coro::detail::task_access::release(std::move(third_actor));
 
     auto waiter_task = [&]() -> task<void> {
         co_await m.lock();
@@ -115,7 +115,7 @@ TEST_CASE("mutex waiter keeps transferred lock until explicit unlock", "[sync][m
     };
 
     auto t = waiter_task();
-    auto h = elio::coro::detail::task_access::release(t);
+    auto h = elio::coro::detail::task_access::release(std::move(t));
     h.resume();
 
     REQUIRE_FALSE(waiter_entered);
@@ -838,7 +838,7 @@ TEST_CASE("condition_variable generic wait does not resume before unlock returns
         };
 
         auto t = waiter();
-        auto h = elio::coro::detail::task_access::release(t);
+        auto h = elio::coro::detail::task_access::release(std::move(t));
         h.resume();
 
         REQUIRE(lock.unlock_returned);

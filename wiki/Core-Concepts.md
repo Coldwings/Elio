@@ -26,6 +26,13 @@ coro::task<void> do_work() {
 }
 ```
 
+`task<T>` is a move-only, single-shot lazy owner. Moving it transfers the
+unstarted coroutine frame and leaves the source empty, which allows lazy tasks
+to be stored in containers or passed through move-only callables. The task
+object does not represent running work: once ownership is transferred to the
+scheduler, use the `join_handle<T>` returned by `spawn()` when the work must be
+observed. Moving a task never migrates a running coroutine or pending I/O.
+
 ### Awaiting Tasks
 
 Use `co_await` to wait for a task to complete:

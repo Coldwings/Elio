@@ -714,7 +714,7 @@ private:
             }
         }();
 
-        auto handle = coro::detail::task_access::release(wrapper);
+        auto handle = coro::detail::task_access::release(std::move(wrapper));
         handle.promise().detached_ = true;
         if constexpr (Pinned) {
             handle.promise().set_affinity(worker_id);

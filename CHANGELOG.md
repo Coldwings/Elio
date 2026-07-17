@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Move-only lazy tasks**: `coro::task<T>` and `coro::task<void>` now support
+  move construction and move assignment while remaining non-copyable. Moving a
+  task transfers ownership of its unstarted coroutine frame and leaves the
+  source empty. Replacing an owned task destroys the destination's previous
+  lazy frame. Runtime handoff paths now require an explicit rvalue ownership
+  transfer.
 - **Coroutine frame allocation**: `task<T>` frames now use the standard heap
   allocation path in every build, without allocator-owned LIFO lifetime rules.
   Logical coroutine ancestry remains available through the `promise_base`

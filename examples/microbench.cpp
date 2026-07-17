@@ -31,7 +31,7 @@ int main() {
         auto start = high_resolution_clock::now();
         for (int i = 0; i < N; ++i) {
             auto t = empty_task();
-            handles.push_back(coro::detail::task_access::release(t));
+            handles.push_back(coro::detail::task_access::release(std::move(t)));
         }
         auto end = high_resolution_clock::now();
         auto ns = duration_cast<nanoseconds>(end - start).count();
@@ -50,7 +50,7 @@ int main() {
         auto start = high_resolution_clock::now();
         for (int i = 0; i < N; ++i) {
             auto t = empty_task();
-            handles.push_back(coro::detail::task_access::release(t));
+            handles.push_back(coro::detail::task_access::release(std::move(t)));
         }
         auto end = high_resolution_clock::now();
         auto ns = duration_cast<nanoseconds>(end - start).count();

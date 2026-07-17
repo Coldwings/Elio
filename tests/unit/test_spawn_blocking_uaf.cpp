@@ -141,7 +141,7 @@ TEST_CASE("spawn_blocking survives coroutine destruction (non-void)",
     // Start the coroutine manually so we control its lifetime.
     // task() creates a suspended coroutine; release() extracts the raw handle.
     auto t = task_fn();
-    auto handle = elio::coro::detail::task_access::release(t);
+    auto handle = elio::coro::detail::task_access::release(std::move(t));
     // Resume to start execution up to the spawn_blocking suspension point
     handle.resume();
 
@@ -179,7 +179,7 @@ TEST_CASE("spawn_blocking survives coroutine destruction (void)",
     };
 
     auto t = task_fn();
-    auto handle = elio::coro::detail::task_access::release(t);
+    auto handle = elio::coro::detail::task_access::release(std::move(t));
     handle.resume();
 
     while (!work_started.load(std::memory_order_acquire)) {
@@ -213,7 +213,7 @@ TEST_CASE("spawn_blocking survives coroutine destruction with exception",
     };
 
     auto t = task_fn();
-    auto handle = elio::coro::detail::task_access::release(t);
+    auto handle = elio::coro::detail::task_access::release(std::move(t));
     handle.resume();
 
     while (!work_started.load(std::memory_order_acquire)) {
@@ -283,7 +283,7 @@ TEST_CASE("spawn_blocking detached thread fallback respects caller_alive",
 
     // Run outside any scheduler context to trigger the detached thread path
     auto t = task_fn();
-    auto handle = elio::coro::detail::task_access::release(t);
+    auto handle = elio::coro::detail::task_access::release(std::move(t));
     handle.resume();
 
     while (!work_started.load(std::memory_order_acquire)) {
@@ -314,7 +314,7 @@ TEST_CASE("spawn_blocking detached thread fallback completes without self-deadlo
     };
 
     auto t = task_fn();
-    auto handle = elio::coro::detail::task_access::release(t);
+    auto handle = elio::coro::detail::task_access::release(std::move(t));
     handle.resume();
 
     const auto deadline = std::chrono::steady_clock::now() + scaled_ms(5000);

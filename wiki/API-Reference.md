@@ -45,13 +45,16 @@ class task {
 public:
     using promise_type = /* implementation */;
     
-    // Non-copyable, non-movable
+    // Non-copyable, move-only
     task(const task&) = delete;
     task& operator=(const task&) = delete;
-    task(task&&) = delete;
-    task& operator=(task&&) = delete;
+    task(task&&) noexcept;
+    task& operator=(task&&) noexcept;
     
     ~task();  // Destroys the coroutine frame
+
+    bool valid() const noexcept;
+    explicit operator bool() const noexcept;
     
     // Awaitable interface (use with co_await)
     bool await_ready() const noexcept;
@@ -59,6 +62,12 @@ public:
     T await_resume();  // Returns result or rethrows exception
 };
 ```
+
+`task<T>` is a single-shot lazy owner. Moving it transfers only ownership of
+the unstarted coroutine frame and leaves the source empty; it does not migrate
+running work or pending I/O. Destroying a non-empty task destroys the frame if
+ownership has not been transferred to the runtime. Do not await an empty task
+or await the same task more than once.
 
 **Basic Usage:**
 ```cpp

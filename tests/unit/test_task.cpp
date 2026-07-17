@@ -1,7 +1,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/coro/task_handle.hpp>
+#include <elio/coro/when_all.hpp>
 #include <elio/coro/frame.hpp>
+#include <elio/runtime/async_main.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/affinity.hpp>
@@ -10,6 +12,7 @@
 #include <chrono>
 #include <latch>
 #include <thread>
+#include <utility>
 #include <vector>
 #include "../test_main.cpp"  // For scaled timeouts
 
@@ -17,7 +20,7 @@ using namespace elio::coro;
 using namespace elio::runtime;
 using namespace elio::test;
 
-// Helper: access handle from immovable task (for testing only)
+// Helper: access an owned lazy task handle for lifecycle assertions.
 template<typename T>
 auto get_handle(task<T>& t) {
     return elio::coro::detail::task_access::handle(t);
@@ -32,6 +35,77 @@ task<int> simple_return_value() {
 task<void> simple_void() {
     co_return;
 }
+
+task<int> return_value(int value) {
+    co_return value;
+}
+
+struct task_lifetime_probe {
+    std::atomic<int>* destructions;
+
+    explicit task_lifetime_probe(std::atomic<int>* counter) noexcept
+        : destructions(counter) {}
+
+    task_lifetime_probe(const task_lifetime_probe&) = delete;
+    task_lifetime_probe& operator=(const task_lifetime_probe&) = delete;
+
+    task_lifetime_probe(task_lifetime_probe&& other) noexcept
+        : destructions(std::exchange(other.destructions, nullptr)) {}
+
+    ~task_lifetime_probe() {
+        if (destructions) {
+            destructions->fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+};
+
+task<void> probed_lazy_task(task_lifetime_probe probe) {
+    (void)probe;
+    co_return;
+}
+
+task<int> sum_moved_task_vector() {
+    std::vector<task<int>> tasks;
+    for (int i = 1; i <= 16; ++i) {
+        tasks.emplace_back(return_value(i));
+    }
+
+    int total = 0;
+    for (auto& pending : tasks) {
+        total += co_await pending;
+    }
+    co_return total;
+}
+
+task<int> combine_moved_lazy_tasks() {
+    auto first = return_value(20);
+    auto second = return_value(22);
+
+    auto combined = elio::when_all(
+        [owned = std::move(first)]() mutable -> task<int> {
+            return std::move(owned);
+        },
+        [owned = std::move(second)]() mutable -> task<int> {
+            return std::move(owned);
+        });
+
+    if (first.valid() || second.valid()) {
+        co_return -1;
+    }
+
+    auto [a, b] = co_await combined;
+    co_return a + b;
+}
+
+template<typename Task>
+concept releases_lvalue = requires(Task& value) {
+    elio::coro::detail::task_access::release(value);
+};
+
+template<typename Task>
+concept releases_rvalue = requires(Task& value) {
+    elio::coro::detail::task_access::release(std::move(value));
+};
 
 // Helper: Coroutine that throws
 task<int> throwing_coroutine() {
@@ -74,17 +148,72 @@ TEST_CASE("task construction and destruction", "[task]") {
     // Task should destroy handle in destructor
 }
 
-TEST_CASE("task is non-movable", "[task]") {
-    // Verify task<T> is non-movable and non-copyable
-    STATIC_REQUIRE_FALSE(std::is_move_constructible_v<task<int>>);
-    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<task<int>>);
+TEST_CASE("task is move-only", "[task][ownership]") {
+    STATIC_REQUIRE(std::is_nothrow_move_constructible_v<task<int>>);
+    STATIC_REQUIRE(std::is_nothrow_move_assignable_v<task<int>>);
     STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<task<int>>);
     STATIC_REQUIRE_FALSE(std::is_copy_assignable_v<task<int>>);
-    
-    STATIC_REQUIRE_FALSE(std::is_move_constructible_v<task<void>>);
-    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<task<void>>);
+
+    STATIC_REQUIRE(std::is_nothrow_move_constructible_v<task<void>>);
+    STATIC_REQUIRE(std::is_nothrow_move_assignable_v<task<void>>);
     STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<task<void>>);
     STATIC_REQUIRE_FALSE(std::is_copy_assignable_v<task<void>>);
+
+    STATIC_REQUIRE_FALSE(releases_lvalue<task<int>>);
+    STATIC_REQUIRE(releases_rvalue<task<int>>);
+
+    auto source = simple_return_value();
+    const auto original_handle = get_handle(source);
+    auto destination = std::move(source);
+
+    REQUIRE_FALSE(source.valid());
+    REQUIRE_FALSE(static_cast<bool>(source));
+    REQUIRE(destination.valid());
+    REQUIRE(static_cast<bool>(destination));
+    REQUIRE(get_handle(destination) == original_handle);
+
+    auto released = elio::coro::detail::task_access::release(
+        std::move(destination));
+    REQUIRE_FALSE(destination.valid());
+    REQUIRE(released == original_handle);
+    released.destroy();
+}
+
+TEST_CASE("task move assignment destroys replaced lazy frame",
+          "[task][ownership][lifetime]") {
+    std::atomic<int> source_destructions{0};
+    std::atomic<int> replaced_destructions{0};
+
+    {
+        auto source = probed_lazy_task(
+            task_lifetime_probe{&source_destructions});
+        auto destination = probed_lazy_task(
+            task_lifetime_probe{&replaced_destructions});
+        const auto source_handle = get_handle(source);
+
+        destination = std::move(source);
+
+        REQUIRE_FALSE(source.valid());
+        REQUIRE(destination.valid());
+        REQUIRE(get_handle(destination) == source_handle);
+        REQUIRE(replaced_destructions.load(std::memory_order_relaxed) == 1);
+
+        destination = std::move(destination);
+        REQUIRE(destination.valid());
+    }
+
+    REQUIRE(source_destructions.load(std::memory_order_relaxed) == 1);
+    REQUIRE(replaced_destructions.load(std::memory_order_relaxed) == 1);
+}
+
+TEST_CASE("moved lazy tasks survive vector reallocation and await",
+          "[task][ownership][vector]") {
+    REQUIRE(elio::run([] { return sum_moved_task_vector(); }) == 136);
+}
+
+TEST_CASE("when_all accepts callables owning moved lazy tasks",
+          "[task][ownership][combinator]") {
+    REQUIRE(elio::run([] { return combine_moved_lazy_tasks(); }) == 42);
 }
 
 TEST_CASE("destroyed task_handle waiter is unregistered",
@@ -98,7 +227,7 @@ TEST_CASE("destroyed task_handle waiter is unregistered",
     };
 
     auto waiter = waiter_task();
-    auto h = elio::coro::detail::task_access::release(waiter);
+    auto h = elio::coro::detail::task_access::release(std::move(waiter));
     h.resume();
     REQUIRE_FALSE(h.done());
 
@@ -116,7 +245,7 @@ TEST_CASE("destroyed join_handle waiter is unregistered",
     };
 
     auto waiter = waiter_task();
-    auto h = elio::coro::detail::task_access::release(waiter);
+    auto h = elio::coro::detail::task_access::release(std::move(waiter));
     h.resume();
     REQUIRE_FALSE(h.done());
 

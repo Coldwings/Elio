@@ -314,6 +314,14 @@ add_test(NAME non_linux_platform_rejected
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_linux_platform.cmake
 )
 
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME debugger_script_helpers
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/test_debugger_scripts.py
+    )
+endif()
+
 add_executable(elio_rdma_cuda_lifetime_tests
     unit/test_rdma_cuda_gpu_memory_region.cpp
 )

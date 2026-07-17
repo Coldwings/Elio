@@ -35,6 +35,13 @@ COROUTINE_STATES = {
     4: "failed"
 }
 
+
+def frame_display_identity(info):
+    """Return printable identity fields without inventing debug metadata."""
+    frame_id = info.get("id")
+    state = info.get("state")
+    return ("?" if frame_id is None else str(frame_id), state or "unknown")
+
 # Check if debug metadata is enabled in the build
 def is_debug_metadata_enabled():
     """Check if ELIO_ENABLE_DEBUG_METADATA is enabled."""
@@ -167,9 +174,9 @@ def get_frame_from_handle(handle_addr):
         if magic != FRAME_MAGIC:
             return None
 
-        # Resolve field offsets from debug information when available. The
-        # Without type information, only the stable magic/parent prefix is
-        # safe to inspect. Optional metadata may not be compiled in.
+        # Resolve field offsets from debug information when available. Without
+        # type information, only the stable magic/parent prefix is safe to
+        # inspect. Optional metadata may not be compiled in.
 
         # Read parent pointer (always present)
         parent_bytes = inferior.read_memory(
@@ -180,9 +187,9 @@ def get_frame_from_handle(handle_addr):
         file_ptr = 0
         func_ptr = 0
         line = 0
-        state = 1
-        worker_id = 0xFFFFFFFF
-        debug_id = 0
+        state = None
+        worker_id = None
+        debug_id = None
 
         try:
             if not has_debug_metadata:
@@ -211,7 +218,7 @@ def get_frame_from_handle(handle_addr):
                 promise_addr + layout["debug_id_"], 8)
             debug_id = int.from_bytes(bytes(debug_id_bytes), 'little')
         except Exception:
-            # Debug metadata not available - use defaults
+            # Debug metadata is unavailable; retain explicit unknown values.
             has_debug_metadata = False
 
         # Read strings (only if debug metadata enabled)
@@ -232,7 +239,8 @@ def get_frame_from_handle(handle_addr):
 
         return {
             "id": debug_id,
-            "state": COROUTINE_STATES.get(state, "unknown"),
+            "state": (COROUTINE_STATES.get(state, "unknown")
+                      if state is not None else None),
             "worker_id": worker_id,
             "parent": parent,
             "file": file_str,
@@ -502,11 +510,12 @@ class ElioListCommand(gdb.Command):
 
             worker = str(worker_id)
 
-            print(f"{info['id']:<8} {info['state']:<12} {worker:<8} {func:<30} {loc}")
+            display_id, display_state = frame_display_identity(info)
+            print(f"{display_id:<8} {display_state:<12} {worker:<8} {func:<30} {loc}")
 
         print(f"\nTotal queued coroutines: {count}")
         if has_debug_metadata_warning:
-            print("(Note: Debug metadata is disabled - location info not available)")
+            print("(Note: Debug metadata is unavailable - identity and location are unknown)")
 
 
 class ElioBtCommand(gdb.Command):
@@ -542,7 +551,8 @@ class ElioBtCommand(gdb.Command):
                 continue
 
             found = True
-            print(f"vthread #{info['id']} [{info['state']}] (worker {worker_id})")
+            display_id, display_state = frame_display_identity(info)
+            print(f"vthread #{display_id} [{display_state}] (worker {worker_id})")
 
             stack = walk_virtual_stack(task_addr)
             for i, frame in enumerate(stack):
@@ -648,8 +658,9 @@ class ElioInfoCommand(gdb.Command):
             if info["id"] != target_id:
                 continue
 
-            print(f"vthread #{info['id']}")
-            print(f"  State:    {info['state']}")
+            display_id, display_state = frame_display_identity(info)
+            print(f"vthread #{display_id}")
+            print(f"  State:    {display_state}")
             print(f"  Worker:   {worker_id}")
             print(f"  Handle:   0x{info['address']:016x}")
             print(f"  Promise:  0x{info['promise_addr']:016x}")

@@ -34,6 +34,13 @@ COROUTINE_STATES = {
 }
 
 
+def frame_display_identity(info):
+    """Return printable identity fields without inventing debug metadata."""
+    frame_id = info.get("id")
+    state = info.get("state")
+    return ("?" if frame_id is None else str(frame_id), state or "unknown")
+
+
 def read_cstring(process, addr):
     """Read a null-terminated string from memory."""
     if addr == 0:
@@ -165,9 +172,9 @@ def get_frame_from_handle(process, handle_addr):
         if magic != FRAME_MAGIC:
             return None
 
-        # Resolve field offsets from debug information when available. The
-        # Without type information, only the stable magic/parent prefix is
-        # safe to inspect. Optional metadata may not be compiled in.
+        # Resolve field offsets from debug information when available. Without
+        # type information, only the stable magic/parent prefix is safe to
+        # inspect. Optional metadata may not be compiled in.
 
         # Read parent pointer (always present)
         parent = read_pointer(process, promise_addr + layout["parent_"])
@@ -176,9 +183,9 @@ def get_frame_from_handle(process, handle_addr):
         file_ptr = 0
         func_ptr = 0
         line = 0
-        state = 1
-        worker_id = 0xFFFFFFFF
-        debug_id = 0
+        state = None
+        worker_id = None
+        debug_id = None
 
         try:
             if not has_debug_metadata:
@@ -199,12 +206,13 @@ def get_frame_from_handle(process, handle_addr):
             debug_id = read_uint64(
                 process, promise_addr + layout["debug_id_"])
         except Exception:
-            # Debug metadata not available - use defaults
+            # Debug metadata is unavailable; retain explicit unknown values.
             has_debug_metadata = False
 
         return {
             "id": debug_id,
-            "state": COROUTINE_STATES.get(state, "unknown"),
+            "state": (COROUTINE_STATES.get(state, "unknown")
+                      if state is not None else None),
             "worker_id": worker_id,
             "parent": parent,
             "file": read_cstring(process, file_ptr) if has_debug_metadata else None,
@@ -500,11 +508,14 @@ def elio_list(debugger, command, result, internal_dict):
 
         worker = str(info.get("queue_worker_id", info["worker_id"]))
 
-        result.AppendMessage(f"{info['id']:<8} {info['state']:<12} {worker:<8} {func:<30} {loc}")
+        display_id, display_state = frame_display_identity(info)
+        result.AppendMessage(
+            f"{display_id:<8} {display_state:<12} {worker:<8} {func:<30} {loc}")
 
     result.AppendMessage(f"\nTotal queued coroutines: {count}")
     if has_debug_metadata_warning:
-        result.AppendMessage("(Note: Debug metadata is disabled - location info not available)")
+        result.AppendMessage(
+            "(Note: Debug metadata is unavailable - identity and location are unknown)")
     result.AppendMessage("Note: Only queued (not currently executing) coroutines are shown.")
 
 
@@ -537,7 +548,9 @@ def elio_bt(debugger, command, result, internal_dict):
 
         found = True
         worker_id = info.get("queue_worker_id", info["worker_id"])
-        result.AppendMessage(f"vthread #{info['id']} [{info['state']}] (worker {worker_id})")
+        display_id, display_state = frame_display_identity(info)
+        result.AppendMessage(
+            f"vthread #{display_id} [{display_state}] (worker {worker_id})")
 
         stack = walk_virtual_stack(process, task_addr)
         for i, frame in enumerate(stack):
@@ -582,8 +595,9 @@ def elio_info(debugger, command, result, internal_dict):
         if info["id"] != target_id:
             continue
         
-        result.AppendMessage(f"vthread #{info['id']}")
-        result.AppendMessage(f"  State:    {info['state']}")
+        display_id, display_state = frame_display_identity(info)
+        result.AppendMessage(f"vthread #{display_id}")
+        result.AppendMessage(f"  State:    {display_state}")
         worker = info.get('queue_worker_id', info['worker_id'])
         result.AppendMessage(f"  Worker:   {worker}")
         result.AppendMessage(f"  Handle:   0x{info['address']:016x}")

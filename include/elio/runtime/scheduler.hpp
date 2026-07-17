@@ -1133,6 +1133,15 @@ inline void worker_thread::redistribute_tasks(scheduler* sched) noexcept {
 }
 
 inline void worker_thread::drain_inbox() noexcept {
+    // A producer that arrives after this observation will wake the worker and
+    // be drained on the next pass. Avoid two epoch RMWs on the normal local
+    // execution path when there is no cross-thread work to transfer.
+    if (inbox_->empty() &&
+        overflow_size_.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    transfer_epoch_.fetch_add(1, std::memory_order_acq_rel);
+
     // Drain the MPSC fast path into the local Chase-Lev deque.
     void* item;
     while ((item = inbox_->pop()) != nullptr) {
@@ -1173,6 +1182,7 @@ inline void worker_thread::drain_inbox() noexcept {
         // false idle window between the overflow queue and local deque.
         overflow_size_.fetch_sub(transfer_size, std::memory_order_release);
     }
+    transfer_epoch_.fetch_add(1, std::memory_order_release);
 }
 
 inline void worker_thread::run() {

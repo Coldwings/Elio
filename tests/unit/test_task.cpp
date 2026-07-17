@@ -476,6 +476,82 @@ TEST_CASE("overflow transfer remains visible to scheduler accounting",
     REQUIRE(drained);
 }
 
+TEST_CASE("queue snapshot detects a completed overflow transfer",
+          "[task][ownership][scheduler][overflow][shutdown]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> blocker_started{false};
+    std::atomic<bool> release_blocker{false};
+    auto blocker_fn = [&]() -> task<void> {
+        blocker_started.store(true, std::memory_order_release);
+        while (!release_blocker.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        co_return;
+    };
+    auto blocker = blocker_fn();
+    sched.spawn(elio::coro::detail::task_access::release(std::move(blocker)));
+
+    const auto blocker_deadline =
+        std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!blocker_started.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < blocker_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    std::atomic<size_t> snapshot{0};
+    elio::runtime::detail::pause_queue_snapshot_for_test.store(
+        true, std::memory_order_release);
+    std::thread observer([&]() {
+        snapshot.store(sched.pending_tasks(), std::memory_order_release);
+    });
+
+    const auto snapshot_deadline =
+        std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!elio::runtime::detail::queue_snapshot_paused_for_test.load(
+               std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < snapshot_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool snapshot_paused =
+        elio::runtime::detail::queue_snapshot_paused_for_test.load(
+            std::memory_order_acquire);
+
+    std::atomic<bool> completed{false};
+    auto resumed_fn = [&]() -> task<void> {
+        completed.store(true, std::memory_order_release);
+        co_return;
+    };
+    auto resumed = resumed_fn();
+    const bool accepted = sched.get_worker(0)->schedule_overflow_for_test(
+        get_handle(resumed));
+
+    release_blocker.store(true, std::memory_order_release);
+    const auto completion_deadline =
+        std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < completion_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool did_complete = completed.load(std::memory_order_acquire);
+
+    elio::runtime::detail::pause_queue_snapshot_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::pause_queue_snapshot_for_test.notify_all();
+    observer.join();
+
+    const bool drained = sched.wait_for_idle(scaled_sec(5));
+    sched.shutdown();
+
+    REQUIRE(blocker_started.load(std::memory_order_acquire));
+    REQUIRE(snapshot_paused);
+    REQUIRE(accepted);
+    REQUIRE(did_complete);
+    REQUIRE(snapshot.load(std::memory_order_acquire) > 0);
+    REQUIRE(drained);
+}
+
 TEST_CASE("destroyed task_handle waiter is unregistered",
           "[task][task_handle][cancellation]") {
     auto state = std::make_shared<elio::coro::detail::task_state<void>>();

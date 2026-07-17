@@ -22,18 +22,19 @@ class scheduler;
 namespace detail {
 inline std::atomic<bool> pause_overflow_transfer_for_test{false};
 inline std::atomic<bool> overflow_transfer_paused_for_test{false};
+inline std::atomic<bool> pause_queue_snapshot_for_test{false};
+inline std::atomic<bool> queue_snapshot_paused_for_test{false};
 }  // namespace detail
 #endif
 
 /// Worker thread that executes tasks from a local queue
 /// and steals from other workers when idle
 /// 
-/// Uses a two-queue architecture for optimal scalability:
-/// - MPSC inbox: lock-free queue for external task submissions
+/// Uses bounded queues on the scheduling fast path:
+/// - MPSC inbox: lock-free ring used behind the worker lifecycle guard
 /// - Chase-Lev deque: lock-free SPMC for owner ops and work stealing
-/// 
-/// This design eliminates contention between external producers and
-/// the owner thread, enabling linear scaling with thread count.
+/// Rare sustained bursts spill into a mutex-protected overflow queue instead
+/// of rejecting accepted worker-bound resumptions.
 class worker_thread {
     friend class scheduler;
 
@@ -187,8 +188,35 @@ public:
     }
 
     [[nodiscard]] size_t queue_size() const noexcept {
-        return queue_->size() + inbox_->size_approx() +
-               overflow_size_.load(std::memory_order_acquire);
+        const size_t epoch_before =
+            transfer_epoch_.load(std::memory_order_acquire);
+        size_t total = queue_->size();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (detail::pause_queue_snapshot_for_test.load(
+                std::memory_order_acquire)) {
+            detail::queue_snapshot_paused_for_test.store(
+                true, std::memory_order_release);
+            detail::queue_snapshot_paused_for_test.notify_all();
+            while (detail::pause_queue_snapshot_for_test.load(
+                std::memory_order_acquire)) {
+                detail::pause_queue_snapshot_for_test.wait(
+                    true, std::memory_order_acquire);
+            }
+            detail::queue_snapshot_paused_for_test.store(
+                false, std::memory_order_release);
+        }
+#endif
+        total += inbox_->size_approx();
+        total += overflow_size_.load(std::memory_order_acquire);
+        const size_t epoch_after =
+            transfer_epoch_.load(std::memory_order_acquire);
+        if ((epoch_before & 1U) != 0 || epoch_before != epoch_after) {
+            // A source-to-deque transfer overlapped this non-atomic snapshot.
+            // Conservatively report pending work so idle detection cannot
+            // observe a false zero. Exact diagnostics recover next sample.
+            return total == 0 ? 1 : total;
+        }
+        return total;
     }
 
     [[nodiscard]] std::coroutine_handle<> steal_task() noexcept {
@@ -289,6 +317,9 @@ private:
     // handle in that batch has been published to queue_. This may briefly
     // overcount work, but it must never let idle detection miss accepted work.
     std::atomic<size_t> overflow_size_{0};
+    // Even while idle; odd while drain_inbox() moves handles between queues.
+    // queue_size() uses this generation to reject incoherent zero snapshots.
+    std::atomic<size_t> transfer_epoch_{0};
     std::atomic<bool> draining_{false};
     // Hot-write fields (owner thread writes per task) — isolated cache line
     alignas(64) std::atomic<size_t> tasks_executed_;

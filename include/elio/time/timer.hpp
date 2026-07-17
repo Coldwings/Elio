@@ -23,6 +23,7 @@ namespace detail {
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 inline thread_local bool reject_next_timeout_prepare = false;
+inline std::atomic<bool> cancellable_sleep_registered_for_test{false};
 
 inline void reject_next_timeout_prepare_for_test() noexcept {
     reject_next_timeout_prepare = true;
@@ -290,6 +291,11 @@ public:
             }
             state->worker->schedule_or_destroy(exec.handle);
         });
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        detail::cancellable_sleep_registered_for_test.store(
+            true, std::memory_order_release);
+        detail::cancellable_sleep_registered_for_test.notify_all();
+#endif
 
         // Check again after registration (cancelled between is_cancelled()
         // above and on_cancel()). If add_callback already saw `cancelled`

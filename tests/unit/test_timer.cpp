@@ -289,6 +289,58 @@ TEST_CASE("cancellable sleep - cancelled early", "[time][sleep][cancel]") {
     REQUIRE(result_value == 1);  // Should be cancelled
 }
 
+TEST_CASE("timer cancellation preserves cancelling thread virtual stack",
+          "[time][sleep][cancel][virtual_stack][ownership]") {
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source source;
+    std::atomic<bool> completed{false};
+    std::atomic<bool> cancelled{false};
+    elio::time::detail::cancellable_sleep_registered_for_test.store(
+        false, std::memory_order_release);
+
+    auto sleep_task = [&]() -> task<void> {
+        auto result = co_await sleep_for(5s, source.get_token());
+        cancelled.store(result == cancel_result::cancelled,
+                        std::memory_order_release);
+        completed.store(true, std::memory_order_release);
+    };
+    spawn_task(sched, sleep_task);
+
+    const auto registration_deadline =
+        std::chrono::steady_clock::now() + 5s;
+    while (!elio::time::detail::cancellable_sleep_registered_for_test.load(
+               std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < registration_deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    const bool registered =
+        elio::time::detail::cancellable_sleep_registered_for_test.load(
+            std::memory_order_acquire);
+
+    bool frame_preserved = false;
+    {
+        promise_base caller;
+        source.cancel();
+        frame_preserved = promise_base::current_frame() == &caller;
+    }
+
+    const auto completion_deadline = std::chrono::steady_clock::now() + 5s;
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < completion_deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    const bool did_complete = completed.load(std::memory_order_acquire);
+    const bool drained = sched.shutdown(5s);
+
+    REQUIRE(registered);
+    REQUIRE(frame_preserved);
+    REQUIRE(did_complete);
+    REQUIRE(cancelled.load(std::memory_order_acquire));
+    REQUIRE(drained);
+}
+
 TEST_CASE("cancellable sleep - already cancelled token", "[time][sleep][cancel]") {
     std::atomic<bool> completed{false};
     std::atomic<int> result_value{-1};

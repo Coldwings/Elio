@@ -24,6 +24,7 @@ inline std::atomic<bool> pause_overflow_transfer_for_test{false};
 inline std::atomic<bool> overflow_transfer_paused_for_test{false};
 inline std::atomic<bool> pause_queue_snapshot_for_test{false};
 inline std::atomic<bool> queue_snapshot_paused_for_test{false};
+inline std::atomic<bool> queue_transfer_waiting_for_test{false};
 }  // namespace detail
 #endif
 
@@ -188,8 +189,13 @@ public:
     }
 
     [[nodiscard]] size_t queue_size() const noexcept {
-        const size_t epoch_before =
-            transfer_epoch_.load(std::memory_order_acquire);
+        std::unique_lock<std::mutex> transfer_lock(transfer_mutex_,
+                                                   std::try_to_lock);
+        if (!transfer_lock.owns_lock()) {
+            // A source-to-deque transfer is in progress. Conservatively
+            // report pending work instead of blocking an accounting reader.
+            return 1;
+        }
         size_t total = queue_->size();
 #ifdef ELIO_RUNTIME_TEST_HOOKS
         if (detail::pause_queue_snapshot_for_test.load(
@@ -208,14 +214,6 @@ public:
 #endif
         total += inbox_->size_approx();
         total += overflow_size_.load(std::memory_order_acquire);
-        const size_t epoch_after =
-            transfer_epoch_.load(std::memory_order_acquire);
-        if ((epoch_before & 1U) != 0 || epoch_before != epoch_after) {
-            // A source-to-deque transfer overlapped this non-atomic snapshot.
-            // Conservatively report pending work so idle detection cannot
-            // observe a false zero. Exact diagnostics recover next sample.
-            return total == 0 ? 1 : total;
-        }
         return total;
     }
 
@@ -313,13 +311,13 @@ private:
     std::atomic<bool> running_;
     std::mutex schedule_mutex_;
     std::mutex overflow_mutex_;
+    // Serializes external-queue transfers with non-blocking accounting
+    // snapshots. It is not used by the local scheduling fast path.
+    mutable std::mutex transfer_mutex_;
     // Includes entries swapped into a worker-local transfer batch until every
     // handle in that batch has been published to queue_. This may briefly
     // overcount work, but it must never let idle detection miss accepted work.
     std::atomic<size_t> overflow_size_{0};
-    // Even while idle; odd while drain_inbox() moves handles between queues.
-    // queue_size() uses this generation to reject incoherent zero snapshots.
-    std::atomic<size_t> transfer_epoch_{0};
     std::atomic<bool> draining_{false};
     // Hot-write fields (owner thread writes per task) — isolated cache line
     alignas(64) std::atomic<size_t> tasks_executed_;

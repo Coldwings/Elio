@@ -1134,13 +1134,25 @@ inline void worker_thread::redistribute_tasks(scheduler* sched) noexcept {
 
 inline void worker_thread::drain_inbox() noexcept {
     // A producer that arrives after this observation will wake the worker and
-    // be drained on the next pass. Avoid two epoch RMWs on the normal local
-    // execution path when there is no cross-thread work to transfer.
+    // be drained on the next pass. Avoid transfer-lock traffic on the normal
+    // local execution path when there is no cross-thread work to transfer.
     if (inbox_->empty() &&
         overflow_size_.load(std::memory_order_acquire) == 0) {
         return;
     }
-    transfer_epoch_.fetch_add(1, std::memory_order_acq_rel);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (detail::queue_snapshot_paused_for_test.load(
+            std::memory_order_acquire)) {
+        detail::queue_transfer_waiting_for_test.store(
+            true, std::memory_order_release);
+        detail::queue_transfer_waiting_for_test.notify_all();
+    }
+#endif
+    std::lock_guard<std::mutex> transfer_lock(transfer_mutex_);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    detail::queue_transfer_waiting_for_test.store(false,
+                                                  std::memory_order_release);
+#endif
 
     // Drain the MPSC fast path into the local Chase-Lev deque.
     void* item;
@@ -1182,7 +1194,6 @@ inline void worker_thread::drain_inbox() noexcept {
         // false idle window between the overflow queue and local deque.
         overflow_size_.fetch_sub(transfer_size, std::memory_order_release);
     }
-    transfer_epoch_.fetch_add(1, std::memory_order_release);
 }
 
 inline void worker_thread::run() {

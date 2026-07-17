@@ -179,7 +179,9 @@ public:
 
                 [[nodiscard]] std::coroutine_handle<> await_suspend(
                     std::coroutine_handle<promise_type> h) noexcept {
-                    auto consumer = h.promise().consumer_;
+                    auto& promise = h.promise();
+                    auto consumer = promise.consumer_;
+                    promise.leave_frame_context();
                     if (consumer) {
                         return consumer;  // symmetric transfer → consumer
                     }
@@ -202,7 +204,8 @@ public:
                 [[nodiscard]] bool await_ready() const noexcept { return false; }
 
                 [[nodiscard]] std::coroutine_handle<> await_suspend(
-                    std::coroutine_handle<>) noexcept {
+                    std::coroutine_handle<promise_type> h) noexcept {
+                    h.promise().leave_frame_context();
                     return consumer;  // symmetric transfer → consumer
                 }
 
@@ -265,6 +268,11 @@ public:
                 std::coroutine_handle<> consumer) noexcept {
                 // Tell the producer who to transfer back to.
                 producer.promise().consumer_ = consumer;
+                // Bind the producer to the consumer that actually drives this
+                // iteration. yield/final suspend restore that context before
+                // transferring control back, including after internal I/O.
+                producer.promise().enter_frame_context(
+                    promise_base::current_frame());
                 // Symmetric transfer → producer runs until co_yield / end.
                 return producer;
             }

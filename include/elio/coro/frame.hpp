@@ -48,6 +48,9 @@ inline void log_virtual_stack() {
 /// @note This uses implementation-specific knowledge of coroutine frame layout
 ///       but is portable across GCC and Clang. The frame layout is:
 ///       [resume_fn_ptr][destroy_fn_ptr][promise...]
+///       The stable promise prefix contains frame magic and the virtual-stack
+///       parent. Runtime policy lives behind promise_base's shared execution
+///       context and does not change this prefix.
 inline promise_base* get_promise_base(void* handle_addr) noexcept {
     if (!handle_addr) return nullptr;
     
@@ -79,7 +82,7 @@ inline bool check_affinity_allows(void* handle_addr, size_t worker_id) noexcept 
         return true;
     }
     
-    size_t affinity = promise->affinity();
+    size_t affinity = promise->effective_affinity();
     return affinity == NO_AFFINITY || affinity == worker_id;
 }
 
@@ -89,7 +92,15 @@ inline bool check_affinity_allows(void* handle_addr, size_t worker_id) noexcept 
 /// @return The worker affinity, or NO_AFFINITY if not set or invalid
 inline size_t get_affinity(void* handle_addr) noexcept {
     auto* promise = get_promise_base(handle_addr);
-    return promise ? promise->affinity() : NO_AFFINITY;
+    return promise ? promise->effective_affinity() : NO_AFFINITY;
+}
+
+/// Get shared runtime policy state from a live Elio coroutine handle.
+/// The returned reference keeps the context alive independently of the frame.
+inline std::shared_ptr<task_execution_context>
+get_execution_context(void* handle_addr) noexcept {
+    auto* promise = get_promise_base(handle_addr);
+    return promise ? promise->execution_context() : nullptr;
 }
 
 } // namespace elio::coro

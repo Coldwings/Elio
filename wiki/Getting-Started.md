@@ -297,7 +297,8 @@ include/elio/
 ├── elio.hpp              # Main include
 ├── coro/                 # Coroutine primitives
 │   ├── task.hpp          # task<T>
-│   ├── promise_base.hpp  # Virtual stack base
+│   ├── promise_base.hpp  # Virtual stack and runtime-state anchor
+│   ├── task_execution_context.hpp # Shared task runtime policy
 │   ├── frame.hpp         # Stack introspection
 │   ├── generator.hpp     # Async generator
 │   ├── cancel_token.hpp  # Cooperative cancellation

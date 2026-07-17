@@ -33,6 +33,15 @@ object does not represent running work: once ownership is transferred to the
 scheduler, use the `join_handle<T>` returned by `spawn()` when the work must be
 observed. Moving a task never migrates a running coroutine or pending I/O.
 
+Runtime policy is deliberately separate from this lazy owner. Every
+`promise_base` holds a `shared_ptr<task_execution_context>`, which currently
+stores caller-requested affinity and the internal worker-local flag. A
+scheduler-created join state shares that context with its wrapper promise, so
+the policy state can remain valid after frame destruction without a raw promise
+pointer. The context neither owns nor keeps the coroutine frame alive.
+Awaitables continue to own each pending operation's completion and cleanup
+state; those state machines are not moved into the task-wide context.
+
 ### Awaiting Tasks
 
 Use `co_await` to wait for a task to complete:
@@ -298,7 +307,10 @@ C++20 stackless coroutines do not maintain a call stack in the traditional sense
 
 Elio reconstructs this information through a **virtual stack**: an intrusive linked list of `promise_base` objects connected by `parent_` pointers. The `current_frame_` thread-local identifies the frame executing on a thread. A lazy `task<T>` does not remain installed merely because its frame is owned; when it is awaited, its `parent_` is rebound to the actual awaiting coroutine for that execution chain. Scheduler, synchronization, I/O, and affinity-migration resume paths preserve that parent and install the resumed frame for the duration of the resume call. Generator iteration similarly binds the producer to its active consumer and restores the consumer context before transferring a yielded value or completion. Initial scheduler ownership handoff, including targeted spawn, is separate and detaches construction-time ancestry.
 
-The overhead is minimal -- one pointer per coroutine frame, updated when logical ancestry is established.
+Virtual-stack ancestry itself costs one parent pointer per coroutine frame.
+Separately, `promise_base` holds a shared execution-context reference; the
+context has its own allocation and may outlive the frame when an external
+runtime owner retains it.
 
 ### What it enables
 
@@ -314,6 +326,10 @@ Each `promise_base` also carries debug metadata:
 - **`debug_id_`**: A lazily-allocated unique ID (batch-allocated per thread to avoid global contention).
 - **`debug_location_`**: Source file, function name, and line number.
 - **`debug_state_`**: Current state (created, running, suspended, completed, failed).
+
+Runtime policy is not debugger metadata. It is referenced through
+`execution_context_`; debugger scripts discover that field from symbols but do
+not decode implementation-specific `std::shared_ptr` internals.
 
 ## Coroutine Frame Allocation
 

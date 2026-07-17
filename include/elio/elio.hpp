@@ -14,6 +14,7 @@
 #define ELIO_VERSION_PATCH 0
 
 // Core coroutine types
+#include "coro/task_execution_context.hpp"
 #include "coro/promise_base.hpp"
 #include "coro/task.hpp"
 #include "coro/awaitable_base.hpp"

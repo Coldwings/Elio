@@ -215,7 +215,8 @@ elio::
 ├── coro::                    // Coroutine primitives
 │   ├── task<T>              // Primary coroutine type
 │   ├── join_handle<T>       // Handle for awaiting spawned tasks
-│   ├── promise_base         // Virtual stack base class
+│   ├── promise_base         // Virtual stack and runtime-state anchor
+│   ├── task_execution_context // Shared task runtime policy
 │   ├── awaitable_base<T>    // CRTP awaitable base
 │   └── frame utilities      // Virtual stack inspection
 │

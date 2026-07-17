@@ -133,6 +133,7 @@ class DebuggerScriptTests(unittest.TestCase):
             FakeGdbField("debug_state_", 384),
             FakeGdbField("debug_worker_id_", 416),
             FakeGdbField("debug_id_", 448),
+            FakeGdbField("execution_context_", 512),
         ])
         self.fake_gdb.lookup_type = lambda _name: promise_type
 
@@ -141,7 +142,9 @@ class DebuggerScriptTests(unittest.TestCase):
         self.assertEqual(layout["frame_magic_"], 0)
         self.assertEqual(layout["parent_"], 8)
         self.assertEqual(layout["debug_id_"], 56)
+        self.assertEqual(layout["execution_context_"], 64)
         self.assertTrue(layout["has_debug_metadata"])
+        self.assertTrue(layout["has_execution_context"])
 
     def test_gdb_layout_fallback_is_prefix_only(self):
         self.fake_gdb.lookup_type = lambda _name: (_ for _ in ()).throw(
@@ -153,6 +156,7 @@ class DebuggerScriptTests(unittest.TestCase):
             "frame_magic_": 0,
             "parent_": 8,
             "has_debug_metadata": False,
+            "has_execution_context": False,
         })
 
     def test_lldb_layout_discovery_and_fallback(self):
@@ -163,6 +167,7 @@ class DebuggerScriptTests(unittest.TestCase):
             FakeLldbField("debug_state_", 48),
             FakeLldbField("debug_worker_id_", 52),
             FakeLldbField("debug_id_", 56),
+            FakeLldbField("execution_context_", 64),
         ])
 
         layout = self.lldb_module.get_promise_layout(
@@ -172,10 +177,12 @@ class DebuggerScriptTests(unittest.TestCase):
 
         self.assertEqual(layout["debug_id_"], 56)
         self.assertTrue(layout["has_debug_metadata"])
+        self.assertTrue(layout["has_execution_context"])
         self.assertEqual(fallback, {
             "frame_magic_": 0,
             "parent_": 8,
             "has_debug_metadata": False,
+            "has_execution_context": False,
         })
 
 

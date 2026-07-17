@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <stdexcept>
 
 namespace elio::runtime {
 class scheduler;  // Forward declaration
@@ -91,9 +92,21 @@ struct task_access {
     static auto get_join_state(PromiseT& p) noexcept {
         return p.join_state_;
     }
+
+    template<typename T>
+    static std::shared_ptr<task_execution_context>
+    get_join_execution_context(const join_handle<T>& handle) noexcept;
 };
 
 struct join_state_base {
+    join_state_base()
+        : execution_context_(std::make_shared<task_execution_context>()) {}
+
+    explicit join_state_base(
+        std::shared_ptr<task_execution_context> execution_context)
+        : execution_context_(require_execution_context(
+              std::move(execution_context))) {}
+
     alignas(64) completion_waiter_slot waiter_;
     std::atomic<bool> completed_{false};
     std::atomic<bool> destroyed_{false};
@@ -131,16 +144,37 @@ struct join_state_base {
         return completed_.load(std::memory_order_acquire);
     }
 
+    [[nodiscard]] std::shared_ptr<task_execution_context>
+    execution_context() const noexcept {
+        return execution_context_;
+    }
+
     bool set_waiter(completion_waiter& waiter,
                     std::coroutine_handle<> h) noexcept {
         return waiter_.register_waiter(waiter, h, [this] {
             return completed_.load(std::memory_order_acquire);
         });
     }
+
+private:
+    static std::shared_ptr<task_execution_context> require_execution_context(
+        std::shared_ptr<task_execution_context> context) {
+        if (!context) {
+            throw std::invalid_argument(
+                "join state requires a task execution context");
+        }
+        return context;
+    }
+
+    const std::shared_ptr<task_execution_context> execution_context_;
 };
 
 template<typename T>
 struct join_state : join_state_base {
+    join_state() = default;
+    explicit join_state(std::shared_ptr<task_execution_context> context)
+        : join_state_base(std::move(context)) {}
+
     std::optional<T> value_;
     std::exception_ptr exception_;
 
@@ -162,6 +196,10 @@ struct join_state : join_state_base {
 
 template<>
 struct join_state<void> : join_state_base {
+    join_state() = default;
+    explicit join_state(std::shared_ptr<task_execution_context> context)
+        : join_state_base(std::move(context)) {}
+
     std::exception_ptr exception_;
 
     void set_value() { complete(); }
@@ -182,6 +220,7 @@ struct join_state<void> : join_state_base {
 /// Returned by elio::spawn(), allows co_await to get the result
 template<typename T>
 class join_handle {
+    friend struct detail::task_access;
 public:
     explicit join_handle(std::shared_ptr<detail::join_state<T>> state) noexcept
         : state_(std::move(state)), waiter_(state_->waiter_) {}
@@ -242,6 +281,7 @@ private:
 /// Specialization for void
 template<>
 class join_handle<void> {
+    friend struct detail::task_access;
 public:
     explicit join_handle(std::shared_ptr<detail::join_state<void>> state) noexcept
         : state_(std::move(state)), waiter_(state_->waiter_) {}
@@ -298,6 +338,13 @@ private:
     std::shared_ptr<detail::join_state<void>> state_;
     detail::completion_waiter waiter_;
 };
+
+template<typename T>
+std::shared_ptr<task_execution_context>
+detail::task_access::get_join_execution_context(
+    const join_handle<T>& handle) noexcept {
+    return handle.state_ ? handle.state_->execution_context() : nullptr;
+}
 
 /// Move-only, single-shot lazy coroutine owner for a non-void result.
 /// Moving transfers frame ownership and leaves the source empty.

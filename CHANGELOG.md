@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Shared task execution context**: Every `promise_base` now references a
+  shared `task_execution_context` control block. User affinity and the internal
+  worker-local flag moved into this block, while scheduler placement reads its
+  distinct effective-affinity boundary. Scheduler-created `join_handle` state
+  shares the same context as the spawned wrapper promise, so runtime policy can
+  outlive frame destruction without storing a raw promise pointer or keeping
+  the frame alive. Lazy `task<T>` objects still own only their coroutine handle;
+  operation completion state remains local to awaitables. Debugger layout
+  discovery and frame helpers have been updated for the new promise layout.
 - **Move-only lazy tasks**: `coro::task<T>` and `coro::task<void>` now support
   move construction and move assignment while remaining non-copyable. Moving a
   task transfers ownership of its unstarted coroutine frame and leaves the

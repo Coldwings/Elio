@@ -739,7 +739,8 @@ private:
         handle.promise().detach_from_parent();
 
         if constexpr (Joinable) {
-            auto state = std::make_shared<coro::detail::join_state<T>>();
+            auto state = std::make_shared<coro::detail::join_state<T>>(
+                handle.promise().execution_context());
             handle.promise().join_state_ = state;
             mark_tracked_(handle.promise());
             bool scheduled = false;
@@ -822,7 +823,7 @@ private:
         }
 
         if (promise && promise->is_worker_local()) {
-            size_t affinity = promise->affinity();
+            size_t affinity = promise->effective_affinity();
             if (affinity == worker_id && affinity < n &&
                 workers_[affinity] && workers_[affinity]->schedule(handle)) {
                 return true;
@@ -861,7 +862,8 @@ private:
 
         // Check if task has affinity - if so, schedule to that specific worker.
         auto* promise = coro::get_promise_base(handle.address());
-        size_t affinity = promise ? promise->affinity() : coro::NO_AFFINITY;
+        size_t affinity = promise ? promise->effective_affinity()
+                                  : coro::NO_AFFINITY;
         if (affinity != coro::NO_AFFINITY && affinity < n) {
             if (workers_[affinity] && workers_[affinity]->schedule(handle)) {
                 return true;
@@ -1091,7 +1093,8 @@ inline bool worker_thread::run_or_redistribute_retiring_task(
     scheduler* sched,
     std::coroutine_handle<> handle) noexcept {
     auto* promise = coro::get_promise_base(handle.address());
-    if (promise && promise->is_worker_local() && promise->affinity() == worker_id_) {
+    if (promise && promise->is_worker_local() &&
+        promise->effective_affinity() == worker_id_) {
         needs_sync_ = true;
         run_task(handle);
         return true;
@@ -1386,7 +1389,8 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
         if (handle) {
             // Check if this task has affinity for a different worker
             auto* promise = coro::get_promise_base(handle.address());
-            size_t affinity = promise ? promise->affinity() : coro::NO_AFFINITY;
+            size_t affinity = promise ? promise->effective_affinity()
+                                      : coro::NO_AFFINITY;
 
             if (promise && promise->is_worker_local()) {
                 if (affinity == worker_id_) {

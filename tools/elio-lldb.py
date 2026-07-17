@@ -90,6 +90,7 @@ def get_promise_layout(process, _ptr_size):
         "frame_magic_": 0,
         "parent_": 8,
         "has_debug_metadata": False,
+        "has_execution_context": False,
     }
 
     try:
@@ -109,6 +110,9 @@ def get_promise_layout(process, _ptr_size):
         has_debug_metadata = all(name in offsets for name in (
             "debug_location_", "debug_state_", "debug_worker_id_", "debug_id_"))
         offsets["has_debug_metadata"] = has_debug_metadata
+        # std::shared_ptr representation is library specific. Record only that
+        # the current promise layout exposes the execution-context field.
+        offsets["has_execution_context"] = "execution_context_" in offsets
         return offsets
     except Exception:
         return fallback
@@ -220,7 +224,8 @@ def get_frame_from_handle(process, handle_addr):
             "line": line if has_debug_metadata else 0,
             "address": handle_addr,
             "promise_addr": promise_addr,
-            "has_debug_metadata": has_debug_metadata
+            "has_debug_metadata": has_debug_metadata,
+            "has_execution_context": layout["has_execution_context"]
         }
     except Exception as e:
         return None

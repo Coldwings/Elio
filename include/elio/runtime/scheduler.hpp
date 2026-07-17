@@ -694,10 +694,9 @@ private:
     /// window.
     void mark_tracked_(coro::promise_base& p) noexcept {
         on_task_spawned();
-        p.on_spawn_completion_data_ = this;
-        p.on_spawn_completion_ = +[](void* self) noexcept {
+        p.set_spawn_completion(+[](void* self) noexcept {
             static_cast<scheduler*>(self)->on_task_completed();
-        };
+        }, this);
     }
 
     template<bool Joinable, bool Pinned, typename F, typename... Args>
@@ -1250,7 +1249,7 @@ inline void worker_thread::run_task(std::coroutine_handle<> handle) noexcept {
 
     // Restore the virtual-stack frame context while user code is running.
     auto* promise = coro::get_promise_base(handle.address());
-    coro::frame_context_scope frame_scope(promise);
+    coro::detail::frame_context_scope frame_scope(promise);
     handle.resume();
     tasks_executed_.fetch_add(1, std::memory_order_relaxed);
     update_last_task_time();

@@ -108,6 +108,46 @@ def read_cstring(addr):
         return None
 
 
+def align_up(value, alignment):
+    """Round an offset up to the requested ABI alignment."""
+    return (value + alignment - 1) // alignment * alignment
+
+
+def get_promise_layout(ptr_size):
+    """Resolve promise_base field offsets, with a stripped-binary fallback."""
+    debug_location_offset = 8 + ptr_size + ptr_size
+    debug_location_size = align_up(2 * ptr_size + 4, ptr_size)
+    state_offset = debug_location_offset + debug_location_size
+    worker_id_offset = align_up(state_offset + 1, 4)
+    debug_id_offset = align_up(worker_id_offset + 4, min(8, ptr_size))
+    fallback = {
+        "frame_magic_": 0,
+        "parent_": 8,
+        "debug_location_": debug_location_offset,
+        "debug_state_": state_offset,
+        "debug_worker_id_": worker_id_offset,
+        "debug_id_": debug_id_offset,
+        "has_debug_metadata": True,
+    }
+
+    try:
+        promise_type = gdb.lookup_type("elio::coro::promise_base").strip_typedefs()
+        offsets = {}
+        for field in promise_type.fields():
+            if field.name and field.bitpos is not None:
+                offsets[field.name] = int(field.bitpos) // 8
+
+        if "frame_magic_" not in offsets or "parent_" not in offsets:
+            return fallback
+
+        has_debug_metadata = all(name in offsets for name in (
+            "debug_location_", "debug_state_", "debug_worker_id_", "debug_id_"))
+        offsets["has_debug_metadata"] = has_debug_metadata
+        return offsets
+    except Exception:
+        return fallback
+
+
 def get_frame_from_handle(handle_addr):
     """Extract promise_base info from a coroutine handle address.
 
@@ -129,32 +169,39 @@ def get_frame_from_handle(handle_addr):
 
         # Promise is typically at offset 2*ptr_size (after resume and destroy)
         promise_addr = handle_addr + 2 * ptr_size
+        layout = get_promise_layout(ptr_size)
 
         # Read magic to validate
         inferior = gdb.selected_inferior()
-        magic_bytes = inferior.read_memory(promise_addr, 8)
+        magic_bytes = inferior.read_memory(
+            promise_addr + layout["frame_magic_"], 8)
         magic = int.from_bytes(bytes(magic_bytes), 'little')
 
         if magic != FRAME_MAGIC:
             return None
 
-        # Read promise_base fields (layout varies based on ELIO_ENABLE_DEBUG_METADATA)
-        # Base layout (always present): magic(8) + parent(8) + exception(16)
-        # Debug layout (when enabled): + debug_location(24) + state(1) + pad(3) + worker_id(4) + debug_id(8)
-        # Affinity: size_t (8 bytes on 64-bit)
+        # Resolve field offsets from debug information when available. The
+        # fallback matches the stable magic/parent prefix and supported
+        # GCC/Clang standard-library ABIs.
 
         # Read parent pointer (always present)
-        parent_bytes = inferior.read_memory(promise_addr + 8, ptr_size)
+        parent_bytes = inferior.read_memory(
+            promise_addr + layout["parent_"], ptr_size)
         parent = int.from_bytes(bytes(parent_bytes), 'little')
 
-        # Try to detect if debug metadata is present by checking if debug_state_ exists
-        # We'll try to read the debug fields and gracefully handle failures
-
-        # First, try to read debug metadata (assume enabled by default)
-        has_debug_metadata = True
-        debug_location_offset = 8 + ptr_size + 16  # magic + parent + exception_ptr
+        has_debug_metadata = layout["has_debug_metadata"]
+        file_ptr = 0
+        func_ptr = 0
+        line = 0
+        state = 1
+        worker_id = 0xFFFFFFFF
+        debug_id = 0
 
         try:
+            if not has_debug_metadata:
+                raise ValueError("debug metadata is disabled")
+
+            debug_location_offset = layout["debug_location_"]
             # Try reading debug_location.file pointer
             file_ptr_bytes = inferior.read_memory(promise_addr + debug_location_offset, ptr_size)
             file_ptr = int.from_bytes(bytes(file_ptr_bytes), 'little')
@@ -165,27 +212,20 @@ def get_frame_from_handle(handle_addr):
             line_bytes = inferior.read_memory(promise_addr + debug_location_offset + 2 * ptr_size, 4)
             line = int.from_bytes(bytes(line_bytes), 'little')
 
-            # state at debug_location_offset + 24
-            state_offset = debug_location_offset + 2 * ptr_size + 4
-            state_byte = inferior.read_memory(promise_addr + state_offset, 1)
+            state_byte = inferior.read_memory(
+                promise_addr + layout["debug_state_"], 1)
             state = int.from_bytes(bytes(state_byte), 'little')
 
-            # worker_id at state_offset + 4 (after 3 bytes padding)
-            worker_id_bytes = inferior.read_memory(promise_addr + state_offset + 4, 4)
+            worker_id_bytes = inferior.read_memory(
+                promise_addr + layout["debug_worker_id_"], 4)
             worker_id = int.from_bytes(bytes(worker_id_bytes), 'little')
 
-            # debug_id at worker_id + 4
-            debug_id_bytes = inferior.read_memory(promise_addr + state_offset + 8, 8)
+            debug_id_bytes = inferior.read_memory(
+                promise_addr + layout["debug_id_"], 8)
             debug_id = int.from_bytes(bytes(debug_id_bytes), 'little')
-        except Exception as e:
+        except Exception:
             # Debug metadata not available - use defaults
             has_debug_metadata = False
-            file_ptr = 0
-            func_ptr = 0
-            line = 0
-            state = 1  # running
-            worker_id = 0xFFFFFFFF  # Unknown
-            debug_id = 0
 
         # Read strings (only if debug metadata enabled)
         file_str = None

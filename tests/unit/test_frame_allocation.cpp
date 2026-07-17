@@ -33,7 +33,36 @@ concept has_class_specific_allocation = requires(std::size_t size, void* ptr) {
     Promise::operator delete(ptr, size);
 };
 
-task<void> empty_task() {
+struct destruction_observation {
+    std::thread::id thread_id;
+    bool called = false;
+};
+
+struct frame_destruction_probe {
+    destruction_observation* observation;
+
+    explicit frame_destruction_probe(
+        destruction_observation* target) noexcept
+        : observation(target) {}
+
+    frame_destruction_probe(const frame_destruction_probe&) = delete;
+    frame_destruction_probe& operator=(const frame_destruction_probe&) = delete;
+
+    frame_destruction_probe(frame_destruction_probe&& other) noexcept
+        : observation(other.observation) {
+        other.observation = nullptr;
+    }
+
+    ~frame_destruction_probe() {
+        if (observation) {
+            observation->thread_id = std::this_thread::get_id();
+            observation->called = true;
+        }
+    }
+};
+
+task<void> task_with_destruction_probe(frame_destruction_probe probe) {
+    (void)probe;
     co_return;
 }
 
@@ -70,11 +99,6 @@ task<void> observe_nested_over_aligned_locals(std::atomic<int>* aligned_count) {
     }
 }
 
-struct destruction_observation {
-    std::thread::id thread_id;
-    bool called = false;
-};
-
 struct io_observation {
     std::mutex mutex;
     std::condition_variable cv;
@@ -107,19 +131,35 @@ TEST_CASE("task promises use standard coroutine frame allocation",
     STATIC_REQUIRE_FALSE(has_class_specific_allocation<task<int>::promise_type>);
 }
 
+TEST_CASE("promise_base retains its debugger-visible frame prefix",
+          "[frame_allocation][virtual_stack][debugger]") {
+    STATIC_REQUIRE(std::is_standard_layout_v<promise_base>);
+
+    auto* previous_frame = promise_base::current_frame();
+    {
+        promise_base parent;
+        promise_base child;
+        uint64_t magic = 0;
+        promise_base* recorded_parent = nullptr;
+        const auto* bytes = reinterpret_cast<const std::byte*>(&child);
+
+        std::memcpy(&magic, bytes, sizeof(magic));
+        std::memcpy(&recorded_parent, bytes + sizeof(magic),
+                    sizeof(recorded_parent));
+
+        REQUIRE(magic == promise_base::FRAME_MAGIC);
+        REQUIRE(recorded_parent == &parent);
+    }
+    REQUIRE(promise_base::current_frame() == previous_frame);
+}
+
 TEST_CASE("detached task frame can be destroyed on another thread",
           "[task][frame_allocation][thread]") {
     auto* previous_frame = promise_base::current_frame();
-    auto t = empty_task();
-    auto handle = elio::coro::detail::task_access::release(t);
     destruction_observation observation;
-
-    handle.promise().on_spawn_completion_data_ = &observation;
-    handle.promise().on_spawn_completion_ = +[](void* data) noexcept {
-        auto* observed = static_cast<destruction_observation*>(data);
-        observed->thread_id = std::this_thread::get_id();
-        observed->called = true;
-    };
+    auto t = task_with_destruction_probe(
+        frame_destruction_probe{&observation});
+    auto handle = elio::coro::detail::task_access::release(t);
     handle.promise().detach_from_parent();
     promise_base::set_current_frame(previous_frame);
 

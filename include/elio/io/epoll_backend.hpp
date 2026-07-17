@@ -839,7 +839,7 @@ private:
     /// Resume a coroutine with its virtual-stack frame context installed.
     static void safe_resume(std::coroutine_handle<> handle) {
         auto* promise = coro::get_promise_base(handle.address());
-        coro::frame_context_scope frame_scope(promise);
+        coro::detail::frame_context_scope frame_scope(promise);
         handle.resume();
     }
 

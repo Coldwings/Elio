@@ -45,7 +45,7 @@ class task {
 public:
     using promise_type = /* implementation */;
     
-    // Non-copyable, non-movable (ensures LIFO destruction order)
+    // Non-copyable, non-movable
     task(const task&) = delete;
     task& operator=(const task&) = delete;
     task(task&&) = delete;

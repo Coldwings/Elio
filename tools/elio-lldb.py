@@ -77,6 +77,50 @@ def read_pointer(process, addr):
     return process.ReadUnsignedFromMemory(addr, ptr_size, error)
 
 
+def align_up(value, alignment):
+    """Round an offset up to the requested ABI alignment."""
+    return (value + alignment - 1) // alignment * alignment
+
+
+def get_promise_layout(process, ptr_size):
+    """Resolve promise_base field offsets, with a stripped-binary fallback."""
+    debug_location_offset = 8 + ptr_size + ptr_size
+    debug_location_size = align_up(2 * ptr_size + 4, ptr_size)
+    state_offset = debug_location_offset + debug_location_size
+    worker_id_offset = align_up(state_offset + 1, 4)
+    debug_id_offset = align_up(worker_id_offset + 4, min(8, ptr_size))
+    fallback = {
+        "frame_magic_": 0,
+        "parent_": 8,
+        "debug_location_": debug_location_offset,
+        "debug_state_": state_offset,
+        "debug_worker_id_": worker_id_offset,
+        "debug_id_": debug_id_offset,
+        "has_debug_metadata": True,
+    }
+
+    try:
+        promise_type = process.GetTarget().FindFirstType(
+            "elio::coro::promise_base")
+        if not promise_type.IsValid():
+            return fallback
+
+        offsets = {}
+        for index in range(promise_type.GetNumberOfFields()):
+            field = promise_type.GetFieldAtIndex(index)
+            offsets[field.GetName()] = field.GetOffsetInBytes()
+
+        if "frame_magic_" not in offsets or "parent_" not in offsets:
+            return fallback
+
+        has_debug_metadata = all(name in offsets for name in (
+            "debug_location_", "debug_state_", "debug_worker_id_", "debug_id_"))
+        offsets["has_debug_metadata"] = has_debug_metadata
+        return offsets
+    except Exception:
+        return fallback
+
+
 def get_scheduler(target, process):
     """Find the current scheduler."""
     # Try to find scheduler::current()
@@ -128,51 +172,49 @@ def get_frame_from_handle(process, handle_addr):
 
         # Promise is typically at offset 2*ptr_size (after resume and destroy)
         promise_addr = handle_addr + 2 * ptr_size
+        layout = get_promise_layout(process, ptr_size)
 
         # Read magic to validate
-        magic = read_uint64(process, promise_addr)
+        magic = read_uint64(process, promise_addr + layout["frame_magic_"])
         if magic != FRAME_MAGIC:
             return None
 
-        # Read promise_base fields (layout varies based on ELIO_ENABLE_DEBUG_METADATA)
-        # Base layout (always present): magic(8) + parent(8) + exception(16)
-        # Debug layout (when enabled): + debug_location(24) + state(1) + pad(3) + worker_id(4) + debug_id(8)
-        # Affinity: size_t (8 bytes on 64-bit)
+        # Resolve field offsets from debug information when available. The
+        # fallback matches the stable magic/parent prefix and supported
+        # GCC/Clang standard-library ABIs.
 
         # Read parent pointer (always present)
-        parent = read_pointer(process, promise_addr + 8)
+        parent = read_pointer(process, promise_addr + layout["parent_"])
 
-        # Try to detect if debug metadata is present
-        # We'll try to read the debug fields and gracefully handle failures
-
-        # First, try to read debug metadata (assume enabled by default)
-        has_debug_metadata = True
-        debug_location_offset = 8 + ptr_size + 16  # magic + parent + exception_ptr
+        has_debug_metadata = layout["has_debug_metadata"]
+        file_ptr = 0
+        func_ptr = 0
+        line = 0
+        state = 1
+        worker_id = 0xFFFFFFFF
+        debug_id = 0
 
         try:
+            if not has_debug_metadata:
+                raise ValueError("debug metadata is disabled")
+
+            debug_location_offset = layout["debug_location_"]
             # Try reading debug_location.file pointer
             file_ptr = read_pointer(process, promise_addr + debug_location_offset)
             func_ptr = read_pointer(process, promise_addr + debug_location_offset + ptr_size)
             line = read_uint32(process, promise_addr + debug_location_offset + 2 * ptr_size)
 
-            # state at debug_location_offset + 24
-            state_offset = debug_location_offset + 2 * ptr_size + 4
-            state = read_uint8(process, promise_addr + state_offset)
+            state = read_uint8(
+                process, promise_addr + layout["debug_state_"])
 
-            # worker_id at state_offset + 4 (after 3 bytes padding)
-            worker_id = read_uint32(process, promise_addr + state_offset + 4)
+            worker_id = read_uint32(
+                process, promise_addr + layout["debug_worker_id_"])
 
-            # debug_id at worker_id + 4
-            debug_id = read_uint64(process, promise_addr + state_offset + 8)
-        except Exception as e:
+            debug_id = read_uint64(
+                process, promise_addr + layout["debug_id_"])
+        except Exception:
             # Debug metadata not available - use defaults
             has_debug_metadata = False
-            file_ptr = 0
-            func_ptr = 0
-            line = 0
-            state = 1  # running
-            worker_id = 0xFFFFFFFF  # Unknown
-            debug_id = 0
 
         return {
             "id": debug_id,

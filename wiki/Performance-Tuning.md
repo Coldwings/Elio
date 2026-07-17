@@ -17,13 +17,11 @@ Elio is designed for high performance through:
 
 | Operation | Typical | Best Case | Notes |
 |-----------|---------|-----------|-------|
-| Task Spawn | ~1300 ns | ~570 ns | Best with pre-allocated frames |
+| Task Spawn | Benchmark-dependent | - | Standard heap frames |
 | Context Switch | ~230 ns | ~212 ns | Suspend and resume |
 | Yield | ~30 ns | ~16 ns | Per 1000 vthreads |
 | MPSC push | ~5 ns | - | Cross-thread scheduling |
 | Chase-Lev push | ~13 ns | - | Local queue operation |
-| Frame alloc (cold) | ~250 ns | - | First allocation |
-| Frame alloc (hot) | ~72 ns | - | Pool hit |
 
 ### I/O Benchmarks
 
@@ -326,7 +324,7 @@ Keep coroutine frames small to reduce allocation and cache cost:
 ```cpp
 // Bad: Large array increases every coroutine frame allocation
 coro::task<void> large_frame() {
-    char buffer[8192];  // Too large for pool
+    char buffer[8192];  // Increases every frame allocation
     co_await read_data(buffer);
 }
 

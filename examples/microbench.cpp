@@ -38,11 +38,11 @@ int main() {
 
         std::cout << "Coroutine frame alloc (cold): " << (ns / N) << " ns/task" << std::endl;
 
-        // Cleanup - this will return frames to pool
+        // Destroy the first-pass frames.
         for (auto h : handles) h.destroy();
     }
 
-    // 2. Measure coroutine frame allocation (warm - pool has frames)
+    // 2. Repeat frame allocation to expose allocator/cache warm-up effects.
     {
         std::vector<std::coroutine_handle<>> handles;
         handles.reserve(N);

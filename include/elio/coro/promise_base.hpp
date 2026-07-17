@@ -4,6 +4,11 @@
 #include <atomic>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
+
+namespace elio::runtime {
+class scheduler;
+}
 
 namespace elio::coro {
 
@@ -97,23 +102,6 @@ public:
     {
         current_frame_ = this;
     }
-
-    /// Optional callback invoked from the promise destructor to notify a
-    /// scheduler that a tracked task is going away. Set by
-    /// ``scheduler::go``/``go_to``/``go_joinable`` immediately after the
-    /// matching ``on_task_spawned()`` call; cleared on no-op promises
-    /// (e.g. tasks ``co_await``-ed inline by user code).
-    ///
-    /// Living in the promise (not in a body-local guard) is the key:
-    /// the promise is constructed when the coroutine *frame* is allocated
-    /// (i.e. at ``sched.go``-time, before the wrapper body has had a
-    /// chance to run) and destructed when the frame is freed — including
-    /// the corner case where ``handle.destroy()`` runs on a handle whose
-    /// body never executed (e.g. drained out of an inbox during shutdown).
-    /// A body-local guard misses both endpoints in that corner case.
-    using spawn_completion_fn = void (*)(void*) noexcept;
-    spawn_completion_fn on_spawn_completion_ = nullptr;
-    void* on_spawn_completion_data_ = nullptr;
 
     ~promise_base() noexcept {
         // Invoke spawn-completion callback first. This is the universal
@@ -255,6 +243,18 @@ public:
     }
 
 private:
+    friend class runtime::scheduler;
+
+    /// Optional callback invoked from the promise destructor to notify a
+    /// scheduler that a tracked task is going away. Living in the promise
+    /// covers frames destroyed before their coroutine body starts.
+    using spawn_completion_fn = void (*)(void*) noexcept;
+
+    void set_spawn_completion(spawn_completion_fn callback, void* data) noexcept {
+        on_spawn_completion_data_ = data;
+        on_spawn_completion_ = callback;
+    }
+
     // Magic number at start for debugger validation
     uint64_t frame_magic_;
 
@@ -278,12 +278,22 @@ private:
     // must not be migrated when their affinity owner is retired.
     std::atomic<bool> worker_local_{false};
 
+    // Keep scheduler accounting after the debugger-visible frame fields so the
+    // stable magic/parent prefix remains at the start of promise_base.
+    spawn_completion_fn on_spawn_completion_ = nullptr;
+    void* on_spawn_completion_data_ = nullptr;
+
     static inline thread_local promise_base* current_frame_ = nullptr;
 };
+
+static_assert(std::is_standard_layout_v<promise_base>,
+              "promise_base must retain a debugger-readable member layout");
 
 /// Install a coroutine as the current virtual-stack frame for one resume call.
 /// The previous virtual-stack frame is restored when control returns to the
 /// resumer.
+namespace detail {
+
 class frame_context_scope {
 public:
     explicit frame_context_scope(promise_base* frame) noexcept
@@ -303,5 +313,7 @@ public:
 private:
     promise_base* previous_;
 };
+
+} // namespace detail
 
 } // namespace elio::coro

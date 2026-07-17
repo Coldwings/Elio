@@ -979,7 +979,13 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
     if (!handle) return;
 
     auto* sched = scheduler::current();
-    if (sched && sched->is_running() && sched->try_schedule(handle)) {
+    if (sched) {
+        if (sched->is_running() && sched->try_schedule(handle)) {
+            return;
+        }
+        // This handle may be bound to a worker's I/O backend. Once its
+        // scheduler has stopped, resuming it on this arbitrary caller thread
+        // is unsafe; leave lifetime resolution to its task owner/shutdown.
         return;
     }
 
@@ -1069,11 +1075,9 @@ inline void worker_thread::stop() {
 /// Final cleanup for any orphaned tasks - only call after ALL workers have stopped.
 /// This is a safety net for edge cases where tasks might still exist after drain phase.
 inline void worker_thread::drain_remaining_tasks() noexcept {
-    // First drain inbox to deque
+    // First drain external queues to the local deque.
+    drain_inbox();
     void* addr;
-    while ((addr = inbox_->pop()) != nullptr) {
-        queue_->push(addr);
-    }
     // Destroy any remaining tasks (should be rare after drain phase in run())
     while ((addr = queue_->pop()) != nullptr) {
         auto handle = std::coroutine_handle<>::from_address(addr);
@@ -1114,11 +1118,9 @@ inline bool worker_thread::run_or_redistribute_retiring_task(
 
 /// Redistribute remaining tasks to active workers - call during thread pool shrink
 inline void worker_thread::redistribute_tasks(scheduler* sched) noexcept {
-    // First drain inbox to deque
+    // First drain external queues to the local deque.
+    drain_inbox();
     void* addr;
-    while ((addr = inbox_->pop()) != nullptr) {
-        queue_->push(addr);
-    }
     // Then redistribute all tasks to active workers
     while ((addr = queue_->pop()) != nullptr) {
         auto handle = std::coroutine_handle<>::from_address(addr);
@@ -1134,11 +1136,23 @@ inline void worker_thread::redistribute_tasks(scheduler* sched) noexcept {
 }
 
 inline void worker_thread::drain_inbox() noexcept {
-    // Drain MPSC inbox into local Chase-Lev deque
-    // Drain all available items to ensure tasks aren't stuck in inbox
+    // Drain the MPSC fast path into the local Chase-Lev deque.
     void* item;
     while ((item = inbox_->pop()) != nullptr) {
         queue_->push(item);
+    }
+
+    // Overflow is used only after bounded inbox retries. Swap under the lock
+    // so producers are never held while the worker updates its local deque.
+    std::deque<void*> overflow;
+    {
+        std::lock_guard<std::mutex> lock(overflow_mutex_);
+        overflow.swap(overflow_);
+        overflow_size_.fetch_sub(overflow.size(), std::memory_order_acq_rel);
+    }
+    while (!overflow.empty()) {
+        queue_->push(overflow.front());
+        overflow.pop_front();
     }
 }
 
@@ -1402,7 +1416,8 @@ inline void worker_thread::poll_io_when_idle() {
     // Optional spinning phase (if configured via wait_strategy)
     if (strategy_.spin_iterations > 0) {
         for (size_t i = 0; i < strategy_.spin_iterations; ++i) {
-            if (inbox_->size_approx() > 0) {
+            if (inbox_->size_approx() > 0 ||
+                overflow_size_.load(std::memory_order_acquire) > 0) {
                 idle_.store(false, std::memory_order_relaxed);
                 return;
             }

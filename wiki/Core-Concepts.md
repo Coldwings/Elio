@@ -284,7 +284,7 @@ All three functions are also available in the `elio` namespace as convenience al
 
 **Why Chase-Lev deque.** The Chase-Lev algorithm gives the owner thread lock-free push and pop operations with no atomic read-modify-write on the fast path. Contention only occurs when the deque has a single element and both the owner and a thief attempt to take it simultaneously. The deque also supports dynamic resizing by replacing the underlying circular buffer, which avoids the need to pre-allocate a fixed upper bound.
 
-**Why MPSC inbox for external submissions.** Cross-thread task submissions (e.g., spawning a task onto a specific worker from another thread) go through a bounded MPSC ring buffer rather than directly into the Chase-Lev deque. This separation keeps the deque's invariants simple -- only the owner ever pushes -- and the bounded capacity with cache-line aligned slots (`alignas(64)`) eliminates false sharing between producers and the consumer.
+**Why MPSC inbox for external submissions.** Cross-thread task submissions (e.g., spawning a task onto a specific worker from another thread) go through a bounded MPSC ring buffer rather than directly into the Chase-Lev deque. This separation keeps the deque's invariants simple -- only the owner ever pushes -- and the bounded capacity with cache-line aligned slots (`alignas(64)`) eliminates false sharing between producers and the consumer. If a sustained burst fills the ring after bounded retries, submissions spill into a locked per-worker overflow queue. This rare slow path preserves worker affinity and borrowed coroutine ownership instead of resuming on the submitting thread.
 
 ## Vthreads And The Virtual Stack
 

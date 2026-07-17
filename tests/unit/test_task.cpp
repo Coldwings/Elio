@@ -8,6 +8,7 @@
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/affinity.hpp>
 #include <elio/sync/event.hpp>
+#include <elio/time/timer.hpp>
 #include <string>
 #include <atomic>
 #include <chrono>
@@ -356,6 +357,72 @@ TEST_CASE("rejected resume scheduling preserves task ownership",
     }
 
     REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+}
+
+TEST_CASE("resume overflow preserves worker execution context",
+          "[task][ownership][scheduler][overflow][io]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> blocker_started{false};
+    std::atomic<bool> release_blocker{false};
+    auto blocker_fn = [&]() -> task<void> {
+        blocker_started.store(true, std::memory_order_release);
+        blocker_started.notify_one();
+        while (!release_blocker.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        co_return;
+    };
+    auto blocker = blocker_fn();
+    sched.spawn(elio::coro::detail::task_access::release(std::move(blocker)));
+
+    auto start_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!blocker_started.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < start_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!blocker_started.load(std::memory_order_acquire)) {
+        release_blocker.store(true, std::memory_order_release);
+        sched.shutdown_force();
+    }
+    REQUIRE(blocker_started.load(std::memory_order_acquire));
+
+    for (size_t i = 0; i < mpsc_queue<void>::capacity; ++i) {
+        auto filler = simple_void();
+        sched.spawn(elio::coro::detail::task_access::release(std::move(filler)));
+    }
+
+    std::atomic<size_t> first_worker{NO_AFFINITY};
+    std::atomic<size_t> second_worker{NO_AFFINITY};
+    std::atomic<bool> completed{false};
+    auto resumed_fn = [&]() -> task<void> {
+        first_worker.store(current_worker_id(), std::memory_order_release);
+        co_await elio::time::sleep_for(scaled_ms(1));
+        second_worker.store(current_worker_id(), std::memory_order_release);
+        completed.store(true, std::memory_order_release);
+        completed.notify_one();
+    };
+    auto resumed = resumed_fn();
+
+    REQUIRE(sched.try_schedule(get_handle(resumed)));
+    release_blocker.store(true, std::memory_order_release);
+    release_blocker.notify_one();
+
+    auto completion_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < completion_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool did_complete = completed.load(std::memory_order_acquire);
+    const bool drained = sched.wait_for_idle(scaled_sec(5));
+
+    sched.shutdown();
+
+    REQUIRE(did_complete);
+    REQUIRE(first_worker.load(std::memory_order_acquire) == 0);
+    REQUIRE(second_worker.load(std::memory_order_acquire) == 0);
+    REQUIRE(drained);
 }
 
 TEST_CASE("destroyed task_handle waiter is unregistered",

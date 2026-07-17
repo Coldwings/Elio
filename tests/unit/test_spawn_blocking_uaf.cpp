@@ -1,10 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/runtime/affinity.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/spawn_blocking.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <string_view>
 #include <thread>
 
 #include "../test_main.cpp"  // For scaled_ms / scaled_sec
@@ -13,54 +15,6 @@ using namespace elio::runtime;
 using namespace elio::coro;
 using namespace elio::test;
 using namespace std::chrono_literals;
-
-namespace {
-
-struct scheduler_handoff_race_context {
-    std::atomic<bool> before_spawn{false};
-    std::atomic<bool> proceed{false};
-    std::atomic<bool> after_spawn{false};
-};
-
-void pause_before_scheduler_spawn(void* ptr) noexcept {
-    auto* ctx = static_cast<scheduler_handoff_race_context*>(ptr);
-    ctx->before_spawn.store(true, std::memory_order_release);
-    while (!ctx->proceed.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
-}
-
-void mark_after_scheduler_spawn(void* ptr) noexcept {
-    auto* ctx = static_cast<scheduler_handoff_race_context*>(ptr);
-    ctx->after_spawn.store(true, std::memory_order_release);
-}
-
-class scheduler_spawn_hook_guard {
-public:
-    explicit scheduler_spawn_hook_guard(scheduler_handoff_race_context& ctx) {
-        elio::detail::before_scheduler_spawn_hook.context.store(
-            &ctx, std::memory_order_release);
-        elio::detail::before_scheduler_spawn_hook.callback.store(
-            &pause_before_scheduler_spawn, std::memory_order_release);
-        elio::detail::after_scheduler_spawn_hook.context.store(
-            &ctx, std::memory_order_release);
-        elio::detail::after_scheduler_spawn_hook.callback.store(
-            &mark_after_scheduler_spawn, std::memory_order_release);
-    }
-
-    ~scheduler_spawn_hook_guard() {
-        elio::detail::before_scheduler_spawn_hook.callback.store(
-            nullptr, std::memory_order_release);
-        elio::detail::before_scheduler_spawn_hook.context.store(
-            nullptr, std::memory_order_release);
-        elio::detail::after_scheduler_spawn_hook.callback.store(
-            nullptr, std::memory_order_release);
-        elio::detail::after_scheduler_spawn_hook.context.store(
-            nullptr, std::memory_order_release);
-    }
-};
-
-} // namespace
 
 // ---------------------------------------------------------------------------
 // Normal operation: spawn_blocking completes before coroutine destruction
@@ -327,45 +281,31 @@ TEST_CASE("spawn_blocking detached thread fallback completes without self-deadlo
     REQUIRE(result.load(std::memory_order_acquire) == 123);
 }
 
-TEST_CASE("spawn_blocking scheduler handoff rejection avoids self-deadlock",
-          "[spawn_blocking][shutdown]") {
+TEST_CASE("spawn_blocking pool rejection stays on the scheduler worker",
+          "[spawn_blocking][shutdown][affinity]") {
     scheduler sched(1);
     sched.start();
     sched.get_blocking_pool()->shutdown();
 
-    scheduler_handoff_race_context ctx;
-    scheduler_spawn_hook_guard hooks(ctx);
-
-    auto task_fn = []() -> task<void> {
-        co_await elio::spawn_blocking([] {});
+    std::atomic<bool> rejected{false};
+    std::atomic<size_t> before_worker{NO_AFFINITY};
+    std::atomic<size_t> after_worker{NO_AFFINITY};
+    auto task_fn = [&]() -> task<void> {
+        before_worker.store(current_worker_id(), std::memory_order_release);
+        try {
+            co_await elio::spawn_blocking([] {});
+        } catch (const std::runtime_error& ex) {
+            rejected.store(
+                std::string_view(ex.what()).starts_with("spawn_blocking rejected:"),
+                std::memory_order_release);
+        }
+        after_worker.store(current_worker_id(), std::memory_order_release);
     };
 
     sched.go(task_fn);
 
-    const auto before_deadline =
-        std::chrono::steady_clock::now() + scaled_ms(5000);
-    while (!ctx.before_spawn.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < before_deadline) {
-        std::this_thread::sleep_for(scaled_ms(10));
-    }
-    REQUIRE(ctx.before_spawn.load(std::memory_order_acquire));
-
-    sched.shutdown_force();
-    ctx.proceed.store(true, std::memory_order_release);
-
-    const auto after_deadline =
-        std::chrono::steady_clock::now() + scaled_ms(5000);
-    while (!ctx.after_spawn.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < after_deadline) {
-        std::this_thread::sleep_for(scaled_ms(10));
-    }
-    REQUIRE(ctx.after_spawn.load(std::memory_order_acquire));
-
-    const auto idle_deadline =
-        std::chrono::steady_clock::now() + scaled_ms(5000);
-    while (sched.active_tasks() != 0 &&
-           std::chrono::steady_clock::now() < idle_deadline) {
-        std::this_thread::sleep_for(scaled_ms(10));
-    }
-    REQUIRE(sched.active_tasks() == 0);
+    REQUIRE(sched.shutdown(scaled_ms(5000)));
+    REQUIRE(rejected.load(std::memory_order_acquire));
+    REQUIRE(before_worker.load(std::memory_order_acquire) == 0);
+    REQUIRE(after_worker.load(std::memory_order_acquire) == 0);
 }

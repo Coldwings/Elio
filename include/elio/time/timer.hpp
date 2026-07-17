@@ -63,14 +63,10 @@ inline bool submit_blocking(F&& work) {
             // rejection branch. Drop.
             return false;
         }
-        // Scheduler exists, is running, but exposes no pool: fall through
-        // to the standalone detached-thread path.
+        // A scheduler-bound continuation must not move to a detached thread.
+        return false;
     }
-    // Standalone use (no scheduler) or scheduler-running-without-pool:
-    // detached thread is safe because the work captures either a null
-    // ``sched`` (resume falls through to direct ``handle.resume()`` with
-    // no scheduler context to dangle) or a scheduler that stays alive
-    // past the resume.
+    // Standalone use has no scheduler/backend affinity to preserve.
     std::thread(std::forward<F>(work)).detach();
     return true;
 }
@@ -81,7 +77,12 @@ inline bool submit_blocking(F&& work) {
 inline void resume_via_scheduler(std::coroutine_handle<> handle,
                                  runtime::scheduler* sched) noexcept {
     if (!handle) return;
-    if (sched && sched->is_running() && sched->try_schedule(handle)) {
+    if (sched) {
+        if (sched->is_running() && sched->try_schedule(handle)) {
+            return;
+        }
+        // A scheduler-bound coroutine cannot safely continue on this blocking
+        // thread after shutdown. Its owner remains responsible for the frame.
         return;
     }
     if (!handle.done()) {

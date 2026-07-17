@@ -11,7 +11,11 @@ Elio coroutines maintain debug metadata in each frame:
 - Worker thread assignment
 - Parent pointer for virtual stack traversal
 
-The debugger extensions find coroutine frames by traversing the scheduler's worker queues (Chase-Lev deque and MPSC inbox). This approach has **zero runtime overhead** - no global registry or synchronization is required.
+The debugger extensions find runnable coroutine frames through each worker's
+Chase-Lev deque. The transient MPSC inbox and rare overflow queue are not walked
+because concurrent producers make a lock-free debugger snapshot unreliable;
+their tasks appear after the worker drains them into the deque. This avoids a
+global frame registry and its always-on synchronization cost.
 
 ## Virtual Stack
 

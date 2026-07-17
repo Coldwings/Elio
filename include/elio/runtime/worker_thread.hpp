@@ -9,6 +9,7 @@
 #include <coroutine>
 #include <thread>
 #include <atomic>
+#include <deque>
 #include <mutex>
 #include <random>
 #include <chrono>
@@ -60,9 +61,10 @@ public:
     /// Redistribute remaining tasks to active workers - call during thread pool shrink
     void redistribute_tasks(scheduler* sched) noexcept;
 
-    /// Schedule a task from external thread - pushes to lock-free MPSC inbox.
-    /// Returns false without taking ownership if this worker is stopped or the
-    /// inbox remains full after bounded retries.
+    /// Schedule a task from an external thread. The lock-free MPSC inbox is
+    /// the fast path; sustained bursts spill into a locked overflow queue so
+    /// live workers do not reject borrowed resume handles.
+    /// Returns false without taking ownership only if this worker is stopped.
     [[nodiscard]] bool schedule(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return false;
 
@@ -122,10 +124,22 @@ public:
             std::this_thread::yield();
         }
 
-        ELIO_LOG_ERROR("worker {} schedule(): rejecting handle after {} "
-                      "inbox retries exhausted",
-                      worker_id_, max_total_retries);
-        return false;
+        // Preserve progress without making the hot queue dynamically sized.
+        // schedule_mutex_ closes the race with request_stop(); overflow_mutex_
+        // protects the slow-path queue from its single worker consumer.
+        {
+            std::lock_guard<std::mutex> schedule_lock(schedule_mutex_);
+            if (!running_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> overflow_lock(overflow_mutex_);
+                overflow_.push_back(handle.address());
+                overflow_size_.fetch_add(1, std::memory_order_release);
+            }
+            wake();
+        }
+        return true;
     }
 
     void schedule_or_destroy(std::coroutine_handle<> handle) {
@@ -149,7 +163,8 @@ public:
     }
 
     [[nodiscard]] size_t queue_size() const noexcept {
-        return queue_->size() + inbox_->size_approx();
+        return queue_->size() + inbox_->size_approx() +
+               overflow_size_.load(std::memory_order_acquire);
     }
 
     [[nodiscard]] std::coroutine_handle<> steal_task() noexcept {
@@ -241,9 +256,12 @@ private:
     size_t worker_id_;
     std::unique_ptr<chase_lev_deque<void>> queue_;      // Owner's local deque (SPMC)
     std::unique_ptr<mpsc_queue<void>> inbox_;           // External submissions (MPSC)
+    std::deque<void*> overflow_;                        // Rare full-inbox fallback
     std::thread thread_;
     std::atomic<bool> running_;
     std::mutex schedule_mutex_;
+    std::mutex overflow_mutex_;
+    std::atomic<size_t> overflow_size_{0};
     std::atomic<bool> draining_{false};
     // Hot-write fields (owner thread writes per task) — isolated cache line
     alignas(64) std::atomic<size_t> tasks_executed_;

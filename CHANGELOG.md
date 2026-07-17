@@ -17,7 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transfer. Lazy ownership no longer installs a frame in creator-thread
   virtual-stack state; ancestry is bound when the task is actually awaited and
   preserved when a suspended task is scheduled for resumption, including
-  targeted affinity migration between workers.
+  targeted affinity migration between workers. Resume scheduling borrows the
+  coroutine handle, reports stopped-worker rejection without consuming it, and
+  uses a per-worker overflow queue for rare full-inbox bursts so worker-bound
+  tasks are not resumed on submitting threads. Scheduler-bound
+  `spawn_blocking()` calls now report an unavailable blocking pool on the
+  current worker instead of falling back to a detached thread.
 - **Coroutine frame allocation**: `task<T>` frames now use the standard heap
   allocation path in every build, without allocator-owned LIFO lifetime rules.
   Logical coroutine ancestry remains available through the `promise_base`

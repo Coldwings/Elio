@@ -7,6 +7,7 @@
 #include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <elio/runtime/affinity.hpp>
+#include <elio/sync/event.hpp>
 #include <string>
 #include <atomic>
 #include <chrono>
@@ -110,6 +111,30 @@ task<size_t> await_moved_task_and_report_depth() {
     auto child = report_virtual_stack_depth();
     auto moved = std::move(child);
     co_return co_await moved;
+}
+
+task<size_t> suspend_then_report_virtual_stack_depth(
+        elio::sync::event& waiting, elio::sync::event& release) {
+    waiting.set();
+    co_await release.wait();
+    co_return get_stack_depth();
+}
+
+task<bool> verify_scheduled_resume_virtual_stack() {
+    elio::sync::event waiting;
+    elio::sync::event release;
+    auto* sched = scheduler::current();
+
+    sched->go([&]() -> task<void> {
+        co_await waiting.wait();
+        release.set();
+    });
+
+    const auto parent_depth = get_stack_depth();
+    auto child = suspend_then_report_virtual_stack_depth(waiting, release);
+    const auto child_depth = co_await child;
+    co_return child_depth == parent_depth + 1 &&
+              get_stack_depth() == parent_depth;
 }
 
 template<typename Task>
@@ -279,6 +304,11 @@ TEST_CASE("when_all accepts callables owning moved lazy tasks",
 TEST_CASE("moved task binds virtual stack ancestry when awaited",
           "[task][ownership][virtual_stack]") {
     REQUIRE(elio::run([] { return await_moved_task_and_report_depth(); }) >= 2);
+}
+
+TEST_CASE("scheduled task resume preserves await ancestry",
+          "[task][ownership][virtual_stack][scheduler]") {
+    REQUIRE(elio::run([] { return verify_scheduled_resume_virtual_stack(); }));
 }
 
 TEST_CASE("destroyed task_handle waiter is unregistered",

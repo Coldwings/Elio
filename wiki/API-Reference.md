@@ -488,9 +488,15 @@ public:
     size_t active_tasks() const noexcept;
     bool wait_for_idle(std::chrono::milliseconds timeout = std::chrono::milliseconds::max());
     
-    // Spawn a coroutine for execution
+    // Hand independent work to the scheduler for its first execution.
+    // Construction-time virtual-stack ancestry is detached.
     void spawn(std::coroutine_handle<> handle);
     bool try_spawn(std::coroutine_handle<> handle);
+
+    // Re-enqueue an already-suspended coroutine. Logical await ancestry is
+    // preserved so continuation transfer restores the correct parent frame.
+    void schedule(std::coroutine_handle<> handle);
+    bool try_schedule(std::coroutine_handle<> handle);
     
     // Spawn a task directly (convenience overload)
     template<typename Task>
@@ -554,6 +560,13 @@ public:
     void report_unhandled_exception(std::exception_ptr ex) noexcept;
 };
 ```
+
+The raw-handle APIs have distinct ownership and virtual-stack contracts.
+`spawn()`/`try_spawn()` are for an independent handle before its first
+execution; they detach construction-time ancestry. `schedule()`/`try_schedule()`
+are for a coroutine that has already suspended and must preserve the logical
+parent established by its await chain. Internal wake paths use `schedule()`;
+callers must not substitute one pair for the other.
 
 `shutdown()` is the graceful path: it waits for tasks spawned through
 `go()`, `go_to()`, `go_joinable()`, `go_joinable_to()`, or `elio::run()` to

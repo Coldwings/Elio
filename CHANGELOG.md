@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source empty. Replacing an owned task destroys the destination's previous
   lazy frame. Runtime handoff paths now require an explicit rvalue ownership
   transfer. Lazy ownership no longer installs a frame in creator-thread
-  virtual-stack state; ancestry is bound when the task is actually awaited.
+  virtual-stack state; ancestry is bound when the task is actually awaited and
+  preserved when a suspended task is scheduled for resumption.
 - **Coroutine frame allocation**: `task<T>` frames now use the standard heap
   allocation path in every build, without allocator-owned LIFO lifetime rules.
   Logical coroutine ancestry remains available through the `promise_base`

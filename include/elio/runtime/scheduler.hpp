@@ -164,11 +164,11 @@ public:
         // Drain the blocking pool BEFORE flipping running_=false. Pool tasks
         // finishing here resume their callers via the spawn_blocking awaitable;
         // that path checks scheduler::is_running() to decide whether to route
-        // through scheduler::spawn() (correct) or fall back to caller.resume()
-        // on the pool thread (broken — leaves the coroutine without a worker /
-        // io_context context, breaking subsequent co_awaits). Doing the drain
-        // first keeps running_=true while pool tasks finish, so all resumes
-        // land on a real worker.
+        // through scheduler::try_schedule() or fall back to caller.resume() on
+        // the pool thread. The fallback restores virtual-stack context but has
+        // no worker/io_context, so subsequent I/O would still be invalid. Doing
+        // the drain first keeps running_=true while pool tasks finish, so all
+        // resumes land on a real worker.
         //
         // blocking_pool::shutdown() is idempotent, so this is safe even on
         // repeated calls or when shutdown_force() is invoked from contexts
@@ -318,8 +318,9 @@ public:
     void pause() { paused_.store(true, std::memory_order_relaxed); }
     void resume() { paused_.store(false, std::memory_order_relaxed); }
 
-    /// Try to enqueue a raw coroutine handle. On failure the handle remains
-    /// live, so the caller must either resume it or destroy it.
+    /// Try to hand an independent coroutine to the scheduler for its first
+    /// execution. This detaches any construction-time virtual-stack ancestry.
+    /// On failure the handle remains live.
     [[nodiscard]] bool try_spawn(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return false;
         if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
@@ -337,6 +338,24 @@ public:
     void spawn(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return;
         if (!try_spawn(handle)) {
+            handle.destroy();
+        }
+    }
+
+    /// Try to re-enqueue a suspended coroutine while preserving the logical
+    /// parent established by its await chain. On failure the handle remains
+    /// live, so the caller must either resume it or destroy it.
+    [[nodiscard]] bool try_schedule(std::coroutine_handle<> handle) {
+        if (!handle) [[unlikely]] return false;
+        if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
+            return false;
+        }
+        return do_spawn(handle, false);
+    }
+
+    void schedule(std::coroutine_handle<> handle) {
+        if (!handle) [[unlikely]] return;
+        if (!try_schedule(handle)) {
             handle.destroy();
         }
     }
@@ -948,7 +967,7 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
 
     auto* sched = scheduler::current();
     if (sched && sched->is_running()) {
-        sched->spawn(handle);
+        sched->schedule(handle);
     } else {
         static thread_local std::vector<std::coroutine_handle<>> trampoline_queue;
         static thread_local bool trampoline_running = false;
@@ -982,7 +1001,11 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
             while (!trampoline_queue.empty()) {
                 auto h = trampoline_queue.back();
                 trampoline_queue.pop_back();
-                if (!h.done()) h.resume();
+                if (!h.done()) {
+                    auto* promise = coro::get_promise_base(h.address());
+                    coro::detail::frame_context_scope frame_scope(promise);
+                    h.resume();
+                }
             }
         }
     }
@@ -1060,7 +1083,7 @@ inline void worker_thread::run_or_redistribute_retiring_task(
         return;
     }
 
-    sched->spawn(handle);
+    sched->schedule(handle);
 }
 
 /// Redistribute remaining tasks to active workers - call during thread pool shrink

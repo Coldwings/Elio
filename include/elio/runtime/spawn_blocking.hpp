@@ -181,11 +181,15 @@ public:
                 // Scheduler shutdown can race between is_running() and enqueue.
                 // If it rejects without taking ownership, finish the awaiter
                 // inline so the continuation chain can unwind and release.
-                if (!sched->try_spawn(caller) && caller && !caller.done()) {
+                if (!sched->try_schedule(caller) && caller && !caller.done()) {
+                    auto* promise = coro::get_promise_base(caller.address());
+                    coro::detail::frame_context_scope frame_scope(promise);
                     caller.resume();
                 }
             } else if (caller && !caller.done()) {
                 inline_resume_guard guard(state.get());
+                auto* promise = coro::get_promise_base(caller.address());
+                coro::detail::frame_context_scope frame_scope(promise);
                 caller.resume();
             }
 

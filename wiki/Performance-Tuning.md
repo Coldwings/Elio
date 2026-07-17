@@ -8,7 +8,7 @@ Elio is designed for high performance through:
 - Lock-free data structures (Chase-Lev deque)
 - Work-stealing scheduler
 - Efficient I/O backends (io_uring, epoll)
-- Custom coroutine frame allocator
+- Standard coroutine frame allocation with unrestricted destruction order
 - Minimal synchronization overhead
 
 ## Actual Performance Numbers
@@ -314,14 +314,17 @@ For best io_uring performance:
 
 ### Coroutine Frame Allocation
 
-`coro::task` frames allocate from `vthread_stack` when the task coroutine is created inside an active vthread stack context. Each vthread maintains a segmented bump-pointer stack allocator for nested task frames. If no vthread stack context is active, task frames fall back to `::operator new`; other coroutine types may use their own allocation strategy. Under sanitizers, task frame allocation automatically falls back to `::operator new/delete`.
+`coro::task` frames use the standard coroutine heap allocation path. There is no
+per-vthread bump allocator or LIFO destruction requirement. Keeping frames small
+still reduces allocation traffic and cache pressure, but callers should not
+depend on allocator locality or on the worker that eventually frees a frame.
 
 ### Avoiding Allocations
 
-Keep coroutine frames small for pool allocation:
+Keep coroutine frames small to reduce allocation and cache cost:
 
 ```cpp
-// Bad: Large array in coroutine frame (can't use pool)
+// Bad: Large array increases every coroutine frame allocation
 coro::task<void> large_frame() {
     char buffer[8192];  // Too large for pool
     co_await read_data(buffer);

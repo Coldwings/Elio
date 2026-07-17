@@ -5,8 +5,6 @@
 #include <cstdint>
 #include <limits>
 
-#include "vthread_stack.hpp"
-
 namespace elio::coro {
 
 /// Constant indicating no affinity (vthread can migrate freely)
@@ -72,7 +70,7 @@ private:
 };
 
 /// Base class for all coroutine promise types
-/// Implements lightweight virtual stack tracking via thread-local intrusive list
+/// Implements lightweight virtual stack tracking via a thread-local pointer.
 ///
 /// Debug support (when ELIO_ENABLE_DEBUG_METADATA=1):
 /// - Each frame has a unique ID for identification
@@ -96,8 +94,6 @@ public:
         , debug_id_(0)  // Lazy allocation - only allocated when id() is called
 #endif
         , affinity_(NO_AFFINITY)
-        , vstack_(vthread_stack::current())  // Use current vstack from thread-local
-        , owns_vstack_(false)
     {
         current_frame_ = this;
     }
@@ -135,15 +131,6 @@ public:
         // detach) would clobber an unrelated active frame chain.
         if (current_frame_ == this) {
             current_frame_ = parent_;
-        }
-        if (owns_vstack_) {
-            // The owning coroutine frame is allocated from this vstack, so defer
-            // deleting segment storage until the frame's operator delete runs.
-            auto* vs = vstack_.exchange(nullptr, std::memory_order_acq_rel);
-            if (vthread_stack::current() == vs) {
-                vthread_stack::set_current(nullptr);
-            }
-            vthread_stack::delete_after_current_deallocation(vs);
         }
     }
 
@@ -267,37 +254,6 @@ public:
         return worker_local_.load(std::memory_order_acquire);
     }
 
-    // vthread_stack accessors
-    [[nodiscard]] vthread_stack* vstack() const noexcept { 
-        return vstack_.load(std::memory_order_acquire); 
-    }
-
-    void set_vstack(vthread_stack* vs) noexcept { 
-        vstack_.store(vs, std::memory_order_release); 
-    }
-
-    void set_vstack_owner(vthread_stack* vs) noexcept {
-        vstack_.store(vs, std::memory_order_release);
-        owns_vstack_ = true;
-    }
-
-    [[nodiscard]] bool owns_vstack() const noexcept { return owns_vstack_; }
-
-    /// Release ownership of vstack without deleting it.
-    /// Returns the vstack pointer for caller to delete after coroutine frame is destroyed.
-    /// Used by final_awaiter to avoid use-after-free when self-destructing.
-    vthread_stack* release_vstack_ownership() noexcept {
-        if (owns_vstack_) {
-            owns_vstack_ = false;
-            auto* vs = vstack_.exchange(nullptr, std::memory_order_acq_rel);
-            if (vthread_stack::current() == vs) {
-                vthread_stack::set_current(nullptr);
-            }
-            return vs;
-        }
-        return nullptr;
-    }
-
 private:
     // Magic number at start for debugger validation
     uint64_t frame_magic_;
@@ -322,11 +278,30 @@ private:
     // must not be migrated when their affinity owner is retired.
     std::atomic<bool> worker_local_{false};
 
-    // vthread_stack support
-    std::atomic<vthread_stack*> vstack_{nullptr};
-    bool owns_vstack_ = false;
-
     static inline thread_local promise_base* current_frame_ = nullptr;
+};
+
+/// Install a coroutine as the current virtual-stack frame for one resume call.
+/// The previous virtual-stack frame is restored when control returns to the
+/// resumer.
+class frame_context_scope {
+public:
+    explicit frame_context_scope(promise_base* frame) noexcept
+        : previous_(promise_base::current_frame()) {
+        if (frame) {
+            promise_base::set_current_frame(frame);
+        }
+    }
+
+    ~frame_context_scope() {
+        promise_base::set_current_frame(previous_);
+    }
+
+    frame_context_scope(const frame_context_scope&) = delete;
+    frame_context_scope& operator=(const frame_context_scope&) = delete;
+
+private:
+    promise_base* previous_;
 };
 
 } // namespace elio::coro

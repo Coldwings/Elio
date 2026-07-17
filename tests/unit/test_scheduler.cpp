@@ -109,24 +109,15 @@ TEST_CASE("Scheduler construction clamps oversized thread count", "[scheduler]")
     REQUIRE(!sched.is_running());
 }
 
-TEST_CASE("Scheduler restores vthread stack when wrapper construction throws",
-          "[scheduler][vthread_stack]") {
+TEST_CASE("Scheduler preserves caller frame when wrapper construction throws",
+          "[scheduler][virtual_stack]") {
     scheduler sched(1);
     throwing_task_factory factory;
 
-    auto* previous = vthread_stack::current();
-    struct current_stack_restore {
-        vthread_stack* previous;
-        ~current_stack_restore() {
-            vthread_stack::set_current(previous);
-        }
-    } restore{previous};
-
-    vthread_stack caller_stack;
-    vthread_stack::set_current(&caller_stack);
+    promise_base caller_frame;
 
     REQUIRE_THROWS_AS(sched.go(factory), throwing_factory_error);
-    REQUIRE(vthread_stack::current() == &caller_stack);
+    REQUIRE(promise_base::current_frame() == &caller_frame);
 }
 
 TEST_CASE("Worker schedule rejects stopped workers", "[scheduler]") {

@@ -4,7 +4,6 @@
 #include "blocking_pool.hpp"
 #include <elio/log/macros.hpp>
 #include <elio/coro/frame.hpp>
-#include <elio/coro/vthread_stack.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/coro/traits.hpp>
 #include <type_traits>
@@ -706,12 +705,9 @@ private:
         using ResultTask = std::invoke_result_t<F, Args...>;
         using T = detail::task_value_t<ResultTask>;
 
-        auto vstack_owner = std::make_unique<coro::vthread_stack>();
-        auto* new_vstack = vstack_owner.get();
         auto* old_frame = coro::promise_base::current_frame();
 
-        auto wrapper = [&] {
-            coro::vthread_stack_scope vstack_scope(new_vstack);
+        auto wrapper = [&]() {
             if constexpr (Joinable) {
                 return detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
             } else {
@@ -721,7 +717,6 @@ private:
 
         auto handle = coro::detail::task_access::release(wrapper);
         handle.promise().detached_ = true;
-        handle.promise().set_vstack_owner(vstack_owner.release());
         if constexpr (Pinned) {
             handle.promise().set_affinity(worker_id);
         }
@@ -1253,19 +1248,10 @@ inline void worker_thread::run_task(std::coroutine_handle<> handle) noexcept {
     
     if (!handle || handle.done()) [[unlikely]] return;
 
-    // Context switch: set vstack and current_frame before resume, restore after
+    // Restore the virtual-stack frame context while user code is running.
     auto* promise = coro::get_promise_base(handle.address());
-    auto* prev_vstack = coro::vthread_stack::current();
-    auto* prev_frame = coro::promise_base::current_frame();
-    if (promise) {
-        coro::vthread_stack::set_current(promise->vstack());
-        coro::promise_base::set_current_frame(promise);
-    }
-
+    coro::frame_context_scope frame_scope(promise);
     handle.resume();
-
-    coro::vthread_stack::set_current(prev_vstack);
-    coro::promise_base::set_current_frame(prev_frame);
     tasks_executed_.fetch_add(1, std::memory_order_relaxed);
     update_last_task_time();
 

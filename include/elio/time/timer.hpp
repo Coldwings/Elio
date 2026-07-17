@@ -35,8 +35,8 @@ namespace detail {
 ///     dangling pointer;
 ///   * even while the scheduler is alive but ``is_running() == false``,
 ///     ``resume_via_scheduler`` falls through to ``handle.resume()`` on
-///     the detached thread — which has no ``worker_thread::current()``,
-///     no ``current_io_context()`` and no ``vthread_stack``, so every
+///     the detached thread — which has no ``worker_thread::current()`` or
+///     ``current_io_context()``, so every
 ///     subsequent ``co_await`` on the resumed coroutine is a UAF.
 ///
 /// Returns true if the work was accepted (by the blocking pool or a

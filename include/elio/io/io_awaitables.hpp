@@ -830,7 +830,6 @@ inline bool submit_batch_io_uring_with_submitter(io_uring_backend* backend,
 
     const int total = st.total;
     st.awaiter = awaiter;
-    st.awaiter_vstack = coro::vthread_stack::current();
     st.trampolines.resize(total);
 
     size_t in_flight = 0;
@@ -853,7 +852,6 @@ inline bool submit_batch_io_uring_with_submitter(io_uring_backend* backend,
         // must resume the awaiter inline. Reset awaiter so a stray CQE
         // (there should be none) cannot resume twice.
         st.awaiter = {};
-        st.awaiter_vstack = nullptr;
         st.completed.store(total, std::memory_order_release);
         return false;
     }

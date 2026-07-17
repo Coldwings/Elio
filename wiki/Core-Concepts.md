@@ -304,11 +304,22 @@ Each `promise_base` also carries debug metadata:
 
 ## Coroutine Frame Allocation
 
-`coro::task` frames allocate from `vthread_stack` when the task coroutine is created inside an active vthread stack context. Each vthread maintains its own segmented bump-pointer stack allocator, so nested task frames are allocated in LIFO order within segments. If no vthread stack context is active, task frames fall back to `::operator new`; other coroutine types may use their own allocation strategy.
+`coro::task` frames use the implementation's standard coroutine heap allocation
+path in every build. Elio does not pool task frames or require nested frames to
+be destroyed in LIFO order. A frame may be destroyed on a different worker from
+the one that created or last resumed it, provided ownership is transferred and
+the frame is destroyed exactly once.
+
+Frame allocation is independent of the vthread abstraction described above.
+Vthreads still maintain a logical virtual stack through the `promise_base`
+parent chain; that chain tracks coroutine ancestry but does not own or allocate
+the coroutine frames.
 
 ### Sanitizer compatibility
 
-Under AddressSanitizer or ThreadSanitizer, the custom allocator is bypassed entirely -- all allocations go directly through `::operator new` and `::operator delete`. This ensures that sanitizers can accurately detect leaks, use-after-free, and data races without being confused by the pooling layer. The sanitizer fallback is automatic via `ELIO_SANITIZER_ACTIVE` preprocessor detection.
+AddressSanitizer and ThreadSanitizer observe the same task-frame allocation and
+deallocation path as normal builds. There is no sanitizer-specific allocator
+mode, so sanitizer coverage matches production frame lifetime behavior.
 
 ## I/O Context
 

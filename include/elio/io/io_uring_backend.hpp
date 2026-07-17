@@ -2,7 +2,6 @@
 
 #include "io_backend.hpp"
 #include <elio/log/macros.hpp>
-#include <elio/coro/vthread_stack.hpp>
 #include <elio/coro/promise_base.hpp>
 #include <elio/coro/frame.hpp>
 
@@ -211,7 +210,6 @@ struct batch_state {
     std::vector<int> results;                      ///< Per-segment results (bytes or -errno)
     std::vector<batch_completion> trampolines;     ///< One trampoline per segment (io_uring only)
     std::coroutine_handle<> awaiter{};             ///< Resumed when completed == total
-    coro::vthread_stack* awaiter_vstack = nullptr; ///< Captured at suspend time
     std::atomic<uint8_t> phase{phase_pending};     ///< Orphan protocol phase
 
     explicit batch_state(int n) : total(n), results(n) {}
@@ -688,13 +686,6 @@ public:
         }
     }
 
-    /// Resume a coroutine handle while temporarily setting its
-    /// ``vthread_stack`` as current. Exposed for the batch trampoline to
-    /// reuse the same logic the backend uses internally.
-    static void resume_with_vstack(std::coroutine_handle<> handle) {
-        safe_resume(handle);
-    }
-
     void notify() override {
         uint64_t val = 1;
         ssize_t ret = ::write(wake_fd_, &val, sizeof(val));
@@ -900,20 +891,11 @@ private:
         }
     }
     
-    /// Safely resume a coroutine handle with proper coroutine context.
-    /// This mirrors scheduler worker resumes so both the vthread stack and
-    /// virtual frame chain are valid while user code runs after I/O completion.
+    /// Resume a coroutine with its virtual-stack frame context installed.
     static void safe_resume(std::coroutine_handle<> handle) {
         auto* promise = coro::get_promise_base(handle.address());
-        auto* prev_vstack = coro::vthread_stack::current();
-        auto* prev_frame = coro::promise_base::current_frame();
-        if (promise) {
-            coro::vthread_stack::set_current(promise->vstack());
-            coro::promise_base::set_current_frame(promise);
-        }
+        coro::frame_context_scope frame_scope(promise);
         handle.resume();
-        coro::vthread_stack::set_current(prev_vstack);
-        coro::promise_base::set_current_frame(prev_frame);
     }
 
     /// Resume collected coroutine handles (call outside of lock)

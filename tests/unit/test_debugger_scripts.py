@@ -9,6 +9,8 @@ import types
 import unittest
 
 
+sys.dont_write_bytecode = True
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 

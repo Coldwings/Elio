@@ -511,9 +511,15 @@ public:
     coro::join_handle</* task value */> go_joinable(F&& f, Args&&... args);
     template<typename F, typename... Args>
     coro::join_handle</* task value */> go_joinable_to(size_t worker_id, F&& f, Args&&... args);
+
+    // Initial ownership handoff toward a worker; detaches construction ancestry.
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle);
 
-    // For go_to(), go_joinable_to(), and spawn_to(), exact placement requires
+    // Re-enqueue suspended work toward a worker; preserves await ancestry.
+    void schedule_to(size_t worker_id, std::coroutine_handle<> handle);
+    bool try_schedule_to(size_t worker_id, std::coroutine_handle<> handle);
+
+    // For targeted spawn and schedule APIs, exact placement requires
     // worker_id in [0, num_threads()) and an available target worker. Larger
     // values or unavailable targets use fallback scheduling.
 
@@ -562,11 +568,13 @@ public:
 ```
 
 The raw-handle APIs have distinct ownership and virtual-stack contracts.
-`spawn()`/`try_spawn()` are for an independent handle before its first
-execution; they detach construction-time ancestry. `schedule()`/`try_schedule()`
-are for a coroutine that has already suspended and must preserve the logical
-parent established by its await chain. Internal wake paths use `schedule()`;
-callers must not substitute one pair for the other.
+`spawn()`/`try_spawn()` and `spawn_to()` are for an independent handle before
+its first execution; they detach construction-time ancestry.
+`schedule()`/`try_schedule()` and `schedule_to()`/`try_schedule_to()` are for a
+coroutine that has already suspended and must preserve the logical parent
+established by its await chain. Internal wake and affinity-migration paths use
+the corresponding `schedule` variant; callers must not substitute one family
+for the other.
 
 `shutdown()` is the graceful path: it waits for tasks spawned through
 `go()`, `go_to()`, `go_joinable()`, `go_joinable_to()`, or `elio::run()` to

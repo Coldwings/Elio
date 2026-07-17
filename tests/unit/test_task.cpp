@@ -137,6 +137,26 @@ task<bool> verify_scheduled_resume_virtual_stack() {
               get_stack_depth() == parent_depth;
 }
 
+task<bool> migrate_and_verify_virtual_stack(size_t parent_depth) {
+    auto* sched = scheduler::current();
+    const auto source_worker = current_worker_id();
+    if (!sched || sched->num_threads() < 2 || source_worker == NO_AFFINITY) {
+        co_return false;
+    }
+
+    const auto target_worker = (source_worker + 1) % sched->num_threads();
+    co_await set_affinity(target_worker);
+
+    co_return current_worker_id() == target_worker &&
+              get_stack_depth() == parent_depth + 1;
+}
+
+task<bool> verify_affinity_migration_virtual_stack() {
+    const auto parent_depth = get_stack_depth();
+    const auto child_ok = co_await migrate_and_verify_virtual_stack(parent_depth);
+    co_return child_ok && get_stack_depth() == parent_depth;
+}
+
 template<typename Task>
 concept releases_lvalue = requires(Task& value) {
     elio::coro::detail::task_access::release(value);
@@ -309,6 +329,14 @@ TEST_CASE("moved task binds virtual stack ancestry when awaited",
 TEST_CASE("scheduled task resume preserves await ancestry",
           "[task][ownership][virtual_stack][scheduler]") {
     REQUIRE(elio::run([] { return verify_scheduled_resume_virtual_stack(); }));
+}
+
+TEST_CASE("affinity migration preserves await ancestry",
+          "[task][ownership][virtual_stack][scheduler][affinity]") {
+    run_config config;
+    config.num_threads = 2;
+    REQUIRE(elio::run([] { return verify_affinity_migration_virtual_stack(); },
+                      config));
 }
 
 TEST_CASE("destroyed task_handle waiter is unregistered",

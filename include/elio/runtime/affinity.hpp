@@ -52,7 +52,7 @@ public:
         // Schedule on target worker
         auto* sched = scheduler::current();
         if (sched && sched->is_running()) {
-            sched->spawn_to(worker_id_, handle);
+            sched->schedule_to(worker_id_, handle);
             return true;  // Suspend and let target worker resume
         }
         

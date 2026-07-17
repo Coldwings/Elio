@@ -411,8 +411,24 @@ public:
 
     /// Spawn an existing coroutine toward worker_id. Exact placement requires
     /// worker_id < num_threads(); otherwise scheduling is best-effort fallback.
+    /// This is an initial ownership handoff and detaches construction-time
+    /// virtual-stack ancestry.
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle) {
         (void)do_spawn_to_(worker_id, handle);
+    }
+
+    /// Try to re-enqueue a suspended coroutine toward worker_id while
+    /// preserving the logical parent established by its await chain. On
+    /// failure the handle remains live.
+    [[nodiscard]] bool try_schedule_to(size_t worker_id,
+                                       std::coroutine_handle<> handle) {
+        return do_schedule_to_(worker_id, handle, false);
+    }
+
+    /// Re-enqueue a suspended coroutine toward worker_id while preserving its
+    /// logical await ancestry. Destroys the handle if it cannot be scheduled.
+    void schedule_to(size_t worker_id, std::coroutine_handle<> handle) {
+        (void)do_schedule_to_(worker_id, handle);
     }
 
     [[nodiscard]] size_t num_threads(std::memory_order order = std::memory_order_relaxed) const noexcept {
@@ -792,16 +808,26 @@ private:
 
     bool do_spawn_to_(size_t worker_id, std::coroutine_handle<> handle,
                       bool destroy_on_failure = true) {
+        return do_enqueue_to_(worker_id, handle, destroy_on_failure, true);
+    }
+
+    bool do_schedule_to_(size_t worker_id, std::coroutine_handle<> handle,
+                         bool destroy_on_failure = true) {
+        return do_enqueue_to_(worker_id, handle, destroy_on_failure, false);
+    }
+
+    bool do_enqueue_to_(size_t worker_id, std::coroutine_handle<> handle,
+                        bool destroy_on_failure, bool detach_parent) {
         if (!handle) [[unlikely]] return false;
         if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
             if (destroy_on_failure) handle.destroy();
             return false;
         }
 
-        // Detach from current thread's frame chain before spawning to another thread
-        // to avoid use-after-free when this thread creates another coroutine.
         auto* promise = coro::get_promise_base(handle.address());
-        if (promise) {
+        if (detach_parent && promise) {
+            // Initial ownership handoff must not retain construction-time
+            // ancestry. Suspended-coroutine migration preserves await ancestry.
             promise->detach_from_parent();
         }
 
@@ -1308,7 +1334,7 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
                     return handle;
                 }
                 if (affinity < num_workers) {
-                    scheduler_->spawn_to(affinity, handle);
+                    scheduler_->schedule_to(affinity, handle);
                 } else {
                     handle.destroy();
                 }
@@ -1327,7 +1353,7 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
             
             // Task has affinity for another worker - schedule it there
             if (affinity < num_workers) {
-                scheduler_->spawn_to(affinity, handle);
+                scheduler_->schedule_to(affinity, handle);
             } else {
                 if (promise) {
                     promise->clear_affinity();

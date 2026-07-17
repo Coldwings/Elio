@@ -21,7 +21,7 @@ namespace elio::time {
 
 namespace detail {
 
-#ifdef ELIO_TIMER_TEST_HOOKS
+#ifdef ELIO_RUNTIME_TEST_HOOKS
 inline thread_local bool reject_next_timeout_prepare = false;
 
 inline void reject_next_timeout_prepare_for_test() noexcept {
@@ -30,7 +30,7 @@ inline void reject_next_timeout_prepare_for_test() noexcept {
 #endif
 
 inline bool prepare_timeout(io::io_context& ctx, const io::io_request& req) {
-#ifdef ELIO_TIMER_TEST_HOOKS
+#ifdef ELIO_RUNTIME_TEST_HOOKS
     if (std::exchange(reject_next_timeout_prepare, false)) {
         return false;
     }

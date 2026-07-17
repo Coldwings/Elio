@@ -425,6 +425,57 @@ TEST_CASE("resume overflow preserves worker execution context",
     REQUIRE(drained);
 }
 
+TEST_CASE("overflow transfer remains visible to scheduler accounting",
+          "[task][ownership][scheduler][overflow][shutdown]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> completed{false};
+    auto resumed_fn = [&]() -> task<void> {
+        completed.store(true, std::memory_order_release);
+        co_return;
+    };
+    auto resumed = resumed_fn();
+
+    elio::runtime::detail::pause_overflow_transfer_for_test.store(
+        true, std::memory_order_release);
+    REQUIRE(sched.get_worker(0)->schedule_overflow_for_test(get_handle(resumed)));
+
+    const auto pause_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!elio::runtime::detail::overflow_transfer_paused_for_test.load(
+               std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < pause_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    const bool transfer_paused =
+        elio::runtime::detail::overflow_transfer_paused_for_test.load(
+            std::memory_order_acquire);
+    const size_t pending_during_transfer = transfer_paused ? sched.pending_tasks() : 0;
+    const bool idle_during_transfer =
+        transfer_paused && sched.wait_for_idle(std::chrono::milliseconds(0));
+
+    elio::runtime::detail::pause_overflow_transfer_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::pause_overflow_transfer_for_test.notify_all();
+
+    const auto completion_deadline =
+        std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < completion_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool did_complete = completed.load(std::memory_order_acquire);
+    const bool drained = sched.wait_for_idle(scaled_sec(5));
+    sched.shutdown();
+
+    REQUIRE(transfer_paused);
+    REQUIRE(pending_during_transfer == 1);
+    REQUIRE_FALSE(idle_during_transfer);
+    REQUIRE(did_complete);
+    REQUIRE(drained);
+}
+
 TEST_CASE("destroyed task_handle waiter is unregistered",
           "[task][task_handle][cancellation]") {
     auto state = std::make_shared<elio::coro::detail::task_state<void>>();

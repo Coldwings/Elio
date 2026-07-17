@@ -18,6 +18,13 @@ namespace elio::runtime {
 
 class scheduler;
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace detail {
+inline std::atomic<bool> pause_overflow_transfer_for_test{false};
+inline std::atomic<bool> overflow_transfer_paused_for_test{false};
+}  // namespace detail
+#endif
+
 /// Worker thread that executes tasks from a local queue
 /// and steals from other workers when idle
 /// 
@@ -142,6 +149,23 @@ public:
         return true;
     }
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    [[nodiscard]] bool schedule_overflow_for_test(std::coroutine_handle<> handle) {
+        if (!handle) return false;
+        {
+            std::lock_guard<std::mutex> schedule_lock(schedule_mutex_);
+            if (!running_.load(std::memory_order_acquire)) {
+                return false;
+            }
+            std::lock_guard<std::mutex> overflow_lock(overflow_mutex_);
+            overflow_.push_back(handle.address());
+            overflow_size_.fetch_add(1, std::memory_order_release);
+        }
+        wake();
+        return true;
+    }
+#endif
+
     void schedule_or_destroy(std::coroutine_handle<> handle) {
         if (!schedule(handle) && handle) {
             handle.destroy();
@@ -261,6 +285,9 @@ private:
     std::atomic<bool> running_;
     std::mutex schedule_mutex_;
     std::mutex overflow_mutex_;
+    // Includes entries swapped into a worker-local transfer batch until every
+    // handle in that batch has been published to queue_. This may briefly
+    // overcount work, but it must never let idle detection miss accepted work.
     std::atomic<size_t> overflow_size_{0};
     std::atomic<bool> draining_{false};
     // Hot-write fields (owner thread writes per task) — isolated cache line

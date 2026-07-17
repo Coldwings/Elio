@@ -1145,11 +1145,33 @@ inline void worker_thread::drain_inbox() noexcept {
     {
         std::lock_guard<std::mutex> lock(overflow_mutex_);
         overflow.swap(overflow_);
-        overflow_size_.fetch_sub(overflow.size(), std::memory_order_acq_rel);
     }
+
+    const size_t transfer_size = overflow.size();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (transfer_size > 0 &&
+        detail::pause_overflow_transfer_for_test.load(std::memory_order_acquire)) {
+        detail::overflow_transfer_paused_for_test.store(true,
+                                                        std::memory_order_release);
+        detail::overflow_transfer_paused_for_test.notify_all();
+        while (detail::pause_overflow_transfer_for_test.load(
+            std::memory_order_acquire)) {
+            detail::pause_overflow_transfer_for_test.wait(true,
+                                                          std::memory_order_acquire);
+        }
+        detail::overflow_transfer_paused_for_test.store(false,
+                                                        std::memory_order_release);
+    }
+#endif
     while (!overflow.empty()) {
         queue_->push(overflow.front());
         overflow.pop_front();
+    }
+    if (transfer_size > 0) {
+        // Publish every handle to queue_ before removing the transfer batch
+        // from accounting. Readers may briefly overcount, but never observe a
+        // false idle window between the overflow queue and local deque.
+        overflow_size_.fetch_sub(transfer_size, std::memory_order_release);
     }
 }
 

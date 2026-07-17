@@ -353,13 +353,6 @@ public:
         return do_spawn(handle, false);
     }
 
-    void schedule(std::coroutine_handle<> handle) {
-        if (!handle) [[unlikely]] return;
-        if (!try_schedule(handle)) {
-            handle.destroy();
-        }
-    }
-    
     /// Spawn a task directly (convenience overload)
     /// Accepts any type with a release() method that returns a coroutine_handle
     template<typename Task>
@@ -423,12 +416,6 @@ public:
     [[nodiscard]] bool try_schedule_to(size_t worker_id,
                                        std::coroutine_handle<> handle) {
         return do_schedule_to_(worker_id, handle, false);
-    }
-
-    /// Re-enqueue a suspended coroutine toward worker_id while preserving its
-    /// logical await ancestry. Destroys the handle if it cannot be scheduled.
-    void schedule_to(size_t worker_id, std::coroutine_handle<> handle) {
-        (void)do_schedule_to_(worker_id, handle);
     }
 
     [[nodiscard]] size_t num_threads(std::memory_order order = std::memory_order_relaxed) const noexcept {
@@ -992,46 +979,46 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
     if (!handle) return;
 
     auto* sched = scheduler::current();
-    if (sched && sched->is_running()) {
-        sched->schedule(handle);
-    } else {
-        static thread_local std::vector<std::coroutine_handle<>> trampoline_queue;
-        static thread_local bool trampoline_running = false;
+    if (sched && sched->is_running() && sched->try_schedule(handle)) {
+        return;
+    }
 
-        trampoline_queue.push_back(handle);
+    static thread_local std::vector<std::coroutine_handle<>> trampoline_queue;
+    static thread_local bool trampoline_running = false;
 
-        if (!trampoline_running) {
-            trampoline_running = true;
-            struct trampoline_guard {
-                std::vector<std::coroutine_handle<>>& q;
-                ~trampoline_guard() {
-                    // Only destroy completed coroutines.  Live (suspended)
-                    // handles are intentionally leaked: there is no scheduler
-                    // to adopt them, and destroying them here would UAF any
-                    // awaitables holding raw coroutine_handle references.
-                    size_t leaked = 0;
-                    for (auto h : q) {
-                        if (h.done()) {
-                            h.destroy();
-                        } else {
-                            ++leaked;
-                        }
+    trampoline_queue.push_back(handle);
+
+    if (!trampoline_running) {
+        trampoline_running = true;
+        struct trampoline_guard {
+            std::vector<std::coroutine_handle<>>& q;
+            ~trampoline_guard() {
+                // Only destroy completed coroutines.  Live (suspended)
+                // handles are intentionally leaked: there is no scheduler
+                // to adopt them, and destroying them here would UAF any
+                // awaitables holding raw coroutine_handle references.
+                size_t leaked = 0;
+                for (auto h : q) {
+                    if (h.done()) {
+                        h.destroy();
+                    } else {
+                        ++leaked;
                     }
-                    if (leaked > 0) {
-                        ELIO_LOG_WARNING("trampoline: {} live coroutine(s) leaked (no scheduler available)", leaked);
-                    }
-                    q.clear();
-                    trampoline_running = false;
                 }
-            } guard{trampoline_queue};
-            while (!trampoline_queue.empty()) {
-                auto h = trampoline_queue.back();
-                trampoline_queue.pop_back();
-                if (!h.done()) {
-                    auto* promise = coro::get_promise_base(h.address());
-                    coro::detail::frame_context_scope frame_scope(promise);
-                    h.resume();
+                if (leaked > 0) {
+                    ELIO_LOG_WARNING("trampoline: {} live coroutine(s) leaked (no scheduler available)", leaked);
                 }
+                q.clear();
+                trampoline_running = false;
+            }
+        } guard{trampoline_queue};
+        while (!trampoline_queue.empty()) {
+            auto h = trampoline_queue.back();
+            trampoline_queue.pop_back();
+            if (!h.done()) {
+                auto* promise = coro::get_promise_base(h.address());
+                coro::detail::frame_context_scope frame_scope(promise);
+                h.resume();
             }
         }
     }
@@ -1099,17 +1086,30 @@ inline void worker_thread::drain_remaining_tasks() noexcept {
 /// Run worker-local maintenance tasks on this retiring worker; redistribute
 /// normal user tasks to active workers so they cannot start fresh I/O on a
 /// worker whose io_context is about to stop being polled.
-inline void worker_thread::run_or_redistribute_retiring_task(
+inline bool worker_thread::run_or_redistribute_retiring_task(
     scheduler* sched,
     std::coroutine_handle<> handle) noexcept {
     auto* promise = coro::get_promise_base(handle.address());
     if (promise && promise->is_worker_local() && promise->affinity() == worker_id_) {
         needs_sync_ = true;
         run_task(handle);
-        return;
+        return true;
     }
 
-    sched->schedule(handle);
+    if (sched->try_schedule(handle)) {
+        return true;
+    }
+
+    // A concurrent full shutdown may start after this worker entered its
+    // retirement drain. In that case there is no surviving worker to accept
+    // the handle, so finish it on this worker instead of retrying forever.
+    if (!sched->is_running()) {
+        needs_sync_ = true;
+        run_task(handle);
+        return true;
+    }
+
+    return false;
 }
 
 /// Redistribute remaining tasks to active workers - call during thread pool shrink
@@ -1123,7 +1123,10 @@ inline void worker_thread::redistribute_tasks(scheduler* sched) noexcept {
     while ((addr = queue_->pop()) != nullptr) {
         auto handle = std::coroutine_handle<>::from_address(addr);
         if (handle && !handle.done()) {
-            run_or_redistribute_retiring_task(sched, handle);
+            if (!run_or_redistribute_retiring_task(sched, handle)) {
+                queue_->push(handle.address());
+                return;
+            }
         } else if (handle) {
             handle.destroy();
         }
@@ -1223,7 +1226,10 @@ inline void worker_thread::run() {
                 // before this worker was stopped, so they never land back here).
                 // Worker-local maintenance tasks are the exception: they touch
                 // this worker's io_context and must run here before exit.
-                run_or_redistribute_retiring_task(scheduler_, handle);
+                if (!run_or_redistribute_retiring_task(scheduler_, handle)) {
+                    queue_->push(handle.address());
+                    std::this_thread::yield();
+                }
             } else {
                 needs_sync_ = true;  // Conservatively ensure memory visibility for drained tasks
                 run_task(handle);
@@ -1334,7 +1340,11 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
                     return handle;
                 }
                 if (affinity < num_workers) {
-                    scheduler_->schedule_to(affinity, handle);
+                    if (!scheduler_->try_schedule_to(affinity, handle)) {
+                        // Worker-local maintenance tasks are detached runtime
+                        // work and cannot execute away from their owner.
+                        handle.destroy();
+                    }
                 } else {
                     handle.destroy();
                 }
@@ -1353,7 +1363,15 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
             
             // Task has affinity for another worker - schedule it there
             if (affinity < num_workers) {
-                scheduler_->schedule_to(affinity, handle);
+                if (!scheduler_->try_schedule_to(affinity, handle)) {
+                    // This is a borrowed suspended handle. Keep it live and
+                    // execute locally rather than consuming its owner's frame.
+                    if (promise) {
+                        promise->clear_affinity();
+                    }
+                    steals_executed_.fetch_add(1, std::memory_order_relaxed);
+                    return handle;
+                }
             } else {
                 if (promise) {
                     promise->clear_affinity();

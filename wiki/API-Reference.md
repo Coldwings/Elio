@@ -495,7 +495,7 @@ public:
 
     // Re-enqueue an already-suspended coroutine. Logical await ancestry is
     // preserved so continuation transfer restores the correct parent frame.
-    void schedule(std::coroutine_handle<> handle);
+    // Rejection leaves the borrowed handle live.
     bool try_schedule(std::coroutine_handle<> handle);
     
     // Spawn a task directly (convenience overload)
@@ -516,7 +516,6 @@ public:
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle);
 
     // Re-enqueue suspended work toward a worker; preserves await ancestry.
-    void schedule_to(size_t worker_id, std::coroutine_handle<> handle);
     bool try_schedule_to(size_t worker_id, std::coroutine_handle<> handle);
 
     // For targeted spawn and schedule APIs, exact placement requires
@@ -570,11 +569,12 @@ public:
 The raw-handle APIs have distinct ownership and virtual-stack contracts.
 `spawn()`/`try_spawn()` and `spawn_to()` are for an independent handle before
 its first execution; they detach construction-time ancestry.
-`schedule()`/`try_schedule()` and `schedule_to()`/`try_schedule_to()` are for a
-coroutine that has already suspended and must preserve the logical parent
-established by its await chain. Internal wake and affinity-migration paths use
-the corresponding `schedule` variant; callers must not substitute one family
-for the other.
+`try_schedule()` and `try_schedule_to()` are for a coroutine that has already
+suspended and must preserve the logical parent established by its await chain.
+These APIs borrow the handle: rejection leaves it live, and the caller must
+resume, retain, or otherwise resolve it. Internal wake and affinity-migration
+paths handle rejection explicitly; callers must not substitute one family for
+the other.
 
 `shutdown()` is the graceful path: it waits for tasks spawned through
 `go()`, `go_to()`, `go_joinable()`, `go_joinable_to()`, or `elio::run()` to

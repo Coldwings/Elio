@@ -230,8 +230,8 @@ private:
 
     void run();
     void drain_inbox() noexcept;
-    void run_or_redistribute_retiring_task(scheduler* sched,
-                                           std::coroutine_handle<> handle) noexcept;
+    [[nodiscard]] bool run_or_redistribute_retiring_task(
+        scheduler* sched, std::coroutine_handle<> handle) noexcept;
     [[nodiscard]] std::coroutine_handle<> get_next_task() noexcept;
     void run_task(std::coroutine_handle<> handle) noexcept;
     [[nodiscard]] std::coroutine_handle<> try_steal() noexcept;

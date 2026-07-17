@@ -52,8 +52,9 @@ public:
         // Schedule on target worker
         auto* sched = scheduler::current();
         if (sched && sched->is_running()) {
-            sched->schedule_to(worker_id_, handle);
-            return true;  // Suspend and let target worker resume
+            // A resumed coroutine is still owned by its awaiting task. If the
+            // target rejects it, return false so it continues on this worker.
+            return sched->try_schedule_to(worker_id_, handle);
         }
         
         return false;  // No scheduler, resume immediately

@@ -31,7 +31,7 @@ namespace detail {
 /// is in progress is unsafe two ways:
 ///
 ///   * the scheduler may be destroyed between the submit and the resume
-///     so ``sched->is_running()`` / ``sched->schedule(awaiter)`` reads a
+///     so ``sched->is_running()`` / ``sched->try_schedule(awaiter)`` reads a
 ///     dangling pointer;
 ///   * even while the scheduler is alive but ``is_running() == false``,
 ///     ``resume_via_scheduler`` falls through to ``handle.resume()`` on
@@ -81,8 +81,7 @@ inline bool submit_blocking(F&& work) {
 inline void resume_via_scheduler(std::coroutine_handle<> handle,
                                  runtime::scheduler* sched) noexcept {
     if (!handle) return;
-    if (sched && sched->is_running()) {
-        sched->schedule(handle);
+    if (sched && sched->is_running() && sched->try_schedule(handle)) {
         return;
     }
     if (!handle.done()) {
@@ -506,12 +505,15 @@ public:
 
         // Slow path: no current worker, go through scheduler
         auto* sched = runtime::scheduler::current();
-        if (sched) {
-            sched->schedule(awaiter);
-        } else {
-            // No scheduler, just resume immediately
-            awaiter.resume();
+        if (sched && sched->try_schedule(awaiter)) {
+            return;
         }
+
+        // No scheduler or enqueue rejection: resume without consuming the
+        // borrowed handle.
+        auto* promise = coro::get_promise_base(awaiter.address());
+        coro::detail::frame_context_scope frame_scope(promise);
+        awaiter.resume();
     }
 
     void await_resume() const noexcept {}

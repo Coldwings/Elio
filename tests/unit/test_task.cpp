@@ -339,6 +339,25 @@ TEST_CASE("affinity migration preserves await ancestry",
                       config));
 }
 
+TEST_CASE("rejected resume scheduling preserves task ownership",
+          "[task][ownership][lifetime][scheduler]") {
+    std::atomic<int> destructions{0};
+    scheduler stopped_scheduler(1);
+
+    {
+        auto pending = probed_lazy_task(task_lifetime_probe{&destructions});
+        const auto handle = get_handle(pending);
+
+        REQUIRE_FALSE(stopped_scheduler.try_schedule(handle));
+        REQUIRE_FALSE(stopped_scheduler.try_schedule_to(0, handle));
+        REQUIRE(pending.valid());
+        REQUIRE(get_handle(pending) == handle);
+        REQUIRE(destructions.load(std::memory_order_relaxed) == 0);
+    }
+
+    REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+}
+
 TEST_CASE("destroyed task_handle waiter is unregistered",
           "[task][task_handle][cancellation]") {
     auto state = std::make_shared<elio::coro::detail::task_state<void>>();

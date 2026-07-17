@@ -165,7 +165,7 @@ endif()
 if(TARGET elio_rdma_ibverbs)
     target_link_libraries(elio_tests PRIVATE elio_rdma_ibverbs)
 endif()
-target_compile_definitions(elio_tests PRIVATE ELIO_DEBUG)
+target_compile_definitions(elio_tests PRIVATE ELIO_DEBUG ELIO_TIMER_TEST_HOOKS)
 
 if(ELIO_BUILD_SANITIZER_TESTS)
     # ASAN-enabled test executable
@@ -188,7 +188,7 @@ if(ELIO_BUILD_SANITIZER_TESTS)
     endif()
     target_compile_options(elio_tests_asan PRIVATE -fsanitize=address -g -fno-omit-frame-pointer)
     target_link_options(elio_tests_asan PRIVATE -fsanitize=address)
-    target_compile_definitions(elio_tests_asan PRIVATE ELIO_DEBUG)
+    target_compile_definitions(elio_tests_asan PRIVATE ELIO_DEBUG ELIO_TIMER_TEST_HOOKS)
 
     # TSAN-enabled test executable
     add_executable(elio_tests_tsan ${TEST_SOURCES})
@@ -210,7 +210,7 @@ if(ELIO_BUILD_SANITIZER_TESTS)
     endif()
     target_compile_options(elio_tests_tsan PRIVATE -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan)
     target_link_options(elio_tests_tsan PRIVATE -fsanitize=thread)
-    target_compile_definitions(elio_tests_tsan PRIVATE ELIO_DEBUG)
+    target_compile_definitions(elio_tests_tsan PRIVATE ELIO_DEBUG ELIO_TIMER_TEST_HOOKS)
 endif()
 
 # Stress test executable for shared_mutex

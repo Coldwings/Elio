@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Scheduler accounting hooks**: The promise-level spawn-completion callback
   is now an internal scheduler detail rather than a public `promise_base`
   field. It was never a supported application extension point.
+- **Timer fallback rejection**: If a timer cannot be prepared by the I/O
+  backend and the scheduler blocking pool is unavailable, `sleep_for()` and
+  `sleep_until()` now continue on the current worker and throw
+  `std::runtime_error`. They no longer destroy the borrowed awaiting coroutine
+  frame. This applies to both regular and cancellation-aware sleeps.
 - **0.6.0 development metadata**: The in-tree development version is now 0.6.0,
   with README, public header, and CMake release metadata aligned after v0.5.3.
 

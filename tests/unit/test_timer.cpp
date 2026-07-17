@@ -1,10 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/time/timer.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/runtime/affinity.hpp>
 #include <elio/runtime/scheduler.hpp>
 
 #include <chrono>
 #include <atomic>
+#include <string_view>
 
 using namespace elio::time;
 using namespace elio::coro;
@@ -67,6 +69,44 @@ TEST_CASE("sleep_for zero duration", "[time][sleep]") {
     get_handle(t).resume();
     
     REQUIRE(completed);
+}
+
+TEST_CASE("sleep_for prepare fallback rejection preserves its awaiting task",
+          "[time][sleep][shutdown][affinity]") {
+    scheduler sched(1);
+    sched.start();
+    sched.get_blocking_pool()->shutdown();
+
+    std::atomic<bool> completed{false};
+    std::atomic<bool> rejected{false};
+    std::atomic<size_t> before_worker{NO_AFFINITY};
+    std::atomic<size_t> after_worker{NO_AFFINITY};
+    auto sleep_task = [&]() -> task<void> {
+        before_worker.store(elio::runtime::current_worker_id(),
+                            std::memory_order_release);
+        elio::time::detail::reject_next_timeout_prepare_for_test();
+        try {
+            co_await sleep_for(1s);
+        } catch (const std::runtime_error& ex) {
+            rejected.store(
+                std::string_view(ex.what()).starts_with("sleep_for rejected:"),
+                std::memory_order_release);
+        }
+        after_worker.store(elio::runtime::current_worker_id(),
+                           std::memory_order_release);
+        completed.store(true, std::memory_order_release);
+    };
+
+    spawn_task(sched, sleep_task);
+    for (int i = 0; i < 100 && !completed.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    REQUIRE(sched.shutdown(5s));
+
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(rejected.load(std::memory_order_acquire));
+    REQUIRE(before_worker.load(std::memory_order_acquire) == 0);
+    REQUIRE(after_worker.load(std::memory_order_acquire) == 0);
 }
 
 TEST_CASE("yield execution", "[time][yield]") {
@@ -284,6 +324,45 @@ TEST_CASE("cancellable sleep - already cancelled token", "[time][sleep][cancel]"
     
     REQUIRE(completed);
     REQUIRE(result_value == 1);  // Should be cancelled
+}
+
+TEST_CASE("cancellable sleep prepare fallback rejection preserves its awaiting task",
+          "[time][sleep][cancel][shutdown][affinity]") {
+    scheduler sched(1);
+    sched.start();
+    sched.get_blocking_pool()->shutdown();
+
+    cancel_source source;
+    std::atomic<bool> completed{false};
+    std::atomic<bool> rejected{false};
+    std::atomic<size_t> before_worker{NO_AFFINITY};
+    std::atomic<size_t> after_worker{NO_AFFINITY};
+    auto sleep_task = [&]() -> task<void> {
+        before_worker.store(elio::runtime::current_worker_id(),
+                            std::memory_order_release);
+        elio::time::detail::reject_next_timeout_prepare_for_test();
+        try {
+            (void)co_await sleep_for(1s, source.get_token());
+        } catch (const std::runtime_error& ex) {
+            rejected.store(
+                std::string_view(ex.what()).starts_with("sleep_for rejected:"),
+                std::memory_order_release);
+        }
+        after_worker.store(elio::runtime::current_worker_id(),
+                           std::memory_order_release);
+        completed.store(true, std::memory_order_release);
+    };
+
+    spawn_task(sched, sleep_task);
+    for (int i = 0; i < 100 && !completed.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    REQUIRE(sched.shutdown(5s));
+
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(rejected.load(std::memory_order_acquire));
+    REQUIRE(before_worker.load(std::memory_order_acquire) == 0);
+    REQUIRE(after_worker.load(std::memory_order_acquire) == 0);
 }
 
 TEST_CASE("cancel_token basic operations", "[time][cancel]") {

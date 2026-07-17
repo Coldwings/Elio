@@ -162,13 +162,10 @@ public:
     /// drain_remaining_tasks). Use shutdown() for graceful drain.
     void shutdown_force() {
         // Drain the blocking pool BEFORE flipping running_=false. Pool tasks
-        // finishing here resume their callers via the spawn_blocking awaitable;
-        // that path checks scheduler::is_running() to decide whether to route
-        // through scheduler::try_schedule() or fall back to caller.resume() on
-        // the pool thread. The fallback restores virtual-stack context but has
-        // no worker/io_context, so subsequent I/O would still be invalid. Doing
-        // the drain first keeps running_=true while pool tasks finish, so all
-        // resumes land on a real worker.
+        // finishing here resume their callers through
+        // scheduler::try_schedule(). Doing the drain first keeps running_=true
+        // while accepted work finishes, so every continuation can land on a
+        // real worker instead of being stranded during teardown.
         //
         // blocking_pool::shutdown() is idempotent, so this is safe even on
         // repeated calls or when shutdown_force() is invoked from contexts

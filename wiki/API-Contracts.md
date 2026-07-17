@@ -71,8 +71,8 @@ by a broad module heading without checking the feature page or header comment.
 | `runtime::clear_affinity()` | Clears the current coroutine's affinity requirement. | Use it only when the coroutine no longer depends on worker-local state. |
 | `runtime::bind_to_current_worker()` | Binds the current coroutine to its current worker when one exists. | Call it only after entering scheduler execution and before relying on worker-local resources. |
 | `coro::promise_base::affinity()`, `set_affinity()`, `clear_affinity()` | Store and report affinity metadata used by the scheduler. | Treat them as coroutine-runtime integration points, not as general synchronization APIs. |
-| `time::sleep_for()` | Wakes after the requested duration or token cancellation for cancellable overloads. | Pass a token if cancellation is required. Do not rely on exact wakeup time under scheduler load. |
-| `time::sleep_until()` | Wakes at or after the requested time point or token cancellation for cancellable overloads. | Use a clock/source appropriate for the application deadline. |
+| `time::sleep_for()` | Wakes after the requested duration or token cancellation for cancellable overloads. If backend timer preparation fails, Elio uses the scheduler blocking pool without moving the continuation off its scheduler; if that pool is unavailable, the await resumes on its current worker and throws `std::runtime_error`. | Pass a token if cancellation is required. Do not rely on exact wakeup time under scheduler load. Keep the scheduler blocking pool available while fallback may be needed, or handle rejection exceptions. |
+| `time::sleep_until()` | Wakes at or after the requested time point. It has the same backend-fallback and blocking-pool rejection behavior as `sleep_for()`. | Use a clock/source appropriate for the application deadline and handle fallback rejection when the blocking pool can be shut down independently. |
 | `time::yield()` | Reschedules the current coroutine according to scheduler policy. | Use it to cooperate, not to enforce ordering with other tasks. |
 
 ## Server Lifecycle And Signals

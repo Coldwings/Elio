@@ -9,6 +9,7 @@
 #include <coroutine>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -20,29 +21,46 @@ namespace elio::time {
 
 namespace detail {
 
+#ifdef ELIO_TIMER_TEST_HOOKS
+inline thread_local bool reject_next_timeout_prepare = false;
+
+inline void reject_next_timeout_prepare_for_test() noexcept {
+    reject_next_timeout_prepare = true;
+}
+#endif
+
+inline bool prepare_timeout(io::io_context& ctx, const io::io_request& req) {
+#ifdef ELIO_TIMER_TEST_HOOKS
+    if (std::exchange(reject_next_timeout_prepare, false)) {
+        return false;
+    }
+#endif
+    return ctx.prepare(req);
+}
+
 /// Submit `work` to the scheduler's blocking pool, falling back to a
 /// detached std::thread when there is no scheduler (e.g. unit tests).
 /// Used by the timer SQ-full fallback paths so we never block a worker
 /// thread for the full sleep duration.
 ///
-/// During scheduler shutdown the work is silently dropped. Callers pass a
-/// lambda that captures a raw ``runtime::scheduler*`` and the awaiter's
-/// ``coroutine_handle``; running that on a detached thread once shutdown
-/// is in progress is unsafe two ways:
+/// Scheduler-bound work must not fall back to a detached thread when the pool
+/// rejects it. Callers pass a lambda that captures a raw
+/// ``runtime::scheduler*`` and the awaiter's ``coroutine_handle``; detached
+/// execution would sit outside the scheduler's shutdown drain and is unsafe
+/// two ways:
 ///
 ///   * the scheduler may be destroyed between the submit and the resume
 ///     so ``sched->is_running()`` / ``sched->try_schedule(awaiter)`` reads a
 ///     dangling pointer;
-///   * even while the scheduler is alive but ``is_running() == false``,
-///     ``resume_via_scheduler`` falls through to ``handle.resume()`` on
-///     the detached thread — which has no ``worker_thread::current()`` or
-///     ``current_io_context()``, so every
-///     subsequent ``co_await`` on the resumed coroutine is a UAF.
+///   * directly resuming on that thread would provide no
+///     ``worker_thread::current()`` or ``current_io_context()``, so subsequent
+///     worker-local I/O would access invalid runtime state.
 ///
 /// Returns true if the work was accepted (by the blocking pool or a
 /// detached thread). Returns false if the scheduler is shutting down
-/// and the work was dropped — the caller MUST resume or destroy the
-/// awaiter to avoid leaking the coroutine frame.
+/// and the work was dropped. Awaiters must then remain on the current
+/// worker and report the rejection; the coroutine frame is borrowed and
+/// must not be destroyed here.
 template <typename F>
 inline bool submit_blocking(F&& work) {
     auto* sched = runtime::get_current_scheduler();
@@ -123,7 +141,7 @@ public:
         return duration_ns_ <= 0;
     }
 
-    void await_suspend(std::coroutine_handle<> awaiter) {
+    bool await_suspend(std::coroutine_handle<> awaiter) {
         // Get io_context from current worker or use provided one
         io::io_context* ctx = ctx_;
         if (!ctx) {
@@ -144,7 +162,7 @@ public:
         req.timeout_ts = &ts_;
 #endif
 
-        if (!ctx->prepare(req)) {
+        if (!detail::prepare_timeout(*ctx, req)) {
             // SQ full / submit failed: no SQE went out, so no CQE will
             // arrive. Drop the op_state (no orphan needed) and route the
             // sleep to the blocking pool so we don't block this worker
@@ -159,19 +177,21 @@ public:
                 std::this_thread::sleep_for(std::chrono::nanoseconds(duration));
                 detail::resume_via_scheduler(awaiter, sched);
             })) {
-                // Scheduler shutting down: work was dropped. Destroy the
-                // awaiter handle to prevent coroutine frame leak.
-                if (awaiter && !awaiter.done()) {
-                    awaiter.destroy();
-                }
+                fallback_rejected_ = true;
+                return false;
             }
-            return;
+            return true;
         }
 
         ctx->submit();
+        return true;
     }
 
-    void await_resume() noexcept {
+    void await_resume() {
+        if (fallback_rejected_) {
+            throw std::runtime_error(
+                "sleep_for rejected: scheduler blocking pool is unavailable");
+        }
         // Nothing to return; op_state lifetime is handled by the base
         // destructor (deletes via unique_ptr in the completed phase).
     }
@@ -179,6 +199,7 @@ public:
 private:
     io::io_context* ctx_ = nullptr;
     int64_t duration_ns_;
+    bool fallback_rejected_ = false;
 #ifdef __linux__
     mutable __kernel_timespec ts_{};  // Storage for io_uring timeout (always available on Linux)
 #endif
@@ -300,7 +321,7 @@ public:
         req.timeout_ts = &ts_;
 #endif
 
-        if (ctx->prepare(req)) {
+        if (detail::prepare_timeout(*ctx, req)) {
             ctx->submit();
             return true;  // Suspend (wait for timeout to complete)
         }
@@ -334,19 +355,16 @@ public:
                 state->resumed.store(true, std::memory_order_release);
                 detail::resume_via_scheduler(awaiter, sched);
             })) {
-            // Scheduler shutting down: work was dropped. Destroy the
-            // awaiter handle to prevent coroutine frame leak. The
-            // coroutine was already popped from the worker deque and
-            // suspended via await_suspend returning void, so
-            // drain_remaining_tasks will NOT find it.
-            if (awaiter && !awaiter.done()) {
-                awaiter.destroy();
-            }
+            // No work owns the suspension. Continue on this worker and
+            // report the rejection from await_resume().
+            state->resumed.store(true, std::memory_order_release);
+            fallback_rejected_ = true;
+            return false;
         }
         return true;  // Suspend (blocking pool will resume when done)
     }
 
-    cancel_result await_resume() noexcept {
+    cancel_result await_resume() {
         // Unregister to prevent the cancel callback from firing after
         // teardown. trigger() may still race us; if it has already moved
         // the head into a local list, this becomes a no-op and the
@@ -367,6 +385,10 @@ public:
             state_->resumed.store(true, std::memory_order_release);
             was_cancelled = was_cancelled ||
                             state_->cancelled.load(std::memory_order_acquire);
+        }
+        if (fallback_rejected_) {
+            throw std::runtime_error(
+                "sleep_for rejected: scheduler blocking pool is unavailable");
         }
         return (was_cancelled || token_.is_cancelled()) ? cancel_result::cancelled
                                                          : cancel_result::completed;
@@ -451,6 +473,7 @@ private:
     coro::cancel_token::registration cancel_registration_;
     std::shared_ptr<shared_state> state_;
     bool already_cancelled_before_setup_ = false;
+    bool fallback_rejected_ = false;
 #ifdef __linux__
     mutable __kernel_timespec ts_{};  // Storage for io_uring timeout (always available on Linux)
 #endif
@@ -459,6 +482,8 @@ private:
 /// Sleep for a duration
 /// @param duration Duration to sleep
 /// @return Awaitable that completes after the duration
+/// @throws std::runtime_error if the I/O backend rejects the timer and the
+/// scheduler blocking pool is unavailable for fallback execution
 template<typename Rep, typename Period>
 inline auto sleep_for(std::chrono::duration<Rep, Period> duration) {
     return sleep_awaitable(duration);
@@ -468,6 +493,8 @@ inline auto sleep_for(std::chrono::duration<Rep, Period> duration) {
 /// @param duration Duration to sleep
 /// @param token Cancellation token - sleep returns early if cancelled
 /// @return Awaitable that returns cancel_result::completed or cancel_result::cancelled
+/// @throws std::runtime_error if the I/O backend rejects the timer and the
+/// scheduler blocking pool is unavailable for fallback execution
 template<typename Rep, typename Period>
 inline auto sleep_for(std::chrono::duration<Rep, Period> duration, coro::cancel_token token) {
     return cancellable_sleep_awaitable(duration, std::move(token));
@@ -476,6 +503,8 @@ inline auto sleep_for(std::chrono::duration<Rep, Period> duration, coro::cancel_
 /// Sleep until a time point
 /// @param time_point Time point to sleep until
 /// @return Awaitable that completes at the time point
+/// @throws std::runtime_error if the I/O backend rejects the timer and the
+/// scheduler blocking pool is unavailable for fallback execution
 template<typename Clock, typename Duration>
 inline auto sleep_until(std::chrono::time_point<Clock, Duration> time_point) {
     auto now = Clock::now();

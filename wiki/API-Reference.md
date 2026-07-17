@@ -2919,6 +2919,12 @@ template<typename Clock, typename Duration>
 /* awaitable */ yield();
 ```
 
+`sleep_for()` and `sleep_until()` normally use the current worker's I/O
+backend. If timer preparation fails, they route the wait through the scheduler
+blocking pool while preserving worker affinity. If that pool is unavailable,
+the await continues on its current worker and throws `std::runtime_error`;
+this rejection is not reported as token cancellation.
+
 **Example:**
 ```cpp
 coro::task<void> example(coro::cancel_token token) {

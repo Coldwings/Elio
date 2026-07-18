@@ -2815,9 +2815,11 @@ that context alive while accepts are pending and while accepted streams use it.
 
 Coroutine-aware synchronization primitives (`mutex`, `shared_mutex`, `event`, `semaphore`, `condition_variable`, `channel`) track suspended waiters through intrusive nodes embedded in coroutine frames. If a frame is destroyed while its waiter is still linked, the awaiter's destructor unlinks the node from the primitive.
 
-This cleanup does not make every operation cancellable. `with_timeout()` requests cooperative cancellation but does not forcibly destroy its losing child. The child must pass the supplied `cancel_token` to a token-aware operation to stop on timeout. For example, `event::wait()` is not token-aware, so a timed-out `with_timeout()` child waiting on an event remains suspended and linked until the event is set.
+This cleanup does not make every operation cancellable. `with_timeout()` requests cooperative cancellation but does not forcibly destroy its losing child. The child must pass the supplied `cancel_token` to a token-aware operation to stop on timeout. `mutex::lock(token)`, `semaphore::acquire(token)`, and `event::wait(token)` provide that boundary and return `coro::cancel_result`. Their no-token overloads remain non-cancellable and preserve their `void` await result.
 
-The event and all objects captured by that child must outlive the pending wait. They must remain alive until the child has resumed past `event::wait()`, including the interval after `set()` dequeues the waiter but before the scheduler resumes it.
+Cancellation and normal notification atomically select one terminal result. A cancellation winner does not acquire a lock or permit. Once normal notification wins, the operation returns `completed` and any acquired resource remains owned by the caller. `condition_variable`, `channel`, and `shared_mutex` waits are not yet token-aware; their pending waits and captures must remain alive until normal notification resumes them.
+
+Callers must inspect the `cancel_result` from every token-aware wait before assuming that notification occurred or that a lock or permit was acquired.
 
 ### `mutex`
 
@@ -2830,6 +2832,9 @@ public:
     
     // Acquire lock (awaitable)
     /* awaitable */ lock();
+
+    // Acquire or return cancel_result::cancelled
+    /* awaitable<cancel_result> */ lock(coro::cancel_token token);
     
     // Try to acquire without waiting
     bool try_lock();
@@ -3029,6 +3034,9 @@ public:
     // Wait for the event to be set (awaitable)
     /* awaitable */ wait();
 
+    // Wait or return cancel_result::cancelled
+    /* awaitable<cancel_result> */ wait(coro::cancel_token token);
+
     // Set the event (wakes all waiters)
     void set();
 
@@ -3082,6 +3090,9 @@ public:
 
     // Acquire (awaitable)
     /* awaitable */ acquire();
+
+    // Acquire or return cancel_result::cancelled
+    /* awaitable<cancel_result> */ acquire(coro::cancel_token token);
 
     // Try acquire without waiting
     bool try_acquire();

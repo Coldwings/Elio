@@ -612,14 +612,15 @@ Coroutine-aware synchronization primitives (`event`, `mutex`, `semaphore`, `cond
 
 This lifetime cleanup is not itself a cancellation API. `with_timeout()` requests cooperative cancellation when its timer wins; it does not forcibly destroy the losing child task. The child stops promptly only when it passes the supplied `cancel_token` to an operation that supports cancellation.
 
-In particular, `event::wait()` has no `cancel_token` overload. Wrapping it in `with_timeout()` does not cancel or destroy the event waiter when the timeout wins; that child remains suspended and linked until the event is set.
+`mutex::lock(token)`, `semaphore::acquire(token)`, and `event::wait(token)` are cancellation-aware and return `coro::cancel_result`. Cancellation and normal notification atomically select one terminal result. If cancellation wins, a mutex lock or semaphore permit is not acquired. If normal notification wins first, the operation returns `completed` and the caller owns the acquired resource even if cancellation is requested immediately afterward. The overloads without a token remain non-cancellable and preserve their `void` await result.
 
-The event and every object captured by that child must therefore outlive the pending wait. They must remain alive until the child has resumed past `event::wait()`, including the interval after `set()` dequeues the waiter but before the scheduler resumes it.
+`condition_variable`, `channel`, and `shared_mutex` do not yet provide token-aware waits. A timed-out child blocked on one of those operations remains suspended and linked until the primitive wakes it. The primitive and every object captured by that child must outlive the pending wait, including the interval after a notifier dequeues the waiter but before the scheduler resumes it.
 
 **Key guarantees:**
 - Destroying a frame whose waiter is still linked removes that waiter from the primitive's list
 - No manual waiter-list cleanup is required; unlinking happens in the awaiter's destructor
 - Timeout cancellation remains cooperative and requires a token-aware operation
+- A completed lock or permit acquisition is not rolled back by a later cancellation request
 
 ### Condition Variable
 

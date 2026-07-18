@@ -1,15 +1,485 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/sync/primitives.hpp>
+#include <elio/sync/detail/wake_state.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/coro/this_coro.hpp>
 #include <elio/runtime/scheduler.hpp>
 
 #include <atomic>
+#include <barrier>
+#include <chrono>
 #include <coroutine>
 #include <thread>
+#include <type_traits>
 
 using namespace elio::sync;
 using namespace elio::coro;
 using namespace elio::runtime;
+
+namespace {
+
+bool wait_for_flag(const std::atomic<bool>& flag) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(5);
+    while (!flag.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return flag.load(std::memory_order_acquire);
+}
+
+} // namespace
+
+TEST_CASE("wake_state resolves completion during blocked publication",
+          "[sync][cancellation][wake_state]") {
+    SECTION("cancellation") {
+        auto state = elio::sync::detail::make_wake_state();
+        REQUIRE(state->set_handle_blocked(std::noop_coroutine()));
+        REQUIRE(state->request_cancel());
+        REQUIRE_FALSE(state->unblock_after_publish());
+        REQUIRE(state->was_cancelled());
+        REQUIRE_FALSE(state->schedule_selected());
+    }
+
+    SECTION("notification") {
+        auto state = elio::sync::detail::make_wake_state();
+        REQUIRE(state->set_handle_blocked(std::noop_coroutine()));
+        REQUIRE(state->claim_notification() ==
+                elio::sync::detail::wake_action::completed_inline);
+        REQUIRE_FALSE(state->unblock_after_publish());
+        REQUIRE_FALSE(state->was_cancelled());
+        REQUIRE_FALSE(state->request_cancel());
+    }
+}
+
+TEST_CASE("basic sync waits preserve resources when already cancelled",
+          "[sync][cancellation][cancel_token]") {
+    cancel_source source;
+    source.cancel();
+
+    SECTION("mutex") {
+        mutex m;
+        auto waiter = m.lock(source.get_token());
+        REQUIRE(waiter.await_ready());
+        REQUIRE(waiter.await_resume() == cancel_result::cancelled);
+        REQUIRE_FALSE(m.is_locked());
+    }
+
+    SECTION("semaphore") {
+        semaphore sem(1);
+        auto waiter = sem.acquire(source.get_token());
+        REQUIRE(waiter.await_ready());
+        REQUIRE(waiter.await_resume() == cancel_result::cancelled);
+        REQUIRE(sem.count() == 1);
+    }
+
+    SECTION("event") {
+        event e;
+        e.set();
+        auto waiter = e.wait(source.get_token());
+        REQUIRE(waiter.await_ready());
+        REQUIRE(waiter.await_resume() == cancel_result::cancelled);
+        REQUIRE(e.is_set());
+    }
+}
+
+TEST_CASE("basic sync waits without tokens preserve void results",
+          "[sync][cancellation][result]") {
+    SECTION("mutex") {
+        mutex m;
+        auto waiter = m.lock();
+        REQUIRE(waiter.await_ready());
+        static_assert(std::is_void_v<decltype(waiter.await_resume())>);
+        waiter.await_resume();
+        m.unlock();
+    }
+
+    SECTION("semaphore") {
+        semaphore sem(1);
+        auto waiter = sem.acquire();
+        REQUIRE(waiter.await_ready());
+        static_assert(std::is_void_v<decltype(waiter.await_resume())>);
+        waiter.await_resume();
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("event") {
+        event e;
+        e.set();
+        auto waiter = e.wait();
+        REQUIRE(waiter.await_ready());
+        static_assert(std::is_void_v<decltype(waiter.await_resume())>);
+        waiter.await_resume();
+    }
+}
+
+TEST_CASE("runtime cancellation wakes basic sync waits",
+          "[sync][cancellation][cancel_token][runtime]") {
+    scheduler sched(2);
+    sched.start();
+
+    SECTION("mutex") {
+        mutex m;
+        REQUIRE(m.try_lock());
+        std::atomic<bool> started{false};
+        std::atomic<bool> completed{false};
+        std::atomic<cancel_result> result{cancel_result::completed};
+
+        auto joined = sched.go_joinable([&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            result.store(co_await m.lock(this_coro::cancel_token()),
+                         std::memory_order_release);
+            completed.store(true, std::memory_order_release);
+            co_return;
+        });
+
+        REQUIRE(wait_for_flag(started));
+        joined.request_cancel();
+        REQUIRE(wait_for_flag(completed));
+        joined.wait_destroyed();
+        REQUIRE(result.load(std::memory_order_acquire) ==
+                cancel_result::cancelled);
+        REQUIRE(m.is_locked());
+        m.unlock();
+    }
+
+    SECTION("semaphore") {
+        semaphore sem(0);
+        std::atomic<bool> started{false};
+        std::atomic<bool> completed{false};
+        std::atomic<cancel_result> result{cancel_result::completed};
+
+        auto joined = sched.go_joinable([&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            result.store(co_await sem.acquire(this_coro::cancel_token()),
+                         std::memory_order_release);
+            completed.store(true, std::memory_order_release);
+            co_return;
+        });
+
+        REQUIRE(wait_for_flag(started));
+        joined.request_cancel();
+        REQUIRE(wait_for_flag(completed));
+        joined.wait_destroyed();
+        REQUIRE(result.load(std::memory_order_acquire) ==
+                cancel_result::cancelled);
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("event") {
+        event e;
+        std::atomic<bool> started{false};
+        std::atomic<bool> completed{false};
+        std::atomic<cancel_result> result{cancel_result::completed};
+
+        auto joined = sched.go_joinable([&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            result.store(co_await e.wait(this_coro::cancel_token()),
+                         std::memory_order_release);
+            completed.store(true, std::memory_order_release);
+            co_return;
+        });
+
+        REQUIRE(wait_for_flag(started));
+        joined.request_cancel();
+        REQUIRE(wait_for_flag(completed));
+        joined.wait_destroyed();
+        REQUIRE(result.load(std::memory_order_acquire) ==
+                cancel_result::cancelled);
+        REQUIRE_FALSE(e.is_set());
+    }
+
+    sched.shutdown();
+}
+
+TEST_CASE("basic sync notification wins before later cancellation",
+          "[sync][cancellation][cancel_token][notification]") {
+    scheduler sched(2);
+    sched.start();
+
+    SECTION("mutex") {
+        mutex m;
+        REQUIRE(m.try_lock());
+        cancel_source source;
+        std::atomic<bool> started{false};
+        std::atomic<bool> completed{false};
+        std::atomic<cancel_result> result{cancel_result::cancelled};
+
+        auto joined = sched.go_joinable([&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            const auto terminal = co_await m.lock(source.get_token());
+            result.store(terminal, std::memory_order_release);
+            if (terminal == cancel_result::completed) {
+                m.unlock();
+            }
+            completed.store(true, std::memory_order_release);
+            co_return;
+        });
+
+        REQUIRE(wait_for_flag(started));
+        m.unlock();
+        REQUIRE(wait_for_flag(completed));
+        source.cancel();
+        joined.wait_destroyed();
+        REQUIRE(result.load(std::memory_order_acquire) ==
+                cancel_result::completed);
+        REQUIRE_FALSE(m.is_locked());
+    }
+
+    SECTION("semaphore") {
+        semaphore sem(0);
+        cancel_source source;
+        std::atomic<bool> started{false};
+        std::atomic<bool> completed{false};
+        std::atomic<cancel_result> result{cancel_result::cancelled};
+
+        auto joined = sched.go_joinable([&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            result.store(co_await sem.acquire(source.get_token()),
+                         std::memory_order_release);
+            completed.store(true, std::memory_order_release);
+            co_return;
+        });
+
+        REQUIRE(wait_for_flag(started));
+        sem.release();
+        REQUIRE(wait_for_flag(completed));
+        source.cancel();
+        joined.wait_destroyed();
+        REQUIRE(result.load(std::memory_order_acquire) ==
+                cancel_result::completed);
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("event") {
+        event e;
+        cancel_source source;
+        std::atomic<bool> started{false};
+        std::atomic<bool> completed{false};
+        std::atomic<cancel_result> result{cancel_result::cancelled};
+
+        auto joined = sched.go_joinable([&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            result.store(co_await e.wait(source.get_token()),
+                         std::memory_order_release);
+            completed.store(true, std::memory_order_release);
+            co_return;
+        });
+
+        REQUIRE(wait_for_flag(started));
+        e.set();
+        REQUIRE(wait_for_flag(completed));
+        source.cancel();
+        joined.wait_destroyed();
+        REQUIRE(result.load(std::memory_order_acquire) ==
+                cancel_result::completed);
+        REQUIRE(e.is_set());
+    }
+
+    sched.shutdown();
+}
+
+TEST_CASE("semaphore cancellation and release select one terminal result",
+          "[sync][semaphore][cancellation][cancel_token][race]") {
+    scheduler sched(2);
+    sched.start();
+
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        semaphore sem(0);
+        cancel_source source;
+        std::atomic<bool> started{false};
+        std::atomic<bool> completed{false};
+        std::atomic<cancel_result> result{cancel_result::completed};
+
+        auto waiter = [&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            result.store(co_await sem.acquire(source.get_token()),
+                         std::memory_order_release);
+            completed.store(true, std::memory_order_release);
+            co_return;
+        };
+        auto pending = waiter();
+        sched.spawn(elio::coro::detail::task_access::release(
+            std::move(pending)));
+
+        REQUIRE(wait_for_flag(started));
+
+        std::barrier race_start(3);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        std::thread releaser([&] {
+            race_start.arrive_and_wait();
+            sem.release();
+        });
+        race_start.arrive_and_wait();
+        canceller.join();
+        releaser.join();
+
+        REQUIRE(wait_for_flag(completed));
+        const auto terminal = result.load(std::memory_order_acquire);
+        if (terminal == cancel_result::completed) {
+            REQUIRE(sem.count() == 0);
+        } else {
+            REQUIRE(sem.count() == 1);
+        }
+    }
+
+    sched.shutdown();
+}
+
+TEST_CASE("mutex cancellation and unlock select one terminal result",
+          "[sync][mutex][cancellation][cancel_token][race]") {
+    scheduler sched(2);
+    sched.start();
+
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        mutex m;
+        REQUIRE(m.try_lock());
+        cancel_source source;
+        std::atomic<bool> started{false};
+        std::atomic<bool> completed{false};
+        std::atomic<cancel_result> result{cancel_result::cancelled};
+
+        auto waiter = [&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            const auto terminal = co_await m.lock(source.get_token());
+            result.store(terminal, std::memory_order_release);
+            if (terminal == cancel_result::completed) {
+                m.unlock();
+            }
+            completed.store(true, std::memory_order_release);
+            co_return;
+        };
+        auto pending = waiter();
+        sched.spawn(elio::coro::detail::task_access::release(
+            std::move(pending)));
+
+        REQUIRE(wait_for_flag(started));
+
+        std::barrier race_start(3);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        std::thread unlocker([&] {
+            race_start.arrive_and_wait();
+            m.unlock();
+        });
+        race_start.arrive_and_wait();
+        canceller.join();
+        unlocker.join();
+
+        REQUIRE(wait_for_flag(completed));
+        const auto terminal = result.load(std::memory_order_acquire);
+        REQUIRE((terminal == cancel_result::completed ||
+                 terminal == cancel_result::cancelled));
+        REQUIRE_FALSE(m.is_locked());
+    }
+
+    sched.shutdown();
+}
+
+TEST_CASE("event cancellation and set select one terminal result",
+          "[sync][event][cancellation][cancel_token][race]") {
+    scheduler sched(2);
+    sched.start();
+
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        event e;
+        cancel_source source;
+        std::atomic<bool> started{false};
+        std::atomic<bool> completed{false};
+        std::atomic<cancel_result> result{cancel_result::cancelled};
+
+        auto waiter = [&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            result.store(co_await e.wait(source.get_token()),
+                         std::memory_order_release);
+            completed.store(true, std::memory_order_release);
+            co_return;
+        };
+        auto pending = waiter();
+        sched.spawn(elio::coro::detail::task_access::release(
+            std::move(pending)));
+
+        REQUIRE(wait_for_flag(started));
+
+        std::barrier race_start(3);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        std::thread setter([&] {
+            race_start.arrive_and_wait();
+            e.set();
+        });
+        race_start.arrive_and_wait();
+        canceller.join();
+        setter.join();
+
+        REQUIRE(wait_for_flag(completed));
+        const auto terminal = result.load(std::memory_order_acquire);
+        REQUIRE((terminal == cancel_result::completed ||
+                 terminal == cancel_result::cancelled));
+        REQUIRE(e.is_set());
+    }
+
+    sched.shutdown();
+}
+
+TEST_CASE("basic sync wake paths skip a cancelled head waiter",
+          "[sync][cancellation][cancel_token][queue]") {
+    cancel_source cancelled;
+
+    SECTION("mutex") {
+        mutex m;
+        REQUIRE(m.try_lock());
+        auto first = m.lock(cancelled.get_token());
+        auto second = m.lock();
+        REQUIRE(first.await_suspend(std::noop_coroutine()));
+        REQUIRE(second.await_suspend(std::noop_coroutine()));
+
+        cancelled.cancel();
+        m.unlock();
+
+        REQUIRE(first.await_resume() == cancel_result::cancelled);
+        second.await_resume();
+        REQUIRE(m.is_locked());
+        m.unlock();
+    }
+
+    SECTION("semaphore") {
+        semaphore sem(0);
+        auto first = sem.acquire(cancelled.get_token());
+        auto second = sem.acquire();
+        REQUIRE(first.await_suspend(std::noop_coroutine()));
+        REQUIRE(second.await_suspend(std::noop_coroutine()));
+
+        cancelled.cancel();
+        sem.release();
+
+        REQUIRE(first.await_resume() == cancel_result::cancelled);
+        second.await_resume();
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("event") {
+        event e;
+        auto first = e.wait(cancelled.get_token());
+        auto second = e.wait();
+        REQUIRE(first.await_suspend(std::noop_coroutine()));
+        REQUIRE(second.await_suspend(std::noop_coroutine()));
+
+        cancelled.cancel();
+        e.set();
+
+        REQUIRE(first.await_resume() == cancel_result::cancelled);
+        second.await_resume();
+        REQUIRE(e.is_set());
+    }
+}
 
 TEST_CASE("event: destroying waiter does not crash on set()", "[sync][event][cancellation]") {
     event e;

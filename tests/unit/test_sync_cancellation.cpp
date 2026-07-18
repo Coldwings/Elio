@@ -857,6 +857,58 @@ TEST_CASE("channel recv API preserves values across cancellation races",
     sched.shutdown();
 }
 
+TEST_CASE("channel rendezvous handoff selects send or cancellation",
+          "[sync][channel][cancellation][cancel_token][race][runtime]") {
+    scheduler sched(2);
+    sched.start();
+
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        channel<int> ch;
+        cancel_source source;
+        std::atomic<bool> started{false};
+        std::atomic<bool> send_succeeded{false};
+        std::optional<channel<int>::cancellable_recv_result> result;
+
+        auto receiver = sched.go_joinable([&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            result = co_await ch.recv(source.get_token());
+        });
+        REQUIRE(wait_for_flag(started));
+
+        std::barrier race_start(3);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        std::thread sender([&] {
+            race_start.arrive_and_wait();
+            send_succeeded.store(ch.try_send(iteration),
+                                 std::memory_order_release);
+        });
+        race_start.arrive_and_wait();
+        canceller.join();
+        sender.join();
+        receiver.wait_destroyed();
+
+        REQUIRE(result.has_value());
+        const bool sent = send_succeeded.load(std::memory_order_acquire);
+        if (result->success()) {
+            REQUIRE(sent);
+            REQUIRE(result->value == iteration);
+        } else {
+            REQUIRE(result->was_cancelled());
+            if (sent) {
+                REQUIRE(ch.try_recv() == iteration);
+            } else {
+                REQUIRE_FALSE(ch.try_recv().has_value());
+            }
+        }
+        REQUIRE(ch.empty());
+    }
+
+    sched.shutdown();
+}
+
 TEST_CASE("channel wake paths skip cancelled head waiters",
           "[sync][channel][cancellation][cancel_token][queue]") {
     SECTION("receivers") {

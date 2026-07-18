@@ -852,8 +852,6 @@ public:
                 result_ = io::io_result{-ECANCELED, 0};
                 return false;
             }
-
-            bind_to_worker(awaiter);
             auto& ctx = io::current_io_context();
 
             if (is_cancellable()) {
@@ -861,6 +859,7 @@ public:
                 state->ctx = &ctx;
                 state->awaiter = awaiter;
                 state->worker = runtime::worker_thread::current();
+                state->context_generation = ctx.generation();
                 cancel_state_ = state;
 
                 cancel_registration_ = token_.on_cancel([state]() {
@@ -892,7 +891,7 @@ public:
             req.addrlen = &peer_addr_len_;
             req.socket_flags = SOCK_NONBLOCK | SOCK_CLOEXEC;
             req.awaiter = awaiter;
-            req.state = setup_op_state(awaiter);
+            req.state = setup_op_state(awaiter, ctx);
 
             if (cancel_state_) {
                 cancel_state_->op = req.state;
@@ -905,7 +904,14 @@ public:
                 }
             }
 
-            if (!ctx.prepare(req)) {
+            if (!prepare_op_state(ctx, req, [&]() noexcept {
+                    if (cancel_state_) {
+                        cancel_state_->op = nullptr;
+                        cancel_state_->resumed.store(
+                            true, std::memory_order_release);
+                    }
+                    cancel_registration_.unregister();
+                })) {
                 clear_op_state();
                 if (cancel_state_) {
                     cancel_state_->op = nullptr;
@@ -923,7 +929,6 @@ public:
                 cancel_state_->resumed.store(true, std::memory_order_release);
             }
             result_ = read_result_from_op_state();
-            restore_affinity();
 
             if (!result_.success()) {
                 errno = result_.error_code();
@@ -1072,8 +1077,6 @@ public:
             result_ = io::io_result{-ECANCELED, 0};
             return false;
         }
-
-        bind_to_worker(awaiter);
         auto& ctx = io::current_io_context();
 
         if (is_cancellable()) {
@@ -1081,6 +1084,7 @@ public:
             state->ctx = &ctx;
             state->awaiter = awaiter;
             state->worker = runtime::worker_thread::current();
+            state->context_generation = ctx.generation();
             cancel_state_ = state;
 
             cancel_registration_ = token_.on_cancel([state]() {
@@ -1145,7 +1149,7 @@ public:
         req.addr = reinterpret_cast<struct sockaddr*>(&sa_);
         req.addrlen = &sa_len_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
 
         if (cancel_state_) {
             cancel_state_->op = req.state;
@@ -1160,7 +1164,14 @@ public:
             }
         }
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req, [&]() noexcept {
+                if (cancel_state_) {
+                    cancel_state_->op = nullptr;
+                    cancel_state_->resumed.store(
+                        true, std::memory_order_release);
+                }
+                cancel_registration_.unregister();
+            })) {
             clear_op_state();
             if (cancel_state_) {
                 cancel_state_->op = nullptr;
@@ -1186,8 +1197,6 @@ public:
         if (cancel_state_) {
             cancel_state_->resumed.store(true, std::memory_order_release);
         }
-
-        restore_affinity();
 
         // Async path completion result comes from op_state.
         if (connect_in_progress_ && fd_ >= 0) {

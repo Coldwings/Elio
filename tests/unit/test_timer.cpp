@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <atomic>
+#include <limits>
 #include <string_view>
 
 using namespace elio::time;
@@ -81,6 +82,10 @@ TEST_CASE("sleep_for prepare fallback rejection preserves its awaiting task",
     std::atomic<bool> rejected{false};
     std::atomic<size_t> before_worker{NO_AFFINITY};
     std::atomic<size_t> after_worker{NO_AFFINITY};
+    std::atomic<size_t> task_pins_after_rejection{
+        std::numeric_limits<size_t>::max()};
+    std::atomic<size_t> context_pins_after_rejection{
+        std::numeric_limits<size_t>::max()};
     auto sleep_task = [&]() -> task<void> {
         before_worker.store(elio::runtime::current_worker_id(),
                             std::memory_order_release);
@@ -94,6 +99,16 @@ TEST_CASE("sleep_for prepare fallback rejection preserves its awaiting task",
         }
         after_worker.store(elio::runtime::current_worker_id(),
                            std::memory_order_release);
+        auto* frame = promise_base::current_frame();
+        auto* worker = worker_thread::current();
+        task_pins_after_rejection.store(
+            frame ? frame->active_io_pin_count() :
+                    std::numeric_limits<size_t>::max(),
+            std::memory_order_release);
+        context_pins_after_rejection.store(
+            worker ? worker->io_context().active_pin_count() :
+                     std::numeric_limits<size_t>::max(),
+            std::memory_order_release);
         completed.store(true, std::memory_order_release);
     };
 
@@ -107,6 +122,8 @@ TEST_CASE("sleep_for prepare fallback rejection preserves its awaiting task",
     REQUIRE(rejected.load(std::memory_order_acquire));
     REQUIRE(before_worker.load(std::memory_order_acquire) == 0);
     REQUIRE(after_worker.load(std::memory_order_acquire) == 0);
+    REQUIRE(task_pins_after_rejection.load(std::memory_order_acquire) == 0);
+    REQUIRE(context_pins_after_rejection.load(std::memory_order_acquire) == 0);
 }
 
 TEST_CASE("yield execution", "[time][yield]") {

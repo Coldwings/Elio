@@ -198,7 +198,9 @@ public:
                 timer_queue_.push(timer_entry{deadline, req.awaiter, ckey, req.state});
                 pending_count_++;
 
-                ELIO_LOG_DEBUG("Prepared timeout: {}ns", timeout_ns);
+                detail::run_noexcept([&]() {
+                    ELIO_LOG_DEBUG("Prepared timeout: {}ns", timeout_ns);
+                });
                 return true;
             }
                 
@@ -226,8 +228,10 @@ public:
                 state.registered = previous_registered;
                 io_result result{-err, 0};
                 last_result_ = result;
-                ELIO_LOG_WARNING("epoll_ctl failed for fd {}: {}",
-                                 req.fd, strerror(err));
+                detail::run_noexcept([&]() {
+                    ELIO_LOG_WARNING("epoll_ctl failed for fd {}: {}",
+                                     req.fd, strerror(err));
+                });
                 if (state.pending_ops.empty() && !state.registered) {
                     fd_states_.erase(state_it);
                 }
@@ -270,8 +274,10 @@ public:
         
         state.pending_ops.push_back(std::move(op));
         pending_count_++;
-        ELIO_LOG_DEBUG("Prepared io_op::{} on fd={}", 
-                       static_cast<int>(req.op), req.fd);
+        detail::run_noexcept([&]() {
+            ELIO_LOG_DEBUG("Prepared io_op::{} on fd={}",
+                           static_cast<int>(req.op), req.fd);
+        });
         return true;
     }
     
@@ -576,11 +582,14 @@ public:
         return last_result_;
     }
 
-    void notify() override {
+    void notify() noexcept override {
         uint64_t val = 1;
         ssize_t ret = ::write(wake_fd_, &val, sizeof(val));
         if (ret < 0 && errno != EAGAIN) {
-            ELIO_LOG_WARNING("eventfd write failed: {}", strerror(errno));
+            int error = errno;
+            detail::run_noexcept([&]() {
+                ELIO_LOG_WARNING("eventfd write failed: {}", strerror(error));
+            });
         }
     }
 
@@ -634,6 +643,10 @@ private:
             state->result = result.result;
             state->flags = result.flags;
             handle = state->handle;
+            // This backend operation is terminal. Release the operation pin
+            // before publishing completed because the awaitable may free the
+            // state immediately after the successful CAS.
+            state->operation_guard.release();
 
             uint8_t expected = op_state::phase_pending;
             if (!state->phase.compare_exchange_strong(

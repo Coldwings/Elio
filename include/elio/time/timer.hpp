@@ -142,7 +142,8 @@ public:
         return duration_ns_ <= 0;
     }
 
-    bool await_suspend(std::coroutine_handle<> awaiter) {
+    template<typename Promise>
+    bool await_suspend(std::coroutine_handle<Promise> awaiter) {
         // Get io_context from current worker or use provided one
         io::io_context* ctx = ctx_;
         if (!ctx) {
@@ -156,14 +157,15 @@ public:
         req.awaiter = awaiter;
         // Owner-controlled op_state: tags the SQE so a CQE arriving after
         // teardown is dropped instead of resuming a freed coroutine frame.
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, *ctx);
 #ifdef __linux__
         // Provide our local timespec for io_uring backend (runtime check)
         // epoll backend ignores this field
         req.timeout_ts = &ts_;
 #endif
 
-        if (!detail::prepare_timeout(*ctx, req)) {
+        if (!prepare_op_state(
+                [&]() { return detail::prepare_timeout(*ctx, req); })) {
             // SQ full / submit failed: no SQE went out, so no CQE will
             // arrive. Drop the op_state (no orphan needed) and route the
             // sleep to the blocking pool so we don't block this worker
@@ -239,7 +241,8 @@ public:
         return token_.is_cancelled() || duration_ns_ <= 0;
     }
 
-    bool await_suspend(std::coroutine_handle<> awaiter) {
+    template<typename Promise>
+    bool await_suspend(std::coroutine_handle<Promise> awaiter) {
         // Check if already cancelled before setting up
         if (token_.is_cancelled()) {
             already_cancelled_before_setup_ = true;
@@ -265,6 +268,7 @@ public:
         state->ctx = ctx;
         state->awaiter = awaiter;
         state->worker = runtime::worker_thread::current();
+        state->context_generation = ctx->generation();
         // ``op`` is set below once setup_op_state succeeds. The cancel
         // executor uses it as the SQE-matching key (tagged user_data) so
         // it cancels the right entry even though the SQE no longer keys
@@ -319,7 +323,7 @@ public:
         // sleep_awaitable. The pointer is stashed in shared_state so the
         // cancel executor can pass the matching tagged user_data to
         // io_context::cancel().
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, *ctx);
         state->op = req.state;
 #ifdef __linux__
         // Provide our local timespec for io_uring backend (runtime check)
@@ -327,7 +331,13 @@ public:
         req.timeout_ts = &ts_;
 #endif
 
-        if (detail::prepare_timeout(*ctx, req)) {
+        if (prepare_op_state_with_rollback(
+                [&]() { return detail::prepare_timeout(*ctx, req); },
+                [&]() noexcept {
+                    state->op = nullptr;
+                    state->resumed.store(true, std::memory_order_release);
+                    cancel_registration_.unregister();
+                })) {
             ctx->submit();
             return true;  // Suspend (wait for timeout to complete)
         }
@@ -416,6 +426,7 @@ private:
         io::io_context* ctx = nullptr;
         std::coroutine_handle<> awaiter;
         runtime::worker_thread* worker = nullptr;
+        uint64_t context_generation = 0;
         io::op_state* op = nullptr;
         std::atomic<bool> resumed{false};
         std::atomic<bool> cancelled{false};
@@ -426,11 +437,9 @@ private:
     /// final_suspend. Captures shared_ptr<shared_state> by value so it
     /// holds an independent ref to the state.
     ///
-    /// NOTE: promise_type MUST inherit coro::promise_base to enable the
-    /// affinity mechanism. Without it, try_steal() sees NO_AFFINITY and
-    /// allows stealing this task to other workers, which then access the
-    /// wrong io_context's io_uring ring — causing data races (TSAN warning
-    /// in CI run 27592314235).
+    /// This promise inherits promise_base so the executor can be marked as
+    /// worker-local maintenance. Its affinity identifies the backend owner;
+    /// the scheduler must not run it on another worker.
     struct cancel_executor {
         struct promise_type : public coro::promise_base {
             cancel_executor get_return_object() {
@@ -464,6 +473,12 @@ private:
         // timer CQE), resumed is still false here and we proceed to
         // issue ctx->cancel() as intended.
         if (state->resumed.load(std::memory_order_acquire)) {
+            co_return;
+        }
+        if (state->worker &&
+            (&state->worker->io_context() != state->ctx ||
+             state->worker->io_context().generation() !=
+                 state->context_generation)) {
             co_return;
         }
         if (state->ctx && state->op) {

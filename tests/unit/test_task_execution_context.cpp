@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/coro/frame.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/io/io_context_identity.hpp>
+#include <elio/io/io_operation_guard.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <memory>
 
@@ -49,6 +51,78 @@ TEST_CASE("promise runtime policy is stored in task execution context",
 
     promise.clear_affinity();
     REQUIRE(context->user_affinity() == NO_AFFINITY);
+}
+
+TEST_CASE("I/O pins override but do not rewrite user affinity",
+          "[task][execution_context][io][affinity]") {
+    auto context = std::make_shared<task_execution_context>();
+    auto first_identity =
+        std::make_shared<elio::io::detail::io_context_identity>(2, 41);
+    auto other_identity =
+        std::make_shared<elio::io::detail::io_context_identity>(3, 42);
+
+    context->set_user_affinity(7);
+    {
+        elio::io::detail::io_operation_guard outer(context, first_identity);
+        REQUIRE(context->has_active_io_pin());
+        REQUIRE(context->active_io_pin_count() == 1);
+        REQUIRE(context->io_owner_worker() == 2);
+        REQUIRE(context->io_context_generation() == 41);
+        REQUIRE(context->effective_affinity() == 2);
+        REQUIRE(first_identity->active_pins.load() == 1);
+
+        context->clear_user_affinity();
+        REQUIRE(context->user_affinity() == NO_AFFINITY);
+        REQUIRE(context->effective_affinity() == 2);
+
+        {
+            elio::io::detail::io_operation_guard nested(context, first_identity);
+            REQUIRE(context->active_io_pin_count() == 2);
+            REQUIRE(first_identity->active_pins.load() == 2);
+            REQUIRE_THROWS_AS(
+                elio::io::detail::io_operation_guard(context, other_identity),
+                std::logic_error);
+            REQUIRE(other_identity->active_pins.load() == 0);
+        }
+
+        REQUIRE(context->active_io_pin_count() == 1);
+        REQUIRE(first_identity->active_pins.load() == 1);
+    }
+
+    REQUIRE_FALSE(context->has_active_io_pin());
+    REQUIRE(context->active_io_pin_count() == 0);
+    REQUIRE(context->effective_affinity() == NO_AFFINITY);
+    REQUIRE(first_identity->active_pins.load() == 0);
+}
+
+TEST_CASE("I/O operation guard move and standalone accounting release once",
+          "[task][execution_context][io][ownership]") {
+    auto context = std::make_shared<task_execution_context>();
+    auto worker_identity =
+        std::make_shared<elio::io::detail::io_context_identity>(1, 9);
+
+    elio::io::detail::io_operation_guard source(context, worker_identity);
+    elio::io::detail::io_operation_guard moved(std::move(source));
+    REQUIRE_FALSE(source.active());
+    REQUIRE(moved.active());
+    REQUIRE(context->active_io_pin_count() == 1);
+
+    moved.release();
+    moved.release();
+    REQUIRE(context->active_io_pin_count() == 0);
+    REQUIRE(worker_identity->active_pins.load() == 0);
+
+    auto standalone_identity =
+        std::make_shared<elio::io::detail::io_context_identity>(
+            elio::io::detail::NO_IO_CONTEXT_OWNER, 10);
+    {
+        elio::io::detail::io_operation_guard standalone(
+            context, standalone_identity);
+        REQUIRE(standalone.active());
+        REQUIRE_FALSE(context->has_active_io_pin());
+        REQUIRE(standalone_identity->active_pins.load() == 1);
+    }
+    REQUIRE(standalone_identity->active_pins.load() == 0);
 }
 
 TEST_CASE("task execution context survives task movement and frame destruction",

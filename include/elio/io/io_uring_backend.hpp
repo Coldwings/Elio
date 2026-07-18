@@ -35,7 +35,7 @@ namespace elio::io {
 //     race; resume the handle) or detects ``orphaned`` (the awaitable was
 //     destroyed first; just delete the state). This guards against
 //     resuming a freed coroutine frame after forced cancellation /
-//     vthread teardown.
+//     coroutine-frame teardown.
 //
 //   * ``bit 0 == 0`` and ``bit 1 == 0``: legacy raw coroutine handle. Used
 //     by callers (e.g. timer, net, signal) that have not yet migrated to
@@ -211,6 +211,7 @@ struct batch_state {
     std::vector<batch_completion> trampolines;     ///< One trampoline per segment (io_uring only)
     std::coroutine_handle<> awaiter{};             ///< Resumed when completed == total
     std::atomic<uint8_t> phase{phase_pending};     ///< Orphan protocol phase
+    detail::io_operation_guard operation_guard{};  ///< Worker/context pin until terminal CQE
 
     explicit batch_state(int n) : total(n), results(n) {}
 
@@ -454,8 +455,10 @@ public:
         }
         
         pending_ops_.fetch_add(1, std::memory_order_relaxed);
-        ELIO_LOG_DEBUG("Prepared io_op::{} on fd={}", 
-                       static_cast<int>(req.op), req.fd);
+        detail::run_noexcept([&]() {
+            ELIO_LOG_DEBUG("Prepared io_op::{} on fd={}",
+                           static_cast<int>(req.op), req.fd);
+        });
         return true;
     }
     
@@ -686,11 +689,14 @@ public:
         }
     }
 
-    void notify() override {
+    void notify() noexcept override {
         uint64_t val = 1;
         ssize_t ret = ::write(wake_fd_, &val, sizeof(val));
         if (ret < 0 && errno != EAGAIN) {
-            ELIO_LOG_WARNING("eventfd write failed: {}", strerror(errno));
+            int error = errno;
+            detail::run_noexcept([&]() {
+                ELIO_LOG_WARNING("eventfd write failed: {}", strerror(error));
+            });
         }
     }
 
@@ -813,6 +819,10 @@ private:
         st->result = res;
         st->flags = flags;
         auto handle = st->handle;
+        // A CQE is terminal for this operation. Release backend ownership
+        // before publishing phase_completed: once the CAS succeeds, the
+        // awaitable may immediately destroy op_state on another thread.
+        st->operation_guard.release();
         uint8_t expected = op_state::phase_pending;
         if (!st->phase.compare_exchange_strong(
                 expected, op_state::phase_completed,
@@ -869,6 +879,8 @@ private:
             return;
         }
         auto handle = st->awaiter;
+        // As above, no state fields may be touched after publishing completed.
+        st->operation_guard.release();
         // Mark as completed so the destructor's CAS fails and unique_ptr cleans up.
         // Use CAS instead of unconditional store to handle the race where destructor
         // CAS's to orphaned between our load above and this store.
@@ -977,7 +989,7 @@ public:
     static bool is_available() noexcept { return false; }
     static io_result get_last_result() noexcept { return {}; }
 
-    void notify() override {}
+    void notify() noexcept override {}
     void drain_notify() override {}
 };
 

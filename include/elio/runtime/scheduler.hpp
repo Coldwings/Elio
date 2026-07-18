@@ -650,7 +650,9 @@ private:
     [[nodiscard]] size_t worker_pending_load_at_(size_t index) const noexcept {
         auto* worker = workers_[index].get();
         if (!worker) return 0;
-        return worker->queue_size() + worker->io_context().pending_count();
+        const auto& ctx = worker->io_context();
+        return worker->queue_size() +
+               std::max(ctx.pending_count(), ctx.active_pin_count());
     }
 
     [[nodiscard]] size_t worker_pending_load_(size_t visible_count) const noexcept {
@@ -801,6 +803,25 @@ private:
         return do_enqueue_to_(worker_id, handle, destroy_on_failure, false);
     }
 
+    /// Route an actively I/O-pinned coroutine to the exact backend owner.
+    /// The owner may be outside num_threads() while a shrink is draining it,
+    /// so this deliberately addresses the fixed worker slot directly.
+    [[nodiscard]] bool schedule_active_io_pin_(
+        coro::promise_base* promise,
+        std::coroutine_handle<> handle) {
+        if (!promise || !promise->has_active_io_pin()) return false;
+
+        const size_t owner = promise->io_owner_worker();
+        if (owner >= MAX_THREADS) return false;
+        auto* worker = workers_[owner].get();
+        if (!worker || !worker->is_running() ||
+            worker->io_context().generation() !=
+                promise->io_context_generation()) {
+            return false;
+        }
+        return worker->schedule(handle);
+    }
+
     bool do_enqueue_to_(size_t worker_id, std::coroutine_handle<> handle,
                         bool destroy_on_failure, bool detach_parent) {
         if (!handle) [[unlikely]] return false;
@@ -816,6 +837,14 @@ private:
             promise->detach_from_parent();
         }
 
+        if (promise && promise->has_active_io_pin()) {
+            if (schedule_active_io_pin_(promise, handle)) {
+                return true;
+            }
+            if (destroy_on_failure) handle.destroy();
+            return false;
+        }
+
         size_t n = num_threads_.load(std::memory_order_acquire);
         if (n == 0) [[unlikely]] {
             if (destroy_on_failure) handle.destroy();
@@ -824,7 +853,7 @@ private:
 
         if (promise && promise->is_worker_local()) {
             size_t affinity = promise->effective_affinity();
-            if (affinity == worker_id && affinity < n &&
+            if (affinity == worker_id && affinity < MAX_THREADS &&
                 workers_[affinity] && workers_[affinity]->schedule(handle)) {
                 return true;
             }
@@ -862,6 +891,13 @@ private:
 
         // Check if task has affinity - if so, schedule to that specific worker.
         auto* promise = coro::get_promise_base(handle.address());
+        if (promise && promise->has_active_io_pin()) {
+            if (schedule_active_io_pin_(promise, handle)) {
+                return true;
+            }
+            if (destroy_on_failure) handle.destroy();
+            return false;
+        }
         size_t affinity = promise ? promise->effective_affinity()
                                   : coro::NO_AFFINITY;
         if (affinity != coro::NO_AFFINITY && affinity < n) {
@@ -876,7 +912,12 @@ private:
             if (promise) {
                 promise->clear_affinity();
             }
-        } else if (affinity != coro::NO_AFFINITY && promise && promise->is_worker_local()) {
+        } else if (affinity != coro::NO_AFFINITY && promise &&
+                   promise->is_worker_local()) {
+            if (affinity < MAX_THREADS && workers_[affinity] &&
+                workers_[affinity]->schedule(handle)) {
+                return true;
+            }
             if (destroy_on_failure) handle.destroy();
             return false;
         }
@@ -1093,6 +1134,19 @@ inline bool worker_thread::run_or_redistribute_retiring_task(
     scheduler* sched,
     std::coroutine_handle<> handle) noexcept {
     auto* promise = coro::get_promise_base(handle.address());
+    if (promise && promise->has_active_io_pin()) {
+        if (promise->is_io_pin_owner(
+                worker_id_, io_context_->generation())) {
+            needs_sync_ = true;
+            run_task(handle);
+            return true;
+        }
+
+        // An active operation may only resume on the backend owner. Never
+        // clear this pin or execute the continuation on the retiring worker.
+        return sched->try_schedule(handle);
+    }
+
     if (promise && promise->is_worker_local() &&
         promise->effective_affinity() == worker_id_) {
         needs_sync_ = true;
@@ -1216,13 +1270,15 @@ inline void worker_thread::run() {
     // Set the current scheduler and worker for this thread
     scheduler::current_scheduler_ = scheduler_;
     current_worker_ = this;
+    io_context_->bind_owner_thread();
 
     while (running_.load(std::memory_order_relaxed)) {
         if (draining_.load(std::memory_order_acquire)) [[unlikely]] {
             // Draining mode: only poll I/O, no new tasks or stealing.
             // Redistribute any queued tasks, then wait for pending I/O to complete.
             redistribute_tasks(scheduler_);
-            if (io_context_->pending_count() == 0) {
+            if (io_context_->pending_count() == 0 &&
+                io_context_->active_pin_count() == 0) {
                 {
                     std::lock_guard<std::mutex> lock(schedule_mutex_);
                     running_.store(false, std::memory_order_release);
@@ -1297,6 +1353,7 @@ inline void worker_thread::run() {
     }
     
     // Clear the references when done
+    io_context_->unbind_owner_thread();
     scheduler::current_scheduler_ = nullptr;
     current_worker_ = nullptr;
 }
@@ -1391,6 +1448,29 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
             auto* promise = coro::get_promise_base(handle.address());
             size_t affinity = promise ? promise->effective_affinity()
                                       : coro::NO_AFFINITY;
+
+            if (promise && promise->has_active_io_pin()) {
+                if (promise->is_io_pin_owner(
+                        worker_id_, io_context_->generation())) {
+                    steals_executed_.fetch_add(1, std::memory_order_relaxed);
+                    return handle;
+                }
+
+                if (!scheduler_->schedule_active_io_pin_(promise, handle)) {
+                    // Preserve the borrowed suspended frame while its backend
+                    // owner remains unavailable. Returning it to the victim is
+                    // preferable to executing it against the wrong context.
+                    if (!victim->schedule(handle)) {
+                        handle.destroy();
+                    }
+                }
+                if (++retry_count >= max_retries) {
+                    return nullptr;
+                }
+                i = static_cast<size_t>(-1);
+                start = (steal_start + retry_count) % num_workers;
+                continue;
+            }
 
             if (promise && promise->is_worker_local()) {
                 if (affinity == worker_id_) {

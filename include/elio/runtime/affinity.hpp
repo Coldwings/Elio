@@ -17,7 +17,8 @@ namespace elio::runtime {
 /// Awaitable that sets thread affinity for the current vthread
 /// 
 /// When awaited, this sets the affinity on the current coroutine's promise
-/// and optionally migrates the coroutine to the target worker thread.
+/// and optionally requests migration to the target worker thread. An active
+/// worker-local I/O pin takes precedence until backend completion.
 /// 
 /// Usage:
 /// @code
@@ -67,7 +68,8 @@ private:
     bool migrate_;
 };
 
-/// Awaitable that clears thread affinity for the current vthread
+/// Awaitable that clears caller affinity for the current vthread.
+/// An active worker-local I/O pin remains authoritative until completion.
 /// 
 /// After awaiting this, the vthread can migrate freely between workers.
 /// 
@@ -114,8 +116,8 @@ inline auto set_affinity(size_t worker_id, bool migrate = true) {
 
 /// Clear thread affinity for the current vthread
 /// 
-/// Removes any affinity binding, allowing the vthread to migrate
-/// freely between workers via work stealing.
+/// Removes caller affinity, allowing the vthread to migrate between workers
+/// when no active runtime ownership constraint (such as pending I/O) exists.
 /// 
 /// @return Awaitable that clears the affinity
 /// 

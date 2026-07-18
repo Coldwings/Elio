@@ -215,7 +215,14 @@ ELIO_ASYNC_MAIN(async_main)
 ```
 
 Outside a scheduler worker, `io::current_io_context()` falls back to the global
-`io::default_io_context()`.
+`io::default_io_context()`. That fallback is a standalone context: code using it
+must serialize submissions, drive polling, and keep all request storage alive.
+Inside scheduler coroutines, use the current worker's context. Elio's standard
+I/O awaitables reject a standalone context or another worker's context because
+the scheduler cannot safely poll or resume those operations as worker-local
+I/O. Mutating `io_context` operations enforce the same exact-owner rule;
+`notify()` is the designated cross-thread wakeup operation. Directly constructed
+backend objects remain standalone and caller-serialized.
 
 ### Alternative: Using elio::run()
 

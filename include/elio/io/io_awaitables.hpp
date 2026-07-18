@@ -15,6 +15,7 @@
 #include <thread>
 #include <atomic>
 #include <memory>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -50,7 +51,7 @@ inline constexpr int with_socket_no_sigpipe(int flags) noexcept {
 ///
 /// Owns the ``op_state`` tag passed through ``io_request::state`` so that a
 /// CQE arriving after the awaitable's frame has been freed (forced cancel /
-/// vthread teardown) is dropped instead of resuming a dangling handle. See
+/// frame teardown) is dropped instead of resuming a dangling handle. See
 /// the contract in io_backend.hpp.
 class io_awaitable_base {
 public:
@@ -103,32 +104,88 @@ public:
 
 protected:
     io_result result_{};
-    size_t saved_affinity_ = coro::NO_AFFINITY;
-    void* handle_address_ = nullptr;
     /// Owned op_state for the in-flight SQE. Nullable: lazily allocated by
     /// ``setup_op_state`` and reset on prepare-failure paths.
     std::unique_ptr<op_state> op_state_;
 
-    /// Save current affinity and bind to current worker
-    template<typename Promise>
-    void bind_to_worker(std::coroutine_handle<Promise> handle) {
-        handle_address_ = handle.address();
-        if constexpr (std::is_base_of_v<coro::promise_base, Promise>) {
-            saved_affinity_ = handle.promise().affinity();
-            auto* worker = runtime::worker_thread::current();
-            if (worker) {
-                handle.promise().set_affinity(worker->worker_id());
+    static void validate_io_context_access(io_context& ctx) {
+        auto* worker = runtime::worker_thread::current();
+        if (ctx.is_worker_owned()) {
+            if (!worker || worker->worker_id() != ctx.owner_worker_id() ||
+                &worker->io_context() != &ctx ||
+                worker->io_context().generation() != ctx.generation()) {
+                throw std::logic_error(
+                    "worker-owned io_context accessed outside its owner worker");
             }
+            return;
         }
+
+        if (worker) {
+            throw std::logic_error(
+                "scheduler coroutine cannot submit to a standalone io_context");
+        }
+    }
+
+    template<typename Promise>
+    [[nodiscard]] detail::io_operation_guard make_operation_guard(
+        std::coroutine_handle<Promise> awaiter, io_context& ctx) {
+        validate_io_context_access(ctx);
+        std::shared_ptr<coro::task_execution_context> execution_context;
+        if constexpr (!std::is_void_v<Promise> &&
+                      std::is_base_of_v<coro::promise_base, Promise>) {
+            execution_context = awaiter.promise().execution_context();
+        }
+        return detail::io_operation_guard(
+            std::move(execution_context), ctx.operation_identity());
     }
 
     /// Allocate the op_state and return a pointer suitable for
     /// ``io_request::state``. Stores the awaiter handle in op_state for
     /// the completion handler to resume.
-    op_state* setup_op_state(std::coroutine_handle<> awaiter) {
-        op_state_ = std::make_unique<op_state>();
-        op_state_->handle = awaiter;
+    template<typename Promise>
+    op_state* setup_op_state(std::coroutine_handle<Promise> awaiter,
+                             io_context& ctx) {
+        auto state = std::make_unique<op_state>();
+        state->handle = awaiter;
+        state->operation_guard = make_operation_guard(awaiter, ctx);
+        op_state_ = std::move(state);
         return op_state_.get();
+    }
+
+    /// Prepare an operation after setup_op_state(). Backend implementations
+    /// transfer ownership only by returning true. If preparation throws before
+    /// that boundary, no CQE can own the state, so release it locally instead
+    /// of letting the destructor mark it orphaned.
+    bool prepare_op_state(io_context& ctx, const io_request& req) {
+        return prepare_op_state_with_rollback(
+            [&]() { return ctx.prepare(req); }, []() noexcept {});
+    }
+
+    template<typename PrepareFn>
+    bool prepare_op_state(PrepareFn&& prepare) {
+        return prepare_op_state_with_rollback(
+            std::forward<PrepareFn>(prepare), []() noexcept {});
+    }
+
+    template<typename RollbackFn>
+    bool prepare_op_state(io_context& ctx,
+                          const io_request& req,
+                          RollbackFn&& rollback) {
+        return prepare_op_state_with_rollback(
+            [&]() { return ctx.prepare(req); },
+            std::forward<RollbackFn>(rollback));
+    }
+
+    template<typename PrepareFn, typename RollbackFn>
+    bool prepare_op_state_with_rollback(PrepareFn&& prepare,
+                                        RollbackFn&& rollback) {
+        try {
+            return std::forward<PrepareFn>(prepare)();
+        } catch (...) {
+            std::forward<RollbackFn>(rollback)();
+            clear_op_state();
+            throw;
+        }
     }
 
     /// Drop op_state ownership without orphaning (used on prepare-failure
@@ -147,19 +204,6 @@ protected:
         return result_;
     }
 
-    /// Restore previous affinity (called from await_resume)
-    void restore_affinity() {
-        if (handle_address_) {
-            auto* promise = coro::get_promise_base(handle_address_);
-            if (promise) {
-                if (saved_affinity_ == coro::NO_AFFINITY) {
-                    promise->clear_affinity();
-                } else {
-                    promise->set_affinity(saved_affinity_);
-                }
-            }
-        }
-    }
 };
 
 /// Awaitable for async read operations
@@ -175,7 +219,6 @@ public:
     
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         io_request req{};
@@ -185,9 +228,9 @@ public:
         req.length = length_;
         req.offset = offset_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req)) {
             clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -199,7 +242,6 @@ public:
 
     io_result await_resume() noexcept {
         result_ = read_result_from_op_state();
-        restore_affinity();
         return result_;
     }
 
@@ -223,7 +265,6 @@ public:
     
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         io_request req{};
@@ -233,9 +274,9 @@ public:
         req.length = length_;
         req.offset = offset_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req)) {
             clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -245,7 +286,6 @@ public:
 
     io_result await_resume() noexcept {
         result_ = read_result_from_op_state();
-        restore_affinity();
         return result_;
     }
 
@@ -269,7 +309,6 @@ public:
     
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         io_request req{};
@@ -279,9 +318,9 @@ public:
         req.length = length_;
         req.socket_flags = flags_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req)) {
             clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -291,7 +330,6 @@ public:
 
     io_result await_resume() noexcept {
         result_ = read_result_from_op_state();
-        restore_affinity();
         return result_;
     }
 
@@ -315,7 +353,6 @@ public:
     
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         io_request req{};
@@ -325,9 +362,9 @@ public:
         req.length = length_;
         req.socket_flags = flags_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req)) {
             clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -337,7 +374,6 @@ public:
 
     io_result await_resume() noexcept {
         result_ = read_result_from_op_state();
-        restore_affinity();
         return result_;
     }
 
@@ -363,7 +399,6 @@ public:
     
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         io_request req{};
@@ -373,9 +408,9 @@ public:
         req.addrlen = addrlen_;
         req.socket_flags = flags_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req)) {
             clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -385,7 +420,6 @@ public:
 
     io_result await_resume() noexcept {
         result_ = read_result_from_op_state();
-        restore_affinity();
         return result_;
     }
 
@@ -414,7 +448,6 @@ public:
     
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         io_request req{};
@@ -423,9 +456,9 @@ public:
         req.addr = const_cast<struct sockaddr*>(addr_);
         req.addrlen = &addrlen_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req)) {
             clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -435,7 +468,6 @@ public:
 
     io_result await_resume() noexcept {
         result_ = read_result_from_op_state();
-        restore_affinity();
         return result_;
     }
 
@@ -454,16 +486,15 @@ public:
     
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         io_request req{};
         req.op = io_op::close;
         req.fd = fd_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req)) {
             clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -473,7 +504,6 @@ public:
 
     io_result await_resume() noexcept {
         result_ = read_result_from_op_state();
-        restore_affinity();
         return result_;
     }
 
@@ -493,7 +523,6 @@ public:
 
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         io_request req{};
@@ -503,9 +532,9 @@ public:
         req.iovec_count = iovec_count_;
         req.offset = -1;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req)) {
             clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -515,7 +544,6 @@ public:
 
     io_result await_resume() noexcept {
         result_ = read_result_from_op_state();
-        restore_affinity();
         return result_;
     }
 
@@ -537,7 +565,6 @@ public:
     
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         io_request req{};
@@ -547,9 +574,9 @@ public:
         req.iovec_count = iovec_count_;
         req.offset = -1;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req)) {
             clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -559,7 +586,6 @@ public:
 
     io_result await_resume() noexcept {
         result_ = read_result_from_op_state();
-        restore_affinity();
         return result_;
     }
 
@@ -583,7 +609,6 @@ public:
 
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         io_request req{};
@@ -593,12 +618,12 @@ public:
         req.iovec_count = iovec_count_;
         req.socket_flags = flags_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
         req.state->msg.msg_iov = iovecs_;
         req.state->msg.msg_iovlen = iovec_count_;
         req.msg = &req.state->msg;
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req)) {
             clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -608,7 +633,6 @@ public:
 
     io_result await_resume() noexcept {
         result_ = read_result_from_op_state();
-        restore_affinity();
         return result_;
     }
 
@@ -629,16 +653,15 @@ public:
     
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         io_request req{};
         req.op = for_read_ ? io_op::poll_read : io_op::poll_write;
         req.fd = fd_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req)) {
             clear_op_state();
             result_ = io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -648,7 +671,6 @@ public:
 
     io_result await_resume() noexcept {
         result_ = read_result_from_op_state();
-        restore_affinity();
         return result_;
     }
 
@@ -764,7 +786,8 @@ inline void close_fd_for_destructor(int fd) noexcept {
     if (worker) {
         auto& ctx = worker->io_context();
         if (ctx.is_io_uring()) {
-            auto* backend = static_cast<io_uring_backend*>(ctx.get_backend());
+            auto* backend = static_cast<io_uring_backend*>(
+                ctx.operation_backend());
             if (backend && backend->submit_close_async(fd)) {
                 return;
             }
@@ -806,6 +829,7 @@ struct batch_write_segment {
 namespace detail {
 
 inline void mark_batch_inline_completed(batch_state& st) noexcept {
+    st.operation_guard.release();
     st.phase.store(batch_state::phase_completed, std::memory_order_release);
 }
 
@@ -817,12 +841,18 @@ inline void mark_batch_inline_completed(batch_state& st) noexcept {
 /// then either fall back to sequential I/O or resume immediately. A negative
 /// submit after at least one SQE is staged still returns true because liburing
 /// keeps those SQEs queued for a later submit/poll retry.
+///
+/// ``st.trampolines`` must be fully allocated before this function is called.
+/// Once the first SQE references that storage, this path never throws and the
+/// caller must retain ``st`` until normal completion or orphan cleanup.
 template<typename PrepFn, typename SubmitFn>
 inline bool submit_batch_io_uring_with_submitter(io_uring_backend* backend,
                                                  batch_state& st,
                                                  std::coroutine_handle<> awaiter,
                                                  PrepFn&& prep_one,
-                                                 SubmitFn&& submit_ring) {
+                                                 SubmitFn&& submit_ring) noexcept {
+    static_assert(std::is_nothrow_invocable_v<PrepFn&, struct io_uring_sqe*, int>,
+                  "batch SQE preparation must not throw after ownership transfer");
     struct io_uring* ring = backend->get_ring();
     if (!ring) {
         return false;
@@ -830,7 +860,9 @@ inline bool submit_batch_io_uring_with_submitter(io_uring_backend* backend,
 
     const int total = st.total;
     st.awaiter = awaiter;
-    st.trampolines.resize(total);
+    if (st.trampolines.size() != static_cast<size_t>(total)) {
+        return false;
+    }
 
     size_t in_flight = 0;
     size_t failed = 0;
@@ -863,10 +895,19 @@ inline bool submit_batch_io_uring_with_submitter(io_uring_backend* backend,
     }
 
     backend->register_pending(in_flight);
-    int submitted = submit_ring(ring);
+    int submitted = 0;
+    try {
+        submitted = submit_ring(ring);
+    } catch (...) {
+        // The SQEs and accounting are already backend-owned. Preserve the
+        // suspended state so a later poll/submit retry can complete them.
+        return true;
+    }
     if (submitted < 0) {
-        ELIO_LOG_ERROR("submit_batch_io_uring: io_uring_submit failed: {}",
-                       strerror(-submitted));
+        detail::run_noexcept([&]() {
+            ELIO_LOG_ERROR("submit_batch_io_uring: io_uring_submit failed: {}",
+                           strerror(-submitted));
+        });
         // The staged SQEs remain in the submission queue, with user_data
         // pointing at this batch_state's trampolines. Keep them accounted
         // and suspended so poll()/submit() can retry and real CQEs can
@@ -878,8 +919,10 @@ inline bool submit_batch_io_uring_with_submitter(io_uring_backend* backend,
         // Keep them accounted for and do not synthesize segment completions;
         // the next submit/poll cycle will retry them and real CQEs will fill
         // the per-segment results.
-        ELIO_LOG_WARNING("submit_batch_io_uring: submitted {}/{} SQEs",
-                         submitted, in_flight);
+        detail::run_noexcept([&]() {
+            ELIO_LOG_WARNING("submit_batch_io_uring: submitted {}/{} SQEs",
+                             submitted, in_flight);
+        });
     }
     return true;
 }
@@ -888,10 +931,10 @@ template<typename PrepFn>
 inline bool submit_batch_io_uring(io_uring_backend* backend,
                                   batch_state& st,
                                   std::coroutine_handle<> awaiter,
-                                  PrepFn&& prep_one) {
+                                  PrepFn&& prep_one) noexcept {
     return submit_batch_io_uring_with_submitter(
         backend, st, awaiter, std::forward<PrepFn>(prep_one),
-        [](struct io_uring* ring) {
+        [](struct io_uring* ring) noexcept {
             return io_uring_submit(ring);
         });
 }
@@ -937,7 +980,7 @@ public:
     ~batch_read_awaitable() {
         if (!batch_st_) return;
         // Orphan protocol: if SQEs are still in flight when the awaitable
-        // is destroyed (forced cancel, vthread teardown), CAS phase to
+        // is destroyed (forced cancel or frame teardown), CAS phase to
         // orphaned so dispatch_batch_completion frees the state instead
         // of resuming a dangling awaiter.
         uint8_t expected = batch_state::phase_pending;
@@ -954,7 +997,6 @@ public:
 
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
 
         if (segments_.empty()) {
             // No segments, no need to allocate batch_state
@@ -968,14 +1010,18 @@ public:
         // an is_io_uring() check, and we know the backend hierarchy
         // statically here.
         auto* backend = ctx.is_io_uring()
-            ? static_cast<io_uring_backend*>(ctx.get_backend())
+            ? static_cast<io_uring_backend*>(ctx.operation_backend())
             : nullptr;
         if (backend && backend->get_ring() &&
             !detail::has_current_position_segment(segments_)) {
-            batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
+            auto state = std::make_unique<batch_state>(
+                static_cast<int>(segments_.size()));
+            state->operation_guard = make_operation_guard(awaiter, ctx);
+            state->trampolines.resize(segments_.size());
+            batch_st_ = std::move(state);
             bool submitted = detail::submit_batch_io_uring(
                 backend, *batch_st_, awaiter,
-                [this](struct io_uring_sqe* sqe, int i) {
+                [this](struct io_uring_sqe* sqe, int i) noexcept {
                     auto off = static_cast<__u64>(segments_[i].offset);
                     io_uring_prep_read(sqe, fd_, segments_[i].buffer,
                         static_cast<unsigned>(segments_[i].length), off);
@@ -1000,7 +1046,6 @@ public:
     }
 
     std::vector<int> await_resume() noexcept {
-        restore_affinity();
         if (batch_st_) {
             return std::move(batch_st_->results);
         }
@@ -1034,7 +1079,6 @@ public:
 
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
 
         if (segments_.empty()) {
             // No segments, no need to allocate batch_state
@@ -1048,14 +1092,18 @@ public:
         // an is_io_uring() check, and we know the backend hierarchy
         // statically here.
         auto* backend = ctx.is_io_uring()
-            ? static_cast<io_uring_backend*>(ctx.get_backend())
+            ? static_cast<io_uring_backend*>(ctx.operation_backend())
             : nullptr;
         if (backend && backend->get_ring() &&
             !detail::has_current_position_segment(segments_)) {
-            batch_st_ = std::make_unique<batch_state>(static_cast<int>(segments_.size()));
+            auto state = std::make_unique<batch_state>(
+                static_cast<int>(segments_.size()));
+            state->operation_guard = make_operation_guard(awaiter, ctx);
+            state->trampolines.resize(segments_.size());
+            batch_st_ = std::move(state);
             bool submitted = detail::submit_batch_io_uring(
                 backend, *batch_st_, awaiter,
-                [this](struct io_uring_sqe* sqe, int i) {
+                [this](struct io_uring_sqe* sqe, int i) noexcept {
                     auto off = static_cast<__u64>(segments_[i].offset);
                     io_uring_prep_write(sqe, fd_, segments_[i].buffer,
                         static_cast<unsigned>(segments_[i].length), off);
@@ -1077,7 +1125,6 @@ public:
     }
 
     std::vector<int> await_resume() noexcept {
-        restore_affinity();
         if (batch_st_) {
             return std::move(batch_st_->results);
         }
@@ -1116,6 +1163,7 @@ struct io_cancel_state {
     io_context* ctx = nullptr;
     std::coroutine_handle<> awaiter;
     runtime::worker_thread* worker = nullptr;
+    uint64_t context_generation = 0;
     op_state* op = nullptr;
     std::atomic<bool> resumed{false};
     std::atomic<bool> cancelled{false};
@@ -1124,10 +1172,8 @@ struct io_cancel_state {
 /// Fire-and-forget coroutine that executes io_context::cancel() on the worker
 /// that owns the ring. Self-destroys via suspend_never on final_suspend.
 ///
-/// NOTE: promise_type MUST inherit coro::promise_base to enable the affinity
-/// mechanism. Without it, try_steal() sees NO_AFFINITY and allows stealing
-/// this task to other workers, which then access the wrong io_context's
-/// io_uring ring — causing data races.
+/// The executor is worker-local maintenance work: its affinity identifies the
+/// backend owner and the scheduler must never run it on another worker.
 struct io_cancel_executor {
     struct promise_type : public coro::promise_base {
         io_cancel_executor get_return_object() {
@@ -1147,6 +1193,12 @@ inline io_cancel_executor make_io_cancel_executor(
     std::shared_ptr<io_cancel_state> state,
     bool allow_epoll_cancel = false) {
     if (state->resumed.exchange(true, std::memory_order_acq_rel)) {
+        co_return;
+    }
+    if (state->worker &&
+        (&state->worker->io_context() != state->ctx ||
+         state->worker->io_context().generation() !=
+             state->context_generation)) {
         co_return;
     }
     if (state->ctx && state->op) {
@@ -1229,8 +1281,6 @@ public:
             awaiter.resume();
             return;
         }
-
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         // Allocate shared state for cancel callback
@@ -1238,6 +1288,7 @@ public:
         state->ctx = &ctx;
         state->awaiter = awaiter;
         state->worker = runtime::worker_thread::current();
+        state->context_generation = ctx.generation();
         state_ = state;
 
         // Register cancel callback
@@ -1272,10 +1323,14 @@ public:
         req.length = length_;
         req.socket_flags = flags_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
         state->op = req.state;
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req, [&]() noexcept {
+                state->op = nullptr;
+                state->resumed.store(true, std::memory_order_release);
+                cancel_registration_.unregister();
+            })) {
             clear_op_state();
             state->op = nullptr;
             cancel_registration_.unregister();
@@ -1302,7 +1357,6 @@ public:
         }
         result_ = detail::finalize_cancellable_io_result(
             cancelled_without_backend_completion, read_result_from_op_state());
-        restore_affinity();
         return cancellable_io_result{
             result_,
             detail::classify_cancellable_io_result(
@@ -1346,14 +1400,13 @@ public:
             awaiter.resume();
             return;
         }
-
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         auto state = std::make_shared<detail::io_cancel_state>();
         state->ctx = &ctx;
         state->awaiter = awaiter;
         state->worker = runtime::worker_thread::current();
+        state->context_generation = ctx.generation();
         state_ = state;
 
         cancel_registration_ = token_.on_cancel([state]() {
@@ -1386,10 +1439,14 @@ public:
         req.length = length_;
         req.socket_flags = flags_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
         state->op = req.state;
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req, [&]() noexcept {
+                state->op = nullptr;
+                state->resumed.store(true, std::memory_order_release);
+                cancel_registration_.unregister();
+            })) {
             clear_op_state();
             state->op = nullptr;
             cancel_registration_.unregister();
@@ -1416,7 +1473,6 @@ public:
         }
         result_ = detail::finalize_cancellable_io_result(
             cancelled_without_backend_completion, read_result_from_op_state());
-        restore_affinity();
         return cancellable_io_result{
             result_,
             detail::classify_cancellable_io_result(
@@ -1460,14 +1516,13 @@ public:
             awaiter.resume();
             return;
         }
-
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         auto state = std::make_shared<detail::io_cancel_state>();
         state->ctx = &ctx;
         state->awaiter = awaiter;
         state->worker = runtime::worker_thread::current();
+        state->context_generation = ctx.generation();
         state_ = state;
 
         cancel_registration_ = token_.on_cancel([state]() {
@@ -1499,10 +1554,14 @@ public:
         req.addr = const_cast<struct sockaddr*>(addr_);
         req.addrlen = &addrlen_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
         state->op = req.state;
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req, [&]() noexcept {
+                state->op = nullptr;
+                state->resumed.store(true, std::memory_order_release);
+                cancel_registration_.unregister();
+            })) {
             clear_op_state();
             state->op = nullptr;
             cancel_registration_.unregister();
@@ -1529,7 +1588,6 @@ public:
         }
         result_ = detail::finalize_cancellable_io_result(
             cancelled_without_backend_completion, read_result_from_op_state());
-        restore_affinity();
         return cancellable_io_result{
             result_,
             detail::classify_cancellable_io_result(
@@ -1569,14 +1627,13 @@ public:
             awaiter.resume();
             return;
         }
-
-        bind_to_worker(awaiter);
         auto& ctx = current_io_context();
 
         auto state = std::make_shared<detail::io_cancel_state>();
         state->ctx = &ctx;
         state->awaiter = awaiter;
         state->worker = runtime::worker_thread::current();
+        state->context_generation = ctx.generation();
         state_ = state;
 
         cancel_registration_ = token_.on_cancel([state]() {
@@ -1606,10 +1663,14 @@ public:
         req.op = for_read_ ? io_op::poll_read : io_op::poll_write;
         req.fd = fd_;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx);
         state->op = req.state;
 
-        if (!ctx.prepare(req)) {
+        if (!prepare_op_state(ctx, req, [&]() noexcept {
+                state->op = nullptr;
+                state->resumed.store(true, std::memory_order_release);
+                cancel_registration_.unregister();
+            })) {
             clear_op_state();
             state->op = nullptr;
             cancel_registration_.unregister();
@@ -1636,7 +1697,6 @@ public:
         }
         result_ = detail::finalize_cancellable_io_result(
             cancelled_without_backend_completion, read_result_from_op_state());
-        restore_affinity();
         return cancellable_io_result{
             result_,
             detail::classify_cancellable_io_result(

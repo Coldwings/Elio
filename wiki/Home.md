@@ -7,7 +7,7 @@
 ## Features
 
 - **C++20 Coroutines**: First-class coroutine support with `co_await` and `co_return`
-- **Multi-threaded Scheduler**: Work-stealing scheduler with per-worker I/O contexts
+- **Multi-threaded Scheduler**: Work-stealing scheduler with operation-pinned per-worker I/O contexts
 - **Async I/O Backends**: io_uring (preferred) and epoll fallback
 - **Signal Handling**: Coroutine-friendly signal handling via signalfd
 - **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel, spinlock, condition_variable

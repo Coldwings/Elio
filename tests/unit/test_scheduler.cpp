@@ -1,10 +1,17 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/runtime/affinity.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/coro/cancel_token.hpp>
+#include <elio/io/io_awaitables.hpp>
+#include <elio/io/io_operation_guard.hpp>
 #include <elio/time/timer.hpp>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <atomic>
 #include <chrono>
 #include <coroutine>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include "../test_main.cpp"  // For scaled timeouts
@@ -95,6 +102,62 @@ task<void> record_current_worker_task(std::atomic<size_t>* observed_worker) {
     co_return;
 }
 
+class pinned_reschedule_awaitable {
+public:
+    pinned_reschedule_awaitable(size_t requested_worker,
+                                std::atomic<size_t>* observed_worker)
+        : requested_worker_(requested_worker)
+        , observed_worker_(observed_worker) {}
+
+    bool await_ready() const noexcept { return false; }
+
+    bool await_suspend(std::coroutine_handle<> handle) {
+        auto* worker = worker_thread::current();
+        auto* sched = scheduler::current();
+        if (!worker || !sched) {
+            throw std::logic_error(
+                "pinned reschedule test requires a scheduler worker");
+        }
+
+        guard_ = elio::io::detail::io_operation_guard(
+            get_execution_context(handle.address()),
+            std::make_shared<elio::io::detail::io_context_identity>(
+                worker->worker_id(), worker->io_context().generation()));
+        return sched->try_schedule_to(requested_worker_, handle);
+    }
+
+    void await_resume() noexcept {
+        observed_worker_->store(current_worker_id(), std::memory_order_release);
+        guard_.release();
+    }
+
+private:
+    size_t requested_worker_;
+    std::atomic<size_t>* observed_worker_;
+    elio::io::detail::io_operation_guard guard_;
+};
+
+task<void> request_migration_while_io_pinned(
+    std::atomic<size_t>* observed_worker) {
+    co_await pinned_reschedule_awaitable(1, observed_worker);
+}
+
+task<void> cancellable_recv_on_worker(
+    int fd,
+    cancel_token token,
+    std::atomic<bool>* started,
+    std::atomic<bool>* cancelled,
+    std::atomic<bool>* completed,
+    std::atomic<size_t>* completion_worker) {
+    char byte = 0;
+    started->store(true, std::memory_order_release);
+    auto result = co_await elio::io::async_recv(
+        fd, &byte, 1, 0, std::move(token));
+    cancelled->store(result.was_cancelled(), std::memory_order_release);
+    completion_worker->store(current_worker_id(), std::memory_order_release);
+    completed->store(true, std::memory_order_release);
+}
+
 } // namespace
 
 TEST_CASE("Scheduler construction", "[scheduler]") {
@@ -157,6 +220,24 @@ TEST_CASE("Scheduler spawn and execute simple coroutine", "[scheduler]") {
     REQUIRE(executed.load());
     
     sched.shutdown();
+}
+
+TEST_CASE("Scheduler routes an I/O-pinned migration request to its owner",
+          "[scheduler][io][affinity]") {
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<size_t> observed_worker{NO_AFFINITY};
+    sched.go_to(0, request_migration_while_io_pinned, &observed_worker);
+
+    auto deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (observed_worker.load(std::memory_order_acquire) == NO_AFFINITY &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    REQUIRE(observed_worker.load(std::memory_order_acquire) == 0);
+    REQUIRE(sched.shutdown(scaled_sec(5)));
 }
 
 TEST_CASE("Scheduler pause/resume", "[scheduler]") {
@@ -537,6 +618,9 @@ TEST_CASE("Scheduler accounting includes pending I/O on draining workers",
     auto raw_task = gated_io_task(&task_running, &proceed,
                                   scaled_ms(500), &io_done);
     auto handle = elio::coro::detail::task_access::release(std::move(raw_task));
+    auto execution_context = handle.promise().execution_context();
+    const uint64_t owner_generation =
+        sched.get_worker(1)->io_context().generation();
     handle.promise().set_affinity(1);
     handle.promise().detach_from_parent();
 
@@ -556,17 +640,21 @@ TEST_CASE("Scheduler accounting includes pending I/O on draining workers",
 
     bool saw_pending = false;
     bool saw_active = false;
+    bool saw_io_pin = false;
     auto accounting_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
-    while ((!saw_pending || !saw_active) &&
+    while ((!saw_pending || !saw_active || !saw_io_pin) &&
            !io_done.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < accounting_deadline) {
         saw_pending = saw_pending || (sched.pending_tasks() > 0);
         saw_active = saw_active || (sched.active_tasks() > 0);
+        saw_io_pin = saw_io_pin || execution_context->is_io_pin_owner(
+                                      1, owner_generation);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     REQUIRE(saw_pending);
     REQUIRE(saw_active);
+    REQUIRE(saw_io_pin);
     REQUIRE_FALSE(sched.wait_for_idle(scaled_ms(50)));
 
     auto io_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
@@ -575,6 +663,7 @@ TEST_CASE("Scheduler accounting includes pending I/O on draining workers",
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     REQUIRE(io_done.load(std::memory_order_acquire));
+    REQUIRE_FALSE(execution_context->has_active_io_pin());
     REQUIRE(sched.wait_for_idle(scaled_sec(5)));
 
     sched.shutdown();
@@ -616,4 +705,70 @@ TEST_CASE("Scheduler shrink runs worker-local maintenance on retiring worker",
     REQUIRE(observed_worker.load(std::memory_order_acquire) == 1);
 
     sched.shutdown();
+}
+
+TEST_CASE("Scheduler shrink keeps cancellation on the retiring I/O owner",
+          "[scheduler][io][cancel][ownership]") {
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                         0, sockets) == 0);
+
+    scheduler sched(2);
+    auto* retiring_worker = sched.get_worker(1);
+    REQUIRE(retiring_worker != nullptr);
+    auto* retiring_context = &retiring_worker->io_context();
+    const auto retiring_generation = retiring_context->generation();
+    sched.start();
+
+    cancel_source source;
+    std::atomic<bool> started{false};
+    std::atomic<bool> cancelled{false};
+    std::atomic<bool> completed{false};
+    std::atomic<size_t> completion_worker{NO_AFFINITY};
+    sched.go_to(1, cancellable_recv_on_worker,
+                sockets[0], source.get_token(), &started, &cancelled,
+                &completed, &completion_worker);
+
+    auto pin_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while ((!started.load(std::memory_order_acquire) ||
+            retiring_context->active_pin_count() != 1) &&
+           std::chrono::steady_clock::now() < pin_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(started.load(std::memory_order_acquire));
+    REQUIRE(retiring_context->active_pin_count() == 1);
+    REQUIRE(retiring_context->generation() == retiring_generation);
+
+    sched.set_thread_count(1);
+    REQUIRE(sched.num_threads(std::memory_order_acquire) == 1);
+    REQUIRE(retiring_worker->is_draining());
+
+    source.cancel();
+
+    auto completion_deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < completion_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(cancelled.load(std::memory_order_acquire));
+    REQUIRE(completion_worker.load(std::memory_order_acquire) == 1);
+    REQUIRE(retiring_context->active_pin_count() == 0);
+
+    sched.set_thread_count(2);
+    REQUIRE(sched.num_threads(std::memory_order_acquire) == 2);
+    auto* restarted_worker = sched.get_worker(1);
+    REQUIRE(restarted_worker == retiring_worker);
+    REQUIRE(restarted_worker->io_context().generation() == retiring_generation);
+
+    std::atomic<size_t> reused_worker{NO_AFFINITY};
+    auto joined = sched.go_joinable_to(1, record_current_worker_task,
+                                       &reused_worker);
+    joined.wait_destroyed();
+    joined.await_resume();
+    REQUIRE(reused_worker.load(std::memory_order_acquire) == 1);
+
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+    ::close(sockets[0]);
+    ::close(sockets[1]);
 }

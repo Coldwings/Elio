@@ -309,18 +309,12 @@ private:
     /// watchdog returns immediately. cancellable_sleep_awaitable owns its
     /// cancel state via shared_ptr (PR #81), so this is race-free.
     ///
-    /// Worker affinity: the watchdog is pinned to the same worker as the
-    /// read loop via go_joinable_to(). The read loop itself is pinned by
-    /// I/O affinity (each recv re-binds the vthread to the worker whose
-    /// io_context owns the completion). Without this pin, autoscaler shrink
-    /// can stop the worker hosting the watchdog while its sleep timer is
-    /// still pending — the io_context is no longer polled, the watchdog
-    /// never resumes, and the read loop hangs forever on `co_await *watchdog`.
-    /// scheduler::set_thread_count's I/O drain has a 5 s bound while
-    /// frame_read_timeout defaults to 30 s, so the leak is reachable in
-    /// practice. Pinning makes shrink-time draining a shared-fate operation:
-    /// either both the read loop and watchdog drain, or neither does (and
-    /// the connection is correctly torn down at scheduler shutdown).
+    /// Worker ownership: go_joinable_to() starts the watchdog on the read
+    /// loop's current worker. Each pending timer and recv then holds its own
+    /// operation-local I/O guard, which records the worker and io_context
+    /// generation that own its completion. During shrink, an owner continues
+    /// polling until its pending backend operations and active I/O pins have
+    /// both reached zero.
     ///
     /// Frame-vs-watchdog race: if the timer CQE fires microseconds before
     /// read_frame_bounded returns a complete frame, both `frame` and
@@ -347,11 +341,9 @@ private:
         coro::cancel_source watchdog_cancel;
         auto wd_token = watchdog_cancel.get_token();
 
-        // Pin the watchdog to the same worker as the read loop so it cannot
-        // be independently shrunk by the autoscaler — otherwise a doomed
-        // worker can have an in-flight timeout SQE pending while its
-        // io_context stops being polled, leaving us hung on
-        // ``co_await *watchdog``.
+        // Start the watchdog on the read loop's current worker. Once its timer
+        // is pending, operation ownership keeps that backend draining through
+        // an autoscaler shrink until completion or cancellation cleanup.
         auto* current_worker = runtime::worker_thread::current();
         auto watchdog_body = [stream_ptr, timed_out, timeout, wd_token]()
                                  -> coro::task<void> {

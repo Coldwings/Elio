@@ -102,6 +102,12 @@ if (rc != 0) {
 
 Async-friendly signalfd wrapper.
 
+The object retains the `io_context` selected at construction. For scheduler
+use, construct and await it on the same worker; pending waits pin that worker's
+backend until completion or cleanup. Do not construct it against a standalone
+context and later await it in a scheduler coroutine. Standalone use requires
+the caller to serialize and poll that context.
+
 ```cpp
 // Create with automatic blocking
 signal_fd sigfd(sigs);

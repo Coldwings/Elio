@@ -252,7 +252,7 @@ coro::task<void> pinned_work() {
 }
 ```
 
-`set_affinity` is an awaitable. When called with `migrate=true` (the default), the coroutine is immediately rescheduled on the target worker. With `migrate=false`, the affinity is recorded but migration is deferred until the next scheduling point. `clear_affinity` removes the binding so the task can be freely stolen by any worker again.
+`set_affinity` is an awaitable. When called with `migrate=true` (the default), the coroutine is immediately rescheduled on the target worker. With `migrate=false`, the affinity is recorded but migration is deferred until the next scheduling point. `clear_affinity` removes caller affinity so the task can be stolen when no stronger runtime ownership constraint exists. An active worker-local I/O pin always wins; neither API migrates a pending backend operation.
 
 #### Spawn-time Pinning with `go_to()`
 
@@ -295,6 +295,13 @@ io::io_context ctx(io::io_context::backend_type::epoll);
 // Check active backend
 std::cout << "Backend: " << ctx.get_backend_name() << std::endl;
 ```
+
+These directly constructed contexts are standalone. Drive and serialize them
+from their owning thread; mutating one from a scheduler worker is rejected.
+Scheduler coroutines should use
+`io::current_io_context()`; a pending operation is pinned to that worker and
+context generation until completion, so it does not incur a central-reactor
+hop or migrate between backends.
 
 **Why io_uring is preferred:**
 - **Submission batching.** Multiple I/O operations can be queued in the submission ring before a single `io_uring_enter` syscall, amortizing syscall overhead across many operations.

@@ -242,9 +242,31 @@ public:
     }
 
     /// Get the scheduler placement constraint. This remains distinct from
-    /// caller affinity so active I/O pins can take precedence in Phase 3.
+    /// caller affinity so active I/O pins can take precedence.
     [[nodiscard]] size_t effective_affinity() const noexcept {
         return execution_context_->effective_affinity();
+    }
+
+    [[nodiscard]] bool has_active_io_pin() const noexcept {
+        return execution_context_->has_active_io_pin();
+    }
+
+    [[nodiscard]] size_t io_owner_worker() const noexcept {
+        return execution_context_->io_owner_worker();
+    }
+
+    [[nodiscard]] uint64_t io_context_generation() const noexcept {
+        return execution_context_->io_context_generation();
+    }
+
+    [[nodiscard]] size_t active_io_pin_count() const noexcept {
+        return execution_context_->active_io_pin_count();
+    }
+
+    [[nodiscard]] bool is_io_pin_owner(
+        size_t worker_id, uint64_t context_generation) const noexcept {
+        return execution_context_->is_io_pin_owner(
+            worker_id, context_generation);
     }
 
     /// Set thread affinity for this vthread
@@ -258,7 +280,8 @@ public:
         return execution_context_->has_user_affinity();
     }
 
-    /// Clear thread affinity, allowing this vthread to migrate freely
+    /// Clear caller affinity. Active runtime ownership may still prevent
+    /// migration until its operation reaches a terminal state.
     void clear_affinity() noexcept {
         execution_context_->clear_user_affinity();
     }

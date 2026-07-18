@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancellation winner does not acquire a lock or consume a permit; an already
   completed acquisition remains caller-owned. The corresponding no-token
   awaiters retain their existing `void` results and lightweight fast paths.
+- **Cancellation-aware shared lock and condition waits**: Added explicit
+  `cancel_token` overloads for shared and exclusive `shared_mutex` acquisition,
+  plus all three `condition_variable` wait modes. Reader/writer counts, writer
+  preference, and notification-versus-cancellation races use the same terminal
+  winner model. A condition wait that released an associated lock re-acquires
+  it before returning either `completed` or `cancelled`; a pre-cancelled wait
+  leaves the already-held lock untouched.
 
 ### Changed
 

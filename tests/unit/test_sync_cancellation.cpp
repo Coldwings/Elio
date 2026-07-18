@@ -18,14 +18,21 @@ using namespace elio::runtime;
 
 namespace {
 
-bool wait_for_flag(const std::atomic<bool>& flag) {
+template<typename Predicate>
+bool wait_for_condition(Predicate&& predicate) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::seconds(5);
-    while (!flag.load(std::memory_order_acquire) &&
+    while (!predicate() &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    return flag.load(std::memory_order_acquire);
+    return predicate();
+}
+
+bool wait_for_flag(const std::atomic<bool>& flag) {
+    return wait_for_condition([&] {
+        return flag.load(std::memory_order_acquire);
+    });
 }
 
 } // namespace
@@ -277,6 +284,310 @@ TEST_CASE("basic sync notification wins before later cancellation",
     }
 
     sched.shutdown();
+}
+
+TEST_CASE("condition_variable pre-cancellation preserves held locks",
+          "[sync][condvar][cancellation][cancel_token]") {
+    cancel_source source;
+    source.cancel();
+    condition_variable cv;
+
+    SECTION("unlocked") {
+        auto waiter = cv.wait_unlocked(source.get_token());
+        REQUIRE(waiter.await_ready());
+        REQUIRE(waiter.await_resume() == cancel_result::cancelled);
+        REQUIRE_FALSE(cv.has_waiters());
+    }
+
+    SECTION("spinlock") {
+        spinlock lock;
+        lock.lock();
+        auto waiter = cv.wait(lock, source.get_token());
+        REQUIRE(waiter.await_ready());
+        REQUIRE(waiter.await_resume() == cancel_result::cancelled);
+        REQUIRE(lock.is_locked());
+        lock.unlock();
+        REQUIRE_FALSE(cv.has_waiters());
+    }
+}
+
+TEST_CASE("condition_variable cancellation re-acquires coroutine mutex",
+          "[sync][condvar][cancellation][cancel_token][runtime]") {
+    scheduler sched(2);
+    sched.start();
+
+    condition_variable cv;
+    mutex m;
+    std::atomic<bool> started{false};
+    std::atomic<bool> completed{false};
+    std::atomic<cancel_result> result{cancel_result::completed};
+
+    auto joined = sched.go_joinable([&]() -> task<void> {
+        co_await m.lock();
+        started.store(true, std::memory_order_release);
+        result.store(co_await cv.wait(m, this_coro::cancel_token()),
+                     std::memory_order_release);
+        m.unlock();
+        completed.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_for_flag(started));
+    REQUIRE(wait_for_condition([&] { return cv.has_waiters(); }));
+    REQUIRE(m.try_lock());
+
+    joined.request_cancel();
+    REQUIRE(wait_for_condition([&] { return !cv.has_waiters(); }));
+    REQUIRE_FALSE(completed.load(std::memory_order_acquire));
+
+    m.unlock();
+    REQUIRE(wait_for_flag(completed));
+    joined.wait_destroyed();
+    REQUIRE(result.load(std::memory_order_acquire) ==
+            cancel_result::cancelled);
+    REQUIRE_FALSE(m.is_locked());
+
+    sched.shutdown();
+}
+
+TEST_CASE("condition_variable notification wins before later cancellation",
+          "[sync][condvar][cancellation][cancel_token][notification]") {
+    scheduler sched(2);
+    sched.start();
+
+    condition_variable cv;
+    cancel_source source;
+    std::atomic<bool> completed{false};
+    std::atomic<cancel_result> result{cancel_result::cancelled};
+
+    auto joined = sched.go_joinable([&]() -> task<void> {
+        result.store(co_await cv.wait_unlocked(source.get_token()),
+                     std::memory_order_release);
+        completed.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_for_condition([&] { return cv.has_waiters(); }));
+    cv.notify_one();
+    REQUIRE(wait_for_flag(completed));
+    source.cancel();
+    joined.wait_destroyed();
+    REQUIRE(result.load(std::memory_order_acquire) ==
+            cancel_result::completed);
+    REQUIRE_FALSE(cv.has_waiters());
+
+    sched.shutdown();
+}
+
+TEST_CASE("condition_variable cancellation and notification select one result",
+          "[sync][condvar][cancellation][cancel_token][race]") {
+    scheduler sched(2);
+    sched.start();
+
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        condition_variable cv;
+        cancel_source source;
+        std::atomic<bool> completed{false};
+        std::atomic<cancel_result> result{cancel_result::cancelled};
+
+        auto joined = sched.go_joinable([&]() -> task<void> {
+            result.store(co_await cv.wait_unlocked(source.get_token()),
+                         std::memory_order_release);
+            completed.store(true, std::memory_order_release);
+            co_return;
+        });
+
+        REQUIRE(wait_for_condition([&] { return cv.has_waiters(); }));
+
+        std::barrier race_start(3);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        std::thread notifier([&] {
+            race_start.arrive_and_wait();
+            cv.notify_one();
+        });
+        race_start.arrive_and_wait();
+        canceller.join();
+        notifier.join();
+
+        REQUIRE(wait_for_flag(completed));
+        joined.wait_destroyed();
+        const auto terminal = result.load(std::memory_order_acquire);
+        REQUIRE((terminal == cancel_result::completed ||
+                 terminal == cancel_result::cancelled));
+        REQUIRE_FALSE(cv.has_waiters());
+    }
+
+    sched.shutdown();
+}
+
+TEST_CASE("condition_variable notify_one skips a cancelled head waiter",
+          "[sync][condvar][cancellation][cancel_token][queue]") {
+    condition_variable cv;
+    cancel_source source;
+    auto first = cv.wait_unlocked(source.get_token());
+    auto second = cv.wait_unlocked();
+
+    REQUIRE(first.await_suspend(std::noop_coroutine()));
+    REQUIRE(second.await_suspend(std::noop_coroutine()));
+    source.cancel();
+    cv.notify_one();
+
+    REQUIRE(first.await_resume() == cancel_result::cancelled);
+    second.await_resume();
+    REQUIRE_FALSE(cv.has_waiters());
+}
+
+TEST_CASE("shared_mutex pre-cancellation preserves reader and writer state",
+          "[sync][shared_mutex][cancellation][cancel_token]") {
+    shared_mutex sm;
+    cancel_source source;
+    source.cancel();
+
+    SECTION("reader") {
+        auto waiter = sm.lock_shared(source.get_token());
+        REQUIRE(waiter.await_ready());
+        REQUIRE(waiter.await_resume() == cancel_result::cancelled);
+        REQUIRE(sm.reader_count() == 0);
+        REQUIRE_FALSE(sm.is_writer_active());
+    }
+
+    SECTION("writer") {
+        auto waiter = sm.lock(source.get_token());
+        REQUIRE(waiter.await_ready());
+        REQUIRE(waiter.await_resume() == cancel_result::cancelled);
+        REQUIRE(sm.reader_count() == 0);
+        REQUIRE_FALSE(sm.is_writer_active());
+    }
+}
+
+TEST_CASE("shared_mutex cancellation and reader grant select one result",
+          "[sync][shared_mutex][cancellation][cancel_token][reader][race]") {
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        shared_mutex sm;
+        REQUIRE(sm.try_lock());
+        cancel_source source;
+        auto waiter = sm.lock_shared(source.get_token());
+        REQUIRE(waiter.await_suspend(std::noop_coroutine()));
+
+        std::barrier race_start(3);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        std::thread unlocker([&] {
+            race_start.arrive_and_wait();
+            sm.unlock();
+        });
+        race_start.arrive_and_wait();
+        canceller.join();
+        unlocker.join();
+
+        const auto terminal = waiter.await_resume();
+        if (terminal == cancel_result::completed) {
+            REQUIRE(sm.reader_count() == 1);
+            sm.unlock_shared();
+        } else {
+            REQUIRE(sm.reader_count() == 0);
+        }
+        REQUIRE_FALSE(sm.is_writer_active());
+    }
+}
+
+TEST_CASE("shared_mutex cancellation and writer grant select one result",
+          "[sync][shared_mutex][cancellation][cancel_token][writer][race]") {
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        shared_mutex sm;
+        REQUIRE(sm.try_lock_shared());
+        cancel_source source;
+        auto waiter = sm.lock(source.get_token());
+        REQUIRE(waiter.await_suspend(std::noop_coroutine()));
+
+        std::barrier race_start(3);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        std::thread unlocker([&] {
+            race_start.arrive_and_wait();
+            sm.unlock_shared();
+        });
+        race_start.arrive_and_wait();
+        canceller.join();
+        unlocker.join();
+
+        const auto terminal = waiter.await_resume();
+        if (terminal == cancel_result::completed) {
+            REQUIRE(sm.is_writer_active());
+            sm.unlock();
+        } else {
+            REQUIRE_FALSE(sm.is_writer_active());
+        }
+        REQUIRE(sm.reader_count() == 0);
+    }
+}
+
+TEST_CASE("shared_mutex cancelled writer releases parked readers",
+          "[sync][shared_mutex][cancellation][cancel_token][queue]") {
+    shared_mutex sm;
+    REQUIRE(sm.try_lock_shared());
+    cancel_source source;
+    auto writer = sm.lock(source.get_token());
+    auto reader = sm.lock_shared();
+
+    REQUIRE(writer.await_suspend(std::noop_coroutine()));
+    REQUIRE(reader.await_suspend(std::noop_coroutine()));
+    source.cancel();
+
+    REQUIRE(writer.await_resume() == cancel_result::cancelled);
+    reader.await_resume();
+    REQUIRE(sm.reader_count() == 2);
+
+    sm.unlock_shared();
+    sm.unlock_shared();
+    REQUIRE(sm.reader_count() == 0);
+    REQUIRE_FALSE(sm.is_writer_active());
+}
+
+TEST_CASE("shared_mutex wake paths skip cancelled head waiters",
+          "[sync][shared_mutex][cancellation][cancel_token][queue]") {
+    SECTION("readers") {
+        shared_mutex sm;
+        REQUIRE(sm.try_lock());
+        cancel_source source;
+        auto first = sm.lock_shared(source.get_token());
+        auto second = sm.lock_shared();
+
+        REQUIRE(first.await_suspend(std::noop_coroutine()));
+        REQUIRE(second.await_suspend(std::noop_coroutine()));
+        source.cancel();
+        sm.unlock();
+
+        REQUIRE(first.await_resume() == cancel_result::cancelled);
+        second.await_resume();
+        REQUIRE(sm.reader_count() == 1);
+        sm.unlock_shared();
+    }
+
+    SECTION("writers") {
+        shared_mutex sm;
+        REQUIRE(sm.try_lock_shared());
+        cancel_source source;
+        auto first = sm.lock(source.get_token());
+        auto second = sm.lock();
+
+        REQUIRE(first.await_suspend(std::noop_coroutine()));
+        REQUIRE(second.await_suspend(std::noop_coroutine()));
+        source.cancel();
+        sm.unlock_shared();
+
+        REQUIRE(first.await_resume() == cancel_result::cancelled);
+        second.await_resume();
+        REQUIRE(sm.is_writer_active());
+        sm.unlock();
+    }
 }
 
 TEST_CASE("semaphore cancellation and release select one terminal result",

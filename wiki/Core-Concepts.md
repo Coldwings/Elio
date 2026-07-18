@@ -614,7 +614,9 @@ This lifetime cleanup is not itself a cancellation API. `with_timeout()` request
 
 `mutex::lock(token)`, `semaphore::acquire(token)`, and `event::wait(token)` are cancellation-aware and return `coro::cancel_result`. Cancellation and normal notification atomically select one terminal result. If cancellation wins, a mutex lock or semaphore permit is not acquired. If normal notification wins first, the operation returns `completed` and the caller owns the acquired resource even if cancellation is requested immediately afterward. The overloads without a token remain non-cancellable and preserve their `void` await result.
 
-`condition_variable`, `channel`, and `shared_mutex` do not yet provide token-aware waits. A timed-out child blocked on one of those operations remains suspended and linked until the primitive wakes it. The primitive and every object captured by that child must outlive the pending wait, including the interval after a notifier dequeues the waiter but before the scheduler resumes it.
+`shared_mutex::lock_shared(token)`, `shared_mutex::lock(token)`, and every `condition_variable` wait mode now participate in the same terminal cancellation race. A shared-mutex cancellation winner owns no lock. A condition wait that released an associated lock always re-acquires it before returning, including when cancellation wins; a pre-cancelled wait leaves the held lock untouched.
+
+`channel` does not yet provide token-aware waits. A timed-out child blocked on a channel remains suspended and linked until normal channel progress resumes it. The channel and every object captured by that child must outlive the pending wait, including the interval after a peer dequeues the waiter but before the scheduler resumes it.
 
 **Key guarantees:**
 - Destroying a frame whose waiter is still linked removes that waiter from the primitive's list

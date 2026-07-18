@@ -620,6 +620,60 @@ TEST_CASE("shared_mutex with coroutines", "[sync][shared_mutex][coro]") {
     REQUIRE(max_concurrent_readers > 0);
 }
 
+TEST_CASE("shared_mutex last-reader handoff preserves exclusive ownership",
+          "[sync][shared_mutex][coro][regression]") {
+    constexpr int NUM_ROUNDS = 256;
+    constexpr int NUM_READERS = 50;
+    constexpr int NUM_WRITERS = 5;
+
+    std::atomic<int> violations{0};
+    scheduler sched(4);
+    sched.start();
+
+    for (int round = 0; round < NUM_ROUNDS; ++round) {
+        shared_mutex m;
+        std::atomic<int> active_readers{0};
+        std::atomic<int> active_writers{0};
+
+        auto reader = [&]() -> task<void> {
+            co_await m.lock_shared();
+            active_readers.fetch_add(1);
+            if (active_writers.load() != 0) {
+                violations.fetch_add(1);
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+            active_readers.fetch_sub(1);
+            m.unlock_shared();
+        };
+
+        auto writer = [&]() -> task<void> {
+            co_await m.lock();
+            const auto writers = active_writers.fetch_add(1) + 1;
+            if (active_readers.load() != 0 || writers != 1) {
+                violations.fetch_add(1);
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
+            active_writers.fetch_sub(1);
+            m.unlock();
+        };
+
+        std::vector<join_handle<void>> joins;
+        joins.reserve(NUM_READERS + NUM_WRITERS);
+        for (int i = 0; i < NUM_READERS; ++i) {
+            joins.push_back(spawn_joinable(sched, reader));
+        }
+        for (int i = 0; i < NUM_WRITERS; ++i) {
+            joins.push_back(spawn_joinable(sched, writer));
+        }
+        for (auto& join : joins) {
+            join.wait_destroyed();
+        }
+    }
+
+    sched.shutdown();
+    REQUIRE(violations.load() == 0);
+}
+
 TEST_CASE("shared_lock_guard RAII", "[sync][shared_mutex]") {
     shared_mutex m;
     

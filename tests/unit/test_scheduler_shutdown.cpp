@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 
@@ -160,6 +161,303 @@ TEST_CASE("shutdown_force from worker task does not self-join",
     sched.go(call_shutdown_force_from_worker, &sched, &returned);
 
     REQUIRE(wait_for_flag(returned, scaled_ms(2000)));
+    REQUIRE(!sched.is_running());
+}
+
+TEST_CASE("shutdown_force from a resize-draining worker does not self-join",
+          "[scheduler][shutdown][resize][regression]") {
+    scheduler sched(2);
+    sched.start();
+    std::atomic<bool> worker_started{false};
+    std::atomic<bool> shrink_complete{false};
+
+    auto owner = sched.go_joinable_to(1, [&]() -> task<void> {
+        worker_started.store(true, std::memory_order_release);
+        while (!shrink_complete.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        sched.shutdown_force();
+        co_return;
+    });
+
+    REQUIRE(wait_for_flag(worker_started, scaled_ms(2000)));
+    sched.set_thread_count(1);
+    shrink_complete.store(true, std::memory_order_release);
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(!sched.is_running());
+}
+
+TEST_CASE("scheduler destructor waits for worker-initiated teardown",
+          "[scheduler][shutdown][lifecycle][regression]") {
+    auto sched = std::make_unique<scheduler>(2);
+    sched->start();
+    auto* raw_scheduler = sched.get();
+    std::atomic<bool> teardown_released{false};
+
+    elio::runtime::detail::pause_shutdown_teardown_for_test.store(
+        true, std::memory_order_release);
+    auto owner = raw_scheduler->go_joinable(
+        [raw_scheduler]() -> task<void> {
+            raw_scheduler->shutdown_force();
+            co_return;
+        });
+
+    const bool teardown_paused = wait_for_flag(
+        elio::runtime::detail::shutdown_teardown_paused_for_test,
+        scaled_ms(2000));
+
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(scaled_ms(20));
+        teardown_released.store(true, std::memory_order_release);
+        elio::runtime::detail::pause_shutdown_teardown_for_test.store(
+            false, std::memory_order_release);
+        elio::runtime::detail::pause_shutdown_teardown_for_test.notify_all();
+    });
+    sched.reset();
+    const bool released_before_destructor_returned =
+        teardown_released.load(std::memory_order_acquire);
+    releaser.join();
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(teardown_paused);
+    REQUIRE(released_before_destructor_returned);
+}
+
+TEST_CASE("concurrent shutdown waiters serialize the final worker join",
+          "[scheduler][shutdown][lifecycle][regression]") {
+    scheduler sched(2);
+    sched.start();
+    std::atomic<int> waiters_returned{0};
+    std::atomic<int> waiter_failures{0};
+    elio::runtime::detail::shutdown_waiters_for_test.store(
+        0, std::memory_order_release);
+
+    elio::runtime::detail::pause_shutdown_teardown_for_test.store(
+        true, std::memory_order_release);
+    auto owner = sched.go_joinable([&sched]() -> task<void> {
+        sched.shutdown_force();
+        co_return;
+    });
+
+    const bool teardown_paused = wait_for_flag(
+        elio::runtime::detail::shutdown_teardown_paused_for_test,
+        scaled_ms(2000));
+
+    if (!teardown_paused) {
+        elio::runtime::detail::pause_shutdown_teardown_for_test.store(
+            false, std::memory_order_release);
+        elio::runtime::detail::pause_shutdown_teardown_for_test.notify_all();
+        owner.wait_destroyed();
+        REQUIRE_NOTHROW(owner.await_resume());
+        REQUIRE(teardown_paused);
+        return;
+    }
+
+    auto wait_for_shutdown = [&] {
+        try {
+            sched.shutdown_force();
+        } catch (...) {
+            waiter_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        waiters_returned.fetch_add(1, std::memory_order_release);
+    };
+    std::thread first(wait_for_shutdown);
+    std::thread second(wait_for_shutdown);
+
+    const auto waiters_deadline =
+        std::chrono::steady_clock::now() + scaled_ms(2000);
+    while (elio::runtime::detail::shutdown_waiters_for_test.load(
+               std::memory_order_acquire) != 2 &&
+           std::chrono::steady_clock::now() < waiters_deadline) {
+        std::this_thread::yield();
+    }
+    const size_t waiters_before_release =
+        elio::runtime::detail::shutdown_waiters_for_test.load(
+            std::memory_order_acquire);
+
+    elio::runtime::detail::pause_shutdown_teardown_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::pause_shutdown_teardown_for_test.notify_all();
+    first.join();
+    second.join();
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(teardown_paused);
+    REQUIRE(waiters_before_release == 2);
+    REQUIRE(waiters_returned.load(std::memory_order_acquire) == 2);
+    REQUIRE(waiter_failures.load(std::memory_order_relaxed) == 0);
+}
+
+TEST_CASE("scheduler does not restart after shutdown begins",
+          "[scheduler][shutdown][lifecycle][regression]") {
+    scheduler sched(1);
+    sched.start();
+    std::atomic<bool> shutdown_returned{false};
+    std::atomic<bool> allow_worker_exit{false};
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        sched.shutdown_force();
+        shutdown_returned.store(true, std::memory_order_release);
+        while (!allow_worker_exit.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        co_return;
+    });
+
+    const bool shutdown_returned_before_release =
+        wait_for_flag(shutdown_returned, scaled_ms(2000));
+    bool restarted_before_worker_exit = false;
+
+    // The initiating worker is still inside its current coroutine and its
+    // std::thread remains joinable here.
+    if (shutdown_returned_before_release) {
+        sched.start();
+        restarted_before_worker_exit = sched.is_running();
+    }
+    allow_worker_exit.store(true, std::memory_order_release);
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(shutdown_returned_before_release);
+    REQUIRE(!restarted_before_worker_exit);
+}
+
+TEST_CASE("shutdown before first start closes the scheduler lifecycle",
+          "[scheduler][shutdown][lifecycle][regression]") {
+    scheduler sched(1);
+    sched.shutdown_force();
+    sched.start();
+    REQUIRE(!sched.is_running());
+}
+
+TEST_CASE("resize is rejected after shutdown teardown begins",
+          "[scheduler][shutdown][resize][lifecycle][regression]") {
+    scheduler sched(1);
+    sched.start();
+
+    elio::runtime::detail::pause_shutdown_teardown_for_test.store(
+        true, std::memory_order_release);
+    auto owner = sched.go_joinable([&sched]() -> task<void> {
+        sched.shutdown_force();
+        co_return;
+    });
+
+    const bool teardown_paused = wait_for_flag(
+        elio::runtime::detail::shutdown_teardown_paused_for_test,
+        scaled_ms(2000));
+    const size_t count_before_resize = sched.num_threads();
+    sched.set_thread_count(2);
+    const size_t count_after_resize = sched.num_threads();
+
+    elio::runtime::detail::pause_shutdown_teardown_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::pause_shutdown_teardown_for_test.notify_all();
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(teardown_paused);
+    REQUIRE(count_before_resize == 1);
+    REQUIRE(count_after_resize == 1);
+}
+
+TEST_CASE("draining worker shutdown is handed to an active resize",
+          "[scheduler][shutdown][resize][lifecycle][regression]") {
+    scheduler sched(2);
+    sched.start();
+    std::atomic<bool> worker_started{false};
+    std::atomic<bool> observe_resize{false};
+    std::atomic<bool> worker_observed_resize{false};
+    std::atomic<bool> worker_shutdown_returned{false};
+    std::atomic<bool> grow_returned{false};
+    elio::runtime::detail::resize_waiting_for_draining_worker_for_test.store(
+        false, std::memory_order_release);
+
+    auto owner = sched.go_joinable_to(1, [&]() -> task<void> {
+        worker_started.store(true, std::memory_order_release);
+        const auto deadline =
+            std::chrono::steady_clock::now() + scaled_ms(2000);
+        while (!observe_resize.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        while (!elio::runtime::detail::resize_waiting_for_draining_worker_for_test.load(
+                   std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        const bool observed =
+            elio::runtime::detail::resize_waiting_for_draining_worker_for_test.load(
+                std::memory_order_acquire);
+        worker_observed_resize.store(observed, std::memory_order_release);
+        if (observed) {
+            sched.shutdown_force();
+            worker_shutdown_returned.store(true, std::memory_order_release);
+        }
+        co_return;
+    });
+
+    const bool started = wait_for_flag(worker_started, scaled_ms(2000));
+    if (started) {
+        sched.set_thread_count(1);
+    }
+    observe_resize.store(true, std::memory_order_release);
+
+    std::thread grower([&] {
+        sched.set_thread_count(2);
+        grow_returned.store(true, std::memory_order_release);
+    });
+    grower.join();
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(started);
+    REQUIRE(worker_observed_resize.load(std::memory_order_acquire));
+    REQUIRE(worker_shutdown_returned.load(std::memory_order_acquire));
+    REQUIRE(grow_returned.load(std::memory_order_acquire));
+    REQUIRE(!sched.is_running());
+}
+
+TEST_CASE("force shutdown interrupts grow waiting on a draining worker",
+          "[scheduler][shutdown][resize][lifecycle][regression]") {
+    scheduler sched(2);
+    sched.start();
+    std::atomic<bool> grow_returned{false};
+    elio::runtime::detail::resize_waiting_for_draining_worker_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::draining_worker_held_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::hold_draining_worker_for_test.store(
+        true, std::memory_order_release);
+
+    sched.set_thread_count(1);
+    const bool worker_held = wait_for_flag(
+        elio::runtime::detail::draining_worker_held_for_test,
+        scaled_ms(2000));
+
+    std::thread grower([&] {
+        sched.set_thread_count(2);
+        grow_returned.store(true, std::memory_order_release);
+    });
+
+    const bool grow_waiting = wait_for_flag(
+        elio::runtime::detail::resize_waiting_for_draining_worker_for_test,
+        scaled_ms(2000));
+    const auto shutdown_start = std::chrono::steady_clock::now();
+    sched.shutdown_force();
+    const auto shutdown_elapsed =
+        std::chrono::steady_clock::now() - shutdown_start;
+    grower.join();
+    elio::runtime::detail::hold_draining_worker_for_test.store(
+        false, std::memory_order_release);
+
+    REQUIRE(worker_held);
+    REQUIRE(grow_waiting);
+    REQUIRE(grow_returned.load(std::memory_order_acquire));
+    REQUIRE(shutdown_elapsed < scaled_ms(1000));
     REQUIRE(!sched.is_running());
 }
 

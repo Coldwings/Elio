@@ -315,8 +315,15 @@ task<void> task_scope(runtime::scheduler& scheduler, F&& body,
                       task_group_options options = {});
 ```
 
-The default constructor binds the group to the current scheduler and throws
-`std::logic_error` when there is none. The explicit constructor submits every
+The explicit-scheduler `task_scope()` overload must initially be awaited on a
+worker of that scheduler. It does not dispatch initial entry from another
+scheduler or from an external thread, including the thread that called
+`scheduler::start()`; violating this precondition throws `std::logic_error`.
+
+The default constructor binds the group to the current scheduler worker and
+throws `std::logic_error` when there is none. Merely calling
+`scheduler::start()` does not make its calling thread a scheduler worker. The
+explicit constructor submits every
 child to the selected scheduler. When construction occurs while executing on
 that same scheduler, the group links to the current task's cancellation token;
 otherwise the group starts with independent cancellation authority.
@@ -326,10 +333,13 @@ argument values in scheduler-owned frames, and discards the result value. It
 throws after joining has started. Scheduler rejection is recorded as a child
 failure and reported by `join()`. A nonzero `max_concurrency` limits child body
 execution, not the number of registered or scheduler-queued child frames.
+`outstanding_children()` reports those accepted child submissions and does not
+include the callback body of an active `task_scope()`.
 
-`join()` is `[[nodiscard]]` and must be awaited from the group's scheduler
-domain. It stops further spawning, waits until every registered child frame has
-left the group, and then reports failures according to the selected policy. Its
+`join()` is `[[nodiscard]]` and must be awaited while executing on a worker of
+the group's scheduler. It stops further spawning, waits until every registered
+child frame has left the group, and then reports failures according to the
+selected policy. Its
 continuation resumes in that scheduler domain; normal completion is queued, and
 a same-domain enqueue rejection falls back to direct resumption with the saved
 frame context. `join()` must
@@ -360,9 +370,14 @@ passes `this_coro::cancel_token()` to its current wait. The body must not call
 single join. If a body awaitable resumes on another executor, the scope wrapper
 hands execution back to the selected scheduler before joining and resuming its
 caller. Both `task_scope()` overloads are `[[nodiscard]]` lazy tasks.
+The scope retains the body callable and its captures through child joining.
+Automatic local objects in the returned body coroutine are still destroyed
+when that coroutine returns; a child that can continue after body return must
+not retain references to those locals.
 
 `request_cancel()` runs group cancellation callbacks on the selected scheduler.
-An ordinary external thread waits for that dispatch and can rethrow a callback
+An ordinary external thread, including the thread that called
+`scheduler::start()`, waits for that dispatch and can rethrow a callback
 exception. A worker belonging to another scheduler posts the request and returns
 without waiting, preventing reciprocal single-worker scheduler deadlocks;
 callback failures from that asynchronous path are recorded as group failures.
@@ -746,6 +761,18 @@ drain completed before the timeout. Use `shutdown_force()` only when
 non-graceful teardown is required: it does not wait for tracked coroutine or
 pending-I/O drain, but it may still wait for already-accepted scheduler-owned
 blocking work before stopping workers.
+
+A scheduler has a one-shot lifecycle. Once either shutdown path begins, later
+`start()` calls are no-ops; create a new scheduler for another run. Concurrent
+shutdown callers share one teardown, and external callers wait for a teardown
+initiated by a scheduler worker before returning. Destroying a scheduler from
+one of its own worker threads is unsupported and terminates the process because
+the scheduler cannot safely join and release the currently executing worker.
+Once shutdown begins, `set_thread_count()` also leaves the configured worker
+count unchanged. If a draining worker requests force shutdown while an external
+grow is waiting to join that same worker, the worker records the request and
+returns; the grow controller performs teardown after the worker unwinds. Use an
+external lifecycle owner when the caller must observe complete teardown.
 
 `set_thread_count()` must be called from outside scheduler worker threads. If a
 worker thread calls it, Elio logs a warning and leaves the worker count

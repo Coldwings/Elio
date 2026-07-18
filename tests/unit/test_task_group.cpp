@@ -68,6 +68,68 @@ private:
     std::atomic<bool>* destroyed_;
 };
 
+class scope_body_lifetime_probe final {
+public:
+    scope_body_lifetime_probe(
+        elio::sync::event& child_started,
+        elio::sync::event& release_child,
+        std::atomic<bool>& body_returned,
+        std::atomic<bool>& callable_destroyed,
+        std::atomic<bool>& child_observed_callable_alive) noexcept
+        : child_started_(&child_started)
+        , release_child_(&release_child)
+        , body_returned_(&body_returned)
+        , callable_destroyed_(&callable_destroyed)
+        , child_observed_callable_alive_(&child_observed_callable_alive) {}
+
+    scope_body_lifetime_probe(scope_body_lifetime_probe&& other) noexcept
+        : child_started_(other.child_started_)
+        , release_child_(other.release_child_)
+        , body_returned_(other.body_returned_)
+        , callable_destroyed_(
+              std::exchange(other.callable_destroyed_, nullptr))
+        , child_observed_callable_alive_(
+              other.child_observed_callable_alive_) {}
+
+    scope_body_lifetime_probe& operator=(scope_body_lifetime_probe&&) = delete;
+    scope_body_lifetime_probe(const scope_body_lifetime_probe&) = delete;
+    scope_body_lifetime_probe& operator=(
+        const scope_body_lifetime_probe&) = delete;
+
+    ~scope_body_lifetime_probe() {
+        if (callable_destroyed_) {
+            callable_destroyed_->store(true, std::memory_order_release);
+        }
+    }
+
+    task<void> operator()(task_group& group) {
+        auto* child_started = child_started_;
+        auto* release_child = release_child_;
+        auto* callable_destroyed = callable_destroyed_;
+        auto* child_observed_callable_alive =
+            child_observed_callable_alive_;
+
+        group.spawn(
+            [child_started, release_child, callable_destroyed,
+             child_observed_callable_alive]() -> task<void> {
+                child_started->set();
+                co_await release_child->wait();
+                child_observed_callable_alive->store(
+                    !callable_destroyed->load(std::memory_order_acquire),
+                    std::memory_order_release);
+            });
+        body_returned_->store(true, std::memory_order_release);
+        co_return;
+    }
+
+private:
+    elio::sync::event* child_started_;
+    elio::sync::event* release_child_;
+    std::atomic<bool>* body_returned_;
+    std::atomic<bool>* callable_destroyed_;
+    std::atomic<bool>* child_observed_callable_alive_;
+};
+
 class inline_resume_gate final {
 public:
     class awaitable final {
@@ -255,6 +317,98 @@ TEST_CASE("task_group enforces bounded child-body concurrency",
     REQUIRE(peak.load(std::memory_order_relaxed) == 2);
     REQUIRE(completed.load(std::memory_order_acquire) == 8);
     sched.shutdown();
+}
+
+TEST_CASE("task_group bounded child survives one permit wake rejection",
+          "[task_group][structured][bounded][scheduler][failure]") {
+    scheduler sched(1);
+    sched.start();
+    elio::sync::event first_started;
+    elio::sync::event release_first;
+    std::atomic<bool> second_started{false};
+    const auto waiter_publications_before =
+        elio::sync::detail::semaphore_waiter_publications_for_test.load(
+            std::memory_order_acquire);
+    const auto local_fallbacks_before =
+        elio::runtime::detail::local_schedule_fallbacks_for_test.load(
+            std::memory_order_acquire);
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        task_group group(task_group_options{.max_concurrency = 1});
+        group.spawn([&]() -> task<void> {
+            first_started.set();
+            co_await release_first.wait();
+            elio::runtime::detail::reject_next_schedule_for_test.store(
+                true, std::memory_order_release);
+        });
+        co_await first_started.wait();
+        group.spawn([&]() -> task<void> {
+            second_started.store(true, std::memory_order_release);
+            co_return;
+        });
+        co_await group.join();
+    });
+
+    REQUIRE(wait_for_condition([&] { return first_started.is_set(); }));
+    REQUIRE(wait_for_condition([&] {
+        return elio::sync::detail::semaphore_waiter_publications_for_test.load(
+                   std::memory_order_acquire) > waiter_publications_before;
+    }));
+    release_first.set();
+    REQUIRE(wait_for_flag(second_started));
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE_FALSE(
+        elio::runtime::detail::reject_next_schedule_for_test.load(
+            std::memory_order_acquire));
+    REQUIRE(
+        elio::runtime::detail::local_schedule_fallbacks_for_test.load(
+            std::memory_order_acquire) > local_fallbacks_before);
+    sched.shutdown();
+}
+
+TEST_CASE("task_group drains a permit wake during worker force shutdown",
+          "[task_group][structured][bounded][scheduler][shutdown]") {
+    scheduler sched(1);
+    sched.start();
+    elio::sync::event first_started;
+    elio::sync::event release_first;
+    std::atomic<bool> second_started{false};
+    const auto waiter_publications_before =
+        elio::sync::detail::semaphore_waiter_publications_for_test.load(
+            std::memory_order_acquire);
+    const auto local_fallbacks_before =
+        elio::runtime::detail::local_schedule_fallbacks_for_test.load(
+            std::memory_order_acquire);
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        task_group group(task_group_options{.max_concurrency = 1});
+        group.spawn([&]() -> task<void> {
+            first_started.set();
+            co_await release_first.wait();
+            sched.shutdown_force();
+            co_return;
+        });
+        co_await first_started.wait();
+        group.spawn([&]() -> task<void> {
+            second_started.store(true, std::memory_order_release);
+            co_return;
+        });
+        co_await group.join();
+    });
+
+    REQUIRE(wait_for_condition([&] { return first_started.is_set(); }));
+    REQUIRE(wait_for_condition([&] {
+        return elio::sync::detail::semaphore_waiter_publications_for_test.load(
+                   std::memory_order_acquire) > waiter_publications_before;
+    }));
+    release_first.set();
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(second_started.load(std::memory_order_acquire));
+    REQUIRE(
+        elio::runtime::detail::local_schedule_fallbacks_for_test.load(
+            std::memory_order_acquire) > local_fallbacks_before);
 }
 
 TEST_CASE("parent cancellation propagates through task_group children",
@@ -497,17 +651,82 @@ TEST_CASE("task_scope accepts a generic lvalue group callable",
     sched.shutdown();
 }
 
-TEST_CASE("task_scope returns to its scheduler after external body wakeup",
-          "[task_group][task_scope][structured][scheduler_domain]") {
+TEST_CASE("task_scope child count excludes its body",
+          "[task_group][task_scope][structured][contract]") {
+    scheduler sched(1);
+    sched.start();
+    elio::sync::event release_child;
+    std::atomic<bool> observed_empty{false};
+    std::atomic<bool> observed_one_child{false};
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        co_await elio::coro::task_scope(
+            [&](task_group& group) -> task<void> {
+                observed_empty.store(
+                    group.outstanding_children() == 0,
+                    std::memory_order_release);
+                group.spawn([&]() -> task<void> {
+                    co_await release_child.wait();
+                });
+                observed_one_child.store(
+                    group.outstanding_children() == 1,
+                    std::memory_order_release);
+                release_child.set();
+                co_return;
+            });
+    });
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(observed_empty.load(std::memory_order_acquire));
+    REQUIRE(observed_one_child.load(std::memory_order_acquire));
+    sched.shutdown();
+}
+
+TEST_CASE("task_scope retains its body callable until children drain",
+          "[task_group][task_scope][structured][lifetime]") {
+    scheduler sched(1);
+    sched.start();
+    elio::sync::event child_started;
+    elio::sync::event release_child;
+    std::atomic<bool> body_returning{false};
+    std::atomic<bool> body_callable_destroyed{false};
+    std::atomic<bool> child_observed_callable_alive{false};
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        co_await elio::coro::task_scope(
+            scope_body_lifetime_probe(
+                child_started, release_child, body_returning,
+                body_callable_destroyed, child_observed_callable_alive));
+    });
+
+    REQUIRE(wait_for_condition([&] { return child_started.is_set(); }));
+    REQUIRE(wait_for_flag(body_returning));
+    release_child.set();
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(child_observed_callable_alive.load(std::memory_order_acquire));
+    REQUIRE(body_callable_destroyed.load(std::memory_order_acquire));
+    sched.shutdown();
+}
+
+TEST_CASE("task_scope survives rejected handoff after external body wakeup",
+          "[task_group][task_scope][structured][scheduler_domain][failure]") {
     scheduler sched(1);
     sched.start();
     inline_resume_gate release_body;
+    elio::sync::event child_started;
+    elio::sync::event release_child;
     std::atomic<bool> body_resumed_externally{false};
     std::atomic<bool> scope_continuation_on_domain{false};
 
     auto owner = sched.go_joinable([&]() -> task<void> {
         co_await elio::coro::task_scope(
-            [&](task_group&) -> task<void> {
+            [&](task_group& group) -> task<void> {
+                group.spawn([&]() -> task<void> {
+                    child_started.set();
+                    co_await release_child.wait();
+                });
                 co_await release_body.wait();
                 body_resumed_externally.store(
                     scheduler::current() == nullptr,
@@ -518,14 +737,54 @@ TEST_CASE("task_scope returns to its scheduler after external body wakeup",
     });
 
     REQUIRE(wait_for_condition([&] { return release_body.is_waiting(); }));
+    REQUIRE(wait_for_condition([&] { return child_started.is_set(); }));
     std::thread external_resumer([&] {
+        elio::runtime::detail::reject_next_schedule_for_test.store(
+            true, std::memory_order_release);
         release_body.resume_inline();
     });
     external_resumer.join();
+    REQUIRE_FALSE(
+        elio::runtime::detail::reject_next_schedule_for_test.load(
+            std::memory_order_acquire));
+    release_child.set();
     owner.wait_destroyed();
     REQUIRE_NOTHROW(owner.await_resume());
     REQUIRE(body_resumed_externally.load(std::memory_order_acquire));
     REQUIRE(scope_continuation_on_domain.load(std::memory_order_acquire));
+    sched.shutdown();
+}
+
+TEST_CASE("task_scope hands off from the scheduler start caller",
+          "[task_group][task_scope][structured][scheduler_domain]") {
+    scheduler sched(1);
+    sched.start();
+    inline_resume_gate release_body;
+    std::atomic<bool> body_resumed_on_start_caller{false};
+    std::atomic<bool> scope_continuation_on_worker{false};
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        co_await elio::coro::task_scope(
+            sched,
+            [&](task_group&) -> task<void> {
+                co_await release_body.wait();
+                body_resumed_on_start_caller.store(
+                    scheduler::current() == &sched &&
+                        elio::runtime::worker_thread::current() == nullptr,
+                    std::memory_order_release);
+            });
+        scope_continuation_on_worker.store(
+            scheduler::current() == &sched &&
+                elio::runtime::worker_thread::current() != nullptr,
+            std::memory_order_release);
+    });
+
+    REQUIRE(wait_for_condition([&] { return release_body.is_waiting(); }));
+    release_body.resume_inline();
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(body_resumed_on_start_caller.load(std::memory_order_acquire));
+    REQUIRE(scope_continuation_on_worker.load(std::memory_order_acquire));
     sched.shutdown();
 }
 
@@ -634,6 +893,53 @@ TEST_CASE("task_group reports scheduler rejection through join",
     owner.wait_destroyed();
     REQUIRE_NOTHROW(owner.await_resume());
     REQUIRE(rejection_propagated.load(std::memory_order_acquire));
+    sched.shutdown();
+}
+
+TEST_CASE("task_group rejection cancellation permits reentrant spawn",
+          "[task_group][structured][failure][cancellation][reentrant]") {
+    scheduler sched(1);
+    sched.start();
+    elio::sync::event callback_ready;
+    elio::sync::event never;
+    std::atomic<bool> callback_reentered{false};
+    std::atomic<bool> rejection_propagated{false};
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        task_group group;
+        group.spawn([&]() -> task<void> {
+            auto registration =
+                elio::coro::this_coro::cancel_token().on_cancel([&] {
+                    group.spawn([]() -> task<void> { co_return; });
+                    callback_reentered.store(true, std::memory_order_release);
+                });
+            callback_ready.set();
+            (void)co_await never.wait(
+                elio::coro::this_coro::cancel_token());
+        });
+
+        co_await callback_ready.wait();
+        elio::runtime::detail::reject_next_spawn_for_test.store(
+            true, std::memory_order_release);
+        group.spawn([]() -> task<void> { co_return; });
+
+        try {
+            co_await group.join();
+        } catch (const std::logic_error& error) {
+            rejection_propagated.store(
+                std::string_view(error.what()).find("scheduler rejected") !=
+                    std::string_view::npos,
+                std::memory_order_release);
+        }
+    });
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(callback_reentered.load(std::memory_order_acquire));
+    REQUIRE(rejection_propagated.load(std::memory_order_acquire));
+    REQUIRE_FALSE(
+        elio::runtime::detail::reject_next_spawn_for_test.load(
+            std::memory_order_acquire));
     sched.shutdown();
 }
 
@@ -766,6 +1072,41 @@ TEST_CASE("task_group cancellation from another scheduler is non-blocking",
     REQUIRE(child_cancelled.load(std::memory_order_acquire));
     foreign_scheduler.shutdown();
     owner_scheduler.shutdown();
+}
+
+TEST_CASE("task_group cancellation dispatches from the scheduler start caller",
+          "[task_group][structured][cancellation][scheduler_domain]") {
+    scheduler sched(1);
+    sched.start();
+    elio::sync::event never;
+    std::atomic<bool> child_started{false};
+    std::atomic<bool> callback_on_worker{false};
+
+    task_group group(sched);
+    group.spawn([&]() -> task<void> {
+        auto token = elio::coro::this_coro::cancel_token();
+        auto registration = token.on_cancel([&] {
+            callback_on_worker.store(
+                scheduler::current() == &sched &&
+                    elio::runtime::worker_thread::current() != nullptr,
+                std::memory_order_release);
+        });
+        child_started.store(true, std::memory_order_release);
+        (void)co_await never.wait(std::move(token));
+    });
+
+    REQUIRE(wait_for_flag(child_started));
+    REQUIRE(scheduler::current() == &sched);
+    REQUIRE(elio::runtime::worker_thread::current() == nullptr);
+    group.request_cancel();
+    REQUIRE(callback_on_worker.load(std::memory_order_acquire));
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        co_await group.join();
+    });
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    sched.shutdown();
 }
 
 TEST_CASE("task_group join survives one completion enqueue rejection",

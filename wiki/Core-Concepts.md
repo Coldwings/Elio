@@ -698,6 +698,10 @@ and join continuation return there. An awaited operation may still define its
 own resumption executor; task groups do not override that operation-level
 policy.
 
+The explicit-scheduler `task_scope()` overload must initially be awaited on a
+worker of that scheduler; it does not migrate a foreign scheduler worker or an
+external thread into the scope.
+
 ```cpp
 coro::task<void> refresh_all(std::span<const key> keys) {
     coro::task_group group({.max_concurrency = 4});
@@ -732,6 +736,12 @@ waits. If a body awaitable resumes elsewhere, scope cleanup first returns to the
 selected scheduler. Return from the body to initiate joining; do not call
 `join()` inside it.
 
+The scope retains the body callable and its captures until all children join.
+This does not extend automatic local lifetimes inside the body coroutine: those
+objects are destroyed when the body returns. Children that may continue after
+body return must capture durable external state or values instead of references
+to body-coroutine locals.
+
 ```cpp
 co_await coro::task_scope(
     [](coro::task_group& group) -> coro::task<void> {
@@ -746,8 +756,9 @@ their runtime task context, but a child must pass
 Neither group cancellation nor scope cleanup forcibly destroys token-ignoring
 work. A child that observes group cancellation before body entry is skipped;
 cancellation racing with an already-starting body remains cooperative.
-Cancellation requested by an ordinary external thread is synchronously
-dispatched onto the group scheduler before the request returns. A task running
+Cancellation requested by an ordinary external thread, including the thread
+that called `scheduler::start()`, is synchronously dispatched onto the group
+scheduler before the request returns. A task running
 on another scheduler posts the request asynchronously, so two scheduler workers
 cannot deadlock by waiting for reciprocal cancellation dispatch. In either case,
 the selected scheduler must remain running until the group drains.

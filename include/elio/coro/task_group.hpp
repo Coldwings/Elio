@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -58,6 +59,13 @@ private:
 };
 
 namespace detail {
+
+[[nodiscard]] inline bool is_scheduler_worker(
+    const runtime::scheduler* scheduler) noexcept {
+    return scheduler != nullptr &&
+           runtime::scheduler::current() == scheduler &&
+           runtime::worker_thread::current() != nullptr;
+}
 
 class task_group_state final
     : public std::enable_shared_from_this<task_group_state> {
@@ -116,13 +124,12 @@ public:
     }
 
     void request_cancel() {
-        auto* current_scheduler = runtime::scheduler::current();
-        if (current_scheduler == scheduler_) {
+        if (is_scheduler_worker(scheduler_)) {
             cancellation_.request_cancel();
             return;
         }
 
-        if (current_scheduler != nullptr) {
+        if (runtime::worker_thread::current() != nullptr) {
             // Never block one scheduler worker on another scheduler: reciprocal
             // cancellation would otherwise deadlock two single-worker domains.
             auto state = shared_from_this();
@@ -222,7 +229,7 @@ public:
         }
     }
 
-    void record_failure(std::exception_ptr failure) noexcept {
+    [[nodiscard]] bool store_failure(std::exception_ptr failure) noexcept {
         bool cancel_siblings = false;
         {
             std::lock_guard<std::mutex> lock(failures_mutex_);
@@ -239,7 +246,11 @@ public:
             }
         }
 
-        if (cancel_siblings) {
+        return cancel_siblings;
+    }
+
+    void record_failure(std::exception_ptr failure) noexcept {
+        if (store_failure(std::move(failure))) {
             request_cancel_noexcept();
         }
     }
@@ -264,7 +275,7 @@ private:
             return;
         }
 
-        if (runtime::scheduler::current() == scheduler_) {
+        if (is_scheduler_worker(scheduler_)) {
             auto* promise = get_promise_base(waiter.address());
             detail::frame_context_scope frame_scope(promise);
             waiter.resume();
@@ -341,7 +352,6 @@ public:
         return state_;
     }
 
-private:
     void finish() noexcept {
         if (state_) {
             state_->child_finished();
@@ -349,6 +359,7 @@ private:
         }
     }
 
+private:
     std::shared_ptr<task_group_state> state_;
 };
 
@@ -388,12 +399,36 @@ private:
 };
 
 template<typename F>
+class task_reference_awaitable final {
+public:
+    explicit task_reference_awaitable(F& task) noexcept
+        : task_(std::addressof(task)) {}
+
+    [[nodiscard]] bool await_ready() const noexcept {
+        return task_->await_ready();
+    }
+
+    template<typename Promise>
+    std::coroutine_handle<> await_suspend(
+        std::coroutine_handle<Promise> awaiter) {
+        return task_->await_suspend(awaiter);
+    }
+
+    decltype(auto) await_resume() {
+        return task_->await_resume();
+    }
+
+private:
+    F* task_;
+};
+
+template<typename F>
 class task_group_scope_operation final {
 public:
-    task_group_scope_operation(task_group_child_registration registration,
-                               F function, task_group& group)
-        : registration_(std::move(registration))
-        , function_(std::move(function))
+    using body_task_type = std::invoke_result_t<F, task_group&>;
+
+    task_group_scope_operation(F function, task_group& group)
+        : function_(std::move(function))
         , group_(std::addressof(group)) {}
 
     task_group_scope_operation(task_group_scope_operation&&) = default;
@@ -402,15 +437,16 @@ public:
     task_group_scope_operation& operator=(
         const task_group_scope_operation&) = delete;
 
-    auto invoke() && -> std::invoke_result_t<F, task_group&> {
-        return std::invoke(std::move(function_), *group_);
+    body_task_type& start() {
+        body_task_.emplace(
+            std::invoke(std::move(function_), *group_));
+        return *body_task_;
     }
 
 private:
-    // Declared first so it is destroyed after the user callable.
-    task_group_child_registration registration_;
     F function_;
     task_group* group_;
+    std::optional<body_task_type> body_task_;
 };
 
 struct task_scope_access;
@@ -458,30 +494,38 @@ public:
                   elio::detail::is_task_v<std::invoke_result_t<
                       std::decay_t<F>, std::decay_t<Args>...>>)
     void spawn(F&& function, Args&&... args) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!accepting_) {
-            throw std::logic_error(
-                "task_group cannot spawn after join has started");
+        bool cancel_siblings = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!accepting_) {
+                throw std::logic_error(
+                    "task_group cannot spawn after join has started");
+            }
+
+            auto child = make_child_task_(
+                std::forward<F>(function), std::forward<Args>(args)...);
+            const bool scheduled = scheduler_->do_go_task_linked_(
+                state_->token(), std::move(child));
+
+            if (!scheduled) {
+                cancel_siblings = state_->store_failure(
+                    std::make_exception_ptr(std::logic_error(
+                        "scheduler rejected task_group child before execution")));
+            }
         }
 
-        auto child = make_child_task_(
-            std::forward<F>(function), std::forward<Args>(args)...);
-        const bool scheduled = scheduler_->do_go_task_linked_(
-            state_->token(), std::move(child));
-
-        if (!scheduled) {
-            state_->record_failure(std::make_exception_ptr(
-                std::logic_error(
-                    "scheduler rejected task_group child before execution")));
+        if (cancel_siblings) {
+            state_->request_cancel_noexcept();
         }
     }
 
     /// Stop accepting children and wait for every child frame to leave the
     /// group. Fail-fast rethrows the first failure; collect-all throws
-    /// task_group_error with every recorded failure. Only one join is allowed.
+    /// task_group_error with every recorded failure. Only one join is allowed,
+    /// and it must execute on a worker of the selected scheduler.
     [[nodiscard("co_await task_group::join()")]]
     task<void> join() {
-        if (runtime::scheduler::current() != scheduler_) {
+        if (!detail::is_scheduler_worker(scheduler_)) {
             throw std::logic_error(
                 "task_group must be joined from its scheduler domain");
         }
@@ -559,7 +603,7 @@ private:
     }
 
     template<typename F>
-    coro::join_handle<void> spawn_scope_body_(F body) {
+    task<void> make_scope_body_(F body) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!accepting_) {
             throw std::logic_error(
@@ -568,13 +612,9 @@ private:
 
         scope_body_active_ = true;
         try {
-            state_->register_child();
-            detail::task_group_child_registration registration(state_);
             using operation_type = detail::task_group_scope_operation<F>;
-            auto child = run_scope_body_(operation_type(
-                std::move(registration), std::move(body), *this));
-            return scheduler_->do_go_task_joinable_linked_(
-                state_->token(), std::move(child));
+            return run_scope_body_(operation_type(
+                std::move(body), *this));
         } catch (...) {
             scope_body_active_ = false;
             throw;
@@ -629,18 +669,20 @@ private:
             co_return;
         }
 
-        using body_task = std::invoke_result_t<F, task_group&>;
+        using body_task =
+            typename detail::task_group_scope_operation<F>::body_task_type;
         using body_result = elio::detail::task_value_t<body_task>;
+        auto& invoked = operation.start();
         if constexpr (std::is_void_v<body_result>) {
-            co_await std::move(operation).invoke();
+            co_await detail::task_reference_awaitable<body_task>(invoked);
         } else {
-            (void)co_await std::move(operation).invoke();
+            (void)co_await detail::task_reference_awaitable<body_task>(invoked);
         }
     }
 
     static runtime::scheduler& require_current_scheduler() {
         auto* scheduler = runtime::scheduler::current();
-        if (!scheduler) {
+        if (!detail::is_scheduler_worker(scheduler)) {
             throw std::logic_error(
                 "task_group requires a current scheduler or an explicit scheduler");
         }
@@ -649,7 +691,7 @@ private:
 
     static cancel_token parent_token_for(
         runtime::scheduler& scheduler) noexcept {
-        if (runtime::scheduler::current() != std::addressof(scheduler)) {
+        if (!detail::is_scheduler_worker(std::addressof(scheduler))) {
             return {};
         }
         return this_coro::cancel_token();
@@ -678,12 +720,21 @@ struct task_scope_access final {
     }
 
     template<typename F>
-    static coro::join_handle<void> spawn_body(task_group& group, F body) {
-        return group.spawn_scope_body_(std::move(body));
+    static task<void> make_body(task_group& group, F body) {
+        return group.make_scope_body_(std::move(body));
     }
 
     static void finish_body(task_group& group) noexcept {
         group.finish_scope_body_();
+    }
+
+    static cancel_registration link_body_cancellation(
+        task_group& group,
+        std::shared_ptr<task_execution_context> scope_context) {
+        return group.state_->token().on_cancel(
+            [scope_context = std::move(scope_context)] {
+                scope_context->request_cancel();
+            });
     }
 };
 
@@ -693,13 +744,16 @@ public:
         : scheduler_(std::addressof(scheduler)) {}
 
     [[nodiscard]] bool await_ready() const noexcept {
-        return runtime::scheduler::current() == scheduler_;
+        return is_scheduler_worker(scheduler_);
     }
 
     bool await_suspend(std::coroutine_handle<> handle) {
-        if (!scheduler_->try_schedule(handle)) {
-            throw std::logic_error(
-                "task_scope scheduler rejected its domain handoff");
+        while (!scheduler_->try_schedule(handle)) {
+            if (!scheduler_->is_running()) {
+                throw std::logic_error(
+                    "task_scope scheduler rejected its domain handoff");
+            }
+            std::this_thread::yield();
         }
         return true;
     }
@@ -732,7 +786,7 @@ template<typename F>
 task<void> task_scope_wrapper(runtime::scheduler* scheduler,
                               task_group_options options,
                               F body) {
-    if (scheduler && runtime::scheduler::current() != scheduler) {
+    if (scheduler && !is_scheduler_worker(scheduler)) {
         throw std::logic_error(
             "task_scope must run in its scheduler domain");
     }
@@ -744,13 +798,21 @@ task<void> task_scope_wrapper(runtime::scheduler* scheduler,
         group = std::make_unique<task_group>(options);
     }
 
+    auto* scope_frame = promise_base::current_frame();
+    if (!scope_frame) {
+        throw std::logic_error("task_scope requires an active Elio task frame");
+    }
+    [[maybe_unused]] auto body_cancellation =
+        task_scope_access::link_body_cancellation(
+        *group, scope_frame->execution_context());
+    std::optional<task<void>> body_task;
     std::exception_ptr body_failure;
     bool body_started = false;
     try {
-        auto body_handle = task_scope_access::spawn_body(
-            *group, std::move(body));
+        body_task.emplace(task_scope_access::make_body(
+            *group, std::move(body)));
         body_started = true;
-        co_await body_handle;
+        co_await task_reference_awaitable<task<void>>(*body_task);
     } catch (...) {
         body_failure = std::current_exception();
         task_scope_access::request_cancel_noexcept(*group);
@@ -784,6 +846,11 @@ task<void> task_scope_wrapper(runtime::scheduler* scheduler,
 
 } // namespace detail
 
+/// Run a callback-shaped structured scope on the current scheduler worker.
+///
+/// The callback object remains alive until every child joins. Automatic local
+/// objects in the callback's returned coroutine still end their lifetime when
+/// that coroutine returns; children must not retain references to those locals.
 template<typename F>
     requires (std::invocable<std::decay_t<F>, task_group&> &&
               elio::detail::is_task_v<std::invoke_result_t<
@@ -794,6 +861,10 @@ task<void> task_scope(F&& body, task_group_options options = {}) {
         nullptr, options, std::decay_t<F>(std::forward<F>(body)));
 }
 
+/// Run a callback-shaped structured scope on the selected scheduler worker.
+/// The callback and coroutine-local lifetime rules match the overload above.
+/// The initial co_await must already execute on a worker of that scheduler; this
+/// overload does not migrate a caller from another scheduler or external thread.
 template<typename F>
     requires (std::invocable<std::decay_t<F>, task_group&> &&
               elio::detail::is_task_v<std::invoke_result_t<

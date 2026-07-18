@@ -73,7 +73,8 @@ public:
     /// Schedule a task from an external thread. The lock-free MPSC inbox is
     /// the fast path; sustained bursts spill into a locked overflow queue so
     /// live workers do not reject borrowed resume handles.
-    /// Returns false without taking ownership only if this worker is stopped.
+    /// Returns false without taking ownership if this worker is stopped or the
+    /// unpublished overflow insertion cannot allocate.
     [[nodiscard]] bool schedule(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return false;
 

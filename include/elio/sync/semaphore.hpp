@@ -15,6 +15,12 @@
 
 namespace elio::sync {
 
+namespace detail {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline std::atomic<size_t> semaphore_waiter_publications_for_test{0};
+#endif
+}
+
 /// Coroutine-aware semaphore
 class semaphore {
 public:
@@ -107,6 +113,10 @@ public:
                 wake_state_->set_handle(awaiter);
                 sem_.waiters_.push_back(this);
                 suspended_ = true;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                detail::semaphore_waiter_publications_for_test.fetch_add(
+                    1, std::memory_order_release);
+#endif
                 return true;
             }
 
@@ -134,6 +144,10 @@ public:
                     }
                     sem_.waiters_.push_back(this);
                     suspended_ = true;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                    detail::semaphore_waiter_publications_for_test.fetch_add(
+                        1, std::memory_order_release);
+#endif
 
                     if (wake_state_->unblock_after_publish()) {
                         return true;

@@ -929,6 +929,84 @@ TEST_CASE("channel close and cancellation preserve the winning terminal state",
     }
 }
 
+TEST_CASE("channel recv distinguishes close and cancellation races",
+          "[sync][channel][cancellation][cancel_token][close][race][runtime]") {
+    scheduler sched(2);
+    sched.start();
+
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        channel<int> ch(1);
+        cancel_source source;
+        std::atomic<bool> started{false};
+        std::optional<channel<int>::cancellable_recv_result> result;
+
+        auto receiver = sched.go_joinable([&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            result = co_await ch.recv(source.get_token());
+        });
+        REQUIRE(wait_for_flag(started));
+
+        std::barrier race_start(3);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        std::thread closer([&] {
+            race_start.arrive_and_wait();
+            ch.close();
+        });
+        race_start.arrive_and_wait();
+        canceller.join();
+        closer.join();
+        receiver.wait_destroyed();
+
+        REQUIRE(result.has_value());
+        REQUIRE_FALSE(result->success());
+        REQUIRE((result->was_cancelled() || result->was_closed()));
+        REQUIRE(ch.empty());
+    }
+
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        channel<int> ch(1);
+        REQUIRE(ch.try_send(iteration));
+        ch.close();
+
+        cancel_source source;
+        std::atomic<bool> started{false};
+        std::atomic<bool> begin_receive{false};
+        std::optional<channel<int>::cancellable_recv_result> result;
+        auto receiver = sched.go_joinable([&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            while (!begin_receive.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            result = co_await ch.recv(source.get_token());
+        });
+        REQUIRE(wait_for_flag(started));
+
+        std::barrier race_start(2);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        race_start.arrive_and_wait();
+        begin_receive.store(true, std::memory_order_release);
+        canceller.join();
+        receiver.wait_destroyed();
+
+        REQUIRE(result.has_value());
+        if (result->success()) {
+            REQUIRE(result->value == iteration);
+            REQUIRE(ch.empty());
+        } else {
+            REQUIRE(result->was_cancelled());
+            REQUIRE(ch.try_recv() == iteration);
+        }
+    }
+
+    sched.shutdown();
+}
+
 TEST_CASE("channel waits observe join-handle cancellation context",
           "[sync][channel][cancellation][cancel_token][runtime]") {
     scheduler sched(2);

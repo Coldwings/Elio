@@ -14,7 +14,7 @@
 - **Work-Stealing Scheduler** with lock-free Chase-Lev deques
 - **Dynamic Thread Pool** with runtime adjustment
 - **Autoscaler** for automatic worker thread scaling under load
-- **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel, spinlock, condition_variable; coroutine-aware waiters use intrusive lifetime cleanup, with token-aware waits available for every suspending core primitive
+- **Synchronization Primitives**: mutex, shared_mutex, semaphore, event, channel, spinlock, condition_variable; coroutine-aware waiters use intrusive lifetime cleanup, with token-aware waits available for every suspending primitive in this list
 - **Timers**: sleep_for, sleep_until, yield
 - **I/O Backends**: io_uring (preferred) and epoll fallback
 - **Batch I/O**: Submit multiple file operations in a single syscall

@@ -73,7 +73,8 @@ public:
     /// Schedule a task from an external thread. The lock-free MPSC inbox is
     /// the fast path; sustained bursts spill into a locked overflow queue so
     /// live workers do not reject borrowed resume handles.
-    /// Returns false without taking ownership only if this worker is stopped.
+    /// Returns false without taking ownership if this worker is stopped or the
+    /// unpublished overflow insertion cannot allocate.
     [[nodiscard]] bool schedule(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return false;
 
@@ -136,7 +137,7 @@ public:
         // Preserve progress without making the hot queue dynamically sized.
         // schedule_mutex_ closes the race with request_stop(); overflow_mutex_
         // protects the slow-path queue from its single worker consumer.
-        {
+        try {
             std::lock_guard<std::mutex> schedule_lock(schedule_mutex_);
             if (!running_.load(std::memory_order_acquire)) {
                 return false;
@@ -147,6 +148,9 @@ public:
                 overflow_size_.fetch_add(1, std::memory_order_release);
             }
             wake();
+        } catch (...) {
+            // The handle was not published if overflow allocation failed.
+            return false;
         }
         return true;
     }

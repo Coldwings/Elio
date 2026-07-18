@@ -18,8 +18,13 @@
 #include <thread>
 #include <algorithm>
 #include <functional>
+#include <exception>
 #include <stdexcept>
 #include <vector>
+
+namespace elio::coro {
+class task_group;
+}
 
 namespace elio::runtime {
 
@@ -29,6 +34,18 @@ namespace detail {
     using elio::detail::task_value_t;
     using elio::detail::is_task;
     using elio::detail::is_task_v;
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    inline std::atomic<bool> reject_next_schedule_for_test{false};
+    inline std::atomic<bool> reject_next_spawn_for_test{false};
+    inline std::atomic<size_t> local_schedule_fallbacks_for_test{0};
+    inline std::atomic<bool> pause_shutdown_teardown_for_test{false};
+    inline std::atomic<bool> shutdown_teardown_paused_for_test{false};
+    inline std::atomic<size_t> shutdown_waiters_for_test{0};
+    inline std::atomic<bool> resize_waiting_for_draining_worker_for_test{false};
+    inline std::atomic<bool> hold_draining_worker_for_test{false};
+    inline std::atomic<bool> draining_worker_held_for_test{false};
+#endif
 
     /// Wrapper coroutine for fire-and-forget (go/go_to).
     /// Stores callable and args in its coroutine frame, ensuring lambda lifetime
@@ -63,6 +80,8 @@ namespace detail {
 /// Work-stealing scheduler for coroutines
 class scheduler {
     friend class worker_thread;  // Allow workers to set current_scheduler_
+    friend class elio::coro::task_group;
+    friend void schedule_handle(std::coroutine_handle<> handle) noexcept;
     
 public:
     static constexpr size_t MAX_THREADS = 256;
@@ -94,14 +113,15 @@ public:
     }
 
     ~scheduler() {
-        if (running_.load(std::memory_order_relaxed)) {
-            // Use force shutdown during destruction: do not wait for graceful
-            // coroutine/I/O drain, but shutdown_force() may still wait for
-            // scheduler-owned blocking work that was already accepted.
-            // Call shutdown() explicitly when callers need a graceful drain
-            // deadline/result before object teardown.
-            shutdown_force();
+        auto* current_worker = worker_thread::current();
+        if (current_worker && current_worker->scheduler_ == this) {
+            ELIO_LOG_ERROR(
+                "scheduler destruction from one of its worker threads is unsupported");
+            std::terminate();
         }
+        // Also waits for a concurrent worker-initiated teardown winner and
+        // joins that worker after its shutdown_force() call unwinds.
+        shutdown_force();
         if (current_scheduler_ == this) {
             current_scheduler_ = nullptr;
         }
@@ -116,6 +136,14 @@ public:
     scheduler& operator=(scheduler&&) = delete;
 
     void start() {
+        std::unique_lock<std::mutex> shutdown_lock(shutdown_mutex_);
+        shutdown_cv_.wait(shutdown_lock, [this] {
+            return !resize_in_progress_ || shutdown_started_;
+        });
+        // Scheduler-owned resources, including the blocking pool, have a
+        // one-shot lifecycle. In particular, a worker-initiated shutdown may
+        // have finished teardown but still be awaiting an external join.
+        if (shutdown_started_) return;
         bool expected = false;
         if (!running_.compare_exchange_strong(expected, true)) {
             return;
@@ -139,6 +167,10 @@ public:
     ///       If detected, falls back to shutdown_force() with a warning.
     bool shutdown(std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) {
         if (!running_.load(std::memory_order_acquire)) {
+            // running_=false is published before the teardown winner finishes.
+            // External callers must still wait for that phase and join any
+            // worker that initiated shutdown itself.
+            shutdown_force();
             return true;
         }
 
@@ -158,9 +190,81 @@ public:
     /// tracked tasks or pending I/O. Already-accepted scheduler-owned blocking
     /// work is drained first so spawn_blocking continuations can resume on
     /// scheduler workers before teardown. Tasks suspended on I/O will be
-    /// orphaned (their CQEs are lost, and their frames are destroyed via
-    /// drain_remaining_tasks). Use shutdown() for graceful drain.
+    /// orphaned when their CQEs are lost. Use shutdown() for graceful drain.
+    /// A scheduler worker cannot join itself. If it requests shutdown while an
+    /// external resize is waiting for that worker to drain, teardown is handed
+    /// to the resize controller and this call returns before final teardown.
     void shutdown_force() {
+        auto* current_worker = worker_thread::current();
+        const bool called_from_own_worker =
+            current_worker && current_worker->scheduler_ == this;
+
+        while (true) {
+            std::unique_lock<std::mutex> lock(shutdown_mutex_);
+            if (shutdown_teardown_in_progress_) {
+                // The winner may be joining this worker. Waiting here would
+                // deadlock that join; let the task unwind instead.
+                if (called_from_own_worker) return;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                detail::shutdown_waiters_for_test.fetch_add(
+                    1, std::memory_order_release);
+                detail::shutdown_waiters_for_test.notify_all();
+#endif
+                shutdown_cv_.wait(lock, [this] {
+                    return !shutdown_teardown_in_progress_;
+                });
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                detail::shutdown_waiters_for_test.fetch_sub(
+                    1, std::memory_order_release);
+#endif
+                lock.unlock();
+                join_remaining_workers_();
+                return;
+            }
+
+            // Every first shutdown invocation closes the one-shot lifecycle,
+            // including shutdown before start().
+            shutdown_started_ = true;
+            if (resize_in_progress_) {
+                // A resize may be joining this draining worker. Waiting from
+                // the worker would deadlock that join, so hand teardown to the
+                // external resize controller after it releases resize state.
+                if (called_from_own_worker) {
+                    shutdown_deferred_by_resize_ = true;
+                    return;
+                }
+                shutdown_cv_.wait(lock, [this] {
+                    return !resize_in_progress_;
+                });
+                continue;
+            }
+            if (!running_.load(std::memory_order_acquire)) {
+                lock.unlock();
+                if (!called_from_own_worker) {
+                    join_remaining_workers_();
+                }
+                return;
+            }
+            shutdown_teardown_in_progress_ = true;
+            break;
+        }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (detail::pause_shutdown_teardown_for_test.load(
+                std::memory_order_acquire)) {
+            detail::shutdown_teardown_paused_for_test.store(
+                true, std::memory_order_release);
+            detail::shutdown_teardown_paused_for_test.notify_all();
+            while (detail::pause_shutdown_teardown_for_test.load(
+                    std::memory_order_acquire)) {
+                detail::pause_shutdown_teardown_for_test.wait(
+                    true, std::memory_order_acquire);
+            }
+            detail::shutdown_teardown_paused_for_test.store(
+                false, std::memory_order_release);
+        }
+#endif
+
         // Drain the blocking pool BEFORE flipping running_=false. Pool tasks
         // finishing here resume their callers through
         // scheduler::try_schedule(). Doing the drain first keeps running_=true
@@ -174,12 +278,23 @@ public:
             blocking_pool_->shutdown();
         }
 
-        bool expected = true;
-        if (!running_.compare_exchange_strong(expected, false)) {
-            return;
-        }
+        running_.store(false, std::memory_order_release);
 
-        auto* current_worker = worker_thread::current();
+        try {
+            perform_shutdown_teardown_(current_worker);
+        } catch (...) {
+            finish_shutdown_teardown_();
+            throw;
+        }
+        finish_shutdown_teardown_();
+
+        if (!called_from_own_worker) {
+            join_remaining_workers_();
+        }
+    }
+
+private:
+    void perform_shutdown_teardown_(worker_thread* current_worker) {
 
         // Stop all workers (sets running_=false and joins threads). If this is
         // called from a worker, request that worker to stop but let its run()
@@ -211,18 +326,25 @@ public:
         // Stop and join any draining workers left from prior shrink operations.
         {
             std::lock_guard<std::mutex> lock(workers_mutex_);
-            for (auto& [idx, t] : draining_workers_) {
+            auto it = draining_workers_.begin();
+            while (it != draining_workers_.end()) {
+                auto& [idx, thread] = *it;
                 auto* worker = workers_[idx].get();
+                if (worker == current_worker) {
+                    worker->request_stop();
+                    ++it;
+                    continue;
+                }
                 if (worker) {
                     worker->stop();
                 }
-                if (t.joinable()) t.join();
+                if (thread.joinable()) thread.join();
                 if (worker) {
                     worker->leave_draining_mode();
                 }
                 clear_draining_slot_(idx);
+                it = draining_workers_.erase(it);
             }
-            draining_workers_.clear();
         }
 
         // Wake any threads still parked in wait_for_idle so they can observe
@@ -232,10 +354,15 @@ public:
             idle_cv_.notify_all();
         }
 
-        if (current_scheduler_ == this) {
+        // A worker that initiated force shutdown still has to finish its
+        // current coroutine and drain locally deferred continuations. Keep its
+        // scheduler domain visible until worker_thread::run() actually exits.
+        if (current_scheduler_ == this && current_worker == nullptr) {
             current_scheduler_ = nullptr;
         }
     }
+
+public:
 
     /// Number of tracked tasks currently in flight: spawned but not yet
     /// completed (running, suspended on I/O, sleeping, or queued). Tasks
@@ -344,6 +471,12 @@ public:
     /// live, so the caller must either resume it or destroy it.
     [[nodiscard]] bool try_schedule(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return false;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (detail::reject_next_schedule_for_test.exchange(
+                false, std::memory_order_acq_rel)) {
+            return false;
+        }
+#endif
         if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
             return false;
         }
@@ -429,6 +562,8 @@ public:
     /// Must be called from outside scheduler worker threads. Calls from a
     /// worker thread are ignored after logging a warning, because the shrink
     /// path joins worker threads and would otherwise be able to deadlock.
+    /// Calls after shutdown begins are also ignored; scheduler lifecycle is
+    /// one-shot and no worker may be introduced during teardown.
     void set_thread_count(size_t count) {
         // Guard against calling from a worker thread. The shrink path joins
         // worker threads while holding workers_mutex_; if the joined worker's
@@ -440,86 +575,87 @@ public:
             return;
         }
 
-        if (count == 0) count = 1;
-        if (count > MAX_THREADS) count = MAX_THREADS;
-        
-        size_t old_count = num_threads_.load(std::memory_order_relaxed);
-        
-        if (count > old_count) {
-            std::lock_guard<std::mutex> lock(workers_mutex_);
-            old_count = num_threads_.load(std::memory_order_relaxed);
-            if (count <= old_count) return;
-            
-            for (size_t i = old_count; i < count; ++i) {
-                if (workers_[i]) {
-                    // Slot already populated by the ctor or a prior shrink.
-                    // If the prior worker is still draining I/O, wait for its
-                    // detached thread before restarting this slot in place.
-                    wait_for_draining_worker_(i);
-                    if (running_.load(std::memory_order_relaxed)) {
-                        workers_[i]->start();
+        {
+            std::unique_lock<std::mutex> shutdown_lock(shutdown_mutex_);
+            shutdown_cv_.wait(shutdown_lock, [this] {
+                return !resize_in_progress_ || shutdown_started_;
+            });
+            if (shutdown_started_) return;
+            resize_in_progress_ = true;
+        }
+
+        try {
+            if (count == 0) count = 1;
+            if (count > MAX_THREADS) count = MAX_THREADS;
+
+            size_t old_count = num_threads_.load(std::memory_order_relaxed);
+
+            if (count > old_count) {
+                std::lock_guard<std::mutex> lock(workers_mutex_);
+                old_count = num_threads_.load(std::memory_order_relaxed);
+                if (count > old_count) {
+                    for (size_t i = old_count; i < count; ++i) {
+                        if (workers_[i]) {
+                            // Slot already populated by the ctor or a prior shrink.
+                            // If the prior worker is still draining I/O, wait for its
+                            // detached thread before restarting this slot in place.
+                            wait_for_draining_worker_(i);
+                            (void)try_start_worker_during_resize_(workers_[i].get());
+                        } else {
+                            auto worker = std::make_unique<worker_thread>(
+                                this, i, wait_strategy_);
+                            (void)try_start_worker_during_resize_(worker.get());
+                            workers_[i] = std::move(worker);
+                        }
                     }
-                } else {
-                    auto worker = std::make_unique<worker_thread>(this, i, wait_strategy_);
-                    if (running_.load(std::memory_order_relaxed)) {
-                        worker->start();
+                    // Publish the new size AFTER all slot writes are visible.
+                    // Shutdown waits for resize_in_progress_ to clear before
+                    // snapshotting this count, so every started worker is included.
+                    num_threads_.store(count, std::memory_order_release);
+                }
+            } else if (count < old_count) {
+                // Hold the worker lock across the entire shrink transition.
+                // The lifecycle state remains unlocked: a draining worker may
+                // request shutdown while the resize controller waits to join it.
+                std::lock_guard<std::mutex> lock(workers_mutex_);
+                old_count = num_threads_.load(std::memory_order_relaxed);
+                if (count < old_count) {
+                    const bool running = running_.load(std::memory_order_relaxed);
+                    if (running) {
+                        draining_workers_.reserve(
+                            draining_workers_.size() + (old_count - count));
+                        mark_draining_range_(count, old_count);
                     }
-                    workers_[i] = std::move(worker);
+
+                    // Update count after publishing draining slots so accounting
+                    // readers never lose workers leaving the visible range.
+                    num_threads_.store(count, std::memory_order_release);
+
+                    reap_draining_workers_();
+
+                    if (running) {
+                        for (size_t i = count; i < old_count; ++i) {
+                            workers_[i]->enter_draining_mode();
+                            std::thread t = workers_[i]->detach_thread();
+                            draining_workers_.emplace_back(i, std::move(t));
+                        }
+                    }
                 }
             }
-            // Publish the new size AFTER all slot writes are visible. Hot-path
-            // readers (get_worker, do_spawn, active_tasks) gate on
-            // num_threads_.load(acquire); the release here pairs with their
-            // acquire to make the slot writes visible.
-            num_threads_.store(count, std::memory_order_release);
-        } else if (count < old_count) {
-            // Hold the lock across the entire shrink transition — marking the
-            // retiring slots, publishing the smaller visible range, and
-            // detaching the retiring threads. This serializes shrink against a
-            // concurrent grow: without it, a grow that runs in the window
-            // between the num_threads_ store and thread detachment could reuse
-            // slots whose worker threads are still transitioning into drain
-            // mode, leaving tasks and I/O accounting split across two lifetimes
-            // for the same slot.
-            //
-            // Correctness wins over throughput here: set_thread_count is a
-            // slow-path control operation, not a hot path. The detached worker
-            // continues polling its own I/O context until all pending operations
-            // complete; grow waits for that worker before reusing the slot.
-            //
-            // Note: must NOT be called from a worker thread. Resize control
-            // operations can wait for draining threads on grow/reap paths, and
-            // re-entering them from a running worker would be unsafe.
-            std::lock_guard<std::mutex> lock(workers_mutex_);
-            old_count = num_threads_.load(std::memory_order_relaxed);
-            if (count >= old_count) return;
-
-            const bool running = running_.load(std::memory_order_relaxed);
-            if (running) {
-                draining_workers_.reserve(
-                    draining_workers_.size() + (old_count - count));
-                mark_draining_range_(count, old_count);
-            }
-
-            // Update count after publishing draining slots so accounting readers
-            // never lose workers that are leaving the visible range.
-            num_threads_.store(count, std::memory_order_release);
-
-            // Join any previously-draining workers that have finished.
-            reap_draining_workers_();
-
-            // Move retiring workers out of normal task execution before their
-            // I/O contexts are allowed to drain. Otherwise a worker can observe
-            // pending_count()==0, run a queued task before draining takes
-            // effect, and bind fresh I/O to an io_context that is about to
-            // leave the visible worker pool.
-            if (running) {
-                for (size_t i = count; i < old_count; ++i) {
-                    workers_[i]->enter_draining_mode();
-                    std::thread t = workers_[i]->detach_thread();
-                    draining_workers_.emplace_back(i, std::move(t));
+        } catch (...) {
+            auto failure = std::current_exception();
+            if (finish_resize_()) {
+                try {
+                    shutdown_force();
+                } catch (...) {
+                    // Preserve the resize failure; destruction can retry teardown.
                 }
             }
+            std::rethrow_exception(failure);
+        }
+
+        if (finish_resize_()) {
+            shutdown_force();
         }
     }
 
@@ -639,6 +775,66 @@ public:
     }
 
 private:
+    [[nodiscard]] bool shutdown_started_during_resize_() const noexcept {
+        std::lock_guard<std::mutex> lock(shutdown_mutex_);
+        return shutdown_started_;
+    }
+
+    [[nodiscard]] bool try_start_worker_during_resize_(
+        worker_thread* worker) {
+        if (!worker) return false;
+        std::lock_guard<std::mutex> lock(shutdown_mutex_);
+        if (shutdown_started_ ||
+            !running_.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        worker->start();
+        return true;
+    }
+
+    [[nodiscard]] bool finish_resize_() noexcept {
+        bool run_deferred_shutdown = false;
+        {
+            std::lock_guard<std::mutex> lock(shutdown_mutex_);
+            resize_in_progress_ = false;
+            run_deferred_shutdown = shutdown_deferred_by_resize_;
+            shutdown_deferred_by_resize_ = false;
+        }
+        shutdown_cv_.notify_all();
+        return run_deferred_shutdown;
+    }
+
+    void finish_shutdown_teardown_() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(shutdown_mutex_);
+            shutdown_teardown_in_progress_ = false;
+        }
+        shutdown_cv_.notify_all();
+    }
+
+    /// Join worker threads left behind when shutdown was initiated by one of
+    /// those workers. Only non-owner threads may call this, and only after the
+    /// teardown winner has released shutdown_teardown_in_progress_.
+    void join_remaining_workers_() {
+        // Several external shutdown callers may wake together after a
+        // worker-initiated teardown. std::thread::joinable()/join() are not
+        // safe to race on the same thread object, so serialize this final
+        // ownership handoff independently of the teardown winner election.
+        std::lock_guard<std::mutex> join_lock(shutdown_join_mutex_);
+
+        for (auto& worker : workers_) {
+            if (worker) worker->stop();
+        }
+
+        std::lock_guard<std::mutex> lock(workers_mutex_);
+        for (auto& [idx, thread] : draining_workers_) {
+            if (thread.joinable()) thread.join();
+            if (workers_[idx]) workers_[idx]->leave_draining_mode();
+            clear_draining_slot_(idx);
+        }
+        draining_workers_.clear();
+    }
+
     static std::exception_ptr spawn_rejected_exception_() noexcept {
         try {
             throw std::logic_error("scheduler rejected joinable task before execution");
@@ -720,6 +916,23 @@ private:
         }, this);
     }
 
+    bool do_go_task_linked_(coro::cancel_token parent,
+                            coro::task<void>&& wrapper) {
+        auto wrapper_handle = coro::detail::task_access::handle(wrapper);
+        wrapper_handle.promise().link_parent_cancellation(std::move(parent));
+
+        auto handle = coro::detail::task_access::release(std::move(wrapper));
+        handle.promise().detached_ = true;
+        handle.promise().detach_from_parent();
+        mark_tracked_(handle.promise());
+        try {
+            return do_spawn(handle);
+        } catch (...) {
+            handle.destroy();
+            throw;
+        }
+    }
+
     template<bool Joinable, bool Pinned, typename F, typename... Args>
     auto do_go_(size_t worker_id, F&& f, Args&&... args) {
         using ResultTask = std::invoke_result_t<F, Args...>;
@@ -787,6 +1000,24 @@ private:
         if (it == draining_workers_.end()) return;
 
         auto* worker = workers_[index].get();
+        if (worker && worker->is_running()) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            detail::resize_waiting_for_draining_worker_for_test.store(
+                true, std::memory_order_release);
+            detail::resize_waiting_for_draining_worker_for_test.notify_all();
+#endif
+            while (worker->is_running()) {
+                if (shutdown_started_during_resize_()) {
+                    worker->request_stop();
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            detail::resize_waiting_for_draining_worker_for_test.store(
+                false, std::memory_order_release);
+#endif
+        }
         if (it->second.joinable()) it->second.join();
         if (worker) worker->leave_draining_mode();
         clear_draining_slot_(index);
@@ -879,6 +1110,13 @@ private:
     bool do_spawn(std::coroutine_handle<> handle,
                   bool destroy_on_failure = true) {
         if (!handle) [[unlikely]] return false;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (detail::reject_next_spawn_for_test.exchange(
+                false, std::memory_order_acq_rel)) {
+            if (destroy_on_failure) handle.destroy();
+            return false;
+        }
+#endif
         // Release fence ensures all writes to the coroutine frame (including
         // captured lambda state) are visible to the worker that will run this task
         std::atomic_thread_fence(std::memory_order_release);
@@ -941,6 +1179,86 @@ private:
         }
     }
 
+    /// Preserve progress for a borrowed continuation when its current owner
+    /// worker rejected an external-queue insertion. Publishing to the owner's
+    /// local deque defers execution until the current coroutine returns, so it
+    /// neither recurses nor bypasses affinity or active-I/O ownership.
+    [[nodiscard]] bool try_schedule_current_worker_local_(
+        std::coroutine_handle<> handle) noexcept {
+        auto* current = worker_thread::current();
+        if (!handle || !current || current->scheduler_ != this) {
+            return false;
+        }
+
+        auto* promise = coro::get_promise_base(handle.address());
+        if (promise && promise->has_active_io_pin()) {
+            if (!promise->is_io_pin_owner(
+                    current->worker_id(),
+                    current->io_context().generation())) {
+                return false;
+            }
+        } else if (promise) {
+            const size_t affinity = promise->effective_affinity();
+            if (promise->is_worker_local()) {
+                if (affinity != current->worker_id()) {
+                    return false;
+                }
+            } else if (affinity != coro::NO_AFFINITY) {
+                const size_t n = num_threads_.load(std::memory_order_acquire);
+                if (affinity < n && affinity != current->worker_id()) {
+                    return false;
+                }
+                if (affinity >= n) {
+                    // Match do_spawn(): invalid best-effort affinity does not
+                    // prevent an otherwise movable task from making progress.
+                    promise->clear_affinity();
+                }
+            }
+        }
+
+        std::atomic_thread_fence(std::memory_order_release);
+        current->schedule_local(handle);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        detail::local_schedule_fallbacks_for_test.fetch_add(
+            1, std::memory_order_release);
+#endif
+        return true;
+    }
+
+    /// Report whether retrying normal scheduler routing can still make
+    /// progress. Exact worker-local and active-I/O ownership must remain live;
+    /// movable tasks only need one visible worker that is still accepting work.
+    [[nodiscard]] bool has_live_schedule_target_(
+        std::coroutine_handle<> handle) const noexcept {
+        if (!handle || !running_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        auto* promise = coro::get_promise_base(handle.address());
+        if (promise && promise->has_active_io_pin()) {
+            const size_t owner = promise->io_owner_worker();
+            if (owner >= MAX_THREADS) return false;
+            const auto* worker = workers_[owner].get();
+            return worker && worker->is_running() &&
+                   worker->io_context().generation() ==
+                       promise->io_context_generation();
+        }
+
+        if (promise && promise->is_worker_local()) {
+            const size_t owner = promise->effective_affinity();
+            return owner < MAX_THREADS && workers_[owner] &&
+                   workers_[owner]->is_running();
+        }
+
+        const size_t n = num_threads_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < n; ++i) {
+            if (workers_[i] && workers_[i]->is_running()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Fixed-size storage indexed up to MAX_THREADS. Slot occupancy is
     // controlled by the num_threads_ atomic: writers populate workers_[i]
     // before publishing the new size via num_threads_.store(release);
@@ -970,6 +1288,17 @@ private:
     alignas(64) std::atomic<size_t> num_threads_;
     std::atomic<bool> running_;
     std::atomic<bool> paused_;
+
+    // running_=false means no new work is accepted; teardown completion is a
+    // separate lifecycle phase because a worker can initiate shutdown and must
+    // unwind before an external thread can join it.
+    mutable std::mutex shutdown_mutex_;
+    std::condition_variable shutdown_cv_;
+    bool shutdown_teardown_in_progress_ = false;
+    bool shutdown_started_ = false;
+    bool resize_in_progress_ = false;
+    bool shutdown_deferred_by_resize_ = false;
+    std::mutex shutdown_join_mutex_;
 
     // spawn_index_ is incremented on every spawn(); isolate it so modifications
     // don't invalidate the num_threads_/running_ cache line on other cores.
@@ -1020,13 +1349,26 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
 
     auto* sched = scheduler::current();
     if (sched) {
-        if (sched->is_running() && sched->try_schedule(handle)) {
-            return;
+        // Rejection leaves this borrowed handle live. Prefer normal routing;
+        // when the current worker is the valid owner, defer through its local
+        // deque so a full inbox cannot make that worker spin instead of drain.
+        while (true) {
+            if (sched->is_running() && sched->try_schedule(handle)) {
+                return;
+            }
+            if (sched->try_schedule_current_worker_local_(handle)) {
+                return;
+            }
+            if (!sched->is_running() ||
+                !sched->has_live_schedule_target_(handle)) {
+                // schedule_handle() borrows the frame and cannot destroy or
+                // adopt it without coordinating with the owning task object.
+                // No thread is safe for an exact-owner continuation here;
+                // leave lifetime resolution to that owner/shutdown contract.
+                return;
+            }
+            std::this_thread::yield();
         }
-        // This handle may be bound to a worker's I/O backend. Once its
-        // scheduler has stopped, resuming it on this arbitrary caller thread
-        // is unsafe; leave lifetime resolution to its task owner/shutdown.
-        return;
     }
 
     static thread_local std::vector<std::coroutine_handle<>> trampoline_queue;
@@ -1274,6 +1616,18 @@ inline void worker_thread::run() {
 
     while (running_.load(std::memory_order_relaxed)) {
         if (draining_.load(std::memory_order_acquire)) [[unlikely]] {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (detail::hold_draining_worker_for_test.load(
+                    std::memory_order_acquire)) {
+                detail::draining_worker_held_for_test.store(
+                    true, std::memory_order_release);
+                detail::draining_worker_held_for_test.notify_all();
+                io_context_->poll(std::chrono::milliseconds(1));
+                continue;
+            }
+            detail::draining_worker_held_for_test.store(
+                false, std::memory_order_release);
+#endif
             // Draining mode: only poll I/O, no new tasks or stealing.
             // Redistribute any queued tasks, then wait for pending I/O to complete.
             redistribute_tasks(scheduler_);
@@ -1302,7 +1656,12 @@ inline void worker_thread::run() {
             poll_io_when_idle();
         }
     }
-    
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    detail::draining_worker_held_for_test.store(
+        false, std::memory_order_release);
+#endif
+
     // Drain phase: after running_ becomes false, continue executing all
     // remaining tasks until both local queue and inbox are empty.
     // This ensures shutdown() returns only when all submitted tasks have

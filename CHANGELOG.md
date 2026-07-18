@@ -21,6 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `task::await_suspend` are therefore no longer `noexcept`. Requests are
   best-effort and do not force frame destruction, roll back side effects, or
   replace a result that already completed.
+- **Structured task groups**: Added scheduler-bound `coro::task_group` and
+  callback-shaped `coro::task_scope()` APIs. Groups propagate parent and group
+  cancellation to children, join every registered child frame, default to
+  fail-fast sibling cancellation, optionally collect all failures without
+  cancelling siblings through `task_group_error`, and can bound concurrently
+  executing child bodies. `task_scope()` runs its body in the group cancellation
+  context, so child fail-fast cancellation can wake a token-aware body, and
+  always cancels and joins children when its body fails. Collect-all scopes
+  aggregate simultaneous body and child failures. Completion and cancellation
+  dispatch preserve the selected scheduler domain; requests from another
+  scheduler are posted asynchronously to avoid reciprocal worker deadlock. A bare
+  group requires an explicit `co_await group.join()`; its destructor can only
+  request cancellation as a non-joining fallback. Task scopes retain their body
+  callable and captures through child joining, while automatic locals in the
+  returned body coroutine retain normal coroutine lifetime and must not be
+  referenced by children after the body returns. Scheduler-domain operations
+  require an actual worker; the thread that called `scheduler::start()` remains
+  an external caller for cancellation dispatch.
 - **Cancellation-aware basic synchronization waits**: Added explicit
   `cancel_token` overloads for `mutex::lock()`, `semaphore::acquire()`, and
   `event::wait()`. Each returns `cancel_result` and uses one terminal wake state
@@ -45,6 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One-shot scheduler lifecycle**: Once scheduler shutdown begins, later
+  `start()` calls no longer restart workers or scheduler-owned resources, and
+  pool resize no longer introduces workers during teardown. Concurrent shutdown
+  callers now share one teardown, final worker joins are serialized, and
+  external destruction waits for worker-initiated teardown.
 - **Worker-local I/O ownership**: Scheduler-owned `io_context` instances now
   carry stable worker/generation identity. Submitted operations hold context
   drain accounting until completion, cancellation completion, prepare rollback,

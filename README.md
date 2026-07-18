@@ -10,6 +10,7 @@
 
 - **C++20 Stackless Coroutines** with `task<T>` type
 - **Ergonomic Task Spawning**: `go()` for fire-and-forget, `spawn()` for joinable tasks
+- **Structured Concurrency**: scheduler-bound `task_group` and lexical `task_scope()` with cancellation, failure propagation, and bounded child concurrency
 - **Virtual Stack Tracking** for natural exception propagation
 - **Work-Stealing Scheduler** with lock-free Chase-Lev deques
 - **Dynamic Thread Pool** with runtime adjustment

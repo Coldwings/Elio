@@ -6,11 +6,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <coroutine>
+#include <exception>
 #include <latch>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "../test_main.cpp"
 
@@ -19,6 +22,75 @@ using namespace elio::runtime;
 using namespace elio::test;
 
 namespace {
+
+class foreign_task_adapter {
+public:
+    struct promise_type;
+    using handle_type = std::coroutine_handle<promise_type>;
+
+    explicit foreign_task_adapter(handle_type handle) noexcept
+        : handle_(handle) {}
+
+    foreign_task_adapter(const foreign_task_adapter&) = delete;
+    foreign_task_adapter& operator=(const foreign_task_adapter&) = delete;
+    foreign_task_adapter(foreign_task_adapter&& other) noexcept
+        : handle_(std::exchange(other.handle_, nullptr)) {}
+    foreign_task_adapter& operator=(foreign_task_adapter&&) = delete;
+
+    ~foreign_task_adapter() {
+        if (handle_) handle_.destroy();
+    }
+
+    bool await_ready() const noexcept { return false; }
+
+    std::coroutine_handle<> await_suspend(
+        std::coroutine_handle<> continuation) noexcept;
+
+    void await_resume();
+
+private:
+    handle_type handle_;
+};
+
+struct foreign_task_adapter::promise_type {
+    std::coroutine_handle<> continuation = std::noop_coroutine();
+    std::exception_ptr exception;
+
+    foreign_task_adapter get_return_object() noexcept {
+        return foreign_task_adapter{handle_type::from_promise(*this)};
+    }
+
+    std::suspend_always initial_suspend() noexcept { return {}; }
+
+    struct final_awaiter {
+        bool await_ready() const noexcept { return false; }
+
+        std::coroutine_handle<> await_suspend(
+            handle_type handle) const noexcept {
+            return handle.promise().continuation;
+        }
+
+        void await_resume() const noexcept {}
+    };
+
+    final_awaiter final_suspend() noexcept { return {}; }
+    void return_void() noexcept {}
+    void unhandled_exception() noexcept {
+        exception = std::current_exception();
+    }
+};
+
+std::coroutine_handle<> foreign_task_adapter::await_suspend(
+    std::coroutine_handle<> continuation) noexcept {
+    handle_.promise().continuation = continuation;
+    return handle_;
+}
+
+void foreign_task_adapter::await_resume() {
+    if (handle_.promise().exception) {
+        std::rethrow_exception(handle_.promise().exception);
+    }
+}
 
 bool wait_for_flag(const std::atomic<bool>& flag) {
     const auto deadline = std::chrono::steady_clock::now() + scaled_sec(5);
@@ -93,6 +165,23 @@ task<void> capture_cancellation_then_suspend(cancel_token* observed) {
     co_await std::suspend_always{};
 }
 
+task<void> capture_foreign_child_token(cancel_token* observed,
+                                       std::atomic<bool>* started) {
+    *observed = this_coro::cancel_token();
+    started->store(true, std::memory_order_release);
+    co_await std::suspend_always{};
+}
+
+foreign_task_adapter await_child_through_foreign_promise(
+    cancel_token* observed, std::atomic<bool>* started) {
+    co_await capture_foreign_child_token(observed, started);
+}
+
+task<void> enter_foreign_cancellation_boundary(
+    cancel_token* observed, std::atomic<bool>* started) {
+    co_await await_child_through_foreign_promise(observed, started);
+}
+
 task<void> await_cancellation_capture(cancel_token* observed) {
     co_await capture_cancellation_then_suspend(observed);
 }
@@ -139,6 +228,27 @@ TEST_CASE("lazy task cancellation binds to the actual Elio awaiter",
     REQUIRE_FALSE(observed.is_cancelled());
     parent_handle.promise().execution_context()->request_cancel();
     REQUIRE(observed.is_cancelled());
+}
+
+TEST_CASE("foreign coroutine promises are cancellation boundaries",
+          "[task][cancellation_context][boundary]") {
+    cancel_token observed;
+    std::atomic<bool> child_started{false};
+    auto parent = enter_foreign_cancellation_boundary(
+        &observed, &child_started);
+    auto parent_handle = elio::coro::detail::task_access::handle(parent);
+
+    promise_base::set_current_frame(&parent_handle.promise());
+    parent_handle.resume();
+    promise_base::set_current_frame(nullptr);
+
+    REQUIRE(child_started.load(std::memory_order_acquire));
+    REQUIRE_FALSE(observed.is_cancelled());
+    parent_handle.promise().execution_context()->request_cancel();
+    REQUIRE(parent_handle.promise()
+                .execution_context()
+                ->is_cancellation_requested());
+    REQUIRE_FALSE(observed.is_cancelled());
 }
 
 TEST_CASE("join handle cancellation reaches a nested lazy task chain",

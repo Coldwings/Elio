@@ -16,10 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never-cancelled fallback outside Elio execution. Cancellation propagates
   one-way through direct lazy-task awaits between Elio tasks; foreign coroutine
   types, independent spawns, and explicit token parameters remain separate
-  cancellation boundaries. Linking a lazy child can now report allocation
-  failure from `co_await`. Requests are best-effort and do not force frame
-  destruction, roll back side effects, or replace a result that already
-  completed.
+  cancellation boundaries. Constructing a task execution context and linking a
+  lazy child can now report allocation failure; the context constructor and
+  `task::await_suspend` are therefore no longer `noexcept`. Requests are
+  best-effort and do not force frame destruction, roll back side effects, or
+  replace a result that already completed.
 
 ### Changed
 

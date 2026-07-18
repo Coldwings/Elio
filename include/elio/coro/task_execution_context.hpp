@@ -28,6 +28,8 @@ inline constexpr size_t NO_AFFINITY = std::numeric_limits<size_t>::max();
 /// still owns its own completion and cancellation state machine.
 class task_execution_context final {
 public:
+    /// Allocate the task-local cancellation state. This can throw
+    /// std::bad_alloc; the constructor is intentionally not noexcept in 0.6.
     task_execution_context() = default;
 
     task_execution_context(const task_execution_context&) = delete;
@@ -102,8 +104,9 @@ public:
     }
 
     /// Request cooperative, best-effort cancellation. Registered callbacks run
-    /// synchronously and the first callback exception is rethrown after all
-    /// callbacks have been dispatched, matching cancel_source::cancel().
+    /// synchronously and the first callback exception is rethrown after every
+    /// callback not suppressed by same-dispatch reentrant teardown has been
+    /// dispatched, matching cancel_source::cancel().
     void request_cancel() {
         cancellation_context_.request_cancel();
     }

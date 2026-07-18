@@ -421,7 +421,7 @@ public:
     // Get a token to pass to cancellable operations
     cancel_token get_token() const noexcept;
     
-    // Request cancellation (invokes all callbacks)
+    // Request cancellation (invokes callbacks not reentrantly suppressed)
     void cancel();
     
     // Check if cancelled
@@ -985,6 +985,9 @@ namespace elio::coro {
 
 class task_execution_context {
 public:
+    // Allocates cancellation state and may throw std::bad_alloc in 0.6
+    task_execution_context();
+
     size_t user_affinity() const noexcept;
     size_t effective_affinity() const noexcept;
     void set_user_affinity(size_t worker_id) noexcept;
@@ -1022,6 +1025,11 @@ token. A `join_handle` shares the spawned wrapper context, so cancellation
 remains race-safe without storing a raw promise pointer. Completion and
 cancellation of individual operations remain in their awaitable/backend state
 machines.
+
+In 0.6, construction is no longer `noexcept` because each context allocates its
+cancellation state. Allocation failure propagates to the code creating the
+context; downstream code that explicitly relied on the old `noexcept`
+constructor contract must be updated.
 
 The promise affinity methods delegate caller-requested affinity to that shared
 context. `effective_affinity()` is the scheduler placement boundary and is kept

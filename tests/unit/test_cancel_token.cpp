@@ -889,6 +889,50 @@ TEST_CASE("callbacks on separate dispatchers can mutually unregister",
     REQUIRE_FALSE(second_registration.has_value());
 }
 
+TEST_CASE("cross-dispatch unregister preserves a claimed callback",
+          "[cancel_token][callback][thread][lifetime]") {
+    cancel_source target_source;
+    cancel_source unregister_source;
+    std::optional<cancel_registration> target_registration;
+    std::latch blocker_started(1);
+    std::latch release_blocker(1);
+    std::atomic<unsigned> target_invocations{0};
+    std::atomic<bool> unregister_done{false};
+
+    target_registration.emplace(target_source.get_token().on_cancel([&] {
+        target_invocations.fetch_add(1, std::memory_order_relaxed);
+    }));
+    auto blocker_registration = target_source.get_token().on_cancel([&] {
+        blocker_started.count_down();
+        release_blocker.wait();
+    });
+    auto unregister_registration = unregister_source.get_token().on_cancel([&] {
+        target_registration.reset();
+        unregister_done.store(true, std::memory_order_release);
+    });
+
+    std::thread target_canceller([&] { target_source.cancel(); });
+    blocker_started.wait();
+    std::thread unregister_canceller([&] { unregister_source.cancel(); });
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(5);
+    while (!unregister_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool returned_without_wait =
+        unregister_done.load(std::memory_order_acquire);
+
+    release_blocker.count_down();
+    target_canceller.join();
+    unregister_canceller.join();
+
+    REQUIRE(returned_without_wait);
+    REQUIRE(target_invocations.load(std::memory_order_relaxed) == 1);
+    REQUIRE_FALSE(target_registration.has_value());
+}
+
 TEST_CASE("callback payload destructors can mutually unregister",
           "[cancel_token][callback][thread][lifetime]") {
     cancel_source first_source;

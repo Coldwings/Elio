@@ -177,16 +177,9 @@ struct callback_node {
             invoking_thread != std::this_thread::get_id()) {
             if (callback_dispatch_depth != 0) {
                 // Waiting from one cancellation callback for another dispatcher
-                // can form a cross-source wait cycle. A claimed callback can be
-                // suppressed; an invoking callback retains its payload through
-                // dispatcher ownership and completes independently.
-                if (dispatch_phase == phase::claimed) {
-                    dispatch_phase = phase::unregistered;
-                    invoking_thread = {};
-                    lock.unlock();
-                    destroy_payload();
-                    dispatch_cv.notify_all();
-                }
+                // can form a cross-source wait cycle. Dispatcher ownership keeps
+                // both claimed and invoking callbacks alive, so defer teardown
+                // and let every callback selected by that dispatcher complete.
                 return;
             }
             dispatch_cv.wait(lock, [this] {
@@ -281,7 +274,8 @@ struct cancel_state {
         // state lock. Concurrent remove_callback() calls synchronize through
         // the individual node. Teardown suppresses a not-yet-started callback,
         // waits for an in-progress callback outside callback dispatch, or
-        // defers cross-dispatch callback reentry to avoid wait cycles.
+        // defers cross-dispatch callback reentry without suppressing callbacks
+        // already selected by another dispatcher.
         std::exception_ptr first_exception;
         while (list) {
             auto node = std::move(list);

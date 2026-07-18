@@ -234,6 +234,14 @@ public:
         return execution_context_;
     }
 
+    /// Establish one-way cancellation propagation from the coroutine that is
+    /// actually starting this lazy task. This is separate from construction-
+    /// time virtual-stack ancestry, which may no longer be relevant after a
+    /// task has been moved.
+    void link_parent_cancellation(cancel_token parent) {
+        execution_context_->link_parent_cancellation(std::move(parent));
+    }
+
     // Affinity accessors
     /// Get the current thread affinity for this vthread
     /// @return Worker ID this vthread is bound to, or NO_AFFINITY if unbound

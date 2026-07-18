@@ -261,6 +261,23 @@ public:
     [[nodiscard]] bool is_ready() const noexcept {
         return state_->is_completed();
     }
+
+    /// Request cooperative cancellation of the spawned task chain. This does
+    /// not change a completed result, destroy the frame, or guarantee prompt
+    /// completion; the task must observe this_coro::cancel_token() directly or
+    /// pass it to a cancellation-aware operation.
+    void request_cancel() const {
+        auto state = state_;
+        if (state) {
+            state->execution_context()->request_cancel();
+        }
+    }
+
+    [[nodiscard]] bool is_cancellation_requested() const noexcept {
+        auto state = state_;
+        return state &&
+               state->execution_context()->is_cancellation_requested();
+    }
     
     /// Check if the coroutine has been destroyed (stack released)
     [[nodiscard]] bool is_destroyed() const noexcept {
@@ -321,6 +338,21 @@ public:
 
     [[nodiscard]] bool is_ready() const noexcept {
         return state_->is_completed();
+    }
+
+    /// Request cooperative cancellation of the spawned task chain. See the
+    /// primary join_handle<T> template for the best-effort contract.
+    void request_cancel() const {
+        auto state = state_;
+        if (state) {
+            state->execution_context()->request_cancel();
+        }
+    }
+
+    [[nodiscard]] bool is_cancellation_requested() const noexcept {
+        auto state = state_;
+        return state &&
+               state->execution_context()->is_cancellation_requested();
     }
     
     /// Check if the coroutine has been destroyed (stack released)
@@ -427,13 +459,22 @@ public:
         assert(!handle_.done() && "task can only be awaited once");
         return false;
     }
-    [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept {
+    template<typename AwaiterPromise>
+    [[nodiscard]] std::coroutine_handle<> await_suspend(
+        std::coroutine_handle<AwaiterPromise> awaiter) {
         assert(handle_ && "cannot await an empty task");
         assert(!handle_.done() && "task can only be awaited once");
         assert(!handle_.promise().continuation_ &&
                "task cannot have multiple awaiters");
+        auto* parent = promise_base::current_frame();
+        cancel_token parent_token;
+        if constexpr (std::is_convertible_v<AwaiterPromise*, promise_base*>) {
+            parent = std::addressof(awaiter.promise());
+            parent_token = parent->execution_context()->get_cancel_token();
+        }
+        handle_.promise().link_parent_cancellation(std::move(parent_token));
         handle_.promise().continuation_ = awaiter;
-        handle_.promise().enter_frame_context(promise_base::current_frame());
+        handle_.promise().enter_frame_context(parent);
         return handle_;
     }
     T await_resume() {
@@ -520,13 +561,22 @@ public:
         assert(!handle_.done() && "task can only be awaited once");
         return false;
     }
-    [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept {
+    template<typename AwaiterPromise>
+    [[nodiscard]] std::coroutine_handle<> await_suspend(
+        std::coroutine_handle<AwaiterPromise> awaiter) {
         assert(handle_ && "cannot await an empty task");
         assert(!handle_.done() && "task can only be awaited once");
         assert(!handle_.promise().continuation_ &&
                "task cannot have multiple awaiters");
+        auto* parent = promise_base::current_frame();
+        cancel_token parent_token;
+        if constexpr (std::is_convertible_v<AwaiterPromise*, promise_base*>) {
+            parent = std::addressof(awaiter.promise());
+            parent_token = parent->execution_context()->get_cancel_token();
+        }
+        handle_.promise().link_parent_cancellation(std::move(parent_token));
         handle_.promise().continuation_ = awaiter;
-        handle_.promise().enter_frame_context(promise_base::current_frame());
+        handle_.promise().enter_frame_context(parent);
         return handle_;
     }
     void await_resume() {

@@ -220,6 +220,10 @@ public:
     
     // Check if the spawned task has completed (non-blocking)
     bool is_ready() const noexcept;
+
+    // Cooperative, best-effort cancellation request
+    void request_cancel() const;
+    bool is_cancellation_requested() const noexcept;
 };
 ```
 
@@ -243,6 +247,14 @@ coro::task<void> main_task() {
     std::cout << "Result: " << result << std::endl;
 }
 ```
+
+`request_cancel()` publishes through state shared with the spawned task; it does
+not access the coroutine frame and remains valid after frame destruction. The
+request propagates through direct lazy-task awaits. It does not forcibly destroy
+the task, roll back side effects, or guarantee prompt completion. Separate
+spawned tasks have independent contexts, and explicit token arguments remain
+independent unless deliberately bridged. Registered cancellation callback
+exceptions are rethrown after all callbacks have run.
 
 ### `generator<T>`
 
@@ -406,7 +418,23 @@ public:
 };
 
 } // namespace elio::coro
+
+namespace elio::coro::this_coro {
+
+// Current runtime task token, or a never-cancelled token outside Elio execution
+cancel_token cancel_token() noexcept;
+
+} // namespace elio::coro::this_coro
 ```
+
+`cancel()` synchronously selects and invokes callbacks on the requesting thread,
+then rethrows the first callback exception after dispatching the rest.
+Registration teardown suppresses a callback not yet selected by cancellation;
+once another thread has selected or started it, teardown waits for dispatch to
+finish. Self-unregistration is supported, as is reentrant removal of a later
+callback selected by the same synchronous dispatcher. Callbacks can overlap when
+registration races with an already cancelled source, so shared mutable state
+still requires synchronization.
 
 **Basic Example:**
 ```cpp
@@ -455,6 +483,11 @@ write, and response-header/body reads. A token passed to WebSocket or SSE
 `receive()` can abort a pending frame/event read. Cancelled client operations
 return the normal failure shape (`std::nullopt` or `false`) and set `errno` to
 `ECANCELED`.
+
+Cancellation is best-effort: actual completion may win a race, I/O side effects
+are not rolled back, and a backend that cannot actively abort accepted work may
+wait for natural completion. A task-level token only affects operations that
+receive or inspect it.
 
 ---
 
@@ -954,6 +987,11 @@ public:
     // Internal scheduler-maintenance policy
     void set_worker_local(bool worker_local = true) noexcept;
     bool is_worker_local() const noexcept;
+
+    // Task-chain cancellation control
+    cancel_token get_cancel_token() const noexcept;
+    void request_cancel();
+    bool is_cancellation_requested() const noexcept;
 };
 
 } // namespace elio::coro
@@ -962,6 +1000,13 @@ public:
 `io_owner_worker()` and `io_context_generation()` expose the last recorded
 identity. Treat them as an active placement constraint only when
 `has_active_io_pin()` is true; `active_io_pin_count()` is authoritative.
+
+The context's cancellation source survives independently of the frame through
+shared context ownership. Starting a lazy task with direct `co_await` links its
+context one-way to the active awaiter's token. A `join_handle` shares the spawned
+wrapper context, so cancellation remains race-safe without storing a raw promise
+pointer. Completion and cancellation of individual operations remain in their
+awaitable/backend state machines.
 
 The promise affinity methods delegate caller-requested affinity to that shared
 context. `effective_affinity()` is the scheduler placement boundary and is kept

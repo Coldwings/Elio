@@ -33,6 +33,7 @@ set(TEST_SOURCES
     unit/test_close_wake.cpp
     unit/test_simple_channel.cpp
     unit/test_cancel_token.cpp
+    unit/test_cancellation_context.cpp
     unit/test_timer.cpp
     unit/test_hash.cpp
     unit/test_rpc.cpp

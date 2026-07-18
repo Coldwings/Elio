@@ -136,7 +136,7 @@ public:
         // Preserve progress without making the hot queue dynamically sized.
         // schedule_mutex_ closes the race with request_stop(); overflow_mutex_
         // protects the slow-path queue from its single worker consumer.
-        {
+        try {
             std::lock_guard<std::mutex> schedule_lock(schedule_mutex_);
             if (!running_.load(std::memory_order_acquire)) {
                 return false;
@@ -147,6 +147,9 @@ public:
                 overflow_size_.fetch_add(1, std::memory_order_release);
             }
             wake();
+        } catch (...) {
+            // The handle was not published if overflow allocation failed.
+            return false;
         }
         return true;
     }

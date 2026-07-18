@@ -21,6 +21,10 @@
 #include <stdexcept>
 #include <vector>
 
+namespace elio::coro {
+class task_group;
+}
+
 namespace elio::runtime {
 
 class scheduler;
@@ -29,6 +33,10 @@ namespace detail {
     using elio::detail::task_value_t;
     using elio::detail::is_task;
     using elio::detail::is_task_v;
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    inline std::atomic<bool> reject_next_schedule_for_test{false};
+#endif
 
     /// Wrapper coroutine for fire-and-forget (go/go_to).
     /// Stores callable and args in its coroutine frame, ensuring lambda lifetime
@@ -63,6 +71,7 @@ namespace detail {
 /// Work-stealing scheduler for coroutines
 class scheduler {
     friend class worker_thread;  // Allow workers to set current_scheduler_
+    friend class elio::coro::task_group;
     
 public:
     static constexpr size_t MAX_THREADS = 256;
@@ -344,6 +353,12 @@ public:
     /// live, so the caller must either resume it or destroy it.
     [[nodiscard]] bool try_schedule(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return false;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (detail::reject_next_schedule_for_test.exchange(
+                false, std::memory_order_acq_rel)) {
+            return false;
+        }
+#endif
         if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
             return false;
         }
@@ -718,6 +733,48 @@ private:
         p.set_spawn_completion(+[](void* self) noexcept {
             static_cast<scheduler*>(self)->on_task_completed();
         }, this);
+    }
+
+    bool do_go_task_linked_(coro::cancel_token parent,
+                            coro::task<void>&& wrapper) {
+        auto wrapper_handle = coro::detail::task_access::handle(wrapper);
+        wrapper_handle.promise().link_parent_cancellation(std::move(parent));
+
+        auto handle = coro::detail::task_access::release(std::move(wrapper));
+        handle.promise().detached_ = true;
+        handle.promise().detach_from_parent();
+        mark_tracked_(handle.promise());
+        try {
+            return do_spawn(handle);
+        } catch (...) {
+            handle.destroy();
+            throw;
+        }
+    }
+
+    coro::join_handle<void> do_go_task_joinable_linked_(
+        coro::cancel_token parent, coro::task<void>&& wrapper) {
+        auto wrapper_handle = coro::detail::task_access::handle(wrapper);
+        wrapper_handle.promise().link_parent_cancellation(std::move(parent));
+        auto state = std::make_shared<coro::detail::join_state<void>>(
+            wrapper_handle.promise().execution_context());
+
+        auto handle = coro::detail::task_access::release(std::move(wrapper));
+        handle.promise().detached_ = true;
+        handle.promise().detach_from_parent();
+        handle.promise().join_state_ = state;
+        mark_tracked_(handle.promise());
+
+        try {
+            if (!do_spawn(handle)) {
+                state->set_exception(spawn_rejected_exception_());
+            }
+        } catch (...) {
+            auto failure = std::current_exception();
+            handle.destroy();
+            state->set_exception(std::move(failure));
+        }
+        return coro::join_handle<void>(std::move(state));
     }
 
     template<bool Joinable, bool Pinned, typename F, typename... Args>

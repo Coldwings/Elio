@@ -21,6 +21,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `task::await_suspend` are therefore no longer `noexcept`. Requests are
   best-effort and do not force frame destruction, roll back side effects, or
   replace a result that already completed.
+- **Structured task groups**: Added scheduler-bound `coro::task_group` and
+  callback-shaped `coro::task_scope()` APIs. Groups propagate parent and group
+  cancellation to children, join every registered child frame, default to
+  fail-fast sibling cancellation, optionally collect all failures without
+  cancelling siblings through `task_group_error`, and can bound concurrently
+  executing child bodies. `task_scope()` runs its body in the group cancellation
+  context, so child fail-fast cancellation can wake a token-aware body, and
+  always cancels and joins children when its body fails. Collect-all scopes
+  aggregate simultaneous body and child failures. Completion and cancellation
+  dispatch preserve the selected scheduler domain; requests from another
+  scheduler are posted asynchronously to avoid reciprocal worker deadlock. A bare
+  group requires an explicit `co_await group.join()`; its destructor can only
+  request cancellation as a non-joining fallback.
 - **Cancellation-aware basic synchronization waits**: Added explicit
   `cancel_token` overloads for `mutex::lock()`, `semaphore::acquire()`, and
   `event::wait()`. Each returns `cancel_result` and uses one terminal wake state

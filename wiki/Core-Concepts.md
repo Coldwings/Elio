@@ -688,6 +688,70 @@ coro::task<void> waiter() {
 
 `notify_one()` wakes exactly one waiting coroutine; `notify_all()` wakes all of them.
 
+## Structured Task Groups
+
+Use `coro::task_group` when a parent task must own the lifetime, cancellation,
+and failures of multiple scheduler-submitted children. A group uses the current
+scheduler by default, or one explicit scheduler supplied at construction. All
+child frames are initially submitted there, and group cancellation, cleanup,
+and join continuation return there. An awaited operation may still define its
+own resumption executor; task groups do not override that operation-level
+policy.
+
+```cpp
+coro::task<void> refresh_all(std::span<const key> keys) {
+    coro::task_group group({.max_concurrency = 4});
+
+    for (const auto& key : keys) {
+        group.spawn([&key]() -> coro::task<void> {
+            co_await refresh(key, coro::this_coro::cancel_token());
+        });
+    }
+
+    co_await group.join();
+}
+```
+
+The default `fail_fast` policy records the first child failure, requests
+cooperative cancellation of unfinished siblings, waits for every child frame,
+and then rethrows the failure from `join()`. Set the policy to `collect_all` to
+let siblings finish; `join()` then throws `task_group_error`, whose `failures()`
+view contains every observed exception. A bare group also exposes those records
+through its own `failures()` accessor. A
+nonzero `max_concurrency` limits how many child bodies execute at once; zero is
+unlimited.
+
+`join()` is required exactly once for a bare group. Its destructor can request
+cancellation but cannot block a scheduler worker to join children. For lexical
+ownership, use `coro::task_scope()`: it always joins, and a body exception first
+cancels children before the scope waits for them. Fail-fast rethrows that body
+exception; collect-all combines it with child failures in `task_group_error`.
+The body runs
+under the group token, so child fail-fast cancellation wakes token-aware body
+waits. If a body awaitable resumes elsewhere, scope cleanup first returns to the
+selected scheduler. Return from the body to initiate joining; do not call
+`join()` inside it.
+
+```cpp
+co_await coro::task_scope(
+    [](coro::task_group& group) -> coro::task<void> {
+        group.spawn(background_step);
+        co_await foreground_step();
+    });
+```
+
+Cancellation remains best-effort. Children inherit the group token through
+their runtime task context, but a child must pass
+`coro::this_coro::cancel_token()` into token-aware waits or poll it explicitly.
+Neither group cancellation nor scope cleanup forcibly destroys token-ignoring
+work. A child that observes group cancellation before body entry is skipped;
+cancellation racing with an already-starting body remains cooperative.
+Cancellation requested by an ordinary external thread is synchronously
+dispatched onto the group scheduler before the request returns. A task running
+on another scheduler posts the request asynchronously, so two scheduler workers
+cannot deadlock by waiting for reciprocal cancellation dispatch. In either case,
+the selected scheduler must remain running until the group drains.
+
 ## Cancellation
 
 Elio provides cooperative, best-effort cancellation through explicit

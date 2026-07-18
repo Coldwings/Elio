@@ -267,6 +267,123 @@ completion. Foreign coroutine promises, separately spawned tasks, and explicit
 token arguments remain independent unless deliberately bridged. Registered
 cancellation callback exceptions are rethrown after callback dispatch.
 
+### `task_group` and `task_scope()`
+
+Structured ownership for child tasks submitted to one scheduler domain.
+
+```cpp
+enum class task_group_failure_policy {
+    fail_fast,
+    collect_all,
+};
+
+struct task_group_options {
+    task_group_failure_policy failure_policy =
+        task_group_failure_policy::fail_fast;
+    size_t max_concurrency = 0;  // Zero means unlimited
+};
+
+class task_group_error : public std::exception {
+public:
+    const char* what() const noexcept override;
+    const std::vector<std::exception_ptr>& failures() const noexcept;
+};
+
+class task_group {
+public:
+    explicit task_group(task_group_options options = {});
+    explicit task_group(runtime::scheduler& scheduler,
+                        task_group_options options = {});
+
+    template<typename F, typename... Args>
+    void spawn(F&& function, Args&&... args);
+
+    task<void> join();
+    void request_cancel();
+    bool is_cancellation_requested() const noexcept;
+    size_t outstanding_children() const noexcept;
+    std::vector<std::exception_ptr> failures() const;
+    task_group_options options() const noexcept;
+    runtime::scheduler& scheduler_domain() const noexcept;
+};
+
+template<typename F>
+task<void> task_scope(F&& body, task_group_options options = {});
+
+template<typename F>
+task<void> task_scope(runtime::scheduler& scheduler, F&& body,
+                      task_group_options options = {});
+```
+
+The default constructor binds the group to the current scheduler and throws
+`std::logic_error` when there is none. The explicit constructor submits every
+child to the selected scheduler. When construction occurs while executing on
+that same scheduler, the group links to the current task's cancellation token;
+otherwise the group starts with independent cancellation authority.
+
+`spawn()` accepts a callable returning `task<T>`, stores decayed callable and
+argument values in scheduler-owned frames, and discards the result value. It
+throws after joining has started. Scheduler rejection is recorded as a child
+failure and reported by `join()`. A nonzero `max_concurrency` limits child body
+execution, not the number of registered or scheduler-queued child frames.
+
+`join()` is `[[nodiscard]]` and must be awaited from the group's scheduler
+domain. It stops further spawning, waits until every registered child frame has
+left the group, and then reports failures according to the selected policy. Its
+continuation resumes in that scheduler domain; normal completion is queued, and
+a same-domain enqueue rejection falls back to direct resumption with the saved
+frame context. `join()` must
+be awaited exactly once. Under `fail_fast`, the first child failure requests
+cooperative sibling cancellation and is rethrown directly. Under `collect_all`,
+siblings continue and `join()` throws `task_group_error`; its `failures()` view
+contains every recorded exception. A bare group's `failures()` accessor exposes
+the same records before or after join. Child code must pass
+`this_coro::cancel_token()` to token-aware waits when prompt cancellation is
+required.
+
+Children that have not entered their body when group cancellation is already
+visible finish without invoking the user callable. Cancellation that races with
+body entry remains cooperative; once the callable starts, it must observe or
+forward its runtime token.
+
+The `task_group` destructor requests cancellation for unfinished children but
+cannot synchronously join from a scheduler worker. Always await `join()` before
+destroying a bare group. Prefer `task_scope()` for lexical ownership: it joins
+on normal body completion, and on body failure it first requests cancellation,
+joins all children, and then rethrows the body failure under `fail_fast`. Under
+`collect_all`, concurrent body and child failures are combined into one
+`task_group_error`, with the body exception first. If the body succeeds but a
+child fails, the child failure is reported after all children finish. The
+scope body itself inherits group cancellation, so fail-fast can wake a body that
+passes `this_coro::cancel_token()` to its current wait. The body must not call
+`join()` on the supplied group; returning from the body initiates the scope's
+single join. If a body awaitable resumes on another executor, the scope wrapper
+hands execution back to the selected scheduler before joining and resuming its
+caller. Both `task_scope()` overloads are `[[nodiscard]]` lazy tasks.
+
+`request_cancel()` runs group cancellation callbacks on the selected scheduler.
+An ordinary external thread waits for that dispatch and can rethrow a callback
+exception. A worker belonging to another scheduler posts the request and returns
+without waiting, preventing reciprocal single-worker scheduler deadlocks;
+callback failures from that asynchronous path are recorded as group failures.
+Keep the selected scheduler running while cancellation or join is pending.
+
+```cpp
+coro::task<void> process_batch(std::span<const item> items) {
+    co_await coro::task_scope(
+        [&](coro::task_group& group) -> coro::task<void> {
+            for (const auto& item : items) {
+                group.spawn([&item]() -> coro::task<void> {
+                    co_await process(item,
+                        coro::this_coro::cancel_token());
+                });
+            }
+            co_return;
+        },
+        {.max_concurrency = 8});
+}
+```
+
 ### `generator<T>`
 
 Async generator for producing a stream of values via symmetric transfer. A single type serves as both the coroutine return type and the consumer interface — the producer coroutine uses `co_yield` to produce values, and the consumer retrieves them via `co_await gen.next()`.

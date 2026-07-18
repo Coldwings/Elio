@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Worker-local I/O ownership**: Scheduler-owned `io_context` instances now
+  carry stable worker/generation identity. Submitted operations hold context
+  drain accounting until completion, cancellation completion, prepare rollback,
+  or orphan cleanup; Elio task promises also receive an operation-scoped
+  effective-affinity pin. Pool shrink keeps retiring workers alive to poll
+  pinned I/O and run owner-local cancellation work before a slot can restart.
+  Mutating `io_context` operations enforce the exact owner thread, while
+  `notify()` remains cross-thread safe and standalone contexts remain
+  caller-driven. `io_context::notify()` and the `io_backend::notify()` override
+  contract are now `noexcept`, so custom backend implementations must provide a
+  non-throwing wakeup override. The mutable raw-backend accessor has been
+  removed. These ownership checks do not serialize or diagnose conflicting
+  operations on the same stream or fd; that concurrency remains the caller's
+  responsibility. Downstream awaitables derived from `io_awaitable_base` must
+  replace the removed `bind_to_worker()` / `restore_affinity()` pattern with
+  `setup_op_state(awaiter, ctx)` and submit through `prepare_op_state()` so
+  worker/context pin accounting and prepare-exception rollback are preserved.
 - **Shared task execution context**: Every `promise_base` now references a
   shared `task_execution_context` control block. User affinity and the internal
   worker-local flag moved into this block, while scheduler placement reads its

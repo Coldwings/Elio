@@ -207,8 +207,6 @@ public:
 
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
-        bind_to_worker(awaiter);
-
         io::io_request req{};
         req.op = io::io_op::read;
         req.fd = fd_;
@@ -216,9 +214,9 @@ public:
         req.length = sizeof(siginfo_);
         req.offset = -1;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter);
+        req.state = setup_op_state(awaiter, ctx_);
 
-        if (!ctx_.prepare(req)) {
+        if (!prepare_op_state(ctx_, req)) {
             clear_op_state();
             result_ = io::io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -228,7 +226,6 @@ public:
 
     std::optional<signal_info> await_resume() {
         result_ = read_result_from_op_state();
-        restore_affinity();
         if (result_.result == static_cast<int>(sizeof(signalfd_siginfo))) {
             return signal_info(siginfo_);
         }

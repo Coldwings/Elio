@@ -1,19 +1,29 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
+#include <mutex>
+#include <stdexcept>
+
+namespace elio::io::detail {
+class io_operation_guard;
+}
 
 namespace elio::coro {
 
-/// Constant indicating no user affinity (the vthread may migrate freely).
+/// Constant indicating no user affinity. Internal ownership such as an active
+/// worker-local I/O pin may still prevent migration.
 inline constexpr size_t NO_AFFINITY = std::numeric_limits<size_t>::max();
 
 /// Shared runtime policy state for one coroutine task.
 ///
 /// The coroutine promise and external runtime owners keep shared references to
-/// this control block. Operation-local completion and cancellation state does
-/// not belong here; awaitables retain ownership of those state machines.
+/// this control block. It records operation-local I/O ownership for scheduler
+/// placement, but completion and cancellation state remains owned by the
+/// awaitable/backend state machine.
 class task_execution_context final {
 public:
     task_execution_context() noexcept = default;
@@ -42,7 +52,37 @@ public:
     /// Scheduler placement constraint. Keeping this distinct lets internal
     /// worker-local pins take precedence without rewriting caller affinity.
     [[nodiscard]] size_t effective_affinity() const noexcept {
+        if (has_active_io_pin()) {
+            return io_owner_worker_.load(std::memory_order_acquire);
+        }
         return user_affinity();
+    }
+
+    [[nodiscard]] bool has_active_io_pin() const noexcept {
+        return active_io_pins_.load(std::memory_order_acquire) != 0;
+    }
+
+    /// Last observed owner. Meaningful for placement only while
+    /// has_active_io_pin() is true.
+    [[nodiscard]] size_t io_owner_worker() const noexcept {
+        return io_owner_worker_.load(std::memory_order_acquire);
+    }
+
+    /// Last observed context generation. Meaningful for placement only while
+    /// has_active_io_pin() is true.
+    [[nodiscard]] uint64_t io_context_generation() const noexcept {
+        return io_context_generation_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] size_t active_io_pin_count() const noexcept {
+        return active_io_pins_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool is_io_pin_owner(
+        size_t worker_id, uint64_t context_generation) const noexcept {
+        return has_active_io_pin() &&
+               io_owner_worker() == worker_id &&
+               io_context_generation() == context_generation;
     }
 
     void set_worker_local(bool worker_local = true) noexcept {
@@ -54,8 +94,54 @@ public:
     }
 
 private:
+    friend class elio::io::detail::io_operation_guard;
+
+    void acquire_io_pin(size_t worker_id, uint64_t context_generation) {
+        std::lock_guard<std::mutex> lock(io_pin_mutex_);
+        size_t count = active_io_pins_.load(std::memory_order_relaxed);
+        if (count != 0 &&
+            (io_owner_worker_.load(std::memory_order_relaxed) != worker_id ||
+             io_context_generation_.load(std::memory_order_relaxed) !=
+                 context_generation)) {
+            throw std::logic_error(
+                "one task cannot await I/O from multiple worker contexts");
+        }
+        if (count == std::numeric_limits<size_t>::max()) {
+            throw std::overflow_error("task I/O pin count overflow");
+        }
+        if (count == 0) {
+            io_owner_worker_.store(worker_id, std::memory_order_relaxed);
+            io_context_generation_.store(
+                context_generation, std::memory_order_relaxed);
+        }
+        active_io_pins_.store(count + 1, std::memory_order_release);
+    }
+
+    void release_io_pin(size_t worker_id,
+                        uint64_t context_generation) noexcept {
+        std::lock_guard<std::mutex> lock(io_pin_mutex_);
+        size_t count = active_io_pins_.load(std::memory_order_relaxed);
+        const bool valid =
+            count != 0 &&
+            io_owner_worker_.load(std::memory_order_relaxed) == worker_id &&
+            io_context_generation_.load(std::memory_order_relaxed) ==
+                context_generation;
+        assert(valid && "I/O operation guard released a mismatched task pin");
+        if (!valid) return;
+
+        // Owner and generation deliberately remain as the last observed
+        // identity when count reaches zero. The count is authoritative, and
+        // retaining immutable snapshot fields avoids torn clear/read windows
+        // for lock-free scheduler diagnostics.
+        active_io_pins_.store(count - 1, std::memory_order_release);
+    }
+
     std::atomic<size_t> user_affinity_{NO_AFFINITY};
     std::atomic<bool> worker_local_{false};
+    mutable std::mutex io_pin_mutex_;
+    std::atomic<size_t> io_owner_worker_{NO_AFFINITY};
+    std::atomic<uint64_t> io_context_generation_{0};
+    std::atomic<size_t> active_io_pins_{0};
 };
 
 } // namespace elio::coro

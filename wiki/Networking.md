@@ -6,7 +6,21 @@ Elio provides async networking support for TCP, Unix Domain Sockets (UDS), HTTP/
 
 ### Per-Worker I/O Contexts
 
-Each worker thread in the Elio scheduler owns its own io_uring or epoll backend instance. When a coroutine performs an I/O operation, the request is submitted to the worker's local backend. This means I/O operations never require locking or cross-thread synchronization. The result is lower latency and higher throughput, especially under heavy concurrent I/O loads. If a task migrates to a different worker (via work-stealing), subsequent I/O operations simply use the new worker's local context.
+Each worker thread in the Elio scheduler owns its own io_uring or epoll backend
+instance. When a coroutine performs an I/O operation, the request is submitted
+to the current worker's backend and the operation pins that coroutine to the
+worker/context generation until terminal completion. Submission and polling
+therefore stay local instead of paying a cross-thread reactor hop. A task may
+migrate through work stealing only when it has no active I/O pin; a later
+operation then uses the new worker's context. Pending operations are never
+migrated between backends.
+
+Backend ownership is not stream synchronization. TCP and UDS are full duplex,
+so one read-side operation and one write-side operation may overlap where the
+stream contract says so. Multiple concurrent readers, multiple concurrent
+writers, and close/destruction racing with active I/O require caller-side
+serialization. Elio does not add locks or queues to reinterpret those races,
+even when the low-level backend can accept multiple requests for the same fd.
 
 ### Separate TCP and UDS Modules
 

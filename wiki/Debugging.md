@@ -37,6 +37,21 @@ Runtime policy is held through `execution_context_`, a
 type information is available but intentionally do not assume a particular
 standard-library `shared_ptr` representation.
 
+With type information available, inspect the context through normal C++
+expressions when diagnosing worker-local I/O placement:
+
+```text
+promise.execution_context()->has_active_io_pin()
+promise.execution_context()->io_owner_worker()
+promise.execution_context()->io_context_generation()
+promise.execution_context()->active_io_pin_count()
+```
+
+An active pin must match the owning worker's `io_context::owner_worker_id()`
+and `io_context::generation()`. User affinity may differ while the operation is
+pending because effective affinity gives the I/O owner priority. The debugger
+scripts intentionally do not decode these fields from raw `shared_ptr` bytes.
+
 ### Debug Metadata
 
 Every frame carries the following debug metadata with no additional allocation:

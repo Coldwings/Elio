@@ -49,7 +49,7 @@ public:
         , running_(false)
         , tasks_executed_(0)
         , strategy_(strategy)
-        , io_context_(std::make_unique<io::io_context>()) {
+        , io_context_(io::io_context::make_worker_owned(worker_id)) {
     }
 
     ~worker_thread() {
@@ -263,6 +263,10 @@ public:
     
     /// Get the io_context for this worker thread
     [[nodiscard]] io::io_context& io_context() noexcept {
+        return *io_context_;
+    }
+
+    [[nodiscard]] const io::io_context& io_context() const noexcept {
         return *io_context_;
     }
     

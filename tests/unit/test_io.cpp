@@ -4,6 +4,8 @@
 #include <elio/coro/task.hpp>
 #include <elio/coro/cancel_token.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/runtime/affinity.hpp>
+#include <elio/sync/event.hpp>
 #include <elio/net/resolve.hpp>
 #include <elio/net/tcp.hpp>
 #include <elio/time/timer.hpp>
@@ -38,12 +40,102 @@
 #include <chrono>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 using namespace elio::io;
 using namespace elio::coro;
 using namespace elio::runtime;
+
+namespace {
+
+class throwing_prepare_awaitable : public io_awaitable_base {
+public:
+    throwing_prepare_awaitable(io_context& ctx, bool& rolled_back) noexcept
+        : ctx_(ctx), rolled_back_(rolled_back) {}
+
+    bool await_suspend(std::coroutine_handle<> awaiter) {
+        io_request req{};
+        req.op = io_op::timeout;
+        req.awaiter = awaiter;
+        req.state = setup_op_state(awaiter, ctx_);
+        return prepare_op_state_with_rollback(
+            []() -> bool {
+                throw std::runtime_error("injected prepare failure");
+            },
+            [&]() noexcept { rolled_back_ = true; });
+    }
+
+    void await_resume() const noexcept {}
+
+private:
+    io_context& ctx_;
+    bool& rolled_back_;
+};
+
+class custom_io_task {
+public:
+    struct promise_type {
+        custom_io_task get_return_object() noexcept {
+            return custom_io_task{
+                std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+
+        std::suspend_always initial_suspend() const noexcept { return {}; }
+        std::suspend_always final_suspend() const noexcept { return {}; }
+        void return_void() const noexcept {}
+        void unhandled_exception() noexcept {
+            exception = std::current_exception();
+        }
+
+        std::exception_ptr exception;
+    };
+
+    using handle_type = std::coroutine_handle<promise_type>;
+
+    custom_io_task(const custom_io_task&) = delete;
+    custom_io_task& operator=(const custom_io_task&) = delete;
+
+    custom_io_task(custom_io_task&& other) noexcept
+        : handle_(std::exchange(other.handle_, nullptr)) {}
+
+    ~custom_io_task() {
+        if (handle_) {
+            handle_.destroy();
+        }
+    }
+
+    void resume() const { handle_.resume(); }
+    [[nodiscard]] bool done() const noexcept { return handle_.done(); }
+    [[nodiscard]] std::exception_ptr exception() const noexcept {
+        return handle_.promise().exception;
+    }
+
+private:
+    explicit custom_io_task(handle_type handle) noexcept : handle_(handle) {}
+
+    handle_type handle_;
+};
+
+custom_io_task custom_promise_recv(
+    int fd,
+    char* buffer,
+    std::atomic<int>* result,
+    std::atomic<size_t>* completion_worker,
+    elio::sync::event* completed) {
+    auto io = co_await async_recv(fd, buffer, 1, 0);
+    result->store(io.result, std::memory_order_release);
+    completion_worker->store(current_worker_id(), std::memory_order_release);
+    completed->set();
+}
+
+task<void> orphaned_worker_recv(int fd, char* buffer) {
+    (void)co_await async_recv(fd, buffer, 1, 0);
+}
+
+} // namespace
 
 #ifdef SIGPIPE
 namespace {
@@ -183,7 +275,378 @@ TEST_CASE("io_context creation", "[io][context]") {
         io_context ctx;
         REQUIRE_FALSE(ctx.has_pending());
         REQUIRE(ctx.pending_count() == 0);
+        REQUIRE_FALSE(ctx.is_worker_owned());
+        REQUIRE(ctx.owner_worker_id() ==
+                elio::io::detail::NO_IO_CONTEXT_OWNER);
+        REQUIRE(ctx.active_pin_count() == 0);
     }
+
+    SECTION("worker-owned contexts expose stable unique identities") {
+        scheduler sched(2);
+        auto& first = sched.get_worker(0)->io_context();
+        auto& second = sched.get_worker(1)->io_context();
+
+        REQUIRE(first.is_worker_owned());
+        REQUIRE(second.is_worker_owned());
+        REQUIRE(first.owner_worker_id() == 0);
+        REQUIRE(second.owner_worker_id() == 1);
+        REQUIRE(first.generation() != second.generation());
+    }
+}
+
+TEST_CASE("orphaned standalone I/O releases context accounting on completion",
+          "[io][context][orphan][ownership]") {
+    io_context ctx(io_context::backend_type::epoll);
+
+    auto pending_sleep = [&ctx]() -> task<void> {
+        co_await elio::time::sleep_awaitable(ctx, std::chrono::milliseconds(10));
+    };
+
+    {
+        auto pending = pending_sleep();
+        elio::coro::detail::task_access::handle(pending).resume();
+        REQUIRE(ctx.pending_count() == 1);
+        REQUIRE(ctx.active_pin_count() == 1);
+    }
+
+    // Destroying the frame transfers op_state ownership to the backend. The
+    // context remains accounted until the late timer completion deletes it.
+    REQUIRE(ctx.active_pin_count() == 1);
+    ctx.run_until_complete();
+    REQUIRE(ctx.pending_count() == 0);
+    REQUIRE(ctx.active_pin_count() == 0);
+}
+
+TEST_CASE("prepare exceptions release unsubmitted I/O ownership",
+          "[io][context][ownership][exception]") {
+    io_context ctx(io_context::backend_type::epoll);
+    bool caught = false;
+    bool rolled_back = false;
+
+    auto operation = [&]() -> task<void> {
+        try {
+            co_await throwing_prepare_awaitable(ctx, rolled_back);
+        } catch (const std::runtime_error&) {
+            caught = true;
+        }
+    };
+
+    auto pending = operation();
+    elio::coro::detail::task_access::handle(pending).resume();
+
+    REQUIRE(caught);
+    REQUIRE(rolled_back);
+    REQUIRE(ctx.pending_count() == 0);
+    REQUIRE(ctx.active_pin_count() == 0);
+}
+
+TEST_CASE("worker-local I/O pin preserves owner until backend completion",
+          "[io][scheduler][affinity][ownership]") {
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                         0, sockets) == 0);
+
+    scheduler sched(2);
+    sched.start();
+
+    std::shared_ptr<task_execution_context> execution_context;
+    std::atomic<bool> context_published{false};
+    std::atomic<size_t> completion_worker{NO_AFFINITY};
+    std::atomic<size_t> migration_worker{NO_AFFINITY};
+    std::atomic<size_t> pin_count_after_resume{std::numeric_limits<size_t>::max()};
+    std::atomic<size_t> effective_after_resume{NO_AFFINITY};
+    std::atomic<int> recv_result{-1};
+
+    auto operation = [&]() -> task<void> {
+        auto* frame = promise_base::current_frame();
+        if (!frame) {
+            throw std::logic_error("I/O pin test requires a current frame");
+        }
+        execution_context = frame->execution_context();
+
+        co_await set_affinity(1, false);
+        context_published.store(true, std::memory_order_release);
+
+        char byte = 0;
+        auto result = co_await async_recv(sockets[0], &byte, 1, 0);
+        recv_result.store(result.result, std::memory_order_release);
+        completion_worker.store(current_worker_id(), std::memory_order_release);
+        pin_count_after_resume.store(
+            execution_context->active_io_pin_count(),
+            std::memory_order_release);
+        effective_after_resume.store(
+            execution_context->effective_affinity(),
+            std::memory_order_release);
+
+        co_await set_affinity(1, true);
+        migration_worker.store(current_worker_id(), std::memory_order_release);
+    };
+
+    auto joined = sched.go_joinable_to(0, operation);
+
+    auto context_deadline = std::chrono::steady_clock::now() +
+                            elio::test::scaled_sec(5);
+    while (!context_published.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < context_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(context_published.load(std::memory_order_acquire));
+    REQUIRE(execution_context);
+
+    auto pin_deadline = std::chrono::steady_clock::now() +
+                        elio::test::scaled_sec(5);
+    while (!execution_context->has_active_io_pin() &&
+           std::chrono::steady_clock::now() < pin_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    auto* owner = sched.get_worker(0);
+    REQUIRE(owner != nullptr);
+    REQUIRE(execution_context->is_io_pin_owner(
+        0, owner->io_context().generation()));
+    REQUIRE(execution_context->user_affinity() == 1);
+    REQUIRE(execution_context->effective_affinity() == 0);
+    REQUIRE(owner->io_context().active_pin_count() == 1);
+
+    const char byte = 'x';
+    REQUIRE(::write(sockets[1], &byte, 1) == 1);
+
+    joined.wait_destroyed();
+    joined.await_resume();
+
+    REQUIRE(recv_result.load(std::memory_order_acquire) == 1);
+    REQUIRE(completion_worker.load(std::memory_order_acquire) == 0);
+    REQUIRE(pin_count_after_resume.load(std::memory_order_acquire) == 0);
+    REQUIRE(effective_after_resume.load(std::memory_order_acquire) == 1);
+    REQUIRE(migration_worker.load(std::memory_order_acquire) == 1);
+    REQUIRE(owner->io_context().active_pin_count() == 0);
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+    ::close(sockets[0]);
+    ::close(sockets[1]);
+}
+
+TEST_CASE("scheduler coroutine rejects foreign and standalone io_contexts",
+          "[io][scheduler][context][ownership]") {
+    scheduler sched(2);
+    auto* wrong_context = &sched.get_worker(1)->io_context();
+    io_context standalone_context(io_context::backend_type::epoll);
+    sched.start();
+
+    std::atomic<bool> foreign_rejected{false};
+    std::atomic<bool> standalone_rejected{false};
+    auto operation = [&]() -> task<void> {
+        try {
+            co_await elio::time::sleep_awaitable(
+                *wrong_context, std::chrono::milliseconds(1));
+        } catch (const std::logic_error&) {
+            foreign_rejected.store(true, std::memory_order_release);
+        }
+        try {
+            co_await elio::time::sleep_awaitable(
+                standalone_context, std::chrono::milliseconds(1));
+        } catch (const std::logic_error&) {
+            standalone_rejected.store(true, std::memory_order_release);
+        }
+    };
+
+    auto joined = sched.go_joinable_to(0, operation);
+    joined.wait_destroyed();
+    joined.await_resume();
+
+    REQUIRE(foreign_rejected.load(std::memory_order_acquire));
+    REQUIRE(standalone_rejected.load(std::memory_order_acquire));
+    REQUIRE(wrong_context->pending_count() == 0);
+    REQUIRE(wrong_context->active_pin_count() == 0);
+    REQUIRE(standalone_context.pending_count() == 0);
+    REQUIRE(standalone_context.active_pin_count() == 0);
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("io_context mutable operations enforce exact owner thread",
+          "[io][scheduler][context][ownership]") {
+    scheduler sched(2);
+    auto* owner_context = &sched.get_worker(0)->io_context();
+    auto* foreign_context = &sched.get_worker(1)->io_context();
+    io_context standalone_context(io_context::backend_type::epoll);
+    sched.start();
+
+    REQUIRE_THROWS_AS(owner_context->submit(), std::logic_error);
+    REQUIRE_NOTHROW(owner_context->notify());
+
+    std::atomic<bool> owner_submit_allowed{false};
+    std::atomic<bool> cross_thread_notify_allowed{false};
+    std::atomic<int> foreign_rejections{0};
+    std::atomic<int> standalone_rejections{0};
+    auto operation = [&]() -> task<void> {
+        owner_submit_allowed.store(
+            current_io_context().submit() >= 0, std::memory_order_release);
+
+        io_request request{};
+        auto expect_rejected = [](std::atomic<int>& rejected, auto&& operation) {
+            try {
+                operation();
+            } catch (const std::logic_error&) {
+                rejected.fetch_add(1, std::memory_order_relaxed);
+            }
+        };
+
+        expect_rejected(foreign_rejections,
+                        [&] { (void)foreign_context->prepare(request); });
+        expect_rejected(foreign_rejections,
+                        [&] { (void)foreign_context->submit(); });
+        expect_rejected(foreign_rejections,
+                        [&] { (void)foreign_context->poll(); });
+        expect_rejected(foreign_rejections,
+                        [&] { (void)foreign_context->cancel(nullptr); });
+
+        expect_rejected(standalone_rejections,
+                        [&] { (void)standalone_context.prepare(request); });
+        expect_rejected(standalone_rejections,
+                        [&] { (void)standalone_context.submit(); });
+        expect_rejected(standalone_rejections,
+                        [&] { (void)standalone_context.poll(); });
+        expect_rejected(standalone_rejections,
+                        [&] { (void)standalone_context.cancel(nullptr); });
+
+        try {
+            foreign_context->notify();
+            standalone_context.notify();
+            cross_thread_notify_allowed.store(true, std::memory_order_release);
+        } catch (...) {
+        }
+        co_return;
+    };
+
+    auto joined = sched.go_joinable_to(0, operation);
+    joined.wait_destroyed();
+    joined.await_resume();
+
+    REQUIRE(owner_submit_allowed.load(std::memory_order_acquire));
+    REQUIRE(cross_thread_notify_allowed.load(std::memory_order_acquire));
+    REQUIRE(foreign_rejections.load(std::memory_order_acquire) == 4);
+    REQUIRE(standalone_rejections.load(std::memory_order_acquire) == 4);
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("standard I/O awaitables support non-Elio coroutine promises",
+          "[io][scheduler][context][ownership][custom-promise]") {
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                         0, sockets) == 0);
+
+    scheduler sched(1);
+    auto* owner_context = &sched.get_worker(0)->io_context();
+    sched.start();
+
+    char received = 0;
+    std::atomic<bool> submitted{false};
+    std::atomic<int> recv_result{-1};
+    std::atomic<size_t> completion_worker{NO_AFFINITY};
+    elio::sync::event custom_completed;
+    auto operation = [&]() -> task<void> {
+        auto custom = custom_promise_recv(
+            sockets[0], &received, &recv_result, &completion_worker,
+            &custom_completed);
+        custom.resume();
+        submitted.store(true, std::memory_order_release);
+        co_await custom_completed.wait();
+        if (!custom.done()) {
+            throw std::logic_error(
+                "custom coroutine signaled completion before final suspend");
+        }
+        if (auto exception = custom.exception()) {
+            std::rethrow_exception(exception);
+        }
+    };
+
+    auto joined = sched.go_joinable_to(0, operation);
+    auto submit_deadline = std::chrono::steady_clock::now() +
+                           elio::test::scaled_sec(5);
+    while (!submitted.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < submit_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(submitted.load(std::memory_order_acquire));
+    REQUIRE(owner_context->active_pin_count() >= 1);
+
+    const char byte = 'c';
+    REQUIRE(::write(sockets[1], &byte, 1) == 1);
+
+    joined.wait_destroyed();
+    joined.await_resume();
+    REQUIRE(recv_result.load(std::memory_order_acquire) == 1);
+    REQUIRE(completion_worker.load(std::memory_order_acquire) == 0);
+    REQUIRE(received == byte);
+    REQUIRE(owner_context->active_pin_count() == 0);
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+
+    ::close(sockets[0]);
+    ::close(sockets[1]);
+}
+
+TEST_CASE("orphaned worker I/O keeps ownership until backend cleanup",
+          "[io][scheduler][context][orphan][ownership]") {
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                         0, sockets) == 0);
+
+    scheduler sched(1);
+    auto* owner_context = &sched.get_worker(0)->io_context();
+    const auto owner_generation = owner_context->generation();
+    sched.start();
+
+    char received = 0;
+    std::shared_ptr<task_execution_context> child_context;
+    std::atomic<bool> orphaned{false};
+    std::atomic<size_t> task_pins_before_destroy{0};
+    std::atomic<size_t> task_pins_after_destroy{0};
+    std::atomic<size_t> context_pins_after_destroy{0};
+    auto operation = [&]() -> task<void> {
+        std::optional<task<void>> child;
+        child.emplace(orphaned_worker_recv(sockets[0], &received));
+        auto child_handle = elio::coro::detail::task_access::handle(*child);
+        child_context = child_handle.promise().execution_context();
+        child_handle.resume();
+
+        task_pins_before_destroy.store(
+            child_context->active_io_pin_count(), std::memory_order_release);
+        child.reset();
+        task_pins_after_destroy.store(
+            child_context->active_io_pin_count(), std::memory_order_release);
+        context_pins_after_destroy.store(
+            current_io_context().active_pin_count(), std::memory_order_release);
+        orphaned.store(true, std::memory_order_release);
+        co_return;
+    };
+
+    auto joined = sched.go_joinable_to(0, operation);
+    joined.wait_destroyed();
+    joined.await_resume();
+    REQUIRE(orphaned.load(std::memory_order_acquire));
+    REQUIRE(child_context);
+    REQUIRE(task_pins_before_destroy.load(std::memory_order_acquire) == 1);
+    REQUIRE(task_pins_after_destroy.load(std::memory_order_acquire) == 1);
+    REQUIRE(context_pins_after_destroy.load(std::memory_order_acquire) == 1);
+    REQUIRE(child_context->is_io_pin_owner(0, owner_generation));
+
+    const char byte = 'o';
+    REQUIRE(::write(sockets[1], &byte, 1) == 1);
+
+    auto cleanup_deadline = std::chrono::steady_clock::now() +
+                            elio::test::scaled_sec(5);
+    while ((child_context->has_active_io_pin() ||
+            owner_context->active_pin_count() != 0) &&
+           std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE_FALSE(child_context->has_active_io_pin());
+    REQUIRE(owner_context->active_pin_count() == 0);
+    REQUIRE(owner_context->pending_count() == 0);
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+
+    ::close(sockets[0]);
+    ::close(sockets[1]);
 }
 
 TEST_CASE("io_result basic operations", "[io][result]") {
@@ -299,11 +762,12 @@ TEST_CASE("io_uring short submit keeps excess operations pending",
 
         io_uring_backend backend;
         batch_state st(3);
+        st.trampolines.resize(st.total);
         int submit_calls = 0;
 
         bool submitted = elio::io::detail::submit_batch_io_uring_with_submitter(
             &backend, st, std::coroutine_handle<>{},
-            [](struct io_uring_sqe* sqe, int) {
+            [](struct io_uring_sqe* sqe, int) noexcept {
                 io_uring_prep_nop(sqe);
             },
             [&](struct io_uring*) {
@@ -338,11 +802,12 @@ TEST_CASE("io_uring short submit keeps excess operations pending",
 
         io_uring_backend backend;
         batch_state st(2);
+        st.trampolines.resize(st.total);
         int submit_calls = 0;
 
         bool submitted = elio::io::detail::submit_batch_io_uring_with_submitter(
             &backend, st, std::coroutine_handle<>{},
-            [](struct io_uring_sqe* sqe, int) {
+            [](struct io_uring_sqe* sqe, int) noexcept {
                 io_uring_prep_nop(sqe);
             },
             [&](struct io_uring*) {
@@ -367,6 +832,38 @@ TEST_CASE("io_uring short submit keeps excess operations pending",
         REQUIRE(st.all_done());
         REQUIRE(std::all_of(st.results.begin(), st.results.end(),
                             [](int result) { return result == 0; }));
+    }
+
+    SECTION("batch submit exceptions preserve backend-owned state") {
+        if (!io_uring_backend::is_available()) {
+            SUCCEED("io_uring is not available at runtime");
+            return;
+        }
+
+        io_uring_backend backend;
+        batch_state st(2);
+        st.trampolines.resize(st.total);
+
+        bool submitted = elio::io::detail::submit_batch_io_uring_with_submitter(
+            &backend, st, std::coroutine_handle<>{},
+            [](struct io_uring_sqe* sqe, int) noexcept {
+                io_uring_prep_nop(sqe);
+            },
+            [](struct io_uring*) -> int {
+                throw std::runtime_error("injected submit failure");
+            });
+
+        REQUIRE(submitted);
+        REQUIRE(backend.pending_count() == 2);
+        REQUIRE_FALSE(st.all_done());
+
+        for (int attempts = 0;
+             backend.pending_count() != 0 && attempts < 20; ++attempts) {
+            backend.poll(std::chrono::milliseconds(10));
+        }
+
+        REQUIRE(backend.pending_count() == 0);
+        REQUIRE(st.all_done());
     }
 #else
     SUCCEED("io_uring backend is not compiled in");

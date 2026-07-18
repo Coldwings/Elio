@@ -298,7 +298,7 @@ outer() -> middle() -> inner()
 The scheduler manages a pool of worker threads, each with a local task queue. Key features:
 - **Lock-free operations**: Chase-Lev deques for optimal performance
 - **Work stealing**: Idle threads steal tasks from busy threads
-- **Per-worker I/O context**: Each worker has its own io_uring/epoll backend for thread-safe I/O
+- **Per-worker I/O context**: Pending operations stay pinned to the worker/backend generation that accepted them
 - **Dynamic sizing**: Adjust thread count at runtime
 - **Load balancing**: Automatic task distribution
 

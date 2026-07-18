@@ -1,15 +1,31 @@
 #pragma once
 
+#include "io_operation_guard.hpp"
+
 #include <atomic>
 #include <memory>
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <sys/uio.h>
 #include <sys/socket.h>
 
 namespace elio::io {
+
+namespace detail {
+
+template<typename Fn>
+void run_noexcept(Fn&& fn) noexcept {
+    try {
+        std::forward<Fn>(fn)();
+    } catch (...) {
+        // Diagnostics must never invalidate backend-owned operation state.
+    }
+}
+
+} // namespace detail
 
 /// Owner-controlled op tag carried as ``user_data`` on submitted SQEs.
 ///
@@ -30,7 +46,7 @@ namespace elio::io {
 ///     copied every field it still needs, so the awaitable's ``unique_ptr``
 ///     may free the state on destruction.
 ///   * ``orphaned`` (2): the awaitable was destroyed before the CQE arrived
-///     (e.g. forced ``coroutine_handle::destroy()`` or vthread teardown). The
+///     (e.g. forced ``coroutine_handle::destroy()`` or frame teardown). The
 ///     destructor releases ownership; ``process_completion`` sees the
 ///     orphaned phase, deletes the state, and skips the resume — preventing
 ///     the use-after-free on a freed coroutine frame.
@@ -51,6 +67,8 @@ struct op_state {
     int32_t result = 0;
     uint32_t flags = 0;
     ::msghdr msg{};
+    /// Retains worker/backend ownership until completion or orphan cleanup.
+    detail::io_operation_guard operation_guard{};
 };
 
 /// I/O operation types
@@ -131,6 +149,9 @@ public:
     /// @param req The I/O request to prepare
     /// @return true if prepared successfully, false if no operation was staged
     ///         because the queue is full or the backend rejected the request
+    /// @throws Any exception is reported before the backend accepts the
+    ///         request state; after accepting it, implementations must not
+    ///         throw.
     virtual bool prepare(const io_request& req) = 0;
 
     /// Submit all prepared I/O operations
@@ -159,7 +180,7 @@ public:
 
     /// Wake up a thread blocked in poll()
     /// Called from external threads to interrupt blocking I/O wait
-    virtual void notify() = 0;
+    virtual void notify() noexcept = 0;
 
     /// Drain the wake notification (call after poll returns due to notify)
     /// This is a no-op if poll returned due to I/O completion

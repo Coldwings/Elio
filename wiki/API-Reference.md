@@ -849,7 +849,7 @@ Thread affinity allows you to bind vthreads (coroutines) to specific worker thre
 ### Constants
 
 ```cpp
-// Constant indicating no affinity (vthread can migrate freely)
+// Constant indicating no caller affinity (internal ownership may still pin)
 inline constexpr size_t NO_AFFINITY = std::numeric_limits<size_t>::max();
 ```
 
@@ -888,7 +888,9 @@ coro::task<void> pinned_task() {
 
 ### `clear_affinity()`
 
-Remove affinity binding, allowing the vthread to migrate freely.
+Remove caller-requested affinity, allowing the vthread to migrate freely when
+no internal ownership constraint is active. This does not clear or migrate an
+active worker-local I/O operation.
 
 ```cpp
 auto clear_affinity();
@@ -943,6 +945,12 @@ public:
     bool has_user_affinity() const noexcept;
     void clear_user_affinity() noexcept;
 
+    // Read-only operation-local I/O ownership diagnostics
+    bool has_active_io_pin() const noexcept;
+    size_t io_owner_worker() const noexcept;
+    uint64_t io_context_generation() const noexcept;
+    size_t active_io_pin_count() const noexcept;
+
     // Internal scheduler-maintenance policy
     void set_worker_local(bool worker_local = true) noexcept;
     bool is_worker_local() const noexcept;
@@ -951,9 +959,14 @@ public:
 } // namespace elio::coro
 ```
 
+`io_owner_worker()` and `io_context_generation()` expose the last recorded
+identity. Treat them as an active placement constraint only when
+`has_active_io_pin()` is true; `active_io_pin_count()` is authoritative.
+
 The promise affinity methods delegate caller-requested affinity to that shared
 context. `effective_affinity()` is the scheduler placement boundary and is kept
-distinct from caller affinity:
+distinct from caller affinity. An active I/O owner takes precedence over user
+affinity; clearing or changing user affinity does not clear the operation pin:
 
 ```cpp
 class promise_base {
@@ -990,15 +1003,27 @@ class io_context {
 public:
     io_context();
     ~io_context();
+
+    // Scheduler ownership diagnostics. Standalone contexts report no owner.
+    bool is_worker_owned() const noexcept;
+    size_t owner_worker_id() const noexcept;
+    uint64_t generation() const noexcept;
+    size_t active_pin_count() const noexcept;
+
+    // Low-level mutation. Scheduler contexts require their exact owner thread.
+    bool prepare(const io_request& request);
+    int submit();
+    bool cancel(void* user_data);
     
     // Poll for I/O completions (with optional timeout)
     int poll(std::chrono::milliseconds timeout = std::chrono::milliseconds::zero());
+
+    // Cross-thread-safe wakeup entry
+    void notify() noexcept;
     
-    // Check if there are pending operations
+    // Read-only diagnostics
     bool has_pending() const noexcept;
-    
-    // Get the I/O backend
-    io_backend& backend() noexcept;
+    size_t pending_count() const noexcept;
 };
 
 // Get the current scheduler worker's I/O context, or the global fallback
@@ -1008,6 +1033,71 @@ io_context& current_io_context() noexcept;
 // Get the default global I/O context.
 io_context& default_io_context();
 ```
+
+Scheduler workers own their contexts. I/O awaitables validate that a
+scheduler-owned context is used only on its owner worker and pin the awaiting
+coroutine to that context generation until backend completion or orphan
+cleanup. Work stealing and affinity migration cannot move the continuation
+while the pin is active. A retiring worker continues polling until both its
+backend pending count and active pin count are zero.
+
+A directly constructed `io_context` is standalone. The caller must serialize
+access, poll it, and keep it alive for all pending operations. Scheduler
+coroutines must use their current worker context; they cannot submit through a
+standalone context or another worker's context. Mutating context operations
+enforce the exact owner thread and throw `std::logic_error` on violation, while
+`notify()` is a non-throwing cross-thread wakeup. Mutable raw-backend access is
+not exposed.
+
+Standard awaitables used from a non-Elio coroutine promise retain context-level
+drain accounting and complete on the backend owner, but cannot install an Elio
+task execution-context pin. A custom coroutine runtime that independently
+re-enqueues such a suspended handle must preserve that owner itself.
+
+I/O pinning protects backend ownership only. It does not serialize concurrent
+operations on the same stream or fd. Follow the concrete stream contract and
+externally serialize conflicting reads, writes, close, or destruction.
+
+### Custom I/O Awaitables
+
+`io_awaitable_base` is a protected integration surface for awaitables that use
+Elio's owner-controlled `op_state`. In 0.6, derived awaitables must select and
+validate an `io_context` while installing that state. The old
+`bind_to_worker()` / `restore_affinity()` pair is removed; the operation guard
+now releases the internal pin when backend ownership reaches a terminal state,
+allowing the unchanged caller affinity to become effective again.
+
+Use this submission pattern:
+
+```cpp
+template<typename Promise>
+void await_suspend(std::coroutine_handle<Promise> awaiter) {
+    auto& ctx = current_io_context();
+
+    io_request req{};
+    req.op = io_op::read;
+    req.fd = fd_;
+    req.buffer = buffer_;
+    req.length = length_;
+    req.awaiter = awaiter;
+    req.state = setup_op_state(awaiter, ctx);
+
+    if (!prepare_op_state(ctx, req)) {
+        clear_op_state();
+        result_ = io_result{-EAGAIN, 0};
+        awaiter.resume();
+        return;
+    }
+    ctx.submit();
+}
+```
+
+If custom cancellation state stores `req.state`, use the rollback-callback
+overload of `prepare_op_state()` to clear that pointer and unregister callbacks
+before an exception escapes. A `false` prepare result means no backend
+ownership was transferred and still requires `clear_op_state()`. Once prepare
+returns `true`, leave the state attached to the awaitable; normal completion or
+the orphan protocol releases the operation guard.
 
 ### `io_result`
 
@@ -1187,6 +1277,12 @@ API.
 ### `signal_fd`
 
 Async-friendly signalfd wrapper.
+
+`signal_fd` retains the `io_context` selected at construction. Construct and
+await it on the same scheduler worker. A directly constructed standalone
+context may be used only when the caller also serializes and polls that context;
+standard waits reject crossing between standalone and scheduler execution or
+between scheduler workers.
 
 ```cpp
 class signal_fd {

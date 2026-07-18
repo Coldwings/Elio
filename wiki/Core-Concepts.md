@@ -35,12 +35,17 @@ observed. Moving a task never migrates a running coroutine or pending I/O.
 
 Runtime policy is deliberately separate from this lazy owner. Every
 `promise_base` holds a `shared_ptr<task_execution_context>`, which currently
-stores caller-requested affinity and the internal worker-local flag. A
+stores caller-requested affinity, the internal worker-local flag, and
+operation-local I/O pin diagnostics. A
 scheduler-created join state shares that context with its wrapper promise, so
 the policy state can remain valid after frame destruction without a raw promise
 pointer. The context neither owns nor keeps the coroutine frame alive.
 Awaitables continue to own each pending operation's completion and cleanup
 state; those state machines are not moved into the task-wide context.
+While a worker-local I/O operation is pending, its operation state holds an
+`io_operation_guard`. The guard records the owning worker and I/O context
+generation in the shared task context without transferring operation ownership
+to the task object.
 
 ### Awaiting Tasks
 
@@ -276,7 +281,7 @@ coro::task<void> affinity_example() {
     // Bind to the current worker (prevent migration)
     co_await elio::runtime::bind_to_current_worker();
 
-    // Remove affinity (allow free migration again)
+    // Remove caller affinity (migration is allowed when no I/O pin is active)
     co_await elio::runtime::clear_affinity();
 
     co_return;
@@ -286,6 +291,13 @@ coro::task<void> affinity_example() {
 All three functions are also available in the `elio` namespace as convenience aliases (`elio::set_affinity`, `elio::bind_to_current_worker`, `elio::clear_affinity`).
 
 `set_affinity` accepts an optional second parameter `migrate` (default `true`). When `true`, the coroutine is immediately rescheduled on the target worker. When `false`, the affinity is recorded but the coroutine continues on its current worker until its next suspension point.
+
+Caller affinity and I/O ownership are independent. An active I/O pin is the
+effective scheduler affinity and takes precedence over a caller request.
+`clear_affinity()` clears only caller affinity; it cannot move a pending
+operation or make its continuation runnable on a different backend owner.
+Affinity changes made during pending I/O become effective after that operation
+reaches a terminal backend completion.
 
 ### Design Rationale
 
@@ -352,7 +364,43 @@ mode, so sanitizer coverage matches production frame lifetime behavior.
 
 ## I/O Context
 
-The I/O context manages async I/O operations. Each worker thread has its own I/O context for lock-free operation. In most cases, you don't need to interact with io_context directly - the library automatically uses the per-thread io_context.
+The I/O context manages async I/O operations. Each scheduler worker owns one
+context with a stable worker ID and context generation. Backend submission,
+cancellation, and polling stay on that worker, so normal I/O does not require a
+hop through a central reactor.
+
+An awaitable acquires an `io_operation_guard` in `await_suspend()` and stores it
+in backend-visible operation state. Until normal completion, cancellation
+completion, prepare failure, or orphan cleanup releases that guard, the
+coroutine cannot be scheduled or stolen onto another worker. Completion
+releases the pin before resuming the coroutine, so a previously requested user
+affinity can then take effect. Destroying a suspended coroutine does not release
+the pin early: the orphaned operation retains it until the backend observes the
+terminal completion and deletes the operation state.
+
+Pool shrink does not migrate pending I/O. A retiring worker keeps polling its
+own context until both backend pending work and active operation pins reach
+zero. A later pool grow reuses the same worker context only after that drain has
+finished.
+
+Standalone `io_context` objects have no scheduler owner. Their caller must
+serialize backend access, drive polling, and keep the context alive. Standard
+Elio awaitables reject a standalone context from scheduler execution and reject
+another worker's context. The context's mutating low-level entries also reject
+cross-owner access; only `notify()` is a cross-thread wakeup entry. A directly
+constructed backend that is not owned by an `io_context` remains a standalone
+integration surface that its caller must serialize and drive.
+
+When a standard awaitable is used by a coroutine promise that does not derive
+from `promise_base`, the backend still resumes completion on its owner worker
+and context-level accounting still keeps retirement drain alive. Such a promise
+has no Elio task execution context, so a custom runtime that independently
+re-enqueues the suspended handle must preserve worker ownership itself.
+
+These ownership rules do not serialize object-level operations. The runtime
+does not prevent overlapping reads, overlapping writes, or close-versus-I/O on
+the same stream or fd. Callers must provide that synchronization unless a
+higher-level type explicitly documents a stronger concurrent-use contract.
 
 ### Accessing the Current Context
 

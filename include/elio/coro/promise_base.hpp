@@ -1,9 +1,10 @@
 #pragma once
 
+#include "task_execution_context.hpp"
 #include <exception>
 #include <atomic>
 #include <cstdint>
-#include <limits>
+#include <memory>
 #include <type_traits>
 
 namespace elio::runtime {
@@ -11,9 +12,6 @@ class scheduler;
 }
 
 namespace elio::coro {
-
-/// Constant indicating no affinity (vthread can migrate freely)
-inline constexpr size_t NO_AFFINITY = std::numeric_limits<size_t>::max();
 
 /// Coroutine state for debugging
 enum class coroutine_state : uint8_t {
@@ -90,7 +88,7 @@ public:
     /// Magic number for debugger validation: "ELIOFRME"
     static constexpr uint64_t FRAME_MAGIC = 0x454C494F46524D45ULL;
 
-    promise_base() noexcept
+    promise_base()
         : frame_magic_(FRAME_MAGIC)
         , parent_(current_frame_)
 #if ELIO_ENABLE_DEBUG_METADATA
@@ -98,7 +96,7 @@ public:
         , debug_worker_id_(static_cast<uint32_t>(-1))
         , debug_id_(0)  // Lazy allocation - only allocated when id() is called
 #endif
-        , affinity_(NO_AFFINITY)
+        , execution_context_(std::make_shared<task_execution_context>())
     {
         current_frame_ = this;
     }
@@ -229,39 +227,52 @@ public:
     void set_worker_id(uint32_t) noexcept {}
 #endif
 
+    /// Shared scheduler-visible runtime policy state for this task. The task
+    /// owner itself deliberately does not carry this authority.
+    [[nodiscard]] std::shared_ptr<task_execution_context>
+    execution_context() const noexcept {
+        return execution_context_;
+    }
+
     // Affinity accessors
     /// Get the current thread affinity for this vthread
     /// @return Worker ID this vthread is bound to, or NO_AFFINITY if unbound
-    [[nodiscard]] size_t affinity() const noexcept { 
-        return affinity_.load(std::memory_order_acquire); 
+    [[nodiscard]] size_t affinity() const noexcept {
+        return execution_context_->user_affinity();
+    }
+
+    /// Get the scheduler placement constraint. This remains distinct from
+    /// caller affinity so active I/O pins can take precedence in Phase 3.
+    [[nodiscard]] size_t effective_affinity() const noexcept {
+        return execution_context_->effective_affinity();
     }
 
     /// Set thread affinity for this vthread
     /// @param worker_id Worker ID to bind to, or NO_AFFINITY to clear
-    void set_affinity(size_t worker_id) noexcept { 
-        affinity_.store(worker_id, std::memory_order_release); 
+    void set_affinity(size_t worker_id) noexcept {
+        execution_context_->set_user_affinity(worker_id);
     }
 
     /// Check if this vthread has affinity set
-    [[nodiscard]] bool has_affinity() const noexcept { 
-        return affinity_.load(std::memory_order_acquire) != NO_AFFINITY; 
+    [[nodiscard]] bool has_affinity() const noexcept {
+        return execution_context_->has_user_affinity();
     }
 
     /// Clear thread affinity, allowing this vthread to migrate freely
-    void clear_affinity() noexcept { 
-        affinity_.store(NO_AFFINITY, std::memory_order_release); 
+    void clear_affinity() noexcept {
+        execution_context_->clear_user_affinity();
     }
 
     /// Mark this coroutine as internal work that must run on its affinity
     /// owner. Used by scheduler maintenance tasks that access worker-local
     /// state such as an io_context.
     void set_worker_local(bool worker_local = true) noexcept {
-        worker_local_.store(worker_local, std::memory_order_release);
+        execution_context_->set_worker_local(worker_local);
     }
 
     /// Check whether this coroutine must stay on its affinity owner.
     [[nodiscard]] bool is_worker_local() const noexcept {
-        return worker_local_.load(std::memory_order_acquire);
+        return execution_context_->is_worker_local();
     }
 
 private:
@@ -292,13 +303,9 @@ private:
     uint64_t debug_id_;
 #endif
 
-    // Thread affinity: NO_AFFINITY means can migrate freely
-    // Must be atomic to avoid data races in work-stealing scenarios
-    std::atomic<size_t> affinity_;
-
-    // Internal scheduler maintenance tasks may access worker-local state and
-    // must not be migrated when their affinity owner is retired.
-    std::atomic<bool> worker_local_{false};
+    // Shared runtime policy/control plane. External runtime owners may retain
+    // this state after the coroutine frame itself has been destroyed.
+    const std::shared_ptr<task_execution_context> execution_context_;
 
     // Keep scheduler accounting after the debugger-visible frame fields so the
     // stable magic/parent prefix remains at the start of promise_base.

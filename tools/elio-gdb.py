@@ -121,6 +121,7 @@ def get_promise_layout(_ptr_size):
         "frame_magic_": 0,
         "parent_": 8,
         "has_debug_metadata": False,
+        "has_execution_context": False,
     }
 
     try:
@@ -137,6 +138,10 @@ def get_promise_layout(_ptr_size):
         has_debug_metadata = all(name in offsets for name in (
             "debug_location_", "debug_state_", "debug_worker_id_", "debug_id_"))
         offsets["has_debug_metadata"] = has_debug_metadata
+        # Do not decode std::shared_ptr internals; their layout is standard
+        # library specific. Presence still confirms symbols match the current
+        # promise_base runtime-state boundary.
+        offsets["has_execution_context"] = "execution_context_" in offsets
         return offsets
     except Exception:
         return fallback
@@ -248,7 +253,8 @@ def get_frame_from_handle(handle_addr):
             "line": line,
             "address": handle_addr,
             "promise_addr": promise_addr,
-            "has_debug_metadata": has_debug_metadata
+            "has_debug_metadata": has_debug_metadata,
+            "has_execution_context": layout["has_execution_context"]
         }
     except Exception as e:
         return None

@@ -925,15 +925,46 @@ coro::task<void> stay_here() {
 }
 ```
 
-### Promise Base Affinity Methods
+### Task Execution Context And Promise Affinity
 
-The `promise_base` class provides direct access to affinity state:
+`promise_base` is the frame-resident anchor for a shared
+`task_execution_context`. The task object itself does not carry scheduler
+policy. External runtime owners may share the context without keeping the frame
+alive.
+
+```cpp
+namespace elio::coro {
+
+class task_execution_context {
+public:
+    size_t user_affinity() const noexcept;
+    size_t effective_affinity() const noexcept;
+    void set_user_affinity(size_t worker_id) noexcept;
+    bool has_user_affinity() const noexcept;
+    void clear_user_affinity() noexcept;
+
+    // Internal scheduler-maintenance policy
+    void set_worker_local(bool worker_local = true) noexcept;
+    bool is_worker_local() const noexcept;
+};
+
+} // namespace elio::coro
+```
+
+The promise affinity methods delegate caller-requested affinity to that shared
+context. `effective_affinity()` is the scheduler placement boundary and is kept
+distinct from caller affinity:
 
 ```cpp
 class promise_base {
 public:
+    std::shared_ptr<task_execution_context> execution_context() const noexcept;
+
     // Get current affinity (NO_AFFINITY if not set)
     size_t affinity() const noexcept;
+
+    // Get the scheduler placement constraint
+    size_t effective_affinity() const noexcept;
     
     // Set affinity to a specific worker
     void set_affinity(size_t worker_id) noexcept;

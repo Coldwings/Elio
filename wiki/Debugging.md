@@ -31,6 +31,12 @@ The thread-local `current_frame_` tracks which frame is currently executing. A t
 
 Each `promise_base` contains a `frame_magic_` field set to `0x454C494F46524D45` (the ASCII string "ELIOFRME"). The debugger tools check this magic value when traversing memory to distinguish valid Elio coroutine frames from arbitrary data. This is especially important during coredump analysis, where the debugger walks raw memory without type information.
 
+The stable raw-memory fallback is limited to `frame_magic_` and `parent_`.
+Runtime policy is held through `execution_context_`, a
+`shared_ptr<task_execution_context>`. GDB/LLDB scripts detect that field when
+type information is available but intentionally do not assume a particular
+standard-library `shared_ptr` representation.
+
 ### Debug Metadata
 
 Every frame carries the following debug metadata with no additional allocation:

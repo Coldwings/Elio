@@ -2815,11 +2815,11 @@ that context alive while accepts are pending and while accepted streams use it.
 
 Coroutine-aware synchronization primitives (`mutex`, `shared_mutex`, `event`, `semaphore`, `condition_variable`, `channel`) track suspended waiters through intrusive nodes embedded in coroutine frames. If a frame is destroyed while its waiter is still linked, the awaiter's destructor unlinks the node from the primitive.
 
-This cleanup does not make every operation cancellable. `with_timeout()` requests cooperative cancellation but does not forcibly destroy its losing child. The child must pass the supplied `cancel_token` to a token-aware operation to stop on timeout. `mutex`, `shared_mutex`, `semaphore`, `event`, and `condition_variable` provide explicit token-aware waits that return `coro::cancel_result`. Their no-token overloads remain non-cancellable and preserve their existing await results.
+This cleanup does not make every operation cancellable. `with_timeout()` requests cooperative cancellation but does not forcibly destroy its losing child. The child must pass the supplied `cancel_token` to a token-aware operation to stop on timeout. Every suspending core synchronization primitive provides an explicit token-aware wait. Their no-token overloads remain non-cancellable and preserve their existing await results.
 
-Cancellation and normal notification atomically select one terminal result. A cancellation winner does not acquire a lock or permit. Once normal notification wins, the operation returns `completed` and any acquired resource remains owned by the caller. A condition wait that released an associated lock re-acquires it before returning either result. `channel` waits are not yet token-aware; their pending waits and captures must remain alive until normal completion resumes them.
+Cancellation and normal notification atomically select one terminal result. A cancellation winner does not acquire a lock or permit, transfer a pending send value into a channel, or consume a channel receive value. Once normal notification wins, the operation returns `completed` and any acquired resource or completed transfer remains caller-owned. A condition wait that released an associated lock re-acquires it before returning either result. Channel result objects carry both `cancel_result` and the existing sent/value result so cancellation remains distinct from closure.
 
-Callers must inspect the `cancel_result` from every token-aware wait before assuming that notification occurred or that a lock or permit was acquired.
+Callers must inspect the `cancel_result` from every token-aware wait before assuming that notification occurred, a lock or permit was acquired, or a channel operation observed closure rather than cancellation.
 
 ### `mutex`
 
@@ -3070,6 +3070,24 @@ Multi-producer multi-consumer channel for passing values between coroutines. Sup
 template<typename T>
 class channel {
 public:
+    struct cancellable_send_result {
+        bool sent;
+        coro::cancel_result cancel;
+
+        bool success() const noexcept;
+        bool was_cancelled() const noexcept;
+        bool was_closed() const noexcept;
+    };
+
+    struct cancellable_recv_result {
+        std::optional<T> value;
+        coro::cancel_result cancel;
+
+        bool success() const noexcept;
+        bool was_cancelled() const noexcept;
+        bool was_closed() const noexcept;
+    };
+
     // Create a rendezvous channel (default, capacity 0)
     channel();
 
@@ -3082,8 +3100,16 @@ public:
     // Send a value (awaitable, blocks if full for bounded channels)
     /* awaitable */ send(T value);
 
+    // Send, report cancellation separately from channel closure
+    /* awaitable<cancellable_send_result> */
+    send(T value, coro::cancel_token token);
+
     // Receive a value (awaitable, blocks if empty)
     /* awaitable<std::optional<T>> */ recv();
+
+    // Receive, report cancellation separately from channel closure
+    /* awaitable<cancellable_recv_result> */
+    recv(coro::cancel_token token);
 
     // Close the channel
     void close();

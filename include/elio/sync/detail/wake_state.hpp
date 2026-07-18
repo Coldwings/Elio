@@ -137,37 +137,40 @@ public:
 
     // Schedule either an ordinary waiter or a waiter whose terminal result was
     // selected under its primitive's queue lock. The common legacy path needs
-    // only the first waiting -> scheduling CAS.
+    // a waiting -> scheduling transition. Retry if publication changes blocked
+    // to waiting while a notifier is selecting the wake action.
     bool schedule_selected() noexcept {
-        auto expected = waiting;
-        if (state_.compare_exchange_strong(expected, notification_scheduling,
-                                           std::memory_order_acq_rel,
-                                           std::memory_order_acquire)) {
-            runtime::schedule_handle(handle_);
-            return true;
-        }
+        auto current = state_.load(std::memory_order_acquire);
+        for (;;) {
+            unsigned char desired;
+            bool should_schedule;
+            switch (current) {
+            case waiting:
+            case notification_claimed:
+                desired = notification_scheduling;
+                should_schedule = true;
+                break;
+            case cancellation_claimed:
+                desired = cancellation_scheduling;
+                should_schedule = true;
+                break;
+            case blocked:
+                desired = notified_inline;
+                should_schedule = false;
+                break;
+            default:
+                return false;
+            }
 
-        expected = notification_claimed;
-        if (state_.compare_exchange_strong(expected, notification_scheduling,
-                                           std::memory_order_acq_rel,
-                                           std::memory_order_acquire)) {
-            runtime::schedule_handle(handle_);
-            return true;
+            if (state_.compare_exchange_weak(current, desired,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
+                if (should_schedule) {
+                    runtime::schedule_handle(handle_);
+                }
+                return should_schedule;
+            }
         }
-
-        expected = cancellation_claimed;
-        if (state_.compare_exchange_strong(expected, cancellation_scheduling,
-                                           std::memory_order_acq_rel,
-                                           std::memory_order_acquire)) {
-            runtime::schedule_handle(handle_);
-            return true;
-        }
-
-        expected = blocked;
-        state_.compare_exchange_strong(expected, notified_inline,
-                                       std::memory_order_acq_rel,
-                                       std::memory_order_acquire);
-        return false;
     }
 
     [[nodiscard]] bool was_cancelled() const noexcept {
@@ -175,6 +178,13 @@ public:
         return current == cancelled_inline ||
                current == cancellation_claimed ||
                current == cancellation_scheduling;
+    }
+
+    [[nodiscard]] bool notification_was_selected() const noexcept {
+        const auto current = state_.load(std::memory_order_acquire);
+        return current == notified_inline ||
+               current == notification_claimed ||
+               current == notification_scheduling;
     }
 
     // Prevent a dequeue-then-schedule wake from resuming a destroyed frame.

@@ -616,13 +616,14 @@ This lifetime cleanup is not itself a cancellation API. `with_timeout()` request
 
 `shared_mutex::lock_shared(token)`, `shared_mutex::lock(token)`, and every `condition_variable` wait mode now participate in the same terminal cancellation race. A shared-mutex cancellation winner owns no lock. A condition wait that released an associated lock always re-acquires it before returning, including when cancellation wins; a pre-cancelled wait leaves the held lock untouched.
 
-`channel` does not yet provide token-aware waits. A timed-out child blocked on a channel remains suspended and linked until normal channel progress resumes it. The channel and every object captured by that child must outlive the pending wait, including the interval after a peer dequeues the waiter but before the scheduler resumes it.
+`channel::send(value, token)` and `channel::recv(token)` return result objects that carry both `cancel_result` and the channel's existing sent/value result. A cancellation winner does not transfer the pending send value into the channel or consume a receive value. A normal transfer or channel close can win first; callers distinguish cancellation from closure with `was_cancelled()` and `was_closed()`.
 
 **Key guarantees:**
 - Destroying a frame whose waiter is still linked removes that waiter from the primitive's list
 - No manual waiter-list cleanup is required; unlinking happens in the awaiter's destructor
 - Timeout cancellation remains cooperative and requires a token-aware operation
 - A completed lock or permit acquisition is not rolled back by a later cancellation request
+- A completed channel transfer is not rolled back by a later cancellation request
 
 ### Condition Variable
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cancel_token.hpp"
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -7,6 +8,7 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <utility>
 
 namespace elio::io::detail {
 class io_operation_guard;
@@ -22,11 +24,13 @@ inline constexpr size_t NO_AFFINITY = std::numeric_limits<size_t>::max();
 ///
 /// The coroutine promise and external runtime owners keep shared references to
 /// this control block. It records operation-local I/O ownership for scheduler
-/// placement, but completion and cancellation state remains owned by the
-/// awaitable/backend state machine.
+/// placement and owns task-chain cancellation authority. Each pending operation
+/// still owns its own completion and cancellation state machine.
 class task_execution_context final {
 public:
-    task_execution_context() noexcept = default;
+    /// Allocate the task-local cancellation state. This can throw
+    /// std::bad_alloc; the constructor is intentionally not noexcept in 0.6.
+    task_execution_context() = default;
 
     task_execution_context(const task_execution_context&) = delete;
     task_execution_context& operator=(const task_execution_context&) = delete;
@@ -93,6 +97,31 @@ public:
         return worker_local_.load(std::memory_order_acquire);
     }
 
+    /// Token observed by code running in this task. Cancellation propagates
+    /// from an active direct Elio awaiter when the lazy child is first started.
+    [[nodiscard]] cancel_token get_cancel_token() const noexcept {
+        return cancellation_context_.token();
+    }
+
+    /// Request cooperative, best-effort cancellation. Registered callbacks run
+    /// synchronously and the first callback exception is rethrown after every
+    /// callback not suppressed by same-dispatch reentrant teardown has been
+    /// dispatched, matching cancel_source::cancel().
+    void request_cancel() {
+        cancellation_context_.request_cancel();
+    }
+
+    [[nodiscard]] bool is_cancellation_requested() const noexcept {
+        return cancellation_context_.is_cancellation_requested();
+    }
+
+    /// Link this not-yet-started lazy task to its actual Elio awaiter. The link
+    /// is one-way: cancelling the parent requests cancellation of the child,
+    /// while cancelling this context does not affect the parent.
+    void link_parent_cancellation(cancel_token parent) {
+        cancellation_context_.link_parent(std::move(parent));
+    }
+
 private:
     friend class elio::io::detail::io_operation_guard;
 
@@ -138,6 +167,7 @@ private:
 
     std::atomic<size_t> user_affinity_{NO_AFFINITY};
     std::atomic<bool> worker_local_{false};
+    detail::cancellation_context cancellation_context_;
     mutable std::mutex io_pin_mutex_;
     std::atomic<size_t> io_owner_worker_{NO_AFFINITY};
     std::atomic<uint64_t> io_context_generation_{0};

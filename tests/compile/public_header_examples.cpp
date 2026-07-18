@@ -157,6 +157,16 @@ coro::task<void> uds_cancellable_api(coro::cancel_token token) {
     (void)span_exact_result;
 }
 
+coro::task<void> runtime_cancellation_api() {
+    auto handle = elio::spawn([]() -> coro::task<void> {
+        auto token = coro::this_coro::cancel_token();
+        if (token.is_cancelled()) co_return;
+    });
+    handle.request_cancel();
+    (void)handle.is_cancellation_requested();
+    co_await handle;
+}
+
 coro::task<void> vectored_io(int fd) {
     char first[8]{};
     char second[8]{};

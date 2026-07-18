@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
@@ -8,6 +9,8 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -29,6 +32,24 @@ enum class cancel_result {
 
 namespace detail {
 
+inline thread_local const void* current_callback_dispatcher = nullptr;
+
+class callback_dispatch_scope final {
+public:
+    explicit callback_dispatch_scope(const void* dispatcher) noexcept
+        : previous_(std::exchange(current_callback_dispatcher, dispatcher)) {}
+
+    ~callback_dispatch_scope() {
+        current_callback_dispatcher = previous_;
+    }
+
+    callback_dispatch_scope(const callback_dispatch_scope&) = delete;
+    callback_dispatch_scope& operator=(const callback_dispatch_scope&) = delete;
+
+private:
+    const void* previous_;
+};
+
 /// Type-erased callback node for the cancel_state intrusive list.
 ///
 /// Each registration owns exactly one heap-allocated callback_node. The
@@ -37,8 +58,15 @@ namespace detail {
 /// single secondary heap allocation. This eliminates the vector growth and
 /// the per-callable std::function allocation of the previous design.
 struct callback_node {
-    callback_node* next = nullptr;
-    uint64_t id = 0;
+    enum class phase : uint8_t {
+        registered,
+        claimed,
+        invoking,
+        completed,
+        unregistered
+    };
+
+    std::shared_ptr<callback_node> next;
 
     static constexpr std::size_t inline_buf_size = 48;
     alignas(alignof(std::max_align_t)) std::byte buf[inline_buf_size];
@@ -78,19 +106,121 @@ struct callback_node {
         }
     }
 
-    void invoke() {
+    void invoke_payload() {
         if (invoke_fn) invoke_fn(this);
     }
 
-    ~callback_node() {
-        if (destroy_fn) destroy_fn(this);
+    void destroy_payload() noexcept {
+        auto destroy = std::exchange(destroy_fn, nullptr);
+        invoke_fn = nullptr;
+        if (destroy) destroy(this);
     }
+
+    void dispatch() {
+        const void* active_dispatcher;
+        {
+            std::lock_guard<std::mutex> lock(dispatch_mutex);
+            if (dispatch_phase == phase::registered) {
+                invoking_thread = std::this_thread::get_id();
+                dispatcher_identity = this;
+            } else if (dispatch_phase != phase::claimed) {
+                return;
+            }
+            active_dispatcher = dispatcher_identity;
+            dispatch_phase = phase::invoking;
+        }
+
+        std::exception_ptr exception;
+        {
+            callback_dispatch_scope dispatch_scope(active_dispatcher);
+            try {
+                invoke_payload();
+            } catch (...) {
+                exception = std::current_exception();
+            }
+            destroy_payload();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(dispatch_mutex);
+            invoking_thread = {};
+            dispatcher_identity = nullptr;
+            dispatch_phase = phase::completed;
+        }
+        dispatch_cv.notify_all();
+
+        if (exception) {
+            std::rethrow_exception(exception);
+        }
+    }
+
+    void claim_for_dispatch(std::thread::id dispatch_thread,
+                            const void* dispatcher) noexcept {
+        std::lock_guard<std::mutex> lock(dispatch_mutex);
+        if (dispatch_phase != phase::registered) return;
+        invoking_thread = dispatch_thread;
+        dispatcher_identity = dispatcher;
+        dispatch_phase = phase::claimed;
+    }
+
+    void unregister_and_wait() noexcept {
+        std::unique_lock<std::mutex> lock(dispatch_mutex);
+        if (dispatch_phase == phase::registered) {
+            dispatch_phase = phase::unregistered;
+            lock.unlock();
+            destroy_payload();
+            return;
+        }
+
+        if (dispatch_phase == phase::claimed &&
+            dispatcher_identity == current_callback_dispatcher) {
+            // A callback may unregister a later callback selected by the same
+            // synchronous cancel() dispatch. Waiting here would deadlock the
+            // dispatcher, so suppress that not-yet-invoked callback.
+            dispatch_phase = phase::unregistered;
+            invoking_thread = {};
+            dispatcher_identity = nullptr;
+            lock.unlock();
+            destroy_payload();
+            dispatch_cv.notify_all();
+            return;
+        }
+
+        if (dispatch_phase == phase::claimed ||
+            dispatch_phase == phase::invoking) {
+            if (current_callback_dispatcher != nullptr) {
+                // Waiting from one cancellation callback for another dispatcher
+                // can form a cross-source wait cycle. Dispatcher ownership keeps
+                // both claimed and invoking callbacks alive, so defer teardown
+                // and let every callback selected by that dispatcher complete.
+                return;
+            }
+            if (invoking_thread == std::this_thread::get_id()) return;
+            dispatch_cv.wait(lock, [this] {
+                return dispatch_phase != phase::claimed &&
+                       dispatch_phase != phase::invoking;
+            });
+        }
+    }
+
+    ~callback_node() {
+        destroy_payload();
+    }
+
+private:
+    std::mutex dispatch_mutex;
+    std::condition_variable dispatch_cv;
+    phase dispatch_phase = phase::registered;
+    std::thread::id invoking_thread;
+    const void* dispatcher_identity = nullptr;
 };
 
 /// Shared cancellation state (implementation detail).
 ///
-/// Stores active callbacks as an intrusive singly-linked list of
-/// callback_nodes guarded by a mutex. Compared with the previous
+/// Stores active callbacks as an intrusive shared-ownership list guarded by a
+/// mutex. Each node also synchronizes callback dispatch with unregistration so
+/// a registration can be destroyed concurrently without releasing callback
+/// captures while they are still in use. Compared with the previous
 /// std::vector<std::pair<id, std::function>> implementation:
 ///   * registration is O(1) without vector growth/copies;
 ///   * each registration owns a single heap-allocated node, and its
@@ -100,72 +230,75 @@ struct callback_node {
 struct cancel_state {
     std::atomic<bool> cancelled{false};
     std::mutex mutex;
-    callback_node* head = nullptr;
-    uint64_t next_id = 1;
+    std::shared_ptr<callback_node> head;
 
     cancel_state() = default;
     cancel_state(const cancel_state&) = delete;
     cancel_state& operator=(const cancel_state&) = delete;
 
     template<typename F>
-    uint64_t add_callback(F&& cb) {
+    std::shared_ptr<callback_node> add_callback(F&& cb) {
         // Allocate the node before taking the lock to keep the critical
         // section short.
-        auto node = std::make_unique<callback_node>();
+        auto node = std::make_shared<callback_node>();
         node->emplace(std::forward<F>(cb));
 
         std::unique_lock<std::mutex> lock(mutex);
         if (cancelled.load(std::memory_order_relaxed)) {
             // Already cancelled: invoke and drop without inserting.
             lock.unlock();
-            node->invoke();
-            return 0;
+            node->dispatch();
+            return {};
         }
-        node->id = next_id++;
         node->next = head;
-        const auto id = node->id;
-        head = node.release();
-        return id;
+        head = node;
+        return node;
     }
 
-    void remove_callback(uint64_t id) {
-        if (id == 0) return;
-        callback_node* to_delete = nullptr;
+    void remove_callback(const std::shared_ptr<callback_node>& node) noexcept {
+        if (!node) return;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            callback_node** prev = &head;
-            while (*prev) {
-                if ((*prev)->id == id) {
-                    to_delete = *prev;
-                    *prev = (*prev)->next;
+            auto* link = &head;
+            while (*link) {
+                if (link->get() == node.get()) {
+                    auto removed = std::move(*link);
+                    *link = std::move(removed->next);
                     break;
                 }
-                prev = &(*prev)->next;
+                link = &((*link)->next);
             }
         }
-        delete to_delete;  // delete on nullptr is a no-op
+        node->unregister_and_wait();
     }
 
     void trigger() {
-        callback_node* list = nullptr;
+        const char dispatcher_identity = 0;
+        std::shared_ptr<callback_node> list;
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (cancelled.exchange(true, std::memory_order_release)) {
                 return;  // Already cancelled
             }
-            list = head;
-            head = nullptr;
+            list = std::move(head);
+            const auto dispatch_thread = std::this_thread::get_id();
+            for (auto node = list; node; node = node->next) {
+                node->claim_for_dispatch(
+                    dispatch_thread, &dispatcher_identity);
+            }
         }
-        // List is now exclusively owned by this call. Invoke each callback
-        // outside the lock and free its node. Concurrent remove_callback()
-        // calls will simply find no matching id in the (empty) head list,
-        // which is the correct no-op semantics.
+        // List is now owned by this call. Invoke each callback outside the
+        // state lock. Concurrent remove_callback() calls synchronize through
+        // the individual node. Teardown suppresses a not-yet-started callback,
+        // waits for an in-progress callback outside callback dispatch, or
+        // defers cross-dispatch callback reentry without suppressing callbacks
+        // already selected by another dispatcher.
         std::exception_ptr first_exception;
         while (list) {
-            std::unique_ptr<callback_node> node{list};
-            list = node->next;
+            auto node = std::move(list);
+            list = std::move(node->next);
             try {
-                node->invoke();
+                node->dispatch();
             } catch (...) {
                 if (!first_exception) {
                     first_exception = std::current_exception();
@@ -180,9 +313,9 @@ struct cancel_state {
     ~cancel_state() {
         // Drop any callbacks that were never triggered or unregistered.
         while (head) {
-            auto* next = head->next;
-            delete head;
-            head = next;
+            auto node = std::move(head);
+            head = std::move(node->next);
+            node->unregister_and_wait();
         }
     }
 };
@@ -197,15 +330,12 @@ class cancel_registration {
 public:
     cancel_registration() = default;
     cancel_registration(cancel_registration&& other) noexcept
-        : state_(std::move(other.state_)), id_(other.id_) {
-        other.id_ = 0;
-    }
+        : state_(std::move(other.state_)), node_(std::move(other.node_)) {}
     cancel_registration& operator=(cancel_registration&& other) noexcept {
         if (this != &other) {
             unregister();
             state_ = std::move(other.state_);
-            id_ = other.id_;
-            other.id_ = 0;
+            node_ = std::move(other.node_);
         }
         return *this;
     }
@@ -216,21 +346,23 @@ public:
     cancel_registration& operator=(const cancel_registration&) = delete;
 
     /// Manually unregister the callback
-    void unregister() {
-        if (state_ && id_ != 0) {
-            state_->remove_callback(id_);
-            id_ = 0;
+    void unregister() noexcept {
+        if (state_ && node_) {
+            auto state = std::move(state_);
+            auto node = std::move(node_);
+            state->remove_callback(node);
         }
     }
 
 private:
     friend class cancel_token;
 
-    cancel_registration(std::shared_ptr<detail::cancel_state> state, uint64_t id)
-        : state_(std::move(state)), id_(id) {}
+    cancel_registration(std::shared_ptr<detail::cancel_state> state,
+                        std::shared_ptr<detail::callback_node> node)
+        : state_(std::move(state)), node_(std::move(node)) {}
 
     std::shared_ptr<detail::cancel_state> state_;
-    uint64_t id_ = 0;
+    std::shared_ptr<detail::callback_node> node_;
 };
 
 /// A token that can be used to check for and respond to cancellation requests.
@@ -277,6 +409,16 @@ public:
     /// exclusion with other cancel callbacks; use external synchronization
     /// if shared mutable state is accessed.
     ///
+    /// Destroying or unregistering the returned registration suppresses a
+    /// callback that cancellation has not selected. Outside callback dispatch,
+    /// teardown waits for a callback selected or running on a different thread.
+    /// During callback reentry, cross-dispatch teardown is deferred instead of
+    /// waiting, so mutually unregistering callbacks cannot deadlock; the target
+    /// callback payload remains alive through dispatch, but externally owned
+    /// captured state still requires synchronization. Self-unregistration and
+    /// removal of a later callback selected by the same synchronous dispatcher
+    /// are also supported.
+    ///
     /// @param callback Function to call on cancellation
     /// @return Registration handle (callback unregisters when handle is destroyed)
     template<typename F>
@@ -284,7 +426,9 @@ public:
         if (!state_) {
             return registration{};
         }
-        return registration{state_, state_->add_callback(std::forward<F>(callback))};
+        auto node = state_->add_callback(std::forward<F>(callback));
+        if (!node) return registration{};
+        return registration{state_, std::move(node)};
     }
 
     /// Register a coroutine handle to be resumed when cancelled.
@@ -349,7 +493,8 @@ private:
 ///
 /// cancel_source owns the cancellation state and can create multiple tokens
 /// that share the same state. When cancel() is called, all associated tokens
-/// become cancelled and their registered callbacks are invoked.
+/// become cancelled. Selected callbacks are dispatched unless same-dispatch
+/// reentrant teardown suppresses a later callback.
 ///
 /// Example:
 /// ```cpp
@@ -374,8 +519,10 @@ public:
     }
 
     /// Request cancellation
-    /// All registered callbacks will be invoked and all tokens will report
-    /// is_cancelled() == true
+    /// All tokens will report is_cancelled() == true. Callbacks run
+    /// synchronously on this thread. Every callback selected at cancellation
+    /// start is dispatched unless same-dispatch reentrant teardown removes a
+    /// later callback; the first exception is rethrown after dispatch.
     void cancel() {
         if (state_) {
             state_->trigger();
@@ -390,5 +537,58 @@ public:
 private:
     std::shared_ptr<detail::cancel_state> state_;
 };
+
+namespace detail {
+
+/// Task-lifetime cancellation authority. The source remains valid through the
+/// shared task_execution_context even after the coroutine frame is destroyed.
+/// A lazy child links to its active Elio awaiter's token before first resume, so
+/// a request flows down the running Elio task chain without granting
+/// cancellation authority to the lazy task owner itself.
+class cancellation_context final {
+public:
+    cancellation_context() = default;
+
+    cancellation_context(const cancellation_context&) = delete;
+    cancellation_context& operator=(const cancellation_context&) = delete;
+    cancellation_context(cancellation_context&&) = delete;
+    cancellation_context& operator=(cancellation_context&&) = delete;
+
+    [[nodiscard]] cancel_token token() const noexcept {
+        return source_.get_token();
+    }
+
+    void request_cancel() {
+        source_.cancel();
+    }
+
+    [[nodiscard]] bool is_cancellation_requested() const noexcept {
+        return source_.is_cancelled();
+    }
+
+    void link_parent(cancel_token parent) {
+        auto registration = parent.on_cancel([source = source_]() mutable {
+            source.cancel();
+        });
+
+        std::lock_guard<std::mutex> lock(parent_mutex_);
+        if (parent_linked_) {
+            throw std::logic_error(
+                "task cancellation context already has a parent");
+        }
+        parent_registration_ = std::move(registration);
+        parent_linked_ = true;
+    }
+
+private:
+    // Keep registration last so it unregisters before the owned source is
+    // released during destruction.
+    cancel_source source_;
+    std::mutex parent_mutex_;
+    bool parent_linked_ = false;
+    cancel_registration parent_registration_;
+};
+
+} // namespace detail
 
 } // namespace elio::coro

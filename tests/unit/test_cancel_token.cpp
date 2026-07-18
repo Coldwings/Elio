@@ -5,11 +5,14 @@
 #include <elio/time/timer.hpp>
 
 #include <atomic>
+#include <barrier>
 #include <latch>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace elio::coro;
@@ -21,6 +24,36 @@ template<typename F>
 auto spawn_joinable(scheduler& sched, F&& f) {
     return sched.go_joinable(std::forward<F>(f));
 }
+
+struct unregister_on_destroy {
+    std::optional<cancel_registration>* target;
+    std::barrier<>* callbacks_started;
+    std::atomic<bool>* invoked;
+
+    unregister_on_destroy(std::optional<cancel_registration>* target_registration,
+                          std::barrier<>* started,
+                          std::atomic<bool>* was_invoked) noexcept
+        : target(target_registration),
+          callbacks_started(started),
+          invoked(was_invoked) {}
+
+    unregister_on_destroy(unregister_on_destroy&& other) noexcept
+        : target(std::exchange(other.target, nullptr)),
+          callbacks_started(other.callbacks_started),
+          invoked(other.invoked) {}
+
+    unregister_on_destroy(const unregister_on_destroy&) = delete;
+    unregister_on_destroy& operator=(const unregister_on_destroy&) = delete;
+
+    ~unregister_on_destroy() {
+        if (target) target->reset();
+    }
+
+    void operator()() {
+        callbacks_started->arrive_and_wait();
+        invoked->store(true, std::memory_order_release);
+    }
+};
 
 
 
@@ -707,4 +740,253 @@ TEST_CASE("cancel_token stress test with many callbacks", "[cancel_token][thread
         
         REQUIRE(callbacks_invoked.load(std::memory_order_relaxed) == NUM_CALLBACKS);
     }
+}
+
+TEST_CASE("cancel registration waits for a callback running on another thread",
+          "[cancel_token][callback][thread][lifetime]") {
+    cancel_source source;
+    std::latch callback_started(1);
+    std::latch release_callback(1);
+    std::latch unregister_started(1);
+    std::atomic<bool> unregister_done{false};
+    std::atomic<bool> callback_done{false};
+
+    auto registration = source.get_token().on_cancel([&] {
+        callback_started.count_down();
+        release_callback.wait();
+        callback_done.store(true, std::memory_order_release);
+    });
+
+    std::thread canceller([&] { source.cancel(); });
+    callback_started.wait();
+
+    std::thread unregisterer(
+        [registration = std::move(registration), &unregister_started,
+         &unregister_done]() mutable {
+            unregister_started.count_down();
+            registration.unregister();
+            unregister_done.store(true, std::memory_order_release);
+        });
+    unregister_started.wait();
+
+    // Give the dedicated unregister thread a scheduling opportunity. It must
+    // remain inside unregister() until the callback has stopped using captures.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    REQUIRE_FALSE(unregister_done.load(std::memory_order_acquire));
+
+    release_callback.count_down();
+    canceller.join();
+    unregisterer.join();
+    REQUIRE(callback_done.load(std::memory_order_acquire));
+    REQUIRE(unregister_done.load(std::memory_order_acquire));
+}
+
+TEST_CASE("cancel registration waits after another thread selects its callback",
+          "[cancel_token][callback][thread][lifetime]") {
+    cancel_source source;
+    std::latch dispatch_blocked(1);
+    std::latch release_dispatch(1);
+    std::latch unregister_started(1);
+    std::atomic<bool> selected_callback_ran{false};
+    std::atomic<bool> unregister_done{false};
+
+    // The list is LIFO. Register the selected callback first so the blocker is
+    // dispatched before it after cancel() atomically claims both callbacks.
+    auto selected = source.get_token().on_cancel([&] {
+        selected_callback_ran.store(true, std::memory_order_release);
+    });
+    auto blocker = source.get_token().on_cancel([&] {
+        dispatch_blocked.count_down();
+        release_dispatch.wait();
+    });
+
+    std::thread canceller([&] { source.cancel(); });
+    dispatch_blocked.wait();
+
+    std::thread unregisterer(
+        [selected = std::move(selected), &unregister_started,
+         &unregister_done]() mutable {
+            unregister_started.count_down();
+            selected.unregister();
+            unregister_done.store(true, std::memory_order_release);
+        });
+    unregister_started.wait();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    REQUIRE_FALSE(unregister_done.load(std::memory_order_acquire));
+
+    release_dispatch.count_down();
+    canceller.join();
+    unregisterer.join();
+    REQUIRE(selected_callback_ran.load(std::memory_order_acquire));
+    REQUIRE(unregister_done.load(std::memory_order_acquire));
+}
+
+TEST_CASE("cancel callback can unregister itself without deadlock",
+          "[cancel_token][callback][thread][lifetime]") {
+    cancel_source source;
+    std::optional<cancel_registration> registration;
+    std::atomic<bool> callback_done{false};
+
+    registration.emplace(source.get_token().on_cancel([&] {
+        registration.reset();
+        callback_done.store(true, std::memory_order_release);
+    }));
+
+    source.cancel();
+    REQUIRE(callback_done.load(std::memory_order_acquire));
+    REQUIRE_FALSE(registration.has_value());
+}
+
+TEST_CASE("cancel callback can remove a later selected callback",
+          "[cancel_token][callback][thread][lifetime]") {
+    cancel_source source;
+    std::optional<cancel_registration> later_registration;
+    std::atomic<bool> first_ran{false};
+    std::atomic<bool> later_ran{false};
+
+    later_registration.emplace(source.get_token().on_cancel([&] {
+        later_ran.store(true, std::memory_order_release);
+    }));
+    auto first_registration = source.get_token().on_cancel([&] {
+        first_ran.store(true, std::memory_order_release);
+        later_registration.reset();
+    });
+
+    source.cancel();
+    REQUIRE(first_ran.load(std::memory_order_acquire));
+    REQUIRE_FALSE(later_ran.load(std::memory_order_acquire));
+}
+
+TEST_CASE("nested cancellation preserves an outer selected callback",
+          "[cancel_token][callback][lifetime]") {
+    cancel_source outer_source;
+    cancel_source nested_source;
+    std::optional<cancel_registration> outer_later_registration;
+    std::atomic<unsigned> outer_later_invocations{0};
+    std::atomic<bool> outer_first_ran{false};
+    std::atomic<bool> nested_ran{false};
+
+    outer_later_registration.emplace(
+        outer_source.get_token().on_cancel([&] {
+            outer_later_invocations.fetch_add(1, std::memory_order_relaxed);
+        }));
+    auto nested_registration = nested_source.get_token().on_cancel([&] {
+        nested_ran.store(true, std::memory_order_release);
+        outer_later_registration.reset();
+    });
+    auto outer_first_registration = outer_source.get_token().on_cancel([&] {
+        outer_first_ran.store(true, std::memory_order_release);
+        nested_source.cancel();
+    });
+
+    outer_source.cancel();
+
+    REQUIRE(outer_first_ran.load(std::memory_order_acquire));
+    REQUIRE(nested_ran.load(std::memory_order_acquire));
+    REQUIRE(outer_later_invocations.load(std::memory_order_relaxed) == 1);
+    REQUIRE_FALSE(outer_later_registration.has_value());
+}
+
+TEST_CASE("callbacks on separate dispatchers can mutually unregister",
+          "[cancel_token][callback][thread][lifetime]") {
+    cancel_source first_source;
+    cancel_source second_source;
+    std::optional<cancel_registration> first_registration;
+    std::optional<cancel_registration> second_registration;
+    std::barrier callbacks_started(2);
+    std::atomic<bool> first_done{false};
+    std::atomic<bool> second_done{false};
+
+    first_registration.emplace(first_source.get_token().on_cancel([&] {
+        callbacks_started.arrive_and_wait();
+        second_registration.reset();
+        first_done.store(true, std::memory_order_release);
+    }));
+    second_registration.emplace(second_source.get_token().on_cancel([&] {
+        callbacks_started.arrive_and_wait();
+        first_registration.reset();
+        second_done.store(true, std::memory_order_release);
+    }));
+
+    std::thread first_canceller([&] { first_source.cancel(); });
+    std::thread second_canceller([&] { second_source.cancel(); });
+    first_canceller.join();
+    second_canceller.join();
+
+    REQUIRE(first_done.load(std::memory_order_acquire));
+    REQUIRE(second_done.load(std::memory_order_acquire));
+    REQUIRE_FALSE(first_registration.has_value());
+    REQUIRE_FALSE(second_registration.has_value());
+}
+
+TEST_CASE("cross-dispatch unregister preserves a claimed callback",
+          "[cancel_token][callback][thread][lifetime]") {
+    cancel_source target_source;
+    cancel_source unregister_source;
+    std::optional<cancel_registration> target_registration;
+    std::latch blocker_started(1);
+    std::latch release_blocker(1);
+    std::atomic<unsigned> target_invocations{0};
+    std::atomic<bool> unregister_done{false};
+
+    target_registration.emplace(target_source.get_token().on_cancel([&] {
+        target_invocations.fetch_add(1, std::memory_order_relaxed);
+    }));
+    auto blocker_registration = target_source.get_token().on_cancel([&] {
+        blocker_started.count_down();
+        release_blocker.wait();
+    });
+    auto unregister_registration = unregister_source.get_token().on_cancel([&] {
+        target_registration.reset();
+        unregister_done.store(true, std::memory_order_release);
+    });
+
+    std::thread target_canceller([&] { target_source.cancel(); });
+    blocker_started.wait();
+    std::thread unregister_canceller([&] { unregister_source.cancel(); });
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(5);
+    while (!unregister_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool returned_without_wait =
+        unregister_done.load(std::memory_order_acquire);
+
+    release_blocker.count_down();
+    target_canceller.join();
+    unregister_canceller.join();
+
+    REQUIRE(returned_without_wait);
+    REQUIRE(target_invocations.load(std::memory_order_relaxed) == 1);
+    REQUIRE_FALSE(target_registration.has_value());
+}
+
+TEST_CASE("callback payload destructors can mutually unregister",
+          "[cancel_token][callback][thread][lifetime]") {
+    cancel_source first_source;
+    cancel_source second_source;
+    std::optional<cancel_registration> first_registration;
+    std::optional<cancel_registration> second_registration;
+    std::barrier callbacks_started(2);
+    std::atomic<bool> first_invoked{false};
+    std::atomic<bool> second_invoked{false};
+
+    first_registration.emplace(first_source.get_token().on_cancel(
+        unregister_on_destroy{&second_registration, &callbacks_started,
+                              &first_invoked}));
+    second_registration.emplace(second_source.get_token().on_cancel(
+        unregister_on_destroy{&first_registration, &callbacks_started,
+                              &second_invoked}));
+
+    std::thread first_canceller([&] { first_source.cancel(); });
+    std::thread second_canceller([&] { second_source.cancel(); });
+    first_canceller.join();
+    second_canceller.join();
+
+    REQUIRE(first_invoked.load(std::memory_order_acquire));
+    REQUIRE(second_invoked.load(std::memory_order_acquire));
+    REQUIRE_FALSE(first_registration.has_value());
+    REQUIRE_FALSE(second_registration.has_value());
 }

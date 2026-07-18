@@ -34,9 +34,9 @@ scheduler, use the `join_handle<T>` returned by `spawn()` when the work must be
 observed. Moving a task never migrates a running coroutine or pending I/O.
 
 Runtime policy is deliberately separate from this lazy owner. Every
-`promise_base` holds a `shared_ptr<task_execution_context>`, which currently
-stores caller-requested affinity, the internal worker-local flag, and
-operation-local I/O pin diagnostics. A
+`promise_base` holds a `shared_ptr<task_execution_context>`, which stores
+task-chain cancellation authority, caller-requested affinity, the internal
+worker-local flag, and operation-local I/O pin diagnostics. A
 scheduler-created join state shares that context with its wrapper promise, so
 the policy state can remain valid after frame destruction without a raw promise
 pointer. The context neither owns nor keeps the coroutine frame alive.
@@ -203,6 +203,29 @@ coro::task<void> parallel_example() {
     co_return;
 }
 ```
+
+Each `spawn()` call has an independent cancellation context. A join handle can
+request cancellation without retaining or addressing the coroutine frame:
+
+```cpp
+coro::task<void> background_request() {
+    auto token = coro::this_coro::cancel_token();
+    auto result = co_await time::sleep_for(30s, token);
+    if (result == coro::cancel_result::cancelled) {
+        co_return;
+    }
+}
+
+coro::task<void> controller() {
+    auto handle = elio::spawn(background_request);
+    handle.request_cancel();
+    co_await handle;  // Still join: cancellation is not forced destruction.
+}
+```
+
+`request_cancel()` is safe when task completion or frame destruction races with
+the request. It does not guarantee prompt completion, overwrite a result that
+already completed, or cancel other independently spawned tasks.
 
 #### Affinity Spawn with `elio::go_to()`
 
@@ -663,7 +686,9 @@ coro::task<void> waiter() {
 
 ## Cancellation
 
-Elio provides a cooperative cancellation mechanism for async operations using `cancel_source` and `cancel_token`.
+Elio provides cooperative, best-effort cancellation through explicit
+`cancel_source` / `cancel_token` pairs and through each running task's runtime
+cancellation context.
 
 ### Basic Usage
 
@@ -703,7 +728,22 @@ coro::task<void> controller() {
 1. **`cancel_source`** - Creates and controls cancellation state
 2. **`cancel_token`** - Lightweight handle passed to operations
 3. Operations periodically check `token.is_cancelled()`
-4. Calling `source.cancel()` triggers all registered callbacks
+4. Calling `source.cancel()` selects registered callbacks for synchronous dispatch
+
+For joinable runtime work, `join_handle::request_cancel()` publishes through the
+spawned task's shared execution context. `coro::this_coro::cancel_token()` reads
+that context from the currently executing Elio frame. A lazy child directly
+awaited by another Elio task is linked to that actual awaiter before first
+resume, so the request flows down the active Elio task chain. The link is
+one-way: cancelling a child does not cancel its parent, and separate `spawn()`
+calls remain independent. A foreign coroutine promise is a cancellation
+boundary unless adapter code deliberately bridges a token.
+
+Outside an active Elio runtime frame, `this_coro::cancel_token()` returns a
+default never-cancelled token. An explicit token parameter remains an independent
+API boundary; runtime cancellation does not silently cancel an unrelated
+`cancel_source`. Framework or application code must deliberately choose which
+token to pass or bridge.
 
 ### Cancellable Operations
 
@@ -743,6 +783,12 @@ WebSocket or SSE `receive()` can abort a blocked frame/event read. These
 operations report cancellation via their normal failure return and set `errno`
 to `ECANCELED` where applicable.
 
+Cancellation is a request, not rollback. An operation that completes before or
+during cancellation may report its actual completion, and already-produced I/O
+side effects remain. Backends that cannot promptly abort an accepted operation
+may wait for its natural terminal completion. Task-level cancellation also does
+not wake a synchronization primitive that has no token-aware wait overload.
+
 ### Implementing Cancellable Operations
 
 Register callbacks to respond to cancellation:
@@ -760,6 +806,19 @@ coro::task<void> custom_operation(coro::cancel_token token) {
     co_return;
 }
 ```
+
+Callbacks run synchronously on the thread that requests cancellation. Callback
+exceptions do not stop the remaining dispatch; afterward, `cancel()` (and a
+`join_handle::request_cancel()` using that context) rethrows the first exception.
+Destroying or unregistering a registration suppresses work not yet selected by
+cancellation. Outside callback dispatch, teardown waits once another thread has
+selected or started the callback. During callback reentry, cross-dispatch
+teardown is deferred instead of waiting, which prevents mutually unregistering
+callbacks from deadlocking while dispatcher ownership keeps the target payload
+alive. It is not a join point for externally owned captured state. Self-
+unregistration and removal of a later callback during the same synchronous
+dispatch are also supported. Callback code must handle reentry and synchronize
+shared mutable state.
 
 ## Error Handling
 

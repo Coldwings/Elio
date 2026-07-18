@@ -58,7 +58,9 @@ public:
     
     // Awaitable interface (use with co_await)
     bool await_ready() const noexcept;
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept;
+    template<typename AwaiterPromise>
+    std::coroutine_handle<> await_suspend(
+        std::coroutine_handle<AwaiterPromise> awaiter);
     T await_resume();  // Returns result or rethrows exception
 };
 ```
@@ -70,6 +72,15 @@ virtual-stack state; ancestry is bound to the actual awaiter when execution
 starts. Destroying a non-empty task destroys the frame if ownership has not
 been transferred to the runtime. Do not await an empty task or await the same
 task more than once.
+
+In 0.6, `await_suspend` is a potentially throwing template so an Elio child can
+link to the actual Elio awaiter's cancellation context before first resume.
+Allocation failure while registering that link propagates from the `co_await`
+expression and the child does not start. Normal `co_await task` source remains
+unchanged, but code that names the exact `await_suspend` member type or requires
+it to be `noexcept` must be updated. A foreign coroutine promise does not
+implicitly inherit an Elio runtime token; adapter code must bridge cancellation
+explicitly when that behavior is required.
 
 **Basic Usage:**
 ```cpp
@@ -220,6 +231,10 @@ public:
     
     // Check if the spawned task has completed (non-blocking)
     bool is_ready() const noexcept;
+
+    // Cooperative, best-effort cancellation request
+    void request_cancel() const;
+    bool is_cancellation_requested() const noexcept;
 };
 ```
 
@@ -243,6 +258,14 @@ coro::task<void> main_task() {
     std::cout << "Result: " << result << std::endl;
 }
 ```
+
+`request_cancel()` publishes through state shared with the spawned task; it does
+not access the coroutine frame and remains valid after frame destruction. The
+request propagates through direct lazy-task awaits between Elio tasks. It does
+not forcibly destroy the task, roll back side effects, or guarantee prompt
+completion. Foreign coroutine promises, separately spawned tasks, and explicit
+token arguments remain independent unless deliberately bridged. Registered
+cancellation callback exceptions are rethrown after callback dispatch.
 
 ### `generator<T>`
 
@@ -398,7 +421,7 @@ public:
     // Get a token to pass to cancellable operations
     cancel_token get_token() const noexcept;
     
-    // Request cancellation (invokes all callbacks)
+    // Request cancellation (invokes callbacks not reentrantly suppressed)
     void cancel();
     
     // Check if cancelled
@@ -406,7 +429,25 @@ public:
 };
 
 } // namespace elio::coro
+
+namespace elio::coro::this_coro {
+
+// Current runtime task token, or a never-cancelled token outside Elio execution
+cancel_token cancel_token() noexcept;
+
+} // namespace elio::coro::this_coro
 ```
+
+`cancel()` synchronously selects and invokes callbacks on the requesting thread,
+then rethrows the first callback exception after dispatching the rest.
+Registration teardown suppresses a callback not yet selected by cancellation;
+outside callback dispatch, teardown waits once another thread has selected or
+started it. During callback reentry, cross-dispatch teardown is deferred instead
+of waiting so mutually unregistering callbacks cannot deadlock; the target
+payload remains alive through dispatch, but external captured state still needs
+synchronization. Self-unregistration and reentrant removal of a later callback
+selected by the same synchronous dispatcher are supported. Callbacks can also
+overlap when registration races with an already cancelled source.
 
 **Basic Example:**
 ```cpp
@@ -455,6 +496,11 @@ write, and response-header/body reads. A token passed to WebSocket or SSE
 `receive()` can abort a pending frame/event read. Cancelled client operations
 return the normal failure shape (`std::nullopt` or `false`) and set `errno` to
 `ECANCELED`.
+
+Cancellation is best-effort: actual completion may win a race, I/O side effects
+are not rolled back, and a backend that cannot actively abort accepted work may
+wait for natural completion. A task-level token only affects operations that
+receive or inspect it.
 
 ---
 
@@ -939,6 +985,9 @@ namespace elio::coro {
 
 class task_execution_context {
 public:
+    // Allocates cancellation state and may throw std::bad_alloc in 0.6
+    task_execution_context();
+
     size_t user_affinity() const noexcept;
     size_t effective_affinity() const noexcept;
     void set_user_affinity(size_t worker_id) noexcept;
@@ -954,6 +1003,11 @@ public:
     // Internal scheduler-maintenance policy
     void set_worker_local(bool worker_local = true) noexcept;
     bool is_worker_local() const noexcept;
+
+    // Task-chain cancellation control
+    cancel_token get_cancel_token() const noexcept;
+    void request_cancel();
+    bool is_cancellation_requested() const noexcept;
 };
 
 } // namespace elio::coro
@@ -962,6 +1016,20 @@ public:
 `io_owner_worker()` and `io_context_generation()` expose the last recorded
 identity. Treat them as an active placement constraint only when
 `has_active_io_pin()` is true; `active_io_pin_count()` is authoritative.
+
+The context's cancellation source survives independently of the frame through
+shared context ownership. Starting a lazy task with direct `co_await` from
+another Elio task links its context one-way to that awaiter's token. A foreign
+coroutine promise is a cancellation boundary unless it deliberately bridges a
+token. A `join_handle` shares the spawned wrapper context, so cancellation
+remains race-safe without storing a raw promise pointer. Completion and
+cancellation of individual operations remain in their awaitable/backend state
+machines.
+
+In 0.6, construction is no longer `noexcept` because each context allocates its
+cancellation state. Allocation failure propagates to the code creating the
+context; downstream code that explicitly relied on the old `noexcept`
+constructor contract must be updated.
 
 The promise affinity methods delegate caller-requested affinity to that shared
 context. `effective_affinity()` is the scheduler placement boundary and is kept

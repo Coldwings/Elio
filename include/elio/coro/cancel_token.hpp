@@ -32,15 +32,22 @@ enum class cancel_result {
 
 namespace detail {
 
-inline thread_local uint32_t callback_dispatch_depth = 0;
+inline thread_local const void* current_callback_dispatcher = nullptr;
 
 class callback_dispatch_scope final {
 public:
-    callback_dispatch_scope() noexcept { ++callback_dispatch_depth; }
-    ~callback_dispatch_scope() { --callback_dispatch_depth; }
+    explicit callback_dispatch_scope(const void* dispatcher) noexcept
+        : previous_(std::exchange(current_callback_dispatcher, dispatcher)) {}
+
+    ~callback_dispatch_scope() {
+        current_callback_dispatcher = previous_;
+    }
 
     callback_dispatch_scope(const callback_dispatch_scope&) = delete;
     callback_dispatch_scope& operator=(const callback_dispatch_scope&) = delete;
+
+private:
+    const void* previous_;
 };
 
 /// Type-erased callback node for the cancel_state intrusive list.
@@ -110,19 +117,22 @@ struct callback_node {
     }
 
     void dispatch() {
+        const void* active_dispatcher;
         {
             std::lock_guard<std::mutex> lock(dispatch_mutex);
             if (dispatch_phase == phase::registered) {
                 invoking_thread = std::this_thread::get_id();
+                dispatcher_identity = this;
             } else if (dispatch_phase != phase::claimed) {
                 return;
             }
+            active_dispatcher = dispatcher_identity;
             dispatch_phase = phase::invoking;
         }
 
         std::exception_ptr exception;
         {
-            callback_dispatch_scope dispatch_scope;
+            callback_dispatch_scope dispatch_scope(active_dispatcher);
             try {
                 invoke_payload();
             } catch (...) {
@@ -134,6 +144,7 @@ struct callback_node {
         {
             std::lock_guard<std::mutex> lock(dispatch_mutex);
             invoking_thread = {};
+            dispatcher_identity = nullptr;
             dispatch_phase = phase::completed;
         }
         dispatch_cv.notify_all();
@@ -143,10 +154,12 @@ struct callback_node {
         }
     }
 
-    void claim_for_dispatch(std::thread::id dispatch_thread) noexcept {
+    void claim_for_dispatch(std::thread::id dispatch_thread,
+                            const void* dispatcher) noexcept {
         std::lock_guard<std::mutex> lock(dispatch_mutex);
         if (dispatch_phase != phase::registered) return;
         invoking_thread = dispatch_thread;
+        dispatcher_identity = dispatcher;
         dispatch_phase = phase::claimed;
     }
 
@@ -160,28 +173,29 @@ struct callback_node {
         }
 
         if (dispatch_phase == phase::claimed &&
-            invoking_thread == std::this_thread::get_id()) {
+            dispatcher_identity == current_callback_dispatcher) {
             // A callback may unregister a later callback selected by the same
             // synchronous cancel() dispatch. Waiting here would deadlock the
             // dispatcher, so suppress that not-yet-invoked callback.
             dispatch_phase = phase::unregistered;
             invoking_thread = {};
+            dispatcher_identity = nullptr;
             lock.unlock();
             destroy_payload();
             dispatch_cv.notify_all();
             return;
         }
 
-        if ((dispatch_phase == phase::claimed ||
-             dispatch_phase == phase::invoking) &&
-            invoking_thread != std::this_thread::get_id()) {
-            if (callback_dispatch_depth != 0) {
+        if (dispatch_phase == phase::claimed ||
+            dispatch_phase == phase::invoking) {
+            if (current_callback_dispatcher != nullptr) {
                 // Waiting from one cancellation callback for another dispatcher
                 // can form a cross-source wait cycle. Dispatcher ownership keeps
                 // both claimed and invoking callbacks alive, so defer teardown
                 // and let every callback selected by that dispatcher complete.
                 return;
             }
+            if (invoking_thread == std::this_thread::get_id()) return;
             dispatch_cv.wait(lock, [this] {
                 return dispatch_phase != phase::claimed &&
                        dispatch_phase != phase::invoking;
@@ -198,6 +212,7 @@ private:
     std::condition_variable dispatch_cv;
     phase dispatch_phase = phase::registered;
     std::thread::id invoking_thread;
+    const void* dispatcher_identity = nullptr;
 };
 
 /// Shared cancellation state (implementation detail).
@@ -258,6 +273,7 @@ struct cancel_state {
     }
 
     void trigger() {
+        const char dispatcher_identity = 0;
         std::shared_ptr<callback_node> list;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -267,7 +283,8 @@ struct cancel_state {
             list = std::move(head);
             const auto dispatch_thread = std::this_thread::get_id();
             for (auto node = list; node; node = node->next) {
-                node->claim_for_dispatch(dispatch_thread);
+                node->claim_for_dispatch(
+                    dispatch_thread, &dispatcher_identity);
             }
         }
         // List is now owned by this call. Invoke each callback outside the
@@ -476,7 +493,8 @@ private:
 ///
 /// cancel_source owns the cancellation state and can create multiple tokens
 /// that share the same state. When cancel() is called, all associated tokens
-/// become cancelled and their registered callbacks are invoked.
+/// become cancelled. Selected callbacks are dispatched unless same-dispatch
+/// reentrant teardown suppresses a later callback.
 ///
 /// Example:
 /// ```cpp

@@ -857,6 +857,36 @@ TEST_CASE("cancel callback can remove a later selected callback",
     REQUIRE_FALSE(later_ran.load(std::memory_order_acquire));
 }
 
+TEST_CASE("nested cancellation preserves an outer selected callback",
+          "[cancel_token][callback][lifetime]") {
+    cancel_source outer_source;
+    cancel_source nested_source;
+    std::optional<cancel_registration> outer_later_registration;
+    std::atomic<unsigned> outer_later_invocations{0};
+    std::atomic<bool> outer_first_ran{false};
+    std::atomic<bool> nested_ran{false};
+
+    outer_later_registration.emplace(
+        outer_source.get_token().on_cancel([&] {
+            outer_later_invocations.fetch_add(1, std::memory_order_relaxed);
+        }));
+    auto nested_registration = nested_source.get_token().on_cancel([&] {
+        nested_ran.store(true, std::memory_order_release);
+        outer_later_registration.reset();
+    });
+    auto outer_first_registration = outer_source.get_token().on_cancel([&] {
+        outer_first_ran.store(true, std::memory_order_release);
+        nested_source.cancel();
+    });
+
+    outer_source.cancel();
+
+    REQUIRE(outer_first_ran.load(std::memory_order_acquire));
+    REQUIRE(nested_ran.load(std::memory_order_acquire));
+    REQUIRE(outer_later_invocations.load(std::memory_order_relaxed) == 1);
+    REQUIRE_FALSE(outer_later_registration.has_value());
+}
+
 TEST_CASE("callbacks on separate dispatchers can mutually unregister",
           "[cancel_token][callback][thread][lifetime]") {
     cancel_source first_source;

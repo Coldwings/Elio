@@ -1,10 +1,10 @@
 #pragma once
 
-#include <array>
 #include <coroutine>
 #include <atomic>
 #include <mutex>
-#include <vector>
+#include <utility>
+#include "../coro/cancel_token.hpp"
 #include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
 #include "detail/wake_state.hpp"
@@ -41,15 +41,28 @@ private:
     static constexpr uint64_t WRITER_FLAGS = WRITER_ACTIVE | WRITER_WAITING;
 
 public:
-    /// Shared lock awaitable (for readers)
-    /// Optimized with lock-free fast path for uncontended acquisition
-    class lock_shared_awaitable : public elio::detail::intrusive_list_node<lock_shared_awaitable> {
+    class lock_shared_waiter;
+    class cancellable_lock_shared_waiter;
+    class lock_shared_awaitable;
+    class cancellable_lock_shared_awaitable;
+    class lock_waiter;
+    class cancellable_lock_waiter;
+    class lock_awaitable;
+    class cancellable_lock_awaitable;
+
+    /// Shared lock waiter (for readers).
+    class lock_shared_waiter : public elio::detail::intrusive_list_node<lock_shared_waiter> {
     public:
-        explicit lock_shared_awaitable(shared_mutex& m)
+        explicit lock_shared_waiter(shared_mutex& m)
             : mtx_(m)
             , wake_state_(detail::make_wake_state()) {}
 
-        ~lock_shared_awaitable() {
+        lock_shared_waiter(shared_mutex& m, bool cancellable)
+            : mtx_(m)
+            , wake_state_(detail::make_wake_state())
+            , cancellable_(cancellable) {}
+
+        ~lock_shared_waiter() {
             // Fast path: if we never suspended, we were never enqueued
             if (!suspended_) return;
 
@@ -74,11 +87,32 @@ public:
             }
         }
 
-        bool await_ready() const noexcept {
-            return mtx_.try_lock_shared();
+        bool await_ready_impl() const {
+            if (cancellable_ && wake_state_->was_cancelled()) {
+                return true;
+            }
+            if (!mtx_.try_lock_shared()) {
+                return false;
+            }
+            if (!cancellable_ ||
+                detail::claim_wake_state(wake_state_) !=
+                    detail::wake_action::rejected) {
+                return true;
+            }
+
+            // Cancellation won after the reader slot was acquired.
+            mtx_.unlock_shared();
+            return true;
         }
 
-        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+        bool await_suspend_impl(std::coroutine_handle<> awaiter) {
+            if (cancellable_) {
+                if (wake_state_->was_cancelled() ||
+                    !wake_state_->set_handle_blocked(awaiter)) {
+                    return false;
+                }
+            }
+
             // Lock-free fast path: attempt to increment reader count without mutex
             // This avoids cache line bouncing on the internal_mutex_ in reader-heavy
             // workloads where writers are rare.
@@ -89,40 +123,92 @@ public:
                 // No writer active or waiting - try CAS to increment reader count
                 if (mtx_.state_.compare_exchange_weak(state, state + 1,
                         std::memory_order_acquire, std::memory_order_relaxed)) {
-                    return false;  // Acquired lock-free, don't suspend
+                    if (!cancellable_ ||
+                        detail::claim_wake_state(wake_state_) !=
+                            detail::wake_action::rejected) {
+                        return false;
+                    }
+                    mtx_.unlock_shared();
+                    return false;
                 }
                 // CAS failed, state updated - loop continues with new state
             }
 
             // Slow path: writer present or CAS failed multiple times
             // Fall back to mutex for proper waiter queue management
-            std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+            bool release_reader = false;
+            {
+                std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
 
-            // Double-check under lock - state may have changed
-            state = mtx_.state_.load(std::memory_order_relaxed);
-            if (!(state & WRITER_FLAGS) && (state & READER_MASK) != READER_MASK) {
-                // Try one more time under lock for fairness
-                if (mtx_.state_.compare_exchange_strong(state, state + 1,
-                        std::memory_order_acquire, std::memory_order_relaxed)) {
-                    return false;  // Acquired, don't suspend
+                if (cancellable_ && wake_state_->was_cancelled()) {
+                    return false;
+                }
+
+                // Double-check under lock - state may have changed
+                state = mtx_.state_.load(std::memory_order_relaxed);
+                if (!(state & WRITER_FLAGS) &&
+                    (state & READER_MASK) != READER_MASK) {
+                    if (mtx_.state_.compare_exchange_strong(
+                            state, state + 1, std::memory_order_acquire,
+                            std::memory_order_relaxed)) {
+                        if (!cancellable_ ||
+                            detail::claim_wake_state(wake_state_) !=
+                                detail::wake_action::rejected) {
+                            return false;
+                        }
+                        release_reader = true;
+                    }
+                }
+
+                if (!release_reader) {
+                    if (!cancellable_) {
+                        wake_state_->set_handle(awaiter);
+                    }
+                    suspended_ = true;
+                    mtx_.reader_waiters_.push_back(this);
+                    if (!cancellable_ ||
+                        wake_state_->unblock_after_publish()) {
+                        return true;
+                    }
+
+                    mtx_.reader_waiters_.remove(this);
+                    suspended_ = false;
                 }
             }
 
-            // Add to reader wait queue
-            wake_state_->set_handle(awaiter);
-            suspended_ = true;
-            mtx_.reader_waiters_.push_back(this);
-            return true;  // Suspend
+            if (release_reader) {
+                mtx_.unlock_shared();
+            }
+            return false;
         }
 
-        void await_resume() noexcept {
+        coro::cancel_result await_resume_impl() noexcept {
+            if (cancellable_ && wake_state_->was_cancelled()) {
+                if (suspended_) {
+                    std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+                    if (this->is_linked()) {
+                        mtx_.reader_waiters_.remove(this);
+                    }
+                }
+                suspended_ = false;
+                return coro::cancel_result::cancelled;
+            }
+
             resumed_ = true;
             grant_pending_ = false;
+            suspended_ = false;
+            return coro::cancel_result::completed;
+        }
+
+    protected:
+        const detail::wake_state_ptr& cancellation_wake_state() const noexcept {
+            return wake_state_;
         }
 
     private:
         shared_mutex& mtx_;
         detail::wake_state_ptr wake_state_;
+        bool cancellable_ = false;
         bool suspended_ = false;
         bool resumed_ = false;
         bool grant_pending_ = false;
@@ -130,53 +216,93 @@ public:
         friend class shared_mutex;
     };
 
-    /// Exclusive lock awaitable (for writers)
-    class lock_awaitable : public elio::detail::intrusive_list_node<lock_awaitable> {
+    class cancellable_lock_shared_waiter : public lock_shared_waiter {
     public:
-        explicit lock_awaitable(shared_mutex& m)
+        cancellable_lock_shared_waiter(shared_mutex& m,
+                                       coro::cancel_token token)
+            : lock_shared_waiter(m, true) {
+            cancel_registration_ = token.on_cancel(
+                [state = cancellation_wake_state()] {
+                state->request_cancel();
+            });
+        }
+
+        ~cancellable_lock_shared_waiter() {
+            cancel_registration_.unregister();
+        }
+
+        coro::cancel_result await_resume_cancellable() noexcept {
+            cancel_registration_.unregister();
+            return await_resume_impl();
+        }
+
+    private:
+        coro::cancel_token::registration cancel_registration_;
+    };
+
+    class lock_shared_awaitable {
+    public:
+        explicit lock_shared_awaitable(shared_mutex& m) : waiter_(m) {}
+
+        bool await_ready() const noexcept { return waiter_.await_ready_impl(); }
+        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+            return waiter_.await_suspend_impl(awaiter);
+        }
+        void await_resume() noexcept {
+            (void)waiter_.await_resume_impl();
+        }
+
+    private:
+        lock_shared_waiter waiter_;
+    };
+
+    class cancellable_lock_shared_awaitable {
+    public:
+        cancellable_lock_shared_awaitable(shared_mutex& m,
+                                          coro::cancel_token token)
+            : waiter_(m, std::move(token)) {}
+
+        bool await_ready() const { return waiter_.await_ready_impl(); }
+        bool await_suspend(std::coroutine_handle<> awaiter) {
+            return waiter_.await_suspend_impl(awaiter);
+        }
+        [[nodiscard("check whether the shared lock was acquired")]]
+        coro::cancel_result await_resume() noexcept {
+            return waiter_.await_resume_cancellable();
+        }
+
+    private:
+        cancellable_lock_shared_waiter waiter_;
+    };
+
+    /// Exclusive lock waiter (for writers).
+    class lock_waiter : public elio::detail::intrusive_list_node<lock_waiter> {
+    public:
+        explicit lock_waiter(shared_mutex& m)
             : mtx_(m)
             , wake_state_(detail::make_wake_state()) {}
 
-        ~lock_awaitable() {
+        lock_waiter(shared_mutex& m, bool cancellable)
+            : mtx_(m)
+            , wake_state_(detail::make_wake_state())
+            , cancellable_(cancellable) {}
+
+        ~lock_waiter() {
             // Fast path: if we never suspended, we were never enqueued
             if (!suspended_) return;
 
-            // Slow path: acquire internal_mutex_ to prevent race with unlock
-            std::vector<detail::wake_state_ptr> readers_to_wake;
+            detail::wake_state_ptr reader_to_wake;
+            bool wake_more_readers = false;
             bool release_grant = false;
             {
                 std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
                 if (this->is_linked()) {
                     mtx_.writer_waiters_.remove(this);
                     detail::cancel_wake_state(wake_state_);
-                    // Reverse the bookkeeping from await_suspend: decrement pending_writers_
-                    // and clear WRITER_WAITING if no more pending writers
+                    assert(mtx_.pending_writers_ > 0);
                     --mtx_.pending_writers_;
-                    if (mtx_.pending_writers_ == 0) {
-                        // No more pending writers, clear WRITER_WAITING bit
-                        // Use fetch_and to clear the bit while preserving other bits
-                        mtx_.state_.fetch_and(~WRITER_WAITING, std::memory_order_release);
-
-                        // If no writer is active and there are parked readers, wake them
-                        // to prevent lost wakeups (they were blocked by WRITER_WAITING)
-                        uint64_t state = mtx_.state_.load(std::memory_order_relaxed);
-                        if (!(state & WRITER_ACTIVE) && !mtx_.reader_waiters_.empty()) {
-                            size_t parked_count = mtx_.reader_waiters_.size();
-
-                            while (!mtx_.reader_waiters_.empty()) {
-                                auto* reader = mtx_.reader_waiters_.pop_front();
-                                reader->grant_pending_ = true;
-                                readers_to_wake.push_back(reader->wake_state_);
-                            }
-
-                            // Update state: atomically add parked readers count.
-                            // Use fetch_add instead of store to avoid race with
-                            // lock-free readers who may increment state_ between
-                            // our load and this update (WRITER_WAITING is cleared,
-                            // so lock-free fast path is enabled).
-                            mtx_.state_.fetch_add(parked_count, std::memory_order_release);
-                        }
-                    }
+                    reader_to_wake =
+                        mtx_.finish_writer_removal_locked(wake_more_readers);
                 } else if (grant_pending_ && !resumed_) {
                     detail::cancel_wake_state(wake_state_);
                     grant_pending_ = false;
@@ -185,60 +311,158 @@ public:
                     detail::cancel_wake_state(wake_state_);
                 }
             }
-            // Schedule readers outside the lock
-            detail::schedule_wake_states(readers_to_wake);
+
+            if (reader_to_wake) {
+                detail::schedule_wake_state(reader_to_wake);
+            }
+            if (wake_more_readers) {
+                mtx_.wake_additional_readers();
+            }
             if (release_grant) {
                 mtx_.unlock();
             }
         }
 
-        bool await_ready() const noexcept {
-            return mtx_.try_lock();
+        bool await_ready_impl() const {
+            if (cancellable_ && wake_state_->was_cancelled()) {
+                return true;
+            }
+            if (!mtx_.try_lock()) {
+                return false;
+            }
+            if (!cancellable_ ||
+                detail::claim_wake_state(wake_state_) !=
+                    detail::wake_action::rejected) {
+                return true;
+            }
+
+            // Cancellation won after exclusive ownership was acquired.
+            mtx_.unlock();
+            return true;
         }
 
-        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
-
-            // Try to acquire write lock atomically
-            uint64_t expected = 0;
-            if (mtx_.state_.compare_exchange_strong(expected, WRITER_ACTIVE,
-                    std::memory_order_acquire, std::memory_order_relaxed)) {
-                return false;  // Acquired, don't suspend
+        bool await_suspend_impl(std::coroutine_handle<> awaiter) {
+            if (cancellable_) {
+                if (wake_state_->was_cancelled() ||
+                    !wake_state_->set_handle_blocked(awaiter)) {
+                    return false;
+                }
             }
 
-            // Lock is held — publish WRITER_WAITING so future readers/writers
-            // observe contention. A reader's lock-free unlock_shared could have
-            // dropped the count to 0 between our failing CAS above and now,
-            // leaving the lock effectively free without anyone scheduled to
-            // wake us.  Re-attempt the acquire from the WRITER_WAITING state
-            // before enqueuing to close that window.
-            mtx_.state_.fetch_or(WRITER_WAITING, std::memory_order_acq_rel);
+            detail::wake_state_ptr reader_to_wake;
+            bool wake_more_readers = false;
+            bool release_writer = false;
+            {
+                std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
 
-            expected = WRITER_WAITING;
-            uint64_t claim_state = WRITER_ACTIVE;
-            if (mtx_.pending_writers_ > 0) {
-                claim_state |= WRITER_WAITING;
-            }
-            if (mtx_.state_.compare_exchange_strong(expected, claim_state,
-                    std::memory_order_acquire, std::memory_order_relaxed)) {
-                return false;  // Acquired — lock was just released
+                if (cancellable_ && wake_state_->was_cancelled()) {
+                    return false;
+                }
+
+                // Try to acquire write lock atomically
+                uint64_t expected = 0;
+                if (mtx_.state_.compare_exchange_strong(
+                        expected, WRITER_ACTIVE, std::memory_order_acquire,
+                        std::memory_order_relaxed)) {
+                    if (!cancellable_ ||
+                        detail::claim_wake_state(wake_state_) !=
+                            detail::wake_action::rejected) {
+                        return false;
+                    }
+                    release_writer = true;
+                } else {
+                    // Publish WRITER_WAITING before enqueuing and retry the
+                    // just-released state to close the last-reader window.
+                    mtx_.state_.fetch_or(WRITER_WAITING,
+                                         std::memory_order_acq_rel);
+
+                    expected = WRITER_WAITING;
+                    uint64_t claim_state = WRITER_ACTIVE;
+                    if (mtx_.pending_writers_ > 0) {
+                        claim_state |= WRITER_WAITING;
+                    }
+                    if (mtx_.state_.compare_exchange_strong(
+                            expected, claim_state, std::memory_order_acquire,
+                            std::memory_order_relaxed)) {
+                        if (!cancellable_ ||
+                            detail::claim_wake_state(wake_state_) !=
+                                detail::wake_action::rejected) {
+                            return false;
+                        }
+                        release_writer = true;
+                    } else {
+                        ++mtx_.pending_writers_;
+                        if (!cancellable_) {
+                            wake_state_->set_handle(awaiter);
+                        }
+                        suspended_ = true;
+                        mtx_.writer_waiters_.push_back(this);
+                        if (!cancellable_ ||
+                            wake_state_->unblock_after_publish()) {
+                            return true;
+                        }
+
+                        mtx_.writer_waiters_.remove(this);
+                        suspended_ = false;
+                        assert(mtx_.pending_writers_ > 0);
+                        --mtx_.pending_writers_;
+                        reader_to_wake = mtx_.finish_writer_removal_locked(
+                            wake_more_readers);
+                    }
+                }
             }
 
-            ++mtx_.pending_writers_;
-            wake_state_->set_handle(awaiter);
-            suspended_ = true;
-            mtx_.writer_waiters_.push_back(this);
-            return true;  // Suspend
+            if (reader_to_wake) {
+                detail::schedule_wake_state(reader_to_wake);
+            }
+            if (wake_more_readers) {
+                mtx_.wake_additional_readers();
+            }
+            if (release_writer) {
+                mtx_.unlock();
+            }
+            return false;
         }
 
-        void await_resume() noexcept {
+        coro::cancel_result await_resume_impl() noexcept {
+            if (cancellable_ && wake_state_->was_cancelled()) {
+                detail::wake_state_ptr reader_to_wake;
+                bool wake_more_readers = false;
+                if (suspended_) {
+                    std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+                    if (this->is_linked()) {
+                        mtx_.writer_waiters_.remove(this);
+                        assert(mtx_.pending_writers_ > 0);
+                        --mtx_.pending_writers_;
+                        reader_to_wake = mtx_.finish_writer_removal_locked(
+                            wake_more_readers);
+                    }
+                    suspended_ = false;
+                }
+                if (reader_to_wake) {
+                    detail::schedule_wake_state(reader_to_wake);
+                }
+                if (wake_more_readers) {
+                    mtx_.wake_additional_readers();
+                }
+                return coro::cancel_result::cancelled;
+            }
+
             resumed_ = true;
             grant_pending_ = false;
+            suspended_ = false;
+            return coro::cancel_result::completed;
+        }
+
+    protected:
+        const detail::wake_state_ptr& cancellation_wake_state() const noexcept {
+            return wake_state_;
         }
 
     private:
         shared_mutex& mtx_;
         detail::wake_state_ptr wake_state_;
+        bool cancellable_ = false;
         bool suspended_ = false;
         bool resumed_ = false;
         bool grant_pending_ = false;
@@ -246,14 +470,81 @@ public:
         friend class shared_mutex;
     };
 
+    class cancellable_lock_waiter : public lock_waiter {
+    public:
+        cancellable_lock_waiter(shared_mutex& m, coro::cancel_token token)
+            : lock_waiter(m, true) {
+            cancel_registration_ = token.on_cancel(
+                [state = cancellation_wake_state()] {
+                state->request_cancel();
+            });
+        }
+
+        ~cancellable_lock_waiter() {
+            cancel_registration_.unregister();
+        }
+
+        coro::cancel_result await_resume_cancellable() noexcept {
+            cancel_registration_.unregister();
+            return await_resume_impl();
+        }
+
+    private:
+        coro::cancel_token::registration cancel_registration_;
+    };
+
+    class lock_awaitable {
+    public:
+        explicit lock_awaitable(shared_mutex& m) : waiter_(m) {}
+
+        bool await_ready() const noexcept { return waiter_.await_ready_impl(); }
+        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+            return waiter_.await_suspend_impl(awaiter);
+        }
+        void await_resume() noexcept {
+            (void)waiter_.await_resume_impl();
+        }
+
+    private:
+        lock_waiter waiter_;
+    };
+
+    class cancellable_lock_awaitable {
+    public:
+        cancellable_lock_awaitable(shared_mutex& m, coro::cancel_token token)
+            : waiter_(m, std::move(token)) {}
+
+        bool await_ready() const { return waiter_.await_ready_impl(); }
+        bool await_suspend(std::coroutine_handle<> awaiter) {
+            return waiter_.await_suspend_impl(awaiter);
+        }
+        [[nodiscard("check whether the exclusive lock was acquired")]]
+        coro::cancel_result await_resume() noexcept {
+            return waiter_.await_resume_cancellable();
+        }
+
+    private:
+        cancellable_lock_waiter waiter_;
+    };
+
     /// Acquire shared (read) lock
     auto lock_shared() {
         return lock_shared_awaitable(*this);
     }
 
+    /// Acquire a shared lock, or return cancelled if the token wins.
+    auto lock_shared(coro::cancel_token token) {
+        return cancellable_lock_shared_awaitable(*this, std::move(token));
+    }
+
     /// Acquire exclusive (write) lock
     auto lock() {
         return lock_awaitable(*this);
+    }
+
+    /// Acquire an exclusive lock, or return cancelled if the token wins.
+    auto lock(coro::cancel_token token) {
+        return cancellable_lock_awaitable(*this, std::move(token));
     }
 
     /// Try to acquire shared lock without waiting
@@ -301,88 +592,75 @@ public:
             return;
         }
 
-        // Slow path: might need to wake a writer
+        // Slow path: transfer ownership to an eligible writer. Cancelled
+        // writers are removed without consuming the wakeup; if none remain,
+        // clear writer preference and release parked readers.
         detail::wake_state_ptr to_resume;
+        bool wake_more_readers = false;
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
 
             // Double-check under lock
             uint64_t state = state_.load(std::memory_order_relaxed);
-            if ((state & READER_MASK) == 0 && !writer_waiters_.empty()) {
-                auto* writer = writer_waiters_.pop_front();
-                --pending_writers_;
-
-                // Clear WRITER_WAITING if no more pending writers, set WRITER_ACTIVE
-                uint64_t new_state = WRITER_ACTIVE;
-                if (pending_writers_ > 0) {
-                    new_state |= WRITER_WAITING;
+            // A writer may have acquired directly after our last-reader
+            // decrement but before we obtained internal_mutex_. In that case
+            // ownership is already settled and must not be handed off again.
+            if ((state & (READER_MASK | WRITER_ACTIVE)) == 0) {
+                if (auto* writer = claim_writer_locked()) {
+                    uint64_t new_state = WRITER_ACTIVE;
+                    if (pending_writers_ > 0) {
+                        new_state |= WRITER_WAITING;
+                    }
+                    state_.store(new_state, std::memory_order_release);
+                    to_resume = writer->wake_state_;
+                } else {
+                    to_resume = finish_writer_removal_locked(
+                        wake_more_readers);
                 }
-                state_.store(new_state, std::memory_order_release);
-                writer->grant_pending_ = true;
-                to_resume = writer->wake_state_;
             }
         }
 
         if (to_resume) {
             detail::schedule_wake_state(to_resume);
         }
+        if (wake_more_readers) {
+            wake_additional_readers();
+        }
     }
 
     /// Release exclusive (write) lock
     void unlock() {
-        // Stack-allocated small buffer to avoid heap allocation in the common
-        // case.  The writer path always resumes exactly one handle; the reader
-        // path typically resumes a handful.  Only when reader waiters exceed
-        // the inline capacity do we fall back to a heap-allocated vector.
-        static constexpr size_t kInlineCapacity = 8;
-        std::array<detail::wake_state_ptr, kInlineCapacity> inline_buf;
-        size_t inline_count = 0;
-        std::vector<detail::wake_state_ptr> overflow;
+        detail::wake_state_ptr to_resume;
+        bool wake_more_readers = false;
 
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
 
             // Prefer writers over readers to prevent writer starvation
-            if (!writer_waiters_.empty()) {
-                auto* writer = writer_waiters_.pop_front();
-                --pending_writers_;
-
+            if (auto* writer = claim_writer_locked()) {
                 // Keep WRITER_ACTIVE, update WRITER_WAITING based on remaining writers
                 uint64_t new_state = WRITER_ACTIVE;
                 if (pending_writers_ > 0) {
                     new_state |= WRITER_WAITING;
                 }
                 state_.store(new_state, std::memory_order_release);
-
-                // Writer path: always exactly one handle — fits in inline buffer
-                writer->grant_pending_ = true;
-                inline_buf[0] = writer->wake_state_;
-                inline_count = 1;
+                to_resume = writer->wake_state_;
             } else {
-                // Wake all waiting readers
-                size_t reader_count = reader_waiters_.size();
-                while (!reader_waiters_.empty()) {
-                    auto* reader = reader_waiters_.pop_front();
-                    reader->grant_pending_ = true;
-                    if (inline_count < kInlineCapacity) {
-                        inline_buf[inline_count++] = reader->wake_state_;
-                    } else {
-                        overflow.push_back(reader->wake_state_);
-                    }
+                auto* reader = claim_reader_locked();
+                state_.store(reader ? 1 : 0, std::memory_order_release);
+                if (reader) {
+                    to_resume = reader->wake_state_;
+                    wake_more_readers = !reader_waiters_.empty();
                 }
-                // Set reader count, preserve WRITER_WAITING if there are pending writers
-                uint64_t new_state = reader_count;
-                if (pending_writers_ > 0) {
-                    new_state |= WRITER_WAITING;
-                }
-                state_.store(new_state, std::memory_order_release);
             }
         }
 
-        for (size_t i = 0; i < inline_count; ++i) {
-            detail::schedule_wake_state(inline_buf[i]);
+        if (to_resume) {
+            detail::schedule_wake_state(to_resume);
         }
-        detail::schedule_wake_states(overflow);
+        if (wake_more_readers) {
+            wake_additional_readers();
+        }
     }
 
     /// Get current reader count
@@ -396,6 +674,110 @@ public:
     }
 
 private:
+    lock_shared_waiter* claim_reader_locked() noexcept {
+        while (!reader_waiters_.empty()) {
+            auto* reader = reader_waiters_.pop_front();
+            if (reader->cancellable_ &&
+                detail::claim_wake_state(reader->wake_state_) ==
+                    detail::wake_action::rejected) {
+                continue;
+            }
+            reader->grant_pending_ = true;
+            return reader;
+        }
+        return nullptr;
+    }
+
+    lock_waiter* claim_writer_locked() noexcept {
+        while (!writer_waiters_.empty()) {
+            auto* writer = writer_waiters_.pop_front();
+            assert(pending_writers_ > 0);
+            --pending_writers_;
+            if (writer->cancellable_ &&
+                detail::claim_wake_state(writer->wake_state_) ==
+                    detail::wake_action::rejected) {
+                continue;
+            }
+            writer->grant_pending_ = true;
+            return writer;
+        }
+        return nullptr;
+    }
+
+    // Clear writer preference after the last pending writer disappears. If
+    // no writer is active, reserve one reader slot in the same atomic update
+    // that clears WRITER_WAITING so a new writer cannot take the lock between
+    // those transitions.
+    detail::wake_state_ptr finish_writer_removal_locked(
+            bool& wake_more_readers) noexcept {
+        wake_more_readers = false;
+        if (pending_writers_ != 0) {
+            return nullptr;
+        }
+
+        auto current = state_.load(std::memory_order_acquire);
+        if (current & WRITER_ACTIVE) {
+            state_.fetch_and(~WRITER_WAITING, std::memory_order_release);
+            return nullptr;
+        }
+
+        auto* reader = claim_reader_locked();
+        const uint64_t reader_grant = reader ? 1 : 0;
+        for (;;) {
+            assert((current & READER_MASK) <= READER_MASK - reader_grant);
+            const auto desired = (current & ~WRITER_WAITING) + reader_grant;
+            if (state_.compare_exchange_weak(
+                    current, desired, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                break;
+            }
+            assert(!(current & WRITER_ACTIVE));
+        }
+
+        if (!reader) {
+            return nullptr;
+        }
+        wake_more_readers = !reader_waiters_.empty();
+        return reader->wake_state_;
+    }
+
+    // Add parked readers without allocating a temporary handle array. A
+    // reader slot is reserved atomically before its waiter is removed, so a
+    // racing try_lock() either sees the reader or wins before queue mutation.
+    void wake_additional_readers() noexcept {
+        for (;;) {
+            detail::wake_state_ptr to_resume;
+            {
+                std::lock_guard<std::mutex> guard(internal_mutex_);
+                if (pending_writers_ != 0 || reader_waiters_.empty()) {
+                    return;
+                }
+
+                auto current = state_.load(std::memory_order_acquire);
+                for (;;) {
+                    if ((current & WRITER_FLAGS) ||
+                        (current & READER_MASK) == READER_MASK) {
+                        return;
+                    }
+                    if (state_.compare_exchange_weak(
+                            current, current + 1, std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                        break;
+                    }
+                }
+
+                auto* reader = claim_reader_locked();
+                if (!reader) {
+                    state_.fetch_sub(1, std::memory_order_release);
+                    return;
+                }
+                to_resume = reader->wake_state_;
+            }
+
+            detail::schedule_wake_state(to_resume);
+        }
+    }
+
     // state_ is the hot field: read on every lock_shared() fast path,
     // and written on every reader acquire/release.  Keeping it isolated
     // avoids false sharing with the slow-path internal_mutex_.
@@ -404,8 +786,8 @@ private:
     // slow-path fields: only accessed under internal_mutex_
     alignas(64) mutable std::mutex internal_mutex_;
     size_t pending_writers_ = 0;       // Count of pending writers (for WRITER_WAITING flag management)
-    elio::detail::intrusive_list<lock_shared_awaitable> reader_waiters_;
-    elio::detail::intrusive_list<lock_awaitable> writer_waiters_;
+    elio::detail::intrusive_list<lock_shared_waiter> reader_waiters_;
+    elio::detail::intrusive_list<lock_waiter> writer_waiters_;
 };
 
 /// RAII shared lock guard for shared_mutex (reader lock)

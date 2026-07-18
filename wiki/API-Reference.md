@@ -2815,9 +2815,9 @@ that context alive while accepts are pending and while accepted streams use it.
 
 Coroutine-aware synchronization primitives (`mutex`, `shared_mutex`, `event`, `semaphore`, `condition_variable`, `channel`) track suspended waiters through intrusive nodes embedded in coroutine frames. If a frame is destroyed while its waiter is still linked, the awaiter's destructor unlinks the node from the primitive.
 
-This cleanup does not make every operation cancellable. `with_timeout()` requests cooperative cancellation but does not forcibly destroy its losing child. The child must pass the supplied `cancel_token` to a token-aware operation to stop on timeout. `mutex::lock(token)`, `semaphore::acquire(token)`, and `event::wait(token)` provide that boundary and return `coro::cancel_result`. Their no-token overloads remain non-cancellable and preserve their `void` await result.
+This cleanup does not make every operation cancellable. `with_timeout()` requests cooperative cancellation but does not forcibly destroy its losing child. The child must pass the supplied `cancel_token` to a token-aware operation to stop on timeout. `mutex`, `shared_mutex`, `semaphore`, `event`, and `condition_variable` provide explicit token-aware waits that return `coro::cancel_result`. Their no-token overloads remain non-cancellable and preserve their existing await results.
 
-Cancellation and normal notification atomically select one terminal result. A cancellation winner does not acquire a lock or permit. Once normal notification wins, the operation returns `completed` and any acquired resource remains owned by the caller. `condition_variable`, `channel`, and `shared_mutex` waits are not yet token-aware; their pending waits and captures must remain alive until normal notification resumes them.
+Cancellation and normal notification atomically select one terminal result. A cancellation winner does not acquire a lock or permit. Once normal notification wins, the operation returns `completed` and any acquired resource remains owned by the caller. A condition wait that released an associated lock re-acquires it before returning either result. `channel` waits are not yet token-aware; their pending waits and captures must remain alive until normal completion resumes them.
 
 Callers must inspect the `cancel_result` from every token-aware wait before assuming that notification occurred or that a lock or permit was acquired.
 
@@ -2855,9 +2855,15 @@ public:
     
     // Acquire shared (read) lock (awaitable)
     /* awaitable */ lock_shared();
+
+    // Acquire shared lock or return cancel_result::cancelled
+    /* awaitable<cancel_result> */ lock_shared(coro::cancel_token token);
     
     // Acquire exclusive (write) lock (awaitable)
     /* awaitable */ lock();
+
+    // Acquire exclusive lock or return cancel_result::cancelled
+    /* awaitable<cancel_result> */ lock(coro::cancel_token token);
     
     // Try to acquire shared lock without waiting
     bool try_lock_shared();
@@ -2966,13 +2972,21 @@ public:
     /// Wait with elio::sync::mutex (single co_await)
     coro::task<void> wait(mutex& m);
 
+    // Cancellation-aware wait; re-acquires m if the wait released it
+    coro::task<coro::cancel_result> wait(mutex& m, coro::cancel_token token);
+
     // Wait with a generic lockable (e.g., spinlock)
     // Re-acquires the lock synchronously before resuming
     template<lockable Lock>
     /* awaitable */ wait(Lock& lock);
 
+    template<lockable Lock>
+    /* awaitable<cancel_result> */ wait(Lock& lock, coro::cancel_token token);
+
     // Wait without external lock (single-worker-thread only)
     /* awaitable */ wait_unlocked();
+
+    /* awaitable<cancel_result> */ wait_unlocked(coro::cancel_token token);
 
     // Wake one waiting coroutine
     void notify_one();

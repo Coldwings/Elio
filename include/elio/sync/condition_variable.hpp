@@ -5,6 +5,8 @@
 #include <vector>
 #include <concepts>
 #include <cassert>
+#include <utility>
+#include "../coro/cancel_token.hpp"
 #include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
 #include "detail/wake_state.hpp"
@@ -45,11 +47,76 @@ public:
     /// Inherits intrusive_list_node so all awaiter types can share one list.
     class cv_waiter_base : public elio::detail::intrusive_list_node<cv_waiter_base> {
     public:
+        ~cv_waiter_base() {
+            if (!suspended_) return;
+
+            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+            if (this->is_linked()) {
+                cv_.waiters_.remove(this);
+            }
+            detail::cancel_wake_state(wake_state_);
+        }
+
         detail::wake_state_ptr wake_state_;
+        bool cancellable_ = false;
         bool suspended_ = false;  // True if enqueued in waiters_
+
     protected:
-        cv_waiter_base()
-            : wake_state_(detail::make_wake_state()) {}
+        explicit cv_waiter_base(condition_variable& cv,
+                                bool cancellable = false)
+            : wake_state_(detail::make_wake_state())
+            , cancellable_(cancellable)
+            , cv_(cv) {}
+
+        [[nodiscard]] bool prepare_blocked_wait(
+                std::coroutine_handle<> awaiter) noexcept {
+            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+            if (cancellable_ && wake_state_->was_cancelled()) {
+                return false;
+            }
+            if (!wake_state_->set_handle_blocked(awaiter)) {
+                return false;
+            }
+            cv_.waiters_.push_back(this);
+            suspended_ = true;
+            return true;
+        }
+
+        [[nodiscard]] bool finish_blocked_publication() noexcept {
+            if (wake_state_->unblock_after_publish()) {
+                return true;
+            }
+
+            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+            if (this->is_linked()) {
+                cv_.waiters_.remove(this);
+            }
+            suspended_ = false;
+            return false;
+        }
+
+        coro::cancel_result finish_wait() noexcept {
+            if (cancellable_ && wake_state_->was_cancelled()) {
+                if (suspended_) {
+                    std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
+                    if (this->is_linked()) {
+                        cv_.waiters_.remove(this);
+                    }
+                }
+                suspended_ = false;
+                return coro::cancel_result::cancelled;
+            }
+
+            suspended_ = false;
+            return coro::cancel_result::completed;
+        }
+
+        const detail::wake_state_ptr& cancellation_wake_state() const noexcept {
+            return wake_state_;
+        }
+
+    private:
+        condition_variable& cv_;
     };
 
     condition_variable() = default;
@@ -68,20 +135,7 @@ public:
     class wait_suspend_awaitable : public cv_waiter_base {
     public:
         wait_suspend_awaitable(condition_variable& cv, mutex& m)
-            : cv_(cv), mutex_(m) {}
-
-        ~wait_suspend_awaitable() {
-            // Fast path: if we never suspended, we were never enqueued,
-            // so no wake function could hold a reference to us.
-            if (!this->suspended_) return;
-
-            // Slow path: acquire internal_mutex_ to prevent race with notify
-            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
-            if (this->is_linked()) {
-                cv_.waiters_.remove(this);
-            }
-            detail::cancel_wake_state(this->wake_state_);
-        }
+            : cv_waiter_base(cv), cv_(cv), mutex_(m) {}
 
         bool await_ready() const noexcept { return false; }
 
@@ -111,19 +165,7 @@ public:
     class wait_awaitable_lock : public cv_waiter_base {
     public:
         wait_awaitable_lock(condition_variable& cv, Lock& lock)
-            : cv_(cv), lock_(lock) {}
-
-        ~wait_awaitable_lock() {
-            // Fast path: if we never suspended, we were never enqueued
-            if (!this->suspended_) return;
-
-            // Slow path: acquire internal_mutex_ to prevent race with notify
-            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
-            if (this->is_linked()) {
-                cv_.waiters_.remove(this);
-            }
-            detail::cancel_wake_state(this->wake_state_);
-        }
+            : cv_waiter_base(cv), cv_(cv), lock_(lock) {}
 
         bool await_ready() const noexcept { return false; }
 
@@ -153,19 +195,8 @@ public:
     /// Wait awaitable without any external lock
     class wait_awaitable_unlocked : public cv_waiter_base {
     public:
-        explicit wait_awaitable_unlocked(condition_variable& cv) : cv_(cv) {}
-
-        ~wait_awaitable_unlocked() {
-            // Fast path: if we never suspended, we were never enqueued
-            if (!this->suspended_) return;
-
-            // Slow path: acquire internal_mutex_ to prevent race with notify
-            std::lock_guard<std::mutex> guard(cv_.internal_mutex_);
-            if (this->is_linked()) {
-                cv_.waiters_.remove(this);
-            }
-            detail::cancel_wake_state(this->wake_state_);
-        }
+        explicit wait_awaitable_unlocked(condition_variable& cv)
+            : cv_waiter_base(cv), cv_(cv) {}
 
         bool await_ready() const noexcept { return false; }
 
@@ -181,6 +212,139 @@ public:
 
     private:
         condition_variable& cv_;
+    };
+
+    struct cancellable_wait_completion {
+        coro::cancel_result result;
+        bool lock_released;
+    };
+
+    /// Internal cancellable wait for elio::sync::mutex. Re-locking remains
+    /// asynchronous and is completed by wait(mutex&, cancel_token).
+    class cancellable_wait_suspend_awaitable : public cv_waiter_base {
+    public:
+        cancellable_wait_suspend_awaitable(condition_variable& cv, mutex& m,
+                                           coro::cancel_token token)
+            : cv_waiter_base(cv, true)
+            , mutex_(m) {
+            cancel_registration_ = token.on_cancel(
+                [state = cancellation_wake_state()] {
+                state->request_cancel();
+            });
+        }
+
+        ~cancellable_wait_suspend_awaitable() {
+            cancel_registration_.unregister();
+        }
+
+        bool await_ready() const noexcept {
+            return cancellation_wake_state()->was_cancelled();
+        }
+
+        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+            if (!prepare_blocked_wait(awaiter)) {
+                return false;
+            }
+
+            mutex_.unlock();
+            lock_released_ = true;
+            return finish_blocked_publication();
+        }
+
+        cancellable_wait_completion await_resume() noexcept {
+            cancel_registration_.unregister();
+            return {finish_wait(), lock_released_};
+        }
+
+    private:
+        mutex& mutex_;
+        coro::cancel_token::registration cancel_registration_;
+        bool lock_released_ = false;
+    };
+
+    /// Cancellable wait for a synchronous lockable type such as spinlock.
+    template<detail::lockable Lock>
+    class cancellable_wait_awaitable_lock : public cv_waiter_base {
+    public:
+        cancellable_wait_awaitable_lock(condition_variable& cv, Lock& lock,
+                                        coro::cancel_token token)
+            : cv_waiter_base(cv, true)
+            , lock_(lock) {
+            cancel_registration_ = token.on_cancel(
+                [state = this->cancellation_wake_state()] {
+                state->request_cancel();
+            });
+        }
+
+        ~cancellable_wait_awaitable_lock() {
+            cancel_registration_.unregister();
+        }
+
+        bool await_ready() const noexcept {
+            return this->cancellation_wake_state()->was_cancelled();
+        }
+
+        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+            if (!this->prepare_blocked_wait(awaiter)) {
+                return false;
+            }
+
+            lock_.unlock();
+            lock_released_ = true;
+            return this->finish_blocked_publication();
+        }
+
+        [[nodiscard("check whether the condition wait was notified")]]
+        coro::cancel_result await_resume() {
+            cancel_registration_.unregister();
+            const auto result = this->finish_wait();
+            if (lock_released_) {
+                lock_.lock();
+            }
+            return result;
+        }
+
+    private:
+        Lock& lock_;
+        coro::cancel_token::registration cancel_registration_;
+        bool lock_released_ = false;
+    };
+
+    /// Cancellable wait without an external lock.
+    class cancellable_wait_awaitable_unlocked : public cv_waiter_base {
+    public:
+        cancellable_wait_awaitable_unlocked(condition_variable& cv,
+                                            coro::cancel_token token)
+            : cv_waiter_base(cv, true) {
+            cancel_registration_ = token.on_cancel(
+                [state = cancellation_wake_state()] {
+                state->request_cancel();
+            });
+        }
+
+        ~cancellable_wait_awaitable_unlocked() {
+            cancel_registration_.unregister();
+        }
+
+        bool await_ready() const noexcept {
+            return cancellation_wake_state()->was_cancelled();
+        }
+
+        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+            if (!prepare_blocked_wait(awaiter)) {
+                return false;
+            }
+            return finish_blocked_publication();
+        }
+
+        [[nodiscard("check whether the condition wait was notified")]]
+        coro::cancel_result await_resume() noexcept {
+            cancel_registration_.unregister();
+            return finish_wait();
+        }
+
+    private:
+        coro::cancel_token::registration cancel_registration_;
     };
 
     /// Wait with elio::sync::mutex
@@ -205,10 +369,29 @@ public:
         co_await m.lock();
     }
 
+    /// Wait with elio::sync::mutex until notified or cancellation wins.
+    /// The mutex is held again before returning whenever the wait released it.
+    coro::task<coro::cancel_result> wait(mutex& m,
+                                         coro::cancel_token token) {
+        const auto completion = co_await cancellable_wait_suspend_awaitable(
+            *this, m, std::move(token));
+        if (completion.lock_released) {
+            co_await m.lock();
+        }
+        co_return completion.result;
+    }
+
     /// Wait with a generic lockable (e.g., spinlock)
     template<detail::lockable Lock>
     auto wait(Lock& lock) {
         return wait_awaitable_lock<Lock>(*this, lock);
+    }
+
+    /// Wait with a synchronous lockable until notified or cancellation wins.
+    template<detail::lockable Lock>
+    auto wait(Lock& lock, coro::cancel_token token) {
+        return cancellable_wait_awaitable_lock<Lock>(
+            *this, lock, std::move(token));
     }
 
     /// Wait without external lock (single-worker only)
@@ -216,18 +399,29 @@ public:
         return wait_awaitable_unlocked(*this);
     }
 
+    /// Wait without an external lock until notified or cancellation wins.
+    auto wait_unlocked(coro::cancel_token token) {
+        return cancellable_wait_awaitable_unlocked(
+            *this, std::move(token));
+    }
+
     /// Wake one waiting coroutine
     void notify_one() {
         detail::wake_state_ptr to_schedule;
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
-            if (waiters_.empty()) return;
-
-            // Collect handle and pop from list under lock.
-            // Popping marks node as unlinked, so destructor's locked slow path
-            // won't try to remove it (is_linked() == false).
-            auto* waiter = waiters_.pop_front();
-            to_schedule = waiter->wake_state_;
+            while (!waiters_.empty()) {
+                // Popping marks the node as unlinked. A cancellation winner is
+                // skipped so notify_one still reaches one eligible waiter.
+                auto* waiter = waiters_.pop_front();
+                if (waiter->cancellable_ &&
+                    detail::claim_wake_state(waiter->wake_state_) ==
+                        detail::wake_action::rejected) {
+                    continue;
+                }
+                to_schedule = waiter->wake_state_;
+                break;
+            }
         }
         // Schedule outside lock to avoid deadlock if schedule_handle()
         // resumes inline (trampoline path) and destructor re-acquires mutex.
@@ -239,10 +433,16 @@ public:
         std::vector<detail::wake_state_ptr> to_schedule;
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
+            to_schedule.reserve(waiters_.size());
             while (!waiters_.empty()) {
                 // Collect handles and pop from list under lock.
                 // Popping marks nodes as unlinked, so destructors won't try to remove them.
                 auto* waiter = waiters_.pop_front();
+                if (waiter->cancellable_ &&
+                    detail::claim_wake_state(waiter->wake_state_) ==
+                        detail::wake_action::rejected) {
+                    continue;
+                }
                 to_schedule.push_back(waiter->wake_state_);
             }
         }

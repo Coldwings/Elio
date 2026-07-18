@@ -544,33 +544,24 @@ public:
     coro::task<std::optional<T>> recv() {
         if (is_bounded()) {
             while (true) {
-                auto val = ring_->try_pop();
-                if (val.has_value()) {
-                    detail::wake_state_ptr sender_handle;
-                    {
-                        std::lock_guard<std::mutex> guard(mutex_);
-                        if (auto* sender = claim_sender_locked()) {
-                            if (ring_->try_push(sender->value_)) {
-                                sender->success_ = true;
-                                sender_handle = sender->wake_state_;
-                            } else {
-                                assert(false &&
-                                       "channel ring lost a freed slot");
-                            }
-                        }
-                    }
-                    if (sender_handle) {
-                        detail::schedule_wake_state(sender_handle);
-                    }
-                    co_return val;
-                }
-
                 detail::wake_state_ptr sender_handle;
                 std::optional<T> result;
                 bool should_wait = false;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
-                    if (auto* sender = claim_sender_locked()) {
+                    // Keep pop and waiter refill atomic with bounded producers.
+                    result = ring_->try_pop();
+                    if (result.has_value()) {
+                        if (auto* sender = claim_sender_locked()) {
+                            const bool pushed = ring_->try_push(sender->value_);
+                            assert(pushed &&
+                                   "channel ring lost a freed slot");
+                            if (pushed) {
+                                sender->success_ = true;
+                                sender_handle = sender->wake_state_;
+                            }
+                        }
+                    } else if (auto* sender = claim_sender_locked()) {
                         result = std::optional<T>(std::move(sender->value_));
                         sender->success_ = true;
                         sender_handle = sender->wake_state_;
@@ -745,36 +736,31 @@ public:
     /// Try to receive without waiting
     std::optional<T> try_recv() {
         if (is_bounded()) {
-            auto val = ring_->try_pop();
-            if (val.has_value()) {
-                detail::wake_state_ptr sender_handle;
-                {
-                    std::lock_guard<std::mutex> guard(mutex_);
+            detail::wake_state_ptr sender_handle;
+            std::optional<T> result;
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                // A claimed sender must retain the slot freed by this pop.
+                result = ring_->try_pop();
+                if (result.has_value()) {
                     if (auto* sender = claim_sender_locked()) {
-                        if (ring_->try_push(sender->value_)) {
+                        const bool pushed = ring_->try_push(sender->value_);
+                        assert(pushed && "channel ring lost a freed slot");
+                        if (pushed) {
                             sender->success_ = true;
                             sender_handle = sender->wake_state_;
-                        } else {
-                            assert(false &&
-                                   "channel ring lost a freed slot");
                         }
                     }
-                }
-                if (sender_handle) {
-                    detail::schedule_wake_state(sender_handle);
-                }
-                return val;
-            }
-
-            if (closed_.load(std::memory_order_acquire)) {
-                std::lock_guard<std::mutex> guard(mutex_);
-                if (!queue_.empty()) {
-                    auto result = std::move(queue_.front());
+                } else if (closed_.load(std::memory_order_acquire) &&
+                           !queue_.empty()) {
+                    result = std::move(queue_.front());
                     queue_.pop();
-                    return result;
                 }
             }
-            return std::nullopt;
+            if (sender_handle) {
+                detail::schedule_wake_state(sender_handle);
+            }
+            return result;
         }
 
         detail::wake_state_ptr sender_handle;

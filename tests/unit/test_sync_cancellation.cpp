@@ -5,6 +5,7 @@
 #include <elio/coro/this_coro.hpp>
 #include <elio/runtime/scheduler.hpp>
 
+#include <array>
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -60,6 +61,44 @@ TEST_CASE("wake_state resolves completion during blocked publication",
         REQUIRE(state->notification_was_selected());
         REQUIRE_FALSE(state->request_cancel());
     }
+}
+
+TEST_CASE("wake_state does not lose notification while publication unblocks",
+          "[sync][cancellation][wake_state][race]") {
+    constexpr int iterations = 1024;
+    std::barrier start_race(3);
+    std::barrier finish_race(3);
+    elio::sync::detail::wake_state_ptr state;
+    std::array<bool, iterations> unblocked{};
+    std::array<bool, iterations> scheduled{};
+
+    std::thread publisher([&] {
+        for (int i = 0; i < iterations; ++i) {
+            start_race.arrive_and_wait();
+            unblocked[i] = state->unblock_after_publish();
+            finish_race.arrive_and_wait();
+        }
+    });
+    std::thread notifier([&] {
+        for (int i = 0; i < iterations; ++i) {
+            start_race.arrive_and_wait();
+            scheduled[i] = state->schedule_selected();
+            finish_race.arrive_and_wait();
+        }
+    });
+
+    for (int i = 0; i < iterations; ++i) {
+        state = elio::sync::detail::make_wake_state();
+        REQUIRE(state->set_handle_blocked(std::noop_coroutine()));
+        start_race.arrive_and_wait();
+        finish_race.arrive_and_wait();
+
+        REQUIRE((!unblocked[i] || scheduled[i]));
+        REQUIRE(state->notification_was_selected());
+    }
+
+    publisher.join();
+    notifier.join();
 }
 
 TEST_CASE("basic sync waits preserve resources when already cancelled",

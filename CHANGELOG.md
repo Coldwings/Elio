@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   winner model. A condition wait that released an associated lock re-acquires
   it before returning either `completed` or `cancelled`; a pre-cancelled wait
   leaves the already-held lock untouched.
+- **Cancellation-aware channel operations**: Added `cancel_token` overloads for
+  `channel::send()` and `channel::recv()`. Their result objects distinguish
+  cancellation from a closed channel while preserving the existing boolean and
+  optional results on no-token overloads. Cancellation winners do not transfer
+  a pending send value into the channel or consume a received value; send,
+  receive, and close paths skip cancelled waiters without consuming another
+  waiter's wakeup.
 
 ### Changed
 

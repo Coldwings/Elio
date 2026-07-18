@@ -9,6 +9,7 @@
 #include <barrier>
 #include <chrono>
 #include <coroutine>
+#include <memory>
 #include <thread>
 #include <type_traits>
 
@@ -45,6 +46,7 @@ TEST_CASE("wake_state resolves completion during blocked publication",
         REQUIRE(state->request_cancel());
         REQUIRE_FALSE(state->unblock_after_publish());
         REQUIRE(state->was_cancelled());
+        REQUIRE_FALSE(state->notification_was_selected());
         REQUIRE_FALSE(state->schedule_selected());
     }
 
@@ -55,6 +57,7 @@ TEST_CASE("wake_state resolves completion during blocked publication",
                 elio::sync::detail::wake_action::completed_inline);
         REQUIRE_FALSE(state->unblock_after_publish());
         REQUIRE_FALSE(state->was_cancelled());
+        REQUIRE(state->notification_was_selected());
         REQUIRE_FALSE(state->request_cancel());
     }
 }
@@ -588,6 +591,382 @@ TEST_CASE("shared_mutex wake paths skip cancelled head waiters",
         REQUIRE(sm.is_writer_active());
         sm.unlock();
     }
+}
+
+TEST_CASE("channel token-aware results distinguish success close and cancellation",
+          "[sync][channel][cancellation][cancel_token]") {
+    scheduler sched(2);
+    sched.start();
+
+    channel<int> bounded(1);
+    static_assert(std::is_same_v<decltype(bounded.send(1)), task<bool>>);
+    static_assert(std::is_same_v<decltype(bounded.recv()),
+                                 task<std::optional<int>>>);
+    static_assert(std::is_same_v<decltype(bounded.send(1, cancel_token{})),
+                                 task<channel<int>::cancellable_send_result>>);
+    static_assert(std::is_same_v<decltype(bounded.recv(cancel_token{})),
+                                 task<channel<int>::cancellable_recv_result>>);
+    std::optional<channel<int>::cancellable_send_result> send_result;
+    std::optional<channel<int>::cancellable_recv_result> recv_result;
+
+    auto send_join = sched.go_joinable([&]() -> task<void> {
+        send_result = co_await bounded.send(7, cancel_token{});
+    });
+    send_join.wait_destroyed();
+    REQUIRE(send_result->success());
+    REQUIRE_FALSE(send_result->was_cancelled());
+    REQUIRE_FALSE(send_result->was_closed());
+
+    auto recv_join = sched.go_joinable([&]() -> task<void> {
+        recv_result = co_await bounded.recv(cancel_token{});
+    });
+    recv_join.wait_destroyed();
+    REQUIRE(recv_result->success());
+    REQUIRE(recv_result->value == 7);
+    REQUIRE_FALSE(recv_result->was_cancelled());
+
+    channel<int> unbounded = channel<int>::unbounded();
+    auto unbounded_send = sched.go_joinable([&]() -> task<void> {
+        send_result = co_await unbounded.send(11, cancel_token{});
+    });
+    unbounded_send.wait_destroyed();
+    REQUIRE(send_result->success());
+    REQUIRE(unbounded.try_recv() == 11);
+
+    channel<std::unique_ptr<int>> move_only(1);
+    std::optional<channel<std::unique_ptr<int>>::cancellable_send_result>
+        move_send_result;
+    std::optional<channel<std::unique_ptr<int>>::cancellable_recv_result>
+        move_recv_result;
+    auto move_send = sched.go_joinable([&]() -> task<void> {
+        move_send_result = co_await move_only.send(
+            std::make_unique<int>(23), cancel_token{});
+    });
+    move_send.wait_destroyed();
+    auto move_recv = sched.go_joinable([&]() -> task<void> {
+        move_recv_result = co_await move_only.recv(cancel_token{});
+    });
+    move_recv.wait_destroyed();
+    REQUIRE(move_send_result->success());
+    REQUIRE(move_recv_result->success());
+    REQUIRE(**move_recv_result->value == 23);
+
+    channel<int> closed(1);
+    closed.close();
+    auto closed_send = sched.go_joinable([&]() -> task<void> {
+        send_result = co_await closed.send(13, cancel_token{});
+    });
+    closed_send.wait_destroyed();
+    REQUIRE(send_result->was_closed());
+    REQUIRE_FALSE(send_result->was_cancelled());
+
+    auto closed_recv = sched.go_joinable([&]() -> task<void> {
+        recv_result = co_await closed.recv(cancel_token{});
+    });
+    closed_recv.wait_destroyed();
+    REQUIRE(recv_result->was_closed());
+    REQUIRE_FALSE(recv_result->was_cancelled());
+
+    cancel_source cancelled;
+    cancelled.cancel();
+    channel<int> preserved(1);
+    auto cancelled_send = sched.go_joinable([&]() -> task<void> {
+        send_result = co_await preserved.send(17, cancelled.get_token());
+    });
+    cancelled_send.wait_destroyed();
+    REQUIRE(send_result->was_cancelled());
+    REQUIRE(preserved.empty());
+
+    REQUIRE(preserved.try_send(19));
+    auto cancelled_recv = sched.go_joinable([&]() -> task<void> {
+        recv_result = co_await preserved.recv(cancelled.get_token());
+    });
+    cancelled_recv.wait_destroyed();
+    REQUIRE(recv_result->was_cancelled());
+    REQUIRE(preserved.try_recv() == 19);
+
+    channel<int> closed_preserved(1);
+    REQUIRE(closed_preserved.try_send(29));
+    closed_preserved.close();
+    auto cancelled_closed_recv = sched.go_joinable([&]() -> task<void> {
+        recv_result = co_await closed_preserved.recv(cancelled.get_token());
+    });
+    cancelled_closed_recv.wait_destroyed();
+    REQUIRE(recv_result->was_cancelled());
+    REQUIRE(closed_preserved.try_recv() == 29);
+
+    sched.shutdown();
+}
+
+TEST_CASE("channel queued cancellation does not move values",
+          "[sync][channel][cancellation][cancel_token][queue]") {
+    SECTION("bounded sender") {
+        channel<int> ch(1);
+        REQUIRE(ch.try_send(1));
+        cancel_source source;
+        channel<int>::cancellable_send_awaitable sender(
+            ch, 2, source.get_token());
+
+        REQUIRE(sender.await_suspend(std::noop_coroutine()));
+        source.cancel();
+        const auto result = sender.await_resume();
+
+        REQUIRE(result.was_cancelled());
+        REQUIRE(ch.try_recv() == 1);
+        REQUIRE_FALSE(ch.try_recv().has_value());
+    }
+
+    SECTION("rendezvous sender") {
+        channel<int> ch;
+        cancel_source source;
+        channel<int>::cancellable_send_awaitable sender(
+            ch, 3, source.get_token());
+
+        REQUIRE(sender.await_suspend(std::noop_coroutine()));
+        source.cancel();
+        REQUIRE(sender.await_resume().was_cancelled());
+        REQUIRE_FALSE(ch.try_recv().has_value());
+    }
+
+    SECTION("receiver") {
+        channel<int> ch(1);
+        cancel_source source;
+        channel<int>::cancellable_recv_awaitable receiver(
+            ch, source.get_token());
+
+        REQUIRE(receiver.await_suspend(std::noop_coroutine()));
+        source.cancel();
+        REQUIRE(receiver.await_resume() == cancel_result::cancelled);
+        REQUIRE(ch.try_send(5));
+        REQUIRE(ch.try_recv() == 5);
+    }
+}
+
+TEST_CASE("channel send cancellation and bounded handoff select one result",
+          "[sync][channel][cancellation][cancel_token][race]") {
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        channel<int> ch(1);
+        REQUIRE(ch.try_send(1));
+        cancel_source source;
+        channel<int>::cancellable_send_awaitable sender(
+            ch, 2, source.get_token());
+        REQUIRE(sender.await_suspend(std::noop_coroutine()));
+
+        std::optional<int> first;
+        std::barrier race_start(3);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        std::thread receiver([&] {
+            race_start.arrive_and_wait();
+            first = ch.try_recv();
+        });
+        race_start.arrive_and_wait();
+        canceller.join();
+        receiver.join();
+
+        REQUIRE(first == 1);
+        const auto terminal = sender.await_resume();
+        if (terminal.success()) {
+            REQUIRE(terminal.cancel == cancel_result::completed);
+            REQUIRE(ch.try_recv() == 2);
+        } else {
+            REQUIRE(terminal.was_cancelled());
+            REQUIRE_FALSE(ch.try_recv().has_value());
+        }
+    }
+}
+
+TEST_CASE("channel receive cancellation and send select one result",
+          "[sync][channel][cancellation][cancel_token][race]") {
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        channel<int> ch(1);
+        cancel_source source;
+        channel<int>::cancellable_recv_awaitable receiver(
+            ch, source.get_token());
+        REQUIRE(receiver.await_suspend(std::noop_coroutine()));
+
+        std::atomic<bool> send_succeeded{false};
+        std::barrier race_start(3);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        std::thread sender([&] {
+            race_start.arrive_and_wait();
+            send_succeeded.store(ch.try_send(9),
+                                 std::memory_order_release);
+        });
+        race_start.arrive_and_wait();
+        canceller.join();
+        sender.join();
+
+        REQUIRE(send_succeeded.load(std::memory_order_acquire));
+        const auto terminal = receiver.await_resume();
+        REQUIRE((terminal == cancel_result::completed ||
+                 terminal == cancel_result::cancelled));
+        REQUIRE(ch.try_recv() == 9);
+    }
+}
+
+TEST_CASE("channel recv API preserves values across cancellation races",
+          "[sync][channel][cancellation][cancel_token][race][runtime]") {
+    scheduler sched(2);
+    sched.start();
+
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        channel<int> ch(1);
+        cancel_source source;
+        std::atomic<bool> started{false};
+        std::atomic<bool> send_succeeded{false};
+        std::optional<channel<int>::cancellable_recv_result> result;
+
+        auto receiver = sched.go_joinable([&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            result = co_await ch.recv(source.get_token());
+        });
+        REQUIRE(wait_for_flag(started));
+
+        std::barrier race_start(3);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        std::thread sender([&] {
+            race_start.arrive_and_wait();
+            send_succeeded.store(ch.try_send(iteration),
+                                 std::memory_order_release);
+        });
+        race_start.arrive_and_wait();
+        canceller.join();
+        sender.join();
+        receiver.wait_destroyed();
+
+        REQUIRE(send_succeeded.load(std::memory_order_acquire));
+        REQUIRE(result.has_value());
+        if (result->success()) {
+            REQUIRE(result->value == iteration);
+            REQUIRE(ch.empty());
+        } else {
+            REQUIRE(result->was_cancelled());
+            REQUIRE(ch.try_recv() == iteration);
+        }
+    }
+
+    sched.shutdown();
+}
+
+TEST_CASE("channel wake paths skip cancelled head waiters",
+          "[sync][channel][cancellation][cancel_token][queue]") {
+    SECTION("receivers") {
+        channel<int> ch(1);
+        cancel_source source;
+        channel<int>::cancellable_recv_awaitable first(
+            ch, source.get_token());
+        channel<int>::recv_awaitable second(ch);
+
+        REQUIRE(first.await_suspend(std::noop_coroutine()));
+        REQUIRE(second.await_suspend(std::noop_coroutine()));
+        source.cancel();
+        REQUIRE(ch.try_send(21));
+
+        REQUIRE(first.await_resume() == cancel_result::cancelled);
+        second.await_resume();
+        REQUIRE(ch.try_recv() == 21);
+    }
+
+    SECTION("senders") {
+        channel<int> ch(1);
+        REQUIRE(ch.try_send(1));
+        cancel_source source;
+        channel<int>::cancellable_send_awaitable first(
+            ch, 2, source.get_token());
+        channel<int>::send_awaitable second(ch, 3);
+
+        REQUIRE(first.await_suspend(std::noop_coroutine()));
+        REQUIRE(second.await_suspend(std::noop_coroutine()));
+        source.cancel();
+        REQUIRE(ch.try_recv() == 1);
+
+        REQUIRE(first.await_resume().was_cancelled());
+        REQUIRE(second.await_resume());
+        REQUIRE(ch.try_recv() == 3);
+    }
+}
+
+TEST_CASE("channel close and cancellation preserve the winning terminal state",
+          "[sync][channel][cancellation][cancel_token][close][race]") {
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        channel<int> ch;
+        cancel_source source;
+        channel<int>::cancellable_send_awaitable sender(
+            ch, iteration, source.get_token());
+        REQUIRE(sender.await_suspend(std::noop_coroutine()));
+
+        std::barrier race_start(3);
+        std::thread canceller([&] {
+            race_start.arrive_and_wait();
+            source.cancel();
+        });
+        std::thread closer([&] {
+            race_start.arrive_and_wait();
+            ch.close();
+        });
+        race_start.arrive_and_wait();
+        canceller.join();
+        closer.join();
+
+        const auto terminal = sender.await_resume();
+        const auto delivered = ch.try_recv();
+        if (terminal.success()) {
+            REQUIRE(terminal.cancel == cancel_result::completed);
+            REQUIRE(delivered == iteration);
+        } else {
+            REQUIRE(terminal.was_cancelled());
+            REQUIRE_FALSE(delivered.has_value());
+        }
+    }
+}
+
+TEST_CASE("channel waits observe join-handle cancellation context",
+          "[sync][channel][cancellation][cancel_token][runtime]") {
+    scheduler sched(2);
+    sched.start();
+
+    channel<int> send_channel(1);
+    REQUIRE(send_channel.try_send(1));
+    std::atomic<bool> send_started{false};
+    std::optional<channel<int>::cancellable_send_result> send_result;
+    auto sender = sched.go_joinable([&]() -> task<void> {
+        send_started.store(true, std::memory_order_release);
+        send_result = co_await send_channel.send(
+            2, this_coro::cancel_token());
+    });
+
+    REQUIRE(wait_for_flag(send_started));
+    sender.request_cancel();
+    sender.wait_destroyed();
+    REQUIRE(send_result->was_cancelled());
+    REQUIRE(send_channel.try_recv() == 1);
+    REQUIRE_FALSE(send_channel.try_recv().has_value());
+
+    channel<int> recv_channel(1);
+    std::atomic<bool> recv_started{false};
+    std::optional<channel<int>::cancellable_recv_result> recv_result;
+    auto receiver = sched.go_joinable([&]() -> task<void> {
+        recv_started.store(true, std::memory_order_release);
+        recv_result = co_await recv_channel.recv(
+            this_coro::cancel_token());
+    });
+
+    REQUIRE(wait_for_flag(recv_started));
+    receiver.request_cancel();
+    receiver.wait_destroyed();
+    REQUIRE(recv_result->was_cancelled());
+    REQUIRE(recv_channel.empty());
+
+    sched.shutdown();
 }
 
 TEST_CASE("semaphore cancellation and release select one terminal result",

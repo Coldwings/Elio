@@ -11,6 +11,7 @@
 #include <memory>
 #include <cassert>
 #include "lockfree_ring.hpp"
+#include "../coro/cancel_token.hpp"
 #include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
 #include "detail/wake_state.hpp"
@@ -23,7 +24,37 @@ class channel {
 public:
     // Forward declarations for intrusive_list
     class send_awaitable;
+    class cancellable_send_awaitable;
     class recv_awaitable;
+    class cancellable_recv_awaitable;
+
+    /// Result of a cancellation-aware send operation.
+    struct cancellable_send_result {
+        bool sent;
+        coro::cancel_result cancel;
+
+        bool success() const noexcept { return sent; }
+        bool was_cancelled() const noexcept {
+            return cancel == coro::cancel_result::cancelled;
+        }
+        bool was_closed() const noexcept {
+            return !sent && !was_cancelled();
+        }
+    };
+
+    /// Result of a cancellation-aware receive operation.
+    struct cancellable_recv_result {
+        std::optional<T> value;
+        coro::cancel_result cancel;
+
+        bool success() const noexcept { return value.has_value(); }
+        bool was_cancelled() const noexcept {
+            return cancel == coro::cancel_result::cancelled;
+        }
+        bool was_closed() const noexcept {
+            return !value.has_value() && !was_cancelled();
+        }
+    };
 
     /// Create a channel with the given capacity.
     ///
@@ -83,32 +114,53 @@ public:
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> h) noexcept {
+            if (!wake_state_->set_handle_blocked(h)) {
+                return false;
+            }
+
             detail::wake_state_ptr to_schedule;
             bool should_suspend = true;
 
             {
                 std::lock_guard<std::mutex> guard(ch_.mutex_);
 
-                if (ch_.closed_) {
+                if (cancellable_ && wake_state_->was_cancelled()) {
+                    should_suspend = false;
+                } else if (ch_.closed_) {
+                    (void)claim_completion();
                     should_suspend = false;
                 } else if (ch_.is_rendezvous()) {
                     // Rendezvous: direct handoff to a waiting receiver
-                    if (!ch_.recv_waiters_.empty()) {
-                        ch_.queue_.push(std::move(value_));
-                        success_ = true;
-                        auto* receiver = ch_.recv_waiters_.pop_front();
+                    if (auto* receiver = ch_.claim_receiver_locked()) {
                         to_schedule = receiver->wake_state_;
+                        if (claim_completion()) {
+                            ch_.queue_.push(std::move(value_));
+                            success_ = true;
+                        }
                         should_suspend = false;
                     }
+                } else if (ch_.is_unbounded()) {
+                    if (claim_completion()) {
+                        ch_.queue_.push(std::move(value_));
+                        success_ = true;
+                        if (auto* receiver = ch_.claim_receiver_locked()) {
+                            to_schedule = receiver->wake_state_;
+                        }
+                    }
+                    should_suspend = false;
                 } else {
                     // Bounded: try to push into ring
                     if (ch_.ring_->size() < ch_.capacity_) {
-                        if (ch_.ring_->try_push(value_)) {
+                        if (claim_completion() &&
+                            ch_.ring_->try_push(value_)) {
                             success_ = true;
-                            if (!ch_.recv_waiters_.empty()) {
-                                auto* receiver = ch_.recv_waiters_.pop_front();
+                            if (auto* receiver =
+                                    ch_.claim_receiver_locked()) {
                                 to_schedule = receiver->wake_state_;
                             }
+                            should_suspend = false;
+                        } else if (cancellable_ &&
+                                   wake_state_->was_cancelled()) {
                             should_suspend = false;
                         }
                     }
@@ -116,30 +168,109 @@ public:
 
                 if (should_suspend) {
                     // Cannot send now — suspend
-                    wake_state_->set_handle(h);
                     ch_.send_waiters_.push_back(this);
                     suspended_ = true;  // Mark as enqueued
                 }
+            }
+
+            if (should_suspend) {
+                // A successful unblock makes the frame externally resumable.
+                // Do not access this awaiter after that transition.
+                if (wake_state_->unblock_after_publish()) {
+                    return true;
+                }
+
+                std::lock_guard<std::mutex> guard(ch_.mutex_);
+                if (this->is_linked()) {
+                    ch_.send_waiters_.remove(this);
+                }
+                suspended_ = false;
+                return false;
             }
 
             // Schedule outside lock to avoid deadlock
             if (to_schedule) {
                 ch_.schedule_receiver_or_retry(to_schedule);
             }
-
-            return should_suspend;
+            return false;
         }
 
-        bool await_resume() const noexcept { return success_; }
+        bool await_resume() noexcept {
+            suspended_ = false;
+            return success_;
+        }
+
+    protected:
+        send_awaitable(channel& ch, T value, bool cancellable)
+            : ch_(ch)
+            , value_(std::move(value))
+            , wake_state_(detail::make_wake_state())
+            , cancellable_(cancellable) {}
+
+        const detail::wake_state_ptr& cancellation_wake_state() const noexcept {
+            return wake_state_;
+        }
+
+        cancellable_send_result await_resume_cancellable() noexcept {
+            if (wake_state_->was_cancelled()) {
+                if (suspended_) {
+                    std::lock_guard<std::mutex> guard(ch_.mutex_);
+                    if (this->is_linked()) {
+                        ch_.send_waiters_.remove(this);
+                    }
+                }
+                suspended_ = false;
+                return {false, coro::cancel_result::cancelled};
+            }
+
+            suspended_ = false;
+            return {success_, coro::cancel_result::completed};
+        }
 
     private:
+        bool claim_completion() noexcept {
+            return !cancellable_ ||
+                   detail::claim_wake_state(wake_state_) !=
+                       detail::wake_action::rejected;
+        }
+
         channel& ch_;
         T value_;
         detail::wake_state_ptr wake_state_;
         bool success_ = false;
         bool suspended_ = false;  // True if enqueued in send_waiters_
+        bool cancellable_ = false;
 
         friend class channel;
+    };
+
+    class cancellable_send_awaitable : public send_awaitable {
+    public:
+        cancellable_send_awaitable(channel& ch, T value,
+                                   coro::cancel_token token)
+            : send_awaitable(ch, std::move(value), true) {
+            cancel_registration_ = token.on_cancel(
+                [state = this->cancellation_wake_state()] {
+                state->request_cancel();
+            });
+        }
+
+        ~cancellable_send_awaitable() {
+            cancel_registration_.unregister();
+        }
+
+        bool await_ready() const noexcept {
+            return this->cancellation_wake_state()->was_cancelled();
+        }
+
+        [[nodiscard("check whether the value was sent or cancellation won")]]
+        cancellable_send_result await_resume() noexcept {
+            cancel_registration_.unregister();
+            return this->await_resume_cancellable();
+        }
+
+    private:
+        coro::cancel_token::registration cancel_registration_;
     };
 
     /// Recv awaitable — handles bounded, unbounded, and rendezvous channels.
@@ -164,36 +295,123 @@ public:
         bool await_ready() const noexcept { return false; }
 
         bool await_suspend(std::coroutine_handle<> h) noexcept {
-            std::lock_guard<std::mutex> guard(ch_.mutex_);
-
-            if (ch_.is_bounded()) {
-                if (!ch_.ring_->empty() || !ch_.send_waiters_.empty() ||
-                    ch_.closed_.load(std::memory_order_acquire)) {
-                    return false;
-                }
-            } else {
-                if (!ch_.queue_.empty() || ch_.closed_.load(std::memory_order_acquire)) {
-                    return false;
-                }
-                if (ch_.is_rendezvous() && !ch_.send_waiters_.empty()) {
-                    return false;
-                }
+            if (!wake_state_->set_handle_blocked(h)) {
+                return false;
             }
 
-            wake_state_->set_handle(h);
-            ch_.recv_waiters_.push_back(this);
-            suspended_ = true;  // Mark as enqueued
-            return true;
+            {
+                std::lock_guard<std::mutex> guard(ch_.mutex_);
+
+                if (ch_.is_bounded()) {
+                    if (!ch_.ring_->empty() || !ch_.send_waiters_.empty() ||
+                        ch_.closed_.load(std::memory_order_acquire)) {
+                        (void)claim_completion();
+                        return false;
+                    }
+                } else {
+                    if (!ch_.queue_.empty() ||
+                        ch_.closed_.load(std::memory_order_acquire)) {
+                        (void)claim_completion();
+                        return false;
+                    }
+                    if (ch_.is_rendezvous() && !ch_.send_waiters_.empty()) {
+                        (void)claim_completion();
+                        return false;
+                    }
+                }
+
+                if (cancellable_ && wake_state_->was_cancelled()) {
+                    return false;
+                }
+                ch_.recv_waiters_.push_back(this);
+                suspended_ = true;  // Mark as enqueued
+            }
+
+            // A successful unblock makes the frame externally resumable.
+            // Do not access this awaiter after that transition.
+            if (wake_state_->unblock_after_publish()) {
+                return true;
+            }
+
+            {
+                std::lock_guard<std::mutex> guard(ch_.mutex_);
+                if (this->is_linked()) {
+                    ch_.recv_waiters_.remove(this);
+                }
+                suspended_ = false;
+            }
+            return false;
         }
 
-        void await_resume() noexcept {}
+        void await_resume() noexcept { suspended_ = false; }
+
+    protected:
+        recv_awaitable(channel& ch, bool cancellable)
+            : ch_(ch)
+            , wake_state_(detail::make_wake_state())
+            , cancellable_(cancellable) {}
+
+        const detail::wake_state_ptr& cancellation_wake_state() const noexcept {
+            return wake_state_;
+        }
+
+        bool claim_completion() noexcept {
+            return !cancellable_ ||
+                   detail::claim_wake_state(wake_state_) !=
+                       detail::wake_action::rejected;
+        }
+
+        coro::cancel_result await_resume_cancellable() noexcept {
+            if (wake_state_->was_cancelled()) {
+                if (suspended_) {
+                    std::lock_guard<std::mutex> guard(ch_.mutex_);
+                    if (this->is_linked()) {
+                        ch_.recv_waiters_.remove(this);
+                    }
+                }
+                suspended_ = false;
+                return coro::cancel_result::cancelled;
+            }
+
+            suspended_ = false;
+            return coro::cancel_result::completed;
+        }
 
     private:
         channel& ch_;
         detail::wake_state_ptr wake_state_;
         bool suspended_ = false;  // True if enqueued in recv_waiters_
+        bool cancellable_ = false;
 
         friend class channel;
+    };
+
+    class cancellable_recv_awaitable : public recv_awaitable {
+    public:
+        cancellable_recv_awaitable(channel& ch, coro::cancel_token token)
+            : recv_awaitable(ch, true) {
+            cancel_registration_ = token.on_cancel(
+                [state = this->cancellation_wake_state()] {
+                state->request_cancel();
+            });
+        }
+
+        ~cancellable_recv_awaitable() {
+            cancel_registration_.unregister();
+        }
+
+        bool await_ready() const noexcept {
+            return this->cancellation_wake_state()->was_cancelled();
+        }
+
+        [[nodiscard("check whether a value, close, or cancellation won")]]
+        coro::cancel_result await_resume() noexcept {
+            cancel_registration_.unregister();
+            return this->await_resume_cancellable();
+        }
+
+    private:
+        coro::cancel_token::registration cancel_registration_;
     };
 
     /// Send a value to the channel
@@ -210,8 +428,7 @@ public:
                     co_return false;
                 }
                 queue_.push(std::move(value));
-                if (!recv_waiters_.empty()) {
-                    auto* receiver = recv_waiters_.pop_front();
+                if (auto* receiver = claim_receiver_locked()) {
                     receiver_handle = receiver->wake_state_;
                 }
             }
@@ -230,8 +447,7 @@ public:
                 if (!closed_ && ring_->size() < capacity_) {
                     if (ring_->try_push(value)) {
                         pushed = true;
-                        if (!recv_waiters_.empty()) {
-                            auto* receiver = recv_waiters_.pop_front();
+                        if (auto* receiver = claim_receiver_locked()) {
                             receiver_handle = receiver->wake_state_;
                         }
                     }
@@ -258,6 +474,14 @@ public:
         co_return !closed_.load(std::memory_order_acquire);
     }
 
+    /// Send a value, preserving closed-channel status when cancellation races.
+    /// A cancellation winner does not transfer the value into the channel.
+    coro::task<cancellable_send_result> send(
+            T value, coro::cancel_token token) {
+        co_return co_await cancellable_send_awaitable(
+            *this, std::move(value), std::move(token));
+    }
+
     /// Try to send without waiting
     bool try_send(T value) {
         if (closed_.load(std::memory_order_acquire)) {
@@ -271,8 +495,7 @@ public:
                 if (closed_) return false;
                 if (ring_->size() >= capacity_) return false;
                 if (ring_->try_push(value)) {
-                    if (!recv_waiters_.empty()) {
-                        auto* receiver = recv_waiters_.pop_front();
+                    if (auto* receiver = claim_receiver_locked()) {
                         receiver_handle = receiver->wake_state_;
                     }
                 } else {
@@ -290,9 +513,8 @@ public:
             {
                 std::lock_guard<std::mutex> guard(mutex_);
                 if (closed_) return false;
-                if (!recv_waiters_.empty()) {
+                if (auto* receiver = claim_receiver_locked()) {
                     queue_.push(std::move(value));
-                    auto* receiver = recv_waiters_.pop_front();
                     receiver_handle = receiver->wake_state_;
                 } else {
                     return false;
@@ -308,8 +530,7 @@ public:
             std::lock_guard<std::mutex> guard(mutex_);
             if (closed_) return false;
             queue_.push(std::move(value));
-            if (!recv_waiters_.empty()) {
-                auto* receiver = recv_waiters_.pop_front();
+            if (auto* receiver = claim_receiver_locked()) {
                 receiver_handle = receiver->wake_state_;
             }
         }
@@ -328,12 +549,13 @@ public:
                     detail::wake_state_ptr sender_handle;
                     {
                         std::lock_guard<std::mutex> guard(mutex_);
-                        if (!send_waiters_.empty()) {
-                            auto* sender = send_waiters_.front();
+                        if (auto* sender = claim_sender_locked()) {
                             if (ring_->try_push(sender->value_)) {
                                 sender->success_ = true;
                                 sender_handle = sender->wake_state_;
-                                send_waiters_.pop_front();
+                            } else {
+                                assert(false &&
+                                       "channel ring lost a freed slot");
                             }
                         }
                     }
@@ -348,8 +570,7 @@ public:
                 bool should_wait = false;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
-                    if (!send_waiters_.empty()) {
-                        auto* sender = send_waiters_.pop_front();
+                    if (auto* sender = claim_sender_locked()) {
                         result = std::optional<T>(std::move(sender->value_));
                         sender->success_ = true;
                         sender_handle = sender->wake_state_;
@@ -386,11 +607,18 @@ public:
                 if (!queue_.empty()) {
                     result = std::move(queue_.front());
                     queue_.pop();
-                } else if (is_rendezvous() && !send_waiters_.empty()) {
-                    auto* sender = send_waiters_.pop_front();
-                    result = std::optional<T>(std::move(sender->value_));
-                    sender->success_ = true;
-                    sender_handle = sender->wake_state_;
+                } else if (is_rendezvous()) {
+                    auto* sender = claim_sender_locked();
+                    if (sender) {
+                        result = std::optional<T>(
+                            std::move(sender->value_));
+                        sender->success_ = true;
+                        sender_handle = sender->wake_state_;
+                    } else if (closed_.load(std::memory_order_acquire)) {
+                        result = std::nullopt;
+                    } else {
+                        should_wait = true;
+                    }
                 } else if (closed_.load(std::memory_order_acquire)) {
                     result = std::nullopt;
                 } else {
@@ -409,6 +637,111 @@ public:
         }
     }
 
+    /// Receive a value while preserving closed-channel status on cancellation.
+    /// A cancellation winner does not consume a value from the channel.
+    coro::task<cancellable_recv_result> recv(coro::cancel_token token) {
+        while (true) {
+            cancellable_recv_awaitable awaitable{*this, token};
+            detail::wake_state_ptr sender_handle;
+            std::optional<T> result;
+            bool resolved = false;
+            bool retry = false;
+
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+
+                if (is_bounded()) {
+                    if (!ring_->empty()) {
+                        if (!awaitable.claim_completion()) {
+                            resolved = true;
+                        } else {
+                            result = ring_->try_pop();
+                            if (!result.has_value()) {
+                                retry = true;
+                            } else {
+                                resolved = true;
+                                if (auto* sender = claim_sender_locked()) {
+                                    if (ring_->try_push(sender->value_)) {
+                                        sender->success_ = true;
+                                        sender_handle = sender->wake_state_;
+                                    } else {
+                                        assert(false &&
+                                               "channel ring lost a freed slot");
+                                    }
+                                }
+                            }
+                        }
+                    } else if (!send_waiters_.empty()) {
+                        if (!awaitable.claim_completion()) {
+                            resolved = true;
+                        } else if (auto* sender = claim_sender_locked()) {
+                            result = std::optional<T>(
+                                std::move(sender->value_));
+                            sender->success_ = true;
+                            sender_handle = sender->wake_state_;
+                            resolved = true;
+                        } else {
+                            retry = true;
+                        }
+                    } else if (closed_.load(std::memory_order_acquire)) {
+                        if (awaitable.claim_completion() && !queue_.empty()) {
+                            result = std::move(queue_.front());
+                            queue_.pop();
+                        }
+                        resolved = true;
+                    }
+                } else if (!queue_.empty()) {
+                    if (!awaitable.claim_completion()) {
+                        resolved = true;
+                    } else {
+                        result = std::move(queue_.front());
+                        queue_.pop();
+                        resolved = true;
+                    }
+                } else if (is_rendezvous() && !send_waiters_.empty()) {
+                    if (!awaitable.claim_completion()) {
+                        resolved = true;
+                    } else if (auto* sender = claim_sender_locked()) {
+                        result = std::optional<T>(std::move(sender->value_));
+                        sender->success_ = true;
+                        sender_handle = sender->wake_state_;
+                        resolved = true;
+                    } else {
+                        retry = true;
+                    }
+                } else if (closed_.load(std::memory_order_acquire)) {
+                    (void)awaitable.claim_completion();
+                    resolved = true;
+                }
+            }
+
+            if (sender_handle) {
+                detail::schedule_wake_state(sender_handle);
+            }
+
+            if (resolved) {
+                const auto completion = awaitable.await_resume();
+                if (completion == coro::cancel_result::cancelled) {
+                    co_return cancellable_recv_result{
+                        std::nullopt, coro::cancel_result::cancelled};
+                }
+                co_return cancellable_recv_result{
+                    std::move(result), coro::cancel_result::completed};
+            }
+
+            if (retry) {
+                (void)awaitable.await_resume();
+                continue;
+            }
+
+            const auto completion = co_await awaitable;
+            if (completion == coro::cancel_result::cancelled) {
+                co_return cancellable_recv_result{
+                    std::nullopt, coro::cancel_result::cancelled};
+            }
+        }
+    }
+
     /// Try to receive without waiting
     std::optional<T> try_recv() {
         if (is_bounded()) {
@@ -417,12 +750,13 @@ public:
                 detail::wake_state_ptr sender_handle;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
-                    if (!send_waiters_.empty()) {
-                        auto* sender = send_waiters_.front();
+                    if (auto* sender = claim_sender_locked()) {
                         if (ring_->try_push(sender->value_)) {
                             sender->success_ = true;
                             sender_handle = sender->wake_state_;
-                            send_waiters_.pop_front();
+                        } else {
+                            assert(false &&
+                                   "channel ring lost a freed slot");
                         }
                     }
                 }
@@ -448,8 +782,11 @@ public:
         {
             std::lock_guard<std::mutex> guard(mutex_);
             if (queue_.empty()) {
-                if (is_rendezvous() && !send_waiters_.empty()) {
-                    auto* sender = send_waiters_.pop_front();
+                if (is_rendezvous()) {
+                    auto* sender = claim_sender_locked();
+                    if (!sender) {
+                        return std::nullopt;
+                    }
                     result = std::optional<T>(std::move(sender->value_));
                     sender->success_ = true;
                     sender_handle = sender->wake_state_;
@@ -477,6 +814,7 @@ public:
         std::vector<detail::wake_state_ptr> to_schedule;
         {
             std::lock_guard<std::mutex> guard(mutex_);
+            to_schedule.reserve(send_waiters_.size() + recv_waiters_.size());
 
             // Drain ring and send_waiters_ into queue_ for bounded channels
             if (is_bounded()) {
@@ -485,8 +823,7 @@ public:
                     if (!val.has_value()) break;
                     queue_.push(std::move(*val));
                 }
-                while (!send_waiters_.empty()) {
-                    auto* sender = send_waiters_.pop_front();
+                while (auto* sender = claim_sender_locked()) {
                     queue_.push(std::move(sender->value_));
                     sender->success_ = true;  // Value was delivered to queue
                     to_schedule.push_back(sender->wake_state_);
@@ -495,8 +832,7 @@ public:
 
             // Drain rendezvous send_waiters_
             if (is_rendezvous()) {
-                while (!send_waiters_.empty()) {
-                    auto* sender = send_waiters_.pop_front();
+                while (auto* sender = claim_sender_locked()) {
                     queue_.push(std::move(sender->value_));
                     sender->success_ = true;  // Value was delivered to queue
                     to_schedule.push_back(sender->wake_state_);
@@ -504,8 +840,7 @@ public:
             }
 
             // Wake all waiting receivers
-            while (!recv_waiters_.empty()) {
-                auto* receiver = recv_waiters_.pop_front();
+            while (auto* receiver = claim_receiver_locked()) {
                 to_schedule.push_back(receiver->wake_state_);
             }
         }
@@ -550,18 +885,42 @@ private:
         return capacity_ == 0;
     }
 
+    recv_awaitable* claim_receiver_locked() noexcept {
+        while (!recv_waiters_.empty()) {
+            auto* receiver = recv_waiters_.pop_front();
+            if (receiver->cancellable_ &&
+                detail::claim_wake_state(receiver->wake_state_) ==
+                    detail::wake_action::rejected) {
+                continue;
+            }
+            return receiver;
+        }
+        return nullptr;
+    }
+
+    send_awaitable* claim_sender_locked() noexcept {
+        while (!send_waiters_.empty()) {
+            auto* sender = send_waiters_.pop_front();
+            if (sender->cancellable_ &&
+                detail::claim_wake_state(sender->wake_state_) ==
+                    detail::wake_action::rejected) {
+                continue;
+            }
+            return sender;
+        }
+        return nullptr;
+    }
+
     void schedule_receiver_or_retry(detail::wake_state_ptr receiver) {
         while (receiver) {
-            if (detail::schedule_wake_state(receiver)) {
+            if (detail::schedule_wake_state(receiver) ||
+                receiver->notification_was_selected()) {
                 return;
             }
 
             std::lock_guard<std::mutex> guard(mutex_);
-            if (recv_waiters_.empty()) {
-                return;
-            }
-            auto* next = recv_waiters_.pop_front();
-            receiver = next->wake_state_;
+            auto* next = claim_receiver_locked();
+            receiver = next ? next->wake_state_ : nullptr;
         }
     }
 

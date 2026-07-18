@@ -177,6 +177,13 @@ public:
                current == cancellation_scheduling;
     }
 
+    [[nodiscard]] bool notification_was_selected() const noexcept {
+        const auto current = state_.load(std::memory_order_acquire);
+        return current == notified_inline ||
+               current == notification_claimed ||
+               current == notification_scheduling;
+    }
+
     // Prevent a dequeue-then-schedule wake from resuming a destroyed frame.
     void abandon() noexcept {
         auto current = state_.load(std::memory_order_acquire);

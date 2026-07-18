@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `task::await_suspend` are therefore no longer `noexcept`. Requests are
   best-effort and do not force frame destruction, roll back side effects, or
   replace a result that already completed.
+- **Cancellation-aware basic synchronization waits**: Added explicit
+  `cancel_token` overloads for `mutex::lock()`, `semaphore::acquire()`, and
+  `event::wait()`. Each returns `cancel_result` and uses one terminal wake state
+  so cancellation and normal notification cannot both resume a waiter. A
+  cancellation winner does not acquire a lock or consume a permit; an already
+  completed acquisition remains caller-owned. The corresponding no-token
+  awaiters retain their existing `void` results and lightweight fast paths.
 
 ### Changed
 

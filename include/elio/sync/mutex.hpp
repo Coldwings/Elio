@@ -4,6 +4,8 @@
 #include <atomic>
 #include <mutex>
 #include <cassert>
+#include <utility>
+#include "../coro/cancel_token.hpp"
 #include "../detail/intrusive_list.hpp"
 #include "../runtime/scheduler.hpp"
 #include "detail/wake_state.hpp"
@@ -12,8 +14,12 @@ namespace elio::sync {
 
 class mutex {
 public:
-    // Forward declaration for intrusive_list
+    // Forward declarations for the shared intrusive waiter node and public
+    // awaiters.
+    class lock_waiter;
+    class cancellable_lock_waiter;
     class lock_awaitable;
+    class cancellable_lock_awaitable;
 
     mutex() = default;
 
@@ -27,14 +33,18 @@ public:
     mutex(mutex&&) = delete;
     mutex& operator=(mutex&&) = delete;
 
-    /// Lock awaitable — inherits intrusive_list_node for safe unlinking
-    class lock_awaitable : public elio::detail::intrusive_list_node<lock_awaitable> {
+    class lock_waiter : public elio::detail::intrusive_list_node<lock_waiter> {
     public:
-        explicit lock_awaitable(mutex& m)
+        explicit lock_waiter(mutex& m)
             : mtx_(m)
             , wake_state_(detail::make_wake_state()) {}
 
-        ~lock_awaitable() {
+        lock_waiter(mutex& m, bool cancellable)
+            : mtx_(m)
+            , wake_state_(detail::make_wake_state())
+            , cancellable_(cancellable) {}
+
+        ~lock_waiter() {
             // Fast path: if we never suspended, we were never enqueued,
             // so no wake function could hold a reference to us.
             if (!suspended_) return;
@@ -60,50 +70,194 @@ public:
             }
         }
 
-        bool await_ready() const noexcept {
-            return mtx_.try_lock();
-        }
-
-        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            // Try to acquire the lock (fast path)
-            void* expected = nullptr;
-            if (mtx_.state_.compare_exchange_strong(
-                    expected, awaiter.address(),
-                    std::memory_order_acq_rel, std::memory_order_acquire)) {
-                return false; // Acquired, don't suspend
+        bool await_ready_impl() const noexcept {
+            if (!cancellable_) {
+                return mtx_.try_lock();
             }
 
-            // Lock is held, add to wait queue
-            std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
-
-            // Double-check after acquiring internal lock
-            expected = nullptr;
-            if (mtx_.state_.compare_exchange_strong(
-                    expected, awaiter.address(),
-                    std::memory_order_acq_rel, std::memory_order_acquire)) {
-                return false; // Acquired, don't suspend
+            if (wake_state_->was_cancelled()) {
+                return true;
+            }
+            if (!mtx_.try_lock()) {
+                return false;
+            }
+            if (detail::claim_wake_state(wake_state_) !=
+                detail::wake_action::rejected) {
+                return true;
             }
 
-            // Add to wait queue
-            wake_state_->set_handle(awaiter);
-            mtx_.waiters_.push_back(this);
-            suspended_ = true;  // Mark as enqueued
-            return true; // Suspend
+            // Cancellation won after the lock was acquired.
+            mtx_.unlock();
+            return true;
         }
 
-        void await_resume() noexcept {
+        bool await_suspend_impl(std::coroutine_handle<> awaiter) noexcept {
+            if (!cancellable_) {
+                void* expected = nullptr;
+                if (mtx_.state_.compare_exchange_strong(
+                        expected, awaiter.address(),
+                        std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    return false;
+                }
+
+                std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+                expected = nullptr;
+                if (mtx_.state_.compare_exchange_strong(
+                        expected, awaiter.address(),
+                        std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    return false;
+                }
+
+                wake_state_->set_handle(awaiter);
+                mtx_.waiters_.push_back(this);
+                suspended_ = true;
+                return true;
+            }
+
+            detail::wake_state_ptr to_schedule;
+            {
+                // Lock is held, add to wait queue
+                std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+
+                if (wake_state_->was_cancelled()) {
+                    return false;
+                }
+
+                // Double-check after acquiring internal lock
+                void* expected = nullptr;
+                if (mtx_.state_.compare_exchange_strong(
+                        expected, awaiter.address(),
+                        std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    if (detail::claim_wake_state(wake_state_) !=
+                        detail::wake_action::rejected) {
+                        return false;
+                    }
+
+                    // Cancellation won the acquire race. Transfer the lock to
+                    // another live waiter, or release it when none remain.
+                    to_schedule = mtx_.recover_cancelled_handoff_locked();
+                } else {
+                    if (!wake_state_->set_handle_blocked(awaiter)) {
+                        return false;
+                    }
+                    mtx_.waiters_.push_back(this);
+                    suspended_ = true;
+
+                    if (wake_state_->unblock_after_publish()) {
+                        return true;
+                    }
+
+                    mtx_.waiters_.remove(this);
+                    suspended_ = false;
+                }
+            }
+
+            if (to_schedule) {
+                detail::schedule_wake_state(to_schedule);
+            }
+            return false;
+        }
+
+        coro::cancel_result await_resume_impl() noexcept {
+            if (!cancellable_) {
+                resumed_ = true;
+                grant_pending_ = false;
+                suspended_ = false;
+                return coro::cancel_result::completed;
+            }
+
+            if (wake_state_->was_cancelled()) {
+                if (suspended_) {
+                    std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+                    if (this->is_linked()) {
+                        mtx_.waiters_.remove(this);
+                    }
+                    suspended_ = false;
+                }
+                return coro::cancel_result::cancelled;
+            }
+
             resumed_ = true;
             grant_pending_ = false;
+            suspended_ = false;
+            return coro::cancel_result::completed;
+        }
+
+    protected:
+        const detail::wake_state_ptr& cancellation_wake_state() const noexcept {
+            return wake_state_;
         }
 
     private:
         mutex& mtx_;
         detail::wake_state_ptr wake_state_;
+        bool cancellable_ = false;
         bool suspended_ = false;  // True if enqueued in waiters_
         bool resumed_ = false;    // True after a popped waiter resumes normally
         bool grant_pending_ = false;  // True after unlock() transfers ownership
 
         friend class mutex;
+    };
+
+    class cancellable_lock_waiter : public lock_waiter {
+    public:
+        cancellable_lock_waiter(mutex& m, coro::cancel_token token)
+            : lock_waiter(m, true) {
+            cancel_registration_ = token.on_cancel(
+                [state = cancellation_wake_state()] {
+                state->request_cancel();
+            });
+        }
+
+        ~cancellable_lock_waiter() {
+            cancel_registration_.unregister();
+        }
+
+        coro::cancel_result await_resume_cancellable() noexcept {
+            cancel_registration_.unregister();
+            return await_resume_impl();
+        }
+
+    private:
+        coro::cancel_token::registration cancel_registration_;
+    };
+
+    /// Non-cancellable lock awaiter. The await result remains void for source
+    /// compatibility with the pre-0.6 API.
+    class lock_awaitable {
+    public:
+        explicit lock_awaitable(mutex& m) : waiter_(m) {}
+
+        bool await_ready() const noexcept { return waiter_.await_ready_impl(); }
+        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+            return waiter_.await_suspend_impl(awaiter);
+        }
+        void await_resume() noexcept {
+            (void)waiter_.await_resume_impl();
+        }
+
+    private:
+        lock_waiter waiter_;
+    };
+
+    /// Cancellation-aware lock awaiter. Callers must check the result before
+    /// entering the protected critical section.
+    class cancellable_lock_awaitable {
+    public:
+        cancellable_lock_awaitable(mutex& m, coro::cancel_token token)
+            : waiter_(m, std::move(token)) {}
+
+        bool await_ready() const noexcept { return waiter_.await_ready_impl(); }
+        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+            return waiter_.await_suspend_impl(awaiter);
+        }
+        [[nodiscard("check whether the mutex was acquired")]]
+        coro::cancel_result await_resume() noexcept {
+            return waiter_.await_resume_cancellable();
+        }
+
+    private:
+        cancellable_lock_waiter waiter_;
     };
 
     /// Unlock awaitable — releases the lock and wakes one waiter if any
@@ -127,9 +281,14 @@ public:
         mutex& mtx_;
     };
 
-    /// Lock the mutex (coroutine-aware)
+    /// Lock the mutex (coroutine-aware).
     [[nodiscard]] lock_awaitable lock() {
         return lock_awaitable(*this);
+    }
+
+    /// Lock the mutex, or return cancelled if the token wins the wait race.
+    [[nodiscard]] cancellable_lock_awaitable lock(coro::cancel_token token) {
+        return cancellable_lock_awaitable(*this, std::move(token));
     }
 
     /// Try to lock the mutex (non-blocking)
@@ -146,19 +305,7 @@ public:
         {
             std::lock_guard<std::mutex> guard(internal_mutex_);
 
-            if (waiters_.empty()) {
-                // No waiters, just release
-                state_.store(nullptr, std::memory_order_release);
-            } else {
-                // Transfer lock to next waiter using sentinel marker
-                state_.store(reinterpret_cast<void*>(1), std::memory_order_release);
-
-                // Collect handle and pop from list under lock.
-                // Popping marks node as unlinked, so destructor won't try to remove it.
-                auto* waiter = waiters_.pop_front();
-                waiter->grant_pending_ = true;
-                to_schedule = waiter->wake_state_;
-            }
+            to_schedule = recover_cancelled_handoff_locked();
         }
         // Schedule outside lock to avoid deadlock if schedule_handle()
         // resumes inline (trampoline path) and destructor re-acquires mutex.
@@ -175,18 +322,26 @@ public:
 private:
     std::atomic<void*> state_{nullptr};
     mutable std::mutex internal_mutex_;
-    elio::detail::intrusive_list<lock_awaitable> waiters_;
+    elio::detail::intrusive_list<lock_waiter> waiters_;
 
     detail::wake_state_ptr recover_cancelled_handoff_locked() noexcept {
-        if (waiters_.empty()) {
-            state_.store(nullptr, std::memory_order_release);
-            return nullptr;
+        while (!waiters_.empty()) {
+            auto* waiter = waiters_.pop_front();
+            if (waiter->cancellable_) {
+                const auto action =
+                    detail::claim_wake_state(waiter->wake_state_);
+                if (action == detail::wake_action::rejected) {
+                    continue;
+                }
+            }
+
+            state_.store(reinterpret_cast<void*>(1), std::memory_order_release);
+            waiter->grant_pending_ = true;
+            return waiter->wake_state_;
         }
 
-        state_.store(reinterpret_cast<void*>(1), std::memory_order_release);
-        auto* waiter = waiters_.pop_front();
-        waiter->grant_pending_ = true;
-        return waiter->wake_state_;
+        state_.store(nullptr, std::memory_order_release);
+        return nullptr;
     }
 };
 

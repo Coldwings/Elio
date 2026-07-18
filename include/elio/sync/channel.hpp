@@ -10,6 +10,7 @@
 #include <utility>
 #include <memory>
 #include <cassert>
+#include <thread>
 #include "lockfree_ring.hpp"
 #include "../coro/cancel_token.hpp"
 #include "../detail/intrusive_list.hpp"
@@ -544,24 +545,24 @@ public:
     coro::task<std::optional<T>> recv() {
         if (is_bounded()) {
             while (true) {
+                auto result = ring_->try_pop();
+                if (result.has_value()) {
+                    detail::wake_state_ptr sender_handle;
+                    {
+                        std::lock_guard<std::mutex> guard(mutex_);
+                        sender_handle = refill_sender_after_pop_locked();
+                    }
+                    if (sender_handle) {
+                        detail::schedule_wake_state(sender_handle);
+                    }
+                    co_return result;
+                }
+
                 detail::wake_state_ptr sender_handle;
-                std::optional<T> result;
                 bool should_wait = false;
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
-                    // Keep pop and waiter refill atomic with bounded producers.
-                    result = ring_->try_pop();
-                    if (result.has_value()) {
-                        if (auto* sender = claim_sender_locked()) {
-                            const bool pushed = ring_->try_push(sender->value_);
-                            assert(pushed &&
-                                   "channel ring lost a freed slot");
-                            if (pushed) {
-                                sender->success_ = true;
-                                sender_handle = sender->wake_state_;
-                            }
-                        }
-                    } else if (auto* sender = claim_sender_locked()) {
+                    if (auto* sender = claim_sender_locked()) {
                         result = std::optional<T>(std::move(sender->value_));
                         sender->success_ = true;
                         sender_handle = sender->wake_state_;
@@ -651,15 +652,8 @@ public:
                                 retry = true;
                             } else {
                                 resolved = true;
-                                if (auto* sender = claim_sender_locked()) {
-                                    if (ring_->try_push(sender->value_)) {
-                                        sender->success_ = true;
-                                        sender_handle = sender->wake_state_;
-                                    } else {
-                                        assert(false &&
-                                               "channel ring lost a freed slot");
-                                    }
-                                }
+                                sender_handle =
+                                    refill_sender_after_pop_locked();
                             }
                         }
                     } else if (!send_waiters_.empty()) {
@@ -736,26 +730,22 @@ public:
     /// Try to receive without waiting
     std::optional<T> try_recv() {
         if (is_bounded()) {
+            auto result = ring_->try_pop();
+            if (!result.has_value()) {
+                if (closed_.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> guard(mutex_);
+                    if (!queue_.empty()) {
+                        result = std::move(queue_.front());
+                        queue_.pop();
+                    }
+                }
+                return result;
+            }
+
             detail::wake_state_ptr sender_handle;
-            std::optional<T> result;
             {
                 std::lock_guard<std::mutex> guard(mutex_);
-                // A claimed sender must retain the slot freed by this pop.
-                result = ring_->try_pop();
-                if (result.has_value()) {
-                    if (auto* sender = claim_sender_locked()) {
-                        const bool pushed = ring_->try_push(sender->value_);
-                        assert(pushed && "channel ring lost a freed slot");
-                        if (pushed) {
-                            sender->success_ = true;
-                            sender_handle = sender->wake_state_;
-                        }
-                    }
-                } else if (closed_.load(std::memory_order_acquire) &&
-                           !queue_.empty()) {
-                    result = std::move(queue_.front());
-                    queue_.pop();
-                }
+                sender_handle = refill_sender_after_pop_locked();
             }
             if (sender_handle) {
                 detail::schedule_wake_state(sender_handle);
@@ -895,6 +885,31 @@ private:
             return sender;
         }
         return nullptr;
+    }
+
+    detail::wake_state_ptr refill_sender_after_pop_locked() noexcept {
+        // This thread has already advanced tail_ by one successful pop. Atomic
+        // coherence makes that advance visible here, while mutex_ exposes all
+        // earlier producer head_ advances and excludes new ones. Concurrent
+        // consumers can only free more room. Therefore a full logical size
+        // means a producer filled this operation's slot before we took mutex_.
+        if (ring_->size() >= capacity_) {
+            return {};
+        }
+
+        auto* sender = claim_sender_locked();
+        if (!sender) {
+            return {};
+        }
+
+        // Another consumer may have reserved the physical ring slot but not
+        // published its release yet. No producer can take it while mutex_ is
+        // held, so retry until that already-freed slot becomes visible.
+        while (!ring_->try_push(sender->value_)) {
+            std::this_thread::yield();
+        }
+        sender->success_ = true;
+        return sender->wake_state_;
     }
 
     void schedule_receiver_or_retry(detail::wake_state_ptr receiver) {

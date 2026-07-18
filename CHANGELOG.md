@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Runtime task cancellation contexts**: Every task execution context now owns
+  cooperative cancellation authority. `join_handle::request_cancel()` remains
+  valid across task completion and frame destruction, while
+  `this_coro::cancel_token()` exposes the active task token with a
+  never-cancelled fallback outside Elio execution. Cancellation propagates
+  one-way through direct lazy-task awaits between Elio tasks; foreign coroutine
+  types, independent spawns, and explicit token parameters remain separate
+  cancellation boundaries. Linking a lazy child can now report allocation
+  failure from `co_await`. Requests are best-effort and do not force frame
+  destruction, roll back side effects, or replace a result that already
+  completed.
+
 ### Changed
 
 - **Worker-local I/O ownership**: Scheduler-owned `io_context` instances now
@@ -86,6 +100,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allocator. Code that used them for logical coroutine ancestry should use the
   virtual-stack inspection APIs instead; custom allocation is now independent
   of Elio runtime state.
+
+### Fixed
+
+- **Cancellation callback teardown**: Destroying or unregistering a callback
+  registration now synchronizes with cancellation that has already selected or
+  started the callback, preventing callback captures from being released while
+  dispatch still uses them. Self-unregistration and same-dispatch removal of a
+  later callback remain deadlock-free. Cross-dispatch teardown requested from
+  inside another cancellation callback is deferred to avoid mutual wait cycles;
+  the callback payload remains alive through dispatch, while external captures
+  still require caller synchronization. Cancellation rethrows the first
+  callback exception after dispatching the remaining callbacks.
 
 ## [0.5.3] - 2026-07-17
 

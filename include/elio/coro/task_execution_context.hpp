@@ -96,7 +96,7 @@ public:
     }
 
     /// Token observed by code running in this task. Cancellation propagates
-    /// from an active direct awaiter when the lazy child is first started.
+    /// from an active direct Elio awaiter when the lazy child is first started.
     [[nodiscard]] cancel_token get_cancel_token() const noexcept {
         return cancellation_context_.token();
     }
@@ -112,9 +112,9 @@ public:
         return cancellation_context_.is_cancellation_requested();
     }
 
-    /// Link this not-yet-started lazy task to its actual awaiter. The link is
-    /// one-way: cancelling the parent requests cancellation of the child, while
-    /// cancelling this context does not affect the parent.
+    /// Link this not-yet-started lazy task to its actual Elio awaiter. The link
+    /// is one-way: cancelling the parent requests cancellation of the child,
+    /// while cancelling this context does not affect the parent.
     void link_parent_cancellation(cancel_token parent) {
         cancellation_context_.link_parent(std::move(parent));
     }

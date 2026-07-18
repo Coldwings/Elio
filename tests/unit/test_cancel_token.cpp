@@ -5,12 +5,14 @@
 #include <elio/time/timer.hpp>
 
 #include <atomic>
+#include <barrier>
 #include <latch>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace elio::coro;
@@ -22,6 +24,36 @@ template<typename F>
 auto spawn_joinable(scheduler& sched, F&& f) {
     return sched.go_joinable(std::forward<F>(f));
 }
+
+struct unregister_on_destroy {
+    std::optional<cancel_registration>* target;
+    std::barrier<>* callbacks_started;
+    std::atomic<bool>* invoked;
+
+    unregister_on_destroy(std::optional<cancel_registration>* target_registration,
+                          std::barrier<>* started,
+                          std::atomic<bool>* was_invoked) noexcept
+        : target(target_registration),
+          callbacks_started(started),
+          invoked(was_invoked) {}
+
+    unregister_on_destroy(unregister_on_destroy&& other) noexcept
+        : target(std::exchange(other.target, nullptr)),
+          callbacks_started(other.callbacks_started),
+          invoked(other.invoked) {}
+
+    unregister_on_destroy(const unregister_on_destroy&) = delete;
+    unregister_on_destroy& operator=(const unregister_on_destroy&) = delete;
+
+    ~unregister_on_destroy() {
+        if (target) target->reset();
+    }
+
+    void operator()() {
+        callbacks_started->arrive_and_wait();
+        invoked->store(true, std::memory_order_release);
+    }
+};
 
 
 
@@ -823,4 +855,64 @@ TEST_CASE("cancel callback can remove a later selected callback",
     source.cancel();
     REQUIRE(first_ran.load(std::memory_order_acquire));
     REQUIRE_FALSE(later_ran.load(std::memory_order_acquire));
+}
+
+TEST_CASE("callbacks on separate dispatchers can mutually unregister",
+          "[cancel_token][callback][thread][lifetime]") {
+    cancel_source first_source;
+    cancel_source second_source;
+    std::optional<cancel_registration> first_registration;
+    std::optional<cancel_registration> second_registration;
+    std::barrier callbacks_started(2);
+    std::atomic<bool> first_done{false};
+    std::atomic<bool> second_done{false};
+
+    first_registration.emplace(first_source.get_token().on_cancel([&] {
+        callbacks_started.arrive_and_wait();
+        second_registration.reset();
+        first_done.store(true, std::memory_order_release);
+    }));
+    second_registration.emplace(second_source.get_token().on_cancel([&] {
+        callbacks_started.arrive_and_wait();
+        first_registration.reset();
+        second_done.store(true, std::memory_order_release);
+    }));
+
+    std::thread first_canceller([&] { first_source.cancel(); });
+    std::thread second_canceller([&] { second_source.cancel(); });
+    first_canceller.join();
+    second_canceller.join();
+
+    REQUIRE(first_done.load(std::memory_order_acquire));
+    REQUIRE(second_done.load(std::memory_order_acquire));
+    REQUIRE_FALSE(first_registration.has_value());
+    REQUIRE_FALSE(second_registration.has_value());
+}
+
+TEST_CASE("callback payload destructors can mutually unregister",
+          "[cancel_token][callback][thread][lifetime]") {
+    cancel_source first_source;
+    cancel_source second_source;
+    std::optional<cancel_registration> first_registration;
+    std::optional<cancel_registration> second_registration;
+    std::barrier callbacks_started(2);
+    std::atomic<bool> first_invoked{false};
+    std::atomic<bool> second_invoked{false};
+
+    first_registration.emplace(first_source.get_token().on_cancel(
+        unregister_on_destroy{&second_registration, &callbacks_started,
+                              &first_invoked}));
+    second_registration.emplace(second_source.get_token().on_cancel(
+        unregister_on_destroy{&first_registration, &callbacks_started,
+                              &second_invoked}));
+
+    std::thread first_canceller([&] { first_source.cancel(); });
+    std::thread second_canceller([&] { second_source.cancel(); });
+    first_canceller.join();
+    second_canceller.join();
+
+    REQUIRE(first_invoked.load(std::memory_order_acquire));
+    REQUIRE(second_invoked.load(std::memory_order_acquire));
+    REQUIRE_FALSE(first_registration.has_value());
+    REQUIRE_FALSE(second_registration.has_value());
 }

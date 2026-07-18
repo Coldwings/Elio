@@ -32,6 +32,17 @@ enum class cancel_result {
 
 namespace detail {
 
+inline thread_local uint32_t callback_dispatch_depth = 0;
+
+class callback_dispatch_scope final {
+public:
+    callback_dispatch_scope() noexcept { ++callback_dispatch_depth; }
+    ~callback_dispatch_scope() { --callback_dispatch_depth; }
+
+    callback_dispatch_scope(const callback_dispatch_scope&) = delete;
+    callback_dispatch_scope& operator=(const callback_dispatch_scope&) = delete;
+};
+
 /// Type-erased callback node for the cancel_state intrusive list.
 ///
 /// Each registration owns exactly one heap-allocated callback_node. The
@@ -110,12 +121,15 @@ struct callback_node {
         }
 
         std::exception_ptr exception;
-        try {
-            invoke_payload();
-        } catch (...) {
-            exception = std::current_exception();
+        {
+            callback_dispatch_scope dispatch_scope;
+            try {
+                invoke_payload();
+            } catch (...) {
+                exception = std::current_exception();
+            }
+            destroy_payload();
         }
-        destroy_payload();
 
         {
             std::lock_guard<std::mutex> lock(dispatch_mutex);
@@ -161,6 +175,20 @@ struct callback_node {
         if ((dispatch_phase == phase::claimed ||
              dispatch_phase == phase::invoking) &&
             invoking_thread != std::this_thread::get_id()) {
+            if (callback_dispatch_depth != 0) {
+                // Waiting from one cancellation callback for another dispatcher
+                // can form a cross-source wait cycle. A claimed callback can be
+                // suppressed; an invoking callback retains its payload through
+                // dispatcher ownership and completes independently.
+                if (dispatch_phase == phase::claimed) {
+                    dispatch_phase = phase::unregistered;
+                    invoking_thread = {};
+                    lock.unlock();
+                    destroy_payload();
+                    dispatch_cv.notify_all();
+                }
+                return;
+            }
             dispatch_cv.wait(lock, [this] {
                 return dispatch_phase != phase::claimed &&
                        dispatch_phase != phase::invoking;
@@ -251,8 +279,9 @@ struct cancel_state {
         }
         // List is now owned by this call. Invoke each callback outside the
         // state lock. Concurrent remove_callback() calls synchronize through
-        // the individual node and either suppress a not-yet-started callback
-        // or wait for an in-progress callback to finish.
+        // the individual node. Teardown suppresses a not-yet-started callback,
+        // waits for an in-progress callback outside callback dispatch, or
+        // defers cross-dispatch callback reentry to avoid wait cycles.
         std::exception_ptr first_exception;
         while (list) {
             auto node = std::move(list);
@@ -370,10 +399,14 @@ public:
     /// if shared mutable state is accessed.
     ///
     /// Destroying or unregistering the returned registration suppresses a
-    /// callback that cancellation has not selected. Once selected or already
-    /// running on a different thread, teardown waits for dispatch to finish. A
-    /// callback may unregister itself, or a later callback selected by the same
-    /// synchronous dispatch, without deadlocking.
+    /// callback that cancellation has not selected. Outside callback dispatch,
+    /// teardown waits for a callback selected or running on a different thread.
+    /// During callback reentry, cross-dispatch teardown is deferred instead of
+    /// waiting, so mutually unregistering callbacks cannot deadlock; the target
+    /// callback payload remains alive through dispatch, but externally owned
+    /// captured state still requires synchronization. Self-unregistration and
+    /// removal of a later callback selected by the same synchronous dispatcher
+    /// are also supported.
     ///
     /// @param callback Function to call on cancellation
     /// @return Registration handle (callback unregisters when handle is destroyed)
@@ -474,9 +507,10 @@ public:
     }
 
     /// Request cancellation
-    /// All registered callbacks will be invoked and all tokens will report
-    /// is_cancelled() == true. Callbacks run synchronously on this thread; all
-    /// are dispatched, then the first callback exception is rethrown.
+    /// All tokens will report is_cancelled() == true. Callbacks run
+    /// synchronously on this thread. Every callback selected at cancellation
+    /// start is dispatched unless same-dispatch reentrant teardown removes a
+    /// later callback; the first exception is rethrown after dispatch.
     void cancel() {
         if (state_) {
             state_->trigger();
@@ -496,9 +530,9 @@ namespace detail {
 
 /// Task-lifetime cancellation authority. The source remains valid through the
 /// shared task_execution_context even after the coroutine frame is destroyed.
-/// A lazy child links to its active awaiter's token before first resume, so a
-/// request flows down the running task chain without granting cancellation
-/// authority to the lazy task owner itself.
+/// A lazy child links to its active Elio awaiter's token before first resume, so
+/// a request flows down the running Elio task chain without granting
+/// cancellation authority to the lazy task owner itself.
 class cancellation_context final {
 public:
     cancellation_context() = default;

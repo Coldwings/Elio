@@ -58,7 +58,9 @@ public:
     
     // Awaitable interface (use with co_await)
     bool await_ready() const noexcept;
-    std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiter) noexcept;
+    template<typename AwaiterPromise>
+    std::coroutine_handle<> await_suspend(
+        std::coroutine_handle<AwaiterPromise> awaiter);
     T await_resume();  // Returns result or rethrows exception
 };
 ```
@@ -70,6 +72,15 @@ virtual-stack state; ancestry is bound to the actual awaiter when execution
 starts. Destroying a non-empty task destroys the frame if ownership has not
 been transferred to the runtime. Do not await an empty task or await the same
 task more than once.
+
+In 0.6, `await_suspend` is a potentially throwing template so an Elio child can
+link to the actual Elio awaiter's cancellation context before first resume.
+Allocation failure while registering that link propagates from the `co_await`
+expression and the child does not start. Normal `co_await task` source remains
+unchanged, but code that names the exact `await_suspend` member type or requires
+it to be `noexcept` must be updated. A foreign coroutine promise does not
+implicitly inherit an Elio runtime token; adapter code must bridge cancellation
+explicitly when that behavior is required.
 
 **Basic Usage:**
 ```cpp
@@ -250,11 +261,11 @@ coro::task<void> main_task() {
 
 `request_cancel()` publishes through state shared with the spawned task; it does
 not access the coroutine frame and remains valid after frame destruction. The
-request propagates through direct lazy-task awaits. It does not forcibly destroy
-the task, roll back side effects, or guarantee prompt completion. Separate
-spawned tasks have independent contexts, and explicit token arguments remain
-independent unless deliberately bridged. Registered cancellation callback
-exceptions are rethrown after all callbacks have run.
+request propagates through direct lazy-task awaits between Elio tasks. It does
+not forcibly destroy the task, roll back side effects, or guarantee prompt
+completion. Foreign coroutine promises, separately spawned tasks, and explicit
+token arguments remain independent unless deliberately bridged. Registered
+cancellation callback exceptions are rethrown after callback dispatch.
 
 ### `generator<T>`
 
@@ -430,11 +441,13 @@ cancel_token cancel_token() noexcept;
 `cancel()` synchronously selects and invokes callbacks on the requesting thread,
 then rethrows the first callback exception after dispatching the rest.
 Registration teardown suppresses a callback not yet selected by cancellation;
-once another thread has selected or started it, teardown waits for dispatch to
-finish. Self-unregistration is supported, as is reentrant removal of a later
-callback selected by the same synchronous dispatcher. Callbacks can overlap when
-registration races with an already cancelled source, so shared mutable state
-still requires synchronization.
+outside callback dispatch, teardown waits once another thread has selected or
+started it. During callback reentry, cross-dispatch teardown is deferred instead
+of waiting so mutually unregistering callbacks cannot deadlock; the target
+payload remains alive through dispatch, but external captured state still needs
+synchronization. Self-unregistration and reentrant removal of a later callback
+selected by the same synchronous dispatcher are supported. Callbacks can also
+overlap when registration races with an already cancelled source.
 
 **Basic Example:**
 ```cpp
@@ -1002,11 +1015,13 @@ identity. Treat them as an active placement constraint only when
 `has_active_io_pin()` is true; `active_io_pin_count()` is authoritative.
 
 The context's cancellation source survives independently of the frame through
-shared context ownership. Starting a lazy task with direct `co_await` links its
-context one-way to the active awaiter's token. A `join_handle` shares the spawned
-wrapper context, so cancellation remains race-safe without storing a raw promise
-pointer. Completion and cancellation of individual operations remain in their
-awaitable/backend state machines.
+shared context ownership. Starting a lazy task with direct `co_await` from
+another Elio task links its context one-way to that awaiter's token. A foreign
+coroutine promise is a cancellation boundary unless it deliberately bridges a
+token. A `join_handle` shares the spawned wrapper context, so cancellation
+remains race-safe without storing a raw promise pointer. Completion and
+cancellation of individual operations remain in their awaitable/backend state
+machines.
 
 The promise affinity methods delegate caller-requested affinity to that shared
 context. `effective_affinity()` is the scheduler placement boundary and is kept

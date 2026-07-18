@@ -468,6 +468,8 @@ public:
                "task cannot have multiple awaiters");
         auto* parent = promise_base::current_frame();
         cancel_token parent_token;
+        // Runtime cancellation crosses direct awaits between Elio promises.
+        // A foreign coroutine promise is an explicit propagation boundary.
         if constexpr (std::is_convertible_v<AwaiterPromise*, promise_base*>) {
             parent = std::addressof(awaiter.promise());
             parent_token = parent->execution_context()->get_cancel_token();
@@ -570,6 +572,8 @@ public:
                "task cannot have multiple awaiters");
         auto* parent = promise_base::current_frame();
         cancel_token parent_token;
+        // Runtime cancellation crosses direct awaits between Elio promises.
+        // A foreign coroutine promise is an explicit propagation boundary.
         if constexpr (std::is_convertible_v<AwaiterPromise*, promise_base*>) {
             parent = std::addressof(awaiter.promise());
             parent_token = parent->execution_context()->get_cancel_token();

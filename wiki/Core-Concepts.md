@@ -728,14 +728,16 @@ coro::task<void> controller() {
 1. **`cancel_source`** - Creates and controls cancellation state
 2. **`cancel_token`** - Lightweight handle passed to operations
 3. Operations periodically check `token.is_cancelled()`
-4. Calling `source.cancel()` triggers all registered callbacks
+4. Calling `source.cancel()` selects registered callbacks for synchronous dispatch
 
 For joinable runtime work, `join_handle::request_cancel()` publishes through the
 spawned task's shared execution context. `coro::this_coro::cancel_token()` reads
-that context from the currently executing Elio frame. A directly awaited lazy
-child is linked to its actual awaiter before first resume, so the request flows
-down the active task chain. The link is one-way: cancelling a child does not
-cancel its parent, and separate `spawn()` calls remain independent.
+that context from the currently executing Elio frame. A lazy child directly
+awaited by another Elio task is linked to that actual awaiter before first
+resume, so the request flows down the active Elio task chain. The link is
+one-way: cancelling a child does not cancel its parent, and separate `spawn()`
+calls remain independent. A foreign coroutine promise is a cancellation
+boundary unless adapter code deliberately bridges a token.
 
 Outside an active Elio runtime frame, `this_coro::cancel_token()` returns a
 default never-cancelled token. An explicit token parameter remains an independent
@@ -805,14 +807,18 @@ coro::task<void> custom_operation(coro::cancel_token token) {
 }
 ```
 
-Callbacks run synchronously on the thread that requests cancellation. All
-callbacks are dispatched even if one throws, after which `cancel()` (and a
+Callbacks run synchronously on the thread that requests cancellation. Callback
+exceptions do not stop the remaining dispatch; afterward, `cancel()` (and a
 `join_handle::request_cancel()` using that context) rethrows the first exception.
 Destroying or unregistering a registration suppresses work not yet selected by
-cancellation. Once another thread has selected or started the callback, teardown
-waits for dispatch to finish. Unregistering from inside the callback, or removing
-a later callback during the same synchronous dispatch, does not deadlock.
-Callback code must still handle reentry and synchronize shared mutable state.
+cancellation. Outside callback dispatch, teardown waits once another thread has
+selected or started the callback. During callback reentry, cross-dispatch
+teardown is deferred instead of waiting, which prevents mutually unregistering
+callbacks from deadlocking while dispatcher ownership keeps the target payload
+alive. It is not a join point for externally owned captured state. Self-
+unregistration and removal of a later callback during the same synchronous
+dispatch are also supported. Callback code must handle reentry and synchronize
+shared mutable state.
 
 ## Error Handling
 

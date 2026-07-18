@@ -1,11 +1,13 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/coro/this_coro.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/sync/primitives.hpp>
 #include <elio/time/timer.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <latch>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -97,6 +99,19 @@ task<void> await_cancellation_capture(cancel_token* observed) {
 
 task<void> unused_runtime_frame() {
     co_return;
+}
+
+task<void> spawn_independent_child(
+    scheduler* sched,
+    std::optional<join_handle<int>>* child_handle,
+    std::atomic<bool>* child_started,
+    std::atomic<bool>* child_observed,
+    std::atomic<bool>* parent_started,
+    elio::sync::event* release_parent) {
+    child_handle->emplace(sched->go_joinable(
+        wait_for_runtime_cancellation, child_started, child_observed));
+    parent_started->store(true, std::memory_order_release);
+    co_await release_parent->wait();
 }
 
 } // namespace
@@ -200,6 +215,58 @@ TEST_CASE("separate join handles own independent cancellation contexts",
     REQUIRE(sched.shutdown());
 }
 
+TEST_CASE("runtime cancellation does not cross an independent spawn boundary",
+          "[task][spawn][join_handle][cancellation_context]") {
+    scheduler sched(2);
+    sched.start();
+
+    std::optional<join_handle<int>> child;
+    std::atomic<bool> child_started{false};
+    std::atomic<bool> child_observed{false};
+    std::atomic<bool> parent_started{false};
+    elio::sync::event release_parent;
+    auto parent = sched.go_joinable(
+        spawn_independent_child, &sched, &child, &child_started,
+        &child_observed, &parent_started, &release_parent);
+
+    const bool both_started =
+        wait_for_flag(parent_started) && wait_for_flag(child_started);
+    if (!both_started) {
+        release_parent.set();
+        if (child) child->request_cancel();
+        sched.shutdown_force();
+    }
+    REQUIRE(both_started);
+    REQUIRE(child.has_value());
+
+    parent.request_cancel();
+    REQUIRE(parent.is_cancellation_requested());
+    REQUIRE_FALSE(parent.is_ready());
+    REQUIRE_FALSE(child->is_cancellation_requested());
+    REQUIRE_FALSE(child_observed.load(std::memory_order_acquire));
+
+    child->request_cancel();
+    const bool child_ready = wait_until_ready(*child);
+    if (!child_ready) {
+        release_parent.set();
+        sched.shutdown_force();
+    }
+    REQUIRE(child_ready);
+    child->wait_destroyed();
+    REQUIRE(child->await_resume() == 17);
+    REQUIRE(child_observed.load(std::memory_order_acquire));
+
+    release_parent.set();
+    const bool parent_ready = wait_until_ready(parent);
+    if (!parent_ready) {
+        sched.shutdown_force();
+    }
+    REQUIRE(parent_ready);
+    parent.wait_destroyed();
+    parent.await_resume();
+    REQUIRE(sched.shutdown());
+}
+
 TEST_CASE("explicit tokens remain independent cancellation boundaries",
           "[task][spawn][cancel_token][cancellation_context]") {
     scheduler sched(1);
@@ -229,6 +296,42 @@ TEST_CASE("explicit tokens remain independent cancellation boundaries",
     joined.await_resume();
     REQUIRE_FALSE(joined.is_cancellation_requested());
     REQUIRE_FALSE(runtime_cancelled.load(std::memory_order_acquire));
+    REQUIRE(sched.shutdown());
+}
+
+TEST_CASE("runtime cancellation does not request an explicit token",
+          "[task][spawn][cancel_token][cancellation_context]") {
+    scheduler sched(1);
+    sched.start();
+
+    cancel_source explicit_source;
+    std::atomic<bool> started{false};
+    std::atomic<bool> runtime_cancelled{false};
+    auto joined = sched.go_joinable(
+        wait_for_explicit_cancellation, explicit_source.get_token(),
+        &started, &runtime_cancelled);
+
+    const bool did_start = wait_for_flag(started);
+    if (!did_start) {
+        sched.shutdown_force();
+    }
+    REQUIRE(did_start);
+
+    joined.request_cancel();
+    REQUIRE(joined.is_cancellation_requested());
+    REQUIRE_FALSE(explicit_source.is_cancelled());
+    REQUIRE_FALSE(joined.is_ready());
+
+    explicit_source.cancel();
+    const bool ready = wait_until_ready(joined);
+    if (!ready) {
+        sched.shutdown_force();
+    }
+    REQUIRE(ready);
+
+    joined.wait_destroyed();
+    joined.await_resume();
+    REQUIRE(runtime_cancelled.load(std::memory_order_acquire));
     REQUIRE(sched.shutdown());
 }
 

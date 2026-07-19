@@ -2,6 +2,7 @@
 #include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/async_main.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/coro/task_group.hpp>
 #include <elio/sync/primitives.hpp>
 #include <elio/time/timer.hpp>
 
@@ -32,6 +33,14 @@ task<void> mark_after_sleep_counter(std::chrono::milliseconds dur, std::atomic<i
 }
 
 task<void> increment_only(std::atomic<int>* counter) {
+    counter->fetch_add(1, std::memory_order_acq_rel);
+    co_return;
+}
+
+task<void> increment_with_frame_marker(
+    std::atomic<int>* counter,
+    std::shared_ptr<int> frame_marker) {
+    (void)frame_marker;
     counter->fetch_add(1, std::memory_order_acq_rel);
     co_return;
 }
@@ -69,6 +78,88 @@ task<void> wait_on_event(elio::sync::event* gate, std::atomic<int>* counter) {
     counter->fetch_add(1, std::memory_order_acq_rel);
 }
 
+task<void> wait_on_event_started(elio::sync::event* gate,
+                                 std::atomic<bool>* started,
+                                 std::atomic<int>* counter) {
+    started->store(true, std::memory_order_release);
+    co_await gate->wait();
+    counter->fetch_add(1, std::memory_order_acq_rel);
+}
+
+task<void> spawn_group_after_event(
+    elio::sync::event* gate,
+    std::atomic<bool>* started,
+    std::atomic<int>* child_runs,
+    std::atomic<bool>* joined) {
+    started->store(true, std::memory_order_release);
+    co_await gate->wait();
+
+    task_group group;
+    group.spawn(increment_only, child_runs);
+    co_await group.join();
+    joined->store(true, std::memory_order_release);
+}
+
+task<void> spawn_blocked_group_after_event(
+    elio::sync::event* start_gate,
+    elio::sync::event* child_gate,
+    std::atomic<bool>* started,
+    std::atomic<bool>* child_started,
+    std::atomic<int>* child_runs) {
+    started->store(true, std::memory_order_release);
+    co_await start_gate->wait();
+
+    task_group group;
+    group.spawn(wait_on_event_started, child_gate, child_started, child_runs);
+    co_await group.join();
+}
+
+struct external_resume_slot {
+    std::atomic<void*> address{nullptr};
+};
+
+struct external_suspend_awaiter {
+    external_resume_slot* slot;
+
+    [[nodiscard]] bool await_ready() const noexcept { return false; }
+
+    void await_suspend(std::coroutine_handle<> handle) const noexcept {
+        slot->address.store(handle.address(), std::memory_order_release);
+    }
+
+    void await_resume() const noexcept {}
+};
+
+task<void> resuspend_after_timer_cancel(
+    std::chrono::milliseconds dur,
+    external_resume_slot* slot,
+    std::atomic<bool>* cancellation_resumed) {
+    co_await sleep_for(dur);
+    cancellation_resumed->store(true, std::memory_order_release);
+    co_await external_suspend_awaiter{slot};
+}
+
+struct scheduler_test_hook_guard {
+    ~scheduler_test_hook_guard() {
+        elio::runtime::detail::pause_after_graceful_drain_for_test.store(
+            false, std::memory_order_release);
+        elio::runtime::detail::pause_after_graceful_drain_for_test.notify_all();
+        elio::runtime::detail::graceful_drain_paused_for_test.store(
+            false, std::memory_order_release);
+        elio::runtime::detail::graceful_drain_rechecks_for_test.store(
+            0, std::memory_order_release);
+        elio::runtime::detail::graceful_admission_closed_for_test.store(
+            false, std::memory_order_release);
+        elio::runtime::detail::destroying_workers_for_test.store(
+            false, std::memory_order_release);
+        elio::runtime::detail::tracked_completions_during_worker_destroy_for_test.store(
+            0, std::memory_order_release);
+        elio::runtime::detail::worker_io_backend_for_test.store(
+            elio::io::io_context::backend_type::auto_detect,
+            std::memory_order_release);
+    }
+};
+
 } // namespace
 
 TEST_CASE("shutdown waits for tracked tasks suspended on I/O", "[scheduler][shutdown]") {
@@ -96,6 +187,288 @@ TEST_CASE("shutdown waits for tracked tasks suspended on I/O", "[scheduler][shut
     REQUIRE(done_c.load());
 }
 
+TEST_CASE("graceful shutdown closes initial admission before draining",
+          "[scheduler][shutdown][admission][regression]") {
+    scheduler_test_hook_guard hook_guard;
+    elio::runtime::detail::graceful_admission_closed_for_test.store(
+        false, std::memory_order_release);
+
+    scheduler sched(1);
+    sched.start();
+
+    elio::sync::event gate;
+    std::atomic<bool> accepted_started{false};
+    std::atomic<int> accepted_completed{0};
+    std::atomic<int> rejected_bodies{0};
+    auto accepted = sched.go_joinable(
+        wait_on_event_started, &gate, &accepted_started, &accepted_completed);
+    const bool task_started = wait_for_flag(accepted_started, scaled_ms(2000));
+
+    bool drained = false;
+    std::thread shutdown_thread([&] {
+        drained = sched.shutdown(scaled_ms(5000));
+    });
+
+    const bool admission_closed = wait_for_flag(
+        elio::runtime::detail::graceful_admission_closed_for_test,
+        scaled_ms(2000));
+
+    bool raw_rejected = false;
+    bool raw_frame_retained = false;
+    bool raw_frame_released = false;
+    bool owned_frame_released = false;
+    bool joinable_rejected = false;
+    bool pinned_joinable_rejected = false;
+
+    if (admission_closed) {
+        sched.go(increment_only, &rejected_bodies);
+        sched.go_to(0, increment_only, &rejected_bodies);
+
+        auto joined = sched.go_joinable(increment_only, &rejected_bodies);
+        auto pinned_joined =
+            sched.go_joinable_to(0, increment_only, &rejected_bodies);
+
+        joined.wait_destroyed();
+        pinned_joined.wait_destroyed();
+        try {
+            joined.await_resume();
+        } catch (const std::logic_error&) {
+            joinable_rejected = true;
+        }
+        try {
+            pinned_joined.await_resume();
+        } catch (const std::logic_error&) {
+            pinned_joinable_rejected = true;
+        }
+
+        auto raw_marker = std::make_shared<int>(1);
+        std::weak_ptr<int> raw_marker_observer = raw_marker;
+        auto raw_task = increment_with_frame_marker(
+            &rejected_bodies, std::move(raw_marker));
+        auto raw_handle =
+            elio::coro::detail::task_access::release(std::move(raw_task));
+        raw_rejected = !sched.try_spawn(raw_handle);
+        raw_frame_retained = !raw_marker_observer.expired();
+        raw_handle.destroy();
+        raw_frame_released = raw_marker_observer.expired();
+
+        auto owned_marker = std::make_shared<int>(1);
+        std::weak_ptr<int> owned_marker_observer = owned_marker;
+        auto owned_task = increment_with_frame_marker(
+            &rejected_bodies, std::move(owned_marker));
+        auto owned_handle =
+            elio::coro::detail::task_access::release(std::move(owned_task));
+        sched.spawn_to(0, owned_handle);
+        owned_frame_released = owned_marker_observer.expired();
+    }
+
+    gate.set();
+    shutdown_thread.join();
+    accepted.wait_destroyed();
+    REQUIRE_NOTHROW(accepted.await_resume());
+
+    REQUIRE(task_started);
+    REQUIRE(admission_closed);
+    REQUIRE(drained);
+    REQUIRE(accepted_completed.load(std::memory_order_acquire) == 1);
+    REQUIRE(rejected_bodies.load(std::memory_order_acquire) == 0);
+    REQUIRE(raw_rejected);
+    REQUIRE(raw_frame_retained);
+    REQUIRE(raw_frame_released);
+    REQUIRE(owned_frame_released);
+    REQUIRE(joinable_rejected);
+    REQUIRE(pinned_joinable_rejected);
+}
+
+TEST_CASE("graceful shutdown admits linked children of accepted tasks",
+          "[scheduler][shutdown][admission][task_group][regression]") {
+    scheduler_test_hook_guard hook_guard;
+    elio::runtime::detail::graceful_admission_closed_for_test.store(
+        false, std::memory_order_release);
+
+    scheduler sched(1);
+    sched.start();
+
+    elio::sync::event gate;
+    std::atomic<bool> root_started{false};
+    std::atomic<int> child_runs{0};
+    std::atomic<bool> group_joined{false};
+    auto root = sched.go_joinable(
+        spawn_group_after_event, &gate, &root_started, &child_runs,
+        &group_joined);
+    REQUIRE(wait_for_flag(root_started, scaled_ms(2000)));
+
+    bool drained = false;
+    std::thread shutdown_thread([&] {
+        drained = sched.shutdown(scaled_ms(5000));
+    });
+    const bool admission_closed = wait_for_flag(
+        elio::runtime::detail::graceful_admission_closed_for_test,
+        scaled_ms(2000));
+
+    bool external_group_rejected = false;
+    if (admission_closed) {
+        task_group external_group(sched);
+        external_group.spawn(increment_only, &child_runs);
+        external_group_rejected = !external_group.failures().empty();
+    }
+
+    gate.set();
+    shutdown_thread.join();
+    root.wait_destroyed();
+    REQUIRE_NOTHROW(root.await_resume());
+
+    REQUIRE(admission_closed);
+    REQUIRE(drained);
+    REQUIRE(external_group_rejected);
+    REQUIRE(group_joined.load(std::memory_order_acquire));
+    REQUIRE(child_runs.load(std::memory_order_acquire) == 1);
+}
+
+TEST_CASE("graceful shutdown rechecks children admitted after idle observation",
+          "[scheduler][shutdown][admission][task_group][regression]") {
+    scheduler_test_hook_guard hook_guard;
+    elio::runtime::detail::pause_after_graceful_drain_for_test.store(
+        true, std::memory_order_release);
+    elio::runtime::detail::graceful_drain_paused_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::graceful_drain_rechecks_for_test.store(
+        0, std::memory_order_release);
+
+    scheduler sched(1);
+    sched.start();
+
+    elio::sync::event start_gate;
+    elio::sync::event child_gate;
+    std::atomic<bool> root_started{false};
+    std::atomic<bool> child_started{false};
+    std::atomic<int> child_runs{0};
+
+    auto raw_task = spawn_blocked_group_after_event(
+        &start_gate, &child_gate, &root_started, &child_started, &child_runs);
+    auto raw_handle =
+        elio::coro::detail::task_access::release(std::move(raw_task));
+    REQUIRE(sched.try_spawn(raw_handle));
+    REQUIRE(wait_for_flag(root_started, scaled_ms(2000)));
+
+    bool drained = false;
+    std::thread shutdown_thread([&] {
+        drained = sched.shutdown(scaled_ms(5000));
+    });
+
+    const bool initial_drain_observed = wait_for_flag(
+        elio::runtime::detail::graceful_drain_paused_for_test,
+        scaled_ms(2000));
+    start_gate.set();
+    const bool linked_child_started =
+        wait_for_flag(child_started, scaled_ms(2000));
+
+    elio::runtime::detail::pause_after_graceful_drain_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::pause_after_graceful_drain_for_test.notify_all();
+
+    const auto recheck_deadline =
+        std::chrono::steady_clock::now() + scaled_ms(2000);
+    while (elio::runtime::detail::graceful_drain_rechecks_for_test.load(
+               std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < recheck_deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    const bool linked_child_rechecked =
+        elio::runtime::detail::graceful_drain_rechecks_for_test.load(
+            std::memory_order_acquire) > 0;
+
+    child_gate.set();
+    shutdown_thread.join();
+
+    REQUIRE(initial_drain_observed);
+    REQUIRE(linked_child_started);
+    REQUIRE(linked_child_rechecked);
+    REQUIRE(drained);
+    REQUIRE(child_runs.load(std::memory_order_acquire) == 1);
+}
+
+TEST_CASE("scheduler destroys worker backends before tracking state",
+          "[scheduler][shutdown][lifecycle][io][regression]") {
+    scheduler_test_hook_guard hook_guard;
+    elio::runtime::detail::worker_io_backend_for_test.store(
+        elio::io::io_context::backend_type::epoll,
+        std::memory_order_release);
+    elio::runtime::detail::tracked_completions_during_worker_destroy_for_test.store(
+        0, std::memory_order_release);
+
+    std::atomic<bool> timer_resumed{false};
+    auto sched = std::make_unique<scheduler>(1);
+    sched->start();
+    auto owner = sched->go_joinable(
+        mark_after_sleep, scaled_sec(30), &timer_resumed);
+
+    const auto pending_deadline =
+        std::chrono::steady_clock::now() + scaled_ms(2000);
+    while (sched->get_worker(0)->io_context().pending_count() == 0 &&
+           std::chrono::steady_clock::now() < pending_deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    const bool timer_was_pending =
+        sched->get_worker(0)->io_context().pending_count() > 0;
+
+    sched->shutdown_force();
+    sched.reset();
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+
+    const size_t completions_during_worker_destroy =
+        elio::runtime::detail::tracked_completions_during_worker_destroy_for_test.load(
+            std::memory_order_acquire);
+    REQUIRE(timer_was_pending);
+    REQUIRE(timer_resumed.load(std::memory_order_acquire));
+    REQUIRE(completions_during_worker_destroy == 1);
+}
+
+TEST_CASE("tracked completion survives scheduler destruction after resuspension",
+          "[scheduler][shutdown][lifecycle][io][regression]") {
+    scheduler_test_hook_guard hook_guard;
+    elio::runtime::detail::worker_io_backend_for_test.store(
+        elio::io::io_context::backend_type::epoll,
+        std::memory_order_release);
+
+    external_resume_slot slot;
+    std::atomic<bool> cancellation_resumed{false};
+    auto sched = std::make_unique<scheduler>(1);
+    sched->start();
+    auto owner = sched->go_joinable(
+        resuspend_after_timer_cancel,
+        scaled_sec(30),
+        &slot,
+        &cancellation_resumed);
+
+    const auto pending_deadline =
+        std::chrono::steady_clock::now() + scaled_ms(2000);
+    while (sched->get_worker(0)->io_context().pending_count() == 0 &&
+           std::chrono::steady_clock::now() < pending_deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    const bool timer_was_pending =
+        sched->get_worker(0)->io_context().pending_count() > 0;
+
+    sched->shutdown_force();
+    sched.reset();
+
+    void* suspended_address =
+        slot.address.exchange(nullptr, std::memory_order_acq_rel);
+    const bool resuspended_after_backend_cancel =
+        cancellation_resumed.load(std::memory_order_acquire) &&
+        suspended_address != nullptr;
+    if (suspended_address) {
+        std::coroutine_handle<>::from_address(suspended_address).resume();
+    }
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(timer_was_pending);
+    REQUIRE(resuspended_after_backend_cancel);
+}
+
 TEST_CASE("wait_for_idle returns false when tasks exceed timeout",
           "[scheduler][shutdown]") {
     scheduler sched(2);
@@ -117,6 +490,30 @@ TEST_CASE("wait_for_idle returns false when tasks exceed timeout",
     // Let the task complete naturally before shutdown (avoids IO orphaning).
     REQUIRE(sched.shutdown(scaled_ms(2000)));
     REQUIRE(done.load() == 1);
+}
+
+TEST_CASE("scheduler deadlines saturate extreme finite timeouts",
+          "[scheduler][shutdown][timeout][regression]") {
+    using clock = std::chrono::steady_clock;
+    const auto extreme = std::chrono::milliseconds::max() - 1ms;
+
+    CHECK(elio::runtime::detail::saturating_steady_deadline(extreme) ==
+          clock::time_point::max());
+    CHECK(elio::runtime::detail::saturating_steady_deadline(
+              std::chrono::milliseconds::max()) ==
+          clock::time_point::max());
+
+    const auto before = clock::now();
+    const auto nonpositive =
+        elio::runtime::detail::saturating_steady_deadline(-1ms);
+    const auto after = clock::now();
+    CHECK(nonpositive >= before);
+    CHECK(nonpositive <= after);
+
+    scheduler sched(1);
+    sched.start();
+    REQUIRE(sched.wait_for_idle(extreme));
+    REQUIRE(sched.shutdown(extreme));
 }
 
 TEST_CASE("shutdown_force on idle scheduler is near-immediate",

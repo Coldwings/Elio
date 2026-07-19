@@ -104,9 +104,13 @@ struct blocking_move_callable {
     }
 };
 
+// Launch-failure tests pin their launcher to the last worker so this deliberate
+// synchronous block cannot stall the already-submitted round-robin children.
 struct launch_throw_control {
+    std::atomic<bool> block_on_move{false};
+    std::atomic<bool> move_started{false};
+    std::atomic<bool> allow_move{false};
     std::atomic<bool> throw_on_move{false};
-    const std::atomic<bool>* wait_before_throw{nullptr};
 };
 
 struct launch_throwing_move_callable {
@@ -121,14 +125,15 @@ struct launch_throwing_move_callable {
     launch_throwing_move_callable(launch_throwing_move_callable&& other)
         noexcept(false)
         : control(other.control) {
-        if (control && control->throw_on_move.load(std::memory_order_acquire)) {
-            const auto* wait_flag = control->wait_before_throw;
-            const auto deadline =
-                std::chrono::steady_clock::now() + scaled_ms(2000);
-            while (wait_flag && !wait_flag->load(std::memory_order_acquire) &&
-                   std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (control &&
+            control->block_on_move.load(std::memory_order_acquire)) {
+            control->move_started.store(true, std::memory_order_release);
+            control->move_started.notify_all();
+            while (!control->allow_move.load(std::memory_order_acquire)) {
+                control->allow_move.wait(false, std::memory_order_acquire);
             }
+        }
+        if (control && control->throw_on_move.load(std::memory_order_acquire)) {
             throw std::runtime_error("launch move failed");
         }
         other.control = nullptr;
@@ -382,7 +387,6 @@ TEST_CASE("when_all propagates launch-time callable move failure",
     launch_throw_control control;
     std::atomic<bool> caught{false};
     std::atomic<bool> first_completed{false};
-    control.wait_before_throw = &first_completed;
 
     auto test = [&]() -> task<void> {
         auto first = [&]() -> task<int> {
@@ -390,6 +394,7 @@ TEST_CASE("when_all propagates launch-time callable move failure",
             co_return 1;
         };
         auto combo = when_all(first, launch_throwing_move_callable(control));
+        control.block_on_move.store(true, std::memory_order_release);
         control.throw_on_move.store(true, std::memory_order_release);
         try {
             auto result = co_await combo;
@@ -402,20 +407,29 @@ TEST_CASE("when_all propagates launch-time callable move failure",
 
     runtime::scheduler sched(2);
     sched.start();
-    sched.go(test);
-    REQUIRE(sched.shutdown(scaled_ms(2000)));
+    sched.go_to(1, test);
+    const bool move_started = wait_for_flag(control.move_started);
+    const bool first_finished = wait_for_flag(first_completed);
+    control.allow_move.store(true, std::memory_order_release);
+    control.allow_move.notify_all();
+    const bool did_shutdown = sched.shutdown(scaled_ms(2000));
+
+    REQUIRE(move_started);
+    REQUIRE(first_finished);
+    REQUIRE(did_shutdown);
     REQUIRE(caught.load(std::memory_order_acquire));
-    REQUIRE(first_completed.load(std::memory_order_acquire));
 }
 
 TEST_CASE("when_all launch failure takes precedence over child failure",
           "[sync][combinators][regression][exception]") {
     launch_throw_control control;
-    std::atomic<bool> child_failed{false};
+    sync::event observer_ready;
+    sync::event never;
+    std::atomic<bool> child_failure_observed{false};
     std::atomic<bool> child_failure_reported{false};
-    control.wait_before_throw = &child_failed;
+    std::atomic<bool> completed{false};
 
-    runtime::scheduler sched(2);
+    runtime::scheduler sched(4);
     sched.set_unhandled_exception_handler(
         [&](std::exception_ptr exception) {
             try {
@@ -429,14 +443,26 @@ TEST_CASE("when_all launch failure takes precedence over child failure",
         });
     sched.start();
 
-    auto owner = sched.go_joinable([&]() -> task<void> {
+    sched.go_to(3, [&]() -> task<void> {
         auto first = [&]() -> task<int> {
-            child_failed.store(true, std::memory_order_release);
+            co_await observer_ready.wait();
             throw std::runtime_error("child failed first");
             co_return 0;
         };
+        auto observer = [&]() -> task<int> {
+            auto token = this_coro::cancel_token();
+            [[maybe_unused]] auto cancellation_registration =
+                token.on_cancel([&] {
+                    child_failure_observed.store(
+                        true, std::memory_order_release);
+                });
+            observer_ready.set();
+            (void)co_await never.wait(std::move(token));
+            co_return 2;
+        };
         auto combo = when_all(
-            first, launch_throwing_move_callable(control));
+            first, observer, launch_throwing_move_callable(control));
+        control.block_on_move.store(true, std::memory_order_release);
         control.throw_on_move.store(true, std::memory_order_release);
 
         try {
@@ -446,11 +472,21 @@ TEST_CASE("when_all launch failure takes precedence over child failure",
             REQUIRE(std::string_view(error.what()) == "launch move failed");
         }
         REQUIRE(child_failure_reported.load(std::memory_order_acquire));
+        completed.store(true, std::memory_order_release);
     });
 
-    owner.wait_destroyed();
-    REQUIRE_NOTHROW(owner.await_resume());
-    sched.shutdown();
+    const bool move_started = wait_for_flag(control.move_started);
+    const bool child_failure_recorded =
+        wait_for_flag(child_failure_observed);
+    control.allow_move.store(true, std::memory_order_release);
+    control.allow_move.notify_all();
+    const bool owner_completed = wait_for_flag(completed);
+    const bool did_shutdown = sched.shutdown(scaled_ms(2000));
+
+    REQUIRE(move_started);
+    REQUIRE(child_failure_recorded);
+    REQUIRE(owner_completed);
+    REQUIRE(did_shutdown);
 }
 
 // --- when_any tests ---
@@ -508,19 +544,34 @@ TEST_CASE("when_any does not resume while launching children",
     REQUIRE(resume_count.load(std::memory_order_acquire) == 1);
 }
 
-TEST_CASE("when_any propagates launch-time callable move failure",
+TEST_CASE("when_any launch failure takes precedence over selected winner",
           "[sync][combinators][regression]") {
     launch_throw_control control;
+    sync::event observer_ready;
+    sync::event never;
     std::atomic<bool> caught{false};
     std::atomic<bool> first_completed{false};
-    control.wait_before_throw = &first_completed;
+    std::atomic<bool> winner_cancel_observed{false};
 
     auto test = [&]() -> task<void> {
         auto first = [&]() -> task<int> {
+            co_await observer_ready.wait();
             first_completed.store(true, std::memory_order_release);
             co_return 1;
         };
-        auto combo = when_any(first, launch_throwing_move_callable(control));
+        auto observer = [&](cancel_token token) -> task<int> {
+            [[maybe_unused]] auto cancellation_registration =
+                token.on_cancel([&] {
+                    winner_cancel_observed.store(
+                        true, std::memory_order_release);
+                });
+            observer_ready.set();
+            (void)co_await never.wait(std::move(token));
+            co_return 2;
+        };
+        auto combo = when_any(
+            first, observer, launch_throwing_move_callable(control));
+        control.block_on_move.store(true, std::memory_order_release);
         control.throw_on_move.store(true, std::memory_order_release);
         try {
             auto result = co_await combo;
@@ -531,10 +582,18 @@ TEST_CASE("when_any propagates launch-time callable move failure",
         }
     };
 
-    runtime::scheduler sched(2);
+    runtime::scheduler sched(4);
     sched.start();
-    sched.go(test);
-    REQUIRE(sched.shutdown(scaled_ms(2000)));
+    sched.go_to(3, test);
+    const bool move_started = wait_for_flag(control.move_started);
+    const bool winner_selected = wait_for_flag(winner_cancel_observed);
+    control.allow_move.store(true, std::memory_order_release);
+    control.allow_move.notify_all();
+    const bool did_shutdown = sched.shutdown(scaled_ms(2000));
+
+    REQUIRE(move_started);
+    REQUIRE(winner_selected);
+    REQUIRE(did_shutdown);
     REQUIRE(caught.load(std::memory_order_acquire));
     REQUIRE(first_completed.load(std::memory_order_acquire));
 }

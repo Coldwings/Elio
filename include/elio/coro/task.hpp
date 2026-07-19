@@ -34,6 +34,11 @@ class join_handle;
 
 namespace detail {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline std::atomic<bool> pause_before_detached_frame_destroy_for_test{false};
+inline std::atomic<bool> detached_frame_destroy_paused_for_test{false};
+#endif
+
 struct final_awaiter {
     [[nodiscard]] bool await_ready() const noexcept { return false; }
     
@@ -44,18 +49,35 @@ struct final_awaiter {
         if (continuation) {
             return continuation;
         } else if (h.promise().detached_) {
-            // Detached task with no continuation - self-destruct
-            // IMPORTANT: Notify join_state before destruction so waiters know
-            // the coroutine frame is about to be destroyed
-            if (h.promise().join_state_) {
-                h.promise().join_state_->mark_destroyed();
-            }
+            // Keep the externally owned join state after freeing the frame so
+            // wait_destroyed() observes completed parameter/capture teardown.
+            auto join_state = std::move(h.promise().join_state_);
             // If this detached task threw an unhandled exception, report it
             // via the scheduler's exception handler (or default log ERROR).
             if (auto ex = h.promise().exception()) {
                 runtime::report_detached_exception(std::move(ex));
             }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (join_state &&
+                pause_before_detached_frame_destroy_for_test.load(
+                    std::memory_order_acquire)) {
+                detached_frame_destroy_paused_for_test.store(
+                    true, std::memory_order_release);
+                detached_frame_destroy_paused_for_test.notify_all();
+                while (pause_before_detached_frame_destroy_for_test.load(
+                    std::memory_order_acquire)) {
+                    pause_before_detached_frame_destroy_for_test.wait(
+                        true, std::memory_order_acquire);
+                }
+                detached_frame_destroy_paused_for_test.store(
+                    false, std::memory_order_release);
+                detached_frame_destroy_paused_for_test.notify_all();
+            }
+#endif
             h.destroy();
+            if (join_state) {
+                join_state->mark_destroyed();
+            }
             return std::noop_coroutine();
         } else {
             // Owned task with no continuation - stay suspended for owner to destroy

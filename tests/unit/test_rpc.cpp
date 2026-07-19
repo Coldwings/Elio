@@ -3736,14 +3736,53 @@ TEST_CASE("server facade may be released after stopped serve returns",
     CHECK(request_sent.load(std::memory_order_acquire));
     CHECK(handler_started.load(std::memory_order_acquire));
 
+    coro::detail::detached_frame_destroy_paused_for_test.store(
+        false, std::memory_order_release);
+    struct frame_destroy_pause_guard {
+        frame_destroy_pause_guard() {
+            coro::detail::pause_before_detached_frame_destroy_for_test.store(
+                true, std::memory_order_release);
+        }
+
+        ~frame_destroy_pause_guard() { release(); }
+
+        void release() const noexcept {
+            coro::detail::pause_before_detached_frame_destroy_for_test.store(
+                false, std::memory_order_release);
+            coro::detail::pause_before_detached_frame_destroy_for_test.notify_all();
+        }
+    } pause_guard;
+
     server->stop();
-    serve_owner.wait_destroyed();
-    CHECK_NOTHROW(serve_owner.await_resume());
+    for (int i = 0;
+         i < 2000 &&
+             !coro::detail::detached_frame_destroy_paused_for_test.load(
+                 std::memory_order_acquire);
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+    const bool frame_destroy_paused =
+        coro::detail::detached_frame_destroy_paused_for_test.load(
+            std::memory_order_acquire);
+    CHECK(frame_destroy_paused);
+    CHECK_FALSE(serve_owner.is_destroyed());
+    CHECK(serve_owner.is_ready());
+    if (serve_owner.is_ready()) {
+        CHECK_NOTHROW(serve_owner.await_resume());
+    }
     CHECK(server->session_count() == 1);
     CHECK_FALSE(handler_finished.load(std::memory_order_acquire));
 
     std::weak_ptr server_lifetime = server;
     server.reset();
+    CHECK_FALSE(server_lifetime.expired());
+    pause_guard.release();
+    for (int i = 0;
+         i < 2000 && !serve_owner.is_destroyed();
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+    CHECK(serve_owner.is_destroyed());
     CHECK(server_lifetime.expired());
 
     release_handler.set();

@@ -45,7 +45,58 @@ namespace detail {
     inline std::atomic<bool> resize_waiting_for_draining_worker_for_test{false};
     inline std::atomic<bool> hold_draining_worker_for_test{false};
     inline std::atomic<bool> draining_worker_held_for_test{false};
+    inline std::atomic<bool> graceful_admission_closed_for_test{false};
+    inline std::atomic<bool> pause_after_graceful_drain_for_test{false};
+    inline std::atomic<bool> graceful_drain_paused_for_test{false};
+    inline std::atomic<size_t> graceful_drain_rechecks_for_test{0};
+    inline std::atomic<bool> destroying_workers_for_test{false};
+    inline std::atomic<size_t> tracked_completions_during_worker_destroy_for_test{0};
 #endif
+
+    [[nodiscard]] inline std::chrono::steady_clock::time_point
+    saturating_steady_deadline(std::chrono::milliseconds timeout) noexcept {
+        using clock = std::chrono::steady_clock;
+        const auto now = clock::now();
+        if (timeout <= std::chrono::milliseconds::zero()) {
+            return now;
+        }
+
+        const auto maximum_delay =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                clock::time_point::max() - now);
+        if (timeout >= maximum_delay) {
+            return clock::time_point::max();
+        }
+        return now + std::chrono::duration_cast<clock::duration>(timeout);
+    }
+
+    /// Shared accounting outlives scheduler teardown when a backend cancellation
+    /// resumes a tracked task that suspends again. Promise callbacks retain this
+    /// state directly and never dereference a destroyed scheduler.
+    struct tracked_task_state {
+        void on_spawned() noexcept {
+            active.fetch_add(1, std::memory_order_acq_rel);
+        }
+
+        void on_completed() noexcept {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (destroying_workers_for_test.load(std::memory_order_acquire)) {
+                tracked_completions_during_worker_destroy_for_test.fetch_add(
+                    1, std::memory_order_acq_rel);
+            }
+#endif
+            if (active.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+                waiters.load(std::memory_order_acquire) > 0) {
+                std::lock_guard<std::mutex> lock(idle_mutex);
+                idle_cv.notify_all();
+            }
+        }
+
+        alignas(64) std::atomic<size_t> active{0};
+        alignas(64) std::atomic<size_t> waiters{0};
+        std::mutex idle_mutex;
+        std::condition_variable idle_cv;
+    };
 
     /// Wrapper coroutine for fire-and-forget (go/go_to).
     /// Stores callable and args in its coroutine frame, ensuring lambda lifetime
@@ -122,6 +173,20 @@ public:
         // Also waits for a concurrent worker-initiated teardown winner and
         // joins that worker after its shutdown_force() call unwinds.
         shutdown_force();
+
+        // A backend destructor may complete pending operations with ECANCELED,
+        // resume their coroutine frames, and release tracked wrappers. Destroy
+        // every worker while all scheduler accounting and handler state is
+        // still alive instead of relying on reverse member destruction order.
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        detail::destroying_workers_for_test.store(true, std::memory_order_release);
+#endif
+        for (auto& worker : workers_) {
+            worker.reset();
+        }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        detail::destroying_workers_for_test.store(false, std::memory_order_release);
+#endif
         if (current_scheduler_ == this) {
             current_scheduler_ = nullptr;
         }
@@ -154,10 +219,13 @@ public:
         current_scheduler_ = this;
     }
 
-    /// Graceful shutdown: wait for tasks spawned via go/go_to/go_joinable
-    /// (and elio::run()) to complete, including those suspended on I/O, then
-    /// stop workers. If the timeout elapses with tasks still in flight, the
-    /// remaining work is force-stopped (in-flight I/O may be orphaned).
+    /// Graceful shutdown: atomically close independent initial task admission,
+    /// wait for already-accepted tasks spawned via go/go_to/go_joinable (and
+    /// elio::run()) to complete, including those suspended on I/O, then stop
+    /// workers. Continuations and structured children created by accepted tasks
+    /// remain schedulable during the drain. If the timeout elapses with tasks
+    /// still in flight, the remaining work is force-stopped (in-flight I/O may
+    /// be orphaned).
     ///
     /// @param timeout Maximum wait. Default: wait forever.
     /// @return true if all tracked tasks completed within the timeout.
@@ -179,7 +247,78 @@ public:
             return active_tasks() == 0;
         }
 
-        bool drained = wait_for_idle(timeout);
+        {
+            std::lock_guard<std::mutex> lock(shutdown_mutex_);
+            if (!shutdown_started_) {
+                graceful_drain_in_progress_ = true;
+            }
+            shutdown_started_ = true;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            detail::graceful_admission_closed_for_test.store(
+                true, std::memory_order_release);
+            detail::graceful_admission_closed_for_test.notify_all();
+#endif
+        }
+
+        const bool wait_forever =
+            timeout == std::chrono::milliseconds::max();
+        const auto deadline = detail::saturating_steady_deadline(timeout);
+
+        bool drained = false;
+        while (true) {
+            auto remaining = timeout;
+            if (!wait_forever) {
+                const auto now = std::chrono::steady_clock::now();
+                remaining = now >= deadline
+                    ? std::chrono::milliseconds::zero()
+                    : std::chrono::duration_cast<std::chrono::milliseconds>(
+                          deadline - now);
+            }
+
+            drained = wait_for_idle(remaining);
+            if (!drained) {
+                // active_tasks() is intentionally a live aggregate. A linked
+                // child can appear between wait_for_idle() observing zero and
+                // its final return check. Retry while the original timeout
+                // budget and scheduler lifetime still permit a graceful drain.
+                if (running_.load(std::memory_order_acquire) &&
+                    (wait_forever ||
+                     std::chrono::steady_clock::now() < deadline)) {
+                    continue;
+                }
+                break;
+            }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (detail::pause_after_graceful_drain_for_test.load(
+                    std::memory_order_acquire)) {
+                detail::graceful_drain_paused_for_test.store(
+                    true, std::memory_order_release);
+                detail::graceful_drain_paused_for_test.notify_all();
+                while (detail::pause_after_graceful_drain_for_test.load(
+                    std::memory_order_acquire)) {
+                    detail::pause_after_graceful_drain_for_test.wait(
+                        true, std::memory_order_acquire);
+                }
+                detail::graceful_drain_paused_for_test.store(
+                    false, std::memory_order_release);
+            }
+#endif
+
+            std::lock_guard<std::mutex> lock(shutdown_mutex_);
+            if (active_tasks() == 0) {
+                // Seal linked admission while the accepted set is still empty.
+                // A running untracked raw task can no longer register a child
+                // between the final drain observation and force teardown.
+                graceful_drain_in_progress_ = false;
+                break;
+            }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            detail::graceful_drain_rechecks_for_test.fetch_add(
+                1, std::memory_order_acq_rel);
+            detail::graceful_drain_rechecks_for_test.notify_all();
+#endif
+        }
         shutdown_force();
         return drained;
     }
@@ -223,6 +362,7 @@ public:
             // Every first shutdown invocation closes the one-shot lifecycle,
             // including shutdown before start().
             shutdown_started_ = true;
+            graceful_drain_in_progress_ = false;
             if (resize_in_progress_) {
                 // A resize may be joining this draining worker. Waiting from
                 // the worker would deadlock that join, so hand teardown to the
@@ -348,8 +488,8 @@ private:
         // Wake any threads still parked in wait_for_idle so they can observe
         // the !running_ state and bail out promptly.
         {
-            std::lock_guard<std::mutex> lock(idle_mutex_);
-            idle_cv_.notify_all();
+            std::lock_guard<std::mutex> lock(tracking_state_->idle_mutex);
+            tracking_state_->idle_cv.notify_all();
         }
 
         // A worker that initiated force shutdown still has to finish its
@@ -368,7 +508,7 @@ public:
     /// from any source ARE counted, so a coroutine waiting on an io_uring
     /// completion always shows up here.
     [[nodiscard]] size_t active_tasks() const noexcept {
-        size_t total = active_tracked_.load(std::memory_order_acquire);
+        size_t total = tracking_state_->active.load(std::memory_order_acquire);
         size_t n = num_threads_.load(std::memory_order_acquire);
         return total + worker_pending_load_(n);
     }
@@ -391,17 +531,15 @@ public:
         }
 
         const bool wait_forever = (timeout == std::chrono::milliseconds::max());
-        const auto deadline = wait_forever
-            ? std::chrono::steady_clock::time_point::max()
-            : std::chrono::steady_clock::now() + timeout;
+        const auto deadline = detail::saturating_steady_deadline(timeout);
 
         // Periodic wake to re-evaluate queue/io counters (which don't notify
         // the CV directly). The CV only fires on tracked-task transitions to
         // zero; this poll catches everything else within a bounded window.
         constexpr auto poll_interval = std::chrono::milliseconds(5);
 
-        waiters_.fetch_add(1, std::memory_order_acq_rel);
-        std::unique_lock<std::mutex> lock(idle_mutex_);
+        tracking_state_->waiters.fetch_add(1, std::memory_order_acq_rel);
+        std::unique_lock<std::mutex> lock(tracking_state_->idle_mutex);
         while (active_tasks() > 0 && running_.load(std::memory_order_acquire)) {
             auto now = std::chrono::steady_clock::now();
             if (!wait_forever && now >= deadline) break;
@@ -412,16 +550,16 @@ public:
                     deadline - now);
                 if (remaining < wait_for) wait_for = remaining;
             }
-            idle_cv_.wait_for(lock, wait_for);
+            tracking_state_->idle_cv.wait_for(lock, wait_for);
         }
-        waiters_.fetch_sub(1, std::memory_order_acq_rel);
+        tracking_state_->waiters.fetch_sub(1, std::memory_order_acq_rel);
         return active_tasks() == 0;
     }
 
     /// Internal: increment tracked-task counter. Called by mark_tracked_()
     /// before the wrapper handle is exposed to the scheduler.
     void on_task_spawned() noexcept {
-        active_tracked_.fetch_add(1, std::memory_order_acq_rel);
+        tracking_state_->on_spawned();
     }
 
     /// Internal: decrement tracked-task counter. Called from the wrapper
@@ -429,12 +567,7 @@ public:
     /// balanced even if the handle is destroyed before its body runs.
     /// Notifies waiters when the counter transitions to zero.
     void on_task_completed() noexcept {
-        if (active_tracked_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            if (waiters_.load(std::memory_order_acquire) > 0) {
-                std::lock_guard<std::mutex> lock(idle_mutex_);
-                idle_cv_.notify_all();
-            }
-        }
+        tracking_state_->on_completed();
     }
 
     void pause() { paused_.store(true, std::memory_order_relaxed); }
@@ -445,16 +578,15 @@ public:
     /// On failure the handle remains live.
     [[nodiscard]] bool try_spawn(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return false;
-        if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
-            return false;
-        }
-        // Detach from current thread's frame chain before spawning to another thread
-        // to avoid use-after-free when this thread creates another coroutine.
-        auto* promise = coro::get_promise_base(handle.address());
-        if (promise) {
-            promise->detach_from_parent();
-        }
-        return do_spawn(handle, false);
+        return try_initial_admission_([&] {
+            // Detach from the construction thread's frame chain before the
+            // independent task can execute on another worker.
+            auto* promise = coro::get_promise_base(handle.address());
+            if (promise) {
+                promise->detach_from_parent();
+            }
+            return do_spawn(handle, false);
+        });
     }
 
     void spawn(std::coroutine_handle<> handle) {
@@ -535,7 +667,19 @@ public:
     /// This is an initial ownership handoff and detaches construction-time
     /// virtual-stack ancestry.
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle) {
-        (void)do_spawn_to_(worker_id, handle);
+        if (!handle) [[unlikely]] return;
+        bool scheduled = false;
+        try {
+            scheduled = try_initial_admission_([&] {
+                return do_spawn_to_(worker_id, handle, false);
+            });
+        } catch (...) {
+            handle.destroy();
+            throw;
+        }
+        if (!scheduled) {
+            handle.destroy();
+        }
     }
 
     /// Try to re-enqueue a suspended coroutine toward worker_id while
@@ -780,6 +924,40 @@ public:
     }
 
 private:
+    /// Serialize an initial ownership handoff with lifecycle closure. The
+    /// callback must leave the handle live on rejection so any destruction and
+    /// user-owned frame teardown happen after shutdown_mutex_ is released.
+    template<typename Enqueue>
+    [[nodiscard]] bool try_initial_admission_(Enqueue&& enqueue) {
+        std::lock_guard<std::mutex> lock(shutdown_mutex_);
+        if (shutdown_started_ ||
+            !running_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        return std::invoke(std::forward<Enqueue>(enqueue));
+    }
+
+    /// Structured children are part of an already-accepted task's lifetime,
+    /// so graceful drain must let a scheduler worker register them. Calls from
+    /// outside this scheduler remain independent initial admission and close at
+    /// the shutdown boundary. Force teardown never admits more children.
+    template<typename Enqueue>
+    [[nodiscard]] bool try_linked_admission_(Enqueue&& enqueue) {
+        std::lock_guard<std::mutex> lock(shutdown_mutex_);
+        if (!running_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (shutdown_started_) {
+            auto* current = worker_thread::current();
+            if (!graceful_drain_in_progress_ ||
+                shutdown_teardown_in_progress_ || !current ||
+                current->scheduler_ != this) {
+                return false;
+            }
+        }
+        return std::invoke(std::forward<Enqueue>(enqueue));
+    }
+
     [[nodiscard]] std::shared_ptr<const unhandled_exception_handler>
     snapshot_unhandled_exception_handler_() const noexcept {
         std::lock_guard<std::mutex> lock(unhandled_exception_handler_mutex_);
@@ -923,8 +1101,8 @@ private:
     void mark_tracked_(coro::promise_base& p) noexcept {
         on_task_spawned();
         p.set_spawn_completion(+[](void* self) noexcept {
-            static_cast<scheduler*>(self)->on_task_completed();
-        }, this);
+            static_cast<detail::tracked_task_state*>(self)->on_completed();
+        }, tracking_state_);
     }
 
     bool do_go_task_linked_(coro::cancel_token parent,
@@ -935,13 +1113,20 @@ private:
         auto handle = coro::detail::task_access::release(std::move(wrapper));
         handle.promise().detached_ = true;
         handle.promise().detach_from_parent();
-        mark_tracked_(handle.promise());
+        bool scheduled = false;
         try {
-            return do_spawn(handle);
+            scheduled = try_linked_admission_([&] {
+                mark_tracked_(handle.promise());
+                return do_spawn(handle, false);
+            });
         } catch (...) {
             handle.destroy();
             throw;
         }
+        if (!scheduled) {
+            handle.destroy();
+        }
+        return scheduled;
     }
 
     template<bool Joinable, bool Pinned, typename F, typename... Args>
@@ -968,23 +1153,42 @@ private:
             auto state = std::make_shared<coro::detail::join_state<T>>(
                 handle.promise().execution_context());
             handle.promise().join_state_ = state;
-            mark_tracked_(handle.promise());
             bool scheduled = false;
-            if constexpr (Pinned) {
-                scheduled = do_spawn_to_(worker_id, handle);
-            } else {
-                scheduled = do_spawn(handle);
+            try {
+                scheduled = try_initial_admission_([&] {
+                    mark_tracked_(handle.promise());
+                    if constexpr (Pinned) {
+                        return do_spawn_to_(worker_id, handle, false);
+                    } else {
+                        return do_spawn(handle, false);
+                    }
+                });
+            } catch (...) {
+                handle.destroy();
+                throw;
             }
             if (!scheduled) {
+                handle.destroy();
                 state->set_exception(spawn_rejected_exception_());
             }
             return coro::join_handle<T>(std::move(state));
         } else {
-            mark_tracked_(handle.promise());
-            if constexpr (Pinned) {
-                (void)do_spawn_to_(worker_id, handle);
-            } else {
-                (void)do_spawn(handle);
+            bool scheduled = false;
+            try {
+                scheduled = try_initial_admission_([&] {
+                    mark_tracked_(handle.promise());
+                    if constexpr (Pinned) {
+                        return do_spawn_to_(worker_id, handle, false);
+                    } else {
+                        return do_spawn(handle, false);
+                    }
+                });
+            } catch (...) {
+                handle.destroy();
+                throw;
+            }
+            if (!scheduled) {
+                handle.destroy();
             }
         }
     }
@@ -1307,6 +1511,7 @@ private:
     std::condition_variable shutdown_cv_;
     bool shutdown_teardown_in_progress_ = false;
     bool shutdown_started_ = false;
+    bool graceful_drain_in_progress_ = false;
     bool resize_in_progress_ = false;
     bool shutdown_deferred_by_resize_ = false;
     std::mutex shutdown_join_mutex_;
@@ -1323,15 +1528,11 @@ private:
     // Blocking pool for spawn_blocking operations
     std::unique_ptr<blocking_pool> blocking_pool_;
 
-    // Tracked-task accounting for graceful shutdown / wait_for_idle.
-    // active_tracked_ is incremented before spawning a scheduler-owned wrapper
-    // coroutine and decremented from that wrapper promise's destructor.
-    // waiters_ is a hint so the on-completion path skips the CV mutex when no
-    // one is parked in wait_for_idle.
-    alignas(64) std::atomic<size_t> active_tracked_{0};
-    alignas(64) std::atomic<size_t> waiters_{0};
-    mutable std::mutex idle_mutex_;
-    mutable std::condition_variable idle_cv_;
+    // Tracked-task accounting for graceful shutdown / wait_for_idle. Each
+    // tracked promise retains shared ownership so a backend cancellation that
+    // re-suspends can complete safely after the scheduler object is gone.
+    const std::shared_ptr<detail::tracked_task_state> tracking_state_ =
+        std::make_shared<detail::tracked_task_state>();
 
     // Join handles for workers that are draining pending I/O after a shrink
     // operation. The worker objects stay in workers_ slots so stale lock-free

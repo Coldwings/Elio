@@ -1134,3 +1134,65 @@ TEST_CASE("task_group join survives one completion enqueue rejection",
             std::memory_order_acquire));
     sched.shutdown();
 }
+
+TEST_CASE("task_group publishes completion after child state release",
+          "[task_group][structured][lifetime][exception][regression]") {
+    scheduler sched(2);
+    sched.start();
+    struct completion_pause_guard {
+        completion_pause_guard() {
+            elio::coro::detail::task_group_completion_paused_for_test.store(
+                false, std::memory_order_release);
+            elio::coro::detail::task_group_join_observed_pending_for_test.store(
+                false, std::memory_order_release);
+            elio::coro::detail::pause_before_task_group_completion_for_test.store(
+                true, std::memory_order_release);
+        }
+
+        ~completion_pause_guard() { release(); }
+
+        void release() const noexcept {
+            elio::coro::detail::pause_before_task_group_completion_for_test.store(
+                false, std::memory_order_release);
+            elio::coro::detail::pause_before_task_group_completion_for_test
+                .notify_all();
+        }
+    } pause_guard;
+    elio::sync::event enter_join;
+    std::atomic<bool> failure_observed{false};
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        task_group group;
+        group.spawn([]() -> task<void> {
+            throw std::runtime_error("child failure");
+            co_return;
+        });
+
+        co_await enter_join.wait();
+        try {
+            co_await group.join();
+        } catch (const std::runtime_error&) {
+            failure_observed.store(true, std::memory_order_release);
+        }
+    });
+
+    const bool completion_paused = wait_for_flag(
+        elio::coro::detail::task_group_completion_paused_for_test);
+    enter_join.set();
+    const bool join_observed_pending = wait_for_flag(
+        elio::coro::detail::task_group_join_observed_pending_for_test);
+    CHECK_FALSE(owner.is_ready());
+
+    pause_guard.release();
+    const bool owner_destroyed = wait_for_condition([&] {
+        return owner.is_destroyed();
+    });
+    const bool shutdown_ok = sched.shutdown(std::chrono::seconds(5));
+
+    REQUIRE(completion_paused);
+    REQUIRE(join_observed_pending);
+    REQUIRE(owner_destroyed);
+    REQUIRE(shutdown_ok);
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(failure_observed.load(std::memory_order_acquire));
+}

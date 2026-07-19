@@ -8,6 +8,7 @@
 #include "../sync/semaphore.hpp"
 
 #include <climits>
+#include <atomic>
 #include <cstddef>
 #include <coroutine>
 #include <exception>
@@ -60,6 +61,12 @@ private:
 
 namespace detail {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline std::atomic<bool> pause_before_task_group_completion_for_test{false};
+inline std::atomic<bool> task_group_completion_paused_for_test{false};
+inline std::atomic<bool> task_group_join_observed_pending_for_test{false};
+#endif
+
 [[nodiscard]] inline bool is_scheduler_worker(
     const runtime::scheduler* scheduler) noexcept {
     return scheduler != nullptr &&
@@ -67,35 +74,123 @@ namespace detail {
            runtime::worker_thread::current() != nullptr;
 }
 
-class task_group_state final
-    : public std::enable_shared_from_this<task_group_state> {
+struct task_group_child_completion final {
+    runtime::scheduler* scheduler = nullptr;
+    std::coroutine_handle<> waiter{};
+};
+
+inline void resume_task_group_join_waiter(
+    task_group_child_completion completion) noexcept {
+    if (completion.scheduler->try_schedule(completion.waiter)) {
+        return;
+    }
+
+    if (is_scheduler_worker(completion.scheduler)) {
+        auto* promise = get_promise_base(completion.waiter.address());
+        detail::frame_context_scope frame_scope(promise);
+        completion.waiter.resume();
+        return;
+    }
+
+    // Cross-thread child teardown is possible during ownership handoff.
+    // Keep the continuation in its scheduler domain and rely on the public
+    // lifetime contract that the scheduler runs until the group drains.
+    while (completion.scheduler->is_running()) {
+        std::this_thread::yield();
+        if (completion.scheduler->try_schedule(completion.waiter)) {
+            return;
+        }
+    }
+}
+
+class task_group_completion_state final {
 public:
     class all_done_awaitable final {
     public:
-        explicit all_done_awaitable(task_group_state& state) noexcept
-            : state_(state), waiter_(state.all_done_waiter_) {}
+        explicit all_done_awaitable(
+            std::shared_ptr<task_group_completion_state> state) noexcept
+            : state_(std::move(state)), waiter_(state_->all_done_waiter_) {}
 
         [[nodiscard]] bool await_ready() const noexcept {
-            return state_.outstanding_children() == 0;
+            const bool ready = state_->outstanding_children() == 0;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (!ready) {
+                task_group_join_observed_pending_for_test.store(
+                    true, std::memory_order_release);
+                task_group_join_observed_pending_for_test.notify_all();
+            }
+#endif
+            return ready;
         }
 
         bool await_suspend(std::coroutine_handle<> handle) noexcept {
-            return state_.all_done_waiter_.register_waiter(
+            return state_->all_done_waiter_.register_waiter(
                 waiter_, handle, [this] {
-                    return state_.outstanding_children() == 0;
+                    return state_->outstanding_children() == 0;
                 });
         }
 
         void await_resume() const noexcept {}
 
     private:
-        task_group_state& state_;
+        std::shared_ptr<task_group_completion_state> state_;
         completion_waiter waiter_;
     };
 
+    explicit task_group_completion_state(
+        runtime::scheduler& scheduler) noexcept
+        : scheduler_(std::addressof(scheduler)) {}
+
+    void register_child() {
+        std::lock_guard<std::mutex> lock(children_mutex_);
+        if (outstanding_children_ ==
+            std::numeric_limits<size_t>::max()) {
+            throw std::overflow_error("task_group child count overflow");
+        }
+        ++outstanding_children_;
+    }
+
+    [[nodiscard]] task_group_child_completion child_finished() noexcept {
+        bool completed = false;
+        {
+            std::lock_guard<std::mutex> lock(children_mutex_);
+            if (outstanding_children_ == 0) {
+                return {};
+            }
+            --outstanding_children_;
+            completed = outstanding_children_ == 0;
+        }
+
+        if (completed) {
+            auto waiter = all_done_waiter_.take();
+            if (waiter) {
+                return {scheduler_, waiter};
+            }
+        }
+        return {};
+    }
+
+    [[nodiscard]] size_t outstanding_children() const noexcept {
+        std::lock_guard<std::mutex> lock(children_mutex_);
+        return outstanding_children_;
+    }
+
+private:
+    runtime::scheduler* const scheduler_;
+    mutable std::mutex children_mutex_;
+    size_t outstanding_children_ = 0;
+    completion_waiter_slot all_done_waiter_;
+};
+
+class task_group_state final
+    : public std::enable_shared_from_this<task_group_state> {
+public:
     task_group_state(runtime::scheduler& scheduler,
                      task_group_options options)
-        : scheduler_(std::addressof(scheduler)), options_(options) {
+        : scheduler_(std::addressof(scheduler))
+        , options_(options)
+        , completion_(
+              std::make_shared<task_group_completion_state>(scheduler)) {
         if (options_.max_concurrency > static_cast<size_t>(INT_MAX)) {
             throw std::invalid_argument(
                 "task_group max_concurrency exceeds semaphore range");
@@ -171,40 +266,21 @@ public:
     }
 
     void register_child() {
-        std::lock_guard<std::mutex> lock(children_mutex_);
-        if (outstanding_children_ ==
-            std::numeric_limits<size_t>::max()) {
-            throw std::overflow_error("task_group child count overflow");
-        }
-        ++outstanding_children_;
+        completion_->register_child();
     }
 
-    void child_finished() noexcept {
-        bool completed = false;
-        {
-            std::lock_guard<std::mutex> lock(children_mutex_);
-            if (outstanding_children_ == 0) {
-                return;
-            }
-            --outstanding_children_;
-            completed = outstanding_children_ == 0;
-        }
-
-        if (completed) {
-            auto waiter = all_done_waiter_.take();
-            if (waiter) {
-                resume_join_waiter(waiter);
-            }
-        }
+    [[nodiscard]] std::shared_ptr<task_group_completion_state>
+    completion_state() const noexcept {
+        return completion_;
     }
 
     [[nodiscard]] size_t outstanding_children() const noexcept {
-        std::lock_guard<std::mutex> lock(children_mutex_);
-        return outstanding_children_;
+        return completion_->outstanding_children();
     }
 
-    [[nodiscard]] all_done_awaitable wait_all() noexcept {
-        return all_done_awaitable(*this);
+    [[nodiscard]] task_group_completion_state::all_done_awaitable
+    wait_all() noexcept {
+        return task_group_completion_state::all_done_awaitable(completion_);
     }
 
     [[nodiscard]] bool has_concurrency_limit() const noexcept {
@@ -270,29 +346,6 @@ public:
     }
 
 private:
-    void resume_join_waiter(std::coroutine_handle<> waiter) noexcept {
-        if (scheduler_->try_schedule(waiter)) {
-            return;
-        }
-
-        if (is_scheduler_worker(scheduler_)) {
-            auto* promise = get_promise_base(waiter.address());
-            detail::frame_context_scope frame_scope(promise);
-            waiter.resume();
-            return;
-        }
-
-        // Cross-thread child teardown is possible during ownership handoff.
-        // Keep the continuation in its scheduler domain and rely on the public
-        // lifetime contract that the scheduler runs until the group drains.
-        while (scheduler_->is_running()) {
-            std::this_thread::yield();
-            if (scheduler_->try_schedule(waiter)) {
-                return;
-            }
-        }
-    }
-
     void append_failure(std::exception_ptr failure) noexcept {
         std::lock_guard<std::mutex> lock(failures_mutex_);
         if (!first_failure_) {
@@ -307,12 +360,9 @@ private:
 
     runtime::scheduler* const scheduler_;
     const task_group_options options_;
+    const std::shared_ptr<task_group_completion_state> completion_;
     cancellation_context cancellation_;
     std::unique_ptr<sync::semaphore> permits_;
-
-    mutable std::mutex children_mutex_;
-    size_t outstanding_children_ = 0;
-    completion_waiter_slot all_done_waiter_;
 
     mutable std::mutex failures_mutex_;
     std::exception_ptr first_failure_;
@@ -326,15 +376,18 @@ class task_group_child_registration final {
 public:
     explicit task_group_child_registration(
         std::shared_ptr<task_group_state> state) noexcept
-        : state_(std::move(state)) {}
+        : completion_(state->completion_state())
+        , state_(std::move(state)) {}
 
     task_group_child_registration(task_group_child_registration&& other) noexcept
-        : state_(std::move(other.state_)) {}
+        : completion_(std::move(other.completion_))
+        , state_(std::move(other.state_)) {}
 
     task_group_child_registration& operator=(
         task_group_child_registration&& other) noexcept {
         if (this != &other) {
             finish();
+            completion_ = std::move(other.completion_);
             state_ = std::move(other.state_);
         }
         return *this;
@@ -354,12 +407,35 @@ public:
 
     void finish() noexcept {
         if (state_) {
-            state_->child_finished();
+            auto completion_state = std::move(completion_);
             state_.reset();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (pause_before_task_group_completion_for_test.load(
+                    std::memory_order_acquire)) {
+                task_group_completion_paused_for_test.store(
+                    true, std::memory_order_release);
+                task_group_completion_paused_for_test.notify_all();
+                while (pause_before_task_group_completion_for_test.load(
+                    std::memory_order_acquire)) {
+                    pause_before_task_group_completion_for_test.wait(
+                        true, std::memory_order_acquire);
+                }
+                task_group_completion_paused_for_test.store(
+                    false, std::memory_order_release);
+                task_group_completion_paused_for_test.notify_all();
+            }
+#endif
+            auto completion = completion_state->child_finished();
+            if (completion.waiter) {
+                // Failure state ownership is already released before either
+                // readiness or a registered join waiter can observe completion.
+                resume_task_group_join_waiter(completion);
+            }
         }
     }
 
 private:
+    std::shared_ptr<task_group_completion_state> completion_;
     std::shared_ptr<task_group_state> state_;
 };
 
@@ -507,7 +583,7 @@ public:
 
     private:
         task_group* group_;
-        detail::task_group_state::all_done_awaitable all_done_;
+        detail::task_group_completion_state::all_done_awaitable all_done_;
     };
 
     ~task_group() {

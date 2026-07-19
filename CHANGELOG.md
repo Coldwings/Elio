@@ -182,6 +182,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Scheduler exception-handler publication**: Concurrent
+  `set_unhandled_exception_handler()` and `report_unhandled_exception()` calls
+  now exchange shared handler snapshots under an explicit mutex instead of
+  relying on `atomic<shared_ptr>`. Reporters keep their selected handler alive
+  and invoke it outside the lock, preserving concurrent replacement and
+  self-replacement without the GCC 12 ThreadSanitizer race.
 - **Cancellation callback teardown**: Destroying or unregistering a callback
   registration now synchronizes with cancellation that has already selected or
   started the callback, preventing callback captures from being released while

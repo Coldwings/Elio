@@ -805,6 +805,12 @@ public:
 };
 ```
 
+The unhandled-exception handler APIs are thread-safe with each other. A report
+keeps its selected handler alive and invokes it without holding the publication
+lock, so replacing the handler concurrently affects later snapshots and a
+handler may replace itself. Applications remain responsible for synchronizing
+mutable state captured by the handler.
+
 The raw-handle APIs have distinct ownership and virtual-stack contracts.
 `spawn()`/`try_spawn()` and `spawn_to()` are for an independent handle before
 its first execution; they detach construction-time ancestry.

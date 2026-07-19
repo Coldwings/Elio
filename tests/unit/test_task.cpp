@@ -1194,6 +1194,28 @@ TEST_CASE("scheduler exception handler can be replaced during reports", "[task][
     REQUIRE(handled.load(std::memory_order_relaxed) > 0);
 }
 
+TEST_CASE("scheduler exception handler can replace itself while reporting",
+          "[task][spawn][exception]") {
+    scheduler sched(1);
+    bool initial_handler_called = false;
+    bool replacement_handler_called = false;
+
+    sched.set_unhandled_exception_handler([&](std::exception_ptr) {
+        initial_handler_called = true;
+        sched.set_unhandled_exception_handler([&](std::exception_ptr) {
+            replacement_handler_called = true;
+        });
+    });
+
+    sched.report_unhandled_exception(
+        std::make_exception_ptr(std::runtime_error("first report")));
+    sched.report_unhandled_exception(
+        std::make_exception_ptr(std::runtime_error("second report")));
+
+    REQUIRE(initial_handler_called);
+    REQUIRE(replacement_handler_called);
+}
+
 TEST_CASE("go() task throws — default log when no handler set", "[task][spawn][exception]") {
     scheduler sched(2);
     sched.start();

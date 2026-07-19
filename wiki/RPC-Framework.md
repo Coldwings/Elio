@@ -692,9 +692,11 @@ does not add another concurrency limit and does not change
 `max_in_flight_requests_per_session` admission or overload behavior.
 
 Session tracking and slot accounting are held in shared internal state while
-accepted sessions drain. After `rpc_server::stop()` has returned, releasing the
-server facade does not invalidate that bookkeeping even if a cooperative handler
-has not exited yet.
+accepted sessions drain. Keep the server facade alive until every active
+`serve()` and `handle_client()` call has returned. After calling
+`rpc_server::stop()`, await the corresponding `serve()` task before releasing the
+facade; accepted sessions can then finish cooperative drain against the shared
+bookkeeping even if their handlers have not exited yet.
 
 ## Thread Safety
 

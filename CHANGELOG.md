@@ -69,8 +69,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `this_coro::cancel_token()`, cancels pending frame writes and response-lock
   waits, closes pending frame reads when the session owner is cancelled, and
   joins every accepted child before releasing the session slot. Session
-  bookkeeping remains valid if the server facade is released after stop while
-  accepted handlers are still draining cooperatively.
+  bookkeeping remains valid if the server facade is released after its stopped
+  `serve()` call returns while accepted handlers are still draining
+  cooperatively.
   Cancellation remains cooperative, so a handler that stops observing both
   tokens can delay session teardown. Existing per-session admission and overload
   policies are unchanged.

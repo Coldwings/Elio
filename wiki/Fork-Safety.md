@@ -21,11 +21,15 @@ thread or library already owns incompatible state.
 
 If an Elio runtime is active when `fork()` occurs, the parent may continue
 using its existing runtime. The child may only perform operations that are safe
-after `fork()` in a multithreaded process and then immediately call an
-`exec*()` function or `_exit()`.
+after `fork()` in a multithreaded process and then immediately call an exec
+function that is explicitly specified as async-signal-safe, such as
+`execve()`, or call `_exit()`.
 
-After a successful `exec*()`, the new process image may create a fresh Elio
-runtime normally. If `exec*()` fails, call `_exit()` from the child error path.
+After a successful `execve()`, the new process image may create a fresh Elio
+runtime normally. If the exec call fails, call `_exit()` from the child error
+path. Do not assume every exec-family wrapper is safe here. In particular,
+PATH-searching wrappers such as `execlp()` and `execvp()` are not in the POSIX
+async-signal-safe function set.
 
 ```cpp
 pid_t pid = ::fork();
@@ -61,7 +65,8 @@ reinitialization API.
 ## Caller Responsibilities
 
 - Prefer spawning a new process through a direct fork-and-exec facility whose
-  child path performs no application or Elio work before `exec*()`.
+  child path performs no application or Elio work before an explicitly
+  async-signal-safe exec call.
 - Apply `FD_CLOEXEC` or explicit descriptor passing according to application
   policy. File descriptors inherited across `fork()` are a process concern;
   Elio does not decide which application sockets or files should survive

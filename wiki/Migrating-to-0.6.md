@@ -77,8 +77,10 @@ below when upgrading from 0.5.x.
   self-limit.
 - Follow [[Fork Safety]]. A single-threaded process that forks before Elio
   runtime use may create independent parent/child runtimes. With an active
-  runtime or any other thread, the child must immediately `exec*()` or
-  `_exit()` and must not use or destroy inherited Elio state.
+  runtime or any other thread, the child must immediately call an explicitly
+  async-signal-safe exec function such as `execve()`, or `_exit()`, and must not
+  use or destroy inherited Elio state. Do not assume every exec-family wrapper
+  is async-signal-safe.
 
 ## Upgrade Checklist
 

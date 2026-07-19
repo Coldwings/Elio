@@ -63,6 +63,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Structured RPC session teardown**: Server sessions now own accepted request,
+  pong, and overload-response tasks through a scheduler-bound task scope. Session
+  close requests both the explicit `rpc_context::cancel_token` and the runtime
+  `this_coro::cancel_token()`, cancels pending frame writes and response-lock
+  waits, and joins every accepted child before releasing the session slot.
+  Cancellation remains cooperative, so a handler that stops observing both
+  tokens can delay session teardown. Existing per-session admission and overload
+  policies are unchanged.
 - **One-shot scheduler lifecycle**: Once scheduler shutdown begins, later
   `start()` calls no longer restart workers or scheduler-owned resources, and
   pool resize no longer introduces workers during teardown. Concurrent shutdown

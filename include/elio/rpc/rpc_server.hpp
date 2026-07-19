@@ -25,6 +25,7 @@
 
 #include <elio/coro/task.hpp>
 #include <elio/coro/cancel_token.hpp>
+#include <elio/coro/task_group.hpp>
 #include <elio/net/tcp.hpp>
 #include <elio/net/uds.hpp>
 #include <elio/sync/primitives.hpp>
@@ -145,16 +146,15 @@ using raw_handler_t = std::function<coro::task<handler_result>(
 /// A single client session on the server.
 ///
 /// Concurrency model: the read loop streams in one frame at a time and
-/// dispatches each request via `runtime::scheduler::current()->go(...)` so
-/// out-of-order completion is possible (matching what the client promises).
+/// dispatches each request into a session-owned task scope so out-of-order
+/// completion is possible (matching what the client promises).
 /// `rpc_server_config::max_in_flight_requests_per_session` can bound that
 /// per-session active request lifecycle and choose the overload strategy.
 /// Writes are serialised by `send_mutex_` so concurrent handlers cannot
 /// interleave bytes on the wire.
 ///
-/// Lifetime: the session keeps itself alive via shared_from_this() while
-/// any dispatched handler is in flight; the run loop's enable_shared_from_this
-/// pin is dropped only after every handler has completed.
+/// Lifetime: run() pins the session while the task scope owns, cancels, and
+/// joins every accepted request and control-frame task.
 template<typename Stream>
 class rpc_session : public std::enable_shared_from_this<rpc_session<Stream>> {
 public:
@@ -171,49 +171,31 @@ public:
         return ptr(new rpc_session(std::move(stream), std::move(handlers), config));
     }
 
-    /// Run the session (process requests until disconnect).
+    /// Run the session (process requests until disconnect), then cancel and
+    /// join every request and control-frame task accepted by this session.
     coro::task<void> run() {
-        auto self = this->shared_from_this();
+        // session_scope_body stores a raw pointer; this pin outlives its scope.
+        [[maybe_unused]] auto lifetime = this->shared_from_this();
         ELIO_LOG_DEBUG("RPC session started");
 
-        while (stream_.is_valid() && !closed_.load(std::memory_order_acquire)) {
-            auto frame = co_await read_frame_with_deadline();
-            if (!frame) {
-                ELIO_LOG_DEBUG("RPC session: connection closed");
-                break;
-            }
-
-            auto& [header, payload] = *frame;
-
-            switch (header.type) {
-                case message_type::request:
-                    dispatch_request(header, std::move(payload));
-                    break;
-
-                case message_type::ping:
-                    schedule_pong(header.request_id);
-                    break;
-
-                case message_type::cancel:
-                    ELIO_LOG_DEBUG("RPC session: received cancel for request {}",
-                                   header.request_id);
-                    cancel_request(header.request_id);
-                    break;
-
-                default:
-                    ELIO_LOG_WARNING("RPC session: unexpected message type {}",
-                                     static_cast<int>(header.type));
-                    break;
-            }
+        coro::task_group_options options;
+        options.failure_policy = coro::task_group_failure_policy::collect_all;
+        try {
+            co_await coro::task_scope(session_scope_body{this}, options);
+        } catch (const coro::task_group_error& e) {
+            ELIO_LOG_ERROR(
+                "RPC session: {} child task failure(s) during teardown",
+                e.failures().size());
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR("RPC session: unhandled exception: {}", e.what());
+        } catch (...) {
+            ELIO_LOG_ERROR("RPC session: unhandled unknown exception");
         }
-
-        cancel_all_active_requests();
-        closed_.store(true, std::memory_order_release);
         ELIO_LOG_DEBUG("RPC session ended");
     }
 
     /// Close the session. Forces the read loop out of any pending recv.
-    void close() {
+    void close() noexcept {
         if (!closed_.exchange(true, std::memory_order_acq_rel)) {
             // Force any pending recv to return so the run loop wakes up. If a
             // frame write already started, cancel its writable-poll wait and
@@ -223,7 +205,7 @@ public:
             // ::shutdown on a raw fd) lets a tls_stream record that its socket
             // is dead so its destructor can skip the close_notify write that
             // risks SIGPIPE on OpenSSL builds without MSG_NOSIGNAL.
-            frame_write_cancel_.cancel();
+            cancel_source_noexcept(frame_write_cancel_, "frame write");
             request_stream_shutdown();
             cancel_all_active_requests();
         }
@@ -235,6 +217,14 @@ public:
     }
 
 private:
+    struct session_scope_body {
+        rpc_session* self;
+
+        coro::task<void> operator()(coro::task_group& group) {
+            return self->run_scope(group);
+        }
+    };
+
     struct active_request_state {
         coro::cancel_source cancel;
     };
@@ -275,23 +265,34 @@ private:
         rpc_session* self_ = nullptr;
     };
 
-    struct active_request_eraser {
+    struct active_request_lease {
         rpc_session* self = nullptr;
         uint32_t request_id = 0;
         std::shared_ptr<active_request_state> active;
 
-        active_request_eraser() = default;
-        active_request_eraser(rpc_session* s,
-                              uint32_t id,
-                              std::shared_ptr<active_request_state> a)
+        active_request_lease(rpc_session* s,
+                             uint32_t id,
+                             std::shared_ptr<active_request_state> a)
             : self(s), request_id(id), active(std::move(a)) {}
-        active_request_eraser(const active_request_eraser&) = delete;
-        active_request_eraser& operator=(const active_request_eraser&) = delete;
-        ~active_request_eraser() {
+        active_request_lease(const active_request_lease&) = delete;
+        active_request_lease& operator=(const active_request_lease&) = delete;
+        ~active_request_lease() {
             if (self && active) {
                 self->erase_active_request(request_id, active);
             }
         }
+    };
+
+    struct in_flight_flag_lease {
+        explicit in_flight_flag_lease(std::atomic<bool>& flag) noexcept
+            : flag(std::addressof(flag)) {}
+        in_flight_flag_lease(const in_flight_flag_lease&) = delete;
+        in_flight_flag_lease& operator=(const in_flight_flag_lease&) = delete;
+        ~in_flight_flag_lease() {
+            flag->store(false, std::memory_order_release);
+        }
+
+        std::atomic<bool>* flag;
     };
 
     rpc_session(Stream stream,
@@ -300,6 +301,62 @@ private:
         : stream_(std::move(stream))
         , handlers_(std::move(handlers))
         , config_(config) {}
+
+    coro::task<void> run_scope(coro::task_group& group) {
+        std::exception_ptr read_failure;
+        try {
+            while (stream_.is_valid() &&
+                   !closed_.load(std::memory_order_acquire)) {
+                auto frame = co_await read_frame_with_deadline();
+                if (!frame) {
+                    ELIO_LOG_DEBUG("RPC session: connection closed");
+                    break;
+                }
+
+                auto& [header, payload] = *frame;
+                switch (header.type) {
+                    case message_type::request:
+                        dispatch_request(group, header, std::move(payload));
+                        break;
+
+                    case message_type::ping:
+                        schedule_pong(group, header.request_id);
+                        break;
+
+                    case message_type::cancel:
+                        ELIO_LOG_DEBUG(
+                            "RPC session: received cancel for request {}",
+                            header.request_id);
+                        cancel_request(header.request_id);
+                        break;
+
+                    default:
+                        ELIO_LOG_WARNING(
+                            "RPC session: unexpected message type {}",
+                            static_cast<int>(header.type));
+                        break;
+                }
+            }
+        } catch (...) {
+            read_failure = std::current_exception();
+        }
+
+        close();
+        try {
+            group.request_cancel();
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR(
+                "RPC session: task cancellation callback exception: {}",
+                e.what());
+        } catch (...) {
+            ELIO_LOG_ERROR(
+                "RPC session: task cancellation callback unknown exception");
+        }
+
+        if (read_failure) {
+            std::rethrow_exception(std::move(read_failure));
+        }
+    }
 
     /// Read a frame, enforcing config_.frame_read_timeout. The watchdog
     /// shutdown(2)s the socket so any pending recv returns EOF/error.
@@ -392,14 +449,12 @@ private:
 
     /// Dispatch a request handler to the scheduler so the read loop can
     /// continue receiving the next frame (out-of-order completion).
-    void dispatch_request(frame_header header, message_buffer payload) {
-        auto* sched = runtime::scheduler::current();
-        if (!sched) {
-            ELIO_LOG_ERROR("RPC session: no current scheduler; dropping request {}",
-                           header.request_id);
-            return;
-        }
+    void dispatch_request(coro::task_group& group,
+                          frame_header header,
+                          message_buffer payload) {
         auto active = std::make_shared<active_request_state>();
+        auto lease = std::make_shared<active_request_lease>(
+            this, header.request_id, active);
 
         switch (reserve_active_request(header.request_id, active)) {
             case active_request_reservation::reserved:
@@ -415,7 +470,7 @@ private:
             case active_request_reservation::limited:
                 if (config_.request_overload_policy ==
                     rpc_request_overload_policy::reject_request) {
-                    reject_overloaded_request(header, *sched);
+                    reject_overloaded_request(group, header);
                     return;
                 }
 
@@ -427,20 +482,31 @@ private:
         }
 
         auto self = this->shared_from_this();
-        sched->go([self,
-                   hdr = header,
-                   pl = std::move(payload),
-                   active = std::move(active)]() mutable
-                      -> coro::task<void> {
-            co_await self->handle_request(hdr, std::move(pl), std::move(active));
-        });
+        group.spawn(&rpc_session::run_request_task,
+                    std::move(self), header, std::move(payload),
+                    std::move(lease));
+    }
+
+    coro::task<void> run_request_task(
+        frame_header header,
+        message_buffer payload,
+        std::shared_ptr<active_request_lease> lease) {
+        try {
+            co_await handle_request(
+                header, std::move(payload), std::move(lease));
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR(
+                "RPC session: request task exception: {}", e.what());
+        } catch (...) {
+            ELIO_LOG_ERROR("RPC session: request task unknown exception");
+        }
     }
 
     /// Handle an incoming request (runs concurrently with the read loop).
     coro::task<void> handle_request(const frame_header& header,
                                     message_buffer payload,
-                                    std::shared_ptr<active_request_state> active) {
-        active_request_eraser active_guard(this, header.request_id, active);
+                                    std::shared_ptr<active_request_lease> lease) {
+        const auto& active = lease->active;
         const bool no_response =
             has_flag(header.flags, message_flags::no_response);
 
@@ -574,11 +640,11 @@ private:
         }
 
         if (active) {
-            active->cancel.cancel();
+            cancel_source_noexcept(active->cancel, "request");
         }
     }
 
-    void cancel_all_active_requests() {
+    void cancel_all_active_requests() noexcept {
         std::vector<std::shared_ptr<active_request_state>> active;
         {
             std::lock_guard<std::mutex> lock(active_requests_mutex_);
@@ -590,7 +656,22 @@ private:
         }
 
         for (auto& request : active) {
-            request->cancel.cancel();
+            cancel_source_noexcept(request->cancel, "request");
+        }
+    }
+
+    static void cancel_source_noexcept(coro::cancel_source& source,
+                                       const char* operation) noexcept {
+        try {
+            source.cancel();
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR(
+                "RPC session: {} cancellation callback exception: {}",
+                operation, e.what());
+        } catch (...) {
+            ELIO_LOG_ERROR(
+                "RPC session: {} cancellation callback unknown exception",
+                operation);
         }
     }
 
@@ -623,14 +704,7 @@ private:
         return active_request_reservation::reserved;
     }
 
-    void schedule_pong(uint32_t request_id) {
-        auto* sched = runtime::scheduler::current();
-        if (!sched) {
-            ELIO_LOG_ERROR("RPC session: no current scheduler; dropping pong {}",
-                           request_id);
-            return;
-        }
-
+    void schedule_pong(coro::task_group& group, uint32_t request_id) {
         bool expected = false;
         if (!pong_in_flight_.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel,
@@ -642,18 +716,22 @@ private:
         }
 
         auto self = this->shared_from_this();
-        sched->go([self, request_id]() -> coro::task<void> {
-            try {
-                co_await self->send_pong_response(request_id);
-            } catch (const std::exception& e) {
-                ELIO_LOG_ERROR(
-                    "RPC session: pong send exception: {}",
-                    e.what());
-            } catch (...) {
-                ELIO_LOG_ERROR("RPC session: pong send unknown exception");
-            }
-            self->pong_in_flight_.store(false, std::memory_order_release);
-        });
+        auto lease = std::make_shared<in_flight_flag_lease>(pong_in_flight_);
+        group.spawn(&rpc_session::run_pong_task,
+                    std::move(self), request_id, std::move(lease));
+    }
+
+    coro::task<void> run_pong_task(
+        uint32_t request_id,
+        [[maybe_unused]] std::shared_ptr<in_flight_flag_lease> lease) {
+        try {
+            co_await send_pong_response(request_id);
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR(
+                "RPC session: pong send exception: {}", e.what());
+        } catch (...) {
+            ELIO_LOG_ERROR("RPC session: pong send unknown exception");
+        }
     }
 
     coro::task<void> send_pong_response(uint32_t request_id) {
@@ -662,8 +740,8 @@ private:
         (void)co_await send_frame(pong, empty);
     }
 
-    void reject_overloaded_request(const frame_header& header,
-                                   runtime::scheduler& sched) {
+    void reject_overloaded_request(coro::task_group& group,
+                                   const frame_header& header) {
         if (has_flag(header.flags, message_flags::no_response)) {
             ELIO_LOG_WARNING(
                 "RPC session: max_in_flight_requests_per_session={} reached; dropping no_response request {}",
@@ -689,20 +767,25 @@ private:
             header.request_id);
 
         auto self = this->shared_from_this();
-        sched.go([self, hdr = header]() -> coro::task<void> {
-            try {
-                co_await self->send_overloaded_rejection(hdr);
-            } catch (const std::exception& e) {
-                ELIO_LOG_ERROR(
-                    "RPC session: overload rejection send exception: {}",
-                    e.what());
-            } catch (...) {
-                ELIO_LOG_ERROR(
-                    "RPC session: overload rejection send unknown exception");
-            }
-            self->overload_reject_in_flight_.store(
-                false, std::memory_order_release);
-        });
+        auto lease = std::make_shared<in_flight_flag_lease>(
+            overload_reject_in_flight_);
+        group.spawn(&rpc_session::run_overload_rejection_task,
+                    std::move(self), header, std::move(lease));
+    }
+
+    coro::task<void> run_overload_rejection_task(
+        frame_header header,
+        [[maybe_unused]] std::shared_ptr<in_flight_flag_lease> lease) {
+        try {
+            co_await send_overloaded_rejection(header);
+        } catch (const std::exception& e) {
+            ELIO_LOG_ERROR(
+                "RPC session: overload rejection send exception: {}",
+                e.what());
+        } catch (...) {
+            ELIO_LOG_ERROR(
+                "RPC session: overload rejection send unknown exception");
+        }
     }
 
     coro::task<void> send_overloaded_rejection(const frame_header& header) {
@@ -737,7 +820,11 @@ private:
         if (closed_.load(std::memory_order_acquire)) {
             co_return false;
         }
-        co_await send_mutex_.lock();
+        auto lock_result = co_await send_mutex_.lock(
+            coro::this_coro::cancel_token());
+        if (lock_result == coro::cancel_result::cancelled) {
+            co_return false;
+        }
         sync::lock_guard guard(send_mutex_);
         if (!begin_frame_write()) {
             co_return false;
@@ -1227,7 +1314,9 @@ private:
         std::lock_guard<std::mutex> lock(sessions_mutex_);
         auto it = std::find(sessions_.begin(), sessions_.end(), session);
         if (it != sessions_.end()) {
-            *it = std::move(sessions_.back());
+            if (it != sessions_.end() - 1) {
+                *it = std::move(sessions_.back());
+            }
             sessions_.pop_back();
         }
     }

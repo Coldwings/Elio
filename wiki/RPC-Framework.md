@@ -672,6 +672,23 @@ tcp_rpc_server server(config);
   later pings may not receive a pong; clients should rely on their own ping
   timeout and connection policy.
 
+Each server session owns its accepted request handlers, pong writes, and overload
+responses in one structured task scope. Disconnect, timeout, duplicate request
+ID, `close_session` overload handling, and `rpc_server::stop()` close that scope:
+
+- active handlers receive cancellation through both
+  `rpc_context::cancel_token` and `coro::this_coro::cancel_token()`;
+- pending frame writes and waits for the session response lock are cancelled;
+- `handle_client()` and the server's session slot remain active until every
+  accepted child task has left the scope.
+
+Cancellation is cooperative. Handler code should pass one of the supplied
+tokens to every wait that must stop during disconnect. A handler that ignores
+both tokens, blocks a worker thread, or deliberately continues after observing
+cancellation can delay session teardown and slot release. This lifetime rule
+does not add another concurrency limit and does not change
+`max_in_flight_requests_per_session` admission or overload behavior.
+
 ## Thread Safety
 
 - **rpc_client**: Thread-safe for concurrent calls

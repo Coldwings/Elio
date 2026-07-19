@@ -3827,6 +3827,20 @@ sends more pings while a previous pong is still being written, later pings may
 not receive a pong; clients should rely on their own ping timeout and connection
 policy.
 
+Every session owns accepted request handlers, pong writes, and overload
+responses through one scheduler-bound task scope. When the session closes or
+the task awaiting `handle_client()` is cancelled, the server wakes pending
+frame reads, requests the explicit `rpc_context::cancel_token` and the handler's
+runtime `coro::this_coro::cancel_token()`, cancels pending frame writes and
+response-lock waits, and joins all accepted children before `handle_client()`
+returns or the session slot is released. Cancellation is cooperative: handlers
+must pass one of these tokens to waits that should stop, and code that ignores
+both tokens can delay session teardown. This structured ownership does not
+change request admission or overload policy. Session tracking and slot state are
+shared with draining sessions. Keep the server facade alive until active
+`serve()` and `handle_client()` calls return; after a stopped `serve()` call has
+returned, the facade may be released before cooperative handler drain completes.
+
 #### `rpc_server<Stream>`
 
 ```cpp

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -1742,7 +1743,9 @@ struct stalled_send_stream {
 struct bounded_reject_stream_state {
     std::mutex mutex;
     std::deque<uint8_t> inbound;
+    std::function<void()> after_second_read;
     std::atomic<bool> shutdown{false};
+    std::atomic<size_t> successful_reads{0};
     std::atomic<bool> allow_writes{false};
     std::atomic<size_t> total_writes_started{0};
     std::atomic<size_t> error_writes_started{0};
@@ -1780,6 +1783,8 @@ struct bounded_reject_stream {
     elio::coro::task<elio::io::io_result> read_exactly(void* data, size_t len) {
         auto* out = static_cast<uint8_t*>(data);
         while (!state->shutdown.load(std::memory_order_acquire)) {
+            std::function<void()> after_read;
+            bool completed = false;
             {
                 std::lock_guard<std::mutex> lock(state->mutex);
                 if (state->inbound.size() >= len) {
@@ -1787,10 +1792,22 @@ struct bounded_reject_stream {
                         out[i] = state->inbound.front();
                         state->inbound.pop_front();
                     }
-                    co_return elio::io::io_result{static_cast<int32_t>(len), 0};
+                    auto read_index = state->successful_reads.fetch_add(
+                        1, std::memory_order_acq_rel);
+                    if (read_index == 1) {
+                        after_read = state->after_second_read;
+                    }
+                    completed = true;
                 }
             }
-            co_await elio::time::sleep_for(elio::test::scaled_ms(1));
+            if (!completed) {
+                co_await elio::time::sleep_for(elio::test::scaled_ms(1));
+                continue;
+            }
+            if (after_read) {
+                after_read();
+            }
+            co_return elio::io::io_result{static_cast<int32_t>(len), 0};
         }
         co_return elio::io::io_result{-ECANCELED, 0};
     }
@@ -3459,6 +3476,290 @@ TEST_CASE("server per-session overload rejection is single-flight",
     }
     REQUIRE(server_done.load(std::memory_order_acquire));
     REQUIRE(sched.shutdown(std::chrono::seconds(30)));
+}
+
+TEST_CASE("server session teardown cancels and joins handler tasks",
+          "[rpc][cancel][lifetime]") {
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    using DelayReq = ConcurrencyDelayReq;
+    using DelayResp = ConcurrencyDelayResp;
+    using DelayMethod = ConcurrencyDelayMethod;
+
+    rpc_server_config cfg;
+    cfg.frame_read_timeout = std::chrono::seconds(0);
+
+    auto server = std::make_shared<rpc_server<bounded_reject_stream>>(cfg);
+    elio::sync::event release_handler;
+    elio::sync::event explicit_wait;
+    elio::sync::event runtime_wait;
+    std::atomic<bool> handler_started{false};
+    std::atomic<bool> explicit_cancel_seen{false};
+    std::atomic<bool> runtime_cancel_seen{false};
+    std::atomic<bool> reentrant_callback_done{false};
+    std::atomic<size_t> reentrant_session_count{0};
+    std::atomic<bool> handler_finished{false};
+    auto* server_ptr = server.get();
+
+    server->register_method_with_context<DelayMethod>(
+        [&, server_ptr](const rpc_context& ctx,
+                        const DelayReq& req) -> coro::task<DelayResp> {
+            handler_started.store(true, std::memory_order_release);
+
+            [[maybe_unused]] auto reentrant_callback =
+                ctx.cancel_token.on_cancel(
+                    [&, server_ptr] {
+                        reentrant_session_count.store(
+                            server_ptr->session_count(),
+                            std::memory_order_release);
+                        reentrant_callback_done.store(
+                            true, std::memory_order_release);
+                    });
+
+            auto explicit_result = co_await explicit_wait.wait(ctx.cancel_token);
+            explicit_cancel_seen.store(
+                explicit_result == coro::cancel_result::cancelled,
+                std::memory_order_release);
+
+            auto runtime_result = co_await runtime_wait.wait(
+                coro::this_coro::cancel_token());
+            runtime_cancel_seen.store(
+                runtime_result == coro::cancel_result::cancelled,
+                std::memory_order_release);
+
+            // Deliberately stop observing cancellation after recording it. The
+            // session must retain and join this accepted handler until it exits.
+            co_await release_handler.wait();
+            handler_finished.store(true, std::memory_order_release);
+            co_return DelayResp{req.ms};
+        });
+
+    auto state = std::make_shared<bounded_reject_stream_state>();
+    auto request = build_oneway_request(
+        1, DelayMethod::id, DelayReq{1});
+    enqueue_bounded_reject_frame(*state, request.first, request.second);
+
+    scheduler sched(3);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    sched.go([&, state]() -> coro::task<void> {
+        co_await server->handle_client(bounded_reject_stream{state});
+        server_done.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0;
+         i < 2000 && !handler_started.load(std::memory_order_acquire);
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+    CHECK(handler_started.load(std::memory_order_acquire));
+
+    server->stop();
+    for (int i = 0;
+         i < 2000 &&
+             (!explicit_cancel_seen.load(std::memory_order_acquire) ||
+              !runtime_cancel_seen.load(std::memory_order_acquire) ||
+              !reentrant_callback_done.load(std::memory_order_acquire));
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+
+    CHECK(explicit_cancel_seen.load(std::memory_order_acquire));
+    CHECK(runtime_cancel_seen.load(std::memory_order_acquire));
+    CHECK(reentrant_callback_done.load(std::memory_order_acquire));
+    CHECK(reentrant_session_count.load(std::memory_order_acquire) == 1);
+    CHECK_FALSE(server_done.load(std::memory_order_acquire));
+
+    release_handler.set();
+    for (int i = 0;
+         i < 2000 && !server_done.load(std::memory_order_acquire);
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+
+    auto shutdown_ok = sched.shutdown(std::chrono::seconds(30));
+    REQUIRE(handler_finished.load(std::memory_order_acquire));
+    REQUIRE(server_done.load(std::memory_order_acquire));
+    REQUIRE(shutdown_ok);
+}
+
+TEST_CASE("server close rejects a frame that completed during teardown",
+          "[rpc][cancel][lifetime][race]") {
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    using DelayReq = ConcurrencyDelayReq;
+    using DelayResp = ConcurrencyDelayResp;
+    using DelayMethod = ConcurrencyDelayMethod;
+
+    rpc_server_config cfg;
+    cfg.frame_read_timeout = std::chrono::seconds(0);
+
+    auto server = std::make_shared<rpc_server<bounded_reject_stream>>(cfg);
+    std::atomic<bool> handler_started{false};
+    server->register_method<DelayMethod>(
+        [&](const DelayReq& req) -> coro::task<DelayResp> {
+            handler_started.store(true, std::memory_order_release);
+            co_return DelayResp{req.ms};
+        });
+
+    auto state = std::make_shared<bounded_reject_stream_state>();
+    state->after_second_read = [server] {
+        server->stop();
+    };
+    auto request = build_oneway_request(1, DelayMethod::id, DelayReq{1});
+    enqueue_bounded_reject_frame(*state, request.first, request.second);
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    sched.go([&, state]() -> coro::task<void> {
+        co_await server->handle_client(bounded_reject_stream{state});
+        server_done.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0;
+         i < 2000 && !server_done.load(std::memory_order_acquire);
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+
+    auto shutdown_ok = sched.shutdown(std::chrono::seconds(30));
+    REQUIRE(state->successful_reads.load(std::memory_order_acquire) == 2);
+    REQUIRE_FALSE(handler_started.load(std::memory_order_acquire));
+    REQUIRE(server_done.load(std::memory_order_acquire));
+    REQUIRE(shutdown_ok);
+}
+
+TEST_CASE("cancelling handle_client owner closes its pending frame read",
+          "[rpc][cancel][lifetime]") {
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    rpc_server_config cfg;
+    cfg.frame_read_timeout = std::chrono::seconds(0);
+
+    auto server = std::make_shared<rpc_server<bounded_reject_stream>>(cfg);
+    auto state = std::make_shared<bounded_reject_stream_state>();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> owner_done{false};
+    auto owner = sched.go_joinable([&, state]() -> coro::task<void> {
+        co_await server->handle_client(bounded_reject_stream{state});
+        owner_done.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0; i < 2000 && server->session_count() == 0; ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+    CHECK(server->session_count() == 1);
+
+    owner.request_cancel();
+    owner.wait_destroyed();
+    CHECK_NOTHROW(owner.await_resume());
+
+    auto shutdown_ok = sched.shutdown(std::chrono::seconds(30));
+    REQUIRE(state->shutdown.load(std::memory_order_acquire));
+    REQUIRE(owner_done.load(std::memory_order_acquire));
+    REQUIRE(server->session_count() == 0);
+    REQUIRE(shutdown_ok);
+}
+
+TEST_CASE("server facade may be released after stopped serve returns",
+          "[rpc][cancel][lifetime][tcp]") {
+    using namespace elio::net;
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    using DelayReq = ConcurrencyDelayReq;
+    using DelayResp = ConcurrencyDelayResp;
+    using DelayMethod = ConcurrencyDelayMethod;
+
+    auto listener = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener.has_value());
+    auto port = listener->local_address().port();
+
+    rpc_server_config cfg;
+    cfg.frame_read_timeout = std::chrono::seconds(0);
+    auto server = std::make_shared<tcp_rpc_server>(cfg);
+
+    elio::sync::event release_handler;
+    elio::sync::event release_client;
+    std::atomic<bool> handler_started{false};
+    std::atomic<bool> handler_finished{false};
+    std::atomic<bool> request_sent{false};
+    std::atomic<bool> client_done{false};
+
+    server->register_method<DelayMethod>(
+        [&](const DelayReq& req) -> coro::task<DelayResp> {
+            handler_started.store(true, std::memory_order_release);
+            co_await release_handler.wait();
+            handler_finished.store(true, std::memory_order_release);
+            co_return DelayResp{req.ms};
+        });
+
+    scheduler sched(4);
+    sched.start();
+
+    auto serve_owner = sched.go_joinable(
+        [server, &listener]() -> coro::task<void> {
+            co_await server->serve(*listener);
+        });
+
+    sched.go([&, port]() -> coro::task<void> {
+        auto stream = co_await tcp_connect(ipv6_address("::1", port));
+        if (!stream) {
+            client_done.store(true, std::memory_order_release);
+            co_return;
+        }
+
+        auto request = build_oneway_request(1, DelayMethod::id, DelayReq{1});
+        request_sent.store(
+            co_await write_frame(*stream, request.first, request.second),
+            std::memory_order_release);
+        co_await release_client.wait();
+        stream->shutdown_socket();
+        co_await stream->close();
+        client_done.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0;
+         i < 2000 && !handler_started.load(std::memory_order_acquire);
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+    CHECK(request_sent.load(std::memory_order_acquire));
+    CHECK(handler_started.load(std::memory_order_acquire));
+
+    server->stop();
+    serve_owner.wait_destroyed();
+    CHECK_NOTHROW(serve_owner.await_resume());
+    CHECK(server->session_count() == 1);
+    CHECK_FALSE(handler_finished.load(std::memory_order_acquire));
+
+    std::weak_ptr server_lifetime = server;
+    server.reset();
+    CHECK(server_lifetime.expired());
+
+    release_handler.set();
+    release_client.set();
+    for (int i = 0;
+         i < 2000 &&
+             (!handler_finished.load(std::memory_order_acquire) ||
+              !client_done.load(std::memory_order_acquire));
+         ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+
+    auto shutdown_ok = sched.shutdown(std::chrono::seconds(30));
+    REQUIRE(handler_finished.load(std::memory_order_acquire));
+    REQUIRE(client_done.load(std::memory_order_acquire));
+    REQUIRE(shutdown_ok);
 }
 
 TEST_CASE("server per-session in-flight limit can close the session",

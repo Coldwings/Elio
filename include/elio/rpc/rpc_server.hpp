@@ -110,7 +110,8 @@ struct rpc_context {
     uint32_t request_id;                    ///< Request ID for correlation
     method_id_t method_id;                  ///< Method being called
     std::optional<uint32_t> timeout_ms;     ///< Client-specified timeout (if any)
-    coro::cancel_token cancel_token;        ///< Cancelled when the client cancels this request
+    /// Cancelled by a client cancel frame or session teardown.
+    coro::cancel_token cancel_token;
     
     /// Check if request has a timeout
     bool has_timeout() const noexcept {
@@ -183,14 +184,18 @@ public:
         try {
             co_await coro::task_scope(session_scope_body{this}, options);
         } catch (const coro::task_group_error& e) {
+            close();
             ELIO_LOG_ERROR(
                 "RPC session: {} child task failure(s) during teardown",
                 e.failures().size());
         } catch (const std::exception& e) {
+            close();
             ELIO_LOG_ERROR("RPC session: unhandled exception: {}", e.what());
         } catch (...) {
+            close();
             ELIO_LOG_ERROR("RPC session: unhandled unknown exception");
         }
+        close();
         ELIO_LOG_DEBUG("RPC session ended");
     }
 
@@ -233,6 +238,7 @@ private:
         reserved,
         duplicate,
         limited,
+        closed,
     };
 
     class frame_write_guard {
@@ -342,6 +348,7 @@ private:
         }
 
         close();
+        cancel_all_active_requests();
         try {
             group.request_cancel();
         } catch (const std::exception& e) {
@@ -478,6 +485,9 @@ private:
                     "RPC session: max_in_flight_requests_per_session={} reached; closing session",
                     config_.max_in_flight_requests_per_session);
                 close();
+                return;
+
+            case active_request_reservation::closed:
                 return;
         }
 
@@ -645,17 +655,14 @@ private:
     }
 
     void cancel_all_active_requests() noexcept {
-        std::vector<std::shared_ptr<active_request_state>> active;
+        decltype(active_requests_) active;
         {
             std::lock_guard<std::mutex> lock(active_requests_mutex_);
-            active.reserve(active_requests_.size());
-            for (auto& [id, request] : active_requests_) {
-                (void)id;
-                active.push_back(request);
-            }
+            active.swap(active_requests_);
         }
 
-        for (auto& request : active) {
+        for (auto& [id, request] : active) {
+            (void)id;
             cancel_source_noexcept(request->cancel, "request");
         }
     }
@@ -665,13 +672,19 @@ private:
         try {
             source.cancel();
         } catch (const std::exception& e) {
-            ELIO_LOG_ERROR(
-                "RPC session: {} cancellation callback exception: {}",
-                operation, e.what());
+            try {
+                ELIO_LOG_ERROR(
+                    "RPC session: {} cancellation callback exception: {}",
+                    operation, e.what());
+            } catch (...) {
+            }
         } catch (...) {
-            ELIO_LOG_ERROR(
-                "RPC session: {} cancellation callback unknown exception",
-                operation);
+            try {
+                ELIO_LOG_ERROR(
+                    "RPC session: {} cancellation callback unknown exception",
+                    operation);
+            } catch (...) {
+            }
         }
     }
 
@@ -692,6 +705,9 @@ private:
         uint32_t request_id,
         const std::shared_ptr<active_request_state>& active) {
         std::lock_guard<std::mutex> lock(active_requests_mutex_);
+        if (closed_.load(std::memory_order_acquire)) {
+            return active_request_reservation::closed;
+        }
         if (active_requests_.find(request_id) != active_requests_.end()) {
             return active_request_reservation::duplicate;
         }
@@ -1221,10 +1237,13 @@ public:
     void stop() {
         running_.store(false, std::memory_order_release);
         cancel_active_accept();
-        
-        // Close all sessions
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        for (auto& session : sessions_) {
+
+        std::vector<session_ptr> sessions;
+        {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
+            sessions = sessions_;
+        }
+        for (auto& session : sessions) {
             session->close();
         }
     }

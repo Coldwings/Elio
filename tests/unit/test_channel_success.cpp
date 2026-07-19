@@ -784,3 +784,75 @@ TEST_CASE("channel receive restores cancellation after a stale notification",
     REQUIRE(result.was_cancelled());
     REQUIRE_FALSE(result.was_closed());
 }
+
+TEST_CASE("channel receive restores cancellation after a failed fast pop",
+          "[sync][channel][cancellation][regression]") {
+    auto gate = std::make_shared<slot_release_gate>();
+    channel<gated_value> ch(1);
+    REQUIRE(ch.try_send(gated_value(7, gate)));
+    gate->block_next_move.store(true, std::memory_order_release);
+
+    cancel_source source;
+    elio::sync::detail::bounded_recv_paused_after_claim_for_test.store(
+        false, std::memory_order_release);
+    elio::sync::detail::pause_bounded_recv_after_claim_for_test.store(
+        true, std::memory_order_release);
+    elio::sync::detail::bounded_recv_paused_after_failed_pop_for_test.store(
+        false, std::memory_order_release);
+    elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.store(
+        true, std::memory_order_release);
+
+    scheduler sched(1);
+    sched.start();
+    auto receiver = sched.go_joinable([&]()
+            -> task<channel<gated_value>::cancellable_recv_result> {
+        co_return co_await ch.recv(source.get_token());
+    });
+    const bool receiver_claimed_completion = wait_for_true(
+        elio::sync::detail::bounded_recv_paused_after_claim_for_test);
+
+    std::optional<gated_value> stolen;
+    std::thread stealing_consumer([&] { stolen = ch.try_recv(); });
+    const bool stealing_consumer_claimed_slot = wait_for_true(
+        gate->move_blocked);
+
+    source.cancel();
+    elio::sync::detail::pause_bounded_recv_after_claim_for_test.store(
+        false, std::memory_order_release);
+    elio::sync::detail::pause_bounded_recv_after_claim_for_test.notify_all();
+
+    const bool receiver_observed_failed_pop = wait_for_true(
+        elio::sync::detail::bounded_recv_paused_after_failed_pop_for_test);
+    gate->release_move.store(true, std::memory_order_release);
+    gate->release_move.notify_all();
+    stealing_consumer.join();
+    const bool replacement_sent = ch.try_send(gated_value(8));
+
+    elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.store(
+        false, std::memory_order_release);
+    elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.notify_all();
+
+    const bool receiver_completed_without_cleanup = wait_for_condition(
+        [&] { return receiver.is_ready(); });
+    if (!receiver_completed_without_cleanup) {
+        ch.close();
+    }
+    REQUIRE(wait_for_condition([&] { return receiver.is_ready(); }));
+    receiver.wait_destroyed();
+    auto result = receiver.await_resume();
+    REQUIRE(sched.shutdown(std::chrono::milliseconds(2000)));
+
+    REQUIRE(receiver_completed_without_cleanup);
+    REQUIRE(receiver_claimed_completion);
+    REQUIRE(stealing_consumer_claimed_slot);
+    REQUIRE(receiver_observed_failed_pop);
+    REQUIRE(stolen.has_value());
+    REQUIRE(stolen->value == 7);
+    REQUIRE(replacement_sent);
+    REQUIRE_FALSE(result.success());
+    REQUIRE(result.was_cancelled());
+    REQUIRE_FALSE(result.was_closed());
+    auto replacement = ch.try_recv();
+    REQUIRE(replacement.has_value());
+    REQUIRE(replacement->value == 8);
+}

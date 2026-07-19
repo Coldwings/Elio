@@ -22,6 +22,10 @@ namespace elio::sync {
 namespace detail {
 inline std::atomic<size_t> bounded_send_publish_waits_for_test{0};
 inline std::atomic<size_t> bounded_recv_waits_for_test{0};
+inline std::atomic<bool> pause_bounded_recv_after_claim_for_test{false};
+inline std::atomic<bool> bounded_recv_paused_after_claim_for_test{false};
+inline std::atomic<bool> pause_bounded_recv_after_failed_pop_for_test{false};
+inline std::atomic<bool> bounded_recv_paused_after_failed_pop_for_test{false};
 }
 #endif
 
@@ -666,6 +670,9 @@ public:
             bool resolved = false;
             bool retry = false;
             bool refill_senders = false;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            bool bounded_pop_failed = false;
+#endif
 
             {
                 std::lock_guard<std::mutex> guard(mutex_);
@@ -675,9 +682,27 @@ public:
                         if (!awaitable.claim_completion()) {
                             resolved = true;
                         } else {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                            if (detail::pause_bounded_recv_after_claim_for_test.load(
+                                    std::memory_order_acquire)) {
+                                detail::bounded_recv_paused_after_claim_for_test.store(
+                                    true, std::memory_order_release);
+                                detail::bounded_recv_paused_after_claim_for_test.notify_all();
+                                while (detail::pause_bounded_recv_after_claim_for_test.load(
+                                    std::memory_order_acquire)) {
+                                    detail::pause_bounded_recv_after_claim_for_test.wait(
+                                        true, std::memory_order_acquire);
+                                }
+                                detail::bounded_recv_paused_after_claim_for_test.store(
+                                    false, std::memory_order_release);
+                            }
+#endif
                             result = ring_->try_pop();
                             if (!result.has_value()) {
                                 retry = true;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                                bounded_pop_failed = true;
+#endif
                             } else {
                                 resolved = true;
                                 refill_senders = true;
@@ -750,7 +775,22 @@ public:
                     co_return cancellable_recv_result{
                         std::nullopt, coro::cancel_result::cancelled};
                 }
-                notification_selected = !consume_notification;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (bounded_pop_failed &&
+                    detail::pause_bounded_recv_after_failed_pop_for_test.load(
+                        std::memory_order_acquire)) {
+                    detail::bounded_recv_paused_after_failed_pop_for_test.store(
+                        true, std::memory_order_release);
+                    detail::bounded_recv_paused_after_failed_pop_for_test.notify_all();
+                    while (detail::pause_bounded_recv_after_failed_pop_for_test.load(
+                        std::memory_order_acquire)) {
+                        detail::pause_bounded_recv_after_failed_pop_for_test.wait(
+                            true, std::memory_order_acquire);
+                    }
+                    detail::bounded_recv_paused_after_failed_pop_for_test.store(
+                        false, std::memory_order_release);
+                }
+#endif
                 continue;
             }
 

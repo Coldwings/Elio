@@ -67,7 +67,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pong, and overload-response tasks through a scheduler-bound task scope. Session
   close requests both the explicit `rpc_context::cancel_token` and the runtime
   `this_coro::cancel_token()`, cancels pending frame writes and response-lock
-  waits, and joins every accepted child before releasing the session slot.
+  waits, closes pending frame reads when the session owner is cancelled, and
+  joins every accepted child before releasing the session slot.
   Cancellation remains cooperative, so a handler that stops observing both
   tokens can delay session teardown. Existing per-session admission and overload
   policies are unchanged.

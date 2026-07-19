@@ -674,11 +674,13 @@ tcp_rpc_server server(config);
 
 Each server session owns its accepted request handlers, pong writes, and overload
 responses in one structured task scope. Disconnect, timeout, duplicate request
-ID, `close_session` overload handling, and `rpc_server::stop()` close that scope:
+ID, `close_session` overload handling, cancellation of the task awaiting
+`handle_client()`, and `rpc_server::stop()` close that scope:
 
 - active handlers receive cancellation through both
   `rpc_context::cancel_token` and `coro::this_coro::cancel_token()`;
-- pending frame writes and waits for the session response lock are cancelled;
+- pending frame reads are woken through stream shutdown, while pending frame
+  writes and waits for the session response lock are cancelled;
 - `handle_client()` and the server's session slot remain active until every
   accepted child task has left the scope.
 

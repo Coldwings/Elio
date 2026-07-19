@@ -309,6 +309,10 @@ private:
         , config_(config) {}
 
     coro::task<void> run_scope(coro::task_group& group) {
+        [[maybe_unused]] auto close_on_runtime_cancel =
+            coro::this_coro::cancel_token().on_cancel([this] {
+                close();
+            });
         std::exception_ptr read_failure;
         try {
             while (stream_.is_valid() &&
@@ -1136,10 +1140,10 @@ public:
             auto session = session_type::create(std::move(*stream),
                                                  frozen_handlers_, config_);
 
-            // Track session
-            {
-                std::lock_guard<std::mutex> lock(sessions_mutex_);
-                sessions_.push_back(session);
+            if (!track_session_if_running(session)) {
+                session->close();
+                release_session_slot();
+                break;
             }
 
             // Spawn session handler
@@ -1189,10 +1193,10 @@ public:
             auto session = session_type::create(std::move(*stream),
                                                  frozen_handlers_, config_);
 
-            // Track session
-            {
-                std::lock_guard<std::mutex> lock(sessions_mutex_);
-                sessions_.push_back(session);
+            if (!track_session_if_running(session)) {
+                session->close();
+                release_session_slot();
+                break;
             }
 
             // Spawn session handler
@@ -1305,6 +1309,15 @@ private:
 
     void release_session_slot() noexcept {
         active_sessions_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    bool track_session_if_running(const session_ptr& session) {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        if (!running_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        sessions_.push_back(session);
+        return true;
     }
 
     coro::cancel_token reset_accept_cancel_source() {

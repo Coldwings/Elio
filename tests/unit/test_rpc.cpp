@@ -3634,6 +3634,42 @@ TEST_CASE("server close rejects a frame that completed during teardown",
     REQUIRE(shutdown_ok);
 }
 
+TEST_CASE("cancelling handle_client owner closes its pending frame read",
+          "[rpc][cancel][lifetime]") {
+    using namespace elio::runtime;
+    namespace coro = elio::coro;
+
+    rpc_server_config cfg;
+    cfg.frame_read_timeout = std::chrono::seconds(0);
+
+    auto server = std::make_shared<rpc_server<bounded_reject_stream>>(cfg);
+    auto state = std::make_shared<bounded_reject_stream_state>();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> owner_done{false};
+    auto owner = sched.go_joinable([&, state]() -> coro::task<void> {
+        co_await server->handle_client(bounded_reject_stream{state});
+        owner_done.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0; i < 2000 && server->session_count() == 0; ++i) {
+        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    }
+    CHECK(server->session_count() == 1);
+
+    owner.request_cancel();
+    owner.wait_destroyed();
+    CHECK_NOTHROW(owner.await_resume());
+
+    auto shutdown_ok = sched.shutdown(std::chrono::seconds(30));
+    REQUIRE(state->shutdown.load(std::memory_order_acquire));
+    REQUIRE(owner_done.load(std::memory_order_acquire));
+    REQUIRE(server->session_count() == 0);
+    REQUIRE(shutdown_ok);
+}
+
 TEST_CASE("server per-session in-flight limit can close the session",
           "[rpc][security][concurrent]") {
     using namespace elio::net;

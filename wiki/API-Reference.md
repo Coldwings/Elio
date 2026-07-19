@@ -634,6 +634,52 @@ are not rolled back, and a backend that cannot actively abort accepted work may
 wait for natural completion. A task-level token only affects operations that
 receive or inspect it.
 
+### Structured Combinators
+
+```cpp
+class combinator_cancelled : public std::runtime_error;
+
+template<typename... Fs>
+coro::task<std::tuple</* branch results */...>> when_all(Fs... callables);
+
+template<typename... Fs>
+coro::task<std::pair<size_t, /* winner result */>>
+when_any(Fs... callables);
+
+template<typename Rep, typename Period, typename F>
+coro::task<timeout_result</* callable result */>>
+with_timeout(std::chrono::duration<Rep, Period> timeout, F callable);
+```
+
+All three helpers return move-only lazy tasks, own their callable objects by
+value, and require execution in a scheduler domain when awaited. Their branches
+are registered in one internal `task_group`; no accepted branch is implicitly
+detached. Move-only callables must be passed as rvalues.
+
+`when_all()` starts every callable, requests cancellation of unfinished
+siblings after the first failure, waits for all accepted child frames to leave
+the group, and then rethrows the first failure. A parent cancellation request is
+propagated to the group. If cancellation prevents a branch from producing the
+value required by the result tuple, `when_all()` throws
+`combinator_cancelled` after drain.
+
+`when_any()` atomically selects the first successful or exceptional branch
+completion. It then requests cancellation of every loser and waits for all of
+them to terminate before returning the winner. A token-accepting callable
+receives its structured child token; a no-argument callable can use
+`this_coro::cancel_token()`. The winner's exception is rethrown. A loser that
+throws after winner selection is reported through the current scheduler's
+unhandled-exception handler before the combinator returns. If parent
+cancellation drains every branch before a winner exists, the operation throws
+`combinator_cancelled`.
+
+`with_timeout()` is a structured `when_any()` between the callable and a
+cancellable timer. Timer expiry selects a timed-out result and requests
+cancellation of the callable, but the returned task remains suspended until the
+callable reaches a terminal state. Consequently, the requested duration is not
+a hard upper bound on return latency. Parent cancellation is not reported as
+timer expiry; if it prevents a result, `combinator_cancelled` is thrown.
+
 ---
 
 ## Runtime (`elio::runtime`)
@@ -2959,7 +3005,13 @@ that context alive while accepts are pending and while accepted streams use it.
 
 Coroutine-aware synchronization primitives (`mutex`, `shared_mutex`, `event`, `semaphore`, `condition_variable`, `channel`) track suspended waiters through intrusive nodes embedded in coroutine frames. If a frame is destroyed while its waiter is still linked, the awaiter's destructor unlinks the node from the primitive.
 
-This cleanup does not make every operation cancellable. `with_timeout()` requests cooperative cancellation but does not forcibly destroy its losing child. The child must pass the supplied `cancel_token` to a token-aware operation to stop on timeout. Every suspending core synchronization primitive provides an explicit token-aware wait. Their no-token overloads remain non-cancellable and preserve their existing await results.
+This cleanup does not make every operation cancellable. `with_timeout()`
+requests cooperative cancellation but does not forcibly destroy its losing
+child. It joins the child before returning, so the child must pass the supplied
+`cancel_token` or `this_coro::cancel_token()` to a token-aware operation to stop
+promptly. Every suspending core synchronization primitive provides an explicit
+token-aware wait. Their no-token overloads remain non-cancellable and preserve
+their existing await results.
 
 Cancellation and normal notification atomically select one terminal result. A cancellation winner does not acquire a lock or permit, transfer a pending send value into a channel, or consume a channel receive value. Once normal notification wins, the operation returns `completed` and any acquired resource or completed transfer remains caller-owned. A condition wait that released an associated lock re-acquires it before returning either result. Channel result objects carry both `cancel_result` and the existing sent/value result so cancellation remains distinct from closure.
 

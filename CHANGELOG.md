@@ -63,6 +63,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Structured coroutine combinators**: `when_all()`, `when_any()`, and
+  `with_timeout()` now own every accepted branch through a scheduler-bound task
+  group instead of detached child tasks. `when_all()` remains fail-fast but
+  drains cancelled siblings before rethrowing the first failure. `when_any()`
+  still selects the first successful or exceptional completion, requests
+  cancellation of the remaining branches, and now waits for every loser to
+  reach a terminal state before returning or throwing. Late loser exceptions
+  remain observable through the scheduler unhandled-exception handler, but no
+  loser outlives the combinator implicitly. `with_timeout()` now waits for the
+  wrapped operation after deadline cancellation, so token-ignoring work can
+  delay return even though the result remains timed out. Parent cancellation
+  that prevents a required result is reported through the new
+  `combinator_cancelled` exception instead of being mistaken for timeout.
+  These lifetime and timing changes are intentional 0.6 breaking changes.
 - **Structured RPC session teardown**: Server sessions now own accepted request,
   pong, and overload-response tasks through a scheduler-bound task scope. Session
   close requests both the explicit `rpc_context::cancel_token` and the runtime

@@ -5,11 +5,13 @@
 #include <elio/coro/with_timeout.hpp>
 #include <elio/time/timer.hpp>
 #include <atomic>
-#include <barrier>
+#include <cerrno>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include "../test_main.cpp"
@@ -19,15 +21,6 @@ using namespace elio::coro;
 using namespace elio::test;
 
 namespace {
-
-bool wait_for_count(const std::atomic<int>& value, int expected) {
-    const auto deadline = std::chrono::steady_clock::now() + scaled_ms(2000);
-    while (value.load(std::memory_order_acquire) != expected &&
-           std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return value.load(std::memory_order_acquire) == expected;
-}
 
 bool wait_for_flag(const std::atomic<bool>& value) {
     const auto deadline = std::chrono::steady_clock::now() + scaled_ms(2000);
@@ -148,46 +141,6 @@ struct launch_throwing_move_callable {
         co_return 3;
     }
 };
-
-struct resume_probe {
-    struct promise_type {
-        resume_probe get_return_object() noexcept {
-            return resume_probe{
-                std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-        std::suspend_never initial_suspend() noexcept { return {}; }
-        std::suspend_always final_suspend() noexcept { return {}; }
-        void return_void() noexcept {}
-        void unhandled_exception() noexcept { std::terminate(); }
-    };
-
-    explicit resume_probe(std::coroutine_handle<promise_type> handle) noexcept
-        : handle_(handle) {}
-
-    resume_probe(resume_probe&& other) noexcept
-        : handle_(other.handle_) {
-        other.handle_ = {};
-    }
-
-    resume_probe(const resume_probe&) = delete;
-    resume_probe& operator=(const resume_probe&) = delete;
-
-    ~resume_probe() {
-        if (handle_) {
-            handle_.destroy();
-        }
-    }
-
-    std::coroutine_handle<> handle() const noexcept { return handle_; }
-
-private:
-    std::coroutine_handle<promise_type> handle_;
-};
-
-resume_probe make_resume_probe(std::atomic<int>& resumes) {
-    co_await std::suspend_always{};
-    resumes.fetch_add(1, std::memory_order_release);
-}
 
 } // namespace
 
@@ -360,62 +313,6 @@ TEST_CASE("when_all propagates launch-time callable move failure",
     REQUIRE(first_completed.load(std::memory_order_acquire));
 }
 
-TEST_CASE("when_all state wakes when completion follows launch",
-          "[sync][combinators][regression]") {
-    auto child = []() -> task<int> { co_return 1; };
-    using state_t = elio::detail::when_all_state<decltype(child)>;
-
-    state_t state(1);
-    coro::detail::completion_waiter waiter(state.waiter_);
-    std::atomic<int> resumes{0};
-    auto probe = make_resume_probe(resumes);
-
-    REQUIRE(state.set_waiter(waiter, probe.handle()));
-    state.finish_launching();
-    REQUIRE(resumes.load(std::memory_order_acquire) == 0);
-
-    state.complete_one();
-    REQUIRE(resumes.load(std::memory_order_acquire) == 1);
-}
-
-TEST_CASE("when_all state wakes when launch follows completion",
-          "[sync][combinators][regression]") {
-    auto child = []() -> task<int> { co_return 1; };
-    using state_t = elio::detail::when_all_state<decltype(child)>;
-
-    state_t state(1);
-    coro::detail::completion_waiter waiter(state.waiter_);
-    std::atomic<int> resumes{0};
-    auto probe = make_resume_probe(resumes);
-
-    REQUIRE(state.set_waiter(waiter, probe.handle()));
-    state.complete_one();
-    REQUIRE(resumes.load(std::memory_order_acquire) == 0);
-
-    state.finish_launching();
-    REQUIRE(resumes.load(std::memory_order_acquire) == 1);
-}
-
-TEST_CASE("when_all state wakes after unlaunched children are accounted",
-          "[sync][combinators][regression]") {
-    auto child = []() -> task<int> { co_return 1; };
-    using state_t =
-        elio::detail::when_all_state<decltype(child), decltype(child)>;
-
-    state_t state(2);
-    coro::detail::completion_waiter waiter(state.waiter_);
-    std::atomic<int> resumes{0};
-    auto probe = make_resume_probe(resumes);
-
-    REQUIRE(state.set_waiter(waiter, probe.handle()));
-    state.complete_one();
-    state.complete_unlaunched(1);
-    REQUIRE(resumes.load(std::memory_order_acquire) == 0);
-
-    state.finish_launching();
-    REQUIRE(resumes.load(std::memory_order_acquire) == 1);
-}
-
 // --- when_any tests ---
 
 TEST_CASE("when_any returns first completer", "[sync][combinators]") {
@@ -425,8 +322,9 @@ TEST_CASE("when_any returns first completer", "[sync][combinators]") {
                 co_await time::sleep_for(std::chrono::milliseconds(1));
                 co_return 1;
             },
-            []() -> task<int> {
-                co_await time::sleep_for(std::chrono::milliseconds(500));
+            [](coro::cancel_token token) -> task<int> {
+                co_await time::sleep_for(
+                    std::chrono::milliseconds(500), std::move(token));
                 co_return 2;
             }
         );
@@ -501,68 +399,12 @@ TEST_CASE("when_any propagates launch-time callable move failure",
     REQUIRE(first_completed.load(std::memory_order_acquire));
 }
 
-TEST_CASE("when_any wake gate claims one resume in either publication order",
-          "[sync][combinators][regression]") {
-    SECTION("resolution is published first") {
-        elio::detail::when_any_wake_gate gate;
-        REQUIRE_FALSE(gate.publish_resolved());
-        REQUIRE(gate.resolved());
-        REQUIRE(gate.finish_launching());
-        REQUIRE_FALSE(gate.publish_resolved());
-        REQUIRE_FALSE(gate.finish_launching());
-    }
-
-    SECTION("launch completion is published first") {
-        elio::detail::when_any_wake_gate gate;
-        REQUIRE_FALSE(gate.finish_launching());
-        REQUIRE_FALSE(gate.resolved());
-        REQUIRE(gate.publish_resolved());
-        REQUIRE(gate.resolved());
-        REQUIRE_FALSE(gate.finish_launching());
-        REQUIRE_FALSE(gate.publish_resolved());
-    }
-}
-
-TEST_CASE("when_any wake gate synchronizes concurrent publications",
-          "[sync][combinators][regression]") {
-    constexpr std::size_t rounds = 1000;
-    auto gates = std::make_unique<elio::detail::when_any_wake_gate[]>(rounds);
-    auto resolved_claimed = std::make_unique<bool[]>(rounds);
-    auto launch_claimed = std::make_unique<bool[]>(rounds);
-    std::barrier rendezvous(3);
-
-    {
-        std::jthread resolved_thread([&] {
-            for (std::size_t i = 0; i < rounds; ++i) {
-                rendezvous.arrive_and_wait();
-                resolved_claimed[i] = gates[i].publish_resolved();
-                rendezvous.arrive_and_wait();
-            }
-        });
-        std::jthread launch_thread([&] {
-            for (std::size_t i = 0; i < rounds; ++i) {
-                rendezvous.arrive_and_wait();
-                launch_claimed[i] = gates[i].finish_launching();
-                rendezvous.arrive_and_wait();
-            }
-        });
-
-        for (std::size_t i = 0; i < rounds; ++i) {
-            rendezvous.arrive_and_wait();
-            rendezvous.arrive_and_wait();
-        }
-    }
-
-    for (std::size_t i = 0; i < rounds; ++i) {
-        REQUIRE(resolved_claimed[i] != launch_claimed[i]);
-    }
-}
-
 TEST_CASE("when_any second finishes first", "[sync][combinators]") {
     auto test = []() -> task<void> {
         auto [idx, value] = co_await when_any(
-            []() -> task<int> {
-                co_await time::sleep_for(std::chrono::milliseconds(500));
+            [](coro::cancel_token token) -> task<int> {
+                co_await time::sleep_for(
+                    std::chrono::milliseconds(500), std::move(token));
                 co_return 1;
             },
             []() -> task<int> {
@@ -589,8 +431,9 @@ TEST_CASE("when_any propagates exception from winner", "[sync][combinators]") {
                     throw std::runtime_error("test error");
                     co_return 0;
                 },
-                []() -> task<int> {
-                    co_await time::sleep_for(std::chrono::milliseconds(500));
+                [](coro::cancel_token token) -> task<int> {
+                    co_await time::sleep_for(
+                        std::chrono::milliseconds(500), std::move(token));
                     co_return 2;
                 }
             );
@@ -626,7 +469,6 @@ TEST_CASE("when_any with cancel_token propagation", "[sync][combinators]") {
         );
         REQUIRE(idx == 0);
         REQUIRE(value == 42);
-        co_await time::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(was_cancelled.load(std::memory_order_relaxed));
     };
 
@@ -644,12 +486,16 @@ TEST_CASE("when_any with void tasks", "[sync][combinators]") {
                 co_await time::sleep_for(std::chrono::milliseconds(1));
                 winner.store(0, std::memory_order_relaxed);
             },
-            [&]() -> task<void> {
-                co_await time::sleep_for(std::chrono::milliseconds(500));
-                winner.store(1, std::memory_order_relaxed);
+            [&](coro::cancel_token token) -> task<void> {
+                const auto result = co_await time::sleep_for(
+                    std::chrono::milliseconds(500), std::move(token));
+                if (result == coro::cancel_result::completed) {
+                    winner.store(1, std::memory_order_relaxed);
+                }
             }
         );
         REQUIRE(idx == 0);
+        REQUIRE(winner.load(std::memory_order_relaxed) == 0);
         static_assert(std::is_same_v<decltype(mono), std::monostate>);
     };
 
@@ -681,8 +527,9 @@ TEST_CASE("when_any with heterogeneous types", "[sync][combinators]") {
                 co_await time::sleep_for(std::chrono::milliseconds(1));
                 co_return 42;
             },
-            []() -> task<std::string> {
-                co_await time::sleep_for(std::chrono::milliseconds(500));
+            [](coro::cancel_token token) -> task<std::string> {
+                co_await time::sleep_for(
+                    std::chrono::milliseconds(500), std::move(token));
                 co_return std::string("hello");
             }
         );
@@ -738,7 +585,8 @@ TEST_CASE("when_any supports a non-default first heterogeneous result",
     sched.shutdown();
 }
 
-TEST_CASE("when_any loser exception is logged", "[sync][combinators]") {
+TEST_CASE("when_any drains a losing exception before returning",
+          "[sync][combinators][structured]") {
     auto test = []() -> task<void> {
         auto [idx, value] = co_await when_any(
             []() -> task<int> {
@@ -753,7 +601,6 @@ TEST_CASE("when_any loser exception is logged", "[sync][combinators]") {
         );
         REQUIRE(idx == 0);
         REQUIRE(value == 42);
-        co_await time::sleep_for(std::chrono::milliseconds(200));
     };
 
     runtime::scheduler sched(2);
@@ -779,7 +626,8 @@ TEST_CASE("when_any loser exception triggers handler", "[sync][combinators]") {
         );
         REQUIRE(idx == 0);
         REQUIRE(value == 42);
-        co_await time::sleep_for(std::chrono::milliseconds(200));
+        REQUIRE(handler_called.load(std::memory_order_acquire));
+        REQUIRE(handler_message == "loser exception for handler");
     };
 
     runtime::scheduler sched(2);
@@ -809,8 +657,9 @@ TEST_CASE("when_any winner exception propagates", "[sync][combinators]") {
                     throw std::runtime_error("winner exception");
                     co_return 0;
                 },
-                []() -> task<int> {
-                    co_await time::sleep_for(std::chrono::milliseconds(500));
+                [](coro::cancel_token token) -> task<int> {
+                    co_await time::sleep_for(
+                        std::chrono::milliseconds(500), std::move(token));
                     co_return 42;
                 }
             );
@@ -828,122 +677,255 @@ TEST_CASE("when_any winner exception propagates", "[sync][combinators]") {
 
 TEST_CASE("when_any publishes result construction failure",
           "[sync][combinators][regression]") {
-    auto first = []() -> task<int> { co_return 1; };
-    auto second = []() -> task<throwing_result> {
-        co_return throwing_result{2};
-    };
-    elio::detail::when_any_state<decltype(first), decltype(second)> state;
-    throwing_result result{2};
-    throwing_result::throw_on_move.store(true, std::memory_order_relaxed);
+    runtime::scheduler sched(1);
+    sched.start();
 
-    state.resolve<1>(std::move(result));
+    auto owner = sched.go_joinable([]() -> task<void> {
+        auto first = []() -> task<int> { co_return 1; };
+        auto second = []() -> task<throwing_result> {
+            co_return throwing_result{2};
+        };
+        elio::detail::when_any_state<decltype(first), decltype(second)> state;
+        task_group group;
+        throwing_result result{2};
+        throwing_result::throw_on_move.store(true, std::memory_order_relaxed);
 
-    REQUIRE(state.winner_claimed_.load(std::memory_order_acquire));
-    REQUIRE(state.wake_gate_.resolved());
-    REQUIRE(state.exception_ != nullptr);
-    std::string exception_message;
-    try {
-        std::rethrow_exception(state.exception_);
-    } catch (const std::exception& e) {
-        exception_message = e.what();
+        state.resolve<1>(group, std::move(result));
+
+        REQUIRE(state.winner_claimed_.load(std::memory_order_acquire));
+        REQUIRE(state.exception_ != nullptr);
+        std::string exception_message;
+        try {
+            std::rethrow_exception(state.exception_);
+        } catch (const std::exception& error) {
+            exception_message = error.what();
+        }
+        REQUIRE(exception_message == "result transfer failed");
+        co_await group.join();
+    });
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    sched.shutdown();
+}
+
+TEST_CASE("when_any preserves its winner when loser cancellation throws",
+          "[sync][combinators][structured][regression]") {
+    sync::event loser_ready;
+    sync::event never;
+    std::atomic<bool> callback_invoked{false};
+    std::atomic<bool> handler_invoked{false};
+
+    runtime::scheduler sched(2);
+    sched.start();
+    sched.set_unhandled_exception_handler([&](std::exception_ptr exception) {
+        try {
+            std::rethrow_exception(exception);
+        } catch (const std::runtime_error& error) {
+            if (std::string_view(error.what()) ==
+                "cancellation callback failed") {
+                handler_invoked.store(true, std::memory_order_release);
+            }
+        }
+    });
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        auto [index, value] = co_await when_any(
+            [&]() -> task<int> {
+                co_await loser_ready.wait();
+                co_return 42;
+            },
+            [&](coro::cancel_token token) -> task<int> {
+                auto registration = token.on_cancel([&] {
+                    callback_invoked.store(true, std::memory_order_release);
+                    throw std::runtime_error("cancellation callback failed");
+                });
+                loser_ready.set();
+                (void)co_await never.wait(token);
+                co_return -1;
+            });
+
+        REQUIRE(index == 0);
+        REQUIRE(value == 42);
+        REQUIRE(callback_invoked.load(std::memory_order_acquire));
+        REQUIRE(handler_invoked.load(std::memory_order_acquire));
+    });
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    sched.shutdown();
+}
+
+TEST_CASE("when_any waits for a token-ignoring loser to finish",
+          "[sync][combinators][structured][lifetime]") {
+    sync::event loser_started;
+    sync::event release_loser;
+    std::atomic<bool> winner_completed{false};
+    std::atomic<bool> combinator_returned{false};
+    runtime::scheduler sched(2);
+    sched.start();
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        auto [index, value] = co_await when_any(
+            [&]() -> task<int> {
+                co_await loser_started.wait();
+                winner_completed.store(true, std::memory_order_release);
+                co_return 42;
+            },
+            [&]() -> task<int> {
+                loser_started.set();
+                co_await release_loser.wait();
+                co_return -1;
+            });
+        REQUIRE(index == 0);
+        REQUIRE(value == 42);
+        combinator_returned.store(true, std::memory_order_release);
+    });
+
+    REQUIRE(wait_for_flag(winner_completed));
+    REQUIRE_FALSE(combinator_returned.load(std::memory_order_acquire));
+    REQUIRE_FALSE(owner.is_ready());
+    release_loser.set();
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(combinator_returned.load(std::memory_order_acquire));
+    sched.shutdown();
+}
+
+TEST_CASE("when_any drains a TCP read cancellation-completion race",
+          "[sync][combinators][structured][io][tcp][cancellation]") {
+    using namespace elio::net;
+
+    auto listener = tcp_listener::bind(ipv6_address("::1", 0));
+    REQUIRE(listener.has_value());
+    const auto port = listener->local_address().port();
+
+    std::optional<tcp_stream> server_stream;
+    std::optional<tcp_stream> client_stream;
+    std::atomic<int> setup_complete{0};
+    runtime::scheduler sched(3);
+    sched.start();
+
+    sched.go([&]() -> task<void> {
+        server_stream = co_await listener->accept();
+        setup_complete.fetch_add(1, std::memory_order_release);
+    });
+    sched.go([&]() -> task<void> {
+        client_stream = co_await tcp_connect(ipv6_address("::1", port));
+        setup_complete.fetch_add(1, std::memory_order_release);
+    });
+
+    const auto setup_deadline =
+        std::chrono::steady_clock::now() + scaled_ms(2000);
+    while (setup_complete.load(std::memory_order_acquire) != 2 &&
+           std::chrono::steady_clock::now() < setup_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    REQUIRE(exception_message == "result transfer failed");
-}
+    REQUIRE(setup_complete.load(std::memory_order_acquire) == 2);
+    REQUIRE(server_stream.has_value());
+    REQUIRE(client_stream.has_value());
 
-TEST_CASE("when_any publishes winner when loser cancellation throws",
-          "[sync][combinators][regression]") {
-    auto first = []() -> task<int> { co_return 1; };
-    auto second = []() -> task<int> { co_return 2; };
-    elio::detail::when_any_state<decltype(first), decltype(second)> state;
-    bool callback_invoked = false;
-    auto registration = state.cancel_source_.get_token().on_cancel([&] {
-        callback_invoked = true;
-        throw std::runtime_error("cancellation callback failed");
+    sync::event read_started;
+    std::atomic<bool> read_terminal{false};
+    std::atomic<bool> writer_terminal{false};
+    std::atomic<int> read_result{0};
+    std::atomic<int> writer_result{0};
+
+    auto writer = sched.go_joinable([&]() -> task<void> {
+        co_await read_started.wait();
+        co_await time::sleep_for(scaled_ms(1));
+        char byte = 'x';
+        const auto result = co_await client_stream->write(&byte, 1);
+        writer_result.store(result.result, std::memory_order_release);
+        writer_terminal.store(true, std::memory_order_release);
     });
 
-    state.resolve<0>(42);
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        auto [index, value] = co_await when_any(
+            [&](coro::cancel_token token) -> task<int> {
+                (void)co_await read_started.wait(token);
+                (void)co_await time::sleep_for(
+                    scaled_ms(1), std::move(token));
+                co_return 0;
+            },
+            [&](coro::cancel_token token) -> task<int> {
+                char byte = 0;
+                read_started.set();
+                const auto result = co_await server_stream->read(
+                    &byte, 1, std::move(token));
+                read_result.store(result.result, std::memory_order_release);
+                read_terminal.store(true, std::memory_order_release);
+                co_return result.result;
+            });
 
-    REQUIRE(callback_invoked);
-    REQUIRE(state.wake_gate_.resolved());
-    REQUIRE(state.exception_ == nullptr);
-    REQUIRE(state.result_.has_value());
-    REQUIRE(std::get<0>(*state.result_) == 42);
+        REQUIRE(read_terminal.load(std::memory_order_acquire));
+        if (index == 0) {
+            REQUIRE(value == 0);
+            const auto observed = read_result.load(std::memory_order_acquire);
+            REQUIRE((observed == 1 || observed == -ECANCELED));
+        } else {
+            REQUIRE(index == 1);
+            REQUIRE(value == 1);
+        }
+    });
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    writer.wait_destroyed();
+    REQUIRE_NOTHROW(writer.await_resume());
+    REQUIRE(writer_terminal.load(std::memory_order_acquire));
+    REQUIRE(writer_result.load(std::memory_order_acquire) == 1);
+    REQUIRE(sched.shutdown(scaled_ms(5000)));
 }
 
-TEST_CASE("destroyed when_all waiter is unregistered",
-          "[sync][combinators][cancellation]") {
-    sync::event gate;
-    std::atomic<int> started{0};
-    std::atomic<int> completed{0};
-
-    auto child = [&]() -> task<void> {
-        started.fetch_add(1, std::memory_order_release);
-        co_await gate.wait();
-        completed.fetch_add(1, std::memory_order_release);
-    };
-    auto outer = [&]() -> task<void> {
-        co_await when_all(child, child);
-    };
-
-    runtime::scheduler sched(2);
+TEST_CASE("pre-cancelled when_all does not start child bodies",
+          "[sync][combinators][structured][cancellation]") {
+    sync::event continue_owner;
+    std::atomic<bool> owner_waiting{false};
+    std::atomic<int> child_starts{0};
+    std::atomic<bool> cancellation_reported{false};
+    runtime::scheduler sched(1);
     sched.start();
-    auto outer_task = outer();
-    auto h = elio::coro::detail::task_access::release(std::move(outer_task));
-    sched.spawn(h);
 
-    REQUIRE(wait_for_count(started, 2));
-    h.destroy();
-    sched.go([&]() -> task<void> {
-        gate.set();
-        co_return;
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        owner_waiting.store(true, std::memory_order_release);
+        co_await continue_owner.wait();
+        try {
+            (void)co_await when_all(
+                [&]() -> task<int> {
+                    child_starts.fetch_add(1, std::memory_order_release);
+                    co_return 1;
+                },
+                [&]() -> task<int> {
+                    child_starts.fetch_add(1, std::memory_order_release);
+                    co_return 2;
+                });
+        } catch (const combinator_cancelled&) {
+            cancellation_reported.store(true, std::memory_order_release);
+        }
     });
-    REQUIRE(wait_for_count(completed, 2));
+
+    REQUIRE(wait_for_flag(owner_waiting));
+    owner.request_cancel();
+    continue_owner.set();
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(child_starts.load(std::memory_order_acquire) == 0);
+    REQUIRE(cancellation_reported.load(std::memory_order_acquire));
     sched.shutdown();
 }
 
-TEST_CASE("destroyed when_any waiter is unregistered",
-          "[sync][combinators][cancellation]") {
-    sync::event gate;
-    std::atomic<int> started{0};
-    std::atomic<int> completed{0};
+TEST_CASE("combinators return move-only lazy tasks",
+          "[sync][combinators][ownership]") {
+    using AllTask = decltype(when_all(
+        std::declval<throwing_move_callable>()));
+    using AnyTask = decltype(when_any(
+        std::declval<throwing_move_callable>()));
 
-    auto child = [&]() -> task<int> {
-        started.fetch_add(1, std::memory_order_release);
-        co_await gate.wait();
-        completed.fetch_add(1, std::memory_order_release);
-        co_return 1;
-    };
-    auto outer = [&]() -> task<void> {
-        (void)co_await when_any(child, child);
-    };
-
-    runtime::scheduler sched(2);
-    sched.start();
-    auto outer_task = outer();
-    auto h = elio::coro::detail::task_access::release(std::move(outer_task));
-    sched.spawn(h);
-
-    REQUIRE(wait_for_count(started, 2));
-    h.destroy();
-    sched.go([&]() -> task<void> {
-        gate.set();
-        co_return;
-    });
-    REQUIRE(wait_for_count(completed, 2));
-    sched.shutdown();
-}
-
-TEST_CASE("combinator awaitable move traits follow callables",
-          "[sync][combinators]") {
-    using AllAwaitable = elio::detail::when_all_awaitable<throwing_move_callable>;
-    using AnyAwaitable = elio::detail::when_any_awaitable<throwing_move_callable>;
-
-    STATIC_REQUIRE(std::is_move_constructible_v<AllAwaitable>);
-    STATIC_REQUIRE(std::is_move_constructible_v<AnyAwaitable>);
-    STATIC_REQUIRE_FALSE(std::is_nothrow_move_constructible_v<AllAwaitable>);
-    STATIC_REQUIRE_FALSE(std::is_nothrow_move_constructible_v<AnyAwaitable>);
-    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<AllAwaitable>);
-    STATIC_REQUIRE_FALSE(std::is_move_assignable_v<AnyAwaitable>);
+    STATIC_REQUIRE(std::is_move_constructible_v<AllTask>);
+    STATIC_REQUIRE(std::is_move_constructible_v<AnyTask>);
+    STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<AllTask>);
+    STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<AnyTask>);
 }
 
 // --- with_timeout tests ---
@@ -963,6 +945,26 @@ TEST_CASE("with_timeout task completes before timeout", "[sync][combinators]") {
     };
 
     runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("with_timeout owns a move-only callable before delayed await",
+          "[sync][combinators][ownership][lifetime]") {
+    auto test = []() -> task<void> {
+        auto pending = with_timeout(
+            std::chrono::milliseconds(500),
+            [owned = std::make_unique<int>(42)]() mutable -> task<int> {
+                co_return *owned;
+            });
+
+        co_await time::yield();
+        auto result = co_await pending;
+        REQUIRE(result);
+        REQUIRE(*result == 42);
+    };
+
+    runtime::scheduler sched(1);
     sched.go(test);
     sched.shutdown();
 }
@@ -1038,12 +1040,76 @@ TEST_CASE("with_timeout with cancel_token propagation", "[sync][combinators]") {
             }
         );
         REQUIRE(result.timed_out);
-        co_await time::sleep_for(std::chrono::milliseconds(50));
         REQUIRE(was_cancelled.load(std::memory_order_relaxed));
     };
 
     runtime::scheduler sched(2);
     sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("with_timeout waits for token-ignoring work after expiry",
+          "[sync][combinators][structured][timeout][lifetime]") {
+    std::atomic<bool> child_started{false};
+    sync::event release_child;
+    std::atomic<bool> timeout_returned{false};
+
+    runtime::scheduler sched(2);
+    sched.start();
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        auto result = co_await with_timeout(
+            scaled_ms(1),
+            [&]() -> task<int> {
+                child_started.store(true, std::memory_order_release);
+                co_await release_child.wait();
+                co_return 42;
+            });
+        REQUIRE(result.timed_out);
+        timeout_returned.store(true, std::memory_order_release);
+    });
+
+    REQUIRE(wait_for_flag(child_started));
+    std::this_thread::sleep_for(scaled_ms(20));
+    REQUIRE_FALSE(timeout_returned.load(std::memory_order_acquire));
+    REQUIRE_FALSE(owner.is_ready());
+    release_child.set();
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(timeout_returned.load(std::memory_order_acquire));
+    sched.shutdown();
+}
+
+TEST_CASE("pre-cancelled with_timeout is not reported as expiry",
+          "[sync][combinators][structured][timeout][cancellation]") {
+    sync::event continue_owner;
+    std::atomic<bool> owner_waiting{false};
+    std::atomic<bool> cancellation_reported{false};
+    std::atomic<bool> child_started{false};
+
+    runtime::scheduler sched(1);
+    sched.start();
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        owner_waiting.store(true, std::memory_order_release);
+        co_await continue_owner.wait();
+        try {
+            (void)co_await with_timeout(
+                scaled_ms(100),
+                [&]() -> task<int> {
+                    child_started.store(true, std::memory_order_release);
+                    co_return 42;
+                });
+        } catch (const combinator_cancelled&) {
+            cancellation_reported.store(true, std::memory_order_release);
+        }
+    });
+
+    REQUIRE(wait_for_flag(owner_waiting));
+    owner.request_cancel();
+    continue_owner.set();
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(cancellation_reported.load(std::memory_order_acquire));
+    REQUIRE_FALSE(child_started.load(std::memory_order_acquire));
     sched.shutdown();
 }
 

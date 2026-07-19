@@ -610,7 +610,14 @@ coro::task<void> safe_update() {
 
 Coroutine-aware synchronization primitives (`event`, `mutex`, `semaphore`, `condition_variable`, `channel`, `shared_mutex`) embed waiter nodes in the suspended coroutine frame. If a frame is destroyed while its waiter is still linked, the awaiter's destructor removes that node from the primitive's internal waiter list.
 
-This lifetime cleanup is not itself a cancellation API. `with_timeout()` requests cooperative cancellation when its timer wins; it does not forcibly destroy the losing child task. The child stops promptly only when it passes the supplied `cancel_token` to an operation that supports cancellation.
+This lifetime cleanup is not itself a cancellation API. `with_timeout()` runs
+its callable and timer in a structured task group. When the timer wins it
+requests cooperative cancellation, then waits for the callable to reach a
+terminal state before returning a timed-out result. The duration is therefore a
+deadline for requesting cancellation, not a guaranteed return-time bound. The
+child stops promptly only when it passes the supplied `cancel_token` or
+`this_coro::cancel_token()` to operations that support cancellation. Work that
+ignores cancellation delays the timeout result until natural completion.
 
 `mutex::lock(token)`, `semaphore::acquire(token)`, and `event::wait(token)` are cancellation-aware and return `coro::cancel_result`. Cancellation and normal notification atomically select one terminal result. If cancellation wins, a mutex lock or semaphore permit is not acquired. If normal notification wins first, the operation returns `completed` and the caller owns the acquired resource even if cancellation is requested immediately afterward. The overloads without a token remain non-cancellable and preserve their `void` await result.
 
@@ -621,7 +628,8 @@ This lifetime cleanup is not itself a cancellation API. `with_timeout()` request
 **Key guarantees:**
 - Destroying a frame whose waiter is still linked removes that waiter from the primitive's list
 - No manual waiter-list cleanup is required; unlinking happens in the awaiter's destructor
-- Timeout cancellation remains cooperative and requires a token-aware operation
+- Timeout cancellation remains cooperative, requires a token-aware operation,
+  and joins the timed-out child before returning
 - A completed lock or permit acquisition is not rolled back by a later cancellation request
 - A completed channel transfer is not rolled back by a later cancellation request
 

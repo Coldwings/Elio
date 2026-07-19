@@ -3836,7 +3836,9 @@ response-lock waits, and joins all accepted children before `handle_client()`
 returns or the session slot is released. Cancellation is cooperative: handlers
 must pass one of these tokens to waits that should stop, and code that ignores
 both tokens can delay session teardown. This structured ownership does not
-change request admission or overload policy.
+change request admission or overload policy. Session tracking and slot state are
+shared with draining sessions, so they remain valid if the server facade is
+released after stop before cooperative handler drain completes.
 
 #### `rpc_server<Stream>`
 

@@ -3572,6 +3572,10 @@ TEST_CASE("server session teardown cancels and joins handler tasks",
     CHECK(reentrant_session_count.load(std::memory_order_acquire) == 1);
     CHECK_FALSE(server_done.load(std::memory_order_acquire));
 
+    std::weak_ptr server_lifetime = server;
+    server.reset();
+    CHECK(server_lifetime.expired());
+
     release_handler.set();
     for (int i = 0;
          i < 2000 && !server_done.load(std::memory_order_acquire);

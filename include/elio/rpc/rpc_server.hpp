@@ -1135,7 +1135,7 @@ public:
                     config_.max_sessions);
                 continue;  // stream dtor closes the socket
             }
-            session_lifetime_guard lifetime(this);
+            session_lifetime_guard lifetime(session_registry_);
 
             // Create and start session
             auto session = session_type::create(std::move(*stream),
@@ -1150,7 +1150,7 @@ public:
             // Spawn session handler
             auto* sched = runtime::scheduler::current();
             if (sched) {
-                sched->go(&rpc_server::run_session, this, session,
+                sched->go(&rpc_server::run_session, session,
                           std::move(lifetime));
             } else {
                 session->close();
@@ -1188,7 +1188,7 @@ public:
                     config_.max_sessions);
                 continue;
             }
-            session_lifetime_guard lifetime(this);
+            session_lifetime_guard lifetime(session_registry_);
 
             // Create and start session
             auto session = session_type::create(std::move(*stream),
@@ -1203,7 +1203,7 @@ public:
             // Spawn session handler
             auto* sched = runtime::scheduler::current();
             if (sched) {
-                sched->go(&rpc_server::run_session, this, session,
+                sched->go(&rpc_server::run_session, session,
                           std::move(lifetime));
             } else {
                 session->close();
@@ -1222,13 +1222,14 @@ public:
                 config_.max_sessions);
             co_return;  // stream dtor closes the socket
         }
-        session_lifetime_guard lifetime(this);
+        session_lifetime_guard lifetime(session_registry_);
         auto session = session_type::create(std::move(stream),
                                              frozen_handlers_, config_);
 
         {
-            std::lock_guard<std::mutex> lock(sessions_mutex_);
-            sessions_.push_back(session);
+            std::lock_guard<std::mutex> lock(
+                session_registry_->sessions_mutex);
+            session_registry_->sessions.push_back(session);
         }
         lifetime.track(session);
 
@@ -1242,8 +1243,9 @@ public:
 
         std::vector<session_ptr> sessions;
         {
-            std::lock_guard<std::mutex> lock(sessions_mutex_);
-            sessions = sessions_;
+            std::lock_guard<std::mutex> lock(
+                session_registry_->sessions_mutex);
+            sessions = session_registry_->sessions;
         }
         for (auto& session : sessions) {
             session->close();
@@ -1257,18 +1259,26 @@ public:
     
     /// Get number of active sessions
     size_t session_count() const {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        return sessions_.size();
+        std::lock_guard<std::mutex> lock(
+            session_registry_->sessions_mutex);
+        return session_registry_->sessions.size();
     }
     
 private:
+    struct session_registry final {
+        std::atomic<size_t> active_sessions{0};
+        std::mutex sessions_mutex;
+        std::vector<session_ptr> sessions;
+    };
+
     class session_lifetime_guard final {
     public:
-        explicit session_lifetime_guard(rpc_server* server) noexcept
-            : server_(server) {}
+        explicit session_lifetime_guard(
+            std::shared_ptr<session_registry> registry) noexcept
+            : registry_(std::move(registry)) {}
 
         session_lifetime_guard(session_lifetime_guard&& other) noexcept
-            : server_(std::exchange(other.server_, nullptr))
+            : registry_(std::move(other.registry_))
             , session_(std::move(other.session_))
             , tracked_(std::exchange(other.tracked_, false)) {}
 
@@ -1277,16 +1287,27 @@ private:
         session_lifetime_guard& operator=(session_lifetime_guard&&) = delete;
 
         ~session_lifetime_guard() {
-            if (!server_) {
+            if (!registry_) {
                 return;
             }
             if (tracked_) {
                 try {
-                    server_->remove_session(session_);
+                    std::lock_guard<std::mutex> lock(
+                        registry_->sessions_mutex);
+                    auto it = std::find(
+                        registry_->sessions.begin(),
+                        registry_->sessions.end(), session_);
+                    if (it != registry_->sessions.end()) {
+                        if (it != registry_->sessions.end() - 1) {
+                            *it = std::move(registry_->sessions.back());
+                        }
+                        registry_->sessions.pop_back();
+                    }
                 } catch (...) {
                 }
             }
-            server_->release_session_slot();
+            registry_->active_sessions.fetch_sub(
+                1, std::memory_order_acq_rel);
         }
 
         void track(session_ptr session) noexcept {
@@ -1295,7 +1316,7 @@ private:
         }
 
     private:
-        rpc_server* server_ = nullptr;
+        std::shared_ptr<session_registry> registry_;
         session_ptr session_;
         bool tracked_ = false;
     };
@@ -1330,12 +1351,14 @@ private:
     /// max_sessions == 0 means unlimited.
     bool try_reserve_session_slot() noexcept {
         if (config_.max_sessions == 0) {
-            active_sessions_.fetch_add(1, std::memory_order_relaxed);
+            session_registry_->active_sessions.fetch_add(
+                1, std::memory_order_relaxed);
             return true;
         }
-        size_t cur = active_sessions_.load(std::memory_order_relaxed);
+        size_t cur = session_registry_->active_sessions.load(
+            std::memory_order_relaxed);
         while (cur < config_.max_sessions) {
-            if (active_sessions_.compare_exchange_weak(
+            if (session_registry_->active_sessions.compare_exchange_weak(
                     cur, cur + 1, std::memory_order_acq_rel)) {
                 return true;
             }
@@ -1343,16 +1366,13 @@ private:
         return false;
     }
 
-    void release_session_slot() noexcept {
-        active_sessions_.fetch_sub(1, std::memory_order_acq_rel);
-    }
-
     bool track_session_if_running(const session_ptr& session) {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        std::lock_guard<std::mutex> lock(
+            session_registry_->sessions_mutex);
         if (!running_.load(std::memory_order_acquire)) {
             return false;
         }
-        sessions_.push_back(session);
+        session_registry_->sessions.push_back(session);
         return true;
     }
 
@@ -1376,21 +1396,8 @@ private:
         return false;
     }
 
-    /// Remove a session from the tracking vector using swap-and-pop (O(1)).
-    /// Must be called without sessions_mutex_ held.
-    void remove_session(const session_ptr& session) {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        auto it = std::find(sessions_.begin(), sessions_.end(), session);
-        if (it != sessions_.end()) {
-            if (it != sessions_.end() - 1) {
-                *it = std::move(sessions_.back());
-            }
-            sessions_.pop_back();
-        }
-    }
-
     /// Run a session while its tracking and slot reservation remain owned.
-    coro::task<void> run_session(
+    static coro::task<void> run_session(
         session_ptr session,
         [[maybe_unused]] session_lifetime_guard lifetime) {
         co_await session->run();
@@ -1402,10 +1409,8 @@ private:
     std::once_flag freeze_once_;
     std::shared_ptr<const handler_map> frozen_handlers_;
     std::atomic<bool> running_{false};
-    std::atomic<size_t> active_sessions_{0};
-
-    mutable std::mutex sessions_mutex_;
-    std::vector<session_ptr> sessions_;
+    std::shared_ptr<session_registry> session_registry_ =
+        std::make_shared<session_registry>();
     mutable std::mutex accept_cancel_mutex_;
     coro::cancel_source accept_cancel_source_;
 };

@@ -691,6 +691,11 @@ cancellation can delay session teardown and slot release. This lifetime rule
 does not add another concurrency limit and does not change
 `max_in_flight_requests_per_session` admission or overload behavior.
 
+Session tracking and slot accounting are held in shared internal state while
+accepted sessions drain. After `rpc_server::stop()` has returned, releasing the
+server facade does not invalidate that bookkeeping even if a cooperative handler
+has not exited yet.
+
 ## Thread Safety
 
 - **rpc_client**: Thread-safe for concurrent calls

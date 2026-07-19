@@ -182,6 +182,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Scheduler exception-handler publication**: Concurrent handler replacement,
+  reporting, and getter calls now exchange shared handler snapshots under an
+  explicit mutex instead of relying on `atomic<shared_ptr>`. Reporters and
+  getter callers keep their selected handler alive, while reports invoke it
+  outside the lock. This preserves concurrent replacement and self-replacement
+  without the GCC 12 ThreadSanitizer race.
 - **Cancellation callback teardown**: Destroying or unregistering a callback
   registration now synchronizes with cancellation that has already selected or
   started the callback, preventing callback captures from being released while

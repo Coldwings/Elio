@@ -686,10 +686,12 @@ branch from producing the value required by the result tuple, `when_all()` throw
 completion. It then requests cancellation of every loser and waits for all of
 them to terminate before returning the winner. A token-accepting callable
 receives its structured child token; a no-argument callable can use
-`this_coro::cancel_token()`. The winner's exception is rethrown. A loser that
+`this_coro::cancel_token()`. A launch-time callable-transfer failure takes
+precedence over an already selected winner because the complete branch set was
+never accepted. Otherwise, the winner's exception is rethrown. A loser that
 throws after winner selection is reported through the current scheduler's
-unhandled-exception handler before the combinator returns. If parent
-cancellation drains every branch before a winner exists, the operation throws
+unhandled-exception handler before the combinator returns. If parent cancellation
+drains every branch before a winner exists, the operation throws
 `combinator_cancelled`.
 
 `with_timeout()` is a structured `when_any()` between the callable and a

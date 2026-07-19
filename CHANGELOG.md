@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-20
+
 ### Added
 
 - **Runtime task cancellation contexts**: Every task execution context now owns
@@ -78,8 +80,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tasks or dedicated combinator awaitables. `when_all()` remains fail-fast but
   drains cancelled siblings before rethrowing the first child failure. Later
   child failures remain observable through the scheduler unhandled-exception
-  handler. A callable-transfer failure while launching takes precedence because
-  the complete branch set was not accepted. `when_any()`
+  handler. A callable-transfer failure while launching `when_all()` or
+  `when_any()` takes precedence over an accepted child failure or an already
+  selected winner because the complete branch set was not accepted. `when_any()`
   still selects the first successful or exceptional completion, requests
   cancellation of the remaining branches, and now waits for every loser to
   reach a terminal state before returning or throwing. Late loser exceptions

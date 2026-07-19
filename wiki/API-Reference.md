@@ -232,11 +232,20 @@ public:
     // Check if the spawned task has completed (non-blocking)
     bool is_ready() const noexcept;
 
+    // Observe or wait for coroutine-frame destruction
+    bool is_destroyed() const noexcept;
+    void wait_destroyed() const;
+
     // Cooperative, best-effort cancellation request
     void request_cancel() const;
     bool is_cancellation_requested() const noexcept;
 };
 ```
+
+`is_ready()` reports result publication and may become true before the spawned
+wrapper frame is destroyed. `wait_destroyed()` is for non-coroutine callers that
+must wait until a normally completed wrapper has released its frame parameters,
+callable, arguments, and captures.
 
 **Example:**
 ```cpp
@@ -819,15 +828,27 @@ The raw-handle APIs have distinct ownership and virtual-stack contracts.
 its first execution; they detach construction-time ancestry.
 `try_schedule()` and `try_schedule_to()` are for a coroutine that has already
 suspended and must preserve the logical parent established by its await chain.
-These APIs borrow the handle: rejection leaves it live, and the caller must
-resume, retain, or otherwise resolve it. Internal wake and affinity-migration
-paths handle rejection explicitly; callers must not substitute one family for
-the other.
+The `try_` APIs borrow the handle: rejection leaves it live, and the caller must
+resume, retain, destroy, or otherwise resolve it. `spawn()` and `spawn_to()`
+consume ownership and destroy a handle rejected before execution. Internal wake
+and affinity-migration paths handle rejection explicitly; callers must not
+substitute one family for the other.
 
-`shutdown()` is the graceful path: it waits for tasks spawned through
-`go()`, `go_to()`, `go_joinable()`, `go_joinable_to()`, or `elio::run()` to
-finish, including work suspended on scheduler-owned I/O, and returns whether the
-drain completed before the timeout. Use `shutdown_force()` only when
+`shutdown()` is the graceful path. Before waiting, it atomically closes
+independent initial task admission against `go()`, `go_to()`, `go_joinable()`,
+`go_joinable_to()`, `spawn()`, `try_spawn()`, and `spawn_to()`. Work accepted
+before that boundary may still enqueue continuations through `try_schedule()` or
+`try_schedule_to()` and register structured task-group children while the
+scheduler drains. Task-group submission from outside the scheduler remains
+independent admission and is rejected after closure. Before teardown, shutdown
+seals linked child registration and rechecks the tracked accepted set under the
+lifecycle lock. A running raw task that is not itself tracked therefore cannot
+register a new child after shutdown has observed the accepted set empty. The call
+waits for tracked work, including work suspended on scheduler-owned I/O, and
+returns whether the drain completed before the timeout. A rejected `go()` body
+does not run; a rejected `go_joinable()` handle reports `std::logic_error`;
+rejected raw-handle calls keep or destroy ownership according to the
+`try_`/consuming distinction above. Use `shutdown_force()` only when
 non-graceful teardown is required: it does not wait for tracked coroutine or
 pending-I/O drain, but it may still wait for already-accepted scheduler-owned
 blocking work before stopping workers.

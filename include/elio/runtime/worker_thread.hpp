@@ -25,6 +25,8 @@ inline std::atomic<bool> overflow_transfer_paused_for_test{false};
 inline std::atomic<bool> pause_queue_snapshot_for_test{false};
 inline std::atomic<bool> queue_snapshot_paused_for_test{false};
 inline std::atomic<bool> queue_transfer_waiting_for_test{false};
+inline std::atomic<io::io_context::backend_type> worker_io_backend_for_test{
+    io::io_context::backend_type::auto_detect};
 }  // namespace detail
 #endif
 
@@ -49,7 +51,14 @@ public:
         , running_(false)
         , tasks_executed_(0)
         , strategy_(strategy)
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        , io_context_(io::io_context::make_worker_owned(
+              worker_id,
+              detail::worker_io_backend_for_test.load(
+                  std::memory_order_acquire))) {
+#else
         , io_context_(io::io_context::make_worker_owned(worker_id)) {
+#endif
     }
 
     ~worker_thread() {

@@ -107,7 +107,7 @@ public:
         // ``go``-time. It runs whether the body completed normally, was
         // cancelled, or the handle was force-destroyed before resuming.
         if (on_spawn_completion_) {
-            on_spawn_completion_(on_spawn_completion_data_);
+            on_spawn_completion_(on_spawn_completion_state_.get());
         }
 
         // Only restore current_frame_ if this frame is actually the current
@@ -314,8 +314,9 @@ private:
     /// covers frames destroyed before their coroutine body starts.
     using spawn_completion_fn = void (*)(void*) noexcept;
 
-    void set_spawn_completion(spawn_completion_fn callback, void* data) noexcept {
-        on_spawn_completion_data_ = data;
+    void set_spawn_completion(spawn_completion_fn callback,
+                              std::shared_ptr<void> state) noexcept {
+        on_spawn_completion_state_ = std::move(state);
         on_spawn_completion_ = callback;
     }
 
@@ -341,7 +342,7 @@ private:
     // Keep scheduler accounting after the debugger-visible frame fields so the
     // stable magic/parent prefix remains at the start of promise_base.
     spawn_completion_fn on_spawn_completion_ = nullptr;
-    void* on_spawn_completion_data_ = nullptr;
+    std::shared_ptr<void> on_spawn_completion_state_;
 
     static inline thread_local promise_base* current_frame_ = nullptr;
 };

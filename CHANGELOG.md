@@ -108,7 +108,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `start()` calls no longer restart workers or scheduler-owned resources, and
   pool resize no longer introduces workers during teardown. Concurrent shutdown
   callers now share one teardown, final worker joins are serialized, and
-  external destruction waits for worker-initiated teardown.
+  external destruction waits for worker-initiated teardown. Graceful shutdown
+  now closes independent initial task admission before waiting for accepted work
+  while preserving continuation scheduling and structured child registration
+  during the drain. Before teardown it seals structured child registration and
+  rechecks the accepted set under the lifecycle lock, so an untracked raw task
+  cannot add a child after the final idle observation. External task-group
+  submissions remain closed. Completed joinable wrappers now publish frame
+  destruction only after `handle.destroy()` has released their stored callable,
+  arguments, and captures.
 - **Worker-local I/O ownership**: Scheduler-owned `io_context` instances now
   carry stable worker/generation identity. Submitted operations hold context
   drain accounting until completion, cancellation completion, prepare rollback,
@@ -383,6 +391,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   task-completion waiter lifetime races, and stale current-scheduler TLS after
   cross-thread shutdown, and blocking-pool worker self-shutdown. (#391, #660,
   #665)
+- **Scheduler backend teardown lifetime**: Worker-owned I/O backends are now
+  destroyed explicitly while scheduler tracking, idle-wait, and exception
+  handler state remains alive. Tracked promises retain independent shared
+  accounting state, so a backend cancellation that resumes and re-suspends a
+  task can later release its frame without accessing a destroyed scheduler.
 - **Synchronization and object-cache lifetime**: Fixed mutex waiter lock
   transfer lifetime, sync handoff cancellation leaks, object-cache release
   handoff and canceled-construction cleanup, bounded-channel close state, and

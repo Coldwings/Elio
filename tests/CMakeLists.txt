@@ -150,6 +150,28 @@ if(TARGET elio_rdma_ibverbs AND TARGET elio_rdma_cm)
     )
 endif()
 
+# Standalone process-boundary test. Keeping this outside Catch2 guarantees that
+# its first fork occurs before any Elio runtime has existed in the process.
+set(ELIO_ADDITIONAL_TEST_TARGETS)
+add_executable(elio_fork_boundary_tests fork_boundary_tests.cpp)
+target_link_libraries(elio_fork_boundary_tests PRIVATE elio)
+target_compile_definitions(elio_fork_boundary_tests PRIVATE ELIO_DEBUG)
+list(APPEND ELIO_ADDITIONAL_TEST_TARGETS elio_fork_boundary_tests)
+
+if(ELIO_BUILD_SANITIZER_TESTS)
+    add_executable(elio_fork_boundary_tests_asan fork_boundary_tests.cpp)
+    target_link_libraries(elio_fork_boundary_tests_asan PRIVATE elio)
+    target_compile_options(elio_fork_boundary_tests_asan PRIVATE
+        -fsanitize=address -g -fno-omit-frame-pointer)
+    target_link_options(elio_fork_boundary_tests_asan PRIVATE -fsanitize=address)
+    target_compile_definitions(elio_fork_boundary_tests_asan PRIVATE ELIO_DEBUG)
+    list(APPEND ELIO_ADDITIONAL_TEST_TARGETS elio_fork_boundary_tests_asan)
+endif()
+# Do not add a TSAN variant: the sanitizer runtime is already multithreaded,
+# so its child cannot exercise the supported single-threaded pre-runtime fork.
+# Active-runtime child behavior is limited to exec/_exit and covered without
+# pretending TSAN can validate inherited-runtime continuation.
+
 # Standard test executable
 add_executable(elio_tests ${TEST_SOURCES})
 target_link_libraries(elio_tests PRIVATE elio Catch2::Catch2WithMain)
@@ -214,6 +236,15 @@ if(ELIO_BUILD_SANITIZER_TESTS)
     target_compile_options(elio_tests_tsan PRIVATE -fsanitize=thread -g -fno-omit-frame-pointer -Wno-tsan)
     target_link_options(elio_tests_tsan PRIVATE -fsanitize=thread)
     target_compile_definitions(elio_tests_tsan PRIVATE ELIO_DEBUG ELIO_RUNTIME_TEST_HOOKS)
+endif()
+
+add_test(NAME elio_fork_boundary COMMAND elio_fork_boundary_tests)
+set_tests_properties(elio_fork_boundary PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+if(ELIO_BUILD_SANITIZER_TESTS)
+    add_test(NAME elio_fork_boundary_asan COMMAND elio_fork_boundary_tests_asan)
+    set_tests_properties(elio_fork_boundary_asan PROPERTIES
+        TIMEOUT 60
+        RUN_SERIAL TRUE)
 endif()
 
 # Stress test executable for shared_mutex
@@ -335,7 +366,7 @@ target_link_libraries(elio_rdma_cuda_lifetime_tests PRIVATE
     elio Catch2::Catch2WithMain)
 target_compile_definitions(elio_rdma_cuda_lifetime_tests PRIVATE ELIO_DEBUG)
 catch_discover_tests(elio_rdma_cuda_lifetime_tests)
-set(ELIO_ADDITIONAL_TEST_TARGETS elio_rdma_cuda_lifetime_tests)
+list(APPEND ELIO_ADDITIONAL_TEST_TARGETS elio_rdma_cuda_lifetime_tests)
 
 if(NOT TARGET elio_rdma_ibverbs)
     add_executable(elio_rdma_ibverbs_backend_stub_tests
@@ -382,8 +413,10 @@ add_custom_target(test_all
 
 if(ELIO_BUILD_SANITIZER_TESTS)
     add_custom_target(test_asan
-        COMMAND ${CMAKE_CTEST_COMMAND} -R "^elio_tests_asan\\." --output-on-failure
-        DEPENDS elio_tests_asan
+        COMMAND ${CMAKE_CTEST_COMMAND}
+            -R "^(elio_tests_asan\\..*|elio_fork_boundary_asan)$"
+            --output-on-failure
+        DEPENDS elio_tests_asan elio_fork_boundary_tests_asan
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     )
 

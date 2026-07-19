@@ -145,6 +145,8 @@ jobs:
           http2_option_requires_http
           package_version_compatibility
           non_linux_platform_rejected
+          elio_fork_boundary
+          elio_fork_boundary_asan
         )
 
         ctest --test-dir build -N
@@ -156,7 +158,7 @@ jobs:
         done
 
         ctest --test-dir build --output-on-failure \
-          -R "^(package_rdma_cuda_export_metadata|rdma_cuda_example_api_metadata|package_liburing_export_metadata|package_threads_export_metadata|package_rdma_dependency_export_metadata|package_elio_compile_feature_export|http2_fetchcontent_cache_scope|http2_option_requires_http|package_version_compatibility|non_linux_platform_rejected)$"
+          -R "^(package_rdma_cuda_export_metadata|rdma_cuda_example_api_metadata|package_liburing_export_metadata|package_threads_export_metadata|package_rdma_dependency_export_metadata|package_elio_compile_feature_export|http2_fetchcontent_cache_scope|http2_option_requires_http|package_version_compatibility|non_linux_platform_rejected|elio_fork_boundary|elio_fork_boundary_asan)$"
 
         for test_binary in \
           ./build/tests/elio_rdma_cuda_lifetime_tests \

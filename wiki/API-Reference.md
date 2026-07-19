@@ -291,6 +291,8 @@ public:
 
 class task_group {
 public:
+    class join_awaitable;
+
     explicit task_group(task_group_options options = {});
     explicit task_group(runtime::scheduler& scheduler,
                         task_group_options options = {});
@@ -298,7 +300,7 @@ public:
     template<typename F, typename... Args>
     void spawn(F&& function, Args&&... args);
 
-    task<void> join();
+    join_awaitable join() noexcept;
     void request_cancel();
     bool is_cancellation_requested() const noexcept;
     size_t outstanding_children() const noexcept;
@@ -336,10 +338,12 @@ execution, not the number of registered or scheduler-queued child frames.
 `outstanding_children()` reports those accepted child submissions and does not
 include the callback body of an active `task_scope()`.
 
-`join()` is `[[nodiscard]]` and must be awaited while executing on a worker of
-the group's scheduler. It stops further spawning, waits until every registered
-child frame has left the group, and then reports failures according to the
-selected policy. Its
+`join()` is `[[nodiscard]]`, returns a direct single-use awaitable, and must be
+awaited while executing on a worker of the group's scheduler. It does not create
+or link a nested task, so beginning the join does not allocate a parent
+cancellation registration. It stops further spawning, waits until every
+registered child frame has left the group, and then reports failures according
+to the selected policy. Its
 continuation resumes in that scheduler domain; normal completion is queued, and
 a same-domain enqueue rejection falls back to direct resumption with the saved
 frame context. `join()` must
@@ -634,6 +638,62 @@ are not rolled back, and a backend that cannot actively abort accepted work may
 wait for natural completion. A task-level token only affects operations that
 receive or inspect it.
 
+### Structured Combinators
+
+```cpp
+class combinator_cancelled : public std::runtime_error;
+
+template<typename... Fs>
+coro::task<std::tuple</* branch results */...>> when_all(Fs... callables);
+
+template<typename... Fs>
+coro::task<std::pair<size_t, /* winner result */>>
+when_any(Fs... callables);
+
+template<typename Rep, typename Period, typename F>
+coro::task<timeout_result</* callable result */>>
+with_timeout(std::chrono::duration<Rep, Period> timeout, F callable);
+```
+
+All three helpers return concrete move-only lazy `coro::task` objects, replacing
+the dedicated combinator awaitable types from 0.5. They own their callable
+objects by value and require execution in a scheduler domain when awaited. Their
+branches are registered in one internal `task_group`; no accepted branch is
+implicitly detached. Move-only callables must be passed as rvalues.
+
+`when_all()` registers every callable as a group child. A child whose body has
+not started when cancellation is already visible may finish without invoking
+its callable. After the first failure, `when_all()` requests cancellation of
+unfinished siblings, waits for all accepted child frames to leave the group,
+and then rethrows the first child failure. Later child failures are
+reported through the scheduler's unhandled-exception handler before return. A
+failure while transferring a callable into a launched child takes precedence
+over child failures because the complete branch set was never accepted. A parent
+cancellation request is propagated to the group. If cancellation prevents a
+branch from producing the value required by the result tuple, `when_all()` throws
+`combinator_cancelled` after drain.
+
+`when_any()` atomically selects the first successful or exceptional branch
+completion. It then requests cancellation of every loser and waits for all of
+them to terminate before returning the winner. A token-accepting callable
+receives its structured child token; a no-argument callable can use
+`this_coro::cancel_token()`. The winner's exception is rethrown. A loser that
+throws after winner selection is reported through the current scheduler's
+unhandled-exception handler before the combinator returns. If parent
+cancellation drains every branch before a winner exists, the operation throws
+`combinator_cancelled`.
+
+`with_timeout()` is a structured `when_any()` between the callable and a
+cancellable timer. When the timer reports expiry, it selects a timed-out result
+and requests cancellation of the callable, but the returned task remains
+suspended until the callable reaches a terminal state. Consequently, the
+requested duration is not a hard upper bound on return latency. Parent
+cancellation is not reported as
+timer expiry; if it prevents a result, `combinator_cancelled` is thrown.
+If deadline expiry and parent cancellation race before the timer branch publishes
+its result, the timer's best-effort cancellation contract applies and either a
+timed-out result or `combinator_cancelled` may be observed.
+
 ---
 
 ## Runtime (`elio::runtime`)
@@ -736,7 +796,8 @@ public:
     const wait_strategy& get_wait_strategy() const noexcept;
     blocking_pool* get_blocking_pool() noexcept;
 
-    // Unhandled exception reporting for detached tasks and when_any losers
+    // Unhandled exception reporting for detached tasks and discarded
+    // structured-combinator branches
     using unhandled_exception_handler = std::function<void(std::exception_ptr)>;
     void set_unhandled_exception_handler(unhandled_exception_handler handler);
     const unhandled_exception_handler* get_unhandled_exception_handler() const noexcept;
@@ -2959,7 +3020,13 @@ that context alive while accepts are pending and while accepted streams use it.
 
 Coroutine-aware synchronization primitives (`mutex`, `shared_mutex`, `event`, `semaphore`, `condition_variable`, `channel`) track suspended waiters through intrusive nodes embedded in coroutine frames. If a frame is destroyed while its waiter is still linked, the awaiter's destructor unlinks the node from the primitive.
 
-This cleanup does not make every operation cancellable. `with_timeout()` requests cooperative cancellation but does not forcibly destroy its losing child. The child must pass the supplied `cancel_token` to a token-aware operation to stop on timeout. Every suspending core synchronization primitive provides an explicit token-aware wait. Their no-token overloads remain non-cancellable and preserve their existing await results.
+This cleanup does not make every operation cancellable. `with_timeout()`
+requests cooperative cancellation but does not forcibly destroy its losing
+child. It joins the child before returning, so the child must pass the supplied
+`cancel_token` or `this_coro::cancel_token()` to a token-aware operation to stop
+promptly. Every suspending core synchronization primitive provides an explicit
+token-aware wait. Their no-token overloads remain non-cancellable and preserve
+their existing await results.
 
 Cancellation and normal notification atomically select one terminal result. A cancellation winner does not acquire a lock or permit, transfer a pending send value into a channel, or consume a channel receive value. Once normal notification wins, the operation returns `completed` and any acquired resource or completed transfer remains caller-owned. A condition wait that released an associated lock re-acquires it before returning either result. Channel result objects carry both `cancel_result` and the existing sent/value result so cancellation remains distinct from closure.
 

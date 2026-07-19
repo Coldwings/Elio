@@ -1,25 +1,29 @@
 #pragma once
 
-#include <atomic>
-#include <cassert>
-#include <coroutine>
 #include <exception>
 #include <functional>
-#include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
 
+#include "task_group.hpp"
 #include "traits.hpp"
-#include "cancel_token.hpp"
-#include "detail/completion_waiter.hpp"
 #include "../log/macros.hpp"
-#include "../runtime/spawn.hpp"
 
 namespace elio {
+
+/// Raised when parent cancellation prevents a structured combinator from
+/// producing the result required by its return type.
+class combinator_cancelled final : public std::runtime_error {
+public:
+    combinator_cancelled()
+        : std::runtime_error(
+              "structured combinator cancelled before producing a result") {}
+};
 
 namespace detail {
 
@@ -34,245 +38,167 @@ template<typename T>
 using when_all_slot_t = typename when_all_slot<T>::type;
 
 template<typename... Fs>
-struct when_all_state {
-    coro::detail::completion_waiter_slot waiter_;
-    std::tuple<std::optional<when_all_slot_t<callable_result_t<Fs>>>...> values_;
-    std::exception_ptr first_exception_;
-    std::atomic<bool> has_exception_{false};
-    coro::cancel_source cancel_source_;
-
-    explicit when_all_state(size_t count) : state_(count) {
-        assert(count <= kRemainingMask);
-    }
-
-    void complete_one() {
-        complete_count(1);
-    }
-
-    void complete_unlaunched(size_t count) noexcept {
-        if (count == 0) {
-            return;
-        }
-        complete_count(count);
-    }
-
-    void finish_launching() noexcept {
-        const auto previous =
-            state_.fetch_or(kLaunchComplete, std::memory_order_acq_rel);
-        if (try_claim_resume(previous | kLaunchComplete)) {
-            resume_waiter();
-        }
-    }
-
-    bool set_waiter(coro::detail::completion_waiter& waiter,
-                    std::coroutine_handle<> handle) noexcept {
-        return waiter_.register_waiter(waiter, handle, [this] {
-            return ready(state_.load(std::memory_order_acquire));
-        });
-    }
-
-    void store_exception(std::exception_ptr ex) {
-        bool expected = false;
-        if (has_exception_.compare_exchange_strong(expected, true,
-                std::memory_order_acq_rel)) {
-            first_exception_ = std::move(ex);
-            cancel_source_.cancel();
-        } else {
-            ELIO_LOG_WARNING("when_all: discarding subsequent exception "
-                             "(only the first is propagated)");
-        }
-    }
-
-    void store_launch_exception(std::exception_ptr ex) noexcept {
-        bool expected = false;
-        if (has_exception_.compare_exchange_strong(expected, true,
-                std::memory_order_acq_rel)) {
-            first_exception_ = std::move(ex);
-            cancel_children_noexcept();
-        } else {
-            ELIO_LOG_WARNING("when_all: discarding subsequent exception "
-                             "(only the first is propagated)");
-        }
-    }
-
-private:
-    static constexpr size_t kLaunchComplete =
-        size_t{1} << (std::numeric_limits<size_t>::digits - 1);
-    static constexpr size_t kResumeClaimed =
-        size_t{1} << (std::numeric_limits<size_t>::digits - 2);
-    static constexpr size_t kControlMask = kLaunchComplete | kResumeClaimed;
-    static constexpr size_t kRemainingMask = ~kControlMask;
-
-    std::atomic<size_t> state_;
-
-    static constexpr size_t remaining(size_t state) noexcept {
-        return state & kRemainingMask;
-    }
-
-    static constexpr bool ready(size_t state) noexcept {
-        return (state & kLaunchComplete) != 0 && remaining(state) == 0;
-    }
-
-    void cancel_children_noexcept() noexcept {
-        try {
-            cancel_source_.cancel();
-        } catch (const std::exception& e) {
-            ELIO_LOG_WARNING("when_all: cancellation callback threw during "
-                             "launch failure cleanup: {}", e.what());
-        } catch (...) {
-            ELIO_LOG_WARNING("when_all: cancellation callback threw during "
-                             "launch failure cleanup: <unknown>");
-        }
-    }
-
-    void complete_count(size_t count) noexcept {
-        const auto previous =
-            state_.fetch_sub(count, std::memory_order_acq_rel);
-        assert(remaining(previous) >= count);
-        if (try_claim_resume(previous - count)) {
-            resume_waiter();
-        }
-    }
-
-    bool try_claim_resume(size_t state) noexcept {
-        while (ready(state)) {
-            if ((state & kResumeClaimed) != 0) {
-                return false;
-            }
-            if (state_.compare_exchange_weak(
-                    state, state | kResumeClaimed,
-                    std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    void resume_waiter() noexcept {
-        auto waiter = waiter_.take();
-        if (waiter) {
-            runtime::schedule_handle(waiter);
-        }
-    }
-};
+using when_all_result_t =
+    std::tuple<when_all_slot_t<callable_result_t<Fs>>...>;
 
 template<typename... Fs>
-struct when_all_awaitable {
-    using state_type = when_all_state<Fs...>;
-    using callables_type = std::tuple<Fs...>;
-    std::shared_ptr<state_type> state_;
-    coro::detail::completion_waiter waiter_;
-    callables_type callables_;
+using when_all_storage_t =
+    std::tuple<std::optional<when_all_slot_t<callable_result_t<Fs>>>...>;
 
-    explicit when_all_awaitable(Fs... fs)
-        : state_(std::make_shared<state_type>(sizeof...(Fs)))
-        , waiter_(state_->waiter_)
-        , callables_(std::move(fs)...) {}
-
-    when_all_awaitable(when_all_awaitable&&)
-        noexcept(std::is_nothrow_move_constructible_v<callables_type>) = default;
-
-    when_all_awaitable& operator=(when_all_awaitable&& other)
-        noexcept(std::is_nothrow_move_assignable_v<callables_type>)
-        requires std::is_move_assignable_v<callables_type> {
-        if (this != &other) {
-            waiter_ = std::move(other.waiter_);
-            state_ = std::move(other.state_);
-            callables_ = std::move(other.callables_);
-        }
-        return *this;
+inline void report_discarded_combinator_exception(
+    std::exception_ptr exception) noexcept {
+    if (auto* scheduler = runtime::get_current_scheduler()) {
+        scheduler->report_unhandled_exception(std::move(exception));
+        return;
     }
 
-    bool await_ready() const noexcept { return sizeof...(Fs) == 0; }
+    try {
+        std::rethrow_exception(exception);
+    } catch (const std::exception& error) {
+        ELIO_LOG_ERROR("unhandled structured combinator exception: {}",
+                       error.what());
+    } catch (...) {
+        ELIO_LOG_ERROR("unhandled structured combinator exception: <unknown>");
+    }
+}
 
-    template<size_t I>
-    void spawn_one(coro::cancel_token token) {
-        elio::go([state = this->state_, token,
-                  f = std::move(std::get<I>(callables_))]() mutable
-                     -> coro::task<void> {
-            if (token.is_cancelled()) {
-                state->complete_one();
-                co_return;
+inline void request_combinator_cancel_noexcept(
+    coro::task_group& group) noexcept {
+    try {
+        group.request_cancel();
+    } catch (...) {
+        report_discarded_combinator_exception(std::current_exception());
+    }
+}
+
+inline void request_combinator_cancel_noexcept(
+    coro::detail::task_group_state& group_state) noexcept {
+    try {
+        group_state.request_cancel();
+    } catch (...) {
+        report_discarded_combinator_exception(std::current_exception());
+    }
+}
+
+template<size_t I, typename Callables, typename Values>
+void spawn_when_all_child(coro::task_group& group,
+                          Callables& callables,
+                          const std::shared_ptr<Values>& values) {
+    using F = std::remove_reference_t<
+        std::tuple_element_t<I, Callables>>;
+    using T = callable_result_t<F>;
+
+    group.spawn(
+        [function = std::move(std::get<I>(callables)),
+         values]() mutable -> coro::task<void> {
+            auto& slot = std::get<I>(*values);
+            if constexpr (std::is_void_v<T>) {
+                co_await std::invoke(std::move(function));
+                slot.emplace(std::monostate{});
+            } else {
+                slot.emplace(co_await std::invoke(std::move(function)));
             }
-            using T = callable_result_t<std::tuple_element_t<I, std::tuple<Fs...>>>;
-            try {
-                if constexpr (std::is_void_v<T>) {
-                    co_await f();
-                    std::get<I>(state->values_).emplace(std::monostate{});
-                } else {
-                    std::get<I>(state->values_).emplace(co_await f());
-                }
-            } catch (...) {
-                state->store_exception(std::current_exception());
-            }
-            state->complete_one();
         });
-    }
+}
 
-    template<size_t... Is>
-    void spawn_all(std::index_sequence<Is...>, size_t& launched) {
-        auto token = state_->cancel_source_.get_token();
-        ((spawn_one<Is>(token), ++launched), ...);
-    }
+template<typename Callables, typename Values, size_t... Is>
+void spawn_when_all_children(coro::task_group& group,
+                             Callables& callables,
+                             const std::shared_ptr<Values>& values,
+                             std::index_sequence<Is...>) {
+    (spawn_when_all_child<Is>(group, callables, values), ...);
+}
 
-    bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-        auto state = state_;
-        bool should_suspend = state->set_waiter(waiter_, awaiter);
-
-        size_t launched = 0;
-        try {
-            spawn_all(std::index_sequence_for<Fs...>{}, launched);
-        } catch (...) {
-            state->store_launch_exception(std::current_exception());
-            state->complete_unlaunched(sizeof...(Fs) - launched);
+inline void report_secondary_when_all_failures(
+    const coro::task_group& group,
+    const std::exception_ptr& primary) noexcept {
+    try {
+        bool skipped_primary = false;
+        for (auto& failure : group.failures()) {
+            if (!skipped_primary && primary && failure == primary) {
+                skipped_primary = true;
+                continue;
+            }
+            report_discarded_combinator_exception(std::move(failure));
         }
-        state->finish_launching();
-
-        // Non-empty inputs suspend and rely on complete_one() ->
-        // schedule_handle() for resumption. Empty input is handled by
-        // await_ready().
-        // schedule_handle() provides sufficient internal
-        // synchronization (mutex/atomic in the scheduler's mpsc_queue) to
-        // establish happens-before between sub-task data writes and the
-        // waiter's await_resume reads. Keep non-empty completions on the
-        // scheduled path instead of mixing inline and scheduled publication.
-        return should_suspend;
+    } catch (...) {
+        ELIO_LOG_ERROR("unable to inspect secondary when_all failures");
     }
+}
 
-    auto await_resume() {
-        // Check for exceptions BEFORE extracting values. If any sub-task threw,
-        // its corresponding values_ slot is disengaged (std::nullopt), and
-        // extracting would dereference a disengaged optional → UB.
-        if (state_->first_exception_) {
-            std::rethrow_exception(state_->first_exception_);
-        }
-        // Only extract values if all tasks completed successfully
-        return extract_values(std::index_sequence_for<Fs...>{});
-    }
+template<typename Values, size_t... Is>
+[[nodiscard]] bool all_when_all_values_present(
+    const Values& values, std::index_sequence<Is...>) noexcept {
+    return (std::get<Is>(values).has_value() && ...);
+}
 
-private:
-    template<size_t... Is>
-    auto extract_values(std::index_sequence<Is...>) {
-        return std::tuple{std::move(*std::get<Is>(state_->values_))...};
-    }
-};
+template<typename... Fs, size_t... Is>
+auto extract_when_all_values(when_all_storage_t<Fs...>& values,
+                             std::index_sequence<Is...>)
+    -> when_all_result_t<Fs...> {
+    return when_all_result_t<Fs...>{
+        std::move(*std::get<Is>(values))...};
+}
 
 } // namespace detail
 
-/// Await multiple callables concurrently, resuming when all complete.
-/// Each callable must return a task<T>. Returns a tuple of results.
-/// If any task throws, the first exception is propagated.
+/// Await multiple task-producing callables concurrently in one structured
+/// scheduler-bound group. The first child failure requests cancellation of
+/// unfinished siblings, but the combinator does not return until every accepted
+/// child reaches a terminal state. The first child failure is then rethrown and
+/// later child failures are reported through the scheduler's unhandled-exception
+/// handler. A launch-time callable transfer failure takes precedence over child
+/// failures because the complete branch set was never accepted.
 ///
-/// Usage:
-///   auto [a, b] = co_await elio::when_all(
-///       []() -> coro::task<int> { co_return 1; },
-///       []() -> coro::task<int> { co_return 2; }
-///   );
+/// Parent cancellation is propagated through the group. If it prevents one or
+/// more result slots from being produced, the combinator throws
+/// combinator_cancelled after all children have drained.
 template<typename... Fs>
-    requires ((std::invocable<Fs> && detail::is_task_v<std::invoke_result_t<Fs>>) && ...)
-auto when_all(Fs... fs) {
-    return detail::when_all_awaitable<Fs...>(std::move(fs)...);
+    requires ((std::invocable<Fs> &&
+               detail::is_task_v<std::invoke_result_t<Fs>>) && ...)
+auto when_all(Fs... fs)
+    -> coro::task<detail::when_all_result_t<Fs...>> {
+    if constexpr (sizeof...(Fs) == 0) {
+        co_return detail::when_all_result_t<Fs...>{};
+    } else {
+        auto values =
+            std::make_shared<detail::when_all_storage_t<Fs...>>();
+        auto callables = std::forward_as_tuple(fs...);
+        coro::task_group group;
+
+        std::exception_ptr launch_failure;
+        try {
+            detail::spawn_when_all_children(
+                group, callables, values, std::index_sequence_for<Fs...>{});
+        } catch (...) {
+            launch_failure = std::current_exception();
+            detail::request_combinator_cancel_noexcept(group);
+        }
+
+        std::exception_ptr join_failure;
+        try {
+            co_await group.join();
+        } catch (...) {
+            join_failure = std::current_exception();
+        }
+
+        const auto& primary = launch_failure ? launch_failure : join_failure;
+        detail::report_secondary_when_all_failures(group, primary);
+
+        if (launch_failure) {
+            std::rethrow_exception(std::move(launch_failure));
+        }
+        if (join_failure) {
+            std::rethrow_exception(std::move(join_failure));
+        }
+        if (!detail::all_when_all_values_present(
+                *values, std::index_sequence_for<Fs...>{})) {
+            throw combinator_cancelled();
+        }
+
+        co_return detail::extract_when_all_values<Fs...>(
+            *values, std::index_sequence_for<Fs...>{});
+    }
 }
 
 } // namespace elio

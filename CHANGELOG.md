@@ -32,8 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aggregate simultaneous body and child failures. Completion and cancellation
   dispatch preserve the selected scheduler domain; requests from another
   scheduler are posted asynchronously to avoid reciprocal worker deadlock. A bare
-  group requires an explicit `co_await group.join()`; its destructor can only
-  request cancellation as a non-joining fallback. Task scopes retain their body
+  group requires an explicit `co_await group.join()`; `join()` returns a direct
+  single-use awaitable instead of creating a nested task and therefore has no
+  child-link allocation window. The group destructor can only request
+  cancellation as a non-joining fallback. Task scopes retain their body
   callable and captures through child joining, while automatic locals in the
   returned body coroutine retain normal coroutine lifetime and must not be
   referenced by children after the body returns. Scheduler-domain operations
@@ -63,6 +65,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Structured coroutine combinators**: `when_all()`, `when_any()`, and
+  `with_timeout()` now return move-only lazy `coro::task` objects and own every
+  accepted branch through a scheduler-bound task group instead of detached child
+  tasks or dedicated combinator awaitables. `when_all()` remains fail-fast but
+  drains cancelled siblings before rethrowing the first child failure. Later
+  child failures remain observable through the scheduler unhandled-exception
+  handler. A callable-transfer failure while launching takes precedence because
+  the complete branch set was not accepted. `when_any()`
+  still selects the first successful or exceptional completion, requests
+  cancellation of the remaining branches, and now waits for every loser to
+  reach a terminal state before returning or throwing. Late loser exceptions
+  remain observable through the scheduler unhandled-exception handler, but no
+  loser outlives the combinator implicitly. `with_timeout()` now waits for the
+  wrapped operation after deadline cancellation, so token-ignoring work can
+  delay return even though the result remains timed out. Parent cancellation
+  that prevents a required result is reported through the new
+  `combinator_cancelled` exception instead of being mistaken for timeout.
+  Concurrent deadline expiry and parent cancellation follow the underlying
+  best-effort timer outcome and may report either timeout or cancellation. These
+  return-type, lifetime, and timing changes are intentional 0.6 breaking changes.
 - **Structured RPC session teardown**: Server sessions now own accepted request,
   pong, and overload-response tasks through a scheduler-bound task scope. Session
   close requests both the explicit `rpc_context::cancel_token` and the runtime

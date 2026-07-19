@@ -809,7 +809,10 @@ The unhandled-exception handler APIs are thread-safe with each other. A report
 keeps its selected handler alive and invokes it without holding the publication
 lock, so replacing the handler concurrently affects later snapshots and a
 handler may replace itself. Applications remain responsible for synchronizing
-mutable state captured by the handler.
+mutable state captured by the handler. A pointer returned by
+`get_unhandled_exception_handler()` is backed by a shared snapshot owned by the
+calling thread. It remains valid until that same thread calls the getter again
+or exits, even if another thread replaces or clears the scheduler handler.
 
 The raw-handle APIs have distinct ownership and virtual-stack contracts.
 `spawn()`/`try_spawn()` and `spawn_to()` are for an independent handle before

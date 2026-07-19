@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <latch>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1166,6 +1167,10 @@ TEST_CASE("scheduler exception handler can be replaced during reports", "[task][
         do {
             sched.report_unhandled_exception(
                 std::make_exception_ptr(std::runtime_error("reported")));
+            if (auto* handler = sched.get_unhandled_exception_handler()) {
+                (*handler)(std::make_exception_ptr(
+                    std::runtime_error("reported through getter")));
+            }
         } while (!done.load(std::memory_order_acquire));
     };
 
@@ -1192,6 +1197,76 @@ TEST_CASE("scheduler exception handler can be replaced during reports", "[task][
     }
 
     REQUIRE(handled.load(std::memory_order_relaxed) > 0);
+}
+
+TEST_CASE("scheduler report retains selected handler during replacement",
+          "[task][spawn][exception]") {
+    scheduler sched(1);
+    std::latch original_entered(1);
+    std::latch release_original(1);
+    bool original_completed = false;
+    bool replacement_called = false;
+
+    auto lifetime = std::make_shared<int>(42);
+    std::weak_ptr<int> lifetime_observer = lifetime;
+    sched.set_unhandled_exception_handler(
+        [lifetime, &original_entered, &release_original,
+         &original_completed](std::exception_ptr) {
+            original_entered.count_down();
+            release_original.wait();
+            original_completed = (*lifetime == 42);
+        });
+    lifetime.reset();
+
+    std::thread reporter([&] {
+        sched.report_unhandled_exception(
+            std::make_exception_ptr(std::runtime_error("original report")));
+    });
+
+    original_entered.wait();
+    sched.set_unhandled_exception_handler([&](std::exception_ptr) {
+        replacement_called = true;
+    });
+    const bool original_alive_after_replacement = !lifetime_observer.expired();
+    release_original.count_down();
+    reporter.join();
+
+    sched.report_unhandled_exception(
+        std::make_exception_ptr(std::runtime_error("replacement report")));
+
+    REQUIRE(original_alive_after_replacement);
+    REQUIRE(original_completed);
+    REQUIRE(lifetime_observer.expired());
+    REQUIRE(replacement_called);
+}
+
+TEST_CASE("scheduler exception handler getter retains its thread-local snapshot",
+          "[task][spawn][exception]") {
+    scheduler sched(1);
+    int initial_calls = 0;
+    auto replacement_calls = std::make_shared<std::atomic<int>>(0);
+
+    sched.set_unhandled_exception_handler([&](std::exception_ptr) {
+        ++initial_calls;
+    });
+    const auto* retained = sched.get_unhandled_exception_handler();
+    REQUIRE(retained != nullptr);
+
+    std::thread updater([&] {
+        sched.set_unhandled_exception_handler([replacement_calls](std::exception_ptr) {
+            replacement_calls->fetch_add(1, std::memory_order_relaxed);
+        });
+    });
+    updater.join();
+
+    (*retained)(std::make_exception_ptr(std::runtime_error("retained snapshot")));
+    REQUIRE(initial_calls == 1);
+
+    const auto* replacement = sched.get_unhandled_exception_handler();
+    REQUIRE(replacement != nullptr);
+    (*replacement)(
+        std::make_exception_ptr(std::runtime_error("replacement snapshot")));
+    REQUIRE(replacement_calls->load(std::memory_order_relaxed) == 1);
 }
 
 TEST_CASE("scheduler exception handler can replace itself while reporting",

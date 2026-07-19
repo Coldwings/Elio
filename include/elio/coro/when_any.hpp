@@ -174,6 +174,9 @@ void spawn_when_any_children(coro::task_group& group,
 /// requested for every unfinished sibling and the combinator waits for all
 /// accepted children to reach a terminal state before returning or throwing.
 ///
+/// A launch-time callable transfer failure takes precedence over an already
+/// selected winner because the complete branch set was never accepted.
+///
 /// A losing exception is reported through the scheduler's unhandled-exception
 /// handler after the winner has already been fixed. Parent cancellation that
 /// drains every branch before any result is produced throws

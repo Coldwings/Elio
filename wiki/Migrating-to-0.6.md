@@ -42,6 +42,8 @@ below when upgrading from 0.5.x.
   tasks and structurally own every accepted branch.
 - `when_any()` cancels and joins losers before returning. A token-ignoring loser
   can therefore delay the result.
+- A launch-time callable-transfer failure in `when_any()` takes precedence over
+  an already selected winner because the complete branch set was not accepted.
 - `with_timeout()` treats the duration as the point at which cancellation is
   requested, not as a hard return-time bound. It waits for the wrapped work to
   reach a terminal state.
@@ -100,4 +102,4 @@ below when upgrading from 0.5.x.
    cancellation callbacks.
 
 See [[API Contracts]] for the authoritative guarantee/responsibility inventory
-and the Unreleased section of `CHANGELOG.md` for the complete change list.
+and the `0.6.0` section of `CHANGELOG.md` for the complete change list.

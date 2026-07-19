@@ -1135,6 +1135,7 @@ public:
                     config_.max_sessions);
                 continue;  // stream dtor closes the socket
             }
+            session_lifetime_guard lifetime(this);
 
             // Create and start session
             auto session = session_type::create(std::move(*stream),
@@ -1142,18 +1143,17 @@ public:
 
             if (!track_session_if_running(session)) {
                 session->close();
-                release_session_slot();
                 break;
             }
+            lifetime.track(session);
 
             // Spawn session handler
             auto* sched = runtime::scheduler::current();
             if (sched) {
-                sched->go([this, s = session]() { return run_session(s); });
+                sched->go(&rpc_server::run_session, this, session,
+                          std::move(lifetime));
             } else {
-                // No scheduler available - remove session from tracking and release slot
-                remove_session(session);
-                release_session_slot();
+                session->close();
             }
         }
 
@@ -1188,6 +1188,7 @@ public:
                     config_.max_sessions);
                 continue;
             }
+            session_lifetime_guard lifetime(this);
 
             // Create and start session
             auto session = session_type::create(std::move(*stream),
@@ -1195,18 +1196,17 @@ public:
 
             if (!track_session_if_running(session)) {
                 session->close();
-                release_session_slot();
                 break;
             }
+            lifetime.track(session);
 
             // Spawn session handler
             auto* sched = runtime::scheduler::current();
             if (sched) {
-                sched->go([this, s = session]() { return run_session(s); });
+                sched->go(&rpc_server::run_session, this, session,
+                          std::move(lifetime));
             } else {
-                // No scheduler available - remove session from tracking and release slot
-                remove_session(session);
-                release_session_slot();
+                session->close();
             }
         }
 
@@ -1222,6 +1222,7 @@ public:
                 config_.max_sessions);
             co_return;  // stream dtor closes the socket
         }
+        session_lifetime_guard lifetime(this);
         auto session = session_type::create(std::move(stream),
                                              frozen_handlers_, config_);
 
@@ -1229,12 +1230,9 @@ public:
             std::lock_guard<std::mutex> lock(sessions_mutex_);
             sessions_.push_back(session);
         }
+        lifetime.track(session);
 
         co_await session->run();
-
-        // Remove from active sessions (swap-and-pop for O(1) removal)
-        remove_session(session);
-        release_session_slot();
     }
     
     /// Stop the server
@@ -1264,6 +1262,44 @@ public:
     }
     
 private:
+    class session_lifetime_guard final {
+    public:
+        explicit session_lifetime_guard(rpc_server* server) noexcept
+            : server_(server) {}
+
+        session_lifetime_guard(session_lifetime_guard&& other) noexcept
+            : server_(std::exchange(other.server_, nullptr))
+            , session_(std::move(other.session_))
+            , tracked_(std::exchange(other.tracked_, false)) {}
+
+        session_lifetime_guard(const session_lifetime_guard&) = delete;
+        session_lifetime_guard& operator=(const session_lifetime_guard&) = delete;
+        session_lifetime_guard& operator=(session_lifetime_guard&&) = delete;
+
+        ~session_lifetime_guard() {
+            if (!server_) {
+                return;
+            }
+            if (tracked_) {
+                try {
+                    server_->remove_session(session_);
+                } catch (...) {
+                }
+            }
+            server_->release_session_slot();
+        }
+
+        void track(session_ptr session) noexcept {
+            session_ = std::move(session);
+            tracked_ = true;
+        }
+
+    private:
+        rpc_server* server_ = nullptr;
+        session_ptr session_;
+        bool tracked_ = false;
+    };
+
     /// Insert a handler entry, rejecting duplicates and post-serve writes.
     /// (Fixes 5 and 8.)
     void insert_handler(method_id_t id, raw_handler_t handler) {
@@ -1353,13 +1389,11 @@ private:
         }
     }
 
-    /// Run a session and clean up when done
-    coro::task<void> run_session(session_ptr session) {
+    /// Run a session while its tracking and slot reservation remain owned.
+    coro::task<void> run_session(
+        session_ptr session,
+        [[maybe_unused]] session_lifetime_guard lifetime) {
         co_await session->run();
-
-        // Remove from active sessions (swap-and-pop for O(1) removal)
-        remove_session(session);
-        release_session_slot();
     }
 
     rpc_server_config config_{};

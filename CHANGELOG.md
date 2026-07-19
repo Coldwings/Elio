@@ -189,6 +189,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bounded-channel slot publication**: Blocking and cancellation-aware sends
+  no longer lose a value or report a false closed result when a concurrent
+  receiver has advanced the ring tail but has not yet published the physical
+  slot as reusable.
 - **Scheduler exception-handler publication**: Concurrent handler replacement,
   reporting, and getter calls now exchange shared handler snapshots under an
   explicit mutex instead of relying on `atomic<shared_ptr>`. Reporters and

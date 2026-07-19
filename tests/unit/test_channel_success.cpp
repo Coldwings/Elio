@@ -23,6 +23,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
+#include <optional>
 #include <thread>
 
 using namespace elio::sync;
@@ -34,6 +36,86 @@ template<typename F>
 auto spawn_joinable(scheduler& sched, F&& f) {
     return sched.go_joinable(std::forward<F>(f));
 }
+
+namespace {
+
+struct slot_release_gate {
+    std::atomic<bool> block_next_move{false};
+    std::atomic<bool> move_blocked{false};
+    std::atomic<bool> release_move{false};
+};
+
+struct gated_value {
+    int value = 0;
+    std::shared_ptr<slot_release_gate> gate;
+
+    explicit gated_value(int v,
+                         std::shared_ptr<slot_release_gate> g = {}) noexcept
+        : value(v), gate(std::move(g)) {}
+
+    gated_value(gated_value&& other) noexcept
+        : value(other.value), gate(std::move(other.gate)) {
+        maybe_block();
+    }
+
+    gated_value& operator=(gated_value&& other) noexcept {
+        value = other.value;
+        gate = std::move(other.gate);
+        maybe_block();
+        return *this;
+    }
+
+    gated_value(const gated_value&) = delete;
+    gated_value& operator=(const gated_value&) = delete;
+
+private:
+    void maybe_block() noexcept {
+        if (!gate || !gate->block_next_move.exchange(
+                         false, std::memory_order_acq_rel)) {
+            return;
+        }
+        gate->move_blocked.store(true, std::memory_order_release);
+        gate->move_blocked.notify_all();
+        while (!gate->release_move.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+};
+
+bool wait_for_true(std::atomic<bool>& flag,
+                   std::chrono::milliseconds timeout =
+                       std::chrono::milliseconds(2000)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!flag.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    return flag.load(std::memory_order_acquire);
+}
+
+bool wait_for_at_least(std::atomic<size_t>& value, size_t expected,
+                       std::chrono::milliseconds timeout =
+                           std::chrono::milliseconds(2000)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (value.load(std::memory_order_acquire) < expected &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    return value.load(std::memory_order_acquire) >= expected;
+}
+
+template<typename Predicate>
+bool wait_for_condition(Predicate&& predicate,
+                        std::chrono::milliseconds timeout =
+                            std::chrono::milliseconds(2000)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    return predicate();
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Test 1: recv() direct steal from blocked sender on bounded channel
@@ -219,4 +301,239 @@ TEST_CASE("channel send returns true after try_recv() rendezvous direct steal",
 
     REQUIRE(sender_done.load());
     REQUIRE(send_result.load());
+}
+
+TEST_CASE("bounded channel send waits for a logically freed slot to publish",
+          "[sync][channel][coro][regression]") {
+    auto run_case = [](bool token_aware) {
+        auto gate = std::make_shared<slot_release_gate>();
+        channel<gated_value> ch(2);
+        REQUIRE(ch.try_send(gated_value(1, gate)));
+        REQUIRE(ch.try_send(gated_value(2)));
+
+        gate->block_next_move.store(true, std::memory_order_release);
+        std::optional<gated_value> first;
+        std::thread consumer([&] {
+            first = ch.try_recv();
+        });
+
+        const bool consumer_claimed_slot = wait_for_true(gate->move_blocked);
+        if (!consumer_claimed_slot) {
+            gate->release_move.store(true, std::memory_order_release);
+            consumer.join();
+            REQUIRE(consumer_claimed_slot);
+            return;
+        }
+
+        elio::sync::detail::bounded_send_publish_waits_for_test.store(
+            0, std::memory_order_release);
+        scheduler sched(1);
+        sched.start();
+        auto sender = sched.go_joinable([&]() -> task<bool> {
+            if (!token_aware) {
+                co_return co_await ch.send(gated_value(3));
+            }
+
+            cancel_source source;
+            auto result = co_await ch.send(
+                gated_value(3), source.get_token());
+            co_return result.success() && !result.was_cancelled() &&
+                      !result.was_closed();
+        });
+
+        const bool sender_observed_publish_window = wait_for_at_least(
+            elio::sync::detail::bounded_send_publish_waits_for_test, 1);
+        gate->release_move.store(true, std::memory_order_release);
+        consumer.join();
+        const bool sender_completed = wait_for_condition(
+            [&] { return sender.is_ready(); });
+        if (!sender_completed) {
+            ch.close();
+        }
+        sender.wait_destroyed();
+        const bool sent = sender.await_resume();
+        REQUIRE(sched.shutdown(std::chrono::milliseconds(2000)));
+
+        REQUIRE(consumer_claimed_slot);
+        REQUIRE(sender_observed_publish_window);
+        REQUIRE(sender_completed);
+        REQUIRE(first.has_value());
+        REQUIRE(first->value == 1);
+        REQUIRE(sent);
+
+        auto second = ch.try_recv();
+        auto third = ch.try_recv();
+        REQUIRE(second.has_value());
+        REQUIRE(second->value == 2);
+        REQUIRE(third.has_value());
+        REQUIRE(third->value == 3);
+    };
+
+    SECTION("no-token send") {
+        run_case(false);
+    }
+    SECTION("token-aware send") {
+        run_case(true);
+    }
+}
+
+TEST_CASE("bounded channel drains refill credits after out-of-order publication",
+          "[sync][channel][coro][regression]") {
+    auto first_gate = std::make_shared<slot_release_gate>();
+    auto second_gate = std::make_shared<slot_release_gate>();
+    channel<gated_value> ch(2);
+    REQUIRE(ch.try_send(gated_value(1, first_gate)));
+    REQUIRE(ch.try_send(gated_value(2, second_gate)));
+
+    first_gate->block_next_move.store(true, std::memory_order_release);
+    second_gate->block_next_move.store(true, std::memory_order_release);
+    std::optional<gated_value> first;
+    std::optional<gated_value> second;
+    std::thread first_consumer([&] { first = ch.try_recv(); });
+    const bool first_claimed = wait_for_true(first_gate->move_blocked);
+    if (!first_claimed) {
+        first_gate->release_move.store(true, std::memory_order_release);
+        first_consumer.join();
+        REQUIRE(first_claimed);
+        return;
+    }
+    std::thread second_consumer([&] { second = ch.try_recv(); });
+    const bool second_claimed = wait_for_true(second_gate->move_blocked);
+    if (!second_claimed) {
+        second_gate->release_move.store(true, std::memory_order_release);
+        first_gate->release_move.store(true, std::memory_order_release);
+        second_consumer.join();
+        first_consumer.join();
+        REQUIRE(second_claimed);
+        return;
+    }
+
+    elio::sync::detail::bounded_send_publish_waits_for_test.store(
+        0, std::memory_order_release);
+    scheduler sched(2);
+    sched.start();
+    auto first_sender = sched.go_joinable([&]() -> task<bool> {
+        co_return co_await ch.send(gated_value(3));
+    });
+    auto second_sender = sched.go_joinable([&]() -> task<bool> {
+        co_return co_await ch.send(gated_value(4));
+    });
+    const bool both_senders_waited = wait_for_at_least(
+        elio::sync::detail::bounded_send_publish_waits_for_test, 2);
+
+    second_gate->release_move.store(true, std::memory_order_release);
+    second_consumer.join();
+    first_gate->release_move.store(true, std::memory_order_release);
+    first_consumer.join();
+
+    const bool both_senders_completed = wait_for_condition([&] {
+        return first_sender.is_ready() && second_sender.is_ready();
+    });
+    if (!both_senders_completed) {
+        ch.close();
+    }
+    first_sender.wait_destroyed();
+    second_sender.wait_destroyed();
+    const bool first_sent = first_sender.await_resume();
+    const bool second_sent = second_sender.await_resume();
+    REQUIRE(sched.shutdown(std::chrono::milliseconds(2000)));
+
+    REQUIRE(first_claimed);
+    REQUIRE(second_claimed);
+    REQUIRE(both_senders_waited);
+    REQUIRE(both_senders_completed);
+    REQUIRE(first.has_value());
+    REQUIRE(first->value == 1);
+    REQUIRE(second.has_value());
+    REQUIRE(second->value == 2);
+    REQUIRE(first_sent);
+    REQUIRE(second_sent);
+
+    auto third = ch.try_recv();
+    auto fourth = ch.try_recv();
+    REQUIRE(third.has_value());
+    REQUIRE(fourth.has_value());
+    REQUIRE(((third->value == 3 && fourth->value == 4) ||
+             (third->value == 4 && fourth->value == 3)));
+}
+
+TEST_CASE("bounded channel refill wakes a receiver queued behind consumers",
+          "[sync][channel][coro][regression]") {
+    auto first_gate = std::make_shared<slot_release_gate>();
+    auto second_gate = std::make_shared<slot_release_gate>();
+    channel<gated_value> ch(2);
+    REQUIRE(ch.try_send(gated_value(1, first_gate)));
+    REQUIRE(ch.try_send(gated_value(2, second_gate)));
+
+    first_gate->block_next_move.store(true, std::memory_order_release);
+    second_gate->block_next_move.store(true, std::memory_order_release);
+    std::optional<gated_value> first;
+    std::optional<gated_value> second;
+    std::thread first_consumer([&] { first = ch.try_recv(); });
+    const bool first_claimed = wait_for_true(first_gate->move_blocked);
+    if (!first_claimed) {
+        first_gate->release_move.store(true, std::memory_order_release);
+        first_consumer.join();
+        REQUIRE(first_claimed);
+        return;
+    }
+    std::thread second_consumer([&] { second = ch.try_recv(); });
+    const bool second_claimed = wait_for_true(second_gate->move_blocked);
+    if (!second_claimed) {
+        second_gate->release_move.store(true, std::memory_order_release);
+        first_gate->release_move.store(true, std::memory_order_release);
+        second_consumer.join();
+        first_consumer.join();
+        REQUIRE(second_claimed);
+        return;
+    }
+
+    elio::sync::detail::bounded_recv_waiting_for_value_for_test.store(
+        false, std::memory_order_release);
+    scheduler sched(2);
+    sched.start();
+    auto receiver = sched.go_joinable([&]() -> task<int> {
+        auto value = co_await ch.recv();
+        co_return value ? value->value : -1;
+    });
+    const bool receiver_waited = wait_for_true(
+        elio::sync::detail::bounded_recv_waiting_for_value_for_test);
+
+    elio::sync::detail::bounded_send_publish_waits_for_test.store(
+        0, std::memory_order_release);
+    auto sender = sched.go_joinable([&]() -> task<bool> {
+        co_return co_await ch.send(gated_value(3));
+    });
+    const bool sender_waited = wait_for_at_least(
+        elio::sync::detail::bounded_send_publish_waits_for_test, 1);
+
+    second_gate->release_move.store(true, std::memory_order_release);
+    second_consumer.join();
+    first_gate->release_move.store(true, std::memory_order_release);
+    first_consumer.join();
+
+    const bool operations_completed = wait_for_condition([&] {
+        return receiver.is_ready() && sender.is_ready();
+    });
+    if (!operations_completed) {
+        ch.close();
+    }
+    receiver.wait_destroyed();
+    sender.wait_destroyed();
+    const int received = receiver.await_resume();
+    const bool sent = sender.await_resume();
+    REQUIRE(sched.shutdown(std::chrono::milliseconds(2000)));
+
+    REQUIRE(first_claimed);
+    REQUIRE(second_claimed);
+    REQUIRE(receiver_waited);
+    REQUIRE(sender_waited);
+    REQUIRE(operations_completed);
+    REQUIRE(first.has_value());
+    REQUIRE(first->value == 1);
+    REQUIRE(second.has_value());
+    REQUIRE(second->value == 2);
+    REQUIRE(sent);
+    REQUIRE(received == 3);
+    REQUIRE(ch.empty());
 }

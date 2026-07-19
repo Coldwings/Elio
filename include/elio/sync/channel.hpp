@@ -650,11 +650,13 @@ public:
     coro::task<cancellable_recv_result> recv(coro::cancel_token token) {
         bool notification_selected = false;
         while (true) {
-            // Once normal notification wins, a later token request cannot
-            // replace that terminal choice while this loop retries the shared
-            // ring. Preserve it through any transient pop race until a value
-            // or close result is observed.
-            auto effective_token = notification_selected
+            // Give a selected normal notification one cancellation-immune
+            // attempt to consume the advertised state. Notifications do not
+            // reserve values, so restore the caller token if another receiver
+            // wins that attempt.
+            const bool consume_notification =
+                std::exchange(notification_selected, false);
+            auto effective_token = consume_notification
                 ? coro::cancel_token{}
                 : token;
             cancellable_recv_awaitable awaitable{
@@ -748,7 +750,11 @@ public:
                     co_return cancellable_recv_result{
                         std::nullopt, coro::cancel_result::cancelled};
                 }
-                notification_selected = true;
+                notification_selected = !consume_notification;
+                continue;
+            }
+
+            if (consume_notification) {
                 continue;
             }
 

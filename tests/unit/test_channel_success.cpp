@@ -345,18 +345,20 @@ TEST_CASE("bounded channel send waits for a logically freed slot to publish",
             elio::sync::detail::bounded_send_publish_waits_for_test, 1);
         gate->release_move.store(true, std::memory_order_release);
         consumer.join();
-        bool sender_completed = wait_for_condition(
+        const bool sender_completed_without_cleanup = wait_for_condition(
             [&] { return sender.is_ready(); });
-        if (!sender_completed) {
+        if (!sender_completed_without_cleanup) {
             ch.close();
-            sender_completed = wait_for_condition(
+            const bool sender_completed_after_cleanup = wait_for_condition(
                 [&] { return sender.is_ready(); });
+            REQUIRE(sender_completed_after_cleanup);
         }
-        REQUIRE(sender_completed);
+        REQUIRE(sender.is_ready());
         sender.wait_destroyed();
         const bool sent = sender.await_resume();
         REQUIRE(sched.shutdown(std::chrono::milliseconds(2000)));
 
+        REQUIRE(sender_completed_without_cleanup);
         REQUIRE(consumer_claimed_slot);
         REQUIRE(sender_observed_publish_window);
         REQUIRE(first.has_value());
@@ -434,22 +436,27 @@ TEST_CASE("bounded channel drains refill credits after out-of-order publication"
     second_consumer.join();
     first_consumer.join();
 
-    bool both_senders_completed = wait_for_condition([&] {
-        return first_sender.is_ready() && second_sender.is_ready();
-    });
-    if (!both_senders_completed) {
-        ch.close();
-        both_senders_completed = wait_for_condition([&] {
+    const bool both_senders_completed_without_cleanup =
+        wait_for_condition([&] {
             return first_sender.is_ready() && second_sender.is_ready();
         });
+    if (!both_senders_completed_without_cleanup) {
+        ch.close();
+        const bool both_senders_completed_after_cleanup =
+            wait_for_condition([&] {
+                return first_sender.is_ready() && second_sender.is_ready();
+            });
+        REQUIRE(both_senders_completed_after_cleanup);
     }
-    REQUIRE(both_senders_completed);
+    REQUIRE(first_sender.is_ready());
+    REQUIRE(second_sender.is_ready());
     first_sender.wait_destroyed();
     second_sender.wait_destroyed();
     const bool first_sent = first_sender.await_resume();
     const bool second_sent = second_sender.await_resume();
     REQUIRE(sched.shutdown(std::chrono::milliseconds(2000)));
 
+    REQUIRE(both_senders_completed_without_cleanup);
     REQUIRE(first_claimed);
     REQUIRE(second_claimed);
     REQUIRE(second_completed_before_first);
@@ -530,22 +537,27 @@ TEST_CASE("bounded channel refill wakes a receiver queued behind consumers",
     second_consumer.join();
     first_consumer.join();
 
-    bool operations_completed = wait_for_condition([&] {
-        return receiver.is_ready() && sender.is_ready();
-    });
-    if (!operations_completed) {
-        ch.close();
-        operations_completed = wait_for_condition([&] {
+    const bool operations_completed_without_cleanup =
+        wait_for_condition([&] {
             return receiver.is_ready() && sender.is_ready();
         });
+    if (!operations_completed_without_cleanup) {
+        ch.close();
+        const bool operations_completed_after_cleanup =
+            wait_for_condition([&] {
+                return receiver.is_ready() && sender.is_ready();
+            });
+        REQUIRE(operations_completed_after_cleanup);
     }
-    REQUIRE(operations_completed);
+    REQUIRE(receiver.is_ready());
+    REQUIRE(sender.is_ready());
     receiver.wait_destroyed();
     sender.wait_destroyed();
     const int received = receiver.await_resume();
     const bool sent = sender.await_resume();
     REQUIRE(sched.shutdown(std::chrono::milliseconds(2000)));
 
+    REQUIRE(operations_completed_without_cleanup);
     REQUIRE(first_claimed);
     REQUIRE(second_claimed);
     REQUIRE(second_completed_before_first);
@@ -679,14 +691,15 @@ TEST_CASE("channel receive preserves notification against later cancellation",
     notifier.wait_destroyed();
     notifier.await_resume();
 
-    bool first_completed = wait_for_condition(
+    const bool first_completed_without_cleanup = wait_for_condition(
         [&] { return first.is_ready(); });
-    if (!first_completed) {
+    if (!first_completed_without_cleanup) {
         ch.close();
-        first_completed = wait_for_condition(
+        const bool first_completed_after_cleanup = wait_for_condition(
             [&] { return first.is_ready(); });
+        REQUIRE(first_completed_after_cleanup);
     }
-    REQUIRE(first_completed);
+    REQUIRE(first.is_ready());
     first.wait_destroyed();
     auto first_result = first.await_resume();
 
@@ -698,6 +711,7 @@ TEST_CASE("channel receive preserves notification against later cancellation",
     auto second_result = second.await_resume();
     REQUIRE(sched.shutdown(std::chrono::milliseconds(2000)));
 
+    REQUIRE(first_completed_without_cleanup);
     REQUIRE(first_waited);
     REQUIRE(second_waited);
     REQUIRE(send_succeeded.load(std::memory_order_acquire));
@@ -707,4 +721,66 @@ TEST_CASE("channel receive preserves notification against later cancellation",
     REQUIRE(*first_result.value == 7);
     REQUIRE_FALSE(second_result.has_value());
     REQUIRE(ch.empty());
+}
+
+TEST_CASE("channel receive restores cancellation after a stale notification",
+          "[sync][channel][cancellation][regression]") {
+    channel<int> ch(1);
+    cancel_source source;
+    elio::sync::detail::bounded_recv_waits_for_test.store(
+        0, std::memory_order_release);
+
+    std::atomic<bool> blocker_running{false};
+    std::atomic<bool> release_blocker{false};
+    scheduler sched(2);
+    sched.start();
+
+    auto receiver = sched.go_joinable_to(0, [&]()
+            -> task<channel<int>::cancellable_recv_result> {
+        co_return co_await ch.recv(source.get_token());
+    });
+    const bool receiver_waited = wait_for_at_least(
+        elio::sync::detail::bounded_recv_waits_for_test, 1);
+
+    auto blocker = sched.go_joinable_to(0, [&]() -> task<void> {
+        blocker_running.store(true, std::memory_order_release);
+        blocker_running.notify_all();
+        while (!release_blocker.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        co_return;
+    });
+    const bool worker_blocked = wait_for_true(blocker_running);
+
+    const bool sent = ch.try_send(7);
+    auto stolen = ch.try_recv();
+    source.cancel();
+    release_blocker.store(true, std::memory_order_release);
+    release_blocker.notify_all();
+
+    const bool receiver_completed = wait_for_condition(
+        [&] { return receiver.is_ready(); });
+    const bool blocker_completed = wait_for_condition(
+        [&] { return blocker.is_ready(); });
+    if (!receiver_completed) {
+        ch.close();
+    }
+    REQUIRE(wait_for_condition([&] { return receiver.is_ready(); }));
+    REQUIRE((blocker_completed ||
+             wait_for_condition([&] { return blocker.is_ready(); })));
+    receiver.wait_destroyed();
+    blocker.wait_destroyed();
+    auto result = receiver.await_resume();
+    blocker.await_resume();
+    REQUIRE(sched.shutdown(std::chrono::milliseconds(2000)));
+
+    REQUIRE(receiver_completed);
+    REQUIRE(receiver_waited);
+    REQUIRE(worker_blocked);
+    REQUIRE(sent);
+    REQUIRE(stolen.has_value());
+    REQUIRE(*stolen == 7);
+    REQUIRE_FALSE(result.success());
+    REQUIRE(result.was_cancelled());
+    REQUIRE_FALSE(result.was_closed());
 }

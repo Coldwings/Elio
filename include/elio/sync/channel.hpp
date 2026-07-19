@@ -21,7 +21,7 @@ namespace elio::sync {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 namespace detail {
 inline std::atomic<size_t> bounded_send_publish_waits_for_test{0};
-inline std::atomic<bool> bounded_recv_waiting_for_value_for_test{false};
+inline std::atomic<size_t> bounded_recv_waits_for_test{0};
 }
 #endif
 
@@ -340,9 +340,9 @@ public:
                 }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
                 if (ch_.is_bounded()) {
-                    detail::bounded_recv_waiting_for_value_for_test.store(
-                        true, std::memory_order_release);
-                    detail::bounded_recv_waiting_for_value_for_test.notify_all();
+                    detail::bounded_recv_waits_for_test.fetch_add(
+                        1, std::memory_order_release);
+                    detail::bounded_recv_waits_for_test.notify_all();
                 }
 #endif
                 ch_.recv_waiters_.push_back(this);
@@ -648,8 +648,17 @@ public:
     /// Receive a value while preserving closed-channel status on cancellation.
     /// A cancellation winner does not consume a value from the channel.
     coro::task<cancellable_recv_result> recv(coro::cancel_token token) {
+        bool notification_selected = false;
         while (true) {
-            cancellable_recv_awaitable awaitable{*this, token};
+            // Once normal notification wins, a later token request cannot
+            // replace that terminal choice while this loop retries the shared
+            // ring. Preserve it through any transient pop race until a value
+            // or close result is observed.
+            auto effective_token = notification_selected
+                ? coro::cancel_token{}
+                : token;
+            cancellable_recv_awaitable awaitable{
+                *this, std::move(effective_token)};
             detail::wake_state_ptr sender_handle;
             std::optional<T> result;
             bool resolved = false;
@@ -734,7 +743,12 @@ public:
             }
 
             if (retry) {
-                (void)awaitable.await_resume();
+                const auto completion = awaitable.await_resume();
+                if (completion == coro::cancel_result::cancelled) {
+                    co_return cancellable_recv_result{
+                        std::nullopt, coro::cancel_result::cancelled};
+                }
+                notification_selected = true;
                 continue;
             }
 
@@ -743,6 +757,7 @@ public:
                 co_return cancellable_recv_result{
                     std::nullopt, coro::cancel_result::cancelled};
             }
+            notification_selected = true;
         }
     }
 
@@ -903,8 +918,19 @@ private:
         // Out-of-order consumers can publish several reusable slots before the
         // next producer slot becomes available. Drain every currently usable
         // refill credit so queued senders cannot be stranded without a future
-        // pop to wake them.
-        while (true) {
+        // pop to wake them. Snapshot the logical credit so sustained traffic
+        // cannot keep one receiver servicing later arrivals indefinitely.
+        size_t refill_budget;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            const size_t logical_size = ring_->size();
+            refill_budget = logical_size < capacity_
+                ? capacity_ - logical_size
+                : 0;
+        }
+
+        while (refill_budget > 0) {
+            --refill_budget;
             detail::wake_state_ptr sender_handle;
             detail::wake_state_ptr receiver_handle;
             {

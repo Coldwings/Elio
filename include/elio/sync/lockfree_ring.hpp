@@ -9,6 +9,9 @@
 
 namespace elio::sync {
 
+template<typename T>
+class channel;
+
 /// Lock-free multi-producer multi-consumer ring buffer
 /// Uses Vyukov's bounded MPMC queue algorithm with sequence numbers for ABA prevention
 template<typename T>
@@ -138,10 +141,11 @@ public:
     /// Get the capacity of the ring (always a power of 2)
     size_t capacity() const noexcept { return capacity_; }
 
-    /// Check whether the next producer slot is physically reusable.
-    ///
-    /// This is stable until the next producer advances head_ only when callers
-    /// serialize producers externally. Consumers can only make the result
+private:
+    friend class channel<T>;
+
+    /// Check whether the next producer slot is physically reusable while the
+    /// owning channel serializes producers. Consumers can only make the result
     /// transition from false to true.
     bool can_push() const noexcept {
         const uint64_t head = head_.load(std::memory_order_relaxed);
@@ -149,6 +153,8 @@ public:
         const uint64_t seq = slot.sequence.load(std::memory_order_acquire);
         return static_cast<int64_t>(seq) - static_cast<int64_t>(head) == 0;
     }
+
+public:
 
     /// Check if the ring is empty (approximate, for diagnostics only)
     bool empty() const noexcept {

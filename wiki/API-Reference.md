@@ -661,9 +661,11 @@ objects by value and require execution in a scheduler domain when awaited. Their
 branches are registered in one internal `task_group`; no accepted branch is
 implicitly detached. Move-only callables must be passed as rvalues.
 
-`when_all()` starts every callable, requests cancellation of unfinished
-siblings after the first failure, waits for all accepted child frames to leave
-the group, and then rethrows the first child failure. Later child failures are
+`when_all()` registers every callable as a group child. A child whose body has
+not started when cancellation is already visible may finish without invoking
+its callable. After the first failure, `when_all()` requests cancellation of
+unfinished siblings, waits for all accepted child frames to leave the group,
+and then rethrows the first child failure. Later child failures are
 reported through the scheduler's unhandled-exception handler before return. A
 failure while transferring a callable into a launched child takes precedence
 over child failures because the complete branch set was never accepted. A parent

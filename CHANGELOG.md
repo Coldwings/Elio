@@ -62,6 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a pending send value into the channel or consume a received value; send,
   receive, and close paths skip cancelled waiters without consuming another
   waiter's wakeup.
+- **Process fork boundary**: Documented the unsupported inherited-runtime
+  continuation path and regression-tested supported single-threaded
+  fork-before-runtime use plus active-runtime parent continuation with child
+  `execve()`/`_exit()`. Elio does not install `pthread_atfork` repair hooks or
+  provide child-side runtime reinitialization. Added a 0.5.x-to-0.6 migration
+  guide covering ownership, cancellation, combinators, I/O integration, RPC,
+  and process lifecycle changes.
 
 ### Changed
 

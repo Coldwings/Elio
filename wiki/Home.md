@@ -81,6 +81,8 @@ Elio is built around a few key technical decisions:
 - [[Core Concepts]] - Coroutines, tasks, and scheduler
 - [[API Contracts]] - Per-interface library guarantees and caller
   responsibilities for audit and triage
+- [[Fork Safety]] - Supported process creation boundaries and inherited-runtime restrictions
+- [[Migrating to 0.6]] - Breaking changes and upgrade checklist for 0.5.x users
 - [[Signal Handling]] - Safe signal handling with signalfd
 - [[Networking]] - TCP, HTTP/1.1, and connections
 - [[HTTP2 Guide]] - HTTP/2 client usage and multiplexing

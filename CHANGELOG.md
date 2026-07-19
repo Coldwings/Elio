@@ -189,6 +189,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bounded-channel slot publication**: Cancellation-aware sends no longer
+  claim normal completion before a logically freed ring slot is physically
+  reusable, preventing value loss and false closed results. Token-aware receives
+  give an already-selected normal notification one cancellation-immune value
+  acquisition attempt, then restore the caller token if another receiver wins.
+  Deferred refills now drain every reusable credit and wake queued receivers,
+  so no-token and token-aware operations cannot be stranded by out-of-order
+  consumer publication.
 - **Scheduler exception-handler publication**: Concurrent handler replacement,
   reporting, and getter calls now exchange shared handler snapshots under an
   explicit mutex instead of relying on `atomic<shared_ptr>`. Reporters and

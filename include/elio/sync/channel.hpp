@@ -10,7 +10,6 @@
 #include <utility>
 #include <memory>
 #include <cassert>
-#include <thread>
 #include "lockfree_ring.hpp"
 #include "../coro/cancel_token.hpp"
 #include "../detail/intrusive_list.hpp"
@@ -18,6 +17,17 @@
 #include "detail/wake_state.hpp"
 
 namespace elio::sync {
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace detail {
+inline std::atomic<size_t> bounded_send_publish_waits_for_test{0};
+inline std::atomic<size_t> bounded_recv_waits_for_test{0};
+inline std::atomic<bool> pause_bounded_recv_after_claim_for_test{false};
+inline std::atomic<bool> bounded_recv_paused_after_claim_for_test{false};
+inline std::atomic<bool> pause_bounded_recv_after_failed_pop_for_test{false};
+inline std::atomic<bool> bounded_recv_paused_after_failed_pop_for_test{false};
+}
+#endif
 
 /// Multi-producer multi-consumer channel
 template<typename T>
@@ -151,19 +161,27 @@ public:
                     should_suspend = false;
                 } else {
                     // Bounded: try to push into ring
-                    if (ch_.ring_->size() < ch_.capacity_) {
-                        if (claim_completion() &&
-                            ch_.ring_->try_push(value_)) {
+                    if (ch_.ring_->size() < ch_.capacity_ &&
+                        ch_.ring_->can_push()) {
+                        if (claim_completion()) {
+                            const bool pushed = ch_.ring_->try_push(value_);
+                            assert(pushed);
+                            (void)pushed;
                             success_ = true;
                             if (auto* receiver =
                                     ch_.claim_receiver_locked()) {
                                 to_schedule = receiver->wake_state_;
                             }
-                            should_suspend = false;
-                        } else if (cancellable_ &&
-                                   wake_state_->was_cancelled()) {
-                            should_suspend = false;
                         }
+                        // Reusable room selects either normal completion or a
+                        // racing cancellation. Neither result may be enqueued.
+                        should_suspend = false;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                    } else if (ch_.ring_->size() < ch_.capacity_) {
+                        detail::bounded_send_publish_waits_for_test.fetch_add(
+                            1, std::memory_order_release);
+                        detail::bounded_send_publish_waits_for_test.notify_all();
+#endif
                     }
                 }
 
@@ -324,6 +342,13 @@ public:
                 if (cancellable_ && wake_state_->was_cancelled()) {
                     return false;
                 }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (ch_.is_bounded()) {
+                    detail::bounded_recv_waits_for_test.fetch_add(
+                        1, std::memory_order_release);
+                    detail::bounded_recv_waits_for_test.notify_all();
+                }
+#endif
                 ch_.recv_waiters_.push_back(this);
                 suspended_ = true;  // Mark as enqueued
             }
@@ -445,12 +470,14 @@ public:
             detail::wake_state_ptr receiver_handle;
             {
                 std::lock_guard<std::mutex> guard(mutex_);
-                if (!closed_ && ring_->size() < capacity_) {
-                    if (ring_->try_push(value)) {
-                        pushed = true;
-                        if (auto* receiver = claim_receiver_locked()) {
-                            receiver_handle = receiver->wake_state_;
-                        }
+                if (!closed_ && ring_->size() < capacity_ &&
+                    ring_->can_push()) {
+                    const bool did_push = ring_->try_push(value);
+                    assert(did_push);
+                    (void)did_push;
+                    pushed = true;
+                    if (auto* receiver = claim_receiver_locked()) {
+                        receiver_handle = receiver->wake_state_;
                     }
                 }
             }
@@ -547,14 +574,7 @@ public:
             while (true) {
                 auto result = ring_->try_pop();
                 if (result.has_value()) {
-                    detail::wake_state_ptr sender_handle;
-                    {
-                        std::lock_guard<std::mutex> guard(mutex_);
-                        sender_handle = refill_sender_after_pop_locked();
-                    }
-                    if (sender_handle) {
-                        detail::schedule_wake_state(sender_handle);
-                    }
+                    refill_senders_after_pop();
                     co_return result;
                 }
 
@@ -632,12 +652,27 @@ public:
     /// Receive a value while preserving closed-channel status on cancellation.
     /// A cancellation winner does not consume a value from the channel.
     coro::task<cancellable_recv_result> recv(coro::cancel_token token) {
+        bool notification_selected = false;
         while (true) {
-            cancellable_recv_awaitable awaitable{*this, token};
+            // Give a selected normal notification one cancellation-immune
+            // attempt to consume the advertised state. Notifications do not
+            // reserve values, so restore the caller token if another receiver
+            // wins that attempt.
+            const bool consume_notification =
+                std::exchange(notification_selected, false);
+            auto effective_token = consume_notification
+                ? coro::cancel_token{}
+                : token;
+            cancellable_recv_awaitable awaitable{
+                *this, std::move(effective_token)};
             detail::wake_state_ptr sender_handle;
             std::optional<T> result;
             bool resolved = false;
             bool retry = false;
+            bool refill_senders = false;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            bool bounded_pop_failed = false;
+#endif
 
             {
                 std::lock_guard<std::mutex> guard(mutex_);
@@ -647,13 +682,30 @@ public:
                         if (!awaitable.claim_completion()) {
                             resolved = true;
                         } else {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                            if (detail::pause_bounded_recv_after_claim_for_test.load(
+                                    std::memory_order_acquire)) {
+                                detail::bounded_recv_paused_after_claim_for_test.store(
+                                    true, std::memory_order_release);
+                                detail::bounded_recv_paused_after_claim_for_test.notify_all();
+                                while (detail::pause_bounded_recv_after_claim_for_test.load(
+                                    std::memory_order_acquire)) {
+                                    detail::pause_bounded_recv_after_claim_for_test.wait(
+                                        true, std::memory_order_acquire);
+                                }
+                                detail::bounded_recv_paused_after_claim_for_test.store(
+                                    false, std::memory_order_release);
+                            }
+#endif
                             result = ring_->try_pop();
                             if (!result.has_value()) {
                                 retry = true;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                                bounded_pop_failed = true;
+#endif
                             } else {
                                 resolved = true;
-                                sender_handle =
-                                    refill_sender_after_pop_locked();
+                                refill_senders = true;
                             }
                         }
                     } else if (!send_waiters_.empty()) {
@@ -703,6 +755,9 @@ public:
             if (sender_handle) {
                 detail::schedule_wake_state(sender_handle);
             }
+            if (refill_senders) {
+                refill_senders_after_pop();
+            }
 
             if (resolved) {
                 const auto completion = awaitable.await_resume();
@@ -715,7 +770,31 @@ public:
             }
 
             if (retry) {
-                (void)awaitable.await_resume();
+                const auto completion = awaitable.await_resume();
+                if (completion == coro::cancel_result::cancelled) {
+                    co_return cancellable_recv_result{
+                        std::nullopt, coro::cancel_result::cancelled};
+                }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (bounded_pop_failed &&
+                    detail::pause_bounded_recv_after_failed_pop_for_test.load(
+                        std::memory_order_acquire)) {
+                    detail::bounded_recv_paused_after_failed_pop_for_test.store(
+                        true, std::memory_order_release);
+                    detail::bounded_recv_paused_after_failed_pop_for_test.notify_all();
+                    while (detail::pause_bounded_recv_after_failed_pop_for_test.load(
+                        std::memory_order_acquire)) {
+                        detail::pause_bounded_recv_after_failed_pop_for_test.wait(
+                            true, std::memory_order_acquire);
+                    }
+                    detail::bounded_recv_paused_after_failed_pop_for_test.store(
+                        false, std::memory_order_release);
+                }
+#endif
+                continue;
+            }
+
+            if (consume_notification) {
                 continue;
             }
 
@@ -724,6 +803,7 @@ public:
                 co_return cancellable_recv_result{
                     std::nullopt, coro::cancel_result::cancelled};
             }
+            notification_selected = true;
         }
     }
 
@@ -742,14 +822,7 @@ public:
                 return result;
             }
 
-            detail::wake_state_ptr sender_handle;
-            {
-                std::lock_guard<std::mutex> guard(mutex_);
-                sender_handle = refill_sender_after_pop_locked();
-            }
-            if (sender_handle) {
-                detail::schedule_wake_state(sender_handle);
-            }
+            refill_senders_after_pop();
             return result;
         }
 
@@ -887,29 +960,51 @@ private:
         return nullptr;
     }
 
-    detail::wake_state_ptr refill_sender_after_pop_locked() noexcept {
-        // This thread has already advanced tail_ by one successful pop. Atomic
-        // coherence makes that advance visible here, while mutex_ exposes all
-        // earlier producer head_ advances and excludes new ones. Concurrent
-        // consumers can only free more room. Therefore a full logical size
-        // means a producer filled this operation's slot before we took mutex_.
-        if (ring_->size() >= capacity_) {
-            return {};
+    void refill_senders_after_pop() {
+        // Out-of-order consumers can publish several reusable slots before the
+        // next producer slot becomes available. Drain every currently usable
+        // refill credit so queued senders cannot be stranded without a future
+        // pop to wake them. Snapshot the logical credit so sustained traffic
+        // cannot keep one receiver servicing later arrivals indefinitely.
+        size_t refill_budget;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            const size_t logical_size = ring_->size();
+            refill_budget = logical_size < capacity_
+                ? capacity_ - logical_size
+                : 0;
         }
 
-        auto* sender = claim_sender_locked();
-        if (!sender) {
-            return {};
-        }
+        while (refill_budget > 0) {
+            --refill_budget;
+            detail::wake_state_ptr sender_handle;
+            detail::wake_state_ptr receiver_handle;
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                if (ring_->size() >= capacity_ || !ring_->can_push()) {
+                    return;
+                }
 
-        // Another consumer may have reserved the physical ring slot but not
-        // published its release yet. No producer can take it while mutex_ is
-        // held, so retry until that already-freed slot becomes visible.
-        while (!ring_->try_push(sender->value_)) {
-            std::this_thread::yield();
+                auto* sender = claim_sender_locked();
+                if (!sender) {
+                    return;
+                }
+
+                const bool pushed = ring_->try_push(sender->value_);
+                assert(pushed);
+                (void)pushed;
+                sender->success_ = true;
+                sender_handle = sender->wake_state_;
+                if (auto* receiver = claim_receiver_locked()) {
+                    receiver_handle = receiver->wake_state_;
+                }
+            }
+
+            if (receiver_handle) {
+                schedule_receiver_or_retry(receiver_handle);
+            }
+            detail::schedule_wake_state(sender_handle);
         }
-        sender->success_ = true;
-        return sender->wake_state_;
     }
 
     void schedule_receiver_or_retry(detail::wake_state_ptr receiver) {

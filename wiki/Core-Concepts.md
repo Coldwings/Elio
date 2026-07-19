@@ -618,6 +618,9 @@ deadline for requesting cancellation, not a guaranteed return-time bound. The
 child stops promptly only when it passes the supplied `cancel_token` or
 `this_coro::cancel_token()` to operations that support cancellation. Work that
 ignores cancellation delays the timeout result until natural completion.
+If deadline expiry and parent cancellation race before the timer branch publishes
+its terminal result, best-effort timer cancellation permits either a timed-out
+result or `combinator_cancelled`.
 
 `mutex::lock(token)`, `semaphore::acquire(token)`, and `event::wait(token)` are cancellation-aware and return `coro::cancel_result`. Cancellation and normal notification atomically select one terminal result. If cancellation wins, a mutex lock or semaphore permit is not acquired. If normal notification wins first, the operation returns `completed` and the caller owns the acquired resource even if cancellation is requested immediately afterward. The overloads without a token remain non-cancellable and preserve their `void` await result.
 

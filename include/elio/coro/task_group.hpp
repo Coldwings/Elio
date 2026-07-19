@@ -450,6 +450,7 @@ private:
 };
 
 struct task_scope_access;
+struct task_group_access;
 
 } // namespace detail
 
@@ -476,6 +477,38 @@ public:
     task_group& operator=(const task_group&) = delete;
     task_group(task_group&&) = delete;
     task_group& operator=(task_group&&) = delete;
+
+    class join_awaitable final {
+    public:
+        explicit join_awaitable(task_group& group) noexcept
+            : group_(std::addressof(group))
+            , all_done_(group.state_->wait_all()) {}
+
+        join_awaitable(join_awaitable&& other) noexcept
+            : group_(std::exchange(other.group_, nullptr))
+            , all_done_(std::move(other.all_done_)) {}
+
+        join_awaitable& operator=(join_awaitable&&) = delete;
+        join_awaitable(const join_awaitable&) = delete;
+        join_awaitable& operator=(const join_awaitable&) = delete;
+
+        [[nodiscard]] bool await_ready() {
+            group_->begin_join_();
+            return all_done_.await_ready();
+        }
+
+        bool await_suspend(std::coroutine_handle<> handle) noexcept {
+            return all_done_.await_suspend(handle);
+        }
+
+        void await_resume() {
+            group_->finish_join_();
+        }
+
+    private:
+        task_group* group_;
+        detail::task_group_state::all_done_awaitable all_done_;
+    };
 
     ~task_group() {
         bool joined = false;
@@ -519,47 +552,14 @@ public:
         }
     }
 
-    /// Stop accepting children and wait for every child frame to leave the
-    /// group. Fail-fast rethrows the first failure; collect-all throws
-    /// task_group_error with every recorded failure. Only one join is allowed,
-    /// and it must execute on a worker of the selected scheduler.
+    /// Return a single-use awaitable that stops accepting children and waits for
+    /// every child frame to leave the group. Fail-fast rethrows the first
+    /// failure; collect-all throws task_group_error with every recorded failure.
+    /// Only one join is allowed, and it must execute on a worker of the selected
+    /// scheduler.
     [[nodiscard("co_await task_group::join()")]]
-    task<void> join() {
-        if (!detail::is_scheduler_worker(scheduler_)) {
-            throw std::logic_error(
-                "task_group must be joined from its scheduler domain");
-        }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (scope_body_active_) {
-                throw std::logic_error(
-                    "task_scope body cannot join its own task_group");
-            }
-            if (join_started_) {
-                throw std::logic_error("task_group can only be joined once");
-            }
-            join_started_ = true;
-            accepting_ = false;
-        }
-
-        co_await state_->wait_all();
-
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            join_completed_ = true;
-        }
-        if (state_->options().failure_policy ==
-            task_group_failure_policy::collect_all) {
-            auto failures = state_->failures();
-            if (!failures.empty()) {
-                throw task_group_error(std::move(failures));
-            }
-            if (auto failure = state_->first_failure()) {
-                std::rethrow_exception(std::move(failure));
-            }
-        } else if (auto failure = state_->first_failure()) {
-            std::rethrow_exception(std::move(failure));
-        }
+    join_awaitable join() noexcept {
+        return join_awaitable(*this);
     }
 
     /// Request cancellation on the group scheduler. Ordinary external threads
@@ -590,6 +590,43 @@ public:
     }
 
 private:
+    void begin_join_() {
+        if (!detail::is_scheduler_worker(scheduler_)) {
+            throw std::logic_error(
+                "task_group must be joined from its scheduler domain");
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (scope_body_active_) {
+                throw std::logic_error(
+                    "task_scope body cannot join its own task_group");
+            }
+            if (join_started_) {
+                throw std::logic_error("task_group can only be joined once");
+            }
+            join_started_ = true;
+            accepting_ = false;
+        }
+    }
+
+    void finish_join_() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            join_completed_ = true;
+        }
+        if (state_->options().failure_policy ==
+            task_group_failure_policy::collect_all) {
+            auto failures = state_->failures();
+            if (!failures.empty()) {
+                throw task_group_error(std::move(failures));
+            }
+            if (auto failure = state_->first_failure()) {
+                std::rethrow_exception(std::move(failure));
+            }
+        } else if (auto failure = state_->first_failure()) {
+            std::rethrow_exception(std::move(failure));
+        }
+    }
     template<typename F, typename... Args>
     task<void> make_child_task_(F&& function, Args&&... args) {
         state_->register_child();
@@ -710,9 +747,17 @@ private:
     bool scope_body_active_ = false;
 
     friend struct detail::task_scope_access;
+    friend struct detail::task_group_access;
 };
 
 namespace detail {
+
+struct task_group_access final {
+    static std::shared_ptr<task_group_state> shared_state(
+        task_group& group) noexcept {
+        return group.state_;
+    }
+};
 
 struct task_scope_access final {
     static void request_cancel_noexcept(task_group& group) noexcept {

@@ -718,14 +718,15 @@ public:
         return blocking_pool_.get();
     }
 
-    /// Exception handler type for unhandled exceptions in detached tasks
-    /// and when_any loser exceptions.
+    /// Exception handler type for unhandled exceptions in detached tasks and
+    /// discarded structured-combinator branches.
     using unhandled_exception_handler = std::function<void(std::exception_ptr)>;
 
     /// Set the per-scheduler unhandled exception handler.
     /// Called when:
     /// - A detached task (go/go_to) throws and the exception is not observed
     /// - A when_any loser throws after the winner has already resolved
+    /// - A later when_all child throws after the primary failure is fixed
     ///
     /// Default behavior (no handler set): log ERROR with exception info.
     /// When handler is set: invoke handler instead of logging.
@@ -767,9 +768,12 @@ public:
             try {
                 std::rethrow_exception(ex);
             } catch (const std::exception& e) {
-                ELIO_LOG_ERROR("unhandled exception in detached task or when_any loser: {}", e.what());
+                ELIO_LOG_ERROR(
+                    "unhandled exception in detached task or structured combinator: {}",
+                    e.what());
             } catch (...) {
-                ELIO_LOG_ERROR("unhandled exception in detached task or when_any loser: <unknown>");
+                ELIO_LOG_ERROR(
+                    "unhandled exception in detached task or structured combinator: <unknown>");
             }
         }
     }

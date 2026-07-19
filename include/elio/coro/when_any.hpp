@@ -56,7 +56,8 @@ struct when_any_state {
     size_t winner_index_{0};
 
     template<size_t I, typename... Args>
-    void resolve(coro::task_group& group, Args&&... args) noexcept {
+    void resolve(coro::detail::task_group_state& group_state,
+                 Args&&... args) noexcept {
         bool expected = false;
         if (!winner_claimed_.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel)) {
@@ -70,16 +71,16 @@ struct when_any_state {
         } catch (...) {
             exception_ = std::current_exception();
         }
-        request_combinator_cancel_noexcept(group);
+        request_combinator_cancel_noexcept(group_state);
     }
 
-    void resolve_exception(coro::task_group& group,
+    void resolve_exception(coro::detail::task_group_state& group_state,
                            std::exception_ptr exception) noexcept {
         bool expected = false;
         if (winner_claimed_.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel)) {
             exception_ = std::move(exception);
-            request_combinator_cancel_noexcept(group);
+            request_combinator_cancel_noexcept(group_state);
             return;
         }
 
@@ -113,15 +114,17 @@ using when_any_output_t =
 template<size_t I, typename Callables, typename State>
 void spawn_when_any_child(coro::task_group& group,
                           Callables& callables,
-                          State& state) {
+                          const std::shared_ptr<State>& state,
+                          const std::shared_ptr<
+                              coro::detail::task_group_state>& group_state) {
     using F = std::remove_reference_t<
         std::tuple_element_t<I, Callables>>;
     using T = when_any_result_t<F>;
 
     group.spawn(
         [function = std::move(std::get<I>(callables)),
-         &group,
-         &state]() mutable -> coro::task<void> {
+         state,
+         group_state]() mutable -> coro::task<void> {
             try {
                 auto token = coro::this_coro::cancel_token();
                 if constexpr (std::is_void_v<T>) {
@@ -131,19 +134,23 @@ void spawn_when_any_child(coro::task_group& group,
                     } else {
                         co_await std::invoke(std::move(function));
                     }
-                    state.template resolve<I>(group, std::monostate{});
+                    state->template resolve<I>(
+                        *group_state, std::monostate{});
                 } else if constexpr (
                     std::invocable<F, coro::cancel_token>) {
                     auto value = co_await std::invoke(
                         std::move(function), std::move(token));
-                    state.template resolve<I>(group, std::move(value));
+                    state->template resolve<I>(
+                        *group_state, std::move(value));
                 } else {
                     auto value =
                         co_await std::invoke(std::move(function));
-                    state.template resolve<I>(group, std::move(value));
+                    state->template resolve<I>(
+                        *group_state, std::move(value));
                 }
             } catch (...) {
-                state.resolve_exception(group, std::current_exception());
+                state->resolve_exception(
+                    *group_state, std::current_exception());
             }
         });
 }
@@ -151,9 +158,12 @@ void spawn_when_any_child(coro::task_group& group,
 template<typename Callables, typename State, size_t... Is>
 void spawn_when_any_children(coro::task_group& group,
                              Callables& callables,
-                             State& state,
+                             const std::shared_ptr<State>& state,
+                             const std::shared_ptr<
+                                 coro::detail::task_group_state>& group_state,
                              std::index_sequence<Is...>) {
-    (spawn_when_any_child<Is>(group, callables, state), ...);
+    (spawn_when_any_child<Is>(
+         group, callables, state, group_state), ...);
 }
 
 } // namespace detail
@@ -173,14 +183,17 @@ template<typename... Fs>
               (detail::when_any_callable<Fs> && ...))
 auto when_any(Fs... fs)
     -> coro::task<detail::when_any_output_t<Fs...>> {
-    detail::when_any_state<Fs...> state;
+    auto state = std::make_shared<detail::when_any_state<Fs...>>();
     auto callables = std::forward_as_tuple(fs...);
     coro::task_group group;
+    auto group_state =
+        coro::detail::task_group_access::shared_state(group);
 
     std::exception_ptr launch_failure;
     try {
         detail::spawn_when_any_children(
-            group, callables, state, std::index_sequence_for<Fs...>{});
+            group, callables, state, group_state,
+            std::index_sequence_for<Fs...>{});
     } catch (...) {
         launch_failure = std::current_exception();
         detail::request_combinator_cancel_noexcept(group);
@@ -199,14 +212,14 @@ auto when_any(Fs... fs)
     if (join_failure) {
         std::rethrow_exception(std::move(join_failure));
     }
-    if (!state.winner_claimed_.load(std::memory_order_acquire)) {
+    if (!state->winner_claimed_.load(std::memory_order_acquire)) {
         throw combinator_cancelled();
     }
-    if (state.exception_) {
-        std::rethrow_exception(std::move(state.exception_));
+    if (state->exception_) {
+        std::rethrow_exception(std::move(state->exception_));
     }
 
-    co_return state.take_result();
+    co_return state->take_result();
 }
 
 } // namespace elio

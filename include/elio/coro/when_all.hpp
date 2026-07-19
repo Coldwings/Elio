@@ -2,6 +2,7 @@
 
 #include <exception>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <tuple>
@@ -70,17 +71,27 @@ inline void request_combinator_cancel_noexcept(
     }
 }
 
+inline void request_combinator_cancel_noexcept(
+    coro::detail::task_group_state& group_state) noexcept {
+    try {
+        group_state.request_cancel();
+    } catch (...) {
+        report_discarded_combinator_exception(std::current_exception());
+    }
+}
+
 template<size_t I, typename Callables, typename Values>
 void spawn_when_all_child(coro::task_group& group,
                           Callables& callables,
-                          Values& values) {
+                          const std::shared_ptr<Values>& values) {
     using F = std::remove_reference_t<
         std::tuple_element_t<I, Callables>>;
     using T = callable_result_t<F>;
 
     group.spawn(
         [function = std::move(std::get<I>(callables)),
-         &slot = std::get<I>(values)]() mutable -> coro::task<void> {
+         values]() mutable -> coro::task<void> {
+            auto& slot = std::get<I>(*values);
             if constexpr (std::is_void_v<T>) {
                 co_await std::invoke(std::move(function));
                 slot.emplace(std::monostate{});
@@ -93,9 +104,26 @@ void spawn_when_all_child(coro::task_group& group,
 template<typename Callables, typename Values, size_t... Is>
 void spawn_when_all_children(coro::task_group& group,
                              Callables& callables,
-                             Values& values,
+                             const std::shared_ptr<Values>& values,
                              std::index_sequence<Is...>) {
     (spawn_when_all_child<Is>(group, callables, values), ...);
+}
+
+inline void report_secondary_when_all_failures(
+    const coro::task_group& group,
+    const std::exception_ptr& primary) noexcept {
+    try {
+        bool skipped_primary = false;
+        for (auto& failure : group.failures()) {
+            if (!skipped_primary && primary && failure == primary) {
+                skipped_primary = true;
+                continue;
+            }
+            report_discarded_combinator_exception(std::move(failure));
+        }
+    } catch (...) {
+        ELIO_LOG_ERROR("unable to inspect secondary when_all failures");
+    }
 }
 
 template<typename Values, size_t... Is>
@@ -117,7 +145,10 @@ auto extract_when_all_values(when_all_storage_t<Fs...>& values,
 /// Await multiple task-producing callables concurrently in one structured
 /// scheduler-bound group. The first child failure requests cancellation of
 /// unfinished siblings, but the combinator does not return until every accepted
-/// child reaches a terminal state. The first failure is then rethrown.
+/// child reaches a terminal state. The first child failure is then rethrown and
+/// later child failures are reported through the scheduler's unhandled-exception
+/// handler. A launch-time callable transfer failure takes precedence over child
+/// failures because the complete branch set was never accepted.
 ///
 /// Parent cancellation is propagated through the group. If it prevents one or
 /// more result slots from being produced, the combinator throws
@@ -130,7 +161,8 @@ auto when_all(Fs... fs)
     if constexpr (sizeof...(Fs) == 0) {
         co_return detail::when_all_result_t<Fs...>{};
     } else {
-        detail::when_all_storage_t<Fs...> values;
+        auto values =
+            std::make_shared<detail::when_all_storage_t<Fs...>>();
         auto callables = std::forward_as_tuple(fs...);
         coro::task_group group;
 
@@ -150,6 +182,9 @@ auto when_all(Fs... fs)
             join_failure = std::current_exception();
         }
 
+        const auto& primary = launch_failure ? launch_failure : join_failure;
+        detail::report_secondary_when_all_failures(group, primary);
+
         if (launch_failure) {
             std::rethrow_exception(std::move(launch_failure));
         }
@@ -157,12 +192,12 @@ auto when_all(Fs... fs)
             std::rethrow_exception(std::move(join_failure));
         }
         if (!detail::all_when_all_values_present(
-                values, std::index_sequence_for<Fs...>{})) {
+                *values, std::index_sequence_for<Fs...>{})) {
             throw combinator_cancelled();
         }
 
         co_return detail::extract_when_all_values<Fs...>(
-            values, std::index_sequence_for<Fs...>{});
+            *values, std::index_sequence_for<Fs...>{});
     }
 }
 

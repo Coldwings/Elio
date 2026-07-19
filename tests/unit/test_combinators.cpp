@@ -229,6 +229,101 @@ TEST_CASE("when_all propagates first exception", "[sync][combinators]") {
     sched.shutdown();
 }
 
+TEST_CASE("when_all waits for a token-ignoring sibling after failure",
+          "[sync][combinators][structured][lifetime]") {
+    sync::event sibling_started;
+    sync::event release_sibling;
+    std::atomic<bool> failure_thrown{false};
+    std::atomic<bool> combinator_returned{false};
+
+    runtime::scheduler sched(2);
+    sched.start();
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        bool caught = false;
+        try {
+            (void)co_await when_all(
+                [&]() -> task<int> {
+                    co_await sibling_started.wait();
+                    failure_thrown.store(true, std::memory_order_release);
+                    throw std::runtime_error("primary failure");
+                    co_return 0;
+                },
+                [&]() -> task<int> {
+                    sibling_started.set();
+                    co_await release_sibling.wait();
+                    co_return 2;
+                });
+        } catch (const std::runtime_error& error) {
+            caught = true;
+            REQUIRE(std::string_view(error.what()) == "primary failure");
+        }
+        REQUIRE(caught);
+        combinator_returned.store(true, std::memory_order_release);
+    });
+
+    REQUIRE(wait_for_flag(failure_thrown));
+    REQUIRE_FALSE(combinator_returned.load(std::memory_order_acquire));
+    REQUIRE_FALSE(owner.is_ready());
+    release_sibling.set();
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(combinator_returned.load(std::memory_order_acquire));
+    sched.shutdown();
+}
+
+TEST_CASE("when_all reports secondary exceptions after drain",
+          "[sync][combinators][structured][exception]") {
+    sync::event both_started;
+    std::atomic<int> started{0};
+    std::atomic<int> reported{0};
+    std::string secondary_message;
+
+    runtime::scheduler sched(2);
+    sched.set_unhandled_exception_handler(
+        [&](std::exception_ptr exception) {
+            try {
+                std::rethrow_exception(exception);
+            } catch (const std::runtime_error& error) {
+                secondary_message = error.what();
+                reported.fetch_add(1, std::memory_order_release);
+            }
+        });
+    sched.start();
+
+    auto make_failure = [&](std::string_view message) {
+        return [&, message]() -> task<int> {
+            if (started.fetch_add(1, std::memory_order_acq_rel) + 1 == 2) {
+                both_started.set();
+            }
+            co_await both_started.wait();
+            throw std::runtime_error(std::string(message));
+            co_return 0;
+        };
+    };
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        std::string primary_message;
+        try {
+            (void)co_await when_all(
+                make_failure("first branch failure"),
+                make_failure("second branch failure"));
+        } catch (const std::runtime_error& error) {
+            primary_message = error.what();
+        }
+
+        REQUIRE(reported.load(std::memory_order_acquire) == 1);
+        REQUIRE(primary_message != secondary_message);
+        REQUIRE((primary_message == "first branch failure" ||
+                 primary_message == "second branch failure"));
+        REQUIRE((secondary_message == "first branch failure" ||
+                 secondary_message == "second branch failure"));
+    });
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    sched.shutdown();
+}
+
 TEST_CASE("when_all single task", "[sync][combinators]") {
     auto test = []() -> task<void> {
         auto [result] = co_await when_all(
@@ -311,6 +406,51 @@ TEST_CASE("when_all propagates launch-time callable move failure",
     REQUIRE(sched.shutdown(scaled_ms(2000)));
     REQUIRE(caught.load(std::memory_order_acquire));
     REQUIRE(first_completed.load(std::memory_order_acquire));
+}
+
+TEST_CASE("when_all launch failure takes precedence over child failure",
+          "[sync][combinators][regression][exception]") {
+    launch_throw_control control;
+    std::atomic<bool> child_failed{false};
+    std::atomic<bool> child_failure_reported{false};
+    control.wait_before_throw = &child_failed;
+
+    runtime::scheduler sched(2);
+    sched.set_unhandled_exception_handler(
+        [&](std::exception_ptr exception) {
+            try {
+                std::rethrow_exception(exception);
+            } catch (const std::runtime_error& error) {
+                if (std::string_view(error.what()) == "child failed first") {
+                    child_failure_reported.store(
+                        true, std::memory_order_release);
+                }
+            }
+        });
+    sched.start();
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        auto first = [&]() -> task<int> {
+            child_failed.store(true, std::memory_order_release);
+            throw std::runtime_error("child failed first");
+            co_return 0;
+        };
+        auto combo = when_all(
+            first, launch_throwing_move_callable(control));
+        control.throw_on_move.store(true, std::memory_order_release);
+
+        try {
+            (void)co_await combo;
+            FAIL("expected launch failure");
+        } catch (const std::runtime_error& error) {
+            REQUIRE(std::string_view(error.what()) == "launch move failed");
+        }
+        REQUIRE(child_failure_reported.load(std::memory_order_acquire));
+    });
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    sched.shutdown();
 }
 
 // --- when_any tests ---
@@ -687,10 +827,12 @@ TEST_CASE("when_any publishes result construction failure",
         };
         elio::detail::when_any_state<decltype(first), decltype(second)> state;
         task_group group;
+        auto group_state =
+            coro::detail::task_group_access::shared_state(group);
         throwing_result result{2};
         throwing_result::throw_on_move.store(true, std::memory_order_relaxed);
 
-        state.resolve<1>(group, std::move(result));
+        state.resolve<1>(*group_state, std::move(result));
 
         REQUIRE(state.winner_claimed_.load(std::memory_order_acquire));
         REQUIRE(state.exception_ != nullptr);
@@ -922,10 +1064,55 @@ TEST_CASE("combinators return move-only lazy tasks",
     using AnyTask = decltype(when_any(
         std::declval<throwing_move_callable>()));
 
+    STATIC_REQUIRE(elio::detail::is_task_v<AllTask>);
+    STATIC_REQUIRE(elio::detail::is_task_v<AnyTask>);
     STATIC_REQUIRE(std::is_move_constructible_v<AllTask>);
     STATIC_REQUIRE(std::is_move_constructible_v<AnyTask>);
     STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<AllTask>);
     STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<AnyTask>);
+
+    std::atomic<bool> invoked{false};
+    auto test = [&]() -> task<void> {
+        auto pending = when_all([&]() -> task<int> {
+            invoked.store(true, std::memory_order_release);
+            co_return 42;
+        });
+        REQUIRE_FALSE(invoked.load(std::memory_order_acquire));
+        auto [value] = co_await pending;
+        REQUIRE(value == 42);
+        REQUIRE(invoked.load(std::memory_order_acquire));
+    };
+
+    runtime::scheduler sched(1);
+    sched.go(test);
+    sched.shutdown();
+}
+
+TEST_CASE("when_all and when_any return move-only result values",
+          "[sync][combinators][ownership]") {
+    auto test = []() -> task<void> {
+        auto [all_value] = co_await when_all(
+            []() -> task<std::unique_ptr<int>> {
+                co_return std::make_unique<int>(20);
+            });
+        REQUIRE(*all_value == 20);
+
+        auto [index, any_value] = co_await when_any(
+            []() -> task<std::unique_ptr<int>> {
+                co_return std::make_unique<int>(22);
+            },
+            [](coro::cancel_token token) -> task<std::unique_ptr<int>> {
+                (void)co_await time::sleep_for(
+                    scaled_ms(100), std::move(token));
+                co_return std::make_unique<int>(0);
+            });
+        REQUIRE(index == 0);
+        REQUIRE(*any_value == 22);
+    };
+
+    runtime::scheduler sched(2);
+    sched.go(test);
+    sched.shutdown();
 }
 
 // --- with_timeout tests ---

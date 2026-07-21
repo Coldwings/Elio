@@ -507,6 +507,36 @@ TEST_CASE("object_cache release handoff resumes once when final borrow drops aft
     sched.shutdown();
 }
 
+TEST_CASE("object_cache final shared drop always probes the release waiter slot",
+          "[object_cache][release][handoff]") {
+    detail_oc::release_waiter_probes_for_test.store(0,
+                                                    std::memory_order_relaxed);
+
+    scheduler sched(1);
+    sched.start();
+
+    object_cache<std::string, int> cache({.num_shards = 4});
+    auto h = spawn_joinable(sched, [&]() -> task<void> {
+        auto first = co_await cache.get("handoff_key", []() -> task<int> {
+            co_return 42;
+        });
+        std::optional<object_cache<std::string, int>::borrow> second;
+        second.emplace(co_await cache.get(
+            "handoff_key", []() -> task<int> { co_return 84; }));
+
+        second.reset();
+        REQUIRE(*first == 42);
+        co_return;
+    });
+
+    h.wait_destroyed();
+    REQUIRE_NOTHROW(h.await_resume());
+    REQUIRE(detail_oc::release_waiter_probes_for_test.load(
+                std::memory_order_relaxed) == 1);
+
+    sched.shutdown();
+}
+
 TEST_CASE("object_cache release unregisters waiter when suspended release is destroyed",
           "[object_cache][release][cancellation]") {
     using cache_type = object_cache<std::string, int>;

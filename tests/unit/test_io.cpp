@@ -696,6 +696,34 @@ TEST_CASE("io_uring short submit keeps excess operations pending",
     REQUIRE(elio::io::detail::is_io_uring_short_submit(3, 0));
     REQUIRE_FALSE(elio::io::detail::is_io_uring_short_submit(3, -EAGAIN));
 
+    SECTION("wake poll SQE acquisition remains retryable after a full SQ") {
+        int fake_sqe = 0;
+        int get_calls = 0;
+        int submit_calls = 0;
+        auto get_sqe = [&]() -> int* {
+            ++get_calls;
+            return get_calls >= 3 ? &fake_sqe : nullptr;
+        };
+        auto submit = [&]() {
+            ++submit_calls;
+            return 0;
+        };
+
+        auto* first = elio::io::detail::acquire_io_uring_wake_sqe(
+            get_sqe, submit);
+        REQUIRE(first == nullptr);
+        REQUIRE(submit_calls == 1);
+        REQUIRE_FALSE(elio::io::detail::io_uring_poll_can_block(
+            true, first != nullptr));
+
+        auto* retried = elio::io::detail::acquire_io_uring_wake_sqe(
+            get_sqe, submit);
+        REQUIRE(retried == &fake_sqe);
+        REQUIRE(submit_calls == 1);
+        REQUIRE(elio::io::detail::io_uring_poll_can_block(
+            true, retried != nullptr));
+    }
+
     SECTION("poll submit retry drains positive short submits before blocking") {
         std::vector<size_t> ready_values{3, 1, 1, 0};
         std::vector<int> submit_values{2, 1};

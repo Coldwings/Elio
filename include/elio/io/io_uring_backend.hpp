@@ -58,7 +58,9 @@ namespace elio::io {
 // processed. There is exactly one exception: the wake-eventfd poll SQE
 // (``WAKE_SENTINEL``) is never counted on either side — it is purely
 // internal plumbing and ``process_completion`` returns early before touching
-// ``pending_ops_``.
+// ``pending_ops_``. ``wake_poll_pending_`` tracks that SQE separately so
+// ``poll()`` never enters an indefinite CQE wait while a full SQ prevented
+// the wake poll from being re-armed.
 //
 // Cancel SQEs are slightly subtle but deliberately balanced: ``cancel()``
 // adds one (line where ``pending_ops_.fetch_add(1)`` lives) and the
@@ -122,6 +124,22 @@ inline bool is_io_uring_short_submit(size_t staged, int submitted) noexcept {
 inline bool io_uring_submit_made_progress(size_t ready_before,
                                           size_t ready_after) noexcept {
     return ready_after < ready_before;
+}
+
+template<typename GetSqeFn, typename SubmitFn>
+inline auto acquire_io_uring_wake_sqe(GetSqeFn&& get_sqe,
+                                      SubmitFn&& submit) {
+    auto* sqe = get_sqe();
+    if (sqe) {
+        return sqe;
+    }
+    (void)submit();
+    return get_sqe();
+}
+
+inline bool io_uring_poll_can_block(bool submissions_ready,
+                                    bool wake_poll_pending) noexcept {
+    return submissions_ready && wake_poll_pending;
 }
 
 inline bool io_uring_prepare_request_is_valid(const io_request& req) noexcept {
@@ -296,9 +314,14 @@ public:
             );
         }
 
-        // Submit initial poll_add to watch wake_fd_
-        submit_wake_poll();
-        io_uring_submit(&ring_);
+        // Submit initial poll_add to watch wake_fd_. An empty new ring must
+        // have room; treat failure as backend initialization failure.
+        if (!try_submit_wake_poll()) {
+            ::close(wake_fd_);
+            wake_fd_ = -1;
+            io_uring_queue_exit(&ring_);
+            throw std::runtime_error("failed to install io_uring wake poll");
+        }
     }
     
     /// Destructor
@@ -497,7 +520,20 @@ public:
         // batching: multiple prepares followed by one submit. If a short
         // submit leaves SQEs queued, retry before any blocking CQE wait so a
         // queued cancel/timeout SQE is not left invisible to the kernel.
-        const bool can_block_for_cqe = submit_pending_for_poll();
+        bool submissions_ready = submit_pending_for_poll();
+
+        // A consumed wake CQE must be re-armed before an indefinite wait.
+        // If the SQ was persistently full, leave this poll non-blocking and
+        // retry on the next worker cycle. eventfd retains concurrent wakes.
+        if (!wake_poll_pending_) {
+            (void)try_submit_wake_poll();
+            if (wake_poll_pending_) {
+                submissions_ready = submit_pending_for_poll()
+                    && submissions_ready;
+            }
+        }
+        const bool can_block_for_cqe = detail::io_uring_poll_can_block(
+            submissions_ready, wake_poll_pending_);
 
         struct io_uring_cqe* cqe = nullptr;
         int completions = 0;
@@ -746,8 +782,9 @@ private:
         // block at the top of this file). Must be checked before any tag-bit
         // check because WAKE_SENTINEL itself has bit 0 set.
         if (user_data == reinterpret_cast<void*>(WAKE_SENTINEL)) {
+            wake_poll_pending_ = false;
             drain_notify();
-            submit_wake_poll();
+            (void)try_submit_wake_poll();
             return;
         }
 
@@ -928,25 +965,38 @@ private:
         }
     }
 
-    /// Submit a poll_add SQE to watch the wake eventfd
-    void submit_wake_poll() {
-        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-        if (!sqe) {
-            // SQ is full - flush and retry once. This ensures the wake
-            // poll is always installed, otherwise cross-thread notify()
-            // will be lost and workers can deadlock.
-            ELIO_LOG_WARNING("SQ full for wake poll, flushing and retrying");
-            io_uring_submit(&ring_);
-            sqe = io_uring_get_sqe(&ring_);
-            if (!sqe) {
-                ELIO_LOG_ERROR("Failed to submit wake poll: SQ still full after flush");
-                return;
-            }
+    /// Stage and submit a poll_add SQE for the wake eventfd. Returns false
+    /// without changing wake_poll_pending_ if the SQ has no slot after a
+    /// flush; poll() then remains non-blocking and retries next cycle.
+    bool try_submit_wake_poll() {
+        if (wake_poll_pending_) {
+            return true;
         }
+
+        struct io_uring_sqe* sqe = detail::acquire_io_uring_wake_sqe(
+            [this]() { return io_uring_get_sqe(&ring_); },
+            [this]() {
+                ELIO_LOG_WARNING(
+                    "SQ full for wake poll, flushing and retrying");
+                return io_uring_submit(&ring_);
+            });
+        if (!sqe) {
+            ELIO_LOG_ERROR(
+                "Wake poll SQ still full after flush; retrying next poll cycle");
+            return false;
+        }
+
         io_uring_prep_poll_add(sqe, wake_fd_, POLLIN);
         io_uring_sqe_set_data(sqe, reinterpret_cast<void*>(WAKE_SENTINEL));
-        // Don't count this as a pending user operation - submit immediately
-        io_uring_submit(&ring_);
+        // A staged SQE remains backend-owned even after submit errors or short
+        // submits; submit_pending_for_poll() retries it before blocking.
+        wake_poll_pending_ = true;
+        const int submitted = io_uring_submit(&ring_);
+        if (submitted < 0) {
+            ELIO_LOG_ERROR("io_uring wake-poll submit failed: {}",
+                           strerror(-submitted));
+        }
+        return true;
     }
     
 public:
@@ -960,6 +1010,7 @@ private:
     struct io_uring ring_;                     ///< io_uring instance
     std::atomic<size_t> pending_ops_;          ///< Number of pending operations
     int wake_fd_ = -1;  ///< eventfd for cross-thread wake-up
+    bool wake_poll_pending_ = false; ///< Wake SQE is staged or kernel-owned
     /// Sentinel user_data to identify wake notifications in CQE
     static constexpr uintptr_t WAKE_SENTINEL = 1;
 

@@ -313,8 +313,8 @@ pump_stop.cancel();
 For busy-poll, DPDK-style, or shared-CQ setups, call
 `dispatcher.deliver(wr_id, status, byte_len, imm_data, wc_flags)`
 from any thread. It's safe to call from outside Elio's scheduler;
-the coroutine resumes via `runtime::schedule_handle`, which falls
-back to inline resume when no scheduler is current.
+the waiter is handed to `runtime::schedule_handle` for routing. When no
+scheduler is current, routing resumes it inline.
 
 ## op_state lifecycle
 
@@ -325,14 +325,37 @@ The awaiter and the dispatcher race for ownership of a per-WR
 * On `co_await` it posts the WR with `wr_id =
   dispatcher::make_wr_id(op_state*)`.
 * When the CQE arrives, `dispatcher.deliver(wr_id, ...)` CASes
-  `pending → completed`, fills the result, and resumes the coroutine.
-* If the awaiter is destroyed first (e.g. parent task cancelled), the
-  destructor CASes `pending → orphaned`; the dispatcher's later CQE
-  arrival sees `orphaned` and silently frees the node.
+  `pending → completed`, fills the result, and hands the waiter snapshot to
+  scheduler routing.
+* If an owner explicitly destroys the awaiter before the CQE arrives, the
+  destructor CASes `pending → orphaned`; the dispatcher's later CQE arrival
+  sees `orphaned` and silently frees the node.
 
 Exactly one party frees the heap node; the coroutine is resumed at
 most once. This is the same UAF-safe pattern PR #69 introduced for
 io_uring.
+
+Task cancellation in Elio is cooperative: requesting cancellation does not
+force-destroy a suspended child coroutine, and RDMA operation awaiters do not
+currently accept a cancellation token. Keep the dispatcher/CQ driver alive and
+driving until outstanding operations have been delivered or intentionally
+drained.
+
+For a suspended operation, the dispatcher snapshots its waiter handle before
+winning `pending → completed`, then hands that snapshot to scheduler routing.
+From the successful transition onward, keep the coroutine frame alive until
+`await_resume` clears the handle. Force-destroying it during that interval is
+unsupported even if scheduler routing has not enqueued, or cannot enqueue, the
+snapshot. The awaiter terminates the process because it cannot prove that the
+snapshot is revocable; continuing could leave a stale handle and permit a
+use-after-free. Before completion wins, explicit destruction remains safe via
+the `pending → orphaned` handoff described above.
+
+An operation explicitly launched with `.start()` remains in `posted` without a
+waiter handle. Its completion is stored for a later inline await, and the
+completed awaitable may instead be destroyed safely to discard that result.
+If a coroutine later awaits it and installs a handle, the suspended-operation
+rule applies.
 
 ## The high-level `endpoint` wrapper (libibverbs path)
 

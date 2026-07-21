@@ -15,20 +15,22 @@
 ///     Eager `start()` commits `posting → posted` instead, because there
 ///     is not yet a coroutine handle to resume.
 ///   * On completion, the dispatcher decodes the wr_id, CASes
-///     `pending → completed` and resumes the coroutine, or CASes
+///     `pending → completed` and attempts to route its waiter for resumption,
+///     or CASes
 ///     `posted → completed` and stores the result for a later await.
 ///     The awaiter frees the op_state after await_resume consumes the
 ///     result, or on destruction of the completed started handle.
 ///   * If completion arrives inline before post_* returns, the
 ///     dispatcher records the result with `posting → completed` and
 ///     the awaiter resumes inline only after await_suspend returns.
-///   * If the awaiter is destroyed before the CQE arrives (e.g. its
-///     parent task was cancelled, or an eager started handle is dropped
-///     before being awaited), the awaiter's destructor CASes `pending`
-///     or `posted` to `orphaned`. If that CAS wins, the dispatcher's
-///     later CQE arrival sees `orphaned` and frees the state. If that
-///     CAS loses, the dispatcher already completed it and the awaiter's
-///     unique_ptr frees the state normally.
+///   * If the awaiter is explicitly destroyed before the CQE arrives, or an
+///     eager started handle is dropped before being awaited, its destructor
+///     CASes `pending` or `posted` to `orphaned`. If that CAS wins, the
+///     dispatcher's later CQE arrival sees `orphaned` and frees the state.
+///     If the dispatcher has already changed a suspended operation to
+///     `completed`, however, it has snapshotted the waiter handle for handoff.
+///     Destroying that frame before it consumes the result is unsupported and
+///     fails closed because safe handle revocation cannot be proven.
 ///
 /// Net invariant: exactly one party (dispatcher or awaiter destructor)
 /// frees the op_state, and the coroutine handle is resumed at most once.

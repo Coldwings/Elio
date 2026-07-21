@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reads the calling thread's shared completion slot, so an epoll fallback does
   not return stale io_uring state when both backends were compiled in. (#982)
 
+### Documentation
+
+- Clarified the RDMA operation teardown boundary: cancellation is cooperative,
+  operation awaiters are not token-cancellable, and a suspended operation
+  coroutine must remain alive after delivery wins `pending → completed` until
+  its result is consumed. Completed eager operations without a waiter remain
+  safe to discard.
+
 ## [0.6.0] - 2026-07-20
 
 ### Added

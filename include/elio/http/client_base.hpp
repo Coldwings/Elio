@@ -35,6 +35,22 @@ namespace elio::http {
 
 namespace detail {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+// Allows cancellation regression tests to wait until a client response recv
+// has been staged. Keeping the hook here gives HTTP, WebSocket, and SSE the
+// same synchronization contract.
+inline std::atomic<bool> observe_client_response_read_entry_for_test{false};
+inline std::atomic<bool> client_response_read_staged_for_test{false};
+
+inline void arm_client_response_read_observer_for_test() noexcept {
+    if (observe_client_response_read_entry_for_test.load(
+            std::memory_order_acquire)) {
+        io::detail::arm_next_cancellable_recv_staged_for_test(
+            client_response_read_staged_for_test);
+    }
+}
+#endif
+
 inline size_t next_rotation_offset(const std::string& host, uint16_t port, size_t count) {
     if (count == 0) {
         return 0;

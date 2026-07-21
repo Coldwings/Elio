@@ -540,6 +540,9 @@ private:
                 pending_response_bytes.clear();
             } else {
                 io::io_result read_result{};
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                detail::arm_client_response_read_observer_for_test();
+#endif
                 std::shared_ptr<std::atomic<bool>> read_timed_out;
                 if (deadline_enforced) {
                     // Use remaining time from the absolute response deadline

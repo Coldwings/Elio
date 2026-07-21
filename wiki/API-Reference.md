@@ -1329,6 +1329,9 @@ public:
     // Read-only diagnostics
     bool has_pending() const noexcept;
     size_t pending_count() const noexcept;
+
+    // Most recent built-in-backend completion on the calling thread.
+    static io_result get_last_result() noexcept;
 };
 
 // Get the current scheduler worker's I/O context, or the global fallback
@@ -1362,6 +1365,13 @@ re-enqueues such a suspended handle must preserve that owner itself.
 I/O pinning protects backend ownership only. It does not serialize concurrent
 operations on the same stream or fd. Follow the concrete stream contract and
 externally serialize conflicting reads, writes, close, or destruction.
+
+`get_last_result()` is the legacy result channel used by raw-handle awaitables.
+It reports the latest completion published by either built-in backend on the
+calling thread, including an epoll runtime fallback in a build that also
+supports io_uring. Read it from the resumed completion path before another
+context on the same thread can publish a newer result. Standard `op_state`-based
+awaitables return their operation-owned `io_result` directly.
 
 ### Custom I/O Awaitables
 

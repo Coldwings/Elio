@@ -836,6 +836,7 @@ private:
             deferred_resumes->push_back({handle, result});
         } else {
             last_result_ = result;
+            detail::set_last_completion_result(result);
             safe_resume(handle);
         }
     }
@@ -877,6 +878,7 @@ private:
             deferred_resumes->push_back({handle, result});
         } else {
             last_result_ = result;
+            detail::set_last_completion_result(result);
             safe_resume(handle);
         }
     }
@@ -960,6 +962,7 @@ private:
             // so we just need to check if it's valid
             if (entry.handle) {
                 last_result_ = entry.result;
+                detail::set_last_completion_result(entry.result);
                 safe_resume(entry.handle);
             }
         }
@@ -1000,8 +1003,8 @@ private:
     }
     
 public:
-    /// Get the last completion result (thread-local)
-    /// Used by awaitables to retrieve their result
+    /// Get this backend's last completion result (thread-local).
+    /// Used by legacy raw-handle awaitables to retrieve their result.
     static io_result get_last_result() noexcept {
         return last_result_;
     }
@@ -1013,7 +1016,6 @@ private:
     bool wake_poll_pending_ = false; ///< Wake SQE is staged or kernel-owned
     /// Sentinel user_data to identify wake notifications in CQE
     static constexpr uintptr_t WAKE_SENTINEL = 1;
-
     static inline thread_local io_result last_result_{};
 };
 

@@ -1065,6 +1065,35 @@ TEST_CASE("epoll_backend registration failure does not leave pending op", "[io][
     REQUIRE(backend.pending_count() == 0);
 }
 
+TEST_CASE("io_context reports completion from explicit epoll backend",
+          "[io][context][epoll][regression]") {
+    io_context context(io_context::backend_type::epoll);
+    int pipefd[2] = {-1, -1};
+    REQUIRE(pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) == 0);
+
+    const char expected = 'x';
+    REQUIRE(write(pipefd[1], &expected, sizeof(expected)) ==
+            static_cast<ssize_t>(sizeof(expected)));
+
+    char actual = 0;
+
+    io_request req{};
+    req.op = io_op::read;
+    req.fd = pipefd[0];
+    req.buffer = &actual;
+    req.length = sizeof(actual);
+    req.awaiter = std::noop_coroutine();
+
+    REQUIRE(context.get_backend_type() == io_context::backend_type::epoll);
+    REQUIRE(context.prepare(req));
+    REQUIRE(context.poll(std::chrono::milliseconds(100)) == 1);
+    REQUIRE(io_context::get_last_result().result == 1);
+    REQUIRE(actual == expected);
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+}
+
 TEST_CASE("epoll_backend does not report getsockopt failure as EPOLLERR success",
           "[io][epoll][error]") {
     worker_io_backend_guard backend_guard(io_context::backend_type::epoll);

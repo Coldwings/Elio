@@ -215,11 +215,7 @@ public:
     }
 
     static io_result get_last_result() noexcept {
-#if ELIO_HAS_IO_URING
-        return io_uring_backend::get_last_result();
-#else
-        return epoll_backend::get_last_result();
-#endif
+        return detail::get_last_completion_result();
     }
 
     void run(std::atomic<bool>& stop_flag) {

@@ -987,6 +987,35 @@ TEST_CASE("epoll_backend basic operations", "[io][epoll]") {
     }
 }
 
+TEST_CASE("epoll timeout conversion clamps values above INT_MAX",
+          "[io][epoll][timer]") {
+    using rep = std::chrono::milliseconds::rep;
+    constexpr auto int_max = std::numeric_limits<int>::max();
+
+    REQUIRE(elio::io::detail::to_epoll_timeout(std::chrono::milliseconds(-1))
+            == -1);
+    REQUIRE(elio::io::detail::to_epoll_timeout(std::chrono::milliseconds(0))
+            == 0);
+    REQUIRE(elio::io::detail::to_epoll_timeout(
+                std::chrono::milliseconds(static_cast<rep>(int_max) - 1))
+            == int_max - 1);
+    REQUIRE(elio::io::detail::to_epoll_timeout(
+                std::chrono::milliseconds(static_cast<rep>(int_max)))
+            == int_max);
+    REQUIRE(elio::io::detail::to_epoll_timeout(
+                std::chrono::milliseconds(static_cast<rep>(int_max) + 1))
+            == int_max);
+    REQUIRE(elio::io::detail::min_epoll_timeout(
+                -1, std::chrono::milliseconds(static_cast<rep>(int_max) + 1))
+            == int_max);
+    REQUIRE(elio::io::detail::min_epoll_timeout(
+                50, std::chrono::milliseconds(static_cast<rep>(int_max) + 1))
+            == 50);
+    REQUIRE(elio::io::detail::min_epoll_timeout(
+                50, std::chrono::milliseconds(0))
+            == 0);
+}
+
 TEST_CASE("epoll_backend registration failure does not leave pending op", "[io][epoll][registration]") {
     epoll_backend backend;
     char buffer = 0;

@@ -17,6 +17,7 @@
 
 #include <elio/coro/cancel_token.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/io/io_context.hpp>
 #include <elio/rdma/rdma.hpp>
 #include <elio/runtime/scheduler.hpp>
 
@@ -44,6 +45,24 @@ using elio::rdma::wr_id;
 using elio::runtime::scheduler;
 
 namespace {
+
+class worker_io_backend_guard {
+public:
+    explicit worker_io_backend_guard(elio::io::io_context::backend_type backend)
+        : previous_(elio::runtime::detail::worker_io_backend_for_test.exchange(
+              backend, std::memory_order_acq_rel)) {}
+
+    ~worker_io_backend_guard() {
+        elio::runtime::detail::worker_io_backend_for_test.store(
+            previous_, std::memory_order_release);
+    }
+
+    worker_io_backend_guard(const worker_io_backend_guard&) = delete;
+    worker_io_backend_guard& operator=(const worker_io_backend_guard&) = delete;
+
+private:
+    elio::io::io_context::backend_type previous_;
+};
 
 // Test fixture: an eventfd that stands in for an ibv_comp_channel
 // fd, plus a thread-safe queue of pending wr_ids the test pushes to.
@@ -85,6 +104,8 @@ void wait_for_idle_poll() {
 
 TEST_CASE("cq_pump: drain runs on each fd readiness signal",
           "[rdma][cq_pump]") {
+    worker_io_backend_guard backend_guard(
+        elio::io::io_context::backend_type::epoll);
     scheduler sched(2);
     sched.start();
 
@@ -123,25 +144,24 @@ TEST_CASE("cq_pump: drain runs on each fd readiness signal",
         co_await cq_pump(cq.fd, disp, drain, src.get_token());
     });
 
-    // Push three completions through the pump. Each one is a
-    // freshly-allocated op_state with no coroutine handle (we only
-    // care that deliver was called).
+    // Push three completions through distinct readiness/drain cycles.
+    // epoll reports successful poll readiness with result == 0, so each
+    // cycle verifies that zero is not mistaken for a byte-count EOF.
     for (int i = 0; i < 3; ++i) {
         auto op = std::make_unique<op_state>();
         op->phase.store(op_phase::pending);
         auto id = dispatcher::make_wr_id(op.get());
         ops.push_back(std::move(op));
         cq.enqueue_and_signal(id);
-    }
 
-    // Spin-wait briefly for the pump to process all three.
-    auto deadline = std::chrono::steady_clock::now()
-                  + std::chrono::seconds(2);
-    while (delivered.load() < 3
-           && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        auto deadline = std::chrono::steady_clock::now()
+                      + std::chrono::seconds(2);
+        while (delivered.load() < i + 1
+               && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        REQUIRE(delivered.load() == i + 1);
     }
-    REQUIRE(delivered.load() == 3);
 
     wait_for_idle_poll();
     src.cancel();

@@ -29,10 +29,9 @@
 /// a synthetic fd wakeup.
 ///
 /// **Error handling**: any non-recoverable poll error (errno other
-/// than EINTR / EAGAIN / ECANCELED) ends the loop. A graceful close
-/// of the fd manifests as the poll completing with `result == 0`
-/// (POLLHUP-equivalent on epoll/io_uring); `drain` is called one
-/// final time, then the loop exits.
+/// than EINTR / EAGAIN / ECANCELED) ends the loop. Successful poll
+/// results are readiness notifications; their backend-specific result
+/// payload is not interpreted as a transferred byte count.
 ///
 /// Example:
 ///
@@ -103,12 +102,6 @@ template <detail::cq_drain_callable Drain>
         }
 
         drain(disp);
-
-        // POLLHUP / graceful close: result == 0 means the fd was closed.
-        // drain() was called one final time above; now exit the loop.
-        if (result.bytes_transferred() == 0) {
-            break;
-        }
     }
 }
 

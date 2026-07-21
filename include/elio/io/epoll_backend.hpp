@@ -747,8 +747,11 @@ private:
         if (revents & EPOLLERR) {
             int error = 0;
             socklen_t len = sizeof(error);
-            getsockopt(op.req.fd, SOL_SOCKET, SO_ERROR, &error, &len);
-            result = -error;
+            if (getsockopt(op.req.fd, SOL_SOCKET, SO_ERROR, &error, &len) != 0) {
+                result = -errno;
+            } else {
+                result = error == 0 ? -EIO : -error;
+            }
         } else if ((revents & EPOLLHUP) && !is_read_data_op(op.req.op)) {
             // Non-read data operations cannot drain bytes on HUP.
             result = -EPIPE;

@@ -31,6 +31,7 @@ int main() { return 0; }
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -49,6 +50,57 @@ struct request_header {
 constexpr std::uint16_t kPort = 18515;
 constexpr std::uint32_t kImmDoneTag = 0xABCDEFu;
 
+void abandon_outstanding_or_terminate(
+    elio::rdma_ibverbs::endpoint& ep) noexcept {
+    if (!ep.abandon_outstanding()) {
+        std::terminate();
+    }
+}
+
+elio::coro::task<void> serve_request(
+    elio::rdma_ibverbs::endpoint& ep) {
+    std::array<char, 256> req_buf{};
+    std::array<char, 4096> payload_buf{};
+    std::array<std::uint32_t, 1> notify_buf{};
+
+    auto req_mr = ep.register_buffer(
+        req_buf.data(), req_buf.size(), IBV_ACCESS_LOCAL_WRITE);
+    auto payload_mr = ep.register_buffer(
+        payload_buf.data(), payload_buf.size(), IBV_ACCESS_LOCAL_WRITE);
+    auto notify_mr = ep.register_buffer(
+        notify_buf.data(), sizeof(notify_buf), IBV_ACCESS_LOCAL_WRITE);
+
+    auto req_wc = co_await ep.conn().recv(req_mr.view());
+    if (!req_wc.ok()) {
+        std::cerr << "server: recv failed status="
+                  << static_cast<int>(req_wc.status) << "\n";
+        co_return;
+    }
+    auto* hdr = reinterpret_cast<request_header*>(req_buf.data());
+    std::cout << "server: got request from client "
+              << hdr->client_id << "\n";
+
+    std::string body = "response for client " + std::to_string(hdr->client_id);
+    std::memcpy(payload_buf.data(), body.data(), body.size());
+    elio::rdma::remote_buffer dst{
+        hdr->resp_addr, hdr->resp_length, hdr->resp_rkey};
+
+    auto wr = co_await ep.conn().rdma_write(
+        payload_mr.view(0, body.size()), dst);
+    if (!wr.ok()) {
+        std::cerr << "server: rdma_write failed status="
+                  << static_cast<int>(wr.status) << "\n";
+        co_return;
+    }
+
+    auto notify = co_await ep.conn().send_with_imm(
+        notify_mr.view(0, 0), static_cast<std::uint32_t>(body.size()));
+    if (!notify.ok()) {
+        std::cerr << "server: notify send failed status="
+                  << static_cast<int>(notify.status) << "\n";
+    }
+}
+
 elio::coro::task<void> server(elio::runtime::scheduler& sched) {
     sockaddr_in bind_addr{};
     bind_addr.sin_family      = AF_INET;
@@ -65,57 +117,61 @@ elio::coro::task<void> server(elio::runtime::scheduler& sched) {
                 .max_send_wr = 4, .max_recv_wr = 4});
         ep.start_cq_pump(sched);
 
-        // Stash buffers for the lifetime of this connection.
-        std::array<char, 256>  req_buf{};
-        std::array<char, 4096> payload_buf{};
-        std::array<std::uint32_t, 1> notify_buf{};
-
-        auto req_mr = ep.register_buffer(
-            req_buf.data(), req_buf.size(), IBV_ACCESS_LOCAL_WRITE);
-        auto payload_mr = ep.register_buffer(
-            payload_buf.data(), payload_buf.size(),
-            IBV_ACCESS_LOCAL_WRITE);
-        auto notify_mr = ep.register_buffer(
-            notify_buf.data(), sizeof(notify_buf), IBV_ACCESS_LOCAL_WRITE);
-
-        // Post recv for the request.
-        auto req_wc = co_await ep.conn().recv(req_mr.view());
-        if (!req_wc.ok()) {
-            std::cerr << "server: recv failed status="
-                      << static_cast<int>(req_wc.status) << "\n";
-            co_return;
-        }
-        auto* hdr = reinterpret_cast<request_header*>(req_buf.data());
-        std::cout << "server: got request from client "
-                  << hdr->client_id << "\n";
-
-        // Build a response payload.
-        std::string body = "response for client " + std::to_string(hdr->client_id);
-        std::memcpy(payload_buf.data(), body.data(), body.size());
-
-        elio::rdma::remote_buffer dst{
-            hdr->resp_addr, hdr->resp_length, hdr->resp_rkey};
-
-        // RDMA WRITE the response into the client's exposed buffer.
-        auto wr = co_await ep.conn().rdma_write(
-            payload_mr.view(0, body.size()), dst);
-        if (!wr.ok()) {
-            std::cerr << "server: rdma_write failed status="
-                      << static_cast<int>(wr.status) << "\n";
-            co_return;
-        }
-
-        // SEND_WITH_IMM the OOB completion: imm carries the body length
-        // so the client knows exactly how much was written.
-        auto notify = co_await ep.conn().send_with_imm(
-            notify_mr.view(0, 0),  // zero-length payload; carrier is imm
-            static_cast<std::uint32_t>(body.size()));
-        if (!notify.ok()) {
-            std::cerr << "server: notify send failed status="
-                      << static_cast<int>(notify.status) << "\n";
-        }
+        // The helper frame owns every MR and completed operation. It is
+        // destroyed before terminal endpoint shutdown begins.
+        co_await serve_request(ep);
+        co_await ep.shutdown();
         co_return;  // single-shot demo
     }
+}
+
+elio::coro::task<bool> run_client_request(
+    elio::rdma_ibverbs::endpoint& ep) {
+    std::array<char, 64> req_buf{};
+    std::array<char, 4096> resp_buf{};
+    std::array<std::uint32_t, 1> notify_buf{};
+
+    auto req_mr = ep.register_buffer(
+        req_buf.data(), req_buf.size(), IBV_ACCESS_LOCAL_WRITE);
+    auto resp_mr = ep.register_buffer(
+        resp_buf.data(), resp_buf.size(),
+        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    auto notify_mr = ep.register_buffer(
+        notify_buf.data(), sizeof(notify_buf), IBV_ACCESS_LOCAL_WRITE);
+
+    auto notify_awaiter = ep.conn().recv(notify_mr.view()).start();
+
+    auto* hdr = reinterpret_cast<request_header*>(req_buf.data());
+    auto resp_remote = resp_mr.remote();
+    hdr->resp_addr = resp_remote.addr;
+    hdr->resp_length = resp_remote.length;
+    hdr->resp_rkey = resp_remote.rkey;
+    hdr->client_id = 7;
+
+    auto send_wc = co_await ep.conn().send(
+        req_mr.view(0, sizeof(request_header)));
+    if (!send_wc.ok()) {
+        std::cerr << "client: send failed status="
+                  << static_cast<int>(send_wc.status) << "\n";
+        // The pre-posted notify receive may still be provider-owned. Destroy
+        // the QP while this frame still owns its awaiter, MRs, and buffers;
+        // the terminal fail-closed path intentionally leaks the remaining
+        // endpoint resources.
+        abandon_outstanding_or_terminate(ep);
+        co_return false;
+    }
+
+    auto notify_wc = co_await std::move(notify_awaiter);
+    if (!notify_wc.ok()) {
+        std::cerr << "client: notify recv failed status="
+                  << static_cast<int>(notify_wc.status) << "\n";
+        co_return true;
+    }
+    const auto resp_len = notify_wc.imm_data;
+    std::cout << "client: server wrote " << resp_len
+              << " bytes: '"
+              << std::string(resp_buf.data(), resp_len) << "'\n";
+    co_return true;
 }
 
 elio::coro::task<void> client(elio::runtime::scheduler& sched) {
@@ -131,50 +187,9 @@ elio::coro::task<void> client(elio::runtime::scheduler& sched) {
             .max_send_wr = 4, .max_recv_wr = 4});
     ep.start_cq_pump(sched);
 
-    std::array<char, 64>   req_buf{};
-    std::array<char, 4096> resp_buf{};
-    std::array<std::uint32_t, 1> notify_buf{};
-
-    auto req_mr = ep.register_buffer(
-        req_buf.data(), req_buf.size(), IBV_ACCESS_LOCAL_WRITE);
-    // resp_buf needs REMOTE_WRITE so the server can RDMA_WRITE into it.
-    auto resp_mr = ep.register_buffer(
-        resp_buf.data(), resp_buf.size(),
-        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-    auto notify_mr = ep.register_buffer(
-        notify_buf.data(), sizeof(notify_buf), IBV_ACCESS_LOCAL_WRITE);
-
-    // CRITICAL: post the recv for the OOB notify BEFORE sending the
-    // request. Otherwise the server's send-with-imm will RNR-retry.
-    auto notify_awaiter = ep.conn().recv(notify_mr.view()).start();
-
-    auto* hdr = reinterpret_cast<request_header*>(req_buf.data());
-    auto resp_remote = resp_mr.remote();
-    hdr->resp_addr   = resp_remote.addr;
-    hdr->resp_length = resp_remote.length;
-    hdr->resp_rkey   = resp_remote.rkey;
-    hdr->client_id   = 7;
-
-    auto send_wc = co_await ep.conn().send(
-        req_mr.view(0, sizeof(request_header)));
-    if (!send_wc.ok()) {
-        std::cerr << "client: send failed status="
-                  << static_cast<int>(send_wc.status) << "\n";
-        co_return;
+    if (co_await run_client_request(ep)) {
+        co_await ep.shutdown();
     }
-
-    auto notify_wc = co_await std::move(notify_awaiter);
-    if (!notify_wc.ok()) {
-        std::cerr << "client: notify recv failed status="
-                  << static_cast<int>(notify_wc.status) << "\n";
-        co_return;
-    }
-    // imm_data carries the response length.
-    const auto resp_len = notify_wc.imm_data;
-    std::cout << "client: server wrote " << resp_len
-              << " bytes: '"
-              << std::string(resp_buf.data(), resp_len) << "'\n";
-    co_return;
 }
 
 }  // namespace

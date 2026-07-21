@@ -1159,11 +1159,21 @@ TEST_CASE("task_group publishes completion after child state release",
         }
     } pause_guard;
     elio::sync::event enter_join;
+    elio::sync::event allow_child_failure;
+    std::atomic<bool> child_running_on_worker_1{false};
+    std::atomic<bool> owner_running_on_worker_0{false};
     std::atomic<bool> failure_observed{false};
 
-    auto owner = sched.go_joinable([&]() -> task<void> {
+    auto owner = sched.go_joinable_to(0, [&]() -> task<void> {
+        co_await elio::set_affinity(0);
+        owner_running_on_worker_0.store(
+            elio::current_worker_id() == 0, std::memory_order_release);
         task_group group;
-        group.spawn([]() -> task<void> {
+        group.spawn([&]() -> task<void> {
+            co_await elio::set_affinity(1);
+            child_running_on_worker_1.store(
+                elio::current_worker_id() == 1, std::memory_order_release);
+            co_await allow_child_failure.wait();
             throw std::runtime_error("child failure");
             co_return;
         });
@@ -1176,6 +1186,8 @@ TEST_CASE("task_group publishes completion after child state release",
         }
     });
 
+    const bool child_running = wait_for_flag(child_running_on_worker_1);
+    allow_child_failure.set();
     const bool completion_paused = wait_for_flag(
         elio::coro::detail::task_group_completion_paused_for_test);
     enter_join.set();
@@ -1189,6 +1201,8 @@ TEST_CASE("task_group publishes completion after child state release",
     });
     const bool shutdown_ok = sched.shutdown(std::chrono::seconds(5));
 
+    REQUIRE(child_running);
+    REQUIRE(owner_running_on_worker_0);
     REQUIRE(completion_paused);
     REQUIRE(join_observed_pending);
     REQUIRE(owner_destroyed);

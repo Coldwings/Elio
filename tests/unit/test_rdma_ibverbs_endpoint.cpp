@@ -124,10 +124,11 @@ TEST_CASE("endpoint pump exit signal wakes and unregisters coroutine waiters",
         pump_exit_state state;
         state.mark_exited();
         bool resumed = false;
-        auto waiting = [&]() -> elio::coro::task<void> {
+        auto wait_for_prepublished_exit = [&]() -> elio::coro::task<void> {
             co_await state.wait();
             resumed = true;
-        }();
+        };
+        auto waiting = wait_for_prepublished_exit();
         auto handle = elio::coro::detail::task_access::handle(waiting);
 
         handle.resume();
@@ -138,9 +139,10 @@ TEST_CASE("endpoint pump exit signal wakes and unregisters coroutine waiters",
     SECTION("destroyed shutdown waiter unregisters before pump exit") {
         pump_exit_state state;
         {
-            auto abandoned = [&]() -> elio::coro::task<void> {
+            auto wait_for_abandoned_exit = [&]() -> elio::coro::task<void> {
                 co_await state.wait();
-            }();
+            };
+            auto abandoned = wait_for_abandoned_exit();
             auto handle = elio::coro::detail::task_access::handle(abandoned);
             handle.resume();
             REQUIRE_FALSE(handle.done());

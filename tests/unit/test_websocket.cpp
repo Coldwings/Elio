@@ -2,6 +2,7 @@
 #include <elio/http/websocket.hpp>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <new>
@@ -645,6 +646,48 @@ TEST_CASE("WebSocket frame parser", "[websocket][parser]") {
 
         REQUIRE(parser.has_error());
         REQUIRE(parser.error().find("maximum size") != std::string::npos);
+    }
+
+    SECTION("raw parser defaults to a bounded message size") {
+        frame_parser parser;
+        constexpr uint64_t oversized = default_max_message_size + 1ULL;
+        const std::array<uint8_t, 10> header{
+            0x82, 0x7F,
+            static_cast<uint8_t>(oversized >> 56),
+            static_cast<uint8_t>(oversized >> 48),
+            static_cast<uint8_t>(oversized >> 40),
+            static_cast<uint8_t>(oversized >> 32),
+            static_cast<uint8_t>(oversized >> 24),
+            static_cast<uint8_t>(oversized >> 16),
+            static_cast<uint8_t>(oversized >> 8),
+            static_cast<uint8_t>(oversized)};
+
+        auto consumed = parser.parse(header.data(), header.size());
+
+        REQUIRE(consumed < 0);
+        REQUIRE(parser.has_error());
+        REQUIRE(parser.error_close_code() == close_code::too_large);
+    }
+
+    SECTION("raw parser unlimited mode requires explicit opt in") {
+        frame_parser parser;
+        parser.set_max_message_size(0);
+        constexpr uint64_t oversized = default_max_message_size + 1ULL;
+        const std::array<uint8_t, 10> header{
+            0x82, 0x7F,
+            static_cast<uint8_t>(oversized >> 56),
+            static_cast<uint8_t>(oversized >> 48),
+            static_cast<uint8_t>(oversized >> 40),
+            static_cast<uint8_t>(oversized >> 32),
+            static_cast<uint8_t>(oversized >> 24),
+            static_cast<uint8_t>(oversized >> 16),
+            static_cast<uint8_t>(oversized >> 8),
+            static_cast<uint8_t>(oversized)};
+
+        auto consumed = parser.parse(header.data(), header.size());
+
+        REQUIRE(consumed == 0);
+        REQUIRE_FALSE(parser.has_error());
     }
 
     SECTION("oversized frame reports too_large close code") {

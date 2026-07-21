@@ -34,7 +34,7 @@ namespace elio::http::websocket {
 
 /// WebSocket client configuration
 struct client_config : http::base_client_config {
-    size_t max_message_size = 16 * 1024 * 1024;   ///< Max message size (16MB)
+    size_t max_message_size = default_max_message_size; ///< Max message size (16 MiB)
     std::vector<std::string> subprotocols;        ///< Requested subprotocols
     std::string origin;                           ///< Origin header (for browser compatibility)
 

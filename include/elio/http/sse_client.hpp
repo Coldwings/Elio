@@ -628,6 +628,9 @@ private:
             }
 
             io::io_result read_result{};
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            http::detail::arm_client_response_read_observer_for_test();
+#endif
             if (deadline_enforced) {
                 auto remaining =
                     response_deadline - std::chrono::steady_clock::now();

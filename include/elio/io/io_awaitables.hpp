@@ -33,6 +33,25 @@ inline io_context& current_io_context() noexcept {
 
 namespace detail {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline thread_local std::atomic<bool>*
+    next_cancellable_recv_staged_for_test = nullptr;
+
+inline void arm_next_cancellable_recv_staged_for_test(
+    std::atomic<bool>& staged) noexcept {
+    next_cancellable_recv_staged_for_test = &staged;
+}
+
+inline void publish_cancellable_recv_staged_for_test() noexcept {
+    auto* staged = next_cancellable_recv_staged_for_test;
+    next_cancellable_recv_staged_for_test = nullptr;
+    if (staged != nullptr) {
+        staged->store(true, std::memory_order_release);
+        staged->notify_all();
+    }
+}
+#endif
+
 inline constexpr int socket_no_sigpipe_flag =
 #ifdef MSG_NOSIGNAL
     MSG_NOSIGNAL;
@@ -1338,6 +1357,10 @@ public:
             awaiter.resume();
             return;
         }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        detail::publish_cancellable_recv_staged_for_test();
+#endif
 
         // Post-registration race: cancel may have fired between on_cancel()
         // and setting state->op above. Re-check after prepare so the backend

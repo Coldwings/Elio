@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Bounded raw WebSocket parsing by default**: `websocket::frame_parser` now
+  applies the same 16 MiB aggregate message limit as the high-level client and
+  server configurations. Direct parser users must explicitly set a limit of
+  `0` to accept unbounded messages.
+
 ## [0.6.0] - 2026-07-20
 
 ### Added

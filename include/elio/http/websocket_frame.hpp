@@ -18,6 +18,10 @@
 
 namespace elio::http::websocket {
 
+/// Default aggregate message limit used by the raw parser and high-level
+/// client/server configurations. Callers may explicitly set 0 for unlimited.
+inline constexpr size_t default_max_message_size = 16 * 1024 * 1024;
+
 /// WebSocket opcodes (RFC 6455 Section 5.2)
 enum class opcode : uint8_t {
     continuation = 0x0,  ///< Continuation frame
@@ -459,7 +463,7 @@ class frame_parser {
 public:
     frame_parser() = default;
 
-    /// Set maximum message size (0 = unlimited)
+    /// Set maximum message size (defaults to 16 MiB; 0 = unlimited)
     void set_max_message_size(size_t max_size) {
         max_message_size_ = max_size;
     }
@@ -720,7 +724,7 @@ private:
     std::vector<message> messages_;
     std::vector<std::pair<opcode, std::string>> control_frames_;
     std::vector<queued_frame_kind> queued_frames_;
-    size_t max_message_size_ = 0;
+    size_t max_message_size_ = default_max_message_size;
     bool has_error_ = false;
     bool has_initial_frame_ = false;  ///< Tracks whether a non-continuation frame started the current message
     std::string error_msg_;

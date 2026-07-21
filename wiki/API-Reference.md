@@ -2586,17 +2586,23 @@ std::vector<uint8_t> encode_text_frame(std::string_view text, bool mask = false)
 std::vector<uint8_t> encode_binary_frame(std::string_view data, bool mask = false);
 std::pair<close_code, std::string> parse_close_payload(std::string_view payload);
 
+inline constexpr size_t default_max_message_size = 16 * 1024 * 1024;
+
 class frame_parser {
 public:
+    // Defaults to default_max_message_size (16 MiB); 0 explicitly disables it.
     void set_max_message_size(size_t max_size);
     void set_role(endpoint_role role);
     close_code error_close_code() const noexcept;
 };
 ```
 
-The raw frame parser is a protocol helper. It enforces masking direction only
-after callers configure an endpoint role (`server` or `client`). Applications
-still validate message payload schemas after a frame has been accepted.
+The raw frame parser is a protocol helper. It rejects aggregate messages above
+the 16 MiB `default_max_message_size` unless callers choose another limit with
+`set_max_message_size()`; passing `0` explicitly enables unlimited messages. It
+enforces masking direction only after callers configure an endpoint role
+(`server` or `client`). Applications still validate message payload schemas
+after a frame has been accepted.
 
 ### `websocket::ws_connect`
 

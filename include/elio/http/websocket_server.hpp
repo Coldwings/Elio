@@ -59,7 +59,7 @@ enum class connection_state {
 
 /// WebSocket server configuration
 struct server_config {
-    size_t max_message_size = 16 * 1024 * 1024;     ///< Max message size (16MB)
+    size_t max_message_size = default_max_message_size; ///< Max message size (16 MiB)
     size_t read_buffer_size = 8192;                  ///< Read buffer size
     std::chrono::seconds ping_interval{30};             ///< 0 = disabled
     std::chrono::seconds ping_timeout{10};              ///< <=0 = no timeout close

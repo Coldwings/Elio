@@ -2847,12 +2847,23 @@ struct h2_client_config {
                                // pushed responses are not exposed
     net::resolve_options resolve_options = net::default_cached_resolve_options();
     bool rotate_resolved_addresses = true;
+    size_t max_response_headers = 100;             // Max accepted field lines
+    size_t max_response_header_bytes = 64 * 1024; // Max accepted name/value bytes
 };
 ```
+
+The two response-header limits apply per stream to regular field lines. The
+byte limit is the sum of accepted field-name and field-value lengths. Final
+headers and trailers share the budget; discarded informational blocks do not.
+A limit breach resets only the offending stream with
+`NGHTTP2_ENHANCE_YOUR_CALM` and the request fails with `errno == EMSGSIZE`.
 
 ### `h2_session`
 
 Low-level HTTP/2 session (for advanced use).
+
+`h2_session_config` exposes the same `max_response_headers` and
+`max_response_header_bytes` defaults for direct session users.
 
 ```cpp
 class h2_session {

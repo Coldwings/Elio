@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Non-blocking epoll connect precondition**: the epoll backend now rejects
+  `async_connect()` on a blocking socket with `-EINVAL` before `connect(2)` can
+  block a scheduler worker. Direct callers must set `O_NONBLOCK` first (#997).
 - **Bounded raw WebSocket parsing by default**: `websocket::frame_parser` now
   applies the same 16 MiB aggregate message limit as the high-level client and
   server configurations. Direct parser users must explicitly set a limit of

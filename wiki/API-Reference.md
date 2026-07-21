@@ -1459,6 +1459,8 @@ if (accept_result.result >= 0) {
 }
 
 // Connect
+// Direct callers must keep fd non-blocking when the epoll backend may be used.
+// A blocking socket is rejected with result.result == -EINVAL.
 auto result = co_await async_connect(fd, addr, addrlen);
 
 // Close

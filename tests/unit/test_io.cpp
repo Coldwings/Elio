@@ -51,6 +51,23 @@ using namespace elio::runtime;
 
 namespace {
 
+class worker_io_backend_guard {
+public:
+    explicit worker_io_backend_guard(io_context::backend_type backend)
+        : previous_(elio::runtime::detail::worker_io_backend_for_test.exchange(
+              backend, std::memory_order_acq_rel)) {}
+    worker_io_backend_guard(const worker_io_backend_guard&) = delete;
+    worker_io_backend_guard& operator=(const worker_io_backend_guard&) = delete;
+
+    ~worker_io_backend_guard() {
+        elio::runtime::detail::worker_io_backend_for_test.store(
+            previous_, std::memory_order_release);
+    }
+
+private:
+    io_context::backend_type previous_;
+};
+
 class throwing_prepare_awaitable : public io_awaitable_base {
 public:
     throwing_prepare_awaitable(io_context& ctx, bool& rolled_back) noexcept
@@ -989,6 +1006,36 @@ TEST_CASE("epoll_backend registration failure does not leave pending op", "[io][
 
     REQUIRE_FALSE(backend.has_pending());
     REQUIRE(backend.pending_count() == 0);
+}
+
+TEST_CASE("epoll_backend does not report getsockopt failure as EPOLLERR success",
+          "[io][epoll][error]") {
+    worker_io_backend_guard backend_guard(io_context::backend_type::epoll);
+
+    int pipefd[2] = {-1, -1};
+    REQUIRE(pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) == 0);
+    REQUIRE(close(pipefd[0]) == 0);
+    pipefd[0] = -1;
+
+    io_result write_result{};
+    std::atomic<bool> completed{false};
+    scheduler sched(1);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        const char byte = 'x';
+        write_result = co_await async_write(pipefd[1], &byte, sizeof(byte));
+        completed.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0;
+         i < 100 && !completed.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+    REQUIRE(close(pipefd[1]) == 0);
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(write_result.result == -ENOTSOCK);
 }
 
 TEST_CASE("Pipe read/write with epoll", "[io][epoll][pipe]") {

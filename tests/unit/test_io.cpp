@@ -1091,10 +1091,10 @@ TEST_CASE("io_context reports completion from explicit epoll backend",
         }
 
         try {
+            auto completion = capture_context_last_result(&probe.context_result);
             io_context context(io_context::backend_type::epoll);
             std::array<char, 7> expected{'r', 'u', 'n', 't', 'i', 'm', 'e'};
             std::array<char, 7> actual{};
-            auto completion = capture_context_last_result(&probe.context_result);
 
             io_request req{};
             req.op = io_op::read;

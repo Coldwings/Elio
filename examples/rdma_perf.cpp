@@ -639,6 +639,7 @@ int main(int argc, char* argv[]) {
     sched.start();
 
     std::atomic<int> exit_code{0};
+    std::atomic<bool> done{false};
 
     if (cfg.is_server) {
         sched.go([&]() -> task<void> {
@@ -648,7 +649,6 @@ int main(int argc, char* argv[]) {
         std::printf("press Ctrl+C to stop\n");
         pause();
     } else {
-        std::atomic<bool> done{false};
         sched.go([&]() -> task<void> {
             exit_code.store(co_await run_client(sched, cfg));
             done.store(true);

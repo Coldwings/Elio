@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -20,6 +21,32 @@
 #include <chrono>
 
 namespace elio::io {
+
+namespace detail {
+
+inline constexpr int to_epoll_timeout(
+    std::chrono::milliseconds timeout) noexcept {
+    const auto count = timeout.count();
+    if (count < 0) {
+        return -1;
+    }
+    constexpr auto max_timeout =
+        static_cast<std::chrono::milliseconds::rep>(
+            std::numeric_limits<int>::max());
+    return count > max_timeout ? std::numeric_limits<int>::max()
+                               : static_cast<int>(count);
+}
+
+inline constexpr int min_epoll_timeout(
+    int current_timeout,
+    std::chrono::milliseconds timer_timeout) noexcept {
+    const int timer_timeout_ms = to_epoll_timeout(timer_timeout);
+    return current_timeout < 0 || timer_timeout_ms < current_timeout
+        ? timer_timeout_ms
+        : current_timeout;
+}
+
+} // namespace detail
 
 /// epoll backend implementation
 /// 
@@ -345,10 +372,7 @@ public:
             return completions;
         }
 
-        int timeout_ms = static_cast<int>(timeout.count());
-        if (timeout.count() < 0) {
-            timeout_ms = -1;  // Block indefinitely
-        }
+        int timeout_ms = detail::to_epoll_timeout(timeout);
         
         // Adjust timeout based on earliest timer deadline
         if (!timer_queue_.empty()) {
@@ -358,10 +382,8 @@ public:
                 timeout_ms = 0;  // Timer already expired
             } else {
                 auto timer_timeout = std::chrono::ceil<std::chrono::milliseconds>(
-                    earliest - now).count();
-                if (timeout_ms < 0 || timer_timeout < timeout_ms) {
-                    timeout_ms = static_cast<int>(timer_timeout);
-                }
+                    earliest - now);
+                timeout_ms = detail::min_epoll_timeout(timeout_ms, timer_timeout);
             }
         }
         

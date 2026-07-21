@@ -60,9 +60,13 @@ namespace elio::rdma_ibverbs { /* endpoint API not available */ }
 
 #include <infiniband/verbs.h>
 
+#include <fcntl.h>
+
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -74,6 +78,27 @@ namespace elio::rdma_ibverbs { /* endpoint API not available */ }
 #endif
 
 namespace elio::rdma_ibverbs {
+
+namespace endpoint_detail {
+
+inline void set_nonblocking(int fd) {
+    const int flags = ::fcntl(fd, F_GETFL);
+    if (flags < 0) {
+        const int error = errno;
+        throw std::runtime_error(
+            std::string("endpoint: fcntl(F_GETFL) failed: ")
+            + std::strerror(error));
+    }
+    if ((flags & O_NONBLOCK) == 0
+        && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        const int error = errno;
+        throw std::runtime_error(
+            std::string("endpoint: fcntl(F_SETFL) failed: ")
+            + std::strerror(error));
+    }
+}
+
+} // namespace endpoint_detail
 
 /// Per-endpoint creation knobs. Most users only touch the cap fields.
 /// To go fully custom, set `custom_qp_init_attr` to a pre-populated
@@ -289,6 +314,7 @@ private:
         if (!pd_) throw_verbs_("ibv_alloc_pd");
         comp_ch_ = ::ibv_create_comp_channel(id_.verbs());
         if (!comp_ch_) throw_verbs_("ibv_create_comp_channel");
+        endpoint_detail::set_nonblocking(comp_ch_->fd);
         cq_ = ::ibv_create_cq(id_.verbs(),
                               static_cast<int>(config_.cq_size),
                               /*ctx=*/nullptr, comp_ch_, /*comp_vec=*/0);

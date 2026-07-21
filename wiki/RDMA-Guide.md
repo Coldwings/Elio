@@ -325,7 +325,8 @@ The awaiter and the dispatcher race for ownership of a per-WR
 * On `co_await` it posts the WR with `wr_id =
   dispatcher::make_wr_id(op_state*)`.
 * When the CQE arrives, `dispatcher.deliver(wr_id, ...)` CASes
-  `pending → completed`, fills the result, and resumes the coroutine.
+  `pending → completed`, fills the result, and hands the waiter snapshot to
+  scheduler routing.
 * If an owner explicitly destroys the awaiter before the CQE arrives, the
   destructor CASes `pending → orphaned`; the dispatcher's later CQE arrival
   sees `orphaned` and silently frees the node.

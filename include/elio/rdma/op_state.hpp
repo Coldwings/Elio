@@ -15,7 +15,8 @@
 ///     Eager `start()` commits `posting → posted` instead, because there
 ///     is not yet a coroutine handle to resume.
 ///   * On completion, the dispatcher decodes the wr_id, CASes
-///     `pending → completed` and resumes the coroutine, or CASes
+///     `pending → completed` and attempts to route its waiter for resumption,
+///     or CASes
 ///     `posted → completed` and stores the result for a later await.
 ///     The awaiter frees the op_state after await_resume consumes the
 ///     result, or on destruction of the completed started handle.

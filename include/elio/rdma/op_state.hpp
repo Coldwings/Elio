@@ -22,13 +22,13 @@
 ///   * If completion arrives inline before post_* returns, the
 ///     dispatcher records the result with `posting → completed` and
 ///     the awaiter resumes inline only after await_suspend returns.
-///   * If the awaiter is destroyed before the CQE arrives (e.g. its
-///     parent task was cancelled, or an eager started handle is dropped
-///     before being awaited), the awaiter's destructor CASes `pending`
-///     or `posted` to `orphaned`. If that CAS wins, the dispatcher's
-///     later CQE arrival sees `orphaned` and frees the state. If that
-///     CAS loses, the dispatcher already completed it and the awaiter's
-///     unique_ptr frees the state normally.
+///   * If the awaiter is explicitly destroyed before the CQE arrives, or an
+///     eager started handle is dropped before being awaited, its destructor
+///     CASes `pending` or `posted` to `orphaned`. If that CAS wins, the
+///     dispatcher's later CQE arrival sees `orphaned` and frees the state.
+///     If completion has already scheduled a suspended coroutine, however,
+///     destroying that frame before it consumes the result is unsupported and
+///     fails closed: the queued handle cannot safely be revoked.
 ///
 /// Net invariant: exactly one party (dispatcher or awaiter destructor)
 /// frees the op_state, and the coroutine handle is resumed at most once.

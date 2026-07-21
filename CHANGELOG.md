@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server configurations. Direct parser users must explicitly set a limit of
   `0` to accept unbounded messages.
 
+### Documentation
+
+- Clarified the RDMA operation teardown boundary: cancellation is cooperative,
+  operation awaiters are not token-cancellable, and an operation coroutine
+  must remain alive after completion is queued until its result is consumed.
+
 ## [0.6.0] - 2026-07-20
 
 ### Added

@@ -326,13 +326,24 @@ The awaiter and the dispatcher race for ownership of a per-WR
   dispatcher::make_wr_id(op_state*)`.
 * When the CQE arrives, `dispatcher.deliver(wr_id, ...)` CASes
   `pending → completed`, fills the result, and resumes the coroutine.
-* If the awaiter is destroyed first (e.g. parent task cancelled), the
-  destructor CASes `pending → orphaned`; the dispatcher's later CQE
-  arrival sees `orphaned` and silently frees the node.
+* If an owner explicitly destroys the awaiter before the CQE arrives, the
+  destructor CASes `pending → orphaned`; the dispatcher's later CQE arrival
+  sees `orphaned` and silently frees the node.
 
 Exactly one party frees the heap node; the coroutine is resumed at
 most once. This is the same UAF-safe pattern PR #69 introduced for
 io_uring.
+
+Task cancellation in Elio is cooperative: requesting cancellation does not
+force-destroy a suspended child coroutine, and RDMA operation awaiters do not
+currently accept a cancellation token. Keep the operation's coroutine frame
+and its dispatcher/CQ driver alive until `await_resume` consumes the
+completion. Force-destroying the frame is unsupported once the dispatcher has
+changed the state to `completed` and queued its handle. The awaiter terminates
+the process in that case because the scheduler has no safe way to revoke the
+queued handle; continuing would leave a stale handle and permit a
+use-after-free. Before completion wins, explicit destruction remains safe via
+the `pending → orphaned` handoff described above.
 
 ## The high-level `endpoint` wrapper (libibverbs path)
 

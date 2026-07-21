@@ -107,6 +107,8 @@ struct h2_client_config {
                                // pushed responses are not exposed
     net::resolve_options resolve_options = net::default_cached_resolve_options();
     bool rotate_resolved_addresses = true;
+    size_t max_response_headers = 100;             // Max accepted field lines per stream
+    size_t max_response_header_bytes = 64 * 1024; // Max accepted name/value bytes per stream
 };
 
 // Usage
@@ -121,6 +123,12 @@ h2_client client(config);
 `max_response_size` bounds the accumulated DATA payload stored in the returned
 `http::response`; responses exceeding the limit fail instead of continuing to
 buffer in memory.
+`max_response_headers` and `max_response_header_bytes` bound accepted regular
+response field lines per stream. Informational response fields are discarded
+and reset the live budget when the next response block begins; final response
+headers and trailers share one budget. Exceeding either limit rejects the field,
+resets only that stream with `ENHANCE_YOUR_CALM`, and makes the request fail with
+`errno == EMSGSIZE`.
 `enable_push` only controls the HTTP/2 `SETTINGS_ENABLE_PUSH` value sent to the
 peer. Elio does not currently expose pushed responses through the public client
 API, so applications cannot observe or consume server-pushed streams.

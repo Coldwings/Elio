@@ -486,6 +486,8 @@ coro::task<void> advanced_h2_client() {
     h2_client_config config;
     config.user_agent = "MyApp/1.0";
     config.max_concurrent_streams = 100;
+    config.max_response_headers = 100;
+    config.max_response_header_bytes = 64 * 1024;
 
     h2_client client(config);
     

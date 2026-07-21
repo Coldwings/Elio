@@ -56,6 +56,9 @@ struct h2_stream {
     bool closed = false;
     h2_error error = h2_error::none;
     bool response_size_exceeded = false;
+    size_t response_header_count = 0;
+    size_t response_header_bytes = 0;
+    bool response_headers_exceeded = false;
     
     bool is_complete() const noexcept {
         return headers_complete && body_complete;
@@ -78,6 +81,45 @@ struct h2_stream {
         }
 
         response_body.append(data);
+        return true;
+    }
+
+    void reset_response_headers() {
+        response_headers.clear();
+        response_header_count = 0;
+        response_header_bytes = 0;
+    }
+
+    bool append_response_header(std::string_view name,
+                                std::string_view value,
+                                size_t max_response_headers,
+                                size_t max_response_header_bytes) {
+        if (error != h2_error::none) {
+            return false;
+        }
+
+        const bool count_exceeded =
+            response_header_count >= max_response_headers;
+        const bool field_bytes_exceeded =
+            name.size() > max_response_header_bytes ||
+            value.size() > max_response_header_bytes - name.size();
+        const size_t field_bytes = field_bytes_exceeded
+            ? 0
+            : name.size() + value.size();
+        const bool aggregate_bytes_exceeded =
+            field_bytes_exceeded ||
+            response_header_bytes >
+                max_response_header_bytes - field_bytes;
+
+        if (count_exceeded || aggregate_bytes_exceeded) {
+            response_headers_exceeded = true;
+            error = h2_error::enhance_your_calm;
+            return false;
+        }
+
+        response_headers.add(name, value);
+        ++response_header_count;
+        response_header_bytes += field_bytes;
         return true;
     }
 };
@@ -131,7 +173,10 @@ inline void begin_h2_response_header_block(h2_stream& stream,
         h2_header_block_requires_status(stream, category);
 
     if (stream.current_header_status_required) {
-        stream.response_headers.clear();
+        // A new informational/final response block replaces any retained
+        // informational headers. Final response headers and later trailers,
+        // by contrast, share one live per-stream budget.
+        stream.reset_response_headers();
     }
 }
 
@@ -177,6 +222,27 @@ inline response materialize_h2_response(h2_stream& stream) {
     return resp;
 }
 
+inline int h2_stream_errno(const h2_stream& stream) noexcept {
+    if (stream.response_size_exceeded ||
+        stream.response_headers_exceeded) {
+        return EMSGSIZE;
+    }
+    if (stream.error == h2_error::protocol_error) {
+        return EPROTO;
+    }
+    return 0;
+}
+
+inline int reject_excess_h2_response_headers(nghttp2_session* session,
+                                              int32_t stream_id) noexcept {
+    if (session &&
+        nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE, stream_id,
+                                  NGHTTP2_ENHANCE_YOUR_CALM) != 0) {
+        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    }
+    return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+}
+
 } // namespace detail
 
 /// Configuration used when creating an HTTP/2 session.
@@ -186,6 +252,8 @@ struct h2_session_config {
     size_t max_response_size = 16 * 1024 * 1024;
     std::string user_agent = "elio-http2/1.0";
     bool enable_push = false;  ///< Advertise SETTINGS_ENABLE_PUSH; pushed responses are not exposed
+    size_t max_response_headers = 100;
+    size_t max_response_header_bytes = 64 * 1024;
 };
 
 namespace detail {
@@ -441,10 +509,10 @@ public:
                 it = streams_.find(stream_id);
                 if (it != streams_.end() &&
                     it->second.error != h2_error::none) {
-                    if (it->second.response_size_exceeded) {
-                        errno = EMSGSIZE;
-                    } else if (it->second.error == h2_error::protocol_error) {
-                        errno = EPROTO;
+                    if (const int stream_errno =
+                            detail::h2_stream_errno(it->second);
+                        stream_errno != 0) {
+                        errno = stream_errno;
                     }
                     streams_.erase(it);
                 }
@@ -459,10 +527,9 @@ public:
         auto& stream = it->second;
         
         if (stream.error != h2_error::none) {
-            if (stream.response_size_exceeded) {
-                errno = EMSGSIZE;
-            } else if (stream.error == h2_error::protocol_error) {
-                errno = EPROTO;
+            if (const int stream_errno = detail::h2_stream_errno(stream);
+                stream_errno != 0) {
+                errno = stream_errno;
             }
             streams_.erase(it);
             co_return std::nullopt;
@@ -639,7 +706,8 @@ private:
         return 0;
     }
     
-    static int on_header_callback(nghttp2_session*, const nghttp2_frame* frame,
+    static int on_header_callback(nghttp2_session* session,
+                                   const nghttp2_frame* frame,
                                    const uint8_t* name, size_t namelen,
                                    const uint8_t* value, size_t valuelen,
                                    uint8_t, void* user_data) noexcept {
@@ -666,7 +734,25 @@ private:
                     // offending stream (RST_STREAM) instead of silently
                     // dropping the header.
                     try {
-                        stream->response_headers.add(name_sv, value_sv);
+                        if (!stream->append_response_header(
+                                name_sv, value_sv,
+                                self->config_.max_response_headers,
+                                self->config_.max_response_header_bytes)) {
+                            if (!stream->response_headers_exceeded) {
+                                return NGHTTP2_ERR_CALLBACK_FAILURE;
+                            }
+
+                            ELIO_LOG_ERROR(
+                                "HTTP/2 response headers on stream {} exceed "
+                                "the per-stream limit (max fields {}, max "
+                                "bytes {}; rejected field {} + {} bytes)",
+                                frame->hd.stream_id,
+                                self->config_.max_response_headers,
+                                self->config_.max_response_header_bytes,
+                                namelen, valuelen);
+                            return detail::reject_excess_h2_response_headers(
+                                session, frame->hd.stream_id);
+                        }
                     } catch (...) {
                         return NGHTTP2_ERR_CALLBACK_FAILURE;
                     }

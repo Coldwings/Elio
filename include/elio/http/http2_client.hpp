@@ -35,7 +35,26 @@ struct h2_client_config {
     bool enable_push = false;                     ///< Advertise SETTINGS_ENABLE_PUSH; pushed responses are not exposed
     net::resolve_options resolve_options = net::default_cached_resolve_options();  ///< DNS resolve/cache behavior
     bool rotate_resolved_addresses = true;        ///< Rotate start index across resolved addresses
+    size_t max_response_headers = 100;             ///< Max accepted response field lines per stream
+    size_t max_response_header_bytes = 64 * 1024; ///< Max accepted response name/value bytes per stream
 };
+
+namespace detail {
+
+inline h2_session_config make_h2_session_config(
+    const h2_client_config& config) {
+    return h2_session_config{
+        .max_concurrent_streams = config.max_concurrent_streams,
+        .initial_window_size = config.initial_window_size,
+        .max_response_size = config.max_response_size,
+        .user_agent = config.user_agent,
+        .enable_push = config.enable_push,
+        .max_response_headers = config.max_response_headers,
+        .max_response_header_bytes = config.max_response_header_bytes,
+    };
+}
+
+} // namespace detail
 
 /// HTTP/2 connection wrapper
 class h2_connection {
@@ -203,17 +222,6 @@ public:
     const h2_client_config& config() const noexcept { return config_; }
     
 private:
-    static h2_session_config make_session_config(
-        const h2_client_config& config) {
-        return h2_session_config{
-            .max_concurrent_streams = config.max_concurrent_streams,
-            .initial_window_size = config.initial_window_size,
-            .max_response_size = config.max_response_size,
-            .user_agent = config.user_agent,
-            .enable_push = config.enable_push,
-        };
-    }
-
     static coro::join_handle<void>
     arm_tls_io_watchdog(runtime::scheduler* sched,
                         tls::tls_stream* stream,
@@ -351,7 +359,8 @@ private:
 
         ELIO_LOG_DEBUG("HTTP/2 connection established to {}:{}", host, port);
 
-        h2_connection conn(std::move(*stream), make_session_config(config_));
+        h2_connection conn(std::move(*stream),
+                           detail::make_h2_session_config(config_));
         if (!co_await process_with_timeout(conn, host, port)) {
             ELIO_LOG_ERROR("HTTP/2 session initialization failed");
             co_return std::nullopt;

@@ -316,6 +316,163 @@ TEST_CASE("HTTP/2 stream response body enforces max size",
     REQUIRE(stream.closed);
 }
 
+TEST_CASE("HTTP/2 response headers enforce per-stream limits",
+          "[http2][security][headers]") {
+    SECTION("exact count and byte boundaries accept duplicate field lines") {
+        h2_stream stream;
+
+        REQUIRE(stream.append_response_header("a", "1", 2, 4));
+        REQUIRE(stream.append_response_header("a", "2", 2, 4));
+        REQUIRE(stream.response_header_count == 2);
+        REQUIRE(stream.response_header_bytes == 4);
+        REQUIRE(stream.response_headers.get_all("a").size() == 2);
+        REQUIRE_FALSE(stream.response_headers_exceeded);
+
+        REQUIRE_FALSE(stream.append_response_header("b", "", 2, 4));
+        REQUIRE(stream.response_headers_exceeded);
+        REQUIRE(stream.error == h2_error::enhance_your_calm);
+        REQUIRE(detail::h2_stream_errno(stream) == EMSGSIZE);
+        REQUIRE_FALSE(stream.response_headers.contains("b"));
+        REQUIRE(stream.response_header_count == 2);
+        REQUIRE(stream.response_header_bytes == 4);
+    }
+
+    SECTION("one field over the count limit is rejected independently") {
+        h2_stream stream;
+
+        REQUIRE(stream.append_response_header("a", "1", 1, 100));
+        REQUIRE_FALSE(stream.append_response_header("b", "2", 1, 100));
+        REQUIRE(stream.response_header_count == 1);
+        REQUIRE(stream.response_header_bytes == 2);
+        REQUIRE_FALSE(stream.response_headers.contains("b"));
+        REQUIRE(stream.response_headers_exceeded);
+        REQUIRE(detail::h2_stream_errno(stream) == EMSGSIZE);
+    }
+
+    SECTION("one byte over the aggregate limit is rejected before copying") {
+        h2_stream stream;
+
+        REQUIRE(stream.append_response_header("abc", "de", 10, 5));
+        REQUIRE(stream.response_header_bytes == 5);
+        REQUIRE_FALSE(stream.append_response_header("f", "", 10, 5));
+        REQUIRE(stream.response_header_bytes == 5);
+        REQUIRE_FALSE(stream.response_headers.contains("f"));
+        REQUIRE(stream.response_headers_exceeded);
+    }
+
+    SECTION("one oversized field is rejected without size overflow") {
+        h2_stream stream;
+
+        REQUIRE_FALSE(stream.append_response_header("abc", "def", 10, 5));
+        REQUIRE(stream.response_header_count == 0);
+        REQUIRE(stream.response_header_bytes == 0);
+        REQUIRE(stream.response_headers.empty());
+        REQUIRE(stream.response_headers_exceeded);
+    }
+}
+
+TEST_CASE("HTTP/2 header-limit reset remains stream-local",
+          "[http2][security][headers]") {
+    nghttp2_session_callbacks* callbacks = nullptr;
+    REQUIRE(nghttp2_session_callbacks_new(&callbacks) == 0);
+    nghttp2_session* client = nullptr;
+    REQUIRE(nghttp2_session_client_new(&client, callbacks, nullptr) == 0);
+    nghttp2_session_callbacks_del(callbacks);
+
+    using session_ptr =
+        std::unique_ptr<nghttp2_session, decltype(&nghttp2_session_del)>;
+    session_ptr client_owner(client, nghttp2_session_del);
+    const auto discard_available_client_output = [&] {
+        while (true) {
+            const uint8_t* data = nullptr;
+            const ssize_t len = nghttp2_session_mem_send(client, &data);
+            if (len < 0) {
+                return false;
+            }
+            if (len == 0) {
+                return true;
+            }
+        }
+    };
+
+    nghttp2_settings_entry settings[] = {
+        {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100}};
+    REQUIRE(nghttp2_submit_settings(client, NGHTTP2_FLAG_NONE, settings, 1) ==
+            0);
+
+    const auto nv = [](std::string_view name, std::string_view value) {
+        return nghttp2_nv{
+            reinterpret_cast<uint8_t*>(const_cast<char*>(name.data())),
+            reinterpret_cast<uint8_t*>(const_cast<char*>(value.data())),
+            name.size(), value.size(), NGHTTP2_NV_FLAG_NONE};
+    };
+    std::array<nghttp2_nv, 4> request_headers{
+        nv(":method", "GET"), nv(":scheme", "https"),
+        nv(":authority", "example.test"), nv(":path", "/")};
+    const int32_t limited_stream = nghttp2_submit_request(
+        client, nullptr, request_headers.data(), request_headers.size(),
+        nullptr, nullptr);
+    const int32_t sibling_stream = nghttp2_submit_request(
+        client, nullptr, request_headers.data(), request_headers.size(),
+        nullptr, nullptr);
+    REQUIRE(limited_stream > 0);
+    REQUIRE(sibling_stream > limited_stream);
+    REQUIRE(discard_available_client_output());
+
+    REQUIRE(detail::reject_excess_h2_response_headers(client,
+                                                       limited_stream) ==
+            NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE);
+    const uint8_t* reset_data = nullptr;
+    const ssize_t reset_len = nghttp2_session_mem_send(client, &reset_data);
+    REQUIRE(reset_len == 13);
+    REQUIRE(reset_data[3] == NGHTTP2_RST_STREAM);
+    const uint32_t reset_stream =
+        (static_cast<uint32_t>(reset_data[5] & 0x7f) << 24) |
+        (static_cast<uint32_t>(reset_data[6]) << 16) |
+        (static_cast<uint32_t>(reset_data[7]) << 8) |
+        static_cast<uint32_t>(reset_data[8]);
+    const uint32_t reset_error =
+        (static_cast<uint32_t>(reset_data[9]) << 24) |
+        (static_cast<uint32_t>(reset_data[10]) << 16) |
+        (static_cast<uint32_t>(reset_data[11]) << 8) |
+        static_cast<uint32_t>(reset_data[12]);
+    REQUIRE(reset_stream == static_cast<uint32_t>(limited_stream));
+    REQUIRE(reset_error == NGHTTP2_ENHANCE_YOUR_CALM);
+
+    const int32_t followup_stream = nghttp2_submit_request(
+        client, nullptr, request_headers.data(), request_headers.size(),
+        nullptr, nullptr);
+    REQUIRE(followup_stream > sibling_stream);
+    REQUIRE(nghttp2_session_want_read(client));
+}
+
+TEST_CASE("HTTP/2 response header accounting resets informational blocks only",
+          "[http2][security][headers]") {
+    h2_stream stream;
+
+    detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_RESPONSE);
+    REQUIRE(detail::record_h2_response_status(stream, "103"));
+    REQUIRE(stream.append_response_header("link", "a", 1, 16));
+    REQUIRE(detail::finish_h2_response_header_block(stream));
+    REQUIRE(stream.response_header_count == 1);
+
+    detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_HEADERS);
+    REQUIRE(stream.response_headers.empty());
+    REQUIRE(stream.response_header_count == 0);
+    REQUIRE(stream.response_header_bytes == 0);
+    REQUIRE(detail::record_h2_response_status(stream, "200"));
+    REQUIRE(stream.append_response_header("etag", "b", 1, 16));
+    REQUIRE(detail::finish_h2_response_header_block(stream));
+
+    detail::begin_h2_response_header_block(stream, NGHTTP2_HCAT_HEADERS);
+    REQUIRE_FALSE(stream.current_header_status_required);
+    REQUIRE_FALSE(stream.append_response_header("trailer", "c", 1, 16));
+    REQUIRE(stream.response_headers.contains("etag"));
+    REQUIRE_FALSE(stream.response_headers.contains("trailer"));
+    REQUIRE(stream.response_headers_exceeded);
+    REQUIRE(stream.error == h2_error::enhance_your_calm);
+}
+
 TEST_CASE("HTTP/2 response materialization preserves peer headers",
           "[http2][message]") {
     SECTION("Peer Content-Length is not rewritten") {
@@ -366,11 +523,30 @@ TEST_CASE("HTTP/2 response materialization preserves peer headers",
 }
 
 TEST_CASE("HTTP/2 client configuration", "[http2][config]") {
+    SECTION("new limits preserve legacy positional aggregate initialization") {
+        h2_session_config session_cfg{
+            7, 32768, 4096, "legacy-session-agent", true};
+        REQUIRE(session_cfg.user_agent == "legacy-session-agent");
+        REQUIRE(session_cfg.enable_push);
+        REQUIRE(session_cfg.max_response_headers == 100);
+        REQUIRE(session_cfg.max_response_header_bytes == 64 * 1024);
+
+        h2_client_config client_cfg{
+            std::chrono::seconds{1}, std::chrono::seconds{2},
+            7, 32768, 4096, "legacy-client-agent", true};
+        REQUIRE(client_cfg.user_agent == "legacy-client-agent");
+        REQUIRE(client_cfg.enable_push);
+        REQUIRE(client_cfg.max_response_headers == 100);
+        REQUIRE(client_cfg.max_response_header_bytes == 64 * 1024);
+    }
+
     SECTION("session config defaults match documented client defaults") {
         h2_session_config cfg;
         REQUIRE(cfg.max_concurrent_streams == 100);
         REQUIRE(cfg.initial_window_size == NGHTTP2_INITIAL_WINDOW_SIZE);
         REQUIRE(cfg.max_response_size == 16 * 1024 * 1024);
+        REQUIRE(cfg.max_response_headers == 100);
+        REQUIRE(cfg.max_response_header_bytes == 64 * 1024);
         REQUIRE(cfg.user_agent == "elio-http2/1.0");
         REQUIRE_FALSE(cfg.enable_push);
     }
@@ -380,6 +556,8 @@ TEST_CASE("HTTP/2 client configuration", "[http2][config]") {
         cfg.max_concurrent_streams = 7;
         cfg.initial_window_size = 32768;
         cfg.max_response_size = 4096;
+        cfg.max_response_headers = 17;
+        cfg.max_response_header_bytes = 8192;
         cfg.user_agent = "elio-test-agent/1.0";
         cfg.enable_push = true;
 
@@ -388,8 +566,21 @@ TEST_CASE("HTTP/2 client configuration", "[http2][config]") {
         REQUIRE(client.config().max_concurrent_streams == 7);
         REQUIRE(client.config().initial_window_size == 32768);
         REQUIRE(client.config().max_response_size == 4096);
+        REQUIRE(client.config().max_response_headers == 17);
+        REQUIRE(client.config().max_response_header_bytes == 8192);
         REQUIRE(client.config().user_agent == "elio-test-agent/1.0");
         REQUIRE(client.config().enable_push);
+    }
+
+    SECTION("client response-header limits propagate to the session") {
+        h2_client_config client_cfg;
+        client_cfg.max_response_headers = 9;
+        client_cfg.max_response_header_bytes = 1234;
+
+        auto session_cfg = detail::make_h2_session_config(client_cfg);
+
+        REQUIRE(session_cfg.max_response_headers == 9);
+        REQUIRE(session_cfg.max_response_header_bytes == 1234);
     }
 }
 

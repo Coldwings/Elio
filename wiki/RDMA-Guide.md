@@ -374,8 +374,11 @@ auto ep = co_await elio::rdma_ibverbs::connect(
         .max_send_wr = 8, .max_recv_wr = 8});
 ep.start_cq_pump(sched);
 
-auto mr = ep.register_buffer(buf, len, IBV_ACCESS_LOCAL_WRITE);
-auto wc = co_await ep.conn().send(mr.view());
+{
+    auto mr = ep.register_buffer(buf, len, IBV_ACCESS_LOCAL_WRITE);
+    auto wc = co_await ep.conn().send(mr.view());
+} // The completed awaiter and MR are gone before shutdown.
+co_await ep.shutdown();
 ```
 
 `endpoint` bundles:
@@ -387,6 +390,10 @@ auto wc = co_await ep.conn().send(mr.view());
 * `register_buffer(...)` returning `memory_region<ibverbs_backend>`
   bound to the endpoint's PD.
 
+The direct `endpoint(rdma_cm::cm_id, ...)` constructor takes ownership of a
+resolved CM ID and requires that it does not already have an attached QP; the
+wrapper creates and owns that QP itself.
+
 Server side uses `acceptor`:
 
 ```cpp
@@ -394,6 +401,7 @@ elio::rdma_ibverbs::acceptor ac{cm_ch, bind_addr, len};
 auto ep = co_await ac.accept();    // accepts ONE connection
 ep.start_cq_pump(sched);
 // ... data path identical to client
+co_await ep.shutdown();
 ```
 
 For full control over QP attributes, set
@@ -401,12 +409,43 @@ For full control over QP attributes, set
 the wrapper hands it to `rdma_create_qp` unchanged (it will still
 fill `send_cq` / `recv_cq` if you left them null).
 
-**Shutdown contract**: the destructor cancels the cq_pump, destroys
-the QP first (its flush CQEs wake the pump), waits up to 1s for
-the pump to observe the cancel, then tears down CQ / comp_channel /
-PD. If the pump doesn't exit in time (custom drain that blocks
-indefinitely) the verbs resources are intentionally leaked rather
-than risk a use-after-free.
+**Shutdown contract**: while the endpoint is still alive, explicitly await
+`ep.shutdown()`. It requests CQ-pump cancellation, joins the pump asynchronously,
+and then releases the QP, CQ, completion channel, and PD:
+
+```cpp
+// Let every memory_region registered from ep leave scope first.
+co_await ep.shutdown();
+```
+
+The endpoint destructor does not wait for the CQ pump, so it does not block a
+scheduler worker on pump completion. It requests cancellation and attempts
+checked QP destruction. If QP destruction fails, it relinquishes the whole
+dependency graph, including the CM ID; if destruction races an active pump
+after the QP is gone, it intentionally leaks the remaining verbs resources and
+dispatcher rather than wait or risk a use-after-free.
+Before `shutdown()`, ensure every posted operation and its awaiter has completed
+and destroy all memory regions registered from the endpoint PD. Serialize the
+call with endpoint use, and keep both the endpoint and the scheduler supplied to
+`start_cq_pump()` operational until it completes. `scheduler::shutdown_force()`
+can orphan in-flight I/O and is not a substitute for endpoint shutdown. Once
+`shutdown()` starts executing, the endpoint is terminal: do not restart its pump
+or use its connection/data-path accessors. A provider failure while destroying
+the QP, CQ, completion channel, or PD is reported; the failed resource and its
+dependencies remain owned so a later serialized `shutdown()` can retry.
+
+If a fatal error leaves provider-owned operations that were launched eagerly
+with `.start()` and never awaited, call `ep.abandon_outstanding()` while those
+eager awaitables, memory regions, and payload buffers are still alive. A `true`
+result confirms checked QP destruction, requests pump stop, and intentionally
+relinquishes the CQ, completion channel, PD, and dispatcher; only then can the
+eager objects unwind under the posted/orphaned lifecycle. A `false` result
+retains the QP and dependencies: keep every affected lifetime intact, repair
+provider state through the raw accessors, and retry or terminate. This
+fail-closed path does not wait, leaks resources after success, and makes the
+endpoint terminal. It does not make a suspended operation frame safe to
+destroy: if delivery may have snapshotted its waiter, resume it and consume the
+result. The method is not a substitute for normal `shutdown()`.
 
 Worked example: `examples/rdma_req_resp_ibverbs.cpp` runs a
 client / server in one process — client SEND request → server

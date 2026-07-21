@@ -192,38 +192,42 @@ coro::task<int> async_main(int argc, char* argv[]) {
         ep.start_cq_pump(*sched);
         std::printf("Client connected.\n");
 
-        // Allocate GPU buffer and register
-        elio::rdma_cuda::gpu_memory_region gpu_mr{
-            ep.pd(), cfg.size,
-            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-            IBV_ACCESS_REMOTE_READ};
+        int result = 0;
+        {
+            // This scope owns every MR; it ends before endpoint shutdown.
+            elio::rdma_cuda::gpu_memory_region gpu_mr{
+                ep.pd(), cfg.size,
+                IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                IBV_ACCESS_REMOTE_READ};
 
-        // Exchange remote info via SEND/RECV
-        auto remote = gpu_mr.remote();
-        xchg_msg msg_out{remote.addr, remote.length, remote.rkey};
+            auto remote = gpu_mr.remote();
+            xchg_msg msg_out{remote.addr, remote.length, remote.rkey};
 
-        auto send_mr = ep.register_buffer(&msg_out, sizeof(msg_out),
-            IBV_ACCESS_LOCAL_WRITE);
-        auto send_wc = co_await ep.conn().send(send_mr.view());
-        if (!send_wc.ok()) {
-            std::fprintf(stderr, "server send failed status=%d\n",
-                         static_cast<int>(send_wc.status));
-            co_return 1;
+            auto send_mr = ep.register_buffer(&msg_out, sizeof(msg_out),
+                IBV_ACCESS_LOCAL_WRITE);
+            auto send_wc = co_await ep.conn().send(send_mr.view());
+            if (!send_wc.ok()) {
+                std::fprintf(stderr, "server send failed status=%d\n",
+                             static_cast<int>(send_wc.status));
+                result = 1;
+            } else {
+                xchg_msg msg_in{};
+                auto recv_mr = ep.register_buffer(&msg_in, sizeof(msg_in),
+                    IBV_ACCESS_LOCAL_WRITE);
+                auto recv_wc = co_await ep.conn().recv(recv_mr.view());
+                if (!recv_wc.ok()) {
+                    std::fprintf(stderr, "server recv failed status=%d\n",
+                                 static_cast<int>(recv_wc.status));
+                    result = 1;
+                }
+            }
         }
 
-        // Wait for client "done" signal
-        xchg_msg msg_in{};
-        auto recv_mr = ep.register_buffer(&msg_in, sizeof(msg_in),
-            IBV_ACCESS_LOCAL_WRITE);
-        auto recv_wc = co_await ep.conn().recv(recv_mr.view());
-        if (!recv_wc.ok()) {
-            std::fprintf(stderr, "server recv failed status=%d\n",
-                         static_cast<int>(recv_wc.status));
-            co_return 1;
+        co_await ep.shutdown();
+        if (result == 0) {
+            std::printf("Benchmark complete.\n");
         }
-
-        std::printf("Benchmark complete.\n");
-        co_return 0;
+        co_return result;
     }
 
     // Client
@@ -235,54 +239,60 @@ coro::task<int> async_main(int argc, char* argv[]) {
         cm_ch, reinterpret_cast<sockaddr*>(&addr), sizeof(addr), ep_cfg);
     ep.start_cq_pump(*sched);
 
-    // Receive server's remote buffer info
-    xchg_msg srv_info{};
-    auto recv_mr = ep.register_buffer(&srv_info, sizeof(srv_info),
-        IBV_ACCESS_LOCAL_WRITE);
-    auto recv_wc = co_await ep.conn().recv(recv_mr.view());
-    if (!recv_wc.ok()) {
-        std::fprintf(stderr, "client recv failed status=%d\n",
-                     static_cast<int>(recv_wc.status));
-        co_return 1;
-    }
-
-    rdma::remote_buffer server_buf{srv_info.addr, srv_info.length, srv_info.rkey};
-    std::printf("Connected. Server buffer: %zu bytes\n", cfg.size);
-    std::printf("Running RDMA WRITE bandwidth test (%d iters, %zu B):\n\n",
+    int result = 0;
+    {
+        // Receive server's remote buffer info. All MRs in this scope are
+        // released before endpoint shutdown below.
+        xchg_msg srv_info{};
+        auto recv_mr = ep.register_buffer(&srv_info, sizeof(srv_info),
+            IBV_ACCESS_LOCAL_WRITE);
+        auto recv_wc = co_await ep.conn().recv(recv_mr.view());
+        if (!recv_wc.ok()) {
+            std::fprintf(stderr, "client recv failed status=%d\n",
+                         static_cast<int>(recv_wc.status));
+            result = 1;
+        } else {
+            rdma::remote_buffer server_buf{
+                srv_info.addr, srv_info.length, srv_info.rkey};
+            std::printf("Connected. Server buffer: %zu bytes\n", cfg.size);
+            std::printf(
+                "Running RDMA WRITE bandwidth test (%d iters, %zu B):\n\n",
                 cfg.iters, cfg.size);
 
-    // GPU path
-    if (cfg.buf_mode == "gpu" || cfg.buf_mode == "both") {
-        elio::rdma_cuda::gpu_memory_region gpu_mr{
-            ep.pd(), cfg.size, IBV_ACCESS_LOCAL_WRITE};
-        auto r = co_await run_write_bw(ep, gpu_mr.view(), server_buf,
-                                       DEFAULT_WARMUP, cfg.iters);
-        print_result("GPU", r);
+            if (cfg.buf_mode == "gpu" || cfg.buf_mode == "both") {
+                elio::rdma_cuda::gpu_memory_region gpu_mr{
+                    ep.pd(), cfg.size, IBV_ACCESS_LOCAL_WRITE};
+                auto r = co_await run_write_bw(
+                    ep, gpu_mr.view(), server_buf, DEFAULT_WARMUP, cfg.iters);
+                print_result("GPU", r);
+            }
+
+            if (cfg.buf_mode == "cpu" || cfg.buf_mode == "both") {
+                std::vector<char> cpu_buf(cfg.size, 'A');
+                auto cpu_mr = ep.register_buffer(
+                    cpu_buf.data(), cfg.size, IBV_ACCESS_LOCAL_WRITE);
+                auto r = co_await run_write_bw(
+                    ep, cpu_mr.view(), server_buf, DEFAULT_WARMUP, cfg.iters);
+                print_result("CPU", r);
+            }
+
+            xchg_msg done_msg{};
+            auto done_mr = ep.register_buffer(
+                &done_msg, sizeof(done_msg), IBV_ACCESS_LOCAL_WRITE);
+            auto done_wc = co_await ep.conn().send(done_mr.view());
+            if (!done_wc.ok()) {
+                std::fprintf(stderr, "client done send failed status=%d\n",
+                             static_cast<int>(done_wc.status));
+                result = 1;
+            }
+        }
     }
 
-    // CPU path
-    if (cfg.buf_mode == "cpu" || cfg.buf_mode == "both") {
-        std::vector<char> cpu_buf(cfg.size, 'A');
-        auto cpu_mr = ep.register_buffer(cpu_buf.data(), cfg.size,
-            IBV_ACCESS_LOCAL_WRITE);
-        auto r = co_await run_write_bw(ep, cpu_mr.view(), server_buf,
-                                       DEFAULT_WARMUP, cfg.iters);
-        print_result("CPU", r);
+    co_await ep.shutdown();
+    if (result == 0) {
+        std::printf("\nDone.\n");
     }
-
-    // Signal server we're done
-    xchg_msg done_msg{};
-    auto done_mr = ep.register_buffer(&done_msg, sizeof(done_msg),
-        IBV_ACCESS_LOCAL_WRITE);
-    auto done_wc = co_await ep.conn().send(done_mr.view());
-    if (!done_wc.ok()) {
-        std::fprintf(stderr, "client done send failed status=%d\n",
-                     static_cast<int>(done_wc.status));
-        co_return 1;
-    }
-
-    std::printf("\nDone.\n");
-    co_return 0;
+    co_return result;
 }
 
 ELIO_ASYNC_MAIN(async_main)

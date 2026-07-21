@@ -16,6 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-stream response field-count and name/value-byte limits across final
   headers and trailers, resetting an offending stream before the field is
   copied (#998).
+- **Non-blocking RDMA endpoint teardown**: `rdma_ibverbs::endpoint` destruction
+  no longer sleeps on scheduler workers, and the new awaitable `shutdown()` joins
+  the CQ pump before releasing verbs resources. Provider teardown failures are
+  reported without discarding ownership, allowing a serialized retry; checked
+  QP destruction no longer loses provider failures through `rdma_destroy_qp()`.
+  Shutdown is terminal for data-path use and requires the pump scheduler to
+  remain live until completion. Fatal undrainable eager operations can call
+  `abandon_outstanding()` while their state and buffers remain alive; only a
+  `true` result confirms QP destruction before the remaining verbs resources
+  are intentionally relinquished.
+  Post-shutdown calls to `conn()`, `cas()`, `fetch_add()`, and `dispatcher_ref()`
+  now throw `std::logic_error` instead of retaining their former `noexcept`
+  specification (#975).
 - **Bounded raw WebSocket parsing by default**: `websocket::frame_parser` now
   applies the same 16 MiB aggregate message limit as the high-level client and
   server configurations. Direct parser users must explicitly set a limit of

@@ -934,15 +934,24 @@ elio::coro::task<void> client(elio::runtime::scheduler& sched) {
         {.max_send_wr = 4, .max_recv_wr = 4});
     ep.start_cq_pump(sched);
 
-    auto req_mr  = ep.register_buffer(req_buf, sizeof(req_buf), IBV_ACCESS_LOCAL_WRITE);
-    auto resp_mr = ep.register_buffer(resp_buf, sizeof(resp_buf),
-                                      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    {
+        auto req_mr = ep.register_buffer(
+            req_buf, sizeof(req_buf), IBV_ACCESS_LOCAL_WRITE);
+        auto resp_mr = ep.register_buffer(
+            resp_buf, sizeof(resp_buf),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        std::uint32_t notify_buf{};
+        auto notify_mr = ep.register_buffer(
+            &notify_buf, sizeof(notify_buf), IBV_ACCESS_LOCAL_WRITE);
 
-    // Post recv for OOB notify BEFORE sending the request.
-    auto notify_aw = ep.conn().recv(notify_mr.view()).start();
-    co_await ep.conn().send(req_mr.view(0, sizeof(request_header)));
-    auto wc = co_await std::move(notify_aw);
-    // wc.imm_data carries the response length
+        // Post recv for OOB notify BEFORE sending the request.
+        auto notify_aw = ep.conn().recv(notify_mr.view()).start();
+        co_await ep.conn().send(req_mr.view(0, sizeof(request_header)));
+        auto wc = co_await std::move(notify_aw);
+        // wc.imm_data carries the response length
+    } // Every endpoint-backed MR and awaiter is gone before shutdown.
+
+    co_await ep.shutdown();
 }
 ```
 

@@ -41,6 +41,7 @@ int main() {
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <string>
 #include <utility>
 #include <vector>
@@ -58,6 +59,14 @@ namespace {
 // ------------------------------------------------------------------
 
 enum class test_mode { send, write, read };
+enum class session_result { success, failed_safe, failed_outstanding };
+
+void abandon_outstanding_or_terminate(
+    elio::rdma_ibverbs::endpoint& ep) noexcept {
+    if (!ep.abandon_outstanding()) {
+        std::terminate();
+    }
+}
 
 struct config {
     bool        is_server = false;
@@ -139,8 +148,8 @@ elio::rdma_ibverbs::endpoint_config make_ep_cfg(const config& cfg) {
 // SEND/RECV benchmark
 // ------------------------------------------------------------------
 
-task<void> send_server(elio::rdma_ibverbs::endpoint& ep,
-                       const config& cfg) {
+task<session_result> send_server(elio::rdma_ibverbs::endpoint& ep,
+                                 const config& cfg) {
     const auto depth = std::max<std::size_t>(cfg.depth, 1);
     std::vector<char> buf(cfg.msg_size * depth);
     auto mr = ep.register_buffer(buf.data(), buf.size(),
@@ -163,16 +172,22 @@ task<void> send_server(elio::rdma_ibverbs::endpoint& ep,
         if (!wc.ok()) {
             std::fprintf(stderr, "server recv error #%zu status=%d\n",
                          completed, static_cast<int>(wc.status));
-            co_return;
+            if (!inflight.empty()) {
+                abandon_outstanding_or_terminate(ep);
+                co_return session_result::failed_outstanding;
+            }
+            co_return session_result::failed_safe;
         }
         ++completed;
     }
     // Send a single ACK so client knows we're done.
-    co_await ep.conn().send(mr.view(0, 1));
+    auto ack = co_await ep.conn().send(mr.view(0, 1));
+    co_return ack.ok() ? session_result::success
+                       : session_result::failed_safe;
 }
 
-task<bool> send_client(elio::rdma_ibverbs::endpoint& ep,
-                       const config& cfg) {
+task<session_result> send_client(elio::rdma_ibverbs::endpoint& ep,
+                                 const config& cfg) {
     std::vector<char> tx_buf(cfg.msg_size, 'A');
     std::vector<char> ack_buf(cfg.msg_size);
     auto tx_mr = ep.register_buffer(tx_buf.data(), tx_buf.size(),
@@ -203,26 +218,30 @@ task<bool> send_client(elio::rdma_ibverbs::endpoint& ep,
             if (!wc.ok()) {
                 std::fprintf(stderr, "client send error status=%d\n",
                              static_cast<int>(wc.status));
-                co_return false;
+                abandon_outstanding_or_terminate(ep);
+                co_return session_result::failed_outstanding;
             }
             ++completed;
         }
     }
 
     // Wait for server ACK.
-    co_await std::move(ack_aw);
+    auto ack = co_await std::move(ack_aw);
+    if (!ack.ok()) {
+        co_return session_result::failed_safe;
+    }
 
     const auto end = std::chrono::steady_clock::now();
     print_results(cfg, end - start, cfg.count * cfg.msg_size);
-    co_return true;
+    co_return session_result::success;
 }
 
 // ------------------------------------------------------------------
 // RDMA WRITE benchmark
 // ------------------------------------------------------------------
 
-task<void> write_server(elio::rdma_ibverbs::endpoint& ep,
-                        const config& cfg) {
+task<session_result> write_server(elio::rdma_ibverbs::endpoint& ep,
+                                  const config& cfg) {
     // Expose a buffer for the client to RDMA WRITE into.
     std::vector<char> buf(cfg.msg_size);
     auto mr = ep.register_buffer(buf.data(), buf.size(),
@@ -238,7 +257,7 @@ task<void> write_server(elio::rdma_ibverbs::endpoint& ep,
     if (!ready.ok()) {
         std::fprintf(stderr, "server: client-ready recv failed status=%d\n",
                      static_cast<int>(ready.status));
-        co_return;
+        co_return session_result::failed_safe;
     }
 
     // Send our MR info to the client.
@@ -251,18 +270,20 @@ task<void> write_server(elio::rdma_ibverbs::endpoint& ep,
     if (!ctrl_wc.ok()) {
         std::fprintf(stderr, "server: failed to send MR info status=%d\n",
                      static_cast<int>(ctrl_wc.status));
-        co_return;
+        co_return session_result::failed_safe;
     }
 
     // Wait for client "done" signal (a single SEND).
     std::vector<char> done_buf(4);
     auto done_mr = ep.register_buffer(done_buf.data(), done_buf.size(),
                                       IBV_ACCESS_LOCAL_WRITE);
-    co_await ep.conn().recv(done_mr.view());
+    auto done = co_await ep.conn().recv(done_mr.view());
+    co_return done.ok() ? session_result::success
+                        : session_result::failed_safe;
 }
 
-task<bool> write_client(elio::rdma_ibverbs::endpoint& ep,
-                        const config& cfg) {
+task<session_result> write_client(elio::rdma_ibverbs::endpoint& ep,
+                                  const config& cfg) {
     // Receive server's MR info.
     mr_info info{};
     std::vector<char> ctrl(sizeof(info));
@@ -276,13 +297,14 @@ task<bool> write_client(elio::rdma_ibverbs::endpoint& ep,
     auto ready_wc = co_await ep.conn().send(ready_mr.view(0, 1));
     if (!ready_wc.ok()) {
         std::fprintf(stderr, "client: failed to send metadata-ready signal\n");
-        co_return false;
+        abandon_outstanding_or_terminate(ep);
+        co_return session_result::failed_outstanding;
     }
 
     auto wc = co_await std::move(ctrl_recv);
     if (!wc.ok()) {
         std::fprintf(stderr, "client: failed to recv MR info\n");
-        co_return false;
+        co_return session_result::failed_safe;
     }
     std::memcpy(&info, ctrl.data(), sizeof(info));
     remote_buffer rb{info.addr, info.length, info.rkey};
@@ -309,7 +331,11 @@ task<bool> write_client(elio::rdma_ibverbs::endpoint& ep,
             if (!r.ok()) {
                 std::fprintf(stderr, "write error status=%d\n",
                              static_cast<int>(r.status));
-                co_return false;
+                if (!inflight.empty()) {
+                    abandon_outstanding_or_terminate(ep);
+                    co_return session_result::failed_outstanding;
+                }
+                co_return session_result::failed_safe;
             }
             ++completed;
         }
@@ -321,18 +347,21 @@ task<bool> write_client(elio::rdma_ibverbs::endpoint& ep,
     std::vector<char> done_buf(4, 'D');
     auto done_mr = ep.register_buffer(done_buf.data(), done_buf.size(),
                                       IBV_ACCESS_LOCAL_WRITE);
-    co_await ep.conn().send(done_mr.view(0, 1));
+    auto done = co_await ep.conn().send(done_mr.view(0, 1));
+    if (!done.ok()) {
+        co_return session_result::failed_safe;
+    }
 
     print_results(cfg, end - start, cfg.count * cfg.msg_size);
-    co_return true;
+    co_return session_result::success;
 }
 
 // ------------------------------------------------------------------
 // RDMA READ benchmark
 // ------------------------------------------------------------------
 
-task<void> read_server(elio::rdma_ibverbs::endpoint& ep,
-                       const config& cfg) {
+task<session_result> read_server(elio::rdma_ibverbs::endpoint& ep,
+                                 const config& cfg) {
     // Expose a source buffer for the client to RDMA READ from.
     std::vector<char> buf(cfg.msg_size, 'R');
     auto mr = ep.register_buffer(buf.data(), buf.size(),
@@ -348,7 +377,7 @@ task<void> read_server(elio::rdma_ibverbs::endpoint& ep,
     if (!ready.ok()) {
         std::fprintf(stderr, "server: client-ready recv failed status=%d\n",
                      static_cast<int>(ready.status));
-        co_return;
+        co_return session_result::failed_safe;
     }
 
     mr_info info{remote.addr, remote.length, remote.rkey};
@@ -360,18 +389,20 @@ task<void> read_server(elio::rdma_ibverbs::endpoint& ep,
     if (!ctrl_wc.ok()) {
         std::fprintf(stderr, "server: failed to send MR info status=%d\n",
                      static_cast<int>(ctrl_wc.status));
-        co_return;
+        co_return session_result::failed_safe;
     }
 
     // Wait for client "done" signal.
     std::vector<char> done_buf(4);
     auto done_mr = ep.register_buffer(done_buf.data(), done_buf.size(),
                                       IBV_ACCESS_LOCAL_WRITE);
-    co_await ep.conn().recv(done_mr.view());
+    auto done = co_await ep.conn().recv(done_mr.view());
+    co_return done.ok() ? session_result::success
+                        : session_result::failed_safe;
 }
 
-task<bool> read_client(elio::rdma_ibverbs::endpoint& ep,
-                       const config& cfg) {
+task<session_result> read_client(elio::rdma_ibverbs::endpoint& ep,
+                                 const config& cfg) {
     // Receive server's MR info.
     mr_info info{};
     std::vector<char> ctrl(sizeof(info));
@@ -385,13 +416,14 @@ task<bool> read_client(elio::rdma_ibverbs::endpoint& ep,
     auto ready_wc = co_await ep.conn().send(ready_mr.view(0, 1));
     if (!ready_wc.ok()) {
         std::fprintf(stderr, "client: failed to send metadata-ready signal\n");
-        co_return false;
+        abandon_outstanding_or_terminate(ep);
+        co_return session_result::failed_outstanding;
     }
 
     auto wc = co_await std::move(ctrl_recv);
     if (!wc.ok()) {
         std::fprintf(stderr, "client: failed to recv MR info\n");
-        co_return false;
+        co_return session_result::failed_safe;
     }
     std::memcpy(&info, ctrl.data(), sizeof(info));
     remote_buffer rb{info.addr, info.length, info.rkey};
@@ -422,7 +454,11 @@ task<bool> read_client(elio::rdma_ibverbs::endpoint& ep,
             if (!r.ok()) {
                 std::fprintf(stderr, "read error status=%d\n",
                              static_cast<int>(r.status));
-                co_return false;
+                if (!inflight.empty()) {
+                    abandon_outstanding_or_terminate(ep);
+                    co_return session_result::failed_outstanding;
+                }
+                co_return session_result::failed_safe;
             }
             ++completed;
         }
@@ -433,10 +469,13 @@ task<bool> read_client(elio::rdma_ibverbs::endpoint& ep,
     std::vector<char> done_buf(4, 'D');
     auto done_mr = ep.register_buffer(done_buf.data(), done_buf.size(),
                                       IBV_ACCESS_LOCAL_WRITE);
-    co_await ep.conn().send(done_mr.view(0, 1));
+    auto done = co_await ep.conn().send(done_mr.view(0, 1));
+    if (!done.ok()) {
+        co_return session_result::failed_safe;
+    }
 
     print_results(cfg, end - start, cfg.count * cfg.msg_size);
-    co_return true;
+    co_return session_result::success;
 }
 
 // ------------------------------------------------------------------
@@ -460,16 +499,26 @@ task<void> run_server(elio::runtime::scheduler& sched,
 
         // Pre-post a recv for SEND-based modes (server needs recv WRs
         // ready before client sends).
+        auto result = session_result::failed_safe;
         switch (cfg.mode) {
             case test_mode::send:
-                co_await send_server(ep, cfg);
+                result = co_await send_server(ep, cfg);
                 break;
             case test_mode::write:
-                co_await write_server(ep, cfg);
+                result = co_await write_server(ep, cfg);
                 break;
             case test_mode::read:
-                co_await read_server(ep, cfg);
+                result = co_await read_server(ep, cfg);
                 break;
+        }
+        // Graceful paths have released every helper-owned MR/awaiter before
+        // shutdown. An outstanding failure already called abandon_outstanding()
+        // from inside that helper while those objects were still alive.
+        if (result != session_result::failed_outstanding) {
+            co_await ep.shutdown();
+        }
+        if (result != session_result::success) {
+            std::fprintf(stderr, "session failed\n");
         }
         std::printf("session complete, waiting for next client...\n");
     }
@@ -491,20 +540,27 @@ task<int> run_client(elio::runtime::scheduler& sched,
                 cfg.host.c_str(), cfg.port, mode_str,
                 cfg.msg_size, cfg.count, cfg.depth);
 
-    bool ok = false;
+    auto result = session_result::failed_safe;
     switch (cfg.mode) {
         case test_mode::send:
-            ok = co_await send_client(ep, cfg);
+            result = co_await send_client(ep, cfg);
             break;
         case test_mode::write:
-            ok = co_await write_client(ep, cfg);
+            result = co_await write_client(ep, cfg);
             break;
         case test_mode::read:
-            ok = co_await read_client(ep, cfg);
+            result = co_await read_client(ep, cfg);
             break;
     }
 
-    co_return ok ? 0 : 1;
+    // A failed pipelined session can still own provider work through a
+    // pre-posted receive or remaining WRs. Its helper has already destroyed the
+    // QP fail-closed while the associated MRs and buffers were still alive;
+    // completed error paths are safe to shut down gracefully.
+    if (result != session_result::failed_outstanding) {
+        co_await ep.shutdown();
+    }
+    co_return result == session_result::success ? 0 : 1;
 }
 
 void usage(const char* prog) {

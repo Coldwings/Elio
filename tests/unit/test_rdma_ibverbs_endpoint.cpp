@@ -20,7 +20,22 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <type_traits>
+#include <utility>
+
 using elio::rdma_ibverbs::endpoint_config;
+
+static_assert(std::is_nothrow_destructible_v<elio::rdma_ibverbs::endpoint>);
+static_assert(std::is_same_v<
+              decltype(std::declval<elio::rdma_ibverbs::endpoint&>().shutdown()),
+              elio::coro::task<void>>);
+static_assert(noexcept(
+    std::declval<elio::rdma_ibverbs::endpoint&>().abandon_outstanding()));
+static_assert(std::is_same_v<
+              decltype(std::declval<elio::rdma_ibverbs::endpoint&>()
+                           .abandon_outstanding()),
+              bool>);
 
 TEST_CASE("endpoint comp channel fds are made non-blocking",
           "[rdma][ibverbs][endpoint]") {
@@ -58,6 +73,103 @@ TEST_CASE("endpoint_config defaults match the documented values",
     REQUIRE(cfg.cq_size == 64u);
     REQUIRE(cfg.qp_type == IBV_QPT_RC);
     REQUIRE(cfg.custom_qp_init_attr == nullptr);
+}
+
+TEST_CASE("endpoint teardown only releases resources after the pump is idle",
+          "[rdma][ibverbs][endpoint][shutdown]") {
+    using elio::rdma_ibverbs::endpoint_detail::pump_resources_are_idle;
+
+    REQUIRE(pump_resources_are_idle(false, false, false));
+    REQUIRE_FALSE(pump_resources_are_idle(true, false, false));
+    REQUIRE(pump_resources_are_idle(true, true, false));
+    REQUIRE(pump_resources_are_idle(true, false, true));
+}
+
+TEST_CASE("endpoint pump exit signal wakes and unregisters coroutine waiters",
+          "[rdma][ibverbs][endpoint][shutdown]") {
+    using elio::rdma_ibverbs::endpoint_detail::pump_exit_state;
+
+    SECTION("exit wakes a suspended shutdown waiter") {
+        pump_exit_state state;
+        bool resumed = false;
+        auto waiting = [&]() -> elio::coro::task<void> {
+            co_await state.wait();
+            resumed = true;
+        }();
+        auto handle = elio::coro::detail::task_access::handle(waiting);
+
+        handle.resume();
+        REQUIRE_FALSE(handle.done());
+        REQUIRE_FALSE(resumed);
+
+        state.mark_exited();
+        REQUIRE(handle.done());
+        REQUIRE(resumed);
+    }
+
+    SECTION("pre-published exit does not suspend") {
+        pump_exit_state state;
+        state.mark_exited();
+        bool resumed = false;
+        auto waiting = [&]() -> elio::coro::task<void> {
+            co_await state.wait();
+            resumed = true;
+        }();
+        auto handle = elio::coro::detail::task_access::handle(waiting);
+
+        handle.resume();
+        REQUIRE(handle.done());
+        REQUIRE(resumed);
+    }
+
+    SECTION("destroyed shutdown waiter unregisters before pump exit") {
+        pump_exit_state state;
+        {
+            auto abandoned = [&]() -> elio::coro::task<void> {
+                co_await state.wait();
+            }();
+            auto handle = elio::coro::detail::task_access::handle(abandoned);
+            handle.resume();
+            REQUIRE_FALSE(handle.done());
+        }
+
+        REQUIRE_NOTHROW(state.mark_exited());
+        REQUIRE(state.is_exited());
+    }
+}
+
+TEST_CASE("endpoint resource teardown retains failures for retry",
+          "[rdma][ibverbs][endpoint][shutdown]") {
+    using elio::rdma_ibverbs::endpoint_detail::destroy_resource_or_throw;
+
+    int storage = 0;
+    int* resource = &storage;
+    int attempts = 0;
+    auto destroy = [&](int*) {
+        ++attempts;
+        return attempts == 1 ? EBUSY : 0;
+    };
+
+    REQUIRE_THROWS_AS(
+        destroy_resource_or_throw(resource, destroy, "fake_destroy"),
+        std::runtime_error);
+    REQUIRE(resource == &storage);
+    REQUIRE(errno == EBUSY);
+
+    REQUIRE_NOTHROW(
+        destroy_resource_or_throw(resource, destroy, "fake_destroy"));
+    REQUIRE(resource == nullptr);
+    REQUIRE(attempts == 2);
+}
+
+TEST_CASE("endpoint data-path use is rejected after shutdown starts",
+          "[rdma][ibverbs][endpoint][shutdown]") {
+    using elio::rdma_ibverbs::endpoint_detail::require_endpoint_active;
+
+    REQUIRE_NOTHROW(require_endpoint_active(false, "test_operation"));
+    REQUIRE_THROWS_AS(
+        require_endpoint_active(true, "test_operation"),
+        std::logic_error);
 }
 
 TEST_CASE("rdma_ibverbs module version matches S13",

@@ -63,6 +63,7 @@ struct release_waiter_published_test_hook {
 };
 
 inline release_waiter_published_test_hook release_waiter_published_hook;
+inline std::atomic<size_t> release_waiter_probes_for_test{0};
 #endif
 
 } // namespace detail_oc
@@ -406,7 +407,13 @@ public:
 
             auto prev = entry_->refcount_.fetch_sub(1, std::memory_order_acq_rel);
 
-            if (prev == 2 && entry_->release_requested_.load(std::memory_order_acquire)) {
+            if (prev == 2) {
+                // Always rendezvous with register_waiter(): checking a separate
+                // release flag here permits both threads to observe stale state.
+#ifdef ELIO_OBJECT_CACHE_TEST_HOOKS
+                detail_oc::release_waiter_probes_for_test.fetch_add(
+                    1, std::memory_order_relaxed);
+#endif
                 auto waiter = entry_->release_waiter_.take();
                 if (waiter) {
                     runtime::schedule_handle(waiter);

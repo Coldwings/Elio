@@ -152,6 +152,7 @@ jobs:
           non_linux_platform_rejected
           elio_fork_boundary
           elio_fork_boundary_asan
+          "endpoint comp channel fds are made non-blocking"
         )
 
         ctest --test-dir build -N
@@ -163,11 +164,9 @@ jobs:
         done
 
         ctest --test-dir build --output-on-failure \
-          -R "^(package_rdma_cuda_export_metadata|rdma_cuda_example_api_metadata|package_liburing_export_metadata|package_threads_export_metadata|package_rdma_dependency_export_metadata|package_elio_compile_feature_export|http2_fetchcontent_cache_scope|http2_option_requires_http|package_version_compatibility|non_linux_platform_rejected|elio_fork_boundary|elio_fork_boundary_asan)$"
+          -R "^(package_rdma_cuda_export_metadata|rdma_cuda_example_api_metadata|package_liburing_export_metadata|package_threads_export_metadata|package_rdma_dependency_export_metadata|package_elio_compile_feature_export|http2_fetchcontent_cache_scope|http2_option_requires_http|package_version_compatibility|non_linux_platform_rejected|elio_fork_boundary|elio_fork_boundary_asan|endpoint comp channel fds are made non-blocking)$"
 
-        for test_binary in \
-          ./build/tests/elio_rdma_cuda_lifetime_tests \
-          ./build/tests/elio_rdma_ibverbs_backend_stub_tests; do
+        for test_binary in ./build/tests/elio_rdma_cuda_lifetime_tests; do
           if [[ ! -x "${test_binary}" ]]; then
             echo "::error title=Missing test binary::${test_binary} was not built"
             exit 1

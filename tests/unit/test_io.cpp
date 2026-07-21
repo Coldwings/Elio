@@ -1084,8 +1084,9 @@ TEST_CASE("io_context reports completion from explicit epoll backend",
     // A fresh thread makes the old io_uring-specific TLS deterministically
     // zero, independent of Catch2 test order.
     std::thread probe_thread([&] {
-        int pipefd[2] = {-1, -1};
-        if (pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) != 0) {
+        int sockets[2] = {-1, -1};
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                       0, sockets) != 0) {
             probe.failure = 1;
             return;
         }
@@ -1097,13 +1098,13 @@ TEST_CASE("io_context reports completion from explicit epoll backend",
             std::array<char, 7> actual{};
 
             io_request req{};
-            req.op = io_op::read;
-            req.fd = pipefd[0];
+            req.op = io_op::recv;
+            req.fd = sockets[0];
             req.buffer = actual.data();
             req.length = actual.size();
             req.awaiter = completion.native_handle();
 
-            if (write(pipefd[1], expected.data(), expected.size()) !=
+            if (::send(sockets[1], expected.data(), expected.size(), MSG_NOSIGNAL) !=
                 static_cast<ssize_t>(expected.size())) {
                 probe.failure = 2;
             } else if (!context.prepare(req)) {
@@ -1121,8 +1122,8 @@ TEST_CASE("io_context reports completion from explicit epoll backend",
             probe.failure = 7;
         }
 
-        close(pipefd[0]);
-        close(pipefd[1]);
+        close(sockets[0]);
+        close(sockets[1]);
     });
     probe_thread.join();
 

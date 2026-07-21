@@ -14,12 +14,14 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <elio/rdma_ibverbs/rdma_ibverbs.hpp>
+#include <elio/runtime/scheduler.hpp>
 
 #include <infiniband/verbs.h>
 
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <type_traits>
 #include <utility>
@@ -91,20 +93,31 @@ TEST_CASE("endpoint pump exit signal wakes and unregisters coroutine waiters",
 
     SECTION("exit wakes a suspended shutdown waiter") {
         pump_exit_state state;
-        bool resumed = false;
-        auto waiting = [&]() -> elio::coro::task<void> {
+        std::atomic<bool> waiting{false};
+        std::atomic<bool> resumed{false};
+        elio::runtime::scheduler scheduler(1);
+        scheduler.start();
+
+        auto wait_for_exit = [&]() -> elio::coro::task<void> {
+            waiting.store(true, std::memory_order_release);
+            waiting.notify_one();
             co_await state.wait();
-            resumed = true;
-        }();
-        auto handle = elio::coro::detail::task_access::handle(waiting);
+            resumed.store(true, std::memory_order_release);
+        };
+        auto waiter = scheduler.go_joinable(wait_for_exit);
 
-        handle.resume();
-        REQUIRE_FALSE(handle.done());
-        REQUIRE_FALSE(resumed);
+        waiting.wait(false, std::memory_order_acquire);
+        auto publish_exit = [&]() -> elio::coro::task<void> {
+            state.mark_exited();
+            co_return;
+        };
+        auto publisher = scheduler.go_joinable(publish_exit);
 
-        state.mark_exited();
-        REQUIRE(handle.done());
-        REQUIRE(resumed);
+        publisher.wait_destroyed();
+        waiter.wait_destroyed();
+        scheduler.shutdown();
+
+        REQUIRE(resumed.load(std::memory_order_acquire));
     }
 
     SECTION("pre-published exit does not suspend") {

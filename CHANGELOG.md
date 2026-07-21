@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applies the same 16 MiB aggregate message limit as the high-level client and
   server configurations. Direct parser users must explicitly set a limit of
   `0` to accept unbounded messages.
+- **Runtime I/O backend result dispatch**: `io_context::get_last_result()` now
+  reads the calling thread's shared completion slot, so an epoll fallback does
+  not return stale io_uring state when both backends were compiled in. (#982)
 
 ## [0.6.0] - 2026-07-20
 

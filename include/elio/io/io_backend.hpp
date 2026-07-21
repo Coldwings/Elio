@@ -108,6 +108,22 @@ struct io_result {
     }
 };
 
+namespace detail {
+
+/// Completion slot shared by every backend on the current polling thread.
+/// Legacy raw-handle awaitables read this immediately when they are resumed.
+inline thread_local io_result last_completion_result{};
+
+inline void set_last_completion_result(io_result result) noexcept {
+    last_completion_result = result;
+}
+
+[[nodiscard]] inline io_result get_last_completion_result() noexcept {
+    return last_completion_result;
+}
+
+} // namespace detail
+
 /// I/O operation request
 struct io_request {
     io_op op;                           ///< Operation type

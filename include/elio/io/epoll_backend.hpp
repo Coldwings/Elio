@@ -255,6 +255,7 @@ public:
                 state.registered = previous_registered;
                 io_result result{-err, 0};
                 last_result_ = result;
+                detail::set_last_completion_result(result);
                 detail::run_noexcept([&]() {
                     ELIO_LOG_WARNING("epoll_ctl failed for fd {}: {}",
                                      req.fd, strerror(err));
@@ -587,6 +588,7 @@ public:
         // Resume the cancelled coroutine
         if (found_entry && to_resume.handle && !to_resume.handle.done()) {
             last_result_ = to_resume.result;
+            detail::set_last_completion_result(to_resume.result);
             safe_resume(to_resume.handle);
             return true;
         }
@@ -714,6 +716,7 @@ private:
             deferred_resumes->push_back(entry);
         } else {
             last_result_ = entry.result;
+            detail::set_last_completion_result(entry.result);
             safe_resume(entry.handle);
         }
     }
@@ -882,11 +885,13 @@ private:
     }
 
     /// Resume collected coroutine handles (call outside of lock)
-    /// Sets last_result_ before resuming each coroutine
+    /// Publishes backend-specific and context-wide thread-local results before
+    /// resuming each coroutine.
     static void resume_deferred(std::vector<deferred_resume_entry>& entries) {
         for (auto& entry : entries) {
             if (entry.handle && !entry.handle.done()) {
                 last_result_ = entry.result;
+                detail::set_last_completion_result(entry.result);
                 safe_resume(entry.handle);
             }
         }
@@ -900,7 +905,6 @@ private:
     timer_queue_t timer_queue_;                           ///< Timer queue for timeouts
     std::atomic<size_t> pending_count_{0};                ///< Number of pending operations (atomic for cross-thread reads)
     int wake_fd_ = -1;  ///< eventfd for cross-thread wake-up
-
     static inline thread_local io_result last_result_{};
 };
 

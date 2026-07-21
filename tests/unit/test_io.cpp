@@ -126,6 +126,9 @@ public:
 
     void resume() const { handle_.resume(); }
     [[nodiscard]] bool done() const noexcept { return handle_.done(); }
+    [[nodiscard]] std::coroutine_handle<> native_handle() const noexcept {
+        return handle_;
+    }
     [[nodiscard]] std::exception_ptr exception() const noexcept {
         return handle_.promise().exception;
     }
@@ -146,6 +149,11 @@ custom_io_task custom_promise_recv(
     result->store(io.result, std::memory_order_release);
     completion_worker->store(current_worker_id(), std::memory_order_release);
     completed->set();
+}
+
+custom_io_task capture_context_last_result(int* result) {
+    *result = io_context::get_last_result().result;
+    co_return;
 }
 
 task<void> orphaned_worker_recv(int fd, char* buffer) {
@@ -1063,6 +1071,66 @@ TEST_CASE("epoll_backend registration failure does not leave pending op", "[io][
 
     REQUIRE_FALSE(backend.has_pending());
     REQUIRE(backend.pending_count() == 0);
+}
+
+TEST_CASE("io_context reports completion from explicit epoll backend",
+          "[io][context][epoll][regression]") {
+    struct probe_result {
+        int failure = 0;
+        int context_result = -1;
+        bool resumed = false;
+    } probe;
+
+    // A fresh thread makes the old io_uring-specific TLS deterministically
+    // zero, independent of Catch2 test order.
+    std::thread probe_thread([&] {
+        int sockets[2] = {-1, -1};
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                       0, sockets) != 0) {
+            probe.failure = 1;
+            return;
+        }
+
+        try {
+            auto completion = capture_context_last_result(&probe.context_result);
+            io_context context(io_context::backend_type::epoll);
+            std::array<char, 7> expected{'r', 'u', 'n', 't', 'i', 'm', 'e'};
+            std::array<char, 7> actual{};
+
+            io_request req{};
+            req.op = io_op::recv;
+            req.fd = sockets[0];
+            req.buffer = actual.data();
+            req.length = actual.size();
+            req.awaiter = completion.native_handle();
+
+            if (::send(sockets[1], expected.data(), expected.size(), MSG_NOSIGNAL) !=
+                static_cast<ssize_t>(expected.size())) {
+                probe.failure = 2;
+            } else if (!context.prepare(req)) {
+                probe.failure = 3;
+            } else if (context.poll(std::chrono::milliseconds(100)) != 1) {
+                probe.failure = 4;
+            } else if (actual != expected) {
+                probe.failure = 5;
+            } else if (!completion.done() || completion.exception()) {
+                probe.failure = 6;
+            } else {
+                probe.resumed = true;
+            }
+        } catch (...) {
+            probe.failure = 7;
+        }
+
+        close(sockets[0]);
+        close(sockets[1]);
+    });
+    probe_thread.join();
+
+    INFO("probe failure stage=" << probe.failure);
+    REQUIRE(probe.failure == 0);
+    REQUIRE(probe.resumed);
+    REQUIRE(probe.context_result == 7);
 }
 
 TEST_CASE("epoll_backend does not report getsockopt failure as EPOLLERR success",

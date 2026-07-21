@@ -16,7 +16,33 @@
 
 #include <infiniband/verbs.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 using elio::rdma_ibverbs::endpoint_config;
+
+TEST_CASE("endpoint comp channel fds are made non-blocking",
+          "[rdma][ibverbs][endpoint]") {
+    int pipe_fds[2]{-1, -1};
+    REQUIRE(::pipe(pipe_fds) == 0);
+    struct pipe_guard {
+        int* fds;
+        ~pipe_guard() {
+            ::close(fds[0]);
+            ::close(fds[1]);
+        }
+    } guard{pipe_fds};
+
+    REQUIRE_NOTHROW(
+        elio::rdma_ibverbs::endpoint_detail::set_nonblocking(pipe_fds[0]));
+    const int flags = ::fcntl(pipe_fds[0], F_GETFL);
+
+    REQUIRE(flags >= 0);
+    REQUIRE((flags & O_NONBLOCK) != 0);
+    REQUIRE_THROWS_AS(
+        elio::rdma_ibverbs::endpoint_detail::set_nonblocking(-1),
+        std::runtime_error);
+}
 
 TEST_CASE("endpoint_config defaults match the documented values",
           "[rdma][ibverbs][endpoint]") {

@@ -95,6 +95,8 @@ jobs:
           ninja-build \
           liburing-dev \
           libssl-dev \
+          libibverbs-dev \
+          librdmacm-dev \
           g++-14
 
     - name: Configure CMake
@@ -109,7 +111,10 @@ jobs:
           -DELIO_BUILD_EXAMPLES=ON \
           -DELIO_ENABLE_TLS=ON \
           -DELIO_ENABLE_HTTP=ON \
-          -DELIO_ENABLE_HTTP2=ON
+          -DELIO_ENABLE_HTTP2=ON \
+          -DELIO_ENABLE_RDMA=ON \
+          -DELIO_ENABLE_RDMA_CM=ON \
+          -DELIO_ENABLE_RDMA_IBVERBS=ON
 
     - name: Build
       if: needs.changes.outputs.code == 'true'

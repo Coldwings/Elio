@@ -186,6 +186,19 @@ public:
                 break;
 
             case io_op::connect: {
+                const int fd_flags = ::fcntl(req.fd, F_GETFL);
+                if (fd_flags < 0) {
+                    return queue_ready_op(std::move(op),
+                                          io_result{-errno, 0});
+                }
+                if ((fd_flags & O_NONBLOCK) == 0) {
+                    // connect(2) may block the scheduler worker unless the
+                    // caller keeps the socket non-blocking. Do not silently
+                    // mutate the shared open-file description here.
+                    return queue_ready_op(std::move(op),
+                                          io_result{-EINVAL, 0});
+                }
+
                 socklen_t addrlen = req.addrlen ? *req.addrlen : 0;
                 if (::connect(req.fd, req.addr, addrlen) == 0) {
                     return queue_ready_op(std::move(op), io_result{0, 0});

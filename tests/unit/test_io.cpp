@@ -1450,6 +1450,55 @@ TEST_CASE("epoll_backend async connect initiates TCP handshake",
     close(listen_fd);
 }
 
+TEST_CASE("epoll_backend rejects blocking async connect sockets",
+          "[io][epoll][connect][nonblocking]") {
+    int client_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE(client_fd >= 0);
+    const int fd_flags = fcntl(client_fd, F_GETFL);
+    REQUIRE(fd_flags >= 0);
+    REQUIRE((fd_flags & O_NONBLOCK) == 0);
+
+    struct sockaddr_in target{};
+    target.sin_family = AF_INET;
+    target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    target.sin_port = htons(9);
+    socklen_t target_len = sizeof(target);
+
+    epoll_backend backend;
+    io_request req{};
+    req.op = io_op::connect;
+    req.fd = client_fd;
+    req.addr = reinterpret_cast<struct sockaddr*>(&target);
+    req.addrlen = &target_len;
+    req.awaiter = std::noop_coroutine();
+
+    REQUIRE(backend.prepare(req));
+    REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+    REQUIRE(epoll_backend::get_last_result().result == -EINVAL);
+    REQUIRE_FALSE(backend.has_pending());
+
+    REQUIRE(close(client_fd) == 0);
+}
+
+TEST_CASE("epoll_backend preserves fcntl errors for async connect",
+          "[io][epoll][connect][nonblocking]") {
+    epoll_backend backend;
+    struct sockaddr_in target{};
+    socklen_t target_len = sizeof(target);
+
+    io_request req{};
+    req.op = io_op::connect;
+    req.fd = -1;
+    req.addr = reinterpret_cast<struct sockaddr*>(&target);
+    req.addrlen = &target_len;
+    req.awaiter = std::noop_coroutine();
+
+    REQUIRE(backend.prepare(req));
+    REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+    REQUIRE(epoll_backend::get_last_result().result == -EBADF);
+    REQUIRE_FALSE(backend.has_pending());
+}
+
 TEST_CASE("epoll_backend async connect preserves refused SO_ERROR",
           "[io][epoll][connect][regression]") {
     int reserve_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);

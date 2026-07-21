@@ -313,8 +313,8 @@ pump_stop.cancel();
 For busy-poll, DPDK-style, or shared-CQ setups, call
 `dispatcher.deliver(wr_id, status, byte_len, imm_data, wc_flags)`
 from any thread. It's safe to call from outside Elio's scheduler;
-the coroutine resumes via `runtime::schedule_handle`, which falls
-back to inline resume when no scheduler is current.
+the waiter is handed to `runtime::schedule_handle` for routing. When no
+scheduler is current, routing resumes it inline.
 
 ## op_state lifecycle
 

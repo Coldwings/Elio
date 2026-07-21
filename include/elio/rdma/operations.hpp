@@ -226,8 +226,9 @@ public:
                 // The dispatcher won the completion race before this
                 // destructor could orphan the suspended operation, but
                 // await_resume has not consumed the result yet. Destroying the
-                // frame here would leave the scheduler with a stale handle, so
-                // fail closed instead of turning a cancellation race into UAF.
+                // frame here could leave the scheduler with a stale handle, so
+                // fail closed instead of turning forced frame destruction into
+                // a use-after-free.
                 std::terminate();
             }
         }

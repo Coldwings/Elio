@@ -26,9 +26,10 @@
 ///     eager started handle is dropped before being awaited, its destructor
 ///     CASes `pending` or `posted` to `orphaned`. If that CAS wins, the
 ///     dispatcher's later CQE arrival sees `orphaned` and frees the state.
-///     If completion has already scheduled a suspended coroutine, however,
-///     destroying that frame before it consumes the result is unsupported and
-///     fails closed: the queued handle cannot safely be revoked.
+///     If the dispatcher has already changed a suspended operation to
+///     `completed`, however, it has snapshotted the waiter handle for handoff.
+///     Destroying that frame before it consumes the result is unsupported and
+///     fails closed because safe handle revocation cannot be proven.
 ///
 /// Net invariant: exactly one party (dispatcher or awaiter destructor)
 /// frees the op_state, and the coroutine handle is resumed at most once.

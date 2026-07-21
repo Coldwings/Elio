@@ -336,14 +336,25 @@ io_uring.
 
 Task cancellation in Elio is cooperative: requesting cancellation does not
 force-destroy a suspended child coroutine, and RDMA operation awaiters do not
-currently accept a cancellation token. Keep the operation's coroutine frame
-and its dispatcher/CQ driver alive until `await_resume` consumes the
-completion. Force-destroying the frame is unsupported once the dispatcher has
-changed the state to `completed` and queued its handle. The awaiter terminates
-the process in that case because the scheduler has no safe way to revoke the
-queued handle; continuing would leave a stale handle and permit a
+currently accept a cancellation token. Keep the dispatcher/CQ driver alive and
+driving until outstanding operations have been delivered or intentionally
+drained.
+
+For a suspended operation, the dispatcher snapshots its waiter handle before
+winning `pending → completed`, then hands that snapshot to scheduler routing.
+From the successful transition onward, keep the coroutine frame alive until
+`await_resume` clears the handle. Force-destroying it during that interval is
+unsupported even if scheduler routing has not enqueued, or cannot enqueue, the
+snapshot. The awaiter terminates the process because it cannot prove that the
+snapshot is revocable; continuing could leave a stale handle and permit a
 use-after-free. Before completion wins, explicit destruction remains safe via
 the `pending → orphaned` handoff described above.
+
+An operation explicitly launched with `.start()` remains in `posted` without a
+waiter handle. Its completion is stored for a later inline await, and the
+completed awaitable may instead be destroyed safely to discard that result.
+If a coroutine later awaits it and installs a handle, the suspended-operation
+rule applies.
 
 ## The high-level `endpoint` wrapper (libibverbs path)
 

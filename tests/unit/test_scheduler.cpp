@@ -12,6 +12,7 @@
 #include <chrono>
 #include <coroutine>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include "../test_main.cpp"  // For scaled timeouts
@@ -158,6 +159,200 @@ task<void> cancellable_recv_on_worker(
     completed->store(true, std::memory_order_release);
 }
 
+enum class spawn_affinity_mode {
+    inherit,
+    clear,
+    move_to_worker_one,
+};
+
+class manual_schedule_gate {
+public:
+    class awaitable {
+    public:
+        explicit awaitable(manual_schedule_gate& gate) noexcept : gate_(gate) {}
+
+        bool await_ready() const noexcept { return false; }
+
+        bool await_suspend(std::coroutine_handle<> handle) noexcept {
+            gate_.handle_.store(handle.address(), std::memory_order_release);
+            gate_.published_.store(true, std::memory_order_release);
+            gate_.published_.notify_all();
+            return true;
+        }
+
+        void await_resume() const noexcept {}
+
+    private:
+        manual_schedule_gate& gate_;
+    };
+
+    [[nodiscard]] awaitable wait() noexcept { return awaitable{*this}; }
+
+    [[nodiscard]] bool published() const noexcept {
+        return published_.load(std::memory_order_acquire);
+    }
+
+    void resume() noexcept {
+        void* address = handle_.exchange(nullptr, std::memory_order_acq_rel);
+        if (address) {
+            schedule_handle(std::coroutine_handle<>::from_address(address));
+        }
+    }
+
+private:
+    std::atomic<void*> handle_{nullptr};
+    std::atomic<bool> published_{false};
+};
+
+struct spawn_affinity_observation {
+    std::shared_ptr<task_execution_context> context;
+    std::atomic<size_t> first_worker{NO_AFFINITY};
+    std::atomic<size_t> resumed_worker{NO_AFFINITY};
+    std::atomic<size_t> completion_worker{NO_AFFINITY};
+    std::atomic<size_t> first_affinity{NO_AFFINITY};
+    std::atomic<size_t> resumed_affinity{NO_AFFINITY};
+    std::atomic<size_t> post_io_affinity{NO_AFFINITY};
+    std::atomic<bool> io_staged{false};
+    std::atomic<int> recv_result{-1};
+    std::atomic<bool> done{false};
+};
+
+task<void> observe_spawn_affinity(
+    int fd,
+    spawn_affinity_mode mode,
+    manual_schedule_gate* gate,
+    spawn_affinity_observation* observed) {
+    auto* frame = promise_base::current_frame();
+    if (!frame) {
+        throw std::logic_error("spawn affinity test requires a current frame");
+    }
+    observed->context = frame->execution_context();
+    observed->first_worker.store(current_worker_id(), std::memory_order_release);
+    observed->first_affinity.store(frame->affinity(), std::memory_order_release);
+
+    if (mode == spawn_affinity_mode::clear) {
+        co_await clear_affinity();
+    } else if (mode == spawn_affinity_mode::move_to_worker_one) {
+        co_await set_affinity(1, false);
+    }
+
+    co_await gate->wait();
+    observed->resumed_worker.store(
+        current_worker_id(), std::memory_order_release);
+    observed->resumed_affinity.store(
+        frame->affinity(), std::memory_order_release);
+
+    elio::io::detail::arm_next_cancellable_recv_staged_for_test(
+        observed->io_staged);
+    char byte = 0;
+    auto result = co_await elio::io::async_recv(
+        fd, &byte, 1, 0, cancel_token{});
+    observed->recv_result.store(result.io.result, std::memory_order_release);
+    observed->completion_worker.store(
+        current_worker_id(), std::memory_order_release);
+    observed->post_io_affinity.store(
+        frame->effective_affinity(), std::memory_order_release);
+    observed->done.store(true, std::memory_order_release);
+    observed->done.notify_all();
+}
+
+task<void> resume_spawn_affinity_probe(manual_schedule_gate* gate) {
+    elio::runtime::detail::reject_next_schedule_for_test.store(
+        true, std::memory_order_release);
+    gate->resume();
+}
+
+template<typename Predicate>
+bool wait_for_scheduler_condition(Predicate&& predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return predicate();
+}
+
+void check_spawn_affinity_case(bool joinable,
+                               spawn_affinity_mode mode,
+                               size_t expected_worker,
+                               size_t expected_affinity) {
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX,
+                         SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                         0, sockets) == 0);
+
+    elio::runtime::detail::reject_next_schedule_for_test.store(
+        false, std::memory_order_release);
+    scheduler sched(2);
+    sched.start();
+
+    manual_schedule_gate gate;
+    spawn_affinity_observation observed;
+    std::optional<join_handle<void>> joined;
+    if (joinable) {
+        joined.emplace(sched.go_joinable_to(
+            0, observe_spawn_affinity, sockets[0], mode, &gate, &observed));
+    } else {
+        sched.go_to(
+            0, observe_spawn_affinity, sockets[0], mode, &gate, &observed);
+    }
+
+    REQUIRE(wait_for_scheduler_condition([&] { return gate.published(); }));
+    REQUIRE(observed.context);
+    CHECK(observed.first_worker.load(std::memory_order_acquire) == 0);
+    CHECK(observed.first_affinity.load(std::memory_order_acquire) == 0);
+
+    const auto local_fallbacks_before =
+        elio::runtime::detail::local_schedule_fallbacks_for_test.load(
+            std::memory_order_acquire);
+    auto notifier = sched.go_joinable_to(
+        1, resume_spawn_affinity_probe, &gate);
+    notifier.wait_destroyed();
+    notifier.await_resume();
+
+    REQUIRE(wait_for_scheduler_condition([&] {
+        return observed.io_staged.load(std::memory_order_acquire);
+    }));
+    CHECK(observed.resumed_worker.load(std::memory_order_acquire) ==
+          expected_worker);
+    CHECK(observed.resumed_affinity.load(std::memory_order_acquire) ==
+          expected_affinity);
+
+    auto* owner = sched.get_worker(expected_worker);
+    REQUIRE(owner != nullptr);
+    CHECK(observed.context->is_io_pin_owner(
+        expected_worker, owner->io_context().generation()));
+    CHECK(observed.context->effective_affinity() == expected_worker);
+
+    const auto local_fallbacks_after =
+        elio::runtime::detail::local_schedule_fallbacks_for_test.load(
+            std::memory_order_acquire);
+    if (mode == spawn_affinity_mode::inherit) {
+        CHECK(local_fallbacks_after == local_fallbacks_before);
+    } else {
+        CHECK(local_fallbacks_after == local_fallbacks_before + 1);
+    }
+
+    const char byte = 'x';
+    REQUIRE(::write(sockets[1], &byte, 1) == 1);
+    REQUIRE(wait_for_scheduler_condition([&] {
+        return observed.done.load(std::memory_order_acquire);
+    }));
+
+    if (joined) {
+        joined->wait_destroyed();
+        joined->await_resume();
+    }
+    CHECK(observed.recv_result.load(std::memory_order_acquire) == 1);
+    CHECK(observed.completion_worker.load(std::memory_order_acquire) ==
+          expected_worker);
+    CHECK(observed.post_io_affinity.load(std::memory_order_acquire) ==
+          expected_affinity);
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+
+    ::close(sockets[0]);
+    ::close(sockets[1]);
+}
+
 } // namespace
 
 TEST_CASE("Scheduler construction", "[scheduler]") {
@@ -238,6 +433,28 @@ TEST_CASE("Scheduler routes an I/O-pinned migration request to its owner",
 
     REQUIRE(observed_worker.load(std::memory_order_acquire) == 0);
     REQUIRE(sched.shutdown(scaled_sec(5)));
+}
+
+TEST_CASE("go_to affinity reaches the returned task across suspension",
+          "[scheduler][task][io][affinity][regression]") {
+    check_spawn_affinity_case(
+        false, spawn_affinity_mode::inherit, 0, 0);
+}
+
+TEST_CASE("go_joinable_to affinity reaches the returned task and remains overridable",
+          "[scheduler][task][io][affinity][join_handle][regression]") {
+    SECTION("inherit spawn affinity") {
+        check_spawn_affinity_case(
+            true, spawn_affinity_mode::inherit, 0, 0);
+    }
+    SECTION("clear spawn affinity") {
+        check_spawn_affinity_case(
+            true, spawn_affinity_mode::clear, 1, NO_AFFINITY);
+    }
+    SECTION("replace spawn affinity") {
+        check_spawn_affinity_case(
+            true, spawn_affinity_mode::move_to_worker_one, 1, 1);
+    }
 }
 
 TEST_CASE("Scheduler pause/resume", "[scheduler]") {

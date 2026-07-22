@@ -2,9 +2,11 @@
 #include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/affinity.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/coro/task_group.hpp>
 #include <elio/coro/cancel_token.hpp>
 #include <elio/io/io_awaitables.hpp>
 #include <elio/io/io_operation_guard.hpp>
+#include <elio/sync/channel.hpp>
 #include <elio/time/timer.hpp>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -12,6 +14,7 @@
 #include <chrono>
 #include <coroutine>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include "../test_main.cpp"  // For scaled timeouts
@@ -158,6 +161,297 @@ task<void> cancellable_recv_on_worker(
     completed->store(true, std::memory_order_release);
 }
 
+enum class spawn_affinity_mode {
+    inherit,
+    clear,
+    move_to_worker_one,
+};
+
+class scoped_socket_pair {
+public:
+    scoped_socket_pair() noexcept {
+        valid_ = ::socketpair(AF_UNIX,
+                              SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                              0, fds_) == 0;
+    }
+
+    ~scoped_socket_pair() {
+        for (int fd : fds_) {
+            if (fd >= 0) {
+                ::close(fd);
+            }
+        }
+    }
+
+    scoped_socket_pair(const scoped_socket_pair&) = delete;
+    scoped_socket_pair& operator=(const scoped_socket_pair&) = delete;
+
+    [[nodiscard]] bool valid() const noexcept { return valid_; }
+    [[nodiscard]] int reader() const noexcept { return fds_[0]; }
+    [[nodiscard]] int writer() const noexcept { return fds_[1]; }
+
+private:
+    int fds_[2] = {-1, -1};
+    bool valid_ = false;
+};
+
+struct spawn_affinity_observation {
+    std::shared_ptr<task_execution_context> context;
+    std::atomic<size_t> first_worker{NO_AFFINITY};
+    std::atomic<size_t> resumed_worker{NO_AFFINITY};
+    std::atomic<size_t> after_scope_worker{NO_AFFINITY};
+    std::atomic<size_t> completion_worker{NO_AFFINITY};
+    std::atomic<size_t> first_affinity{NO_AFFINITY};
+    std::atomic<size_t> resumed_affinity{NO_AFFINITY};
+    std::atomic<size_t> after_scope_affinity{NO_AFFINITY};
+    std::atomic<size_t> post_io_affinity{NO_AFFINITY};
+    std::atomic<bool> gate_received{false};
+    std::atomic<bool> io_staged{false};
+    std::atomic<int> recv_result{-1};
+    std::atomic<bool> done{false};
+};
+
+task<void> observe_spawn_affinity(
+    int fd,
+    spawn_affinity_mode mode,
+    elio::sync::channel<int>* gate,
+    cancel_token cleanup_token,
+    spawn_affinity_observation* observed) {
+    auto* root_frame = promise_base::current_frame();
+    if (!root_frame) {
+        throw std::logic_error("spawn affinity test requires a current frame");
+    }
+    observed->context = root_frame->execution_context();
+    observed->first_worker.store(current_worker_id(), std::memory_order_release);
+    observed->first_affinity.store(
+        root_frame->affinity(), std::memory_order_release);
+
+    co_await task_scope(
+        [mode, gate, observed](task_group&) -> task<void> {
+            auto* body_frame = promise_base::current_frame();
+            if (!body_frame) {
+                throw std::logic_error(
+                    "spawn affinity scope requires a current frame");
+            }
+
+            if (mode == spawn_affinity_mode::clear) {
+                co_await clear_affinity();
+            } else if (mode == spawn_affinity_mode::move_to_worker_one) {
+                co_await set_affinity(1, false);
+            }
+
+            auto value = co_await gate->recv();
+            observed->gate_received.store(
+                value.has_value() && *value == 1,
+                std::memory_order_release);
+            observed->resumed_worker.store(
+                current_worker_id(), std::memory_order_release);
+            observed->resumed_affinity.store(
+                body_frame->affinity(), std::memory_order_release);
+        });
+
+    observed->after_scope_worker.store(
+        current_worker_id(), std::memory_order_release);
+    observed->after_scope_affinity.store(
+        root_frame->affinity(), std::memory_order_release);
+
+    elio::io::detail::arm_next_cancellable_recv_staged_for_test(
+        observed->io_staged);
+    char byte = 0;
+    auto result = co_await elio::io::async_recv(
+        fd, &byte, 1, 0, std::move(cleanup_token));
+    observed->recv_result.store(result.io.result, std::memory_order_release);
+    observed->completion_worker.store(
+        current_worker_id(), std::memory_order_release);
+    observed->post_io_affinity.store(
+        root_frame->effective_affinity(), std::memory_order_release);
+    observed->done.store(true, std::memory_order_release);
+    observed->done.notify_all();
+}
+
+task<void> resume_spawn_affinity_probe(
+    elio::sync::channel<int>* gate,
+    std::atomic<bool>* sent) {
+    elio::runtime::detail::reject_next_schedule_for_test.store(
+        true, std::memory_order_release);
+    sent->store(gate->try_send(1), std::memory_order_release);
+    co_return;
+}
+
+template<typename Predicate>
+bool wait_for_scheduler_condition(Predicate&& predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return predicate();
+}
+
+void check_spawn_affinity_case(bool joinable,
+                               spawn_affinity_mode mode,
+                               size_t expected_worker,
+                               size_t expected_affinity) {
+    scoped_socket_pair sockets;
+    REQUIRE(sockets.valid());
+
+    elio::runtime::detail::reject_next_schedule_for_test.store(
+        false, std::memory_order_release);
+    elio::sync::channel<int> gate(1);
+    spawn_affinity_observation observed;
+    cancel_source cleanup_cancellation;
+    std::optional<join_handle<void>> joined;
+    scheduler sched(2);
+    sched.start();
+
+    const auto recv_waits_before =
+        elio::sync::detail::bounded_recv_waits_for_test.load(
+            std::memory_order_acquire);
+    if (joinable) {
+        joined.emplace(sched.go_joinable_to(
+            0, observe_spawn_affinity, sockets.reader(), mode, &gate,
+            cleanup_cancellation.get_token(), &observed));
+    } else {
+        sched.go_to(
+            0, observe_spawn_affinity, sockets.reader(), mode, &gate,
+            cleanup_cancellation.get_token(), &observed);
+    }
+
+    const bool receiver_waited = wait_for_scheduler_condition([&] {
+        return elio::sync::detail::bounded_recv_waits_for_test.load(
+                   std::memory_order_acquire) > recv_waits_before;
+    });
+
+    bool marker_completed = false;
+    bool marker_succeeded = false;
+    if (receiver_waited) {
+        auto marker = sched.go_joinable_to(0, empty_task);
+        marker_completed = wait_for_scheduler_condition([&] {
+            return marker.is_destroyed();
+        });
+        if (marker_completed) {
+            try {
+                marker.await_resume();
+                marker_succeeded = true;
+            } catch (...) {
+            }
+        }
+    }
+
+    const auto local_fallbacks_before =
+        elio::runtime::detail::local_schedule_fallbacks_for_test.load(
+            std::memory_order_acquire);
+    std::atomic<bool> gate_sent{false};
+    bool notifier_completed = false;
+    bool notifier_succeeded = false;
+    if (marker_succeeded) {
+        auto notifier = sched.go_joinable_to(
+            1, resume_spawn_affinity_probe, &gate, &gate_sent);
+        notifier_completed = wait_for_scheduler_condition([&] {
+            return notifier.is_destroyed();
+        });
+        if (notifier_completed) {
+            try {
+                notifier.await_resume();
+                notifier_succeeded = true;
+            } catch (...) {
+            }
+        }
+    }
+    elio::runtime::detail::reject_next_schedule_for_test.store(
+        false, std::memory_order_release);
+
+    const bool io_staged = wait_for_scheduler_condition([&] {
+        return observed.io_staged.load(std::memory_order_acquire);
+    });
+
+    bool io_owner_matches = false;
+    bool effective_io_affinity_matches = false;
+    if (io_staged && observed.context) {
+        auto* owner = sched.get_worker(expected_worker);
+        if (owner) {
+            io_owner_matches = observed.context->is_io_pin_owner(
+                expected_worker, owner->io_context().generation());
+            effective_io_affinity_matches =
+                observed.context->effective_affinity() == expected_worker;
+        }
+    }
+
+    const auto local_fallbacks_after =
+        elio::runtime::detail::local_schedule_fallbacks_for_test.load(
+            std::memory_order_acquire);
+
+    const char byte = 'x';
+    const auto write_result = ::write(sockets.writer(), &byte, 1);
+    bool task_completed = wait_for_scheduler_condition([&] {
+        return observed.done.load(std::memory_order_acquire);
+    });
+    if (!task_completed) {
+        gate.close();
+        try {
+            cleanup_cancellation.cancel();
+        } catch (...) {
+        }
+        task_completed = wait_for_scheduler_condition([&] {
+            return observed.done.load(std::memory_order_acquire);
+        });
+    }
+
+    bool joined_destroyed = !joined.has_value();
+    bool joined_succeeded = !joined.has_value();
+    if (joined) {
+        joined_destroyed = wait_for_scheduler_condition([&] {
+            return joined->is_destroyed();
+        });
+        if (joined_destroyed) {
+            try {
+                joined->await_resume();
+                joined_succeeded = true;
+            } catch (...) {
+            }
+        }
+    }
+
+    gate.close();
+    const bool shutdown_succeeded = sched.shutdown(scaled_sec(5));
+
+    REQUIRE(receiver_waited);
+    REQUIRE(marker_completed);
+    REQUIRE(marker_succeeded);
+    REQUIRE(notifier_completed);
+    REQUIRE(notifier_succeeded);
+    REQUIRE(gate_sent.load(std::memory_order_acquire));
+    REQUIRE(io_staged);
+    REQUIRE(observed.context);
+    CHECK(observed.first_worker.load(std::memory_order_acquire) == 0);
+    CHECK(observed.first_affinity.load(std::memory_order_acquire) == 0);
+    CHECK(observed.gate_received.load(std::memory_order_acquire));
+    CHECK(observed.resumed_worker.load(std::memory_order_acquire) ==
+          expected_worker);
+    CHECK(observed.resumed_affinity.load(std::memory_order_acquire) ==
+          expected_affinity);
+    CHECK(observed.after_scope_worker.load(std::memory_order_acquire) ==
+          expected_worker);
+    CHECK(observed.after_scope_affinity.load(std::memory_order_acquire) ==
+          expected_affinity);
+    CHECK(io_owner_matches);
+    CHECK(effective_io_affinity_matches);
+    if (mode == spawn_affinity_mode::inherit) {
+        CHECK(local_fallbacks_after == local_fallbacks_before);
+    } else {
+        CHECK(local_fallbacks_after == local_fallbacks_before + 1);
+    }
+    CHECK(write_result == 1);
+    REQUIRE(task_completed);
+    REQUIRE(joined_destroyed);
+    REQUIRE(joined_succeeded);
+    CHECK(observed.recv_result.load(std::memory_order_acquire) == 1);
+    CHECK(observed.completion_worker.load(std::memory_order_acquire) ==
+          expected_worker);
+    CHECK(observed.post_io_affinity.load(std::memory_order_acquire) ==
+          expected_affinity);
+    REQUIRE(shutdown_succeeded);
+}
+
 } // namespace
 
 TEST_CASE("Scheduler construction", "[scheduler]") {
@@ -238,6 +532,28 @@ TEST_CASE("Scheduler routes an I/O-pinned migration request to its owner",
 
     REQUIRE(observed_worker.load(std::memory_order_acquire) == 0);
     REQUIRE(sched.shutdown(scaled_sec(5)));
+}
+
+TEST_CASE("go_to affinity reaches the returned task across suspension",
+          "[scheduler][task][io][affinity][regression]") {
+    check_spawn_affinity_case(
+        false, spawn_affinity_mode::inherit, 0, 0);
+}
+
+TEST_CASE("go_joinable_to affinity reaches the returned task and remains overridable",
+          "[scheduler][task][io][affinity][join_handle][regression]") {
+    SECTION("inherit spawn affinity") {
+        check_spawn_affinity_case(
+            true, spawn_affinity_mode::inherit, 0, 0);
+    }
+    SECTION("clear spawn affinity") {
+        check_spawn_affinity_case(
+            true, spawn_affinity_mode::clear, 1, NO_AFFINITY);
+    }
+    SECTION("replace spawn affinity") {
+        check_spawn_affinity_case(
+            true, spawn_affinity_mode::move_to_worker_one, 1, 1);
+    }
 }
 
 TEST_CASE("Scheduler pause/resume", "[scheduler]") {

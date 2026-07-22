@@ -411,6 +411,7 @@ public:
     struct promise_type : promise_base {
         std::optional<T> value_;
         std::coroutine_handle<> continuation_;
+        promise_base* awaiter_promise_ = nullptr;
         bool detached_ = false;
         std::shared_ptr<detail::join_state<T>> join_state_;
 
@@ -495,6 +496,14 @@ public:
         if constexpr (std::is_convertible_v<AwaiterPromise*, promise_base*>) {
             parent = std::addressof(awaiter.promise());
             parent_token = parent->execution_context()->get_cancel_token();
+            // Directly awaited Elio tasks form one logical vthread. Carry the
+            // current user affinity into a new child frame; await_resume()
+            // copies the child's final value back so explicit changes made by
+            // deeper frames remain visible to the rest of the chain.
+            handle_.promise().awaiter_promise_ = parent;
+            if (!handle_.promise().has_affinity() && parent->has_affinity()) {
+                handle_.promise().set_affinity(parent->affinity());
+            }
         }
         handle_.promise().link_parent_cancellation(std::move(parent_token));
         handle_.promise().continuation_ = awaiter;
@@ -505,6 +514,13 @@ public:
         assert(handle_ && "cannot resume an empty task");
         auto& promise = handle_.promise();
         auto exception = promise.exception();
+        if (auto* awaiter = std::exchange(promise.awaiter_promise_, nullptr)) {
+            if (promise.has_affinity()) {
+                awaiter->set_affinity(promise.affinity());
+            } else {
+                awaiter->clear_affinity();
+            }
+        }
         promise.detach_from_parent();
         if (exception) std::rethrow_exception(exception);
         return std::move(*promise.value_);
@@ -523,6 +539,7 @@ public:
 
     struct promise_type : promise_base {
         std::coroutine_handle<> continuation_;
+        promise_base* awaiter_promise_ = nullptr;
         bool detached_ = false;
         std::shared_ptr<detail::join_state<void>> join_state_;
 
@@ -599,6 +616,12 @@ public:
         if constexpr (std::is_convertible_v<AwaiterPromise*, promise_base*>) {
             parent = std::addressof(awaiter.promise());
             parent_token = parent->execution_context()->get_cancel_token();
+            // Keep user affinity continuous across the logical vthread even
+            // though each lazy task owns a distinct execution context.
+            handle_.promise().awaiter_promise_ = parent;
+            if (!handle_.promise().has_affinity() && parent->has_affinity()) {
+                handle_.promise().set_affinity(parent->affinity());
+            }
         }
         handle_.promise().link_parent_cancellation(std::move(parent_token));
         handle_.promise().continuation_ = awaiter;
@@ -609,6 +632,13 @@ public:
         assert(handle_ && "cannot resume an empty task");
         auto& promise = handle_.promise();
         auto exception = promise.exception();
+        if (auto* awaiter = std::exchange(promise.awaiter_promise_, nullptr)) {
+            if (promise.has_affinity()) {
+                awaiter->set_affinity(promise.affinity());
+            } else {
+                awaiter->clear_affinity();
+            }
+        }
         promise.detach_from_parent();
         if (exception) std::rethrow_exception(exception);
     }

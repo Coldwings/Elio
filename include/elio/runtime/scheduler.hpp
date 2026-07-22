@@ -113,22 +113,10 @@ namespace detail {
     /// done in promise_base::~promise_base via the on_spawn_completion_
     /// callback, which fires whenever the frame is destroyed regardless of
     /// whether the body ever ran.
-    template<typename Task>
-    void inherit_spawn_affinity(Task& task) noexcept {
-        auto* wrapper = coro::promise_base::current_frame();
-        auto child = coro::detail::task_access::handle(task);
-        if (wrapper && wrapper->has_affinity() && child &&
-            !child.promise().has_affinity()) {
-            child.promise().set_affinity(wrapper->affinity());
-        }
-    }
-
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && is_task_v<std::invoke_result_t<F, Args...>>)
     coro::task<void> callable_wrapper_void(F f, Args... args) {
-        auto task = std::invoke(std::move(f), std::move(args)...);
-        inherit_spawn_affinity(task);
-        co_await task;
+        co_await std::invoke(std::move(f), std::move(args)...);
     }
 
     /// Wrapper coroutine for joinable spawn (go_joinable).
@@ -136,9 +124,7 @@ namespace detail {
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && is_task_v<std::invoke_result_t<F, Args...>>)
     auto callable_wrapper(F f, Args... args) -> std::invoke_result_t<F, Args...> {
-        auto task = std::invoke(std::move(f), std::move(args)...);
-        inherit_spawn_affinity(task);
-        co_return co_await task;
+        co_return co_await std::invoke(std::move(f), std::move(args)...);
     }
 } // namespace detail
 

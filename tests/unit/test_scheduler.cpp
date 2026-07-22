@@ -260,6 +260,7 @@ task<void> resume_spawn_affinity_probe(manual_schedule_gate* gate) {
     elio::runtime::detail::reject_next_schedule_for_test.store(
         true, std::memory_order_release);
     gate->resume();
+    co_return;
 }
 
 template<typename Predicate>

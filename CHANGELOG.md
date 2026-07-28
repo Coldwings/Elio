@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepts but does not cancel an accept already submitted to the I/O backend.
   Stoppable accept loops must use token cancellation, await completion, and
   only then close or destroy the listener (#1009).
+- Clarified that graceful scheduler shutdown does not stop application service
+  loops by itself. Callers must cancel or wake long-running loops and await
+  completion before an unbounded shutdown, or use a finite timeout and accept
+  force-stop semantics (#1010).
 - Clarified the RDMA operation teardown boundary: cancellation is cooperative,
   operation awaiters are not token-cancellable, and a suspended operation
   coroutine must remain alive after delivery wins `pending → completed` until

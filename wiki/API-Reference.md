@@ -855,6 +855,13 @@ non-graceful teardown is required: it does not wait for tracked coroutine or
 pending-I/O drain, but it may still wait for already-accepted scheduler-owned
 blocking work before stopping workers.
 
+Graceful shutdown does not itself request application-level service loops to
+stop. Before calling unbounded `shutdown()`, signal or cancel accept loops,
+periodic timers, and other long-running tasks, wake any non-cancellable wait,
+and wait for those tasks to finish. If the application cannot guarantee that
+drain, pass a finite timeout and handle a `false` result; once the budget
+expires, shutdown force-stops the remaining work and may orphan in-flight I/O.
+
 A scheduler has a one-shot lifecycle. Once either shutdown path begins, later
 `start()` calls are no-ops; create a new scheduler for another run. Concurrent
 shutdown callers share one teardown, and external callers wait for a teardown

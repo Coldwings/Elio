@@ -227,6 +227,11 @@ public:
     /// still in flight, the remaining work is force-stopped (in-flight I/O may
     /// be orphaned).
     ///
+    /// Long-running service tasks such as accept or periodic loops do not stop
+    /// merely because shutdown begins. Signal or cancel those loops and wait
+    /// for them to finish before calling the unbounded form, or pass a finite
+    /// timeout and accept force-stop semantics for work that misses the budget.
+    ///
     /// @param timeout Maximum wait. Default: wait forever.
     /// @return true if all tracked tasks completed within the timeout.
     /// @note Must NOT be called from a worker thread (would deadlock).

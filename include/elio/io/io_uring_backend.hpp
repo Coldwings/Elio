@@ -302,8 +302,9 @@ public:
             );
         }
         
-        ELIO_LOG_INFO("io_uring_backend initialized (queue_depth={}, flags=0x{:x})",
-                      depth, params.flags);
+        ELIO_LOG_DEBUG(
+            "io_uring_backend initialized (queue_depth={}, flags=0x{:x})",
+            depth, params.flags);
 
         // Create eventfd for cross-thread wake notifications
         wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);

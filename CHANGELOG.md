@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Clarified the `tcp_listener` shutdown boundary: `close()` invalidates future
+  accepts but does not cancel an accept already submitted to the I/O backend.
+  Stoppable accept loops must use token cancellation, await completion, and
+  only then close or destroy the listener (#1009).
 - Clarified the RDMA operation teardown boundary: cancellation is cooperative,
   operation awaiters are not token-cancellable, and a suspended operation
   coroutine must remain alive after delivery wins `pending → completed` until

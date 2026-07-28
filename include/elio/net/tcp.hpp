@@ -962,17 +962,27 @@ public:
         bool cancellable_ = false;
     };
     
-    /// Accept a new connection
+    /// Accept a new connection.
+    ///
+    /// The listener must remain open and alive until the await completes.
+    /// ``close()`` does not cancel an accept already submitted to the backend.
     auto accept() {
         return accept_awaitable(*this);
     }
 
-    /// Accept a new connection, cancellable by token
+    /// Accept a new connection, cancellable by token.
+    ///
+    /// Use this overload for service loops that must stop: request
+    /// cancellation, await the accept-loop task, and only then close or destroy
+    /// the listener.
     auto accept(coro::cancel_token token) {
         return accept_awaitable(*this, std::move(token));
     }
     
-    /// Close the listener
+    /// Close the listener and prevent later accepts from succeeding.
+    ///
+    /// This does not cancel an accept already submitted to the I/O backend.
+    /// Cancel and await any pending ``accept(token)`` before calling ``close()``.
     void close() {
         close_sync();
     }

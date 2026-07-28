@@ -135,7 +135,8 @@ private:
                 try {
                     backend_ = std::make_unique<io_uring_backend>();
                     backend_type_ = backend_type::io_uring;
-                    ELIO_LOG_INFO("io_context using io_uring backend (auto-detected)");
+                    ELIO_LOG_DEBUG(
+                        "io_context using io_uring backend (auto-detected)");
                     return;
                 } catch (const std::exception& ex) {
                     ELIO_LOG_WARNING(
@@ -153,7 +154,8 @@ private:
 #if ELIO_HAS_IO_URING
                 backend_ = std::make_unique<io_uring_backend>();
                 backend_type_ = backend_type::io_uring;
-                ELIO_LOG_INFO("io_context using io_uring backend (explicit)");
+                ELIO_LOG_DEBUG(
+                    "io_context using io_uring backend (explicit)");
 #else
                 throw std::runtime_error("io_uring backend not available (not compiled with liburing)");
 #endif

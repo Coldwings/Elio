@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reads the calling thread's shared completion slot, so an epoll fallback does
   not return stale io_uring state when both backends were compiled in. (#982)
 
+### Changed
+
+- **Quieter io_uring initialization**: per-context backend initialization and
+  selection diagnostics now use DEBUG instead of the default INFO level
+  (#1011).
+
 ### Documentation
 
 - Clarified the RDMA operation teardown boundary: cancellation is cooperative,

@@ -602,6 +602,9 @@ cmake --build build
 # Microbenchmarks - individual operation timing
 ./build/examples/microbench
 
+# Scheduler service latency - armed I/O and remote inbox under runnable load
+./build/examples/scheduler_service_benchmark
+
 # I/O benchmark - file read throughput
 ./build/examples/io_benchmark
 
@@ -621,6 +624,12 @@ Benchmark results can vary significantly (min/max differ by 2-7x) due to:
 - Memory allocation patterns
 
 Run benchmarks multiple times and use minimum values for best-case analysis.
+For `scheduler_service_benchmark`, inspect p50, p99, and maximum latency rather
+than the minimum. The benchmark intentionally keeps one worker's local deque
+runnable while it delivers one armed I/O completion and one remote submission;
+it measures scheduler service delay, not the underlying eventfd syscall time.
+Use `--smoke` only to verify build and termination in CI. Timing values are not
+CI pass/fail thresholds because shared runners are noisy.
 
 ## Quick Reference
 

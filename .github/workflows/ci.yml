@@ -182,6 +182,10 @@ jobs:
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
       run: timeout --kill-after=10s 5m ./build/examples/bench_channel
 
+    - name: Run scheduler service benchmark smoke test
+      if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
+      run: timeout --kill-after=5s 30s ./build/examples/scheduler_service_benchmark --smoke
+
   package-consumer-check:
     needs: changes
     runs-on: ubuntu-24.04

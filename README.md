@@ -314,7 +314,8 @@ their corresponding feature targets.
   `autoscaler_example.cpp`, `thread_affinity.cpp`, `signal_handling.cpp`,
   `debug_test.cpp`
 - **Benchmarks**: `benchmark.cpp`, `quick_benchmark.cpp`, `microbench.cpp`,
-  `io_benchmark.cpp`, `scalability_test.cpp`, `bench_channel.cpp`
+  `scheduler_service_benchmark.cpp`, `io_benchmark.cpp`,
+  `scalability_test.cpp`, `bench_channel.cpp`
 - **TCP/UDS/RPC/file I/O**: `tcp_echo_server.cpp`, `tcp_echo_client.cpp`,
   `uds_echo_server.cpp`, `uds_echo_client.cpp`, `rpc_server_example.cpp`,
   `rpc_client_example.cpp`, `async_file_io.cpp`
@@ -531,13 +532,16 @@ Elio achieves competitive performance through careful optimization:
 
 ```bash
 cd build
-cmake --build . --target quick_benchmark microbench io_benchmark benchmark scalability_test
+cmake --build . --target quick_benchmark microbench scheduler_service_benchmark io_benchmark benchmark scalability_test
 
 # Quick benchmark (spawn, context switch, yield)
 ./examples/quick_benchmark
 
 # Microbenchmarks (individual operations)
 ./examples/microbench
+
+# Scheduler I/O and remote-inbox service latency under runnable load
+./examples/scheduler_service_benchmark
 
 # I/O throughput benchmark
 ./examples/io_benchmark

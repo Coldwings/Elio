@@ -50,6 +50,10 @@ add_executable(microbench microbench.cpp)
 target_link_libraries(microbench PRIVATE elio)
 target_link_options(microbench PRIVATE ${STATIC_LINK_FLAGS})
 
+add_executable(scheduler_service_benchmark scheduler_service_benchmark.cpp)
+target_link_libraries(scheduler_service_benchmark PRIVATE elio)
+target_link_options(scheduler_service_benchmark PRIVATE ${STATIC_LINK_FLAGS})
+
 add_executable(io_benchmark io_benchmark.cpp)
 target_link_libraries(io_benchmark PRIVATE elio)
 target_link_options(io_benchmark PRIVATE ${STATIC_LINK_FLAGS})

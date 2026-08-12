@@ -376,8 +376,9 @@ per-vthread bump allocator or LIFO destruction requirement. Keeping frames small
 still reduces allocation traffic and cache pressure, but callers should not
 depend on allocator locality or on the worker that eventually frees a frame.
 
-If an application already owns a lazy task, transfer it directly to avoid a
-callable-wrapper frame and its task-local control state:
+If an application already owns a non-empty lazy task that has not completed,
+transfer it directly to avoid a callable-wrapper frame and its task-local
+control state:
 
 ```cpp
 // A callable wrapper safely owns arbitrary callable state and arguments.

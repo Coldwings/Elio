@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <functional>
 #include <exception>
+#include <new>
 #include <stdexcept>
 #include <vector>
 
@@ -38,6 +39,7 @@ namespace detail {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     inline std::atomic<bool> reject_next_schedule_for_test{false};
     inline std::atomic<bool> reject_next_spawn_for_test{false};
+    inline std::atomic<bool> fail_next_join_state_allocation_for_test{false};
     inline std::atomic<size_t> local_schedule_fast_paths_for_test{0};
     inline std::atomic<size_t> local_schedule_fallbacks_for_test{0};
     inline std::atomic<bool> pause_shutdown_teardown_for_test{false};
@@ -1172,6 +1174,10 @@ private:
             throw std::invalid_argument(
                 "cannot transfer an empty task to the scheduler");
         }
+        if (coro::detail::task_access::handle(task).done()) {
+            throw std::invalid_argument(
+                "cannot transfer a completed task to the scheduler");
+        }
 
         auto handle = coro::detail::task_access::release(std::move(task));
         handle.promise().detached_ = true;
@@ -1183,6 +1189,12 @@ private:
         if constexpr (Joinable) {
             std::shared_ptr<coro::detail::join_state<T>> state;
             try {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (detail::fail_next_join_state_allocation_for_test.exchange(
+                        false, std::memory_order_acq_rel)) {
+                    throw std::bad_alloc{};
+                }
+#endif
                 state = std::make_shared<coro::detail::join_state<T>>(
                     handle.promise().execution_context());
             } catch (...) {

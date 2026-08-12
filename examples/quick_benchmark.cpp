@@ -16,6 +16,7 @@ using namespace std::chrono;
 
 // Minimum benchmark duration - reduced for quick testing
 constexpr auto MIN_BENCH_DURATION = seconds(3);
+constexpr auto SPAWN_BATCH_TIMEOUT = seconds(30);
 
 // Statistics helper
 struct bench_stats {
@@ -113,7 +114,7 @@ void benchmark_spawn_overhead() {
             sched.go(empty_task);
         }
 
-        if (!sched.wait_for_idle()) {
+        if (!sched.wait_for_idle(SPAWN_BATCH_TIMEOUT)) {
             std::cerr << "Timed out waiting for callable-spawn batch"
                       << std::endl;
             std::abort();
@@ -160,7 +161,7 @@ void benchmark_direct_task_spawn_overhead() {
             sched.go(empty_task());
         }
 
-        if (!sched.wait_for_idle()) {
+        if (!sched.wait_for_idle(SPAWN_BATCH_TIMEOUT)) {
             std::cerr << "Timed out waiting for direct-spawn batch"
                       << std::endl;
             std::abort();

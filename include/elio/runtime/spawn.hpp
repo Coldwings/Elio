@@ -125,11 +125,15 @@ auto spawn(coro::task<T>&& task) -> coro::join_handle<T> {
         throw std::invalid_argument(
             "cannot transfer an empty task to the scheduler");
     }
+    auto task_handle = coro::detail::task_access::handle(task);
+    if (task_handle.done()) {
+        throw std::invalid_argument(
+            "cannot transfer a completed task to the scheduler");
+    }
     auto* sched = runtime::scheduler::current();
     if (sched && sched->is_running()) {
         return sched->go_joinable(std::move(task));
     }
-    auto task_handle = coro::detail::task_access::handle(task);
     auto state = std::make_shared<coro::detail::join_state<T>>(
         task_handle.promise().execution_context());
     task_handle = coro::detail::task_access::release(std::move(task));

@@ -198,20 +198,22 @@ coro::task<void> parallel_example() {
     // avoids a callable-wrapper frame.
     auto direct = elio::spawn(compute(40));
     
-    // All three run in parallel
+    // All four run in parallel
     // Now wait for results
     int a = co_await h1;  // 20
     int b = co_await h2;  // 40
     int c = co_await h3;  // 60
+    int d = co_await direct;  // 80
     
-    ELIO_LOG_INFO("Sum: {}", a + b + c);  // 120
+    ELIO_LOG_INFO("Sum: {}", a + b + c + d);  // 200
 }
 ```
 
-The direct overload consumes a non-empty rvalue task. Keep using the callable
-form for an arbitrary temporary coroutine lambda or member callable: the
-wrapper owns that callable while its returned coroutine executes, including
-implementations whose frame retains the callable through `this`.
+The direct overload consumes a non-empty rvalue task that has not already
+completed. Keep using the callable form for an arbitrary temporary coroutine
+lambda or member callable: the wrapper owns that callable while its returned
+coroutine executes, including implementations whose frame retains the callable
+through `this`.
 
 #### Spawn Macros
 

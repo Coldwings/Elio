@@ -400,7 +400,7 @@ sched.start();
 // Callable form safely keeps the callable and arguments in a wrapper frame
 sched.go(my_coroutine);  // fire-and-forget
 
-// Direct form transfers an already-constructed lazy task without a wrapper
+// Direct form transfers an uncompleted lazy task without a wrapper
 sched.go(my_coroutine());
 auto handle = sched.go_joinable(my_coroutine());
 

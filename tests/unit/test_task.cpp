@@ -829,6 +829,63 @@ TEST_CASE("direct task join reports scheduler rejection",
     REQUIRE_THROWS_AS(joined.await_resume(), std::logic_error);
 }
 
+TEST_CASE("direct task transfer rejects a completed owner",
+          "[task][spawn][join_handle][lifecycle]") {
+    auto completed = return_value(42);
+    get_handle(completed).resume();
+    REQUIRE(get_handle(completed).done());
+
+    REQUIRE_THROWS_AS(elio::spawn(std::move(completed)),
+                      std::invalid_argument);
+    REQUIRE(completed.valid());
+
+    scheduler sched(1);
+    sched.start();
+    REQUIRE_THROWS_AS(sched.go_joinable(std::move(completed)),
+                      std::invalid_argument);
+    REQUIRE(completed.valid());
+    REQUIRE(sched.wait_for_idle(scaled_sec(5)));
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+}
+
+TEST_CASE("direct task join destroys its frame when state allocation fails",
+          "[task][spawn][join_handle][lifecycle][allocation]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<int> destructions{0};
+    auto direct = probed_lazy_task(task_lifetime_probe{&destructions});
+    elio::runtime::detail::fail_next_join_state_allocation_for_test.store(
+        true, std::memory_order_release);
+
+    REQUIRE_THROWS_AS(sched.go_joinable(std::move(direct)), std::bad_alloc);
+    REQUIRE_FALSE(direct.valid());
+    REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+    REQUIRE(sched.wait_for_idle(scaled_sec(5)));
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+}
+
+TEST_CASE("direct task join balances tracking after enqueue rejection",
+          "[task][spawn][join_handle][lifecycle]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<int> destructions{0};
+    auto direct = probed_lazy_task(task_lifetime_probe{&destructions});
+    elio::runtime::detail::reject_next_spawn_for_test.store(
+        true, std::memory_order_release);
+
+    auto joined = sched.go_joinable(std::move(direct));
+
+    REQUIRE_FALSE(direct.valid());
+    REQUIRE(joined.is_ready());
+    REQUIRE(joined.is_destroyed());
+    REQUIRE_THROWS_AS(joined.await_resume(), std::logic_error);
+    REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+    REQUIRE(sched.wait_for_idle(scaled_sec(5)));
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+}
+
 TEST_CASE("direct task spawn without a scheduler returns a terminal handle",
           "[task][spawn][join_handle][lifecycle]") {
     auto direct = return_value(42);

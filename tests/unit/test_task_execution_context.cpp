@@ -53,6 +53,68 @@ TEST_CASE("promise runtime policy is stored in task execution context",
     REQUIRE(context->user_affinity() == NO_AFFINITY);
 }
 
+TEST_CASE("runtime task control state uses one shared allocation",
+          "[task][execution_context][cancellation][allocation]") {
+    elio::coro::detail::separate_cancel_state_allocations_for_test.store(
+        0, std::memory_order_relaxed);
+
+    std::weak_ptr<task_execution_context> weak_context;
+    cancel_token retained_token;
+    {
+        auto value = context_noop();
+        auto context = get_handle(value).promise().execution_context();
+        weak_context = context;
+        retained_token = context->get_cancel_token();
+
+        REQUIRE(context);
+        REQUIRE_FALSE(retained_token.is_cancelled());
+        REQUIRE(
+            elio::coro::detail::separate_cancel_state_allocations_for_test.load(
+                std::memory_order_relaxed) == 0);
+    }
+
+    // The aliasing token shares the task-context control block, so the
+    // embedded cancel_state remains valid after the coroutine frame is gone.
+    REQUIRE_FALSE(weak_context.expired());
+    REQUIRE_FALSE(retained_token.is_cancelled());
+    retained_token = {};
+    REQUIRE(weak_context.expired());
+
+    // Source-compatible standalone construction keeps its independent state.
+    auto standalone = std::make_shared<task_execution_context>();
+    auto standalone_token = standalone->get_cancel_token();
+    REQUIRE(
+        elio::coro::detail::separate_cancel_state_allocations_for_test.load(
+            std::memory_order_relaxed) == 1);
+    elio::coro::detail::join_state<void> default_join_state;
+    REQUIRE_FALSE(default_join_state.is_completed());
+    REQUIRE(
+        elio::coro::detail::separate_cancel_state_allocations_for_test.load(
+            std::memory_order_relaxed) == 1);
+    standalone->request_cancel();
+    REQUIRE(standalone_token.is_cancelled());
+}
+
+TEST_CASE("co-allocated parent cancellation links do not retain a cycle",
+          "[task][execution_context][cancellation][ownership]") {
+    auto parent = elio::coro::detail::make_task_execution_context();
+    auto child = elio::coro::detail::make_task_execution_context();
+    auto child_token = child->get_cancel_token();
+    child->link_parent_cancellation(parent->get_cancel_token());
+
+    parent->request_cancel();
+    REQUIRE(child_token.is_cancelled());
+
+    std::weak_ptr<task_execution_context> weak_parent = parent;
+    std::weak_ptr<task_execution_context> weak_child = child;
+    child_token = {};
+    parent.reset();
+    child.reset();
+
+    REQUIRE(weak_parent.expired());
+    REQUIRE(weak_child.expired());
+}
+
 TEST_CASE("I/O pins override but do not rewrite user affinity",
           "[task][execution_context][io][affinity]") {
     auto context = std::make_shared<task_execution_context>();

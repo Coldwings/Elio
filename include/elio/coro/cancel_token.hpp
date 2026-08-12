@@ -32,6 +32,8 @@ enum class cancel_result {
 
 namespace detail {
 
+class cancellation_context;
+
 inline thread_local const void* current_callback_dispatcher = nullptr;
 
 class callback_dispatch_scope final {
@@ -320,6 +322,18 @@ struct cancel_state {
     }
 };
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline std::atomic<size_t> separate_cancel_state_allocations_for_test{0};
+#endif
+
+inline std::shared_ptr<cancel_state> make_cancel_state() {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    separate_cancel_state_allocations_for_test.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
+    return std::make_shared<cancel_state>();
+}
+
 } // namespace detail
 
 /// Forward declaration
@@ -482,6 +496,7 @@ public:
 
 private:
     friend class cancel_source;
+    friend class detail::cancellation_context;
 
     explicit cancel_token(std::shared_ptr<detail::cancel_state> state)
         : state_(std::move(state)) {}
@@ -511,7 +526,7 @@ class cancel_source {
 public:
     /// Create a new cancel source
     cancel_source()
-        : state_(std::make_shared<detail::cancel_state>()) {}
+        : state_(detail::make_cancel_state()) {}
 
     /// Get a token associated with this source
     cancel_token get_token() const noexcept {
@@ -540,14 +555,21 @@ private:
 
 namespace detail {
 
-/// Task-lifetime cancellation authority. The source remains valid through the
+/// Task-lifetime cancellation authority. The state remains valid through the
 /// shared task_execution_context even after the coroutine frame is destroyed.
 /// A lazy child links to its active Elio awaiter's token before first resume, so
 /// a request flows down the running Elio task chain without granting
 /// cancellation authority to the lazy task owner itself.
 class cancellation_context final {
 public:
-    cancellation_context() = default;
+    struct deferred_state_t final {};
+
+    cancellation_context()
+        : owned_state_(make_cancel_state())
+        , shared_state_(owned_state_)
+        , state_(owned_state_.get()) {}
+
+    explicit cancellation_context(deferred_state_t) noexcept {}
 
     cancellation_context(const cancellation_context&) = delete;
     cancellation_context& operator=(const cancellation_context&) = delete;
@@ -555,20 +577,26 @@ public:
     cancellation_context& operator=(cancellation_context&&) = delete;
 
     [[nodiscard]] cancel_token token() const noexcept {
-        return source_.get_token();
+        return cancel_token{shared_state_.lock()};
     }
 
     void request_cancel() {
-        source_.cancel();
+        if (state_) {
+            state_->trigger();
+        }
     }
 
     [[nodiscard]] bool is_cancellation_requested() const noexcept {
-        return source_.is_cancelled();
+        return state_ &&
+               state_->cancelled.load(std::memory_order_acquire);
     }
 
     void link_parent(cancel_token parent) {
-        auto registration = parent.on_cancel([source = source_]() mutable {
-            source.cancel();
+        auto child_state = shared_state_;
+        auto registration = parent.on_cancel([child_state]() mutable {
+            if (auto state = child_state.lock()) {
+                state->trigger();
+            }
         });
 
         std::lock_guard<std::mutex> lock(parent_mutex_);
@@ -580,10 +608,17 @@ public:
         parent_linked_ = true;
     }
 
+    void bind_shared_state(std::shared_ptr<cancel_state> state) noexcept {
+        shared_state_ = state;
+        state_ = state.get();
+    }
+
 private:
-    // Keep registration last so it unregisters before the owned source is
-    // released during destruction.
-    cancel_source source_;
+    // Keep registration last so it unregisters before either the separately
+    // owned state or a co-allocated task context can be released.
+    std::shared_ptr<cancel_state> owned_state_;
+    std::weak_ptr<cancel_state> shared_state_;
+    cancel_state* state_ = nullptr;
     std::mutex parent_mutex_;
     bool parent_linked_ = false;
     cancel_registration parent_registration_;

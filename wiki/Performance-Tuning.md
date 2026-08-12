@@ -375,6 +375,10 @@ For best io_uring performance:
 per-vthread bump allocator or LIFO destruction requirement. Keeping frames small
 still reduces allocation traffic and cache pressure, but callers should not
 depend on allocator locality or on the worker that eventually frees a frame.
+The runtime co-allocates each promise's task execution context and task-lifetime
+cancellation state in one shared control block. Cancellation tokens can retain
+that block after frame destruction, so the allocation reduction does not weaken
+token lifetime or parent-to-child cancellation propagation.
 
 If an application already owns a non-empty lazy task that has not completed,
 transfer it directly to avoid a callable-wrapper frame and its task-local

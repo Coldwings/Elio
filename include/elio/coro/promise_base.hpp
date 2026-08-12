@@ -102,7 +102,7 @@ public:
         , debug_worker_id_(static_cast<uint32_t>(-1))
         , debug_id_(0)  // Lazy allocation - only allocated when id() is called
 #endif
-        , execution_context_(std::make_shared<task_execution_context>())
+        , execution_context_(detail::make_task_execution_context())
     {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
         detail::promise_constructions_for_test.fetch_add(

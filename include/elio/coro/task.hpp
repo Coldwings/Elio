@@ -122,7 +122,7 @@ struct task_access {
 
 struct join_state_base {
     join_state_base()
-        : execution_context_(std::make_shared<task_execution_context>()) {}
+        : execution_context_(detail::make_task_execution_context()) {}
 
     explicit join_state_base(
         std::shared_ptr<task_execution_context> execution_context)

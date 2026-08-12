@@ -614,7 +614,7 @@ cmake --build .
 - Use CPU affinity for scheduler threads
 - Consider real-time scheduling
 
-Elio periodically services competing work even if an owner-local deque remains
+Elio periodically services competing work even if a worker remains continuously
 runnable: external submissions every 256 coroutine resumptions and pending I/O
 every 16,384 resumptions. These constants deliberately use different scales
 because checking an inbox is cheap while polling a backend has measurable cost.

@@ -52,10 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Bounded scheduler service under local runnable load**: Workers now check
+- **Bounded scheduler service under runnable load**: Workers now check
   cross-thread submissions every 256 coroutine resumptions and give pending I/O
   a non-blocking service opportunity every 16,384 resumptions while the local
-  deque remains runnable. These are cooperative resumption-count bounds, not
+  worker remains runnable. These are cooperative resumption-count bounds, not
   wall-clock guarantees; user code must still suspend before the scheduler can
   service competing work (#1028).
 - **Coalesced external-submission wakes**: Each worker now issues at most one

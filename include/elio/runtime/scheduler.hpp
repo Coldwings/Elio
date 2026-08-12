@@ -1975,12 +1975,6 @@ inline void worker_thread::run() {
 }
 
 inline void worker_thread::service_competing_work() noexcept {
-    // If the local deque drained naturally, the normal selection and idle
-    // paths already service the inbox and I/O backend.
-    if (queue_->empty()) {
-        return;
-    }
-
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     if (detail::pause_before_periodic_service_for_test.load(
             std::memory_order_acquire)) {
@@ -2002,7 +1996,9 @@ inline void worker_thread::service_competing_work() noexcept {
             io_service_quantum_ / external_service_quantum_;
         // Avoid a syscall on CPU-only workloads. Pending operations need a
         // periodic non-blocking poll so already-ready completions cannot wait
-        // for the owner-local deque to become empty.
+        // for a runnable workload to become idle. Count all resumptions, not
+        // only tasks sourced locally: a worker repeatedly stealing one task at
+        // a time can also remain continuously busy with an empty local deque.
         if (io_context_->has_pending()) {
             io_context_->poll(std::chrono::milliseconds(0));
         }

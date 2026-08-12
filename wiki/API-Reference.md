@@ -835,7 +835,7 @@ eligible continuation is published directly to that worker's local deque.
 Valid affinity to another worker still routes there, and an active I/O pin
 always follows its backend owner. Initial admission through `spawn()`, `go()`,
 and their variants retains normal distribution semantics.
-While an owner-local deque remains continuously runnable, each worker
+While a worker remains continuously runnable, it
 periodically services external submissions and pending I/O. The bounds are
 measured in completed coroutine resumptions: the external inbox is checked at
 most every 256 resumptions, and pending I/O receives a non-blocking poll at most
@@ -950,7 +950,7 @@ public:
   one outstanding eventfd notification; before blocking again, the worker
   clears the wake claim and rechecks its external queues so no wake is lost
 - The bounded MPSC inbox remains the fast path; a locked overflow queue absorbs rare bursts without resuming worker-bound coroutines on submitter threads
-- A continuously runnable local deque receives periodic service points:
+- A continuously runnable worker receives periodic service points:
   external submissions are transferred every 256 coroutine resumptions and
   pending I/O is polled non-blockingly every 16,384 resumptions. User code must
   suspend for either cooperative bound to advance

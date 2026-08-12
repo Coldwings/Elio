@@ -347,6 +347,11 @@ Separately, `promise_base` holds a shared execution-context reference; the
 context has its own allocation and may outlive the frame when an external
 runtime owner retains it.
 
+High-level spawn APIs retain arbitrary callables and their arguments in a root
+wrapper frame. When a caller already owns a lazy `task<T>`, the rvalue-task
+overloads transfer that frame directly, avoiding a redundant wrapper frame and
+its separate execution context while preserving independent-root semantics.
+
 ### What it enables
 
 - **`elio-pstack`**: A CLI tool that attaches to a running process (or reads a coredump) and walks the virtual stack chains to print coroutine backtraces, similar to `pstack` for threads.

@@ -16,6 +16,7 @@ using namespace std::chrono;
 
 // Minimum benchmark duration - reduced for quick testing
 constexpr auto MIN_BENCH_DURATION = seconds(3);
+constexpr auto SPAWN_BATCH_TIMEOUT = seconds(30);
 
 // Statistics helper
 struct bench_stats {
@@ -113,8 +114,10 @@ void benchmark_spawn_overhead() {
             sched.go(empty_task);
         }
 
-        while (sched.pending_tasks() > 0) {
-            std::this_thread::sleep_for(microseconds(1));
+        if (!sched.wait_for_idle(SPAWN_BATCH_TIMEOUT)) {
+            std::cerr << "Timed out waiting for callable-spawn batch"
+                      << std::endl;
+            std::abort();
         }
 
         auto batch_end = high_resolution_clock::now();
@@ -131,8 +134,58 @@ void benchmark_spawn_overhead() {
 
     auto stats = bench_stats::compute(samples);
 
-    std::cout << "Task Spawn: " << std::fixed << std::setprecision(2)
+    std::cout << "Task Spawn (callable): " << std::fixed << std::setprecision(2)
               << stats.avg << " ns/task (min=" << stats.min
+              << ", max=" << stats.max << ")" << std::endl;
+    std::cout << "  Throughput: " << std::fixed << std::setprecision(0)
+              << (total_tasks / total_sec) << " tasks/sec" << std::endl;
+}
+
+// Same work with an already-constructed lazy task transferred directly. This
+// isolates the callable-wrapper frame and control-state cost.
+void benchmark_direct_task_spawn_overhead() {
+    const int batch_size = 10000;
+    std::vector<double> samples;
+    size_t total_tasks = 0;
+
+    auto bench_start = high_resolution_clock::now();
+
+    while (duration_cast<seconds>(high_resolution_clock::now() - bench_start) <
+           MIN_BENCH_DURATION) {
+        runtime::scheduler sched(4);
+        sched.start();
+
+        auto batch_start = high_resolution_clock::now();
+
+        for (int i = 0; i < batch_size; ++i) {
+            sched.go(empty_task());
+        }
+
+        if (!sched.wait_for_idle(SPAWN_BATCH_TIMEOUT)) {
+            std::cerr << "Timed out waiting for direct-spawn batch"
+                      << std::endl;
+            std::abort();
+        }
+
+        auto batch_end = high_resolution_clock::now();
+        auto batch_ns = duration_cast<nanoseconds>(
+            batch_end - batch_start).count();
+
+        samples.push_back(static_cast<double>(batch_ns) / batch_size);
+        total_tasks += batch_size;
+
+        sched.shutdown();
+    }
+
+    auto bench_end = high_resolution_clock::now();
+    auto total_sec = duration_cast<milliseconds>(
+        bench_end - bench_start).count() / 1000.0;
+
+    auto stats = bench_stats::compute(samples);
+
+    std::cout << "Task Spawn (direct task): " << std::fixed
+              << std::setprecision(2) << stats.avg
+              << " ns/task (min=" << stats.min
               << ", max=" << stats.max << ")" << std::endl;
     std::cout << "  Throughput: " << std::fixed << std::setprecision(0)
               << (total_tasks / total_sec) << " tasks/sec" << std::endl;
@@ -327,6 +380,7 @@ int main() {
               << duration_cast<seconds>(MIN_BENCH_DURATION).count() << "s each) ===" << std::endl;
 
     benchmark_spawn_overhead();
+    benchmark_direct_task_spawn_overhead();
     benchmark_context_switch();
     benchmark_yield();
     benchmark_scheduler_reschedule();

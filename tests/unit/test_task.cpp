@@ -39,6 +39,12 @@ task<void> simple_void() {
     co_return;
 }
 
+task<void> record_spawn_worker(std::atomic<size_t>* observed_worker) {
+    observed_worker->store(elio::current_worker_id(),
+                           std::memory_order_release);
+    co_return;
+}
+
 task<int> return_value(int value) {
     co_return value;
 }
@@ -759,6 +765,159 @@ TEST_CASE("task<void> exception propagation", "[task]") {
 // ============================================================================
 // Tests for new task spawning API: elio::go(), elio::spawn(), join_handle
 // ============================================================================
+
+TEST_CASE("direct task transfer avoids a callable-wrapper coroutine",
+          "[task][spawn][performance][allocation]") {
+    scheduler sched(1);
+    sched.start();
+
+    elio::coro::detail::promise_constructions_for_test.store(
+        0, std::memory_order_relaxed);
+    auto direct = simple_void();
+    REQUIRE(elio::coro::detail::promise_constructions_for_test.load(
+                std::memory_order_relaxed) == 1);
+    elio::go(std::move(direct));
+    REQUIRE(sched.wait_for_idle(scaled_sec(5)));
+    REQUIRE(elio::coro::detail::promise_constructions_for_test.load(
+                std::memory_order_relaxed) == 1);
+
+    elio::coro::detail::promise_constructions_for_test.store(
+        0, std::memory_order_relaxed);
+    elio::go(simple_void);
+    REQUIRE(sched.wait_for_idle(scaled_sec(5)));
+    REQUIRE(elio::coro::detail::promise_constructions_for_test.load(
+                std::memory_order_relaxed) == 2);
+
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+}
+
+TEST_CASE("direct task spawn preserves result and affinity",
+          "[task][spawn][join_handle][affinity]") {
+    scheduler sched(2);
+    sched.start();
+
+    auto value_task = return_value(100);
+    auto value = elio::spawn(std::move(value_task));
+    value.wait_destroyed();
+    REQUIRE(value.await_resume() == 100);
+
+    std::atomic<size_t> direct_go_to_worker{NO_AFFINITY};
+    elio::go_to(0, record_spawn_worker(&direct_go_to_worker));
+    REQUIRE(sched.wait_for_idle(scaled_sec(5)));
+    REQUIRE(direct_go_to_worker.load(std::memory_order_acquire) == 0);
+
+    std::atomic<size_t> observed_worker{NO_AFFINITY};
+    auto pinned_task = record_spawn_worker(&observed_worker);
+    auto pinned = sched.go_joinable_to(1, std::move(pinned_task));
+    pinned.wait_destroyed();
+    pinned.await_resume();
+    REQUIRE(observed_worker.load(std::memory_order_acquire) == 1);
+
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+}
+
+TEST_CASE("direct task join reports scheduler rejection",
+          "[task][spawn][join_handle][lifecycle]") {
+    scheduler sched(1);
+    auto direct = return_value(42);
+
+    auto joined = sched.go_joinable(std::move(direct));
+
+    REQUIRE_FALSE(direct.valid());
+    REQUIRE(joined.is_ready());
+    REQUIRE(joined.is_destroyed());
+    REQUIRE_THROWS_AS(joined.await_resume(), std::logic_error);
+}
+
+TEST_CASE("direct task transfer rejects a completed owner",
+          "[task][spawn][join_handle][lifecycle]") {
+    auto completed = return_value(42);
+    get_handle(completed).resume();
+    REQUIRE(get_handle(completed).done());
+
+    REQUIRE_THROWS_AS(elio::spawn(std::move(completed)),
+                      std::invalid_argument);
+    REQUIRE(completed.valid());
+
+    scheduler sched(1);
+    sched.start();
+    REQUIRE_THROWS_AS(sched.go_joinable(std::move(completed)),
+                      std::invalid_argument);
+    REQUIRE(completed.valid());
+    REQUIRE(sched.wait_for_idle(scaled_sec(5)));
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+}
+
+TEST_CASE("direct task join destroys its frame when state allocation fails",
+          "[task][spawn][join_handle][lifecycle][allocation]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<int> destructions{0};
+    auto direct = probed_lazy_task(task_lifetime_probe{&destructions});
+    elio::runtime::detail::fail_next_join_state_allocation_for_test.store(
+        true, std::memory_order_release);
+
+    REQUIRE_THROWS_AS(sched.go_joinable(std::move(direct)), std::bad_alloc);
+    REQUIRE_FALSE(direct.valid());
+    REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+    REQUIRE(sched.wait_for_idle(scaled_sec(5)));
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+}
+
+TEST_CASE("direct task join balances tracking after enqueue rejection",
+          "[task][spawn][join_handle][lifecycle]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<int> destructions{0};
+    auto direct = probed_lazy_task(task_lifetime_probe{&destructions});
+    elio::runtime::detail::reject_next_spawn_for_test.store(
+        true, std::memory_order_release);
+
+    auto joined = sched.go_joinable(std::move(direct));
+
+    REQUIRE_FALSE(direct.valid());
+    REQUIRE(joined.is_ready());
+    REQUIRE(joined.is_destroyed());
+    REQUIRE_THROWS_AS(joined.await_resume(), std::logic_error);
+    REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+    REQUIRE(sched.wait_for_idle(scaled_sec(5)));
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+}
+
+TEST_CASE("direct task spawn without a scheduler returns a terminal handle",
+          "[task][spawn][join_handle][lifecycle]") {
+    auto direct = return_value(42);
+
+    auto joined = elio::spawn(std::move(direct));
+
+    REQUIRE_FALSE(direct.valid());
+    REQUIRE(joined.is_ready());
+    REQUIRE(joined.is_destroyed());
+    joined.request_cancel();
+    REQUIRE(joined.is_cancellation_requested());
+    REQUIRE_THROWS_AS(joined.await_resume(), std::logic_error);
+}
+
+TEST_CASE("direct task transfer rejects an empty owner",
+          "[task][spawn][lifecycle]") {
+    scheduler sched(1);
+    sched.start();
+
+    auto task_owner = simple_void();
+    auto moved_owner = std::move(task_owner);
+
+    REQUIRE_THROWS_AS(sched.go(std::move(task_owner)),
+                      std::invalid_argument);
+    REQUIRE_THROWS_AS(sched.go_joinable(std::move(task_owner)),
+                      std::invalid_argument);
+
+    auto joined = sched.go_joinable(std::move(moved_owner));
+    joined.wait_destroyed();
+    joined.await_resume();
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+}
 
 TEST_CASE("elio::go() spawns fire-and-forget task", "[task][spawn]") {
     scheduler sched(2);

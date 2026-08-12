@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Custom autoscaler trigger packs**: `autoscaler<Scheduler, Triggers...>` now
+  constructs and dispatches each configured trigger correctly instead of
+  failing template instantiation because the trigger argument was omitted.
+  Unit coverage now exercises all three documented custom trigger forms
+  together (#1020).
 - **Non-blocking epoll connect precondition**: the epoll backend now rejects
   `async_connect()` on a blocking socket with `-EINVAL` before `connect(2)` can
   block a scheduler worker. Direct callers must set `O_NONBLOCK` first (#997).

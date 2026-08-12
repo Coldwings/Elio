@@ -13,6 +13,12 @@ class scheduler;
 
 namespace elio::coro {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace detail {
+inline std::atomic<size_t> promise_constructions_for_test{0};
+}  // namespace detail
+#endif
+
 /// Coroutine state for debugging
 enum class coroutine_state : uint8_t {
     created = 0,    // Just created, not started
@@ -98,6 +104,10 @@ public:
 #endif
         , execution_context_(std::make_shared<task_execution_context>())
     {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        detail::promise_constructions_for_test.fetch_add(
+            1, std::memory_order_relaxed);
+#endif
         current_frame_ = this;
     }
 

@@ -397,9 +397,12 @@ elio::coro::task<int> compute() {
 elio::runtime::scheduler sched(num_threads);
 sched.start();
 
-// Spawn coroutines (pass callable, not invoked task)
+// Callable form safely keeps the callable and arguments in a wrapper frame
 sched.go(my_coroutine);  // fire-and-forget
-// Or for joinable: auto handle = sched.go_joinable(my_coroutine);
+
+// Direct form transfers an already-constructed lazy task without a wrapper
+sched.go(my_coroutine());
+auto handle = sched.go_joinable(my_coroutine());
 
 // Dynamic thread adjustment
 sched.set_thread_count(8);
@@ -430,6 +433,9 @@ elio::go(some_task);
 // With arguments
 elio::go(task_with_args, arg1, arg2);
 
+// Directly transfer an already-constructed task (no callable wrapper)
+elio::go(task_with_args(arg1, arg2));
+
 // Lambda with captures (safe - copied into coroutine frame)
 int value = 42;
 elio::go([value]() -> coro::task<void> {
@@ -439,6 +445,7 @@ elio::go([value]() -> coro::task<void> {
 
 // Joinable spawn: get a handle to await later
 auto handle = elio::spawn(compute_value);
+auto direct_handle = elio::spawn(compute_value());
 // ... do other work ...
 int result = co_await handle;  // Wait and get result
 

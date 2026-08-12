@@ -36,6 +36,18 @@ void go(F&& f, Args&&... args) {
     std::abort();
 }
 
+/// Fire-and-forget direct transfer of an already-constructed lazy task.
+template<typename T>
+void go(coro::task<T>&& task) {
+    auto* sched = runtime::scheduler::current();
+    if (sched && sched->is_running()) {
+        sched->go(std::move(task));
+        return;
+    }
+    ELIO_LOG_ERROR("elio::go() called without a running scheduler — aborting");
+    std::abort();
+}
+
 /// Fire-and-forget: spawn a coroutine with affinity to a specific worker.
 /// The task is bound to the given worker before first resume. Steal attempts
 /// that observe it on another queue bounce it back instead of executing it.
@@ -57,6 +69,19 @@ void go_to(size_t worker_id, F&& f, Args&&... args) {
     auto* sched = runtime::scheduler::current();
     if (sched && sched->is_running()) {
         sched->go_to(worker_id, std::forward<F>(f), std::forward<Args>(args)...);
+        return;
+    }
+    ELIO_LOG_ERROR("elio::go_to() called without a running scheduler — aborting");
+    std::abort();
+}
+
+/// Fire-and-forget direct transfer of an already-constructed lazy task toward
+/// a specific worker.
+template<typename T>
+void go_to(size_t worker_id, coro::task<T>&& task) {
+    auto* sched = runtime::scheduler::current();
+    if (sched && sched->is_running()) {
+        sched->go_to(worker_id, std::move(task));
         return;
     }
     ELIO_LOG_ERROR("elio::go_to() called without a running scheduler — aborting");
@@ -86,6 +111,30 @@ auto spawn(F&& f, Args&&... args)
     }
     using T = detail::task_value_t<std::invoke_result_t<F, Args...>>;
     auto state = std::make_shared<coro::detail::join_state<T>>();
+    state->set_exception(std::make_exception_ptr(
+        std::logic_error("elio::spawn() called without a running scheduler")));
+    state->mark_destroyed();
+    return coro::join_handle<T>{std::move(state)};
+}
+
+/// Directly transfer an already-constructed lazy task and retain join
+/// authority without creating a callable-wrapper coroutine.
+template<typename T>
+auto spawn(coro::task<T>&& task) -> coro::join_handle<T> {
+    if (!task) {
+        throw std::invalid_argument(
+            "cannot transfer an empty task to the scheduler");
+    }
+    auto* sched = runtime::scheduler::current();
+    if (sched && sched->is_running()) {
+        return sched->go_joinable(std::move(task));
+    }
+    auto task_handle = coro::detail::task_access::handle(task);
+    auto state = std::make_shared<coro::detail::join_state<T>>(
+        task_handle.promise().execution_context());
+    task_handle = coro::detail::task_access::release(std::move(task));
+    task_handle.promise().detach_from_parent();
+    task_handle.destroy();
     state->set_exception(std::make_exception_ptr(
         std::logic_error("elio::spawn() called without a running scheduler")));
     state->mark_destroyed();

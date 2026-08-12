@@ -376,6 +376,22 @@ per-vthread bump allocator or LIFO destruction requirement. Keeping frames small
 still reduces allocation traffic and cache pressure, but callers should not
 depend on allocator locality or on the worker that eventually frees a frame.
 
+If an application already owns a lazy task, transfer it directly to avoid a
+callable-wrapper frame and its task-local control state:
+
+```cpp
+// A callable wrapper safely owns arbitrary callable state and arguments.
+scheduler.go(make_request, input);
+
+// An already-constructed task can be transferred without that wrapper.
+scheduler.go(make_request(input));
+auto joined = scheduler.go_joinable(make_request(input));
+```
+
+Do not eagerly invoke an arbitrary temporary coroutine lambda merely to select
+the direct overload: its returned frame may retain the lambda through `this`.
+Passing the callable lets Elio keep that object alive in the wrapper.
+
 ### Avoiding Allocations
 
 Keep coroutine frames small to reduce allocation and cache cost:

@@ -96,7 +96,9 @@ coro::task<void> example() {
 
 ### Spawn Functions
 
-Elio provides free functions for spawning concurrent tasks with automatic lambda lifetime safety.
+Elio provides free functions for spawning concurrent tasks. Callable overloads
+provide automatic callable lifetime safety; rvalue-task overloads transfer an
+already-constructed lazy task without a wrapper.
 
 #### `elio::go()` - Fire-and-Forget
 
@@ -105,6 +107,9 @@ Spawn a coroutine without awaiting its result. The coroutine runs independently 
 ```cpp
 template<typename F, typename... Args>
 void go(F&& f, Args&&... args);
+
+template<typename T>
+void go(coro::task<T>&& task);
 ```
 
 **Example:**
@@ -117,6 +122,9 @@ coro::task<void> background_work(int x) {
 coro::task<void> main_task() {
     // Spawn and continue immediately (fire-and-forget)
     elio::go(background_work, 42);
+
+    // Transfer an already-constructed task without a wrapper frame
+    elio::go(background_work(42));
     
     // Lambda with captures is also safe
     int value = 100;
@@ -136,6 +144,9 @@ Spawn a coroutine with affinity to a specific worker thread. The affinity is set
 ```cpp
 template<typename F, typename... Args>
 void go_to(size_t worker_id, F&& f, Args&&... args);
+
+template<typename T>
+void go_to(size_t worker_id, coro::task<T>&& task);
 ```
 
 `worker_id` should be less than the scheduler's current `num_threads()` for
@@ -166,6 +177,9 @@ Spawn a coroutine and return a `join_handle` to await the result later.
 ```cpp
 template<typename F, typename... Args>
 auto spawn(F&& f, Args&&... args) -> coro::join_handle<T>;
+
+template<typename T>
+auto spawn(coro::task<T>&& task) -> coro::join_handle<T>;
 ```
 
 **Example:**
@@ -179,6 +193,10 @@ coro::task<void> parallel_example() {
     auto h1 = elio::spawn(compute, 10);
     auto h2 = elio::spawn(compute, 20);
     auto h3 = elio::spawn(compute, 30);
+
+    // Direct transfer keeps the constructed task's execution context and
+    // avoids a callable-wrapper frame.
+    auto direct = elio::spawn(compute(40));
     
     // All three run in parallel
     // Now wait for results
@@ -189,6 +207,11 @@ coro::task<void> parallel_example() {
     ELIO_LOG_INFO("Sum: {}", a + b + c);  // 120
 }
 ```
+
+The direct overload consumes a non-empty rvalue task. Keep using the callable
+form for an arbitrary temporary coroutine lambda or member callable: the
+wrapper owns that callable while its returned coroutine executes, including
+implementations whose frame retains the callable through `this`.
 
 #### Spawn Macros
 
@@ -754,12 +777,20 @@ public:
     // High-level scheduler-owned spawning APIs
     template<typename F, typename... Args>
     void go(F&& f, Args&&... args);
+    template<typename T>
+    void go(coro::task<T>&& task);
     template<typename F, typename... Args>
     void go_to(size_t worker_id, F&& f, Args&&... args);
+    template<typename T>
+    void go_to(size_t worker_id, coro::task<T>&& task);
     template<typename F, typename... Args>
     coro::join_handle</* task value */> go_joinable(F&& f, Args&&... args);
+    template<typename T>
+    coro::join_handle<T> go_joinable(coro::task<T>&& task);
     template<typename F, typename... Args>
     coro::join_handle</* task value */> go_joinable_to(size_t worker_id, F&& f, Args&&... args);
+    template<typename T>
+    coro::join_handle<T> go_joinable_to(size_t worker_id, coro::task<T>&& task);
 
     // Initial ownership handoff toward a worker; detaches construction ancestry.
     void spawn_to(size_t worker_id, std::coroutine_handle<> handle);

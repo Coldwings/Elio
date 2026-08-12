@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Direct task spawn handoff**: `go`, `go_to`, `go_joinable`, and
+  `go_joinable_to` now accept an already-constructed rvalue `task<T>` without
+  creating a callable-wrapper coroutine. Callable overloads retain their
+  existing lifetime-safe wrapper behavior (#1030).
 - **Bounded scheduler service under runnable load**: Workers now check
   cross-thread submissions every 256 completed worker-loop task dispatches and
   give pending I/O a non-blocking service opportunity every 16,384 dispatches

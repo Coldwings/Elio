@@ -638,6 +638,13 @@ public:
         do_go_<false, false>(0, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
+    /// Transfer an already-constructed lazy task directly to this scheduler.
+    /// Unlike the callable overload, this does not need a lifetime wrapper.
+    template<typename T>
+    void go(coro::task<T>&& task) {
+        do_go_task_<false, false>(0, std::move(task));
+    }
+
     /// High-level API: fire-and-forget, with affinity to a specific worker.
     /// Affinity is set before first resume; steal attempts that observe the
     /// task on another queue bounce it back to the target worker instead of
@@ -649,6 +656,12 @@ public:
         do_go_<false, true>(worker_id, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
+    /// Transfer an already-constructed lazy task toward a specific worker.
+    template<typename T>
+    void go_to(size_t worker_id, coro::task<T>&& task) {
+        do_go_task_<false, true>(worker_id, std::move(task));
+    }
+
     /// High-level API: spawn + join, spawn to this scheduler
     template<typename F, typename... Args>
         requires (std::invocable<F, Args...> && detail::is_task_v<std::invoke_result_t<F, Args...>>)
@@ -656,6 +669,12 @@ public:
         -> coro::join_handle<detail::task_value_t<std::invoke_result_t<F, Args...>>>
     {
         return do_go_<true, false>(0, std::forward<F>(f), std::forward<Args>(args)...);
+    }
+
+    /// Transfer an already-constructed lazy task and retain join authority.
+    template<typename T>
+    auto go_joinable(coro::task<T>&& task) -> coro::join_handle<T> {
+        return do_go_task_<true, false>(0, std::move(task));
     }
 
     /// High-level API: spawn + join, with affinity to a specific worker.
@@ -670,6 +689,14 @@ public:
         -> coro::join_handle<detail::task_value_t<std::invoke_result_t<F, Args...>>>
     {
         return do_go_<true, true>(worker_id, std::forward<F>(f), std::forward<Args>(args)...);
+    }
+
+    /// Transfer an already-constructed lazy task toward a worker and retain
+    /// join authority.
+    template<typename T>
+    auto go_joinable_to(size_t worker_id, coro::task<T>&& task)
+        -> coro::join_handle<T> {
+        return do_go_task_<true, true>(worker_id, std::move(task));
     }
 
     /// Spawn an existing coroutine toward worker_id. Exact placement requires
@@ -1139,20 +1166,14 @@ private:
         return scheduled;
     }
 
-    template<bool Joinable, bool Pinned, typename F, typename... Args>
-    auto do_go_(size_t worker_id, F&& f, Args&&... args) {
-        using ResultTask = std::invoke_result_t<F, Args...>;
-        using T = detail::task_value_t<ResultTask>;
+    template<bool Joinable, bool Pinned, typename T>
+    auto do_go_task_(size_t worker_id, coro::task<T>&& task) {
+        if (!task) {
+            throw std::invalid_argument(
+                "cannot transfer an empty task to the scheduler");
+        }
 
-        auto wrapper = [&]() {
-            if constexpr (Joinable) {
-                return detail::callable_wrapper(std::forward<F>(f), std::forward<Args>(args)...);
-            } else {
-                return detail::callable_wrapper_void(std::forward<F>(f), std::forward<Args>(args)...);
-            }
-        }();
-
-        auto handle = coro::detail::task_access::release(std::move(wrapper));
+        auto handle = coro::detail::task_access::release(std::move(task));
         handle.promise().detached_ = true;
         if constexpr (Pinned) {
             handle.promise().set_affinity(worker_id);
@@ -1160,8 +1181,14 @@ private:
         handle.promise().detach_from_parent();
 
         if constexpr (Joinable) {
-            auto state = std::make_shared<coro::detail::join_state<T>>(
-                handle.promise().execution_context());
+            std::shared_ptr<coro::detail::join_state<T>> state;
+            try {
+                state = std::make_shared<coro::detail::join_state<T>>(
+                    handle.promise().execution_context());
+            } catch (...) {
+                handle.destroy();
+                throw;
+            }
             handle.promise().join_state_ = state;
             bool scheduled = false;
             try {
@@ -1201,6 +1228,21 @@ private:
                 handle.destroy();
             }
         }
+    }
+
+    template<bool Joinable, bool Pinned, typename F, typename... Args>
+    auto do_go_(size_t worker_id, F&& f, Args&&... args) {
+        auto wrapper = [&]() {
+            if constexpr (Joinable) {
+                return detail::callable_wrapper(
+                    std::forward<F>(f), std::forward<Args>(args)...);
+            } else {
+                return detail::callable_wrapper_void(
+                    std::forward<F>(f), std::forward<Args>(args)...);
+            }
+        }();
+        return do_go_task_<Joinable, Pinned>(
+            worker_id, std::move(wrapper));
     }
 
     void reap_draining_workers_() noexcept {

@@ -282,6 +282,36 @@ TEST_CASE("join handle cancellation reaches a nested lazy task chain",
     REQUIRE(sched.shutdown());
 }
 
+TEST_CASE("direct task join cancellation uses the transferred root context",
+          "[task][spawn][join_handle][cancellation_context][direct]") {
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> started{false};
+    std::atomic<bool> observed{false};
+    auto direct = nested_runtime_cancellation(&started, &observed);
+    auto joined = sched.go_joinable(std::move(direct));
+
+    const bool did_start = wait_for_flag(started);
+    if (!did_start) {
+        sched.shutdown_force();
+    }
+    REQUIRE(did_start);
+
+    joined.request_cancel();
+    const bool ready = wait_until_ready(joined);
+    if (!ready) {
+        sched.shutdown_force();
+    }
+    REQUIRE(ready);
+
+    joined.wait_destroyed();
+    REQUIRE(joined.await_resume() == 17);
+    REQUIRE(observed.load(std::memory_order_acquire));
+    REQUIRE(joined.is_cancellation_requested());
+    REQUIRE(sched.shutdown());
+}
+
 TEST_CASE("separate join handles own independent cancellation contexts",
           "[task][spawn][join_handle][cancellation_context]") {
     scheduler sched(2);

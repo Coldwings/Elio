@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Scheduler service-latency benchmark**: Added a repeatable mixed-workload
+  benchmark that reports I/O-completion and remote-inbox p50, p99, and maximum
+  latency while a worker's local runnable deque remains non-empty. A short
+  `--smoke` mode verifies build and termination in CI without imposing timing
+  thresholds on shared runners (#1015).
+
 ### Fixed
 
 - **Non-blocking epoll connect precondition**: the epoll backend now rejects

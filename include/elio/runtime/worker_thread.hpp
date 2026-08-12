@@ -49,7 +49,6 @@ public:
         , queue_(std::make_unique<chase_lev_deque<void>>())
         , inbox_(std::make_unique<mpsc_queue<void>>())
         , running_(false)
-        , tasks_executed_(0)
         , strategy_(strategy)
 #ifdef ELIO_RUNTIME_TEST_HOOKS
         , io_context_(io::io_context::make_worker_owned(
@@ -304,6 +303,16 @@ public:
     }
 
 private:
+    void record_task_execution() noexcept {
+        tasks_executed_.store(++tasks_executed_local_,
+                              std::memory_order_relaxed);
+    }
+
+    void record_successful_steal() noexcept {
+        steals_executed_.store(++steals_executed_local_,
+                               std::memory_order_relaxed);
+    }
+
     void request_stop() noexcept;
 
     void leave_draining_mode() noexcept {
@@ -336,8 +345,11 @@ private:
     // overcount work, but it must never let idle detection miss accepted work.
     std::atomic<size_t> overflow_size_{0};
     std::atomic<bool> draining_{false};
-    // Hot-write fields (owner thread writes per task) — isolated cache line
-    alignas(64) std::atomic<size_t> tasks_executed_;
+    // Only the owner mutates the local counters. Relaxed atomic stores publish
+    // exact monotonic snapshots without a read-modify-write instruction.
+    alignas(64) size_t tasks_executed_local_{0};
+    std::atomic<size_t> tasks_executed_{0};
+    size_t steals_executed_local_{0};
     std::atomic<size_t> steals_executed_{0};
 
     // Idle flag (owner writes, other threads read) — isolated cache line

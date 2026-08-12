@@ -477,6 +477,9 @@ size_t threads = sched.num_threads();            // Current thread count
 ```
 
 These are lightweight atomic reads suitable for periodic monitoring in production. Combine with `set_thread_count` to implement your own adaptive scaling.
+Workers publish execution and successful-steal counts from single-writer local
+counters, so metric collection does not require atomic read-modify-write
+instructions on coroutine resume or steal paths.
 
 ### Logging Overhead
 

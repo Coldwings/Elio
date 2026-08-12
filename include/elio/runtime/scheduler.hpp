@@ -1989,7 +1989,7 @@ inline void worker_thread::run_task(std::coroutine_handle<> handle) noexcept {
     auto* promise = coro::get_promise_base(handle.address());
     coro::detail::frame_context_scope frame_scope(promise);
     handle.resume();
-    tasks_executed_.fetch_add(1, std::memory_order_relaxed);
+    record_task_execution();
     update_last_task_time();
 
     // Note: We do NOT check done() or call destroy() here.
@@ -2029,7 +2029,7 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
             if (promise && promise->has_active_io_pin()) {
                 if (promise->is_io_pin_owner(
                         worker_id_, io_context_->generation())) {
-                    steals_executed_.fetch_add(1, std::memory_order_relaxed);
+                    record_successful_steal();
                     return handle;
                 }
 
@@ -2051,7 +2051,7 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
 
             if (promise && promise->is_worker_local()) {
                 if (affinity == worker_id_) {
-                    steals_executed_.fetch_add(1, std::memory_order_relaxed);
+                    record_successful_steal();
                     return handle;
                 }
                 if (affinity < num_workers) {
@@ -2072,7 +2072,7 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
             }
             
             if (affinity == coro::NO_AFFINITY || affinity == worker_id_) {
-                steals_executed_.fetch_add(1, std::memory_order_relaxed);
+                record_successful_steal();
                 return handle;
             }
             
@@ -2084,14 +2084,14 @@ inline std::coroutine_handle<> worker_thread::try_steal() noexcept {
                     if (promise) {
                         promise->clear_affinity();
                     }
-                    steals_executed_.fetch_add(1, std::memory_order_relaxed);
+                    record_successful_steal();
                     return handle;
                 }
             } else {
                 if (promise) {
                     promise->clear_affinity();
                 }
-                steals_executed_.fetch_add(1, std::memory_order_relaxed);
+                record_successful_steal();
                 return handle;
             }
             

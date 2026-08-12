@@ -516,6 +516,8 @@ Elio achieves competitive performance through careful optimization:
 - **Queue-based Scheduling Fast Path**: bounded MPSC inbox (~5 ns) +
   Chase-Lev deque (~13 ns), with a locked overflow queue for rare sustained
   bursts
+- **Single-writer Metric Publication**: worker execution and steal counters use
+  owner-local increments with relaxed atomic snapshots for external readers
 
 ### Scalability
 

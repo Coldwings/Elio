@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Single-writer worker metrics**: Coroutine-resume and successful-steal
+  counters now use owner-local increments with relaxed atomic snapshot stores,
+  preserving exact monotonic metric reads without atomic read-modify-write
+  instructions on worker hot paths (#1017).
 - **Quieter io_uring initialization**: per-context backend initialization and
   selection diagnostics now use DEBUG instead of the default INFO level
   (#1011).

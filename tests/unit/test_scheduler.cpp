@@ -37,6 +37,20 @@ task<void> increment_counter_task(std::atomic<int>* counter) {
     co_return;
 }
 
+task<void> yield_for_metric_reads(size_t sample_count,
+                                  std::atomic<size_t>* sample_ready,
+                                  std::atomic<size_t>* sample_acknowledged,
+                                  std::atomic<bool>* completed) {
+    for (size_t sample = 1; sample <= sample_count; ++sample) {
+        co_await yield();
+        sample_ready->store(sample, std::memory_order_release);
+        while (sample_acknowledged->load(std::memory_order_acquire) < sample) {
+            co_await yield();
+        }
+    }
+    completed->store(true, std::memory_order_release);
+}
+
 task<void> empty_task() {
     co_return;
 }
@@ -712,6 +726,49 @@ TEST_CASE("Scheduler statistics", "[scheduler]") {
     REQUIRE(sched.total_tasks_executed() >= num_tasks);
     
     sched.shutdown();
+}
+
+TEST_CASE("Scheduler task counter remains monotonic during concurrent reads",
+          "[scheduler][metrics]") {
+    constexpr size_t sample_count = 128;
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<size_t> sample_ready{0};
+    std::atomic<size_t> sample_acknowledged{0};
+    std::atomic<bool> completed{false};
+    const auto initial = sched.worker_tasks_executed(0);
+    sched.go_to(0, yield_for_metric_reads, sample_count, &sample_ready,
+                &sample_acknowledged, &completed);
+
+    const auto deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    size_t previous = initial;
+    bool monotonic = true;
+    size_t active_samples = 0;
+    for (size_t sample = 1; sample <= sample_count; ++sample) {
+        while (sample_ready.load(std::memory_order_acquire) < sample &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        REQUIRE(sample_ready.load(std::memory_order_acquire) >= sample);
+
+        const auto current = sched.worker_tasks_executed(0);
+        monotonic = monotonic && current >= previous;
+        previous = current;
+        active_samples +=
+            !completed.load(std::memory_order_acquire) ? 1U : 0U;
+        sample_acknowledged.store(sample, std::memory_order_release);
+    }
+
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+    CHECK(monotonic);
+    CHECK(active_samples == sample_count);
+    CHECK(sched.worker_tasks_executed(0) >= initial + sample_count);
 }
 
 TEST_CASE("Scheduler thread-local current", "[scheduler]") {

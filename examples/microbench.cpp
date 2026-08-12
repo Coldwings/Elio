@@ -1,6 +1,7 @@
 #include <elio/runtime/scheduler.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/log/macros.hpp>
+#include <atomic>
 #include <iostream>
 #include <chrono>
 #include <vector>
@@ -95,7 +96,39 @@ int main() {
         while (queue.pop()) {}
     }
 
-    // 5. Measure atomic fence alone
+    // 5. Compare atomic RMW with single-writer snapshot publication
+    {
+        std::atomic<size_t> published{0};
+
+        auto start = high_resolution_clock::now();
+        for (int i = 0; i < N; ++i) {
+            published.fetch_add(1, std::memory_order_relaxed);
+        }
+        auto end = high_resolution_clock::now();
+        auto ns = duration_cast<nanoseconds>(end - start).count();
+
+        std::cout << "Atomic counter fetch_add: "
+                  << (static_cast<double>(ns) / N)
+                  << " ns/update" << std::endl;
+    }
+
+    {
+        size_t local = 0;
+        std::atomic<size_t> published{0};
+
+        auto start = high_resolution_clock::now();
+        for (int i = 0; i < N; ++i) {
+            published.store(++local, std::memory_order_relaxed);
+        }
+        auto end = high_resolution_clock::now();
+        auto ns = duration_cast<nanoseconds>(end - start).count();
+
+        std::cout << "Single-writer counter publish: "
+                  << (static_cast<double>(ns) / N)
+                  << " ns/update" << std::endl;
+    }
+
+    // 6. Measure atomic fence alone
     {
         auto start = high_resolution_clock::now();
         for (int i = 0; i < N; ++i) {
@@ -107,7 +140,7 @@ int main() {
         std::cout << "Atomic release fence: " << (ns / N) << " ns" << std::endl;
     }
 
-    // 6. Measure eventfd write
+    // 7. Measure eventfd write
     {
         int fd = eventfd(0, EFD_NONBLOCK);
         uint64_t val = 1;
@@ -123,7 +156,7 @@ int main() {
         close(fd);
     }
 
-    // 7. Full spawn path (with running scheduler) - includes alloc + spawn
+    // 8. Full spawn path (with running scheduler) - includes alloc + spawn
     {
         runtime::scheduler sched(4);
         sched.start();
@@ -145,7 +178,7 @@ int main() {
         sched.shutdown();
     }
 
-    // 8. Measure warmed-up worker overhead
+    // 9. Measure warmed-up worker overhead
     {
         runtime::scheduler sched(4);
         sched.start();

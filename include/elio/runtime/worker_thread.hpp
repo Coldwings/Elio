@@ -258,8 +258,19 @@ public:
         return idle_.load(std::memory_order_relaxed);
     }
 
-    /// Get the last time a task was executed
-    [[nodiscard]] std::chrono::steady_clock::time_point last_task_time() const noexcept {
+    /// Enable exact task-time diagnostics for this worker.
+    void enable_task_time_tracking() noexcept {
+        track_task_time_.store(true, std::memory_order_relaxed);
+    }
+
+    /// Get the last recorded execution time.
+    /// This also enables tracking to preserve the original observation API.
+    [[nodiscard]] std::chrono::steady_clock::time_point
+    last_task_time() const noexcept {
+        // Enabling observational instrumentation is logically const. Keep this
+        // compatibility side effect here while exposing the explicit mutator
+        // above for call sites that want their instrumentation intent visible.
+        track_task_time_.store(true, std::memory_order_relaxed);
         return last_task_time_.load(std::memory_order_relaxed);
     }
 
@@ -306,6 +317,9 @@ private:
     void record_task_execution() noexcept {
         tasks_executed_.store(++tasks_executed_local_,
                               std::memory_order_relaxed);
+        if (track_task_time_.load(std::memory_order_relaxed)) [[unlikely]] {
+            update_last_task_time();
+        }
     }
 
     void record_successful_steal() noexcept {
@@ -355,8 +369,12 @@ private:
     // Idle flag (owner writes, other threads read) — isolated cache line
     alignas(64) std::atomic<bool> idle_{false};
 
-    // Slow-update fields — isolated cache line
-    alignas(64) std::atomic<std::chrono::steady_clock::time_point> last_task_time_{std::chrono::steady_clock::now()};
+    // Diagnostic timestamps are opt-in so normal resumes avoid clock reads.
+    // The mutable flag supports the legacy const observation entry point.
+    alignas(64) mutable std::atomic<bool> track_task_time_{false};
+    // Isolate diagnostic readers from the flag checked on every resume.
+    alignas(64) std::atomic<std::chrono::steady_clock::time_point>
+        last_task_time_{std::chrono::steady_clock::now()};
     bool needs_sync_ = false;          // Whether current task needs memory synchronization
     wait_strategy strategy_;           // Configurable wait strategy
     std::unique_ptr<io::io_context> io_context_;  // Per-worker io_context

@@ -889,6 +889,11 @@ The autoscaler supports:
 - **Actions**: `scale_up`, `scale_down`, `log`, `null`
 - **Combinators**: `on_success`, `on_failure`
 
+`on_block` is a best-effort sampled diagnostic. A non-idle worker is considered
+blocked when its completed-resume counter does not advance for longer than
+`block_threshold`; detection can trail the threshold by approximately one
+`tick_interval`.
+
 ## RDMA Ping-Pong (Mock Backend)
 
 A single-process SEND/RECV ping-pong using a mock backend — no RDMA hardware required. Demonstrates `connection`, `dispatcher`, `cq_pump`, and `wc_result`. See [`examples/rdma_pingpong_mock.cpp`](../examples/rdma_pingpong_mock.cpp).

@@ -52,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Sampled worker block detection**: The autoscaler now detects non-idle
+  workers with no completed-resume progress by sampling their execution
+  counters at `tick_interval`, removing the unconditional clock read and atomic
+  timestamp publication from every coroutine resume. `on_block` remains a
+  best-effort diagnostic whose notification can trail `block_threshold` by a
+  sampling interval. `worker_thread::enable_task_time_tracking()` provides an
+  explicit opt-in to exact timestamps; `last_task_time()` retains the implicit
+  opt-in for backward compatibility (#1019).
 - **Single-writer worker metrics**: Coroutine-resume and successful-steal
   counters now use owner-local increments with relaxed atomic snapshot stores,
   preserving exact monotonic metric reads without atomic read-modify-write

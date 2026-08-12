@@ -128,7 +128,42 @@ int main() {
                   << " ns/update" << std::endl;
     }
 
-    // 6. Measure atomic fence alone
+    // 6. Compare exact timestamps with the disabled diagnostic fast path
+    {
+        std::atomic<steady_clock::time_point> last_task_time{
+            steady_clock::now()};
+
+        auto start = high_resolution_clock::now();
+        for (int i = 0; i < N; ++i) {
+            last_task_time.store(steady_clock::now(),
+                                 std::memory_order_relaxed);
+        }
+        auto end = high_resolution_clock::now();
+        auto ns = duration_cast<nanoseconds>(end - start).count();
+
+        std::cout << "Exact task timestamp publish: "
+                  << (static_cast<double>(ns) / N)
+                  << " ns/update" << std::endl;
+    }
+
+    {
+        std::atomic<bool> track_task_time{false};
+
+        auto start = high_resolution_clock::now();
+        for (int i = 0; i < N; ++i) {
+            if (track_task_time.load(std::memory_order_relaxed)) {
+                std::atomic_signal_fence(std::memory_order_seq_cst);
+            }
+        }
+        auto end = high_resolution_clock::now();
+        auto ns = duration_cast<nanoseconds>(end - start).count();
+
+        std::cout << "Disabled task timestamp check: "
+                  << (static_cast<double>(ns) / N)
+                  << " ns/update" << std::endl;
+    }
+
+    // 7. Measure atomic fence alone
     {
         auto start = high_resolution_clock::now();
         for (int i = 0; i < N; ++i) {
@@ -140,7 +175,7 @@ int main() {
         std::cout << "Atomic release fence: " << (ns / N) << " ns" << std::endl;
     }
 
-    // 7. Measure eventfd write
+    // 8. Measure eventfd write
     {
         int fd = eventfd(0, EFD_NONBLOCK);
         uint64_t val = 1;
@@ -156,7 +191,7 @@ int main() {
         close(fd);
     }
 
-    // 8. Full spawn path (with running scheduler) - includes alloc + spawn
+    // 9. Full spawn path (with running scheduler) - includes alloc + spawn
     {
         runtime::scheduler sched(4);
         sched.start();
@@ -178,7 +213,7 @@ int main() {
         sched.shutdown();
     }
 
-    // 9. Measure warmed-up worker overhead
+    // 10. Measure warmed-up worker overhead
     {
         runtime::scheduler sched(4);
         sched.start();

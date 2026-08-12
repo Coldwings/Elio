@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Owner-local continuation routing**: `scheduler::try_schedule()` now keeps an
+  already-suspended coroutine on the current worker when that worker satisfies
+  its affinity and active-I/O ownership constraints. Initial task admission
+  remains distributed, while eligible continuations avoid the round-robin
+  atomic, external MPSC inbox, lifecycle mutex, and eventfd wake (#1024).
 - **Sampled worker block detection**: The autoscaler now detects non-idle
   workers with no completed-resume progress by sampling their execution
   counters at `tick_interval`, removing the unconditional clock read and atomic

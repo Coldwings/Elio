@@ -830,6 +830,11 @@ The raw-handle APIs have distinct ownership and virtual-stack contracts.
 its first execution; they detach construction-time ancestry.
 `try_schedule()` and `try_schedule_to()` are for a coroutine that has already
 suspended and must preserve the logical parent established by its await chain.
+When `try_schedule()` is called from one of the scheduler's active workers, an
+eligible continuation is published directly to that worker's local deque.
+Valid affinity to another worker still routes there, and an active I/O pin
+always follows its backend owner. Initial admission through `spawn()`, `go()`,
+and their variants retains normal distribution semantics.
 The `try_` APIs borrow the handle: rejection leaves it live, and the caller must
 resume, retain, destroy, or otherwise resolve it. `spawn()` and `spawn_to()`
 consume ownership and destroy a handle rejected before execution. Internal wake

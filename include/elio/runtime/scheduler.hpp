@@ -38,6 +38,7 @@ namespace detail {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     inline std::atomic<bool> reject_next_schedule_for_test{false};
     inline std::atomic<bool> reject_next_spawn_for_test{false};
+    inline std::atomic<size_t> local_schedule_fast_paths_for_test{0};
     inline std::atomic<size_t> local_schedule_fallbacks_for_test{0};
     inline std::atomic<bool> pause_shutdown_teardown_for_test{false};
     inline std::atomic<bool> shutdown_teardown_paused_for_test{false};
@@ -614,6 +615,10 @@ public:
 #endif
         if (!running_.load(std::memory_order_relaxed)) [[unlikely]] {
             return false;
+        }
+        if (try_schedule_current_worker_local_(
+                handle, local_schedule_reason::preferred)) {
+            return true;
         }
         return do_spawn(handle, false);
     }
@@ -1399,12 +1404,18 @@ private:
         }
     }
 
-    /// Preserve progress for a borrowed continuation when its current owner
-    /// worker rejected an external-queue insertion. Publishing to the owner's
-    /// local deque defers execution until the current coroutine returns, so it
-    /// neither recurses nor bypasses affinity or active-I/O ownership.
+    enum class local_schedule_reason {
+        preferred,
+        rejection_fallback,
+    };
+
+    /// Route a borrowed continuation through its current owner's local deque.
+    /// Preferred routing excludes movable work on a draining worker so shrink
+    /// can redistribute it. The rejection fallback may retain such work to
+    /// preserve progress after normal routing has no accepting target.
     [[nodiscard]] bool try_schedule_current_worker_local_(
-        std::coroutine_handle<> handle) noexcept {
+        std::coroutine_handle<> handle,
+        local_schedule_reason reason) noexcept {
         auto* current = worker_thread::current();
         if (!handle || !current || current->scheduler_ != this) {
             return false;
@@ -1436,11 +1447,24 @@ private:
             }
         }
 
-        std::atomic_thread_fence(std::memory_order_release);
+        if ((!promise || !promise->has_active_io_pin()) &&
+            (!promise || !promise->is_worker_local()) &&
+            reason == local_schedule_reason::preferred) {
+            const size_t n = num_threads_.load(std::memory_order_acquire);
+            if (!current->is_running() || current->is_draining() ||
+                current->worker_id() >= n) {
+                return false;
+            }
+        }
+
+        // chase_lev_deque::push() publishes prior frame writes with release
+        // ordering, so same-thread routing needs no separate scheduler fence.
         current->schedule_local(handle);
 #ifdef ELIO_RUNTIME_TEST_HOOKS
-        detail::local_schedule_fallbacks_for_test.fetch_add(
-            1, std::memory_order_release);
+        auto& counter = reason == local_schedule_reason::preferred
+            ? detail::local_schedule_fast_paths_for_test
+            : detail::local_schedule_fallbacks_for_test;
+        counter.fetch_add(1, std::memory_order_release);
 #endif
         return true;
     }
@@ -1574,7 +1598,9 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
             if (sched->is_running() && sched->try_schedule(handle)) {
                 return;
             }
-            if (sched->try_schedule_current_worker_local_(handle)) {
+            if (sched->try_schedule_current_worker_local_(
+                    handle,
+                    scheduler::local_schedule_reason::rejection_fallback)) {
                 return;
             }
             if (!sched->is_running() ||

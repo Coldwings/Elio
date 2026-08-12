@@ -70,6 +70,20 @@ That slow path trades burst-only synchronization for correctness: a borrowed
 resume handle stays assigned to its worker rather than running on the producer
 thread or being destroyed.
 
+### Owner-Local Continuations
+
+`scheduler::try_schedule()` distinguishes continuation resumption from initial
+task admission. When called by an active worker and the suspended coroutine can
+legally remain there, it publishes directly to the owner's Chase-Lev deque.
+This avoids the round-robin counter, external MPSC publication, lifecycle
+mutex, and eventfd write. The continuation remains visible to work stealing.
+
+Affinity and I/O ownership remain authoritative. A valid affinity for another
+worker takes the external route, while an active I/O pin stays with the backend
+owner even while that worker is draining. Movable continuations do not take the
+local fast path on a draining worker. New independent tasks submitted through
+`go()` or `spawn()` retain normal distributed admission.
+
 ### Unified Wake Mechanism
 
 Each worker's I/O backend (epoll or io_uring) contains an embedded `eventfd`. When a task is submitted to a worker from another thread, the submitter writes to that worker's eventfd. Because the eventfd is registered with the same epoll/io_uring instance that handles I/O completions, both I/O events and task wake-ups unblock the same `poll()` call.
@@ -611,7 +625,7 @@ Elio includes several benchmark tools:
 ```bash
 cmake --build build
 
-# Quick benchmark - measures spawn, context switch, yield
+# Quick benchmark - measures spawn, context switch, yield, reschedule
 ./build/examples/quick_benchmark
 
 # Microbenchmarks - individual operation timing

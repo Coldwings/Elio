@@ -1903,8 +1903,8 @@ inline void worker_thread::run() {
 
         if (handle) {
             run_task(handle);
-            // Reuse the existing owner-local execution counter. The power-of-
-            // two mask avoids another per-resume counter mutation.
+            // Reuse the existing worker-loop dispatch counter. The power-of-
+            // two mask avoids another hot-path counter mutation.
             if ((tasks_executed_local_ &
                  (external_service_quantum_ - 1)) == 0) [[unlikely]] {
                 service_competing_work();
@@ -1996,9 +1996,10 @@ inline void worker_thread::service_competing_work() noexcept {
             io_service_quantum_ / external_service_quantum_;
         // Avoid a syscall on CPU-only workloads. Pending operations need a
         // periodic non-blocking poll so already-ready completions cannot wait
-        // for a runnable workload to become idle. Count all resumptions, not
-        // only tasks sourced locally: a worker repeatedly stealing one task at
-        // a time can also remain continuously busy with an empty local deque.
+        // for a runnable workload to become idle. Count all main-loop task
+        // dispatches, not only tasks sourced locally: a worker repeatedly
+        // stealing one task at a time can also remain continuously busy with
+        // an empty local deque.
         if (io_context_->has_pending()) {
             io_context_->poll(std::chrono::milliseconds(0));
         }

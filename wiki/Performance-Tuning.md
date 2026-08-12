@@ -615,12 +615,14 @@ cmake --build .
 - Consider real-time scheduling
 
 Elio periodically services competing work even if a worker remains continuously
-runnable: external submissions every 256 coroutine resumptions and pending I/O
-every 16,384 resumptions. These constants deliberately use different scales
-because checking an inbox is cheap while polling a backend has measurable cost.
-They bound cooperative scheduler turns, not elapsed time. A coroutine that runs
-CPU work without suspending can still starve its worker; split that work, yield
-at suitable application boundaries, or use `spawn_blocking()`.
+runnable: external submissions every 256 completed worker-loop task dispatches
+and pending I/O every 16,384 dispatches. These constants deliberately use
+different scales because checking an inbox is cheap while polling a backend has
+measurable cost. They bound cooperative scheduler turns, not elapsed time. A
+coroutine that runs CPU work without suspending can still starve its worker;
+split that work, yield at suitable application boundaries, or use
+`spawn_blocking()`. A backend poll may resume a ready completion batch inline;
+those resumptions are part of the poll, not separate worker-loop dispatches.
 
 ### Problem: Low Throughput
 

@@ -835,6 +835,15 @@ eligible continuation is published directly to that worker's local deque.
 Valid affinity to another worker still routes there, and an active I/O pin
 always follows its backend owner. Initial admission through `spawn()`, `go()`,
 and their variants retains normal distribution semantics.
+While a worker remains continuously runnable, it
+periodically services external submissions and pending I/O. The bounds are
+measured in completed task dispatches from the main worker loop: the external
+inbox is checked at most every 256 dispatches, and pending I/O receives a
+non-blocking poll at most every 16,384 dispatches. These are cooperative
+scheduling bounds, not wall-clock deadlines; a coroutine that does not suspend
+can still occupy its worker indefinitely. Coroutines resumed inline while a
+backend delivers a completion batch are part of that poll and do not consume
+the worker-loop dispatch budget.
 The `try_` APIs borrow the handle: rejection leaves it live, and the caller must
 resume, retain, destroy, or otherwise resolve it. `spawn()` and `spawn_to()`
 consume ownership and destroy a handle rejected before execution. Internal wake
@@ -943,6 +952,11 @@ public:
   one outstanding eventfd notification; before blocking again, the worker
   clears the wake claim and rechecks its external queues so no wake is lost
 - The bounded MPSC inbox remains the fast path; a locked overflow queue absorbs rare bursts without resuming worker-bound coroutines on submitter threads
+- A continuously runnable worker receives periodic service points:
+  external submissions are transferred every 256 completed worker-loop task
+  dispatches and pending I/O is polled non-blockingly every 16,384 dispatches.
+  User code must suspend for either cooperative bound to advance; inline
+  resumes delivered by one backend poll are not separate worker-loop dispatches
 - Results in near-zero CPU usage (< 1%) when idle with default blocking strategy
 
 ### `wait_strategy`

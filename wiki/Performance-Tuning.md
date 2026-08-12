@@ -614,6 +614,16 @@ cmake --build .
 - Use CPU affinity for scheduler threads
 - Consider real-time scheduling
 
+Elio periodically services competing work even if a worker remains continuously
+runnable: external submissions every 256 completed worker-loop task dispatches
+and pending I/O every 16,384 dispatches. These constants deliberately use
+different scales because checking an inbox is cheap while polling a backend has
+measurable cost. They bound cooperative scheduler turns, not elapsed time. A
+coroutine that runs CPU work without suspending can still starve its worker;
+split that work, yield at suitable application boundaries, or use
+`spawn_blocking()`. A backend poll may resume a ready completion batch inline;
+those resumptions are part of the poll, not separate worker-loop dispatches.
+
 ### Problem: Low Throughput
 
 **Causes:**
@@ -678,6 +688,8 @@ For `scheduler_service_benchmark`, inspect p50, p99, and maximum latency rather
 than the minimum. The benchmark intentionally keeps one worker's local deque
 runnable while it delivers one armed I/O completion and one remote submission;
 it measures scheduler service delay, not the underlying eventfd syscall time.
+It also reports total backlog yields so a latency improvement can be evaluated
+against its worst-case pending-I/O throughput cost.
 Use `--smoke` only to verify build and termination in CI. Timing values are not
 CI pass/fail thresholds because shared runners are noisy.
 

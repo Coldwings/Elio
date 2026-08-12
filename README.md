@@ -303,6 +303,8 @@ The scheduler manages a pool of worker threads, each with a local task queue. Ke
   external inbox and wake path while remaining stealable
 - **Coalesced external wakes**: bursts targeting one worker share an outstanding
   eventfd notification without sampling an idle flag or risking a lost wake
+- **Bounded cooperative service**: persistent runnable work cannot
+  indefinitely suppress cross-thread submissions or already-ready I/O
 - **Per-worker I/O context**: Pending operations stay pinned to the worker/backend generation that accepted them
 - **Dynamic sizing**: Adjust thread count at runtime
 - **Load balancing**: Automatic task distribution

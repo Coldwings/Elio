@@ -52,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Bounded scheduler service under runnable load**: Workers now check
+  cross-thread submissions every 256 completed worker-loop task dispatches and
+  give pending I/O a non-blocking service opportunity every 16,384 dispatches
+  while the worker remains runnable. These are cooperative dispatch-count
+  bounds, not wall-clock guarantees; user code must still suspend before the
+  scheduler can service competing work (#1028).
 - **Coalesced external-submission wakes**: Each worker now issues at most one
   `eventfd` notification for a burst of cross-thread task submissions. Before
   blocking, the worker clears the pending-wake claim and rechecks both external

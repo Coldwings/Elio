@@ -1990,7 +1990,6 @@ inline void worker_thread::run_task(std::coroutine_handle<> handle) noexcept {
     coro::detail::frame_context_scope frame_scope(promise);
     handle.resume();
     record_task_execution();
-    update_last_task_time();
 
     // Note: We do NOT check done() or call destroy() here.
     // If the task completed, its final_suspend will self-destruct (fire-and-forget)

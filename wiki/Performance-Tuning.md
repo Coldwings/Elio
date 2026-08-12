@@ -226,6 +226,18 @@ autoscaler.start(&sched);
 ```
 
 This is useful for adapting to load changes automatically (see [Scheduler Statistics](#scheduler-statistics)).
+The `on_block` trigger samples each non-idle worker's completed-resume counter
+once per `tick_interval`. It reports a block when that sampled counter has made
+no progress for longer than `block_threshold`; notification is therefore
+best-effort and can lag the threshold by roughly one sampling interval. Idle
+time is excluded, and any observed progress restarts the threshold. Block
+detection does not add a clock read to every coroutine resume.
+
+Call the concrete worker diagnostic `enable_task_time_tracking()` to explicitly
+opt that worker into exact per-resume timestamp collection. For backward
+compatibility, `last_task_time()` also enables tracking when called directly.
+Periodic monitoring should prefer `worker_tasks_executed()`, which stays on the
+lower-cost counter path.
 
 ### Thread Affinity
 

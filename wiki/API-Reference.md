@@ -917,6 +917,15 @@ public:
     // Check if running
     bool is_running() const noexcept;
 
+    // Explicitly opt in to exact per-resume timestamp diagnostics.
+    void enable_task_time_tracking() noexcept;
+
+    // Return the latest recorded time. For backward compatibility this also
+    // enables tracking when the explicit mutator was not called first. Prefer
+    // scheduler counters for periodic monitoring because they do not enable
+    // clock reads on every resume.
+    std::chrono::steady_clock::time_point last_task_time() const noexcept;
+
     // Get current worker (thread-local)
     static worker_thread* current() noexcept;
 };

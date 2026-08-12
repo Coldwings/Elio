@@ -6,9 +6,84 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <stop_token>
+#include <vector>
 
 namespace elio::runtime {
+
+namespace detail {
+
+class worker_progress_observation {
+public:
+    using clock = std::chrono::steady_clock;
+
+    template<typename Worker>
+    [[nodiscard]] std::optional<clock::duration> sample(
+        Worker* worker, clock::time_point now) noexcept {
+        if (!worker) {
+            reset();
+            return std::nullopt;
+        }
+
+        if constexpr (requires { worker->is_running(); }) {
+            if (!worker->is_running()) {
+                reset();
+                return std::nullopt;
+            }
+        }
+
+        if constexpr (requires { worker->tasks_executed(); }) {
+            const size_t tasks_executed = worker->tasks_executed();
+            const void* identity = static_cast<const void*>(worker);
+            if (worker->is_idle()) {
+                // Keep the latest identity and counter snapshot so the next
+                // active sample can classify the transition without stale data.
+                worker_ = identity;
+                tasks_executed_ = tasks_executed;
+                last_progress_ = now;
+                active_ = false;
+                return std::nullopt;
+            }
+
+            if (worker_ != identity || !active_ ||
+                tasks_executed_ != tasks_executed) {
+                worker_ = identity;
+                tasks_executed_ = tasks_executed;
+                last_progress_ = now;
+                active_ = true;
+                return clock::duration::zero();
+            }
+
+            return now - last_progress_;
+        } else {
+            if (worker->is_idle()) {
+                reset();
+                return std::nullopt;
+            }
+            // Preserve compatibility with custom Scheduler worker types that
+            // implemented the original timestamp-based on_block contract. A
+            // custom last_task_time() may intentionally enable timestamp
+            // collection as part of that pre-existing observation contract.
+            return now - worker->last_task_time();
+        }
+    }
+
+    void reset() noexcept {
+        worker_ = nullptr;
+        tasks_executed_ = 0;
+        last_progress_ = {};
+        active_ = false;
+    }
+
+private:
+    const void* worker_{nullptr};
+    size_t tasks_executed_{0};
+    clock::time_point last_progress_{};
+    bool active_{false};
+};
+
+}  // namespace detail
 
 // Main autoscaler class
 template<typename Scheduler, typename... Triggers>
@@ -26,6 +101,7 @@ public:
     void start(Scheduler* sched) {
         bool expected = false;
         if (!running_.compare_exchange_strong(expected, true)) return;
+        block_observations_.clear();
         scheduler_ = sched;
         thread_ = std::jthread([this](std::stop_token st) { run(st); });
     }
@@ -189,17 +265,18 @@ private:
         (void)pending;
         (void)last_idle_time;
 
+        // Shrinking discards observations for removed workers. A later worker
+        // at the same index therefore starts with a fresh progress baseline.
+        block_observations_.resize(num_workers);
         for (size_t i = 0; i < num_workers; ++i) {
             auto* worker = scheduler_->get_worker(i);
-            if (worker && !worker->is_idle()) {
-                auto last_time = worker->last_task_time();
-                auto blocked_duration = now - last_time;
-                if (blocked_duration > cfg.block_threshold) {
-                    // Execute block actions
-                    if constexpr (sizeof...(Actions) > 0) {
-                        auto blocked_ms = std::chrono::duration_cast<std::chrono::milliseconds>(blocked_duration);
-                        execute_block_actions<Actions...>(i, blocked_ms);
-                    }
+            auto blocked_duration = block_observations_[i].sample(worker, now);
+            if (blocked_duration && *blocked_duration > cfg.block_threshold) {
+                if constexpr (sizeof...(Actions) > 0) {
+                    auto blocked_ms =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            *blocked_duration);
+                    execute_block_actions<Actions...>(i, blocked_ms);
                 }
             }
         }
@@ -299,6 +376,7 @@ private:
     std::atomic<bool> running_;
     Scheduler* scheduler_;
     std::jthread thread_;
+    std::vector<detail::worker_progress_observation> block_observations_;
 };
 
 // Convenience type alias

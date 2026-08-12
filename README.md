@@ -407,6 +407,12 @@ size_t executed = sched.total_tasks_executed();
 sched.shutdown();
 ```
 
+Scheduler execution metrics are published from worker-local counters. Optional
+autoscaler `on_block` detection samples those counters at `tick_interval`, so
+ordinary coroutine resumes do not read the clock. Block notifications are
+best-effort and can arrive up to roughly one sampling interval after
+`block_threshold`.
+
 ### Task Spawning
 
 Elio provides flexible ways to spawn concurrent tasks:

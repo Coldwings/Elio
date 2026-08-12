@@ -299,6 +299,8 @@ outer() -> middle() -> inner()
 The scheduler manages a pool of worker threads, each with a local task queue. Key features:
 - **Lock-free operations**: Chase-Lev deques for optimal performance
 - **Work stealing**: Idle threads steal tasks from busy threads
+- **Owner-local continuations**: eligible same-worker resumptions bypass the
+  external inbox and wake path while remaining stealable
 - **Per-worker I/O context**: Pending operations stay pinned to the worker/backend generation that accepted them
 - **Dynamic sizing**: Adjust thread count at runtime
 - **Load balancing**: Automatic task distribution
@@ -522,6 +524,9 @@ Elio achieves competitive performance through careful optimization:
 - **Queue-based Scheduling Fast Path**: bounded MPSC inbox (~5 ns) +
   Chase-Lev deque (~13 ns), with a locked overflow queue for rare sustained
   bursts
+- **Owner-local Continuation Routing**: suspended coroutines that can legally
+  stay on the current worker publish directly to its local deque without an
+  external-queue lock, round-robin RMW, or eventfd write
 - **Single-writer Metric Publication**: worker execution and steal counters use
   owner-local increments with relaxed atomic snapshots for external readers
 
@@ -542,7 +547,7 @@ Elio achieves competitive performance through careful optimization:
 cd build
 cmake --build . --target quick_benchmark microbench scheduler_service_benchmark io_benchmark benchmark scalability_test
 
-# Quick benchmark (spawn, context switch, yield)
+# Quick benchmark (spawn, context switch, yield, scheduler reschedule)
 ./examples/quick_benchmark
 
 # Microbenchmarks (individual operations)

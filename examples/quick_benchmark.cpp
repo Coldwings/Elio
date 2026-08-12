@@ -54,6 +54,38 @@ coro::task<int> compute_task(int value) {
     co_return value * 2;
 }
 
+class scheduler_reschedule_awaitable {
+public:
+    explicit scheduler_reschedule_awaitable(runtime::scheduler* sched)
+        : sched_(sched) {}
+
+    [[nodiscard]] bool await_ready() const noexcept { return false; }
+
+    [[nodiscard]] bool await_suspend(
+        std::coroutine_handle<> handle) const noexcept {
+        return sched_->try_schedule(handle);
+    }
+
+    void await_resume() const noexcept {}
+
+private:
+    runtime::scheduler* sched_;
+};
+
+coro::task<void> measure_scheduler_reschedules(
+    runtime::scheduler* sched, int iterations,
+    std::atomic<int64_t>* elapsed_ns, std::atomic<bool>* completed) {
+    const auto start = steady_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        co_await scheduler_reschedule_awaitable{sched};
+    }
+    elapsed_ns->store(
+        duration_cast<nanoseconds>(steady_clock::now() - start).count(),
+        std::memory_order_relaxed);
+    completed->store(true, std::memory_order_release);
+    co_return;
+}
+
 // Time-based spawn overhead benchmark
 void benchmark_spawn_overhead() {
     const int batch_size = 10000;
@@ -206,6 +238,39 @@ void benchmark_yield() {
               << ", max=" << stats.max << ")" << std::endl;
 }
 
+// Measure a suspended coroutine re-enqueuing itself through scheduler routing.
+void benchmark_scheduler_reschedule() {
+    constexpr int reschedules_per_task = 100000;
+    std::vector<double> samples;
+
+    const auto bench_start = steady_clock::now();
+    while (duration_cast<seconds>(steady_clock::now() - bench_start) <
+           MIN_BENCH_DURATION) {
+        runtime::scheduler sched(1);
+        sched.start();
+
+        std::atomic<int64_t> elapsed_ns{0};
+        std::atomic<bool> completed{false};
+        sched.go_to(0, measure_scheduler_reschedules, &sched,
+                    reschedules_per_task, &elapsed_ns, &completed);
+
+        while (!completed.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+
+        samples.push_back(
+            static_cast<double>(elapsed_ns.load(std::memory_order_relaxed)) /
+            reschedules_per_task);
+        sched.shutdown();
+    }
+
+    const auto stats = bench_stats::compute(samples);
+    std::cout << "Scheduler reschedule: " << std::fixed
+              << std::setprecision(2) << stats.avg
+              << " ns/reschedule (min=" << stats.min
+              << ", max=" << stats.max << ")" << std::endl;
+}
+
 int main() {
     log::logger::instance().set_level(log::level::error);
 
@@ -215,6 +280,7 @@ int main() {
     benchmark_spawn_overhead();
     benchmark_context_switch();
     benchmark_yield();
+    benchmark_scheduler_reschedule();
 
     std::cout << "=== Done ===" << std::endl;
 

@@ -119,6 +119,40 @@ task<void> record_current_worker_task(std::atomic<size_t>* observed_worker) {
     co_return;
 }
 
+class scheduler_reschedule_probe_awaitable {
+public:
+    scheduler_reschedule_probe_awaitable(
+        std::atomic<size_t>* before, std::atomic<size_t>* after)
+        : before_(before), after_(after) {}
+
+    bool await_ready() const noexcept { return false; }
+
+    bool await_suspend(std::coroutine_handle<> handle) const {
+        auto* sched = scheduler::current();
+        if (!sched) {
+            throw std::logic_error(
+                "reschedule probe requires a scheduler worker");
+        }
+        before_->store(current_worker_id(), std::memory_order_release);
+        return sched->try_schedule(handle);
+    }
+
+    void await_resume() const noexcept {
+        after_->store(current_worker_id(), std::memory_order_release);
+    }
+
+private:
+    std::atomic<size_t>* before_;
+    std::atomic<size_t>* after_;
+};
+
+task<void> probe_local_continuation_route(
+    std::atomic<size_t>* before, std::atomic<size_t>* after,
+    std::atomic<bool>* completed) {
+    co_await scheduler_reschedule_probe_awaitable{before, after};
+    completed->store(true, std::memory_order_release);
+}
+
 class pinned_reschedule_awaitable {
 public:
     pinned_reschedule_awaitable(size_t requested_worker,
@@ -546,6 +580,42 @@ TEST_CASE("Scheduler routes an I/O-pinned migration request to its owner",
 
     REQUIRE(observed_worker.load(std::memory_order_acquire) == 0);
     REQUIRE(sched.shutdown(scaled_sec(5)));
+}
+
+TEST_CASE("Scheduler keeps an eligible continuation on the owner-local deque",
+          "[scheduler][task][continuation][performance]") {
+    const auto fast_paths_before =
+        elio::runtime::detail::local_schedule_fast_paths_for_test.load(
+            std::memory_order_acquire);
+    const auto fallbacks_before =
+        elio::runtime::detail::local_schedule_fallbacks_for_test.load(
+            std::memory_order_acquire);
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<size_t> before{NO_AFFINITY};
+    std::atomic<size_t> after{NO_AFFINITY};
+    std::atomic<bool> completed{false};
+    sched.go(probe_local_continuation_route, &before, &after, &completed);
+
+    REQUIRE(wait_for_scheduler_condition([&] {
+        return completed.load(std::memory_order_acquire);
+    }));
+    REQUIRE(sched.shutdown(scaled_sec(5)));
+
+    const auto fast_paths_after =
+        elio::runtime::detail::local_schedule_fast_paths_for_test.load(
+            std::memory_order_acquire);
+    const auto fallbacks_after =
+        elio::runtime::detail::local_schedule_fallbacks_for_test.load(
+            std::memory_order_acquire);
+    REQUIRE(before.load(std::memory_order_acquire) != NO_AFFINITY);
+    // The owner-local deque remains stealable, so execution may legally move
+    // after publication even though the fast-path route itself was local.
+    CHECK(after.load(std::memory_order_acquire) != NO_AFFINITY);
+    CHECK(fast_paths_after == fast_paths_before + 1);
+    CHECK(fallbacks_after == fallbacks_before);
 }
 
 TEST_CASE("go_to affinity reaches the returned task across suspension",

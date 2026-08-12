@@ -27,6 +27,8 @@ inline std::atomic<bool> queue_snapshot_paused_for_test{false};
 inline std::atomic<bool> queue_transfer_waiting_for_test{false};
 inline std::atomic<bool> pause_before_submission_wake_reset_for_test{false};
 inline std::atomic<bool> submission_wake_reset_paused_for_test{false};
+inline std::atomic<bool> pause_before_periodic_service_for_test{false};
+inline std::atomic<bool> periodic_service_paused_for_test{false};
 inline std::atomic<io::io_context::backend_type> worker_io_backend_for_test{
     io::io_context::backend_type::auto_detect};
 }  // namespace detail
@@ -387,6 +389,7 @@ private:
 
     void run();
     void drain_inbox() noexcept;
+    void service_competing_work() noexcept;
     [[nodiscard]] bool run_or_redistribute_retiring_task(
         scheduler* sched, std::coroutine_handle<> handle) noexcept;
     [[nodiscard]] std::coroutine_handle<> get_next_task() noexcept;
@@ -417,6 +420,17 @@ private:
     std::atomic<size_t> tasks_executed_{0};
     size_t steals_executed_local_{0};
     std::atomic<size_t> steals_executed_{0};
+
+    // Inbox checks are cheap enough for a tight latency bound. Backend polls
+    // need a wider quantum to keep sustained pending-I/O throughput close to
+    // the no-service baseline while still preventing indefinite starvation.
+    static constexpr size_t external_service_quantum_ = 256;
+    static constexpr size_t io_service_quantum_ = 16384;
+    static_assert((external_service_quantum_ &
+                   (external_service_quantum_ - 1)) == 0);
+    static_assert(io_service_quantum_ % external_service_quantum_ == 0);
+    size_t io_service_rounds_remaining_{
+        io_service_quantum_ / external_service_quantum_};
 
     // The first external submit in a busy/blocked interval owns the eventfd
     // wake. The owner clears this before polling and then rechecks the queues,

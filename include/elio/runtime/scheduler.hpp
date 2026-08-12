@@ -1903,6 +1903,12 @@ inline void worker_thread::run() {
 
         if (handle) {
             run_task(handle);
+            // Reuse the existing owner-local execution counter. The power-of-
+            // two mask avoids another per-resume counter mutation.
+            if ((tasks_executed_local_ &
+                 (external_service_quantum_ - 1)) == 0) [[unlikely]] {
+                service_competing_work();
+            }
         } else {
             poll_io_when_idle();
         }
@@ -1966,6 +1972,49 @@ inline void worker_thread::run() {
     io_context_->unbind_owner_thread();
     scheduler::current_scheduler_ = nullptr;
     current_worker_ = nullptr;
+}
+
+inline void worker_thread::service_competing_work() noexcept {
+    // If the local deque drained naturally, the normal selection and idle
+    // paths already service the inbox and I/O backend.
+    if (queue_->empty()) {
+        return;
+    }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (detail::pause_before_periodic_service_for_test.load(
+            std::memory_order_acquire)) {
+        detail::periodic_service_paused_for_test.store(
+            true, std::memory_order_release);
+        detail::periodic_service_paused_for_test.notify_all();
+        while (detail::pause_before_periodic_service_for_test.load(
+                std::memory_order_acquire)) {
+            detail::pause_before_periodic_service_for_test.wait(
+                true, std::memory_order_acquire);
+        }
+        detail::periodic_service_paused_for_test.store(
+            false, std::memory_order_release);
+    }
+#endif
+
+    if (--io_service_rounds_remaining_ == 0) {
+        io_service_rounds_remaining_ =
+            io_service_quantum_ / external_service_quantum_;
+        // Avoid a syscall on CPU-only workloads. Pending operations need a
+        // periodic non-blocking poll so already-ready completions cannot wait
+        // for the owner-local deque to become empty.
+        if (io_context_->has_pending()) {
+            io_context_->poll(std::chrono::milliseconds(0));
+        }
+    }
+
+    // Poll first, then drain. An external task is consequently newer than an
+    // I/O continuation that yielded during direct completion delivery and is
+    // selected first by the owner-LIFO deque. drain_inbox() already acquires
+    // each producer publication before republishing it locally.
+    if (has_external_submission()) {
+        drain_inbox();
+    }
 }
 
 inline std::coroutine_handle<> worker_thread::get_next_task() noexcept {

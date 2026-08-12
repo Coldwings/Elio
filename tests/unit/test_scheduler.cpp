@@ -9,6 +9,7 @@
 #include <elio/sync/channel.hpp>
 #include <elio/time/timer.hpp>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
@@ -80,6 +81,28 @@ task<void> record_blocking_poll_count(
                            std::memory_order_relaxed);
     completed->store(true, std::memory_order_release);
     co_return;
+}
+
+task<void> wait_for_periodic_service_io(
+    int fd,
+    std::atomic<bool>* started,
+    std::atomic<bool>* completed,
+    std::atomic<int>* error) {
+    started->store(true, std::memory_order_release);
+    const auto result = co_await elio::io::async_poll_read(fd);
+    error->store(result.error_code(), std::memory_order_relaxed);
+    completed->store(true, std::memory_order_release);
+}
+
+task<void> keep_periodic_service_backlog(
+    std::atomic<bool>* started,
+    std::atomic<bool>* keep_running,
+    std::atomic<bool>* completed) {
+    started->store(true, std::memory_order_release);
+    while (keep_running->load(std::memory_order_acquire)) {
+        co_await elio::time::yield();
+    }
+    completed->store(true, std::memory_order_release);
 }
 
 template<typename Predicate>
@@ -207,6 +230,84 @@ void check_skipped_submission_rechecked_before_blocking(
     CHECK(wake_calls_before_release == wake_calls_before + 1);
     CHECK(marker_poll_calls.load(std::memory_order_relaxed) ==
           poll_calls_before_release);
+}
+
+void check_periodic_service_under_local_backlog(
+    elio::io::io_context::backend_type backend) {
+    worker_io_backend_guard backend_guard(backend);
+    elio::runtime::detail::pause_before_periodic_service_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::periodic_service_paused_for_test.store(
+        false, std::memory_order_release);
+
+    const int event_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    REQUIRE(event_fd >= 0);
+
+    scheduler sched(1);
+    sched.start();
+    auto* worker = sched.get_worker(0);
+    REQUIRE(worker != nullptr);
+
+    std::atomic<bool> io_started{false};
+    std::atomic<bool> io_completed{false};
+    std::atomic<int> io_error{0};
+    std::atomic<bool> backlog_started{false};
+    std::atomic<bool> keep_backlog_running{true};
+    std::atomic<bool> backlog_completed{false};
+    std::atomic<bool> remote_completed{false};
+
+    sched.go_to(0, wait_for_periodic_service_io, event_fd,
+                &io_started, &io_completed, &io_error);
+    const bool io_pending = wait_for_scheduler_condition([&] {
+        return io_started.load(std::memory_order_acquire) &&
+            worker->io_context().has_pending();
+    });
+
+    if (io_pending) {
+        elio::runtime::detail::pause_before_periodic_service_for_test.store(
+            true, std::memory_order_release);
+        sched.go_to(0, keep_periodic_service_backlog,
+                    &backlog_started, &keep_backlog_running,
+                    &backlog_completed);
+    }
+    const bool service_paused = wait_for_scheduler_condition([&] {
+        return backlog_started.load(std::memory_order_acquire) &&
+            elio::runtime::detail::periodic_service_paused_for_test.load(
+                std::memory_order_acquire);
+    });
+
+    bool readiness_written = false;
+    if (service_paused) {
+        const std::uint64_t value = 1;
+        readiness_written =
+            ::write(event_fd, &value, sizeof(value)) ==
+            static_cast<ssize_t>(sizeof(value));
+        sched.go_to(0, set_executed_task, &remote_completed);
+    }
+
+    elio::runtime::detail::pause_before_periodic_service_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::pause_before_periodic_service_for_test.notify_all();
+
+    const bool both_serviced_while_backlog_running =
+        wait_for_scheduler_condition([&] {
+            return io_completed.load(std::memory_order_acquire) &&
+                remote_completed.load(std::memory_order_acquire);
+        });
+    keep_backlog_running.store(false, std::memory_order_release);
+    const bool backlog_stopped = wait_for_scheduler_condition([&] {
+        return backlog_completed.load(std::memory_order_acquire);
+    });
+    const bool stopped = sched.shutdown(scaled_sec(5));
+    ::close(event_fd);
+
+    REQUIRE(io_pending);
+    REQUIRE(service_paused);
+    REQUIRE(readiness_written);
+    REQUIRE(both_serviced_while_backlog_running);
+    REQUIRE(backlog_stopped);
+    REQUIRE(stopped);
+    CHECK(io_error.load(std::memory_order_relaxed) == 0);
 }
 
 task<void> yield_for_metric_reads(size_t sample_count,
@@ -820,6 +921,23 @@ TEST_CASE("Scheduler rechecks skipped submissions before blocking",
             return;
         }
         check_skipped_submission_rechecked_before_blocking(
+            elio::io::io_context::backend_type::io_uring);
+    }
+}
+
+TEST_CASE("Scheduler periodically services I/O and remote work under local backlog",
+          "[scheduler][performance][service][io][regression]") {
+    SECTION("epoll") {
+        check_periodic_service_under_local_backlog(
+            elio::io::io_context::backend_type::epoll);
+    }
+
+    SECTION("io_uring") {
+        if (!elio::io::io_uring_backend::is_available()) {
+            SUCCEED("io_uring is not available at runtime");
+            return;
+        }
+        check_periodic_service_under_local_backlog(
             elio::io::io_context::backend_type::io_uring);
     }
 }

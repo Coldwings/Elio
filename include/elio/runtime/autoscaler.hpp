@@ -70,7 +70,8 @@ private:
             // Handle each trigger
             if constexpr (sizeof...(Triggers) > 0) {
                 // Custom triggers provided
-                ((handle_trigger<Triggers>(pending, num_workers, now, last_idle_time, cfg)), ...);
+                (handle_trigger(Triggers{}, pending, num_workers, now,
+                                last_idle_time, cfg), ...);
             } else {
                 // Default behavior: scale up on overload, scale down on idle
                 handle_default_overload(pending, num_workers, cfg);

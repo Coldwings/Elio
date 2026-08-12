@@ -611,8 +611,9 @@ TEST_CASE("Scheduler keeps an eligible continuation on the owner-local deque",
         elio::runtime::detail::local_schedule_fallbacks_for_test.load(
             std::memory_order_acquire);
     REQUIRE(before.load(std::memory_order_acquire) != NO_AFFINITY);
-    CHECK(after.load(std::memory_order_acquire) ==
-          before.load(std::memory_order_acquire));
+    // The owner-local deque remains stealable, so execution may legally move
+    // after publication even though the fast-path route itself was local.
+    CHECK(after.load(std::memory_order_acquire) != NO_AFFINITY);
     CHECK(fast_paths_after == fast_paths_before + 1);
     CHECK(fallbacks_after == fallbacks_before);
 }

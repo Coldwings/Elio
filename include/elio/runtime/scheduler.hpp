@@ -1883,6 +1883,10 @@ inline void worker_thread::run() {
                 }
                 break;
             }
+            reset_submission_wake_before_poll();
+            if (has_external_submission()) {
+                continue;
+            }
             io_context_->poll(std::chrono::milliseconds(50));
             continue;
         }
@@ -2139,11 +2143,20 @@ inline void worker_thread::poll_io_when_idle() {
     // Mark as idle before any blocking so diagnostics can observe wait state.
     idle_.store(true, std::memory_order_release);
 
+    // A submit that observed the previous outstanding wake may have skipped
+    // its eventfd write. Clear that claim before the queue recheck: work
+    // published earlier is found below, while a later producer claims the
+    // clear state and wakes the poll.
+    reset_submission_wake_before_poll();
+    if (has_external_submission()) {
+        idle_.store(false, std::memory_order_relaxed);
+        return;
+    }
+
     // Optional spinning phase (if configured via wait_strategy)
     if (strategy_.spin_iterations > 0) {
         for (size_t i = 0; i < strategy_.spin_iterations; ++i) {
-            if (inbox_->size_approx() > 0 ||
-                overflow_size_.load(std::memory_order_acquire) > 0) {
+            if (has_external_submission()) {
                 idle_.store(false, std::memory_order_relaxed);
                 return;
             }

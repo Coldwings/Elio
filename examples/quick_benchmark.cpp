@@ -86,6 +86,15 @@ coro::task<void> measure_scheduler_reschedules(
     co_return;
 }
 
+coro::task<void> hold_worker_for_external_burst(
+    std::atomic<bool>* started, std::atomic<bool>* release) {
+    started->store(true, std::memory_order_release);
+    while (!release->load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    co_return;
+}
+
 // Time-based spawn overhead benchmark
 void benchmark_spawn_overhead() {
     const int batch_size = 10000;
@@ -271,6 +280,46 @@ void benchmark_scheduler_reschedule() {
               << ", max=" << stats.max << ")" << std::endl;
 }
 
+// Measure producer-side enqueue cost when many submissions target one busy
+// worker and therefore share one outstanding wake notification.
+void benchmark_external_submission_burst() {
+    constexpr int submissions_per_burst = 4000;
+    std::vector<double> samples;
+
+    const auto bench_start = steady_clock::now();
+    while (duration_cast<seconds>(steady_clock::now() - bench_start) <
+           MIN_BENCH_DURATION) {
+        runtime::scheduler sched(1);
+        sched.start();
+
+        std::atomic<bool> holder_started{false};
+        std::atomic<bool> release_holder{false};
+        sched.go_to(0, hold_worker_for_external_burst,
+                    &holder_started, &release_holder);
+        while (!holder_started.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+
+        const auto start = steady_clock::now();
+        for (int i = 0; i < submissions_per_burst; ++i) {
+            sched.spawn_to(0, std::noop_coroutine());
+        }
+        const auto elapsed = duration_cast<nanoseconds>(
+            steady_clock::now() - start).count();
+        samples.push_back(
+            static_cast<double>(elapsed) / submissions_per_burst);
+
+        release_holder.store(true, std::memory_order_release);
+        sched.shutdown();
+    }
+
+    const auto stats = bench_stats::compute(samples);
+    std::cout << "External submission burst: " << std::fixed
+              << std::setprecision(2) << stats.avg
+              << " ns/submit (min=" << stats.min
+              << ", max=" << stats.max << ")" << std::endl;
+}
+
 int main() {
     log::logger::instance().set_level(log::level::error);
 
@@ -281,6 +330,7 @@ int main() {
     benchmark_context_switch();
     benchmark_yield();
     benchmark_scheduler_reschedule();
+    benchmark_external_submission_burst();
 
     std::cout << "=== Done ===" << std::endl;
 

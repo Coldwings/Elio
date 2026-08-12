@@ -45,24 +45,36 @@ Scaling efficiency depends on workload characteristics. Tasks with more computat
 
 ### Wake-up Mechanism
 
-Elio uses an **eventfd embedded in each worker's I/O backend** (epoll/io_uring) for cross-thread notifications. This provides a single unified wait point — both I/O completions and task wake-ups unblock the same `poll()` call, eliminating the latency gap that exists with separate wait mechanisms. The eventfd counter deduplicates wakes, making unconditional wake safe and minimizing scheduling overhead.
+Elio uses an **eventfd embedded in each worker's I/O backend** (epoll/io_uring)
+for cross-thread notifications. This provides a single unified wait point: both
+I/O completions and task wake-ups unblock the same `poll()` call, eliminating
+the latency gap that exists with separate wait mechanisms. A worker-level
+pending-wake claim lets a burst of submissions share one eventfd notification.
 
 ## Built-in Optimizations
 
-### Unconditional Wake
+### Coalesced Submission Wake
 
-Workers track their idle state. Task submissions always trigger wake syscalls on cross-thread submit; the eventfd counter deduplicates, making unconditional wake safe:
+The first cross-thread submission in a busy or blocked interval claims and
+writes an eventfd wake. Later submissions still publish their queue entries but
+share that outstanding notification:
 
 ```cpp
 // In worker_thread::schedule()
 if (inbox_->push(handle.address())) {
-    // Always wake on cross-thread submit. The eventfd dedupes via its
-    // counter — calling wake() on a busy worker just bumps the counter.
-    wake();
+    wake_for_submission();
 }
 ```
 
-The previous lazy wake optimization was removed due to a race condition that caused 10ms tail latency on weak hardware.
+Before entering a blocking poll, the worker atomically clears the pending-wake
+claim and rechecks both external queues. A submission published before that
+clear is found by the recheck; a submission published after it claims a new
+wake and interrupts the poll. This handshake preserves unconditional-wake
+correctness while avoiding one `eventfd_write` syscall per task in a burst.
+
+This is deliberately not the previous idle-flag lazy-wake optimization. The
+producer never decides that a wake is unnecessary from a sampled worker state;
+that approach had a race which caused 10 ms tail latency on weak hardware.
 
 The MPSC ring remains the normal submission path. If it stays full after
 bounded retries, the worker accepts the handle through a locked overflow queue.
@@ -86,15 +98,23 @@ local fast path on a draining worker. New independent tasks submitted through
 
 ### Unified Wake Mechanism
 
-Each worker's I/O backend (epoll or io_uring) contains an embedded `eventfd`. When a task is submitted to a worker from another thread, the submitter writes to that worker's eventfd. Because the eventfd is registered with the same epoll/io_uring instance that handles I/O completions, both I/O events and task wake-ups unblock the same `poll()` call.
+Each worker's I/O backend (epoll or io_uring) contains an embedded `eventfd`.
+The first task submitted from another thread while no submission wake is
+outstanding writes to that eventfd. Because the descriptor is registered with
+the same epoll/io_uring instance that handles I/O completions, both I/O events
+and task wake-ups unblock the same `poll()` call.
 
 This unified design has two key benefits:
 
 1. **Single wait point.** A worker blocked on I/O poll is immediately woken by a cross-thread task submission. There is no separate condition variable or futex that could introduce a latency gap between "I/O ready" and "task ready" paths.
 
-2. **Safe unconditional wake.** The eventfd counter deduplicates wakes — calling `wake()` on a busy worker just bumps the counter, which is consumed on the next poll return. This eliminates the race condition that existed with the previous lazy wake optimization.
+2. **Safe coalescing.** Producers atomically share one outstanding submission
+   wake. The worker clears that claim and rechecks its external queues before
+   every blocking poll, closing the clear-versus-block lost-wake window.
 
-The result is that cross-thread scheduling latency equals one `eventfd_write` plus one `epoll_wait`/`io_uring_enter` return — typically under 5 microseconds.
+The first submission pays for one `eventfd_write`; additional tasks in the same
+burst pay only for the atomic claim check. A blocked worker is still interrupted
+immediately rather than waiting for a polling timeout.
 
 ### Wait Strategy
 
@@ -625,7 +645,8 @@ Elio includes several benchmark tools:
 ```bash
 cmake --build build
 
-# Quick benchmark - measures spawn, context switch, yield, reschedule
+# Quick benchmark - measures spawn, context switch, yield, reschedule,
+# and external submission bursts
 ./build/examples/quick_benchmark
 
 # Microbenchmarks - individual operation timing

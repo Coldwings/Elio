@@ -52,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Coalesced external-submission wakes**: Each worker now issues at most one
+  `eventfd` notification for a burst of cross-thread task submissions. Before
+  blocking, the worker clears the pending-wake claim and rechecks both external
+  queues, preserving the unconditional-wake correctness guarantee without one
+  syscall per submitted task. Interrupted eventfd writes are retried before the
+  wake remains claimed (#1026).
 - **Owner-local continuation routing**: `scheduler::try_schedule()` now keeps an
   already-suspended coroutine on the current worker when that worker satisfies
   its affinity and active-I/O ownership constraints. Initial task admission

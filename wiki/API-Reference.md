@@ -901,7 +901,7 @@ Individual worker that executes tasks. Workers use a unified idle mechanism wher
 ```cpp
 class worker_thread {
 public:
-    // Schedule a task to this worker (thread-safe, wakes worker if sleeping).
+    // Schedule a task to this worker (thread-safe, wakes worker as needed).
     // A full bounded inbox spills to a locked overflow queue; false means the
     // worker has stopped and the caller retains the handle.
     bool schedule(std::coroutine_handle<> handle);
@@ -939,7 +939,9 @@ public:
 **Idle Behavior:**
 - Workers block efficiently on I/O poll (with eventfd wake support) when no tasks are available
 - Optional spin phase before blocking (configurable via `wait_strategy`)
-- When a task is scheduled via `schedule()`, the worker is automatically woken
+- Cross-thread submissions automatically wake a blocked worker. A burst shares
+  one outstanding eventfd notification; before blocking again, the worker
+  clears the wake claim and rechecks its external queues so no wake is lost
 - The bounded MPSC inbox remains the fast path; a locked overflow queue absorbs rare bursts without resuming worker-bound coroutines on submitter threads
 - Results in near-zero CPU usage (< 1%) when idle with default blocking strategy
 

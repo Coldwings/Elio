@@ -25,6 +25,8 @@ inline std::atomic<bool> overflow_transfer_paused_for_test{false};
 inline std::atomic<bool> pause_queue_snapshot_for_test{false};
 inline std::atomic<bool> queue_snapshot_paused_for_test{false};
 inline std::atomic<bool> queue_transfer_waiting_for_test{false};
+inline std::atomic<bool> pause_before_submission_wake_reset_for_test{false};
+inline std::atomic<bool> submission_wake_reset_paused_for_test{false};
 inline std::atomic<io::io_context::backend_type> worker_io_backend_for_test{
     io::io_context::backend_type::auto_detect};
 }  // namespace detail
@@ -100,12 +102,7 @@ public:
             if (!inbox_->push(handle.address())) {
                 return push_result::full;
             }
-            // Always wake on cross-thread submit. The eventfd dedupes via its
-            // counter — calling wake() on a busy worker just bumps the counter
-            // and is consumed in the next poll cycle. The previous "lazy wake"
-            // load on idle_ raced with the worker's relaxed idle_=false store,
-            // missing wakes and producing 10 ms tail latency on weak hardware.
-            wake();
+            wake_for_submission();
             return push_result::accepted;
         };
 
@@ -155,7 +152,7 @@ public:
                 overflow_.push_back(handle.address());
                 overflow_size_.fetch_add(1, std::memory_order_release);
             }
-            wake();
+            wake_for_submission();
         } catch (...) {
             // The handle was not published if overflow allocation failed.
             return false;
@@ -175,7 +172,7 @@ public:
             overflow_.push_back(handle.address());
             overflow_size_.fetch_add(1, std::memory_order_release);
         }
-        wake();
+        wake_for_submission();
         return true;
     }
 #endif
@@ -199,6 +196,20 @@ public:
     [[nodiscard]] size_t steals_executed() const noexcept {
         return steals_executed_.load(std::memory_order_relaxed);
     }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    [[nodiscard]] size_t submission_wake_calls_for_test() const noexcept {
+        return submission_wake_calls_for_test_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] size_t blocking_poll_calls_for_test() const noexcept {
+        return blocking_poll_calls_for_test_.load(std::memory_order_relaxed);
+    }
+
+    void record_blocking_poll_for_test() noexcept {
+        blocking_poll_calls_for_test_.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
 
     [[nodiscard]] size_t queue_size() const noexcept {
         std::unique_lock<std::mutex> transfer_lock(transfer_mutex_,
@@ -329,6 +340,47 @@ private:
 
     void request_stop() noexcept;
 
+    void wake_for_submission() noexcept {
+        // Every producer performs a release RMW, including producers that
+        // share an existing wake. The owner's acquire exchange before poll
+        // therefore observes the whole release sequence before rechecking the
+        // MPSC inbox; a failed CAS would not publish skipped submissions.
+        if (submission_wake_pending_.exchange(
+                true, std::memory_order_acq_rel)) {
+            return;
+        }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        submission_wake_calls_for_test_.fetch_add(
+            1, std::memory_order_relaxed);
+#endif
+        wake();
+    }
+
+    void reset_submission_wake_before_poll() noexcept {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (detail::pause_before_submission_wake_reset_for_test.load(
+                std::memory_order_acquire)) {
+            detail::submission_wake_reset_paused_for_test.store(
+                true, std::memory_order_release);
+            detail::submission_wake_reset_paused_for_test.notify_all();
+            while (detail::pause_before_submission_wake_reset_for_test.load(
+                    std::memory_order_acquire)) {
+                detail::pause_before_submission_wake_reset_for_test.wait(
+                    true, std::memory_order_acquire);
+            }
+            detail::submission_wake_reset_paused_for_test.store(
+                false, std::memory_order_release);
+        }
+#endif
+        (void)submission_wake_pending_.exchange(
+            false, std::memory_order_acq_rel);
+    }
+
+    [[nodiscard]] bool has_external_submission() const noexcept {
+        return !inbox_->empty() ||
+            overflow_size_.load(std::memory_order_acquire) > 0;
+    }
+
     void leave_draining_mode() noexcept {
         draining_.store(false, std::memory_order_release);
     }
@@ -365,6 +417,16 @@ private:
     std::atomic<size_t> tasks_executed_{0};
     size_t steals_executed_local_{0};
     std::atomic<size_t> steals_executed_{0};
+
+    // The first external submit in a busy/blocked interval owns the eventfd
+    // wake. The owner clears this before polling and then rechecks the queues,
+    // closing the clear-versus-block lost-wake window without sampling idle_.
+    alignas(64) std::atomic<bool> submission_wake_pending_{false};
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    std::atomic<size_t> submission_wake_calls_for_test_{0};
+    std::atomic<size_t> blocking_poll_calls_for_test_{0};
+#endif
 
     // Idle flag (owner writes, other threads read) — isolated cache line
     alignas(64) std::atomic<bool> idle_{false};

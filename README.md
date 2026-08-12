@@ -301,6 +301,8 @@ The scheduler manages a pool of worker threads, each with a local task queue. Ke
 - **Work stealing**: Idle threads steal tasks from busy threads
 - **Owner-local continuations**: eligible same-worker resumptions bypass the
   external inbox and wake path while remaining stealable
+- **Coalesced external wakes**: bursts targeting one worker share an outstanding
+  eventfd notification without sampling an idle flag or risking a lost wake
 - **Per-worker I/O context**: Pending operations stay pinned to the worker/backend generation that accepted them
 - **Dynamic sizing**: Adjust thread count at runtime
 - **Load balancing**: Automatic task distribution
@@ -519,7 +521,9 @@ Elio achieves competitive performance through careful optimization:
 
 ### Key Optimizations
 
-- **Unconditional Wake**: Cross-thread submissions always wake the target worker; eventfd deduplication prevents lost wakes
+- **Coalesced Submission Wake**: The first cross-thread submission claims an
+  eventfd wake; later submissions share it until the worker clears the claim
+  and rechecks its queues before blocking
 - **io_uring Batch Submit**: Automatic batching of I/O operations
 - **Queue-based Scheduling Fast Path**: bounded MPSC inbox (~5 ns) +
   Chase-Lev deque (~13 ns), with a locked overflow queue for rare sustained
@@ -547,7 +551,8 @@ Elio achieves competitive performance through careful optimization:
 cd build
 cmake --build . --target quick_benchmark microbench scheduler_service_benchmark io_benchmark benchmark scalability_test
 
-# Quick benchmark (spawn, context switch, yield, scheduler reschedule)
+# Quick benchmark (spawn, context switch, yield, scheduler reschedule,
+# external submission burst)
 ./examples/quick_benchmark
 
 # Microbenchmarks (individual operations)

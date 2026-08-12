@@ -27,6 +27,25 @@ using namespace elio::test;
 // Standalone task functions to avoid lambda capture lifetime issues
 namespace {
 
+class worker_io_backend_guard {
+public:
+    explicit worker_io_backend_guard(
+        elio::io::io_context::backend_type backend)
+        : previous_(elio::runtime::detail::worker_io_backend_for_test.exchange(
+              backend, std::memory_order_acq_rel)) {}
+
+    worker_io_backend_guard(const worker_io_backend_guard&) = delete;
+    worker_io_backend_guard& operator=(const worker_io_backend_guard&) = delete;
+
+    ~worker_io_backend_guard() {
+        elio::runtime::detail::worker_io_backend_for_test.store(
+            previous_, std::memory_order_release);
+    }
+
+private:
+    elio::io::io_context::backend_type previous_;
+};
+
 task<void> set_executed_task(std::atomic<bool>* executed) {
     executed->store(true);
     co_return;
@@ -35,6 +54,159 @@ task<void> set_executed_task(std::atomic<bool>* executed) {
 task<void> increment_counter_task(std::atomic<int>* counter) {
     counter->fetch_add(1);
     co_return;
+}
+
+task<void> hold_worker_for_submission_burst(
+    std::atomic<bool>* started, std::atomic<bool>* release) {
+    started->store(true, std::memory_order_release);
+    while (!release->load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    co_return;
+}
+
+task<void> arm_submission_wake_reset_pause(std::atomic<bool>* armed) {
+    elio::runtime::detail::pause_before_submission_wake_reset_for_test.store(
+        true, std::memory_order_release);
+    armed->store(true, std::memory_order_release);
+    co_return;
+}
+
+task<void> record_blocking_poll_count(
+    std::atomic<size_t>* poll_calls_seen,
+    std::atomic<bool>* completed) {
+    auto* worker = worker_thread::current();
+    poll_calls_seen->store(worker ? worker->blocking_poll_calls_for_test() : 0,
+                           std::memory_order_relaxed);
+    completed->store(true, std::memory_order_release);
+    co_return;
+}
+
+template<typename Predicate>
+bool wait_for_scheduler_condition(Predicate&& predicate);
+
+void check_submission_wake_burst(
+    elio::io::io_context::backend_type backend) {
+    worker_io_backend_guard backend_guard(backend);
+
+    scheduler sched(1);
+    sched.start();
+    auto* worker = sched.get_worker(0);
+    REQUIRE(worker != nullptr);
+    const auto wake_calls_before = worker->submission_wake_calls_for_test();
+
+    std::atomic<bool> holder_started{false};
+    std::atomic<bool> release_holder{false};
+    std::atomic<int> completed{0};
+    sched.go_to(0, hold_worker_for_submission_burst,
+                &holder_started, &release_holder);
+
+    const bool started = wait_for_scheduler_condition([&] {
+        return holder_started.load(std::memory_order_acquire);
+    });
+    const auto wake_calls_before_burst =
+        worker->submission_wake_calls_for_test();
+
+    constexpr int burst_size = 128;
+    if (started) {
+        for (int i = 0; i < burst_size; ++i) {
+            sched.go_to(0, increment_counter_task, &completed);
+        }
+    }
+    const auto wake_calls_after_burst =
+        worker->submission_wake_calls_for_test();
+    release_holder.store(true, std::memory_order_release);
+
+    const bool burst_completed = wait_for_scheduler_condition([&] {
+        return completed.load(std::memory_order_acquire) == burst_size;
+    });
+    const bool stopped = sched.shutdown(scaled_sec(5));
+
+    REQUIRE(started);
+    REQUIRE(burst_completed);
+    REQUIRE(stopped);
+    CHECK(wake_calls_before_burst == wake_calls_before + 1);
+    // The worker may clear the holder's claim immediately before resuming it,
+    // so the burst can require one fresh wake, but never one wake per task.
+    CHECK(wake_calls_after_burst >= wake_calls_before_burst);
+    CHECK(wake_calls_after_burst <= wake_calls_before_burst + 1);
+}
+
+void check_skipped_submission_rechecked_before_blocking(
+    elio::io::io_context::backend_type backend) {
+    worker_io_backend_guard backend_guard(backend);
+    elio::runtime::detail::pause_before_submission_wake_reset_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::submission_wake_reset_paused_for_test.store(
+        false, std::memory_order_release);
+
+    scheduler sched(1);
+    sched.start();
+    auto* worker = sched.get_worker(0);
+    REQUIRE(worker != nullptr);
+
+    // Wait until the worker has cleared its claim and entered a blocking poll.
+    // The holder's wake then remains outstanding while it runs, so both the
+    // pause task and marker deterministically share that claim.
+    std::atomic<bool> holder_started{false};
+    std::atomic<bool> release_holder{false};
+    std::atomic<bool> pause_armed{false};
+    std::atomic<bool> marker_completed{false};
+    std::atomic<size_t> marker_poll_calls{0};
+    const auto poll_calls_before_holder =
+        worker->blocking_poll_calls_for_test();
+    const bool worker_blocking = wait_for_scheduler_condition([&] {
+        return worker->blocking_poll_calls_for_test() >
+            poll_calls_before_holder;
+    });
+    const auto wake_calls_before = worker->submission_wake_calls_for_test();
+    if (worker_blocking) {
+        sched.go_to(0, hold_worker_for_submission_burst,
+                    &holder_started, &release_holder);
+    }
+    const bool holder_running = wait_for_scheduler_condition([&] {
+        return holder_started.load(std::memory_order_acquire);
+    });
+    if (holder_running) {
+        sched.go_to(0, arm_submission_wake_reset_pause, &pause_armed);
+    }
+    const auto wake_calls_after_arm =
+        worker->submission_wake_calls_for_test();
+    release_holder.store(true, std::memory_order_release);
+
+    const bool reset_paused = wait_for_scheduler_condition([&] {
+        return pause_armed.load(std::memory_order_acquire) &&
+            elio::runtime::detail::submission_wake_reset_paused_for_test.load(
+                std::memory_order_acquire);
+    });
+    const auto poll_calls_before_release =
+        worker->blocking_poll_calls_for_test();
+    if (reset_paused) {
+        sched.go_to(0, record_blocking_poll_count,
+                    &marker_poll_calls, &marker_completed);
+    }
+    const auto wake_calls_before_release =
+        worker->submission_wake_calls_for_test();
+
+    elio::runtime::detail::pause_before_submission_wake_reset_for_test.store(
+        false, std::memory_order_release);
+    elio::runtime::detail::pause_before_submission_wake_reset_for_test
+        .notify_all();
+
+    const bool marker_ran = wait_for_scheduler_condition([&] {
+        return marker_completed.load(std::memory_order_acquire);
+    });
+    const bool stopped = sched.shutdown(scaled_sec(5));
+
+    REQUIRE(worker_blocking);
+    REQUIRE(holder_running);
+    REQUIRE(reset_paused);
+    REQUIRE(marker_ran);
+    REQUIRE(stopped);
+    CHECK(wake_calls_after_arm == wake_calls_before + 1);
+    CHECK(wake_calls_before_release == wake_calls_before + 1);
+    CHECK(marker_poll_calls.load(std::memory_order_relaxed) ==
+          poll_calls_before_release);
 }
 
 task<void> yield_for_metric_reads(size_t sample_count,
@@ -616,6 +788,40 @@ TEST_CASE("Scheduler keeps an eligible continuation on the owner-local deque",
     CHECK(after.load(std::memory_order_acquire) != NO_AFFINITY);
     CHECK(fast_paths_after == fast_paths_before + 1);
     CHECK(fallbacks_after == fallbacks_before);
+}
+
+TEST_CASE("Scheduler coalesces external submission wakes while a worker is busy",
+          "[scheduler][performance][wake][io]") {
+    SECTION("epoll") {
+        check_submission_wake_burst(
+            elio::io::io_context::backend_type::epoll);
+    }
+
+    SECTION("io_uring") {
+        if (!elio::io::io_uring_backend::is_available()) {
+            SUCCEED("io_uring is not available at runtime");
+            return;
+        }
+        check_submission_wake_burst(
+            elio::io::io_context::backend_type::io_uring);
+    }
+}
+
+TEST_CASE("Scheduler rechecks skipped submissions before blocking",
+          "[scheduler][performance][wake][race][regression]") {
+    SECTION("epoll") {
+        check_skipped_submission_rechecked_before_blocking(
+            elio::io::io_context::backend_type::epoll);
+    }
+
+    SECTION("io_uring") {
+        if (!elio::io::io_uring_backend::is_available()) {
+            SUCCEED("io_uring is not available at runtime");
+            return;
+        }
+        check_skipped_submission_rechecked_before_blocking(
+            elio::io::io_context::backend_type::io_uring);
+    }
 }
 
 TEST_CASE("go_to affinity reaches the returned task across suspension",

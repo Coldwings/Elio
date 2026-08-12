@@ -728,7 +728,10 @@ public:
 
     void notify() noexcept override {
         uint64_t val = 1;
-        ssize_t ret = ::write(wake_fd_, &val, sizeof(val));
+        ssize_t ret;
+        do {
+            ret = ::write(wake_fd_, &val, sizeof(val));
+        } while (ret < 0 && errno == EINTR);
         if (ret < 0 && errno != EAGAIN) {
             int error = errno;
             detail::run_noexcept([&]() {

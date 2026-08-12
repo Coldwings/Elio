@@ -25,7 +25,6 @@ inline std::atomic<bool> overflow_transfer_paused_for_test{false};
 inline std::atomic<bool> pause_queue_snapshot_for_test{false};
 inline std::atomic<bool> queue_snapshot_paused_for_test{false};
 inline std::atomic<bool> queue_transfer_waiting_for_test{false};
-inline std::atomic<size_t> submission_wake_calls_for_test{0};
 inline std::atomic<bool> pause_before_submission_wake_reset_for_test{false};
 inline std::atomic<bool> submission_wake_reset_paused_for_test{false};
 inline std::atomic<io::io_context::backend_type> worker_io_backend_for_test{
@@ -198,6 +197,20 @@ public:
         return steals_executed_.load(std::memory_order_relaxed);
     }
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    [[nodiscard]] size_t submission_wake_calls_for_test() const noexcept {
+        return submission_wake_calls_for_test_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] size_t blocking_poll_calls_for_test() const noexcept {
+        return blocking_poll_calls_for_test_.load(std::memory_order_relaxed);
+    }
+
+    void record_blocking_poll_for_test() noexcept {
+        blocking_poll_calls_for_test_.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
+
     [[nodiscard]] size_t queue_size() const noexcept {
         std::unique_lock<std::mutex> transfer_lock(transfer_mutex_,
                                                    std::try_to_lock);
@@ -337,7 +350,7 @@ private:
             return;
         }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
-        detail::submission_wake_calls_for_test.fetch_add(
+        submission_wake_calls_for_test_.fetch_add(
             1, std::memory_order_relaxed);
 #endif
         wake();
@@ -409,6 +422,11 @@ private:
     // wake. The owner clears this before polling and then rechecks the queues,
     // closing the clear-versus-block lost-wake window without sampling idle_.
     alignas(64) std::atomic<bool> submission_wake_pending_{false};
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    std::atomic<size_t> submission_wake_calls_for_test_{0};
+    std::atomic<size_t> blocking_poll_calls_for_test_{0};
+#endif
 
     // Idle flag (owner writes, other threads read) — isolated cache line
     alignas(64) std::atomic<bool> idle_{false};

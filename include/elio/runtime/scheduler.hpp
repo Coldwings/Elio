@@ -1887,6 +1887,9 @@ inline void worker_thread::run() {
             if (has_external_submission()) {
                 continue;
             }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            record_blocking_poll_for_test();
+#endif
             io_context_->poll(std::chrono::milliseconds(50));
             continue;
         }
@@ -2170,6 +2173,9 @@ inline void worker_thread::poll_io_when_idle() {
 
     // Single unified wait: blocks on I/O backend (epoll/io_uring)
     // Both I/O completions AND task wake-ups (via eventfd) will unblock this
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    record_blocking_poll_for_test();
+#endif
     io_context_->poll(std::chrono::milliseconds(idle_timeout_ms));
 
     // Clear idle flag after waking up

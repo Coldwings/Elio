@@ -889,6 +889,11 @@ The autoscaler supports:
 - **Actions**: `scale_up`, `scale_down`, `log`, `null`
 - **Combinators**: `on_success`, `on_failure`
 
+The complete `autoscaler_example` retains join handles for every submitted load
+phase and waits for all task frames to be destroyed before releasing captured
+phase state or beginning its low-load observation. Use
+`./build/examples/autoscaler_example --smoke` for a short termination check.
+
 `on_block` is a best-effort sampled diagnostic. A non-idle worker is considered
 blocked when its completed-resume counter does not advance for longer than
 `block_threshold`; detection can trail the threshold by approximately one

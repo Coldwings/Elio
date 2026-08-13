@@ -24,6 +24,8 @@ void schedule_handle(std::coroutine_handle<> handle) noexcept;
 
 namespace elio::coro {
 
+class cancel_token;
+
 /// Result of a cancellable operation
 enum class cancel_result {
     completed,   ///< Operation completed normally
@@ -33,6 +35,7 @@ enum class cancel_result {
 namespace detail {
 
 class cancellation_context;
+struct cancel_state;
 
 inline thread_local const void* current_callback_dispatcher = nullptr;
 
@@ -217,6 +220,10 @@ private:
     const void* dispatcher_identity = nullptr;
 };
 
+struct task_parent_callback_node final : callback_node {
+    std::weak_ptr<cancel_state> parent_state;
+};
+
 /// Shared cancellation state (implementation detail).
 ///
 /// Stores active callbacks as an intrusive shared-ownership list guarded by a
@@ -245,16 +252,21 @@ struct cancel_state {
         auto node = std::make_shared<callback_node>();
         node->emplace(std::forward<F>(cb));
 
+        if (!add_callback_node(node)) return {};
+        return node;
+    }
+
+    bool add_callback_node(const std::shared_ptr<callback_node>& node) {
         std::unique_lock<std::mutex> lock(mutex);
         if (cancelled.load(std::memory_order_relaxed)) {
             // Already cancelled: invoke and drop without inserting.
             lock.unlock();
             node->dispatch();
-            return {};
+            return false;
         }
         node->next = head;
         head = node;
-        return node;
+        return true;
     }
 
     void remove_callback(const std::shared_ptr<callback_node>& node) noexcept {
@@ -333,6 +345,43 @@ inline std::shared_ptr<cancel_state> make_cancel_state() {
 #endif
     return std::make_shared<cancel_state>();
 }
+
+class task_parent_registration final {
+public:
+    task_parent_registration() = default;
+    task_parent_registration(task_parent_registration&& other) noexcept
+        : node_(std::move(other.node_)) {}
+    task_parent_registration& operator=(
+        task_parent_registration&& other) noexcept {
+        if (this != &other) {
+            unregister();
+            node_ = std::move(other.node_);
+        }
+        return *this;
+    }
+    ~task_parent_registration() { unregister(); }
+
+    task_parent_registration(const task_parent_registration&) = delete;
+    task_parent_registration& operator=(
+        const task_parent_registration&) = delete;
+
+    void unregister() noexcept {
+        auto node = std::move(node_);
+        if (!node) return;
+        if (auto parent = node->parent_state.lock()) {
+            parent->remove_callback(node);
+        }
+    }
+
+private:
+    friend class elio::coro::cancel_token;
+
+    explicit task_parent_registration(
+        std::shared_ptr<task_parent_callback_node> node) noexcept
+        : node_(std::move(node)) {}
+
+    std::shared_ptr<task_parent_callback_node> node_;
+};
 
 } // namespace detail
 
@@ -498,6 +547,18 @@ private:
     friend class cancel_source;
     friend class detail::cancellation_context;
 
+    template<typename F>
+    [[nodiscard]] detail::task_parent_registration
+    on_cancel_for_task(F&& callback) const {
+        if (!state_) return {};
+
+        auto node = std::make_shared<detail::task_parent_callback_node>();
+        node->parent_state = state_;
+        node->emplace(std::forward<F>(callback));
+        if (!state_->add_callback_node(node)) return {};
+        return detail::task_parent_registration{std::move(node)};
+    }
+
     explicit cancel_token(std::shared_ptr<detail::cancel_state> state)
         : state_(std::move(state)) {}
 
@@ -591,21 +652,13 @@ public:
                state_->cancelled.load(std::memory_order_acquire);
     }
 
-    void link_parent(cancel_token parent) {
+    [[nodiscard]] task_parent_registration link_parent(cancel_token parent) {
         auto child_state = shared_state_;
-        auto registration = parent.on_cancel([child_state]() mutable {
+        return parent.on_cancel_for_task([child_state]() mutable {
             if (auto state = child_state.lock()) {
                 state->trigger();
             }
         });
-
-        std::lock_guard<std::mutex> lock(parent_mutex_);
-        if (parent_linked_) {
-            throw std::logic_error(
-                "task cancellation context already has a parent");
-        }
-        parent_registration_ = std::move(registration);
-        parent_linked_ = true;
     }
 
     void bind_shared_state(std::shared_ptr<cancel_state> state) noexcept {
@@ -614,14 +667,9 @@ public:
     }
 
 private:
-    // Keep registration last so it unregisters before either the separately
-    // owned state or a co-allocated task context can be released.
     std::shared_ptr<cancel_state> owned_state_;
     std::weak_ptr<cancel_state> shared_state_;
     cancel_state* state_ = nullptr;
-    std::mutex parent_mutex_;
-    bool parent_linked_ = false;
-    cancel_registration parent_registration_;
 };
 
 } // namespace detail

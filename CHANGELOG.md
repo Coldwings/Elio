@@ -56,7 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   states now allocate `task_execution_context` together with its task-lifetime
   cancellation state in one shared control block. Aliasing cancellation tokens
   retain the same post-frame lifetime, callback, and propagation semantics,
-  while parent links use weak child ownership to avoid cycles (#1032).
+  while frame-owned parent links use weak ownership in both directions so an
+  escaped child token retains neither the registration nor its ancestors
+  (#1032).
 - **Direct task spawn handoff**: `go`, `go_to`, `go_joinable`, and
   `go_joinable_to` now accept an already-constructed rvalue `task<T>` without
   creating a callable-wrapper coroutine. Callable overloads retain their

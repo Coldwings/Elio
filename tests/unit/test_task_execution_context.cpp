@@ -24,6 +24,20 @@ task<int> context_value() {
     co_return 42;
 }
 
+task<void> capture_child_control(cancel_token* token,
+                                 std::weak_ptr<task_execution_context>* weak) {
+    auto* frame = promise_base::current_frame();
+    auto context = frame->execution_context();
+    *token = context->get_cancel_token();
+    *weak = context;
+    co_return;
+}
+
+task<void> await_captured_child(
+    cancel_token* token, std::weak_ptr<task_execution_context>* weak) {
+    co_await capture_child_control(token, weak);
+}
+
 } // namespace
 
 TEST_CASE("promise runtime policy is stored in task execution context",
@@ -112,6 +126,32 @@ TEST_CASE("co-allocated parent cancellation links do not retain a cycle",
     child.reset();
 
     REQUIRE(weak_parent.expired());
+    REQUIRE(weak_child.expired());
+}
+
+TEST_CASE("escaped child tokens do not retain parent links or ancestors",
+          "[task][execution_context][cancellation][ownership]") {
+    cancel_token escaped_token;
+    std::weak_ptr<task_execution_context> weak_parent;
+    std::weak_ptr<task_execution_context> weak_child;
+    {
+        auto parent = await_captured_child(&escaped_token, &weak_child);
+        auto parent_context = get_handle(parent).promise().execution_context();
+        weak_parent = parent_context;
+
+        get_handle(parent).resume();
+        REQUIRE(get_handle(parent).done());
+        REQUIRE_FALSE(weak_child.expired());
+
+        // The completed child frame has released its parent registration.
+        parent_context->request_cancel();
+        REQUIRE_FALSE(escaped_token.is_cancelled());
+    }
+
+    REQUIRE(weak_parent.expired());
+    REQUIRE_FALSE(weak_child.expired());
+
+    escaped_token = {};
     REQUIRE(weak_child.expired());
 }
 

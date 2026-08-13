@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -17,6 +18,7 @@ class io_operation_guard;
 namespace elio::coro {
 
 class task_execution_context;
+class promise_base;
 
 namespace detail {
 struct task_execution_control_block;
@@ -37,14 +39,27 @@ inline constexpr size_t NO_AFFINITY = std::numeric_limits<size_t>::max();
 class task_execution_context final {
 private:
     struct coallocated_state_key final {};
+    struct external_parent_link final {
+        explicit external_parent_link(
+            detail::task_parent_registration registration_value) noexcept
+            : registration(std::move(registration_value)) {}
+
+        detail::task_parent_registration registration;
+    };
+
     friend struct detail::task_execution_control_block;
     friend std::shared_ptr<task_execution_context>
     detail::make_task_execution_context();
+    friend class promise_base;
 
 public:
     /// Standalone construction preserves source compatibility and allocates a
     /// separate task-local cancellation state.
     task_execution_context() = default;
+
+    ~task_execution_context() {
+        delete external_parent_link_.load(std::memory_order_relaxed);
+    }
 
     task_execution_context(const task_execution_context&) = delete;
     task_execution_context& operator=(const task_execution_context&) = delete;
@@ -133,7 +148,16 @@ public:
     /// is one-way: cancelling the parent requests cancellation of the child,
     /// while cancelling this context does not affect the parent.
     void link_parent_cancellation(cancel_token parent) {
-        cancellation_context_.link_parent(std::move(parent));
+        auto link = std::make_unique<external_parent_link>(
+            make_parent_cancellation_registration(std::move(parent)));
+        external_parent_link* expected = nullptr;
+        if (!external_parent_link_.compare_exchange_strong(
+                expected, link.get(), std::memory_order_release,
+                std::memory_order_relaxed)) {
+            throw std::logic_error(
+                "task cancellation context already has a parent");
+        }
+        link.release();
     }
 
 private:
@@ -142,6 +166,11 @@ private:
     explicit task_execution_context(coallocated_state_key) noexcept
         : cancellation_context_(
               detail::cancellation_context::deferred_state_t{}) {}
+
+    [[nodiscard]] detail::task_parent_registration
+    make_parent_cancellation_registration(cancel_token parent) {
+        return cancellation_context_.link_parent(std::move(parent));
+    }
 
     void acquire_io_pin(size_t worker_id, uint64_t context_generation) {
         std::lock_guard<std::mutex> lock(io_pin_mutex_);
@@ -190,6 +219,7 @@ private:
     std::atomic<size_t> io_owner_worker_{NO_AFFINITY};
     std::atomic<uint64_t> io_context_generation_{0};
     std::atomic<size_t> active_io_pins_{0};
+    std::atomic<external_parent_link*> external_parent_link_{nullptr};
 };
 
 namespace detail {
@@ -198,8 +228,6 @@ struct task_execution_control_block final {
     task_execution_control_block()
         : context(task_execution_context::coallocated_state_key{}) {}
 
-    // Context teardown unregisters its parent callback before the colocated
-    // cancellation state is destroyed.
     cancel_state cancellation_state;
     task_execution_context context;
 };

@@ -42,9 +42,12 @@ the policy state can remain valid after frame destruction without a raw promise
 pointer. Coroutine promises allocate the context and its cancellation state in
 one shared control block. Tokens use aliasing shared ownership of that block,
 so a retained token preserves the cancellation state after frame destruction
-without a second task-control allocation. Parent cancellation callbacks hold a
-weak child reference, preventing the one-way propagation link from forming an
-ownership cycle. The context neither owns nor keeps the coroutine frame alive.
+without a second task-control allocation. The coroutine frame owns its parent
+cancellation registration; that registration weakly references the parent
+state, and its callback weakly references the child state. An escaped child
+token therefore retains neither the registration nor any ancestor context, and
+frame destruction ends parent propagation as before. The context neither owns
+nor keeps the coroutine frame alive.
 Awaitables continue to own each pending operation's completion and cleanup
 state; those state machines are not moved into the task-wide context.
 While a worker-local I/O operation is pending, its operation state holds an

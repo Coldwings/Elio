@@ -249,7 +249,15 @@ public:
     /// time virtual-stack ancestry, which may no longer be relevant after a
     /// task has been moved.
     void link_parent_cancellation(cancel_token parent) {
-        execution_context_->link_parent_cancellation(std::move(parent));
+        if (parent_cancellation_linked_) {
+            throw std::logic_error(
+                "task cancellation context already has a parent");
+        }
+        auto registration =
+            execution_context_->make_parent_cancellation_registration(
+                std::move(parent));
+        parent_cancellation_registration_ = std::move(registration);
+        parent_cancellation_linked_ = true;
     }
 
     // Affinity accessors
@@ -348,6 +356,11 @@ private:
     // Shared runtime policy/control plane. External runtime owners may retain
     // this state after the coroutine frame itself has been destroyed.
     const std::shared_ptr<task_execution_context> execution_context_;
+
+    // The task frame owns parent propagation so an escaped child token retains
+    // only the child control block, not the frame's registration or ancestors.
+    detail::task_parent_registration parent_cancellation_registration_;
+    bool parent_cancellation_linked_ = false;
 
     // Keep scheduler accounting after the debugger-visible frame fields so the
     // stable magic/parent prefix remains at the start of promise_base.

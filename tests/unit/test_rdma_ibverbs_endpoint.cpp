@@ -23,6 +23,8 @@
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -150,6 +152,55 @@ TEST_CASE("endpoint pump exit signal wakes and unregisters coroutine waiters",
 
         REQUIRE_NOTHROW(state.mark_exited());
         REQUIRE(state.is_exited());
+    }
+
+    SECTION("destroyed shutdown waiter abandons a selected pump exit wake") {
+        using namespace elio::coro::detail;
+
+        pump_exit_state state;
+        std::atomic<bool> resumed{false};
+        auto wait_for_abandoned_exit = [&]() -> elio::coro::task<void> {
+            co_await state.wait();
+            resumed.store(true, std::memory_order_release);
+        };
+        auto waiting = wait_for_abandoned_exit();
+        auto handle = task_access::release(std::move(waiting));
+        handle.resume();
+        REQUIRE_FALSE(handle.done());
+
+        completion_wake_claim_paused_for_test.store(false,
+                                                    std::memory_order_release);
+        pause_before_completion_wake_claim_for_test.store(
+            true, std::memory_order_release);
+        std::thread producer([&state] { state.mark_exited(); });
+
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::seconds(5);
+        while (!completion_wake_claim_paused_for_test.load(
+                   std::memory_order_acquire)
+               && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        const bool claim_paused =
+            completion_wake_claim_paused_for_test.load(
+                std::memory_order_acquire);
+        if (claim_paused) {
+            handle.destroy();
+        }
+
+        pause_before_completion_wake_claim_for_test.store(
+            false, std::memory_order_release);
+        pause_before_completion_wake_claim_for_test.notify_all();
+        producer.join();
+        completion_wake_claim_paused_for_test.store(false,
+                                                    std::memory_order_release);
+        if (!claim_paused) {
+            handle.destroy();
+        }
+
+        REQUIRE(claim_paused);
+        REQUIRE(state.is_exited());
+        REQUIRE_FALSE(resumed.load(std::memory_order_acquire));
     }
 }
 

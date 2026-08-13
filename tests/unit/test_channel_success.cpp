@@ -288,8 +288,10 @@ TEST_CASE("channel send frames transfer move-only payloads once",
 
     SECTION("active-token ready send transfers once") {
         channel<payload> ch(1);
+        cancel_source source;
         send_move_observation observed;
-        auto send_task = ch.send(payload(16, &observed), cancel_token{});
+        auto send_task = ch.send(
+            payload(16, &observed), source.get_token());
         observed.armed = true;
         auto handle = elio::coro::detail::task_access::handle(send_task);
         handle.resume();

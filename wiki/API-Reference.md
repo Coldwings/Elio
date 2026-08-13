@@ -413,6 +413,13 @@ Automatic local objects in the returned body coroutine are still destroyed
 when that coroutine returns; a child that can continue after body return must
 not retain references to those locals.
 
+Unlike an ordinary transparent Elio task await, `task_scope()` establishes a
+distinct structured-cancellation context. Cancellation of the caller still
+flows into the scope, but cancellation selected by the group does not remain
+set on the caller after join. The scope inherits caller user affinity and
+publishes its final user-affinity value back at return; operation-owned active
+I/O pins remain local to the scope context.
+
 `request_cancel()` runs group cancellation callbacks on the selected scheduler.
 An ordinary external thread, including the thread that called
 `scheduler::start()`, waits for that dispatch and can rethrow a callback
@@ -1284,8 +1291,8 @@ coro::task<void> stay_here() {
 
 `promise_base` is the frame-resident anchor for a shared
 `task_execution_context`. The task object itself does not carry scheduler
-policy. External runtime owners may share the context without keeping the frame
-alive.
+policy. Directly awaited Elio frames share the logical-vthread root's context;
+external runtime owners may share it without keeping any frame alive.
 
 ```cpp
 namespace elio::coro {
@@ -1324,22 +1331,30 @@ public:
 identity. Treat them as an active placement constraint only when
 `has_active_io_pin()` is true; `active_io_pin_count()` is authoritative.
 
-The context's cancellation state survives independently of the frame through
-shared context ownership. Runtime-created contexts co-allocate this state in
-one shared control block; a token uses aliasing ownership of that block and can
-still outlive the frame. Starting a lazy task with direct `co_await` from
-another Elio task links its context one-way to that awaiter's token through a
-completion-scoped registration that weakly references the parent state and
-whose callback weakly references the child state. Consequently, an escaped
-child token retains neither the parent registration nor ancestor contexts, and
-a completed named child does not observe later parent cancellation even while
-its frame remains owned. Final suspend deactivates the link with a non-waiting
-atomic transition; it does not block a scheduler worker while a concurrent
-parent-cancellation callback finishes. A foreign coroutine promise is a
-cancellation boundary unless it deliberately bridges a token. A `join_handle`
-shares the spawned wrapper context, so cancellation remains race-safe without
-storing a raw promise pointer. Completion and cancellation of individual
-operations remain in their awaitable/backend state machines.
+The context's cancellation state survives independently of frames through
+shared ownership. Runtime-created contexts co-allocate this state in one shared
+control block; a token uses aliasing ownership and can outlive the frame that
+produced it. Elio-to-Elio direct `co_await` binds an unstarted child to the
+actual awaiter's context. This requires no parent callback registration and
+makes cancellation, affinity changes, and active I/O ownership continuous
+through transparent helper frames. A retained child token names and may retain
+the surrounding logical-vthread context after the child completes.
+
+Independent scheduler and task-group roots materialize distinct contexts before
+first resume. Structured roots that inherit cancellation use a weak,
+completion-scoped parent registration; final suspend deactivates that link with
+a non-waiting atomic transition. `task_scope()` deliberately uses this isolated
+model even when directly awaited, so group cancellation cannot poison its
+caller. A foreign coroutine promise is also a context and cancellation boundary
+unless it deliberately bridges a token. A
+`join_handle` shares its spawned root's context, so cancellation remains
+race-safe without a raw promise pointer. Completion and cancellation of
+individual operations remain in their awaitable/backend state machines.
+
+An unstarted task created inside an active Elio frame may not have a materialized
+context yet. Runtime integrations that bypass task `co_await`, `spawn()`, or a
+scheduler handoff must establish an independent context before inspecting its
+policy or resuming its raw coroutine handle.
 
 In 0.6, standalone construction is no longer `noexcept` because it allocates an
 independent cancellation state. Runtime construction can likewise fail while

@@ -24,18 +24,22 @@ namespace detail {
 struct task_execution_control_block;
 [[nodiscard]] std::shared_ptr<task_execution_context>
 make_task_execution_context();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline std::atomic<size_t> task_execution_context_allocations_for_test{0};
+#endif
 }
 
 /// Constant indicating no user affinity. Internal ownership such as an active
 /// worker-local I/O pin may still prevent migration.
 inline constexpr size_t NO_AFFINITY = std::numeric_limits<size_t>::max();
 
-/// Shared runtime policy state for one coroutine task.
+/// Shared runtime policy state for one logical vthread execution root.
 ///
-/// The coroutine promise and external runtime owners keep shared references to
-/// this control block. It records operation-local I/O ownership for scheduler
-/// placement and owns task-chain cancellation authority. Each pending operation
-/// still owns its own completion and cancellation state machine.
+/// A root promise, its transparently awaited Elio task frames, and external
+/// runtime owners keep shared references to this control block. It records
+/// operation-local I/O ownership for scheduler placement and owns vthread-wide
+/// cancellation authority. Each pending operation still owns its own completion
+/// and cancellation state machine.
 class task_execution_context final {
 private:
     struct coallocated_state_key final {};
@@ -115,8 +119,8 @@ public:
         return worker_local_.load(std::memory_order_acquire);
     }
 
-    /// Token observed by code running in this task. Cancellation propagates
-    /// from an active direct Elio awaiter when the lazy child is first started.
+    /// Token observed by code running in this logical vthread. Directly awaited
+    /// Elio task frames share this state; independent runtime roots do not.
     [[nodiscard]] cancel_token get_cancel_token() const noexcept {
         return cancellation_context_.token();
     }
@@ -209,6 +213,10 @@ struct task_execution_control_block final {
 inline std::shared_ptr<task_execution_context>
 detail::make_task_execution_context() {
     auto control = std::make_shared<detail::task_execution_control_block>();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    task_execution_context_allocations_for_test.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
     auto context = std::shared_ptr<task_execution_context>(
         control, &control->context);
     auto cancellation_state = std::shared_ptr<detail::cancel_state>(

@@ -134,6 +134,7 @@ auto spawn(coro::task<T>&& task) -> coro::join_handle<T> {
     if (sched && sched->is_running()) {
         return sched->go_joinable(std::move(task));
     }
+    task_handle.promise().ensure_independent_execution_context();
     auto state = std::make_shared<coro::detail::join_state<T>>(
         task_handle.promise().execution_context());
     task_handle = coro::detail::task_access::release(std::move(task));

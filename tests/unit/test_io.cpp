@@ -631,6 +631,10 @@ TEST_CASE("orphaned worker I/O keeps ownership until backend cleanup",
         std::optional<task<void>> child;
         child.emplace(orphaned_worker_recv(sockets[0], &received));
         auto child_handle = elio::coro::detail::task_access::handle(*child);
+        // This test deliberately starts the child by raw handle instead of a
+        // transparent co_await or scheduler handoff, so it must model the
+        // independent-root boundary that those runtime APIs normally install.
+        child_handle.promise().ensure_independent_execution_context();
         child_context = child_handle.promise().execution_context();
         child_handle.resume();
 

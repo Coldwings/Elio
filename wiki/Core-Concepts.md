@@ -33,25 +33,33 @@ object does not represent running work: once ownership is transferred to the
 scheduler, use the `join_handle<T>` returned by `spawn()` when the work must be
 observed. Moving a task never migrates a running coroutine or pending I/O.
 
-Runtime policy is deliberately separate from this lazy owner. Every
-`promise_base` holds a `shared_ptr<task_execution_context>`, which stores
-task-chain cancellation authority, caller-requested affinity, the internal
-worker-local flag, and operation-local I/O pin diagnostics. A
-scheduler-created join state shares that context with its wrapper promise, so
-the policy state can remain valid after frame destruction without a raw promise
-pointer. Coroutine promises allocate the context and its cancellation state in
-one shared control block. Tokens use aliasing shared ownership of that block,
-so a retained token preserves the cancellation state after frame destruction
-without a second task-control allocation. The coroutine frame owns its parent
-cancellation registration until final suspend; that registration weakly
-references the parent state, and its callback weakly references the child
-state. An escaped child token therefore retains neither the registration nor
-any ancestor context, and task completion ends parent propagation even if a
-named task object keeps the completed frame alive. Completion deactivates the
-link through a one-shot atomic gate and never waits for a concurrently running
-parent-cancellation callback on the scheduler worker; shared callback-node
-ownership handles later reclamation. The context neither owns nor keeps the
-coroutine frame alive.
+Runtime policy is deliberately separate from this lazy owner. One logical
+vthread execution root and all Elio tasks directly awaited beneath it share a
+`task_execution_context`, which stores cancellation authority,
+caller-requested affinity, the internal worker-local flag, and operation-local
+I/O pin diagnostics. A nested lazy task can defer this control allocation: an
+Elio-to-Elio direct await binds it to the actual awaiter's context, while an
+independent scheduler handoff or foreign-promise boundary materializes a
+distinct context before first resume. The creation site is not authoritative,
+so moving an unstarted task does not preserve an accidental creator context.
+
+A scheduler-created join state shares its independent root's context, so policy
+state can remain valid after frame destruction without a raw promise pointer.
+Each materialized context and its cancellation state use one shared control
+block. Tokens use aliasing ownership of that block, so a retained token from a
+transparent child preserves the surrounding logical-vthread context after the
+child frame completes. Independently linked structured-runtime roots still use
+a frame-owned weak parent registration. Completion deactivates that link
+through a one-shot atomic gate and never waits for a concurrently running
+parent-cancellation callback on a scheduler worker. The context neither owns
+nor keeps any coroutine frame alive.
+
+`task_scope()` is the intentional exception to transparent direct-await
+sharing. It uses a distinct context because group/fail-fast cancellation must
+stop scope work without leaving the caller's token permanently cancelled after
+join. Parent cancellation still propagates into the scope, and user-affinity
+changes flow back when it returns; operation-owned I/O pins do not.
+
 Awaitables continue to own each pending operation's completion and cleanup
 state; those state machines are not moved into the task-wide context.
 While a worker-local I/O operation is pending, its operation state holds an
@@ -355,9 +363,9 @@ C++20 stackless coroutines do not maintain a call stack in the traditional sense
 Elio reconstructs this information through a **virtual stack**: an intrusive linked list of `promise_base` objects connected by `parent_` pointers. The `current_frame_` thread-local identifies the frame executing on a thread. A lazy `task<T>` does not remain installed merely because its frame is owned; when it is awaited, its `parent_` is rebound to the actual awaiting coroutine for that execution chain. Scheduler, synchronization, I/O, and affinity-migration resume paths preserve that parent and install the resumed frame for the duration of the resume call. Generator iteration similarly binds the producer to its active consumer and restores the consumer context before transferring a yielded value or completion. Initial scheduler ownership handoff, including targeted spawn, is separate and detaches construction-time ancestry.
 
 Virtual-stack ancestry itself costs one parent pointer per coroutine frame.
-Separately, `promise_base` holds a shared execution-context reference; the
-context has its own allocation and may outlive the frame when an external
-runtime owner retains it.
+Separately, a bound `promise_base` holds a shared execution-context reference.
+Transparent frames reuse the root reference; the context may outlive every
+frame when a token, join handle, or other runtime owner retains it.
 
 High-level spawn APIs retain arbitrary callables and their arguments in a root
 wrapper frame. When a caller already owns a lazy `task<T>`, the rvalue-task
@@ -764,6 +772,11 @@ waits. If a body awaitable resumes elsewhere, scope cleanup first returns to the
 selected scheduler. Return from the body to initiate joining; do not call
 `join()` inside it.
 
+The scope is a cancellation boundary even though it is directly awaited:
+caller cancellation flows in, while cancellation selected inside the group
+does not become sticky on the caller after the scope joins. User-affinity
+changes remain continuous across the boundary.
+
 The scope retains the body callable and its captures until all children join.
 This does not extend automatic local lifetimes inside the body coroutine: those
 objects are destroyed when the body returns. Children that may continue after
@@ -838,13 +851,14 @@ coro::task<void> controller() {
 4. Calling `source.cancel()` selects registered callbacks for synchronous dispatch
 
 For joinable runtime work, `join_handle::request_cancel()` publishes through the
-spawned task's shared execution context. `coro::this_coro::cancel_token()` reads
+spawned root's shared execution context. `coro::this_coro::cancel_token()` reads
 that context from the currently executing Elio frame. A lazy child directly
-awaited by another Elio task is linked to that actual awaiter before first
-resume, so the request flows down the active Elio task chain. The link is
-one-way: cancelling a child does not cancel its parent, and separate `spawn()`
-calls remain independent. A foreign coroutine promise is a cancellation
-boundary unless adapter code deliberately bridges a token.
+awaited by another Elio task binds to that actual awaiter's context before first
+resume, so every transparent frame observes the same request and affinity
+state. A retained child token therefore continues to name the logical vthread
+after that child frame completes. Separate `spawn()` calls remain independent,
+and a foreign coroutine promise is a cancellation boundary unless adapter code
+deliberately bridges a token.
 
 Outside an active Elio runtime frame, `this_coro::cancel_token()` returns a
 default never-cancelled token. An explicit token parameter remains an independent

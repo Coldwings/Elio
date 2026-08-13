@@ -2,8 +2,10 @@
 #include <elio/coro/task.hpp>
 #include <elio/log/macros.hpp>
 #include <atomic>
+#include <cstdlib>
 #include <iostream>
 #include <chrono>
+#include <memory>
 #include <vector>
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -13,6 +15,12 @@ using namespace std::chrono;
 
 coro::task<void> empty_task() {
     co_return;
+}
+
+coro::task<void> direct_await_chain(size_t frames) {
+    if (frames > 1) {
+        co_await direct_await_chain(frames - 1);
+    }
 }
 
 int main() {
@@ -62,7 +70,34 @@ int main() {
         for (auto h : handles) h.destroy();
     }
 
-    // 3. Measure MPSC push only (no scheduler overhead)
+    // 3. Measure direct Elio task composition.
+    {
+        constexpr int chain_iterations = 25000;
+        constexpr size_t chain_frames = 8;
+
+        auto start = high_resolution_clock::now();
+        for (int i = 0; i < chain_iterations; ++i) {
+            auto chain = direct_await_chain(chain_frames);
+            auto handle = coro::detail::task_access::handle(chain);
+            {
+                coro::detail::frame_context_scope frame_scope(
+                    std::addressof(handle.promise()));
+                handle.resume();
+            }
+            if (!handle.done()) {
+                std::abort();
+            }
+        }
+        auto end = high_resolution_clock::now();
+        auto ns = duration_cast<nanoseconds>(end - start).count();
+
+        std::cout << "Direct await chain (8 frames): "
+                  << (static_cast<double>(ns) /
+                      (chain_iterations * chain_frames))
+                  << " ns/frame" << std::endl;
+    }
+
+    // 4. Measure MPSC push only (no scheduler overhead)
     {
         runtime::mpsc_queue<void> queue;
 
@@ -79,7 +114,7 @@ int main() {
         while (queue.pop()) {}
     }
 
-    // 4. Measure Chase-Lev push only
+    // 5. Measure Chase-Lev push only
     {
         runtime::chase_lev_deque<void> queue;
 
@@ -96,7 +131,7 @@ int main() {
         while (queue.pop()) {}
     }
 
-    // 5. Compare atomic RMW with single-writer snapshot publication
+    // 6. Compare atomic RMW with single-writer snapshot publication
     {
         std::atomic<size_t> published{0};
 
@@ -128,7 +163,7 @@ int main() {
                   << " ns/update" << std::endl;
     }
 
-    // 6. Compare exact timestamps with the disabled diagnostic fast path
+    // 7. Compare exact timestamps with the disabled diagnostic fast path
     {
         std::atomic<steady_clock::time_point> last_task_time{
             steady_clock::now()};
@@ -163,7 +198,7 @@ int main() {
                   << " ns/update" << std::endl;
     }
 
-    // 7. Measure atomic fence alone
+    // 8. Measure atomic fence alone
     {
         auto start = high_resolution_clock::now();
         for (int i = 0; i < N; ++i) {
@@ -175,7 +210,7 @@ int main() {
         std::cout << "Atomic release fence: " << (ns / N) << " ns" << std::endl;
     }
 
-    // 8. Measure eventfd write
+    // 9. Measure eventfd write
     {
         int fd = eventfd(0, EFD_NONBLOCK);
         uint64_t val = 1;
@@ -191,7 +226,7 @@ int main() {
         close(fd);
     }
 
-    // 9. Full spawn path (with running scheduler) - includes alloc + spawn
+    // 10. Full spawn path (with running scheduler) - includes alloc + spawn
     {
         runtime::scheduler sched(4);
         sched.start();
@@ -213,7 +248,7 @@ int main() {
         sched.shutdown();
     }
 
-    // 10. Measure warmed-up worker overhead
+    // 11. Measure warmed-up worker overhead
     {
         runtime::scheduler sched(4);
         sched.start();

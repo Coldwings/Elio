@@ -52,14 +52,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Transparent direct-await execution contexts**: Elio-to-Elio direct
+  `co_await` chains now share one `task_execution_context` for the complete
+  logical vthread. Nested lazy task promises defer their control allocation
+  until the actual first await or runtime handoff, so transparent helpers no
+  longer allocate frame-local cancellation state, a parent callback node, or
+  affinity copy-back bookkeeping. The actual awaiter is authoritative even
+  when a task was created elsewhere and moved. Independent `go`/`spawn` and
+  task-group roots still materialize distinct contexts, while foreign coroutine
+  promises remain context and cancellation boundaries. `task_scope()` is also
+  an explicit structured-cancellation boundary: caller cancellation flows in,
+  scope cancellation does not poison the caller after join, and final user
+  affinity flows back while operation-owned I/O pins remain local. A retained
+  token from a completed transparent child now identifies and can retain the
+  surrounding logical-vthread context. Low-level integrations that inspect or
+  raw-resume an unstarted nested promise must first materialize an independent
+  context; integrations that treated every directly awaited frame as an
+  independent cancellation domain must migrate to `spawn`/`go` (#1034).
 - **Co-allocated task control state**: Coroutine promises and default join
   states now allocate `task_execution_context` together with its task-lifetime
   cancellation state in one shared control block. Aliasing cancellation tokens
   retain the same post-frame lifetime, callback, and propagation semantics,
-  while completion-scoped parent links use weak ownership in both directions
-  so an escaped child token retains neither the registration nor its ancestors
-  and a completed named child cannot observe later parent cancellation. Child
-  final suspend deactivates propagation through a non-waiting atomic gate, so
+  while completion-scoped parent links for independently owned structured roots
+  use weak ownership in both directions. A token from such a root retains
+  neither its registration nor the parent context after completion. Final
+  suspend deactivates propagation through a non-waiting atomic gate, so
   concurrent parent cancellation cannot block a scheduler worker (#1032).
   The previously public but undocumented
   `task_execution_context::link_parent_cancellation()` runtime hook is now

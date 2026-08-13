@@ -566,6 +566,72 @@ TEST_CASE("task_scope fail-fast cancellation reaches its suspended body",
     sched.shutdown();
 }
 
+TEST_CASE("task_scope cancellation does not poison its caller context",
+          "[task_group][task_scope][structured][cancellation][context]") {
+    scheduler sched(1);
+    sched.start();
+    std::shared_ptr<elio::coro::task_execution_context> caller_context;
+    std::shared_ptr<elio::coro::task_execution_context> scope_context;
+    std::atomic<bool> scope_cancelled{false};
+    std::atomic<bool> caller_cancelled{true};
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        caller_context =
+            elio::coro::promise_base::current_frame()->execution_context();
+        co_await elio::coro::task_scope(
+            [&](task_group& group) -> task<void> {
+                scope_context =
+                    elio::coro::promise_base::current_frame()
+                        ->execution_context();
+                group.request_cancel();
+                scope_cancelled.store(
+                    elio::coro::this_coro::cancel_token().is_cancelled(),
+                    std::memory_order_release);
+                co_return;
+            });
+        caller_cancelled.store(
+            elio::coro::this_coro::cancel_token().is_cancelled(),
+            std::memory_order_release);
+    });
+
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(caller_context);
+    REQUIRE(scope_context);
+    REQUIRE(scope_context != caller_context);
+    REQUIRE(scope_cancelled.load(std::memory_order_acquire));
+    REQUIRE_FALSE(caller_cancelled.load(std::memory_order_acquire));
+    sched.shutdown();
+}
+
+TEST_CASE("caller cancellation propagates into isolated task_scope context",
+          "[task_group][task_scope][structured][cancellation][context]") {
+    scheduler sched(1);
+    sched.start();
+    elio::sync::event never;
+    std::atomic<bool> body_started{false};
+    std::atomic<bool> body_cancelled{false};
+
+    auto owner = sched.go_joinable([&]() -> task<void> {
+        co_await elio::coro::task_scope(
+            [&](task_group&) -> task<void> {
+                body_started.store(true, std::memory_order_release);
+                const auto result = co_await never.wait(
+                    elio::coro::this_coro::cancel_token());
+                body_cancelled.store(
+                    result == cancel_result::cancelled,
+                    std::memory_order_release);
+            });
+    });
+
+    REQUIRE(wait_for_flag(body_started));
+    owner.request_cancel();
+    owner.wait_destroyed();
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(body_cancelled.load(std::memory_order_acquire));
+    sched.shutdown();
+}
+
 TEST_CASE("task_scope collect-all preserves every child failure",
           "[task_group][task_scope][structured][failure]") {
     scheduler sched(3);

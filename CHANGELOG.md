@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Task-group final-wake eligibility**: A child completion that previously
+  observed an outstanding count of zero now revalidates that zero while
+  selecting the join waiter. A child accepted before join closes admission can
+  no longer be bypassed by an older zero transition (#1056).
 - **Completion waiter wake lifetime**: Join handles, task handles, task groups,
   object-cache release waits, and RDMA pump-exit waits now retain a slot-owned
   selected-wake lease between dequeue and scheduling. Destroying an awaiting

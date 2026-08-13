@@ -13,6 +13,11 @@ class scheduler;
 
 namespace elio::coro {
 
+namespace detail {
+struct defer_nested_task_context_t final {};
+inline constexpr defer_nested_task_context_t defer_nested_task_context{};
+}  // namespace detail
+
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 namespace detail {
 inline std::atomic<size_t> promise_constructions_for_test{0};
@@ -95,22 +100,16 @@ public:
     static constexpr uint64_t FRAME_MAGIC = 0x454C494F46524D45ULL;
 
     promise_base()
-        : frame_magic_(FRAME_MAGIC)
-        , parent_(current_frame_)
-#if ELIO_ENABLE_DEBUG_METADATA
-        , debug_state_(coroutine_state::created)
-        , debug_worker_id_(static_cast<uint32_t>(-1))
-        , debug_id_(0)  // Lazy allocation - only allocated when id() is called
-#endif
-        , execution_context_(detail::make_task_execution_context())
-    {
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-        detail::promise_constructions_for_test.fetch_add(
-            1, std::memory_order_relaxed);
-#endif
-        current_frame_ = this;
-    }
+        : promise_base(false) {}
 
+protected:
+    /// Elio task promises may defer their control block while they are created
+    /// inside another Elio frame. The actual first await or runtime handoff,
+    /// rather than the creation site, decides their execution context.
+    explicit promise_base(detail::defer_nested_task_context_t)
+        : promise_base(true) {}
+
+public:
     ~promise_base() noexcept {
         // Invoke spawn-completion callback first. This is the universal
         // -1 for active_tracked_ paired with the +1 the scheduler did at
@@ -127,6 +126,29 @@ public:
         // detach) would clobber an unrelated active frame chain.
         leave_frame_context();
     }
+
+private:
+    explicit promise_base(bool defer_nested_context)
+        : frame_magic_(FRAME_MAGIC)
+        , parent_(current_frame_)
+#if ELIO_ENABLE_DEBUG_METADATA
+        , debug_state_(coroutine_state::created)
+        , debug_worker_id_(static_cast<uint32_t>(-1))
+        , debug_id_(0)  // Lazy allocation - only allocated when id() is called
+#endif
+        , execution_context_(
+              defer_nested_context && parent_
+                  ? nullptr
+                  : detail::make_task_execution_context())
+    {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        detail::promise_constructions_for_test.fetch_add(
+            1, std::memory_order_relaxed);
+#endif
+        current_frame_ = this;
+    }
+
+public:
 
     /// Detach this frame from the current thread's frame chain.
     /// Call this before spawning a coroutine to another thread to avoid
@@ -237,18 +259,80 @@ public:
     void set_worker_id(uint32_t) noexcept {}
 #endif
 
-    /// Shared scheduler-visible runtime policy state for this task. The task
-    /// owner itself deliberately does not carry this authority.
+    /// Shared scheduler-visible runtime policy state for this logical vthread.
+    /// A nested unstarted task may return null until its first direct await or
+    /// independent runtime handoff binds the authoritative context.
     [[nodiscard]] std::shared_ptr<task_execution_context>
     execution_context() const noexcept {
         return execution_context_;
     }
 
-    /// Establish one-way cancellation propagation from the Elio coroutine that
-    /// is actually starting this lazy task. This is separate from construction-
-    /// time virtual-stack ancestry, which may no longer be relevant after a
-    /// task has been moved.
+    /// Bind an unstarted transparent child to the context of the Elio promise
+    /// that actually awaits it. A task created outside the awaiter may already
+    /// have a provisional independent context; no task body has run yet, so
+    /// replacing it here is still safe and makes the actual await authoritative.
+    void bind_direct_await_context(
+        const std::shared_ptr<task_execution_context>& context) noexcept {
+        assert(context && "direct Elio await requires an execution context");
+        assert(!parent_cancellation_linked_ &&
+               "cannot rebind a task after parent cancellation is linked");
+        execution_context_ = context;
+    }
+
+    /// Mark an explicit structured-cancellation scope. Its direct await keeps
+    /// a distinct context so cancelling the scope cannot poison the caller's
+    /// logical vthread after the scope has joined.
+    void isolate_direct_await_context() noexcept {
+        isolate_direct_await_context_ = true;
+    }
+
+    [[nodiscard]] bool direct_await_context_isolated() const noexcept {
+        return isolate_direct_await_context_;
+    }
+
+    /// Bind an isolated structured scope to an Elio caller. Cancellation flows
+    /// into the scope, while the distinct context prevents scope cancellation
+    /// from becoming a sticky state on the caller.
+    void bind_isolated_direct_await_context(promise_base& parent) {
+        assert(isolate_direct_await_context_ &&
+               "only an isolated task may use an isolated direct await");
+        parent.ensure_independent_execution_context();
+        ensure_independent_execution_context();
+        if (parent.has_affinity()) {
+            set_affinity(parent.affinity());
+        }
+        set_worker_local(parent.is_worker_local());
+        link_parent_cancellation(
+            parent.execution_context()->get_cancel_token());
+        isolated_elio_awaiter_bound_ = true;
+    }
+
+    /// Preserve the logical vthread's user affinity when an isolated scope
+    /// returns. Runtime-owned I/O pins remain local to the completed scope.
+    void propagate_isolated_direct_await_policy_to_parent() noexcept {
+        if (!isolated_elio_awaiter_bound_ || !parent_) {
+            return;
+        }
+        if (has_affinity()) {
+            parent_->set_affinity(affinity());
+        } else {
+            parent_->clear_affinity();
+        }
+    }
+
+    /// Materialize a distinct control block before an independent runtime
+    /// handoff or a foreign-promise await boundary.
+    void ensure_independent_execution_context() {
+        if (!execution_context_) {
+            execution_context_ = detail::make_task_execution_context();
+        }
+    }
+
+    /// Establish one-way cancellation propagation for an independently owned
+    /// task root linked by structured runtime policy. Transparent direct Elio
+    /// awaits share a context and do not need a callback registration.
     void link_parent_cancellation(cancel_token parent) {
+        ensure_independent_execution_context();
         if (parent_cancellation_linked_) {
             throw std::logic_error(
                 "task cancellation context already has a parent");
@@ -260,7 +344,7 @@ public:
         parent_cancellation_linked_ = true;
     }
 
-    /// End direct-await propagation when this task reaches final suspend.
+    /// End independently linked propagation when this task reaches final suspend.
     /// A named task object may retain the completed frame, but that ownership
     /// must not extend the logical parent/child cancellation relationship.
     void unlink_parent_cancellation() noexcept {
@@ -361,15 +445,17 @@ private:
     uint64_t debug_id_;
 #endif
 
-    // Shared runtime policy/control plane. External runtime owners may retain
-    // this state after the coroutine frame itself has been destroyed.
-    const std::shared_ptr<task_execution_context> execution_context_;
+    // Shared runtime policy/control plane. Transparent direct-await frames use
+    // the root's state; external runtime owners may retain it after frame
+    // destruction. A nested unstarted task may remain null until it is bound.
+    std::shared_ptr<task_execution_context> execution_context_;
 
-    // The task frame owns parent propagation until final suspend, so an
-    // escaped child token retains only the child control block, not the
-    // registration or ancestors.
+    // An independently linked task frame owns parent propagation until final
+    // suspend. Transparent direct-await frames leave this registration empty.
     detail::task_parent_registration parent_cancellation_registration_;
     bool parent_cancellation_linked_ = false;
+    bool isolate_direct_await_context_ = false;
+    bool isolated_elio_awaiter_bound_ = false;
 
     // Keep scheduler accounting after the debugger-visible frame fields so the
     // stable magic/parent prefix remains at the start of promise_base.

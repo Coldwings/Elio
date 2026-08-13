@@ -591,6 +591,7 @@ public:
             // independent task can execute on another worker.
             auto* promise = coro::get_promise_base(handle.address());
             if (promise) {
+                promise->ensure_independent_execution_context();
                 promise->detach_from_parent();
             }
             return do_spawn(handle, false);
@@ -599,7 +600,14 @@ public:
 
     void spawn(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return;
-        if (!try_spawn(handle)) {
+        bool scheduled = false;
+        try {
+            scheduled = try_spawn(handle);
+        } catch (...) {
+            handle.destroy();
+            throw;
+        }
+        if (!scheduled) {
             handle.destroy();
         }
     }
@@ -1179,11 +1187,13 @@ private:
                 "cannot transfer a completed task to the scheduler");
         }
 
+        auto task_handle = coro::detail::task_access::handle(task);
+        task_handle.promise().ensure_independent_execution_context();
+        if constexpr (Pinned) {
+            task_handle.promise().set_affinity(worker_id);
+        }
         auto handle = coro::detail::task_access::release(std::move(task));
         handle.promise().detached_ = true;
-        if constexpr (Pinned) {
-            handle.promise().set_affinity(worker_id);
-        }
         handle.promise().detach_from_parent();
 
         if constexpr (Joinable) {
@@ -1344,6 +1354,7 @@ private:
         if (detach_parent && promise) {
             // Initial ownership handoff must not retain construction-time
             // ancestry. Suspended-coroutine migration preserves await ancestry.
+            promise->ensure_independent_execution_context();
             promise->detach_from_parent();
         }
 

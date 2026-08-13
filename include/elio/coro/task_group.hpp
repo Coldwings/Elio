@@ -978,8 +978,10 @@ template<typename F>
                   std::decay_t<F>, task_group&>>)
 [[nodiscard("co_await task_scope()")]]
 task<void> task_scope(F&& body, task_group_options options = {}) {
-    return detail::task_scope_wrapper(
+    auto scope = detail::task_scope_wrapper(
         nullptr, options, std::decay_t<F>(std::forward<F>(body)));
+    detail::task_access::isolate_direct_await_context(scope);
+    return scope;
 }
 
 /// Run a callback-shaped structured scope on the selected scheduler worker.
@@ -993,9 +995,11 @@ template<typename F>
 [[nodiscard("co_await task_scope()")]]
 task<void> task_scope(runtime::scheduler& scheduler, F&& body,
                       task_group_options options = {}) {
-    return detail::task_scope_wrapper(
+    auto scope = detail::task_scope_wrapper(
         std::addressof(scheduler), options,
         std::decay_t<F>(std::forward<F>(body)));
+    detail::task_access::isolate_direct_await_context(scope);
+    return scope;
 }
 
 } // namespace elio::coro

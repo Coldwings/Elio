@@ -532,10 +532,23 @@ private:
             std::weak_ptr<internals>(state_), state_->cfg_.sweep_interval,
             sweep_cancel_.get_token());
 
+        // Materialize while t still owns its frame. If allocation throws, task
+        // destruction during stack unwinding reclaims the frame and the guard
+        // restores sweep_started_ so a later cache access can retry.
+        coro::detail::task_access::handle(t)
+            .promise()
+            .ensure_independent_execution_context();
         auto handle = coro::detail::task_access::release(std::move(t));
         handle.promise().detached_ = true;
         handle.promise().detach_from_parent();
-        if (sched->try_spawn(handle)) {
+        bool scheduled = false;
+        try {
+            scheduled = sched->try_spawn(handle);
+        } catch (...) {
+            handle.destroy();
+            throw;
+        }
+        if (scheduled) {
             started_guard.committed = true;
         } else {
             handle.destroy();

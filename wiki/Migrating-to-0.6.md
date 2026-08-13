@@ -16,16 +16,28 @@ below when upgrading from 0.5.x.
 - The logical vthread model remains. Virtual-stack ancestry, task chains,
   debugger inspection, affinity, and runtime execution context still describe
   coroutine execution independently of frame allocation.
+- Directly awaited Elio task frames now share one execution context for the
+  logical vthread. A token captured in a transparent child therefore remains a
+  token for the surrounding chain after that child completes, and affinity
+  changes are immediately shared rather than copied back at return. Use an
+  explicit `spawn`/`go` root when a helper needs an independent cancellation or
+  affinity domain. `task_scope()` remains an isolated structured-cancellation
+  boundary so group cancellation cannot poison its caller; its final user
+  affinity still flows back. Foreign coroutine promises remain boundaries.
 - Lazy task ownership no longer installs creator-thread virtual-stack state.
   Ancestry is bound when a task is actually awaited; independent scheduler
   spawn detaches construction-time ancestry.
 
 ## Cancellation And Structured Concurrency
 
-- Every Elio task has a shared execution context with cooperative cancellation
-  authority. Direct lazy-task awaits propagate runtime cancellation between
-  Elio promises. Foreign coroutine promises and explicit token parameters stay
-  separate unless an adapter deliberately bridges them.
+- Every running Elio logical vthread has a shared execution context with
+  cooperative cancellation authority. Direct lazy-task awaits reuse it between
+  Elio promises. Independent runtime roots, foreign coroutine promises, and
+  explicit token parameters stay separate unless an adapter deliberately
+  bridges them.
+- Low-level integrations that raw-resume a nested unstarted task must establish
+  an independent execution context before inspecting promise policy. Normal
+  task awaits and runtime handoffs do this automatically.
 - `join_handle::request_cancel()` is a best-effort request, not forced frame
   destruction. Pass `this_coro::cancel_token()` into every wait that should
   react and handle cancellation callback exceptions where callbacks may throw.

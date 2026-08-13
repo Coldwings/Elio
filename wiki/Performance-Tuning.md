@@ -375,10 +375,16 @@ For best io_uring performance:
 per-vthread bump allocator or LIFO destruction requirement. Keeping frames small
 still reduces allocation traffic and cache pressure, but callers should not
 depend on allocator locality or on the worker that eventually frees a frame.
-The runtime co-allocates each promise's task execution context and task-lifetime
-cancellation state in one shared control block. Cancellation tokens can retain
-that block after frame destruction, so the allocation reduction does not weaken
-token lifetime or parent-to-child cancellation propagation.
+The runtime co-allocates each independent logical-vthread execution context and
+cancellation state in one shared control block. Nested Elio tasks defer that
+allocation and, when directly awaited by another Elio task, reuse the actual
+awaiter's context. A deep transparent helper chain therefore pays one control
+allocation for its root rather than one context plus one cancellation-link node
+per frame. Independent `go`/`spawn` and task-group roots still receive separate
+contexts; `task_scope()` also preserves a separate cancellation context by
+contract. Use those APIs when policy isolation is intentional. Cancellation
+tokens can retain the shared logical-vthread block after a particular frame is
+destroyed.
 
 If an application already owns a non-empty lazy task that has not completed,
 transfer it directly to avoid a callable-wrapper frame and its task-local

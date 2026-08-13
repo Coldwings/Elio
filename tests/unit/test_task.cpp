@@ -662,6 +662,17 @@ TEST_CASE("completion wake lease preserves slot ownership transitions",
         REQUIRE_FALSE(slot.take());
     }
 
+    SECTION("conditional selection leaves a registered waiter linked") {
+        completion_waiter_slot slot;
+        completion_waiter waiter(slot);
+        const auto handle = std::noop_coroutine();
+
+        REQUIRE(slot.register_waiter(waiter, handle, [] { return false; }));
+        REQUIRE_FALSE(slot.take_if([] { return false; }));
+        auto wake = slot.take_if([] { return true; });
+        REQUIRE(wake.claim() == handle);
+    }
+
     SECTION("an abandoned generation cannot claim a reused slot") {
         completion_waiter_slot slot;
         std::optional<completion_waiter> first(std::in_place, slot);

@@ -115,8 +115,15 @@ public:
     }
 
     completion_wake_lease take() noexcept {
+        return take_if([] { return true; });
+    }
+
+    /// Select the registered waiter only while `ready` is still true under
+    /// the same slot lock used by waiter registration.
+    template<typename Ready>
+    completion_wake_lease take_if(Ready&& ready) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!waiter_ || selected()) {
+        if (!waiter_ || selected() || !std::forward<Ready>(ready)()) {
             return {};
         }
 

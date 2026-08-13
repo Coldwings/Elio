@@ -65,6 +65,8 @@ namespace detail {
 inline std::atomic<bool> pause_before_task_group_completion_for_test{false};
 inline std::atomic<bool> task_group_completion_paused_for_test{false};
 inline std::atomic<bool> task_group_join_observed_pending_for_test{false};
+inline std::atomic<bool> pause_before_task_group_final_wake_for_test{false};
+inline std::atomic<bool> task_group_final_wake_paused_for_test{false};
 #endif
 
 [[nodiscard]] inline bool is_scheduler_worker(
@@ -166,7 +168,29 @@ public:
         }
 
         if (completed) {
-            auto wake = all_done_waiter_.take();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (pause_before_task_group_final_wake_for_test.load(
+                    std::memory_order_acquire)) {
+                task_group_final_wake_paused_for_test.store(
+                    true, std::memory_order_release);
+                task_group_final_wake_paused_for_test.notify_all();
+                while (pause_before_task_group_final_wake_for_test.load(
+                    std::memory_order_acquire)) {
+                    pause_before_task_group_final_wake_for_test.wait(
+                        true, std::memory_order_acquire);
+                }
+                task_group_final_wake_paused_for_test.store(
+                    false, std::memory_order_release);
+                task_group_final_wake_paused_for_test.notify_all();
+            }
+#endif
+            // Admission can legally reopen the count from zero before join
+            // closes the group. A registered waiter means public admission is
+            // already closed. Revalidate under that waiter-slot lock so an
+            // older zero transition cannot select a later join waiter.
+            auto wake = all_done_waiter_.take_if([this] {
+                return outstanding_children() == 0;
+            });
             if (wake) {
                 return {scheduler_, std::move(wake)};
             }

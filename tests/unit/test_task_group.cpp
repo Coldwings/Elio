@@ -832,6 +832,80 @@ TEST_CASE("task_group completion skips a join waiter destroyed after selection",
     REQUIRE(drained);
 }
 
+TEST_CASE("task_group ignores a stale zero transition after new admission",
+          "[task_group][structured][lifetime][regression]") {
+    using namespace elio::coro::detail;
+
+    scheduler sched(1);
+    auto state = std::make_shared<task_group_completion_state>(sched);
+    state->register_child();
+    pause_before_task_group_final_wake_for_test.store(
+        true, std::memory_order_release);
+    task_group_final_wake_paused_for_test.store(
+        false, std::memory_order_release);
+    std::atomic<bool> old_selected{false};
+
+    std::thread old_child([&] {
+        auto completion = state->child_finished();
+        old_selected.store(static_cast<bool>(completion.wake),
+                           std::memory_order_release);
+        if (auto selected = completion.wake.claim()) {
+            selected.resume();
+        }
+    });
+    const bool old_final_paused = wait_for_flag(
+        task_group_final_wake_paused_for_test);
+    if (!old_final_paused) {
+        pause_before_task_group_final_wake_for_test.store(
+            false, std::memory_order_release);
+        pause_before_task_group_final_wake_for_test.notify_all();
+        old_child.join();
+        REQUIRE(old_final_paused);
+        return;
+    }
+
+    state->register_child();
+    std::atomic<bool> resumed{false};
+    auto waiter_task = [state, &resumed]() -> task<void> {
+        co_await task_group_completion_state::all_done_awaitable(state);
+        resumed.store(true, std::memory_order_release);
+    };
+    auto waiter = waiter_task();
+    auto handle = task_access::handle(waiter);
+    handle.resume();
+    const bool waiter_registered = !handle.done();
+
+    pause_before_task_group_final_wake_for_test.store(
+        false, std::memory_order_release);
+    pause_before_task_group_final_wake_for_test.notify_all();
+    old_child.join();
+    task_group_final_wake_paused_for_test.store(
+        false, std::memory_order_release);
+
+    const bool resumed_by_old = resumed.load(std::memory_order_acquire);
+    const auto outstanding_after_old = state->outstanding_children();
+    auto final_completion = state->child_finished();
+    const bool final_selected = static_cast<bool>(final_completion.wake);
+    auto selected = final_completion.wake.claim();
+    const bool selected_expected_handle =
+        selected && selected.address() == handle.address();
+    if (selected) {
+        selected.resume();
+    }
+    const bool resumed_by_final = resumed.load(std::memory_order_acquire);
+    const bool waiter_done = handle.done();
+
+    REQUIRE(waiter_registered);
+    REQUIRE_FALSE(old_selected.load(std::memory_order_acquire));
+    REQUIRE_FALSE(resumed_by_old);
+    REQUIRE(outstanding_after_old == 1);
+    REQUIRE(final_selected);
+    REQUIRE(selected_expected_handle);
+    REQUIRE(resumed_by_final);
+    REQUIRE(waiter_done);
+    REQUIRE(state->outstanding_children() == 0);
+}
+
 TEST_CASE("task_scope survives rejected handoff after external body wakeup",
           "[task_group][task_scope][structured][scheduler_domain][failure]") {
     scheduler sched(1);

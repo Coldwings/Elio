@@ -5,7 +5,9 @@
 #include <elio/time/timer.hpp>
 
 #include <atomic>
+#include <array>
 #include <barrier>
+#include <cstddef>
 #include <latch>
 #include <memory>
 #include <optional>
@@ -54,6 +56,73 @@ struct unregister_on_destroy {
         invoked->store(true, std::memory_order_release);
     }
 };
+
+template<std::size_t PayloadBytes>
+struct counted_callback {
+    std::atomic<unsigned>* invocations;
+    std::atomic<unsigned>* destructions;
+    bool owns_payload = true;
+    std::array<std::byte, PayloadBytes> payload{};
+
+    counted_callback(std::atomic<unsigned>* invocation_count,
+                     std::atomic<unsigned>* destruction_count) noexcept
+        : invocations(invocation_count), destructions(destruction_count) {}
+
+    counted_callback(counted_callback&& other) noexcept
+        : invocations(other.invocations),
+          destructions(other.destructions),
+          owns_payload(std::exchange(other.owns_payload, false)),
+          payload(other.payload) {}
+
+    counted_callback(const counted_callback&) = delete;
+    counted_callback& operator=(const counted_callback&) = delete;
+
+    ~counted_callback() {
+        if (owns_payload) {
+            destructions->fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void operator()() {
+        invocations->fetch_add(1, std::memory_order_relaxed);
+    }
+};
+
+struct release_on_destroy_callback {
+    std::atomic<bool>* invoked;
+    std::atomic<bool>* destroyed;
+    bool owns_payload = true;
+
+    release_on_destroy_callback(std::atomic<bool>* invocation_flag,
+                                std::atomic<bool>* destruction_flag) noexcept
+        : invoked(invocation_flag), destroyed(destruction_flag) {}
+    release_on_destroy_callback(release_on_destroy_callback&& other) noexcept
+        : invoked(other.invoked),
+          destroyed(other.destroyed),
+          owns_payload(std::exchange(other.owns_payload, false)) {}
+    release_on_destroy_callback(const release_on_destroy_callback&) = delete;
+    ~release_on_destroy_callback() {
+        if (owns_payload) destroyed->store(true, std::memory_order_release);
+    }
+    void operator()() { invoked->store(true, std::memory_order_release); }
+};
+
+void wait_for_test_hook(std::atomic<bool>& hook) {
+    while (!hook.load(std::memory_order_acquire)) {
+        hook.wait(false, std::memory_order_acquire);
+    }
+}
+
+void wait_for_cancel_callback_waiter() {
+    auto count = elio::coro::detail::cancel_callback_waiters_for_test.load(
+        std::memory_order_acquire);
+    while (count == 0) {
+        elio::coro::detail::cancel_callback_waiters_for_test.wait(
+            count, std::memory_order_acquire);
+        count = elio::coro::detail::cancel_callback_waiters_for_test.load(
+            std::memory_order_acquire);
+    }
+}
 
 
 
@@ -159,6 +228,18 @@ TEST_CASE("cancel_source multiple cancel calls are safe", "[cancel_token][source
 
 // ==================== Callbacks ====================
 
+TEST_CASE("cancel callback phase uses lock-free native atomic storage",
+          "[cancel_token][callback][layout]") {
+    static_assert(noexcept(
+        std::declval<cancel_registration&>().unregister()));
+    std::atomic<elio::coro::detail::callback_node::phase> phase;
+    INFO("callback_node bytes: "
+         << sizeof(elio::coro::detail::callback_node));
+    INFO("task_parent_callback_node bytes: "
+         << sizeof(elio::coro::detail::task_parent_callback_node));
+    REQUIRE(phase.is_lock_free());
+}
+
 TEST_CASE("cancel_token on_cancel registers callback", "[cancel_token][callback]") {
     cancel_source source;
     cancel_token token = source.get_token();
@@ -215,6 +296,154 @@ TEST_CASE("cancel_token multiple callbacks all invoked", "[cancel_token][callbac
         
         REQUIRE(callback_count.load(std::memory_order_relaxed) == 3);
     }
+}
+
+TEST_CASE("cancel callbacks retain LIFO dispatch order",
+          "[cancel_token][callback][ordering]") {
+    cancel_source source;
+    std::vector<unsigned> order;
+
+    auto first = source.get_token().on_cancel([&] { order.push_back(1); });
+    auto second = source.get_token().on_cancel([&] { order.push_back(2); });
+    auto third = source.get_token().on_cancel([&] { order.push_back(3); });
+
+    source.cancel();
+
+    REQUIRE(order == std::vector<unsigned>{3, 2, 1});
+}
+
+TEST_CASE("cancel callback payload is destroyed exactly once",
+          "[cancel_token][callback][lifetime]") {
+    std::atomic<unsigned> invocations{0};
+    std::atomic<unsigned> destructions{0};
+    elio::coro::detail::cancel_callback_node_allocations_for_test.store(
+        0, std::memory_order_relaxed);
+
+    SECTION("inline payload after dispatch") {
+        cancel_source source;
+        auto registration = source.get_token().on_cancel(
+            counted_callback<1>{&invocations, &destructions});
+
+        REQUIRE(elio::coro::detail::cancel_callback_node_allocations_for_test.load(
+                    std::memory_order_relaxed) == 1);
+        source.cancel();
+
+        REQUIRE(invocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+    }
+
+    SECTION("heap payload after unregister") {
+        cancel_source source;
+        auto registration = source.get_token().on_cancel(
+            counted_callback<96>{&invocations, &destructions});
+
+        REQUIRE(elio::coro::detail::cancel_callback_node_allocations_for_test.load(
+                    std::memory_order_relaxed) == 1);
+        registration.unregister();
+        source.cancel();
+
+        REQUIRE(invocations.load(std::memory_order_relaxed) == 0);
+        REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+    }
+
+    SECTION("heap payload after immediate cancellation") {
+        cancel_source source;
+        source.cancel();
+
+        auto registration = source.get_token().on_cancel(
+            counted_callback<96>{&invocations, &destructions});
+
+        REQUIRE(elio::coro::detail::cancel_callback_node_allocations_for_test.load(
+                    std::memory_order_relaxed) == 1);
+        REQUIRE(invocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+    }
+}
+
+TEST_CASE("throwing cancel callback destroys its counted payload once",
+          "[cancel_token][callback][exception][lifetime]") {
+    struct throwing_counted_callback {
+        std::atomic<unsigned>* invocations;
+        std::atomic<unsigned>* destructions;
+        bool owns_payload = true;
+
+        throwing_counted_callback(
+            std::atomic<unsigned>* invocation_count,
+            std::atomic<unsigned>* destruction_count) noexcept
+            : invocations(invocation_count),
+              destructions(destruction_count) {}
+        throwing_counted_callback(throwing_counted_callback&& other) noexcept
+            : invocations(other.invocations),
+              destructions(other.destructions),
+              owns_payload(std::exchange(other.owns_payload, false)) {}
+        throwing_counted_callback(const throwing_counted_callback&) = delete;
+        ~throwing_counted_callback() {
+            if (owns_payload) {
+                destructions->fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        void operator()() {
+            invocations->fetch_add(1, std::memory_order_relaxed);
+            throw std::runtime_error("counted callback failed");
+        }
+    };
+
+    std::atomic<unsigned> invocations{0};
+    std::atomic<unsigned> destructions{0};
+
+    SECTION("selected callback") {
+        cancel_source source;
+        auto registration = source.get_token().on_cancel(
+            throwing_counted_callback{&invocations, &destructions});
+
+        std::string exception_message;
+        try {
+            source.cancel();
+        } catch (const std::runtime_error& exception) {
+            exception_message = exception.what();
+        }
+        REQUIRE(exception_message == "counted callback failed");
+        REQUIRE(invocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+    }
+
+    SECTION("already-cancelled immediate callback") {
+        cancel_source source;
+        source.cancel();
+
+        std::string exception_message;
+        try {
+            auto registration = source.get_token().on_cancel(
+                throwing_counted_callback{&invocations, &destructions});
+            (void)registration;
+        } catch (const std::runtime_error& exception) {
+            exception_message = exception.what();
+        }
+        REQUIRE(exception_message == "counted callback failed");
+        REQUIRE(invocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+    }
+}
+
+TEST_CASE("concurrent callback-node teardown destroys its payload once",
+          "[cancel_token][callback][thread][lifetime]") {
+    auto state = std::make_shared<elio::coro::detail::cancel_state>();
+    auto node = std::make_shared<elio::coro::detail::callback_node>();
+    std::atomic<unsigned> invocations{0};
+    std::atomic<unsigned> destructions{0};
+    node->emplace(counted_callback<1>{&invocations, &destructions});
+    REQUIRE(state->add_callback_node(node));
+
+    std::vector<std::thread> teardown_threads;
+    for (unsigned i = 0; i < 4; ++i) {
+        teardown_threads.emplace_back(
+            [state, node] { state->remove_callback(node); });
+    }
+    for (auto& thread : teardown_threads) thread.join();
+
+    state->trigger();
+    REQUIRE(invocations.load(std::memory_order_relaxed) == 0);
+    REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
 }
 
 TEST_CASE("cancel_token releases all callbacks when one throws",
@@ -745,80 +974,103 @@ TEST_CASE("cancel_token stress test with many callbacks", "[cancel_token][thread
 TEST_CASE("cancel registration waits for a callback running on another thread",
           "[cancel_token][callback][thread][lifetime]") {
     cancel_source source;
-    std::latch callback_started(1);
-    std::latch release_callback(1);
-    std::latch unregister_started(1);
     std::atomic<bool> unregister_done{false};
+    std::atomic<bool> payload_destroyed_at_unregister_return{false};
     std::atomic<bool> callback_done{false};
+    std::atomic<bool> payload_destroyed{false};
+    elio::coro::detail::cancel_callback_waiters_for_test.store(
+        0, std::memory_order_relaxed);
+    elio::coro::detail::cancel_callback_paused_after_invoking_for_test.store(
+        false, std::memory_order_relaxed);
+    elio::coro::detail::pause_cancel_callback_after_invoking_for_test.store(
+        true, std::memory_order_release);
 
-    auto registration = source.get_token().on_cancel([&] {
-        callback_started.count_down();
-        release_callback.wait();
-        callback_done.store(true, std::memory_order_release);
-    });
+    auto registration = source.get_token().on_cancel(
+        release_on_destroy_callback{&callback_done, &payload_destroyed});
 
     std::thread canceller([&] { source.cancel(); });
-    callback_started.wait();
+    wait_for_test_hook(
+        elio::coro::detail::cancel_callback_paused_after_invoking_for_test);
 
     std::thread unregisterer(
-        [registration = std::move(registration), &unregister_started,
+        [registration = std::move(registration), &payload_destroyed,
+         &payload_destroyed_at_unregister_return,
          &unregister_done]() mutable {
-            unregister_started.count_down();
             registration.unregister();
+            payload_destroyed_at_unregister_return.store(
+                payload_destroyed.load(std::memory_order_acquire),
+                std::memory_order_release);
             unregister_done.store(true, std::memory_order_release);
         });
-    unregister_started.wait();
+    wait_for_cancel_callback_waiter();
 
-    // Give the dedicated unregister thread a scheduling opportunity. It must
-    // remain inside unregister() until the callback has stopped using captures.
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    REQUIRE_FALSE(unregister_done.load(std::memory_order_acquire));
+    CHECK_FALSE(unregister_done.load(std::memory_order_acquire));
+    CHECK_FALSE(callback_done.load(std::memory_order_acquire));
 
-    release_callback.count_down();
+    elio::coro::detail::pause_cancel_callback_after_invoking_for_test.store(
+        false, std::memory_order_release);
+    elio::coro::detail::pause_cancel_callback_after_invoking_for_test
+        .notify_all();
     canceller.join();
     unregisterer.join();
     REQUIRE(callback_done.load(std::memory_order_acquire));
+    REQUIRE(payload_destroyed.load(std::memory_order_acquire));
+    REQUIRE(payload_destroyed_at_unregister_return.load(
+        std::memory_order_acquire));
     REQUIRE(unregister_done.load(std::memory_order_acquire));
+    REQUIRE(elio::coro::detail::cancel_callback_waiters_for_test.load(
+                std::memory_order_acquire) == 0);
 }
 
 TEST_CASE("cancel registration waits after another thread selects its callback",
           "[cancel_token][callback][thread][lifetime]") {
     cancel_source source;
-    std::latch dispatch_blocked(1);
-    std::latch release_dispatch(1);
-    std::latch unregister_started(1);
     std::atomic<bool> selected_callback_ran{false};
+    std::atomic<bool> payload_destroyed{false};
     std::atomic<bool> unregister_done{false};
+    std::atomic<bool> payload_destroyed_at_unregister_return{false};
+    elio::coro::detail::cancel_callback_waiters_for_test.store(
+        0, std::memory_order_relaxed);
+    elio::coro::detail::cancel_callback_paused_after_claim_for_test.store(
+        false, std::memory_order_relaxed);
+    elio::coro::detail::pause_cancel_callback_after_claim_for_test.store(
+        true, std::memory_order_release);
 
-    // The list is LIFO. Register the selected callback first so the blocker is
-    // dispatched before it after cancel() atomically claims both callbacks.
-    auto selected = source.get_token().on_cancel([&] {
-        selected_callback_ran.store(true, std::memory_order_release);
-    });
-    auto blocker = source.get_token().on_cancel([&] {
-        dispatch_blocked.count_down();
-        release_dispatch.wait();
-    });
+    auto selected = source.get_token().on_cancel(
+        release_on_destroy_callback{&selected_callback_ran,
+                                    &payload_destroyed});
 
     std::thread canceller([&] { source.cancel(); });
-    dispatch_blocked.wait();
+    wait_for_test_hook(
+        elio::coro::detail::cancel_callback_paused_after_claim_for_test);
 
     std::thread unregisterer(
-        [selected = std::move(selected), &unregister_started,
+        [selected = std::move(selected), &payload_destroyed,
+         &payload_destroyed_at_unregister_return,
          &unregister_done]() mutable {
-            unregister_started.count_down();
             selected.unregister();
+            payload_destroyed_at_unregister_return.store(
+                payload_destroyed.load(std::memory_order_acquire),
+                std::memory_order_release);
             unregister_done.store(true, std::memory_order_release);
         });
-    unregister_started.wait();
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    REQUIRE_FALSE(unregister_done.load(std::memory_order_acquire));
+    wait_for_cancel_callback_waiter();
 
-    release_dispatch.count_down();
+    CHECK_FALSE(unregister_done.load(std::memory_order_acquire));
+    CHECK_FALSE(selected_callback_ran.load(std::memory_order_acquire));
+
+    elio::coro::detail::pause_cancel_callback_after_claim_for_test.store(
+        false, std::memory_order_release);
+    elio::coro::detail::pause_cancel_callback_after_claim_for_test.notify_all();
     canceller.join();
     unregisterer.join();
     REQUIRE(selected_callback_ran.load(std::memory_order_acquire));
+    REQUIRE(payload_destroyed.load(std::memory_order_acquire));
+    REQUIRE(payload_destroyed_at_unregister_return.load(
+        std::memory_order_acquire));
     REQUIRE(unregister_done.load(std::memory_order_acquire));
+    REQUIRE(elio::coro::detail::cancel_callback_waiters_for_test.load(
+                std::memory_order_acquire) == 0);
 }
 
 TEST_CASE("cancel callback can unregister itself without deadlock",
@@ -835,6 +1087,26 @@ TEST_CASE("cancel callback can unregister itself without deadlock",
     source.cancel();
     REQUIRE(callback_done.load(std::memory_order_acquire));
     REQUIRE_FALSE(registration.has_value());
+}
+
+TEST_CASE("cancel callback can reenter its own source",
+          "[cancel_token][callback][reentrant]") {
+    cancel_source source;
+    std::atomic<unsigned> reentrant_invocations{0};
+    std::atomic<unsigned> later_invocations{0};
+
+    auto later = source.get_token().on_cancel([&] {
+        later_invocations.fetch_add(1, std::memory_order_relaxed);
+    });
+    auto reentrant = source.get_token().on_cancel([&] {
+        reentrant_invocations.fetch_add(1, std::memory_order_relaxed);
+        source.cancel();
+    });
+
+    source.cancel();
+
+    REQUIRE(reentrant_invocations.load(std::memory_order_relaxed) == 1);
+    REQUIRE(later_invocations.load(std::memory_order_relaxed) == 1);
 }
 
 TEST_CASE("cancel callback can remove a later selected callback",
@@ -855,6 +1127,25 @@ TEST_CASE("cancel callback can remove a later selected callback",
     source.cancel();
     REQUIRE(first_ran.load(std::memory_order_acquire));
     REQUIRE_FALSE(later_ran.load(std::memory_order_acquire));
+}
+
+TEST_CASE("same dispatcher suppresses a claimed counted callback exactly once",
+          "[cancel_token][callback][lifetime]") {
+    cancel_source source;
+    std::optional<cancel_registration> later_registration;
+    std::atomic<unsigned> invocations{0};
+    std::atomic<unsigned> destructions{0};
+
+    later_registration.emplace(source.get_token().on_cancel(
+        counted_callback<1>{&invocations, &destructions}));
+    auto first_registration = source.get_token().on_cancel(
+        [&] { later_registration.reset(); });
+
+    source.cancel();
+
+    REQUIRE(invocations.load(std::memory_order_relaxed) == 0);
+    REQUIRE(destructions.load(std::memory_order_relaxed) == 1);
+    REQUIRE_FALSE(later_registration.has_value());
 }
 
 TEST_CASE("nested cancellation preserves an outer selected callback",
@@ -883,6 +1174,34 @@ TEST_CASE("nested cancellation preserves an outer selected callback",
 
     REQUIRE(outer_first_ran.load(std::memory_order_acquire));
     REQUIRE(nested_ran.load(std::memory_order_acquire));
+    REQUIRE(outer_later_invocations.load(std::memory_order_relaxed) == 1);
+    REQUIRE_FALSE(outer_later_registration.has_value());
+}
+
+TEST_CASE("immediate nested cancellation preserves an outer selected callback",
+          "[cancel_token][callback][lifetime]") {
+    cancel_source outer_source;
+    cancel_source already_cancelled_source;
+    already_cancelled_source.cancel();
+    std::optional<cancel_registration> outer_later_registration;
+    std::atomic<unsigned> outer_later_invocations{0};
+    std::atomic<bool> immediate_ran{false};
+
+    outer_later_registration.emplace(
+        outer_source.get_token().on_cancel([&] {
+            outer_later_invocations.fetch_add(1, std::memory_order_relaxed);
+        }));
+    auto outer_first_registration = outer_source.get_token().on_cancel([&] {
+        auto immediate_registration =
+            already_cancelled_source.get_token().on_cancel([&] {
+                immediate_ran.store(true, std::memory_order_release);
+                outer_later_registration.reset();
+            });
+    });
+
+    outer_source.cancel();
+
+    REQUIRE(immediate_ran.load(std::memory_order_acquire));
     REQUIRE(outer_later_invocations.load(std::memory_order_relaxed) == 1);
     REQUIRE_FALSE(outer_later_registration.has_value());
 }

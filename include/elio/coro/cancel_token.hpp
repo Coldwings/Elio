@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <condition_variable>
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
@@ -10,7 +9,6 @@
 #include <mutex>
 #include <new>
 #include <stdexcept>
-#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -55,6 +53,28 @@ private:
     const void* previous_;
 };
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline std::atomic<bool> pause_cancel_callback_after_claim_for_test{false};
+inline std::atomic<bool> cancel_callback_paused_after_claim_for_test{false};
+inline std::atomic<bool> pause_cancel_callback_after_invoking_for_test{false};
+inline std::atomic<bool> cancel_callback_paused_after_invoking_for_test{false};
+inline std::atomic<std::size_t> cancel_callback_waiters_for_test{0};
+inline std::atomic<std::size_t> cancel_callback_node_allocations_for_test{0};
+
+inline void pause_cancel_callback_dispatch_for_test(
+    std::atomic<bool>& pause, std::atomic<bool>& paused) noexcept {
+    if (!pause.load(std::memory_order_acquire)) return;
+
+    paused.store(true, std::memory_order_release);
+    paused.notify_all();
+    while (pause.load(std::memory_order_acquire)) {
+        pause.wait(true, std::memory_order_acquire);
+    }
+    paused.store(false, std::memory_order_release);
+    paused.notify_all();
+}
+#endif
+
 /// Type-erased callback node for the cancel_state intrusive list.
 ///
 /// Each registration owns exactly one heap-allocated callback_node. The
@@ -63,7 +83,10 @@ private:
 /// single secondary heap allocation. This eliminates the vector growth and
 /// the per-callable std::function allocation of the previous design.
 struct callback_node {
-    enum class phase : uint8_t {
+    // Keep the phase native-width: libstdc++ implements byte-sized atomic
+    // waits through a shared hashed waiter pool instead of the direct futex
+    // path used for a 32-bit atomic.
+    enum class phase : uint32_t {
         registered,
         claimed,
         invoking,
@@ -122,18 +145,30 @@ struct callback_node {
     }
 
     void dispatch() {
-        const void* active_dispatcher;
-        {
-            std::lock_guard<std::mutex> lock(dispatch_mutex);
-            if (dispatch_phase == phase::registered) {
-                invoking_thread = std::this_thread::get_id();
-                dispatcher_identity = this;
-            } else if (dispatch_phase != phase::claimed) {
+        const void* active_dispatcher = this;
+        auto expected = phase::registered;
+        if (!dispatch_phase.compare_exchange_strong(
+                expected, phase::invoking, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            if (expected != phase::claimed) return;
+
+            expected = phase::claimed;
+            if (!dispatch_phase.compare_exchange_strong(
+                    expected, phase::invoking, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
                 return;
             }
+            // claim_for_dispatch() published this identity before its release
+            // transition to claimed. The successful acquire above makes it
+            // visible for the whole callback dispatch.
             active_dispatcher = dispatcher_identity;
-            dispatch_phase = phase::invoking;
         }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        pause_cancel_callback_dispatch_for_test(
+            pause_cancel_callback_after_invoking_for_test,
+            cancel_callback_paused_after_invoking_for_test);
+#endif
 
         std::exception_ptr exception;
         {
@@ -146,53 +181,60 @@ struct callback_node {
             destroy_payload();
         }
 
-        {
-            std::lock_guard<std::mutex> lock(dispatch_mutex);
-            invoking_thread = {};
-            dispatcher_identity = nullptr;
-            dispatch_phase = phase::completed;
-        }
-        dispatch_cv.notify_all();
+        dispatch_phase.store(phase::completed, std::memory_order_release);
+        dispatch_phase.notify_all();
 
         if (exception) {
             std::rethrow_exception(exception);
         }
     }
 
-    void claim_for_dispatch(std::thread::id dispatch_thread,
-                            const void* dispatcher) noexcept {
-        std::lock_guard<std::mutex> lock(dispatch_mutex);
-        if (dispatch_phase != phase::registered) return;
-        invoking_thread = dispatch_thread;
+    void claim_for_dispatch(const void* dispatcher) noexcept {
+        // The cancel-state mutex excludes registration teardown until after
+        // the node is detached and this selection is published.
+        if (dispatch_phase.load(std::memory_order_relaxed) !=
+            phase::registered) {
+            return;
+        }
         dispatcher_identity = dispatcher;
-        dispatch_phase = phase::claimed;
+        dispatch_phase.store(phase::claimed, std::memory_order_release);
     }
 
     void unregister_and_wait() noexcept {
-        std::unique_lock<std::mutex> lock(dispatch_mutex);
-        if (dispatch_phase == phase::registered) {
-            dispatch_phase = phase::unregistered;
-            lock.unlock();
-            destroy_payload();
-            return;
-        }
+        auto observed = dispatch_phase.load(std::memory_order_acquire);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        bool announced_waiter = false;
+#endif
+        while (observed == phase::registered || observed == phase::claimed ||
+               observed == phase::invoking) {
+            if (observed == phase::registered) {
+                if (dispatch_phase.compare_exchange_weak(
+                        observed, phase::unregistered,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    destroy_payload();
+                    return;
+                }
+                continue;
+            }
 
-        if (dispatch_phase == phase::claimed &&
-            dispatcher_identity == current_callback_dispatcher) {
-            // A callback may unregister a later callback selected by the same
-            // synchronous cancel() dispatch. Waiting here would deadlock the
-            // dispatcher, so suppress that not-yet-invoked callback.
-            dispatch_phase = phase::unregistered;
-            invoking_thread = {};
-            dispatcher_identity = nullptr;
-            lock.unlock();
-            destroy_payload();
-            dispatch_cv.notify_all();
-            return;
-        }
+            if (observed == phase::claimed &&
+                dispatcher_identity == current_callback_dispatcher) {
+                // A callback may unregister a later callback selected by the
+                // same synchronous cancel() dispatch. Waiting here would
+                // deadlock the dispatcher, so suppress that not-yet-invoked
+                // callback.
+                if (dispatch_phase.compare_exchange_weak(
+                        observed, phase::unregistered,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    destroy_payload();
+                    dispatch_phase.notify_all();
+                    return;
+                }
+                continue;
+            }
 
-        if (dispatch_phase == phase::claimed ||
-            dispatch_phase == phase::invoking) {
             if (current_callback_dispatcher != nullptr) {
                 // Waiting from one cancellation callback for another dispatcher
                 // can form a cross-source wait cycle. Dispatcher ownership keeps
@@ -200,12 +242,26 @@ struct callback_node {
                 // and let every callback selected by that dispatcher complete.
                 return;
             }
-            if (invoking_thread == std::this_thread::get_id()) return;
-            dispatch_cv.wait(lock, [this] {
-                return dispatch_phase != phase::claimed &&
-                       dispatch_phase != phase::invoking;
-            });
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (!announced_waiter) {
+                announced_waiter = true;
+                cancel_callback_waiters_for_test.fetch_add(
+                    1, std::memory_order_release);
+                cancel_callback_waiters_for_test.notify_all();
+            }
+#endif
+            dispatch_phase.wait(observed, std::memory_order_acquire);
+            observed = dispatch_phase.load(std::memory_order_acquire);
         }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (announced_waiter) {
+            cancel_callback_waiters_for_test.fetch_sub(
+                1, std::memory_order_release);
+            cancel_callback_waiters_for_test.notify_all();
+        }
+#endif
     }
 
     ~callback_node() {
@@ -213,10 +269,7 @@ struct callback_node {
     }
 
 private:
-    std::mutex dispatch_mutex;
-    std::condition_variable dispatch_cv;
-    phase dispatch_phase = phase::registered;
-    std::thread::id invoking_thread;
+    std::atomic<phase> dispatch_phase{phase::registered};
     const void* dispatcher_identity = nullptr;
 };
 
@@ -231,9 +284,10 @@ struct task_parent_callback_node final : callback_node {
 /// Shared cancellation state (implementation detail).
 ///
 /// Stores active callbacks as an intrusive shared-ownership list guarded by a
-/// mutex. Each node also synchronizes callback dispatch with unregistration so
-/// a registration can be destroyed concurrently without releasing callback
-/// captures while they are still in use. Compared with the previous
+/// mutex. Each node uses an atomic dispatch phase to synchronize callback
+/// dispatch with unregistration so a registration can be destroyed
+/// concurrently without releasing callback captures while they are still in
+/// use. Compared with the previous
 /// std::vector<std::pair<id, std::function>> implementation:
 ///   * registration is O(1) without vector growth/copies;
 ///   * each registration owns a single heap-allocated node, and its
@@ -254,6 +308,10 @@ struct cancel_state {
         // Allocate the node before taking the lock to keep the critical
         // section short.
         auto node = std::make_shared<callback_node>();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        cancel_callback_node_allocations_for_test.fetch_add(
+            1, std::memory_order_relaxed);
+#endif
         node->emplace(std::forward<F>(cb));
 
         if (!add_callback_node(node)) return {};
@@ -320,18 +378,23 @@ struct cancel_state {
                 return;  // Already cancelled
             }
             list = std::move(head);
-            const auto dispatch_thread = std::this_thread::get_id();
             for (auto node = list; node; node = node->next) {
-                node->claim_for_dispatch(
-                    dispatch_thread, &dispatcher_identity);
+                node->claim_for_dispatch(&dispatcher_identity);
             }
         }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (list) {
+            pause_cancel_callback_dispatch_for_test(
+                pause_cancel_callback_after_claim_for_test,
+                cancel_callback_paused_after_claim_for_test);
+        }
+#endif
         // List is now owned by this call. Invoke each callback outside the
         // state lock. Concurrent remove_callback() calls synchronize through
-        // the individual node. Teardown suppresses a not-yet-started callback,
-        // waits for an in-progress callback outside callback dispatch, or
-        // defers cross-dispatch callback reentry without suppressing callbacks
-        // already selected by another dispatcher.
+        // the individual node's atomic phase. Teardown suppresses a
+        // not-yet-started callback, waits for an in-progress callback outside
+        // callback dispatch, or defers cross-dispatch callback reentry without
+        // suppressing callbacks already selected by another dispatcher.
         std::exception_ptr first_exception;
         while (list) {
             auto node = std::move(list);
@@ -590,6 +653,10 @@ private:
         if (!state_) return {};
 
         auto node = std::make_shared<detail::task_parent_callback_node>();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        detail::cancel_callback_node_allocations_for_test.fetch_add(
+            1, std::memory_order_relaxed);
+#endif
         node->parent_state = state_;
         std::weak_ptr<detail::task_parent_callback_node> weak_node = node;
         node->emplace(

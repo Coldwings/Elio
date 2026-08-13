@@ -67,6 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Directly constructed public send awaiters remain owning, and queue,
   cancellation, close, and dequeue-versus-destruction behavior is unchanged
   (#1047).
+- **Compact cancellation callback dispatch**: Cancellation registrations now
+  synchronize selection, invocation, and teardown through a native-width
+  atomic phase instead of embedding a mutex and condition variable in every
+  callback node. Immediate cancellation, LIFO dispatch, same-dispatch
+  suppression, cross-source reentrant teardown, exception aggregation, and
+  exactly-once payload destruction retain their existing contracts (#1053).
 - **Allocation-free ready semaphore acquires**: Non-cancellable acquires now
   defer shared wake-state allocation until the ready permit check fails.
   Entering `await_suspend` allocates before taking the semaphore queue lock,

@@ -403,6 +403,43 @@ Do not eagerly invoke an arbitrary temporary coroutine lambda merely to select
 the direct overload: its returned frame may retain the lambda through `this`.
 Passing the callable lets Elio keep that object alive in the wrapper.
 
+### Cancellation Callback Registration
+
+Each `cancel_token::on_cancel()` registration owns one shared callback node.
+Small nothrow-movable callables use the node's inline buffer; larger callables
+require a second payload allocation. The node uses a native-width atomic phase
+for selection, invocation, and teardown. Ordinary register/unregister traffic
+therefore does not initialize or lock a per-registration mutex or condition
+variable. The cancellation-state mutex still owns list insertion, selection,
+and O(N) unlinking, so unregistering an old callback from a long-lived source
+costs more than removing its newest callback.
+
+`cancel_callback_benchmark` reports the platform-specific node sizes and
+allocator-requested bytes for an inline callback, register/unregister latency,
+newest and oldest unlink latency for several list sizes, cancellation dispatch,
+immediate registration after cancellation, and cancellation p95/p99 while
+another thread unregisters callbacks. Build it in Release mode and collect
+multiple process-level runs on a fixed CPU when comparing revisions:
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \
+  -DELIO_BUILD_EXAMPLES=ON
+cmake --build build-release --target cancel_callback_benchmark --parallel 2
+taskset -c 2 ./build-release/examples/cancel_callback_benchmark 2000
+```
+
+Use `--smoke` for a short 20-sample termination and output check. The optional
+numeric argument must be a strict positive sample count; invalid or additional
+arguments return exit status 2.
+
+Use at least two isolated CPUs for the concurrent-unregister tail diagnostic,
+for example `taskset -c 2,3`. Its `removed` and `invoked` outcome totals confirm
+that cancellation and teardown actually overlapped. Keep the one-CPU run for
+the single-thread register, unlink, dispatch, and immediate-callback metrics.
+Use an external paired runner across multiple process invocations to calculate
+revision-to-revision confidence intervals; the in-process percentiles are
+diagnostic samples, not a substitute for paired confidence intervals.
+
 ### Avoiding Allocations
 
 Keep coroutine frames small to reduce allocation and cache cost:

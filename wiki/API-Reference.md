@@ -3224,6 +3224,14 @@ public:
 };
 ```
 
+The no-token `lock()` completes without allocation when the mutex is
+uncontended, including when an unlock wins the race between `await_ready()` and
+`await_suspend()`. A wait that remains contended creates independently owned
+wake state before entering the waiter-queue critical section, so
+`await_suspend()` may propagate `std::bad_alloc` without changing lock or queue
+state. Token-aware waits create their arbitration state eagerly so cancellation
+can race ownership transfer with exactly one terminal result.
+
 ### `shared_mutex`
 
 Coroutine-aware read-write lock. Allows multiple concurrent readers or a single exclusive writer.

@@ -56,6 +56,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Allocation-free uncontended mutex locks**: Non-cancellable locks now defer
+  shared wake-state allocation until both the initial acquisition and the
+  suspension-entry recheck observe contention. Truly parked waiters retain
+  independent wake lifetime and FIFO ownership transfer, while token-aware
+  locks retain eager cancellation state (#1038).
 - **Allocation-free ready event waits**: Non-cancellable waits on an already-set
   manual-reset event now complete without allocating shared wake state. A wait
   that reaches the unset slow path creates the same independently owned state

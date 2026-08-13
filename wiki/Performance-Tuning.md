@@ -434,7 +434,16 @@ suspension.
 
 ### Mutex Performance
 
-Elio's mutex uses atomic fast-path for uncontended cases:
+Elio's mutex uses an atomic, allocation-free fast path for non-cancellable,
+uncontended locks. It rechecks that fast path at suspension entry, so an unlock
+that wins the `await_ready()` / `await_suspend()` race also avoids allocation.
+A wait that remains contended at that recheck creates independently owned wake
+state before taking the queue lock. It enters the FIFO waiter queue only if the
+final locked acquisition recheck also fails; otherwise it acquires without
+parking and releases the unused wake state. Token-aware locks create arbitration
+state eagerly so cancellation can race ownership transfer safely. This deferral
+favors workloads with a meaningful uncontended fraction; a permanently
+contended handoff loop can be slightly slower.
 
 ```cpp
 #include <elio/sync/primitives.hpp>

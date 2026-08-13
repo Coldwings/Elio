@@ -11,6 +11,7 @@
 #include <chrono>
 #include <coroutine>
 #include <memory>
+#include <new>
 #include <thread>
 #include <type_traits>
 
@@ -238,6 +239,181 @@ TEST_CASE("event ready path avoids wake-state allocation",
         REQUIRE(waiter.await_ready());
         REQUIRE(waiter.await_resume() == cancel_result::cancelled);
         REQUIRE(e.is_set());
+    }
+}
+
+TEST_CASE("mutex fast paths defer wake-state allocation",
+          "[sync][mutex][allocation]") {
+    auto& allocations =
+        elio::sync::detail::wake_state_allocations_for_test;
+    auto& fail_next =
+        elio::sync::detail::fail_next_wake_state_allocation_for_test;
+    fail_next.store(false, std::memory_order_relaxed);
+
+    SECTION("uncontended lock") {
+        mutex m;
+        allocations.store(0, std::memory_order_relaxed);
+
+        for (int i = 0; i < 4; ++i) {
+            auto waiter = m.lock();
+            static_assert(!noexcept(
+                waiter.await_suspend(std::noop_coroutine())));
+            REQUIRE(waiter.await_ready());
+            waiter.await_resume();
+            REQUIRE(m.is_locked());
+            m.unlock();
+        }
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+    }
+
+    SECTION("unlock between ready and suspend") {
+        mutex m;
+        REQUIRE(m.try_lock());
+        allocations.store(0, std::memory_order_relaxed);
+
+        auto waiter = m.lock();
+        REQUIRE_FALSE(waiter.await_ready());
+        m.unlock();
+        REQUIRE_FALSE(waiter.await_suspend(std::noop_coroutine()));
+        waiter.await_resume();
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+        REQUIRE(m.is_locked());
+        m.unlock();
+    }
+
+    SECTION("explicit non-cancellable waiter configuration stays lazy") {
+        mutex m;
+        allocations.store(0, std::memory_order_relaxed);
+
+        mutex::lock_waiter ready_waiter(m, false);
+        REQUIRE(ready_waiter.await_ready_impl());
+        REQUIRE(ready_waiter.await_resume_impl() == cancel_result::completed);
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+        REQUIRE(m.is_locked());
+
+        mutex::lock_waiter parked_waiter(m, false);
+        REQUIRE_FALSE(parked_waiter.await_ready_impl());
+        REQUIRE(parked_waiter.await_suspend_impl(std::noop_coroutine()));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+
+        m.unlock();
+        REQUIRE(m.is_locked());
+        REQUIRE(parked_waiter.await_resume_impl() == cancel_result::completed);
+        m.unlock();
+        REQUIRE_FALSE(m.is_locked());
+    }
+
+    SECTION("explicit cancellable waiter configuration dispatches safely") {
+        mutex m;
+        REQUIRE(m.try_lock());
+        allocations.store(0, std::memory_order_relaxed);
+
+        mutex::lock_waiter waiter(m, true);
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE_FALSE(waiter.await_ready_impl());
+        REQUIRE(waiter.await_suspend_impl(std::noop_coroutine()));
+
+        m.unlock();
+        REQUIRE(m.is_locked());
+        REQUIRE(waiter.await_resume_impl() == cancel_result::completed);
+        m.unlock();
+        REQUIRE_FALSE(m.is_locked());
+    }
+
+    SECTION("parked lock") {
+        mutex m;
+        REQUIRE(m.try_lock());
+        allocations.store(0, std::memory_order_relaxed);
+
+        auto waiter = m.lock();
+        REQUIRE_FALSE(waiter.await_ready());
+        REQUIRE(waiter.await_suspend(std::noop_coroutine()));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+
+        m.unlock();
+        REQUIRE(m.is_locked());
+        waiter.await_resume();
+        m.unlock();
+        REQUIRE_FALSE(m.is_locked());
+    }
+
+    SECTION("cancellable ready lock keeps eager arbitration state") {
+        mutex m;
+        cancel_source source;
+        allocations.store(0, std::memory_order_relaxed);
+
+        auto waiter = m.lock(source.get_token());
+        static_assert(noexcept(
+            waiter.await_suspend(std::noop_coroutine())));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(waiter.await_ready());
+        REQUIRE(waiter.await_resume() == cancel_result::completed);
+        REQUIRE(m.is_locked());
+        m.unlock();
+    }
+
+    SECTION("cancellable parked lock keeps eager arbitration state") {
+        mutex m;
+        REQUIRE(m.try_lock());
+        cancel_source source;
+        allocations.store(0, std::memory_order_relaxed);
+
+        auto waiter = m.lock(source.get_token());
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE_FALSE(waiter.await_ready());
+        REQUIRE(waiter.await_suspend(std::noop_coroutine()));
+
+        m.unlock();
+        REQUIRE(m.is_locked());
+        REQUIRE(waiter.await_resume() == cancel_result::completed);
+        m.unlock();
+        REQUIRE_FALSE(m.is_locked());
+    }
+
+    SECTION("allocation failure leaves mutex and queue unchanged") {
+        mutex m;
+        REQUIRE(m.try_lock());
+        allocations.store(0, std::memory_order_relaxed);
+
+        {
+            auto waiter = m.lock();
+            REQUIRE_FALSE(waiter.await_ready());
+            fail_next.store(true, std::memory_order_release);
+            REQUIRE_THROWS_AS(
+                waiter.await_suspend(std::noop_coroutine()), std::bad_alloc);
+        }
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+        REQUIRE(m.is_locked());
+        m.unlock();
+        REQUIRE_FALSE(m.is_locked());
+
+        auto next = m.lock();
+        REQUIRE(next.await_ready());
+        next.await_resume();
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+        m.unlock();
+    }
+
+    SECTION("cancellable construction failure leaves mutex unchanged") {
+        mutex m;
+        cancel_source source;
+        allocations.store(0, std::memory_order_relaxed);
+        fail_next.store(true, std::memory_order_release);
+
+        REQUIRE_THROWS_AS(
+            (void)m.lock(source.get_token()), std::bad_alloc);
+
+        REQUIRE_FALSE(fail_next.load(std::memory_order_acquire));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+        REQUIRE_FALSE(m.is_locked());
+
+        auto next = m.lock();
+        REQUIRE(next.await_ready());
+        next.await_resume();
+        m.unlock();
     }
 }
 

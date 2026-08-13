@@ -73,10 +73,12 @@ starts. Destroying a non-empty task destroys the frame if ownership has not
 been transferred to the runtime. Do not await an empty task or await the same
 task more than once.
 
-In 0.6, `await_suspend` is a potentially throwing template so an Elio child can
-link to the actual Elio awaiter's cancellation context before first resume.
-Allocation failure while registering that link propagates from the `co_await`
-expression and the child does not start. Normal `co_await task` source remains
+In 0.6, `await_suspend` is a potentially throwing template. A normal
+Elio-to-Elio direct await binds the child to the logical vthread's existing
+context without allocating. Context materialization may still allocate for a
+raw-resumed deferred parent, a foreign-promise boundary, or the isolated
+`task_scope()` boundary. Allocation failure propagates from the `co_await`
+expression before the child starts. Normal `co_await task` source remains
 unchanged, but code that names the exact `await_suspend` member type or requires
 it to be `noexcept` must be updated. A foreign coroutine promise does not
 implicitly inherit an Elio runtime token; adapter code must bridge cancellation
@@ -889,6 +891,9 @@ resume, retain, destroy, or otherwise resolve it. `spawn()` and `spawn_to()`
 consume ownership and destroy a handle rejected before execution. Internal wake
 and affinity-migration paths handle rejection explicitly; callers must not
 substitute one family for the other.
+Materializing an independent execution context before initial publication can
+throw. On that exception, `try_spawn()` leaves the borrowed handle live;
+`spawn()` and `spawn_to()` destroy their consumed handle and then rethrow.
 
 `shutdown()` is the graceful path. Before waiting, it atomically closes
 independent initial task admission against `go()`, `go_to()`, `go_joinable()`,

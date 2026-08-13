@@ -600,7 +600,14 @@ public:
 
     void spawn(std::coroutine_handle<> handle) {
         if (!handle) [[unlikely]] return;
-        if (!try_spawn(handle)) {
+        bool scheduled = false;
+        try {
+            scheduled = try_spawn(handle);
+        } catch (...) {
+            handle.destroy();
+            throw;
+        }
+        if (!scheduled) {
             handle.destroy();
         }
     }

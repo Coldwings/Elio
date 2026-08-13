@@ -64,6 +64,17 @@ task<void> create_unstarted_child(
     co_return;
 }
 
+task<void> retain_frame_marker(std::shared_ptr<int> marker) {
+    (void)marker;
+    co_return;
+}
+
+task<void> create_unstarted_marked_child(
+    std::optional<task<void>>* output, std::shared_ptr<int> marker) {
+    output->emplace(retain_frame_marker(std::move(marker)));
+    co_return;
+}
+
 task<void> create_unstarted_direct_chain(
     std::optional<task<void>>* output,
     std::shared_ptr<task_execution_context>* nested_context) {
@@ -305,6 +316,49 @@ TEST_CASE("raw-resumed deferred task materializes a root context on direct await
     REQUIRE(
         elio::coro::detail::task_execution_context_allocations_for_test.load(
             std::memory_order_relaxed) == 2);
+}
+
+TEST_CASE("raw scheduler spawn keeps exception-safe frame ownership",
+          "[task][execution_context][scheduler][ownership][allocation]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::optional<task<void>> borrowed_child;
+    auto borrowed_marker = std::make_shared<int>(1);
+    std::weak_ptr<int> borrowed_observer = borrowed_marker;
+    auto borrowed_producer = create_unstarted_marked_child(
+        &borrowed_child, std::move(borrowed_marker));
+    resume_in_frame(borrowed_producer);
+    REQUIRE(borrowed_child.has_value());
+    REQUIRE_FALSE(get_handle(borrowed_child.value())
+                      .promise()
+                      .execution_context());
+
+    auto borrowed_handle = elio::coro::detail::task_access::release(
+        std::move(borrowed_child.value()));
+    elio::coro::detail::fail_next_task_execution_context_allocation_for_test
+        .store(true, std::memory_order_release);
+    REQUIRE_THROWS_AS(sched.try_spawn(borrowed_handle), std::bad_alloc);
+    REQUIRE_FALSE(borrowed_observer.expired());
+    borrowed_handle.destroy();
+    REQUIRE(borrowed_observer.expired());
+
+    std::optional<task<void>> owned_child;
+    auto owned_marker = std::make_shared<int>(1);
+    std::weak_ptr<int> owned_observer = owned_marker;
+    auto owned_producer = create_unstarted_marked_child(
+        &owned_child, std::move(owned_marker));
+    resume_in_frame(owned_producer);
+    REQUIRE(owned_child.has_value());
+
+    auto owned_handle = elio::coro::detail::task_access::release(
+        std::move(owned_child.value()));
+    elio::coro::detail::fail_next_task_execution_context_allocation_for_test
+        .store(true, std::memory_order_release);
+    REQUIRE_THROWS_AS(sched.spawn(owned_handle), std::bad_alloc);
+    REQUIRE(owned_observer.expired());
+
+    REQUIRE(sched.shutdown());
 }
 
 TEST_CASE("spawned children materialize independent execution contexts",

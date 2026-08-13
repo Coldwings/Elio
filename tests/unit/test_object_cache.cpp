@@ -159,6 +159,45 @@ TEST_CASE("object_cache construction failure and retry", "[object_cache]") {
     sched.shutdown();
 }
 
+TEST_CASE("object_cache retries sweep startup after context allocation failure",
+          "[object_cache][sweep][allocation][regression]") {
+    scheduler sched(1);
+    sched.start();
+
+    {
+        object_cache<std::string, int> cache;
+        bool allocation_failed = false;
+        int observed = 0;
+
+        auto h = spawn_joinable(sched, [&]() -> task<void> {
+            auto& fail_next_context_allocation =
+                elio::coro::detail::
+                    fail_next_task_execution_context_allocation_for_test;
+            fail_next_context_allocation.store(
+                true, std::memory_order_release);
+            try {
+                (void)co_await cache.get("first", []() -> task<int> {
+                    co_return 1;
+                });
+            } catch (const std::bad_alloc&) {
+                allocation_failed = true;
+            }
+
+            auto value = co_await cache.get("second", []() -> task<int> {
+                co_return 2;
+            });
+            observed = *value;
+        });
+
+        h.wait_destroyed();
+        REQUIRE_NOTHROW(h.await_resume());
+        REQUIRE(allocation_failed);
+        REQUIRE(observed == 2);
+    }
+
+    REQUIRE(sched.shutdown());
+}
+
 TEST_CASE("object_cache constructor destruction clears constructing entry",
           "[object_cache][construction][cancellation]") {
     using cache_type = object_cache<std::string, int>;

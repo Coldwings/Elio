@@ -26,6 +26,8 @@ struct task_execution_control_block;
 make_task_execution_context();
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 inline std::atomic<size_t> task_execution_context_allocations_for_test{0};
+inline std::atomic<bool> fail_next_task_execution_context_allocation_for_test{
+    false};
 #endif
 }
 
@@ -212,6 +214,12 @@ struct task_execution_control_block final {
 
 inline std::shared_ptr<task_execution_context>
 detail::make_task_execution_context() {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (fail_next_task_execution_context_allocation_for_test.exchange(
+            false, std::memory_order_acq_rel)) {
+        throw std::bad_alloc{};
+    }
+#endif
     auto control = std::make_shared<detail::task_execution_control_block>();
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     task_execution_context_allocations_for_test.fetch_add(

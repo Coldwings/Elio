@@ -1,10 +1,15 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/coro/frame.hpp>
 #include <elio/coro/task.hpp>
+#include <elio/coro/this_coro.hpp>
 #include <elio/io/io_context_identity.hpp>
 #include <elio/io/io_operation_guard.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <atomic>
+#include <chrono>
+#include <coroutine>
 #include <memory>
+#include <thread>
 
 using namespace elio::coro;
 using namespace elio::runtime;
@@ -59,6 +64,40 @@ task<void> capture_suspended_child(
 task<void> await_suspended_child(
     cancel_token* token, std::weak_ptr<task_execution_context>* weak) {
     co_await capture_suspended_child(token, weak);
+}
+
+struct capture_handle_awaitable final {
+    std::coroutine_handle<>* output;
+
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(std::coroutine_handle<> handle) const noexcept {
+        *output = handle;
+    }
+    void await_resume() const noexcept {}
+};
+
+task<void> expose_child_token_and_suspend(
+    std::coroutine_handle<>* child_handle, cancel_token* child_token) {
+    *child_token = this_coro::cancel_token();
+    co_await capture_handle_awaitable{child_handle};
+}
+
+task<void> await_named_child_and_continue(
+    std::coroutine_handle<>* child_handle, cancel_token* child_token,
+    std::atomic<bool>* parent_continued) {
+    auto child = expose_child_token_and_suspend(child_handle, child_token);
+    co_await child;
+    parent_continued->store(true, std::memory_order_release);
+}
+
+bool wait_for_flag(const std::atomic<bool>& flag) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!flag.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return flag.load(std::memory_order_acquire);
 }
 
 } // namespace
@@ -209,6 +248,50 @@ TEST_CASE("completed named children release parent cancellation links",
     REQUIRE_FALSE(weak_child.expired());
     escaped_token = {};
     REQUIRE(weak_child.expired());
+}
+
+TEST_CASE("child completion never waits for a parent cancellation callback",
+          "[task][execution_context][cancellation][thread][ownership]") {
+    std::coroutine_handle<> child_handle;
+    cancel_token child_token;
+    std::atomic<bool> callback_started{false};
+    std::atomic<bool> parent_continued{false};
+    std::atomic<bool> completion_returned{false};
+
+    auto parent = await_named_child_and_continue(
+        &child_handle, &child_token, &parent_continued);
+    auto parent_context = get_handle(parent).promise().execution_context();
+    get_handle(parent).resume();
+    // Raw test-only resume bypasses the scheduler's frame-context guard.
+    promise_base::set_current_frame(nullptr);
+    REQUIRE(child_handle);
+
+    // The test owns this ordinary registration outside the child frame so
+    // child completion isolates the task-parent link's non-blocking teardown.
+    auto blocking_registration = child_token.on_cancel([&] {
+        callback_started.store(true, std::memory_order_release);
+        while (!parent_continued.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    });
+
+    std::thread cancel_request([&] { parent_context->request_cancel(); });
+    REQUIRE(wait_for_flag(callback_started));
+
+    std::thread complete_child([&] {
+        child_handle.resume();
+        completion_returned.store(true, std::memory_order_release);
+    });
+    const bool completed_without_wait = wait_for_flag(completion_returned);
+
+    // On failure, release the callback so both threads can be joined and the
+    // test reports normally instead of hanging the entire suite.
+    parent_continued.store(true, std::memory_order_release);
+    complete_child.join();
+    cancel_request.join();
+
+    REQUIRE(completed_without_wait);
+    REQUIRE(get_handle(parent).done());
 }
 
 TEST_CASE("I/O pins override but do not rewrite user affinity",

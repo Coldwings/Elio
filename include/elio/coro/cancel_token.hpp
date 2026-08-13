@@ -221,6 +221,10 @@ private:
 };
 
 struct task_parent_callback_node final : callback_node {
+    // Completion and parent cancellation race through this one-shot gate.
+    // Whichever side exchanges true first defines whether propagation occurs;
+    // neither side waits for the other to finish.
+    std::atomic<bool> active{true};
     std::weak_ptr<cancel_state> parent_state;
 };
 
@@ -284,6 +288,27 @@ struct cancel_state {
             }
         }
         node->unregister_and_wait();
+    }
+
+    /// Best-effort list removal for task-parent links. Their callback payload
+    /// owns no frame state and is independently deactivated, so shared node
+    /// ownership makes it safe to let an in-progress dispatcher reclaim the
+    /// node without waiting on a scheduler worker.
+    void try_remove_task_parent_callback(
+        const std::shared_ptr<task_parent_callback_node>& node) noexcept {
+        if (!node) return;
+        std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return;
+
+        auto* link = &head;
+        while (*link) {
+            if (link->get() == node.get()) {
+                auto removed = std::move(*link);
+                *link = std::move(removed->next);
+                return;
+            }
+            link = &((*link)->next);
+        }
     }
 
     void trigger() {
@@ -365,11 +390,18 @@ public:
     task_parent_registration& operator=(
         const task_parent_registration&) = delete;
 
+    void deactivate() noexcept {
+        if (node_) {
+            node_->active.exchange(false, std::memory_order_acq_rel);
+        }
+    }
+
     void unregister() noexcept {
         auto node = std::move(node_);
         if (!node) return;
+        node->active.exchange(false, std::memory_order_acq_rel);
         if (auto parent = node->parent_state.lock()) {
-            parent->remove_callback(node);
+            parent->try_remove_task_parent_callback(node);
         }
     }
 
@@ -554,7 +586,17 @@ private:
 
         auto node = std::make_shared<detail::task_parent_callback_node>();
         node->parent_state = state_;
-        node->emplace(std::forward<F>(callback));
+        std::weak_ptr<detail::task_parent_callback_node> weak_node = node;
+        node->emplace(
+            [weak_node, callback = std::forward<F>(callback)]() mutable {
+                auto node = weak_node.lock();
+                if (!node ||
+                    !node->active.exchange(
+                        false, std::memory_order_acq_rel)) {
+                    return;
+                }
+                callback();
+            });
         if (!state_->add_callback_node(node)) return {};
         return detail::task_parent_registration{std::move(node)};
     }

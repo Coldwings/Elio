@@ -264,7 +264,7 @@ public:
     /// A named task object may retain the completed frame, but that ownership
     /// must not extend the logical parent/child cancellation relationship.
     void unlink_parent_cancellation() noexcept {
-        parent_cancellation_registration_.unregister();
+        parent_cancellation_registration_.deactivate();
         parent_cancellation_linked_ = false;
     }
 

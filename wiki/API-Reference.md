@@ -1333,11 +1333,13 @@ completion-scoped registration that weakly references the parent state and
 whose callback weakly references the child state. Consequently, an escaped
 child token retains neither the parent registration nor ancestor contexts, and
 a completed named child does not observe later parent cancellation even while
-its frame remains owned. A foreign coroutine promise is a cancellation
-boundary unless it deliberately bridges a token. A `join_handle` shares the
-spawned wrapper context, so cancellation remains race-safe without storing a
-raw promise pointer. Completion and cancellation of individual operations
-remain in their awaitable/backend state machines.
+its frame remains owned. Final suspend deactivates the link with a non-waiting
+atomic transition; it does not block a scheduler worker while a concurrent
+parent-cancellation callback finishes. A foreign coroutine promise is a
+cancellation boundary unless it deliberately bridges a token. A `join_handle`
+shares the spawned wrapper context, so cancellation remains race-safe without
+storing a raw promise pointer. Completion and cancellation of individual
+operations remain in their awaitable/backend state machines.
 
 In 0.6, standalone construction is no longer `noexcept` because it allocates an
 independent cancellation state. Runtime construction can likewise fail while

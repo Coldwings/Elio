@@ -58,7 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retain the same post-frame lifetime, callback, and propagation semantics,
   while completion-scoped parent links use weak ownership in both directions
   so an escaped child token retains neither the registration nor its ancestors
-  and a completed named child cannot observe later parent cancellation (#1032).
+  and a completed named child cannot observe later parent cancellation. Child
+  final suspend deactivates propagation through a non-waiting atomic gate, so
+  concurrent parent cancellation cannot block a scheduler worker (#1032).
   The previously public but undocumented
   `task_execution_context::link_parent_cancellation()` runtime hook is now
   promise-internal; callers should establish propagation by awaiting or

@@ -151,7 +151,8 @@ public:
 
     void mark_exited() noexcept {
         exited_.store(true, std::memory_order_release);
-        if (auto waiter = waiter_.take()) {
+        auto wake = waiter_.take();
+        if (auto waiter = wake.claim()) {
             elio::runtime::schedule_handle(waiter);
         }
     }

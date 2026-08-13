@@ -6,6 +6,7 @@
 #include <elio/time/timer.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <optional>
 #include <string>
 #include <thread>
@@ -639,6 +640,93 @@ TEST_CASE("object_cache release unregisters waiter when suspended release is des
     h.destroy();
     other.reset();
 
+    REQUIRE(release_continuations.load(std::memory_order_acquire) == 0);
+}
+
+TEST_CASE("object_cache release skips a waiter destroyed after selection",
+          "[object_cache][release][cancellation][lifetime][regression]") {
+    using cache_type = object_cache<std::string, int>;
+    using namespace elio::coro::detail;
+
+    cache_type cache({.num_shards = 4});
+    std::optional<cache_type::borrow> other;
+    std::atomic<int> published{0};
+    std::atomic<int> release_continuations{0};
+
+    struct hook_context {
+        std::atomic<int>* published;
+    } ctx{&published};
+
+    struct hook_guard {
+        hook_guard(void (*cb)(void*), void* ctx) {
+            detail_oc::release_waiter_published_hook.context.store(
+                ctx, std::memory_order_release);
+            detail_oc::release_waiter_published_hook.callback.store(
+                cb, std::memory_order_release);
+        }
+
+        ~hook_guard() {
+            detail_oc::release_waiter_published_hook.callback.store(
+                nullptr, std::memory_order_release);
+            detail_oc::release_waiter_published_hook.context.store(
+                nullptr, std::memory_order_release);
+        }
+    } guard{
+        [](void* raw) noexcept {
+            auto* c = static_cast<hook_context*>(raw);
+            c->published->fetch_add(1, std::memory_order_acq_rel);
+        },
+        &ctx};
+
+    auto waiter_task = [&]() -> task<void> {
+        auto releaser = co_await cache.get("selected_key", []() -> task<int> {
+            co_return 17;
+        });
+        other.emplace(co_await cache.get(
+            "selected_key", []() -> task<int> { co_return 19; }));
+
+        auto owned = co_await releaser.release();
+        release_continuations.fetch_add(1, std::memory_order_relaxed);
+        REQUIRE(owned != nullptr);
+    };
+
+    auto waiter = waiter_task();
+    auto handle = task_access::release(std::move(waiter));
+    handle.resume();
+    REQUIRE(published.load(std::memory_order_acquire) == 1);
+    REQUIRE(other.has_value());
+    REQUIRE(release_continuations.load(std::memory_order_acquire) == 0);
+
+    completion_wake_claim_paused_for_test.store(false,
+                                                std::memory_order_release);
+    pause_before_completion_wake_claim_for_test.store(
+        true, std::memory_order_release);
+    std::thread producer([&other] { other.reset(); });
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(5);
+    while (!completion_wake_claim_paused_for_test.load(
+               std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool claim_paused = completion_wake_claim_paused_for_test.load(
+        std::memory_order_acquire);
+    if (claim_paused) {
+        handle.destroy();
+    }
+    pause_before_completion_wake_claim_for_test.store(
+        false, std::memory_order_release);
+    pause_before_completion_wake_claim_for_test.notify_all();
+    producer.join();
+
+    completion_wake_claim_paused_for_test.store(false,
+                                                std::memory_order_release);
+    if (!claim_paused) {
+        handle.destroy();
+    }
+    REQUIRE(claim_paused);
+    REQUIRE_FALSE(other.has_value());
     REQUIRE(release_continuations.load(std::memory_order_acquire) == 0);
 }
 

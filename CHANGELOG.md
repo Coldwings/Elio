@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Completion waiter wake lifetime**: Join handles, task handles, task groups,
+  object-cache release waits, and RDMA pump-exit waits now retain a slot-owned
+  selected-wake lease between dequeue and scheduling. Destroying an awaiting
+  coroutine before scheduling ownership is claimed abandons that wake instead
+  of leaving completion with a stale raw coroutine handle (#1049).
 - **Autoscaler example task lifetime**: Each load phase now retains join handles
   and drains every submitted task before releasing its phase-local completion
   counter or beginning the low-load phase. The shorter workload and CI smoke

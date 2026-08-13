@@ -4,6 +4,7 @@
 #include <atomic>
 #include <climits>
 #include <chrono>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -774,6 +775,61 @@ TEST_CASE("task_scope retains its body callable until children drain",
     REQUIRE(child_observed_callable_alive.load(std::memory_order_acquire));
     REQUIRE(body_callable_destroyed.load(std::memory_order_acquire));
     sched.shutdown();
+}
+
+TEST_CASE("task_group completion skips a join waiter destroyed after selection",
+          "[task_group][cancellation][lifetime][regression]") {
+    using namespace elio::coro::detail;
+
+    scheduler sched(1);
+    sched.start();
+    auto state = std::make_shared<task_group_completion_state>(sched);
+    state->register_child();
+    std::atomic<bool> resumed{false};
+    std::atomic<bool> selected{false};
+
+    auto waiter_task = [state, &resumed]() -> task<void> {
+        co_await task_group_completion_state::all_done_awaitable(state);
+        resumed.store(true, std::memory_order_release);
+    };
+    auto waiter = waiter_task();
+    auto handle = task_access::release(std::move(waiter));
+    handle.resume();
+    REQUIRE_FALSE(handle.done());
+
+    completion_wake_claim_paused_for_test.store(false,
+                                                std::memory_order_release);
+    pause_before_completion_wake_claim_for_test.store(
+        true, std::memory_order_release);
+    std::thread producer([state, &selected] {
+        auto completion = state->child_finished();
+        selected.store(static_cast<bool>(completion.wake),
+                       std::memory_order_release);
+        resume_task_group_join_waiter(std::move(completion));
+    });
+
+    const bool claim_paused = wait_for_flag(
+        completion_wake_claim_paused_for_test);
+    if (claim_paused) {
+        handle.destroy();
+    }
+    pause_before_completion_wake_claim_for_test.store(
+        false, std::memory_order_release);
+    pause_before_completion_wake_claim_for_test.notify_all();
+    producer.join();
+
+    completion_wake_claim_paused_for_test.store(false,
+                                                std::memory_order_release);
+    const bool drained = sched.wait_for_idle(std::chrono::seconds(5));
+    sched.shutdown();
+    if (!claim_paused) {
+        handle.destroy();
+    }
+    REQUIRE(claim_paused);
+    REQUIRE(selected.load(std::memory_order_acquire));
+    REQUIRE_FALSE(resumed.load(std::memory_order_acquire));
+    REQUIRE(state->outstanding_children() == 0);
+    REQUIRE(drained);
 }
 
 TEST_CASE("task_scope survives rejected handoff after external body wakeup",

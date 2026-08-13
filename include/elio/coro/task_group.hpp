@@ -76,19 +76,23 @@ inline std::atomic<bool> task_group_join_observed_pending_for_test{false};
 
 struct task_group_child_completion final {
     runtime::scheduler* scheduler = nullptr;
-    std::coroutine_handle<> waiter{};
+    completion_wake_lease wake{};
 };
 
 inline void resume_task_group_join_waiter(
     task_group_child_completion completion) noexcept {
-    if (completion.scheduler->try_schedule(completion.waiter)) {
+    auto waiter = completion.wake.claim();
+    if (!waiter) {
+        return;
+    }
+    if (completion.scheduler->try_schedule(waiter)) {
         return;
     }
 
     if (is_scheduler_worker(completion.scheduler)) {
-        auto* promise = get_promise_base(completion.waiter.address());
+        auto* promise = get_promise_base(waiter.address());
         detail::frame_context_scope frame_scope(promise);
-        completion.waiter.resume();
+        waiter.resume();
         return;
     }
 
@@ -97,7 +101,7 @@ inline void resume_task_group_join_waiter(
     // lifetime contract that the scheduler runs until the group drains.
     while (completion.scheduler->is_running()) {
         std::this_thread::yield();
-        if (completion.scheduler->try_schedule(completion.waiter)) {
+        if (completion.scheduler->try_schedule(waiter)) {
             return;
         }
     }
@@ -162,9 +166,9 @@ public:
         }
 
         if (completed) {
-            auto waiter = all_done_waiter_.take();
-            if (waiter) {
-                return {scheduler_, waiter};
+            auto wake = all_done_waiter_.take();
+            if (wake) {
+                return {scheduler_, std::move(wake)};
             }
         }
         return {};
@@ -426,10 +430,10 @@ public:
             }
 #endif
             auto completion = completion_state->child_finished();
-            if (completion.waiter) {
+            if (completion.wake) {
                 // Failure state ownership is already released before either
                 // readiness or a registered join waiter can observe completion.
-                resume_task_group_join_waiter(completion);
+                resume_task_group_join_waiter(std::move(completion));
             }
         }
     }

@@ -4,7 +4,10 @@
 #include <climits>
 #include <coroutine>
 #include <atomic>
+#include <cstddef>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <vector>
 #include <algorithm>
 #include <utility>
@@ -47,18 +50,16 @@ public:
     class acquire_waiter : public elio::detail::intrusive_list_node<acquire_waiter> {
     public:
         explicit acquire_waiter(semaphore& s)
-            : sem_(s)
-            , wake_state_(detail::make_wake_state()) {}
+            : sem_(s) {}
 
         acquire_waiter(semaphore& s, bool cancellable)
             : sem_(s)
-            , wake_state_(detail::make_wake_state())
-            , cancellable_(cancellable) {}
+            , waiter_state_(cancellable) {}
 
         ~acquire_waiter() {
             // Fast path: if we never suspended, we were never enqueued,
             // so no wake function could hold a reference to us.
-            if (!suspended_) return;
+            if (!waiter_state_.suspended) return;
 
             detail::wake_state_ptr to_schedule;
             // Slow path: acquire mutex to prevent race with release()
@@ -66,13 +67,14 @@ public:
                 std::lock_guard<std::mutex> guard(sem_.mutex_);
                 if (this->is_linked()) {
                     sem_.waiters_.remove(this);
-                    detail::cancel_wake_state(wake_state_);
-                } else if (grant_pending_ && !resumed_) {
-                    detail::cancel_wake_state(wake_state_);
-                    grant_pending_ = false;
+                    detail::cancel_wake_state(waiter_state_.wake());
+                } else if (waiter_state_.grant_pending &&
+                           !waiter_state_.resumed) {
+                    detail::cancel_wake_state(waiter_state_.wake());
+                    waiter_state_.grant_pending = false;
                     to_schedule = sem_.recover_cancelled_handoff_locked();
                 } else {
-                    detail::cancel_wake_state(wake_state_);
+                    detail::cancel_wake_state(waiter_state_.wake());
                 }
             }
 
@@ -82,17 +84,17 @@ public:
         }
 
         bool await_ready_impl() const {
-            if (!cancellable_) {
+            if (!waiter_state_.cancellable) {
                 return sem_.try_acquire();
             }
 
-            if (wake_state_->was_cancelled()) {
+            if (waiter_state_->was_cancelled()) {
                 return true;
             }
             if (!sem_.try_acquire()) {
                 return false;
             }
-            if (detail::claim_wake_state(wake_state_) !=
+            if (detail::claim_wake_state(waiter_state_.wake()) !=
                 detail::wake_action::rejected) {
                 return true;
             }
@@ -102,35 +104,53 @@ public:
             return true;
         }
 
-        bool await_suspend_impl(std::coroutine_handle<> awaiter) noexcept {
-            if (!cancellable_) {
-                std::lock_guard<std::mutex> guard(sem_.mutex_);
-                if (sem_.count_ > 0) {
-                    --sem_.count_;
-                    return false;
-                }
+        bool await_suspend_impl(std::coroutine_handle<> awaiter) {
+            if (waiter_state_.cancellable) {
+                return await_suspend_cancellable_impl(awaiter);
+            }
+            return await_suspend_non_cancellable_impl(awaiter);
+        }
 
-                wake_state_->set_handle(awaiter);
-                sem_.waiters_.push_back(this);
-                suspended_ = true;
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-                detail::semaphore_waiter_publications_for_test.fetch_add(
-                    1, std::memory_order_release);
-#endif
-                return true;
+        bool await_suspend_non_cancellable_impl(
+                std::coroutine_handle<> awaiter) {
+            assert(!waiter_state_.cancellable);
+
+            // A release may outlive the coroutine frame after dequeuing this
+            // waiter, so an acquire that reaches suspension still needs
+            // independent shared ownership. Allocate before taking the queue
+            // lock so failure leaves both the permit count and queue unchanged.
+            waiter_state_.emplace();
+
+            std::lock_guard<std::mutex> guard(sem_.mutex_);
+            if (sem_.count_ > 0) {
+                --sem_.count_;
+                return false;
             }
 
+            waiter_state_->set_handle(awaiter);
+            sem_.waiters_.push_back(this);
+            waiter_state_.suspended = true;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            detail::semaphore_waiter_publications_for_test.fetch_add(
+                1, std::memory_order_release);
+#endif
+            return true;
+        }
+
+        bool await_suspend_cancellable_impl(
+                std::coroutine_handle<> awaiter) noexcept {
+            assert(waiter_state_.cancellable);
             detail::wake_state_ptr to_schedule;
             {
                 std::lock_guard<std::mutex> guard(sem_.mutex_);
 
-                if (wake_state_->was_cancelled()) {
+                if (waiter_state_->was_cancelled()) {
                     return false;
                 }
 
                 if (sem_.count_ > 0) {
                     --sem_.count_;
-                    if (detail::claim_wake_state(wake_state_) !=
+                    if (detail::claim_wake_state(waiter_state_.wake()) !=
                         detail::wake_action::rejected) {
                         return false;
                     }
@@ -139,22 +159,22 @@ public:
                     // another live waiter, or restore it to the count.
                     to_schedule = sem_.recover_cancelled_handoff_locked();
                 } else {
-                    if (!wake_state_->set_handle_blocked(awaiter)) {
+                    if (!waiter_state_->set_handle_blocked(awaiter)) {
                         return false;
                     }
                     sem_.waiters_.push_back(this);
-                    suspended_ = true;
+                    waiter_state_.suspended = true;
 #ifdef ELIO_RUNTIME_TEST_HOOKS
                     detail::semaphore_waiter_publications_for_test.fetch_add(
                         1, std::memory_order_release);
 #endif
 
-                    if (wake_state_->unblock_after_publish()) {
+                    if (waiter_state_->unblock_after_publish()) {
                         return true;
                     }
 
                     sem_.waiters_.remove(this);
-                    suspended_ = false;
+                    waiter_state_.suspended = false;
                 }
             }
 
@@ -165,42 +185,109 @@ public:
         }
 
         coro::cancel_result await_resume_impl() noexcept {
-            if (!cancellable_) {
-                resumed_ = true;
-                grant_pending_ = false;
-                suspended_ = false;
+            if (!waiter_state_.cancellable) {
+                waiter_state_.resumed = true;
+                waiter_state_.grant_pending = false;
+                waiter_state_.suspended = false;
                 return coro::cancel_result::completed;
             }
 
-            if (wake_state_->was_cancelled()) {
-                if (suspended_) {
+            if (waiter_state_->was_cancelled()) {
+                if (waiter_state_.suspended) {
                     std::lock_guard<std::mutex> guard(sem_.mutex_);
                     if (this->is_linked()) {
                         sem_.waiters_.remove(this);
                     }
-                    suspended_ = false;
+                    waiter_state_.suspended = false;
                 }
                 return coro::cancel_result::cancelled;
             }
 
-            resumed_ = true;
-            grant_pending_ = false;
-            suspended_ = false;
+            waiter_state_.resumed = true;
+            waiter_state_.grant_pending = false;
+            waiter_state_.suspended = false;
             return coro::cancel_result::completed;
         }
 
     protected:
         const detail::wake_state_ptr& cancellation_wake_state() const noexcept {
-            return wake_state_;
+            return waiter_state_.wake();
         }
 
     private:
+        class waiter_state {
+        public:
+            waiter_state() noexcept = default;
+
+            explicit waiter_state(bool is_cancellable)
+                : cancellable(is_cancellable) {
+                if (!is_cancellable) return;
+
+                ::new (static_cast<void*>(storage_))
+                    detail::wake_state_ptr(detail::make_wake_state());
+                // Publish engagement only after placement construction
+                // succeeds; a throwing allocation leaves no active object.
+                engaged = true;
+            }
+
+            ~waiter_state() {
+                if (engaged) {
+                    std::destroy_at(std::addressof(storage_ref()));
+                }
+            }
+
+            waiter_state(const waiter_state&) = delete;
+            waiter_state& operator=(const waiter_state&) = delete;
+            waiter_state(waiter_state&&) = delete;
+            waiter_state& operator=(waiter_state&&) = delete;
+
+            void emplace() {
+                assert(!engaged);
+                ::new (static_cast<void*>(storage_))
+                    detail::wake_state_ptr(detail::make_wake_state());
+                // A failed allocation leaves the slot disengaged.
+                engaged = true;
+            }
+
+            [[nodiscard]] const detail::wake_state_ptr& wake() const noexcept {
+                assert(engaged);
+                return storage_ref();
+            }
+
+            [[nodiscard]] detail::wake_state* operator->() const noexcept {
+                return wake().get();
+            }
+
+            bool engaged = false;
+            bool cancellable = false;
+            bool suspended = false;
+            bool resumed = false;
+            bool grant_pending = false;
+
+        private:
+            detail::wake_state_ptr& storage_ref() noexcept {
+                return *std::launder(storage_ptr());
+            }
+
+            const detail::wake_state_ptr& storage_ref() const noexcept {
+                return *std::launder(storage_ptr());
+            }
+
+            detail::wake_state_ptr* storage_ptr() noexcept {
+                return reinterpret_cast<detail::wake_state_ptr*>(storage_);
+            }
+
+            const detail::wake_state_ptr* storage_ptr() const noexcept {
+                return reinterpret_cast<const detail::wake_state_ptr*>(
+                    storage_);
+            }
+
+            alignas(detail::wake_state_ptr)
+                std::byte storage_[sizeof(detail::wake_state_ptr)];
+        };
+
         semaphore& sem_;
-        detail::wake_state_ptr wake_state_;
-        bool cancellable_ = false;
-        bool suspended_ = false;  // True if enqueued in waiters_
-        bool resumed_ = false;    // True after a popped waiter resumes normally
-        bool grant_pending_ = false;  // True after release() transfers a permit
+        waiter_state waiter_state_;
 
         friend class semaphore;
     };
@@ -219,6 +306,11 @@ public:
             cancel_registration_.unregister();
         }
 
+        bool await_suspend_impl(
+                std::coroutine_handle<> awaiter) noexcept {
+            return await_suspend_cancellable_impl(awaiter);
+        }
+
         coro::cancel_result await_resume_cancellable() noexcept {
             cancel_registration_.unregister();
             return await_resume_impl();
@@ -233,8 +325,8 @@ public:
         explicit acquire_awaitable(semaphore& s) : waiter_(s) {}
 
         bool await_ready() const noexcept { return waiter_.await_ready_impl(); }
-        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            return waiter_.await_suspend_impl(awaiter);
+        bool await_suspend(std::coroutine_handle<> awaiter) {
+            return waiter_.await_suspend_non_cancellable_impl(awaiter);
         }
         void await_resume() noexcept {
             (void)waiter_.await_resume_impl();
@@ -262,7 +354,9 @@ public:
         cancellable_acquire_waiter waiter_;
     };
 
-    /// Acquire (decrement) the semaphore.
+    /// Acquire (decrement) the semaphore. A ready no-token acquire completes
+    /// without allocation. Suspension allocates shared wake state and can
+    /// propagate std::bad_alloc from await_suspend().
     auto acquire() {
         return acquire_awaitable(*this);
     }
@@ -325,14 +419,14 @@ private:
     detail::wake_state_ptr claim_waiter_locked() noexcept {
         while (!waiters_.empty()) {
             auto* waiter = waiters_.pop_front();
-            if (waiter->cancellable_) {
-                if (detail::claim_wake_state(waiter->wake_state_) ==
+            if (waiter->waiter_state_.cancellable) {
+                if (detail::claim_wake_state(waiter->waiter_state_.wake()) ==
                     detail::wake_action::rejected) {
                     continue;
                 }
             }
-            waiter->grant_pending_ = true;
-            return waiter->wake_state_;
+            waiter->waiter_state_.grant_pending = true;
+            return waiter->waiter_state_.wake();
         }
 
         return nullptr;

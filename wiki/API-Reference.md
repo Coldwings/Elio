@@ -3537,6 +3537,17 @@ public:
 };
 ```
 
+The no-token `acquire()` completes without wake-state allocation when a permit
+is immediately available. If the ready check observes no permit, suspension
+creates independently owned wake state before entering the semaphore queue
+critical section. `await_suspend()` may therefore propagate `std::bad_alloc`,
+but allocation failure does not consume a permit or publish a waiter. If a
+permit released between `await_ready()` and `await_suspend()` remains
+available, the locked recheck consumes it; that race can perform one unused
+allocation without losing the permit. Token-aware acquires create arbitration
+state eagerly so cancellation can race permit handoff with exactly one terminal
+result.
+
 ---
 
 ## Timers (`elio::time`)

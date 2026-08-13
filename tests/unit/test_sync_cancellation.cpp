@@ -417,6 +417,240 @@ TEST_CASE("mutex fast paths defer wake-state allocation",
     }
 }
 
+TEST_CASE("semaphore ready path defers wake-state allocation",
+          "[sync][semaphore][allocation]") {
+    auto& allocations =
+        elio::sync::detail::wake_state_allocations_for_test;
+    auto& publications =
+        elio::sync::detail::semaphore_waiter_publications_for_test;
+    auto& fail_next =
+        elio::sync::detail::fail_next_wake_state_allocation_for_test;
+    fail_next.store(false, std::memory_order_relaxed);
+    allocations.store(0, std::memory_order_relaxed);
+    publications.store(0, std::memory_order_relaxed);
+
+    SECTION("ready acquire") {
+        semaphore sem(1);
+        auto waiter = sem.acquire();
+        static_assert(!noexcept(
+            waiter.await_suspend(std::noop_coroutine())));
+
+        REQUIRE(waiter.await_ready());
+        waiter.await_resume();
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 0);
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("parked acquire") {
+        semaphore sem(0);
+        auto waiter = sem.acquire();
+
+        REQUIRE_FALSE(waiter.await_ready());
+        REQUIRE(waiter.await_suspend(std::noop_coroutine()));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 1);
+
+        sem.release();
+        REQUIRE(sem.count() == 0);
+        waiter.await_resume();
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("explicit non-cancellable waiter defers its state") {
+        semaphore ready_sem(1);
+        {
+            semaphore::acquire_waiter waiter(ready_sem, false);
+
+            REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+            REQUIRE(waiter.await_ready_impl());
+            REQUIRE(waiter.await_resume_impl() == cancel_result::completed);
+            REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+            REQUIRE(publications.load(std::memory_order_relaxed) == 0);
+        }
+        REQUIRE(ready_sem.count() == 0);
+
+        semaphore parked_sem(0);
+        {
+            semaphore::acquire_waiter waiter(parked_sem, false);
+
+            REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+            REQUIRE_FALSE(waiter.await_ready_impl());
+            REQUIRE(waiter.await_suspend_impl(std::noop_coroutine()));
+            REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+            REQUIRE(publications.load(std::memory_order_relaxed) == 1);
+
+            parked_sem.release();
+            REQUIRE(waiter.await_resume_impl() == cancel_result::completed);
+        }
+        REQUIRE(parked_sem.count() == 0);
+    }
+
+    SECTION("explicit cancellable base waiter keeps suspend compatibility") {
+        semaphore sem(0);
+        semaphore::acquire_waiter waiter(sem, true);
+        static_assert(!noexcept(
+            waiter.await_suspend_impl(std::noop_coroutine())));
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE_FALSE(waiter.await_ready_impl());
+        REQUIRE(waiter.await_suspend_impl(std::noop_coroutine()));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 1);
+
+        sem.release();
+        REQUIRE(waiter.await_resume_impl() == cancel_result::completed);
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("direct cancellable waiter keeps noexcept suspend compatibility") {
+        semaphore sem(0);
+        cancel_source source;
+        semaphore::cancellable_acquire_waiter waiter(
+            sem, source.get_token());
+        static_assert(noexcept(
+            waiter.await_suspend_impl(std::noop_coroutine())));
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE_FALSE(waiter.await_ready_impl());
+        REQUIRE(waiter.await_suspend_impl(std::noop_coroutine()));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 1);
+
+        sem.release();
+        REQUIRE(waiter.await_resume_cancellable() ==
+                cancel_result::completed);
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("release between ready and suspend") {
+        semaphore sem(0);
+        auto waiter = sem.acquire();
+
+        REQUIRE_FALSE(waiter.await_ready());
+        sem.release();
+        REQUIRE_FALSE(waiter.await_suspend(std::noop_coroutine()));
+        waiter.await_resume();
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 0);
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("another acquire may consume an unpublished permit") {
+        semaphore sem(0);
+        auto first = sem.acquire();
+        REQUIRE_FALSE(first.await_ready());
+
+        sem.release();
+        auto next = sem.acquire();
+        REQUIRE(next.await_ready());
+        next.await_resume();
+        REQUIRE(sem.count() == 0);
+
+        REQUIRE(first.await_suspend(std::noop_coroutine()));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 1);
+
+        sem.release();
+        first.await_resume();
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("allocation failure leaves an empty semaphore unchanged") {
+        semaphore sem(0);
+        {
+            auto waiter = sem.acquire();
+            REQUIRE_FALSE(waiter.await_ready());
+            fail_next.store(true, std::memory_order_release);
+            REQUIRE_THROWS_AS(
+                waiter.await_suspend(std::noop_coroutine()), std::bad_alloc);
+        }
+
+        REQUIRE_FALSE(fail_next.load(std::memory_order_acquire));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 0);
+        REQUIRE(sem.count() == 0);
+
+        sem.release();
+        auto next = sem.acquire();
+        REQUIRE(next.await_ready());
+        next.await_resume();
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("allocation failure preserves a concurrently released permit") {
+        semaphore sem(0);
+        {
+            auto waiter = sem.acquire();
+            REQUIRE_FALSE(waiter.await_ready());
+            sem.release();
+            fail_next.store(true, std::memory_order_release);
+            REQUIRE_THROWS_AS(
+                waiter.await_suspend(std::noop_coroutine()), std::bad_alloc);
+        }
+
+        REQUIRE_FALSE(fail_next.load(std::memory_order_acquire));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 0);
+        REQUIRE(sem.count() == 1);
+
+        auto next = sem.acquire();
+        REQUIRE(next.await_ready());
+        next.await_resume();
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("cancellable ready acquire keeps eager arbitration state") {
+        semaphore sem(1);
+        cancel_source source;
+        auto waiter = sem.acquire(source.get_token());
+        static_assert(noexcept(
+            waiter.await_suspend(std::noop_coroutine())));
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(waiter.await_ready());
+        REQUIRE(waiter.await_resume() == cancel_result::completed);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 0);
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("cancellable parked acquire keeps eager arbitration state") {
+        semaphore sem(0);
+        cancel_source source;
+        auto waiter = sem.acquire(source.get_token());
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE_FALSE(waiter.await_ready());
+        REQUIRE(waiter.await_suspend(std::noop_coroutine()));
+        REQUIRE(publications.load(std::memory_order_relaxed) == 1);
+
+        sem.release();
+        REQUIRE(waiter.await_resume() == cancel_result::completed);
+        REQUIRE(sem.count() == 0);
+    }
+
+    SECTION("cancellable construction failure leaves semaphore unchanged") {
+        semaphore sem(1);
+        cancel_source source;
+        fail_next.store(true, std::memory_order_release);
+
+        REQUIRE_THROWS_AS(
+            (void)sem.acquire(source.get_token()), std::bad_alloc);
+
+        REQUIRE_FALSE(fail_next.load(std::memory_order_acquire));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 0);
+        REQUIRE(sem.count() == 1);
+
+        auto next = sem.acquire();
+        REQUIRE(next.await_ready());
+        next.await_resume();
+        REQUIRE(sem.count() == 0);
+    }
+}
+
 TEST_CASE("runtime cancellation wakes basic sync waits",
           "[sync][cancellation][cancel_token][runtime]") {
     scheduler sched(2);
@@ -1720,6 +1954,7 @@ TEST_CASE("semaphore release does not schedule a waiter destroyed after dequeue"
 
     sem.release(2);
     destroyer.join();
+    REQUIRE(sem.count() == 1);
 }
 
 TEST_CASE("shared_mutex reader wake does not schedule a waiter destroyed after dequeue",

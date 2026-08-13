@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Allocation-free ready semaphore acquires**: Non-cancellable acquires now
+  defer shared wake-state allocation until the ready permit check fails.
+  Entering `await_suspend` allocates before taking the semaphore queue lock,
+  even if its locked recheck consumes a released permit. This preserves permit
+  accounting and dequeue-versus-frame-destruction safety. Token-aware acquires
+  retain eager cancellation state (#1039).
 - **Allocation-free uncontended mutex locks**: Non-cancellable locks now defer
   shared wake-state allocation until both the initial acquisition and the
   suspension-entry recheck observe contention. Truly parked waiters retain

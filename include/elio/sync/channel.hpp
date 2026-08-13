@@ -33,7 +33,7 @@ inline std::atomic<bool> bounded_recv_paused_after_failed_pop_for_test{false};
 template<typename T>
 class channel {
 public:
-    // Forward declarations for intrusive_list
+    // Public awaitable declarations
     class send_awaitable;
     class cancellable_send_awaitable;
     class recv_awaitable;
@@ -101,16 +101,17 @@ public:
     channel(channel&&) = delete;
     channel& operator=(channel&&) = delete;
 
-    /// Send awaitable — handles both bounded and rendezvous channels.
-    /// Stores handle + value. Inherits intrusive_list_node for safe unlinking.
-    class send_awaitable : public elio::detail::intrusive_list_node<send_awaitable> {
+private:
+    class send_waiter_core
+        : public elio::detail::intrusive_list_node<send_waiter_core> {
     public:
-        send_awaitable(channel& ch, T value)
+        send_waiter_core(channel& ch, T& value, bool cancellable = false)
             : ch_(ch)
-            , value_(std::move(value))
-            , wake_state_(detail::make_wake_state()) {}
+            , value_(std::addressof(value))
+            , wake_state_(detail::make_wake_state())
+            , cancellable_(cancellable) {}
 
-        ~send_awaitable() {
+        ~send_waiter_core() {
             // Fast path: if we never suspended, we were never enqueued
             if (!suspended_) return;
 
@@ -145,14 +146,14 @@ public:
                     if (auto* receiver = ch_.claim_receiver_locked()) {
                         to_schedule = receiver->wake_state_;
                         if (claim_completion()) {
-                            ch_.queue_.push(std::move(value_));
+                            ch_.queue_.push(std::move(*value_));
                             success_ = true;
                         }
                         should_suspend = false;
                     }
                 } else if (ch_.is_unbounded()) {
                     if (claim_completion()) {
-                        ch_.queue_.push(std::move(value_));
+                        ch_.queue_.push(std::move(*value_));
                         success_ = true;
                         if (auto* receiver = ch_.claim_receiver_locked()) {
                             to_schedule = receiver->wake_state_;
@@ -164,7 +165,7 @@ public:
                     if (ch_.ring_->size() < ch_.capacity_ &&
                         ch_.ring_->can_push()) {
                         if (claim_completion()) {
-                            const bool pushed = ch_.ring_->try_push(value_);
+                            const bool pushed = ch_.ring_->try_push(*value_);
                             assert(pushed);
                             (void)pushed;
                             success_ = true;
@@ -219,13 +220,6 @@ public:
             return success_;
         }
 
-    protected:
-        send_awaitable(channel& ch, T value, bool cancellable)
-            : ch_(ch)
-            , value_(std::move(value))
-            , wake_state_(detail::make_wake_state())
-            , cancellable_(cancellable) {}
-
         const detail::wake_state_ptr& cancellation_wake_state() const noexcept {
             return wake_state_;
         }
@@ -246,21 +240,96 @@ public:
             return {success_, coro::cancel_result::completed};
         }
 
-    private:
         bool claim_completion() noexcept {
             return !cancellable_ ||
                    detail::claim_wake_state(wake_state_) !=
                        detail::wake_action::rejected;
         }
 
+        T& value() noexcept { return *value_; }
+        void mark_success() noexcept { success_ = true; }
+        const detail::wake_state_ptr& wake_state() const noexcept {
+            return wake_state_;
+        }
+        bool is_cancellable() const noexcept { return cancellable_; }
+
+    private:
         channel& ch_;
-        T value_;
+        T* value_;
         detail::wake_state_ptr wake_state_;
         bool success_ = false;
         bool suspended_ = false;  // True if enqueued in send_waiters_
         bool cancellable_ = false;
+    };
 
-        friend class channel;
+    class borrowed_cancellable_send_awaitable {
+    public:
+        borrowed_cancellable_send_awaitable(
+                channel& ch, T& value, coro::cancel_token token)
+            : core_(ch, value, true) {
+            cancel_registration_ = token.on_cancel(
+                [state = core_.cancellation_wake_state()] {
+                state->request_cancel();
+            });
+        }
+
+        ~borrowed_cancellable_send_awaitable() {
+            cancel_registration_.unregister();
+        }
+
+        bool await_ready() const noexcept {
+            return core_.cancellation_wake_state()->was_cancelled();
+        }
+
+        bool await_suspend(std::coroutine_handle<> h) noexcept {
+            return core_.await_suspend(h);
+        }
+
+        cancellable_send_result await_resume() noexcept {
+            cancel_registration_.unregister();
+            return core_.await_resume_cancellable();
+        }
+
+    private:
+        send_waiter_core core_;
+        coro::cancel_token::registration cancel_registration_;
+    };
+
+public:
+    /// Send awaitable — handles both bounded and rendezvous channels.
+    /// Directly constructed awaiters own their value independently.
+    class send_awaitable
+        : public elio::detail::intrusive_list_node<send_awaitable> {
+    public:
+        send_awaitable(channel& ch, T value)
+            : value_(std::move(value))
+            , core_(ch, value_) {}
+
+        bool await_ready() const noexcept { return core_.await_ready(); }
+
+        bool await_suspend(std::coroutine_handle<> h) noexcept {
+            return core_.await_suspend(h);
+        }
+
+        bool await_resume() noexcept { return core_.await_resume(); }
+        bool is_linked() const noexcept { return core_.is_linked(); }
+
+    protected:
+        send_awaitable(channel& ch, T value, bool cancellable)
+            : value_(std::move(value))
+            , core_(ch, value_, cancellable) {}
+
+        const detail::wake_state_ptr& cancellation_wake_state() const noexcept {
+            return core_.cancellation_wake_state();
+        }
+
+        cancellable_send_result await_resume_cancellable() noexcept {
+            return core_.await_resume_cancellable();
+        }
+
+    private:
+        T value_;
+        send_waiter_core core_;
     };
 
     class cancellable_send_awaitable : public send_awaitable {
@@ -492,8 +561,8 @@ public:
             }
         }
 
-        // Suspend via send_awaitable
-        send_awaitable awaitable{*this, std::move(value)};
+        // The coroutine frame owns value for the complete suspended lifetime.
+        send_waiter_core awaitable{*this, value};
         bool pushed = co_await awaitable;
 
         if (pushed) {
@@ -506,8 +575,8 @@ public:
     /// A cancellation winner does not transfer the value into the channel.
     coro::task<cancellable_send_result> send(
             T value, coro::cancel_token token) {
-        co_return co_await cancellable_send_awaitable(
-            *this, std::move(value), std::move(token));
+        co_return co_await borrowed_cancellable_send_awaitable(
+            *this, value, std::move(token));
     }
 
     /// Try to send without waiting
@@ -583,9 +652,9 @@ public:
                 {
                     std::lock_guard<std::mutex> guard(mutex_);
                     if (auto* sender = claim_sender_locked()) {
-                        result = std::optional<T>(std::move(sender->value_));
-                        sender->success_ = true;
-                        sender_handle = sender->wake_state_;
+                        result = std::optional<T>(std::move(sender->value()));
+                        sender->mark_success();
+                        sender_handle = sender->wake_state();
                     } else if (closed_.load(std::memory_order_acquire)) {
                         if (!queue_.empty()) {
                             result = std::move(queue_.front());
@@ -623,9 +692,9 @@ public:
                     auto* sender = claim_sender_locked();
                     if (sender) {
                         result = std::optional<T>(
-                            std::move(sender->value_));
-                        sender->success_ = true;
-                        sender_handle = sender->wake_state_;
+                            std::move(sender->value()));
+                        sender->mark_success();
+                        sender_handle = sender->wake_state();
                     } else if (closed_.load(std::memory_order_acquire)) {
                         result = std::nullopt;
                     } else {
@@ -713,9 +782,9 @@ public:
                             resolved = true;
                         } else if (auto* sender = claim_sender_locked()) {
                             result = std::optional<T>(
-                                std::move(sender->value_));
-                            sender->success_ = true;
-                            sender_handle = sender->wake_state_;
+                                std::move(sender->value()));
+                            sender->mark_success();
+                            sender_handle = sender->wake_state();
                             resolved = true;
                         } else {
                             retry = true;
@@ -739,9 +808,9 @@ public:
                     if (!awaitable.claim_completion()) {
                         resolved = true;
                     } else if (auto* sender = claim_sender_locked()) {
-                        result = std::optional<T>(std::move(sender->value_));
-                        sender->success_ = true;
-                        sender_handle = sender->wake_state_;
+                        result = std::optional<T>(std::move(sender->value()));
+                        sender->mark_success();
+                        sender_handle = sender->wake_state();
                         resolved = true;
                     } else {
                         retry = true;
@@ -836,9 +905,9 @@ public:
                     if (!sender) {
                         return std::nullopt;
                     }
-                    result = std::optional<T>(std::move(sender->value_));
-                    sender->success_ = true;
-                    sender_handle = sender->wake_state_;
+                    result = std::optional<T>(std::move(sender->value()));
+                    sender->mark_success();
+                    sender_handle = sender->wake_state();
                 } else {
                     return std::nullopt;
                 }
@@ -873,18 +942,18 @@ public:
                     queue_.push(std::move(*val));
                 }
                 while (auto* sender = claim_sender_locked()) {
-                    queue_.push(std::move(sender->value_));
-                    sender->success_ = true;  // Value was delivered to queue
-                    to_schedule.push_back(sender->wake_state_);
+                    queue_.push(std::move(sender->value()));
+                    sender->mark_success();  // Value was delivered to queue
+                    to_schedule.push_back(sender->wake_state());
                 }
             }
 
             // Drain rendezvous send_waiters_
             if (is_rendezvous()) {
                 while (auto* sender = claim_sender_locked()) {
-                    queue_.push(std::move(sender->value_));
-                    sender->success_ = true;  // Value was delivered to queue
-                    to_schedule.push_back(sender->wake_state_);
+                    queue_.push(std::move(sender->value()));
+                    sender->mark_success();  // Value was delivered to queue
+                    to_schedule.push_back(sender->wake_state());
                 }
             }
 
@@ -947,11 +1016,11 @@ private:
         return nullptr;
     }
 
-    send_awaitable* claim_sender_locked() noexcept {
+    send_waiter_core* claim_sender_locked() noexcept {
         while (!send_waiters_.empty()) {
             auto* sender = send_waiters_.pop_front();
-            if (sender->cancellable_ &&
-                detail::claim_wake_state(sender->wake_state_) ==
+            if (sender->is_cancellable() &&
+                detail::claim_wake_state(sender->wake_state()) ==
                     detail::wake_action::rejected) {
                 continue;
             }
@@ -990,11 +1059,11 @@ private:
                     return;
                 }
 
-                const bool pushed = ring_->try_push(sender->value_);
+                const bool pushed = ring_->try_push(sender->value());
                 assert(pushed);
                 (void)pushed;
-                sender->success_ = true;
-                sender_handle = sender->wake_state_;
+                sender->mark_success();
+                sender_handle = sender->wake_state();
                 if (auto* receiver = claim_receiver_locked()) {
                     receiver_handle = receiver->wake_state_;
                 }
@@ -1024,7 +1093,7 @@ private:
     std::unique_ptr<LockfreeMPMCRing<T>> ring_;
     std::queue<T> queue_;
     elio::detail::intrusive_list<recv_awaitable> recv_waiters_;
-    elio::detail::intrusive_list<send_awaitable> send_waiters_;
+    elio::detail::intrusive_list<send_waiter_core> send_waiters_;
     size_t capacity_;
     std::atomic<bool> closed_;
 };

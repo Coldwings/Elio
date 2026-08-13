@@ -536,6 +536,25 @@ bool pushed = ring.try_push(value);
 auto popped = ring.try_pop();
 ```
 
+The `channel<T>::send(...)` task stores one by-value `T` in its coroutine frame.
+When a bounded or rendezvous send must wait, its intrusive waiter borrows that
+same frame-owned object rather than moving it into a second `T` subobject. The
+reduction is approximately one payload region for large inline types and
+applies to both ordinary and token-aware sends. It does not change the delivery
+move: the payload is transferred only after normal completion wins. Public
+awaiter objects constructed directly by callers still own one independent
+payload so their lifetime does not depend on a constructor argument.
+
+`bench_channel_send_frame` reports requested coroutine-frame bytes,
+allocator-usable bytes where the platform exposes them,
+construction/destruction cost for naturally aligned 8/64/256/1024-byte inline
+payloads, ready bounded/unbounded sends, and forced bounded-full/rendezvous
+handoffs with and without active tokens. Its allocation recorder is isolated
+from the ordinary `bench_channel` executable. Compare Release builds with
+pinned, interleaved baseline/candidate samples; the benchmark intentionally
+does not impose timing thresholds on shared CI runners. Pass `--smoke` for
+reduced iteration counts when validating a Debug build.
+
 ## Network Performance
 
 ### Connection Pooling

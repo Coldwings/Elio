@@ -3514,6 +3514,15 @@ public:
 };
 ```
 
+Both `send` overloads take their payload by value, so the returned task owns it
+in the coroutine frame until delivery, cancellation, closure, or task
+destruction resolves the operation. The internal queued waiter borrows that
+frame-owned object and transfers it only after normal completion wins. It does
+not add a second `T` to the frame. This is an implementation detail of the task
+wrappers: directly constructed `send_awaitable` and
+`cancellable_send_awaitable` objects continue to own their payload and may
+outlive the expression that supplied it.
+
 ### `semaphore`
 
 Counting semaphore.

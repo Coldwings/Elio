@@ -392,15 +392,20 @@ public:
 
     void deactivate() noexcept {
         if (node_) {
-            node_->active.exchange(false, std::memory_order_acq_rel);
+            // The callback's exchange decides whether propagation won. The
+            // completion side does not consume prior callback writes, so a
+            // release store is sufficient and avoids an unnecessary RMW.
+            node_->active.store(false, std::memory_order_release);
         }
     }
 
     void unregister() noexcept {
         auto node = std::move(node_);
         if (!node) return;
-        node->active.exchange(false, std::memory_order_acq_rel);
+        node->active.store(false, std::memory_order_release);
         if (auto parent = node->parent_state.lock()) {
+            // Failure only leaves an inactive, weak-reference-only node for
+            // the parent cancellation state or dispatcher to reclaim later.
             parent->try_remove_task_parent_callback(node);
         }
     }

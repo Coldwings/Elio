@@ -143,7 +143,8 @@ struct join_state_base {
 
     void complete() {
         completed_.store(true, std::memory_order_release);
-        auto waiter = waiter_.take();
+        auto wake = waiter_.take();
+        auto waiter = wake.claim();
         if (waiter) {
             runtime::schedule_handle(waiter);
         }

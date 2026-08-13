@@ -122,7 +122,8 @@ struct task_state {
     }
 
     void notify_waiter() {
-        auto waiter = waiter_.take();
+        auto wake = waiter_.take();
+        auto waiter = wake.claim();
         if (waiter) {
             runtime::schedule_handle(waiter);
         }
@@ -204,7 +205,8 @@ struct task_state<void> {
     }
 
     void notify_waiter() {
-        auto waiter = waiter_.take();
+        auto wake = waiter_.take();
+        auto waiter = wake.claim();
         if (waiter) {
             runtime::schedule_handle(waiter);
         }

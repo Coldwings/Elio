@@ -14,7 +14,9 @@
 #include <chrono>
 #include <latch>
 #include <memory>
+#include <optional>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include "../test_main.cpp"  // For scaled timeouts
@@ -607,6 +609,197 @@ TEST_CASE("destroyed join_handle waiter is unregistered",
 
     h.destroy();
     state->set_value();
+}
+
+TEST_CASE("completion wake lease preserves slot ownership transitions",
+          "[task][completion_waiter][lifetime][regression]") {
+    using elio::coro::detail::completion_waiter;
+    using elio::coro::detail::completion_waiter_slot;
+    using elio::coro::detail::completion_wake_lease;
+
+    STATIC_REQUIRE(std::is_nothrow_move_constructible_v<completion_waiter>);
+    STATIC_REQUIRE(std::is_nothrow_move_assignable_v<completion_waiter>);
+    STATIC_REQUIRE(std::is_nothrow_move_constructible_v<completion_wake_lease>);
+    STATIC_REQUIRE(std::is_nothrow_move_assignable_v<completion_wake_lease>);
+    STATIC_REQUIRE(sizeof(completion_waiter) == sizeof(completion_wake_lease));
+    STATIC_REQUIRE(sizeof(completion_waiter_slot) <=
+                   sizeof(std::mutex) + 4 * sizeof(void*));
+    INFO("completion_waiter_slot=" << sizeof(completion_waiter_slot)
+         << ", completion_waiter=" << sizeof(completion_waiter)
+         << ", completion_wake_lease=" << sizeof(completion_wake_lease)
+         << ", join_state_base="
+         << sizeof(elio::coro::detail::join_state_base)
+         << ", task_state<void>="
+         << sizeof(elio::coro::detail::task_state<void>)
+         << ", task_state<int>="
+         << sizeof(elio::coro::detail::task_state<int>));
+
+    SECTION("lease destruction abandons the selected wake") {
+        completion_waiter_slot slot;
+        completion_waiter waiter(slot);
+        const auto handle = std::noop_coroutine();
+
+        REQUIRE(slot.register_waiter(waiter, handle, [] { return false; }));
+        {
+            auto wake = slot.take();
+            REQUIRE(wake);
+            REQUIRE_FALSE(slot.take());
+            STATIC_REQUIRE(noexcept(wake.claim()));
+        }
+
+        REQUIRE(slot.register_waiter(waiter, handle, [] { return false; }));
+        auto wake = slot.take();
+        REQUIRE(wake.claim() == handle);
+    }
+
+    SECTION("ready registration remains side-effect free") {
+        completion_waiter_slot slot;
+        completion_waiter waiter(slot);
+        const auto handle = std::noop_coroutine();
+
+        REQUIRE_FALSE(slot.register_waiter(
+            waiter, handle, [] { return true; }));
+        REQUIRE_FALSE(slot.take());
+    }
+
+    SECTION("an abandoned generation cannot claim a reused slot") {
+        completion_waiter_slot slot;
+        std::optional<completion_waiter> first(std::in_place, slot);
+        const auto handle = std::noop_coroutine();
+
+        REQUIRE(slot.register_waiter(*first, handle, [] { return false; }));
+        auto stale_wake = slot.take();
+        first.reset();
+
+        completion_waiter second(slot);
+        REQUIRE(slot.register_waiter(second, handle, [] { return false; }));
+        auto current_wake = slot.take();
+        REQUIRE_FALSE(stale_wake.claim());
+        REQUIRE(current_wake.claim() == handle);
+    }
+
+    SECTION("moving a registered waiter preserves its registration") {
+        completion_waiter_slot slot;
+        completion_waiter first(slot);
+        const auto handle = std::noop_coroutine();
+
+        REQUIRE(slot.register_waiter(first, handle, [] { return false; }));
+        completion_waiter second(std::move(first));
+        auto wake = slot.take();
+        REQUIRE(wake.claim() == handle);
+    }
+
+    SECTION("moving then destroying a selected waiter abandons its wake") {
+        completion_waiter_slot slot;
+        completion_waiter first(slot);
+        const auto handle = std::noop_coroutine();
+
+        REQUIRE(slot.register_waiter(first, handle, [] { return false; }));
+        auto wake = slot.take();
+        {
+            completion_waiter second(std::move(first));
+        }
+        REQUIRE_FALSE(wake.claim());
+    }
+}
+
+TEST_CASE("join completion skips a waiter destroyed after selection",
+          "[task][join_handle][cancellation][lifetime][regression]") {
+    auto state = std::make_shared<elio::coro::detail::join_state<void>>();
+    std::atomic<bool> resumed{false};
+
+    auto waiter_task = [state, &resumed]() -> task<void> {
+        join_handle<void> handle(state);
+        co_await handle;
+        resumed.store(true, std::memory_order_release);
+    };
+
+    auto waiter = waiter_task();
+    auto h = elio::coro::detail::task_access::release(std::move(waiter));
+    h.resume();
+    REQUIRE_FALSE(h.done());
+
+    using namespace elio::coro::detail;
+    completion_wake_claim_paused_for_test.store(false,
+                                                std::memory_order_release);
+    pause_before_completion_wake_claim_for_test.store(
+        true, std::memory_order_release);
+
+    std::thread producer([state] { state->set_value(); });
+    const auto deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!completion_wake_claim_paused_for_test.load(
+               std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool selection_paused =
+        completion_wake_claim_paused_for_test.load(std::memory_order_acquire);
+    if (selection_paused) {
+        h.destroy();
+    }
+
+    pause_before_completion_wake_claim_for_test.store(
+        false, std::memory_order_release);
+    pause_before_completion_wake_claim_for_test.notify_all();
+    producer.join();
+
+    completion_wake_claim_paused_for_test.store(false,
+                                                std::memory_order_release);
+    if (!selection_paused) {
+        h.destroy();
+    }
+    REQUIRE(selection_paused);
+    REQUIRE_FALSE(resumed.load(std::memory_order_acquire));
+}
+
+TEST_CASE("task handle completion skips a waiter destroyed after selection",
+          "[task][task_handle][cancellation][lifetime][regression]") {
+    auto state = std::make_shared<elio::coro::detail::task_state<void>>();
+    task_handle<void> handle(state);
+    std::atomic<bool> resumed{false};
+
+    auto waiter_task = [&handle, &resumed]() -> task<void> {
+        auto result = co_await handle;
+        (void)result;
+        resumed.store(true, std::memory_order_release);
+    };
+
+    auto waiter = waiter_task();
+    auto h = elio::coro::detail::task_access::release(std::move(waiter));
+    h.resume();
+    REQUIRE_FALSE(h.done());
+
+    using namespace elio::coro::detail;
+    completion_wake_claim_paused_for_test.store(false,
+                                                std::memory_order_release);
+    pause_before_completion_wake_claim_for_test.store(
+        true, std::memory_order_release);
+
+    std::thread producer([state] { state->set_value(); });
+    const auto deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!completion_wake_claim_paused_for_test.load(
+               std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool selection_paused =
+        completion_wake_claim_paused_for_test.load(std::memory_order_acquire);
+    if (selection_paused) {
+        h.destroy();
+    }
+
+    pause_before_completion_wake_claim_for_test.store(
+        false, std::memory_order_release);
+    pause_before_completion_wake_claim_for_test.notify_all();
+    producer.join();
+
+    completion_wake_claim_paused_for_test.store(false,
+                                                std::memory_order_release);
+    if (!selection_paused) {
+        h.destroy();
+    }
+    REQUIRE(selection_paused);
+    REQUIRE_FALSE(resumed.load(std::memory_order_acquire));
 }
 
 TEST_CASE("task<int> co_return value", "[task]") {

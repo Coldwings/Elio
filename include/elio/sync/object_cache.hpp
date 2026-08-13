@@ -414,7 +414,8 @@ public:
                 detail_oc::release_waiter_probes_for_test.fetch_add(
                     1, std::memory_order_relaxed);
 #endif
-                auto waiter = entry_->release_waiter_.take();
+                auto wake = entry_->release_waiter_.take();
+                auto waiter = wake.claim();
                 if (waiter) {
                     runtime::schedule_handle(waiter);
                 }

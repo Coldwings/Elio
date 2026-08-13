@@ -43,11 +43,12 @@ pointer. Coroutine promises allocate the context and its cancellation state in
 one shared control block. Tokens use aliasing shared ownership of that block,
 so a retained token preserves the cancellation state after frame destruction
 without a second task-control allocation. The coroutine frame owns its parent
-cancellation registration; that registration weakly references the parent
-state, and its callback weakly references the child state. An escaped child
-token therefore retains neither the registration nor any ancestor context, and
-frame destruction ends parent propagation as before. The context neither owns
-nor keeps the coroutine frame alive.
+cancellation registration until final suspend; that registration weakly
+references the parent state, and its callback weakly references the child
+state. An escaped child token therefore retains neither the registration nor
+any ancestor context, and task completion ends parent propagation even if a
+named task object keeps the completed frame alive. The context neither owns nor
+keeps the coroutine frame alive.
 Awaitables continue to own each pending operation's completion and cleanup
 state; those state machines are not moved into the task-wide context.
 While a worker-local I/O operation is pending, its operation state holds an

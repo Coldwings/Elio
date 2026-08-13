@@ -38,6 +38,15 @@ task<void> await_captured_child(
     co_await capture_child_control(token, weak);
 }
 
+task<void> retain_completed_named_child(
+    cancel_token* token, std::weak_ptr<task_execution_context>* weak,
+    bool* child_completed) {
+    auto child = capture_child_control(token, weak);
+    co_await child;
+    *child_completed = true;
+    co_await std::suspend_always{};
+}
+
 task<void> capture_suspended_child(
     cancel_token* token, std::weak_ptr<task_execution_context>* weak) {
     auto* frame = promise_base::current_frame();
@@ -168,6 +177,36 @@ TEST_CASE("escaped child tokens do not retain parent links or ancestors",
     REQUIRE(weak_parent.expired());
     REQUIRE_FALSE(weak_child.expired());
 
+    escaped_token = {};
+    REQUIRE(weak_child.expired());
+}
+
+TEST_CASE("completed named children release parent cancellation links",
+          "[task][execution_context][cancellation][ownership]") {
+    cancel_token escaped_token;
+    std::weak_ptr<task_execution_context> weak_parent;
+    std::weak_ptr<task_execution_context> weak_child;
+    bool child_completed = false;
+    {
+        auto parent = retain_completed_named_child(
+            &escaped_token, &weak_child, &child_completed);
+        auto parent_context = get_handle(parent).promise().execution_context();
+        weak_parent = parent_context;
+
+        get_handle(parent).resume();
+        REQUIRE(child_completed);
+        REQUIRE_FALSE(get_handle(parent).done());
+        // The named child frame is still owned by the suspended parent.
+        REQUIRE_FALSE(weak_child.expired());
+
+        // Completion, rather than eventual frame destruction, ends the
+        // logical parent/child cancellation relationship.
+        parent_context->request_cancel();
+        REQUIRE_FALSE(escaped_token.is_cancelled());
+    }
+
+    REQUIRE(weak_parent.expired());
+    REQUIRE_FALSE(weak_child.expired());
     escaped_token = {};
     REQUIRE(weak_child.expired());
 }

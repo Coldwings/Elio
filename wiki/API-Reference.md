@@ -1329,10 +1329,11 @@ shared context ownership. Runtime-created contexts co-allocate this state in
 one shared control block; a token uses aliasing ownership of that block and can
 still outlive the frame. Starting a lazy task with direct `co_await` from
 another Elio task links its context one-way to that awaiter's token through a
-frame-owned registration that weakly references the parent state and whose
-callback weakly references the child state. Consequently, an escaped child
-token retains neither the parent registration nor ancestor contexts after the
-child frame is destroyed. A foreign coroutine promise is a cancellation
+completion-scoped registration that weakly references the parent state and
+whose callback weakly references the child state. Consequently, an escaped
+child token retains neither the parent registration nor ancestor contexts, and
+a completed named child does not observe later parent cancellation even while
+its frame remains owned. A foreign coroutine promise is a cancellation
 boundary unless it deliberately bridges a token. A `join_handle` shares the
 spawned wrapper context, so cancellation remains race-safe without storing a
 raw promise pointer. Completion and cancellation of individual operations

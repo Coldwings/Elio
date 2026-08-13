@@ -56,9 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   states now allocate `task_execution_context` together with its task-lifetime
   cancellation state in one shared control block. Aliasing cancellation tokens
   retain the same post-frame lifetime, callback, and propagation semantics,
-  while frame-owned parent links use weak ownership in both directions so an
-  escaped child token retains neither the registration nor its ancestors
-  (#1032). The previously public but undocumented
+  while completion-scoped parent links use weak ownership in both directions
+  so an escaped child token retains neither the registration nor its ancestors
+  and a completed named child cannot observe later parent cancellation (#1032).
+  The previously public but undocumented
   `task_execution_context::link_parent_cancellation()` runtime hook is now
   promise-internal; callers should establish propagation by awaiting or
   spawning tasks instead of manually linking execution contexts.

@@ -260,6 +260,14 @@ public:
         parent_cancellation_linked_ = true;
     }
 
+    /// End direct-await propagation when this task reaches final suspend.
+    /// A named task object may retain the completed frame, but that ownership
+    /// must not extend the logical parent/child cancellation relationship.
+    void unlink_parent_cancellation() noexcept {
+        parent_cancellation_registration_.unregister();
+        parent_cancellation_linked_ = false;
+    }
+
     // Affinity accessors
     /// Get the current thread affinity for this vthread
     /// @return Worker ID this vthread is bound to, or NO_AFFINITY if unbound
@@ -357,8 +365,9 @@ private:
     // this state after the coroutine frame itself has been destroyed.
     const std::shared_ptr<task_execution_context> execution_context_;
 
-    // The task frame owns parent propagation so an escaped child token retains
-    // only the child control block, not the frame's registration or ancestors.
+    // The task frame owns parent propagation until final suspend, so an
+    // escaped child token retains only the child control block, not the
+    // registration or ancestors.
     detail::task_parent_registration parent_cancellation_registration_;
     bool parent_cancellation_linked_ = false;
 

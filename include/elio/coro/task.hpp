@@ -45,6 +45,7 @@ struct final_awaiter {
     template<typename Promise>
     [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) noexcept {
         auto continuation = h.promise().continuation_;
+        h.promise().unlink_parent_cancellation();
         h.promise().leave_frame_context();
         if (continuation) {
             return continuation;

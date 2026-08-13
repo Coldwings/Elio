@@ -58,7 +58,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retain the same post-frame lifetime, callback, and propagation semantics,
   while frame-owned parent links use weak ownership in both directions so an
   escaped child token retains neither the registration nor its ancestors
-  (#1032).
+  (#1032). The previously public but undocumented
+  `task_execution_context::link_parent_cancellation()` runtime hook is now
+  promise-internal; callers should establish propagation by awaiting or
+  spawning tasks instead of manually linking execution contexts.
 - **Direct task spawn handoff**: `go`, `go_to`, `go_joinable`, and
   `go_joinable_to` now accept an already-constructed rvalue `task<T>` without
   creating a callable-wrapper coroutine. Callable overloads retain their

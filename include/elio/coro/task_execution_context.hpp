@@ -39,13 +39,6 @@ inline constexpr size_t NO_AFFINITY = std::numeric_limits<size_t>::max();
 class task_execution_context final {
 private:
     struct coallocated_state_key final {};
-    struct external_parent_link final {
-        explicit external_parent_link(
-            detail::task_parent_registration registration_value) noexcept
-            : registration(std::move(registration_value)) {}
-
-        detail::task_parent_registration registration;
-    };
 
     friend struct detail::task_execution_control_block;
     friend std::shared_ptr<task_execution_context>
@@ -56,10 +49,6 @@ public:
     /// Standalone construction preserves source compatibility and allocates a
     /// separate task-local cancellation state.
     task_execution_context() = default;
-
-    ~task_execution_context() {
-        delete external_parent_link_.load(std::memory_order_relaxed);
-    }
 
     task_execution_context(const task_execution_context&) = delete;
     task_execution_context& operator=(const task_execution_context&) = delete;
@@ -144,22 +133,6 @@ public:
         return cancellation_context_.is_cancellation_requested();
     }
 
-    /// Link this not-yet-started lazy task to its actual Elio awaiter. The link
-    /// is one-way: cancelling the parent requests cancellation of the child,
-    /// while cancelling this context does not affect the parent.
-    void link_parent_cancellation(cancel_token parent) {
-        auto link = std::make_unique<external_parent_link>(
-            make_parent_cancellation_registration(std::move(parent)));
-        external_parent_link* expected = nullptr;
-        if (!external_parent_link_.compare_exchange_strong(
-                expected, link.get(), std::memory_order_release,
-                std::memory_order_relaxed)) {
-            throw std::logic_error(
-                "task cancellation context already has a parent");
-        }
-        link.release();
-    }
-
 private:
     friend class elio::io::detail::io_operation_guard;
 
@@ -219,7 +192,6 @@ private:
     std::atomic<size_t> io_owner_worker_{NO_AFFINITY};
     std::atomic<uint64_t> io_context_generation_{0};
     std::atomic<size_t> active_io_pins_{0};
-    std::atomic<external_parent_link*> external_parent_link_{nullptr};
 };
 
 namespace detail {

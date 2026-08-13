@@ -38,6 +38,20 @@ task<void> await_captured_child(
     co_await capture_child_control(token, weak);
 }
 
+task<void> capture_suspended_child(
+    cancel_token* token, std::weak_ptr<task_execution_context>* weak) {
+    auto* frame = promise_base::current_frame();
+    auto context = frame->execution_context();
+    *token = context->get_cancel_token();
+    *weak = context;
+    co_await std::suspend_always{};
+}
+
+task<void> await_suspended_child(
+    cancel_token* token, std::weak_ptr<task_execution_context>* weak) {
+    co_await capture_suspended_child(token, weak);
+}
+
 } // namespace
 
 TEST_CASE("promise runtime policy is stored in task execution context",
@@ -111,19 +125,22 @@ TEST_CASE("runtime task control state uses one shared allocation",
 
 TEST_CASE("co-allocated parent cancellation links do not retain a cycle",
           "[task][execution_context][cancellation][ownership]") {
-    auto parent = elio::coro::detail::make_task_execution_context();
-    auto child = elio::coro::detail::make_task_execution_context();
-    auto child_token = child->get_cancel_token();
-    child->link_parent_cancellation(parent->get_cancel_token());
+    cancel_token child_token;
+    std::weak_ptr<task_execution_context> weak_parent;
+    std::weak_ptr<task_execution_context> weak_child;
+    {
+        auto parent = await_suspended_child(&child_token, &weak_child);
+        auto parent_context = get_handle(parent).promise().execution_context();
+        weak_parent = parent_context;
 
-    parent->request_cancel();
-    REQUIRE(child_token.is_cancelled());
+        get_handle(parent).resume();
+        REQUIRE_FALSE(get_handle(parent).done());
+        REQUIRE_FALSE(weak_child.expired());
 
-    std::weak_ptr<task_execution_context> weak_parent = parent;
-    std::weak_ptr<task_execution_context> weak_child = child;
-    child_token = {};
-    parent.reset();
-    child.reset();
+        parent_context->request_cancel();
+        REQUIRE(child_token.is_cancelled());
+        child_token = {};
+    }
 
     REQUIRE(weak_parent.expired());
     REQUIRE(weak_child.expired());

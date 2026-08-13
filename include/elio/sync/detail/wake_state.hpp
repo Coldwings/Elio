@@ -1,12 +1,17 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <coroutine>
 #include <memory>
 #include <vector>
 #include "../../runtime/scheduler.hpp"
 
 namespace elio::sync::detail {
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline std::atomic<size_t> wake_state_allocations_for_test{0};
+#endif
 
 enum class wake_action {
     rejected,
@@ -231,7 +236,11 @@ private:
 using wake_state_ptr = std::shared_ptr<wake_state>;
 
 inline wake_state_ptr make_wake_state() {
-    return std::make_shared<wake_state>();
+    auto state = std::make_shared<wake_state>();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    wake_state_allocations_for_test.fetch_add(1, std::memory_order_relaxed);
+#endif
+    return state;
 }
 
 inline void cancel_wake_state(const wake_state_ptr& state) noexcept {

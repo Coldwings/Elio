@@ -56,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Allocation-free ready event waits**: Non-cancellable waits on an already-set
+  manual-reset event now complete without allocating shared wake state. A wait
+  that reaches the unset slow path creates the same independently owned state
+  before queueing, preserving dequeue-versus-frame-destruction safety.
+  Token-aware waits retain eager allocation so cancellation can arbitrate with
+  `set()` (#1037).
 - **Transparent direct-await execution contexts**: Elio-to-Elio direct
   `co_await` chains now share one `task_execution_context` for the complete
   logical vthread. Nested lazy task promises defer their control allocation

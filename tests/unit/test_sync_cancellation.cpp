@@ -162,6 +162,85 @@ TEST_CASE("basic sync waits without tokens preserve void results",
     }
 }
 
+TEST_CASE("event ready path avoids wake-state allocation",
+          "[sync][event][allocation]") {
+    auto& allocations =
+        elio::sync::detail::wake_state_allocations_for_test;
+
+    SECTION("already signaled") {
+        event e;
+        e.set();
+        allocations.store(0, std::memory_order_relaxed);
+
+        for (int i = 0; i < 4; ++i) {
+            auto waiter = e.wait();
+            static_assert(!noexcept(
+                waiter.await_suspend(std::noop_coroutine())));
+            REQUIRE(waiter.await_ready());
+            waiter.await_resume();
+        }
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+    }
+
+    SECTION("set between ready and suspend") {
+        event e;
+        allocations.store(0, std::memory_order_relaxed);
+
+        auto waiter = e.wait();
+        REQUIRE_FALSE(waiter.await_ready());
+        e.set();
+        REQUIRE_FALSE(waiter.await_suspend(std::noop_coroutine()));
+        waiter.await_resume();
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+    }
+
+    SECTION("unset and reset waits") {
+        event e;
+        allocations.store(0, std::memory_order_relaxed);
+
+        {
+            auto waiter = e.wait();
+            REQUIRE_FALSE(waiter.await_ready());
+            REQUIRE(waiter.await_suspend(std::noop_coroutine()));
+            REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        }
+
+        e.set();
+        {
+            auto waiter = e.wait();
+            REQUIRE(waiter.await_ready());
+            waiter.await_resume();
+            REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        }
+
+        e.reset();
+        {
+            auto waiter = e.wait();
+            REQUIRE_FALSE(waiter.await_ready());
+            REQUIRE(waiter.await_suspend(std::noop_coroutine()));
+            REQUIRE(allocations.load(std::memory_order_relaxed) == 2);
+        }
+    }
+
+    SECTION("cancellable wait keeps eager arbitration state") {
+        event e;
+        e.set();
+        cancel_source source;
+        source.cancel();
+        allocations.store(0, std::memory_order_relaxed);
+
+        auto waiter = e.wait(source.get_token());
+        static_assert(noexcept(
+            waiter.await_suspend(std::noop_coroutine())));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(waiter.await_ready());
+        REQUIRE(waiter.await_resume() == cancel_result::cancelled);
+        REQUIRE(e.is_set());
+    }
+}
+
 TEST_CASE("runtime cancellation wakes basic sync waits",
           "[sync][cancellation][cancel_token][runtime]") {
     scheduler sched(2);

@@ -36,8 +36,7 @@ public:
     class event_waiter : public elio::detail::intrusive_list_node<event_waiter> {
     public:
         explicit event_waiter(event& e)
-            : evt_(e)
-            , wake_state_(detail::make_wake_state()) {}
+            : evt_(e) {}
 
         event_waiter(event& e, bool cancellable)
             : evt_(e)
@@ -75,10 +74,22 @@ public:
             return true;
         }
 
-        bool await_suspend_impl(std::coroutine_handle<> awaiter) noexcept {
-            std::lock_guard<std::mutex> guard(evt_.mutex_);
-
+        bool await_suspend_impl(std::coroutine_handle<> awaiter) {
             if (!cancellable_) {
+                // await_ready() normally handles this case without allocating.
+                // Recheck before allocation to avoid paying for a state when
+                // set() wins the race between ready and suspend.
+                if (evt_.signaled_.load(std::memory_order_acquire)) {
+                    return false;
+                }
+
+                // A notifier may outlive the coroutine frame after dequeuing
+                // this waiter, so the suspending path still needs independent
+                // shared ownership. Allocate before taking the primitive lock
+                // to keep allocation and exceptions outside the critical path.
+                wake_state_ = detail::make_wake_state();
+
+                std::lock_guard<std::mutex> guard(evt_.mutex_);
                 if (evt_.signaled_.load(std::memory_order_relaxed)) {
                     return false;
                 }
@@ -88,6 +99,13 @@ public:
                 suspended_ = true;
                 return true;
             }
+
+            return await_suspend_cancellable_impl(awaiter);
+        }
+
+        bool await_suspend_cancellable_impl(
+                std::coroutine_handle<> awaiter) noexcept {
+            std::lock_guard<std::mutex> guard(evt_.mutex_);
 
             if (wake_state_->was_cancelled()) {
                 return false;
@@ -176,7 +194,7 @@ public:
         explicit wait_awaitable(event& e) : waiter_(e) {}
 
         bool await_ready() const noexcept { return waiter_.await_ready_impl(); }
-        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+        bool await_suspend(std::coroutine_handle<> awaiter) {
             return waiter_.await_suspend_impl(awaiter);
         }
         void await_resume() const noexcept {
@@ -194,7 +212,7 @@ public:
 
         bool await_ready() const noexcept { return waiter_.await_ready_impl(); }
         bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            return waiter_.await_suspend_impl(awaiter);
+            return waiter_.await_suspend_cancellable_impl(awaiter);
         }
         [[nodiscard("check whether the event wait completed")]]
         coro::cancel_result await_resume() noexcept {
@@ -205,7 +223,9 @@ public:
         cancellable_event_waiter waiter_;
     };
 
-    /// Wait for the event to be signaled.
+    /// Wait for the event to be signaled. An already-signaled wait completes
+    /// without allocation. A wait that reaches the unset slow path allocates
+    /// shared wake state and can propagate std::bad_alloc from await_suspend().
     auto wait() {
         return wait_awaitable(*this);
     }

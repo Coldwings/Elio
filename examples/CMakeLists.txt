@@ -66,6 +66,13 @@ add_executable(bench_channel bench_channel.cpp)
 target_link_libraries(bench_channel PRIVATE elio)
 target_link_options(bench_channel PRIVATE ${STATIC_LINK_FLAGS})
 
+add_executable(bench_channel_send_frame
+    bench_channel_send_frame.cpp
+    channel_send_frame_bench_factory.cpp
+)
+target_link_libraries(bench_channel_send_frame PRIVATE elio)
+target_link_options(bench_channel_send_frame PRIVATE ${STATIC_LINK_FLAGS})
+
 # Signal handling example
 add_executable(signal_handling signal_handling.cpp)
 target_link_libraries(signal_handling PRIVATE elio)

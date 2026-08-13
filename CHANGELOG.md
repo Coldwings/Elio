@@ -61,6 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Smaller channel send coroutine frames**: `channel<T>::send(...)` now lets
+  its internal waiter borrow the by-value payload already owned by the send
+  coroutine frame instead of retaining a second moved-from/moved-to `T` pair.
+  Directly constructed public send awaiters remain owning, and queue,
+  cancellation, close, and dequeue-versus-destruction behavior is unchanged
+  (#1047).
 - **Allocation-free ready semaphore acquires**: Non-cancellable acquires now
   defer shared wake-state allocation until the ready permit check fails.
   Entering `await_suspend` allocates before taking the semaphore queue lock,

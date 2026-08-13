@@ -22,10 +22,14 @@
 #include <elio/runtime/scheduler.hpp>
 
 #include <atomic>
+#include <array>
+#include <barrier>
+#include <cstddef>
 #include <chrono>
 #include <memory>
 #include <optional>
 #include <thread>
+#include <type_traits>
 
 using namespace elio::sync;
 using namespace elio::coro;
@@ -82,6 +86,52 @@ private:
     }
 };
 
+struct send_move_observation {
+    bool armed = false;
+    size_t frame_transfers = 0;
+};
+
+template<size_t InlineBytes = 128>
+struct inline_move_only_value {
+    std::array<std::byte, InlineBytes> storage{};
+    int id = 0;
+    send_move_observation* observation = nullptr;
+    bool frame_origin = true;
+
+    inline_move_only_value(int value, send_move_observation* observed) noexcept
+        : id(value), observation(observed) {}
+
+    inline_move_only_value(const inline_move_only_value&) = delete;
+    inline_move_only_value& operator=(const inline_move_only_value&) = delete;
+
+    inline_move_only_value(inline_move_only_value&& other) noexcept
+        : storage(other.storage)
+        , id(other.id)
+        , observation(other.observation)
+        , frame_origin(other.frame_origin) {
+        finish_move(other);
+    }
+
+    inline_move_only_value& operator=(inline_move_only_value&& other) noexcept {
+        storage = other.storage;
+        id = other.id;
+        observation = other.observation;
+        frame_origin = other.frame_origin;
+        finish_move(other);
+        return *this;
+    }
+
+private:
+    void finish_move(inline_move_only_value& other) noexcept {
+        if (frame_origin && observation && observation->armed) {
+            ++observation->frame_transfers;
+            frame_origin = false;
+        }
+        other.frame_origin = false;
+        other.id = -1;
+    }
+};
+
 bool wait_for_true(std::atomic<bool>& flag,
                    std::chrono::milliseconds timeout =
                        std::chrono::milliseconds(2000)) {
@@ -116,6 +166,308 @@ bool wait_for_condition(Predicate&& predicate,
 }
 
 }  // namespace
+
+TEST_CASE("channel send frames transfer move-only payloads once",
+          "[sync][channel][coro][frame_allocation]") {
+    using payload = inline_move_only_value<>;
+
+    SECTION("ready bounded send") {
+        channel<payload> ch(1);
+        send_move_observation observed;
+        auto send_task = ch.send(payload(11, &observed));
+        observed.armed = true;
+
+        auto handle = elio::coro::detail::task_access::handle(send_task);
+        handle.resume();
+
+        REQUIRE(handle.done());
+        REQUIRE(handle.promise().value_.value());
+        REQUIRE(observed.frame_transfers == 1);
+        auto received = ch.try_recv();
+        REQUIRE(received.has_value());
+        REQUIRE(received->id == 11);
+        REQUIRE(observed.frame_transfers == 1);
+    }
+
+    SECTION("ready unbounded send") {
+        auto ch = channel<payload>::unbounded();
+        send_move_observation observed;
+        auto send_task = ch.send(payload(17, &observed));
+        observed.armed = true;
+
+        auto handle = elio::coro::detail::task_access::handle(send_task);
+        handle.resume();
+
+        REQUIRE(handle.done());
+        REQUIRE(handle.promise().value_.value());
+        REQUIRE(observed.frame_transfers == 1);
+        auto received = ch.try_recv();
+        REQUIRE(received.has_value());
+        REQUIRE(received->id == 17);
+        REQUIRE(observed.frame_transfers == 1);
+    }
+
+    SECTION("bounded parked sender refill") {
+        channel<payload> ch(1);
+        send_move_observation filler_observed;
+        send_move_observation observed;
+        REQUIRE(ch.try_send(payload(1, &filler_observed)));
+
+        auto send_task = ch.send(payload(12, &observed));
+        observed.armed = true;
+        auto handle = elio::coro::detail::task_access::handle(send_task);
+        handle.resume();
+        REQUIRE_FALSE(handle.done());
+        REQUIRE(observed.frame_transfers == 0);
+
+        auto first = ch.try_recv();
+        REQUIRE(first.has_value());
+        REQUIRE(first->id == 1);
+        REQUIRE(handle.done());
+        REQUIRE(observed.frame_transfers == 1);
+        auto second = ch.try_recv();
+        REQUIRE(second.has_value());
+        REQUIRE(second->id == 12);
+        REQUIRE(observed.frame_transfers == 1);
+    }
+
+    SECTION("rendezvous receiver steals parked sender") {
+        channel<payload> ch;
+        send_move_observation observed;
+        auto send_task = ch.send(payload(13, &observed));
+        observed.armed = true;
+        auto handle = elio::coro::detail::task_access::handle(send_task);
+        handle.resume();
+        REQUIRE_FALSE(handle.done());
+        REQUIRE(observed.frame_transfers == 0);
+
+        auto received = ch.try_recv();
+        REQUIRE(received.has_value());
+        REQUIRE(received->id == 13);
+        REQUIRE(handle.done());
+        REQUIRE(observed.frame_transfers == 1);
+    }
+
+    SECTION("close drains parked sender") {
+        channel<payload> ch;
+        send_move_observation observed;
+        auto send_task = ch.send(payload(14, &observed));
+        observed.armed = true;
+        auto handle = elio::coro::detail::task_access::handle(send_task);
+        handle.resume();
+        REQUIRE_FALSE(handle.done());
+
+        ch.close();
+        REQUIRE(handle.done());
+        REQUIRE(handle.promise().value_.value());
+        REQUIRE(observed.frame_transfers == 1);
+        auto received = ch.try_recv();
+        REQUIRE(received.has_value());
+        REQUIRE(received->id == 14);
+        REQUIRE(observed.frame_transfers == 1);
+    }
+
+    SECTION("cancellation winner leaves frame payload untouched") {
+        channel<payload> ch;
+        cancel_source source;
+        send_move_observation observed;
+        auto send_task = ch.send(
+            payload(15, &observed), source.get_token());
+        observed.armed = true;
+        auto handle = elio::coro::detail::task_access::handle(send_task);
+        handle.resume();
+        REQUIRE_FALSE(handle.done());
+        REQUIRE(observed.frame_transfers == 0);
+
+        source.cancel();
+        REQUIRE(handle.done());
+        REQUIRE(handle.promise().value_->was_cancelled());
+        REQUIRE(observed.frame_transfers == 0);
+        REQUIRE_FALSE(ch.try_recv().has_value());
+    }
+
+    SECTION("active-token ready send transfers once") {
+        channel<payload> ch(1);
+        cancel_source source;
+        send_move_observation observed;
+        auto send_task = ch.send(
+            payload(16, &observed), source.get_token());
+        observed.armed = true;
+        auto handle = elio::coro::detail::task_access::handle(send_task);
+        handle.resume();
+
+        REQUIRE(handle.done());
+        REQUIRE(handle.promise().value_->success());
+        REQUIRE(observed.frame_transfers == 1);
+        auto received = ch.try_recv();
+        REQUIRE(received.has_value());
+        REQUIRE(received->id == 16);
+        REQUIRE(observed.frame_transfers == 1);
+    }
+
+    SECTION("active-token parked send transfers once after refill") {
+        channel<payload> ch(1);
+        send_move_observation filler_observed;
+        send_move_observation observed;
+        REQUIRE(ch.try_send(payload(1, &filler_observed)));
+        cancel_source source;
+        auto send_task = ch.send(
+            payload(18, &observed), source.get_token());
+        observed.armed = true;
+        auto handle = elio::coro::detail::task_access::handle(send_task);
+        handle.resume();
+        REQUIRE_FALSE(handle.done());
+        REQUIRE(observed.frame_transfers == 0);
+
+        auto first = ch.try_recv();
+        REQUIRE(first.has_value());
+        REQUIRE(first->id == 1);
+        REQUIRE(handle.done());
+        REQUIRE(handle.promise().value_->success());
+        REQUIRE(observed.frame_transfers == 1);
+        auto second = ch.try_recv();
+        REQUIRE(second.has_value());
+        REQUIRE(second->id == 18);
+        REQUIRE(observed.frame_transfers == 1);
+    }
+}
+
+TEST_CASE("channel send races move frame payload only for delivery winners",
+          "[sync][channel][cancellation][race][frame_allocation]") {
+    using payload = inline_move_only_value<64>;
+
+    SECTION("cancellation versus bounded refill") {
+        for (int iteration = 0; iteration < 64; ++iteration) {
+            channel<payload> ch(1);
+            send_move_observation filler_observed;
+            send_move_observation observed;
+            REQUIRE(ch.try_send(payload(1, &filler_observed)));
+            cancel_source source;
+            auto send_task = ch.send(
+                payload(30 + iteration, &observed), source.get_token());
+            observed.armed = true;
+            auto handle = elio::coro::detail::task_access::handle(send_task);
+            handle.resume();
+            REQUIRE_FALSE(handle.done());
+
+            std::optional<payload> first;
+            std::barrier start(3);
+            std::thread canceller([&] {
+                start.arrive_and_wait();
+                source.cancel();
+            });
+            std::thread receiver([&] {
+                start.arrive_and_wait();
+                first = ch.try_recv();
+            });
+            start.arrive_and_wait();
+            canceller.join();
+            receiver.join();
+
+            REQUIRE(first.has_value());
+            REQUIRE(first->id == 1);
+            REQUIRE(handle.done());
+            const auto& result = handle.promise().value_.value();
+            if (result.success()) {
+                REQUIRE(observed.frame_transfers == 1);
+                auto delivered = ch.try_recv();
+                REQUIRE(delivered.has_value());
+                REQUIRE(delivered->id == 30 + iteration);
+            } else {
+                REQUIRE(result.was_cancelled());
+                REQUIRE(observed.frame_transfers == 0);
+                REQUIRE_FALSE(ch.try_recv().has_value());
+            }
+        }
+    }
+
+    SECTION("cancellation versus close drain") {
+        for (int iteration = 0; iteration < 64; ++iteration) {
+            channel<payload> ch;
+            send_move_observation observed;
+            cancel_source source;
+            auto send_task = ch.send(
+                payload(100 + iteration, &observed), source.get_token());
+            observed.armed = true;
+            auto handle = elio::coro::detail::task_access::handle(send_task);
+            handle.resume();
+            REQUIRE_FALSE(handle.done());
+
+            std::barrier start(3);
+            std::thread canceller([&] {
+                start.arrive_and_wait();
+                source.cancel();
+            });
+            std::thread closer([&] {
+                start.arrive_and_wait();
+                ch.close();
+            });
+            start.arrive_and_wait();
+            canceller.join();
+            closer.join();
+
+            REQUIRE(handle.done());
+            const auto& result = handle.promise().value_.value();
+            auto delivered = ch.try_recv();
+            if (result.success()) {
+                REQUIRE(observed.frame_transfers == 1);
+                REQUIRE(delivered.has_value());
+                REQUIRE(delivered->id == 100 + iteration);
+            } else {
+                REQUIRE(result.was_cancelled());
+                REQUIRE(observed.frame_transfers == 0);
+                REQUIRE_FALSE(delivered.has_value());
+            }
+        }
+    }
+}
+
+TEST_CASE("public channel send awaiters retain owned move-only values",
+          "[sync][channel][cancellation][lifetime]") {
+    using payload = inline_move_only_value<64>;
+    using owning_awaiter = channel<payload>::send_awaitable;
+    STATIC_REQUIRE((std::is_base_of_v<
+        elio::detail::intrusive_list_node<owning_awaiter>, owning_awaiter>));
+
+    SECTION("ordinary awaiter") {
+        channel<payload> ch;
+        send_move_observation observed;
+        std::optional<channel<payload>::send_awaitable> sender;
+        {
+            payload source(21, &observed);
+            sender.emplace(ch, std::move(source));
+        }
+
+        REQUIRE_FALSE(sender->await_ready());
+        REQUIRE(sender->await_suspend(std::noop_coroutine()));
+        REQUIRE(sender->is_linked());
+        auto received = ch.try_recv();
+        REQUIRE(received.has_value());
+        REQUIRE(received->id == 21);
+        REQUIRE_FALSE(sender->is_linked());
+        REQUIRE(sender->await_resume());
+    }
+
+    SECTION("cancellable awaiter remains an owning send awaiter") {
+        channel<payload> ch;
+        send_move_observation observed;
+        std::optional<channel<payload>::cancellable_send_awaitable> sender;
+        {
+            payload source(22, &observed);
+            sender.emplace(ch, std::move(source), cancel_token{});
+        }
+
+        channel<payload>::send_awaitable& base = *sender;
+        REQUIRE_FALSE(base.await_ready());
+        REQUIRE(sender->await_suspend(std::noop_coroutine()));
+        REQUIRE(base.is_linked());
+        auto received = ch.try_recv();
+        REQUIRE(received.has_value());
+        REQUIRE(received->id == 22);
+        REQUIRE_FALSE(base.is_linked());
+        REQUIRE(sender->await_resume().success());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Test 1: recv() direct steal from blocked sender on bounded channel

@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Autoscaler example task lifetime**: Each load phase now retains join handles
+  and drains every submitted task before releasing its phase-local completion
+  counter or beginning the low-load phase. The shorter workload and CI smoke
+  mode keep termination coverage practical (#1022).
 - **Custom autoscaler trigger packs**: `autoscaler<Scheduler, Triggers...>` now
   constructs and dispatches each configured trigger correctly instead of
   failing template instantiation because the trigger argument was omitted.

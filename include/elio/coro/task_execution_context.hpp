@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -15,6 +16,15 @@ class io_operation_guard;
 }
 
 namespace elio::coro {
+
+class task_execution_context;
+class promise_base;
+
+namespace detail {
+struct task_execution_control_block;
+[[nodiscard]] std::shared_ptr<task_execution_context>
+make_task_execution_context();
+}
 
 /// Constant indicating no user affinity. Internal ownership such as an active
 /// worker-local I/O pin may still prevent migration.
@@ -27,9 +37,17 @@ inline constexpr size_t NO_AFFINITY = std::numeric_limits<size_t>::max();
 /// placement and owns task-chain cancellation authority. Each pending operation
 /// still owns its own completion and cancellation state machine.
 class task_execution_context final {
+private:
+    struct coallocated_state_key final {};
+
+    friend struct detail::task_execution_control_block;
+    friend std::shared_ptr<task_execution_context>
+    detail::make_task_execution_context();
+    friend class promise_base;
+
 public:
-    /// Allocate the task-local cancellation state. This can throw
-    /// std::bad_alloc; the constructor is intentionally not noexcept in 0.6.
+    /// Standalone construction preserves source compatibility and allocates a
+    /// separate task-local cancellation state.
     task_execution_context() = default;
 
     task_execution_context(const task_execution_context&) = delete;
@@ -115,15 +133,17 @@ public:
         return cancellation_context_.is_cancellation_requested();
     }
 
-    /// Link this not-yet-started lazy task to its actual Elio awaiter. The link
-    /// is one-way: cancelling the parent requests cancellation of the child,
-    /// while cancelling this context does not affect the parent.
-    void link_parent_cancellation(cancel_token parent) {
-        cancellation_context_.link_parent(std::move(parent));
-    }
-
 private:
     friend class elio::io::detail::io_operation_guard;
+
+    explicit task_execution_context(coallocated_state_key) noexcept
+        : cancellation_context_(
+              detail::cancellation_context::deferred_state_t{}) {}
+
+    [[nodiscard]] detail::task_parent_registration
+    make_parent_cancellation_registration(cancel_token parent) {
+        return cancellation_context_.link_parent(std::move(parent));
+    }
 
     void acquire_io_pin(size_t worker_id, uint64_t context_generation) {
         std::lock_guard<std::mutex> lock(io_pin_mutex_);
@@ -173,5 +193,29 @@ private:
     std::atomic<uint64_t> io_context_generation_{0};
     std::atomic<size_t> active_io_pins_{0};
 };
+
+namespace detail {
+
+struct task_execution_control_block final {
+    task_execution_control_block()
+        : context(task_execution_context::coallocated_state_key{}) {}
+
+    cancel_state cancellation_state;
+    task_execution_context context;
+};
+
+} // namespace detail
+
+inline std::shared_ptr<task_execution_context>
+detail::make_task_execution_context() {
+    auto control = std::make_shared<detail::task_execution_control_block>();
+    auto context = std::shared_ptr<task_execution_context>(
+        control, &control->context);
+    auto cancellation_state = std::shared_ptr<detail::cancel_state>(
+        control, &control->cancellation_state);
+    context->cancellation_context_.bind_shared_state(
+        std::move(cancellation_state));
+    return context;
+}
 
 } // namespace elio::coro

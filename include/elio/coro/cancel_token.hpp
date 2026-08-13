@@ -24,6 +24,8 @@ void schedule_handle(std::coroutine_handle<> handle) noexcept;
 
 namespace elio::coro {
 
+class cancel_token;
+
 /// Result of a cancellable operation
 enum class cancel_result {
     completed,   ///< Operation completed normally
@@ -31,6 +33,9 @@ enum class cancel_result {
 };
 
 namespace detail {
+
+class cancellation_context;
+struct cancel_state;
 
 inline thread_local const void* current_callback_dispatcher = nullptr;
 
@@ -215,6 +220,14 @@ private:
     const void* dispatcher_identity = nullptr;
 };
 
+struct task_parent_callback_node final : callback_node {
+    // Completion and parent cancellation race through this one-shot gate.
+    // Whichever side exchanges true first defines whether propagation occurs;
+    // neither side waits for the other to finish.
+    std::atomic<bool> active{true};
+    std::weak_ptr<cancel_state> parent_state;
+};
+
 /// Shared cancellation state (implementation detail).
 ///
 /// Stores active callbacks as an intrusive shared-ownership list guarded by a
@@ -243,16 +256,21 @@ struct cancel_state {
         auto node = std::make_shared<callback_node>();
         node->emplace(std::forward<F>(cb));
 
+        if (!add_callback_node(node)) return {};
+        return node;
+    }
+
+    bool add_callback_node(const std::shared_ptr<callback_node>& node) {
         std::unique_lock<std::mutex> lock(mutex);
         if (cancelled.load(std::memory_order_relaxed)) {
             // Already cancelled: invoke and drop without inserting.
             lock.unlock();
             node->dispatch();
-            return {};
+            return false;
         }
         node->next = head;
         head = node;
-        return node;
+        return true;
     }
 
     void remove_callback(const std::shared_ptr<callback_node>& node) noexcept {
@@ -270,6 +288,27 @@ struct cancel_state {
             }
         }
         node->unregister_and_wait();
+    }
+
+    /// Best-effort list removal for task-parent links. Their callback payload
+    /// owns no frame state and is independently deactivated, so shared node
+    /// ownership makes it safe to let an in-progress dispatcher reclaim the
+    /// node without waiting on a scheduler worker.
+    void try_remove_task_parent_callback(
+        const std::shared_ptr<task_parent_callback_node>& node) noexcept {
+        if (!node) return;
+        std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return;
+
+        auto* link = &head;
+        while (*link) {
+            if (link->get() == node.get()) {
+                auto removed = std::move(*link);
+                *link = std::move(removed->next);
+                return;
+            }
+            link = &((*link)->next);
+        }
     }
 
     void trigger() {
@@ -318,6 +357,67 @@ struct cancel_state {
             node->unregister_and_wait();
         }
     }
+};
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline std::atomic<size_t> separate_cancel_state_allocations_for_test{0};
+#endif
+
+inline std::shared_ptr<cancel_state> make_cancel_state() {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    separate_cancel_state_allocations_for_test.fetch_add(
+        1, std::memory_order_relaxed);
+#endif
+    return std::make_shared<cancel_state>();
+}
+
+class task_parent_registration final {
+public:
+    task_parent_registration() = default;
+    task_parent_registration(task_parent_registration&& other) noexcept
+        : node_(std::move(other.node_)) {}
+    task_parent_registration& operator=(
+        task_parent_registration&& other) noexcept {
+        if (this != &other) {
+            unregister();
+            node_ = std::move(other.node_);
+        }
+        return *this;
+    }
+    ~task_parent_registration() { unregister(); }
+
+    task_parent_registration(const task_parent_registration&) = delete;
+    task_parent_registration& operator=(
+        const task_parent_registration&) = delete;
+
+    void deactivate() noexcept {
+        if (node_) {
+            // The callback's exchange decides whether propagation won. The
+            // completion side does not consume prior callback writes, so a
+            // release store is sufficient and avoids an unnecessary RMW.
+            node_->active.store(false, std::memory_order_release);
+        }
+    }
+
+    void unregister() noexcept {
+        auto node = std::move(node_);
+        if (!node) return;
+        node->active.store(false, std::memory_order_release);
+        if (auto parent = node->parent_state.lock()) {
+            // Failure only leaves an inactive, weak-reference-only node for
+            // the parent cancellation state or dispatcher to reclaim later.
+            parent->try_remove_task_parent_callback(node);
+        }
+    }
+
+private:
+    friend class elio::coro::cancel_token;
+
+    explicit task_parent_registration(
+        std::shared_ptr<task_parent_callback_node> node) noexcept
+        : node_(std::move(node)) {}
+
+    std::shared_ptr<task_parent_callback_node> node_;
 };
 
 } // namespace detail
@@ -482,6 +582,29 @@ public:
 
 private:
     friend class cancel_source;
+    friend class detail::cancellation_context;
+
+    template<typename F>
+    [[nodiscard]] detail::task_parent_registration
+    on_cancel_for_task(F&& callback) const {
+        if (!state_) return {};
+
+        auto node = std::make_shared<detail::task_parent_callback_node>();
+        node->parent_state = state_;
+        std::weak_ptr<detail::task_parent_callback_node> weak_node = node;
+        node->emplace(
+            [weak_node, callback = std::forward<F>(callback)]() mutable {
+                auto node = weak_node.lock();
+                if (!node ||
+                    !node->active.exchange(
+                        false, std::memory_order_acq_rel)) {
+                    return;
+                }
+                callback();
+            });
+        if (!state_->add_callback_node(node)) return {};
+        return detail::task_parent_registration{std::move(node)};
+    }
 
     explicit cancel_token(std::shared_ptr<detail::cancel_state> state)
         : state_(std::move(state)) {}
@@ -511,7 +634,7 @@ class cancel_source {
 public:
     /// Create a new cancel source
     cancel_source()
-        : state_(std::make_shared<detail::cancel_state>()) {}
+        : state_(detail::make_cancel_state()) {}
 
     /// Get a token associated with this source
     cancel_token get_token() const noexcept {
@@ -540,14 +663,21 @@ private:
 
 namespace detail {
 
-/// Task-lifetime cancellation authority. The source remains valid through the
+/// Task-lifetime cancellation authority. The state remains valid through the
 /// shared task_execution_context even after the coroutine frame is destroyed.
 /// A lazy child links to its active Elio awaiter's token before first resume, so
 /// a request flows down the running Elio task chain without granting
 /// cancellation authority to the lazy task owner itself.
 class cancellation_context final {
 public:
-    cancellation_context() = default;
+    struct deferred_state_t final {};
+
+    cancellation_context()
+        : owned_state_(make_cancel_state())
+        , shared_state_(owned_state_)
+        , state_(owned_state_.get()) {}
+
+    explicit cancellation_context(deferred_state_t) noexcept {}
 
     cancellation_context(const cancellation_context&) = delete;
     cancellation_context& operator=(const cancellation_context&) = delete;
@@ -555,38 +685,38 @@ public:
     cancellation_context& operator=(cancellation_context&&) = delete;
 
     [[nodiscard]] cancel_token token() const noexcept {
-        return source_.get_token();
+        return cancel_token{shared_state_.lock()};
     }
 
     void request_cancel() {
-        source_.cancel();
+        if (state_) {
+            state_->trigger();
+        }
     }
 
     [[nodiscard]] bool is_cancellation_requested() const noexcept {
-        return source_.is_cancelled();
+        return state_ &&
+               state_->cancelled.load(std::memory_order_acquire);
     }
 
-    void link_parent(cancel_token parent) {
-        auto registration = parent.on_cancel([source = source_]() mutable {
-            source.cancel();
+    [[nodiscard]] task_parent_registration link_parent(cancel_token parent) {
+        auto child_state = shared_state_;
+        return parent.on_cancel_for_task([child_state]() mutable {
+            if (auto state = child_state.lock()) {
+                state->trigger();
+            }
         });
+    }
 
-        std::lock_guard<std::mutex> lock(parent_mutex_);
-        if (parent_linked_) {
-            throw std::logic_error(
-                "task cancellation context already has a parent");
-        }
-        parent_registration_ = std::move(registration);
-        parent_linked_ = true;
+    void bind_shared_state(std::shared_ptr<cancel_state> state) noexcept {
+        shared_state_ = state;
+        state_ = state.get();
     }
 
 private:
-    // Keep registration last so it unregisters before the owned source is
-    // released during destruction.
-    cancel_source source_;
-    std::mutex parent_mutex_;
-    bool parent_linked_ = false;
-    cancel_registration parent_registration_;
+    std::shared_ptr<cancel_state> owned_state_;
+    std::weak_ptr<cancel_state> shared_state_;
+    cancel_state* state_ = nullptr;
 };
 
 } // namespace detail

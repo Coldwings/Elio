@@ -102,7 +102,7 @@ public:
         , debug_worker_id_(static_cast<uint32_t>(-1))
         , debug_id_(0)  // Lazy allocation - only allocated when id() is called
 #endif
-        , execution_context_(std::make_shared<task_execution_context>())
+        , execution_context_(detail::make_task_execution_context())
     {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
         detail::promise_constructions_for_test.fetch_add(
@@ -249,7 +249,23 @@ public:
     /// time virtual-stack ancestry, which may no longer be relevant after a
     /// task has been moved.
     void link_parent_cancellation(cancel_token parent) {
-        execution_context_->link_parent_cancellation(std::move(parent));
+        if (parent_cancellation_linked_) {
+            throw std::logic_error(
+                "task cancellation context already has a parent");
+        }
+        auto registration =
+            execution_context_->make_parent_cancellation_registration(
+                std::move(parent));
+        parent_cancellation_registration_ = std::move(registration);
+        parent_cancellation_linked_ = true;
+    }
+
+    /// End direct-await propagation when this task reaches final suspend.
+    /// A named task object may retain the completed frame, but that ownership
+    /// must not extend the logical parent/child cancellation relationship.
+    void unlink_parent_cancellation() noexcept {
+        parent_cancellation_registration_.deactivate();
+        parent_cancellation_linked_ = false;
     }
 
     // Affinity accessors
@@ -348,6 +364,12 @@ private:
     // Shared runtime policy/control plane. External runtime owners may retain
     // this state after the coroutine frame itself has been destroyed.
     const std::shared_ptr<task_execution_context> execution_context_;
+
+    // The task frame owns parent propagation until final suspend, so an
+    // escaped child token retains only the child control block, not the
+    // registration or ancestors.
+    detail::task_parent_registration parent_cancellation_registration_;
+    bool parent_cancellation_linked_ = false;
 
     // Keep scheduler accounting after the debugger-visible frame fields so the
     // stable magic/parent prefix remains at the start of promise_base.

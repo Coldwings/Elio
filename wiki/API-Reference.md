@@ -1324,19 +1324,28 @@ public:
 identity. Treat them as an active placement constraint only when
 `has_active_io_pin()` is true; `active_io_pin_count()` is authoritative.
 
-The context's cancellation source survives independently of the frame through
-shared context ownership. Starting a lazy task with direct `co_await` from
-another Elio task links its context one-way to that awaiter's token. A foreign
-coroutine promise is a cancellation boundary unless it deliberately bridges a
-token. A `join_handle` shares the spawned wrapper context, so cancellation
-remains race-safe without storing a raw promise pointer. Completion and
-cancellation of individual operations remain in their awaitable/backend state
-machines.
+The context's cancellation state survives independently of the frame through
+shared context ownership. Runtime-created contexts co-allocate this state in
+one shared control block; a token uses aliasing ownership of that block and can
+still outlive the frame. Starting a lazy task with direct `co_await` from
+another Elio task links its context one-way to that awaiter's token through a
+completion-scoped registration that weakly references the parent state and
+whose callback weakly references the child state. Consequently, an escaped
+child token retains neither the parent registration nor ancestor contexts, and
+a completed named child does not observe later parent cancellation even while
+its frame remains owned. Final suspend deactivates the link with a non-waiting
+atomic transition; it does not block a scheduler worker while a concurrent
+parent-cancellation callback finishes. A foreign coroutine promise is a
+cancellation boundary unless it deliberately bridges a token. A `join_handle`
+shares the spawned wrapper context, so cancellation remains race-safe without
+storing a raw promise pointer. Completion and cancellation of individual
+operations remain in their awaitable/backend state machines.
 
-In 0.6, construction is no longer `noexcept` because each context allocates its
-cancellation state. Allocation failure propagates to the code creating the
-context; downstream code that explicitly relied on the old `noexcept`
-constructor contract must be updated.
+In 0.6, standalone construction is no longer `noexcept` because it allocates an
+independent cancellation state. Runtime construction can likewise fail while
+allocating the combined shared control block. Allocation failure propagates to
+the code creating the context; downstream code that explicitly relied on the
+old `noexcept` constructor contract must be updated.
 
 The promise affinity methods delegate caller-requested affinity to that shared
 context. `effective_affinity()` is the scheduler placement boundary and is kept

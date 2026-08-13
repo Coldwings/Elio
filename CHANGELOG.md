@@ -52,6 +52,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Co-allocated task control state**: Coroutine promises and default join
+  states now allocate `task_execution_context` together with its task-lifetime
+  cancellation state in one shared control block. Aliasing cancellation tokens
+  retain the same post-frame lifetime, callback, and propagation semantics,
+  while completion-scoped parent links use weak ownership in both directions
+  so an escaped child token retains neither the registration nor its ancestors
+  and a completed named child cannot observe later parent cancellation. Child
+  final suspend deactivates propagation through a non-waiting atomic gate, so
+  concurrent parent cancellation cannot block a scheduler worker (#1032).
+  The previously public but undocumented
+  `task_execution_context::link_parent_cancellation()` runtime hook is now
+  promise-internal; callers should establish propagation by awaiting or
+  spawning tasks instead of manually linking execution contexts.
 - **Direct task spawn handoff**: `go`, `go_to`, `go_joinable`, and
   `go_joinable_to` now accept an already-constructed rvalue `task<T>` without
   creating a callable-wrapper coroutine. Callable overloads retain their

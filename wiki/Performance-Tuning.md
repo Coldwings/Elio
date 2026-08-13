@@ -423,6 +423,15 @@ coro::task<void> small_frame() {
 
 ## Synchronization Primitives
 
+### Event Ready Path
+
+A non-cancellable wait on an already-set manual-reset `event` completes with an
+atomic state check and does not allocate. A wait that reaches the unset slow
+path creates shared wake state for safe dequeue-then-schedule lifetime
+management. Token-aware waits create that state eagerly because the
+cancellation callback must be able to select a terminal result before
+suspension.
+
 ### Mutex Performance
 
 Elio's mutex uses atomic fast-path for uncontended cases:

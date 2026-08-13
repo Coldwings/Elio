@@ -3442,6 +3442,13 @@ public:
 };
 ```
 
+The no-token `wait()` completes without allocation when the event is already
+set. If it reaches the unset slow path, `await_suspend()` creates independently
+owned wake state and may propagate `std::bad_alloc`; that state keeps a dequeued
+wake safe if the coroutine frame is destroyed before scheduling. Token-aware
+waits create their arbitration state eagerly so cancellation can race `set()`
+with exactly one terminal result.
+
 ### `channel<T>`
 
 Multi-producer multi-consumer channel for passing values between coroutines. Supports rendezvous (synchronous), bounded, and unbounded modes.

@@ -1,6 +1,7 @@
 #include <elio/runtime/scheduler.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/log/macros.hpp>
+#include <elio/sync/event.hpp>
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
@@ -20,6 +21,13 @@ coro::task<void> empty_task() {
 coro::task<void> direct_await_chain(size_t frames) {
     if (frames > 1) {
         co_await direct_await_chain(frames - 1);
+    }
+}
+
+coro::task<void> ready_event_waits(sync::event& ready_event,
+                                   size_t iterations) {
+    for (size_t i = 0; i < iterations; ++i) {
+        co_await ready_event.wait();
     }
 }
 
@@ -97,7 +105,34 @@ int main() {
                   << " ns/frame" << std::endl;
     }
 
-    // 4. Measure MPSC push only (no scheduler overhead)
+    // 4. Measure an already-signaled manual-reset event wait. The task and its
+    // execution context are constructed before timing, so this isolates the
+    // ready awaiter path rather than coroutine-frame allocation or scheduling.
+    {
+        constexpr size_t ready_wait_iterations = 1000000;
+        sync::event ready_event;
+        ready_event.set();
+        auto waits = ready_event_waits(ready_event, ready_wait_iterations);
+        auto handle = coro::detail::task_access::handle(waits);
+
+        auto start = high_resolution_clock::now();
+        {
+            coro::detail::frame_context_scope frame_scope(
+                std::addressof(handle.promise()));
+            handle.resume();
+        }
+        auto end = high_resolution_clock::now();
+        if (!handle.done()) {
+            std::abort();
+        }
+        auto ns = duration_cast<nanoseconds>(end - start).count();
+
+        std::cout << "Ready event wait: "
+                  << (static_cast<double>(ns) / ready_wait_iterations)
+                  << " ns/wait" << std::endl;
+    }
+
+    // 5. Measure MPSC push only (no scheduler overhead)
     {
         runtime::mpsc_queue<void> queue;
 
@@ -114,7 +149,7 @@ int main() {
         while (queue.pop()) {}
     }
 
-    // 5. Measure Chase-Lev push only
+    // 6. Measure Chase-Lev push only
     {
         runtime::chase_lev_deque<void> queue;
 
@@ -131,7 +166,7 @@ int main() {
         while (queue.pop()) {}
     }
 
-    // 6. Compare atomic RMW with single-writer snapshot publication
+    // 7. Compare atomic RMW with single-writer snapshot publication
     {
         std::atomic<size_t> published{0};
 
@@ -163,7 +198,7 @@ int main() {
                   << " ns/update" << std::endl;
     }
 
-    // 7. Compare exact timestamps with the disabled diagnostic fast path
+    // 8. Compare exact timestamps with the disabled diagnostic fast path
     {
         std::atomic<steady_clock::time_point> last_task_time{
             steady_clock::now()};
@@ -198,7 +233,7 @@ int main() {
                   << " ns/update" << std::endl;
     }
 
-    // 8. Measure atomic fence alone
+    // 9. Measure atomic fence alone
     {
         auto start = high_resolution_clock::now();
         for (int i = 0; i < N; ++i) {
@@ -210,7 +245,7 @@ int main() {
         std::cout << "Atomic release fence: " << (ns / N) << " ns" << std::endl;
     }
 
-    // 9. Measure eventfd write
+    // 10. Measure eventfd write
     {
         int fd = eventfd(0, EFD_NONBLOCK);
         uint64_t val = 1;
@@ -226,7 +261,7 @@ int main() {
         close(fd);
     }
 
-    // 10. Full spawn path (with running scheduler) - includes alloc + spawn
+    // 11. Full spawn path (with running scheduler) - includes alloc + spawn
     {
         runtime::scheduler sched(4);
         sched.start();
@@ -248,7 +283,7 @@ int main() {
         sched.shutdown();
     }
 
-    // 11. Measure warmed-up worker overhead
+    // 12. Measure warmed-up worker overhead
     {
         runtime::scheduler sched(4);
         sched.start();

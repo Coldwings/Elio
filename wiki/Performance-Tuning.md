@@ -468,6 +468,30 @@ if (mtx.try_lock()) {
 }
 ```
 
+### Semaphore Performance
+
+A non-cancellable `semaphore::acquire()` consumes an immediately available
+permit without allocating shared wake state. If no permit is ready, the
+awaiter creates independently owned state before taking the queue lock and
+rechecks the count under that lock before parking. This preserves permit
+accounting when `release()` races the transition from `await_ready()` to
+`await_suspend()`, although that race can create one state that is not used for
+suspension. Token-aware acquires retain eager allocation for cancellation and
+permit-handoff arbitration.
+
+For steady-state permit guards, pair each successful acquire with the matching
+release:
+
+```cpp
+sync::semaphore permits(1);
+
+coro::task<void> use_permit() {
+    co_await permits.acquire();
+    // ... bounded work ...
+    permits.release();
+}
+```
+
 ### Reader-Writer Lock
 
 For read-heavy workloads:

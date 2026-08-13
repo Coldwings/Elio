@@ -2,6 +2,7 @@
 #include <elio/coro/task.hpp>
 #include <elio/log/macros.hpp>
 #include <elio/sync/event.hpp>
+#include <elio/sync/mutex.hpp>
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
@@ -28,6 +29,21 @@ coro::task<void> ready_event_waits(sync::event& ready_event,
                                    size_t iterations) {
     for (size_t i = 0; i < iterations; ++i) {
         co_await ready_event.wait();
+    }
+}
+
+coro::task<void> uncontended_mutex_locks(sync::mutex& mutex,
+                                         size_t iterations) {
+    for (size_t i = 0; i < iterations; ++i) {
+        co_await mutex.lock();
+        mutex.unlock();
+    }
+}
+
+coro::task<void> mutex_handoffs(sync::mutex& mutex, size_t iterations) {
+    for (size_t i = 0; i < iterations; ++i) {
+        co_await mutex.lock();
+        mutex.unlock();
     }
 }
 
@@ -132,7 +148,76 @@ int main() {
                   << " ns/wait" << std::endl;
     }
 
-    // 5. Measure MPSC push only (no scheduler overhead)
+    // 5. Measure uncontended mutex lock/unlock. As with the ready-event
+    // benchmark, construction happens before timing and one long-lived frame
+    // executes the whole loop without scheduler handoffs.
+    {
+        constexpr size_t lock_iterations = 1000000;
+        sync::mutex mutex;
+        auto locks = uncontended_mutex_locks(mutex, lock_iterations);
+        auto handle = coro::detail::task_access::handle(locks);
+
+        auto start = high_resolution_clock::now();
+        {
+            coro::detail::frame_context_scope frame_scope(
+                std::addressof(handle.promise()));
+            handle.resume();
+        }
+        auto end = high_resolution_clock::now();
+        if (!handle.done() || mutex.is_locked()) {
+            std::abort();
+        }
+        auto ns = duration_cast<nanoseconds>(end - start).count();
+
+        std::cout << "Uncontended mutex lock/unlock: "
+                  << (static_cast<double>(ns) / lock_iterations)
+                  << " ns/iteration" << std::endl;
+    }
+
+    // 6. Measure forced handoff between two long-lived coroutine frames. Both
+    // frames are parked before timing; unlock then drives an alternating chain
+    // through the local trampoline without worker scheduling noise.
+    {
+        constexpr size_t handoff_iterations_per_task = 100000;
+        constexpr size_t total_handoffs = handoff_iterations_per_task * 2;
+        sync::mutex mutex;
+        if (!mutex.try_lock()) {
+            std::abort();
+        }
+
+        auto first = mutex_handoffs(mutex, handoff_iterations_per_task);
+        auto second = mutex_handoffs(mutex, handoff_iterations_per_task);
+        auto first_handle = coro::detail::task_access::handle(first);
+        auto second_handle = coro::detail::task_access::handle(second);
+        {
+            coro::detail::frame_context_scope frame_scope(
+                std::addressof(first_handle.promise()));
+            first_handle.resume();
+        }
+        {
+            coro::detail::frame_context_scope frame_scope(
+                std::addressof(second_handle.promise()));
+            second_handle.resume();
+        }
+        if (first_handle.done() || second_handle.done()) {
+            std::abort();
+        }
+
+        auto start = high_resolution_clock::now();
+        mutex.unlock();
+        auto end = high_resolution_clock::now();
+        if (!first_handle.done() || !second_handle.done() ||
+            mutex.is_locked()) {
+            std::abort();
+        }
+        auto ns = duration_cast<nanoseconds>(end - start).count();
+
+        std::cout << "Forced two-task mutex handoff: "
+                  << (static_cast<double>(ns) / total_handoffs)
+                  << " ns/handoff" << std::endl;
+    }
+
+    // 7. Measure MPSC push only (no scheduler overhead)
     {
         runtime::mpsc_queue<void> queue;
 
@@ -149,7 +234,7 @@ int main() {
         while (queue.pop()) {}
     }
 
-    // 6. Measure Chase-Lev push only
+    // 8. Measure Chase-Lev push only
     {
         runtime::chase_lev_deque<void> queue;
 
@@ -166,7 +251,7 @@ int main() {
         while (queue.pop()) {}
     }
 
-    // 7. Compare atomic RMW with single-writer snapshot publication
+    // 9. Compare atomic RMW with single-writer snapshot publication
     {
         std::atomic<size_t> published{0};
 
@@ -198,7 +283,7 @@ int main() {
                   << " ns/update" << std::endl;
     }
 
-    // 8. Compare exact timestamps with the disabled diagnostic fast path
+    // 10. Compare exact timestamps with the disabled diagnostic fast path
     {
         std::atomic<steady_clock::time_point> last_task_time{
             steady_clock::now()};
@@ -233,7 +318,7 @@ int main() {
                   << " ns/update" << std::endl;
     }
 
-    // 9. Measure atomic fence alone
+    // 11. Measure atomic fence alone
     {
         auto start = high_resolution_clock::now();
         for (int i = 0; i < N; ++i) {
@@ -245,7 +330,7 @@ int main() {
         std::cout << "Atomic release fence: " << (ns / N) << " ns" << std::endl;
     }
 
-    // 10. Measure eventfd write
+    // 12. Measure eventfd write
     {
         int fd = eventfd(0, EFD_NONBLOCK);
         uint64_t val = 1;
@@ -261,7 +346,7 @@ int main() {
         close(fd);
     }
 
-    // 11. Full spawn path (with running scheduler) - includes alloc + spawn
+    // 13. Full spawn path (with running scheduler) - includes alloc + spawn
     {
         runtime::scheduler sched(4);
         sched.start();
@@ -283,7 +368,7 @@ int main() {
         sched.shutdown();
     }
 
-    // 12. Measure warmed-up worker overhead
+    // 14. Measure warmed-up worker overhead
     {
         runtime::scheduler sched(4);
         sched.start();

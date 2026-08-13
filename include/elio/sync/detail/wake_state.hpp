@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <coroutine>
 #include <memory>
+#include <new>
 #include <vector>
 #include "../../runtime/scheduler.hpp"
 
@@ -11,6 +12,7 @@ namespace elio::sync::detail {
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 inline std::atomic<size_t> wake_state_allocations_for_test{0};
+inline std::atomic<bool> fail_next_wake_state_allocation_for_test{false};
 #endif
 
 enum class wake_action {
@@ -236,6 +238,12 @@ private:
 using wake_state_ptr = std::shared_ptr<wake_state>;
 
 inline wake_state_ptr make_wake_state() {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (fail_next_wake_state_allocation_for_test.exchange(
+            false, std::memory_order_acq_rel)) {
+        throw std::bad_alloc();
+    }
+#endif
     auto state = std::make_shared<wake_state>();
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     wake_state_allocations_for_test.fetch_add(1, std::memory_order_relaxed);

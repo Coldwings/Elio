@@ -186,6 +186,10 @@ jobs:
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
       run: timeout --kill-after=5s 30s ./build/examples/scheduler_service_benchmark --smoke
 
+    - name: Run shared mutex reader benchmark smoke test
+      if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
+      run: timeout --kill-after=5s 30s ./build/examples/shared_mutex_reader_benchmark --smoke
+
     - name: Run autoscaler example smoke test
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
       run: timeout --kill-after=5s 15s ./build/examples/autoscaler_example --smoke

@@ -3300,6 +3300,15 @@ locked admission recheck retries concurrent packed-state changes before
 deciding to park. If a writer becomes active or waiting during that retry, the
 reader parks behind the writer instead of bypassing writer preference.
 
+The no-token `lock_shared()` path creates no wake state when either its initial
+ready check or its suspension-entry lock-free retry admits the reader. Once it
+still observes writer preference, it creates independently owned wake state
+before taking the waiter-queue mutex; allocation failure can therefore
+propagate from `await_suspend()` without publishing or granting the reader. The
+representation-limit fallback follows the same internal allocation boundary;
+the shared-acquisition precondition above is unchanged. Token-aware readers
+retain eager cancellation arbitration state.
+
 ### `shared_lock_guard`
 
 RAII unlock guard for an already-held shared (reader) lock. Callers must

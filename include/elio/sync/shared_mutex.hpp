@@ -19,6 +19,10 @@ inline std::atomic<bool> pause_shared_reader_after_locked_load_for_test{false};
 inline std::atomic<bool> shared_reader_paused_after_locked_load_for_test{false};
 inline std::atomic<size_t> shared_reader_unlocked_retries_for_test{0};
 inline std::atomic<size_t> shared_reader_waiter_publications_for_test{0};
+inline std::atomic<bool>
+    pause_shared_reader_after_wake_allocation_for_test{false};
+inline std::atomic<bool>
+    shared_reader_paused_after_wake_allocation_for_test{false};
 }
 #endif
 
@@ -69,13 +73,15 @@ public:
     class lock_shared_waiter : public elio::detail::intrusive_list_node<lock_shared_waiter> {
     public:
         explicit lock_shared_waiter(shared_mutex& m)
-            : mtx_(m)
-            , wake_state_(detail::make_wake_state()) {}
+            : mtx_(m) {}
 
         lock_shared_waiter(shared_mutex& m, bool cancellable)
             : mtx_(m)
-            , wake_state_(detail::make_wake_state())
-            , cancellable_(cancellable) {}
+            , cancellable_(cancellable) {
+            if (cancellable_) {
+                wake_state_ = detail::make_wake_state();
+            }
+        }
 
         ~lock_shared_waiter() {
             // Fast path: if we never suspended, we were never enqueued
@@ -102,8 +108,22 @@ public:
             }
         }
 
+        bool await_ready_non_cancellable_impl() const noexcept {
+            assert(!cancellable_);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (detail::force_shared_reader_slow_path_for_test.load(
+                    std::memory_order_acquire)) {
+                return false;
+            }
+#endif
+            return mtx_.try_lock_shared();
+        }
+
         bool await_ready_impl() const {
-            if (cancellable_ && wake_state_->was_cancelled()) {
+            if (!cancellable_) {
+                return await_ready_non_cancellable_impl();
+            }
+            if (wake_state_->was_cancelled()) {
                 return true;
             }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
@@ -115,9 +135,8 @@ public:
             if (!mtx_.try_lock_shared()) {
                 return false;
             }
-            if (!cancellable_ ||
-                detail::claim_wake_state(wake_state_) !=
-                    detail::wake_action::rejected) {
+            if (detail::claim_wake_state(wake_state_) !=
+                detail::wake_action::rejected) {
                 return true;
             }
 
@@ -126,8 +145,11 @@ public:
             return true;
         }
 
-        bool await_suspend_impl(std::coroutine_handle<> awaiter) {
-            if (cancellable_) {
+    private:
+        template<bool Cancellable>
+        bool await_suspend_mode_impl(std::coroutine_handle<> awaiter) {
+            assert(cancellable_ == Cancellable);
+            if constexpr (Cancellable) {
                 if (wake_state_->was_cancelled() ||
                     !wake_state_->set_handle_blocked(awaiter)) {
                     return false;
@@ -153,29 +175,62 @@ public:
                     if (mtx_.state_.compare_exchange_weak(
                             state, state + 1, std::memory_order_acquire,
                             std::memory_order_relaxed)) {
-                        if (!cancellable_ ||
-                            detail::claim_wake_state(wake_state_) !=
+                        if constexpr (!Cancellable) {
+                            return false;
+                        } else {
+                            if (detail::claim_wake_state(wake_state_) !=
                                 detail::wake_action::rejected) {
+                                return false;
+                            }
+                            mtx_.unlock_shared();
                             return false;
                         }
-                        mtx_.unlock_shared();
-                        return false;
                     }
                     // CAS failed, state updated - loop rechecks writer flags.
                 }
                 // The test seam forces only the initial locked recheck. A
                 // retry after that recheck uses this ordinary lock-free path.
+                const bool needs_wake_state =
+                    !Cancellable && !wake_state_;
+                if (needs_wake_state) {
+                    assert(force_slow_path || (state & WRITER_FLAGS) ||
+                           (state & READER_MASK) == READER_MASK);
+                }
                 force_slow_path = false;
 
                 // Slow path: a writer is present or the reader count is
-                // saturated. Fall back to the mutex for waiter publication.
+                // saturated. A dequeued grant may outlive the coroutine frame,
+                // so allocate independent wake ownership before taking the
+                // queue mutex. Failure leaves the state and queue untouched.
+                if (needs_wake_state) {
+                    wake_state_ = detail::make_wake_state();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                    if (detail::pause_shared_reader_after_wake_allocation_for_test
+                            .load(std::memory_order_acquire)) {
+                        detail::shared_reader_paused_after_wake_allocation_for_test
+                            .store(true, std::memory_order_release);
+                        detail::shared_reader_paused_after_wake_allocation_for_test
+                            .notify_all();
+                        while (detail::pause_shared_reader_after_wake_allocation_for_test
+                                   .load(std::memory_order_acquire)) {
+                            detail::pause_shared_reader_after_wake_allocation_for_test
+                                .wait(true, std::memory_order_acquire);
+                        }
+                        detail::shared_reader_paused_after_wake_allocation_for_test
+                            .store(false, std::memory_order_release);
+                    }
+#endif
+                }
+
                 bool release_reader = false;
                 bool retry_unlocked = false;
                 {
                     std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
 
-                    if (cancellable_ && wake_state_->was_cancelled()) {
-                        return false;
+                    if constexpr (Cancellable) {
+                        if (wake_state_->was_cancelled()) {
+                            return false;
+                        }
                     }
 
                     // Double-check under lock - state may have changed.
@@ -207,12 +262,15 @@ public:
                         if (mtx_.state_.compare_exchange_strong(
                                 state, state + 1, std::memory_order_acquire,
                                 std::memory_order_relaxed)) {
-                            if (!cancellable_ ||
-                                detail::claim_wake_state(wake_state_) !=
-                                    detail::wake_action::rejected) {
+                            if constexpr (!Cancellable) {
                                 return false;
+                            } else {
+                                if (detail::claim_wake_state(wake_state_) !=
+                                    detail::wake_action::rejected) {
+                                    return false;
+                                }
+                                release_reader = true;
                             }
-                            release_reader = true;
                         } else if (!(state & WRITER_FLAGS) &&
                                    (state & READER_MASK) != READER_MASK) {
                             retry_unlocked = true;
@@ -224,7 +282,7 @@ public:
                     }
 
                     if (!release_reader && !retry_unlocked) {
-                        if (!cancellable_) {
+                        if constexpr (!Cancellable) {
                             wake_state_->set_handle(awaiter);
                         }
                         suspended_ = true;
@@ -233,8 +291,9 @@ public:
                         detail::shared_reader_waiter_publications_for_test
                             .fetch_add(1, std::memory_order_release);
 #endif
-                        if (!cancellable_ ||
-                            wake_state_->unblock_after_publish()) {
+                        if constexpr (!Cancellable) {
+                            return true;
+                        } else if (wake_state_->unblock_after_publish()) {
                             return true;
                         }
 
@@ -253,8 +312,36 @@ public:
             }
         }
 
+    public:
+        bool await_suspend_non_cancellable_impl(
+                std::coroutine_handle<> awaiter) {
+            return await_suspend_mode_impl<false>(awaiter);
+        }
+
+        bool await_suspend_cancellable_impl(
+                std::coroutine_handle<> awaiter) {
+            return await_suspend_mode_impl<true>(awaiter);
+        }
+
+        bool await_suspend_impl(std::coroutine_handle<> awaiter) {
+            return cancellable_
+                ? await_suspend_cancellable_impl(awaiter)
+                : await_suspend_non_cancellable_impl(awaiter);
+        }
+
+        void await_resume_non_cancellable_impl() noexcept {
+            assert(!cancellable_);
+            resumed_ = true;
+            grant_pending_ = false;
+            suspended_ = false;
+        }
+
         coro::cancel_result await_resume_impl() noexcept {
-            if (cancellable_ && wake_state_->was_cancelled()) {
+            if (!cancellable_) {
+                await_resume_non_cancellable_impl();
+                return coro::cancel_result::completed;
+            }
+            if (wake_state_->was_cancelled()) {
                 if (suspended_) {
                     std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
                     if (this->is_linked()) {
@@ -315,12 +402,14 @@ public:
     public:
         explicit lock_shared_awaitable(shared_mutex& m) : waiter_(m) {}
 
-        bool await_ready() const noexcept { return waiter_.await_ready_impl(); }
-        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
-            return waiter_.await_suspend_impl(awaiter);
+        bool await_ready() const noexcept {
+            return waiter_.await_ready_non_cancellable_impl();
+        }
+        bool await_suspend(std::coroutine_handle<> awaiter) {
+            return waiter_.await_suspend_non_cancellable_impl(awaiter);
         }
         void await_resume() noexcept {
-            (void)waiter_.await_resume_impl();
+            waiter_.await_resume_non_cancellable_impl();
         }
 
     private:
@@ -335,7 +424,7 @@ public:
 
         bool await_ready() const { return waiter_.await_ready_impl(); }
         bool await_suspend(std::coroutine_handle<> awaiter) {
-            return waiter_.await_suspend_impl(awaiter);
+            return waiter_.await_suspend_cancellable_impl(awaiter);
         }
         [[nodiscard("check whether the shared lock was acquired")]]
         coro::cancel_result await_resume() noexcept {
@@ -602,6 +691,9 @@ public:
     ///
     /// The application must ensure fewer than (1ULL << 62) - 1 shared
     /// acquisitions are outstanding when this awaitable attempts admission.
+    /// An immediately admitted reader does not allocate wake state. A reader
+    /// that reaches the writer/saturation slow path allocates before taking
+    /// the queue mutex, and await_suspend may propagate std::bad_alloc.
     auto lock_shared() {
         return lock_shared_awaitable(*this);
     }

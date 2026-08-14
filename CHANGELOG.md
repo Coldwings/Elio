@@ -82,6 +82,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receives reuse the mutex already protecting their successful pop for the
   same decision. Queued-sender refill budgeting, FIFO claim, cancellation,
   and post-unlock scheduling remain unchanged (#1052).
+- **Allocation-free ready shared readers**: No-token
+  `shared_mutex::lock_shared()` now defers independent wake-state allocation
+  until suspension entry still requires the slow path. Ready admission and the
+  suspension-entry lock-free retry allocate nothing; readers that still observe
+  writer preference allocate before the internal queue mutex and may propagate
+  `std::bad_alloc`. The representation-limit fallback and its caller
+  precondition are unchanged. Token-aware readers remain eager (#1040).
 - **Shared-mutex reader-count contract**: Documented that the packed state
   supports at most `(1ULL << 62) - 1` outstanding shared acquisitions and that
   non-try acquisition requires callers to remain below that representation

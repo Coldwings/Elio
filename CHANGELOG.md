@@ -76,6 +76,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Bounded-channel empty refill fast path**: Successful bounded receives now
+  stop after observing an empty blocked-sender queue under the channel mutex,
+  instead of taking a second lock only to repeat that result. Token-aware
+  receives reuse the mutex already protecting their successful pop for the
+  same decision. Queued-sender refill budgeting, FIFO claim, cancellation,
+  and post-unlock scheduling remain unchanged (#1052).
 - **Shared-mutex reader-count contract**: Documented that the packed state
   supports at most `(1ULL << 62) - 1` outstanding shared acquisitions and that
   non-try acquisition requires callers to remain below that representation

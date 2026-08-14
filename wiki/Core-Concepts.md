@@ -542,6 +542,12 @@ coro::task<void> writer() {
 }
 ```
 
+Every successful shared acquisition must be released exactly once. The packed
+state supports at most `(1ULL << 62) - 1` outstanding shared acquisitions;
+the application must not call blocking `lock_shared()` when that many
+acquisitions are already outstanding. `try_lock_shared()` returns `false` if
+another shared acquisition cannot be represented.
+
 ### Event
 
 `event` is a one-shot signaling primitive. One or more coroutines wait for the event to be set:

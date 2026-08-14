@@ -3273,6 +3273,14 @@ public:
 };
 ```
 
+The packed mutex state reserves 62 bits for the number of outstanding shared
+acquisitions. Callers must keep that number below `(1ULL << 62) - 1` before a
+blocking `lock_shared()` acquisition and must balance every successful shared
+acquisition with exactly one `unlock_shared()`. Exceeding the representation
+limit is outside the supported contract. `try_lock_shared()` instead returns
+`false` when another shared acquisition cannot be represented. The limit counts
+outstanding acquisitions, not coroutine frames or distinct reader coroutines.
+
 ### `shared_lock_guard`
 
 RAII unlock guard for an already-held shared (reader) lock. Callers must

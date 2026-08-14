@@ -551,6 +551,59 @@ coro::task<void> writer() {
 }
 ```
 
+No-token `lock_shared()` admission is allocation-free when the initial ready
+CAS or the suspension-entry retry succeeds. A reader that observes an active or
+waiting writer retains independently owned wake state before entering the
+waiter queue, so dequeue-to-schedule lifetime and reserved-grant recovery remain
+safe. Token-aware readers create cancellation arbitration state eagerly.
+
+Benchmark ready readers, forced writer-to-reader handoff, mixed reader/writer
+loads, and sustained queued-writer pressure with the same final source against
+baseline and candidate include trees. Use fixed allowed CPUs and at least 30
+balanced, interleaved process pairs. Analyze paired log ratios with at least
+100,000 stratified bootstrap resamples. A candidate must show a supported ready
+reader improvement. Because this optimization deliberately moves wake-state
+allocation from every reader to the contended path, assess forced handoff by
+absolute cost: its paired point increase must not exceed 3 ns and its 95%
+confidence upper increase must not exceed 4 ns. Reader and mixed aggregate
+controls fail if their paired point regresses by more than 2% or their
+confidence interval establishes a directional regression. Writer p95 and p99
+point regressions must not exceed 5%, with 95% upper bounds no greater than
+10%. Report the raw maximum as a scheduling-sensitive diagnostic rather than a
+starvation gate. Every pressure sample must complete the exact configured
+writer count with zero no-progress observations; reader admission must never
+pass an already-published writer.
+
+Each reader workload runs repeated `co_await lock_shared()` operations in a
+persistent coroutine frame. Scheduler construction, task creation, one same-
+path warmup acquisition, frame destruction, and scheduler shutdown stay
+outside the timed ready/reader interval. The forced row coordinates persistent
+reader and driver coroutines on one worker so writer release occurs only after
+the reader has published, and completion is counted only after the resumed
+reader releases its shared slot.
+
+Build `examples/shared_mutex_reader_benchmark.cpp` twice from the exact same
+final source and compiler flags, changing only the Elio include root. Formal
+runs use one strict suite per process:
+
+```bash
+shared_mutex_reader_benchmark --suite core --iterations 1000000
+shared_mutex_reader_benchmark --suite readers --workers 4 --iterations 250000
+shared_mutex_reader_benchmark --suite mixed --workers 4 --reader-percent 90 --iterations 100000
+shared_mutex_reader_benchmark --suite mixed --workers 4 --reader-percent 50 --iterations 100000
+shared_mutex_reader_benchmark --suite pressure --readers 4 --iterations 50000
+```
+
+Run `core` and the one-reader `readers` case on one allowed physical CPU. Pin
+multi-reader and mixed cases to exactly the requested number of physical CPUs.
+The pressure case uses one affinity-bound scheduler worker per reader, one
+additional scheduler worker for queued writers, and the calling thread as the
+driver, so it needs the requested reader CPUs plus two physical CPUs; disclose
+any oversubscription. Apply an external process timeout, reject unexpected row
+counts or incomplete operation/progress totals, and alternate
+baseline/candidate order in every pair. `--smoke` is only a functional driver,
+not a formal sample.
+
 ### Channel Selection
 
 Choose appropriate channel type:

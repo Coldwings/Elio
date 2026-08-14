@@ -50,6 +50,11 @@ add_executable(microbench microbench.cpp)
 target_link_libraries(microbench PRIVATE elio)
 target_link_options(microbench PRIVATE ${STATIC_LINK_FLAGS})
 
+add_executable(shared_mutex_reader_benchmark
+    shared_mutex_reader_benchmark.cpp)
+target_link_libraries(shared_mutex_reader_benchmark PRIVATE elio)
+target_link_options(shared_mutex_reader_benchmark PRIVATE ${STATIC_LINK_FLAGS})
+
 add_executable(cancel_callback_benchmark cancel_callback_benchmark.cpp)
 target_link_libraries(cancel_callback_benchmark PRIVATE elio)
 target_link_options(cancel_callback_benchmark PRIVATE ${STATIC_LINK_FLAGS})

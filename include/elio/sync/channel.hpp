@@ -26,7 +26,50 @@ inline std::atomic<bool> pause_bounded_recv_after_claim_for_test{false};
 inline std::atomic<bool> bounded_recv_paused_after_claim_for_test{false};
 inline std::atomic<bool> pause_bounded_recv_after_failed_pop_for_test{false};
 inline std::atomic<bool> bounded_recv_paused_after_failed_pop_for_test{false};
+inline std::atomic<size_t> bounded_refill_snapshot_locks_for_test{0};
+inline std::atomic<size_t> bounded_refill_credit_locks_for_test{0};
+inline std::atomic<size_t> bounded_refill_empty_returns_for_test{0};
+inline std::atomic<size_t> bounded_refill_token_skips_for_test{0};
+inline std::atomic<size_t> bounded_try_send_lock_attempts_for_test{0};
+inline std::atomic<bool> pause_bounded_refill_empty_return_for_test{false};
+inline std::atomic<bool> bounded_refill_paused_on_empty_for_test{false};
+inline std::atomic<bool> pause_bounded_refill_after_dequeue_for_test{false};
+inline std::atomic<bool> bounded_refill_paused_after_dequeue_for_test{false};
+
+inline void pause_bounded_refill_on_empty_for_test() noexcept {
+    if (!pause_bounded_refill_empty_return_for_test.load(
+            std::memory_order_acquire)) {
+        return;
+    }
+    bounded_refill_paused_on_empty_for_test.store(
+        true, std::memory_order_release);
+    bounded_refill_paused_on_empty_for_test.notify_all();
+    while (pause_bounded_refill_empty_return_for_test.load(
+        std::memory_order_acquire)) {
+        pause_bounded_refill_empty_return_for_test.wait(
+            true, std::memory_order_acquire);
+    }
+    bounded_refill_paused_on_empty_for_test.store(
+        false, std::memory_order_release);
 }
+
+inline void maybe_pause_bounded_refill_after_dequeue_for_test() noexcept {
+    if (!pause_bounded_refill_after_dequeue_for_test.load(
+            std::memory_order_acquire)) {
+        return;
+    }
+    bounded_refill_paused_after_dequeue_for_test.store(
+        true, std::memory_order_release);
+    bounded_refill_paused_after_dequeue_for_test.notify_all();
+    while (pause_bounded_refill_after_dequeue_for_test.load(
+        std::memory_order_acquire)) {
+        pause_bounded_refill_after_dequeue_for_test.wait(
+            true, std::memory_order_acquire);
+    }
+    bounded_refill_paused_after_dequeue_for_test.store(
+        false, std::memory_order_release);
+}
+}  // namespace detail
 #endif
 
 /// Multi-producer multi-consumer channel
@@ -588,6 +631,11 @@ public:
         if (is_bounded()) {
             detail::wake_state_ptr receiver_handle;
             {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                detail::bounded_try_send_lock_attempts_for_test.fetch_add(
+                    1, std::memory_order_release);
+                detail::bounded_try_send_lock_attempts_for_test.notify_all();
+#endif
                 std::lock_guard<std::mutex> guard(mutex_);
                 if (closed_) return false;
                 if (ring_->size() >= capacity_) return false;
@@ -774,7 +822,15 @@ public:
 #endif
                             } else {
                                 resolved = true;
-                                refill_senders = true;
+                                if (send_waiters_.empty()) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                                    detail::bounded_refill_token_skips_for_test
+                                        .fetch_add(1, std::memory_order_relaxed);
+                                    detail::pause_bounded_refill_on_empty_for_test();
+#endif
+                                } else {
+                                    refill_senders = true;
+                                }
                             }
                         }
                     } else if (!send_waiters_.empty()) {
@@ -1038,6 +1094,22 @@ private:
         size_t refill_budget;
         {
             std::lock_guard<std::mutex> guard(mutex_);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            detail::bounded_refill_snapshot_locks_for_test.fetch_add(
+                1, std::memory_order_relaxed);
+#endif
+            // Enqueue and this observation use the same mutex. A sender that
+            // arrives after an empty observation either uses the newly
+            // reusable producer slot directly or, after out-of-order pops,
+            // is refilled by the consumer that publishes the next slot.
+            if (send_waiters_.empty()) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                detail::bounded_refill_empty_returns_for_test.fetch_add(
+                    1, std::memory_order_relaxed);
+                detail::pause_bounded_refill_on_empty_for_test();
+#endif
+                return;
+            }
             const size_t logical_size = ring_->size();
             refill_budget = logical_size < capacity_
                 ? capacity_ - logical_size
@@ -1050,6 +1122,10 @@ private:
             detail::wake_state_ptr receiver_handle;
             {
                 std::lock_guard<std::mutex> guard(mutex_);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                detail::bounded_refill_credit_locks_for_test.fetch_add(
+                    1, std::memory_order_relaxed);
+#endif
                 if (ring_->size() >= capacity_ || !ring_->can_push()) {
                     return;
                 }
@@ -1069,6 +1145,9 @@ private:
                 }
             }
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            detail::maybe_pause_bounded_refill_after_dequeue_for_test();
+#endif
             if (receiver_handle) {
                 schedule_receiver_or_retry(receiver_handle);
             }

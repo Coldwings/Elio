@@ -592,6 +592,46 @@ pinned, interleaved baseline/candidate samples; the benchmark intentionally
 does not impose timing thresholds on shared CI runners. Pass `--smoke` for
 reduced iteration counts when validating a Debug build.
 
+After a successful bounded receive, Elio checks the blocked-sender queue while
+holding the channel mutex. An empty queue returns without taking the separate
+per-credit refill lock. Token-aware `recv(token)` folds that empty check into
+the lock already protecting its successful ring pop. If a sender is queued,
+the existing finite credit snapshot, per-credit physical-slot check, FIFO
+claim, cancellation arbitration, and post-unlock scheduling are unchanged.
+Because sender enqueue uses the same mutex, a sender arriving after an empty
+decision either uses the newly reusable slot directly or, after out-of-order
+consumer publication, is handled by the consumer that publishes the next
+producer slot.
+
+`bench_channel_refill` isolates ready bounded `recv()`, `try_recv()`, and
+active-token receive paths, forced full-channel sender refill, cancellation and
+close controls, and 1/1, 2/2, and 4/4 producer/consumer throughput. Build the
+same final benchmark source against baseline and candidate include trees, then
+run at least 30 process-level pairs in alternating baseline/candidate order on
+a fixed allowed CPU set. Analyze paired log ratios with at least 100,000
+stratified bootstrap resamples. A formal invocation emits exactly nine unique
+`ns/op` rows; reject missing, duplicate, non-finite, or nonzero-exit samples.
+Ready receive rows must improve. Because the empty-list check deliberately
+trades a small queued-sender branch cost for removing a redundant lock from
+the common path, assess forced refill by absolute cost: its paired point
+increase must not exceed 3 ns and its 95% confidence upper increase must not
+exceed 6 ns. Producer/consumer throughput may not regress by more than 2%.
+Cancellation and close rows are semantic controls and must remain stable. Run
+the 1/1, 2/2, and 4/4 rows on allowed sets containing 2, 4, and 8 distinct
+physical CPUs respectively; an oversubscribed row is diagnostic only.
+
+```bash
+cmake --build build-release --target bench_channel_refill --parallel 2
+taskset -c 2,3 ./build-release/examples/bench_channel_refill
+```
+
+Wrap every benchmark process in an external timeout because the executable has
+no internal watchdog, and record any timeout as a failed sample rather than a
+performance observation.
+
+Use `--smoke` only for a short build and termination check; it is not a formal
+performance sample.
+
 ## Network Performance
 
 ### Connection Pooling

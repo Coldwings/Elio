@@ -165,6 +165,60 @@ bool wait_for_condition(Predicate&& predicate,
     return predicate();
 }
 
+struct bounded_refill_hook_scope {
+    bounded_refill_hook_scope() { reset(); }
+
+    ~bounded_refill_hook_scope() {
+        elio::sync::detail::pause_bounded_refill_empty_return_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_bounded_refill_empty_return_for_test.notify_all();
+        elio::sync::detail::pause_bounded_refill_after_dequeue_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_bounded_refill_after_dequeue_for_test.notify_all();
+    }
+
+    static void reset() {
+        elio::sync::detail::bounded_refill_snapshot_locks_for_test.store(
+            0, std::memory_order_release);
+        elio::sync::detail::bounded_refill_credit_locks_for_test.store(
+            0, std::memory_order_release);
+        elio::sync::detail::bounded_refill_empty_returns_for_test.store(
+            0, std::memory_order_release);
+        elio::sync::detail::bounded_refill_token_skips_for_test.store(
+            0, std::memory_order_release);
+        elio::sync::detail::bounded_try_send_lock_attempts_for_test.store(
+            0, std::memory_order_release);
+        elio::sync::detail::pause_bounded_refill_empty_return_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::bounded_refill_paused_on_empty_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_bounded_refill_after_dequeue_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::bounded_refill_paused_after_dequeue_for_test.store(
+            false, std::memory_order_release);
+    }
+};
+
+size_t refill_snapshot_locks() noexcept {
+    return elio::sync::detail::bounded_refill_snapshot_locks_for_test.load(
+        std::memory_order_relaxed);
+}
+
+size_t refill_credit_locks() noexcept {
+    return elio::sync::detail::bounded_refill_credit_locks_for_test.load(
+        std::memory_order_relaxed);
+}
+
+size_t refill_empty_returns() noexcept {
+    return elio::sync::detail::bounded_refill_empty_returns_for_test.load(
+        std::memory_order_relaxed);
+}
+
+size_t refill_token_skips() noexcept {
+    return elio::sync::detail::bounded_refill_token_skips_for_test.load(
+        std::memory_order_relaxed);
+}
+
 }  // namespace
 
 TEST_CASE("channel send frames transfer move-only payloads once",
@@ -826,6 +880,333 @@ TEST_CASE("bounded channel drains refill credits after out-of-order publication"
     REQUIRE(fourth.has_value());
     REQUIRE(((third->value == 3 && fourth->value == 4) ||
              (third->value == 4 && fourth->value == 3)));
+}
+
+TEST_CASE("bounded channel skips refill work only for an empty sender queue",
+          "[sync][channel][refill][regression]") {
+    bounded_refill_hook_scope hooks;
+
+    SECTION("a sender queued before the decision uses the existing refill path") {
+        channel<int> ch(1);
+        REQUIRE(ch.try_send(1));
+        channel<int>::send_awaitable sender(ch, 2);
+        REQUIRE(sender.await_suspend(std::noop_coroutine()));
+
+        const auto first = ch.try_recv();
+
+        REQUIRE(first == 1);
+        REQUIRE(sender.await_resume());
+        REQUIRE(refill_snapshot_locks() == 1);
+        REQUIRE(refill_credit_locks() == 1);
+        REQUIRE(refill_empty_returns() == 0);
+        REQUIRE(ch.try_recv() == 2);
+    }
+
+    SECTION("a sender arriving during the empty decision sends after unlock") {
+        channel<int> ch(1);
+        REQUIRE(ch.try_send(1));
+        elio::sync::detail::pause_bounded_refill_empty_return_for_test.store(
+            true, std::memory_order_release);
+
+        std::optional<int> first;
+        std::thread consumer([&] { first = ch.try_recv(); });
+        const bool empty_decision_paused = wait_for_true(
+            elio::sync::detail::bounded_refill_paused_on_empty_for_test);
+        if (!empty_decision_paused) {
+            elio::sync::detail::pause_bounded_refill_empty_return_for_test.store(
+                false, std::memory_order_release);
+            elio::sync::detail::pause_bounded_refill_empty_return_for_test
+                .notify_all();
+            consumer.join();
+            REQUIRE(empty_decision_paused);
+            return;
+        }
+
+        std::atomic<bool> sender_done{false};
+        bool sent = false;
+        elio::sync::detail::bounded_try_send_lock_attempts_for_test.store(
+            0, std::memory_order_release);
+        std::thread sender([&] {
+            sent = ch.try_send(2);
+            sender_done.store(true, std::memory_order_release);
+            sender_done.notify_all();
+        });
+        const bool sender_reached_decision = wait_for_at_least(
+            elio::sync::detail::bounded_try_send_lock_attempts_for_test, 1);
+        const bool sender_blocked_by_decision =
+            !sender_done.load(std::memory_order_acquire);
+
+        elio::sync::detail::pause_bounded_refill_empty_return_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_bounded_refill_empty_return_for_test
+            .notify_all();
+        sender.join();
+        consumer.join();
+
+        REQUIRE(sender_reached_decision);
+        REQUIRE(sender_blocked_by_decision);
+        REQUIRE(first == 1);
+        REQUIRE(sent);
+        REQUIRE(refill_snapshot_locks() == 1);
+        REQUIRE(refill_credit_locks() == 0);
+        REQUIRE(refill_empty_returns() == 1);
+        REQUIRE(ch.try_recv() == 2);
+    }
+
+    SECTION("a sender arriving after the empty return uses the freed slot") {
+        channel<int> ch(1);
+        REQUIRE(ch.try_send(1));
+
+        REQUIRE(ch.try_recv() == 1);
+        REQUIRE(refill_snapshot_locks() == 1);
+        REQUIRE(refill_credit_locks() == 0);
+        REQUIRE(refill_empty_returns() == 1);
+
+        REQUIRE(ch.try_send(2));
+        REQUIRE(ch.try_recv() == 2);
+    }
+
+    SECTION("ordinary receive takes one empty-queue snapshot lock") {
+        channel<int> ch(1);
+        REQUIRE(ch.try_send(5));
+        scheduler sched(1);
+        sched.start();
+        auto receiver = sched.go_joinable([&]() -> task<std::optional<int>> {
+            co_return co_await ch.recv();
+        });
+        const bool completed = wait_for_condition(
+            [&] { return receiver.is_ready(); });
+        if (!completed) {
+            ch.close();
+        }
+        REQUIRE(wait_for_condition([&] { return receiver.is_ready(); }));
+        receiver.wait_destroyed();
+        const auto result = receiver.await_resume();
+        REQUIRE(sched.shutdown(std::chrono::milliseconds(2000)));
+
+        REQUIRE(completed);
+        REQUIRE(result == 5);
+        REQUIRE(refill_snapshot_locks() == 1);
+        REQUIRE(refill_credit_locks() == 0);
+        REQUIRE(refill_empty_returns() == 1);
+    }
+
+    SECTION("token receive reuses its existing channel lock") {
+        channel<int> ch(1);
+        REQUIRE(ch.try_send(7));
+        cancel_source source;
+        scheduler sched(1);
+        sched.start();
+        auto receiver = sched.go_joinable([&]()
+                -> task<channel<int>::cancellable_recv_result> {
+            co_return co_await ch.recv(source.get_token());
+        });
+        const bool completed = wait_for_condition(
+            [&] { return receiver.is_ready(); });
+        if (!completed) {
+            ch.close();
+        }
+        REQUIRE(wait_for_condition([&] { return receiver.is_ready(); }));
+        receiver.wait_destroyed();
+        const auto result = receiver.await_resume();
+        REQUIRE(sched.shutdown(std::chrono::milliseconds(2000)));
+
+        REQUIRE(completed);
+        REQUIRE(result.success());
+        REQUIRE(result.value == 7);
+        REQUIRE(refill_token_skips() == 1);
+        REQUIRE(refill_snapshot_locks() == 0);
+        REQUIRE(refill_credit_locks() == 0);
+        REQUIRE(refill_empty_returns() == 0);
+    }
+}
+
+TEST_CASE("bounded channel empty refill decision preserves publication handoff",
+          "[sync][channel][refill][regression]") {
+    bounded_refill_hook_scope hooks;
+    auto first_gate = std::make_shared<slot_release_gate>();
+    auto second_gate = std::make_shared<slot_release_gate>();
+    channel<gated_value> ch(2);
+    REQUIRE(ch.try_send(gated_value(1, first_gate)));
+    REQUIRE(ch.try_send(gated_value(2, second_gate)));
+
+    first_gate->block_next_move.store(true, std::memory_order_release);
+    second_gate->block_next_move.store(true, std::memory_order_release);
+    std::optional<gated_value> first;
+    std::optional<gated_value> second;
+    std::atomic<bool> second_done{false};
+    std::thread first_consumer([&] { first = ch.try_recv(); });
+    const bool first_claimed = wait_for_true(first_gate->move_blocked);
+    if (!first_claimed) {
+        first_gate->release_move.store(true, std::memory_order_release);
+        first_consumer.join();
+        REQUIRE(first_claimed);
+        return;
+    }
+    std::thread second_consumer([&] {
+        second = ch.try_recv();
+        second_done.store(true, std::memory_order_release);
+        second_done.notify_all();
+    });
+    const bool second_claimed = wait_for_true(second_gate->move_blocked);
+    if (!second_claimed) {
+        second_gate->release_move.store(true, std::memory_order_release);
+        first_gate->release_move.store(true, std::memory_order_release);
+        second_consumer.join();
+        first_consumer.join();
+        REQUIRE(second_claimed);
+        return;
+    }
+
+    second_gate->release_move.store(true, std::memory_order_release);
+    second_gate->release_move.notify_all();
+    const bool second_returned_first = wait_for_true(second_done);
+
+    elio::sync::detail::bounded_send_publish_waits_for_test.store(
+        0, std::memory_order_release);
+    scheduler sched(1);
+    sched.start();
+    auto sender = sched.go_joinable([&]() -> task<bool> {
+        co_return co_await ch.send(gated_value(3));
+    });
+    const bool sender_waited_for_next_publication = wait_for_at_least(
+        elio::sync::detail::bounded_send_publish_waits_for_test, 1);
+
+    first_gate->release_move.store(true, std::memory_order_release);
+    first_gate->release_move.notify_all();
+    first_consumer.join();
+    second_consumer.join();
+    const bool sender_completed_without_cleanup = wait_for_condition(
+        [&] { return sender.is_ready(); });
+    if (!sender_completed_without_cleanup) {
+        ch.close();
+    }
+    REQUIRE(wait_for_condition([&] { return sender.is_ready(); }));
+    sender.wait_destroyed();
+    const bool sent = sender.await_resume();
+    REQUIRE(sched.shutdown(std::chrono::milliseconds(2000)));
+
+    REQUIRE(first_claimed);
+    REQUIRE(second_claimed);
+    REQUIRE(second_returned_first);
+    REQUIRE(sender_waited_for_next_publication);
+    REQUIRE(sender_completed_without_cleanup);
+    REQUIRE(first.has_value());
+    REQUIRE(first->value == 1);
+    REQUIRE(second.has_value());
+    REQUIRE(second->value == 2);
+    REQUIRE(sent);
+    REQUIRE(refill_empty_returns() >= 1);
+    REQUIRE(refill_credit_locks() >= 1);
+    auto replacement = ch.try_recv();
+    REQUIRE(replacement.has_value());
+    REQUIRE(replacement->value == 3);
+}
+
+TEST_CASE("bounded channel refill skips cancelled senders without stranding FIFO",
+          "[sync][channel][refill][cancellation][regression]") {
+    bounded_refill_hook_scope hooks;
+
+    SECTION("cancelled head") {
+        channel<int> ch(1);
+        REQUIRE(ch.try_send(1));
+        cancel_source source;
+        channel<int>::cancellable_send_awaitable cancelled(
+            ch, 2, source.get_token());
+        channel<int>::send_awaitable live(ch, 3);
+        REQUIRE(cancelled.await_suspend(std::noop_coroutine()));
+        REQUIRE(live.await_suspend(std::noop_coroutine()));
+        source.cancel();
+
+        const auto first = ch.try_recv();
+        const auto cancelled_result = cancelled.await_resume();
+        const bool live_result = live.await_resume();
+
+        REQUIRE(first == 1);
+        REQUIRE(cancelled_result.was_cancelled());
+        REQUIRE(live_result);
+        REQUIRE(refill_snapshot_locks() == 1);
+        REQUIRE(refill_credit_locks() == 1);
+        REQUIRE(refill_empty_returns() == 0);
+        REQUIRE(ch.try_recv() == 3);
+        REQUIRE_FALSE(ch.try_recv().has_value());
+    }
+
+    SECTION("cancelled middle") {
+        channel<int> ch(2);
+        REQUIRE(ch.try_send(1));
+        REQUIRE(ch.try_send(2));
+        cancel_source source;
+        channel<int>::send_awaitable first_live(ch, 3);
+        channel<int>::cancellable_send_awaitable cancelled(
+            ch, 4, source.get_token());
+        channel<int>::send_awaitable second_live(ch, 5);
+        REQUIRE(first_live.await_suspend(std::noop_coroutine()));
+        REQUIRE(cancelled.await_suspend(std::noop_coroutine()));
+        REQUIRE(second_live.await_suspend(std::noop_coroutine()));
+        source.cancel();
+
+        const auto first = ch.try_recv();
+        const auto second = ch.try_recv();
+        const bool first_live_result = first_live.await_resume();
+        const auto cancelled_result = cancelled.await_resume();
+        const bool second_live_result = second_live.await_resume();
+
+        REQUIRE(first == 1);
+        REQUIRE(second == 2);
+        REQUIRE(first_live_result);
+        REQUIRE(cancelled_result.was_cancelled());
+        REQUIRE(second_live_result);
+        REQUIRE(refill_snapshot_locks() == 2);
+        REQUIRE(refill_credit_locks() == 2);
+        REQUIRE(refill_empty_returns() == 0);
+        REQUIRE(ch.try_recv() == 3);
+        REQUIRE(ch.try_recv() == 5);
+        REQUIRE_FALSE(ch.try_recv().has_value());
+    }
+}
+
+TEST_CASE("bounded channel refill retains a dequeued sender wake across close",
+          "[sync][channel][refill][lifetime][regression]") {
+    bounded_refill_hook_scope hooks;
+    channel<int> ch(1);
+    REQUIRE(ch.try_send(1));
+
+    auto sender_task = ch.send(2);
+    auto sender = elio::coro::detail::task_access::release(
+        std::move(sender_task));
+    sender.resume();
+    REQUIRE_FALSE(sender.done());
+
+    elio::sync::detail::pause_bounded_refill_after_dequeue_for_test.store(
+        true, std::memory_order_release);
+    std::optional<int> first;
+    std::thread consumer([&] { first = ch.try_recv(); });
+    const bool refill_dequeued_sender = wait_for_true(
+        elio::sync::detail::bounded_refill_paused_after_dequeue_for_test);
+    if (!refill_dequeued_sender) {
+        elio::sync::detail::pause_bounded_refill_after_dequeue_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_bounded_refill_after_dequeue_for_test
+            .notify_all();
+        consumer.join();
+        sender.destroy();
+        ch.close();
+        REQUIRE(refill_dequeued_sender);
+        return;
+    }
+
+    sender.destroy();
+    ch.close();
+    elio::sync::detail::pause_bounded_refill_after_dequeue_for_test.store(
+        false, std::memory_order_release);
+    elio::sync::detail::pause_bounded_refill_after_dequeue_for_test.notify_all();
+    consumer.join();
+
+    REQUIRE(first == 1);
+    REQUIRE(refill_credit_locks() == 1);
+    REQUIRE(ch.try_recv() == 2);
+    REQUIRE_FALSE(ch.try_recv().has_value());
 }
 
 TEST_CASE("bounded channel refill wakes a receiver queued behind consumers",

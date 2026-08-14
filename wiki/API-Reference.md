@@ -1461,6 +1461,13 @@ drain accounting and complete on the backend owner, but cannot install an Elio
 task execution-context pin. A custom coroutine runtime that independently
 re-enqueues such a suspended handle must preserve that owner itself.
 
+Built-in token-aware I/O, timer, TCP, and UDS awaiters retire the raw backend
+cancellation key before their base-class orphan transfer can release the
+associated `op_state`. A cancel executor that was queued but had not yet claimed
+the key becomes a no-op; an executor that already claimed it finishes key use on
+the backend owner without waiting in awaiter teardown. This prevents allocation
+address reuse from redirecting an old cancellation to a new operation.
+
 I/O pinning protects backend ownership only. It does not serialize concurrent
 operations on the same stream or fd. Follow the concrete stream contract and
 externally serialize conflicting reads, writes, close, or destruction.
@@ -1512,6 +1519,13 @@ before an exception escapes. A `false` prepare result means no backend
 ownership was transferred and still requires `clear_op_state()`. Once prepare
 returns `true`, leave the state attached to the awaitable; normal completion or
 the orphan protocol releases the operation guard.
+
+A custom cancellation dispatcher that can outlive its awaitable must not keep
+using a raw `req.state` key after frame teardown can enter the orphan protocol.
+It must atomically arbitrate its final key use against derived-awaitable
+destruction before the `io_awaitable_base` destructor runs. Do not wait from
+that destruction path: epoll cancellation may synchronously resume and destroy
+the same awaitable inside `io_context::cancel()`.
 
 ### `io_result`
 

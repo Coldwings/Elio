@@ -50,7 +50,63 @@ inline void publish_cancellable_recv_staged_for_test() noexcept {
         staged->notify_all();
     }
 }
+
+inline std::atomic<bool> pause_io_cancel_executor_before_claim_for_test{false};
+inline std::atomic<bool> io_cancel_executor_paused_before_claim_for_test{false};
+inline std::atomic<bool> pause_io_cancel_executor_after_claim_for_test{false};
+inline std::atomic<bool> io_cancel_executor_paused_after_claim_for_test{false};
+
+inline void pause_io_cancel_executor_for_test(
+    std::atomic<bool>& pause,
+    std::atomic<bool>& paused) noexcept {
+    if (!pause.load(std::memory_order_acquire)) {
+        return;
+    }
+    paused.store(true, std::memory_order_release);
+    paused.notify_all();
+    while (pause.load(std::memory_order_acquire)) {
+        pause.wait(true, std::memory_order_acquire);
+    }
+    paused.store(false, std::memory_order_release);
+}
 #endif
+
+/// Arbitrates a cancellation-key use against awaiter teardown. This gate never
+/// waits: once the executor wins it is already running on the backend owner, so
+/// that owner cannot poll and free an orphaned op_state before cancel() has
+/// consumed the key. If teardown wins, a queued executor must not use the key.
+class io_cancel_key_gate {
+public:
+    [[nodiscard]] bool try_claim_for_executor() noexcept {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        pause_io_cancel_executor_for_test(
+            pause_io_cancel_executor_before_claim_for_test,
+            io_cancel_executor_paused_before_claim_for_test);
+#endif
+        if (terminal_or_claimed_.exchange(true, std::memory_order_acq_rel)) {
+            return false;
+        }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        pause_io_cancel_executor_for_test(
+            pause_io_cancel_executor_after_claim_for_test,
+            io_cancel_executor_paused_after_claim_for_test);
+#endif
+        return true;
+    }
+
+    void retire() noexcept {
+        (void)terminal_or_claimed_.exchange(true, std::memory_order_acq_rel);
+    }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    [[nodiscard]] bool closed_for_test() const noexcept {
+        return terminal_or_claimed_.load(std::memory_order_acquire);
+    }
+#endif
+
+private:
+    std::atomic<bool> terminal_or_claimed_{false};
+};
 
 inline constexpr int socket_no_sigpipe_flag =
 #ifdef MSG_NOSIGNAL
@@ -1176,17 +1232,46 @@ inline auto batch_write(int fd, std::span<const batch_write_segment> segments) {
 
 namespace detail {
 
-/// Shared state for cancellable I/O operations.
-/// Follows the same pattern as cancellable_sleep_awaitable::shared_state.
+/// Shared cancellation state used by generic I/O, timers, TCP, and UDS.
 struct io_cancel_state {
     io_context* ctx = nullptr;
     std::coroutine_handle<> awaiter;
     runtime::worker_thread* worker = nullptr;
     uint64_t context_generation = 0;
     op_state* op = nullptr;
-    std::atomic<bool> resumed{false};
+    /// Exactly one of awaiter teardown or the owner-worker executor may claim
+    /// permission to make the final use of ``op`` as a cancellation key.
+    io_cancel_key_gate key_gate;
     std::atomic<bool> cancelled{false};
 };
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline thread_local std::shared_ptr<io_cancel_state>*
+    next_io_cancel_state_capture_for_test = nullptr;
+
+inline void capture_next_io_cancel_state_for_test(
+    std::shared_ptr<io_cancel_state>& capture) noexcept {
+    next_io_cancel_state_capture_for_test = &capture;
+}
+#endif
+
+inline std::shared_ptr<io_cancel_state> make_io_cancel_state() {
+    auto state = std::make_shared<io_cancel_state>();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (next_io_cancel_state_capture_for_test != nullptr) {
+        *next_io_cancel_state_capture_for_test = state;
+        next_io_cancel_state_capture_for_test = nullptr;
+    }
+#endif
+    return state;
+}
+
+inline void retire_io_cancel_key(
+    const std::shared_ptr<io_cancel_state>& state) noexcept {
+    if (state) {
+        state->key_gate.retire();
+    }
+}
 
 /// Fire-and-forget coroutine that executes io_context::cancel() on the worker
 /// that owns the ring. Self-destroys via suspend_never on final_suspend.
@@ -1211,7 +1296,7 @@ struct io_cancel_executor {
 inline io_cancel_executor make_io_cancel_executor(
     std::shared_ptr<io_cancel_state> state,
     bool allow_epoll_cancel = false) {
-    if (state->resumed.exchange(true, std::memory_order_acq_rel)) {
+    if (!state->key_gate.try_claim_for_executor()) {
         co_return;
     }
     if (state->worker &&
@@ -1288,6 +1373,10 @@ public:
         , flags_(flags)
         , token_(std::move(token)) {}
 
+    ~cancellable_async_recv_awaitable() noexcept {
+        detail::retire_io_cancel_key(state_);
+    }
+
     bool await_ready() const noexcept {
         return token_.is_cancelled();
     }
@@ -1303,7 +1392,7 @@ public:
         auto& ctx = current_io_context();
 
         // Allocate shared state for cancel callback
-        auto state = std::make_shared<detail::io_cancel_state>();
+        auto state = detail::make_io_cancel_state();
         state->ctx = &ctx;
         state->awaiter = awaiter;
         state->worker = runtime::worker_thread::current();
@@ -1329,7 +1418,7 @@ public:
         // Check again after registration
         if (token_.is_cancelled()) {
             cancel_registration_.unregister();
-            state->resumed.store(true, std::memory_order_release);
+            detail::retire_io_cancel_key(state);
             result_ = io_result{-ECANCELED, 0};
             awaiter.resume();
             return;
@@ -1347,7 +1436,7 @@ public:
 
         if (!prepare_op_state(ctx, req, [&]() noexcept {
                 state->op = nullptr;
-                state->resumed.store(true, std::memory_order_release);
+                detail::retire_io_cancel_key(state);
                 cancel_registration_.unregister();
             })) {
             clear_op_state();
@@ -1375,9 +1464,7 @@ public:
         const bool cancelled_without_backend_completion =
             already_cancelled_before_setup_ ||
             (!state_ && token_.is_cancelled());
-        if (state_) {
-            state_->resumed.store(true, std::memory_order_release);
-        }
+        detail::retire_io_cancel_key(state_);
         result_ = detail::finalize_cancellable_io_result(
             cancelled_without_backend_completion, read_result_from_op_state());
         return cancellable_io_result{
@@ -1411,6 +1498,10 @@ public:
         , flags_(detail::with_socket_no_sigpipe(flags))
         , token_(std::move(token)) {}
 
+    ~cancellable_async_send_awaitable() noexcept {
+        detail::retire_io_cancel_key(state_);
+    }
+
     bool await_ready() const noexcept {
         return token_.is_cancelled();
     }
@@ -1425,7 +1516,7 @@ public:
         }
         auto& ctx = current_io_context();
 
-        auto state = std::make_shared<detail::io_cancel_state>();
+        auto state = detail::make_io_cancel_state();
         state->ctx = &ctx;
         state->awaiter = awaiter;
         state->worker = runtime::worker_thread::current();
@@ -1449,7 +1540,7 @@ public:
 
         if (token_.is_cancelled()) {
             cancel_registration_.unregister();
-            state->resumed.store(true, std::memory_order_release);
+            detail::retire_io_cancel_key(state);
             result_ = io_result{-ECANCELED, 0};
             awaiter.resume();
             return;
@@ -1467,7 +1558,7 @@ public:
 
         if (!prepare_op_state(ctx, req, [&]() noexcept {
                 state->op = nullptr;
-                state->resumed.store(true, std::memory_order_release);
+                detail::retire_io_cancel_key(state);
                 cancel_registration_.unregister();
             })) {
             clear_op_state();
@@ -1491,9 +1582,7 @@ public:
         const bool cancelled_without_backend_completion =
             already_cancelled_before_setup_ ||
             (!state_ && token_.is_cancelled());
-        if (state_) {
-            state_->resumed.store(true, std::memory_order_release);
-        }
+        detail::retire_io_cancel_key(state_);
         result_ = detail::finalize_cancellable_io_result(
             cancelled_without_backend_completion, read_result_from_op_state());
         return cancellable_io_result{
@@ -1527,6 +1616,10 @@ public:
         , addrlen_(addrlen)
         , token_(std::move(token)) {}
 
+    ~cancellable_async_connect_awaitable() noexcept {
+        detail::retire_io_cancel_key(state_);
+    }
+
     bool await_ready() const noexcept {
         return token_.is_cancelled();
     }
@@ -1541,7 +1634,7 @@ public:
         }
         auto& ctx = current_io_context();
 
-        auto state = std::make_shared<detail::io_cancel_state>();
+        auto state = detail::make_io_cancel_state();
         state->ctx = &ctx;
         state->awaiter = awaiter;
         state->worker = runtime::worker_thread::current();
@@ -1565,7 +1658,7 @@ public:
 
         if (token_.is_cancelled()) {
             cancel_registration_.unregister();
-            state->resumed.store(true, std::memory_order_release);
+            detail::retire_io_cancel_key(state);
             result_ = io_result{-ECANCELED, 0};
             awaiter.resume();
             return;
@@ -1582,7 +1675,7 @@ public:
 
         if (!prepare_op_state(ctx, req, [&]() noexcept {
                 state->op = nullptr;
-                state->resumed.store(true, std::memory_order_release);
+                detail::retire_io_cancel_key(state);
                 cancel_registration_.unregister();
             })) {
             clear_op_state();
@@ -1606,9 +1699,7 @@ public:
         const bool cancelled_without_backend_completion =
             already_cancelled_before_setup_ ||
             (!state_ && token_.is_cancelled());
-        if (state_) {
-            state_->resumed.store(true, std::memory_order_release);
-        }
+        detail::retire_io_cancel_key(state_);
         result_ = detail::finalize_cancellable_io_result(
             cancelled_without_backend_completion, read_result_from_op_state());
         return cancellable_io_result{
@@ -1638,6 +1729,10 @@ public:
         , for_read_(for_read)
         , token_(std::move(token)) {}
 
+    ~cancellable_async_poll_awaitable() noexcept {
+        detail::retire_io_cancel_key(state_);
+    }
+
     bool await_ready() const noexcept {
         return token_.is_cancelled();
     }
@@ -1652,7 +1747,7 @@ public:
         }
         auto& ctx = current_io_context();
 
-        auto state = std::make_shared<detail::io_cancel_state>();
+        auto state = detail::make_io_cancel_state();
         state->ctx = &ctx;
         state->awaiter = awaiter;
         state->worker = runtime::worker_thread::current();
@@ -1676,7 +1771,7 @@ public:
 
         if (token_.is_cancelled()) {
             cancel_registration_.unregister();
-            state->resumed.store(true, std::memory_order_release);
+            detail::retire_io_cancel_key(state);
             result_ = io_result{-ECANCELED, 0};
             awaiter.resume();
             return;
@@ -1691,7 +1786,7 @@ public:
 
         if (!prepare_op_state(ctx, req, [&]() noexcept {
                 state->op = nullptr;
-                state->resumed.store(true, std::memory_order_release);
+                detail::retire_io_cancel_key(state);
                 cancel_registration_.unregister();
             })) {
             clear_op_state();
@@ -1715,9 +1810,7 @@ public:
         const bool cancelled_without_backend_completion =
             already_cancelled_before_setup_ ||
             (!state_ && token_.is_cancelled());
-        if (state_) {
-            state_->resumed.store(true, std::memory_order_release);
-        }
+        detail::retire_io_cancel_key(state_);
         result_ = detail::finalize_cancellable_io_result(
             cancelled_without_backend_completion, read_result_from_op_state());
         return cancellable_io_result{

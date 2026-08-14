@@ -92,6 +92,55 @@ private:
     bool& rolled_back_;
 };
 
+class observed_recv_awaitable : public io_awaitable_base {
+public:
+    observed_recv_awaitable(io_context& ctx,
+                            int fd,
+                            char* buffer,
+                            op_state*& observed_state) noexcept
+        : ctx_(ctx), fd_(fd), buffer_(buffer), observed_state_(observed_state) {}
+
+    template<typename Promise>
+    bool await_suspend(std::coroutine_handle<Promise> awaiter) {
+        io_request req{};
+        req.op = io_op::recv;
+        req.fd = fd_;
+        req.buffer = buffer_;
+        req.length = 1;
+        req.awaiter = awaiter;
+        req.state = setup_op_state(awaiter, ctx_);
+        observed_state_ = req.state;
+        if (!prepare_op_state(ctx_, req)) {
+            clear_op_state();
+            result_ = io_result{-EAGAIN, 0};
+            return false;
+        }
+        return true;
+    }
+
+    io_result await_resume() noexcept {
+        result_ = read_result_from_op_state();
+        return result_;
+    }
+
+private:
+    io_context& ctx_;
+    int fd_;
+    char* buffer_;
+    op_state*& observed_state_;
+};
+
+class retained_op_state_storage_guard {
+public:
+    retained_op_state_storage_guard() = default;
+    retained_op_state_storage_guard(const retained_op_state_storage_guard&) = delete;
+    retained_op_state_storage_guard& operator=(
+        const retained_op_state_storage_guard&) = delete;
+    ~retained_op_state_storage_guard() {
+        elio::io::detail::release_retained_op_state_storage_for_test();
+    }
+};
+
 class custom_io_task {
 public:
     struct promise_type {
@@ -158,6 +207,30 @@ custom_io_task capture_context_last_result(int* result) {
 
 task<void> orphaned_worker_recv(int fd, char* buffer) {
     (void)co_await async_recv(fd, buffer, 1, 0);
+}
+
+task<void> pending_cancellable_recv_for_key_test(
+    int fd,
+    char* buffer,
+    cancel_token token) {
+    (void)co_await async_recv(fd, buffer, 1, 0, std::move(token));
+}
+
+task<void> pending_cancellable_sleep_for_key_test(
+    io_context& ctx,
+    cancel_token token,
+    cancel_result* result) {
+    *result = co_await elio::time::cancellable_sleep_awaitable(
+        ctx, std::chrono::milliseconds(1), std::move(token));
+}
+
+task<void> observed_recv_for_key_test(io_context& ctx,
+                                      int fd,
+                                      char* buffer,
+                                      op_state*& observed_state,
+                                      io_result* result) {
+    *result = co_await observed_recv_awaitable(
+        ctx, fd, buffer, observed_state);
 }
 
 } // namespace
@@ -4099,6 +4172,180 @@ bool wait_for_io_cancel_test(Predicate&& predicate,
         std::this_thread::sleep_for(elio::test::scaled_ms(10));
     }
     return predicate();
+}
+
+TEST_CASE("I/O cancel key retirement and executor claim never wait",
+          "[io][cancel][lifetime][unit]") {
+    SECTION("retirement suppresses a later executor") {
+        elio::io::detail::io_cancel_key_gate gate;
+        gate.retire();
+        REQUIRE_FALSE(gate.try_claim_for_executor());
+    }
+
+    SECTION("retirement returns while an executor owns the key") {
+        auto& pause =
+            elio::io::detail::pause_io_cancel_executor_after_claim_for_test;
+        auto& paused =
+            elio::io::detail::io_cancel_executor_paused_after_claim_for_test;
+        pause.store(true, std::memory_order_release);
+        paused.store(false, std::memory_order_release);
+
+        elio::io::detail::io_cancel_key_gate gate;
+        std::atomic<bool> claimed{false};
+        std::atomic<bool> finished{false};
+        std::thread executor([&]() {
+            claimed.store(
+                gate.try_claim_for_executor(), std::memory_order_release);
+            finished.store(true, std::memory_order_release);
+        });
+
+        const bool did_pause = wait_for_io_cancel_test([&]() {
+            return paused.load(std::memory_order_acquire);
+        });
+        gate.retire();
+        const bool remained_paused =
+            !finished.load(std::memory_order_acquire);
+
+        pause.store(false, std::memory_order_release);
+        pause.notify_all();
+        executor.join();
+
+        REQUIRE(did_pause);
+        REQUIRE(remained_paused);
+        REQUIRE(claimed.load(std::memory_order_acquire));
+        REQUIRE(finished.load(std::memory_order_acquire));
+    }
+}
+
+TEST_CASE("retired timer cancel executor ignores a reused op_state address",
+          "[io][cancel][timer][orphan][lifetime]") {
+    io_context ctx(io_context::backend_type::epoll);
+    cancel_source source;
+    cancel_result old_result = cancel_result::completed;
+    std::shared_ptr<elio::io::detail::io_cancel_state> old_state;
+    elio::io::detail::capture_next_io_cancel_state_for_test(old_state);
+
+    std::optional<task<void>> old_operation;
+    old_operation.emplace(pending_cancellable_sleep_for_key_test(
+        ctx, source.get_token(), &old_result));
+    elio::coro::detail::task_access::handle(*old_operation).resume();
+
+    REQUIRE(old_state);
+    REQUIRE(old_state->op != nullptr);
+    auto* old_address = old_state->op;
+    REQUIRE(ctx.pending_count() == 1);
+
+    // A selected callback normally creates this executor on the owner worker.
+    // Standalone contexts have no worker, so keep the identical executor frame
+    // suspended explicitly to make the queued-before-run window deterministic.
+    source.cancel();
+    auto stale_executor =
+        elio::io::detail::make_io_cancel_executor(old_state, true);
+
+    old_operation.reset();
+    REQUIRE(old_state->key_gate.closed_for_test());
+
+    retained_op_state_storage_guard retained_storage;
+    elio::io::detail::retain_next_op_state_storage_for_test();
+    std::this_thread::sleep_for(elio::test::scaled_ms(5));
+    ctx.run_until_complete();
+    REQUIRE(ctx.pending_count() == 0);
+    REQUIRE(elio::io::detail::retained_op_state_storage_for_test ==
+            old_address);
+
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX,
+                         SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                         0,
+                         sockets) == 0);
+    char received = 0;
+    op_state* current_address = nullptr;
+    io_result current_result{-EINPROGRESS, 0};
+    auto current_operation = observed_recv_for_key_test(
+        ctx, sockets[0], &received, current_address, &current_result);
+    auto current_handle =
+        elio::coro::detail::task_access::handle(current_operation);
+    current_handle.resume();
+
+    REQUIRE(current_address == old_address);
+    REQUIRE(elio::io::detail::reused_op_state_storage_for_test == old_address);
+    REQUIRE(ctx.pending_count() == 1);
+
+    stale_executor.handle.resume();
+    REQUIRE(ctx.pending_count() == 1);
+    REQUIRE_FALSE(current_handle.done());
+
+    const char byte = 'r';
+    REQUIRE(::write(sockets[1], &byte, 1) == 1);
+    ctx.run_until_complete();
+
+    REQUIRE(current_handle.done());
+    REQUIRE(current_result.result == 1);
+    REQUIRE(received == byte);
+    ::close(sockets[0]);
+    ::close(sockets[1]);
+}
+
+TEST_CASE("claimed epoll timer cancellation may destroy its awaiter inline",
+          "[io][cancel][timer][reentrant][lifetime]") {
+    io_context ctx(io_context::backend_type::epoll);
+    cancel_source source;
+    cancel_result result = cancel_result::completed;
+    std::shared_ptr<elio::io::detail::io_cancel_state> state;
+    elio::io::detail::capture_next_io_cancel_state_for_test(state);
+
+    auto operation = pending_cancellable_sleep_for_key_test(
+        ctx, source.get_token(), &result);
+    auto handle = elio::coro::detail::task_access::handle(operation);
+    handle.resume();
+
+    REQUIRE(state);
+    REQUIRE(state->op != nullptr);
+    REQUIRE(ctx.pending_count() == 1);
+
+    source.cancel();
+    auto executor = elio::io::detail::make_io_cancel_executor(state, true);
+    executor.handle.resume();
+
+    REQUIRE(handle.done());
+    REQUIRE(result == cancel_result::cancelled);
+    REQUIRE(state->key_gate.closed_for_test());
+    REQUIRE(ctx.pending_count() == 0);
+}
+
+TEST_CASE("forced generic cancellable receive destruction retires its key",
+          "[io][cancel][recv][orphan][lifetime]") {
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX,
+                         SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                         0,
+                         sockets) == 0);
+
+    auto& ctx = default_io_context();
+    REQUIRE(ctx.pending_count() == 0);
+    cancel_source source;
+    char received = 0;
+    std::shared_ptr<elio::io::detail::io_cancel_state> state;
+    elio::io::detail::capture_next_io_cancel_state_for_test(state);
+
+    std::optional<task<void>> operation;
+    operation.emplace(pending_cancellable_recv_for_key_test(
+        sockets[0], &received, source.get_token()));
+    elio::coro::detail::task_access::handle(*operation).resume();
+
+    REQUIRE(state);
+    REQUIRE(state->op != nullptr);
+    REQUIRE_FALSE(state->key_gate.closed_for_test());
+    operation.reset();
+    REQUIRE(state->key_gate.closed_for_test());
+
+    const char byte = 'g';
+    REQUIRE(::write(sockets[1], &byte, 1) == 1);
+    ctx.run_until_complete();
+    REQUIRE(ctx.pending_count() == 0);
+
+    ::close(sockets[0]);
+    ::close(sockets[1]);
 }
 
 void fill_socket_send_buffer(int fd) {

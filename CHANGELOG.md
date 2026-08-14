@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cancellable I/O key retirement**: Generic socket I/O, timers, TCP, and UDS
+  awaiters now retire their backend cancellation key before frame teardown can
+  orphan and release the associated `op_state`. A worker-local cancel executor
+  queued for an earlier operation can no longer cancel a later operation that
+  reused the same allocation address (#1064).
 - **Shared-mutex reader admission retry**: A reader that lost the locked
   admission CAS to a concurrent lock-free state update could previously enter
   the waiter queue after writer preference had already disappeared. The slow

@@ -4,7 +4,9 @@
 
 #include <atomic>
 #include <memory>
+#include <new>
 #include <chrono>
+#include <cstddef>
 #include <coroutine>
 #include <cstdint>
 #include <span>
@@ -24,6 +26,26 @@ void run_noexcept(Fn&& fn) noexcept {
         // Diagnostics must never invalidate backend-owned operation state.
     }
 }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline thread_local bool retain_next_deleted_op_state_for_test = false;
+inline thread_local void* retained_op_state_storage_for_test = nullptr;
+inline thread_local void* reused_op_state_storage_for_test = nullptr;
+
+inline void retain_next_op_state_storage_for_test() noexcept {
+    retain_next_deleted_op_state_for_test = true;
+    reused_op_state_storage_for_test = nullptr;
+}
+
+inline void release_retained_op_state_storage_for_test() noexcept {
+    retain_next_deleted_op_state_for_test = false;
+    if (retained_op_state_storage_for_test != nullptr) {
+        ::operator delete(retained_op_state_storage_for_test);
+        retained_op_state_storage_for_test = nullptr;
+    }
+    reused_op_state_storage_for_test = nullptr;
+}
+#endif
 
 } // namespace detail
 
@@ -61,6 +83,28 @@ struct op_state {
         phase_completed = 1,
         phase_orphaned = 2,
     };
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    static void* operator new(std::size_t size) {
+        if (detail::retained_op_state_storage_for_test != nullptr) {
+            void* storage = detail::retained_op_state_storage_for_test;
+            detail::retained_op_state_storage_for_test = nullptr;
+            detail::reused_op_state_storage_for_test = storage;
+            return storage;
+        }
+        return ::operator new(size);
+    }
+
+    static void operator delete(void* storage) noexcept {
+        if (detail::retain_next_deleted_op_state_for_test &&
+            detail::retained_op_state_storage_for_test == nullptr) {
+            detail::retain_next_deleted_op_state_for_test = false;
+            detail::retained_op_state_storage_for_test = storage;
+            return;
+        }
+        ::operator delete(storage);
+    }
+#endif
 
     std::coroutine_handle<> handle{};
     std::atomic<uint8_t> phase{phase_pending};

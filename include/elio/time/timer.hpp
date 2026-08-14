@@ -236,6 +236,10 @@ public:
         , duration_ns_(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count())
         , token_(std::move(token)) {}
 
+    ~cancellable_sleep_awaitable() noexcept {
+        io::detail::retire_io_cancel_key(state_);
+    }
+
     bool await_ready() const noexcept {
         // Complete immediately if already cancelled or duration <= 0
         return token_.is_cancelled() || duration_ns_ <= 0;
@@ -264,7 +268,7 @@ public:
         // and the cancel inbox entry could be processed in the same poll
         // cycle, leaving the executor running after the awaitable's
         // destructor and producing a UAF on `self->ctx_` / `self->awaiter_`.
-        auto state = std::make_shared<shared_state>();
+        auto state = io::detail::make_io_cancel_state();
         state->ctx = ctx;
         state->awaiter = awaiter;
         state->worker = runtime::worker_thread::current();
@@ -287,7 +291,8 @@ public:
             // owns the ring. We set affinity to prevent stealing — this
             // task accesses worker-local io_context and must run on the
             // correct worker.
-            auto exec = make_cancel_executor(state);
+            auto exec = io::detail::make_io_cancel_executor(
+                state, /*allow_epoll_cancel=*/true);
             if (auto* promise = coro::get_promise_base(exec.handle.address())) {
                 promise->set_affinity(state->worker->worker_id());
                 promise->set_worker_local();
@@ -307,10 +312,9 @@ public:
         // unregister() below is then a no-op, which is fine.
         if (token_.is_cancelled()) {
             cancel_registration_.unregister();
-            // Mark resumed so any executor already queued on the worker
-            // observes this state and bails before touching ctx with a
-            // stale awaiter address.
-            state->resumed.store(true, std::memory_order_release);
+            // Retire the cancellation key so an executor already queued on the
+            // worker cannot use it after this awaiter returns inline.
+            io::detail::retire_io_cancel_key(state);
             return false;  // Resume immediately (do not suspend)
         }
 
@@ -335,7 +339,7 @@ public:
                 [&]() { return detail::prepare_timeout(*ctx, req); },
                 [&]() noexcept {
                     state->op = nullptr;
-                    state->resumed.store(true, std::memory_order_release);
+                    io::detail::retire_io_cancel_key(state);
                     cancel_registration_.unregister();
                 })) {
             ctx->submit();
@@ -366,14 +370,13 @@ public:
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
-                // Mark resumed so any concurrent cancel executor becomes a
-                // no-op before touching ctx / awaiter.
-                state->resumed.store(true, std::memory_order_release);
+                // Retire the key before the blocking path resumes the awaiter.
+                io::detail::retire_io_cancel_key(state);
                 detail::resume_via_scheduler(awaiter, sched);
             })) {
             // No work owns the suspension. Continue on this worker and
             // report the rejection from await_resume().
-            state->resumed.store(true, std::memory_order_release);
+            io::detail::retire_io_cancel_key(state);
             fallback_rejected_ = true;
             return false;
         }
@@ -389,16 +392,9 @@ public:
         cancel_registration_.unregister();
         bool was_cancelled = already_cancelled_before_setup_;
         if (state_) {
-            // Set resumed = true to signal to any cancel executor that
-            // has not yet run that the awaiter is already done. Safety
-            // is structural: both backends call safe_resume() (i.e.
-            // handle.resume()) synchronously inside poll(), so
-            // await_resume() always executes before the worker returns
-            // to get_next_task() and drains the inbox where the cancel
-            // executor waits. The store here thus always precedes the
-            // cancel executor's load in program order on the worker
-            // thread.
-            state_->resumed.store(true, std::memory_order_release);
+            // Retire before the awaitable can be destroyed. A queued executor
+            // that has not claimed the gate must not reuse this op_state key.
+            io::detail::retire_io_cancel_key(state_);
             was_cancelled = was_cancelled ||
                             state_->cancelled.load(std::memory_order_acquire);
         }
@@ -411,91 +407,11 @@ public:
     }
 
 private:
-    /// Shared state owned jointly by the awaitable, the cancel callback
-    /// lambda, and the cancel executor coroutine. shared_ptr keeps it
-    /// alive past the awaitable's destruction so cross-thread cancel
-    /// paths cannot UAF.
-    ///
-    /// ``op`` is the awaitable's owned op_state pointer. The cancel
-    /// executor uses ``tagged_op_state_user_data(op)`` as the SQE key
-    /// when issuing the cancel — that matches what the timer SQE was
-    /// submitted with. The pointer is only ever used as a key, never
-    /// dereferenced through the cancel path, so its eventual deletion by
-    /// the backend (after orphan + CQE) is benign.
-    struct shared_state {
-        io::io_context* ctx = nullptr;
-        std::coroutine_handle<> awaiter;
-        runtime::worker_thread* worker = nullptr;
-        uint64_t context_generation = 0;
-        io::op_state* op = nullptr;
-        std::atomic<bool> resumed{false};
-        std::atomic<bool> cancelled{false};
-    };
-
-    /// Fire-and-forget coroutine that executes io_context::cancel() on
-    /// the worker that owns the ring. Self-destroys via suspend_never on
-    /// final_suspend. Captures shared_ptr<shared_state> by value so it
-    /// holds an independent ref to the state.
-    ///
-    /// This promise inherits promise_base so the executor can be marked as
-    /// worker-local maintenance. Its affinity identifies the backend owner;
-    /// the scheduler must not run it on another worker.
-    struct cancel_executor {
-        struct promise_type : public coro::promise_base {
-            cancel_executor get_return_object() {
-                auto handle =
-                    std::coroutine_handle<promise_type>::from_promise(*this);
-                leave_creation_context();
-                return {handle};
-            }
-            std::suspend_always initial_suspend() noexcept { return {}; }
-            std::suspend_never final_suspend() noexcept { return {}; }
-            void return_void() noexcept {}
-        };
-        std::coroutine_handle<promise_type> handle;
-    };
-
-    static cancel_executor make_cancel_executor(std::shared_ptr<shared_state> state) {
-        // Guard against running when the timer already completed naturally.
-        // Safety invariant: both io_uring and epoll backends call
-        // safe_resume() (handle.resume()) synchronously inside poll(),
-        // so await_resume() — which stores resumed=true — is always
-        // executed before the worker returns to get_next_task() and
-        // drains the inbox queue where this coroutine waits. Concretely:
-        //   * Timer CQE arrives inside poll_io_when_idle()
-        //   * resume_deferred() calls safe_resume(timer_coroutine) inline
-        //   * await_resume() stores resumed=true, returns
-        //   * poll() returns, poll_io_when_idle() returns
-        //   * Main loop: get_next_task() drains inbox → this coroutine
-        //     is dequeued and sees resumed==true → co_return safely
-        //
-        // For the normal early-cancel path (cancel fires before the
-        // timer CQE), resumed is still false here and we proceed to
-        // issue ctx->cancel() as intended.
-        if (state->resumed.load(std::memory_order_acquire)) {
-            co_return;
-        }
-        if (state->worker &&
-            (&state->worker->io_context() != state->ctx ||
-             state->worker->io_context().generation() !=
-                 state->context_generation)) {
-            co_return;
-        }
-        if (state->ctx && state->op) {
-            // Match the tagged user_data the timer SQE was submitted
-            // with. ``state->op`` is an opaque key here — never
-            // dereferenced — so it stays sound even if the backend has
-            // already freed the op_state via the orphan/CQE handshake.
-            state->ctx->cancel(io::tagged_op_state_user_data(state->op));
-        }
-        co_return;
-    }
-
     io::io_context* ctx_ = nullptr;
     int64_t duration_ns_;
     coro::cancel_token token_;
     coro::cancel_token::registration cancel_registration_;
-    std::shared_ptr<shared_state> state_;
+    std::shared_ptr<io::detail::io_cancel_state> state_;
     bool already_cancelled_before_setup_ = false;
     bool fallback_rejected_ = false;
 #ifdef __linux__

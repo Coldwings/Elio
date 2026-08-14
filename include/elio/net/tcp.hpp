@@ -842,6 +842,10 @@ public:
             , token_(std::move(token))
             , cancellable_(true) {}
 
+        ~accept_awaitable() noexcept {
+            io::detail::retire_io_cancel_key(cancel_state_);
+        }
+
         bool await_ready() const noexcept {
             return false;
         }
@@ -855,7 +859,7 @@ public:
             auto& ctx = io::current_io_context();
 
             if (is_cancellable()) {
-                auto state = std::make_shared<io::detail::io_cancel_state>();
+                auto state = io::detail::make_io_cancel_state();
                 state->ctx = &ctx;
                 state->awaiter = awaiter;
                 state->worker = runtime::worker_thread::current();
@@ -878,7 +882,7 @@ public:
 
                 if (token_.is_cancelled()) {
                     cancel_registration_.unregister();
-                    state->resumed.store(true, std::memory_order_release);
+                    io::detail::retire_io_cancel_key(state);
                     result_ = io::io_result{-ECANCELED, 0};
                     return false;
                 }
@@ -907,8 +911,7 @@ public:
             if (!prepare_op_state(ctx, req, [&]() noexcept {
                     if (cancel_state_) {
                         cancel_state_->op = nullptr;
-                        cancel_state_->resumed.store(
-                            true, std::memory_order_release);
+                        io::detail::retire_io_cancel_key(cancel_state_);
                     }
                     cancel_registration_.unregister();
                 })) {
@@ -925,9 +928,7 @@ public:
 
         std::optional<tcp_stream> await_resume() {
             cancel_registration_.unregister();
-            if (cancel_state_) {
-                cancel_state_->resumed.store(true, std::memory_order_release);
-            }
+            io::detail::retire_io_cancel_key(cancel_state_);
             result_ = read_result_from_op_state();
 
             if (!result_.success()) {
@@ -1065,7 +1066,8 @@ public:
         , token_(std::move(token))
         , cancellable_(true) {}
 
-    ~tcp_connect_awaitable() {
+    ~tcp_connect_awaitable() noexcept {
+        io::detail::retire_io_cancel_key(cancel_state_);
         if (fd_ >= 0) {
             io::close_fd_for_destructor(fd_);
             fd_ = -1;
@@ -1090,7 +1092,7 @@ public:
         auto& ctx = io::current_io_context();
 
         if (is_cancellable()) {
-            auto state = std::make_shared<io::detail::io_cancel_state>();
+            auto state = io::detail::make_io_cancel_state();
             state->ctx = &ctx;
             state->awaiter = awaiter;
             state->worker = runtime::worker_thread::current();
@@ -1113,7 +1115,7 @@ public:
 
             if (token_.is_cancelled()) {
                 cancel_registration_.unregister();
-                state->resumed.store(true, std::memory_order_release);
+                io::detail::retire_io_cancel_key(state);
                 already_cancelled_before_setup_ = true;
                 result_ = io::io_result{-ECANCELED, 0};
                 return false;
@@ -1177,8 +1179,7 @@ public:
         if (!prepare_op_state(ctx, req, [&]() noexcept {
                 if (cancel_state_) {
                     cancel_state_->op = nullptr;
-                    cancel_state_->resumed.store(
-                        true, std::memory_order_release);
+                    io::detail::retire_io_cancel_key(cancel_state_);
                 }
                 cancel_registration_.unregister();
             })) {
@@ -1204,9 +1205,7 @@ public:
         cancel_registration_.unregister();
         const bool cancelled_without_backend_completion =
             already_cancelled_before_setup_;
-        if (cancel_state_) {
-            cancel_state_->resumed.store(true, std::memory_order_release);
-        }
+        io::detail::retire_io_cancel_key(cancel_state_);
 
         // Async path completion result comes from op_state.
         if (connect_in_progress_ && fd_ >= 0) {

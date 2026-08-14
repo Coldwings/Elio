@@ -22,6 +22,10 @@ namespace elio::sync {
 /// - Bit 63: writer_waiting flag
 /// - Bit 62: writer_active flag
 /// - Bits 0-61: reader_count (max ~4.6 quintillion readers)
+///
+/// Each successful shared acquisition must be matched by exactly one release.
+/// At most (1ULL << 62) - 1 shared acquisitions may be outstanding at once;
+/// exceeding that representation limit is outside the supported contract.
 class shared_mutex {
 public:
     shared_mutex() = default;
@@ -527,12 +531,18 @@ public:
         cancellable_lock_waiter waiter_;
     };
 
-    /// Acquire shared (read) lock
+    /// Acquire shared (read) lock.
+    ///
+    /// The application must ensure fewer than (1ULL << 62) - 1 shared
+    /// acquisitions are outstanding when this awaitable attempts admission.
     auto lock_shared() {
         return lock_shared_awaitable(*this);
     }
 
     /// Acquire a shared lock, or return cancelled if the token wins.
+    ///
+    /// The application must ensure fewer than (1ULL << 62) - 1 shared
+    /// acquisitions are outstanding when this awaitable attempts admission.
     auto lock_shared(coro::cancel_token token) {
         return cancellable_lock_shared_awaitable(*this, std::move(token));
     }
@@ -547,7 +557,8 @@ public:
         return cancellable_lock_awaitable(*this, std::move(token));
     }
 
-    /// Try to acquire shared lock without waiting
+    /// Try to acquire shared lock without waiting.
+    /// Returns false when the shared-acquisition count cannot be represented.
     /// Lock-free fast path using atomic CAS - no mutex needed in common case
     bool try_lock_shared() noexcept {
         uint64_t state = state_.load(std::memory_order_relaxed);

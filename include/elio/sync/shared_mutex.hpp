@@ -533,16 +533,16 @@ public:
 
     /// Acquire shared (read) lock.
     ///
-    /// Requires fewer than (1ULL << 62) - 1 shared acquisitions to be
-    /// outstanding for this mutex.
+    /// The application must ensure fewer than (1ULL << 62) - 1 shared
+    /// acquisitions are outstanding when this awaitable attempts admission.
     auto lock_shared() {
         return lock_shared_awaitable(*this);
     }
 
     /// Acquire a shared lock, or return cancelled if the token wins.
     ///
-    /// Requires fewer than (1ULL << 62) - 1 shared acquisitions to be
-    /// outstanding for this mutex.
+    /// The application must ensure fewer than (1ULL << 62) - 1 shared
+    /// acquisitions are outstanding when this awaitable attempts admission.
     auto lock_shared(coro::cancel_token token) {
         return cancellable_lock_shared_awaitable(*this, std::move(token));
     }

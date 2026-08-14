@@ -67,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Shared-mutex reader-count contract**: Documented that the packed state
   supports at most `(1ULL << 62) - 1` outstanding shared acquisitions and that
-  blocking acquisition requires callers to remain below that representation
+  non-try acquisition requires callers to remain below that representation
   limit. `try_lock_shared()` continues to return `false` when the count cannot
   be represented; no overflow exception or saturation handoff is added (#1045).
 - **Smaller channel send coroutine frames**: `channel<T>::send(...)` now lets

@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Shared-mutex reader admission retry**: A reader that lost the locked
+  admission CAS to a concurrent lock-free state update could previously enter
+  the waiter queue after writer preference had already disappeared. The slow
+  recheck now retries updated reader state and, when an additional reader
+  acquisition can be represented, parks only after observing an active or
+  waiting writer, preventing an unobserved reader waiter (#1058).
 - **Task-group final-wake eligibility**: A child completion that previously
   observed an outstanding count of zero now revalidates that zero while
   selecting the join waiter. A child accepted before join closes admission can

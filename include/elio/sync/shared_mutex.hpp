@@ -2,6 +2,7 @@
 
 #include <coroutine>
 #include <atomic>
+#include <cstddef>
 #include <mutex>
 #include <utility>
 #include "../coro/cancel_token.hpp"
@@ -10,6 +11,16 @@
 #include "detail/wake_state.hpp"
 
 namespace elio::sync {
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace detail {
+inline std::atomic<bool> force_shared_reader_slow_path_for_test{false};
+inline std::atomic<bool> pause_shared_reader_after_locked_load_for_test{false};
+inline std::atomic<bool> shared_reader_paused_after_locked_load_for_test{false};
+inline std::atomic<size_t> shared_reader_unlocked_retries_for_test{0};
+inline std::atomic<size_t> shared_reader_waiter_publications_for_test{0};
+}
+#endif
 
 /// Coroutine-aware shared mutex (read-write lock)
 /// Allows multiple readers or a single writer
@@ -95,6 +106,12 @@ public:
             if (cancellable_ && wake_state_->was_cancelled()) {
                 return true;
             }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (detail::force_shared_reader_slow_path_for_test.load(
+                    std::memory_order_acquire)) {
+                return false;
+            }
+#endif
             if (!mtx_.try_lock_shared()) {
                 return false;
             }
@@ -117,42 +134,23 @@ public:
                 }
             }
 
-            // Lock-free fast path: attempt to increment reader count without mutex
-            // This avoids cache line bouncing on the internal_mutex_ in reader-heavy
-            // workloads where writers are rare.
-            uint64_t state = mtx_.state_.load(std::memory_order_relaxed);
-            while (!(state & WRITER_FLAGS)) {
-                // Overflow guard: if reader count is at max, fall through to slow path
-                if ((state & READER_MASK) == READER_MASK) break;
-                // No writer active or waiting - try CAS to increment reader count
-                if (mtx_.state_.compare_exchange_weak(state, state + 1,
-                        std::memory_order_acquire, std::memory_order_relaxed)) {
-                    if (!cancellable_ ||
-                        detail::claim_wake_state(wake_state_) !=
-                            detail::wake_action::rejected) {
-                        return false;
-                    }
-                    mtx_.unlock_shared();
-                    return false;
-                }
-                // CAS failed, state updated - loop continues with new state
-            }
-
-            // Slow path: writer present or CAS failed multiple times
-            // Fall back to mutex for proper waiter queue management
-            bool release_reader = false;
-            {
-                std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
-
-                if (cancellable_ && wake_state_->was_cancelled()) {
-                    return false;
-                }
-
-                // Double-check under lock - state may have changed
-                state = mtx_.state_.load(std::memory_order_relaxed);
-                if (!(state & WRITER_FLAGS) &&
-                    (state & READER_MASK) != READER_MASK) {
-                    if (mtx_.state_.compare_exchange_strong(
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            bool force_slow_path =
+                detail::force_shared_reader_slow_path_for_test.load(
+                    std::memory_order_acquire);
+#else
+            bool force_slow_path = false;
+#endif
+            for (;;) {
+                // Lock-free fast path: attempt to increment reader count
+                // without the mutex. This also handles a locked recheck that
+                // lost its one-shot CAS to another lock-free reader.
+                uint64_t state = mtx_.state_.load(std::memory_order_relaxed);
+                while (!force_slow_path && !(state & WRITER_FLAGS)) {
+                    // Overflow guard: if reader count is at max, fall through
+                    // to the unchanged slow-path saturation behavior.
+                    if ((state & READER_MASK) == READER_MASK) break;
+                    if (mtx_.state_.compare_exchange_weak(
                             state, state + 1, std::memory_order_acquire,
                             std::memory_order_relaxed)) {
                         if (!cancellable_ ||
@@ -160,30 +158,99 @@ public:
                                 detail::wake_action::rejected) {
                             return false;
                         }
-                        release_reader = true;
+                        mtx_.unlock_shared();
+                        return false;
+                    }
+                    // CAS failed, state updated - loop rechecks writer flags.
+                }
+                // The test seam forces only the initial locked recheck. A
+                // retry after that recheck uses this ordinary lock-free path.
+                force_slow_path = false;
+
+                // Slow path: a writer is present or the reader count is
+                // saturated. Fall back to the mutex for waiter publication.
+                bool release_reader = false;
+                bool retry_unlocked = false;
+                {
+                    std::lock_guard<std::mutex> guard(mtx_.internal_mutex_);
+
+                    if (cancellable_ && wake_state_->was_cancelled()) {
+                        return false;
+                    }
+
+                    // Double-check under lock - state may have changed.
+                    state = mtx_.state_.load(std::memory_order_relaxed);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                    if (!(state & WRITER_FLAGS) &&
+                        (state & READER_MASK) != READER_MASK &&
+                        detail::pause_shared_reader_after_locked_load_for_test
+                            .load(std::memory_order_acquire)) {
+                        detail::shared_reader_paused_after_locked_load_for_test
+                            .store(true, std::memory_order_release);
+                        detail::shared_reader_paused_after_locked_load_for_test
+                            .notify_all();
+                        while (detail::pause_shared_reader_after_locked_load_for_test
+                                   .load(std::memory_order_acquire)) {
+                            detail::pause_shared_reader_after_locked_load_for_test
+                                .wait(true, std::memory_order_acquire);
+                        }
+                        detail::shared_reader_paused_after_locked_load_for_test
+                            .store(false, std::memory_order_release);
+                    }
+#endif
+                    // A lock-free reader or try_lock writer can still change
+                    // state_ while internal_mutex_ is held. Retain one locked
+                    // CAS. If it loses and the updated state still admits a
+                    // representable reader, retry after releasing the mutex.
+                    if (!(state & WRITER_FLAGS) &&
+                        (state & READER_MASK) != READER_MASK) {
+                        if (mtx_.state_.compare_exchange_strong(
+                                state, state + 1, std::memory_order_acquire,
+                                std::memory_order_relaxed)) {
+                            if (!cancellable_ ||
+                                detail::claim_wake_state(wake_state_) !=
+                                    detail::wake_action::rejected) {
+                                return false;
+                            }
+                            release_reader = true;
+                        } else if (!(state & WRITER_FLAGS) &&
+                                   (state & READER_MASK) != READER_MASK) {
+                            retry_unlocked = true;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                            detail::shared_reader_unlocked_retries_for_test
+                                .fetch_add(1, std::memory_order_relaxed);
+#endif
+                        }
+                    }
+
+                    if (!release_reader && !retry_unlocked) {
+                        if (!cancellable_) {
+                            wake_state_->set_handle(awaiter);
+                        }
+                        suspended_ = true;
+                        mtx_.reader_waiters_.push_back(this);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                        detail::shared_reader_waiter_publications_for_test
+                            .fetch_add(1, std::memory_order_release);
+#endif
+                        if (!cancellable_ ||
+                            wake_state_->unblock_after_publish()) {
+                            return true;
+                        }
+
+                        mtx_.reader_waiters_.remove(this);
+                        suspended_ = false;
                     }
                 }
 
-                if (!release_reader) {
-                    if (!cancellable_) {
-                        wake_state_->set_handle(awaiter);
-                    }
-                    suspended_ = true;
-                    mtx_.reader_waiters_.push_back(this);
-                    if (!cancellable_ ||
-                        wake_state_->unblock_after_publish()) {
-                        return true;
-                    }
-
-                    mtx_.reader_waiters_.remove(this);
-                    suspended_ = false;
+                if (release_reader) {
+                    mtx_.unlock_shared();
+                    return false;
+                }
+                if (!retry_unlocked) {
+                    return false;
                 }
             }
-
-            if (release_reader) {
-                mtx_.unlock_shared();
-            }
-            return false;
         }
 
         coro::cancel_result await_resume_impl() noexcept {

@@ -38,6 +38,32 @@ bool wait_for_flag(const std::atomic<bool>& flag) {
     });
 }
 
+struct shared_reader_cas_hook_guard {
+    shared_reader_cas_hook_guard() {
+        elio::sync::detail::force_shared_reader_slow_path_for_test.store(
+            true, std::memory_order_release);
+        elio::sync::detail::pause_shared_reader_after_locked_load_for_test.store(
+            true, std::memory_order_release);
+        elio::sync::detail::shared_reader_paused_after_locked_load_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::shared_reader_unlocked_retries_for_test.store(
+            0, std::memory_order_relaxed);
+        elio::sync::detail::shared_reader_waiter_publications_for_test.store(
+            0, std::memory_order_relaxed);
+    }
+
+    ~shared_reader_cas_hook_guard() { release(); }
+
+    void release() const noexcept {
+        elio::sync::detail::pause_shared_reader_after_locked_load_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_shared_reader_after_locked_load_for_test
+            .notify_all();
+        elio::sync::detail::force_shared_reader_slow_path_for_test.store(
+            false, std::memory_order_release);
+    }
+};
+
 } // namespace
 
 TEST_CASE("wake_state resolves completion during blocked publication",
@@ -1024,6 +1050,143 @@ TEST_CASE("shared_mutex cancellation and reader grant select one result",
             REQUIRE(sm.reader_count() == 0);
         }
         REQUIRE_FALSE(sm.is_writer_active());
+    }
+}
+
+TEST_CASE("shared_mutex locked reader admission rechecks competing state",
+          "[sync][shared_mutex][cancellation][race][regression]") {
+    SECTION("a competing reader does not leave an unobserved waiter") {
+        shared_reader_cas_hook_guard hook;
+        shared_mutex sm;
+        auto target = sm.lock_shared();
+        REQUIRE_FALSE(target.await_ready());
+
+        bool target_suspended = true;
+        std::thread target_thread([&] {
+            target_suspended =
+                target.await_suspend(std::noop_coroutine());
+        });
+        const bool target_paused = wait_for_flag(
+            elio::sync::detail::shared_reader_paused_after_locked_load_for_test);
+        const bool competitor_acquired = target_paused && sm.try_lock_shared();
+        hook.release();
+        target_thread.join();
+
+        const auto reader_count = sm.reader_count();
+        const auto retries =
+            elio::sync::detail::shared_reader_unlocked_retries_for_test.load(
+                std::memory_order_relaxed);
+        const auto publications =
+            elio::sync::detail::shared_reader_waiter_publications_for_test.load(
+                std::memory_order_acquire);
+
+        if (!target_suspended) {
+            target.await_resume();
+            sm.unlock_shared();
+        }
+        if (competitor_acquired) {
+            sm.unlock_shared();
+        }
+
+        REQUIRE(target_paused);
+        REQUIRE(competitor_acquired);
+        REQUIRE_FALSE(target_suspended);
+        REQUIRE(reader_count == 2);
+        REQUIRE(retries == 1);
+        REQUIRE(publications == 0);
+        REQUIRE(sm.reader_count() == 0);
+    }
+
+    SECTION("a competing writer retains admission preference") {
+        shared_reader_cas_hook_guard hook;
+        shared_mutex sm;
+        auto target = sm.lock_shared();
+        REQUIRE_FALSE(target.await_ready());
+
+        bool target_suspended = false;
+        std::thread target_thread([&] {
+            target_suspended =
+                target.await_suspend(std::noop_coroutine());
+        });
+        const bool target_paused = wait_for_flag(
+            elio::sync::detail::shared_reader_paused_after_locked_load_for_test);
+        const bool writer_acquired = target_paused && sm.try_lock();
+        hook.release();
+        target_thread.join();
+
+        const auto retries =
+            elio::sync::detail::shared_reader_unlocked_retries_for_test.load(
+                std::memory_order_relaxed);
+        const auto publications =
+            elio::sync::detail::shared_reader_waiter_publications_for_test.load(
+                std::memory_order_acquire);
+        const bool writer_active_before_release = sm.is_writer_active();
+        const auto readers_before_release = sm.reader_count();
+
+        if (writer_acquired) {
+            sm.unlock();
+        }
+        if (target_suspended && writer_acquired) {
+            target.await_resume();
+            sm.unlock_shared();
+        } else if (!target_suspended) {
+            target.await_resume();
+            sm.unlock_shared();
+        }
+
+        REQUIRE(target_paused);
+        REQUIRE(writer_acquired);
+        REQUIRE(target_suspended);
+        REQUIRE(writer_active_before_release);
+        REQUIRE(readers_before_release == 0);
+        REQUIRE(retries == 0);
+        REQUIRE(publications == 1);
+        REQUIRE_FALSE(sm.is_writer_active());
+        REQUIRE(sm.reader_count() == 0);
+    }
+
+    SECTION("cancellation can win after a competing reader retry") {
+        shared_reader_cas_hook_guard hook;
+        shared_mutex sm;
+        cancel_source source;
+        auto target = sm.lock_shared(source.get_token());
+        REQUIRE_FALSE(target.await_ready());
+
+        bool target_suspended = true;
+        std::thread target_thread([&] {
+            target_suspended =
+                target.await_suspend(std::noop_coroutine());
+        });
+        const bool target_paused = wait_for_flag(
+            elio::sync::detail::shared_reader_paused_after_locked_load_for_test);
+        const bool competitor_acquired = target_paused && sm.try_lock_shared();
+        source.cancel();
+        hook.release();
+        target_thread.join();
+
+        const auto result = target.await_resume();
+        const auto retries =
+            elio::sync::detail::shared_reader_unlocked_retries_for_test.load(
+                std::memory_order_relaxed);
+        const auto publications =
+            elio::sync::detail::shared_reader_waiter_publications_for_test.load(
+                std::memory_order_acquire);
+        const auto reader_count = sm.reader_count();
+        if (result == cancel_result::completed) {
+            sm.unlock_shared();
+        }
+        if (competitor_acquired) {
+            sm.unlock_shared();
+        }
+
+        REQUIRE(target_paused);
+        REQUIRE(competitor_acquired);
+        REQUIRE_FALSE(target_suspended);
+        REQUIRE(result == cancel_result::cancelled);
+        REQUIRE(retries == 1);
+        REQUIRE(publications == 0);
+        REQUIRE(reader_count == 1);
+        REQUIRE(sm.reader_count() == 0);
     }
 }
 

@@ -3281,6 +3281,11 @@ limit is outside the supported contract. `try_lock_shared()` instead returns
 `false` when another shared acquisition cannot be represented. The limit counts
 outstanding acquisitions, not coroutine frames or distinct reader coroutines.
 
+When the current reader count is below `READER_MASK`, a reader that reaches the
+locked admission recheck retries concurrent packed-state changes before
+deciding to park. If a writer becomes active or waiting during that retry, the
+reader parks behind the writer instead of bypassing writer preference.
+
 ### `shared_lock_guard`
 
 RAII unlock guard for an already-held shared (reader) lock. Callers must

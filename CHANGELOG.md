@@ -84,6 +84,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state machine. The no-token `await_suspend()` may now propagate
   `std::bad_alloc` with no writer state or queue mutation. Token-aware writers
   remain eager (#1041).
+- **Simpler joinable-task destruction state**: `join_handle::wait_destroyed()`
+  now waits on a native-width one-way atomic instead of coordinating an atomic
+  predicate with a dedicated mutex and condition variable. Final frame
+  destruction publishes once with release ordering and notifies all external
+  waiters. Result readiness remains distinct from frame destruction, and the
+  separate coroutine completion-waiter state machine is unchanged (#1046).
 - **Bounded-channel empty refill fast path**: Successful bounded receives now
   stop after observing an empty blocked-sender queue under the channel mutex,
   instead of taking a second lock only to repeat that result. Token-aware

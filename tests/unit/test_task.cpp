@@ -12,6 +12,7 @@
 #include <string>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <latch>
 #include <memory>
 #include <optional>
@@ -40,6 +41,45 @@ task<int> simple_return_value() {
 task<void> simple_void() {
     co_return;
 }
+
+template<typename Predicate>
+bool wait_for_task_condition(Predicate&& predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + scaled_sec(5);
+    while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    return predicate();
+}
+
+struct join_destroyed_hook_guard {
+    join_destroyed_hook_guard() {
+        using namespace elio::coro::detail;
+        pause_join_destroyed_wait_before_wait_for_test.store(
+            false, std::memory_order_release);
+        join_destroyed_wait_before_wait_for_test.store(
+            false, std::memory_order_release);
+        join_destroyed_wait_count_for_test.store(
+            0, std::memory_order_release);
+        join_destroyed_notify_count_for_test.store(
+            0, std::memory_order_release);
+        pause_before_detached_frame_destroy_for_test.store(
+            false, std::memory_order_release);
+        detached_frame_destroy_paused_for_test.store(
+            false, std::memory_order_release);
+    }
+
+    ~join_destroyed_hook_guard() { release(); }
+
+    void release() const noexcept {
+        using namespace elio::coro::detail;
+        pause_join_destroyed_wait_before_wait_for_test.store(
+            false, std::memory_order_release);
+        pause_join_destroyed_wait_before_wait_for_test.notify_all();
+        pause_before_detached_frame_destroy_for_test.store(
+            false, std::memory_order_release);
+        pause_before_detached_frame_destroy_for_test.notify_all();
+    }
+};
 
 task<void> record_spawn_worker(std::atomic<size_t>* observed_worker) {
     observed_worker->store(elio::current_worker_id(),
@@ -811,6 +851,180 @@ TEST_CASE("task handle completion skips a waiter destroyed after selection",
     }
     REQUIRE(selection_paused);
     REQUIRE_FALSE(resumed.load(std::memory_order_acquire));
+}
+
+TEST_CASE("join state destruction wait preserves publication order",
+          "[task][join_handle][lifecycle][atomic_wait]") {
+    using namespace elio::coro::detail;
+    join_destroyed_hook_guard hook;
+
+    SECTION("publication before wait returns immediately") {
+        join_state<void> state;
+        state.mark_destroyed();
+        state.mark_destroyed();
+
+        state.wait_destroyed();
+
+        REQUIRE(state.is_destroyed());
+        REQUIRE(join_destroyed_notify_count_for_test.load(
+                    std::memory_order_acquire) == 2);
+        REQUIRE(join_destroyed_wait_count_for_test.load(
+                    std::memory_order_acquire) == 0);
+    }
+
+    SECTION("wait before publication observes preceding writes") {
+        join_state<void> state;
+        std::atomic<bool> returned{false};
+        int published_before_destroy = 0;
+        int observed_after_wait = 0;
+        std::thread waiter([&] {
+            state.wait_destroyed();
+            observed_after_wait = published_before_destroy;
+            returned.store(true, std::memory_order_release);
+        });
+
+        const bool waiting = wait_for_task_condition([&] {
+            return join_destroyed_wait_count_for_test.load(
+                       std::memory_order_acquire) >= 1;
+        });
+        const bool returned_before_publication =
+            returned.load(std::memory_order_acquire);
+        published_before_destroy = 42;
+        state.mark_destroyed();
+        waiter.join();
+
+        REQUIRE(waiting);
+        REQUIRE_FALSE(returned_before_publication);
+        REQUIRE(returned.load(std::memory_order_acquire));
+        REQUIRE(observed_after_wait == 42);
+        REQUIRE(join_destroyed_notify_count_for_test.load(
+                    std::memory_order_acquire) == 1);
+    }
+}
+
+TEST_CASE("join state destruction wakes every blocking thread",
+          "[task][join_handle][lifecycle][atomic_wait][thread]") {
+    using namespace elio::coro::detail;
+    join_destroyed_hook_guard hook;
+    constexpr std::size_t waiter_count = 8;
+    join_state<void> state;
+    std::atomic<std::size_t> returned{0};
+    std::vector<std::thread> waiters;
+    waiters.reserve(waiter_count);
+
+    for (std::size_t i = 0; i < waiter_count; ++i) {
+        waiters.emplace_back([&] {
+            state.wait_destroyed();
+            returned.fetch_add(1, std::memory_order_release);
+        });
+    }
+
+    const bool all_waiting = wait_for_task_condition([&] {
+        return join_destroyed_wait_count_for_test.load(
+                   std::memory_order_acquire) >= waiter_count;
+    });
+    const auto returned_before_publication =
+        returned.load(std::memory_order_acquire);
+    state.mark_destroyed();
+    for (auto& waiter : waiters) {
+        waiter.join();
+    }
+
+    REQUIRE(all_waiting);
+    REQUIRE(returned_before_publication == 0);
+    REQUIRE(returned.load(std::memory_order_acquire) == waiter_count);
+    REQUIRE(join_destroyed_notify_count_for_test.load(
+                std::memory_order_acquire) == 1);
+}
+
+TEST_CASE("join state destruction cannot lose notify before atomic wait",
+          "[task][join_handle][lifecycle][atomic_wait][race]") {
+    using namespace elio::coro::detail;
+    join_destroyed_hook_guard hook;
+    join_state<void> state;
+    std::atomic<bool> returned{false};
+    pause_join_destroyed_wait_before_wait_for_test.store(
+        true, std::memory_order_release);
+
+    std::thread waiter([&] {
+        state.wait_destroyed();
+        returned.store(true, std::memory_order_release);
+    });
+
+    const bool paused_before_wait = wait_for_task_condition([&] {
+        return join_destroyed_wait_before_wait_for_test.load(
+            std::memory_order_acquire);
+    });
+    state.mark_destroyed();
+    hook.release();
+    waiter.join();
+
+    REQUIRE(paused_before_wait);
+    REQUIRE(returned.load(std::memory_order_acquire));
+    REQUIRE_FALSE(join_destroyed_wait_before_wait_for_test.load(
+        std::memory_order_acquire));
+    REQUIRE(join_destroyed_notify_count_for_test.load(
+                std::memory_order_acquire) == 1);
+}
+
+TEST_CASE("join result readiness precedes final frame destruction",
+          "[task][spawn][join_handle][lifecycle][atomic_wait]") {
+    using namespace elio::coro::detail;
+    join_destroyed_hook_guard hook;
+    pause_before_detached_frame_destroy_for_test.store(
+        true, std::memory_order_release);
+
+    scheduler sched(1);
+    sched.start();
+    auto joined = sched.go_joinable(simple_void());
+    const bool frame_paused = wait_for_task_condition([&] {
+        return detached_frame_destroy_paused_for_test.load(
+            std::memory_order_acquire);
+    });
+    const bool ready_while_paused = joined.is_ready();
+    const bool destroyed_while_paused = joined.is_destroyed();
+    std::atomic<bool> wait_returned{false};
+    std::thread waiter([&] {
+        joined.wait_destroyed();
+        wait_returned.store(true, std::memory_order_release);
+    });
+    const bool waiter_waiting = wait_for_task_condition([&] {
+        return join_destroyed_wait_count_for_test.load(
+                   std::memory_order_acquire) >= 1;
+    });
+    const bool wait_returned_while_paused =
+        wait_returned.load(std::memory_order_acquire);
+
+    hook.release();
+    waiter.join();
+    joined.await_resume();
+    const bool destroyed_after_release = joined.is_destroyed();
+    const bool shutdown_succeeded = sched.shutdown(scaled_sec(5));
+
+    REQUIRE(frame_paused);
+    REQUIRE(waiter_waiting);
+    REQUIRE(ready_while_paused);
+    REQUIRE_FALSE(destroyed_while_paused);
+    REQUIRE_FALSE(wait_returned_while_paused);
+    REQUIRE(destroyed_after_release);
+    REQUIRE(wait_returned.load(std::memory_order_acquire));
+    REQUIRE(join_destroyed_notify_count_for_test.load(
+                std::memory_order_acquire) == 1);
+    REQUIRE(shutdown_succeeded);
+}
+
+TEST_CASE("join destruction state uses a native lock-free width",
+          "[task][join_handle][performance][layout]") {
+    using elio::coro::detail::join_state;
+    using elio::coro::detail::join_state_base;
+
+    INFO("join_state_base bytes: " << sizeof(join_state_base));
+    INFO("join_state<void> bytes: " << sizeof(join_state<void>));
+    INFO("join_state<uint64_t> bytes: " << sizeof(join_state<uint64_t>));
+    STATIC_REQUIRE(std::atomic<std::uint32_t>::is_always_lock_free);
+    STATIC_REQUIRE(sizeof(join_state_base) <= 128);
+    STATIC_REQUIRE(sizeof(join_state<void>) <= 128);
+    STATIC_REQUIRE(sizeof(join_state<uint64_t>) <= 128);
 }
 
 TEST_CASE("task<int> co_return value", "[task]") {

@@ -3,6 +3,7 @@
 #include "promise_base.hpp"
 #include "detail/completion_waiter.hpp"
 #include <cassert>
+#include <cstdint>
 #include <coroutine>
 #include <optional>
 #include <exception>
@@ -10,8 +11,6 @@
 #include <type_traits>
 #include <atomic>
 #include <memory>
-#include <mutex>
-#include <condition_variable>
 #include <stdexcept>
 
 namespace elio::runtime {
@@ -37,6 +36,14 @@ namespace detail {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 inline std::atomic<bool> pause_before_detached_frame_destroy_for_test{false};
 inline std::atomic<bool> detached_frame_destroy_paused_for_test{false};
+inline std::atomic<bool>
+    pause_join_destroyed_wait_before_wait_for_test{false};
+inline std::atomic<bool>
+    join_destroyed_wait_before_wait_for_test{false};
+inline std::atomic<std::uint32_t>
+    join_destroyed_wait_count_for_test{0};
+inline std::atomic<std::uint32_t>
+    join_destroyed_notify_count_for_test{0};
 #endif
 
 struct final_awaiter {
@@ -127,6 +134,11 @@ struct task_access {
 };
 
 struct join_state_base {
+    static constexpr std::uint32_t destruction_alive = 0;
+    static constexpr std::uint32_t destruction_destroyed = 1;
+
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+
     join_state_base()
         : execution_context_(detail::make_task_execution_context()) {}
 
@@ -137,9 +149,7 @@ struct join_state_base {
 
     alignas(64) completion_waiter_slot waiter_;
     std::atomic<bool> completed_{false};
-    std::atomic<bool> destroyed_{false};
-    std::mutex destroyed_mtx_;
-    std::condition_variable destroyed_cv_;
+    std::atomic<std::uint32_t> destruction_state_{destruction_alive};
 
     void complete() {
         completed_.store(true, std::memory_order_release);
@@ -151,22 +161,43 @@ struct join_state_base {
     }
 
     void mark_destroyed() noexcept {
-        {
-            std::lock_guard<std::mutex> lock(destroyed_mtx_);
-            destroyed_.store(true, std::memory_order_release);
-        }
-        destroyed_cv_.notify_all();
+        destruction_state_.store(
+            destruction_destroyed, std::memory_order_release);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        join_destroyed_notify_count_for_test.fetch_add(
+            1, std::memory_order_relaxed);
+#endif
+        destruction_state_.notify_all();
     }
 
     void wait_destroyed() {
-        std::unique_lock<std::mutex> lock(destroyed_mtx_);
-        destroyed_cv_.wait(lock, [&] {
-            return destroyed_.load(std::memory_order_acquire);
-        });
+        while (destruction_state_.load(std::memory_order_acquire) ==
+               destruction_alive) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            join_destroyed_wait_count_for_test.fetch_add(
+                1, std::memory_order_relaxed);
+            if (pause_join_destroyed_wait_before_wait_for_test.load(
+                    std::memory_order_acquire)) {
+                join_destroyed_wait_before_wait_for_test.store(
+                    true, std::memory_order_release);
+                join_destroyed_wait_before_wait_for_test.notify_all();
+                while (pause_join_destroyed_wait_before_wait_for_test.load(
+                        std::memory_order_acquire)) {
+                    pause_join_destroyed_wait_before_wait_for_test.wait(
+                        true, std::memory_order_acquire);
+                }
+                join_destroyed_wait_before_wait_for_test.store(
+                    false, std::memory_order_release);
+            }
+#endif
+            destruction_state_.wait(
+                destruction_alive, std::memory_order_acquire);
+        }
     }
 
     [[nodiscard]] bool is_destroyed() const noexcept {
-        return destroyed_.load(std::memory_order_acquire);
+        return destruction_state_.load(std::memory_order_acquire) ==
+            destruction_destroyed;
     }
 
     [[nodiscard]] bool is_completed() const noexcept {
@@ -313,8 +344,8 @@ public:
         return state_->is_destroyed();
     }
     
-    /// Block until the coroutine is destroyed (safe from non-coroutine context)
-    /// Use this for TSAN-safe synchronization before shutdown()
+    /// Block until the coroutine is destroyed. Multiple non-coroutine threads
+    /// may wait concurrently; scheduler workers must not block here.
     void wait_destroyed() const {
         state_->wait_destroyed();
     }
@@ -389,8 +420,8 @@ public:
         return state_->is_destroyed();
     }
     
-    /// Block until the coroutine is destroyed (safe from non-coroutine context)
-    /// Use this for TSAN-safe synchronization before shutdown()
+    /// Block until the coroutine is destroyed. Multiple non-coroutine threads
+    /// may wait concurrently; scheduler workers must not block here.
     void wait_destroyed() const {
         state_->wait_destroyed();
     }

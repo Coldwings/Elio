@@ -63,6 +63,10 @@ target_link_options(shared_mutex_writer_allocation_probe PRIVATE
 target_compile_definitions(shared_mutex_writer_allocation_probe PRIVATE
     ELIO_RUNTIME_TEST_HOOKS)
 
+add_executable(bench_join_destroy_atomic bench_join_destroy_atomic.cpp)
+target_link_libraries(bench_join_destroy_atomic PRIVATE elio)
+target_link_options(bench_join_destroy_atomic PRIVATE ${STATIC_LINK_FLAGS})
+
 add_executable(cancel_callback_benchmark cancel_callback_benchmark.cpp)
 target_link_libraries(cancel_callback_benchmark PRIVATE elio)
 target_link_options(cancel_callback_benchmark PRIVATE ${STATIC_LINK_FLAGS})

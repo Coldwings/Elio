@@ -272,7 +272,9 @@ public:
 `is_ready()` reports result publication and may become true before the spawned
 wrapper frame is destroyed. `wait_destroyed()` is for non-coroutine callers that
 must wait until a normally completed wrapper has released its frame parameters,
-callable, arguments, and captures.
+callable, arguments, and captures. Multiple external threads may wait at once;
+one release publication from final frame destruction wakes all of them.
+Scheduler workers must not call this blocking API.
 
 **Example:**
 ```cpp

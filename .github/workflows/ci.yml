@@ -190,6 +190,10 @@ jobs:
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
       run: timeout --kill-after=5s 30s ./build/examples/shared_mutex_reader_benchmark --smoke
 
+    - name: Run join destruction benchmark smoke test
+      if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
+      run: timeout --kill-after=5s 30s ./build/examples/bench_join_destroy_atomic --smoke
+
     - name: Run autoscaler example smoke test
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
       run: timeout --kill-after=5s 15s ./build/examples/autoscaler_example --smoke

@@ -718,6 +718,38 @@ performance observation.
 Use `--smoke` only for a short build and termination check; it is not a formal
 performance sample.
 
+### Joinable Task Destruction State
+
+`join_handle::wait_destroyed()` observes a native-width one-way atomic state.
+Final frame teardown publishes `destroyed` with release ordering and calls
+`notify_all()`; external waiters use acquire load/wait loops. This keeps result
+completion and final frame destruction separate while avoiding a second
+mutex/condition-variable protocol and waiter-registration bit. Multiple
+external threads may wait concurrently. Scheduler workers must not block in
+this API.
+
+`bench_join_destroy_atomic` reports join-state layout, destruction publication,
+already-destroyed waits, 1/2/4/8 blocking waiters, direct joinable spawn/drain,
+batch spawn/drain, and pending-task release. The blocking suite uses an untimed
+50-microsecond stabilization interval before each wake measurement. Build the
+exact same final source against baseline and candidate include trees, use fixed
+physical CPU sets and balanced process order, retain raw samples, and wrap each
+process in an external timeout.
+
+Treat sub-3% controlled timing differences as approximately neutral. The
+primary acceptance criterion is the simpler one-state synchronization contract;
+a consistent mean regression above 5%, a stable p95 point regression above
+10%, or any correctness/liveness failure blocks the change. With only tens of
+process-level samples, run-level p99 is effectively a near-maximum statistic;
+report it and the raw maximum as diagnostics instead of independent rejection
+gates. Hosted CI should run correctness tests only and must not enforce timing
+thresholds.
+
+```bash
+cmake --build build-release --target bench_join_destroy_atomic --parallel 2
+taskset -c 2,3 ./build-release/examples/bench_join_destroy_atomic --smoke
+```
+
 ## Network Performance
 
 ### Connection Pooling

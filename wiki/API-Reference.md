@@ -3309,6 +3309,15 @@ representation-limit fallback follows the same internal allocation boundary;
 the shared-acquisition precondition above is unchanged. Token-aware readers
 retain eager cancellation arbitration state.
 
+The no-token `lock()` path likewise creates no wake state for a ready writer.
+After a failed ready check, suspension entry creates independently owned wake
+state before taking the waiter-queue mutex and before publishing
+`WRITER_WAITING`, changing pending-writer accounting, or publishing a queue
+node. Its `await_suspend()` may therefore propagate `std::bad_alloc` with no
+exclusive-lock state change. The existing locked writer admission and
+preference protocol is unchanged after allocation. Token-aware writers retain
+eager cancellation arbitration state.
+
 ### `shared_lock_guard`
 
 RAII unlock guard for an already-held shared (reader) lock. Callers must

@@ -23,6 +23,11 @@ inline std::atomic<bool>
     pause_shared_reader_after_wake_allocation_for_test{false};
 inline std::atomic<bool>
     shared_reader_paused_after_wake_allocation_for_test{false};
+inline std::atomic<size_t> shared_writer_waiter_publications_for_test{0};
+inline std::atomic<bool>
+    pause_shared_writer_after_wake_allocation_for_test{false};
+inline std::atomic<bool>
+    shared_writer_paused_after_wake_allocation_for_test{false};
 }
 #endif
 
@@ -439,13 +444,15 @@ public:
     class lock_waiter : public elio::detail::intrusive_list_node<lock_waiter> {
     public:
         explicit lock_waiter(shared_mutex& m)
-            : mtx_(m)
-            , wake_state_(detail::make_wake_state()) {}
+            : mtx_(m) {}
 
         lock_waiter(shared_mutex& m, bool cancellable)
             : mtx_(m)
-            , wake_state_(detail::make_wake_state())
-            , cancellable_(cancellable) {}
+            , cancellable_(cancellable) {
+            if (cancellable_) {
+                wake_state_ = detail::make_wake_state();
+            }
+        }
 
         ~lock_waiter() {
             // Fast path: if we never suspended, we were never enqueued
@@ -507,6 +514,28 @@ public:
                     !wake_state_->set_handle_blocked(awaiter)) {
                     return false;
                 }
+            } else if (!wake_state_) {
+                // A dequeued writer grant can outlive the coroutine frame.
+                // Allocate that independent ownership before the queue lock
+                // and before publishing writer preference. Allocation failure
+                // therefore leaves state, accounting, and queues unchanged.
+                wake_state_ = detail::make_wake_state();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (detail::pause_shared_writer_after_wake_allocation_for_test
+                        .load(std::memory_order_acquire)) {
+                    detail::shared_writer_paused_after_wake_allocation_for_test
+                        .store(true, std::memory_order_release);
+                    detail::shared_writer_paused_after_wake_allocation_for_test
+                        .notify_all();
+                    while (detail::pause_shared_writer_after_wake_allocation_for_test
+                               .load(std::memory_order_acquire)) {
+                        detail::pause_shared_writer_after_wake_allocation_for_test
+                            .wait(true, std::memory_order_acquire);
+                    }
+                    detail::shared_writer_paused_after_wake_allocation_for_test
+                        .store(false, std::memory_order_release);
+                }
+#endif
             }
 
             detail::wake_state_ptr reader_to_wake;
@@ -557,6 +586,10 @@ public:
                         }
                         suspended_ = true;
                         mtx_.writer_waiters_.push_back(this);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                        detail::shared_writer_waiter_publications_for_test
+                            .fetch_add(1, std::memory_order_release);
+#endif
                         if (!cancellable_ ||
                             wake_state_->unblock_after_publish()) {
                             return true;
@@ -658,7 +691,7 @@ public:
         explicit lock_awaitable(shared_mutex& m) : waiter_(m) {}
 
         bool await_ready() const noexcept { return waiter_.await_ready_impl(); }
-        bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
+        bool await_suspend(std::coroutine_handle<> awaiter) {
             return waiter_.await_suspend_impl(awaiter);
         }
         void await_resume() noexcept {
@@ -706,7 +739,12 @@ public:
         return cancellable_lock_shared_awaitable(*this, std::move(token));
     }
 
-    /// Acquire exclusive (write) lock
+    /// Acquire exclusive (write) lock.
+    ///
+    /// An immediately admitted writer does not allocate wake state. A writer
+    /// that reaches the suspend path allocates before publishing writer
+    /// preference or entering the queue mutex, and await_suspend may propagate
+    /// std::bad_alloc.
     auto lock() {
         return lock_awaitable(*this);
     }

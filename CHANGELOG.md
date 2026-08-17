@@ -76,6 +76,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Allocation-free ready shared-mutex writers**: No-token
+  `shared_mutex::lock()` now defers independent wake-state allocation until
+  suspension entry, before taking the queue mutex or publishing writer
+  preference. Ready writers allocate nothing; contended writers allocate once
+  and retain the existing locked admission, preference, grant, and cleanup
+  state machine. The no-token `await_suspend()` may now propagate
+  `std::bad_alloc` with no writer state or queue mutation. Token-aware writers
+  remain eager (#1041).
 - **Bounded-channel empty refill fast path**: Successful bounded receives now
   stop after observing an empty blocked-sender queue under the channel mutex,
   instead of taking a second lock only to repeat that result. Token-aware

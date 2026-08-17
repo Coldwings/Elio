@@ -55,6 +55,14 @@ add_executable(shared_mutex_reader_benchmark
 target_link_libraries(shared_mutex_reader_benchmark PRIVATE elio)
 target_link_options(shared_mutex_reader_benchmark PRIVATE ${STATIC_LINK_FLAGS})
 
+add_executable(shared_mutex_writer_allocation_probe
+    shared_mutex_reader_benchmark.cpp)
+target_link_libraries(shared_mutex_writer_allocation_probe PRIVATE elio)
+target_link_options(shared_mutex_writer_allocation_probe PRIVATE
+    ${STATIC_LINK_FLAGS})
+target_compile_definitions(shared_mutex_writer_allocation_probe PRIVATE
+    ELIO_RUNTIME_TEST_HOOKS)
+
 add_executable(cancel_callback_benchmark cancel_callback_benchmark.cpp)
 target_link_libraries(cancel_callback_benchmark PRIVATE elio)
 target_link_options(cancel_callback_benchmark PRIVATE ${STATIC_LINK_FLAGS})

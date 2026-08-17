@@ -82,6 +82,24 @@ struct shared_reader_allocation_hook_guard {
     }
 };
 
+struct shared_writer_allocation_hook_guard {
+    shared_writer_allocation_hook_guard() {
+        elio::sync::detail::pause_shared_writer_after_wake_allocation_for_test
+            .store(true, std::memory_order_release);
+        elio::sync::detail::shared_writer_paused_after_wake_allocation_for_test
+            .store(false, std::memory_order_release);
+    }
+
+    ~shared_writer_allocation_hook_guard() { release(); }
+
+    void release() const noexcept {
+        elio::sync::detail::pause_shared_writer_after_wake_allocation_for_test
+            .store(false, std::memory_order_release);
+        elio::sync::detail::pause_shared_writer_after_wake_allocation_for_test
+            .notify_all();
+    }
+};
+
 } // namespace
 
 TEST_CASE("wake_state resolves completion during blocked publication",
@@ -695,6 +713,170 @@ TEST_CASE("shared_mutex reader fast paths defer wake-state allocation",
         second.await_resume();
         sm.unlock_shared();
         REQUIRE(sm.reader_count() == 0);
+    }
+}
+
+TEST_CASE("shared_mutex writer fast paths defer wake-state allocation",
+          "[sync][shared_mutex][writer][allocation]") {
+    auto& allocations =
+        elio::sync::detail::wake_state_allocations_for_test;
+    auto& publications =
+        elio::sync::detail::shared_writer_waiter_publications_for_test;
+    auto& fail_next =
+        elio::sync::detail::fail_next_wake_state_allocation_for_test;
+    allocations.store(0, std::memory_order_relaxed);
+    publications.store(0, std::memory_order_relaxed);
+    fail_next.store(false, std::memory_order_relaxed);
+
+    SECTION("ready writer") {
+        shared_mutex sm;
+        auto waiter = sm.lock();
+        static_assert(!noexcept(
+            waiter.await_suspend(std::noop_coroutine())));
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+        REQUIRE(waiter.await_ready());
+        waiter.await_resume();
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 0);
+        REQUIRE(sm.is_writer_active());
+        sm.unlock();
+    }
+
+    SECTION("parked writer allocates exactly once") {
+        shared_mutex sm;
+        REQUIRE(sm.try_lock_shared());
+        auto waiter = sm.lock();
+        REQUIRE_FALSE(waiter.await_ready());
+        REQUIRE(waiter.await_suspend(std::noop_coroutine()));
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 1);
+        REQUIRE_FALSE(sm.is_writer_active());
+        REQUIRE(sm.reader_count() == 1);
+        sm.unlock_shared();
+        REQUIRE(sm.is_writer_active());
+        waiter.await_resume();
+        sm.unlock();
+    }
+
+    SECTION("reader release before suspend uses one slow-path allocation") {
+        shared_mutex sm;
+        REQUIRE(sm.try_lock_shared());
+        auto waiter = sm.lock();
+        REQUIRE_FALSE(waiter.await_ready());
+
+        sm.unlock_shared();
+        REQUIRE_FALSE(waiter.await_suspend(std::noop_coroutine()));
+        waiter.await_resume();
+
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 0);
+        REQUIRE(sm.is_writer_active());
+        sm.unlock();
+    }
+
+    SECTION("reader release during allocation uses the locked recheck") {
+        shared_writer_allocation_hook_guard hook;
+        shared_mutex sm;
+        REQUIRE(sm.try_lock_shared());
+        auto waiter = sm.lock();
+        REQUIRE_FALSE(waiter.await_ready());
+
+        bool suspended = true;
+        std::thread waiter_thread([&] {
+            suspended = waiter.await_suspend(std::noop_coroutine());
+        });
+        const bool allocation_paused = wait_for_flag(
+            elio::sync::detail::
+                shared_writer_paused_after_wake_allocation_for_test);
+        bool reader_released_while_paused = false;
+        if (allocation_paused) {
+            sm.unlock_shared();
+            reader_released_while_paused = true;
+        }
+        hook.release();
+        waiter_thread.join();
+        if (!reader_released_while_paused) {
+            sm.unlock_shared();
+        }
+
+        waiter.await_resume();
+        const auto allocation_count =
+            allocations.load(std::memory_order_relaxed);
+        const auto publication_count =
+            publications.load(std::memory_order_relaxed);
+        REQUIRE(sm.is_writer_active());
+        sm.unlock();
+
+        REQUIRE(allocation_paused);
+        REQUIRE(reader_released_while_paused);
+        REQUIRE_FALSE(suspended);
+        REQUIRE(allocation_count == 1);
+        REQUIRE(publication_count == 0);
+    }
+
+    SECTION("allocation failure preserves reader state and writer queue") {
+        shared_mutex sm;
+        REQUIRE(sm.try_lock_shared());
+        {
+            auto waiter = sm.lock();
+            REQUIRE_FALSE(waiter.await_ready());
+            fail_next.store(true, std::memory_order_release);
+            REQUIRE_THROWS_AS(
+                waiter.await_suspend(std::noop_coroutine()), std::bad_alloc);
+        }
+
+        REQUIRE_FALSE(fail_next.load(std::memory_order_acquire));
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+        REQUIRE(publications.load(std::memory_order_relaxed) == 0);
+        REQUIRE_FALSE(sm.is_writer_active());
+        REQUIRE(sm.reader_count() == 1);
+        REQUIRE(sm.try_lock_shared());
+        sm.unlock_shared();
+        sm.unlock_shared();
+
+        auto next = sm.lock();
+        REQUIRE(next.await_ready());
+        next.await_resume();
+        sm.unlock();
+    }
+
+    SECTION("explicit false stays lazy and true stays eager") {
+        shared_mutex ready;
+        {
+            shared_mutex::lock_waiter waiter(ready, false);
+            REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+            REQUIRE(waiter.await_ready_impl());
+            REQUIRE(waiter.await_resume_impl() == cancel_result::completed);
+            REQUIRE(allocations.load(std::memory_order_relaxed) == 0);
+            ready.unlock();
+        }
+        {
+            shared_mutex::lock_waiter waiter(ready, true);
+            REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+            REQUIRE(waiter.await_ready_impl());
+            REQUIRE(waiter.await_resume_impl() == cancel_result::completed);
+            ready.unlock();
+        }
+    }
+
+    SECTION("token writers retain eager cancellation state") {
+        shared_mutex sm;
+        cancel_source source;
+        auto ready = sm.lock(source.get_token());
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
+        REQUIRE(ready.await_ready());
+        REQUIRE(ready.await_resume() == cancel_result::completed);
+        sm.unlock();
+
+        cancel_source cancelled_source;
+        cancelled_source.cancel();
+        auto cancelled = sm.lock(cancelled_source.get_token());
+        REQUIRE(allocations.load(std::memory_order_relaxed) == 2);
+        REQUIRE(cancelled.await_ready());
+        REQUIRE(cancelled.await_resume() == cancel_result::cancelled);
+        REQUIRE_FALSE(sm.is_writer_active());
     }
 }
 

@@ -557,9 +557,18 @@ waiting writer retains independently owned wake state before entering the
 waiter queue, so dequeue-to-schedule lifetime and reserved-grant recovery remain
 safe. Token-aware readers create cancellation arbitration state eagerly.
 
-Benchmark ready readers, forced writer-to-reader handoff, mixed reader/writer
-loads, and sustained queued-writer pressure with the same final source against
-baseline and candidate include trees. Use fixed allowed CPUs and at least 30
+No-token `lock()` also avoids wake-state allocation when its ready check
+acquires exclusive ownership. A writer that enters `await_suspend()` allocates
+once before the queue mutex and before publishing `WRITER_WAITING`; allocation
+failure cannot leave writer preference, pending-writer accounting, or a queue
+node behind. Token-aware writers remain eager. Unlike readers, this allocation
+occurs before writer preference becomes visible, so sustained-reader writer
+progress remains an explicit correctness and measurement requirement.
+
+Benchmark ready readers and writers, forced writer/reader handoffs, mixed
+reader/writer loads, and sustained queued-writer pressure with the same final
+source against baseline and candidate include trees. Use fixed allowed CPUs
+and at least 30
 balanced, interleaved process pairs. Analyze paired log ratios with at least
 100,000 stratified bootstrap resamples. A candidate must show a supported ready
 reader improvement. Because this optimization deliberately moves wake-state
@@ -574,6 +583,17 @@ starvation gate. Every pressure sample must complete the exact configured
 writer count with zero no-progress observations; reader admission must never
 pass an already-published writer.
 
+For writer lazy allocation, treat sub-3% controlled differences as
+approximately neutral unless an exact mechanism count explains them. The
+ready writer must change from one wake-state allocation per measured operation
+to zero and show a material latency improvement. Evaluate last-reader and
+writer-to-writer handoff in absolute nanoseconds as well as ratios. A
+consistent mixed/pressure point regression above 5%, a p95/p99 point
+regression above 10%, an incomplete writer count, a timeout, or any zero-
+progress observation blocks the change. Confidence intervals and raw maxima
+must still be reported, but a CI-only overrun inside the noise band or a single
+raw maximum is diagnostic rather than an independent rejection criterion.
+
 Each reader workload runs repeated `co_await lock_shared()` operations in a
 persistent coroutine frame. Scheduler construction, task creation, one same-
 path warmup acquisition, frame destruction, and scheduler shutdown stay
@@ -582,12 +602,25 @@ reader and driver coroutines on one worker so writer release occurs only after
 the reader has published, and completion is counted only after the resumed
 reader releases its shared slot.
 
+The writer-core suite uses one persistent writer frame for repeated ready
+`co_await lock()` operations. Its forced rows coordinate a persistent writer
+and driver on one scheduler worker; the driver releases the held reader or
+writer only after the target writer has completed `await_suspend()`, and counts
+completion only after the resumed writer releases exclusive ownership. One
+full handoff is warmed outside the timed interval.
+
 Build `examples/shared_mutex_reader_benchmark.cpp` twice from the exact same
 final source and compiler flags, changing only the Elio include root. Formal
-runs use one strict suite per process:
+timing builds must not define `ELIO_RUNTIME_TEST_HOOKS`, because the hook's
+failure-injection and allocation counters add atomic RMWs to wake-state
+construction. Build the same source separately as
+`shared_mutex_writer_allocation_probe` with hooks enabled to verify the exact
+ready-writer allocation change; do not use probe timings as performance
+evidence. Formal timing runs use one strict suite per process:
 
 ```bash
 shared_mutex_reader_benchmark --suite core --iterations 1000000
+shared_mutex_reader_benchmark --suite writer-core --iterations 1000000
 shared_mutex_reader_benchmark --suite readers --workers 4 --iterations 250000
 shared_mutex_reader_benchmark --suite mixed --workers 4 --reader-percent 90 --iterations 100000
 shared_mutex_reader_benchmark --suite mixed --workers 4 --reader-percent 50 --iterations 100000

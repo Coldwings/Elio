@@ -35,6 +35,7 @@ struct concurrent_summary {
     double ns_per_operation = 0.0;
     double operations_per_second = 0.0;
     std::size_t operations_completed = 0;
+    std::size_t wake_state_allocations = 0;
 };
 
 struct forced_summary {
@@ -55,6 +56,16 @@ struct pressure_summary : concurrent_summary {
     std::size_t writer_progress = 0;
     std::size_t zero_progress_samples = 0;
 };
+
+void report_wake_state_allocations(std::size_t allocations) {
+    std::cout << " wake_state_allocations=";
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    std::cout << allocations;
+#else
+    (void)allocations;
+    std::cout << "disabled";
+#endif
+}
 
 std::size_t parse_positive(std::string_view text) {
     std::size_t result = 0;
@@ -149,11 +160,82 @@ concurrent_summary concurrent_readers(std::size_t workers,
     const double elapsed_seconds = duration<double>(elapsed).count();
     return {elapsed_ns / static_cast<double>(total),
             static_cast<double>(total) / elapsed_seconds,
-            completed.load(std::memory_order_relaxed)};
+            completed.load(std::memory_order_relaxed), 0};
 }
 
 concurrent_summary ready_reader(std::size_t iterations) {
     return concurrent_readers(1, iterations);
+}
+
+coro::task<void> persistent_writer(
+        sync::shared_mutex& mutex, std::atomic<std::size_t>& ready,
+        std::atomic<std::size_t>& warmed, std::atomic<bool>& warmup,
+        std::atomic<bool>& start, std::size_t iterations,
+        std::atomic<std::size_t>& completed) {
+    ready.store(1, std::memory_order_release);
+    ready.notify_one();
+    while (!warmup.load(std::memory_order_acquire)) {
+        co_await time::yield();
+    }
+
+    co_await mutex.lock();
+    mutex.unlock();
+    warmed.store(1, std::memory_order_release);
+    warmed.notify_one();
+    while (!start.load(std::memory_order_acquire)) {
+        co_await time::yield();
+    }
+
+    for (std::size_t i = 0; i < iterations; ++i) {
+        co_await mutex.lock();
+        mutex.unlock();
+    }
+    completed.store(iterations, std::memory_order_release);
+    completed.notify_one();
+    co_return;
+}
+
+concurrent_summary ready_writer(std::size_t iterations) {
+    sync::shared_mutex mutex;
+    runtime::scheduler scheduler(1);
+    scheduler.start();
+    std::atomic<std::size_t> ready{0};
+    std::atomic<std::size_t> warmed{0};
+    std::atomic<std::size_t> completed{0};
+    std::atomic<bool> warmup{false};
+    std::atomic<bool> start{false};
+    auto writer = scheduler.go_joinable_to(0, persistent_writer(
+        mutex, ready, warmed, warmup, start, iterations, completed));
+
+    wait_for_count(ready, 1);
+    warmup.store(true, std::memory_order_release);
+    wait_for_count(warmed, 1);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    sync::detail::wake_state_allocations_for_test.store(
+        0, std::memory_order_relaxed);
+#endif
+    const auto begin = steady_clock::now();
+    start.store(true, std::memory_order_release);
+    wait_for_count(completed, iterations);
+    const auto elapsed = steady_clock::now() - begin;
+    std::size_t allocations = 0;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    allocations =
+        sync::detail::wake_state_allocations_for_test.load(
+            std::memory_order_relaxed);
+#endif
+    writer.wait_destroyed();
+    writer.await_resume();
+    if (!scheduler.shutdown(seconds(5)) ||
+        completed.load(std::memory_order_acquire) != iterations ||
+        mutex.reader_count() != 0 || mutex.is_writer_active()) {
+        std::abort();
+    }
+    const double elapsed_ns = duration<double, std::nano>(elapsed).count();
+    const double elapsed_seconds = duration<double>(elapsed).count();
+    return {elapsed_ns / static_cast<double>(iterations),
+            static_cast<double>(iterations) / elapsed_seconds,
+            completed.load(std::memory_order_relaxed), allocations};
 }
 
 class handoff_yield {
@@ -255,6 +337,97 @@ forced_summary forced_handoff(std::size_t iterations) {
     };
 }
 
+enum class writer_handoff_source {
+    reader,
+    writer,
+};
+
+coro::task<void> persistent_forced_writer(
+        sync::shared_mutex& mutex, std::size_t operations,
+        std::atomic<std::size_t>& generation,
+        std::atomic<std::size_t>& attempted,
+        std::atomic<std::size_t>& completed) {
+    for (std::size_t operation = 1; operation <= operations; ++operation) {
+        while (generation.load(std::memory_order_acquire) != operation) {
+            co_await handoff_yield{};
+        }
+        attempted.store(operation, std::memory_order_release);
+        attempted.notify_one();
+        co_await mutex.lock();
+        mutex.unlock();
+        completed.store(operation, std::memory_order_release);
+        completed.notify_one();
+    }
+    co_return;
+}
+
+coro::task<void> persistent_writer_handoff_driver(
+        sync::shared_mutex& mutex, writer_handoff_source source,
+        std::size_t iterations, std::atomic<std::size_t>& generation,
+        std::atomic<std::size_t>& attempted,
+        std::atomic<std::size_t>& completed,
+        std::atomic<std::int64_t>& elapsed_ns) {
+    steady_clock::time_point begin;
+    const std::size_t operations = iterations + 1;
+    for (std::size_t operation = 1; operation <= operations; ++operation) {
+        const bool acquired = source == writer_handoff_source::reader
+            ? mutex.try_lock_shared()
+            : mutex.try_lock();
+        if (!acquired) std::abort();
+        generation.store(operation, std::memory_order_release);
+        while (attempted.load(std::memory_order_acquire) != operation) {
+            co_await handoff_yield{};
+        }
+        if (source == writer_handoff_source::reader) {
+            mutex.unlock_shared();
+        } else {
+            mutex.unlock();
+        }
+        while (completed.load(std::memory_order_acquire) != operation) {
+            co_await handoff_yield{};
+        }
+        if (operation == 1) begin = steady_clock::now();
+    }
+    elapsed_ns.store(duration_cast<nanoseconds>(
+        steady_clock::now() - begin).count(), std::memory_order_release);
+    co_return;
+}
+
+forced_summary forced_writer_handoff(std::size_t iterations,
+                                     writer_handoff_source source) {
+    sync::shared_mutex mutex;
+    runtime::scheduler scheduler(1);
+    scheduler.start();
+    std::atomic<std::size_t> generation{0};
+    std::atomic<std::size_t> attempted{0};
+    std::atomic<std::size_t> completed{0};
+    std::atomic<std::int64_t> elapsed_ns{0};
+    const std::size_t operations = iterations + 1;
+    auto writer = scheduler.go_joinable_to(0, persistent_forced_writer(
+        mutex, operations, generation, attempted, completed));
+    auto driver = scheduler.go_joinable_to(0, persistent_writer_handoff_driver(
+        mutex, source, iterations, generation, attempted, completed,
+        elapsed_ns));
+    writer.wait_destroyed();
+    driver.wait_destroyed();
+    writer.await_resume();
+    driver.await_resume();
+    if (!scheduler.shutdown(seconds(5)) ||
+        attempted.load(std::memory_order_acquire) != operations ||
+        completed.load(std::memory_order_acquire) != operations ||
+        elapsed_ns.load(std::memory_order_acquire) <= 0 ||
+        mutex.reader_count() != 0 || mutex.is_writer_active()) {
+        std::abort();
+    }
+    return {
+        static_cast<double>(elapsed_ns.load(std::memory_order_relaxed)) /
+            static_cast<double>(iterations),
+        completed.load(std::memory_order_relaxed) - 1,
+        attempted.load(std::memory_order_relaxed),
+        completed.load(std::memory_order_relaxed),
+    };
+}
+
 coro::task<void> mixed_worker(
         sync::shared_mutex& mutex, std::atomic<std::size_t>& ready,
         std::atomic<std::size_t>& warmed, std::atomic<bool>& warmup,
@@ -271,6 +444,8 @@ coro::task<void> mixed_worker(
     }
     co_await mutex.lock_shared();
     mutex.unlock_shared();
+    co_await mutex.lock();
+    mutex.unlock();
     warmed.fetch_add(1, std::memory_order_release);
     warmed.notify_one();
     while (!start.load(std::memory_order_acquire)) {
@@ -499,6 +674,8 @@ void usage() {
         << "usage: shared_mutex_reader_benchmark --suite core --iterations N\n"
         << "       shared_mutex_reader_benchmark --suite readers --workers "
            "{1|2|4|8} --iterations N\n"
+        << "       shared_mutex_reader_benchmark --suite writer-core "
+           "--iterations N\n"
         << "       shared_mutex_reader_benchmark --suite mixed --workers "
            "{2|4|8} --reader-percent {90|50} --iterations N\n"
         << "       shared_mutex_reader_benchmark --suite pressure --readers "
@@ -526,6 +703,27 @@ int main(int argc, char** argv) {
                   << " operations_completed=" << forced.operations_completed
                   << " forced_attempted=" << forced.attempted
                   << " forced_resumed=" << forced.resumed << '\n';
+        const auto writer = ready_writer(100);
+        std::cout << "ready_writer ns/op=" << writer.ns_per_operation
+                  << " operations_completed=" << writer.operations_completed;
+        report_wake_state_allocations(writer.wake_state_allocations);
+        std::cout << '\n';
+        const auto last_reader = forced_writer_handoff(
+            100, writer_handoff_source::reader);
+        std::cout << "last_reader_writer_handoff ns/op="
+                  << last_reader.ns_per_operation
+                  << " operations_completed="
+                  << last_reader.operations_completed
+                  << " forced_attempted=" << last_reader.attempted
+                  << " forced_resumed=" << last_reader.resumed << '\n';
+        const auto writer_writer = forced_writer_handoff(
+            100, writer_handoff_source::writer);
+        std::cout << "writer_writer_handoff ns/op="
+                  << writer_writer.ns_per_operation
+                  << " operations_completed="
+                  << writer_writer.operations_completed
+                  << " forced_attempted=" << writer_writer.attempted
+                  << " forced_resumed=" << writer_writer.resumed << '\n';
         const auto readers = concurrent_readers(2, 100);
         std::cout << "reader_concurrency ns/op=" << readers.ns_per_operation
                   << " ops/s=" << readers.operations_per_second
@@ -545,6 +743,39 @@ int main(int argc, char** argv) {
         std::cout << " writer_progress=" << pressure.writer_progress
                   << " zero_progress=" << pressure.zero_progress_samples
                   << '\n';
+        return 0;
+    }
+
+    if (argc == 5 && std::string_view(argv[1]) == "--suite" &&
+        std::string_view(argv[2]) == "writer-core" &&
+        std::string_view(argv[3]) == "--iterations") {
+        const auto iterations = parse_positive(argv[4]);
+        if (iterations == 0) {
+            usage();
+            return 2;
+        }
+        std::cout << "suite=writer-core iterations=" << iterations << '\n';
+        const auto writer = ready_writer(iterations);
+        std::cout << "ready_writer ns/op=" << writer.ns_per_operation
+                  << " operations_completed=" << writer.operations_completed;
+        report_wake_state_allocations(writer.wake_state_allocations);
+        std::cout << '\n';
+        const auto last_reader = forced_writer_handoff(
+            iterations, writer_handoff_source::reader);
+        std::cout << "last_reader_writer_handoff ns/op="
+                  << last_reader.ns_per_operation
+                  << " operations_completed="
+                  << last_reader.operations_completed
+                  << " forced_attempted=" << last_reader.attempted
+                  << " forced_resumed=" << last_reader.resumed << '\n';
+        const auto writer_writer = forced_writer_handoff(
+            iterations, writer_handoff_source::writer);
+        std::cout << "writer_writer_handoff ns/op="
+                  << writer_writer.ns_per_operation
+                  << " operations_completed="
+                  << writer_writer.operations_completed
+                  << " forced_attempted=" << writer_writer.attempted
+                  << " forced_resumed=" << writer_writer.resumed << '\n';
         return 0;
     }
 

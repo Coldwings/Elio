@@ -14,7 +14,8 @@
 
 namespace elio::sync {
 
-/// Lock concept for condition_variable
+/// Syntactic lock requirement for condition_variable's generic wait overloads.
+/// This does not guarantee that lock() is safe to call on a scheduler worker.
 namespace detail {
 
 template<typename Lock>
@@ -25,13 +26,23 @@ concept lockable = requires(Lock& l) {
 
 } // namespace detail
 
-/// Coroutine-aware condition variable
+/// Coroutine-aware condition variable.
 ///
-/// Suspends the coroutine instead of blocking the thread.
+/// The wait phase suspends the coroutine instead of blocking the thread. A
+/// generic Lock re-lock is synchronous and has the stricter contract below.
 /// Supports three modes of use:
 /// - With elio::sync::mutex (coroutine-aware async re-lock)
-/// - With elio::sync::spinlock or any lockable type (synchronous re-lock)
+/// - With a short-duration synchronous lockable such as elio::sync::spinlock
+///   (direct re-lock on the resuming thread)
 /// - Without any lock (wait_unlocked) for single-worker scenarios
+///
+/// The generic Lock overloads call Lock::lock() synchronously in await_resume().
+/// They are not coroutine-aware re-lock operations. The caller must guarantee
+/// that unlock() releases synchronously and lock() has acquired ownership when
+/// it returns. lock() must also return promptly; scheduler-significant or
+/// unbounded synchronous waiting is outside this contract. A contended
+/// std::mutex can park and block that worker; use the elio::sync::mutex overload
+/// when re-locking may need to wait.
 ///
 /// IMPORTANT: Always use a predicate loop to protect against spurious wakeups:
 /// @code
@@ -160,7 +171,7 @@ public:
         mutex& mutex_;
     };
 
-    /// Wait awaitable for use with a generic lockable type (e.g., spinlock)
+    /// Wait awaitable for a short-duration synchronous lockable.
     template<detail::lockable Lock>
     class wait_awaitable_lock : public cv_waiter_base {
     public:
@@ -184,6 +195,7 @@ public:
         }
 
         void await_resume() {
+            // Intentionally synchronous: generic Lock is not coroutine-aware.
             lock_.lock();
         }
 
@@ -262,7 +274,7 @@ public:
         bool lock_released_ = false;
     };
 
-    /// Cancellable wait for a synchronous lockable type such as spinlock.
+    /// Cancellable wait for a short-duration synchronous lockable.
     template<detail::lockable Lock>
     class cancellable_wait_awaitable_lock : public cv_waiter_base {
     public:
@@ -299,6 +311,8 @@ public:
             cancel_registration_.unregister();
             const auto result = this->finish_wait();
             if (lock_released_) {
+                // Intentionally synchronous: generic Lock is not
+                // coroutine-aware, even on cancellation.
                 lock_.lock();
             }
             return result;
@@ -350,7 +364,7 @@ public:
     /// Wait with elio::sync::mutex
     ///
     /// Atomically releases the mutex and suspends the coroutine.
-    /// When notified, re-acquires the mutex before returning.
+    /// When notified, asynchronously re-acquires the mutex before returning.
     ///
     /// Usage:
     /// @code
@@ -370,7 +384,8 @@ public:
     }
 
     /// Wait with elio::sync::mutex until notified or cancellation wins.
-    /// The mutex is held again before returning whenever the wait released it.
+    /// The mutex is asynchronously re-acquired before returning whenever the
+    /// wait released it.
     coro::task<coro::cancel_result> wait(mutex& m,
                                          coro::cancel_token token) {
         const auto completion = co_await cancellable_wait_suspend_awaitable(
@@ -381,13 +396,28 @@ public:
         co_return completion.result;
     }
 
-    /// Wait with a generic lockable (e.g., spinlock)
+    /// Wait with a short-duration synchronous lockable (e.g., spinlock).
+    ///
+    /// The lock must be held before calling wait(). Re-locking calls
+    /// Lock::lock() directly in await_resume() on the resuming thread; this is
+    /// not a coroutine-aware lock acquisition. Lock::unlock() must release
+    /// synchronously, and Lock::lock() must acquire ownership before returning.
+    /// lock() must also return promptly; scheduler-significant or unbounded
+    /// synchronous waiting is outside this contract. Use sync::spinlock only
+    /// for very short critical sections with rare contention. Do not use a
+    /// potentially contended blocking lock such as std::mutex; use the
+    /// sync::mutex overload instead.
     template<detail::lockable Lock>
     auto wait(Lock& lock) {
         return wait_awaitable_lock<Lock>(*this, lock);
     }
 
-    /// Wait with a synchronous lockable until notified or cancellation wins.
+    /// Wait with a short-duration synchronous lockable until notification or
+    /// cancellation wins, returning the terminal cancel_result. Notification
+    /// and cancellation select one result atomically. A pre-cancelled wait
+    /// leaves the already-held lock untouched. If the wait released the lock,
+    /// it re-locks synchronously before returning either completed or cancelled;
+    /// the generic Lock contract above applies to that re-lock.
     template<detail::lockable Lock>
     auto wait(Lock& lock, coro::cancel_token token) {
         return cancellable_wait_awaitable_lock<Lock>(

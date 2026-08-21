@@ -3410,11 +3410,14 @@ public:
 
 ### `condition_variable`
 
-Coroutine-aware condition variable that suspends coroutines instead of blocking threads.
+Coroutine-aware condition variable whose wait phase suspends the coroutine
+instead of blocking the thread. Generic-lock re-acquisition is synchronous as
+described below.
 
 Supports three modes of use:
 - With `elio::sync::mutex` (coroutine-aware async re-lock)
-- With `elio::sync::spinlock` or any lockable type (synchronous re-lock)
+- With a short-duration synchronous lockable such as `elio::sync::spinlock`
+  (direct re-lock on the resuming thread)
 - Without any lock (`wait_unlocked()`) for single-worker scenarios
 
 ```cpp
@@ -3428,11 +3431,12 @@ public:
     // Cancellation-aware wait; re-acquires m if the wait released it
     coro::task<coro::cancel_result> wait(mutex& m, coro::cancel_token token);
 
-    // Wait with a generic lockable (e.g., spinlock)
-    // Re-acquires the lock synchronously before resuming
+    // Wait with a short-duration synchronous lockable (e.g., spinlock)
+    // Calls Lock::lock() synchronously in await_resume()
     template<lockable Lock>
     /* awaitable */ wait(Lock& lock);
 
+    // The token overload uses the same synchronous re-lock path
     template<lockable Lock>
     /* awaitable<cancel_result> */ wait(Lock& lock, coro::cancel_token token);
 
@@ -3451,6 +3455,24 @@ public:
     bool has_waiters() const noexcept;
 };
 ```
+
+The generic `wait(Lock&)` overloads are selected by a syntactic concept that
+requires `lock()` and `unlock()`; satisfying that concept does not make the lock
+coroutine-aware. After notification, or after cancellation if the wait released
+the lock, `await_resume()` calls `Lock::lock()` directly on the resuming thread.
+The token overload returns `cancel_result` and atomically selects notification
+or cancellation. A pre-cancelled wait keeps the already-held lock; once a wait
+has released the lock, it synchronously re-acquires it before returning either
+`completed` or `cancelled`.
+`Lock::unlock()` must release immediately, and `Lock::lock()` must have acquired
+ownership when it returns; an awaitable-returning `lock()` is not supported by
+the generic overload. The caller must also guarantee that `lock()` returns
+promptly without causing a scheduler-significant or unbounded synchronous wait.
+A contended `std::mutex` satisfies the concept but can park and stall the worker
+and is not suitable for this overload. A `sync::spinlock` is suitable only when
+the critical section is very short and contention is rare. Use the dedicated
+`wait(sync::mutex&)` overload when re-locking may need to wait; it suspends the
+coroutine while asynchronously re-acquiring the mutex.
 
 **Usage with mutex (single co_await):**
 ```cpp
@@ -3483,6 +3505,8 @@ bool ready = false;
 coro::task<void> waiter() {
     sl.lock();
     while (!ready) {
+        // Generic wait re-locks synchronously on this worker. Keep the
+        // critical section very short and contention rare.
         co_await cv.wait(sl);
     }
     sl.unlock();

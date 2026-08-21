@@ -680,7 +680,9 @@ result or `combinator_cancelled`.
 
 ### Condition Variable
 
-`condition_variable` allows coroutines to wait for a condition to become true. It works with `mutex`, `spinlock`, or in an unlocked mode:
+`condition_variable` allows coroutines to wait for a condition to become true.
+It works with `mutex`, a short-duration synchronous lockable such as `spinlock`,
+or in an unlocked mode:
 
 **With mutex** (recommended for most cases):
 
@@ -708,7 +710,7 @@ coro::task<void> notifier() {
 }
 ```
 
-**With spinlock:**
+**With a short-duration synchronous lockable:**
 
 ```cpp
 sync::spinlock sl;
@@ -718,12 +720,26 @@ bool ready = false;
 coro::task<void> waiter() {
     sl.lock();
     while (!ready) {
-        co_await cv.wait(sl);  // Single co_await (spinlock re-lock is synchronous)
+        // Generic wait re-locks synchronously on this scheduler worker.
+        co_await cv.wait(sl);
     }
     sl.unlock();
     co_return;
 }
 ```
+
+The generic `wait(Lock&)` overload (with or without a cancellation token) calls
+`Lock::lock()` directly in `await_resume()`. It does not turn the supplied lock
+into a coroutine-aware acquisition. `Lock::unlock()` must release immediately,
+and `Lock::lock()` must have acquired ownership when it returns; an
+awaitable-returning `lock()` is not supported. The synchronous `lock()` must
+also return promptly without a scheduler-significant or unbounded wait. A
+`sync::spinlock` is suitable only when it protects a very short critical section
+under rare contention. Although `std::mutex` satisfies the overload's syntactic
+concept, a contended `std::mutex::lock()` can park and stall the entire
+scheduler worker. Use the dedicated `wait(sync::mutex&)` overload when
+re-locking may need to wait; that path asynchronously re-acquires the mutex by
+suspending the coroutine.
 
 **Unlocked mode** (for single-worker scenarios where all coroutines run on the same thread):
 

@@ -171,8 +171,12 @@ public:
     /// the returned stream. On failure, returns std::nullopt with errno set by
     /// fcntl(), and the descriptor remains open and owned by the caller.
     /// Socket type, address family, and connected state are caller preconditions.
-    /// The caller must exclusively control the fd and all duplicate aliases
-    /// during adoption; O_NONBLOCK applies to their shared open-file description.
+    /// From call entry until return, the caller must exclusively control the fd
+    /// and all duplicate aliases: no concurrent close, use, or status-flag
+    /// mutation is allowed. After success, O_NONBLOCK must remain set on the
+    /// shared open-file description for as long as the adopted stream owns the
+    /// descriptor; retained aliases must not clear it or otherwise defeat
+    /// non-blocking I/O through status-flag changes.
     static std::optional<uds_stream> adopt(int fd) noexcept {
         if (!detail::set_nonblocking(fd)) {
             return std::nullopt;

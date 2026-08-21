@@ -2042,8 +2042,11 @@ public:
 // inspect IPv4 or IPv6 peers.
 // adopt() sets O_NONBLOCK before ownership transfer. On failure it returns
 // std::nullopt, leaves fd open and caller-owned, and preserves fcntl() errno.
-// The caller must exclusively control fd and its duplicate aliases during the
-// call; O_NONBLOCK applies to their shared open-file description.
+// From call entry until return, the caller must exclusively control fd and its
+// duplicate aliases. After success, O_NONBLOCK must remain set on their shared
+// open-file description for as long as the adopted stream owns the descriptor.
+// Retained aliases must not clear it or otherwise defeat non-blocking I/O
+// through status-flag changes.
 // close() transfers the descriptor to the async close operation and invalidates
 // the stream object. shutdown_socket() interrupts both socket directions without
 // releasing the descriptor; shutdown(int) is the direct half-close wrapper.
@@ -2205,9 +2208,12 @@ failure leaves the descriptor open and caller-owned with the `fcntl()` error in
 `errno`. Both factories require the caller to supply a valid connected stream
 socket for the matching class; they do not validate socket type, address
 family, or connected state. The raw-fd constructors remain unchecked for
-compatibility. During adoption the caller must exclusively control the fd and
-every duplicate alias, with no concurrent close, use, or status-flag mutation.
-Setting `O_NONBLOCK` affects all aliases of the shared open-file description.
+compatibility. From call entry until return, the caller must exclusively control
+the fd and every duplicate alias, with no concurrent close, use, or status-flag
+mutation. After success, `O_NONBLOCK` must remain set on the shared open-file
+description for as long as the adopted stream owns the descriptor; retained
+aliases must not clear it or otherwise defeat non-blocking I/O through
+status-flag changes.
 
 Like the TCP helper, `uds_stream::read_exactly()` returns
 `io_result::result == -ENODATA` when EOF arrives before the requested byte

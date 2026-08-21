@@ -59,12 +59,14 @@ if (!stream) {
 
 The caller must supply a valid connected stream socket for the matching TCP or
 UDS class. Adoption deliberately does not add socket-type, address-family, or
-connected-state probes. The caller must exclusively control the fd and every
-duplicate alias during adoption: no concurrent close, use, or status-flag
-mutation is allowed, and `O_NONBLOCK` applies to all aliases of the shared
-open-file description. The raw-fd constructors remain available for
-compatibility but cannot report non-blocking setup failure; prefer `adopt()`
-for external descriptors.
+connected-state probes. From call entry until return, the caller must
+exclusively control the fd and every duplicate alias: no concurrent close, use,
+or status-flag mutation is allowed. After success, `O_NONBLOCK` must remain set
+on the shared open-file description for as long as the adopted stream owns the
+descriptor; retained aliases must not clear it or otherwise defeat non-blocking
+I/O through status-flag changes. The raw-fd constructors remain available for
+compatibility but cannot report non-blocking setup failure; prefer `adopt()` for
+external descriptors.
 
 ## TCP
 

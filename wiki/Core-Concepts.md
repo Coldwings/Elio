@@ -468,7 +468,10 @@ Elio supports two I/O backends:
 | io_uring | Linux 5.1+ | Best |
 | epoll | Any Linux | Good |
 
-The backend is selected automatically at compile time based on availability.
+Compile-time liburing support determines whether io_uring is a candidate. Each
+auto-detected `io_context` then chooses at construction time: it attempts
+io_uring when compiled in and falls back to epoll if io_uring support is absent
+or initialization fails.
 
 ## Awaitables
 

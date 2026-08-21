@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cancellable semaphore ready-acquire rollback**: Ready token-aware acquires
+  now select completion and debit the permit in one semaphore critical section.
+  Cancellation can no longer expose a temporary debit that lets a concurrent
+  release fill the counter to `INT_MAX` before the cancelled permit is restored
+  (#1094).
 - **Fail-fast RDMA-CM event channel setup**: `rdma_cm::event_channel` now
   rejects `F_GETFL` or `F_SETFL` failures and destroys the partially created
   channel instead of allowing a blocking `rdma_get_cm_event()` call to stall a

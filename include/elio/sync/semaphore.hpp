@@ -21,6 +21,30 @@ namespace elio::sync {
 namespace detail {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 inline std::atomic<size_t> semaphore_waiter_publications_for_test{0};
+inline std::atomic<bool>
+    pause_semaphore_cancellable_ready_before_claim_for_test{false};
+inline std::atomic<bool>
+    semaphore_cancellable_ready_paused_before_claim_for_test{false};
+inline std::atomic<int>
+    semaphore_cancellable_ready_count_before_claim_for_test{-1};
+
+inline void pause_semaphore_cancellable_ready_for_test(
+        int count_before_claim) noexcept {
+    auto& pause = pause_semaphore_cancellable_ready_before_claim_for_test;
+    if (!pause.load(std::memory_order_acquire)) return;
+
+    semaphore_cancellable_ready_count_before_claim_for_test.store(
+        count_before_claim, std::memory_order_release);
+    semaphore_cancellable_ready_paused_before_claim_for_test.store(
+        true, std::memory_order_release);
+    semaphore_cancellable_ready_paused_before_claim_for_test.notify_all();
+    while (pause.load(std::memory_order_acquire)) {
+        pause.wait(true, std::memory_order_acquire);
+    }
+    semaphore_cancellable_ready_paused_before_claim_for_test.store(
+        false, std::memory_order_release);
+    semaphore_cancellable_ready_paused_before_claim_for_test.notify_all();
+}
 #endif
 }
 
@@ -91,16 +115,23 @@ public:
             if (waiter_state_->was_cancelled()) {
                 return true;
             }
-            if (!sem_.try_acquire()) {
+
+            std::lock_guard<std::mutex> guard(sem_.mutex_);
+            if (sem_.count_ == 0) {
                 return false;
             }
-            if (detail::claim_wake_state(waiter_state_.wake()) !=
-                detail::wake_action::rejected) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            detail::pause_semaphore_cancellable_ready_for_test(sem_.count_);
+#endif
+            // Select completion before exposing a permit debit to release().
+            const auto action =
+                detail::claim_wake_state(waiter_state_.wake());
+            if (action == detail::wake_action::rejected) {
                 return true;
             }
 
-            // Cancellation won after the permit was acquired.
-            sem_.restore_cancelled_permit();
+            assert(action == detail::wake_action::completed_inline);
+            --sem_.count_;
             return true;
         }
 
@@ -441,16 +472,6 @@ private:
         return nullptr;
     }
 
-    void restore_cancelled_permit() {
-        detail::wake_state_ptr to_schedule;
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-            to_schedule = recover_cancelled_handoff_locked();
-        }
-        if (to_schedule) {
-            detail::schedule_wake_state(to_schedule);
-        }
-    }
 };
 
 } // namespace elio::sync

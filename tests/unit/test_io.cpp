@@ -1920,7 +1920,119 @@ int count_open_fds_for_uds_test() {
 #endif
 }
 
+template<typename Stream>
+std::array<int, 2> make_connected_stream_pair();
+
+template<>
+std::array<int, 2> make_connected_stream_pair<tcp_stream>() {
+    const int listener_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE(listener_fd >= 0);
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    REQUIRE(::bind(
+        listener_fd,
+        reinterpret_cast<const struct sockaddr*>(&addr),
+        sizeof(addr)) == 0);
+    REQUIRE(::listen(listener_fd, 1) == 0);
+
+    socklen_t addr_len = sizeof(addr);
+    REQUIRE(::getsockname(
+        listener_fd,
+        reinterpret_cast<struct sockaddr*>(&addr),
+        &addr_len) == 0);
+
+    const int client_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    REQUIRE(client_fd >= 0);
+    REQUIRE(::connect(
+        client_fd,
+        reinterpret_cast<const struct sockaddr*>(&addr),
+        sizeof(addr)) == 0);
+
+    const int server_fd = ::accept4(listener_fd, nullptr, nullptr, SOCK_CLOEXEC);
+    REQUIRE(server_fd >= 0);
+    REQUIRE(::close(listener_fd) == 0);
+    return {client_fd, server_fd};
+}
+
+template<>
+std::array<int, 2> make_connected_stream_pair<uds_stream>() {
+    std::array<int, 2> fds{};
+    REQUIRE(::socketpair(
+        AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds.data()) == 0);
+    return fds;
+}
+
+template<typename Stream>
+void check_stream_adopt_contract() {
+    SECTION("blocking descriptor becomes non-blocking and transfers ownership") {
+        auto fds = make_connected_stream_pair<Stream>();
+
+        const int adopted_fd = fds[0];
+        {
+            auto stream = Stream::adopt(adopted_fd);
+            REQUIRE(stream.has_value());
+            REQUIRE(stream->fd() == adopted_fd);
+
+            const int flags = ::fcntl(adopted_fd, F_GETFL, 0);
+            REQUIRE(flags >= 0);
+            REQUIRE((flags & O_NONBLOCK) != 0);
+        }
+
+        errno = 0;
+        REQUIRE(::fcntl(adopted_fd, F_GETFD, 0) == -1);
+        REQUIRE(errno == EBADF);
+        REQUIRE(::close(fds[1]) == 0);
+    }
+
+    SECTION("already non-blocking descriptor is accepted") {
+        auto fds = make_connected_stream_pair<Stream>();
+        const int flags = ::fcntl(fds[0], F_GETFL, 0);
+        REQUIRE(flags >= 0);
+        REQUIRE(::fcntl(fds[0], F_SETFL, flags | O_NONBLOCK) == 0);
+
+        auto stream = Stream::adopt(fds[0]);
+        REQUIRE(stream.has_value());
+        REQUIRE((::fcntl(stream->fd(), F_GETFL, 0) & O_NONBLOCK) != 0);
+        REQUIRE(::close(fds[1]) == 0);
+    }
+
+    SECTION("F_GETFL failure leaves no adopted stream") {
+        errno = 0;
+        auto stream = Stream::adopt(-1);
+        REQUIRE_FALSE(stream.has_value());
+        REQUIRE(errno == EBADF);
+    }
+
+#ifdef O_PATH
+    SECTION("F_SETFL failure retains caller ownership") {
+        const int fd = ::open(".", O_PATH | O_CLOEXEC);
+        REQUIRE(fd >= 0);
+        REQUIRE(::fcntl(fd, F_GETFL, 0) >= 0);
+
+        errno = 0;
+        auto stream = Stream::adopt(fd);
+        REQUIRE_FALSE(stream.has_value());
+        REQUIRE(errno == EBADF);
+        REQUIRE(::fcntl(fd, F_GETFD, 0) >= 0);
+        REQUIRE(::close(fd) == 0);
+    }
+#endif
+}
+
 } // namespace
+
+TEST_CASE("tcp_stream adopts external descriptors with checked ownership",
+          "[tcp][stream][adopt]") {
+    check_stream_adopt_contract<tcp_stream>();
+}
+
+TEST_CASE("uds_stream adopts external descriptors with checked ownership",
+          "[uds][stream][adopt]") {
+    check_stream_adopt_contract<uds_stream>();
+}
 
 TEST_CASE("unix_address basic operations", "[uds][address]") {
     SECTION("default constructor") {

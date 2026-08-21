@@ -4,6 +4,7 @@
 #include <elio/io/io_awaitables.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/log/macros.hpp>
+#include <elio/net/detail/fd.hpp>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -285,13 +286,32 @@ private:
 /// unless externally serialised. The same contract applies to
 /// ``tcp_listener::accept``: only one coroutine may be accepting at a time.
 class tcp_stream {
+    struct configured_fd_t {};
+
+    explicit tcp_stream(int fd, configured_fd_t) noexcept
+        : fd_(fd) {}
+
 public:
-    /// Construct from file descriptor
+    /// Construct from a file descriptor without reporting configuration errors.
+    /// Prefer adopt() for descriptors created outside Elio.
     explicit tcp_stream(int fd)
         : fd_(fd) {
-        // Make non-blocking
-        int flags = fcntl(fd_, F_GETFL, 0);
-        fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+        (void)detail::set_nonblocking(fd_);
+    }
+
+    /// Adopt an already-connected stream socket.
+    ///
+    /// On success, the descriptor is non-blocking and ownership transfers to
+    /// the returned stream. On failure, returns std::nullopt with errno set by
+    /// fcntl(), and the descriptor remains open and owned by the caller.
+    /// Socket type, address family, and connected state are caller preconditions.
+    /// The caller must exclusively control the fd and all duplicate aliases
+    /// during adoption; O_NONBLOCK applies to their shared open-file description.
+    static std::optional<tcp_stream> adopt(int fd) noexcept {
+        if (!detail::set_nonblocking(fd)) {
+            return std::nullopt;
+        }
+        return std::optional<tcp_stream>{tcp_stream(fd, configured_fd_t{})};
     }
 
     /// Move constructor

@@ -1973,6 +1973,9 @@ TCP connection.
 ```cpp
 class tcp_stream {
 public:
+    // Compatibility constructor; does not report O_NONBLOCK setup failure.
+    explicit tcp_stream(int fd);
+    static std::optional<tcp_stream> adopt(int fd) noexcept;
     tcp_stream(tcp_stream&& other) noexcept;
     bool is_valid() const noexcept;
     
@@ -2037,6 +2040,10 @@ public:
 
 // peer_address() returns the generic socket_address wrapper so callers can
 // inspect IPv4 or IPv6 peers.
+// adopt() sets O_NONBLOCK before ownership transfer. On failure it returns
+// std::nullopt, leaves fd open and caller-owned, and preserves fcntl() errno.
+// The caller must exclusively control fd and its duplicate aliases during the
+// call; O_NONBLOCK applies to their shared open-file description.
 // close() transfers the descriptor to the async close operation and invalidates
 // the stream object. shutdown_socket() interrupts both socket directions without
 // releasing the descriptor; shutdown(int) is the direct half-close wrapper.
@@ -2109,6 +2116,9 @@ public:
 
 class uds_stream {
 public:
+    // Compatibility constructor; does not report O_NONBLOCK setup failure.
+    explicit uds_stream(int fd);
+    static std::optional<uds_stream> adopt(int fd) noexcept;
     uds_stream(uds_stream&& other) noexcept;
     bool is_valid() const noexcept;
 
@@ -2188,6 +2198,16 @@ failures after address conversion succeeds, as `std::nullopt` with `errno` set;
 `uds_connect()` reports socket creation/connect failures as `std::nullopt` with
 `errno` set from the awaited operation. Cancellable overloads return
 `std::nullopt` with `errno == ECANCELED` when the token wins the connect wait.
+
+`uds_stream::adopt()` has the same checked descriptor contract as
+`tcp_stream::adopt()`: success sets `O_NONBLOCK` and transfers ownership;
+failure leaves the descriptor open and caller-owned with the `fcntl()` error in
+`errno`. Both factories require the caller to supply a valid connected stream
+socket for the matching class; they do not validate socket type, address
+family, or connected state. The raw-fd constructors remain unchecked for
+compatibility. During adoption the caller must exclusively control the fd and
+every duplicate alias, with no concurrent close, use, or status-flag mutation.
+Setting `O_NONBLOCK` affects all aliases of the shared open-file description.
 
 Like the TCP helper, `uds_stream::read_exactly()` returns
 `io_result::result == -ENODATA` when EOF arrives before the requested byte

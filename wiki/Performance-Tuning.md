@@ -814,9 +814,11 @@ size_t threads = sched.num_threads();            // Logical scheduling pool size
 ```
 
 These are lightweight atomic reads suitable for periodic monitoring in production. Combine with `set_thread_count` to implement your own adaptive scaling.
+
 During retirement, `pending_tasks()` (and `active_tasks()`) includes load owned
 by draining workers outside the logical `num_threads()` range. The execution
 and steal counters, in contrast, cover only currently visible workers.
+
 Workers publish execution and successful-steal counts from single-writer local
 counters, so metric collection does not require atomic read-modify-write
 instructions on coroutine resume or steal paths.

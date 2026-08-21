@@ -19,6 +19,9 @@ namespace elio {
 /// @tparam Args  Argument types
 /// @param f  Callable to invoke (must return a task)
 /// @param args  Arguments to forward to the callable
+/// @note Requires the calling thread's thread-local scheduler to be running.
+///       A scheduler running on another thread is not selected. If the
+///       requirement is not met, logs an error and calls std::abort().
 ///
 /// Example:
 ///   elio::go(async_work);
@@ -37,6 +40,8 @@ void go(F&& f, Args&&... args) {
 }
 
 /// Fire-and-forget direct transfer of an already-constructed lazy task.
+/// Has the same calling-thread scheduler requirement and abort behavior as the
+/// callable overload.
 template<typename T>
 void go(coro::task<T>&& task) {
     auto* sched = runtime::scheduler::current();
@@ -59,6 +64,9 @@ void go(coro::task<T>&& task) {
 /// @param worker_id  Target worker index in [0, scheduler.num_threads())
 /// @param f  Callable to invoke (must return a task)
 /// @param args  Arguments to forward to the callable
+/// @note Requires the calling thread's thread-local scheduler to be running.
+///       A scheduler running on another thread is not selected. If the
+///       requirement is not met, logs an error and calls std::abort().
 ///
 /// Example:
 ///   elio::go_to(0, async_work);
@@ -76,7 +84,8 @@ void go_to(size_t worker_id, F&& f, Args&&... args) {
 }
 
 /// Fire-and-forget direct transfer of an already-constructed lazy task toward
-/// a specific worker.
+/// a specific worker. Has the same calling-thread scheduler requirement and
+/// abort behavior as the callable overload.
 template<typename T>
 void go_to(size_t worker_id, coro::task<T>&& task) {
     auto* sched = runtime::scheduler::current();
@@ -95,7 +104,10 @@ void go_to(size_t worker_id, coro::task<T>&& task) {
 /// @tparam Args  Argument types
 /// @param f  Callable to invoke (must return a task)
 /// @param args  Arguments to forward to the callable
-/// @return join_handle<T> that can be awaited to get the result
+/// @return join_handle<T> that can be awaited to get the result. If the
+///         calling thread has no thread-local running scheduler, the callable
+///         is not invoked and the returned terminal handle rethrows
+///         std::logic_error when its result is observed.
 ///
 /// Example:
 ///   auto handle = elio::spawn(compute_async, input);
@@ -118,7 +130,10 @@ auto spawn(F&& f, Args&&... args)
 }
 
 /// Directly transfer an already-constructed lazy task and retain join
-/// authority without creating a callable-wrapper coroutine.
+/// authority without creating a callable-wrapper coroutine. If the calling
+/// thread has no thread-local running scheduler, a valid task is consumed and
+/// destroyed and the returned terminal handle rethrows std::logic_error when
+/// its result is observed.
 template<typename T>
 auto spawn(coro::task<T>&& task) -> coro::join_handle<T> {
     if (!task) {

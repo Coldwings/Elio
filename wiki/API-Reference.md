@@ -102,6 +102,12 @@ Elio provides free functions for spawning concurrent tasks. Callable overloads
 provide automatic callable lifetime safety; rvalue-task overloads transfer an
 already-constructed lazy task without a wrapper.
 
+These free functions consult only `scheduler::current()` for the calling
+thread and require that scheduler to be running. The lookup is thread-local; a
+scheduler running on another thread is not an implicit target. Call an explicit
+scheduler member function when the caller does not have the intended scheduler
+installed as its current scheduler.
+
 #### `elio::go()` - Fire-and-Forget
 
 Spawn a coroutine without awaiting its result. The coroutine runs independently and self-destructs on completion.
@@ -113,6 +119,9 @@ void go(F&& f, Args&&... args);
 template<typename T>
 void go(coro::task<T>&& task);
 ```
+
+If the calling thread has no current running scheduler, both overloads log an
+error and call `std::abort()`; they do not silently discard the work.
 
 **Example:**
 ```cpp
@@ -151,6 +160,9 @@ template<typename T>
 void go_to(size_t worker_id, coro::task<T>&& task);
 ```
 
+If the calling thread has no current running scheduler, both overloads log an
+error and call `std::abort()`.
+
 `worker_id` should be less than the scheduler's current `num_threads()` for
 deterministic placement. Out-of-range values are not rejected, but exact pinning
 to that numeric worker is not guaranteed; the scheduler may enqueue through a
@@ -183,6 +195,12 @@ auto spawn(F&& f, Args&&... args) -> coro::join_handle<T>;
 template<typename T>
 auto spawn(coro::task<T>&& task) -> coro::join_handle<T>;
 ```
+
+If the calling thread has no current running scheduler, the callable overload
+does not invoke the callable and returns an already-ready, already-destroyed
+join handle. Observing its result rethrows `std::logic_error`. For an otherwise
+valid direct rvalue task, the direct overload consumes and destroys the task
+frame before returning the same terminal exception-bearing handle.
 
 **Example:**
 ```cpp

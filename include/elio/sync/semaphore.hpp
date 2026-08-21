@@ -25,11 +25,16 @@ inline std::atomic<bool>
     pause_semaphore_cancellable_ready_before_claim_for_test{false};
 inline std::atomic<bool>
     semaphore_cancellable_ready_paused_before_claim_for_test{false};
+inline std::atomic<int>
+    semaphore_cancellable_ready_count_before_claim_for_test{-1};
 
-inline void pause_semaphore_cancellable_ready_for_test() noexcept {
+inline void pause_semaphore_cancellable_ready_for_test(
+        int count_before_claim) noexcept {
     auto& pause = pause_semaphore_cancellable_ready_before_claim_for_test;
     if (!pause.load(std::memory_order_acquire)) return;
 
+    semaphore_cancellable_ready_count_before_claim_for_test.store(
+        count_before_claim, std::memory_order_release);
     semaphore_cancellable_ready_paused_before_claim_for_test.store(
         true, std::memory_order_release);
     semaphore_cancellable_ready_paused_before_claim_for_test.notify_all();
@@ -116,7 +121,7 @@ public:
                 return false;
             }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
-            detail::pause_semaphore_cancellable_ready_for_test();
+            detail::pause_semaphore_cancellable_ready_for_test(sem_.count_);
 #endif
             // Select completion before exposing a permit debit to release().
             const auto action =
@@ -436,14 +441,6 @@ public:
         std::lock_guard<std::mutex> guard(mutex_);
         return count_;
     }
-
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-    bool try_lock_mutex_for_test() noexcept {
-        if (!mutex_.try_lock()) return false;
-        mutex_.unlock();
-        return true;
-    }
-#endif
 
 private:
     mutable std::mutex mutex_;

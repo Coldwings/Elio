@@ -48,12 +48,13 @@ namespace detail {
 /// awaitables already report through ``io_result``.
 ///
 /// This changes the process-wide signal disposition; it does not change any
-/// thread's signal mask. Elio neither saves nor restores the prior disposition,
-/// and the ``once_flag`` means a later ``run()`` call will not reinstall the
-/// ignore disposition after an application changes it. An embedding application
-/// that needs to restore another disposition must save it before its first
-/// ``run()``, ``serve()``, or ``serve_all()`` entry and restore it only after all
-/// Elio runtime/server entry-point use has ended.
+/// thread's signal mask. Elio neither saves nor restores the prior disposition.
+/// The ``once_flag`` here covers only the ``run()`` entry path; an independent
+/// ``once_flag`` in ``serve.hpp`` covers ``serve()``/``serve_all()``. Either
+/// unfired flag will reinstall ``SIG_IGN`` on next use of that path, regardless
+/// of changes made in between. An embedding application that needs to restore
+/// another disposition must save it before its first Elio entry and restore it
+/// only after all runtime and server entry-point use has ended.
 inline void ignore_sigpipe_once() {
     static std::once_flag flag;
     std::call_once(flag, []() {

@@ -1732,9 +1732,10 @@ Both paths change the process-wide signal disposition with `sigaction`; neither
 saves or restores the previous value. An embedding application that needs a
 different disposition later must snapshot it before the first Elio
 runtime/server entry and restore it only after all Elio runtime and server use
-has ended. Because each path uses `once_flag`, do not expect a later call on an
-already-used path to reinstall the ignore disposition after external code has
-changed it.
+has ended. Each path has an independent `once_flag`: a path that has never
+been used will still install `SIG_IGN` on first call regardless of any
+disposition change made in between, so restoration is only safe after all
+entry-point paths have been exhausted or will no longer be called.
 
 This policy is separate from signal masking. `signal_set` and `signal_fd` use
 per-thread masks (inherited by threads created later) to route shutdown signals

@@ -36,9 +36,11 @@ they do not change a per-thread signal mask, and Elio neither saves nor restores
 the previous disposition. An embedding application that needs another
 disposition later must snapshot it before its first Elio runtime/server entry
 and restore it only after all Elio runtime and server use has ended. The runtime
-and server paths each use an independent `once_flag`, so a later call on an
-already-used path will not reinstall the ignore disposition after application
-code changes it.
+and server paths each have an independent `once_flag`. A later call on an
+already-fired path will not reinstall the ignore disposition, but an
+as-yet-unused path (e.g. calling `serve()` for the first time after `run()`
+has exited) will still reinstall `SIG_IGN`. Restoring a custom disposition is
+only safe after all Elio runtime and server entry-point use has ended.
 
 This is separate from the per-thread masks described below. `signal_set` and
 `signal_fd` manage masks used by `signalfd`; those masks do not preserve or

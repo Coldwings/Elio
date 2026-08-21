@@ -54,9 +54,12 @@ namespace detail {
 /// or ``ELIO_ASYNC_MAIN``) still get the protection.
 ///
 /// This changes the process-wide signal disposition, not a per-thread signal
-/// mask. Neither entry path saves or restores the prior disposition. Embedders
-/// that need another disposition later must save it before the first Elio
-/// runtime/server entry and restore it only after all such use has ended.
+/// mask. Neither entry path saves or restores the prior disposition. Each
+/// ``once_flag`` is independent — an unfired server-path flag will reinstall
+/// ``SIG_IGN`` on next use even if the runtime-path flag has already fired and
+/// the application has since changed the disposition. Embedders that need
+/// another disposition later must save it before the first Elio entry and
+/// restore it only after all runtime and server use has ended.
 inline void ignore_sigpipe_in_serve_once() {
     static std::once_flag flag;
     std::call_once(flag, []() {

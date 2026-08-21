@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Caller-precondition documentation**: The API contract now distinguishes
+  documented runtime failure channels from optional debug assertions. Unless a
+  specific API promises fail-closed behavior, violating a caller precondition
+  is outside Elio's guarantees and assertions may be absent under `NDEBUG`
+  (#1074).
 - **Exact-length read documentation**: The API contract and networking guides
   now document that TCP, UDS, TLS, and type-erased stream `read_exactly()`
   helpers report an early peer EOF as `-ENODATA` rather than a successful short

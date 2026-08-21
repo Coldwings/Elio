@@ -3710,8 +3710,8 @@ public:
 be positive. Callers must keep the sum of available permits and permits
 reserved for not-yet-resumed waiter handoffs at or below `INT_MAX`. This
 includes permits absent from `count()` while a selected waiter has not yet
-resumed, because cancellation or waiter destruction can return them to the
-available count. These are caller preconditions, not runtime error-reporting
+resumed, because waiter destruction before resume can return that handoff to
+the available count. These are caller preconditions, not runtime error-reporting
 guarantees.
 `count()` takes the semaphore's internal lock and returns an exact instantaneous
 snapshot of the available permits; it excludes pending handoffs. Concurrent

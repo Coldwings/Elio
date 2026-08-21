@@ -85,6 +85,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Channel close and observer contract**: Documented that `channel::close()` is
+  idempotent and preserves committed values for draining. `size()` and `empty()`
+  report buffered values exactly only while the channel is quiescent; concurrent
+  operations make them approximate diagnostics rather than synchronization
+  predicates. The API reference now also lists `try_send()` and `try_recv()`
+  (#1077).
 - **Allocation-free ready shared-mutex writers**: No-token
   `shared_mutex::lock()` now defers independent wake-state allocation until
   suspension entry, before taking the queue mutex or publishing writer

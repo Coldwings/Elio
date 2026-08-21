@@ -50,6 +50,14 @@ auto listener = tcp_listener::bind(ipv4_address(8080), opts);
 complete protocol messages, echo responses, and other full-buffer sends. If you
 use `write()` directly, loop until all bytes have been accepted.
 
+### Exact-Length Read Contract
+
+`read_exactly()` on TCP, UDS, TLS, and the type-erased `net::stream` succeeds
+only after the requested byte count has been stored. If the peer reaches EOF
+before that count, it returns an `io_result` with `result == -ENODATA`; callers
+should treat the destination as an incomplete protocol message. Cancellation
+and other terminal errors retain their ordinary errno-style results.
+
 ### TCP Server
 
 ```cpp

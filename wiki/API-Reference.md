@@ -2058,6 +2058,11 @@ public:
                             const tcp_options& opts = {});
 ```
 
+`read_exactly()` reports success only after storing the full requested byte
+count. If the peer closes first, it returns `io_result::result == -ENODATA`;
+the destination then contains an incomplete message and should not be treated
+as a successful exact-length read.
+
 ### Unix Domain Sockets
 
 Local Unix Domain Socket networking.
@@ -2184,6 +2189,11 @@ failures after address conversion succeeds, as `std::nullopt` with `errno` set;
 `errno` set from the awaited operation. Cancellable overloads return
 `std::nullopt` with `errno == ECANCELED` when the token wins the connect wait.
 
+Like the TCP helper, `uds_stream::read_exactly()` returns
+`io_result::result == -ENODATA` when EOF arrives before the requested byte
+count. Only a result equal to the requested count is a successful exact-length
+read.
+
 UDS streams share the same concurrency contract as TCP streams: one reader and
 one writer may operate concurrently, but multiple concurrent reads, multiple
 concurrent writes, or a read racing with `close()` require external
@@ -2242,6 +2252,10 @@ public:
     /* awaitable */ close();
 };
 ```
+
+`net::stream::read_exactly()` preserves the active TCP or TLS transport's
+exact-length result: EOF before the requested byte count is reported as
+`io_result::result == -ENODATA`.
 
 ---
 
@@ -3146,6 +3160,10 @@ public:
     long verify_result() const;
 };
 ```
+
+`tls_stream::read_exactly()` reports EOF before the requested byte count as
+`io_result::result == -ENODATA`, matching the TCP and UDS exact-length helpers.
+Success reports the full requested count.
 
 `shutdown()` is the graceful TLS close path. It sends `close_notify` and waits
 for the peer's `close_notify` within the supplied wall-clock budget. Callers

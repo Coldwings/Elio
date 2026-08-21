@@ -3687,7 +3687,7 @@ Counting semaphore.
 ```cpp
 class semaphore {
 public:
-    explicit semaphore(int initial_count);
+    explicit semaphore(int initial_count = 0);
 
     // Acquire (awaitable)
     /* awaitable */ acquire();
@@ -3698,10 +3698,21 @@ public:
     // Try acquire without waiting
     bool try_acquire();
 
-    // Release
-    void release();
+    // Release one or more permits
+    void release(int count = 1);
+
+    // Snapshot the currently available permit count
+    int count() const noexcept;
 };
 ```
+
+`initial_count` must be non-negative, and `release(count)` requires `count` to
+be positive. The available permit count is represented by an `int`; callers
+must not release permits when doing so would raise that count above `INT_MAX`.
+These are caller preconditions, not runtime error-reporting guarantees.
+`count()` takes the semaphore's internal lock and returns an exact instantaneous
+snapshot of the available permits. Concurrent acquisitions or releases can
+make that snapshot stale immediately after it returns.
 
 The no-token `acquire()` completes without wake-state allocation when a permit
 is immediately available. If the ready check observes no permit, suspension

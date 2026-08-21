@@ -142,6 +142,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-try acquisition requires callers to remain below that representation
   limit. `try_lock_shared()` continues to return `false` when the count cannot
   be represented; no overflow exception or saturation handoff is added (#1045).
+- **Semaphore permit-count contract**: Documented that construction requires a
+  non-negative initial count, `release(count)` requires a positive count, and
+  callers must keep the available permit count at or below `INT_MAX`. The API
+  reference now shows the bulk-release parameter and `count()` snapshot
+  semantics; runtime behavior is unchanged (#1078).
 - **Smaller channel send coroutine frames**: `channel<T>::send(...)` now lets
   its internal waiter borrow the by-value payload already owned by the send
   coroutine frame instead of retaining a second moved-from/moved-to `T` pair.

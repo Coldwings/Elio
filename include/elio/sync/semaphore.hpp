@@ -48,7 +48,11 @@ inline void pause_semaphore_cancellable_ready_for_test(
 #endif
 }
 
-/// Coroutine-aware semaphore
+/// Coroutine-aware semaphore.
+///
+/// The initial permit count must be non-negative. The available permit count
+/// is represented by an int and must remain at or below INT_MAX; callers must
+/// satisfy that bound when releasing permits.
 class semaphore {
 public:
     class acquire_waiter;
@@ -407,7 +411,10 @@ public:
         return false;
     }
 
-    /// Release (increment) the semaphore
+    /// Release one or more permits.
+    ///
+    /// count must be positive, and the resulting available permit count must
+    /// not exceed INT_MAX. These are caller preconditions.
     void release(int count = 1) {
         assert(count > 0 && "semaphore release count must be positive");
 
@@ -436,7 +443,9 @@ public:
         detail::schedule_wake_states(to_schedule);
     }
 
-    /// Get current count
+    /// Return an instantaneous snapshot of the available permit count.
+    /// Concurrent acquire/release operations can make the snapshot stale
+    /// immediately after this function returns.
     int count() const noexcept {
         std::lock_guard<std::mutex> guard(mutex_);
         return count_;

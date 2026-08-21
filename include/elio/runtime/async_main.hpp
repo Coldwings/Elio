@@ -35,7 +35,7 @@ struct run_config {
 
 namespace detail {
 
-/// Install ``SIG_IGN`` for ``SIGPIPE`` exactly once per process.
+/// Install ``SIG_IGN`` for ``SIGPIPE`` once through the ``run()`` entry path.
 ///
 /// Elio writes to sockets from many places (raw ``tcp_stream::write``, OpenSSL's
 /// ``SSL_shutdown`` close_notify, ``send_file`` retries, slow-loris watchdog
@@ -47,9 +47,13 @@ namespace detail {
 /// rely on ``EPIPE`` return values to detect the condition, which Elio's
 /// awaitables already report through ``io_result``.
 ///
-/// Note: this is a process-wide effect. If the embedding application needs
-/// ``SIGPIPE`` for some other reason, it should restore the previous handler
-/// after ``elio::run`` returns.
+/// This changes the process-wide signal disposition; it does not change any
+/// thread's signal mask. Elio neither saves nor restores the prior disposition,
+/// and the ``once_flag`` means a later ``run()`` call will not reinstall the
+/// ignore disposition after an application changes it. An embedding application
+/// that needs to restore another disposition must save it before its first
+/// ``run()``, ``serve()``, or ``serve_all()`` entry and restore it only after all
+/// Elio runtime/server entry-point use has ended.
 inline void ignore_sigpipe_once() {
     static std::once_flag flag;
     std::call_once(flag, []() {
@@ -151,6 +155,10 @@ coro::task<void> completion_wrapper(F f, completion_signal<T>* signal) {
 /// @param f The callable that returns a coroutine task
 /// @param config Configuration (threads)
 /// @return The result of the task
+///
+/// @note On first use of the ``run()`` entry path, Elio installs ``SIG_IGN``
+/// for ``SIGPIPE`` as a process-wide disposition. It does not save or restore
+/// the previous disposition. See ``detail::ignore_sigpipe_once``.
 /// 
 /// Example:
 /// @code
@@ -173,7 +181,7 @@ auto run(F&& f, const run_config& config = {})
     using T = detail::task_value_t<std::invoke_result_t<F>>;
     detail::completion_signal<T> signal;
 
-    // Mask SIGPIPE process-wide so writes to half-closed sockets surface as
+    // Ignore SIGPIPE process-wide so writes to half-closed sockets surface as
     // EPIPE return values rather than terminating the process. See
     // detail::ignore_sigpipe_once for the full rationale.
     detail::ignore_sigpipe_once();
@@ -298,6 +306,9 @@ using runtime::run_config;
 } // namespace elio
 
 /// Unified macro to define main() that runs an async_main coroutine.
+///
+/// This macro dispatches through ``elio::run()`` and therefore has the same
+/// process-wide ``SIGPIPE`` disposition side effect.
 ///
 /// The callable's signature is detected at compile time. All four combinations
 /// are supported:

@@ -597,6 +597,14 @@ coro::task<void> consumer() {
 }
 ```
 
+Calling `close()` more than once is safe; later calls are no-ops. Values already
+committed to the channel remain available for receivers to drain after close.
+In a quiescent channel, `size()` and `empty()` describe buffered receivable
+values. Concurrent send, receive, or close operations make those observations
+approximate and potentially stale, especially for the bounded channel's
+lock-free ring. Use channel operations or separate synchronization for control
+flow instead of using these observer methods as synchronization predicates.
+
 ### Semaphore
 
 ```cpp

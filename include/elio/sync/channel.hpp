@@ -978,7 +978,7 @@ public:
         return result;
     }
 
-    /// Close the channel
+    /// Close the channel. Calling close() again is a no-op.
     void close() {
         bool expected = false;
         if (!closed_.compare_exchange_strong(expected, true)) {
@@ -1028,7 +1028,12 @@ public:
         return closed_.load(std::memory_order_acquire);
     }
 
-    /// Get current queue size
+    /// Get the number of currently buffered values.
+    ///
+    /// @note This is an exact count only while the channel is quiescent. Under
+    /// concurrent send, receive, or close operations, the result is an
+    /// approximate diagnostic observation and may already be stale when
+    /// returned. Do not use it for synchronization.
     size_t size() const noexcept {
         std::lock_guard<std::mutex> guard(mutex_);
         if (is_bounded()) {
@@ -1037,7 +1042,12 @@ public:
         return queue_.size();
     }
 
-    /// Check if channel is empty
+    /// Check whether the channel currently has no buffered values.
+    ///
+    /// @note This is exact only while the channel is quiescent. Under concurrent
+    /// send, receive, or close operations, the result is an approximate
+    /// diagnostic observation and may already be stale when returned. Do not
+    /// use it for synchronization.
     bool empty() const noexcept {
         std::lock_guard<std::mutex> guard(mutex_);
         if (is_bounded()) {

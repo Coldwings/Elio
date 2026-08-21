@@ -3564,6 +3564,9 @@ public:
     /* awaitable<cancellable_send_result> */
     send(T value, coro::cancel_token token);
 
+    // Try to send without waiting
+    bool try_send(T value);
+
     // Receive a value (awaitable, blocks if empty)
     /* awaitable<std::optional<T>> */ recv();
 
@@ -3571,13 +3574,34 @@ public:
     /* awaitable<cancellable_recv_result> */
     recv(coro::cancel_token token);
 
-    // Close the channel
+    // Try to receive without waiting
+    std::optional<T> try_recv();
+
+    // Close the channel; repeated calls are no-ops
     void close();
 
     // Check if closed
     bool is_closed() const noexcept;
+
+    // Observe the number of buffered values
+    size_t size() const noexcept;
+
+    // Observe whether no values are buffered
+    bool empty() const noexcept;
 };
 ```
+
+`close()` is idempotent. Closing rejects later sends, wakes pending operations,
+and preserves values already committed to the channel so receivers can drain
+them before observing closure.
+
+When no send, receive, or close operation is running concurrently, `size()` and
+`empty()` report the channel's buffered receivable values, including values
+preserved for draining after close. During concurrent operations, bounded
+channels can update their lock-free ring independently of the channel mutex, so
+these observers are approximate and may already be stale when they return. Use
+them for diagnostics only, not as a synchronization predicate. Blocked sender
+values that have not been committed to the channel are not buffered values.
 
 Both `send` overloads take their payload by value, so the returned task owns it
 in the coroutine frame until delivery, cancellation, closure, or task

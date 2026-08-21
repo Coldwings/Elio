@@ -477,6 +477,12 @@ elio::rdma::connection<my_backend> conn{id.qp(), disp};
 co_await conn.send(buf);
 ```
 
+`event_channel` configures the librdmacm fd as non-blocking before construction
+succeeds, so its event probe cannot block a scheduler worker before the
+cancellable poll path. Channel creation or fd configuration failure throws
+`std::runtime_error`; if configuration fails, Elio destroys the partially
+created channel before propagating the exception.
+
 Server side mirrors with `cm_listener` + `accept_connect`.
 
 ## Worked example

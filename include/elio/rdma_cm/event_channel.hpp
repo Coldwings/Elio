@@ -188,12 +188,37 @@ private:
     std::vector<std::weak_ptr<coro::cancel_source>> waiters_{};
 };
 
+[[noreturn]] inline void throw_event_channel_fcntl_error(
+    const char* operation,
+    int error) {
+    throw std::runtime_error(
+        std::string("event_channel: fcntl(") + operation + ") failed: "
+        + std::strerror(error));
+}
+
+inline void set_event_channel_nonblocking(int fd) {
+    const int flags = ::fcntl(fd, F_GETFL);
+    if (flags < 0) {
+        const int error = errno;
+        throw_event_channel_fcntl_error("F_GETFL", error);
+    }
+    if ((flags & O_NONBLOCK) != 0) {
+        return;
+    }
+    if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        const int error = errno;
+        throw_event_channel_fcntl_error("F_SETFL", error);
+    }
+}
+
 }  // namespace detail
 
 class event_channel {
 public:
     /// Create a new `rdma_event_channel` and set its fd non-blocking.
-    /// Throws `std::runtime_error` on creation failure (errno set).
+    /// Throws `std::runtime_error` on creation or fd configuration failure.
+    /// A configuration failure destroys the newly created channel before the
+    /// exception propagates.
     event_channel()
         : channel_(::rdma_create_event_channel()) {
         if (!channel_) {
@@ -202,13 +227,12 @@ public:
                 std::string("rdma_create_event_channel failed: ")
                 + std::strerror(e));
         }
-        // Non-blocking so rdma_get_cm_event returns EAGAIN instead of
-        // blocking the worker. Errors here are non-fatal; we still
-        // have a usable channel, just with worse poll behaviour, so
-        // log via the exception path only on outright failure.
-        const int flags = ::fcntl(channel_->fd, F_GETFL);
-        if (flags >= 0) {
-            (void)::fcntl(channel_->fd, F_SETFL, flags | O_NONBLOCK);
+        try {
+            detail::set_event_channel_nonblocking(channel_->fd);
+        } catch (...) {
+            rdma_event_channel* channel = std::exchange(channel_, nullptr);
+            ::rdma_destroy_event_channel(channel);
+            throw;
         }
     }
 

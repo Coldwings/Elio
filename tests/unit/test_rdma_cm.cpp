@@ -21,6 +21,7 @@
 #include <elio/rdma_cm/rdma_cm.hpp>
 #include <elio/runtime/scheduler.hpp>
 
+#include <fcntl.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -111,6 +112,59 @@ TEST_CASE("cm_status reports invalid cm_id as exact -EINVAL",
     auto status = elio::rdma_cm::detail::cm_id_status(id);
     REQUIRE(status.status == -EINVAL);
     REQUIRE_FALSE(status.ok());
+}
+
+TEST_CASE("RDMA-CM event channel fd setup is checked",
+          "[rdma_cm][event_channel][nonblocking]") {
+    SECTION("sets non-blocking while preserving existing status flags") {
+        int pipe_fds[2];
+        REQUIRE(::pipe2(pipe_fds, O_CLOEXEC) == 0);
+
+        const int initial_flags = ::fcntl(pipe_fds[0], F_GETFL);
+        REQUIRE(initial_flags >= 0);
+        REQUIRE(::fcntl(
+            pipe_fds[0], F_SETFL, initial_flags | O_APPEND) == 0);
+
+        REQUIRE_NOTHROW(
+            elio::rdma_cm::detail::set_event_channel_nonblocking(pipe_fds[0]));
+        const int configured_flags = ::fcntl(pipe_fds[0], F_GETFL);
+        REQUIRE(configured_flags >= 0);
+        REQUIRE((configured_flags & O_NONBLOCK) != 0);
+        REQUIRE((configured_flags & O_APPEND) != 0);
+
+        REQUIRE_NOTHROW(
+            elio::rdma_cm::detail::set_event_channel_nonblocking(pipe_fds[0]));
+        REQUIRE(::close(pipe_fds[0]) == 0);
+        REQUIRE(::close(pipe_fds[1]) == 0);
+    }
+
+    SECTION("reports F_GETFL failure") {
+        std::string message;
+        try {
+            elio::rdma_cm::detail::set_event_channel_nonblocking(-1);
+        } catch (const std::runtime_error& error) {
+            message = error.what();
+        }
+        REQUIRE(message.find("F_GETFL") != std::string::npos);
+    }
+
+#ifdef O_PATH
+    SECTION("reports F_SETFL failure without closing the descriptor") {
+        const int fd = ::open(".", O_PATH | O_CLOEXEC);
+        REQUIRE(fd >= 0);
+        REQUIRE(::fcntl(fd, F_GETFL) >= 0);
+
+        std::string message;
+        try {
+            elio::rdma_cm::detail::set_event_channel_nonblocking(fd);
+        } catch (const std::runtime_error& error) {
+            message = error.what();
+        }
+        REQUIRE(message.find("F_SETFL") != std::string::npos);
+        REQUIRE(::fcntl(fd, F_GETFD) >= 0);
+        REQUIRE(::close(fd) == 0);
+    }
+#endif
 }
 
 TEST_CASE("event backlog preserves events for their matching cm_id",

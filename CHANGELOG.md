@@ -94,6 +94,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Free spawn-function scheduler contract**: Documented that `elio::go()`,
+  `elio::go_to()`, and `elio::spawn()` select only the calling thread's
+  thread-local running scheduler. Fire-and-forget calls fail fast with
+  `std::abort()` when none is available, while `spawn()` returns a terminal
+  handle that reports `std::logic_error` (#1072).
 - **Channel close and observer contract**: Documented that `channel::close()` is
   idempotent and preserves committed values for draining. `size()` and `empty()`
   report buffered values exactly only while the channel is quiescent; concurrent

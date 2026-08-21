@@ -172,9 +172,19 @@ sched.shutdown();
 
 Elio provides several ways to spawn concurrent tasks:
 
+The free `elio::go()`, `elio::go_to()`, and `elio::spawn()` functions select
+only the running scheduler stored in `scheduler::current()` for the calling
+thread. This is thread-local state, not a process-wide scheduler registry: a
+scheduler running on another thread does not satisfy the requirement. Use an
+explicit scheduler member function when dispatching through a scheduler that
+is not current on the caller.
+
 #### Fire-and-Forget with `elio::go()`
 
 Use `elio::go()` to spawn a task that runs independently:
+
+Calling `go()` without a thread-local running scheduler is a fail-fast
+programming error: Elio logs an error and calls `std::abort()`.
 
 ```cpp
 coro::task<void> background_work() {
@@ -201,6 +211,11 @@ coro::task<void> main_task() {
 #### Joinable Tasks with `elio::spawn()`
 
 Use `elio::spawn()` to get a `join_handle` that lets you await the result later:
+
+Without a thread-local running scheduler, `spawn()` does not start the
+callable. It returns an already-terminal join handle whose result rethrows
+`std::logic_error`. The direct rvalue-task overload consumes and destroys the
+accepted task before returning the same exception-bearing handle.
 
 ```cpp
 coro::task<int> compute(int x) {
@@ -250,6 +265,9 @@ already completed, or cancel other independently spawned tasks.
 #### Affinity Spawn with `elio::go_to()`
 
 Use `elio::go_to()` to spawn a task with affinity to a specific worker thread. The task is placed on the target worker's queue with affinity set before it first resumes. If a steal attempt later observes the task on another queue, the scheduler requeues it to the affinity worker instead of executing it on the wrong worker.
+
+Like `go()`, calling `go_to()` without a thread-local running scheduler logs an
+error and calls `std::abort()`.
 
 For deterministic placement, pass a worker id in `[0, scheduler.num_threads())`.
 Out-of-range ids are not rejected, but they are treated as scheduler fallback

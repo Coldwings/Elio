@@ -513,8 +513,8 @@ public:
     /// Number of tracked tasks currently in flight: spawned but not yet
     /// completed (running, suspended on I/O, sleeping, or queued). Tasks
     /// spawned via raw spawn(handle) are NOT counted; pending I/O operations
-    /// from any source ARE counted, so a coroutine waiting on an io_uring
-    /// completion always shows up here.
+    /// from any source ARE counted, including operations owned by a worker
+    /// that is still draining after a pool shrink.
     [[nodiscard]] size_t active_tasks() const noexcept {
         size_t total = tracking_state_->active.load(std::memory_order_acquire);
         size_t n = num_threads_.load(std::memory_order_acquire);
@@ -737,10 +737,14 @@ public:
         return do_schedule_to_(worker_id, handle, false);
     }
 
+    /// Number of workers currently visible for scheduling. A pool shrink
+    /// publishes the lower count before retiring workers finish draining their
+    /// worker-local I/O.
     [[nodiscard]] size_t num_threads(std::memory_order order = std::memory_order_relaxed) const noexcept {
         return num_threads_.load(order);
     }
 
+    /// Pending queue and I/O load on visible and still-draining workers.
     [[nodiscard]] size_t pending_tasks() const noexcept {
         size_t n = num_threads_.load(std::memory_order_acquire);
         return worker_pending_load_(n);
@@ -749,15 +753,14 @@ public:
     /// Dynamically resize the worker thread pool.
     ///
     /// Must be called from outside scheduler worker threads. Calls from a
-    /// worker thread are ignored after logging a warning, because the shrink
-    /// path joins worker threads and would otherwise be able to deadlock.
+    /// worker thread are ignored after logging a warning, because resize may
+    /// wait for and join a draining worker before reusing its slot.
     /// Calls after shutdown begins are also ignored; scheduler lifecycle is
     /// one-shot and no worker may be introduced during teardown.
     void set_thread_count(size_t count) {
-        // Guard against calling from a worker thread. The shrink path joins
-        // worker threads while holding workers_mutex_; if the joined worker's
-        // current task calls set_thread_count() re-entrantly, it would deadlock
-        // trying to acquire the same non-recursive mutex.
+        // Guard against calling from a worker thread. Slot reuse can wait for
+        // and join a draining worker while holding workers_mutex_; allowing a
+        // worker task to re-enter resize could deadlock that lifecycle path.
         if (worker_thread::current() != nullptr) [[unlikely]] {
             ELIO_LOG_WARNING(
                 "set_thread_count() called from a worker thread; ignoring to avoid deadlock");

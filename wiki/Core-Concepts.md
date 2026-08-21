@@ -446,8 +446,17 @@ terminal completion and deletes the operation state.
 
 Pool shrink does not migrate pending I/O. A retiring worker keeps polling its
 own context until both backend pending work and active operation pins reach
-zero. A later pool grow reuses the same worker context only after that drain has
-finished.
+zero. `set_thread_count()` publishes the smaller logical worker count and
+returns after initiating retirement; it does not wait for that physical worker
+thread to exit. `active_tasks()` and `pending_tasks()` continue to include work
+owned by the draining worker. A later pool grow that reuses the same slot waits
+until the drain has finished.
+
+Retirement has no independent timeout. Give potentially unbounded I/O its own
+deadline or cancellation path when prompt worker reclamation matters. The
+scheduler-level escape is non-graceful shutdown (a finite `shutdown()` budget
+or `shutdown_force()`), which may orphan in-flight I/O rather than completing
+the retirement drain.
 
 Standalone `io_context` objects have no scheduler owner. Their caller must
 serialize backend access, drive polling, and keep the context alive. Standard

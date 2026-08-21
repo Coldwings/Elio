@@ -110,6 +110,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operations make them approximate diagnostics rather than synchronization
   predicates. The API reference now also lists `try_send()` and `try_recv()`
   (#1077).
+- **Retiring-worker drain contract**: Pool shrink now explicitly documents that
+  it publishes the smaller logical scheduling range without waiting for removed
+  worker threads to drain their local I/O. Public pending-work accounting still
+  includes draining workers, slot reuse may wait for them, and forced shutdown
+  remains the non-graceful escape for an unbounded drain (#1079).
 - **Allocation-free ready shared-mutex writers**: No-token
   `shared_mutex::lock()` now defers independent wake-state allocation until
   suspension entry, before taking the queue mutex or publishing writer

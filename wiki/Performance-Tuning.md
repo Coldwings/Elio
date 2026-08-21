@@ -235,8 +235,16 @@ The scheduler supports changing the worker thread count at runtime:
 // Adjust thread count at runtime
 sched.set_thread_count(8);  // Grow to 8 workers
 sched.set_thread_count(2);  // Shrink to 2 workers
-// Note: set_thread_count handles starting/stopping workers dynamically
 ```
+
+On shrink, `num_threads()` reflects the smaller logical scheduling pool as soon
+as retirement is published, while each removed worker thread continues polling
+its worker-local I/O until both pending operations and active pins reach zero.
+The shrink call does not wait for that drain. A later grow can wait when it must
+reuse a slot whose previous worker is still draining, so bound long-lived I/O
+with application deadlines or cancellation when resize responsiveness matters.
+`shutdown_force()` can interrupt the drain, but is a non-graceful teardown path
+that may orphan in-flight I/O.
 
 For automatic scaling, use the **Autoscaler** component. It monitors queue length and automatically scales worker threads based on configurable thresholds:
 
@@ -802,10 +810,15 @@ The scheduler exposes individual metric accessors rather than a single stats str
 size_t total = sched.total_tasks_executed();     // Total across all workers
 size_t w0 = sched.worker_tasks_executed(0);      // Worker 0's count
 size_t pending = sched.pending_tasks();          // Currently pending tasks
-size_t threads = sched.num_threads();            // Current thread count
+size_t threads = sched.num_threads();            // Logical scheduling pool size
 ```
 
 These are lightweight atomic reads suitable for periodic monitoring in production. Combine with `set_thread_count` to implement your own adaptive scaling.
+
+During retirement, `pending_tasks()` (and `active_tasks()`) includes load owned
+by draining workers outside the logical `num_threads()` range. The execution
+and steal counters, in contrast, cover only currently visible workers.
+
 Workers publish execution and successful-steal counts from single-writer local
 counters, so metric collection does not require atomic read-modify-write
 instructions on coroutine resume or steal paths.

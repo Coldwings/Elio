@@ -833,10 +833,11 @@ public:
     // worker_id in [0, num_threads()) and an available target worker. Larger
     // values or unavailable targets use fallback scheduling.
 
-    // Get number of worker threads
+    // Get the logical number of workers currently visible for scheduling.
+    // Retiring worker threads may still be draining outside this range.
     size_t num_threads(std::memory_order order = std::memory_order_relaxed) const noexcept;
 
-    // Get total pending tasks across all workers
+    // Get pending queue and I/O load across visible and draining workers.
     size_t pending_tasks() const noexcept;
 
     // Get total tasks executed across all workers
@@ -857,7 +858,7 @@ public:
     void pause();
     void resume();
 
-    // Dynamically resize the thread pool.
+    // Dynamically resize the logical scheduling pool.
     // Must be called from outside scheduler worker threads.
     void set_thread_count(size_t count);
 
@@ -955,7 +956,20 @@ external lifecycle owner when the caller must observe complete teardown.
 
 `set_thread_count()` must be called from outside scheduler worker threads. If a
 worker thread calls it, Elio logs a warning and leaves the worker count
-unchanged to avoid deadlocking the resize path while joining worker threads.
+unchanged to avoid deadlocking a resize path that may wait for and join a
+draining worker.
+
+Shrinking publishes the lower logical `num_threads()` value and returns after
+starting worker retirement; it does not wait for the removed physical threads
+to exit. Each retiring worker continues polling its own I/O context until both
+pending backend work and active operation pins reach zero. `active_tasks()` and
+`pending_tasks()` include that draining work even though its owner is outside
+the logical worker range. A later grow that reuses the slot waits for the old
+worker to finish draining and can therefore wait as long as the outstanding
+I/O. Operations that must not delay reclamation need their own deadline or
+cancellation path. A finite `shutdown()` budget and `shutdown_force()` can
+interrupt the drain only by entering non-graceful teardown, which may orphan
+in-flight I/O.
 
 **Example:**
 ```cpp

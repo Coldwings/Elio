@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Fail-fast RDMA-CM event channel setup**: `rdma_cm::event_channel` now
+  rejects `F_GETFL` or `F_SETFL` failures and destroys the partially created
+  channel instead of allowing a blocking `rdma_get_cm_event()` call to stall a
+  scheduler worker (#1092).
 - **Caller-precondition documentation**: The API contract now distinguishes
   documented runtime failure channels from optional debug assertions. Unless a
   specific API promises fail-closed behavior, violating a caller precondition

@@ -5,6 +5,7 @@
 #include <elio/coro/cancel_token.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/log/macros.hpp>
+#include <elio/net/detail/fd.hpp>
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -151,13 +152,36 @@ struct unix_address {
 /// contract applies to ``uds_listener::accept``: only one coroutine may be
 /// accepting at a time.
 class uds_stream {
+    struct configured_fd_t {};
+
+    explicit uds_stream(int fd, configured_fd_t) noexcept
+        : fd_(fd) {}
+
 public:
-    /// Construct from file descriptor
+    /// Construct from a file descriptor without reporting configuration errors.
+    /// Prefer adopt() for descriptors created outside Elio.
     explicit uds_stream(int fd)
         : fd_(fd) {
-        // Make non-blocking
-        int flags = fcntl(fd_, F_GETFL, 0);
-        fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+        (void)detail::set_nonblocking(fd_);
+    }
+
+    /// Adopt an already-connected Unix-domain stream socket.
+    ///
+    /// On success, the descriptor is non-blocking and ownership transfers to
+    /// the returned stream. On failure, returns std::nullopt with errno set by
+    /// fcntl(), and the descriptor remains open and owned by the caller.
+    /// Socket type, address family, and connected state are caller preconditions.
+    /// From call entry until return, the caller must exclusively control the fd
+    /// and all duplicate aliases: no concurrent close, use, or status-flag
+    /// mutation is allowed. After success, O_NONBLOCK must remain set on the
+    /// shared open-file description for as long as the adopted stream owns the
+    /// descriptor; retained aliases must not clear it or otherwise defeat
+    /// non-blocking I/O through status-flag changes.
+    static std::optional<uds_stream> adopt(int fd) noexcept {
+        if (!detail::set_nonblocking(fd)) {
+            return std::nullopt;
+        }
+        return std::optional<uds_stream>{uds_stream(fd, configured_fd_t{})};
     }
 
     /// Move constructor

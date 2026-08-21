@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Checked external stream adoption**: `tcp_stream::adopt(fd)` and
+  `uds_stream::adopt(fd)` now set `O_NONBLOCK` before transferring ownership.
+  Failure returns `std::nullopt` with the `fcntl()` error in `errno` and leaves
+  the descriptor open and caller-owned; legacy raw-fd constructors remain for
+  compatibility (#1090).
 - **Scheduler service-latency benchmark**: Added a repeatable mixed-workload
   benchmark that reports I/O-completion and remote-inbox p50, p99, and maximum
   latency while a worker's local runnable deque remains non-empty. A short

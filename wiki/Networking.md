@@ -41,6 +41,33 @@ opts.backlog = 512;         // Listen backlog
 auto listener = tcp_listener::bind(ipv4_address(8080), opts);
 ```
 
+## Adopting External Descriptors
+
+Use `tcp_stream::adopt(fd)` or `uds_stream::adopt(fd)` when a connected socket
+comes from socket activation, descriptor passing, or another library. The
+factory sets `O_NONBLOCK` before transferring ownership. On failure it returns
+`std::nullopt`, leaves `fd` open and caller-owned, and preserves the failing
+`fcntl()` error in `errno`:
+
+```cpp
+auto stream = tcp_stream::adopt(fd);
+if (!stream) {
+    ::close(fd); // adoption failed, so the caller still owns fd
+    co_return;
+}
+```
+
+The caller must supply a valid connected stream socket for the matching TCP or
+UDS class. Adoption deliberately does not add socket-type, address-family, or
+connected-state probes. From call entry until return, the caller must
+exclusively control the fd and every duplicate alias: no concurrent close, use,
+or status-flag mutation is allowed. After success, `O_NONBLOCK` must remain set
+on the shared open-file description for as long as the adopted stream owns the
+descriptor; retained aliases must not clear it or otherwise defeat non-blocking
+I/O through status-flag changes. The raw-fd constructors remain available for
+compatibility but cannot report non-blocking setup failure; prefer `adopt()` for
+external descriptors.
+
 ## TCP
 
 ### Write Size Contract

@@ -636,6 +636,13 @@ coro::task<void> limited_work() {
 }
 ```
 
+The initial permit count must be non-negative. `release(count)` requires a
+positive count, and callers must keep the sum of available permits and permits
+reserved for not-yet-resumed waiter handoffs at or below `INT_MAX`. `count()`
+returns only an instantaneous snapshot of the currently available permits; it
+does not include pending handoffs, and concurrent operations can make it stale
+as soon as it returns.
+
 ### Spinlock
 
 `spinlock` is a lightweight, non-suspending lock for very short critical sections. It uses a TTAS (Test-and-Test-and-Set) algorithm with CPU pause instructions for efficient spinning:

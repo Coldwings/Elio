@@ -413,8 +413,11 @@ public:
     }
 
     /// Wait with a short-duration synchronous lockable until notification or
-    /// cancellation wins. If the wait released the lock, the generic Lock
-    /// contract above still applies to its synchronous re-lock before return.
+    /// cancellation wins, returning the terminal cancel_result. Notification
+    /// and cancellation select one result atomically. A pre-cancelled wait
+    /// leaves the already-held lock untouched. If the wait released the lock,
+    /// it re-locks synchronously before returning either completed or cancelled;
+    /// the generic Lock contract above applies to that re-lock.
     template<detail::lockable Lock>
     auto wait(Lock& lock, coro::cancel_token token) {
         return cancellable_wait_awaitable_lock<Lock>(

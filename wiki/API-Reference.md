@@ -3460,6 +3460,10 @@ The generic `wait(Lock&)` overloads are selected by a syntactic concept that
 requires `lock()` and `unlock()`; satisfying that concept does not make the lock
 coroutine-aware. After notification, or after cancellation if the wait released
 the lock, `await_resume()` calls `Lock::lock()` directly on the resuming thread.
+The token overload returns `cancel_result` and atomically selects notification
+or cancellation. A pre-cancelled wait keeps the already-held lock; once a wait
+has released the lock, it synchronously re-acquires it before returning either
+`completed` or `cancelled`.
 `Lock::unlock()` must release immediately, and `Lock::lock()` must have acquired
 ownership when it returns; an awaitable-returning `lock()` is not supported by
 the generic overload. The caller must also guarantee that `lock()` returns

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <climits>
 #include <coroutine>
 #include <memory>
 #include <new>
@@ -97,6 +98,30 @@ struct shared_writer_allocation_hook_guard {
             .store(false, std::memory_order_release);
         elio::sync::detail::pause_shared_writer_after_wake_allocation_for_test
             .notify_all();
+    }
+};
+
+struct semaphore_cancellable_ready_hook_guard {
+    semaphore_cancellable_ready_hook_guard() {
+        elio::sync::detail::
+            semaphore_cancellable_ready_paused_before_claim_for_test.store(
+                false, std::memory_order_release);
+        elio::sync::detail::
+            semaphore_cancellable_ready_mutex_held_for_test.store(
+                false, std::memory_order_release);
+        elio::sync::detail::
+            pause_semaphore_cancellable_ready_before_claim_for_test.store(
+                true, std::memory_order_release);
+    }
+
+    ~semaphore_cancellable_ready_hook_guard() { release(); }
+
+    void release() const noexcept {
+        elio::sync::detail::
+            pause_semaphore_cancellable_ready_before_claim_for_test.store(
+                false, std::memory_order_release);
+        elio::sync::detail::
+            pause_semaphore_cancellable_ready_before_claim_for_test.notify_all();
     }
 };
 
@@ -1074,6 +1099,7 @@ TEST_CASE("semaphore ready path defers wake-state allocation",
 
         REQUIRE(allocations.load(std::memory_order_relaxed) == 1);
         REQUIRE(waiter.await_ready());
+        source.cancel();
         REQUIRE(waiter.await_resume() == cancel_result::completed);
         REQUIRE(publications.load(std::memory_order_relaxed) == 0);
         REQUIRE(sem.count() == 0);
@@ -2293,6 +2319,56 @@ TEST_CASE("semaphore cancellation and release select one terminal result",
     }
 
     sched.shutdown();
+}
+
+TEST_CASE("cancellable semaphore ready claim serializes release",
+          "[sync][semaphore][cancellation][regression]") {
+    semaphore_cancellable_ready_hook_guard hook;
+    semaphore sem(INT_MAX - 1);
+    cancel_source source;
+    auto waiter = sem.acquire(source.get_token());
+    std::atomic<bool> ready{false};
+    std::atomic<cancel_result> result{cancel_result::completed};
+
+    std::thread acquirer([&] {
+        ready.store(waiter.await_ready(), std::memory_order_release);
+        result.store(waiter.await_resume(), std::memory_order_release);
+    });
+
+    const bool paused = wait_for_condition([] {
+        return elio::sync::detail::
+            semaphore_cancellable_ready_paused_before_claim_for_test.load(
+                std::memory_order_acquire);
+    });
+    const bool mutex_held_while_paused = elio::sync::detail::
+        semaphore_cancellable_ready_mutex_held_for_test.load(
+            std::memory_order_acquire);
+    source.cancel();
+
+    std::atomic<bool> release_started{false};
+    std::atomic<bool> release_completed{false};
+    std::thread releaser([&] {
+        release_started.store(true, std::memory_order_release);
+        release_started.notify_all();
+        sem.release();
+        release_completed.store(true, std::memory_order_release);
+    });
+    const bool release_entered_while_paused = wait_for_flag(release_started);
+    const bool release_completed_while_paused =
+        release_completed.load(std::memory_order_acquire);
+
+    hook.release();
+    acquirer.join();
+    releaser.join();
+
+    REQUIRE(paused);
+    REQUIRE(mutex_held_while_paused);
+    REQUIRE(release_entered_while_paused);
+    REQUIRE_FALSE(release_completed_while_paused);
+    REQUIRE(ready.load(std::memory_order_acquire));
+    REQUIRE(result.load(std::memory_order_acquire) == cancel_result::cancelled);
+    REQUIRE(release_completed.load(std::memory_order_acquire));
+    REQUIRE(sem.count() == INT_MAX);
 }
 
 TEST_CASE("mutex cancellation and unlock select one terminal result",

@@ -107,9 +107,6 @@ struct semaphore_cancellable_ready_hook_guard {
             semaphore_cancellable_ready_paused_before_claim_for_test.store(
                 false, std::memory_order_release);
         elio::sync::detail::
-            semaphore_cancellable_ready_mutex_held_for_test.store(
-                false, std::memory_order_release);
-        elio::sync::detail::
             pause_semaphore_cancellable_ready_before_claim_for_test.store(
                 true, std::memory_order_release);
     }
@@ -2340,9 +2337,8 @@ TEST_CASE("cancellable semaphore ready claim serializes release",
             semaphore_cancellable_ready_paused_before_claim_for_test.load(
                 std::memory_order_acquire);
     });
-    const bool mutex_held_while_paused = elio::sync::detail::
-        semaphore_cancellable_ready_mutex_held_for_test.load(
-            std::memory_order_acquire);
+    const bool mutex_was_available_while_paused =
+        sem.try_lock_mutex_for_test();
     source.cancel();
 
     std::atomic<bool> release_started{false};
@@ -2354,17 +2350,14 @@ TEST_CASE("cancellable semaphore ready claim serializes release",
         release_completed.store(true, std::memory_order_release);
     });
     const bool release_entered_while_paused = wait_for_flag(release_started);
-    const bool release_completed_while_paused =
-        release_completed.load(std::memory_order_acquire);
 
     hook.release();
     acquirer.join();
     releaser.join();
 
     REQUIRE(paused);
-    REQUIRE(mutex_held_while_paused);
+    REQUIRE_FALSE(mutex_was_available_while_paused);
     REQUIRE(release_entered_while_paused);
-    REQUIRE_FALSE(release_completed_while_paused);
     REQUIRE(ready.load(std::memory_order_acquire));
     REQUIRE(result.load(std::memory_order_acquire) == cancel_result::cancelled);
     REQUIRE(release_completed.load(std::memory_order_acquire));

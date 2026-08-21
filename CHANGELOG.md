@@ -221,6 +221,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Clarified the `condition_variable::wait(Lock&)` contract: generic lock
+  overloads call `Lock::lock()` synchronously on the resuming thread and require
+  a promptly returning lock suitable for a scheduler worker. A contended
+  `std::mutex` can park and stall the worker; `wait(sync::mutex&)` instead uses
+  the coroutine-aware asynchronous re-lock path (#1073).
 - Clarified the `tcp_listener` shutdown boundary: `close()` invalidates future
   accepts but does not cancel an accept already submitted to the I/O backend.
   Stoppable accept loops must use token cancellation, await completion, and

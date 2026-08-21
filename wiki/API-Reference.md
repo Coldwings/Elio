@@ -1094,6 +1094,12 @@ template<typename F, typename Arg0, typename... Args>
 auto run(F&& f, Arg0&& arg0, Args&&... args) -> task_value_t<invoke_result_t<F, Arg0, Args...>>;
 ```
 
+On the first invocation through the `run()` entry path, Elio installs
+`SIG_IGN` for `SIGPIPE` with `sigaction`. This changes the process-wide signal
+disposition; it does not change a per-thread signal mask. Elio does not save or
+restore the prior disposition, and later `run()` calls do not reapply the
+ignore disposition if application code changes it after that first install.
+
 **Example:**
 ```cpp
 coro::task<int> async_main(int argc, char* argv[]) {
@@ -1137,6 +1143,9 @@ coro::task<int> async_main(int argc, char* argv[]) {
 ELIO_ASYNC_MAIN(async_main)
 ```
 
+The macro dispatches through `elio::run()` and therefore has the same
+process-wide `SIGPIPE` disposition side effect.
+
 ---
 
 ## Server Lifecycle (`elio`)
@@ -1152,6 +1161,11 @@ template<typename Server, typename ListenFunc>
 coro::task<void> serve(Server& server, ListenFunc listen_func,
                        std::initializer_list<int> signals = {SIGINT, SIGTERM});
 ```
+
+The first invocation through the server entry path installs process-wide
+`SIG_IGN` for `SIGPIPE`. This also applies when `serve()` is used with a custom
+scheduler and without `run()` or `ELIO_ASYNC_MAIN`; the server path has its own
+one-time installation guard.
 
 The function:
 1. Spawns the listen function in the background
@@ -1195,6 +1209,9 @@ coro::task<void> serve_all(std::tuple<Servers&...> servers,
                            std::tuple<ListenFuncs...> listen_funcs,
                            std::initializer_list<int> signals = {SIGINT, SIGTERM});
 ```
+
+`serve_all()` has the same server-entry `SIGPIPE` disposition behavior as
+`serve()`.
 
 **Example:**
 ```cpp
@@ -1701,6 +1718,29 @@ struct dir_entry {
 ## Signal Handling (`elio::signal`)
 
 Coroutine-friendly signal handling using Linux signalfd.
+
+### Process-wide `SIGPIPE` disposition
+
+`elio::run()` and therefore `ELIO_ASYNC_MAIN` install `SIG_IGN` for `SIGPIPE`
+on first use of the runtime entry path. `elio::serve()` and `elio::serve_all()`
+perform an independent one-time installation so custom-scheduler server users
+receive the same protection. This is a fallback for socket/TLS paths where
+per-call suppression is unavailable: a peer close is reported as `EPIPE`
+instead of terminating the process.
+
+Both paths change the process-wide signal disposition with `sigaction`; neither
+saves or restores the previous value. An embedding application that needs a
+different disposition later must snapshot it before the first Elio
+runtime/server entry and restore it only after all Elio runtime and server use
+has ended. Each path has an independent `once_flag`: a path that has never
+been used will still install `SIG_IGN` on first call regardless of any
+disposition change made in between, so restoration is only safe after all
+entry-point paths have been exhausted or will no longer be called.
+
+This policy is separate from signal masking. `signal_set` and `signal_fd` use
+per-thread masks (inherited by threads created later) to route shutdown signals
+through `signalfd`; they do not save or restore the process-wide `SIGPIPE`
+disposition.
 
 ### `signal_set`
 

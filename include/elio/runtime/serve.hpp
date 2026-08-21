@@ -47,12 +47,19 @@ inline constexpr std::initializer_list<int> default_shutdown_signals = {SIGINT, 
 
 namespace detail {
 
-/// Install ``SIG_IGN`` for ``SIGPIPE`` exactly once per process. See the
-/// matching helper in ``runtime/async_main.hpp`` for the full rationale —
-/// this duplicate exists so users that wire ``serve()`` into a custom
-/// scheduler (without going through ``elio::run`` / ``ELIO_ASYNC_MAIN``)
-/// still get the protection. ``sigaction`` is idempotent, so running the
-/// install twice is harmless.
+/// Install ``SIG_IGN`` for ``SIGPIPE`` once through the server entry path. See
+/// the matching helper in ``runtime/async_main.hpp`` for the full rationale.
+/// This independent ``once_flag`` exists so users that wire ``serve()`` or
+/// ``serve_all()`` into a custom scheduler (without going through ``elio::run``
+/// or ``ELIO_ASYNC_MAIN``) still get the protection.
+///
+/// This changes the process-wide signal disposition, not a per-thread signal
+/// mask. Neither entry path saves or restores the prior disposition. Each
+/// ``once_flag`` is independent — an unfired server-path flag will reinstall
+/// ``SIG_IGN`` on next use even if the runtime-path flag has already fired and
+/// the application has since changed the disposition. Embedders that need
+/// another disposition later must save it before the first Elio entry and
+/// restore it only after all runtime and server use has ended.
 inline void ignore_sigpipe_in_serve_once() {
     static std::once_flag flag;
     std::call_once(flag, []() {
@@ -132,6 +139,10 @@ inline coro::task<signal::signal_info> wait_shutdown_signal(
 /// calling thread, so a process-directed SIGINT/SIGTERM can terminate the
 /// process before serve() observes it.
 ///
+/// @note On first use of the server entry path, ``serve()`` installs
+/// ``SIG_IGN`` for ``SIGPIPE`` as a process-wide disposition. It neither saves
+/// nor restores the previous disposition.
+///
 /// Example:
 /// @code
 /// coro::task<int> async_main(int argc, char* argv[]) {
@@ -155,7 +166,7 @@ template<typename Server, typename ListenFunc>
 coro::task<void> serve(Server& server, ListenFunc listen_func,
                        std::initializer_list<int> signals = default_shutdown_signals)
 {
-    // Mask SIGPIPE so writes on half-closed sockets surface as EPIPE
+    // Ignore SIGPIPE process-wide so half-closed socket writes surface as EPIPE
     // io_results rather than terminating the process.
     detail::ignore_sigpipe_in_serve_once();
 
@@ -241,6 +252,10 @@ coro::task<void> serve(Server& server, ListenFunc listen_func,
 /// @param listen_funcs Tuple of listen functions (each returning a task)
 /// @param signals Signals to wait for shutdown
 ///
+/// @note Like ``serve()``, the first server-entry invocation installs
+/// process-wide ``SIG_IGN`` for ``SIGPIPE`` and does not restore the previous
+/// disposition.
+///
 /// Example:
 /// @code
 /// coro::task<void> run_servers() {
@@ -267,7 +282,7 @@ coro::task<void> serve_all(std::tuple<Servers&...> servers,
                            std::tuple<ListenFuncs...> listen_funcs,
                            std::initializer_list<int> signals = default_shutdown_signals)
 {
-    // Mask SIGPIPE so writes on half-closed sockets surface as EPIPE
+    // Ignore SIGPIPE process-wide so half-closed socket writes surface as EPIPE
     // io_results rather than terminating the process.
     detail::ignore_sigpipe_in_serve_once();
 

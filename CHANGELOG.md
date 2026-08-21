@@ -251,6 +251,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Documented that `run()`/`ELIO_ASYNC_MAIN` and `serve()`/`serve_all()` install
+  process-wide `SIG_IGN` for `SIGPIPE` through independent one-time entry paths.
+  Elio does not save or restore the previous disposition; embedders that need a
+  different policy must save it before first use and restore it only after all
+  Elio runtime/server use has ended (#1076).
 - Clarified the `condition_variable::wait(Lock&)` contract: generic lock
   overloads call `Lock::lock()` synchronously on the resuming thread and require
   a promptly returning lock suitable for a scheduler worker. A contended

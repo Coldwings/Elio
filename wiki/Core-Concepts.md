@@ -148,6 +148,15 @@ int main(int argc, char* argv[]) {
 }
 ```
 
+> **Process-wide `SIGPIPE` policy:** On first use, `elio::run()` (and therefore
+> `ELIO_ASYNC_MAIN`) installs `SIG_IGN` for `SIGPIPE`. `elio::serve()` and
+> `elio::serve_all()` have an independent one-time installation path for custom
+> schedulers. These calls change the process-wide signal disposition, not a
+> per-thread mask, and Elio does not save or restore the previous value. An
+> embedding application that needs another disposition later must save it before
+> its first Elio runtime/server entry and restore it only after all Elio runtime
+> and server use has ended.
+
 ### Manual Scheduler Control
 
 For advanced use cases, you can manage the scheduler manually:

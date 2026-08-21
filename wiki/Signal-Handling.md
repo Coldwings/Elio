@@ -22,6 +22,30 @@ Linux's `signalfd(2)` converts signals into file descriptor events. By blocking 
 using namespace elio::signal;
 ```
 
+## Process-wide SIGPIPE Policy
+
+`elio::run()` and therefore `ELIO_ASYNC_MAIN` install `SIG_IGN` for `SIGPIPE`
+on first use of the runtime entry path. `elio::serve()` and `elio::serve_all()`
+perform an independent one-time installation so that they provide the same
+protection when used with a custom scheduler. This process-wide fallback lets
+socket and TLS writes report a peer close as `EPIPE` on paths where per-call
+`SIGPIPE` suppression is unavailable, rather than terminating the process.
+
+These entry points change the process-wide signal disposition with `sigaction`;
+they do not change a per-thread signal mask, and Elio neither saves nor restores
+the previous disposition. An embedding application that needs another
+disposition later must snapshot it before its first Elio runtime/server entry
+and restore it only after all Elio runtime and server use has ended. The runtime
+and server paths each have an independent `once_flag`. A later call on an
+already-fired path will not reinstall the ignore disposition, but an
+as-yet-unused path (e.g. calling `serve()` for the first time after `run()`
+has exited) will still reinstall `SIG_IGN`. Restoring a custom disposition is
+only safe after all Elio runtime and server entry-point use has ended.
+
+This is separate from the per-thread masks described below. `signal_set` and
+`signal_fd` manage masks used by `signalfd`; those masks do not preserve or
+restore the process-wide `SIGPIPE` disposition.
+
 ## Quick Start
 
 ### Basic Signal Handling
@@ -143,8 +167,8 @@ sigfd.close();
 With automatic blocking enabled, `update()` blocks the new signal set but does
 not unblock signals removed from the descriptor. This preserves caller-owned
 masks and avoids exposing a removed pending signal before the descriptor update
-commits. Explicitly unblock signals when their process-level disposition is no
-longer needed. If the descriptor update fails, `update()` restores the calling
+commits. Explicitly unblock signals when the calling thread no longer needs
+them blocked. If the descriptor update fails, `update()` restores the calling
 thread's prior mask. Passing `false` as the second argument leaves the thread
 mask unchanged. Closing, moving, or destroying a `signal_fd` never changes the
 thread mask.

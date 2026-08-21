@@ -3696,7 +3696,7 @@ public:
     /* awaitable<cancel_result> */ acquire(coro::cancel_token token);
 
     // Try acquire without waiting
-    bool try_acquire();
+    bool try_acquire() noexcept;
 
     // Release one or more permits
     void release(int count = 1);
@@ -3707,12 +3707,16 @@ public:
 ```
 
 `initial_count` must be non-negative, and `release(count)` requires `count` to
-be positive. The available permit count is represented by an `int`; callers
-must not release permits when doing so would raise that count above `INT_MAX`.
-These are caller preconditions, not runtime error-reporting guarantees.
+be positive. Callers must keep the sum of available permits and permits
+reserved for not-yet-resumed waiter handoffs at or below `INT_MAX`. This
+includes permits absent from `count()` while a selected waiter has not yet
+resumed, because cancellation or waiter destruction can return them to the
+available count. These are caller preconditions, not runtime error-reporting
+guarantees.
 `count()` takes the semaphore's internal lock and returns an exact instantaneous
-snapshot of the available permits. Concurrent acquisitions or releases can
-make that snapshot stale immediately after it returns.
+snapshot of the available permits; it excludes pending handoffs. Concurrent
+acquisitions, releases, or handoff recovery can make that snapshot stale
+immediately after it returns.
 
 The no-token `acquire()` completes without wake-state allocation when a permit
 is immediately available. If the ready check observes no permit, suspension

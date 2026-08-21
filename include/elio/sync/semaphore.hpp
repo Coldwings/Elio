@@ -50,9 +50,10 @@ inline void pause_semaphore_cancellable_ready_for_test(
 
 /// Coroutine-aware semaphore.
 ///
-/// The initial permit count must be non-negative. The available permit count
-/// is represented by an int and must remain at or below INT_MAX; callers must
-/// satisfy that bound when releasing permits.
+/// The initial permit count must be non-negative. The sum of available permits
+/// and permits reserved for not-yet-resumed waiter handoffs is represented by
+/// an int and must remain at or below INT_MAX; callers must satisfy that bound
+/// when releasing permits.
 class semaphore {
 public:
     class acquire_waiter;
@@ -413,8 +414,9 @@ public:
 
     /// Release one or more permits.
     ///
-    /// count must be positive, and the resulting available permit count must
-    /// not exceed INT_MAX. These are caller preconditions.
+    /// count must be positive. After the release, the sum of available permits
+    /// and permits reserved for not-yet-resumed waiter handoffs must not exceed
+    /// INT_MAX. These are caller preconditions.
     void release(int count = 1) {
         assert(count > 0 && "semaphore release count must be positive");
 

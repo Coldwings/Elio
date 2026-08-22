@@ -64,6 +64,16 @@ void rethrow_join_exception(const std::exception_ptr& exception) {
     if (exception) std::rethrow_exception(exception);
 }
 
+template<typename T>
+const T& require_join_value(const join_completion<T>& completion) {
+    REQUIRE(completion.drained);
+    REQUIRE(completion.ready);
+    REQUIRE(completion.destroyed);
+    REQUIRE_NOTHROW(rethrow_join_exception(completion.exception));
+    REQUIRE(completion.value.has_value());
+    return *completion.value;
+}
+
 struct throwing_move_callable {
     throwing_move_callable() = default;
     throwing_move_callable(const throwing_move_callable&) = delete;
@@ -1287,7 +1297,13 @@ TEST_CASE("when_all and when_any return move-only result values",
 // --- with_timeout tests ---
 
 TEST_CASE("with_timeout task completes before timeout", "[sync][combinators]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        bool has_value = false;
+        bool timed_out = true;
+        int value = 0;
+    };
+
+    auto test = []() -> task<observation> {
         auto result = co_await with_timeout(
             std::chrono::milliseconds(500),
             []() -> task<int> {
@@ -1295,19 +1311,32 @@ TEST_CASE("with_timeout task completes before timeout", "[sync][combinators]") {
                 co_return 42;
             }
         );
-        REQUIRE(static_cast<bool>(result));
-        REQUIRE(!result.timed_out);
-        REQUIRE(*result == 42);
+        co_return observation{
+            static_cast<bool>(result),
+            result.timed_out,
+            result ? *result : 0,
+        };
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.has_value);
+    REQUIRE_FALSE(observed.timed_out);
+    REQUIRE(observed.value == 42);
 }
 
 TEST_CASE("with_timeout owns a move-only callable before delayed await",
           "[sync][combinators][ownership][lifetime]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        bool has_value = false;
+        int value = 0;
+    };
+
+    auto test = []() -> task<observation> {
         auto pending = with_timeout(
             std::chrono::milliseconds(500),
             [owned = std::make_unique<int>(42)]() mutable -> task<int> {
@@ -1316,36 +1345,57 @@ TEST_CASE("with_timeout owns a move-only callable before delayed await",
 
         co_await time::yield();
         auto result = co_await pending;
-        REQUIRE(result);
-        REQUIRE(*result == 42);
+        co_return observation{static_cast<bool>(result), result ? *result : 0};
     };
 
     runtime::scheduler sched(1);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.has_value);
+    REQUIRE(observed.value == 42);
 }
 
 TEST_CASE("with_timeout supports non-default-constructible results",
           "[sync][combinators][regression]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        bool has_value = false;
+        int value = 0;
+    };
+
+    auto test = []() -> task<observation> {
         auto result = co_await with_timeout(
             std::chrono::milliseconds(500),
             []() -> task<non_default_result> {
                 co_return non_default_result{42};
             }
         );
-        REQUIRE(result);
-        REQUIRE((*result).value == 42);
+        co_return observation{
+            static_cast<bool>(result),
+            result ? (*result).value : 0,
+        };
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.has_value);
+    REQUIRE(observed.value == 42);
 }
 
 TEST_CASE("with_timeout times out non-default-constructible results",
           "[sync][combinators][regression]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        bool has_value = true;
+        bool timed_out = false;
+    };
+
+    auto test = []() -> task<observation> {
         auto result = co_await with_timeout(
             std::chrono::milliseconds(1),
             [](coro::cancel_token tok) -> task<non_default_result> {
@@ -1353,17 +1403,26 @@ TEST_CASE("with_timeout times out non-default-constructible results",
                 co_return non_default_result{42};
             }
         );
-        REQUIRE_FALSE(result);
-        REQUIRE(result.timed_out);
+        co_return observation{static_cast<bool>(result), result.timed_out};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE_FALSE(observed.has_value);
+    REQUIRE(observed.timed_out);
 }
 
 TEST_CASE("with_timeout task exceeds timeout", "[sync][combinators]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        bool has_value = true;
+        bool timed_out = false;
+    };
+
+    auto test = []() -> task<observation> {
         auto result = co_await with_timeout(
             std::chrono::milliseconds(1),
             [](coro::cancel_token tok) -> task<int> {
@@ -1371,19 +1430,28 @@ TEST_CASE("with_timeout task exceeds timeout", "[sync][combinators]") {
                 co_return 42;
             }
         );
-        REQUIRE(!static_cast<bool>(result));
-        REQUIRE(result.timed_out);
+        co_return observation{static_cast<bool>(result), result.timed_out};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE_FALSE(observed.has_value);
+    REQUIRE(observed.timed_out);
 }
 
 TEST_CASE("with_timeout with cancel_token propagation", "[sync][combinators]") {
     std::atomic<bool> was_cancelled{false};
 
-    auto test = [&]() -> task<void> {
+    struct observation {
+        bool timed_out = false;
+        bool was_cancelled = false;
+    };
+
+    auto test = [&]() -> task<observation> {
         auto result = co_await with_timeout(
             std::chrono::milliseconds(1),
             [&](coro::cancel_token tok) -> task<int> {
@@ -1395,13 +1463,20 @@ TEST_CASE("with_timeout with cancel_token propagation", "[sync][combinators]") {
                 co_return -1;
             }
         );
-        REQUIRE(result.timed_out);
-        REQUIRE(was_cancelled.load(std::memory_order_relaxed));
+        co_return observation{
+            result.timed_out,
+            was_cancelled.load(std::memory_order_relaxed),
+        };
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.timed_out);
+    REQUIRE(observed.was_cancelled);
 }
 
 TEST_CASE("with_timeout waits for token-ignoring work after expiry",
@@ -1472,7 +1547,13 @@ TEST_CASE("pre-cancelled with_timeout is not reported as expiry",
 TEST_CASE("with_timeout with void task", "[sync][combinators]") {
     std::atomic<bool> completed{false};
 
-    auto test = [&]() -> task<void> {
+    struct observation {
+        bool has_value = false;
+        bool timed_out = true;
+        bool completed = false;
+    };
+
+    auto test = [&]() -> task<observation> {
         auto result = co_await with_timeout(
             std::chrono::milliseconds(500),
             [&]() -> task<void> {
@@ -1480,18 +1561,26 @@ TEST_CASE("with_timeout with void task", "[sync][combinators]") {
                 completed.store(true, std::memory_order_relaxed);
             }
         );
-        REQUIRE(static_cast<bool>(result));
-        REQUIRE(!result.timed_out);
-        REQUIRE(completed.load(std::memory_order_relaxed));
+        co_return observation{
+            static_cast<bool>(result),
+            result.timed_out,
+            completed.load(std::memory_order_relaxed),
+        };
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.has_value);
+    REQUIRE_FALSE(observed.timed_out);
+    REQUIRE(observed.completed);
 }
 
 TEST_CASE("with_timeout with zero duration", "[sync][combinators]") {
-    auto test = []() -> task<void> {
+    auto test = []() -> task<bool> {
         auto result = co_await with_timeout(
             std::chrono::milliseconds(0),
             [](coro::cancel_token tok) -> task<int> {
@@ -1499,17 +1588,26 @@ TEST_CASE("with_timeout with zero duration", "[sync][combinators]") {
                 co_return 42;
             }
         );
-        REQUIRE(result.timed_out);
+        co_return result.timed_out;
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    REQUIRE(require_join_value(completion));
 }
 
 TEST_CASE("with_timeout task throws exception", "[sync][combinators]") {
-    auto test = []() -> task<void> {
+    struct observation {
         bool caught = false;
+        std::string message;
+    };
+
+    auto test = []() -> task<observation> {
+        bool caught = false;
+        std::string message;
         try {
             co_await with_timeout(
                 std::chrono::milliseconds(500),
@@ -1521,12 +1619,17 @@ TEST_CASE("with_timeout task throws exception", "[sync][combinators]") {
             );
         } catch (const std::runtime_error& e) {
             caught = true;
-            REQUIRE(std::string(e.what()) == "task error");
+            message = e.what();
         }
-        REQUIRE(caught);
+        co_return observation{caught, std::move(message)};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.caught);
+    REQUIRE(observed.message == "task error");
 }

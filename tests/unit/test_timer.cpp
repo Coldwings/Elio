@@ -4,10 +4,15 @@
 #include <elio/runtime/affinity.hpp>
 #include <elio/runtime/scheduler.hpp>
 
+#include "../test_main.cpp"
+
 #include <chrono>
 #include <atomic>
+#include <exception>
 #include <limits>
+#include <optional>
 #include <string_view>
+#include <utility>
 
 using namespace elio::time;
 using namespace elio::coro;
@@ -26,35 +31,63 @@ void spawn_task(scheduler& sched, F&& f) {
     sched.go(std::forward<F>(f));
 }
 
+namespace {
+
+template<typename T>
+struct join_completion {
+    bool ready = false;
+    bool destroyed = false;
+    std::optional<T> value;
+    std::exception_ptr exception;
+};
+
+template<typename T>
+join_completion<T> collect_join_completion(join_handle<T>& handle) {
+    join_completion<T> result;
+    result.ready = handle.is_ready();
+    result.destroyed = handle.is_destroyed();
+    if (!result.ready || !result.destroyed) return result;
+
+    try {
+        result.value.emplace(handle.await_resume());
+    } catch (...) {
+        result.exception = std::current_exception();
+    }
+    return result;
+}
+
+void rethrow_join_exception(const std::exception_ptr& exception) {
+    if (exception) std::rethrow_exception(exception);
+}
+
+} // namespace
+
 TEST_CASE("sleep_for basic", "[time][sleep]") {
-    std::atomic<bool> completed{false};
-    
-    auto sleep_task = [&]() -> task<void> {
+    struct observation {
+        std::chrono::steady_clock::duration elapsed;
+    };
+
+    auto sleep_task = []() -> task<observation> {
         auto start = std::chrono::steady_clock::now();
         co_await sleep_for(50ms);
         auto elapsed = std::chrono::steady_clock::now() - start;
-        
-        // Timer expiry must not resume the task before its deadline.
-        REQUIRE(elapsed >= 50ms);
-        
-        completed = true;
+        co_return observation{elapsed};
     };
-    
+
     scheduler sched(1);
     sched.start();
-    
-    {
-        spawn_task(sched, sleep_task);  // Transfer ownership to scheduler
-    }
-    
-    // Wait for completion
-    for (int i = 0; i < 50 && !completed; ++i) {
-        std::this_thread::sleep_for(10ms);
-    }
-    
-    sched.shutdown();
-    
-    REQUIRE(completed);
+
+    auto handle = sched.go_joinable(sleep_task);
+    const bool drained = sched.shutdown(elio::test::scaled_sec(5));
+    auto completion = collect_join_completion(handle);
+
+    REQUIRE(drained);
+    REQUIRE(completion.ready);
+    REQUIRE(completion.destroyed);
+    REQUIRE_NOTHROW(rethrow_join_exception(completion.exception));
+    REQUIRE(completion.value.has_value());
+    // Timer expiry must not resume the task before its deadline.
+    REQUIRE(completion.value->elapsed >= 50ms);
 }
 
 TEST_CASE("sleep_for zero duration", "[time][sleep]") {
@@ -157,67 +190,63 @@ TEST_CASE("yield execution", "[time][yield]") {
 }
 
 TEST_CASE("multiple sleeps sequential", "[time][sleep]") {
-    std::atomic<bool> completed{false};
-    
-    auto multi_sleep = [&]() -> task<void> {
-        auto start = std::chrono::steady_clock::now();
-        
-        co_await sleep_for(20ms);
-        co_await sleep_for(20ms);
-        co_await sleep_for(20ms);
-        
-        auto elapsed = std::chrono::steady_clock::now() - start;
-        
-        // Should have waited approximately 60ms total
-        REQUIRE(elapsed >= 50ms);
-        
-        completed = true;
+    struct observation {
+        std::chrono::steady_clock::duration elapsed;
     };
-    
+
+    auto multi_sleep = []() -> task<observation> {
+        auto start = std::chrono::steady_clock::now();
+
+        co_await sleep_for(20ms);
+        co_await sleep_for(20ms);
+        co_await sleep_for(20ms);
+
+        auto elapsed = std::chrono::steady_clock::now() - start;
+        co_return observation{elapsed};
+    };
+
     scheduler sched(1);
     sched.start();
-    
-    {
-        spawn_task(sched, multi_sleep);
-    }
-    
-    for (int i = 0; i < 100 && !completed; ++i) {
-        std::this_thread::sleep_for(10ms);
-    }
-    
-    sched.shutdown();
-    
-    REQUIRE(completed);
+
+    auto handle = sched.go_joinable(multi_sleep);
+    const bool drained = sched.shutdown(elio::test::scaled_sec(5));
+    auto completion = collect_join_completion(handle);
+
+    REQUIRE(drained);
+    REQUIRE(completion.ready);
+    REQUIRE(completion.destroyed);
+    REQUIRE_NOTHROW(rethrow_join_exception(completion.exception));
+    REQUIRE(completion.value.has_value());
+    // Should have waited approximately 60ms total.
+    REQUIRE(completion.value->elapsed >= 50ms);
 }
 
 TEST_CASE("sleep_until", "[time][sleep]") {
-    std::atomic<bool> completed{false};
-    
-    auto sleep_until_task = [&]() -> task<void> {
+    struct observation {
+        std::chrono::steady_clock::time_point target;
+        std::chrono::steady_clock::time_point resumed_at;
+    };
+
+    auto sleep_until_task = []() -> task<observation> {
         auto target = std::chrono::steady_clock::now() + 50ms;
         co_await sleep_until(target);
-        
-        auto now = std::chrono::steady_clock::now();
-        // Should have waited until approximately the target time
-        REQUIRE(now >= target - 10ms);
-        
-        completed = true;
+        co_return observation{target, std::chrono::steady_clock::now()};
     };
-    
+
     scheduler sched(1);
     sched.start();
-    
-    {
-        spawn_task(sched, sleep_until_task);
-    }
-    
-    for (int i = 0; i < 100 && !completed; ++i) {
-        std::this_thread::sleep_for(10ms);
-    }
-    
-    sched.shutdown();
-    
-    REQUIRE(completed);
+
+    auto handle = sched.go_joinable(sleep_until_task);
+    const bool drained = sched.shutdown(elio::test::scaled_sec(5));
+    auto completion = collect_join_completion(handle);
+
+    REQUIRE(drained);
+    REQUIRE(completion.ready);
+    REQUIRE(completion.destroyed);
+    REQUIRE_NOTHROW(rethrow_join_exception(completion.exception));
+    REQUIRE(completion.value.has_value());
+    // Should have waited until approximately the target time.
+    REQUIRE(completion.value->resumed_at >= completion.value->target - 10ms);
 }
 
 TEST_CASE("sleep_until past time", "[time][sleep]") {

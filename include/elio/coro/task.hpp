@@ -308,11 +308,8 @@ public:
     }
 
     T await_resume() {
-        // Keep join_state alive during get_value() execution.
-        // get_value() may rethrow an exception, and the catch block needs
-        // to access the exception object. If join_handle is destroyed before
-        // the catch block completes, join_state would be destroyed, potentially
-        // causing the exception object to be freed while still being accessed.
+        // Pin join_state through get_value(). If it rethrows, the exception
+        // runtime, not this local, keeps the object alive through its handlers.
         auto state = state_;
         return state->get_value();
     }
@@ -387,11 +384,8 @@ public:
     }
 
     void await_resume() {
-        // Keep join_state alive during get_value() execution.
-        // get_value() may rethrow an exception, and the catch block needs
-        // to access the exception object. If join_handle is destroyed before
-        // the catch block completes, join_state would be destroyed, potentially
-        // causing the exception object to be freed while still being accessed.
+        // Pin join_state through get_value(). If it rethrows, the exception
+        // runtime, not this local, keeps the object alive through its handlers.
         auto state = state_;
         state->get_value();
     }

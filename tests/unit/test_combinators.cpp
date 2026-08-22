@@ -1416,30 +1416,52 @@ TEST_CASE("combinators return move-only lazy tasks",
     STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<AnyTask>);
 
     std::atomic<bool> invoked{false};
-    auto test = [&]() -> task<void> {
+
+    struct observation {
+        bool invoked_before_await = true;
+        int value = 0;
+        bool invoked_after_await = false;
+    };
+
+    auto test = [&]() -> task<observation> {
         auto pending = when_all([&]() -> task<int> {
             invoked.store(true, std::memory_order_release);
             co_return 42;
         });
-        REQUIRE_FALSE(invoked.load(std::memory_order_acquire));
+        const bool invoked_before_await =
+            invoked.load(std::memory_order_acquire);
         auto [value] = co_await pending;
-        REQUIRE(value == 42);
-        REQUIRE(invoked.load(std::memory_order_acquire));
+        co_return observation{
+            invoked_before_await,
+            value,
+            invoked.load(std::memory_order_acquire),
+        };
     };
 
     runtime::scheduler sched(1);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE_FALSE(observed.invoked_before_await);
+    REQUIRE(observed.value == 42);
+    REQUIRE(observed.invoked_after_await);
 }
 
 TEST_CASE("when_all and when_any return move-only result values",
           "[sync][combinators][ownership]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        int all_value = 0;
+        std::size_t any_index = static_cast<std::size_t>(-1);
+        int any_value = 0;
+    };
+
+    auto test = []() -> task<observation> {
         auto [all_value] = co_await when_all(
             []() -> task<std::unique_ptr<int>> {
                 co_return std::make_unique<int>(20);
             });
-        REQUIRE(*all_value == 20);
 
         auto [index, any_value] = co_await when_any(
             []() -> task<std::unique_ptr<int>> {
@@ -1450,13 +1472,18 @@ TEST_CASE("when_all and when_any return move-only result values",
                     scaled_ms(100), std::move(token));
                 co_return std::make_unique<int>(0);
             });
-        REQUIRE(index == 0);
-        REQUIRE(*any_value == 22);
+        co_return observation{*all_value, index, *any_value};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.all_value == 20);
+    REQUIRE(observed.any_index == 0);
+    REQUIRE(observed.any_value == 22);
 }
 
 // --- with_timeout tests ---
@@ -1650,9 +1677,13 @@ TEST_CASE("with_timeout waits for token-ignoring work after expiry",
     sync::event release_child;
     std::atomic<bool> timeout_returned{false};
 
+    struct observation {
+        bool timed_out = false;
+    };
+
     runtime::scheduler sched(2);
     sched.start();
-    auto owner = sched.go_joinable([&]() -> task<void> {
+    auto owner = sched.go_joinable([&]() -> task<observation> {
         auto result = co_await with_timeout(
             scaled_ms(1),
             [&]() -> task<int> {
@@ -1660,8 +1691,8 @@ TEST_CASE("with_timeout waits for token-ignoring work after expiry",
                 co_await release_child.wait();
                 co_return 42;
             });
-        REQUIRE(result.timed_out);
         timeout_returned.store(true, std::memory_order_release);
+        co_return observation{result.timed_out};
     });
 
     REQUIRE(wait_for_flag(child_started));
@@ -1669,10 +1700,11 @@ TEST_CASE("with_timeout waits for token-ignoring work after expiry",
     REQUIRE_FALSE(timeout_returned.load(std::memory_order_acquire));
     REQUIRE_FALSE(owner.is_ready());
     release_child.set();
-    owner.wait_destroyed();
-    REQUIRE_NOTHROW(owner.await_resume());
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.timed_out);
     REQUIRE(timeout_returned.load(std::memory_order_acquire));
-    sched.shutdown();
 }
 
 TEST_CASE("pre-cancelled with_timeout is not reported as expiry",

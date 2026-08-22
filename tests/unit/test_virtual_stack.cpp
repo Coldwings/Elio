@@ -113,24 +113,39 @@ TEST_CASE("Virtual stack dump", "[virtual_stack]") {
 TEST_CASE("Thread-local virtual stacks are independent", "[virtual_stack]") {
     promise_base main_frame;
     REQUIRE(get_stack_depth() == 1);
+
+    struct worker_observation {
+        bool initial_frame_is_null = false;
+        size_t initial_depth = 0;
+        size_t first_frame_depth = 0;
+        size_t nested_frame_depth = 0;
+        size_t final_depth = 0;
+    } observed;
     
     std::thread worker([&]() {
         // Worker thread should have empty stack
-        REQUIRE(promise_base::current_frame() == nullptr);
-        REQUIRE(get_stack_depth() == 0);
+        observed.initial_frame_is_null =
+            promise_base::current_frame() == nullptr;
+        observed.initial_depth = get_stack_depth();
         
         promise_base worker_frame1;
-        REQUIRE(get_stack_depth() == 1);
+        observed.first_frame_depth = get_stack_depth();
         
         {
             promise_base worker_frame2;
-            REQUIRE(get_stack_depth() == 2);
+            observed.nested_frame_depth = get_stack_depth();
         }
         
-        REQUIRE(get_stack_depth() == 1);
+        observed.final_depth = get_stack_depth();
     });
     
     worker.join();
+
+    REQUIRE(observed.initial_frame_is_null);
+    REQUIRE(observed.initial_depth == 0);
+    REQUIRE(observed.first_frame_depth == 1);
+    REQUIRE(observed.nested_frame_depth == 2);
+    REQUIRE(observed.final_depth == 1);
     
     // Main thread stack should be unchanged
     REQUIRE(get_stack_depth() == 1);
@@ -141,22 +156,32 @@ TEST_CASE("Multiple concurrent stacks in different threads", "[virtual_stack]") 
     std::vector<std::thread> threads;
     const int num_threads = 5;
     const int stack_depth = 10;
+    std::vector<std::vector<size_t>> observed_depths(
+        num_threads, std::vector<size_t>(stack_depth));
+    std::vector<size_t> final_depths(num_threads);
     
     for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back([stack_depth]() {
+        threads.emplace_back([&, i]() {
             std::vector<std::unique_ptr<promise_base>> frames;
             frames.reserve(stack_depth);
             
             for (int j = 0; j < stack_depth; ++j) {
                 frames.push_back(std::make_unique<promise_base>());
-                REQUIRE(get_stack_depth() == static_cast<size_t>(j + 1));
+                observed_depths[i][j] = get_stack_depth();
             }
             
-            REQUIRE(get_stack_depth() == static_cast<size_t>(stack_depth));
+            final_depths[i] = get_stack_depth();
         });
     }
     
     for (auto& t : threads) {
         t.join();
+    }
+
+    for (int i = 0; i < num_threads; ++i) {
+        for (int j = 0; j < stack_depth; ++j) {
+            REQUIRE(observed_depths[i][j] == static_cast<size_t>(j + 1));
+        }
+        REQUIRE(final_depths[i] == static_cast<size_t>(stack_depth));
     }
 }

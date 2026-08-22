@@ -101,6 +101,9 @@ TEST_CASE("LockfreeMPMCRing concurrent SPSC", "[common][lockfree_ring][concurren
     constexpr int NUM_ITEMS = 10000;
     std::atomic<bool> producer_done{false};
     std::atomic<int> items_received{0};
+    bool mismatch_observed = false;
+    int first_mismatch_expected = 0;
+    int first_mismatch_actual = 0;
 
     std::thread producer([&]() {
         for (int i = 0; i < NUM_ITEMS; ++i) {
@@ -116,7 +119,11 @@ TEST_CASE("LockfreeMPMCRing concurrent SPSC", "[common][lockfree_ring][concurren
         while (received < NUM_ITEMS) {
             auto val = ring.try_pop();
             if (val.has_value()) {
-                REQUIRE(*val == received);
+                if (*val != received && !mismatch_observed) {
+                    mismatch_observed = true;
+                    first_mismatch_expected = received;
+                    first_mismatch_actual = *val;
+                }
                 received++;
             } else {
                 std::this_thread::yield();
@@ -130,6 +137,8 @@ TEST_CASE("LockfreeMPMCRing concurrent SPSC", "[common][lockfree_ring][concurren
 
     REQUIRE(producer_done.load());
     REQUIRE(items_received.load() == NUM_ITEMS);
+    CAPTURE(first_mismatch_expected, first_mismatch_actual);
+    REQUIRE_FALSE(mismatch_observed);
 }
 
 TEST_CASE("LockfreeMPMCRing concurrent MPMC", "[common][lockfree_ring][concurrent]") {

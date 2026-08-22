@@ -1507,86 +1507,131 @@ TEST_CASE("ELIO_GO_TO macro pins task to worker", "[task][spawn][affinity]") {
 TEST_CASE("elio::spawn() returns joinable handle", "[task][spawn][join_handle]") {
     scheduler sched(2);
     sched.start();
-    
-    std::atomic<bool> completed{false};
-    
+
+    struct observation {
+        bool completed = false;
+        int result = 0;
+    } observed;
+
     auto compute = []() -> task<int> {
         co_return 100;
     };
-    
+
     auto driver = [&]() -> task<void> {
         auto handle = elio::spawn(compute);
-        int result = co_await handle;
-        REQUIRE(result == 100);
-        completed.store(true);
+        observed.result = co_await handle;
+        observed.completed = true;
+        co_return;
     };
-    
-    elio::go(driver);
-    
-    std::this_thread::sleep_for(scaled_ms(200));
-    
-    REQUIRE(completed.load());
-    
-    sched.shutdown();
+
+    auto root = sched.go_joinable(driver);
+    const bool ready_before_shutdown = wait_for_task_condition(
+        [&] { return root.is_ready(); });
+    const bool drained = sched.shutdown(scaled_sec(5));
+    const bool root_ready = root.is_ready();
+    const bool root_destroyed = root.is_destroyed();
+    const auto result = observed;
+
+    CAPTURE(ready_before_shutdown, drained, root_ready, root_destroyed,
+            result.completed, result.result);
+    REQUIRE(ready_before_shutdown);
+    REQUIRE(drained);
+    REQUIRE(root_ready);
+    REQUIRE(root_destroyed);
+    REQUIRE_NOTHROW(root.await_resume());
+    REQUIRE(result.completed);
+    REQUIRE(result.result == 100);
 }
 
 TEST_CASE("elio::spawn() with void task returns joinable handle", "[task][spawn][join_handle]") {
     scheduler sched(2);
     sched.start();
-    
-    std::atomic<int> counter{0};
-    std::atomic<bool> completed{false};
-    
+
+    struct observation {
+        bool completed = false;
+        int counter = 0;
+    } observed;
+
     auto work = [&]() -> task<void> {
-        counter.fetch_add(1);
+        ++observed.counter;
         co_return;
     };
-    
+
     auto driver = [&]() -> task<void> {
         auto handle = elio::spawn(work);
         co_await handle;
-        REQUIRE(counter.load() == 1);
-        completed.store(true);
+        observed.completed = true;
+        co_return;
     };
-    
-    elio::go(driver);
-    
-    std::this_thread::sleep_for(scaled_ms(200));
-    
-    REQUIRE(completed.load());
-    
-    sched.shutdown();
+
+    auto root = sched.go_joinable(driver);
+    const bool ready_before_shutdown = wait_for_task_condition(
+        [&] { return root.is_ready(); });
+    const bool drained = sched.shutdown(scaled_sec(5));
+    const bool root_ready = root.is_ready();
+    const bool root_destroyed = root.is_destroyed();
+    const auto result = observed;
+
+    CAPTURE(ready_before_shutdown, drained, root_ready, root_destroyed,
+            result.completed, result.counter);
+    REQUIRE(ready_before_shutdown);
+    REQUIRE(drained);
+    REQUIRE(root_ready);
+    REQUIRE(root_destroyed);
+    REQUIRE_NOTHROW(root.await_resume());
+    REQUIRE(result.completed);
+    REQUIRE(result.counter == 1);
 }
 
 TEST_CASE("join_handle propagates exceptions", "[task][spawn][join_handle]") {
     scheduler sched(2);
     sched.start();
-    
-    std::atomic<bool> caught_exception{false};
-    
+
     auto thrower = []() -> task<int> {
         throw std::runtime_error("spawn error");
         co_return 0;
     };
-    
+
     auto catcher = [&]() -> task<void> {
-        try {
-            auto handle = elio::spawn(thrower);
-            co_await handle;
-            FAIL("Should have thrown");
-        } catch (const std::runtime_error& e) {
-            REQUIRE(std::string(e.what()) == "spawn error");
-            caught_exception.store(true);
-        }
+        auto handle = elio::spawn(thrower);
+        co_await handle;
+        co_return;
     };
-    
-    elio::go(catcher);
-    
-    std::this_thread::sleep_for(scaled_ms(200));
-    
-    REQUIRE(caught_exception.load());
-    
-    sched.shutdown();
+
+    auto root = sched.go_joinable(catcher);
+    const bool ready_before_shutdown = wait_for_task_condition(
+        [&] { return root.is_ready(); });
+    const bool drained = sched.shutdown(scaled_sec(5));
+    const bool root_ready = root.is_ready();
+    const bool root_destroyed = root.is_destroyed();
+
+    enum class exception_outcome {
+        pending,
+        returned,
+        caught_expected,
+        caught_unexpected,
+    } outcome = exception_outcome::pending;
+    std::string message;
+    if (root_ready && root_destroyed) {
+        try {
+            root.await_resume();
+            outcome = exception_outcome::returned;
+        } catch (const std::runtime_error& e) {
+            outcome = exception_outcome::caught_expected;
+            message = e.what();
+        } catch (...) {
+            outcome = exception_outcome::caught_unexpected;
+        }
+    }
+
+    CAPTURE(ready_before_shutdown, drained, root_ready, root_destroyed,
+            static_cast<int>(outcome), message);
+    REQUIRE(ready_before_shutdown);
+    REQUIRE(drained);
+    REQUIRE(root_ready);
+    REQUIRE(root_destroyed);
+    REQUIRE(outcome == exception_outcome::caught_expected);
+    REQUIRE(message == "spawn error");
 }
 
 TEST_CASE("multiple elio::spawn() tasks run concurrently", "[task][spawn][join_handle]") {

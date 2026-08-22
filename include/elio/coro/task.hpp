@@ -60,10 +60,12 @@ struct final_awaiter {
             // Keep the externally owned join state after freeing the frame so
             // wait_destroyed() observes completed parameter/capture teardown.
             auto join_state = std::move(h.promise().join_state_);
-            // If this detached task threw an unhandled exception, report it
-            // via the scheduler's exception handler (or default log ERROR).
-            if (auto ex = h.promise().exception()) {
-                runtime::report_detached_exception(std::move(ex));
+            // Runtime ownership also covers joinable tasks. Only fire-and-
+            // forget tasks lack a join state through which to observe errors.
+            if (!join_state) {
+                if (auto ex = h.promise().exception()) {
+                    runtime::report_detached_exception(std::move(ex));
+                }
             }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
             if (join_state &&

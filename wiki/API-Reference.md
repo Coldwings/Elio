@@ -235,6 +235,15 @@ lambda or member callable: the wrapper owns that callable while its returned
 coroutine executes, including implementations whose frame retains the callable
 through `this`.
 
+An accepted joinable task from `spawn()`, `scheduler::go_joinable()`, or
+`scheduler::go_joinable_to()` retains a failure for
+`join_handle::await_resume()`; it does not also route that failure to the
+scheduler unhandled-exception handler. Destroying the handle without observing
+it intentionally discards the result or exception and does not convert the
+task to fire-and-forget reporting. By contrast, an exception escaping a `go()`
+or `go_to()` task is reported through the handler because those APIs provide no
+observation handle.
+
 #### Spawn Macros
 
 For inline coroutine expressions:

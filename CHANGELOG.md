@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Joinable-task exception disposition**: `spawn()`, `go_joinable()`, and
+  `go_joinable_to()` now retain failures solely for observation through their
+  join handles instead of also routing them to the scheduler unhandled-
+  exception handler. Deliberately discarding a join handle continues to
+  discard its result and exception. Among these scheduler submission APIs,
+  only fire-and-forget tasks report escaping failures through the handler
+  (#1119).
 - **Bounded-channel receive revalidation**: A blocking receive that observed an
   empty ring now rechecks it under the channel mutex before selecting a queued
   sender or closed state. Values committed during that transition can no longer

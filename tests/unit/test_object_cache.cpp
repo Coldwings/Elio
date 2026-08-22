@@ -4,12 +4,17 @@
 #include <elio/coro/task.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/time/timer.hpp>
+#include "../test_main.cpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace elio::sync;
@@ -48,6 +53,283 @@ struct TrackedValue {
 
 std::atomic<int> TrackedValue::ctor_count{0};
 std::atomic<int> TrackedValue::dtor_count{0};
+
+class temporary_cache_key {
+public:
+    temporary_cache_key()
+        : value_(std::make_unique<std::string>()) {}
+
+    explicit temporary_cache_key(
+        std::string value,
+        std::shared_ptr<int> lifetime = {})
+        : value_(std::make_unique<std::string>(std::move(value)))
+        , lifetime_(std::move(lifetime)) {}
+
+    temporary_cache_key(const temporary_cache_key& other)
+        : value_(std::make_unique<std::string>(other.value()))
+        , lifetime_(other.lifetime_) {}
+
+    temporary_cache_key& operator=(const temporary_cache_key& other) {
+        value_ = std::make_unique<std::string>(other.value());
+        lifetime_ = other.lifetime_;
+        return *this;
+    }
+
+    temporary_cache_key(temporary_cache_key&&) noexcept = default;
+    temporary_cache_key& operator=(temporary_cache_key&&) noexcept = default;
+
+    const std::string& value() const { return *value_; }
+
+private:
+    std::unique_ptr<std::string> value_;
+    std::shared_ptr<int> lifetime_;
+};
+
+struct temporary_cache_key_hash {
+    size_t operator()(const temporary_cache_key& key) const {
+        return std::hash<std::string>{}(key.value());
+    }
+};
+
+struct temporary_cache_key_equal {
+    bool operator()(const temporary_cache_key& lhs,
+                    const temporary_cache_key& rhs) const {
+        return lhs.value() == rhs.value();
+    }
+};
+
+class temporary_move_only_factory {
+public:
+    explicit temporary_move_only_factory(
+        int value,
+        std::shared_ptr<int> lifetime = {})
+        : value_(std::make_unique<int>(value))
+        , lifetime_(std::move(lifetime)) {}
+
+    temporary_move_only_factory(temporary_move_only_factory&&) noexcept = default;
+    temporary_move_only_factory& operator=(temporary_move_only_factory&&) noexcept = default;
+    temporary_move_only_factory(const temporary_move_only_factory&) = delete;
+    temporary_move_only_factory& operator=(const temporary_move_only_factory&) = delete;
+
+    task<int> operator()() & = delete;
+    task<int> operator()() const& = delete;
+    task<int> operator()() && { return make_value(*value_); }
+
+private:
+    static task<int> make_value(int value) { co_return value; }
+
+    std::unique_ptr<int> value_;
+    std::shared_ptr<int> lifetime_;
+};
+
+class copy_only_cache_key {
+public:
+    copy_only_cache_key() = default;
+    explicit copy_only_cache_key(std::string value) : value_(std::move(value)) {}
+
+    copy_only_cache_key(const copy_only_cache_key&) = default;
+    copy_only_cache_key& operator=(const copy_only_cache_key&) = default;
+    copy_only_cache_key(copy_only_cache_key&&) = delete;
+    copy_only_cache_key& operator=(copy_only_cache_key&&) = delete;
+
+    const std::string& value() const noexcept { return value_; }
+
+private:
+    std::string value_;
+};
+
+struct copy_only_cache_key_hash {
+    size_t operator()(const copy_only_cache_key& key) const {
+        return std::hash<std::string>{}(key.value());
+    }
+};
+
+struct copy_only_cache_key_equal {
+    bool operator()(const copy_only_cache_key& lhs,
+                    const copy_only_cache_key& rhs) const {
+        return lhs.value() == rhs.value();
+    }
+};
+
+class copy_only_factory {
+public:
+    explicit copy_only_factory(int value) : value_(value) {}
+
+    copy_only_factory(const copy_only_factory&) = default;
+    copy_only_factory& operator=(const copy_only_factory&) = default;
+    copy_only_factory(copy_only_factory&&) = delete;
+    copy_only_factory& operator=(copy_only_factory&&) = delete;
+
+    task<int> operator()() & { co_return value_; }
+
+private:
+    int value_;
+};
+
+struct cvref_factory {
+    int* observed = nullptr;
+
+    task<int> operator()() & {
+        *observed = 1;
+        return make_value(11);
+    }
+
+    task<int> operator()() const& {
+        *observed = 2;
+        return make_value(22);
+    }
+
+    task<int> operator()() && {
+        *observed = 3;
+        return make_value(33);
+    }
+
+    task<int> operator()() const&& {
+        *observed = 4;
+        return make_value(44);
+    }
+
+private:
+    static task<int> make_value(int value) { co_return value; }
+};
+
+struct reference_counting_factory {
+    int* calls = nullptr;
+
+    task<int> operator()() {
+        ++*calls;
+        co_return 91;
+    }
+};
+
+TEST_CASE("object_cache owns stored get arguments",
+          "[object_cache][lifetime][regression]") {
+    using key_cache_type = object_cache<
+        temporary_cache_key, int,
+        temporary_cache_key_hash, temporary_cache_key_equal>;
+
+    std::weak_ptr<int> key_lifetime;
+    std::weak_ptr<int> factory_lifetime;
+
+    {
+        scheduler sched(1);
+        {
+            key_cache_type key_cache;
+
+            auto key_token = std::make_shared<int>(1);
+            auto factory_token = std::make_shared<int>(2);
+            key_lifetime = key_token;
+            factory_lifetime = factory_token;
+
+            auto pending = key_cache.get(
+                temporary_cache_key("temporary-key", std::move(key_token)),
+                temporary_move_only_factory(73, std::move(factory_token)));
+
+            const bool key_owned = !key_lifetime.expired();
+            const bool factory_owned = !factory_lifetime.expired();
+            CAPTURE(key_owned, factory_owned);
+            REQUIRE(key_owned);
+            REQUIRE(factory_owned);
+
+            sched.start();
+            auto h = sched.go_joinable(std::move(pending));
+
+            h.wait_destroyed();
+            auto borrowed = h.await_resume();
+            REQUIRE(*borrowed == 73);
+            REQUIRE(key_cache.size() == 1);
+            REQUIRE(factory_lifetime.expired());
+        }
+        REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+    }
+
+    REQUIRE(key_lifetime.expired());
+    REQUIRE(factory_lifetime.expired());
+}
+
+TEST_CASE("object_cache preserves get constructor invocation category",
+          "[object_cache][lifetime]") {
+    scheduler sched(1);
+    sched.start();
+
+    std::array<int, 4> observed{};
+    std::array<int, 4> values{};
+    int ref_calls = 0;
+    int ref_value = 0;
+
+    {
+        object_cache<std::string, int> cache;
+
+        auto h = spawn_joinable(sched, [&]() -> task<void> {
+            cvref_factory lvalue_factory{&observed[0]};
+            auto lvalue = co_await cache.get("lvalue", lvalue_factory);
+            values[0] = *lvalue;
+
+            const cvref_factory const_lvalue_factory{&observed[1]};
+            auto const_lvalue = co_await cache.get(
+                "const-lvalue", const_lvalue_factory);
+            values[1] = *const_lvalue;
+
+            auto rvalue = co_await cache.get(
+                "rvalue", cvref_factory{&observed[2]});
+            values[2] = *rvalue;
+
+            const cvref_factory const_rvalue_factory{&observed[3]};
+            auto const_rvalue = co_await cache.get(
+                "const-rvalue", std::move(const_rvalue_factory));
+            values[3] = *const_rvalue;
+
+            reference_counting_factory ref_factory{&ref_calls};
+            auto ref_borrow = co_await cache.get("ref", std::ref(ref_factory));
+            ref_value = *ref_borrow;
+        });
+
+        h.wait_destroyed();
+        REQUIRE_NOTHROW(h.await_resume());
+    }
+
+    REQUIRE(observed[0] == 1);
+    REQUIRE(observed[1] == 2);
+    REQUIRE(observed[2] == 3);
+    REQUIRE(observed[3] == 4);
+    REQUIRE(values[0] == 11);
+    REQUIRE(values[1] == 22);
+    REQUIRE(values[2] == 33);
+    REQUIRE(values[3] == 44);
+    REQUIRE(ref_calls == 1);
+    REQUIRE(ref_value == 91);
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("object_cache accepts copy-only get lvalues",
+          "[object_cache][lifetime]") {
+    using cache_type = object_cache<
+        copy_only_cache_key, int,
+        copy_only_cache_key_hash, copy_only_cache_key_equal>;
+
+    scheduler sched(1);
+    sched.start();
+
+    copy_only_cache_key key("copy-only");
+    copy_only_factory factory(58);
+    int result = 0;
+
+    {
+        cache_type cache;
+
+        auto h = spawn_joinable(sched, [&]() -> task<void> {
+            auto borrowed = co_await cache.get(key, factory);
+            result = *borrowed;
+        });
+
+        h.wait_destroyed();
+        REQUIRE_NOTHROW(h.await_resume());
+        REQUIRE(result == 58);
+        REQUIRE(cache.size() == 1);
+    }
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
 
 TEST_CASE("object_cache basic get-or-create", "[object_cache]") {
     scheduler sched(1);

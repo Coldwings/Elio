@@ -357,6 +357,7 @@ TEST_CASE("when_all reports secondary exceptions after drain",
     std::atomic<int> reported{0};
     std::string secondary_message;
     std::string primary_message;
+    int reported_before_owner_completion = 0;
 
     runtime::scheduler sched(2);
     sched.set_unhandled_exception_handler(
@@ -389,11 +390,13 @@ TEST_CASE("when_all reports secondary exceptions after drain",
         } catch (const std::runtime_error& error) {
             primary_message = error.what();
         }
+        reported_before_owner_completion =
+            reported.load(std::memory_order_acquire);
     });
 
     owner.wait_destroyed();
     REQUIRE_NOTHROW(owner.await_resume());
-    REQUIRE(reported.load(std::memory_order_acquire) == 1);
+    REQUIRE(reported_before_owner_completion == 1);
     REQUIRE(primary_message != secondary_message);
     REQUIRE((primary_message == "first branch failure" ||
              primary_message == "second branch failure"));
@@ -526,6 +529,7 @@ TEST_CASE("when_all launch failure takes precedence over child failure",
     std::atomic<bool> completed{false};
     bool launch_failure_caught = false;
     std::string caught_message;
+    bool child_failure_reported_before_completion = false;
 
     runtime::scheduler sched(4);
     sched.set_unhandled_exception_handler(
@@ -570,6 +574,8 @@ TEST_CASE("when_all launch failure takes precedence over child failure",
             launch_failure_caught = true;
             caught_message = error.what();
         }
+        child_failure_reported_before_completion =
+            child_failure_reported.load(std::memory_order_acquire);
         completed.store(true, std::memory_order_release);
     });
 
@@ -590,7 +596,7 @@ TEST_CASE("when_all launch failure takes precedence over child failure",
     REQUIRE_NOTHROW(owner.await_resume());
     REQUIRE(launch_failure_caught);
     REQUIRE(caught_message == "launch move failed");
-    REQUIRE(child_failure_reported.load(std::memory_order_acquire));
+    REQUIRE(child_failure_reported_before_completion);
 }
 
 // --- when_any tests ---

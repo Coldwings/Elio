@@ -2743,24 +2743,39 @@ TEST_CASE("read_frame_bounded rejects oversized payload header",
 
     scheduler sched(2);
     sched.start();
+    coro::cancel_source accept_cancel;
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
+    std::atomic<int> server_accept_errno{0};
+    std::atomic<bool> client_connected{false};
+    std::atomic<int> client_connect_errno{0};
     std::atomic<bool> rejected{false};
 
     sched.go([&]() -> coro::task<void> {
-        auto stream = co_await listener_opt->accept();
-        REQUIRE(stream.has_value());
+        auto stream = co_await listener_opt->accept(accept_cancel.get_token());
+        if (!stream) {
+            server_accept_errno.store(errno, std::memory_order_release);
+            server_done.store(true, std::memory_order_release);
+            co_return;
+        }
+        server_accepted.store(true, std::memory_order_release);
 
         // Cap at 1 KiB, then attempt to read a frame whose header claims
         // 16 MiB of payload. Must return nullopt without allocating.
         auto frame = co_await elio::rpc::read_frame_bounded(*stream, 1024);
-        if (!frame) rejected = true;
-        server_done = true;
+        if (!frame) rejected.store(true, std::memory_order_release);
+        server_done.store(true, std::memory_order_release);
     });
 
     sched.go([&]() -> coro::task<void> {
         auto client = co_await tcp_connect(ipv6_address("::1", port));
-        REQUIRE(client.has_value());
+        if (!client) {
+            client_connect_errno.store(errno, std::memory_order_release);
+            accept_cancel.cancel();
+            co_return;
+        }
+        client_connected.store(true, std::memory_order_release);
 
         // Send a header claiming 1 MiB payload; bounded cap is 1 KiB.
         elio::rpc::frame_header hdr;
@@ -2778,10 +2793,15 @@ TEST_CASE("read_frame_bounded rejects oversized payload header",
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    sched.shutdown();
-
-    REQUIRE(server_done);
-    REQUIRE(rejected);
+    INFO("server accept errno="
+         << server_accept_errno.load(std::memory_order_acquire));
+    INFO("client connect errno="
+         << client_connect_errno.load(std::memory_order_acquire));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+    REQUIRE(server_accepted.load(std::memory_order_acquire));
+    REQUIRE(client_connected.load(std::memory_order_acquire));
+    REQUIRE(server_done.load(std::memory_order_acquire));
+    REQUIRE(rejected.load(std::memory_order_acquire));
 }
 
 TEST_CASE("rpc_session frame_read_timeout fires on slow-loris peer",
@@ -2807,19 +2827,34 @@ TEST_CASE("rpc_session frame_read_timeout fires on slow-loris peer",
 
     scheduler sched(2);
     sched.start();
+    coro::cancel_source accept_cancel;
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
+    std::atomic<int> server_accept_errno{0};
+    std::atomic<bool> client_connected{false};
+    std::atomic<int> client_connect_errno{0};
 
     sched.go([&]() -> coro::task<void> {
-        auto stream = co_await listener_opt->accept();
-        REQUIRE(stream.has_value());
+        auto stream = co_await listener_opt->accept(accept_cancel.get_token());
+        if (!stream) {
+            server_accept_errno.store(errno, std::memory_order_release);
+            server_done.store(true, std::memory_order_release);
+            co_return;
+        }
+        server_accepted.store(true, std::memory_order_release);
         co_await server.handle_client(std::move(*stream));
-        server_done = true;
+        server_done.store(true, std::memory_order_release);
     });
 
     sched.go([&]() -> coro::task<void> {
         auto client = co_await tcp_connect(ipv6_address("::1", port));
-        REQUIRE(client.has_value());
+        if (!client) {
+            client_connect_errno.store(errno, std::memory_order_release);
+            accept_cancel.cancel();
+            co_return;
+        }
+        client_connected.store(true, std::memory_order_release);
         // Send only 4 bytes of a frame header (need 18) and stall.
         // Server must close the connection after frame_read_timeout=1s.
         std::array<uint8_t, 4> trickle{};
@@ -2835,8 +2870,14 @@ TEST_CASE("rpc_session frame_read_timeout fires on slow-loris peer",
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    sched.shutdown();
-    REQUIRE(server_done);
+    INFO("server accept errno="
+         << server_accept_errno.load(std::memory_order_acquire));
+    INFO("client connect errno="
+         << client_connect_errno.load(std::memory_order_acquire));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+    REQUIRE(server_accepted.load(std::memory_order_acquire));
+    REQUIRE(client_connected.load(std::memory_order_acquire));
+    REQUIRE(server_done.load(std::memory_order_acquire));
 }
 
 TEST_CASE("rpc_client frame_read_timeout fires on partial response frame",
@@ -3046,13 +3087,16 @@ TEST_CASE("frame arriving near deadline is delivered, not discarded as timeout",
 
     scheduler sched(2);
     sched.start();
+    coro::cancel_source accept_cancel;
 
     constexpr int iterations = 5;
     std::atomic<int> server_done{0};
+    std::atomic<int> client_connected{0};
+    std::atomic<int> client_connect_errno{0};
 
     sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
         for (int i = 0; i < iterations; ++i) {
-            auto stream = co_await lst.accept();
+            auto stream = co_await lst.accept(accept_cancel.get_token());
             if (!stream) co_return;
             // handle_client returns after the connection closes (the client
             // sends one frame then drops the socket; the next read will hit
@@ -3065,7 +3109,12 @@ TEST_CASE("frame arriving near deadline is delivered, not discarded as timeout",
     sched.go([&]() -> coro::task<void> {
         for (int i = 0; i < iterations; ++i) {
             auto client = co_await tcp_connect(ipv6_address("::1", port));
-            REQUIRE(client.has_value());
+            if (!client) {
+                client_connect_errno.store(errno, std::memory_order_release);
+                accept_cancel.cancel();
+                co_return;
+            }
+            client_connected.fetch_add(1, std::memory_order_release);
 
             // Sleep until ~50 ms before the server-side deadline, then send
             // a complete request frame in two back-to-back writes (header
@@ -3099,8 +3148,10 @@ TEST_CASE("frame arriving near deadline is delivered, not discarded as timeout",
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    sched.shutdown();
-
+    INFO("client connect errno="
+         << client_connect_errno.load(std::memory_order_acquire));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+    REQUIRE(client_connected.load(std::memory_order_acquire) == iterations);
     REQUIRE(server_done.load() == iterations);
     REQUIRE(handler_calls.load() == iterations);
 }

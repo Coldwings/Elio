@@ -4,6 +4,9 @@
 #include <elio/coro/task.hpp>
 #include <elio/runtime/scheduler.hpp>
 
+#include <array>
+#include <chrono>
+#include <exception>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -12,26 +15,61 @@
 #include <atomic>
 #include <cerrno>
 #include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "../test_main.cpp"
 
 using namespace elio::io;
 using namespace elio::coro;
 using namespace elio::runtime;
 
-// Helper: run a coroutine on a scheduler and wait for completion
-template<typename F>
-static void run_on_scheduler(F&& coro_factory, int workers = 1) {
+template<typename T>
+struct scheduler_completion {
+    bool drained = false;
+    bool ready = false;
+    bool destroyed = false;
+    std::optional<T> value;
+    std::exception_ptr exception;
+};
+
+// Helper: run a coroutine on a scheduler and collect completion on the test
+// thread so worker coroutines do not call Catch2 runtime macros.
+template<typename T, typename F>
+static scheduler_completion<T> run_on_scheduler(F&& coro_factory,
+                                                int workers = 1) {
     scheduler sched(workers);
     sched.start();
-    std::atomic<bool> done{false};
-    sched.go([&]() -> task<void> {
-        co_await coro_factory();
-        done = true;
-    });
-    for (int i = 0; i < 200 && !done; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    auto handle = sched.go_joinable(std::forward<F>(coro_factory));
+
+    scheduler_completion<T> result;
+    result.drained = sched.shutdown(elio::test::scaled_sec(5));
+    result.ready = handle.is_ready();
+    result.destroyed = handle.is_destroyed();
+    if (!result.ready || !result.destroyed) return result;
+
+    try {
+        result.value.emplace(handle.await_resume());
+    } catch (...) {
+        result.exception = std::current_exception();
     }
-    sched.shutdown();
-    REQUIRE(done);
+    return result;
+}
+
+static void rethrow_scheduler_exception(const std::exception_ptr& exception) {
+    if (exception) std::rethrow_exception(exception);
+}
+
+template<typename T>
+static const T& require_scheduler_value(
+    const scheduler_completion<T>& completion) {
+    REQUIRE(completion.drained);
+    REQUIRE(completion.ready);
+    REQUIRE(completion.destroyed);
+    REQUIRE_NOTHROW(rethrow_scheduler_exception(completion.exception));
+    REQUIRE(completion.value.has_value());
+    return *completion.value;
 }
 
 // ============================================================================
@@ -39,6 +77,13 @@ static void run_on_scheduler(F&& coro_factory, int workers = 1) {
 // ============================================================================
 
 TEST_CASE("batch_read: read multiple segments from file", "[io][batch][read]") {
+    struct observation {
+        std::vector<int> results;
+        std::string first;
+        std::string second;
+        std::string third;
+    };
+
     // Create a temp file with known content
     char tmpfile[] = "/tmp/elio_batch_read_XXXXXX";
     int fd = mkstemp(tmpfile);
@@ -48,7 +93,7 @@ TEST_CASE("batch_read: read multiple segments from file", "[io][batch][read]") {
     ssize_t written = write(fd, content, strlen(content));
     REQUIRE(written == static_cast<ssize_t>(strlen(content)));
 
-    run_on_scheduler([&]() -> task<void> {
+    const auto completion = run_on_scheduler<observation>([&]() -> task<observation> {
         char buf1[16] = {0};
         char buf2[16] = {0};
         char buf3[16] = {0};
@@ -60,15 +105,22 @@ TEST_CASE("batch_read: read multiple segments from file", "[io][batch][read]") {
 
         auto results = co_await batch_read(fd, std::span<const batch_read_segment>(segments));
 
-        REQUIRE(results.size() == 3);
-        REQUIRE(results[0] == 5);
-        REQUIRE(results[1] == 5);
-        REQUIRE(results[2] == 5);
-
-        REQUIRE(std::string(buf1, 5) == "01234");
-        REQUIRE(std::string(buf2, 5) == "56789");
-        REQUIRE(std::string(buf3, 5) == "FGHIJ");
+        co_return observation{
+            results,
+            std::string(buf1, 5),
+            std::string(buf2, 5),
+            std::string(buf3, 5),
+        };
     });
+
+    const auto& observed = require_scheduler_value(completion);
+    REQUIRE(observed.results.size() == 3);
+    REQUIRE(observed.results[0] == 5);
+    REQUIRE(observed.results[1] == 5);
+    REQUIRE(observed.results[2] == 5);
+    REQUIRE(observed.first == "01234");
+    REQUIRE(observed.second == "56789");
+    REQUIRE(observed.third == "FGHIJ");
 
     close(fd);
     unlink(tmpfile);
@@ -76,6 +128,14 @@ TEST_CASE("batch_read: read multiple segments from file", "[io][batch][read]") {
 
 TEST_CASE("batch_read: negative offset uses current file position",
           "[io][batch][read][regression]") {
+    struct observation {
+        std::vector<int> results;
+        std::string explicit_read;
+        std::string current_first;
+        std::string current_second;
+        off_t position = -1;
+    };
+
     char tmpfile[] = "/tmp/elio_batch_read_current_XXXXXX";
     int fd = mkstemp(tmpfile);
     REQUIRE(fd >= 0);
@@ -85,7 +145,7 @@ TEST_CASE("batch_read: negative offset uses current file position",
     REQUIRE(written == static_cast<ssize_t>(strlen(content)));
     REQUIRE(lseek(fd, 10, SEEK_SET) == 10);
 
-    run_on_scheduler([&]() -> task<void> {
+    const auto completion = run_on_scheduler<observation>([&]() -> task<observation> {
         char explicit_buf[8] = {0};
         char current_buf1[8] = {0};
         char current_buf2[8] = {0};
@@ -97,13 +157,22 @@ TEST_CASE("batch_read: negative offset uses current file position",
 
         auto results = co_await batch_read(fd, std::span<const batch_read_segment>(segments));
 
-        const std::vector<int> expected{2, 3, 3};
-        REQUIRE(results == expected);
-        REQUIRE(std::string(explicit_buf, 2) == "01");
-        REQUIRE(std::string(current_buf1, 3) == "ABC");
-        REQUIRE(std::string(current_buf2, 3) == "DEF");
-        REQUIRE(lseek(fd, 0, SEEK_CUR) == 16);
+        co_return observation{
+            results,
+            std::string(explicit_buf, 2),
+            std::string(current_buf1, 3),
+            std::string(current_buf2, 3),
+            lseek(fd, 0, SEEK_CUR),
+        };
     });
+
+    const auto& observed = require_scheduler_value(completion);
+    const std::vector<int> expected{2, 3, 3};
+    REQUIRE(observed.results == expected);
+    REQUIRE(observed.explicit_read == "01");
+    REQUIRE(observed.current_first == "ABC");
+    REQUIRE(observed.current_second == "DEF");
+    REQUIRE(observed.position == 16);
 
     close(fd);
     unlink(tmpfile);
@@ -119,7 +188,7 @@ TEST_CASE("batch_write: write multiple segments to file", "[io][batch][write]") 
     char zeroes[32] = {0};
     REQUIRE(write(fd, zeroes, sizeof(zeroes)) == static_cast<ssize_t>(sizeof(zeroes)));
 
-    run_on_scheduler([&]() -> task<void> {
+    const auto completion = run_on_scheduler<std::vector<int>>([&]() -> task<std::vector<int>> {
         const char* seg1 = "Hello";
         const char* seg2 = "World";
         const char* seg3 = "Test";
@@ -131,11 +200,14 @@ TEST_CASE("batch_write: write multiple segments to file", "[io][batch][write]") 
 
         auto results = co_await batch_write(fd, std::span<const batch_write_segment>(segments));
 
-        REQUIRE(results.size() == 3);
-        REQUIRE(results[0] == 5);
-        REQUIRE(results[1] == 5);
-        REQUIRE(results[2] == 4);
+        co_return results;
     });
+
+    const auto& results = require_scheduler_value(completion);
+    REQUIRE(results.size() == 3);
+    REQUIRE(results[0] == 5);
+    REQUIRE(results[1] == 5);
+    REQUIRE(results[2] == 4);
 
     // Read back and verify content
     char buffer[32] = {0};
@@ -153,6 +225,11 @@ TEST_CASE("batch_write: write multiple segments to file", "[io][batch][write]") 
 
 TEST_CASE("batch_write: negative offset uses current file position",
           "[io][batch][write][regression]") {
+    struct observation {
+        std::vector<int> results;
+        off_t position = -1;
+    };
+
     char tmpfile[] = "/tmp/elio_batch_write_current_XXXXXX";
     int fd = mkstemp(tmpfile);
     REQUIRE(fd >= 0);
@@ -161,16 +238,19 @@ TEST_CASE("batch_write: negative offset uses current file position",
     REQUIRE(write(fd, content, strlen(content)) == static_cast<ssize_t>(strlen(content)));
     REQUIRE(lseek(fd, 5, SEEK_SET) == 5);
 
-    run_on_scheduler([&]() -> task<void> {
+    const auto completion = run_on_scheduler<observation>([&]() -> task<observation> {
         const char* replacement = "XYZ";
         batch_write_segment segment{-1, replacement, 3};
 
         auto results = co_await batch_write(
             fd, std::span<const batch_write_segment>(&segment, 1));
 
-        REQUIRE(results == std::vector<int>{3});
-        REQUIRE(lseek(fd, 0, SEEK_CUR) == 8);
+        co_return observation{results, lseek(fd, 0, SEEK_CUR)};
     });
+
+    const auto& observed = require_scheduler_value(completion);
+    REQUIRE(observed.results == std::vector<int>{3});
+    REQUIRE(observed.position == 8);
 
     char buffer[16] = {0};
     REQUIRE(lseek(fd, 0, SEEK_SET) == 0);
@@ -186,16 +266,23 @@ TEST_CASE("batch_read: empty segments returns empty result", "[io][batch][read]"
     int fd = mkstemp(tmpfile);
     REQUIRE(fd >= 0);
 
-    run_on_scheduler([&]() -> task<void> {
+    const auto completion = run_on_scheduler<bool>([&]() -> task<bool> {
         auto results = co_await batch_read(fd, std::span<const batch_read_segment>{});
-        REQUIRE(results.empty());
+        co_return results.empty();
     });
+
+    REQUIRE(require_scheduler_value(completion));
 
     close(fd);
     unlink(tmpfile);
 }
 
 TEST_CASE("batch_read: single segment works", "[io][batch][read]") {
+    struct observation {
+        std::vector<int> results;
+        std::string content;
+    };
+
     char tmpfile[] = "/tmp/elio_batch_single_XXXXXX";
     int fd = mkstemp(tmpfile);
     REQUIRE(fd >= 0);
@@ -204,17 +291,20 @@ TEST_CASE("batch_read: single segment works", "[io][batch][read]") {
     ssize_t written = write(fd, content, strlen(content));
     REQUIRE(written == static_cast<ssize_t>(strlen(content)));
 
-    run_on_scheduler([&]() -> task<void> {
+    const auto completion = run_on_scheduler<observation>([&]() -> task<observation> {
         char buf[32] = {0};
 
         batch_read_segment seg{0, buf, 13};  // "SingleSegment"
 
         auto results = co_await batch_read(fd, std::span<const batch_read_segment>(&seg, 1));
 
-        REQUIRE(results.size() == 1);
-        REQUIRE(results[0] == 13);
-        REQUIRE(std::string(buf, 13) == "SingleSegment");
+        co_return observation{results, std::string(buf, 13)};
     });
+
+    const auto& observed = require_scheduler_value(completion);
+    REQUIRE(observed.results.size() == 1);
+    REQUIRE(observed.results[0] == 13);
+    REQUIRE(observed.content == "SingleSegment");
 
     close(fd);
     unlink(tmpfile);
@@ -222,7 +312,12 @@ TEST_CASE("batch_read: single segment works", "[io][batch][read]") {
 
 TEST_CASE("batch I/O reports negative errno for failed segments",
           "[io][batch][error][regression]") {
-    run_on_scheduler([]() -> task<void> {
+    struct observation {
+        std::vector<int> read_results;
+        std::vector<int> write_results;
+    };
+
+    const auto completion = run_on_scheduler<observation>([]() -> task<observation> {
         char read_buffer{};
         batch_read_segment read_segment{0, &read_buffer, 1};
         auto read_results = co_await batch_read(
@@ -233,9 +328,12 @@ TEST_CASE("batch I/O reports negative errno for failed segments",
         auto write_results = co_await batch_write(
             -1, std::span<const batch_write_segment>(&write_segment, 1));
 
-        REQUIRE(read_results == std::vector<int>{-EBADF});
-        REQUIRE(write_results == std::vector<int>{-EBADF});
+        co_return observation{read_results, write_results};
     });
+
+    const auto& observed = require_scheduler_value(completion);
+    REQUIRE(observed.read_results == std::vector<int>{-EBADF});
+    REQUIRE(observed.write_results == std::vector<int>{-EBADF});
 }
 
 // ============================================================================
@@ -243,19 +341,26 @@ TEST_CASE("batch I/O reports negative errno for failed segments",
 // ============================================================================
 
 TEST_CASE("file_helpers: write_file and read_file roundtrip", "[io][file_helpers]") {
+    struct observation {
+        bool written = false;
+        std::optional<std::string> content;
+    };
+
     std::string path = "/tmp/elio_file_helpers_" + std::to_string(getpid()) + ".txt";
 
     // Clean up any leftover
     unlink(path.c_str());
 
-    run_on_scheduler([&]() -> task<void> {
+    const auto completion = run_on_scheduler<observation>([&]() -> task<observation> {
         auto written = co_await write_file(path, "Hello, Elio!");
-        REQUIRE(written);
-
         auto content = co_await read_file(path);
-        REQUIRE(content.has_value());
-        REQUIRE(content.value() == "Hello, Elio!");
+        co_return observation{written, content};
     });
+
+    const auto& observed = require_scheduler_value(completion);
+    REQUIRE(observed.written);
+    REQUIRE(observed.content.has_value());
+    REQUIRE(observed.content.value() == "Hello, Elio!");
 
     unlink(path.c_str());
 }
@@ -268,52 +373,77 @@ TEST_CASE("file_helpers: read_file handles empty files", "[io][file_helpers]") {
     REQUIRE(fd >= 0);
     close(fd);
 
-    run_on_scheduler([&]() -> task<void> {
+    const auto completion = run_on_scheduler<std::optional<std::string>>(
+        [&]() -> task<std::optional<std::string>> {
         auto content = co_await read_file(path);
-        REQUIRE(content.has_value());
-        REQUIRE(content->empty());
+        co_return content;
     });
+
+    const auto& content = require_scheduler_value(completion);
+    REQUIRE(content.has_value());
+    REQUIRE(content->empty());
 
     unlink(path.c_str());
 }
 
 TEST_CASE("file_helpers: read_file handles multi-chunk reads", "[io][file_helpers]") {
+    struct observation {
+        bool written = false;
+        bool has_content = false;
+        bool matches_expected = false;
+    };
+
     std::string path = "/tmp/elio_file_helpers_large_" + std::to_string(getpid()) + ".txt";
     unlink(path.c_str());
 
     std::string expected((1024 * 1024 * 2) + 123, 'x');
     expected.back() = 'z';
 
-    run_on_scheduler([&]() -> task<void> {
+    const auto completion = run_on_scheduler<observation>([&]() -> task<observation> {
         auto written = co_await write_file(path, expected);
-        REQUIRE(written);
-
         auto content = co_await read_file(path);
-        REQUIRE(content.has_value());
-        REQUIRE(*content == expected);
+        co_return observation{
+            written,
+            content.has_value(),
+            content.has_value() && *content == expected,
+        };
     });
+
+    const auto& observed = require_scheduler_value(completion);
+    REQUIRE(observed.written);
+    REQUIRE(observed.has_content);
+    REQUIRE(observed.matches_expected);
 
     unlink(path.c_str());
 }
 
 TEST_CASE("file_helpers: append_file", "[io][file_helpers]") {
+    struct observation {
+        bool first_written = false;
+        bool appended = false;
+        std::optional<std::string> content;
+    };
+
     std::string path = "/tmp/elio_append_" + std::to_string(getpid()) + ".txt";
     unlink(path.c_str());
 
-    run_on_scheduler([&]() -> task<void> {
+    const auto completion = run_on_scheduler<observation>([&]() -> task<observation> {
         // First write
         auto w1 = co_await write_file(path, "Hello");
-        REQUIRE(w1);
 
         // Then append
         auto appended = co_await append_file(path, ", World!");
-        REQUIRE(appended);
 
         // Read back and verify
         auto content = co_await read_file(path);
-        REQUIRE(content.has_value());
-        REQUIRE(content.value() == "Hello, World!");
+        co_return observation{w1, appended, content};
     });
+
+    const auto& observed = require_scheduler_value(completion);
+    REQUIRE(observed.first_written);
+    REQUIRE(observed.appended);
+    REQUIRE(observed.content.has_value());
+    REQUIRE(observed.content.value() == "Hello, World!");
 
     unlink(path.c_str());
 }
@@ -363,17 +493,21 @@ TEST_CASE("file_helpers: read_file non-existent returns nullopt", "[io][file_hel
     std::string path = "/tmp/elio_nofile_" + std::to_string(getpid()) + ".txt";
     unlink(path.c_str());
 
-    run_on_scheduler([&]() -> task<void> {
+    const auto completion = run_on_scheduler<bool>([&]() -> task<bool> {
         auto content = co_await read_file(path);
-        REQUIRE_FALSE(content.has_value());
+        co_return content.has_value();
     });
+
+    REQUIRE_FALSE(require_scheduler_value(completion));
 }
 
 TEST_CASE("file_helpers: write_file to non-writable path returns false", "[io][file_helpers]") {
-    run_on_scheduler([&]() -> task<void> {
+    const auto completion = run_on_scheduler<bool>([&]() -> task<bool> {
         auto result = co_await write_file("/nonexistent/dir/file.txt", "data");
-        REQUIRE_FALSE(result);
+        co_return result;
     });
+
+    REQUIRE_FALSE(require_scheduler_value(completion));
 }
 
 TEST_CASE("file_helpers: read_dir", "[io][file_helpers]") {

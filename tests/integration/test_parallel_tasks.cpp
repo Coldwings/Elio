@@ -88,6 +88,7 @@ TEST_CASE("Parallel tasks with dependencies", "[parallel]") {
     
     std::atomic<int> stage1_completed{0};
     std::atomic<int> stage2_completed{0};
+    std::atomic<int> stage2_value_mismatches{0};
     
     auto stage1_task = [&]() -> task<int> {
         stage1_completed.fetch_add(1);
@@ -97,7 +98,9 @@ TEST_CASE("Parallel tasks with dependencies", "[parallel]") {
     auto stage2_task = [&]() -> task<void> {
         auto t = stage1_task();
         int value = co_await t;
-        REQUIRE(value == 42);
+        if (value != 42) {
+            stage2_value_mismatches.fetch_add(1);
+        }
         stage2_completed.fetch_add(1);
         co_return;
     };
@@ -107,20 +110,17 @@ TEST_CASE("Parallel tasks with dependencies", "[parallel]") {
         sched.go(stage2_task);
     }
     
-    // Active wait for completion with timeout
-    auto start = std::chrono::steady_clock::now();
-    while (stage2_completed.load() < num_chains) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        auto elapsed = std::chrono::steady_clock::now() - start;
-        if (elapsed > scaled_sec(10)) {
-            break;
-        }
-    }
-    
-    REQUIRE(stage1_completed.load() == num_chains);
-    REQUIRE(stage2_completed.load() == num_chains);
-    
-    sched.shutdown();
+    const bool drained = sched.shutdown(scaled_sec(10));
+    const int observed_stage1_completed = stage1_completed.load();
+    const int observed_stage2_completed = stage2_completed.load();
+    const int observed_value_mismatches = stage2_value_mismatches.load();
+
+    CAPTURE(drained, observed_stage1_completed, observed_stage2_completed,
+            observed_value_mismatches);
+    REQUIRE(drained);
+    REQUIRE(observed_stage1_completed == num_chains);
+    REQUIRE(observed_stage2_completed == num_chains);
+    REQUIRE(observed_value_mismatches == 0);
 }
 
 TEST_CASE("Parallel execution distributes work", "[parallel]") {
@@ -223,6 +223,7 @@ TEST_CASE("Nested parallel tasks", "[parallel]") {
     
     std::atomic<int> inner_completed{0};
     std::atomic<int> outer_completed{0};
+    std::atomic<int> sum_mismatches{0};
     
     auto inner_task = [&]() -> task<int> {
         inner_completed.fetch_add(1);
@@ -236,7 +237,9 @@ TEST_CASE("Nested parallel tasks", "[parallel]") {
             int value = co_await t;
             sum += value;
         }
-        REQUIRE(sum == 5);
+        if (sum != 5) {
+            sum_mismatches.fetch_add(1);
+        }
         outer_completed.fetch_add(1);
         co_return;
     };
@@ -246,10 +249,15 @@ TEST_CASE("Nested parallel tasks", "[parallel]") {
         sched.go(outer_task);
     }
     
-    std::this_thread::sleep_for(scaled_ms(800));
-    
-    REQUIRE(outer_completed.load() == num_outer);
-    REQUIRE(inner_completed.load() == num_outer * 5);
-    
-    sched.shutdown();
+    const bool drained = sched.shutdown(scaled_sec(10));
+    const int observed_outer_completed = outer_completed.load();
+    const int observed_inner_completed = inner_completed.load();
+    const int observed_sum_mismatches = sum_mismatches.load();
+
+    CAPTURE(drained, observed_outer_completed, observed_inner_completed,
+            observed_sum_mismatches);
+    REQUIRE(drained);
+    REQUIRE(observed_outer_completed == num_outer);
+    REQUIRE(observed_inner_completed == num_outer * 5);
+    REQUIRE(observed_sum_mismatches == 0);
 }

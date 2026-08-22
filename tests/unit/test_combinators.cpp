@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -29,6 +30,38 @@ bool wait_for_flag(const std::atomic<bool>& value) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return value.load(std::memory_order_acquire);
+}
+
+template<typename T>
+struct join_completion {
+    bool drained = false;
+    bool ready = false;
+    bool destroyed = false;
+    std::optional<T> value;
+    std::exception_ptr exception;
+};
+
+template<typename T, typename Rep, typename Period>
+join_completion<T> shutdown_and_collect(
+    runtime::scheduler& sched,
+    join_handle<T>& handle,
+    std::chrono::duration<Rep, Period> timeout) {
+    join_completion<T> result;
+    result.drained = sched.shutdown(timeout);
+    result.ready = handle.is_ready();
+    result.destroyed = handle.is_destroyed();
+    if (!result.ready || !result.destroyed) return result;
+
+    try {
+        result.value.emplace(handle.await_resume());
+    } catch (...) {
+        result.exception = std::current_exception();
+    }
+    return result;
+}
+
+void rethrow_join_exception(const std::exception_ptr& exception) {
+    if (exception) std::rethrow_exception(exception);
 }
 
 struct throwing_move_callable {
@@ -152,7 +185,13 @@ struct launch_throwing_move_callable {
 // --- when_all tests ---
 
 TEST_CASE("when_all completes all tasks", "[sync][combinators]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        int a = 0;
+        int b = 0;
+        int c = 0;
+    };
+
+    auto test = []() -> task<observation> {
         auto [a, b, c] = co_await when_all(
             []() -> task<int> {
                 co_await time::sleep_for(std::chrono::milliseconds(1));
@@ -167,20 +206,29 @@ TEST_CASE("when_all completes all tasks", "[sync][combinators]") {
                 co_return 30;
             }
         );
-        REQUIRE(a == 10);
-        REQUIRE(b == 20);
-        REQUIRE(c == 30);
+        co_return observation{a, b, c};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion = shutdown_and_collect(
+        sched, owner, scaled_sec(5));
+
+    REQUIRE(completion.drained);
+    REQUIRE(completion.ready);
+    REQUIRE(completion.destroyed);
+    REQUIRE_NOTHROW(rethrow_join_exception(completion.exception));
+    REQUIRE(completion.value.has_value());
+    REQUIRE(completion.value->a == 10);
+    REQUIRE(completion.value->b == 20);
+    REQUIRE(completion.value->c == 30);
 }
 
 TEST_CASE("when_all with void tasks", "[sync][combinators]") {
     std::atomic<int> counter{0};
 
-    auto test = [&]() -> task<void> {
+    auto test = [&]() -> task<int> {
         co_await when_all(
             [&]() -> task<void> {
                 co_await time::sleep_for(std::chrono::milliseconds(1));
@@ -195,17 +243,31 @@ TEST_CASE("when_all with void tasks", "[sync][combinators]") {
                 counter.fetch_add(1, std::memory_order_relaxed);
             }
         );
-        REQUIRE(counter.load() == 3);
+        co_return counter.load(std::memory_order_relaxed);
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion = shutdown_and_collect(
+        sched, owner, scaled_sec(5));
+
+    REQUIRE(completion.drained);
+    REQUIRE(completion.ready);
+    REQUIRE(completion.destroyed);
+    REQUIRE_NOTHROW(rethrow_join_exception(completion.exception));
+    REQUIRE(completion.value.has_value());
+    REQUIRE(*completion.value == 3);
 }
 
 TEST_CASE("when_all propagates first exception", "[sync][combinators]") {
-    auto test = []() -> task<void> {
+    struct observation {
         bool caught = false;
+        std::string message;
+    };
+
+    auto test = []() -> task<observation> {
+        observation observed;
         try {
             co_await when_all(
                 []() -> task<int> {
@@ -223,15 +285,25 @@ TEST_CASE("when_all propagates first exception", "[sync][combinators]") {
                 }
             );
         } catch (const std::runtime_error& e) {
-            caught = true;
-            REQUIRE(std::string(e.what()) == "test error");
+            observed.caught = true;
+            observed.message = e.what();
         }
-        REQUIRE(caught);
+        co_return observed;
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion = shutdown_and_collect(
+        sched, owner, scaled_sec(5));
+
+    REQUIRE(completion.drained);
+    REQUIRE(completion.ready);
+    REQUIRE(completion.destroyed);
+    REQUIRE_NOTHROW(rethrow_join_exception(completion.exception));
+    REQUIRE(completion.value.has_value());
+    REQUIRE(completion.value->caught);
+    REQUIRE(completion.value->message == "test error");
 }
 
 TEST_CASE("when_all waits for a token-ignoring sibling after failure",
@@ -240,6 +312,7 @@ TEST_CASE("when_all waits for a token-ignoring sibling after failure",
     sync::event release_sibling;
     std::atomic<bool> failure_thrown{false};
     std::atomic<bool> combinator_returned{false};
+    std::string caught_message;
 
     runtime::scheduler sched(2);
     sched.start();
@@ -260,9 +333,9 @@ TEST_CASE("when_all waits for a token-ignoring sibling after failure",
                 });
         } catch (const std::runtime_error& error) {
             caught = true;
-            REQUIRE(std::string_view(error.what()) == "primary failure");
+            caught_message = error.what();
         }
-        REQUIRE(caught);
+        if (!caught) caught_message = "<not caught>";
         combinator_returned.store(true, std::memory_order_release);
     });
 
@@ -272,6 +345,7 @@ TEST_CASE("when_all waits for a token-ignoring sibling after failure",
     release_sibling.set();
     owner.wait_destroyed();
     REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(caught_message == "primary failure");
     REQUIRE(combinator_returned.load(std::memory_order_acquire));
     sched.shutdown();
 }
@@ -282,6 +356,8 @@ TEST_CASE("when_all reports secondary exceptions after drain",
     std::atomic<int> started{0};
     std::atomic<int> reported{0};
     std::string secondary_message;
+    std::string primary_message;
+    int reported_before_owner_completion = 0;
 
     runtime::scheduler sched(2);
     sched.set_unhandled_exception_handler(
@@ -307,7 +383,6 @@ TEST_CASE("when_all reports secondary exceptions after drain",
     };
 
     auto owner = sched.go_joinable([&]() -> task<void> {
-        std::string primary_message;
         try {
             (void)co_await when_all(
                 make_failure("first branch failure"),
@@ -315,31 +390,41 @@ TEST_CASE("when_all reports secondary exceptions after drain",
         } catch (const std::runtime_error& error) {
             primary_message = error.what();
         }
-
-        REQUIRE(reported.load(std::memory_order_acquire) == 1);
-        REQUIRE(primary_message != secondary_message);
-        REQUIRE((primary_message == "first branch failure" ||
-                 primary_message == "second branch failure"));
-        REQUIRE((secondary_message == "first branch failure" ||
-                 secondary_message == "second branch failure"));
+        reported_before_owner_completion =
+            reported.load(std::memory_order_acquire);
     });
 
     owner.wait_destroyed();
     REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(reported_before_owner_completion == 1);
+    REQUIRE(primary_message != secondary_message);
+    REQUIRE((primary_message == "first branch failure" ||
+             primary_message == "second branch failure"));
+    REQUIRE((secondary_message == "first branch failure" ||
+             secondary_message == "second branch failure"));
     sched.shutdown();
 }
 
 TEST_CASE("when_all single task", "[sync][combinators]") {
-    auto test = []() -> task<void> {
+    auto test = []() -> task<int> {
         auto [result] = co_await when_all(
             []() -> task<int> { co_return 42; }
         );
-        REQUIRE(result == 42);
+        co_return result;
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion = shutdown_and_collect(
+        sched, owner, scaled_sec(5));
+
+    REQUIRE(completion.drained);
+    REQUIRE(completion.ready);
+    REQUIRE(completion.destroyed);
+    REQUIRE_NOTHROW(rethrow_join_exception(completion.exception));
+    REQUIRE(completion.value.has_value());
+    REQUIRE(*completion.value == 42);
 }
 
 TEST_CASE("when_all with no tasks completes immediately",
@@ -350,8 +435,14 @@ TEST_CASE("when_all with no tasks completes immediately",
     };
 
     runtime::scheduler sched(1);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const bool drained = sched.shutdown(scaled_sec(5));
+
+    REQUIRE(drained);
+    REQUIRE(owner.is_ready());
+    REQUIRE(owner.is_destroyed());
+    REQUIRE_NOTHROW(owner.await_resume());
 }
 
 TEST_CASE("when_all does not resume while launching children",
@@ -374,12 +465,15 @@ TEST_CASE("when_all does not resume while launching children",
 
     runtime::scheduler sched(4);
     sched.start();
-    sched.go(test);
+    auto owner = sched.go_joinable(test);
     REQUIRE(wait_for_flag(blocker.move_started));
     std::this_thread::sleep_for(scaled_ms(20));
     REQUIRE_FALSE(resumed_during_launch.load(std::memory_order_acquire));
     blocker.allow_move.store(true, std::memory_order_release);
     REQUIRE(sched.shutdown(scaled_ms(2000)));
+    REQUIRE(owner.is_ready());
+    REQUIRE(owner.is_destroyed());
+    REQUIRE_NOTHROW(owner.await_resume());
 }
 
 TEST_CASE("when_all propagates launch-time callable move failure",
@@ -387,6 +481,7 @@ TEST_CASE("when_all propagates launch-time callable move failure",
     launch_throw_control control;
     std::atomic<bool> caught{false};
     std::atomic<bool> first_completed{false};
+    std::string caught_message;
 
     auto test = [&]() -> task<void> {
         auto first = [&]() -> task<int> {
@@ -401,13 +496,13 @@ TEST_CASE("when_all propagates launch-time callable move failure",
             (void)result;
         } catch (const std::runtime_error& e) {
             caught.store(true, std::memory_order_release);
-            REQUIRE(std::string(e.what()) == "launch move failed");
+            caught_message = e.what();
         }
     };
 
     runtime::scheduler sched(2);
     sched.start();
-    sched.go_to(1, test);
+    auto owner = sched.go_joinable_to(1, test);
     const bool move_started = wait_for_flag(control.move_started);
     const bool first_finished = wait_for_flag(first_completed);
     control.allow_move.store(true, std::memory_order_release);
@@ -417,7 +512,11 @@ TEST_CASE("when_all propagates launch-time callable move failure",
     REQUIRE(move_started);
     REQUIRE(first_finished);
     REQUIRE(did_shutdown);
+    REQUIRE(owner.is_ready());
+    REQUIRE(owner.is_destroyed());
+    REQUIRE_NOTHROW(owner.await_resume());
     REQUIRE(caught.load(std::memory_order_acquire));
+    REQUIRE(caught_message == "launch move failed");
 }
 
 TEST_CASE("when_all launch failure takes precedence over child failure",
@@ -428,6 +527,9 @@ TEST_CASE("when_all launch failure takes precedence over child failure",
     std::atomic<bool> child_failure_observed{false};
     std::atomic<bool> child_failure_reported{false};
     std::atomic<bool> completed{false};
+    bool launch_failure_caught = false;
+    std::string caught_message;
+    bool child_failure_reported_before_completion = false;
 
     runtime::scheduler sched(4);
     sched.set_unhandled_exception_handler(
@@ -440,10 +542,10 @@ TEST_CASE("when_all launch failure takes precedence over child failure",
                         true, std::memory_order_release);
                 }
             }
-        });
+    });
     sched.start();
 
-    sched.go_to(3, [&]() -> task<void> {
+    auto owner = sched.go_joinable_to(3, [&]() -> task<void> {
         auto first = [&]() -> task<int> {
             co_await observer_ready.wait();
             throw std::runtime_error("child failed first");
@@ -467,11 +569,13 @@ TEST_CASE("when_all launch failure takes precedence over child failure",
 
         try {
             (void)co_await combo;
-            FAIL("expected launch failure");
+            caught_message = "<returned>";
         } catch (const std::runtime_error& error) {
-            REQUIRE(std::string_view(error.what()) == "launch move failed");
+            launch_failure_caught = true;
+            caught_message = error.what();
         }
-        REQUIRE(child_failure_reported.load(std::memory_order_acquire));
+        child_failure_reported_before_completion =
+            child_failure_reported.load(std::memory_order_acquire);
         completed.store(true, std::memory_order_release);
     });
 
@@ -487,6 +591,12 @@ TEST_CASE("when_all launch failure takes precedence over child failure",
     REQUIRE(child_failure_recorded);
     REQUIRE(owner_completed);
     REQUIRE(did_shutdown);
+    REQUIRE(owner.is_ready());
+    REQUIRE(owner.is_destroyed());
+    REQUIRE_NOTHROW(owner.await_resume());
+    REQUIRE(launch_failure_caught);
+    REQUIRE(caught_message == "launch move failed");
+    REQUIRE(child_failure_reported_before_completion);
 }
 
 // --- when_any tests ---

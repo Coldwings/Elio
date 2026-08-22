@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -1742,6 +1743,7 @@ struct stalled_send_stream {
 
 struct bounded_reject_stream_state {
     std::mutex mutex;
+    std::condition_variable activity_changed;
     std::deque<uint8_t> inbound;
     std::function<void()> after_second_read;
     std::atomic<bool> shutdown{false};
@@ -1754,6 +1756,14 @@ struct bounded_reject_stream_state {
     std::atomic<size_t> pong_writes_completed{0};
     std::atomic<bool> first_write_started{false};
 };
+
+template <typename Predicate>
+bool wait_for_bounded_reject_activity(bounded_reject_stream_state& state,
+                                      Predicate predicate) {
+    std::unique_lock<std::mutex> lock(state.mutex);
+    return state.activity_changed.wait_for(
+        lock, elio::test::scaled_sec(5), predicate);
+}
 
 void enqueue_bounded_reject_frame(bounded_reject_stream_state& state,
                                   const frame_header& header,
@@ -1830,11 +1840,19 @@ struct bounded_reject_stream {
                 static_cast<const uint8_t*>(data));
             type = header.type;
             if (type == message_type::error) {
-                state->error_writes_started.fetch_add(
-                    1, std::memory_order_acq_rel);
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->error_writes_started.fetch_add(
+                        1, std::memory_order_acq_rel);
+                }
+                state->activity_changed.notify_all();
             } else if (type == message_type::pong) {
-                state->pong_writes_started.fetch_add(
-                    1, std::memory_order_acq_rel);
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->pong_writes_started.fetch_add(
+                        1, std::memory_order_acq_rel);
+                }
+                state->activity_changed.notify_all();
             }
         }
 
@@ -1844,11 +1862,19 @@ struct bounded_reject_stream {
             }
             if (state->allow_writes.load(std::memory_order_acquire)) {
                 if (type == message_type::error) {
-                    state->error_writes_completed.fetch_add(
-                        1, std::memory_order_acq_rel);
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->error_writes_completed.fetch_add(
+                            1, std::memory_order_acq_rel);
+                    }
+                    state->activity_changed.notify_all();
                 } else if (type == message_type::pong) {
-                    state->pong_writes_completed.fetch_add(
-                        1, std::memory_order_acq_rel);
+                    {
+                        std::lock_guard<std::mutex> lock(state->mutex);
+                        state->pong_writes_completed.fetch_add(
+                            1, std::memory_order_acq_rel);
+                    }
+                    state->activity_changed.notify_all();
                 }
                 co_return elio::io::io_result{static_cast<int32_t>(length), 0};
             }
@@ -3376,23 +3402,23 @@ TEST_CASE("server per-session overload rejection is single-flight",
 
     auto server = std::make_shared<rpc_server<bounded_reject_stream>>(cfg);
     elio::sync::event release_handler;
-    std::atomic<bool> handler_started{false};
-    std::atomic<bool> handler_cancelled{false};
+    std::promise<void> handler_started_promise;
+    auto handler_started_future = handler_started_promise.get_future();
+    std::promise<void> handler_cancelled_promise;
+    auto handler_cancelled_future = handler_cancelled_promise.get_future();
     server->register_method_with_context<DelayMethod>(
-        [&release_handler, &handler_started, &handler_cancelled](
+        [&release_handler, &handler_started_promise,
+         &handler_cancelled_promise](
             const rpc_context& ctx,
             const DelayReq& req) -> coro::task<DelayResp> {
-            handler_started.store(true, std::memory_order_release);
+            handler_started_promise.set_value();
 
-            for (int i = 0; i < 2000; ++i) {
-                if (ctx.cancel_token.is_cancelled()) {
-                    handler_cancelled.store(true, std::memory_order_release);
-                    break;
-                }
-                co_await elio::time::sleep_for(elio::test::scaled_ms(1));
+            auto cancel_result = co_await release_handler.wait(
+                ctx.cancel_token);
+            if (cancel_result == coro::cancel_result::cancelled) {
+                handler_cancelled_promise.set_value();
+                co_await release_handler.wait();
             }
-
-            co_await release_handler.wait();
             co_return DelayResp{req.ms};
         });
 
@@ -3401,81 +3427,131 @@ TEST_CASE("server per-session overload rejection is single-flight",
         1, DelayMethod::id, DelayReq{1});
     enqueue_bounded_reject_frame(*state, first.first, first.second);
 
-    for (uint32_t request_id = 2; request_id <= 4; ++request_id) {
-        auto over_limit = build_request<DelayReq>(
-            request_id, DelayMethod::id,
-            DelayReq{static_cast<int32_t>(request_id)});
-        enqueue_bounded_reject_frame(
-            *state, over_limit.first, over_limit.second);
-    }
-
     scheduler sched(4);
     sched.start();
 
-    std::atomic<bool> server_done{false};
+    std::promise<void> server_done_promise;
+    auto server_done_future = server_done_promise.get_future();
     sched.go([&, state]() -> coro::task<void> {
         co_await server->handle_client(bounded_reject_stream{state});
-        server_done.store(true, std::memory_order_release);
+        server_done_promise.set_value();
     });
 
-    for (int i = 0;
-         i < 2000 &&
-             state->error_writes_started.load(std::memory_order_acquire) == 0;
-         ++i) {
-        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    const bool handler_started = handler_started_future.wait_for(
+        elio::test::scaled_sec(5)) == std::future_status::ready;
+
+    bool rejection_started = false;
+    bool handler_cancelled = false;
+    bool writes_completed = false;
+    bool rejection_reset = false;
+    size_t initial_error_writes_started = 0;
+    size_t initial_error_writes_completed = 0;
+    size_t pre_unblock_error_writes_started = 0;
+    size_t pre_unblock_pong_writes_started = 0;
+    size_t unblocked_error_writes_completed = 0;
+    size_t unblocked_pong_writes_completed = 0;
+    size_t reset_error_writes_started = 0;
+    size_t reset_error_writes_completed = 0;
+
+    if (handler_started) {
+        for (uint32_t request_id = 2; request_id <= 4; ++request_id) {
+            auto over_limit = build_request<DelayReq>(
+                request_id, DelayMethod::id,
+                DelayReq{static_cast<int32_t>(request_id)});
+            enqueue_bounded_reject_frame(
+                *state, over_limit.first, over_limit.second);
+        }
+
+        rejection_started = wait_for_bounded_reject_activity(
+            *state, [&] {
+                return state->error_writes_started.load(
+                           std::memory_order_acquire) != 0;
+            });
+        initial_error_writes_started = state->error_writes_started.load(
+            std::memory_order_acquire);
+        initial_error_writes_completed = state->error_writes_completed.load(
+            std::memory_order_acquire);
+
+        enqueue_bounded_reject_frame(*state, build_ping(99));
+        enqueue_bounded_reject_frame(*state, build_cancel(1));
+
+        handler_cancelled = handler_cancelled_future.wait_for(
+            elio::test::scaled_sec(5)) == std::future_status::ready;
+        pre_unblock_error_writes_started = state->error_writes_started.load(
+            std::memory_order_acquire);
+        pre_unblock_pong_writes_started = state->pong_writes_started.load(
+            std::memory_order_acquire);
+
+        state->allow_writes.store(true, std::memory_order_release);
+        writes_completed = wait_for_bounded_reject_activity(
+            *state, [&] {
+                return state->error_writes_completed.load(
+                           std::memory_order_acquire) >= 1 &&
+                       state->pong_writes_completed.load(
+                           std::memory_order_acquire) >= 1;
+            });
+        unblocked_error_writes_completed =
+            state->error_writes_completed.load(std::memory_order_acquire);
+        unblocked_pong_writes_completed =
+            state->pong_writes_completed.load(std::memory_order_acquire);
+
+        auto after_reset = build_request<DelayReq>(
+            5, DelayMethod::id, DelayReq{5});
+        enqueue_bounded_reject_frame(
+            *state, after_reset.first, after_reset.second);
+        rejection_reset = wait_for_bounded_reject_activity(
+            *state, [&] {
+                return state->error_writes_completed.load(
+                           std::memory_order_acquire) >= 2;
+            });
+        reset_error_writes_started = state->error_writes_started.load(
+            std::memory_order_acquire);
+        reset_error_writes_completed = state->error_writes_completed.load(
+            std::memory_order_acquire);
     }
-
-    REQUIRE(handler_started.load(std::memory_order_acquire));
-    REQUIRE(state->error_writes_started.load(std::memory_order_acquire) == 1);
-    REQUIRE(state->error_writes_completed.load(std::memory_order_acquire) == 0);
-
-    enqueue_bounded_reject_frame(*state, build_ping(99));
-    enqueue_bounded_reject_frame(*state, build_cancel(1));
-
-    for (int i = 0;
-         i < 2000 && !handler_cancelled.load(std::memory_order_acquire);
-         ++i) {
-        std::this_thread::sleep_for(elio::test::scaled_ms(1));
-    }
-
-    REQUIRE(handler_cancelled.load(std::memory_order_acquire));
-    REQUIRE(state->error_writes_started.load(std::memory_order_acquire) == 1);
-    REQUIRE(state->pong_writes_started.load(std::memory_order_acquire) == 0);
-
-    state->allow_writes.store(true, std::memory_order_release);
-    for (int i = 0;
-         i < 2000 &&
-             (state->error_writes_completed.load(std::memory_order_acquire) < 1 ||
-              state->pong_writes_completed.load(std::memory_order_acquire) < 1);
-         ++i) {
-        std::this_thread::sleep_for(elio::test::scaled_ms(1));
-    }
-
-    REQUIRE(state->error_writes_completed.load(std::memory_order_acquire) == 1);
-    REQUIRE(state->pong_writes_completed.load(std::memory_order_acquire) == 1);
-
-    auto after_reset = build_request<DelayReq>(
-        5, DelayMethod::id, DelayReq{5});
-    enqueue_bounded_reject_frame(
-        *state, after_reset.first, after_reset.second);
-    for (int i = 0;
-         i < 2000 &&
-             state->error_writes_completed.load(std::memory_order_acquire) < 2;
-         ++i) {
-        std::this_thread::sleep_for(elio::test::scaled_ms(1));
-    }
-    REQUIRE(state->error_writes_started.load(std::memory_order_acquire) == 2);
-    REQUIRE(state->error_writes_completed.load(std::memory_order_acquire) == 2);
 
     release_handler.set();
     server->stop();
-    for (int i = 0;
-         i < 2000 && !server_done.load(std::memory_order_acquire);
-         ++i) {
-        std::this_thread::sleep_for(elio::test::scaled_ms(1));
+    bool server_done = server_done_future.wait_for(
+        elio::test::scaled_sec(5)) == std::future_status::ready;
+    if (!server_done) {
+        state->shutdown.store(true, std::memory_order_release);
+        state->allow_writes.store(true, std::memory_order_release);
+        server_done = server_done_future.wait_for(
+            elio::test::scaled_sec(5)) == std::future_status::ready;
     }
-    REQUIRE(server_done.load(std::memory_order_acquire));
-    REQUIRE(sched.shutdown(std::chrono::seconds(30)));
+    const bool scheduler_stopped = sched.shutdown(std::chrono::seconds(30));
+
+    CAPTURE(handler_started,
+            rejection_started,
+            handler_cancelled,
+            writes_completed,
+            rejection_reset,
+            initial_error_writes_started,
+            initial_error_writes_completed,
+            pre_unblock_error_writes_started,
+            pre_unblock_pong_writes_started,
+            unblocked_error_writes_completed,
+            unblocked_pong_writes_completed,
+            reset_error_writes_started,
+            reset_error_writes_completed,
+            server_done,
+            scheduler_stopped);
+    REQUIRE(handler_started);
+    REQUIRE(rejection_started);
+    REQUIRE(initial_error_writes_started == 1);
+    REQUIRE(initial_error_writes_completed == 0);
+    REQUIRE(handler_cancelled);
+    REQUIRE(pre_unblock_error_writes_started == 1);
+    REQUIRE(pre_unblock_pong_writes_started == 0);
+    REQUIRE(writes_completed);
+    REQUIRE(unblocked_error_writes_completed == 1);
+    REQUIRE(unblocked_pong_writes_completed == 1);
+    REQUIRE(rejection_reset);
+    REQUIRE(reset_error_writes_started == 2);
+    REQUIRE(reset_error_writes_completed == 2);
+    REQUIRE(server_done);
+    REQUIRE(scheduler_stopped);
 }
 
 TEST_CASE("server session teardown cancels and joins handler tasks",

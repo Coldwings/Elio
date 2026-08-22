@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <concepts>
 #include <coroutine>
 #include <exception>
 #include <functional>
@@ -66,6 +67,35 @@ inline release_waiter_published_test_hook release_waiter_published_hook;
 inline std::atomic<size_t> release_waiter_probes_for_test{0};
 #endif
 
+template<typename From, typename To>
+struct copy_cv {
+    using from_no_ref = std::remove_reference_t<From>;
+    using const_applied = std::conditional_t<
+        std::is_const_v<from_no_ref>, std::add_const_t<To>, To>;
+    using type = std::conditional_t<
+        std::is_volatile_v<from_no_ref>,
+        std::add_volatile_t<const_applied>,
+        const_applied>;
+};
+
+template<typename From, typename To>
+using copy_cv_t = typename copy_cv<From, To>::type;
+
+template<typename From, typename To>
+struct copy_cvref {
+    using cv_type = copy_cv_t<From, To>;
+    using type = std::conditional_t<
+        std::is_lvalue_reference_v<From>,
+        std::add_lvalue_reference_t<cv_type>,
+        std::conditional_t<
+            std::is_rvalue_reference_v<From>,
+            std::add_rvalue_reference_t<cv_type>,
+            cv_type>>;
+};
+
+template<typename From, typename To>
+using copy_cvref_t = typename copy_cvref<From, To>::type;
+
 } // namespace detail_oc
 
 template<typename Key, typename Value,
@@ -100,6 +130,20 @@ private:
 
         Key key_;
         size_t shard_index_ = 0;
+    };
+
+    template<typename Factory>
+    struct get_request {
+        template<typename Ctor>
+        get_request(const Key& requested_key, Ctor&& requested_ctor,
+                    std::chrono::milliseconds requested_ttl)
+            : key(requested_key)
+            , ctor(std::forward<Ctor>(requested_ctor))
+            , ttl(requested_ttl) {}
+
+        Key key;
+        Factory ctor;
+        std::chrono::milliseconds ttl;
     };
 
     struct shard {
@@ -448,15 +492,21 @@ public:
     object_cache& operator=(object_cache&&) = delete;
 
     template<typename Ctor>
+        requires std::constructible_from<std::decay_t<Ctor>, Ctor&&>
     coro::task<borrow> get(const Key& key, Ctor&& ctor) {
-        co_return co_await get_impl(key, std::forward<Ctor>(ctor),
-                                     std::chrono::milliseconds{0});
+        return get(key, std::forward<Ctor>(ctor), std::chrono::milliseconds{0});
     }
 
     template<typename Ctor>
+        requires std::constructible_from<std::decay_t<Ctor>, Ctor&&>
     coro::task<borrow> get(const Key& key, Ctor&& ctor,
                             std::chrono::milliseconds ttl) {
-        co_return co_await get_impl(key, std::forward<Ctor>(ctor), ttl);
+        using factory_type = std::decay_t<Ctor>;
+        using invoke_type =
+            detail_oc::copy_cvref_t<Ctor&&, factory_type>;
+        auto request = std::make_unique<get_request<factory_type>>(
+            key, std::forward<Ctor>(ctor), ttl);
+        return get_impl<invoke_type>(std::move(request));
     }
 
     void evict(const Key& key) {
@@ -556,11 +606,12 @@ private:
         }
     }
 
-    template<typename Ctor>
-    coro::task<borrow> get_impl(const Key& key, Ctor&& ctor,
-                                 std::chrono::milliseconds ttl) {
+    template<typename InvokeCtor, typename Factory>
+    coro::task<borrow> get_impl(
+        std::unique_ptr<get_request<Factory>> request) {
         ensure_sweep_running();
 
+        const auto& key = request->key;
         auto& s = state_->shard_for(key);
 
         for (;;) {
@@ -598,7 +649,7 @@ private:
                     e = std::make_shared<entry>();
                     e->key_ = key;
                     e->shard_index_ = static_cast<size_t>(&s - state_->shards_.get());
-                    e->ttl_ = ttl;
+                    e->ttl_ = request->ttl;
                     s.map[key] = e;
                     i_am_constructor = true;
                 }
@@ -629,7 +680,7 @@ private:
             construction_guard guard(state_, s, e);
 
             try {
-                auto value = co_await std::forward<Ctor>(ctor)();
+                auto value = co_await static_cast<InvokeCtor>(request->ctor)();
                 e->value_ = std::make_unique<Value>(std::move(value));
                 e->refcount_.fetch_add(1, std::memory_order_relaxed);
                 e->state_.store(entry::state::ready, std::memory_order_release);

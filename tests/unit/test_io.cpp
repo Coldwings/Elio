@@ -2166,17 +2166,30 @@ TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
         
         // Create a client connection in a separate thread
         std::atomic<bool> client_connected{false};
+        int client_socket_result = -1;
+        int client_socket_error = 0;
+        int client_connect_result = -1;
+        int client_connect_error = 0;
         std::thread client_thread([&]() {
             // Wait a bit for the accept to be registered
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             
             int client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-            REQUIRE(client_fd >= 0);
+            client_socket_result = client_fd;
+            if (client_fd < 0) {
+                client_socket_error = errno;
+                return;
+            }
             
             auto sa = addr.to_sockaddr();
             int ret = connect(client_fd, reinterpret_cast<struct sockaddr*>(&sa), 
                              addr.sockaddr_len());
-            REQUIRE(ret == 0);
+            client_connect_result = ret;
+            if (ret != 0) {
+                client_connect_error = errno;
+                close(client_fd);
+                return;
+            }
             client_connected = true;
             
             // Keep connection open briefly
@@ -2203,14 +2216,25 @@ TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
         for (int i = 0; i < 200 && !accepted; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        
-        sched.shutdown();
-        
+
+        client_thread.join();
+
+        bool scheduler_stopped = false;
+        if (client_connect_result == 0) {
+            scheduler_stopped = sched.shutdown(elio::test::scaled_sec(5));
+        } else {
+            sched.shutdown_force();
+        }
+
+        CHECK(client_socket_result >= 0);
+        CHECK(client_socket_error == 0);
+        CHECK(client_connect_result == 0);
+        CHECK(client_connect_error == 0);
+        CHECK(client_connected);
+        CHECK(scheduler_stopped);
         REQUIRE(accepted);
         REQUIRE(accepted_stream.has_value());
         REQUIRE(accepted_stream->is_valid());
-        
-        client_thread.join();
     }
 }
 

@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Object-cache lazy task argument lifetime**: `object_cache::get()` now
+  copies the key and stores a decayed copy or moved instance of the constructor
+  callable before returning its lazy task. Storing the task for later await can
+  no longer resume with dangling references to temporary keys or factories.
+  Because ownership is materialized when `get()` is called, move-only lvalue
+  factories must be passed as `std::move(factory)` to transfer ownership or
+  `std::ref(factory)` to opt into explicit borrowing (#1125).
 - **Joinable-task exception disposition**: `spawn()`, `go_joinable()`, and
   `go_joinable_to()` now retain failures solely for observation through their
   join handles instead of also routing them to the scheduler unhandled-

@@ -1752,6 +1752,10 @@ struct bounded_reject_stream_state {
     std::atomic<size_t> total_writes_started{0};
     std::atomic<size_t> error_writes_started{0};
     std::atomic<size_t> error_writes_completed{0};
+    std::atomic<size_t> resource_exhausted_writes_started{0};
+    std::atomic<size_t> resource_exhausted_writes_completed{0};
+    std::atomic<size_t> unexpected_error_writes_started{0};
+    std::atomic<size_t> unexpected_error_writes_completed{0};
     std::atomic<size_t> pong_writes_started{0};
     std::atomic<size_t> pong_writes_completed{0};
     std::atomic<bool> first_write_started{false};
@@ -1835,15 +1839,31 @@ struct bounded_reject_stream {
         }
 
         message_type type = message_type::request;
+        bool resource_exhausted_error = false;
         if (length >= frame_header_size) {
             auto header = frame_header::from_bytes(
                 static_cast<const uint8_t*>(data));
             type = header.type;
             if (type == message_type::error) {
+                if (header.payload_length <= length - frame_header_size) {
+                    buffer_view payload(
+                        static_cast<const uint8_t*>(data) + frame_header_size,
+                        header.payload_length);
+                    resource_exhausted_error =
+                        parse_error(payload).code ==
+                        rpc_error::resource_exhausted;
+                }
                 {
                     std::lock_guard<std::mutex> lock(state->mutex);
                     state->error_writes_started.fetch_add(
                         1, std::memory_order_acq_rel);
+                    if (resource_exhausted_error) {
+                        state->resource_exhausted_writes_started.fetch_add(
+                            1, std::memory_order_acq_rel);
+                    } else {
+                        state->unexpected_error_writes_started.fetch_add(
+                            1, std::memory_order_acq_rel);
+                    }
                 }
                 state->activity_changed.notify_all();
             } else if (type == message_type::pong) {
@@ -1866,6 +1886,13 @@ struct bounded_reject_stream {
                         std::lock_guard<std::mutex> lock(state->mutex);
                         state->error_writes_completed.fetch_add(
                             1, std::memory_order_acq_rel);
+                        if (resource_exhausted_error) {
+                            state->resource_exhausted_writes_completed.fetch_add(
+                                1, std::memory_order_acq_rel);
+                        } else {
+                            state->unexpected_error_writes_completed.fetch_add(
+                                1, std::memory_order_acq_rel);
+                        }
                     }
                     state->activity_changed.notify_all();
                 } else if (type == message_type::pong) {
@@ -3406,17 +3433,24 @@ TEST_CASE("server per-session overload rejection is single-flight",
     auto handler_started_future = handler_started_promise.get_future();
     std::promise<void> handler_cancelled_promise;
     auto handler_cancelled_future = handler_cancelled_promise.get_future();
+    std::atomic<size_t> handler_invocations{0};
     server->register_method_with_context<DelayMethod>(
         [&release_handler, &handler_started_promise,
-         &handler_cancelled_promise](
+         &handler_cancelled_promise, &handler_invocations](
             const rpc_context& ctx,
             const DelayReq& req) -> coro::task<DelayResp> {
-            handler_started_promise.set_value();
+            const auto invocation = handler_invocations.fetch_add(
+                1, std::memory_order_acq_rel);
+            if (invocation == 0) {
+                handler_started_promise.set_value();
+            }
 
             auto cancel_result = co_await release_handler.wait(
                 ctx.cancel_token);
             if (cancel_result == coro::cancel_result::cancelled) {
-                handler_cancelled_promise.set_value();
+                if (invocation == 0) {
+                    handler_cancelled_promise.set_value();
+                }
                 co_await release_handler.wait();
             }
             co_return DelayResp{req.ms};
@@ -3446,12 +3480,20 @@ TEST_CASE("server per-session overload rejection is single-flight",
     bool rejection_reset = false;
     size_t initial_error_writes_started = 0;
     size_t initial_error_writes_completed = 0;
+    size_t initial_resource_exhausted_writes_started = 0;
+    size_t initial_unexpected_error_writes_started = 0;
     size_t pre_unblock_error_writes_started = 0;
     size_t pre_unblock_pong_writes_started = 0;
     size_t unblocked_error_writes_completed = 0;
+    size_t unblocked_resource_exhausted_writes_completed = 0;
+    size_t unblocked_unexpected_error_writes_completed = 0;
     size_t unblocked_pong_writes_completed = 0;
     size_t reset_error_writes_started = 0;
     size_t reset_error_writes_completed = 0;
+    size_t reset_resource_exhausted_writes_started = 0;
+    size_t reset_resource_exhausted_writes_completed = 0;
+    size_t reset_unexpected_error_writes_started = 0;
+    size_t reset_unexpected_error_writes_completed = 0;
 
     if (handler_started) {
         for (uint32_t request_id = 2; request_id <= 4; ++request_id) {
@@ -3471,6 +3513,12 @@ TEST_CASE("server per-session overload rejection is single-flight",
             std::memory_order_acquire);
         initial_error_writes_completed = state->error_writes_completed.load(
             std::memory_order_acquire);
+        initial_resource_exhausted_writes_started =
+            state->resource_exhausted_writes_started.load(
+                std::memory_order_acquire);
+        initial_unexpected_error_writes_started =
+            state->unexpected_error_writes_started.load(
+                std::memory_order_acquire);
 
         enqueue_bounded_reject_frame(*state, build_ping(99));
         enqueue_bounded_reject_frame(*state, build_cancel(1));
@@ -3492,6 +3540,12 @@ TEST_CASE("server per-session overload rejection is single-flight",
             });
         unblocked_error_writes_completed =
             state->error_writes_completed.load(std::memory_order_acquire);
+        unblocked_resource_exhausted_writes_completed =
+            state->resource_exhausted_writes_completed.load(
+                std::memory_order_acquire);
+        unblocked_unexpected_error_writes_completed =
+            state->unexpected_error_writes_completed.load(
+                std::memory_order_acquire);
         unblocked_pong_writes_completed =
             state->pong_writes_completed.load(std::memory_order_acquire);
 
@@ -3508,6 +3562,18 @@ TEST_CASE("server per-session overload rejection is single-flight",
             std::memory_order_acquire);
         reset_error_writes_completed = state->error_writes_completed.load(
             std::memory_order_acquire);
+        reset_resource_exhausted_writes_started =
+            state->resource_exhausted_writes_started.load(
+                std::memory_order_acquire);
+        reset_resource_exhausted_writes_completed =
+            state->resource_exhausted_writes_completed.load(
+                std::memory_order_acquire);
+        reset_unexpected_error_writes_started =
+            state->unexpected_error_writes_started.load(
+                std::memory_order_acquire);
+        reset_unexpected_error_writes_completed =
+            state->unexpected_error_writes_completed.load(
+                std::memory_order_acquire);
     }
 
     release_handler.set();
@@ -3521,6 +3587,8 @@ TEST_CASE("server per-session overload rejection is single-flight",
             elio::test::scaled_sec(5)) == std::future_status::ready;
     }
     const bool scheduler_stopped = sched.shutdown(std::chrono::seconds(30));
+    const auto handler_invocation_count = handler_invocations.load(
+        std::memory_order_acquire);
 
     CAPTURE(handler_started,
             rejection_started,
@@ -3529,27 +3597,45 @@ TEST_CASE("server per-session overload rejection is single-flight",
             rejection_reset,
             initial_error_writes_started,
             initial_error_writes_completed,
+            initial_resource_exhausted_writes_started,
+            initial_unexpected_error_writes_started,
             pre_unblock_error_writes_started,
             pre_unblock_pong_writes_started,
             unblocked_error_writes_completed,
+            unblocked_resource_exhausted_writes_completed,
+            unblocked_unexpected_error_writes_completed,
             unblocked_pong_writes_completed,
             reset_error_writes_started,
             reset_error_writes_completed,
+            reset_resource_exhausted_writes_started,
+            reset_resource_exhausted_writes_completed,
+            reset_unexpected_error_writes_started,
+            reset_unexpected_error_writes_completed,
+            handler_invocation_count,
             server_done,
             scheduler_stopped);
     REQUIRE(handler_started);
     REQUIRE(rejection_started);
     REQUIRE(initial_error_writes_started == 1);
     REQUIRE(initial_error_writes_completed == 0);
+    REQUIRE(initial_resource_exhausted_writes_started == 1);
+    REQUIRE(initial_unexpected_error_writes_started == 0);
     REQUIRE(handler_cancelled);
     REQUIRE(pre_unblock_error_writes_started == 1);
     REQUIRE(pre_unblock_pong_writes_started == 0);
     REQUIRE(writes_completed);
     REQUIRE(unblocked_error_writes_completed == 1);
+    REQUIRE(unblocked_resource_exhausted_writes_completed == 1);
+    REQUIRE(unblocked_unexpected_error_writes_completed == 0);
     REQUIRE(unblocked_pong_writes_completed == 1);
     REQUIRE(rejection_reset);
     REQUIRE(reset_error_writes_started == 2);
     REQUIRE(reset_error_writes_completed == 2);
+    REQUIRE(reset_resource_exhausted_writes_started == 2);
+    REQUIRE(reset_resource_exhausted_writes_completed == 2);
+    REQUIRE(reset_unexpected_error_writes_started == 0);
+    REQUIRE(reset_unexpected_error_writes_completed == 0);
+    REQUIRE(handler_invocation_count == 1);
     REQUIRE(server_done);
     REQUIRE(scheduler_stopped);
 }

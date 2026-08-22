@@ -2709,8 +2709,10 @@ TEST_CASE("channel close does not schedule a recv waiter destroyed after dequeue
     auto second_task = second_waiter();
     auto first = elio::coro::detail::task_access::release(std::move(first_task));
     auto second = elio::coro::detail::task_access::release(std::move(second_task));
-    first.resume();
-    second.resume();
+    schedule_handle(first);
+    schedule_handle(second);
+    const bool frame_clear_after_start =
+        promise_base::current_frame() == nullptr;
 
     std::thread destroyer([&] {
         while (!destroy_second.load(std::memory_order_acquire)) {
@@ -2722,6 +2724,13 @@ TEST_CASE("channel close does not schedule a recv waiter destroyed after dequeue
 
     ch.close();
     destroyer.join();
+    const bool frame_clear_after_cleanup =
+        promise_base::current_frame() == nullptr;
+    if (!frame_clear_after_start || !frame_clear_after_cleanup) {
+        promise_base::set_current_frame(nullptr);
+    }
+    REQUIRE(frame_clear_after_start);
+    REQUIRE(frame_clear_after_cleanup);
 }
 
 TEST_CASE("channel close does not schedule a send waiter destroyed after dequeue",
@@ -2745,8 +2754,10 @@ TEST_CASE("channel close does not schedule a send waiter destroyed after dequeue
     auto second_task = second_waiter();
     auto first = elio::coro::detail::task_access::release(std::move(first_task));
     auto second = elio::coro::detail::task_access::release(std::move(second_task));
-    first.resume();
-    second.resume();
+    schedule_handle(first);
+    schedule_handle(second);
+    const bool frame_clear_after_start =
+        promise_base::current_frame() == nullptr;
 
     std::thread destroyer([&] {
         while (!destroy_second.load(std::memory_order_acquire)) {
@@ -2758,6 +2769,13 @@ TEST_CASE("channel close does not schedule a send waiter destroyed after dequeue
 
     ch.close();
     destroyer.join();
+    const bool frame_clear_after_cleanup =
+        promise_base::current_frame() == nullptr;
+    if (!frame_clear_after_start || !frame_clear_after_cleanup) {
+        promise_base::set_current_frame(nullptr);
+    }
+    REQUIRE(frame_clear_after_start);
+    REQUIRE(frame_clear_after_cleanup);
 }
 
 TEST_CASE("mutex: destroying waiter does not crash on unlock()", "[sync][mutex][cancellation]") {

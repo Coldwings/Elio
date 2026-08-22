@@ -243,11 +243,16 @@ task<int> macro_compute(int value) {
     co_return value * 2;
 }
 
-task<void> macro_spawn_driver(std::atomic<bool>* completed) {
+struct macro_spawn_observation {
+    bool completed = false;
+    int value = 0;
+};
+
+task<void> macro_spawn_driver(macro_spawn_observation* observation) {
     auto handle = ELIO_SPAWN(macro_compute(21));
-    REQUIRE(co_await handle == 42);
-    completed->store(true, std::memory_order_release);
-    completed->notify_one();
+    observation->value = co_await handle;
+    observation->completed = true;
+    co_return;
 }
 
 TEST_CASE("task construction and destruction", "[task]") {
@@ -1396,12 +1401,19 @@ TEST_CASE("ELIO_SPAWN macro returns a joinable handle",
     scheduler sched(1);
     sched.start();
 
-    std::atomic<bool> completed{false};
-    elio::go(macro_spawn_driver, &completed);
-    completed.wait(false, std::memory_order_acquire);
+    macro_spawn_observation observation;
+    auto root = sched.go_joinable(macro_spawn_driver, &observation);
+    const bool ready_before_shutdown = wait_for_task_condition(
+        [&] { return root.is_ready(); });
+    const bool drained = sched.shutdown(scaled_sec(5));
+    const auto observed = observation;
 
-    REQUIRE(completed.load(std::memory_order_acquire));
-    sched.shutdown();
+    CAPTURE(ready_before_shutdown, drained, observed.completed, observed.value);
+    REQUIRE(drained);
+    REQUIRE_NOTHROW(root.await_resume());
+    REQUIRE(ready_before_shutdown);
+    REQUIRE(observed.completed);
+    REQUIRE(observed.value == 42);
 }
 
 TEST_CASE("elio::go_to() pins task to specific worker", "[task][spawn][affinity]") {

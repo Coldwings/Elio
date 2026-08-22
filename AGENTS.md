@@ -46,6 +46,25 @@ and the pull request template.
 - Do not wait for `main` CI after merging a PR when the PR head already passed
   and there were no concurrent main changes that can affect the result.
 
+### Intermittent Sanitizer And Assertion Failures
+
+- Treat even one intermittent ASAN, TSAN, UBSAN, or semantic assertion failure
+  as high-value evidence that requires investigation.
+- First classify the observed signal as a sanitizer diagnostic or a semantic
+  assertion, then investigate library behavior, test defects, contract
+  ambiguity, dependencies or toolchains, and infrastructure as possible root
+  causes. Do not label all intermittent failures as infrastructure noise.
+- For CI failures, preserve the complete job URL, tested head SHA, random seed
+  when available, and relevant logs before rerunning or replacing the job. For
+  local failures, preserve the command, configuration, and environment.
+- For suspected concurrency failures, construct a reachable interleaving when
+  possible. When a repository defect is confirmed and a fix is authorized,
+  add a deterministic regression when feasible, preferring test hooks or
+  barriers over sleeps. Otherwise document why deterministic coverage is
+  impractical and retain the strongest focused sanitizer or stress coverage.
+- A later non-reproduction is supporting evidence only and is not, by itself,
+  a sufficient reason to close or dismiss the finding.
+
 Common CMake pattern for focused validation:
 
 ```bash

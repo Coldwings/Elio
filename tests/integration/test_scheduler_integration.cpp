@@ -153,35 +153,40 @@ TEST_CASE("Mixed chain and parallel coroutines", "[integration]") {
 TEST_CASE("Virtual stack tracking in scheduler", "[integration]") {
     scheduler sched(2);
     sched.start();
-    
-    std::atomic<bool> verified{false};
-    
-    auto inner = []() -> task<int> {
-        // Check virtual stack depth
-        size_t depth = get_stack_depth();
-        REQUIRE(depth >= 1);
+
+    struct virtual_stack_observation {
+        bool completed = false;
+        size_t inner_depth = 0;
+        size_t depth_before = 0;
+        size_t depth_after = 0;
+        int value = 0;
+    } observation;
+
+    auto inner = [&]() -> task<int> {
+        observation.inner_depth = get_stack_depth();
         co_return 42;
     };
-    
+
     auto outer = [&]() -> task<void> {
-        size_t depth_before = get_stack_depth();
-        int value = co_await inner();
-        size_t depth_after = get_stack_depth();
-        
-        // Depth should be restored
-        REQUIRE(depth_before == depth_after);
-        REQUIRE(value == 42);
-        verified.store(true);
+        observation.depth_before = get_stack_depth();
+        observation.value = co_await inner();
+        observation.depth_after = get_stack_depth();
+        observation.completed = true;
         co_return;
     };
-    
-    sched.go(outer);
-    
-    std::this_thread::sleep_for(scaled_ms(200));
-    
-    REQUIRE(verified.load());
-    
-    sched.shutdown();
+
+    auto handle = sched.go_joinable(outer);
+    const bool drained = sched.shutdown(scaled_sec(10));
+    const auto observed = observation;
+
+    CAPTURE(drained, observed.completed, observed.inner_depth,
+            observed.depth_before, observed.depth_after, observed.value);
+    REQUIRE(drained);
+    REQUIRE_NOTHROW(handle.await_resume());
+    REQUIRE(observed.completed);
+    REQUIRE(observed.inner_depth >= 1);
+    REQUIRE(observed.depth_before == observed.depth_after);
+    REQUIRE(observed.value == 42);
 }
 
 TEST_CASE("Scheduler load distribution", "[integration]") {

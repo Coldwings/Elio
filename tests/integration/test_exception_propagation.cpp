@@ -11,11 +11,26 @@ using namespace elio::runtime;
 using namespace elio::coro;
 using namespace elio::test;
 
+namespace {
+
+enum class exception_outcome {
+    pending,
+    returned_without_exception,
+    caught_expected,
+};
+
+struct exception_observation {
+    exception_outcome outcome = exception_outcome::pending;
+    std::string message;
+};
+
+}  // namespace
+
 TEST_CASE("Exception propagation through single level", "[exception]") {
     scheduler sched(2);
     sched.start();
     
-    std::atomic<bool> caught{false};
+    exception_observation observation;
     
     auto thrower = []() -> task<int> {
         throw std::runtime_error("test error");
@@ -26,27 +41,31 @@ TEST_CASE("Exception propagation through single level", "[exception]") {
         try {
             int value = co_await thrower();
             (void)value;
+            observation.outcome = exception_outcome::returned_without_exception;
         } catch (const std::runtime_error& e) {
-            REQUIRE(std::string(e.what()) == "test error");
-            caught.store(true);
+            observation.message = e.what();
+            observation.outcome = exception_outcome::caught_expected;
         }
         co_return;
     };
     
-    sched.go(catcher);
-    
-    std::this_thread::sleep_for(scaled_ms(200));
-    
-    REQUIRE(caught.load());
-    
-    sched.shutdown();
+    auto handle = sched.go_joinable(catcher);
+    const bool drained = sched.shutdown(scaled_sec(10));
+    const auto observed_outcome = observation.outcome;
+    const std::string observed_message = observation.message;
+
+    CAPTURE(drained, static_cast<int>(observed_outcome), observed_message);
+    REQUIRE(drained);
+    REQUIRE_NOTHROW(handle.await_resume());
+    REQUIRE(observed_outcome == exception_outcome::caught_expected);
+    REQUIRE(observed_message == "test error");
 }
 
 TEST_CASE("Exception propagation through multiple levels", "[exception]") {
     scheduler sched(2);
     sched.start();
     
-    std::atomic<bool> caught{false};
+    exception_observation observation;
     std::atomic<int> level_passed{0};
     
     auto thrower = []() -> task<int> {
@@ -71,28 +90,34 @@ TEST_CASE("Exception propagation through multiple levels", "[exception]") {
         try {
             int value = co_await level2();
             (void)value;
+            observation.outcome = exception_outcome::returned_without_exception;
         } catch (const std::runtime_error& e) {
-            REQUIRE(std::string(e.what()) == "deep error");
-            caught.store(true);
+            observation.message = e.what();
+            observation.outcome = exception_outcome::caught_expected;
         }
         co_return;
     };
     
-    sched.go(level1);
-    
-    std::this_thread::sleep_for(scaled_ms(300));
-    
-    REQUIRE(caught.load());
-    REQUIRE(level_passed.load() == 3);  // All levels should execute
-    
-    sched.shutdown();
+    auto handle = sched.go_joinable(level1);
+    const bool drained = sched.shutdown(scaled_sec(10));
+    const auto observed_outcome = observation.outcome;
+    const std::string observed_message = observation.message;
+    const int observed_levels = level_passed.load();
+
+    CAPTURE(drained, static_cast<int>(observed_outcome), observed_message,
+            observed_levels);
+    REQUIRE(drained);
+    REQUIRE_NOTHROW(handle.await_resume());
+    REQUIRE(observed_outcome == exception_outcome::caught_expected);
+    REQUIRE(observed_message == "deep error");
+    REQUIRE(observed_levels == 3);  // All levels should execute
 }
 
 TEST_CASE("Exception propagation with void tasks", "[exception]") {
     scheduler sched(2);
     sched.start();
     
-    std::atomic<bool> caught{false};
+    exception_observation observation;
     
     auto thrower = []() -> task<void> {
         throw std::runtime_error("void error");
@@ -102,20 +127,24 @@ TEST_CASE("Exception propagation with void tasks", "[exception]") {
     auto catcher = [&]() -> task<void> {
         try {
             co_await thrower();
+            observation.outcome = exception_outcome::returned_without_exception;
         } catch (const std::runtime_error& e) {
-            REQUIRE(std::string(e.what()) == "void error");
-            caught.store(true);
+            observation.message = e.what();
+            observation.outcome = exception_outcome::caught_expected;
         }
         co_return;
     };
     
-    sched.go(catcher);
-    
-    std::this_thread::sleep_for(scaled_ms(200));
-    
-    REQUIRE(caught.load());
-    
-    sched.shutdown();
+    auto handle = sched.go_joinable(catcher);
+    const bool drained = sched.shutdown(scaled_sec(10));
+    const auto observed_outcome = observation.outcome;
+    const std::string observed_message = observation.message;
+
+    CAPTURE(drained, static_cast<int>(observed_outcome), observed_message);
+    REQUIRE(drained);
+    REQUIRE_NOTHROW(handle.await_resume());
+    REQUIRE(observed_outcome == exception_outcome::caught_expected);
+    REQUIRE(observed_message == "void error");
 }
 
 TEST_CASE("Multiple exceptions in different coroutines", "[exception]") {
@@ -162,7 +191,7 @@ TEST_CASE("Exception in middle of chain", "[exception]") {
     scheduler sched(2);
     sched.start();
     
-    std::atomic<bool> caught{false};
+    exception_observation observation;
     std::atomic<int> level1_executed{0};
     std::atomic<int> level3_executed{0};
     
@@ -182,29 +211,36 @@ TEST_CASE("Exception in middle of chain", "[exception]") {
         try {
             int value = co_await level2();
             (void)value;
+            observation.outcome = exception_outcome::returned_without_exception;
         } catch (const std::runtime_error& e) {
-            REQUIRE(std::string(e.what()) == "middle error");
-            caught.store(true);
+            observation.message = e.what();
+            observation.outcome = exception_outcome::caught_expected;
         }
         co_return;
     };
     
-    sched.go(level1);
-    
-    std::this_thread::sleep_for(scaled_ms(300));
-    
-    REQUIRE(caught.load());
-    REQUIRE(level1_executed.load() == 1);
-    REQUIRE(level3_executed.load() == 0);  // Should not execute
-    
-    sched.shutdown();
+    auto handle = sched.go_joinable(level1);
+    const bool drained = sched.shutdown(scaled_sec(10));
+    const auto observed_outcome = observation.outcome;
+    const std::string observed_message = observation.message;
+    const int observed_level1 = level1_executed.load();
+    const int observed_level3 = level3_executed.load();
+
+    CAPTURE(drained, static_cast<int>(observed_outcome), observed_message,
+            observed_level1, observed_level3);
+    REQUIRE(drained);
+    REQUIRE_NOTHROW(handle.await_resume());
+    REQUIRE(observed_outcome == exception_outcome::caught_expected);
+    REQUIRE(observed_message == "middle error");
+    REQUIRE(observed_level1 == 1);
+    REQUIRE(observed_level3 == 0);  // Should not execute
 }
 
 TEST_CASE("Exception with custom exception type", "[exception]") {
     scheduler sched(2);
     sched.start();
     
-    std::atomic<bool> caught{false};
+    exception_observation observation;
     
     struct custom_exception : std::exception {
         const char* what() const noexcept override {
@@ -220,20 +256,24 @@ TEST_CASE("Exception with custom exception type", "[exception]") {
     auto catcher = [&]() -> task<void> {
         try {
             co_await thrower();
+            observation.outcome = exception_outcome::returned_without_exception;
         } catch (const custom_exception& e) {
-            REQUIRE(std::string(e.what()) == "custom error");
-            caught.store(true);
+            observation.message = e.what();
+            observation.outcome = exception_outcome::caught_expected;
         }
         co_return;
     };
     
-    sched.go(catcher);
-    
-    std::this_thread::sleep_for(scaled_ms(200));
-    
-    REQUIRE(caught.load());
-    
-    sched.shutdown();
+    auto handle = sched.go_joinable(catcher);
+    const bool drained = sched.shutdown(scaled_sec(10));
+    const auto observed_outcome = observation.outcome;
+    const std::string observed_message = observation.message;
+
+    CAPTURE(drained, static_cast<int>(observed_outcome), observed_message);
+    REQUIRE(drained);
+    REQUIRE_NOTHROW(handle.await_resume());
+    REQUIRE(observed_outcome == exception_outcome::caught_expected);
+    REQUIRE(observed_message == "custom error");
 }
 
 TEST_CASE("Uncaught exception in coroutine", "[exception]") {
@@ -260,7 +300,7 @@ TEST_CASE("Exception propagation preserves exception message", "[exception]") {
     scheduler sched(2);
     sched.start();
     
-    std::atomic<bool> verified{false};
+    exception_observation observation;
     const std::string expected_msg = "detailed error message with context";
     
     auto thrower = [&]() -> task<int> {
@@ -277,18 +317,22 @@ TEST_CASE("Exception propagation preserves exception message", "[exception]") {
         try {
             int value = co_await level2();
             (void)value;
+            observation.outcome = exception_outcome::returned_without_exception;
         } catch (const std::runtime_error& e) {
-            REQUIRE(std::string(e.what()) == expected_msg);
-            verified.store(true);
+            observation.message = e.what();
+            observation.outcome = exception_outcome::caught_expected;
         }
         co_return;
     };
     
-    sched.go(level1);
-    
-    std::this_thread::sleep_for(scaled_ms(300));
-    
-    REQUIRE(verified.load());
-    
-    sched.shutdown();
+    auto handle = sched.go_joinable(level1);
+    const bool drained = sched.shutdown(scaled_sec(10));
+    const auto observed_outcome = observation.outcome;
+    const std::string observed_message = observation.message;
+
+    CAPTURE(drained, static_cast<int>(observed_outcome), observed_message);
+    REQUIRE(drained);
+    REQUIRE_NOTHROW(handle.await_resume());
+    REQUIRE(observed_outcome == exception_outcome::caught_expected);
+    REQUIRE(observed_message == expected_msg);
 }

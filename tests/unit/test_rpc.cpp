@@ -3323,94 +3323,281 @@ TEST_CASE("server per-session in-flight limit rejects excess request",
     cfg.frame_read_timeout = std::chrono::seconds(0);
     auto server = std::make_shared<rpc_server<tcp_stream>>(cfg);
 
-    elio::sync::event release_first;
-    std::atomic<int> handler_started{0};
-    std::atomic<int> handler_finished{0};
+    struct scenario_state {
+        struct counts {
+            int started;
+            int finished;
+        };
+
+        std::mutex mutex;
+        std::condition_variable changed;
+        elio::sync::event handler_started_signal;
+        elio::sync::event release_handler;
+        elio::sync::event continue_handler;
+        std::shared_ptr<tcp_rpc_client> active_client;
+        int handler_started = 0;
+        int handler_finished = 0;
+        bool release_requested = false;
+        bool client_root_done = false;
+        bool server_root_done = false;
+
+        void handler_entered() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                ++handler_started;
+            }
+            changed.notify_all();
+            handler_started_signal.set();
+        }
+
+        void handler_exited() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                ++handler_finished;
+            }
+            changed.notify_all();
+        }
+
+        counts handler_counts() {
+            std::lock_guard<std::mutex> lock(mutex);
+            return {handler_started, handler_finished};
+        }
+
+        void publish_client(std::shared_ptr<tcp_rpc_client> client) {
+            std::lock_guard<std::mutex> lock(mutex);
+            active_client = std::move(client);
+        }
+
+        void clear_client() {
+            std::lock_guard<std::mutex> lock(mutex);
+            active_client.reset();
+        }
+
+        std::shared_ptr<tcp_rpc_client> client_snapshot() {
+            std::lock_guard<std::mutex> lock(mutex);
+            return active_client;
+        }
+
+        void mark_client_done() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                client_root_done = true;
+            }
+            changed.notify_all();
+        }
+
+        void mark_server_done() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                server_root_done = true;
+            }
+            changed.notify_all();
+        }
+
+        bool wait_for_client(std::chrono::steady_clock::duration timeout) {
+            std::unique_lock<std::mutex> lock(mutex);
+            return changed.wait_for(
+                lock, timeout, [&] { return client_root_done; });
+        }
+
+        bool wait_for_roots(std::chrono::steady_clock::duration timeout) {
+            std::unique_lock<std::mutex> lock(mutex);
+            return changed.wait_for(lock, timeout, [&] {
+                return client_root_done && server_root_done;
+            });
+        }
+
+        void begin_cleanup() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                release_requested = true;
+            }
+            handler_started_signal.set();
+            release_handler.set();
+            continue_handler.set();
+        }
+
+        bool cleanup_started() {
+            std::lock_guard<std::mutex> lock(mutex);
+            return release_requested;
+        }
+    };
+
+    struct client_observation {
+        bool connected = false;
+        bool first_sent = false;
+        bool first_handler_active = false;
+        bool overlimit_oneway_sent = false;
+        bool ping_ok = false;
+        bool ping_completed_before_release = false;
+        rpc_error second_error = rpc_error::success;
+        bool second_completed_before_release = false;
+        int handler_started_at_completion = 0;
+        int handler_finished_at_completion = 0;
+        std::exception_ptr exception;
+    };
+
+    struct server_observation {
+        bool accepted = false;
+        bool session_completed = false;
+        std::exception_ptr exception;
+    };
+
+    auto scenario = std::make_shared<scenario_state>();
     server->register_method<DelayMethod>(
-        [&release_first, &handler_started, &handler_finished](const DelayReq& r)
-            -> coro::task<DelayResp> {
-            handler_started.fetch_add(1, std::memory_order_acq_rel);
-            co_await release_first.wait();
-            handler_finished.fetch_add(1, std::memory_order_acq_rel);
+        [scenario](const DelayReq& r) -> coro::task<DelayResp> {
+            scenario->handler_entered();
+            auto release_result = co_await scenario->release_handler.wait(
+                coro::this_coro::cancel_token());
+            if (release_result == coro::cancel_result::cancelled) {
+                co_await scenario->continue_handler.wait();
+            }
+            scenario->handler_exited();
             co_return DelayResp{r.ms};
         });
 
     scheduler sched(4);
     sched.start();
 
-    sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
-        auto s = co_await lst.accept();
-        if (!s) co_return;
-        co_await server->handle_client(std::move(*s));
+    auto server_root = sched.go_joinable(
+        [scenario, server, &lst = *listener_opt]()
+            -> coro::task<server_observation> {
+        server_observation observed;
+        try {
+            auto stream = co_await lst.accept(
+                coro::this_coro::cancel_token());
+            observed.accepted = stream.has_value();
+            if (stream) {
+                co_await server->handle_client(std::move(*stream));
+                observed.session_completed = true;
+            }
+        } catch (...) {
+            observed.exception = std::current_exception();
+        }
+        scenario->mark_server_done();
+        co_return observed;
     });
 
-    std::promise<void> client_done_promise;
-    auto client_done = client_done_promise.get_future();
-    std::atomic<int> second_error{static_cast<int>(rpc_error::success)};
-    std::atomic<int64_t> second_elapsed_ms{-1};
-    std::atomic<bool> first_sent{false};
-    std::atomic<bool> overlimit_oneway_sent{false};
-    std::atomic<bool> ping_ok{false};
+    auto client_root = sched.go_joinable(
+        [scenario, port]() -> coro::task<client_observation> {
+        client_observation observed;
+        std::shared_ptr<tcp_rpc_client> client;
+        try {
+            auto client_opt = co_await tcp_rpc_client::connect("::1", port);
+            observed.connected = client_opt.has_value();
+            if (client_opt) {
+                client = *client_opt;
+                scenario->publish_client(client);
 
-    sched.go([&, p = std::move(client_done_promise)]() mutable -> coro::task<void> {
-        auto client_opt = co_await tcp_rpc_client::connect("::1", port);
-        REQUIRE(client_opt.has_value());
-        auto client = *client_opt;
+                observed.first_sent =
+                    co_await client->send_oneway<DelayMethod>(DelayReq{111});
+                if (observed.first_sent) {
+                    co_await scenario->handler_started_signal.wait();
+                    auto active_counts = scenario->handler_counts();
+                    observed.first_handler_active =
+                        active_counts.started == 1 &&
+                        active_counts.finished == 0;
+                }
 
-        auto call_timeout = elio::test::scaled_sec(30);
-        first_sent.store(co_await client->send_oneway<DelayMethod>(DelayReq{111}),
-                         std::memory_order_release);
-        REQUIRE(first_sent.load(std::memory_order_acquire));
+                if (observed.first_handler_active) {
+                    observed.overlimit_oneway_sent =
+                        co_await client->send_oneway<DelayMethod>(
+                            DelayReq{222});
+                    observed.ping_ok = co_await client->ping(
+                        elio::test::scaled_sec(30));
+                    observed.ping_completed_before_release =
+                        !scenario->cleanup_started();
 
-        for (int i = 0;
-             i < 200 && handler_started.load(std::memory_order_acquire) == 0;
-             ++i) {
-            co_await elio::time::sleep_for(std::chrono::milliseconds(5));
+                    auto second = co_await client->call<DelayMethod>(
+                        DelayReq{333}, elio::test::scaled_sec(30));
+                    observed.second_error = second.error();
+                    observed.second_completed_before_release =
+                        !scenario->cleanup_started();
+                    auto completion_counts = scenario->handler_counts();
+                    observed.handler_started_at_completion =
+                        completion_counts.started;
+                    observed.handler_finished_at_completion =
+                        completion_counts.finished;
+                }
+            }
+        } catch (...) {
+            observed.exception = std::current_exception();
         }
-        REQUIRE(handler_started.load(std::memory_order_acquire) == 1);
 
-        overlimit_oneway_sent.store(
-            co_await client->send_oneway<DelayMethod>(DelayReq{222}),
-            std::memory_order_release);
-        REQUIRE(overlimit_oneway_sent.load(std::memory_order_acquire));
-
-        ping_ok.store(co_await client->ping(elio::test::scaled_sec(30)),
-                      std::memory_order_release);
-        REQUIRE(ping_ok.load(std::memory_order_acquire));
-
-        auto second_start = std::chrono::steady_clock::now();
-        auto second = co_await client->call<DelayMethod>(
-            DelayReq{333}, call_timeout);
-        auto second_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - second_start);
-        second_elapsed_ms.store(second_elapsed.count(), std::memory_order_release);
-        second_error.store(
-            static_cast<int>(second.error()), std::memory_order_release);
-
-        release_first.set();
-        for (int i = 0;
-             i < 200 && handler_finished.load(std::memory_order_acquire) == 0;
-             ++i) {
-            co_await elio::time::sleep_for(std::chrono::milliseconds(5));
+        if (client) {
+            client->close();
         }
-        p.set_value();
+        scenario->clear_client();
+        scenario->mark_client_done();
+        co_return observed;
     });
 
-    auto status = client_done.wait_for(std::chrono::seconds(60));
-    REQUIRE(status == std::future_status::ready);
-    REQUIRE(second_error.load(std::memory_order_acquire) ==
-            static_cast<int>(rpc_error::resource_exhausted));
-    REQUIRE(first_sent.load(std::memory_order_acquire));
-    REQUIRE(overlimit_oneway_sent.load(std::memory_order_acquire));
-    REQUIRE(ping_ok.load(std::memory_order_acquire));
-    REQUIRE(second_elapsed_ms.load(std::memory_order_acquire) >= 0);
-    REQUIRE(second_elapsed_ms.load(std::memory_order_acquire) <
-            elio::test::scaled_ms(500).count());
-    REQUIRE(handler_started.load(std::memory_order_acquire) == 1);
-    REQUIRE(handler_finished.load(std::memory_order_acquire) == 1);
+    const bool client_completed_before_cleanup = scenario->wait_for_client(
+        elio::test::scaled_sec(10));
 
+    scenario->begin_cleanup();
+    if (auto client = scenario->client_snapshot()) {
+        client->close();
+    }
+    client_root.request_cancel();
     server->stop();
-    sched.shutdown(std::chrono::seconds(30));
+    server_root.request_cancel();
+
+    const bool roots_unwound = scenario->wait_for_roots(
+        elio::test::scaled_sec(10));
+    const bool scheduler_stopped = sched.shutdown(elio::test::scaled_sec(10));
+    const bool client_ready = client_root.is_ready();
+    const bool client_destroyed = client_root.is_destroyed();
+    const bool server_ready = server_root.is_ready();
+    const bool server_destroyed = server_root.is_destroyed();
+
+    std::optional<client_observation> client_observed;
+    std::optional<server_observation> server_observed;
+    if (client_ready && client_destroyed) {
+        client_observed.emplace(client_root.await_resume());
+    }
+    if (server_ready && server_destroyed) {
+        server_observed.emplace(server_root.await_resume());
+    }
+    if (server_ready && server_destroyed) {
+        listener_opt->close();
+    }
+
+    auto final_counts = scenario->handler_counts();
+    CAPTURE(client_completed_before_cleanup,
+            roots_unwound,
+            scheduler_stopped,
+            client_ready,
+            client_destroyed,
+            server_ready,
+            server_destroyed,
+            final_counts.started,
+            final_counts.finished);
+    REQUIRE(client_completed_before_cleanup);
+    REQUIRE(roots_unwound);
+    REQUIRE(scheduler_stopped);
+    REQUIRE(client_ready);
+    REQUIRE(client_destroyed);
+    REQUIRE(server_ready);
+    REQUIRE(server_destroyed);
+    REQUIRE(client_observed.has_value());
+    REQUIRE(server_observed.has_value());
+    REQUIRE(client_observed->exception == nullptr);
+    REQUIRE(server_observed->exception == nullptr);
+    REQUIRE(server_observed->accepted);
+    REQUIRE(server_observed->session_completed);
+    REQUIRE(client_observed->connected);
+    REQUIRE(client_observed->first_sent);
+    REQUIRE(client_observed->first_handler_active);
+    REQUIRE(client_observed->overlimit_oneway_sent);
+    REQUIRE(client_observed->ping_ok);
+    REQUIRE(client_observed->ping_completed_before_release);
+    REQUIRE(client_observed->second_error == rpc_error::resource_exhausted);
+    REQUIRE(client_observed->second_completed_before_release);
+    REQUIRE(client_observed->handler_started_at_completion == 1);
+    REQUIRE(client_observed->handler_finished_at_completion == 0);
+    REQUIRE(final_counts.started == 1);
+    REQUIRE(final_counts.finished == 1);
 }
 
 TEST_CASE("server per-session overload rejection is single-flight",

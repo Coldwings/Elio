@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bounded-channel receive revalidation**: A blocking receive that observed an
+  empty ring now rechecks it under the channel mutex before selecting a queued
+  sender or closed state. Values committed during that transition can no longer
+  be stranded behind premature EOF or bypassed by newer senders (#1096).
 - **Cancellable semaphore ready-acquire rollback**: Ready token-aware acquires
   now select completion and debit the permit in one semaphore critical section.
   Cancellation can no longer expose a temporary debit that lets a concurrent

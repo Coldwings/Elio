@@ -149,14 +149,6 @@ jobs:
       env:
         TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:log_path=${{ github.workspace }}/test-logs/tsan-${{ matrix.arch.name }}-${{ matrix.build_type }}
 
-    - name: Upload failing test evidence
-      if: failure() && needs.changes.outputs.code == 'true'
-      uses: actions/upload-artifact@v7
-      with:
-        name: test-failure-logs-${{ matrix.arch.name }}-${{ matrix.build_type }}
-        path: test-logs/
-        if-no-files-found: warn
-
     - name: Run registered CTest checks
       if: needs.changes.outputs.code == 'true' && matrix.arch.name == 'x64' && matrix.build_type == 'Debug'
       run: |
@@ -194,6 +186,8 @@ jobs:
           fi
           "${test_binary}"
         done
+      env:
+        ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:log_path=${{ github.workspace }}/test-logs/asan-${{ matrix.arch.name }}-${{ matrix.build_type }}-ctest
 
     - name: Run benchmark
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
@@ -218,6 +212,14 @@ jobs:
     - name: Run autoscaler example smoke test
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Release'
       run: timeout --kill-after=5s 15s ./build/examples/autoscaler_example --smoke
+
+    - name: Upload failing test evidence
+      if: failure() && needs.changes.outputs.code == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: test-failure-logs-${{ matrix.arch.name }}-${{ matrix.build_type }}
+        path: test-logs/
+        if-no-files-found: warn
 
   package-consumer-check:
     needs: changes

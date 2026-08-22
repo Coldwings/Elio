@@ -4,11 +4,19 @@
 #include <elio/runtime/scheduler.hpp>
 #include <elio/runtime/spawn.hpp>
 #include <elio/coro/cancel_token.hpp>
+#include <elio/coro/this_coro.hpp>
 #include <elio/time/timer.hpp>
+
+#include "../test_main.cpp"
 
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -842,21 +850,6 @@ elio::coro::task<bool> write_all(elio::net::tcp_stream& s,
     co_return true;
 }
 
-/// Read until the buffer either ends or `terminator` has been observed.
-/// Drains the socket so the test can inspect what was written before
-/// it closed.
-elio::coro::task<std::string> read_until_close(elio::net::tcp_stream& s,
-                                                 size_t cap = 65536) {
-    std::string out;
-    char buf[1024];
-    while (out.size() < cap) {
-        auto r = co_await s.read(buf, sizeof(buf));
-        if (r.result <= 0) break;
-        out.append(buf, static_cast<size_t>(r.result));
-    }
-    co_return out;
-}
-
 /// Drain bytes until we see a complete `\r\n\r\n` header terminator.
 /// Returns the consumed prefix on success, empty on EOF.
 elio::coro::task<std::string> read_request_headers(elio::net::tcp_stream& s) {
@@ -917,57 +910,353 @@ TEST_CASE("sse_connection serializes concurrent send_event calls",
     REQUIRE(listener_opt.has_value());
     uint16_t port = listener_opt->local_address().port();
 
+    constexpr int kRoundsPerSender = 25;
+
+    struct sender_observation {
+        int completed_rounds = 0;
+        int failed_round = -1;
+        std::exception_ptr exception;
+    };
+
+    struct server_observation {
+        bool accepted = false;
+        bool alpha_started = false;
+        bool beta_started = false;
+        bool stream_closed = false;
+        sender_observation alpha;
+        sender_observation beta;
+        std::exception_ptr exception;
+    };
+
+    struct reader_observation {
+        bool connected = false;
+        bool read_completed = false;
+        bool stream_closed = false;
+        int terminal_read_result = 0;
+        std::string captured;
+        std::exception_ptr exception;
+    };
+
+    struct shared_session {
+        explicit shared_session(tcp_stream&& accepted)
+            : stream(std::move(accepted)), connection(&stream) {}
+
+        tcp_stream stream;
+        sse_connection connection;
+    };
+
+    struct root_state {
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::shared_ptr<shared_session> active_session;
+        bool interruption_requested = false;
+        bool server_done = false;
+        bool reader_done = false;
+
+        void publish_session(std::shared_ptr<shared_session> session) {
+            std::lock_guard<std::mutex> lock(mutex);
+            active_session = std::move(session);
+            if (interruption_requested) {
+                active_session->connection.close();
+                active_session->stream.shutdown_socket();
+            }
+        }
+
+        void retire_session(const std::shared_ptr<shared_session>& session) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (active_session == session) {
+                active_session.reset();
+            }
+        }
+
+        void interrupt_session() {
+            std::lock_guard<std::mutex> lock(mutex);
+            interruption_requested = true;
+            if (active_session) {
+                active_session->connection.close();
+                active_session->stream.shutdown_socket();
+            }
+        }
+
+        void mark_server_done() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                server_done = true;
+            }
+            changed.notify_all();
+        }
+
+        void mark_reader_done() {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                reader_done = true;
+            }
+            changed.notify_all();
+        }
+
+        bool wait_for_roots(std::chrono::milliseconds timeout) {
+            std::unique_lock<std::mutex> lock(mutex);
+            return changed.wait_for(
+                lock, timeout, [&] { return server_done && reader_done; });
+        }
+    };
+
+    auto listener = std::make_shared<tcp_listener>(std::move(*listener_opt));
+    auto roots = std::make_shared<root_state>();
+
     scheduler sched(2);
     sched.start();
 
-    constexpr int kRoundsPerSender = 25;
-    std::atomic<int> writes_done{0};
-    std::atomic<int> reader_done{0};
-    std::string captured;
+    auto server_root = sched.go_joinable(
+        [listener, roots]() -> coro::task<server_observation> {
+            server_observation observed;
+            std::shared_ptr<shared_session> session;
+            try {
+                auto accepted = co_await listener->accept(
+                    coro::this_coro::cancel_token());
+                observed.accepted = accepted.has_value();
+                if (accepted) {
+                    session = std::make_shared<shared_session>(
+                        std::move(*accepted));
+                    roots->publish_session(session);
 
-    sched.go([&]() -> coro::task<void> {
-        auto server_stream = co_await listener_opt->accept();
-        REQUIRE(server_stream.has_value());
+                    // Two coroutines pump distinct events concurrently.
+                    // Each child owns the session and returns an observation,
+                    // so one failure cannot throw past the sibling join or
+                    // invalidate the connection while the sibling is active.
+                    auto sender =
+                        [session, rounds = kRoundsPerSender](std::string type)
+                            -> coro::task<sender_observation> {
+                            sender_observation sender_observed;
+                            try {
+                                for (int i = 0; i < rounds; ++i) {
+                                    std::string payload =
+                                        type + ":" + std::to_string(i);
+                                    bool ok = co_await session->connection.send_event(
+                                        type, payload);
+                                    if (!ok) {
+                                        sender_observed.failed_round = i;
+                                        co_return sender_observed;
+                                    }
+                                    ++sender_observed.completed_rounds;
+                                }
+                            } catch (...) {
+                                sender_observed.exception =
+                                    std::current_exception();
+                            }
+                            co_return sender_observed;
+                        };
 
-        sse_connection conn(&*server_stream);
+                    std::optional<coro::join_handle<sender_observation>> alpha;
+                    std::optional<coro::join_handle<sender_observation>> beta;
 
-        // Two coroutines pump distinct events concurrently.  Without the send
-        // mutex they would interleave bytes inside `event:`/`data:`/`\n\n`
-        // framing and the wire output would not split cleanly into frames.
-        auto sender = [&](std::string type) -> coro::task<void> {
-            for (int i = 0; i < kRoundsPerSender; ++i) {
-                std::string payload = type + ":" + std::to_string(i);
-                bool ok = co_await conn.send_event(type, payload);
-                REQUIRE(ok);
+                    try {
+                        alpha.emplace(
+                            elio::spawn(sender, std::string("alpha")));
+                        observed.alpha_started = true;
+                    } catch (...) {
+                        observed.alpha.exception = std::current_exception();
+                    }
+                    try {
+                        beta.emplace(elio::spawn(sender, std::string("beta")));
+                        observed.beta_started = true;
+                    } catch (...) {
+                        observed.beta.exception = std::current_exception();
+                    }
+
+                    if (alpha) {
+                        try {
+                            observed.alpha = co_await std::move(*alpha);
+                        } catch (...) {
+                            observed.alpha.exception =
+                                std::current_exception();
+                        }
+                    }
+                    if (beta) {
+                        try {
+                            observed.beta = co_await std::move(*beta);
+                        } catch (...) {
+                            observed.beta.exception =
+                                std::current_exception();
+                        }
+                    }
+                }
+            } catch (...) {
+                observed.exception = std::current_exception();
             }
-            writes_done.fetch_add(1, std::memory_order_release);
-        };
-        auto t_a = elio::spawn([&] { return sender("alpha"); });
-        auto t_b = elio::spawn([&] { return sender("beta"); });
-        co_await std::move(t_a);
-        co_await std::move(t_b);
 
-        conn.close();
-        // Half-close so the reader sees EOF promptly.
-        co_await server_stream->close();
-    });
+            if (session) {
+                session->connection.close();
+                roots->retire_session(session);
+                try {
+                    co_await session->stream.close();
+                    observed.stream_closed = true;
+                } catch (...) {
+                    if (!observed.exception) {
+                        observed.exception = std::current_exception();
+                    }
+                }
+            }
+            roots->mark_server_done();
+            co_return observed;
+        });
 
-    sched.go([&]() -> coro::task<void> {
-        auto client_stream = co_await tcp_connect(ipv4_address("127.0.0.1", port));
-        REQUIRE(client_stream.has_value());
-        captured = co_await read_until_close(*client_stream, 1u << 20);
-        reader_done.fetch_add(1, std::memory_order_release);
-    });
+    auto reader_root = sched.go_joinable(
+        [port, roots]() -> coro::task<reader_observation> {
+            reader_observation observed;
+            std::optional<tcp_stream> stream;
+            try {
+                auto token = coro::this_coro::cancel_token();
+                auto connected = co_await tcp_connect(
+                    ipv4_address("127.0.0.1", port), token);
+                observed.connected = connected.has_value();
+                if (connected) {
+                    stream.emplace(std::move(*connected));
+                    char buffer[1024];
+                    constexpr size_t kCaptureLimit = 1u << 20;
+                    while (observed.captured.size() < kCaptureLimit) {
+                        auto result = co_await stream->read(
+                            buffer, sizeof(buffer), token);
+                        if (result.result <= 0) {
+                            observed.terminal_read_result = result.result;
+                            break;
+                        }
+                        observed.captured.append(
+                            buffer, static_cast<size_t>(result.result));
+                    }
+                    observed.read_completed = true;
+                }
+            } catch (...) {
+                observed.exception = std::current_exception();
+            }
 
-    REQUIRE(wait_for([&] { return reader_done.load() == 1; }));
-    sched.shutdown();
+            if (stream) {
+                try {
+                    co_await stream->close();
+                    observed.stream_closed = true;
+                } catch (...) {
+                    if (!observed.exception) {
+                        observed.exception = std::current_exception();
+                    }
+                }
+            }
+            roots->mark_reader_done();
+            co_return observed;
+        });
+
+    const bool roots_completed_before_cleanup = roots->wait_for_roots(
+        elio::test::scaled_sec(10));
+
+    server_root.request_cancel();
+    reader_root.request_cancel();
+    roots->interrupt_session();
+
+    const bool roots_unwound = roots->wait_for_roots(
+        elio::test::scaled_sec(10));
+    const bool scheduler_stopped = sched.shutdown(elio::test::scaled_sec(10));
+    const bool server_ready = server_root.is_ready();
+    const bool server_destroyed = server_root.is_destroyed();
+    const bool reader_ready = reader_root.is_ready();
+    const bool reader_destroyed = reader_root.is_destroyed();
+
+    std::optional<server_observation> server_observed;
+    std::optional<reader_observation> reader_observed;
+    std::exception_ptr server_join_exception;
+    std::exception_ptr reader_join_exception;
+    if (server_ready && server_destroyed) {
+        try {
+            server_observed.emplace(server_root.await_resume());
+        } catch (...) {
+            server_join_exception = std::current_exception();
+        }
+    }
+    if (reader_ready && reader_destroyed) {
+        try {
+            reader_observed.emplace(reader_root.await_resume());
+        } catch (...) {
+            reader_join_exception = std::current_exception();
+        }
+    }
+    if (server_destroyed) {
+        listener->close();
+    }
+
+    auto exception_message = [](const std::exception_ptr& exception) {
+        if (!exception) {
+            return std::string{};
+        }
+        try {
+            std::rethrow_exception(exception);
+        } catch (const std::exception& error) {
+            return std::string(error.what());
+        } catch (...) {
+            return std::string("non-standard exception");
+        }
+    };
+
+    std::string server_exception;
+    std::string alpha_exception;
+    std::string beta_exception;
+    std::string reader_exception;
+    if (server_observed) {
+        server_exception = exception_message(server_observed->exception);
+        alpha_exception = exception_message(server_observed->alpha.exception);
+        beta_exception = exception_message(server_observed->beta.exception);
+    }
+    if (reader_observed) {
+        reader_exception = exception_message(reader_observed->exception);
+    }
+    const std::string server_join_error =
+        exception_message(server_join_exception);
+    const std::string reader_join_error =
+        exception_message(reader_join_exception);
+
+    CAPTURE(roots_completed_before_cleanup,
+            roots_unwound,
+            scheduler_stopped,
+            server_ready,
+            server_destroyed,
+            reader_ready,
+            reader_destroyed,
+            server_exception,
+            alpha_exception,
+            beta_exception,
+            reader_exception,
+            server_join_error,
+            reader_join_error);
+    REQUIRE(roots_completed_before_cleanup);
+    REQUIRE(roots_unwound);
+    REQUIRE(scheduler_stopped);
+    REQUIRE(server_ready);
+    REQUIRE(server_destroyed);
+    REQUIRE(reader_ready);
+    REQUIRE(reader_destroyed);
+    REQUIRE(server_join_exception == nullptr);
+    REQUIRE(reader_join_exception == nullptr);
+    REQUIRE(server_observed.has_value());
+    REQUIRE(reader_observed.has_value());
+    REQUIRE(server_observed->exception == nullptr);
+    REQUIRE(reader_observed->exception == nullptr);
+    REQUIRE(server_observed->accepted);
+    REQUIRE(server_observed->alpha_started);
+    REQUIRE(server_observed->beta_started);
+    REQUIRE(server_observed->stream_closed);
+    REQUIRE(reader_observed->connected);
+    REQUIRE(reader_observed->read_completed);
+    REQUIRE(reader_observed->stream_closed);
+    REQUIRE(server_observed->alpha.exception == nullptr);
+    REQUIRE(server_observed->alpha.failed_round == -1);
+    REQUIRE(server_observed->alpha.completed_rounds == kRoundsPerSender);
+    REQUIRE(server_observed->beta.exception == nullptr);
+    REQUIRE(server_observed->beta.failed_round == -1);
+    REQUIRE(server_observed->beta.completed_rounds == kRoundsPerSender);
 
     // Re-parse what landed on the wire.  Every byte should belong to one of
     // the well-formed events; if frames had been spliced, the parser would
     // still happily produce events but field values would be corrupted —
     // we therefore validate each event's data matches "<type>:<index>".
     event_parser parser;
-    parser.parse(captured);
+    parser.parse(reader_observed->captured);
 
     int alpha_seen = 0, beta_seen = 0;
     for (;;) {

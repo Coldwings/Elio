@@ -825,8 +825,9 @@ TEST_CASE("SSE JSON data", "[sse][json]") {
 namespace {
 
 /// Spin-wait briefly for a flag/predicate to flip to true.  Returns whether
-/// it did within the timeout.  Used in lieu of join_handles below since the
-/// integration tests fire-and-forget tasks via scheduler::go().
+/// it did within the timeout.  The integration tests use this to avoid
+/// starting scheduler teardown until protocol peers have reached a terminal
+/// state or a timeout-worthy stall is observable.
 template <typename Pred>
 bool wait_for(Pred pred, std::chrono::milliseconds timeout =
                               std::chrono::seconds(5)) {
@@ -862,6 +863,42 @@ elio::coro::task<std::string> read_request_headers(elio::net::tcp_stream& s) {
         if (buf.find("\r\n\r\n") != std::string::npos) co_return buf;
     }
     co_return std::string{};
+}
+
+template <typename T>
+struct join_completion {
+    bool ready = false;
+    bool destroyed = false;
+    std::optional<T> value;
+    std::exception_ptr exception;
+};
+
+template <typename T>
+join_completion<T> collect_join(elio::coro::join_handle<T>& root) {
+    join_completion<T> completion;
+    completion.ready = root.is_ready();
+    completion.destroyed = root.is_destroyed();
+    if (completion.ready && completion.destroyed) {
+        try {
+            completion.value.emplace(root.await_resume());
+        } catch (...) {
+            completion.exception = std::current_exception();
+        }
+    }
+    return completion;
+}
+
+std::string exception_message(const std::exception_ptr& exception) {
+    if (!exception) {
+        return {};
+    }
+    try {
+        std::rethrow_exception(exception);
+    } catch (const std::exception& error) {
+        return error.what();
+    } catch (...) {
+        return "non-standard exception";
+    }
 }
 
 }  // namespace
@@ -1292,17 +1329,39 @@ TEST_CASE("sse_client does not eat events into HTTP body even when the "
     scheduler sched(2);
     sched.start();
 
+    struct server_observation {
+        bool accepted = false;
+        bool request_received = false;
+        bool headers_written = false;
+        bool body_written = false;
+        bool closed = false;
+    };
+
+    struct client_observation {
+        bool connected = false;
+        std::vector<event> got;
+    };
+
     std::atomic<bool> server_done{false};
     std::atomic<int> events_received{0};
-    std::vector<event> got;
 
-    sched.go([&]() -> coro::task<void> {
+    auto server_root = sched.go_joinable([&]() -> coro::task<server_observation> {
+        server_observation observed;
         auto server_stream = co_await listener_opt->accept();
-        REQUIRE(server_stream.has_value());
+        observed.accepted = server_stream.has_value();
+        if (!server_stream) {
+            server_done = true;
+            co_return observed;
+        }
 
         // Drain the GET request.
         auto req = co_await read_request_headers(*server_stream);
-        REQUIRE(!req.empty());
+        observed.request_received = !req.empty();
+        if (!observed.request_received) {
+            co_await server_stream->close();
+            server_done = true;
+            co_return observed;
+        }
 
         // Misbehaving server: declares a bogus Content-Length and then sends
         // SSE events.  Pre-fix, response_parser would consume the first
@@ -1319,45 +1378,78 @@ TEST_CASE("sse_client does not eat events into HTTP body even when the "
             "Cache-Control: no-cache\r\n"
             "\r\n";
 
-        REQUIRE(co_await write_all(*server_stream, headers));
-        REQUIRE(co_await write_all(*server_stream, body));
+        observed.headers_written = co_await write_all(*server_stream, headers);
+        if (observed.headers_written) {
+            observed.body_written = co_await write_all(*server_stream, body);
+        }
         // Hold the socket open briefly so the client can drain events
         // before EOF triggers the auto-reconnect path.
         co_await elio::time::sleep_for(std::chrono::milliseconds(150));
         co_await server_stream->close();
+        observed.closed = true;
         server_done = true;
+        co_return observed;
     });
 
-    sched.go([&]() -> coro::task<void> {
+    auto client_root = sched.go_joinable([&]() -> coro::task<client_observation> {
+        client_observation observed;
         client_config cfg;
         cfg.auto_reconnect = false;  // single-shot; we want a deterministic test
         sse_client client(cfg);
         std::string url =
             "http://127.0.0.1:" + std::to_string(port) + "/events";
-        bool connected = co_await client.connect(url);
-        REQUIRE(connected);
+        observed.connected = co_await client.connect(url);
+        if (!observed.connected) {
+            co_await client.close();
+            co_return observed;
+        }
 
         // We sent 3 events.  If response_parser had consumed any of them as
         // body bytes, fewer than 3 would arrive (or they would be malformed).
         for (int i = 0; i < 3; ++i) {
             auto evt = co_await client.receive();
             if (!evt) break;
-            got.push_back(*evt);
+            observed.got.push_back(*evt);
             events_received.fetch_add(1, std::memory_order_release);
         }
         co_await client.close();
+        co_return observed;
     });
 
     REQUIRE(wait_for([&] { return events_received.load() == 3 && server_done.load(); }));
-    sched.shutdown();
+    const bool scheduler_stopped = sched.shutdown(elio::test::scaled_sec(5));
+    auto server_completion = collect_join(server_root);
+    auto client_completion = collect_join(client_root);
 
-    REQUIRE(got.size() == 3);
-    REQUIRE(got[0].type == "greet");
-    REQUIRE(got[0].data == "hello");
-    REQUIRE(got[1].type == "tick");
-    REQUIRE(got[1].data == "1");
-    REQUIRE(got[2].type == "tick");
-    REQUIRE(got[2].data == "2");
+    CAPTURE(scheduler_stopped,
+            server_completion.ready,
+            server_completion.destroyed,
+            client_completion.ready,
+            client_completion.destroyed,
+            exception_message(server_completion.exception),
+            exception_message(client_completion.exception));
+    REQUIRE(scheduler_stopped);
+    REQUIRE(server_completion.ready);
+    REQUIRE(server_completion.destroyed);
+    REQUIRE(client_completion.ready);
+    REQUIRE(client_completion.destroyed);
+    REQUIRE(server_completion.exception == nullptr);
+    REQUIRE(client_completion.exception == nullptr);
+    REQUIRE(server_completion.value.has_value());
+    REQUIRE(client_completion.value.has_value());
+    REQUIRE(server_completion.value->accepted);
+    REQUIRE(server_completion.value->request_received);
+    REQUIRE(server_completion.value->headers_written);
+    REQUIRE(server_completion.value->body_written);
+    REQUIRE(server_completion.value->closed);
+    REQUIRE(client_completion.value->connected);
+    REQUIRE(client_completion.value->got.size() == 3);
+    REQUIRE(client_completion.value->got[0].type == "greet");
+    REQUIRE(client_completion.value->got[0].data == "hello");
+    REQUIRE(client_completion.value->got[1].type == "tick");
+    REQUIRE(client_completion.value->got[1].data == "1");
+    REQUIRE(client_completion.value->got[2].type == "tick");
+    REQUIRE(client_completion.value->got[2].data == "2");
 }
 
 TEST_CASE("sse_client enforces configured response header limits before "
@@ -1375,28 +1467,51 @@ TEST_CASE("sse_client enforces configured response header limits before "
     scheduler sched(2);
     sched.start();
 
+    struct server_observation {
+        bool accepted = false;
+        bool request_received = false;
+        bool response_written = false;
+        bool closed = false;
+    };
+
+    struct client_observation {
+        bool connected = true;
+        int connect_errno = 0;
+    };
+
     std::atomic<bool> server_done{false};
     std::atomic<bool> client_done{false};
-    bool connected = true;
-    int connect_errno = 0;
 
-    sched.go([&]() -> coro::task<void> {
+    auto server_root = sched.go_joinable([&]() -> coro::task<server_observation> {
+        server_observation observed;
         auto server_stream = co_await listener_opt->accept();
-        REQUIRE(server_stream.has_value());
+        observed.accepted = server_stream.has_value();
+        if (!server_stream) {
+            server_done = true;
+            co_return observed;
+        }
 
         auto req = co_await read_request_headers(*server_stream);
-        REQUIRE(!req.empty());
+        observed.request_received = !req.empty();
+        if (!observed.request_received) {
+            co_await server_stream->close();
+            server_done = true;
+            co_return observed;
+        }
 
         std::string response =
             "HTTP/1.1 200 OK\r\n"
             "X-Too-Long: " + std::string(64, 'a');
-        REQUIRE(co_await write_all(*server_stream, response));
+        observed.response_written = co_await write_all(*server_stream, response);
         co_await elio::time::sleep_for(std::chrono::milliseconds(100));
         co_await server_stream->close();
+        observed.closed = true;
         server_done = true;
+        co_return observed;
     });
 
-    sched.go([&]() -> coro::task<void> {
+    auto client_root = sched.go_joinable([&]() -> coro::task<client_observation> {
+        client_observation observed;
         client_config cfg;
         cfg.auto_reconnect = false;
         cfg.max_header_size = 16;
@@ -1405,17 +1520,40 @@ TEST_CASE("sse_client enforces configured response header limits before "
             "http://127.0.0.1:" + std::to_string(port) + "/events";
 
         errno = 0;
-        connected = co_await client.connect(url);
-        connect_errno = errno;
+        observed.connected = co_await client.connect(url);
+        observed.connect_errno = errno;
         client_done = true;
         co_await client.close();
+        co_return observed;
     });
 
     REQUIRE(wait_for([&] { return client_done.load() && server_done.load(); }));
-    sched.shutdown();
+    const bool scheduler_stopped = sched.shutdown(elio::test::scaled_sec(5));
+    auto server_completion = collect_join(server_root);
+    auto client_completion = collect_join(client_root);
 
-    REQUIRE_FALSE(connected);
-    REQUIRE(connect_errno == EMSGSIZE);
+    CAPTURE(scheduler_stopped,
+            server_completion.ready,
+            server_completion.destroyed,
+            client_completion.ready,
+            client_completion.destroyed,
+            exception_message(server_completion.exception),
+            exception_message(client_completion.exception));
+    REQUIRE(scheduler_stopped);
+    REQUIRE(server_completion.ready);
+    REQUIRE(server_completion.destroyed);
+    REQUIRE(client_completion.ready);
+    REQUIRE(client_completion.destroyed);
+    REQUIRE(server_completion.exception == nullptr);
+    REQUIRE(client_completion.exception == nullptr);
+    REQUIRE(server_completion.value.has_value());
+    REQUIRE(client_completion.value.has_value());
+    REQUIRE(server_completion.value->accepted);
+    REQUIRE(server_completion.value->request_received);
+    REQUIRE(server_completion.value->response_written);
+    REQUIRE(server_completion.value->closed);
+    REQUIRE_FALSE(client_completion.value->connected);
+    REQUIRE(client_completion.value->connect_errno == EMSGSIZE);
 }
 
 TEST_CASE("sse_client honors configured response header limits above 8192",
@@ -1432,23 +1570,45 @@ TEST_CASE("sse_client honors configured response header limits above 8192",
     scheduler sched(2);
     sched.start();
 
+    struct server_observation {
+        bool accepted = false;
+        bool request_received = false;
+        bool prefix_written = false;
+        bool suffix_written = false;
+        bool closed = false;
+    };
+
+    struct client_observation {
+        bool connected = false;
+        bool got_event = false;
+        std::string event_data;
+    };
+
     std::atomic<bool> server_done{false};
     std::atomic<bool> client_done{false};
-    bool connected = false;
-    bool got_event = false;
-    std::string event_data;
 
-    sched.go([&]() -> coro::task<void> {
+    auto server_root = sched.go_joinable([&]() -> coro::task<server_observation> {
+        server_observation observed;
         auto server_stream = co_await listener_opt->accept();
-        REQUIRE(server_stream.has_value());
+        observed.accepted = server_stream.has_value();
+        if (!server_stream) {
+            server_done = true;
+            co_return observed;
+        }
 
         auto req = co_await read_request_headers(*server_stream);
-        REQUIRE(!req.empty());
+        observed.request_received = !req.empty();
+        if (!observed.request_received) {
+            co_await server_stream->close();
+            server_done = true;
+            co_return observed;
+        }
 
         std::string response_prefix =
             "HTTP/1.1 200 OK\r\n"
             "X-Pad: " + std::string(8300, 'a');
-        REQUIRE(co_await write_all(*server_stream, response_prefix));
+        observed.prefix_written =
+            co_await write_all(*server_stream, response_prefix);
         co_await elio::time::sleep_for(std::chrono::milliseconds(100));
 
         std::string response_suffix =
@@ -1459,13 +1619,19 @@ TEST_CASE("sse_client honors configured response header limits above 8192",
             "event: ready\n"
             "data: ok\n"
             "\n";
-        REQUIRE(co_await write_all(*server_stream, response_suffix));
+        if (observed.prefix_written) {
+            observed.suffix_written =
+                co_await write_all(*server_stream, response_suffix);
+        }
         co_await elio::time::sleep_for(std::chrono::milliseconds(100));
         co_await server_stream->close();
+        observed.closed = true;
         server_done = true;
+        co_return observed;
     });
 
-    sched.go([&]() -> coro::task<void> {
+    auto client_root = sched.go_joinable([&]() -> coro::task<client_observation> {
+        client_observation observed;
         client_config cfg;
         cfg.auto_reconnect = false;
         cfg.max_header_size = 9000;
@@ -1473,24 +1639,48 @@ TEST_CASE("sse_client honors configured response header limits above 8192",
         std::string url =
             "http://127.0.0.1:" + std::to_string(port) + "/events";
 
-        connected = co_await client.connect(url);
-        if (connected) {
+        observed.connected = co_await client.connect(url);
+        if (observed.connected) {
             auto evt = co_await client.receive();
-            got_event = evt.has_value();
+            observed.got_event = evt.has_value();
             if (evt) {
-                event_data = evt->data;
+                observed.event_data = evt->data;
             }
         }
         client_done = true;
         co_await client.close();
+        co_return observed;
     });
 
     REQUIRE(wait_for([&] { return client_done.load() && server_done.load(); }));
-    sched.shutdown();
+    const bool scheduler_stopped = sched.shutdown(elio::test::scaled_sec(5));
+    auto server_completion = collect_join(server_root);
+    auto client_completion = collect_join(client_root);
 
-    REQUIRE(connected);
-    REQUIRE(got_event);
-    REQUIRE(event_data == "ok");
+    CAPTURE(scheduler_stopped,
+            server_completion.ready,
+            server_completion.destroyed,
+            client_completion.ready,
+            client_completion.destroyed,
+            exception_message(server_completion.exception),
+            exception_message(client_completion.exception));
+    REQUIRE(scheduler_stopped);
+    REQUIRE(server_completion.ready);
+    REQUIRE(server_completion.destroyed);
+    REQUIRE(client_completion.ready);
+    REQUIRE(client_completion.destroyed);
+    REQUIRE(server_completion.exception == nullptr);
+    REQUIRE(client_completion.exception == nullptr);
+    REQUIRE(server_completion.value.has_value());
+    REQUIRE(client_completion.value.has_value());
+    REQUIRE(server_completion.value->accepted);
+    REQUIRE(server_completion.value->request_received);
+    REQUIRE(server_completion.value->prefix_written);
+    REQUIRE(server_completion.value->suffix_written);
+    REQUIRE(server_completion.value->closed);
+    REQUIRE(client_completion.value->connected);
+    REQUIRE(client_completion.value->got_event);
+    REQUIRE(client_completion.value->event_data == "ok");
 }
 
 TEST_CASE("sse_client syncs id-only and empty Last-Event-ID updates",
@@ -1625,29 +1815,53 @@ TEST_CASE("sse_client rejects non-event-stream responses",
     scheduler sched(2);
     sched.start();
 
+    struct server_observation {
+        bool accepted = false;
+        bool request_received = false;
+        bool headers_written = false;
+        bool closed = false;
+    };
+
+    struct client_observation {
+        bool connected = true;
+        int connect_errno = 0;
+        bool still_connected = true;
+    };
+
     std::atomic<bool> server_done{false};
     std::atomic<bool> client_done{false};
-    bool connected = true;
-    int connect_errno = 0;
 
-    sched.go([&]() -> coro::task<void> {
+    auto server_root = sched.go_joinable([&]() -> coro::task<server_observation> {
+        server_observation observed;
         auto server_stream = co_await listener_opt->accept();
-        REQUIRE(server_stream.has_value());
+        observed.accepted = server_stream.has_value();
+        if (!server_stream) {
+            server_done = true;
+            co_return observed;
+        }
 
         auto req = co_await read_request_headers(*server_stream);
-        REQUIRE(!req.empty());
+        observed.request_received = !req.empty();
+        if (!observed.request_received) {
+            co_await server_stream->close();
+            server_done = true;
+            co_return observed;
+        }
 
         std::string headers =
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Cache-Control: no-cache\r\n"
             "\r\n";
-        REQUIRE(co_await write_all(*server_stream, headers));
+        observed.headers_written = co_await write_all(*server_stream, headers);
         co_await server_stream->close();
+        observed.closed = true;
         server_done = true;
+        co_return observed;
     });
 
-    sched.go([&]() -> coro::task<void> {
+    auto client_root = sched.go_joinable([&]() -> coro::task<client_observation> {
+        client_observation observed;
         client_config cfg;
         cfg.auto_reconnect = false;
         sse_client client(cfg);
@@ -1655,20 +1869,42 @@ TEST_CASE("sse_client rejects non-event-stream responses",
             "http://127.0.0.1:" + std::to_string(port) + "/events";
 
         errno = 0;
-        connected = co_await client.connect(url);
-        connect_errno = errno;
-        REQUIRE_FALSE(connected);
-        REQUIRE(connect_errno == EBADMSG);
-        REQUIRE_FALSE(client.is_connected());
+        observed.connected = co_await client.connect(url);
+        observed.connect_errno = errno;
+        observed.still_connected = client.is_connected();
         client_done = true;
         co_await client.close();
+        co_return observed;
     });
 
     REQUIRE(wait_for([&] { return client_done.load() && server_done.load(); }));
-    sched.shutdown();
+    const bool scheduler_stopped = sched.shutdown(elio::test::scaled_sec(5));
+    auto server_completion = collect_join(server_root);
+    auto client_completion = collect_join(client_root);
 
-    REQUIRE_FALSE(connected);
-    REQUIRE(connect_errno == EBADMSG);
+    CAPTURE(scheduler_stopped,
+            server_completion.ready,
+            server_completion.destroyed,
+            client_completion.ready,
+            client_completion.destroyed,
+            exception_message(server_completion.exception),
+            exception_message(client_completion.exception));
+    REQUIRE(scheduler_stopped);
+    REQUIRE(server_completion.ready);
+    REQUIRE(server_completion.destroyed);
+    REQUIRE(client_completion.ready);
+    REQUIRE(client_completion.destroyed);
+    REQUIRE(server_completion.exception == nullptr);
+    REQUIRE(client_completion.exception == nullptr);
+    REQUIRE(server_completion.value.has_value());
+    REQUIRE(client_completion.value.has_value());
+    REQUIRE(server_completion.value->accepted);
+    REQUIRE(server_completion.value->request_received);
+    REQUIRE(server_completion.value->headers_written);
+    REQUIRE(server_completion.value->closed);
+    REQUIRE_FALSE(client_completion.value->connected);
+    REQUIRE(client_completion.value->connect_errno == EBADMSG);
+    REQUIRE_FALSE(client_completion.value->still_connected);
 }
 
 TEST_CASE("sse_client receive(token) observes the per-call cancel token",
@@ -1685,16 +1921,40 @@ TEST_CASE("sse_client receive(token) observes the per-call cancel token",
     scheduler sched(2);
     sched.start();
 
-    std::atomic<bool> server_handshake_done{false};
-    std::atomic<bool> client_returned{false};
-    std::atomic<bool> got_nullopt{false};
+    struct server_observation {
+        bool accepted = false;
+        bool request_received = false;
+        bool headers_written = false;
+        bool body_written = false;
+        bool handshake_done = false;
+        bool closed = false;
+    };
 
-    sched.go([&]() -> coro::task<void> {
+    struct client_observation {
+        bool connected = false;
+        bool first_event_received = false;
+        std::string first_event_type;
+        bool got_nullopt = false;
+        bool closed = false;
+    };
+
+    std::atomic<bool> client_returned{false};
+
+    auto server_root = sched.go_joinable([&]() -> coro::task<server_observation> {
+        server_observation observed;
         auto server_stream = co_await listener_opt->accept();
-        REQUIRE(server_stream.has_value());
+        observed.accepted = server_stream.has_value();
+        if (!server_stream) {
+            co_return observed;
+        }
 
         auto req = co_await read_request_headers(*server_stream);
-        REQUIRE(!req.empty());
+        observed.request_received = !req.empty();
+        if (!observed.request_received) {
+            co_await server_stream->close();
+            observed.closed = true;
+            co_return observed;
+        }
 
         std::string headers =
             "HTTP/1.1 200 OK\r\n"
@@ -1707,16 +1967,22 @@ TEST_CASE("sse_client receive(token) observes the per-call cancel token",
         // unstick the next receive() — except we cancel BEFORE that receive,
         // so the loop's top-of-iteration check is what fires.
         std::string body = "event: ping\ndata: 1\n\n";
-        REQUIRE(co_await write_all(*server_stream, headers));
-        REQUIRE(co_await write_all(*server_stream, body));
-        server_handshake_done = true;
+        observed.headers_written = co_await write_all(*server_stream, headers);
+        if (observed.headers_written) {
+            observed.body_written = co_await write_all(*server_stream, body);
+        }
+        observed.handshake_done =
+            observed.headers_written && observed.body_written;
 
         // Hold the connection open until the test tears the scheduler down.
         co_await elio::time::sleep_for(std::chrono::seconds(2));
         co_await server_stream->close();
+        observed.closed = true;
+        co_return observed;
     });
 
-    sched.go([&]() -> coro::task<void> {
+    auto client_root = sched.go_joinable([&]() -> coro::task<client_observation> {
+        client_observation observed;
         client_config cfg;
         cfg.auto_reconnect = false;
         sse_client client(cfg);
@@ -1726,13 +1992,19 @@ TEST_CASE("sse_client receive(token) observes the per-call cancel token",
         // the per-call cancellation.
         std::string url =
             "http://127.0.0.1:" + std::to_string(port) + "/events";
-        bool ok = co_await client.connect(url);
-        REQUIRE(ok);
+        observed.connected = co_await client.connect(url);
+        if (!observed.connected) {
+            client_returned = true;
+            co_await client.close();
+            co_return observed;
+        }
 
         // First event arrives normally.
         auto evt = co_await client.receive();
-        REQUIRE(evt.has_value());
-        REQUIRE(evt->type == "ping");
+        observed.first_event_received = evt.has_value();
+        if (evt) {
+            observed.first_event_type = evt->type;
+        }
 
         // Cancel the per-call token, then call receive(token).  The loop
         // checks `cancelled()` at the top of every iteration; with the fix
@@ -1743,15 +2015,44 @@ TEST_CASE("sse_client receive(token) observes the per-call cancel token",
 
         auto evt2 = co_await client.receive(token);
         if (!evt2.has_value()) {
-            got_nullopt = true;
+            observed.got_nullopt = true;
         }
         client_returned = true;
         co_await client.close();
+        observed.closed = true;
+        co_return observed;
     });
 
     REQUIRE(wait_for([&] { return client_returned.load(); }));
-    sched.shutdown();
+    server_root.request_cancel();
+    const bool scheduler_stopped = sched.shutdown(elio::test::scaled_sec(10));
+    auto server_completion = collect_join(server_root);
+    auto client_completion = collect_join(client_root);
 
-    REQUIRE(server_handshake_done.load());
-    REQUIRE(got_nullopt.load());
+    CAPTURE(scheduler_stopped,
+            server_completion.ready,
+            server_completion.destroyed,
+            client_completion.ready,
+            client_completion.destroyed,
+            exception_message(server_completion.exception),
+            exception_message(client_completion.exception));
+    REQUIRE(scheduler_stopped);
+    REQUIRE(server_completion.ready);
+    REQUIRE(server_completion.destroyed);
+    REQUIRE(client_completion.ready);
+    REQUIRE(client_completion.destroyed);
+    REQUIRE(server_completion.exception == nullptr);
+    REQUIRE(client_completion.exception == nullptr);
+    REQUIRE(server_completion.value.has_value());
+    REQUIRE(client_completion.value.has_value());
+    REQUIRE(server_completion.value->accepted);
+    REQUIRE(server_completion.value->request_received);
+    REQUIRE(server_completion.value->headers_written);
+    REQUIRE(server_completion.value->body_written);
+    REQUIRE(server_completion.value->handshake_done);
+    REQUIRE(client_completion.value->connected);
+    REQUIRE(client_completion.value->first_event_received);
+    REQUIRE(client_completion.value->first_event_type == "ping");
+    REQUIRE(client_completion.value->got_nullopt);
+    REQUIRE(client_completion.value->closed);
 }

@@ -2743,6 +2743,7 @@ TEST_CASE("read_frame_bounded rejects oversized payload header",
 
     scheduler sched(2);
     sched.start();
+    coro::cancel_source accept_cancel;
 
     std::atomic<bool> server_done{false};
     std::atomic<bool> server_accepted{false};
@@ -2752,7 +2753,7 @@ TEST_CASE("read_frame_bounded rejects oversized payload header",
     std::atomic<bool> rejected{false};
 
     sched.go([&]() -> coro::task<void> {
-        auto stream = co_await listener_opt->accept();
+        auto stream = co_await listener_opt->accept(accept_cancel.get_token());
         if (!stream) {
             server_accept_errno.store(errno, std::memory_order_release);
             server_done.store(true, std::memory_order_release);
@@ -2771,6 +2772,7 @@ TEST_CASE("read_frame_bounded rejects oversized payload header",
         auto client = co_await tcp_connect(ipv6_address("::1", port));
         if (!client) {
             client_connect_errno.store(errno, std::memory_order_release);
+            accept_cancel.cancel();
             co_return;
         }
         client_connected.store(true, std::memory_order_release);
@@ -2825,6 +2827,7 @@ TEST_CASE("rpc_session frame_read_timeout fires on slow-loris peer",
 
     scheduler sched(2);
     sched.start();
+    coro::cancel_source accept_cancel;
 
     std::atomic<bool> server_done{false};
     std::atomic<bool> server_accepted{false};
@@ -2833,7 +2836,7 @@ TEST_CASE("rpc_session frame_read_timeout fires on slow-loris peer",
     std::atomic<int> client_connect_errno{0};
 
     sched.go([&]() -> coro::task<void> {
-        auto stream = co_await listener_opt->accept();
+        auto stream = co_await listener_opt->accept(accept_cancel.get_token());
         if (!stream) {
             server_accept_errno.store(errno, std::memory_order_release);
             server_done.store(true, std::memory_order_release);
@@ -2848,6 +2851,7 @@ TEST_CASE("rpc_session frame_read_timeout fires on slow-loris peer",
         auto client = co_await tcp_connect(ipv6_address("::1", port));
         if (!client) {
             client_connect_errno.store(errno, std::memory_order_release);
+            accept_cancel.cancel();
             co_return;
         }
         client_connected.store(true, std::memory_order_release);
@@ -3083,6 +3087,7 @@ TEST_CASE("frame arriving near deadline is delivered, not discarded as timeout",
 
     scheduler sched(2);
     sched.start();
+    coro::cancel_source accept_cancel;
 
     constexpr int iterations = 5;
     std::atomic<int> server_done{0};
@@ -3091,7 +3096,7 @@ TEST_CASE("frame arriving near deadline is delivered, not discarded as timeout",
 
     sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
         for (int i = 0; i < iterations; ++i) {
-            auto stream = co_await lst.accept();
+            auto stream = co_await lst.accept(accept_cancel.get_token());
             if (!stream) co_return;
             // handle_client returns after the connection closes (the client
             // sends one frame then drops the socket; the next read will hit
@@ -3106,6 +3111,7 @@ TEST_CASE("frame arriving near deadline is delivered, not discarded as timeout",
             auto client = co_await tcp_connect(ipv6_address("::1", port));
             if (!client) {
                 client_connect_errno.store(errno, std::memory_order_release);
+                accept_cancel.cancel();
                 co_return;
             }
             client_connected.fetch_add(1, std::memory_order_release);

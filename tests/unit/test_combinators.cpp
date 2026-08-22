@@ -1317,6 +1317,13 @@ TEST_CASE("when_any drains a TCP read cancellation-completion race",
     std::atomic<int> read_result{0};
     std::atomic<int> writer_result{0};
 
+    struct tcp_race_observation {
+        bool read_terminal = false;
+        std::size_t index = static_cast<std::size_t>(-1);
+        int value = 0;
+        int read_result = 0;
+    };
+
     auto writer = sched.go_joinable([&]() -> task<void> {
         co_await read_started.wait();
         co_await time::sleep_for(scaled_ms(1));
@@ -1326,7 +1333,7 @@ TEST_CASE("when_any drains a TCP read cancellation-completion race",
         writer_terminal.store(true, std::memory_order_release);
     });
 
-    auto owner = sched.go_joinable([&]() -> task<void> {
+    auto owner = sched.go_joinable([&]() -> task<tcp_race_observation> {
         auto [index, value] = co_await when_any(
             [&](coro::cancel_token token) -> task<int> {
                 (void)co_await read_started.wait(token);
@@ -1344,19 +1351,26 @@ TEST_CASE("when_any drains a TCP read cancellation-completion race",
                 co_return result.result;
             });
 
-        REQUIRE(read_terminal.load(std::memory_order_acquire));
-        if (index == 0) {
-            REQUIRE(value == 0);
-            const auto observed = read_result.load(std::memory_order_acquire);
-            REQUIRE((observed == 1 || observed == -ECANCELED));
-        } else {
-            REQUIRE(index == 1);
-            REQUIRE(value == 1);
-        }
+        co_return tcp_race_observation{
+            .read_terminal = read_terminal.load(std::memory_order_acquire),
+            .index = index,
+            .value = value,
+            .read_result = read_result.load(std::memory_order_acquire),
+        };
     });
 
     owner.wait_destroyed();
-    REQUIRE_NOTHROW(owner.await_resume());
+    tcp_race_observation observed;
+    REQUIRE_NOTHROW(observed = owner.await_resume());
+    REQUIRE(observed.read_terminal);
+    if (observed.index == 0) {
+        REQUIRE(observed.value == 0);
+        REQUIRE((observed.read_result == 1 ||
+                 observed.read_result == -ECANCELED));
+    } else {
+        REQUIRE(observed.index == 1);
+        REQUIRE(observed.value == 1);
+    }
     writer.wait_destroyed();
     REQUIRE_NOTHROW(writer.await_resume());
     REQUIRE(writer_terminal.load(std::memory_order_acquire));

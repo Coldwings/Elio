@@ -34,9 +34,8 @@ TEST_CASE("sleep_for basic", "[time][sleep]") {
         co_await sleep_for(50ms);
         auto elapsed = std::chrono::steady_clock::now() - start;
         
-        // Should have waited approximately 50ms (allow some tolerance)
-        REQUIRE(elapsed >= 40ms);
-        REQUIRE(elapsed < 200ms);
+        // Timer expiry must not resume the task before its deadline.
+        REQUIRE(elapsed >= 50ms);
         
         completed = true;
     };
@@ -268,20 +267,17 @@ TEST_CASE("cancellable sleep - normal completion", "[time][sleep][cancel]") {
 
 TEST_CASE("cancellable sleep - cancelled early", "[time][sleep][cancel]") {
     std::atomic<bool> completed{false};
-    std::atomic<int> result_value{-1};
+    std::atomic<bool> cancelled{false};
     
     cancel_source source;
+    elio::time::detail::cancellable_sleep_registered_for_test.store(
+        false, std::memory_order_release);
     
     auto sleep_task = [&]() -> task<void> {
-        auto start = std::chrono::steady_clock::now();
-        auto result = co_await sleep_for(500ms, source.get_token());
-        auto elapsed = std::chrono::steady_clock::now() - start;
-        
-        result_value = (result == cancel_result::cancelled) ? 1 : 0;
-        completed = true;
-        
-        // Should have been cancelled early, not waited full 500ms
-        REQUIRE(elapsed < 400ms);
+        auto result = co_await sleep_for(1h, source.get_token());
+        cancelled.store(result == cancel_result::cancelled,
+                        std::memory_order_release);
+        completed.store(true, std::memory_order_release);
     };
     
     scheduler sched(1);
@@ -291,19 +287,31 @@ TEST_CASE("cancellable sleep - cancelled early", "[time][sleep][cancel]") {
         spawn_task(sched, sleep_task);
     }
     
-    // Wait a bit then cancel
-    std::this_thread::sleep_for(50ms);
-    source.cancel();
-    
-    // Wait for completion
-    for (int i = 0; i < 100 && !completed; ++i) {
-        std::this_thread::sleep_for(10ms);
+    const auto registration_deadline =
+        std::chrono::steady_clock::now() + 5s;
+    while (!elio::time::detail::cancellable_sleep_registered_for_test.load(
+               std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < registration_deadline) {
+        std::this_thread::sleep_for(1ms);
     }
-    
-    sched.shutdown();
-    
-    REQUIRE(completed);
-    REQUIRE(result_value == 1);  // Should be cancelled
+    const bool registered =
+        elio::time::detail::cancellable_sleep_registered_for_test.load(
+            std::memory_order_acquire);
+
+    source.cancel();
+
+    const auto completion_deadline = std::chrono::steady_clock::now() + 5s;
+    while (!completed.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < completion_deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    const bool did_complete = completed.load(std::memory_order_acquire);
+    const bool drained = sched.shutdown(5s);
+
+    REQUIRE(registered);
+    REQUIRE(did_complete);
+    REQUIRE(cancelled.load(std::memory_order_acquire));
+    REQUIRE(drained);
 }
 
 TEST_CASE("timer cancellation preserves cancelling thread virtual stack",
@@ -359,40 +367,22 @@ TEST_CASE("timer cancellation preserves cancelling thread virtual stack",
 }
 
 TEST_CASE("cancellable sleep - already cancelled token", "[time][sleep][cancel]") {
-    std::atomic<bool> completed{false};
-    std::atomic<int> result_value{-1};
+    bool completed = false;
+    cancel_result result_value = cancel_result::completed;
     
     cancel_source source;
     source.cancel();  // Cancel before sleep starts
     
     auto sleep_task = [&]() -> task<void> {
-        auto start = std::chrono::steady_clock::now();
-        auto result = co_await sleep_for(500ms, source.get_token());
-        auto elapsed = std::chrono::steady_clock::now() - start;
-        
-        result_value = (result == cancel_result::cancelled) ? 1 : 0;
+        result_value = co_await sleep_for(500ms, source.get_token());
         completed = true;
-        
-        // Should complete immediately since already cancelled
-        REQUIRE(elapsed < 50ms);
     };
-    
-    scheduler sched(1);
-    sched.start();
-    
-    {
-        spawn_task(sched, sleep_task);
-    }
-    
-    // Wait for completion
-    for (int i = 0; i < 50 && !completed; ++i) {
-        std::this_thread::sleep_for(10ms);
-    }
-    
-    sched.shutdown();
-    
+
+    auto t = sleep_task();
+    get_handle(t).resume();
+
     REQUIRE(completed);
-    REQUIRE(result_value == 1);  // Should be cancelled
+    REQUIRE(result_value == cancel_result::cancelled);
 }
 
 TEST_CASE("cancellable sleep prepare fallback rejection preserves its awaiting task",

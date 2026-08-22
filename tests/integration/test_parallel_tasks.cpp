@@ -89,6 +89,7 @@ TEST_CASE("Parallel tasks with dependencies", "[parallel]") {
     std::atomic<int> stage1_completed{0};
     std::atomic<int> stage2_completed{0};
     std::atomic<int> stage2_value_mismatches{0};
+    std::atomic<int> first_unexpected_stage2_value{42};
     
     auto stage1_task = [&]() -> task<int> {
         stage1_completed.fetch_add(1);
@@ -99,6 +100,9 @@ TEST_CASE("Parallel tasks with dependencies", "[parallel]") {
         auto t = stage1_task();
         int value = co_await t;
         if (value != 42) {
+            int expected_value = 42;
+            first_unexpected_stage2_value.compare_exchange_strong(
+                expected_value, value);
             stage2_value_mismatches.fetch_add(1);
         }
         stage2_completed.fetch_add(1);
@@ -114,9 +118,11 @@ TEST_CASE("Parallel tasks with dependencies", "[parallel]") {
     const int observed_stage1_completed = stage1_completed.load();
     const int observed_stage2_completed = stage2_completed.load();
     const int observed_value_mismatches = stage2_value_mismatches.load();
+    const int observed_first_unexpected_value =
+        first_unexpected_stage2_value.load();
 
     CAPTURE(drained, observed_stage1_completed, observed_stage2_completed,
-            observed_value_mismatches);
+            observed_value_mismatches, observed_first_unexpected_value);
     REQUIRE(drained);
     REQUIRE(observed_stage1_completed == num_chains);
     REQUIRE(observed_stage2_completed == num_chains);
@@ -224,6 +230,7 @@ TEST_CASE("Nested parallel tasks", "[parallel]") {
     std::atomic<int> inner_completed{0};
     std::atomic<int> outer_completed{0};
     std::atomic<int> sum_mismatches{0};
+    std::atomic<int> first_unexpected_sum{5};
     
     auto inner_task = [&]() -> task<int> {
         inner_completed.fetch_add(1);
@@ -238,6 +245,8 @@ TEST_CASE("Nested parallel tasks", "[parallel]") {
             sum += value;
         }
         if (sum != 5) {
+            int expected_sum = 5;
+            first_unexpected_sum.compare_exchange_strong(expected_sum, sum);
             sum_mismatches.fetch_add(1);
         }
         outer_completed.fetch_add(1);
@@ -253,9 +262,10 @@ TEST_CASE("Nested parallel tasks", "[parallel]") {
     const int observed_outer_completed = outer_completed.load();
     const int observed_inner_completed = inner_completed.load();
     const int observed_sum_mismatches = sum_mismatches.load();
+    const int observed_first_unexpected_sum = first_unexpected_sum.load();
 
     CAPTURE(drained, observed_outer_completed, observed_inner_completed,
-            observed_sum_mismatches);
+            observed_sum_mismatches, observed_first_unexpected_sum);
     REQUIRE(drained);
     REQUIRE(observed_outer_completed == num_outer);
     REQUIRE(observed_inner_completed == num_outer * 5);

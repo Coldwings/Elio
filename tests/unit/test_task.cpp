@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <latch>
 #include <memory>
 #include <optional>
@@ -1587,14 +1588,30 @@ TEST_CASE("join_handle propagates exceptions", "[task][spawn][join_handle]") {
     scheduler sched(2);
     sched.start();
 
+    enum class exception_terminal_state {
+        pending,
+        returned,
+        caught,
+    };
+    struct exception_observation {
+        exception_terminal_state state = exception_terminal_state::pending;
+        std::exception_ptr exception;
+    } observed;
+
     auto thrower = []() -> task<int> {
         throw std::runtime_error("spawn error");
         co_return 0;
     };
 
     auto catcher = [&]() -> task<void> {
-        auto handle = elio::spawn(thrower);
-        co_await handle;
+        try {
+            auto handle = elio::spawn(thrower);
+            co_await handle;
+            observed.state = exception_terminal_state::returned;
+        } catch (...) {
+            observed.exception = std::current_exception();
+            observed.state = exception_terminal_state::caught;
+        }
         co_return;
     };
 
@@ -1604,32 +1621,36 @@ TEST_CASE("join_handle propagates exceptions", "[task][spawn][join_handle]") {
     const bool drained = sched.shutdown(scaled_sec(5));
     const bool root_ready = root.is_ready();
     const bool root_destroyed = root.is_destroyed();
+    const auto result = observed;
 
     enum class exception_outcome {
         pending,
-        returned,
         caught_expected,
         caught_unexpected,
     } outcome = exception_outcome::pending;
     std::string message;
-    if (root_ready && root_destroyed) {
-        try {
-            root.await_resume();
-            outcome = exception_outcome::returned;
-        } catch (const std::runtime_error& e) {
-            outcome = exception_outcome::caught_expected;
-            message = e.what();
-        } catch (...) {
-            outcome = exception_outcome::caught_unexpected;
-        }
-    }
 
     CAPTURE(ready_before_shutdown, drained, root_ready, root_destroyed,
-            static_cast<int>(outcome), message);
+            static_cast<int>(result.state),
+            static_cast<bool>(result.exception));
     REQUIRE(ready_before_shutdown);
     REQUIRE(drained);
     REQUIRE(root_ready);
     REQUIRE(root_destroyed);
+    REQUIRE_NOTHROW(root.await_resume());
+    REQUIRE(result.state == exception_terminal_state::caught);
+    REQUIRE(result.exception);
+
+    try {
+        std::rethrow_exception(result.exception);
+    } catch (const std::runtime_error& e) {
+        outcome = exception_outcome::caught_expected;
+        message = e.what();
+    } catch (...) {
+        outcome = exception_outcome::caught_unexpected;
+    }
+
+    CAPTURE(static_cast<int>(outcome), message);
     REQUIRE(outcome == exception_outcome::caught_expected);
     REQUIRE(message == "spawn error");
 }

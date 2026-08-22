@@ -122,19 +122,40 @@ jobs:
 
     - name: Run unit tests
       if: needs.changes.outputs.code == 'true'
-      run: ./build/tests/elio_tests
+      shell: bash
+      run: |
+        set -o pipefail
+        mkdir -p test-logs
+        ./build/tests/elio_tests --reporter compact --abort 2>&1 \
+          | tee test-logs/catch-normal.log
 
     - name: Run ASAN tests
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Debug'
-      run: ./build/tests/elio_tests_asan
+      shell: bash
+      run: |
+        set -o pipefail
+        ./build/tests/elio_tests_asan --reporter compact --abort 2>&1 \
+          | tee test-logs/catch-asan.log
       env:
-        ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:log_path=${{ github.workspace }}/test-logs/asan-${{ matrix.arch.name }}-${{ matrix.build_type }}
 
     - name: Run TSAN tests
       if: needs.changes.outputs.code == 'true' && matrix.build_type == 'Debug'
-      run: ./build/tests/elio_tests_tsan
+      shell: bash
+      run: |
+        set -o pipefail
+        ./build/tests/elio_tests_tsan --reporter compact --abort 2>&1 \
+          | tee test-logs/catch-tsan.log
       env:
-        TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:log_path=${{ github.workspace }}/test-logs/tsan-${{ matrix.arch.name }}-${{ matrix.build_type }}
+
+    - name: Upload failing test evidence
+      if: failure() && needs.changes.outputs.code == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: test-failure-logs-${{ matrix.arch.name }}-${{ matrix.build_type }}
+        path: test-logs/
+        if-no-files-found: warn
 
     - name: Run registered CTest checks
       if: needs.changes.outputs.code == 'true' && matrix.arch.name == 'x64' && matrix.build_type == 'Debug'

@@ -199,6 +199,32 @@ struct bounded_refill_hook_scope {
     }
 };
 
+struct bounded_recv_revalidation_hook_scope {
+    bounded_recv_revalidation_hook_scope() { reset(); }
+
+    ~bounded_recv_revalidation_hook_scope() {
+        elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test
+            .notify_all();
+        elio::sync::detail::pause_bounded_close_after_publish_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_bounded_close_after_publish_for_test
+            .notify_all();
+    }
+
+    static void reset() {
+        elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::bounded_recv_paused_after_failed_pop_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_bounded_close_after_publish_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::bounded_close_paused_after_publish_for_test.store(
+            false, std::memory_order_release);
+    }
+};
+
 size_t refill_snapshot_locks() noexcept {
     return elio::sync::detail::bounded_refill_snapshot_locks_for_test.load(
         std::memory_order_relaxed);
@@ -1205,6 +1231,120 @@ TEST_CASE("bounded channel refill retains a dequeued sender wake across close",
 
     REQUIRE(first == 1);
     REQUIRE(refill_credit_locks() == 1);
+    REQUIRE(ch.try_recv() == 2);
+    REQUIRE_FALSE(ch.try_recv().has_value());
+}
+
+TEST_CASE("bounded recv drains a committed value before observing close",
+          "[sync][channel][close][regression]") {
+    bounded_recv_revalidation_hook_scope hooks;
+    channel<int> ch(1);
+    auto receive_task = ch.recv();
+    auto receiver = elio::coro::detail::task_access::handle(receive_task);
+
+    elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.store(
+        true, std::memory_order_release);
+    std::thread receiver_thread([&] { receiver.resume(); });
+    const bool receiver_paused = wait_for_true(
+        elio::sync::detail::bounded_recv_paused_after_failed_pop_for_test);
+    if (!receiver_paused) {
+        elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test
+            .notify_all();
+        ch.close();
+        receiver_thread.join();
+        REQUIRE(receiver_paused);
+        return;
+    }
+
+    const bool final_sent = ch.try_send(5);
+    elio::sync::detail::pause_bounded_close_after_publish_for_test.store(
+        true, std::memory_order_release);
+    std::thread closer([&] { ch.close(); });
+    const bool close_paused = wait_for_true(
+        elio::sync::detail::bounded_close_paused_after_publish_for_test);
+    if (!close_paused) {
+        elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test
+            .notify_all();
+        elio::sync::detail::pause_bounded_close_after_publish_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_bounded_close_after_publish_for_test
+            .notify_all();
+        closer.join();
+        receiver_thread.join();
+        REQUIRE(close_paused);
+        return;
+    }
+
+    elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.store(
+        false, std::memory_order_release);
+    elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.notify_all();
+    receiver_thread.join();
+
+    elio::sync::detail::pause_bounded_close_after_publish_for_test.store(
+        false, std::memory_order_release);
+    elio::sync::detail::pause_bounded_close_after_publish_for_test.notify_all();
+    closer.join();
+
+    REQUIRE(receiver.done());
+    auto received = std::move(receiver.promise().value_.value());
+
+    REQUIRE(final_sent);
+    REQUIRE(received == 5);
+    REQUIRE_FALSE(ch.try_recv().has_value());
+}
+
+TEST_CASE("bounded recv preserves buffered-before-waiter FIFO",
+          "[sync][channel][fifo][regression]") {
+    bounded_recv_revalidation_hook_scope hooks;
+    channel<int> ch(1);
+    auto receive_task = ch.recv();
+    auto receiver = elio::coro::detail::task_access::handle(receive_task);
+
+    elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.store(
+        true, std::memory_order_release);
+    std::thread receiver_thread([&] { receiver.resume(); });
+    const bool receiver_paused = wait_for_true(
+        elio::sync::detail::bounded_recv_paused_after_failed_pop_for_test);
+    if (!receiver_paused) {
+        elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.store(
+            false, std::memory_order_release);
+        elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test
+            .notify_all();
+        ch.close();
+        receiver_thread.join();
+        REQUIRE(receiver_paused);
+        return;
+    }
+
+    const bool buffered_sent = ch.try_send(1);
+    channel<int>::send_awaitable queued_sender(ch, 2);
+    const bool sender_queued = queued_sender.await_suspend(
+        std::noop_coroutine());
+    if (!buffered_sent || !sender_queued) {
+        ch.close();
+    }
+
+    elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.store(
+        false, std::memory_order_release);
+    elio::sync::detail::pause_bounded_recv_after_failed_pop_for_test.notify_all();
+    receiver_thread.join();
+
+    REQUIRE(receiver.done());
+    auto first = std::move(receiver.promise().value_.value());
+    const bool sender_completed = !queued_sender.is_linked();
+    if (!sender_completed) {
+        ch.close();
+    }
+
+    REQUIRE(buffered_sent);
+    REQUIRE(sender_queued);
+    REQUIRE(first == 1);
+    REQUIRE(sender_completed);
+    REQUIRE(queued_sender.await_resume());
     REQUIRE(ch.try_recv() == 2);
     REQUIRE_FALSE(ch.try_recv().has_value());
 }

@@ -433,31 +433,30 @@ TEST_CASE("signal utility functions", "[signal][utility]") {
 
 TEST_CASE("wait_signal convenience function", "[signal][wait_signal]") {
     scoped_thread_signal_mask mask_guard({SIGUSR1});
-    std::atomic<bool> received{false};
+    struct observation {
+        bool received = false;
+        int signo = 0;
+    };
     
     // Block signals BEFORE creating scheduler threads
     signal_set sigs{SIGUSR1};
     sigset_t old_mask;
     sigs.block(&old_mask);
     
-    auto wait_task = [&]() -> task<void> {
+    auto wait_task = [&]() -> task<observation> {
         auto info = co_await wait_signal(sigs, current_io_context(), false);  // Don't re-block, already blocked
-        REQUIRE(info.signo == SIGUSR1);
-        received = true;
+        co_return observation{true, info.signo};
     };
     
     scheduler sched(1);
     sched.start();
-    
-    {
-        spawn_task(sched, wait_task);
-    }
+    auto handle = sched.go_joinable(wait_task);
     
     std::this_thread::sleep_for(50ms);
     kill(getpid(), SIGUSR1);
     
     // Wait for completion - don't poll ctx from main thread
-    for (int i = 0; i < 200 && !received; ++i) {
+    for (int i = 0; i < 200 && !handle.is_ready(); ++i) {
         std::this_thread::sleep_for(10ms);
     }
     
@@ -466,7 +465,11 @@ TEST_CASE("wait_signal convenience function", "[signal][wait_signal]") {
     // Restore signal mask
     pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
     
-    REQUIRE(received);
+    REQUIRE(handle.is_ready());
+    REQUIRE(handle.is_destroyed());
+    const auto observed = handle.await_resume();
+    REQUIRE(observed.received);
+    REQUIRE(observed.signo == SIGUSR1);
 }
 
 TEST_CASE("signal_fd update", "[signal][signal_fd]") {

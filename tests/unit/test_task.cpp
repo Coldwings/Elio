@@ -1916,3 +1916,120 @@ TEST_CASE("go() task completes normally — no handler called", "[task][spawn][e
     REQUIRE(task_ran.load(std::memory_order_acquire));
     REQUIRE_FALSE(handler_called.load(std::memory_order_acquire));
 }
+
+TEST_CASE("go_joinable exceptions remain observable without unhandled reports",
+          "[task][spawn][join_handle][exception]") {
+    scheduler sched(1);
+    std::atomic<int> report_count{0};
+    sched.set_unhandled_exception_handler([&](std::exception_ptr) {
+        report_count.fetch_add(1, std::memory_order_relaxed);
+    });
+    sched.start();
+
+    auto joined = sched.go_joinable([]() -> task<int> {
+        throw std::invalid_argument("observed join failure");
+        co_return 0;
+    });
+
+    const bool drained = sched.shutdown(scaled_sec(5));
+    bool caught_expected_type = false;
+    std::string message;
+    if (joined.is_ready()) {
+        try {
+            (void)joined.await_resume();
+        } catch (const std::invalid_argument& ex) {
+            caught_expected_type = true;
+            message = ex.what();
+        } catch (...) {
+        }
+    }
+
+    CAPTURE(drained, caught_expected_type, message,
+            report_count.load(std::memory_order_relaxed));
+    REQUIRE(drained);
+    REQUIRE(joined.is_destroyed());
+    REQUIRE(caught_expected_type);
+    REQUIRE(message == "observed join failure");
+    REQUIRE(report_count.load(std::memory_order_relaxed) == 0);
+}
+
+TEST_CASE("go exceptions still produce one unhandled report",
+          "[task][spawn][exception]") {
+    scheduler sched(1);
+    std::atomic<int> report_count{0};
+    std::string message;
+    sched.set_unhandled_exception_handler([&](std::exception_ptr exception) {
+        report_count.fetch_add(1, std::memory_order_relaxed);
+        try {
+            std::rethrow_exception(exception);
+        } catch (const std::runtime_error& ex) {
+            message = ex.what();
+        } catch (...) {
+        }
+    });
+    sched.start();
+
+    sched.go([]() -> task<void> {
+        throw std::runtime_error("detached failure");
+        co_return;
+    });
+
+    const bool drained = sched.shutdown(scaled_sec(5));
+
+    CAPTURE(drained, message, report_count.load(std::memory_order_relaxed));
+    REQUIRE(drained);
+    REQUIRE(message == "detached failure");
+    REQUIRE(report_count.load(std::memory_order_relaxed) == 1);
+}
+
+TEST_CASE("detached parent reports an awaited spawned failure once",
+          "[task][spawn][join_handle][exception]") {
+    scheduler sched(2);
+    std::atomic<int> report_count{0};
+    std::atomic<bool> child_admitted{false};
+    sched.set_unhandled_exception_handler([&](std::exception_ptr) {
+        report_count.fetch_add(1, std::memory_order_relaxed);
+    });
+    sched.start();
+
+    sched.go([&]() -> task<void> {
+        auto child = elio::spawn([]() -> task<void> {
+            throw std::runtime_error("propagated spawn failure");
+            co_return;
+        });
+        child_admitted.store(true, std::memory_order_release);
+        co_await child;
+    });
+
+    const bool admitted = wait_for_task_condition([&] {
+        return child_admitted.load(std::memory_order_acquire);
+    });
+    const bool drained = sched.shutdown(scaled_sec(5));
+
+    CAPTURE(admitted, drained,
+            report_count.load(std::memory_order_relaxed));
+    REQUIRE(admitted);
+    REQUIRE(drained);
+    REQUIRE(report_count.load(std::memory_order_relaxed) == 1);
+}
+
+TEST_CASE("discarded join handles do not enable unhandled reporting",
+          "[task][spawn][join_handle][exception]") {
+    scheduler sched(1);
+    std::atomic<int> report_count{0};
+    sched.set_unhandled_exception_handler([&](std::exception_ptr) {
+        report_count.fetch_add(1, std::memory_order_relaxed);
+    });
+    sched.start();
+
+    (void)sched.go_joinable([]() -> task<void> {
+        throw std::runtime_error("discarded join failure");
+        co_return;
+    });
+
+    const bool drained = sched.shutdown(scaled_sec(5));
+
+    CAPTURE(drained, report_count.load(std::memory_order_relaxed));
+    REQUIRE(drained);
+    REQUIRE(report_count.load(std::memory_order_relaxed) == 0);
+}

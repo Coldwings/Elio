@@ -1243,6 +1243,7 @@ TEST_CASE("WSS server heartbeat pings while handler is receiving",
 
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_connected{false};
+    std::atomic<bool> client_scheduler_available{false};
     std::atomic<bool> receive_returned{false};
     std::atomic<bool> connection_open_after_heartbeat_window{false};
     std::atomic<bool> handler_running_before_client_close{false};
@@ -1263,7 +1264,13 @@ TEST_CASE("WSS server heartbeat pings while handler is receiving",
         }
 
         auto* current_sched = elio::runtime::scheduler::current();
-        REQUIRE(current_sched != nullptr);
+        client_scheduler_available.store(current_sched != nullptr,
+                                         std::memory_order_release);
+        if (current_sched == nullptr) {
+            client_errno.store(ENODEV, std::memory_order_release);
+            client_done.store(true, std::memory_order_release);
+            co_return;
+        }
         auto receive_cancel = std::make_shared<elio::coro::cancel_source>();
         auto receive_watchdog = current_sched->go_joinable(
             [receive_cancel]() -> task<void> {
@@ -1297,6 +1304,7 @@ TEST_CASE("WSS server heartbeat pings while handler is receiving",
                        elio::test::scaled_sec(8)));
 
     REQUIRE(client_connected.load(std::memory_order_acquire));
+    REQUIRE(client_scheduler_available.load(std::memory_order_acquire));
     REQUIRE(handler_started.load(std::memory_order_acquire));
     REQUIRE(receive_returned.load(std::memory_order_acquire));
     REQUIRE(client_errno.load(std::memory_order_acquire) == ECANCELED);
@@ -1368,6 +1376,7 @@ TEST_CASE("WSS server heartbeat timeout closes raw TLS client",
 
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_connected{false};
+    std::atomic<bool> client_scheduler_available{false};
     std::atomic<bool> client_handshake{false};
     std::atomic<bool> upgrade_written{false};
     std::atomic<bool> saw_switching_protocols{false};
@@ -1407,7 +1416,13 @@ TEST_CASE("WSS server heartbeat timeout closes raw TLS client",
         }
 
         auto* current_sched = elio::runtime::scheduler::current();
-        REQUIRE(current_sched != nullptr);
+        client_scheduler_available.store(current_sched != nullptr,
+                                         std::memory_order_release);
+        if (current_sched == nullptr) {
+            tls.shutdown_socket();
+            client_done.store(true, std::memory_order_release);
+            co_return;
+        }
         auto read_cancel = std::make_shared<elio::coro::cancel_source>();
         auto watchdog = current_sched->go_joinable(
             [read_cancel]() -> task<void> {
@@ -1468,6 +1483,7 @@ TEST_CASE("WSS server heartbeat timeout closes raw TLS client",
                        elio::test::scaled_sec(8)));
 
     REQUIRE(client_connected.load(std::memory_order_acquire));
+    REQUIRE(client_scheduler_available.load(std::memory_order_acquire));
     REQUIRE(client_handshake.load(std::memory_order_acquire));
     REQUIRE(upgrade_written.load(std::memory_order_acquire));
     REQUIRE(saw_switching_protocols.load(std::memory_order_acquire));

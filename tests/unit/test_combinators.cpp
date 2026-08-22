@@ -7,8 +7,10 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -612,7 +614,12 @@ TEST_CASE("when_all launch failure takes precedence over child failure",
 // --- when_any tests ---
 
 TEST_CASE("when_any returns first completer", "[sync][combinators]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        std::size_t index = static_cast<std::size_t>(-1);
+        int value = 0;
+    };
+
+    auto test = []() -> task<observation> {
         auto [idx, value] = co_await when_any(
             []() -> task<int> {
                 co_await time::sleep_for(std::chrono::milliseconds(1));
@@ -624,13 +631,17 @@ TEST_CASE("when_any returns first completer", "[sync][combinators]") {
                 co_return 2;
             }
         );
-        REQUIRE(idx == 0);
-        REQUIRE(value == 1);
+        co_return observation{idx, value};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.index == 0);
+    REQUIRE(observed.value == 1);
 }
 
 TEST_CASE("when_any does not resume while launching children",
@@ -672,6 +683,7 @@ TEST_CASE("when_any launch failure takes precedence over selected winner",
     std::atomic<bool> caught{false};
     std::atomic<bool> first_completed{false};
     std::atomic<bool> winner_cancel_observed{false};
+    std::string caught_message;
 
     auto test = [&]() -> task<void> {
         auto first = [&]() -> task<int> {
@@ -697,8 +709,8 @@ TEST_CASE("when_any launch failure takes precedence over selected winner",
             auto result = co_await combo;
             (void)result;
         } catch (const std::runtime_error& e) {
+            caught_message = e.what();
             caught.store(true, std::memory_order_release);
-            REQUIRE(std::string(e.what()) == "launch move failed");
         }
     };
 
@@ -715,11 +727,17 @@ TEST_CASE("when_any launch failure takes precedence over selected winner",
     REQUIRE(winner_selected);
     REQUIRE(did_shutdown);
     REQUIRE(caught.load(std::memory_order_acquire));
+    REQUIRE(caught_message == "launch move failed");
     REQUIRE(first_completed.load(std::memory_order_acquire));
 }
 
 TEST_CASE("when_any second finishes first", "[sync][combinators]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        std::size_t index = static_cast<std::size_t>(-1);
+        int value = 0;
+    };
+
+    auto test = []() -> task<observation> {
         auto [idx, value] = co_await when_any(
             [](coro::cancel_token token) -> task<int> {
                 co_await time::sleep_for(
@@ -731,18 +749,26 @@ TEST_CASE("when_any second finishes first", "[sync][combinators]") {
                 co_return 2;
             }
         );
-        REQUIRE(idx == 1);
-        REQUIRE(value == 2);
+        co_return observation{idx, value};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.index == 1);
+    REQUIRE(observed.value == 2);
 }
 
 TEST_CASE("when_any propagates exception from winner", "[sync][combinators]") {
-    auto test = []() -> task<void> {
+    struct observation {
         bool caught = false;
+        std::string message;
+    };
+
+    auto test = []() -> task<observation> {
         try {
             co_await when_any(
                 []() -> task<int> {
@@ -757,21 +783,31 @@ TEST_CASE("when_any propagates exception from winner", "[sync][combinators]") {
                 }
             );
         } catch (const std::runtime_error& e) {
-            caught = true;
-            REQUIRE(std::string(e.what()) == "test error");
+            co_return observation{true, e.what()};
         }
-        REQUIRE(caught);
+        co_return observation{};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.caught);
+    REQUIRE(observed.message == "test error");
 }
 
 TEST_CASE("when_any with cancel_token propagation", "[sync][combinators]") {
     std::atomic<bool> was_cancelled{false};
 
-    auto test = [&]() -> task<void> {
+    struct observation {
+        std::size_t index = static_cast<std::size_t>(-1);
+        int value = 0;
+        bool loser_cancelled = false;
+    };
+
+    auto test = [&]() -> task<observation> {
         auto [idx, value] = co_await when_any(
             []() -> task<int> {
                 co_await time::sleep_for(std::chrono::milliseconds(1));
@@ -786,20 +822,33 @@ TEST_CASE("when_any with cancel_token propagation", "[sync][combinators]") {
                 co_return -1;
             }
         );
-        REQUIRE(idx == 0);
-        REQUIRE(value == 42);
-        REQUIRE(was_cancelled.load(std::memory_order_relaxed));
+        co_return observation{
+            idx,
+            value,
+            was_cancelled.load(std::memory_order_relaxed),
+        };
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.index == 0);
+    REQUIRE(observed.value == 42);
+    REQUIRE(observed.loser_cancelled);
 }
 
 TEST_CASE("when_any with void tasks", "[sync][combinators]") {
     std::atomic<int> winner{-1};
 
-    auto test = [&]() -> task<void> {
+    struct observation {
+        std::size_t index = static_cast<std::size_t>(-1);
+        int winner = -1;
+    };
+
+    auto test = [&]() -> task<observation> {
         auto [idx, mono] = co_await when_any(
             [&]() -> task<void> {
                 co_await time::sleep_for(std::chrono::milliseconds(1));
@@ -813,34 +862,52 @@ TEST_CASE("when_any with void tasks", "[sync][combinators]") {
                 }
             }
         );
-        REQUIRE(idx == 0);
-        REQUIRE(winner.load(std::memory_order_relaxed) == 0);
         static_assert(std::is_same_v<decltype(mono), std::monostate>);
+        co_return observation{idx, winner.load(std::memory_order_relaxed)};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.index == 0);
+    REQUIRE(observed.winner == 0);
 }
 
 TEST_CASE("when_any single task", "[sync][combinators]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        std::size_t index = static_cast<std::size_t>(-1);
+        int value = 0;
+    };
+
+    auto test = []() -> task<observation> {
         auto [idx, value] = co_await when_any(
             []() -> task<int> { co_return 99; }
         );
-        REQUIRE(idx == 0);
-        REQUIRE(value == 99);
+        co_return observation{idx, value};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.index == 0);
+    REQUIRE(observed.value == 99);
 }
 
 TEST_CASE("when_any with heterogeneous types", "[sync][combinators]") {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-    auto test = []() -> task<void> {
+    struct observation {
+        std::size_t index = static_cast<std::size_t>(-1);
+        int value = 0;
+    };
+
+    auto test = []() -> task<observation> {
         auto [idx, result] = co_await when_any(
             []() -> task<int> {
                 co_await time::sleep_for(std::chrono::milliseconds(1));
@@ -852,19 +919,28 @@ TEST_CASE("when_any with heterogeneous types", "[sync][combinators]") {
                 co_return std::string("hello");
             }
         );
-        REQUIRE(idx == 0);
-        REQUIRE(std::get<0>(result) == 42);
+        co_return observation{idx, std::get<0>(result)};
     };
 #pragma GCC diagnostic pop
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.index == 0);
+    REQUIRE(observed.value == 42);
 }
 
 TEST_CASE("when_any supports non-default-constructible results",
           "[sync][combinators][regression]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        std::size_t index = static_cast<std::size_t>(-1);
+        int value = 0;
+    };
+
+    auto test = []() -> task<observation> {
         auto [idx, value] = co_await when_any(
             []() -> task<non_default_result> {
                 co_return non_default_result{42};
@@ -874,18 +950,27 @@ TEST_CASE("when_any supports non-default-constructible results",
                 co_return non_default_result{-1};
             }
         );
-        REQUIRE(idx == 0);
-        REQUIRE(value.value == 42);
+        co_return observation{idx, value.value};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.index == 0);
+    REQUIRE(observed.value == 42);
 }
 
 TEST_CASE("when_any supports a non-default first heterogeneous result",
           "[sync][combinators][regression]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        std::size_t index = static_cast<std::size_t>(-1);
+        int value = 0;
+    };
+
+    auto test = []() -> task<observation> {
         auto [idx, value] = co_await when_any(
             [](coro::cancel_token tok) -> task<non_default_result> {
                 co_await time::sleep_for(std::chrono::milliseconds(500), tok);
@@ -895,18 +980,27 @@ TEST_CASE("when_any supports a non-default first heterogeneous result",
                 co_return 42;
             }
         );
-        REQUIRE(idx == 1);
-        REQUIRE(std::get<1>(value) == 42);
+        co_return observation{idx, std::get<1>(value)};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.index == 1);
+    REQUIRE(observed.value == 42);
 }
 
 TEST_CASE("when_any drains a losing exception before returning",
           "[sync][combinators][structured]") {
-    auto test = []() -> task<void> {
+    struct observation {
+        std::size_t index = static_cast<std::size_t>(-1);
+        int value = 0;
+    };
+
+    auto test = []() -> task<observation> {
         auto [idx, value] = co_await when_any(
             []() -> task<int> {
                 co_await time::sleep_for(std::chrono::milliseconds(1));
@@ -918,20 +1012,32 @@ TEST_CASE("when_any drains a losing exception before returning",
                 co_return 0;
             }
         );
-        REQUIRE(idx == 0);
-        REQUIRE(value == 42);
+        co_return observation{idx, value};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.index == 0);
+    REQUIRE(observed.value == 42);
 }
 
 TEST_CASE("when_any loser exception triggers handler", "[sync][combinators]") {
     std::atomic<bool> handler_called{false};
+    std::mutex handler_mutex;
     std::string handler_message;
 
-    auto test = [&]() -> task<void> {
+    struct observation {
+        std::size_t index = static_cast<std::size_t>(-1);
+        int value = 0;
+        bool handler_called_before_return = false;
+        std::string handler_message_before_return;
+    };
+
+    auto test = [&]() -> task<observation> {
         auto [idx, value] = co_await when_any(
             []() -> task<int> {
                 co_await time::sleep_for(std::chrono::milliseconds(1));
@@ -943,32 +1049,55 @@ TEST_CASE("when_any loser exception triggers handler", "[sync][combinators]") {
                 co_return 0;
             }
         );
-        REQUIRE(idx == 0);
-        REQUIRE(value == 42);
-        REQUIRE(handler_called.load(std::memory_order_acquire));
-        REQUIRE(handler_message == "loser exception for handler");
+        observation observed;
+        observed.index = idx;
+        observed.value = value;
+        observed.handler_called_before_return =
+            handler_called.load(std::memory_order_acquire);
+        if (observed.handler_called_before_return) {
+            std::lock_guard lock(handler_mutex);
+            observed.handler_message_before_return = handler_message;
+        }
+        co_return observed;
     };
 
     runtime::scheduler sched(2);
     sched.start();
     sched.set_unhandled_exception_handler([&](std::exception_ptr ex) {
-        handler_called = true;
         try {
             std::rethrow_exception(ex);
         } catch (const std::exception& e) {
-            handler_message = e.what();
+            {
+                std::lock_guard lock(handler_mutex);
+                handler_message = e.what();
+            }
+            handler_called.store(true, std::memory_order_release);
         }
     });
-    sched.go(test);
-    sched.shutdown();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
 
-    REQUIRE(handler_called.load());
-    REQUIRE(handler_message == "loser exception for handler");
+    REQUIRE(observed.index == 0);
+    REQUIRE(observed.value == 42);
+    REQUIRE(observed.handler_called_before_return);
+    REQUIRE(observed.handler_message_before_return ==
+            "loser exception for handler");
+    REQUIRE(handler_called.load(std::memory_order_acquire));
+    {
+        std::lock_guard lock(handler_mutex);
+        REQUIRE(handler_message == "loser exception for handler");
+    }
 }
 
 TEST_CASE("when_any winner exception propagates", "[sync][combinators]") {
-    auto test = []() -> task<void> {
+    struct observation {
         bool caught = false;
+        std::string message;
+    };
+
+    auto test = []() -> task<observation> {
         try {
             co_await when_any(
                 []() -> task<int> {
@@ -983,23 +1112,33 @@ TEST_CASE("when_any winner exception propagates", "[sync][combinators]") {
                 }
             );
         } catch (const std::runtime_error& e) {
-            caught = true;
-            REQUIRE(std::string(e.what()) == "winner exception");
+            co_return observation{true, e.what()};
         }
-        REQUIRE(caught);
+        co_return observation{};
     };
 
     runtime::scheduler sched(2);
-    sched.go(test);
-    sched.shutdown();
+    sched.start();
+    auto owner = sched.go_joinable(test);
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.caught);
+    REQUIRE(observed.message == "winner exception");
 }
 
 TEST_CASE("when_any publishes result construction failure",
           "[sync][combinators][regression]") {
+    struct observation {
+        bool winner_claimed = false;
+        bool has_exception = false;
+        std::string exception_message;
+    };
+
     runtime::scheduler sched(1);
     sched.start();
 
-    auto owner = sched.go_joinable([]() -> task<void> {
+    auto owner = sched.go_joinable([]() -> task<observation> {
         auto first = []() -> task<int> { co_return 1; };
         auto second = []() -> task<throwing_result> {
             co_return throwing_result{2};
@@ -1013,21 +1152,27 @@ TEST_CASE("when_any publishes result construction failure",
 
         state.resolve<1>(*group_state, std::move(result));
 
-        REQUIRE(state.winner_claimed_.load(std::memory_order_acquire));
-        REQUIRE(state.exception_ != nullptr);
-        std::string exception_message;
-        try {
-            std::rethrow_exception(state.exception_);
-        } catch (const std::exception& error) {
-            exception_message = error.what();
+        observation observed;
+        observed.winner_claimed =
+            state.winner_claimed_.load(std::memory_order_acquire);
+        observed.has_exception = state.exception_ != nullptr;
+        if (state.exception_) {
+            try {
+                std::rethrow_exception(state.exception_);
+            } catch (const std::exception& error) {
+                observed.exception_message = error.what();
+            }
         }
-        REQUIRE(exception_message == "result transfer failed");
         co_await group.join();
+        co_return observed;
     });
 
-    owner.wait_destroyed();
-    REQUIRE_NOTHROW(owner.await_resume());
-    sched.shutdown();
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.winner_claimed);
+    REQUIRE(observed.has_exception);
+    REQUIRE(observed.exception_message == "result transfer failed");
 }
 
 TEST_CASE("when_any preserves its winner when loser cancellation throws",
@@ -1036,6 +1181,13 @@ TEST_CASE("when_any preserves its winner when loser cancellation throws",
     sync::event never;
     std::atomic<bool> callback_invoked{false};
     std::atomic<bool> handler_invoked{false};
+
+    struct observation {
+        std::size_t index = static_cast<std::size_t>(-1);
+        int value = 0;
+        bool callback_invoked_before_return = false;
+        bool handler_invoked_before_return = false;
+    };
 
     runtime::scheduler sched(2);
     sched.start();
@@ -1050,7 +1202,7 @@ TEST_CASE("when_any preserves its winner when loser cancellation throws",
         }
     });
 
-    auto owner = sched.go_joinable([&]() -> task<void> {
+    auto owner = sched.go_joinable([&]() -> task<observation> {
         auto [index, value] = co_await when_any(
             [&]() -> task<int> {
                 co_await loser_ready.wait();
@@ -1066,15 +1218,21 @@ TEST_CASE("when_any preserves its winner when loser cancellation throws",
                 co_return -1;
             });
 
-        REQUIRE(index == 0);
-        REQUIRE(value == 42);
-        REQUIRE(callback_invoked.load(std::memory_order_acquire));
-        REQUIRE(handler_invoked.load(std::memory_order_acquire));
+        co_return observation{
+            index,
+            value,
+            callback_invoked.load(std::memory_order_acquire),
+            handler_invoked.load(std::memory_order_acquire),
+        };
     });
 
-    owner.wait_destroyed();
-    REQUIRE_NOTHROW(owner.await_resume());
-    sched.shutdown();
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.index == 0);
+    REQUIRE(observed.value == 42);
+    REQUIRE(observed.callback_invoked_before_return);
+    REQUIRE(observed.handler_invoked_before_return);
 }
 
 TEST_CASE("when_any waits for a token-ignoring loser to finish",
@@ -1083,10 +1241,16 @@ TEST_CASE("when_any waits for a token-ignoring loser to finish",
     sync::event release_loser;
     std::atomic<bool> winner_completed{false};
     std::atomic<bool> combinator_returned{false};
+
+    struct observation {
+        std::size_t index = static_cast<std::size_t>(-1);
+        int value = 0;
+    };
+
     runtime::scheduler sched(2);
     sched.start();
 
-    auto owner = sched.go_joinable([&]() -> task<void> {
+    auto owner = sched.go_joinable([&]() -> task<observation> {
         auto [index, value] = co_await when_any(
             [&]() -> task<int> {
                 co_await loser_started.wait();
@@ -1098,19 +1262,20 @@ TEST_CASE("when_any waits for a token-ignoring loser to finish",
                 co_await release_loser.wait();
                 co_return -1;
             });
-        REQUIRE(index == 0);
-        REQUIRE(value == 42);
         combinator_returned.store(true, std::memory_order_release);
+        co_return observation{index, value};
     });
 
     REQUIRE(wait_for_flag(winner_completed));
     REQUIRE_FALSE(combinator_returned.load(std::memory_order_acquire));
     REQUIRE_FALSE(owner.is_ready());
     release_loser.set();
-    owner.wait_destroyed();
-    REQUIRE_NOTHROW(owner.await_resume());
+    const auto completion =
+        shutdown_and_collect(sched, owner, scaled_ms(2000));
+    const auto& observed = require_join_value(completion);
+    REQUIRE(observed.index == 0);
+    REQUIRE(observed.value == 42);
     REQUIRE(combinator_returned.load(std::memory_order_acquire));
-    sched.shutdown();
 }
 
 TEST_CASE("when_any drains a TCP read cancellation-completion race",

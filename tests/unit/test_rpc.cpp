@@ -5,12 +5,14 @@
 
 #include "../test_main.cpp"
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <future>
 #include <memory>
@@ -210,6 +212,75 @@ private:
 
     std::shared_ptr<scripted_client_rpc_stream_state> state_;
 };
+
+struct rpc_test_root_state {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::shared_ptr<tcp_rpc_client> active_client;
+    bool client_done = false;
+    bool server_done = false;
+
+    void publish_client(std::shared_ptr<tcp_rpc_client> client) {
+        std::lock_guard<std::mutex> lock(mutex);
+        active_client = std::move(client);
+    }
+
+    void clear_client() {
+        std::lock_guard<std::mutex> lock(mutex);
+        active_client.reset();
+    }
+
+    void close_client() {
+        std::shared_ptr<tcp_rpc_client> client;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            client = active_client;
+        }
+        if (client) {
+            client->close();
+        }
+    }
+
+    void mark_client_done() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            client_done = true;
+        }
+        changed.notify_all();
+    }
+
+    void mark_server_done() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            server_done = true;
+        }
+        changed.notify_all();
+    }
+
+    bool wait_for_client(std::chrono::steady_clock::duration timeout) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return changed.wait_for(lock, timeout, [&] { return client_done; });
+    }
+
+    bool wait_for_roots(std::chrono::steady_clock::duration timeout) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return changed.wait_for(
+            lock, timeout, [&] { return client_done && server_done; });
+    }
+};
+
+std::string rpc_test_exception_message(const std::exception_ptr& exception) {
+    if (!exception) {
+        return {};
+    }
+    try {
+        std::rethrow_exception(exception);
+    } catch (const std::exception& error) {
+        return error.what();
+    } catch (...) {
+        return "non-standard exception";
+    }
+}
 
 } // namespace
 
@@ -3213,94 +3284,205 @@ TEST_CASE("server out-of-order dispatch does not head-of-line block",
     // assertion which was flaky on arm64-Debug + ASAN where the shared
     // GitHub runner can stretch a 150ms sleep into hundreds of ms of
     // overhead, blurring the concurrent-vs-sequential gap.
-    std::atomic<int> in_flight{0};
-    std::atomic<int> max_in_flight{0};
+    struct concurrency_state {
+        std::atomic<int> in_flight{0};
+        std::atomic<int> max_in_flight{0};
+    };
+    auto concurrency = std::make_shared<concurrency_state>();
     server->register_method<DelayMethod>(
-        [&in_flight, &max_in_flight](const DelayReq& r) -> coro::task<DelayResp> {
-            int now = in_flight.fetch_add(1, std::memory_order_acq_rel) + 1;
-            int prev = max_in_flight.load(std::memory_order_relaxed);
+        [concurrency](const DelayReq& r) -> coro::task<DelayResp> {
+            int now = concurrency->in_flight.fetch_add(
+                1, std::memory_order_acq_rel) + 1;
+            int prev = concurrency->max_in_flight.load(
+                std::memory_order_relaxed);
             while (prev < now &&
-                   !max_in_flight.compare_exchange_weak(prev, now,
-                                                       std::memory_order_acq_rel)) {
+                   !concurrency->max_in_flight.compare_exchange_weak(
+                       prev, now, std::memory_order_acq_rel)) {
                 // retry
             }
             co_await elio::time::sleep_for(std::chrono::milliseconds(r.ms));
-            in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            concurrency->in_flight.fetch_sub(1, std::memory_order_acq_rel);
             co_return DelayResp{r.ms};
         });
+
+    struct call_observation {
+        bool completed = false;
+        int value = -1;
+        rpc_error error = rpc_error::success;
+        std::exception_ptr exception;
+    };
+
+    struct client_observation {
+        bool connected = false;
+        bool scheduler_available = false;
+        std::array<call_observation, 3> calls;
+        std::exception_ptr exception;
+    };
+
+    struct server_observation {
+        bool accepted = false;
+        bool session_completed = false;
+        std::exception_ptr exception;
+    };
+
+    auto listener = std::make_shared<tcp_listener>(std::move(*listener_opt));
+    auto roots = std::make_shared<rpc_test_root_state>();
 
     scheduler sched(4);
     sched.start();
 
-    // Use handle_client directly to avoid the listener.accept() hang
-    // during shutdown. We accept exactly one connection.
-    sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
-        auto s = co_await lst.accept();
-        if (!s) co_return;
-        co_await server->handle_client(std::move(*s));
-    });
+    auto server_root = sched.go_joinable(
+        [roots, server, listener]() -> coro::task<server_observation> {
+            server_observation observed;
+            try {
+                auto stream = co_await listener->accept(
+                    coro::this_coro::cancel_token());
+                observed.accepted = stream.has_value();
+                if (stream) {
+                    co_await server->handle_client(std::move(*stream));
+                    observed.session_completed = true;
+                }
+            } catch (...) {
+                observed.exception = std::current_exception();
+            }
+            roots->mark_server_done();
+            co_return observed;
+        });
 
-    // Cross-thread synchronization: the test main thread waits on this
-    // promise instead of spinning on a 5-second wall-clock budget. The
-    // budget here (60s) only bounds pathological hangs.
-    std::promise<void> client_done_promise;
-    auto client_done = client_done_promise.get_future();
-    std::atomic<int> ok_count{0};
+    auto client_root = sched.go_joinable(
+        [roots, port]() -> coro::task<client_observation> {
+            client_observation observed;
+            std::shared_ptr<tcp_rpc_client> client;
+            try {
+                auto client_opt = co_await tcp_rpc_client::connect("::1", port);
+                observed.connected = client_opt.has_value();
+                if (client_opt) {
+                    client = *client_opt;
+                    roots->publish_client(client);
 
-    sched.go([&, p = std::move(client_done_promise)]() mutable -> coro::task<void> {
-        auto client_opt = co_await tcp_rpc_client::connect("::1", port);
-        REQUIRE(client_opt.has_value());
-        auto client = *client_opt;
+                    auto* current_sched = scheduler::current();
+                    observed.scheduler_available = current_sched != nullptr;
+                    if (current_sched) {
+                        auto call_timeout = elio::test::scaled_sec(5);
+                        auto start_call =
+                            [current_sched, client, call_timeout]() {
+                                return current_sched->go_joinable(
+                                    [client, call_timeout]()
+                                        -> coro::task<call_observation> {
+                                        call_observation call;
+                                        try {
+                                            auto result = co_await client->call<DelayMethod>(
+                                                DelayReq{150}, call_timeout);
+                                            call.completed = true;
+                                            call.error = result.error();
+                                            if (result.ok()) {
+                                                call.value = result->echo;
+                                            }
+                                        } catch (...) {
+                                            call.exception = std::current_exception();
+                                        }
+                                        co_return call;
+                                    });
+                            };
 
-        auto* current_sched = elio::runtime::scheduler::current();
-        REQUIRE(current_sched != nullptr);
+                        auto first = start_call();
+                        auto second = start_call();
+                        auto third = start_call();
+                        observed.calls[0] = co_await std::move(first);
+                        observed.calls[1] = co_await std::move(second);
+                        observed.calls[2] = co_await std::move(third);
+                    }
+                }
+            } catch (...) {
+                observed.exception = std::current_exception();
+            }
 
-        // Per-call timeout that comfortably accommodates arm64-Debug+ASAN
-        // CI runners where 150ms sleep + frame round-trip can take hundreds
-        // of ms. Still well below the 30s default so a real hang surfaces.
-        auto call_timeout = std::chrono::seconds(5);
-        auto h1 = current_sched->go_joinable(
-            [c = client, call_timeout]() -> coro::task<int> {
-                auto r = co_await c->call<DelayMethod>(DelayReq{150}, call_timeout);
-                co_return r.ok() ? r->echo : -1;
-            });
-        auto h2 = current_sched->go_joinable(
-            [c = client, call_timeout]() -> coro::task<int> {
-                auto r = co_await c->call<DelayMethod>(DelayReq{150}, call_timeout);
-                co_return r.ok() ? r->echo : -1;
-            });
-        auto h3 = current_sched->go_joinable(
-            [c = client, call_timeout]() -> coro::task<int> {
-                auto r = co_await c->call<DelayMethod>(DelayReq{150}, call_timeout);
-                co_return r.ok() ? r->echo : -1;
-            });
+            if (client) {
+                client->close();
+            }
+            roots->clear_client();
+            roots->mark_client_done();
+            co_return observed;
+        });
 
-        int v1 = co_await std::move(h1);
-        int v2 = co_await std::move(h2);
-        int v3 = co_await std::move(h3);
-        if (v1 == 150) ok_count.fetch_add(1);
-        if (v2 == 150) ok_count.fetch_add(1);
-        if (v3 == 150) ok_count.fetch_add(1);
+    const bool client_completed_before_cleanup = roots->wait_for_client(
+        elio::test::scaled_sec(10));
 
-        p.set_value();
-    });
+    roots->close_client();
+    client_root.request_cancel();
+    server->stop();
+    server_root.request_cancel();
 
-    // 60s upper bound only catches pathological hangs; healthy runs
-    // resolve in well under a second on developer machines and a few
-    // seconds on the slowest CI runner.
-    auto status = client_done.wait_for(std::chrono::seconds(60));
-    REQUIRE(status == std::future_status::ready);
-    REQUIRE(ok_count.load() == 3);
+    const bool roots_unwound = roots->wait_for_roots(
+        elio::test::scaled_sec(10));
+    const bool scheduler_stopped = sched.shutdown(elio::test::scaled_sec(10));
+    const bool client_ready = client_root.is_ready();
+    const bool client_destroyed = client_root.is_destroyed();
+    const bool server_ready = server_root.is_ready();
+    const bool server_destroyed = server_root.is_destroyed();
+
+    std::optional<client_observation> client_observed;
+    std::optional<server_observation> server_observed;
+    if (client_ready && client_destroyed) {
+        client_observed.emplace(client_root.await_resume());
+    }
+    if (server_ready && server_destroyed) {
+        server_observed.emplace(server_root.await_resume());
+        listener->close();
+    }
+
+    std::string client_exception;
+    std::string server_exception;
+    std::array<std::string, 3> call_exceptions;
+    if (client_observed) {
+        client_exception = rpc_test_exception_message(client_observed->exception);
+        for (size_t i = 0; i < client_observed->calls.size(); ++i) {
+            call_exceptions[i] = rpc_test_exception_message(
+                client_observed->calls[i].exception);
+        }
+    }
+    if (server_observed) {
+        server_exception = rpc_test_exception_message(server_observed->exception);
+    }
+
+    CAPTURE(client_completed_before_cleanup,
+            roots_unwound,
+            scheduler_stopped,
+            client_ready,
+            client_destroyed,
+            server_ready,
+            server_destroyed,
+            client_exception,
+            server_exception,
+            call_exceptions[0],
+            call_exceptions[1],
+            call_exceptions[2]);
+    REQUIRE(client_completed_before_cleanup);
+    REQUIRE(roots_unwound);
+    REQUIRE(scheduler_stopped);
+    REQUIRE(client_ready);
+    REQUIRE(client_destroyed);
+    REQUIRE(server_ready);
+    REQUIRE(server_destroyed);
+    REQUIRE(client_observed.has_value());
+    REQUIRE(server_observed.has_value());
+    REQUIRE(client_observed->exception == nullptr);
+    REQUIRE(server_observed->exception == nullptr);
+    REQUIRE(server_observed->accepted);
+    REQUIRE(server_observed->session_completed);
+    REQUIRE(client_observed->connected);
+    REQUIRE(client_observed->scheduler_available);
+    for (const auto& call : client_observed->calls) {
+        REQUIRE(call.exception == nullptr);
+        REQUIRE(call.completed);
+        REQUIRE(call.error == rpc_error::success);
+        REQUIRE(call.value == 150);
+    }
     // Deterministic concurrency check: server saw at least 2 handlers in
     // flight simultaneously (with the test's 3 parallel calls and 150ms
     // sleeps, max_in_flight should reach 3 in practice; >= 2 is enough
     // to rule out head-of-line blocking).
-    REQUIRE(max_in_flight.load() >= 2);
-
-    // Drain naturally so any in-flight dispatched handler completes
-    // before the scheduler tears down its workers — keeps ASAN clean.
-    server->stop();
-    sched.shutdown(std::chrono::seconds(30));
+    REQUIRE(concurrency->max_in_flight.load() >= 2);
 }
 
 TEST_CASE("server per-session in-flight limit rejects excess request",
@@ -4170,71 +4352,199 @@ TEST_CASE("server per-session in-flight limit can close the session",
     cfg.frame_read_timeout = std::chrono::seconds(0);
     auto server = std::make_shared<rpc_server<tcp_stream>>(cfg);
 
-    elio::sync::event release_first;
-    std::atomic<int> handler_started{0};
+    auto release_first = std::make_shared<elio::sync::event>();
+    auto handler_started = std::make_shared<std::atomic<int>>(0);
     server->register_method<DelayMethod>(
-        [&release_first, &handler_started](const DelayReq& r)
+        [release_first, handler_started](const DelayReq& r)
             -> coro::task<DelayResp> {
-            handler_started.fetch_add(1, std::memory_order_acq_rel);
-            co_await release_first.wait();
+            handler_started->fetch_add(1, std::memory_order_acq_rel);
+            co_await release_first->wait();
             co_return DelayResp{r.ms};
         });
+
+    struct call_observation {
+        bool completed = false;
+        rpc_error error = rpc_error::success;
+        std::exception_ptr exception;
+    };
+
+    struct client_observation {
+        bool connected = false;
+        bool scheduler_available = false;
+        bool first_handler_started = false;
+        call_observation first;
+        bool second_completed = false;
+        rpc_error second_error = rpc_error::success;
+        std::exception_ptr exception;
+    };
+
+    struct server_observation {
+        bool accepted = false;
+        bool session_completed = false;
+        std::exception_ptr exception;
+    };
+
+    auto listener = std::make_shared<tcp_listener>(std::move(*listener_opt));
+    auto roots = std::make_shared<rpc_test_root_state>();
 
     scheduler sched(4);
     sched.start();
 
-    sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
-        auto s = co_await lst.accept();
-        if (!s) co_return;
-        co_await server->handle_client(std::move(*s));
-    });
+    auto server_root = sched.go_joinable(
+        [roots, server, listener]() -> coro::task<server_observation> {
+            server_observation observed;
+            try {
+                auto stream = co_await listener->accept(
+                    coro::this_coro::cancel_token());
+                observed.accepted = stream.has_value();
+                if (stream) {
+                    co_await server->handle_client(std::move(*stream));
+                    observed.session_completed = true;
+                }
+            } catch (...) {
+                observed.exception = std::current_exception();
+            }
+            roots->mark_server_done();
+            co_return observed;
+        });
 
-    std::promise<void> client_done_promise;
-    auto client_done = client_done_promise.get_future();
-    std::atomic<int> second_error{static_cast<int>(rpc_error::success)};
-    std::atomic<int> first_error{static_cast<int>(rpc_error::success)};
+    auto client_root = sched.go_joinable(
+        [roots, release_first, handler_started, port]()
+            -> coro::task<client_observation> {
+            client_observation observed;
+            std::shared_ptr<tcp_rpc_client> client;
+            try {
+                auto client_opt = co_await tcp_rpc_client::connect("::1", port);
+                observed.connected = client_opt.has_value();
+                if (client_opt) {
+                    client = *client_opt;
+                    roots->publish_client(client);
 
-    sched.go([&, p = std::move(client_done_promise)]() mutable -> coro::task<void> {
-        auto client_opt = co_await tcp_rpc_client::connect("::1", port);
-        REQUIRE(client_opt.has_value());
-        auto client = *client_opt;
-        auto* current_sched = elio::runtime::scheduler::current();
-        REQUIRE(current_sched != nullptr);
+                    auto* current_sched = scheduler::current();
+                    observed.scheduler_available = current_sched != nullptr;
+                    if (current_sched) {
+                        auto call_timeout = elio::test::scaled_sec(5);
+                        auto first = current_sched->go_joinable(
+                            [client, call_timeout]()
+                                -> coro::task<call_observation> {
+                                call_observation call;
+                                try {
+                                    auto result = co_await client->call<DelayMethod>(
+                                        DelayReq{111}, call_timeout);
+                                    call.completed = true;
+                                    call.error = result.error();
+                                } catch (...) {
+                                    call.exception = std::current_exception();
+                                }
+                                co_return call;
+                            });
 
-        auto call_timeout = std::chrono::seconds(5);
-        auto first = current_sched->go_joinable(
-            [c = client, call_timeout]() -> coro::task<int> {
-                auto r = co_await c->call<DelayMethod>(DelayReq{111}, call_timeout);
-                co_return static_cast<int>(r.error());
-            });
+                        for (int i = 0;
+                             i < 200 &&
+                                 handler_started->load(
+                                     std::memory_order_acquire) == 0;
+                             ++i) {
+                            co_await elio::time::sleep_for(
+                                elio::test::scaled_ms(5));
+                        }
+                        observed.first_handler_started =
+                            handler_started->load(std::memory_order_acquire) == 1;
 
-        for (int i = 0;
-             i < 200 && handler_started.load(std::memory_order_acquire) == 0;
-             ++i) {
-            co_await elio::time::sleep_for(std::chrono::milliseconds(5));
-        }
-        REQUIRE(handler_started.load(std::memory_order_acquire) == 1);
+                        if (observed.first_handler_started) {
+                            auto second = co_await client->call<DelayMethod>(
+                                DelayReq{222}, call_timeout);
+                            observed.second_completed = true;
+                            observed.second_error = second.error();
+                        }
 
-        auto second = co_await client->call<DelayMethod>(
-            DelayReq{222}, call_timeout);
-        second_error.store(
-            static_cast<int>(second.error()), std::memory_order_release);
+                        release_first->set();
+                        observed.first = co_await std::move(first);
+                    }
+                }
+            } catch (...) {
+                observed.exception = std::current_exception();
+            }
 
-        release_first.set();
-        first_error.store(co_await std::move(first), std::memory_order_release);
-        p.set_value();
-    });
+            release_first->set();
+            if (client) {
+                client->close();
+            }
+            roots->clear_client();
+            roots->mark_client_done();
+            co_return observed;
+        });
 
-    auto status = client_done.wait_for(std::chrono::seconds(60));
-    REQUIRE(status == std::future_status::ready);
-    REQUIRE(second_error.load(std::memory_order_acquire) ==
-            static_cast<int>(rpc_error::connection_closed));
-    REQUIRE(first_error.load(std::memory_order_acquire) ==
-            static_cast<int>(rpc_error::connection_closed));
-    REQUIRE(handler_started.load(std::memory_order_acquire) == 1);
+    const bool client_completed_before_cleanup = roots->wait_for_client(
+        elio::test::scaled_sec(10));
 
+    release_first->set();
+    roots->close_client();
+    client_root.request_cancel();
     server->stop();
-    sched.shutdown(std::chrono::seconds(30));
+    server_root.request_cancel();
+
+    const bool roots_unwound = roots->wait_for_roots(
+        elio::test::scaled_sec(10));
+    const bool scheduler_stopped = sched.shutdown(elio::test::scaled_sec(10));
+    const bool client_ready = client_root.is_ready();
+    const bool client_destroyed = client_root.is_destroyed();
+    const bool server_ready = server_root.is_ready();
+    const bool server_destroyed = server_root.is_destroyed();
+
+    std::optional<client_observation> client_observed;
+    std::optional<server_observation> server_observed;
+    if (client_ready && client_destroyed) {
+        client_observed.emplace(client_root.await_resume());
+    }
+    if (server_ready && server_destroyed) {
+        server_observed.emplace(server_root.await_resume());
+        listener->close();
+    }
+
+    std::string client_exception;
+    std::string first_exception;
+    std::string server_exception;
+    if (client_observed) {
+        client_exception = rpc_test_exception_message(client_observed->exception);
+        first_exception = rpc_test_exception_message(
+            client_observed->first.exception);
+    }
+    if (server_observed) {
+        server_exception = rpc_test_exception_message(server_observed->exception);
+    }
+
+    CAPTURE(client_completed_before_cleanup,
+            roots_unwound,
+            scheduler_stopped,
+            client_ready,
+            client_destroyed,
+            server_ready,
+            server_destroyed,
+            client_exception,
+            first_exception,
+            server_exception);
+    REQUIRE(client_completed_before_cleanup);
+    REQUIRE(roots_unwound);
+    REQUIRE(scheduler_stopped);
+    REQUIRE(client_ready);
+    REQUIRE(client_destroyed);
+    REQUIRE(server_ready);
+    REQUIRE(server_destroyed);
+    REQUIRE(client_observed.has_value());
+    REQUIRE(server_observed.has_value());
+    REQUIRE(client_observed->exception == nullptr);
+    REQUIRE(client_observed->first.exception == nullptr);
+    REQUIRE(server_observed->exception == nullptr);
+    REQUIRE(server_observed->accepted);
+    REQUIRE(server_observed->session_completed);
+    REQUIRE(client_observed->connected);
+    REQUIRE(client_observed->scheduler_available);
+    REQUIRE(client_observed->first_handler_started);
+    REQUIRE(client_observed->second_completed);
+    REQUIRE(client_observed->second_error == rpc_error::connection_closed);
+    REQUIRE(client_observed->first.completed);
+    REQUIRE(client_observed->first.error == rpc_error::connection_closed);
+    REQUIRE(handler_started->load(std::memory_order_acquire) == 1);
 }
 
 // ============================================================================
@@ -4922,18 +5232,22 @@ TEST_CASE("rpc call cancellation reaches server context token",
     uint16_t port = listener_opt->local_address().port();
 
     auto server = std::make_shared<rpc_server<tcp_stream>>();
-    std::atomic<bool> handler_started{false};
-    std::atomic<bool> server_cancel_seen{false};
+    struct probe_state {
+        std::atomic<bool> handler_started{false};
+        std::atomic<bool> server_cancel_seen{false};
+    };
+    auto probe = std::make_shared<probe_state>();
 
     server->register_method_with_context<CancelProbeMethod>(
-        [&handler_started, &server_cancel_seen](
+        [probe](
             const rpc_context& ctx,
             const CancelProbeReq& req) -> coro::task<CancelProbeResp> {
-            handler_started.store(true, std::memory_order_release);
+            probe->handler_started.store(true, std::memory_order_release);
 
             for (int i = 0; i < 2000; ++i) {
                 if (ctx.cancel_token.is_cancelled()) {
-                    server_cancel_seen.store(true, std::memory_order_release);
+                    probe->server_cancel_seen.store(
+                        true, std::memory_order_release);
                     co_return CancelProbeResp{-1};
                 }
 
@@ -4942,7 +5256,8 @@ TEST_CASE("rpc call cancellation reaches server context token",
                     ctx.cancel_token);
                 if (result == coro::cancel_result::cancelled ||
                     ctx.cancel_token.is_cancelled()) {
-                    server_cancel_seen.store(true, std::memory_order_release);
+                    probe->server_cancel_seen.store(
+                        true, std::memory_order_release);
                     co_return CancelProbeResp{-1};
                 }
             }
@@ -4950,73 +5265,196 @@ TEST_CASE("rpc call cancellation reaches server context token",
             co_return CancelProbeResp{req.value};
         });
 
+    struct call_observation {
+        bool completed = false;
+        rpc_error error = rpc_error::success;
+        std::exception_ptr exception;
+    };
+
+    struct client_observation {
+        bool connected = false;
+        bool scheduler_available = false;
+        bool handler_started_before_cancel = false;
+        call_observation call;
+        bool server_cancel_observed = false;
+        std::exception_ptr exception;
+    };
+
+    struct server_observation {
+        bool accepted = false;
+        bool session_completed = false;
+        std::exception_ptr exception;
+    };
+
+    auto listener = std::make_shared<tcp_listener>(std::move(*listener_opt));
+    auto roots = std::make_shared<rpc_test_root_state>();
+    auto cancel_source = std::make_shared<coro::cancel_source>();
+
     scheduler sched(3);
     sched.start();
 
-    sched.go([&, &lst = *listener_opt]() -> coro::task<void> {
-        auto s = co_await lst.accept();
-        if (!s) co_return;
-        co_await server->handle_client(std::move(*s));
-    });
+    auto server_root = sched.go_joinable(
+        [roots, server, listener]() -> coro::task<server_observation> {
+            server_observation observed;
+            try {
+                auto stream = co_await listener->accept(
+                    coro::this_coro::cancel_token());
+                observed.accepted = stream.has_value();
+                if (stream) {
+                    co_await server->handle_client(std::move(*stream));
+                    observed.session_completed = true;
+                }
+            } catch (...) {
+                observed.exception = std::current_exception();
+            }
+            roots->mark_server_done();
+            co_return observed;
+        });
 
-    coro::cancel_source cancel_source;
-    std::promise<std::pair<int, bool>> done_promise;
-    auto done = done_promise.get_future();
+    auto client_root = sched.go_joinable(
+        [roots, probe, cancel_source, port]()
+            -> coro::task<client_observation> {
+            client_observation observed;
+            std::shared_ptr<tcp_rpc_client> client;
+            try {
+                auto client_opt = co_await tcp_rpc_client::connect("::1", port);
+                observed.connected = client_opt.has_value();
+                if (client_opt) {
+                    client = *client_opt;
+                    roots->publish_client(client);
 
-    sched.go([&, p = std::move(done_promise)]() mutable -> coro::task<void> {
-        auto client_opt = co_await tcp_rpc_client::connect("::1", port);
-        if (!client_opt) {
-            p.set_value({static_cast<int>(rpc_error::connection_closed), false});
-            co_return;
-        }
-        auto client = *client_opt;
+                    auto* current_sched = scheduler::current();
+                    observed.scheduler_available = current_sched != nullptr;
+                    if (current_sched) {
+                        auto call = current_sched->go_joinable(
+                            [client, token = cancel_source->get_token()]() mutable
+                                -> coro::task<call_observation> {
+                                call_observation call_observed;
+                                try {
+                                    auto result =
+                                        co_await client->call<CancelProbeMethod>(
+                                            CancelProbeReq{7},
+                                            elio::test::scaled_sec(30),
+                                            std::move(token));
+                                    call_observed.completed = true;
+                                    call_observed.error = result.error();
+                                } catch (...) {
+                                    call_observed.exception =
+                                        std::current_exception();
+                                }
+                                co_return call_observed;
+                            });
 
-        auto* current_sched = scheduler::current();
-        REQUIRE(current_sched != nullptr);
+                        for (int i = 0;
+                             i < 2000 &&
+                                 !probe->handler_started.load(
+                                     std::memory_order_acquire);
+                             ++i) {
+                            co_await elio::time::sleep_for(
+                                elio::test::scaled_ms(1));
+                        }
+                        observed.handler_started_before_cancel =
+                            probe->handler_started.load(
+                                std::memory_order_acquire);
 
-        auto call = current_sched->go_joinable(
-            [client, token = cancel_source.get_token()]() mutable
-                -> coro::task<int> {
-                auto r = co_await client->call<CancelProbeMethod>(
-                    CancelProbeReq{7},
-                    elio::test::scaled_sec(30),
-                    std::move(token));
-                co_return static_cast<int>(r.error());
-            });
+                        cancel_source->cancel();
+                        observed.call = co_await std::move(call);
 
-        for (int i = 0;
-             i < 2000 && !handler_started.load(std::memory_order_acquire);
-             ++i) {
-            co_await elio::time::sleep_for(elio::test::scaled_ms(1));
-        }
-        if (!handler_started.load(std::memory_order_acquire)) {
-            client->close();
-            p.set_value({static_cast<int>(rpc_error::timeout), false});
-            co_return;
-        }
+                        for (int i = 0;
+                             i < 2000 &&
+                                 !probe->server_cancel_seen.load(
+                                     std::memory_order_acquire);
+                             ++i) {
+                            co_await elio::time::sleep_for(
+                                elio::test::scaled_ms(1));
+                        }
+                        observed.server_cancel_observed =
+                            probe->server_cancel_seen.load(
+                                std::memory_order_acquire);
+                    }
+                }
+            } catch (...) {
+                observed.exception = std::current_exception();
+            }
 
-        cancel_source.cancel();
-        int call_error = co_await std::move(call);
+            cancel_source->cancel();
+            if (client) {
+                client->close();
+            }
+            roots->clear_client();
+            roots->mark_client_done();
+            co_return observed;
+        });
 
-        for (int i = 0;
-             i < 2000 && !server_cancel_seen.load(std::memory_order_acquire);
-             ++i) {
-            co_await elio::time::sleep_for(elio::test::scaled_ms(1));
-        }
+    const bool client_completed_before_cleanup = roots->wait_for_client(
+        elio::test::scaled_sec(10));
 
-        bool observed = server_cancel_seen.load(std::memory_order_acquire);
-        client->close();
-        p.set_value({call_error, observed});
-    });
-
-    auto status = done.wait_for(std::chrono::seconds(60));
-    REQUIRE(status == std::future_status::ready);
-    auto [call_error, observed] = done.get();
-    REQUIRE(call_error == static_cast<int>(rpc_error::cancelled));
-    REQUIRE(observed);
-
+    cancel_source->cancel();
+    roots->close_client();
+    client_root.request_cancel();
     server->stop();
-    REQUIRE(sched.shutdown(std::chrono::seconds(30)));
+    server_root.request_cancel();
+
+    const bool roots_unwound = roots->wait_for_roots(
+        elio::test::scaled_sec(10));
+    const bool scheduler_stopped = sched.shutdown(elio::test::scaled_sec(10));
+    const bool client_ready = client_root.is_ready();
+    const bool client_destroyed = client_root.is_destroyed();
+    const bool server_ready = server_root.is_ready();
+    const bool server_destroyed = server_root.is_destroyed();
+
+    std::optional<client_observation> client_observed;
+    std::optional<server_observation> server_observed;
+    if (client_ready && client_destroyed) {
+        client_observed.emplace(client_root.await_resume());
+    }
+    if (server_ready && server_destroyed) {
+        server_observed.emplace(server_root.await_resume());
+        listener->close();
+    }
+
+    std::string client_exception;
+    std::string call_exception;
+    std::string server_exception;
+    if (client_observed) {
+        client_exception = rpc_test_exception_message(client_observed->exception);
+        call_exception = rpc_test_exception_message(
+            client_observed->call.exception);
+    }
+    if (server_observed) {
+        server_exception = rpc_test_exception_message(server_observed->exception);
+    }
+
+    CAPTURE(client_completed_before_cleanup,
+            roots_unwound,
+            scheduler_stopped,
+            client_ready,
+            client_destroyed,
+            server_ready,
+            server_destroyed,
+            client_exception,
+            call_exception,
+            server_exception);
+    REQUIRE(client_completed_before_cleanup);
+    REQUIRE(roots_unwound);
+    REQUIRE(scheduler_stopped);
+    REQUIRE(client_ready);
+    REQUIRE(client_destroyed);
+    REQUIRE(server_ready);
+    REQUIRE(server_destroyed);
+    REQUIRE(client_observed.has_value());
+    REQUIRE(server_observed.has_value());
+    REQUIRE(client_observed->exception == nullptr);
+    REQUIRE(client_observed->call.exception == nullptr);
+    REQUIRE(server_observed->exception == nullptr);
+    REQUIRE(server_observed->accepted);
+    REQUIRE(server_observed->session_completed);
+    REQUIRE(client_observed->connected);
+    REQUIRE(client_observed->scheduler_available);
+    REQUIRE(client_observed->handler_started_before_cancel);
+    REQUIRE(client_observed->call.completed);
+    REQUIRE(client_observed->call.error == rpc_error::cancelled);
+    REQUIRE(client_observed->server_cancel_observed);
 }
 
 TEST_CASE("rpc session rejects duplicate active request ids",

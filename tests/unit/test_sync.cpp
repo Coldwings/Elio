@@ -559,6 +559,8 @@ TEST_CASE("shared_mutex with coroutines", "[sync][shared_mutex][coro]") {
     std::atomic<int> max_concurrent_readers{0};
     std::atomic<int> write_count{0};
     std::atomic<int> completed{0};
+    std::atomic<int> writer_overlap_count{0};
+    std::atomic<int> first_readers_during_write{-1};
     
     scheduler sched(2);
     sched.start();
@@ -573,6 +575,9 @@ TEST_CASE("shared_mutex with coroutines", "[sync][shared_mutex][coro]") {
     std::atomic<int>* max_concurrent_readers_ptr = &max_concurrent_readers;
     std::atomic<int>* write_count_ptr = &write_count;
     std::atomic<int>* completed_ptr = &completed;
+    std::atomic<int>* writer_overlap_count_ptr = &writer_overlap_count;
+    std::atomic<int>* first_readers_during_write_ptr =
+        &first_readers_during_write;
     
     // Reader task - multiple can run concurrently
     auto make_reader = [=]() -> task<void> {
@@ -591,7 +596,14 @@ TEST_CASE("shared_mutex with coroutines", "[sync][shared_mutex][coro]") {
     auto make_writer = [=]() -> task<void> {
         co_await m_ptr->lock();
         ++(*write_count_ptr);
-        REQUIRE(*read_count_ptr == 0);  // No readers while writing
+        const int readers_during_write = read_count_ptr->load();
+        if (readers_during_write != 0) {
+            writer_overlap_count_ptr->fetch_add(1,
+                                                std::memory_order_relaxed);
+            int expected = -1;
+            first_readers_during_write_ptr->compare_exchange_strong(
+                expected, readers_during_write, std::memory_order_relaxed);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
         m_ptr->unlock();
         completed_ptr->fetch_add(1, std::memory_order_relaxed);
@@ -613,7 +625,9 @@ TEST_CASE("shared_mutex with coroutines", "[sync][shared_mutex][coro]") {
     }
     
     sched.shutdown();
-    
+
+    CAPTURE(first_readers_during_write.load(std::memory_order_relaxed));
+    REQUIRE(writer_overlap_count.load(std::memory_order_relaxed) == 0);
     REQUIRE(completed.load(std::memory_order_relaxed) == TOTAL);
     REQUIRE(write_count == NUM_WRITERS);
     // Multiple readers should have run concurrently at some point

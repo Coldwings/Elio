@@ -1,11 +1,34 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/log/logger.hpp>
 #include <elio/log/macros.hpp>
+#include <atomic>
+#include <latch>
+#include <string>
 #include <thread>
 #include <vector>
-#include <sstream>
 
 using namespace elio::log;
+
+namespace {
+
+class scoped_logger_level {
+public:
+    explicit scoped_logger_level(logger& log) noexcept
+        : log_(log), previous_(log.get_level()) {}
+
+    ~scoped_logger_level() noexcept {
+        log_.set_level(previous_);
+    }
+
+    scoped_logger_level(const scoped_logger_level&) = delete;
+    scoped_logger_level& operator=(const scoped_logger_level&) = delete;
+
+private:
+    logger& log_;
+    level previous_;
+};
+
+} // namespace
 
 TEST_CASE("Logger singleton", "[logger]") {
     auto& logger1 = logger::instance();
@@ -16,6 +39,7 @@ TEST_CASE("Logger singleton", "[logger]") {
 
 TEST_CASE("Log level filtering", "[logger]") {
     auto& log = logger::instance();
+    scoped_logger_level restore_level(log);
     
     // Set to warning level
     log.set_level(level::warning);
@@ -33,6 +57,20 @@ TEST_CASE("Log level filtering", "[logger]") {
     REQUIRE(log.get_level() == level::info);
 }
 
+TEST_CASE("Logger level changes are scoped", "[logger][regression]") {
+    auto& log = logger::instance();
+    scoped_logger_level restore_initial_level(log);
+    log.set_level(level::warning);
+
+    {
+        scoped_logger_level restore_warning_level(log);
+        log.set_level(level::debug);
+        REQUIRE(log.get_level() == level::debug);
+    }
+
+    REQUIRE(log.get_level() == level::warning);
+}
+
 TEST_CASE("Log level conversion", "[logger]") {
     REQUIRE(std::string(level_to_string(level::debug)) == "DEBUG");
     REQUIRE(std::string(level_to_string(level::info)) == "INFO");
@@ -42,30 +80,38 @@ TEST_CASE("Log level conversion", "[logger]") {
 
 TEST_CASE("Concurrent logging", "[logger]") {
     auto& log = logger::instance();
+    scoped_logger_level restore_level(log);
     log.set_level(level::info);
     
     std::vector<std::thread> threads;
     const int num_threads = 10;
-    const int logs_per_thread = 100;
+    const int logs_per_thread = 4;
+    std::latch start(num_threads + 1);
+    std::atomic<int> completed_logs{0};
     
     for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back([i, logs_per_thread]() {
+        threads.emplace_back([&, i]() {
+            start.arrive_and_wait();
             for (int j = 0; j < logs_per_thread; ++j) {
                 ELIO_LOG_INFO("Thread {} log {}", i, j);
+                completed_logs.fetch_add(1, std::memory_order_relaxed);
             }
         });
     }
+
+    start.arrive_and_wait();
     
     for (auto& t : threads) {
         t.join();
     }
     
-    // If we get here without crashing, concurrent logging works
-    REQUIRE(true);
+    REQUIRE(completed_logs.load(std::memory_order_relaxed) ==
+            num_threads * logs_per_thread);
 }
 
 TEST_CASE("Log formatting with various types", "[logger]") {
     auto& log = logger::instance();
+    scoped_logger_level restore_level(log);
     log.set_level(level::info);
     
     // Test various argument types
@@ -81,6 +127,7 @@ TEST_CASE("Log formatting with various types", "[logger]") {
 #ifdef ELIO_DEBUG
 TEST_CASE("Debug logging enabled", "[logger]") {
     auto& log = logger::instance();
+    scoped_logger_level restore_level(log);
     log.set_level(level::debug);
     
     // This should compile and run

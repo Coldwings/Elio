@@ -781,6 +781,8 @@ TEST_CASE("HTTP/2 read_timeout aborts stalled session initialization",
 
     std::atomic<bool> server_handshake{false};
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
+    std::atomic<int> server_accept_errno{0};
     std::atomic<bool> client_done{false};
     std::atomic<bool> release_server{false};
     std::atomic<int> client_errno{0};
@@ -788,7 +790,12 @@ TEST_CASE("HTTP/2 read_timeout aborts stalled session initialization",
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        if (!stream) {
+            server_accept_errno.store(errno, std::memory_order_release);
+            server_done.store(true, std::memory_order_release);
+            co_return;
+        }
+        server_accepted.store(true, std::memory_order_release);
 
         elio::tls::tls_stream tls(std::move(*stream), server_ctx);
         bool ok = co_await tls.handshake();
@@ -836,6 +843,9 @@ TEST_CASE("HTTP/2 read_timeout aborts stalled session initialization",
 
     REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 
+    INFO("server accept errno="
+         << server_accept_errno.load(std::memory_order_acquire));
+    REQUIRE(server_accepted.load(std::memory_order_acquire));
     REQUIRE(server_handshake.load(std::memory_order_acquire));
     REQUIRE(client_errno.load(std::memory_order_acquire) == ETIMEDOUT);
     REQUIRE(client_elapsed_ms.load(std::memory_order_acquire) >= 0);
@@ -858,13 +868,20 @@ TEST_CASE("HTTP/2 connect_timeout aborts stalled TLS handshake",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
+    std::atomic<int> server_accept_errno{0};
     std::atomic<bool> client_done{false};
     std::atomic<int> client_errno{0};
     std::atomic<int64_t> client_elapsed_ms{-1};
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        if (!stream) {
+            server_accept_errno.store(errno, std::memory_order_release);
+            server_done.store(true, std::memory_order_release);
+            co_return;
+        }
+        server_accepted.store(true, std::memory_order_release);
 
         co_await elio::time::sleep_for(elio::test::scaled_sec(3));
         stream->shutdown_socket();
@@ -904,6 +921,9 @@ TEST_CASE("HTTP/2 connect_timeout aborts stalled TLS handshake",
 
     REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
 
+    INFO("server accept errno="
+         << server_accept_errno.load(std::memory_order_acquire));
+    REQUIRE(server_accepted.load(std::memory_order_acquire));
     REQUIRE(client_errno.load(std::memory_order_acquire) == ETIMEDOUT);
     REQUIRE(client_elapsed_ms.load(std::memory_order_acquire) >= 0);
     REQUIRE(client_elapsed_ms.load(std::memory_order_acquire) <

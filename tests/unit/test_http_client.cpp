@@ -182,16 +182,26 @@ void require_websocket_handshake_response_rejected(
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
+    std::atomic<bool> server_key_present{false};
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_failed{false};
     std::atomic<int> client_errno{0};
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         auto headers = co_await read_request_headers(*stream);
         auto key = request_header_value(headers, "Sec-WebSocket-Key");
-        REQUIRE_FALSE(key.empty());
+        server_key_present = !key.empty();
+        if (key.empty()) {
+            server_done = true;
+            co_return;
+        }
 
         auto accept = elio::http::websocket::compute_websocket_accept(key);
         auto response = make_response(accept);
@@ -221,6 +231,8 @@ void require_websocket_handshake_response_rejected(
 
     REQUIRE(client_done);
     REQUIRE(server_done);
+    REQUIRE(server_accepted);
+    REQUIRE(server_key_present);
     REQUIRE(client_failed);
     REQUIRE(client_errno == expected_errno);
 }
@@ -236,16 +248,26 @@ void require_websocket_handshake_response_accepted(
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
+    std::atomic<bool> server_key_present{false};
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_connected{false};
     std::atomic<int> client_errno{0};
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         auto headers = co_await read_request_headers(*stream);
         auto key = request_header_value(headers, "Sec-WebSocket-Key");
-        REQUIRE_FALSE(key.empty());
+        server_key_present = !key.empty();
+        if (key.empty()) {
+            server_done = true;
+            co_return;
+        }
 
         auto accept = elio::http::websocket::compute_websocket_accept(key);
         auto response = make_response(accept);
@@ -275,6 +297,8 @@ void require_websocket_handshake_response_accepted(
 
     REQUIRE(client_done);
     REQUIRE(server_done);
+    REQUIRE(server_accepted);
+    REQUIRE(server_key_present);
     REQUIRE(client_connected);
     REQUIRE(client_errno == 0);
 }
@@ -595,6 +619,7 @@ TEST_CASE("WebSocket client read_timeout fires on a stalled handshake response",
 
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_failed{false};
+    std::atomic<bool> server_accepted{false};
     std::atomic<int> client_errno{0};
     std::atomic<int64_t> client_elapsed_ms{-1};
 
@@ -602,7 +627,10 @@ TEST_CASE("WebSocket client read_timeout fires on a stalled handshake response",
     // the 101 response. The client's read_timeout must bound this phase.
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            co_return;
+        }
         co_await drain_request_headers(*stream);
         co_await elio::time::sleep_for(std::chrono::seconds(3));
         stream->shutdown_socket();
@@ -633,6 +661,7 @@ TEST_CASE("WebSocket client read_timeout fires on a stalled handshake response",
     sched.shutdown();
 
     REQUIRE(client_done);
+    REQUIRE(server_accepted);
     REQUIRE(client_failed);
     REQUIRE(client_errno == ETIMEDOUT);
     REQUIRE(client_elapsed_ms.load() >= 0);
@@ -651,6 +680,8 @@ TEST_CASE("WebSocket client parses bracketed IPv6 URLs",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
+    std::atomic<bool> server_key_present{false};
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_connected{false};
     std::atomic<int> client_errno{0};
@@ -658,11 +689,19 @@ TEST_CASE("WebSocket client parses bracketed IPv6 URLs",
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         auto headers = co_await read_request_headers(*stream);
         observed_host = request_header_value(headers, "Host");
         auto key = request_header_value(headers, "Sec-WebSocket-Key");
-        REQUIRE_FALSE(key.empty());
+        server_key_present = !key.empty();
+        if (key.empty()) {
+            server_done = true;
+            co_return;
+        }
         auto accept = elio::http::websocket::compute_websocket_accept(key);
         auto response = elio::http::websocket::build_server_handshake(accept);
         co_await stream->write(response);
@@ -692,6 +731,8 @@ TEST_CASE("WebSocket client parses bracketed IPv6 URLs",
 
     REQUIRE(client_done);
     REQUIRE(server_done);
+    REQUIRE(server_accepted);
+    REQUIRE(server_key_present);
     REQUIRE(client_connected);
     REQUIRE(client_errno == 0);
     REQUIRE(observed_host == "[::1]:" + std::to_string(port));
@@ -707,6 +748,8 @@ TEST_CASE("WebSocket client rejects unoffered server subprotocol",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
+    std::atomic<bool> server_key_present{false};
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_failed{false};
     std::atomic<int> client_errno{0};
@@ -715,11 +758,19 @@ TEST_CASE("WebSocket client rejects unoffered server subprotocol",
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         auto headers = co_await read_request_headers(*stream);
         observed_protocols = request_header_value(headers, "Sec-WebSocket-Protocol");
         auto key = request_header_value(headers, "Sec-WebSocket-Key");
-        REQUIRE_FALSE(key.empty());
+        server_key_present = !key.empty();
+        if (key.empty()) {
+            server_done = true;
+            co_return;
+        }
 
         auto accept = elio::http::websocket::compute_websocket_accept(key);
         auto response = elio::http::websocket::build_server_handshake(
@@ -753,6 +804,8 @@ TEST_CASE("WebSocket client rejects unoffered server subprotocol",
 
     REQUIRE(client_done);
     REQUIRE(server_done);
+    REQUIRE(server_accepted);
+    REQUIRE(server_key_present);
     REQUIRE(client_failed);
     REQUIRE(client_errno == EBADMSG);
     REQUIRE(observed_protocols == "chat");
@@ -894,6 +947,10 @@ TEST_CASE("WebSocket client clears parser state between connection attempts",
 
     std::atomic<bool> first_server_done{false};
     std::atomic<bool> second_server_done{false};
+    std::atomic<bool> first_server_accepted{false};
+    std::atomic<bool> second_server_accepted{false};
+    std::atomic<bool> first_server_key_present{false};
+    std::atomic<bool> second_server_key_present{false};
     std::atomic<bool> client_done{false};
     std::atomic<bool> first_failed{false};
     std::atomic<bool> second_connected{false};
@@ -902,10 +959,18 @@ TEST_CASE("WebSocket client clears parser state between connection attempts",
 
     sched.go([&]() -> task<void> {
         auto stream = co_await first_listener->accept();
-        REQUIRE(stream.has_value());
+        first_server_accepted = stream.has_value();
+        if (!stream) {
+            first_server_done = true;
+            co_return;
+        }
         auto headers = co_await read_request_headers(*stream);
         auto key = request_header_value(headers, "Sec-WebSocket-Key");
-        REQUIRE_FALSE(key.empty());
+        first_server_key_present = !key.empty();
+        if (key.empty()) {
+            first_server_done = true;
+            co_return;
+        }
 
         auto accept = elio::http::websocket::compute_websocket_accept(key);
         auto masked_server_frame =
@@ -927,10 +992,18 @@ TEST_CASE("WebSocket client clears parser state between connection attempts",
 
     sched.go([&]() -> task<void> {
         auto stream = co_await second_listener->accept();
-        REQUIRE(stream.has_value());
+        second_server_accepted = stream.has_value();
+        if (!stream) {
+            second_server_done = true;
+            co_return;
+        }
         auto headers = co_await read_request_headers(*stream);
         auto key = request_header_value(headers, "Sec-WebSocket-Key");
-        REQUIRE_FALSE(key.empty());
+        second_server_key_present = !key.empty();
+        if (key.empty()) {
+            second_server_done = true;
+            co_return;
+        }
 
         auto accept = elio::http::websocket::compute_websocket_accept(key);
         auto response = elio::http::websocket::build_server_handshake(accept);
@@ -972,6 +1045,10 @@ TEST_CASE("WebSocket client clears parser state between connection attempts",
     REQUIRE(client_done);
     REQUIRE(first_server_done);
     REQUIRE(second_server_done);
+    REQUIRE(first_server_accepted);
+    REQUIRE(second_server_accepted);
+    REQUIRE(first_server_key_present);
+    REQUIRE(second_server_key_present);
     REQUIRE(first_failed);
     REQUIRE(first_errno == EBADMSG);
     REQUIRE(second_connected);
@@ -1464,6 +1541,8 @@ TEST_CASE("WebSocket receive cancellation aborts a pending message read",
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_connected{false};
     std::atomic<bool> client_failed{false};
+    std::atomic<bool> server_accepted{false};
+    std::atomic<bool> server_key_present{false};
     std::atomic<bool> still_open_after_cancel{false};
     std::atomic<int> client_errno{0};
     std::atomic<int64_t> client_elapsed_ms{-1};
@@ -1471,10 +1550,16 @@ TEST_CASE("WebSocket receive cancellation aborts a pending message read",
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            co_return;
+        }
         auto headers = co_await read_request_headers(*stream);
         auto key = request_header_value(headers, "Sec-WebSocket-Key");
-        REQUIRE_FALSE(key.empty());
+        server_key_present = !key.empty();
+        if (key.empty()) {
+            co_return;
+        }
         auto accept = elio::http::websocket::compute_websocket_accept(key);
         auto response = elio::http::websocket::build_server_handshake(accept);
         co_await stream->write(response);
@@ -1530,6 +1615,8 @@ TEST_CASE("WebSocket receive cancellation aborts a pending message read",
 
     REQUIRE(client_done);
     REQUIRE(client_connected);
+    REQUIRE(server_accepted);
+    REQUIRE(server_key_present);
     REQUIRE(client_failed);
     REQUIRE(client_errno == ECANCELED);
     REQUIRE(still_open_after_cancel);

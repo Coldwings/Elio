@@ -502,13 +502,18 @@ TEST_CASE("HTTP client rejects response exceeding max_response_size",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_failed{false};
     std::atomic<int> client_errno{0};
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         co_await drain_request_headers(*stream);
 
         // Claim a 64 KiB body and drip it. The client's max_response_size
@@ -550,6 +555,7 @@ TEST_CASE("HTTP client rejects response exceeding max_response_size",
     sched.shutdown();
 
     REQUIRE(client_done);
+    REQUIRE(server_accepted);
     REQUIRE(client_failed);
     REQUIRE(client_errno == EMSGSIZE);
 }
@@ -564,14 +570,20 @@ TEST_CASE("HTTP client read_timeout fires on a stalled server",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_failed{false};
     std::atomic<int> client_errno{0};
+    std::atomic<int64_t> client_elapsed_ms{-1};
 
     // Server: accept, drain request, then NEVER write a response.
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         co_await drain_request_headers(*stream);
 
         // Hold the connection open well past the client's read_timeout.
@@ -588,12 +600,12 @@ TEST_CASE("HTTP client read_timeout fires on a stalled server",
         auto resp = co_await c.get(make_url(port));
         auto elapsed = std::chrono::steady_clock::now() - t0;
 
+        client_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            elapsed).count();
         if (!resp) {
             client_failed = true;
             client_errno = errno;
         }
-        // Must return well before the server's 3s sleep elapses.
-        REQUIRE(elapsed < std::chrono::seconds(3));
         client_done = true;
     });
 
@@ -604,8 +616,12 @@ TEST_CASE("HTTP client read_timeout fires on a stalled server",
     sched.shutdown();
 
     REQUIRE(client_done);
+    REQUIRE(server_accepted);
     REQUIRE(client_failed);
     REQUIRE(client_errno == ETIMEDOUT);
+    REQUIRE(client_elapsed_ms.load() >= 0);
+    // Must return well before the server's 3s sleep elapses.
+    REQUIRE(client_elapsed_ms.load() < 3000);
 }
 
 TEST_CASE("WebSocket client read_timeout fires on a stalled handshake response",
@@ -1064,6 +1080,7 @@ TEST_CASE("SSE client read_timeout fires on stalled response headers",
     scheduler sched(2);
     sched.start();
 
+    std::atomic<bool> server_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_failed{false};
     std::atomic<int> client_errno{0};
@@ -1073,7 +1090,10 @@ TEST_CASE("SSE client read_timeout fires on stalled response headers",
     // headers. The client's read_timeout must bound response header reads.
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            co_return;
+        }
         co_await drain_request_headers(*stream);
         co_await elio::time::sleep_for(std::chrono::seconds(3));
         stream->shutdown_socket();
@@ -1105,6 +1125,7 @@ TEST_CASE("SSE client read_timeout fires on stalled response headers",
     sched.shutdown();
 
     REQUIRE(client_done);
+    REQUIRE(server_accepted);
     REQUIRE(client_failed);
     REQUIRE(client_errno == ETIMEDOUT);
     REQUIRE(client_elapsed_ms.load() >= 0);
@@ -1452,6 +1473,7 @@ TEST_CASE("SSE receive cancellation aborts a pending event read",
     sched.start();
 
     std::atomic<bool> client_done{false};
+    std::atomic<bool> server_accepted{false};
     std::atomic<bool> client_connected{false};
     std::atomic<bool> client_failed{false};
     std::atomic<bool> still_connected_after_cancel{false};
@@ -1461,7 +1483,10 @@ TEST_CASE("SSE receive cancellation aborts a pending event read",
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            co_return;
+        }
         co_await drain_request_headers(*stream);
         std::string headers =
             "HTTP/1.1 200 OK\r\n"
@@ -1521,6 +1546,7 @@ TEST_CASE("SSE receive cancellation aborts a pending event read",
     REQUIRE(sched.shutdown(std::chrono::seconds(10)));
 
     REQUIRE(client_done);
+    REQUIRE(server_accepted);
     REQUIRE(client_connected);
     REQUIRE(client_failed);
     REQUIRE(client_errno == ECANCELED);
@@ -1635,6 +1661,7 @@ TEST_CASE("HTTP client connect_timeout fires on a stalled TLS handshake",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_failed{false};
     std::atomic<int> client_errno{0};
@@ -1644,7 +1671,11 @@ TEST_CASE("HTTP client connect_timeout fires on a stalled TLS handshake",
     // read_timeout here; connect_timeout covers connection setup.
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         co_await elio::time::sleep_for(std::chrono::seconds(3));
         stream->shutdown_socket();
         server_done = true;
@@ -1677,6 +1708,8 @@ TEST_CASE("HTTP client connect_timeout fires on a stalled TLS handshake",
     sched.shutdown();
 
     REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(server_accepted);
     REQUIRE(client_failed);
     REQUIRE(client_errno == ETIMEDOUT);
     REQUIRE(client_elapsed_ms.load() >= 0);
@@ -2097,13 +2130,18 @@ TEST_CASE("HTTP client caps cumulative informational responses",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_failed{false};
     std::atomic<int> client_errno{0};
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         co_await drain_request_headers(*stream);
 
         std::string interim =
@@ -2148,6 +2186,7 @@ TEST_CASE("HTTP client caps cumulative informational responses",
 
     sched.shutdown();
 
+    REQUIRE(server_accepted);
     REQUIRE(client_done);
     REQUIRE(client_failed);
     REQUIRE(client_errno == EMSGSIZE);

@@ -2073,13 +2073,18 @@ TEST_CASE("HTTP client skips informational responses before final response",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<int> got_status{0};
     std::string got_body;
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         co_await drain_request_headers(*stream);
         std::string resp =
             "HTTP/1.1 100 Continue\r\n"
@@ -2115,6 +2120,7 @@ TEST_CASE("HTTP client skips informational responses before final response",
 
     sched.shutdown();
 
+    REQUIRE(server_accepted);
     REQUIRE(client_done);
     REQUIRE(got_status == 200);
     REQUIRE(got_body == "hello");
@@ -2202,13 +2208,18 @@ TEST_CASE("HTTP client rejects unexpected switching protocols response",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_failed{false};
     std::atomic<int> client_errno{0};
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         co_await drain_request_headers(*stream);
         std::string resp =
             "HTTP/1.1 101 Switching Protocols\r\n"
@@ -2238,6 +2249,7 @@ TEST_CASE("HTTP client rejects unexpected switching protocols response",
 
     sched.shutdown();
 
+    REQUIRE(server_accepted);
     REQUIRE(client_done);
     REQUIRE(client_failed);
     REQUIRE(client_errno == EBADMSG);
@@ -2253,13 +2265,18 @@ TEST_CASE("HTTP client accepts close-delimited response bodies",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<int> got_status{0};
     std::string got_body;
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         co_await drain_request_headers(*stream);
         std::string resp =
             "HTTP/1.1 200 OK\r\n"
@@ -2290,6 +2307,7 @@ TEST_CASE("HTTP client accepts close-delimited response bodies",
 
     sched.shutdown();
 
+    REQUIRE(server_accepted);
     REQUIRE(client_done);
     REQUIRE(got_status == 200);
     REQUIRE(got_body == "hello");

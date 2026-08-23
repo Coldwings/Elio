@@ -281,6 +281,47 @@ cmake --build . --target elio_tests_tsan
 ./tests/elio_tests_tsan
 ```
 
+### Preserving intermittent sanitizer or assertion evidence
+
+When chasing an intermittent full-suite failure, run the test binary through
+`tools/capture-test-evidence.py` before rerunning. The wrapper preserves the
+complete combined output, the command, the current Git HEAD, the explicit
+sanitizer options, and the child exit status while still returning the test
+process status. Each invocation creates a unique log and metadata filename for
+the requested label, so rerunning the same command does not overwrite the
+previous evidence. If a child process terminates due to a signal, the wrapper
+returns the shell-compatible `128 + signal` status and records the signal in
+the metadata.
+
+Example for a complete ASAN run:
+
+```bash
+python3 tools/capture-test-evidence.py \
+  --output-dir /tmp/elio-asan-evidence \
+  --label full-asan \
+  --env 'ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:log_path={output_dir}/asan' \
+  -- \
+  ./build/tests/elio_tests_asan --reporter compact --abort
+```
+
+If the failure is order-sensitive, include the Catch2 order and seed in the
+captured command:
+
+```bash
+python3 tools/capture-test-evidence.py \
+  --output-dir /tmp/elio-asan-evidence \
+  --label full-asan-seed-1507386383 \
+  --env 'ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:log_path={output_dir}/asan' \
+  -- \
+  ./build/tests/elio_tests_asan \
+    --reporter compact --abort --order rand --rng-seed 1507386383
+```
+
+Do not discard a single ASAN, TSAN, UBSAN, or semantic assertion failure solely
+because a later run passes. Preserve the failing log, sanitizer files, seed,
+command, and tested revision first; later non-reproduction is supporting
+evidence only.
+
 ## Limitations
 
 1. **Only queued coroutines are visible**: Coroutines currently executing on a worker thread are not in any queue and cannot be found by the debugger. Use regular GDB/LLDB thread inspection for those.

@@ -1697,12 +1697,17 @@ TEST_CASE("HTTP client returns OK for clean keep-alive responses",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<int> got_status{0};
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         co_await drain_request_headers(*stream);
         std::string resp =
             "HTTP/1.1 200 OK\r\n"
@@ -1730,6 +1735,8 @@ TEST_CASE("HTTP client returns OK for clean keep-alive responses",
     sched.shutdown();
 
     REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(server_accepted);
     REQUIRE(got_status == 200);
 }
 
@@ -1743,13 +1750,19 @@ TEST_CASE("HTTP client resolves redirect Location references",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> first_accepted{false};
+    std::atomic<bool> second_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<int> got_status{0};
     std::string final_request;
 
     sched.go([&]() -> task<void> {
         auto first = co_await listener->accept();
-        REQUIRE(first.has_value());
+        first_accepted = first.has_value();
+        if (!first) {
+            server_done = true;
+            co_return;
+        }
         co_await drain_request_headers(*first);
         std::string redirect =
             "HTTP/1.1 302 Found\r\n"
@@ -1760,7 +1773,11 @@ TEST_CASE("HTTP client resolves redirect Location references",
         co_await first->write(redirect);
 
         auto second = co_await listener->accept();
-        REQUIRE(second.has_value());
+        second_accepted = second.has_value();
+        if (!second) {
+            server_done = true;
+            co_return;
+        }
         final_request = co_await read_request_headers(*second);
         std::string ok =
             "HTTP/1.1 200 OK\r\n"
@@ -1789,6 +1806,8 @@ TEST_CASE("HTTP client resolves redirect Location references",
 
     REQUIRE(client_done);
     REQUIRE(server_done);
+    REQUIRE(first_accepted);
+    REQUIRE(second_accepted);
     REQUIRE(got_status == 200);
     REQUIRE(final_request.find("GET /start/final?ok=1 HTTP/1.1\r\n") !=
             std::string::npos);
@@ -1805,16 +1824,21 @@ TEST_CASE("HTTP client preserves HEAD across 303 redirect",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> first_accepted{false};
+    std::atomic<bool> second_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<int> got_status{0};
+    std::string initial_request;
     std::string redirected_request;
 
     sched.go([&]() -> task<void> {
         auto first = co_await listener->accept();
-        REQUIRE(first.has_value());
-        auto initial_request = co_await read_request_headers(*first);
-        REQUIRE(initial_request.find("HEAD /start HTTP/1.1\r\n") !=
-                std::string::npos);
+        first_accepted = first.has_value();
+        if (!first) {
+            server_done = true;
+            co_return;
+        }
+        initial_request = co_await read_request_headers(*first);
 
         std::string redirect =
             "HTTP/1.1 303 See Other\r\n"
@@ -1825,7 +1849,11 @@ TEST_CASE("HTTP client preserves HEAD across 303 redirect",
         co_await first->write(redirect);
 
         auto second = co_await listener->accept();
-        REQUIRE(second.has_value());
+        second_accepted = second.has_value();
+        if (!second) {
+            server_done = true;
+            co_return;
+        }
         redirected_request = co_await read_request_headers(*second);
         std::string ok =
             "HTTP/1.1 200 OK\r\n"
@@ -1853,7 +1881,11 @@ TEST_CASE("HTTP client preserves HEAD across 303 redirect",
 
     REQUIRE(client_done);
     REQUIRE(server_done);
+    REQUIRE(first_accepted);
+    REQUIRE(second_accepted);
     REQUIRE(got_status == 200);
+    REQUIRE(initial_request.find("HEAD /start HTTP/1.1\r\n") !=
+            std::string::npos);
     REQUIRE(redirected_request.find("HEAD /next HTTP/1.1\r\n") !=
             std::string::npos);
 }
@@ -1868,12 +1900,17 @@ TEST_CASE("HTTP client does not follow non-redirect 3xx Location",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<int> got_status{0};
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
-        REQUIRE(stream.has_value());
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
         co_await drain_request_headers(*stream);
         std::string response =
             "HTTP/1.1 304 Not Modified\r\n"
@@ -1904,6 +1941,7 @@ TEST_CASE("HTTP client does not follow non-redirect 3xx Location",
 
     REQUIRE(client_done);
     REQUIRE(server_done);
+    REQUIRE(server_accepted);
     REQUIRE(got_status == 304);
 }
 
@@ -1917,17 +1955,21 @@ TEST_CASE("HTTP client preserves payload when redirect keeps method",
     sched.start();
 
     std::atomic<bool> server_done{false};
+    std::atomic<bool> first_accepted{false};
+    std::atomic<bool> second_accepted{false};
     std::atomic<bool> client_done{false};
     std::atomic<int> got_status{0};
+    std::string first_request;
     std::string redirected_request;
 
     sched.go([&]() -> task<void> {
         auto first = co_await listener->accept();
-        REQUIRE(first.has_value());
-        auto first_request = co_await read_request_message(*first);
-        REQUIRE(first_request.find("PUT /start HTTP/1.1\r\n") !=
-                std::string::npos);
-        REQUIRE(first_request.find("payload") != std::string::npos);
+        first_accepted = first.has_value();
+        if (!first) {
+            server_done = true;
+            co_return;
+        }
+        first_request = co_await read_request_message(*first);
 
         std::string redirect =
             "HTTP/1.1 302 Found\r\n"
@@ -1938,7 +1980,11 @@ TEST_CASE("HTTP client preserves payload when redirect keeps method",
         co_await first->write(redirect);
 
         auto second = co_await listener->accept();
-        REQUIRE(second.has_value());
+        second_accepted = second.has_value();
+        if (!second) {
+            server_done = true;
+            co_return;
+        }
         redirected_request = co_await read_request_message(*second);
         std::string ok =
             "HTTP/1.1 200 OK\r\n"
@@ -1970,7 +2016,12 @@ TEST_CASE("HTTP client preserves payload when redirect keeps method",
 
     REQUIRE(client_done);
     REQUIRE(server_done);
+    REQUIRE(first_accepted);
+    REQUIRE(second_accepted);
     REQUIRE(got_status == 200);
+    REQUIRE(first_request.find("PUT /start HTTP/1.1\r\n") !=
+            std::string::npos);
+    REQUIRE(first_request.find("payload") != std::string::npos);
     REQUIRE(redirected_request.find("PUT /next HTTP/1.1\r\n") !=
             std::string::npos);
     REQUIRE(request_header_value(redirected_request, "Content-Length") == "7");

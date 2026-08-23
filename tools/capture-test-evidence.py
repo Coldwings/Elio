@@ -19,8 +19,16 @@ from pathlib import Path
 from typing import TextIO
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def format_utc(value: datetime) -> str:
+    return value.isoformat(timespec="seconds")
+
+
+def format_run_id(value: datetime) -> str:
+    return f"{value.strftime('%Y%m%dT%H%M%SZ')}-{os.getpid()}"
 
 
 def parse_env_assignment(value: str) -> tuple[str, str]:
@@ -49,6 +57,24 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
+
+
+def unique_artifact_paths(output_dir: Path, label: str, run_id: str) -> tuple[Path, Path]:
+    base_stem = f"{label}-{run_id}"
+    for suffix in [""] + [f"-{index}" for index in range(1, 1000)]:
+        stem = f"{base_stem}{suffix}"
+        log_path = output_dir / f"{stem}.log"
+        metadata_path = output_dir / f"{stem}.json"
+        if not log_path.exists() and not metadata_path.exists():
+            return log_path, metadata_path
+    raise RuntimeError(f"could not allocate unique artifact names for {base_stem!r}")
+
+
+def child_exit_status(return_code: int) -> tuple[int, int | None]:
+    if return_code < 0:
+        signal_number = -return_code
+        return 128 + signal_number, signal_number
+    return return_code, None
 
 
 def current_git_head() -> str | None:
@@ -126,8 +152,6 @@ def main() -> int:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     label = sanitize_label(args.label)
-    log_path = output_dir / f"{label}.log"
-    metadata_path = output_dir / f"{label}.json"
 
     env = os.environ.copy()
     explicit_env: dict[str, str] = {}
@@ -136,8 +160,12 @@ def main() -> int:
         explicit_env[name] = value
         env[name] = value
 
-    start_time = utc_now()
+    start = utc_now()
+    start_time = format_utc(start)
+    run_id = format_run_id(start)
+    log_path, metadata_path = unique_artifact_paths(output_dir, label, run_id)
     metadata: dict[str, object] = {
+        "artifact_run_id": run_id,
         "command": command,
         "cwd": os.getcwd(),
         "end_time_utc": None,
@@ -145,6 +173,8 @@ def main() -> int:
         "exit_code": None,
         "git_head": current_git_head(),
         "log_path": str(log_path),
+        "return_code": None,
+        "signal": None,
         "start_time_utc": start_time,
     }
     write_json(metadata_path, metadata)
@@ -162,13 +192,19 @@ def main() -> int:
             log.write(json.dumps(explicit_env, sort_keys=True))
             log.write("\n")
         log.flush()
-        exit_code = stream_child(command, env, log)
-        end_time = utc_now()
+        return_code = stream_child(command, env, log)
+        exit_code, signal_number = child_exit_status(return_code)
+        end_time = format_utc(utc_now())
         log.write(f"[capture-test-evidence] end_time_utc={end_time}\n")
+        log.write(f"[capture-test-evidence] return_code={return_code}\n")
+        if signal_number is not None:
+            log.write(f"[capture-test-evidence] signal={signal_number}\n")
         log.write(f"[capture-test-evidence] exit_code={exit_code}\n")
 
     metadata["end_time_utc"] = end_time
     metadata["exit_code"] = exit_code
+    metadata["return_code"] = return_code
+    metadata["signal"] = signal_number
     write_json(metadata_path, metadata)
     return exit_code
 

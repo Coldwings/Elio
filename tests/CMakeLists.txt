@@ -354,6 +354,10 @@ if(Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/test_debugger_scripts.py
     )
+    add_test(NAME capture_test_evidence_helper
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/test_capture_test_evidence.py
+    )
 endif()
 
 add_executable(elio_rdma_cuda_lifetime_tests

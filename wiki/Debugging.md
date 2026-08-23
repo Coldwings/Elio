@@ -286,8 +286,12 @@ cmake --build . --target elio_tests_tsan
 When chasing an intermittent full-suite failure, run the test binary through
 `tools/capture-test-evidence.py` before rerunning. The wrapper preserves the
 complete combined output, the command, the current Git HEAD, the explicit
-sanitizer options, and the child exit code while still returning the test
-process status.
+sanitizer options, and the child exit status while still returning the test
+process status. Each invocation creates a unique log and metadata filename for
+the requested label, so rerunning the same command does not overwrite the
+previous evidence. If a child process terminates due to a signal, the wrapper
+returns the shell-compatible `128 + signal` status and records the signal in
+the metadata.
 
 Example for a complete ASAN run:
 

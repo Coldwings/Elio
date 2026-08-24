@@ -867,7 +867,7 @@ python3 tools/run-tcp-performance-comparison.py \
   --asio-server build-release/examples/bench_tcp_asio_server \
   --client-cpus 2 --server-cpus 4 \
   --dedicated-host \
-  --build-metadata ./build-metadata.json \
+  --build-metadata /var/tmp/elio-build-metadata.json \
   --blocks 18 --seed 1145 \
   --output-dir /var/tmp/elio-tcp-performance-1145
 ```
@@ -883,7 +883,9 @@ makes the run unqualified. CPU isolation does
 not prove that the machine is otherwise idle; checking system load, frequency,
 thermal state, and background services remains the operator's responsibility.
 
-`build-metadata.json` is a caller-maintained JSON object. At minimum, record
+`/var/tmp/elio-build-metadata.json` is a caller-maintained JSON object kept
+outside the worktree so creating it cannot make the source revision dirty. At
+minimum, record
 the compiler name/version, build type, compile/link flags, and CMake options,
 for example:
 
@@ -903,9 +905,9 @@ The runner stores both the object and its SHA-256. Omitting it is allowed for a
 smoke run but makes every result ineligible for publication; a supplied file
 with missing fields or a `source_revision` different from HEAD is rejected.
 Likewise, fewer than 18 blocks or a measured phase shorter than the default
-250 ms is
-diagnostic-only; adjust work counts rather than lowering the duration floor
-without documenting a new methodology.
+250 ms is diagnostic-only. The runner rejects `--minimum-measured-ms` values
+below 250; the option may only raise the publication floor. Increase the fixed
+work count when a case is too short.
 
 For each client-reference trial the runner conservatively divides the POSIX
 reference server's whole-connection process CPU time (including warm-up) by the

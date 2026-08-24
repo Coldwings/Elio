@@ -33,6 +33,7 @@ RUNNER_SCHEMA = "elio.tcp-performance-comparison.v1"
 HOST = "127.0.0.1"
 RUNTIMES = ("elio", "libuv", "asio")
 DEFAULT_SIZES = (64, 1024, 4096, 65536)
+MINIMUM_PUBLISHABLE_MEASURED_MS = 250.0
 
 
 class ComparisonError(RuntimeError):
@@ -136,7 +137,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-bytes", type=positive, default=256 << 10)
     parser.add_argument("--bootstrap-resamples", type=positive, default=20000)
     parser.add_argument("--timeout-seconds", type=positive, default=600)
-    parser.add_argument("--minimum-measured-ms", type=float, default=250.0)
+    parser.add_argument(
+        "--minimum-measured-ms", type=float,
+        default=MINIMUM_PUBLISHABLE_MEASURED_MS,
+        help="publishability floor in milliseconds; may be raised but not lowered",
+    )
     parser.add_argument("--build-metadata", type=Path)
     parser.add_argument(
         "--reference-peer-max-cpu-percent", type=float, default=90.0,
@@ -159,8 +164,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--bootstrap-resamples must be at least 1000")
     if not 0.0 < args.reference_peer_max_cpu_percent <= 100.0:
         parser.error("--reference-peer-max-cpu-percent must be in (0, 100]")
-    if args.minimum_measured_ms <= 0.0:
-        parser.error("--minimum-measured-ms must be positive")
+    if args.minimum_measured_ms < MINIMUM_PUBLISHABLE_MEASURED_MS:
+        parser.error("--minimum-measured-ms must be at least 250")
     if (args.client_cpus is None) != (args.server_cpus is None):
         parser.error("--client-cpus and --server-cpus must be supplied together")
     if args.client_cpus is not None and args.client_cpus & args.server_cpus:

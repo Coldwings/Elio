@@ -635,7 +635,7 @@ python3 ../tools/run-tcp-performance-comparison.py \
   --asio-server ./examples/bench_tcp_asio_server \
   --client-cpus 2 --server-cpus 4 \
   --dedicated-host \
-  --build-metadata ./build-metadata.json \
+  --build-metadata /var/tmp/elio-build-metadata.json \
   --blocks 18 --seed 1145 \
   --output-dir /var/tmp/elio-tcp-performance-1145
 ```
@@ -655,7 +655,8 @@ object recording the compiler/version, build type, flags, and relevant CMake
 options plus the exact `source_revision`; its contents and SHA-256 are retained
 in the manifest. Missing or revision-mismatched build metadata, fewer than 18
 blocks, or a measured phase shorter than the default
-250 ms makes the run diagnostic-only.
+250 ms makes the run diagnostic-only. The 250 ms value is a hard publication
+floor: `--minimum-measured-ms` may raise it but cannot lower it.
 
 See [Performance Tuning Guide](wiki/Performance-Tuning.md) for optimization tips.
 

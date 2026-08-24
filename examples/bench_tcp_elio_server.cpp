@@ -6,10 +6,8 @@
 #include "bench_tcp_server_protocol.hpp"
 
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <span>
-#include <thread>
 #include <vector>
 
 namespace {
@@ -78,6 +76,7 @@ task<void> accept_loop(const bench::config& cfg, scheduler& sched,
         std::fprintf(stderr, "Elio benchmark server failed to bind port %u\n",
                      static_cast<unsigned>(cfg.port));
         failed.store(true, std::memory_order_release);
+        failed.notify_one();
         co_return;
     }
 
@@ -111,11 +110,22 @@ int main(int argc, char* argv[]) {
     scheduler sched(1);
     sched.start();
     std::atomic<bool> failed{false};
-    sched.go([&]() { return accept_loop(cfg, sched, failed); });
-
-    while (!failed.load(std::memory_order_acquire)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    try {
+        sched.go([&]() -> task<void> {
+            try {
+                co_await accept_loop(cfg, sched, failed);
+            } catch (...) {
+                // An unexpected accept-loop failure must not leave main
+                // permanently blocked.
+            }
+            failed.store(true, std::memory_order_release);
+            failed.notify_one();
+        });
+    } catch (...) {
+        failed.store(true, std::memory_order_release);
+        failed.notify_one();
     }
+    failed.wait(false, std::memory_order_acquire);
     sched.shutdown();
     return 1;
 }

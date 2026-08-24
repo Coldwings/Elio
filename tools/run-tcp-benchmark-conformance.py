@@ -32,6 +32,7 @@ CREDIT_WINDOW = 4
 BULK_BYTES = 64 * 1024
 CHUNK_BYTES = 4 * 1024
 TIMEOUT_SECONDS = 30
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 
 
 class ConformanceError(RuntimeError):
@@ -68,7 +69,8 @@ def sha256_file(path: Path) -> str:
 
 def tested_revision() -> str | None:
     completed = subprocess.run(
-        ["git", "rev-parse", "HEAD"], text=True, capture_output=True,
+        ["git", "-C", str(REPOSITORY_ROOT), "rev-parse", "HEAD"],
+        text=True, capture_output=True,
         check=False,
     )
     return completed.stdout.strip() if completed.returncode == 0 else None
@@ -76,7 +78,7 @@ def tested_revision() -> str | None:
 
 def git_dirty_state() -> bool | None:
     inside = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"],
+        ["git", "-C", str(REPOSITORY_ROOT), "rev-parse", "--is-inside-work-tree"],
         text=True, capture_output=True, check=False,
     )
     if inside.returncode != 0 or inside.stdout.strip() != "true":
@@ -84,7 +86,8 @@ def git_dirty_state() -> bool | None:
     status = subprocess.run(
         # Build and artifact directories may intentionally live below the
         # checkout. Only tracked-source changes make the tested revision dirty.
-        ["git", "status", "--porcelain", "--untracked-files=no"],
+        ["git", "-C", str(REPOSITORY_ROOT), "status", "--porcelain",
+         "--untracked-files=no"],
         text=True, capture_output=True, check=False,
     )
     if status.returncode != 0:
@@ -153,6 +156,23 @@ def one_json(stdout: str, label: str) -> dict[str, Any]:
             f"{label} must emit one JSON result, emitted {len(objects)}"
         )
     return objects[0]
+
+
+def enrich_result_lines(text: str, comparison: str) -> str:
+    rewritten: list[str] = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("{"):
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                value = None
+            if isinstance(value, dict) and value.get("kind") != "server_connection":
+                value["comparison"] = comparison
+                value["performance_eligible"] = False
+                rewritten.append(json.dumps(value, sort_keys=True))
+                continue
+        rewritten.append(line)
+    return "\n".join(rewritten) + ("\n" if rewritten else "")
 
 
 def integer(mapping: dict[str, Any], field: str, label: str) -> int:
@@ -280,7 +300,8 @@ def client_command(
 
 def run_case(
     command: list[str], label: str, log_dir: Path, implementation: str,
-    role: str, peer: str, workload: str, size: int,
+    role: str, peer: str, workload: str, size: int, comparison: str,
+    json_path: Path,
 ) -> dict[str, Any]:
     command_record = log_dir / f"{label}.command.json"
     command_evidence: dict[str, Any] = {
@@ -304,13 +325,53 @@ def run_case(
         json.dumps(command_evidence, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    (log_dir / f"{label}.stdout.log").write_text(completed.stdout, encoding="utf-8")
+    stdout_path = log_dir / f"{label}.stdout.log"
+    enriched_stdout = enrich_result_lines(completed.stdout, comparison)
+    stdout_path.write_text(enriched_stdout, encoding="utf-8")
     (log_dir / f"{label}.stderr.log").write_text(completed.stderr, encoding="utf-8")
+    try:
+        native_text = json_path.read_text(encoding="utf-8")
+    except OSError:
+        native_text = ""
+    enriched_native = enrich_result_lines(native_text, comparison)
+    json_path.write_text(enriched_native, encoding="utf-8")
     if completed.returncode != 0:
         raise ConformanceError(f"{label} exited with status {completed.returncode}")
-    result = one_json(completed.stdout, label)
+    result = one_json(enriched_stdout, label)
+    native_result = one_json(enriched_native, label + ".native-jsonl")
+    if native_result != result:
+        raise ConformanceError(f"{label} native JSONL differs from stdout result")
     validate_result(result, implementation, role, peer, workload, size)
     return result
+
+
+def validate_artifact_ineligibility(output_dir: Path) -> None:
+    checked = 0
+    for path in sorted(output_dir.glob("*.jsonl")) + sorted(
+        output_dir.glob("*.stdout.log")
+    ):
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            if not line.lstrip().startswith("{"):
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ConformanceError(
+                    f"{path.name}:{line_number} contains malformed JSON"
+                ) from error
+            if (not isinstance(value, dict) or value.get("schema_version") != SCHEMA
+                    or value.get("kind") == "server_connection"):
+                continue
+            checked += 1
+            if value.get("performance_eligible") is not False:
+                raise ConformanceError(
+                    f"{path.name}:{line_number} retained a result without "
+                    "performance_eligible=false"
+                )
+    if checked == 0:
+        raise ConformanceError("artifact ineligibility self-check found no results")
 
 
 Case = tuple[Path, str, str, str, int]
@@ -393,10 +454,11 @@ def run_against_server(
             wait_ready(server, port, server_name)
             for client, comparison, implementation, workload, size in cases:
                 label = f"{comparison}-{implementation}-{server_name}-{workload}-{size}"
+                case_json_path = output_dir / f"{label}.jsonl"
                 result = run_case(
                     client_command(
                         client, port, workload, size,
-                        output_dir / f"{label}.jsonl",
+                        case_json_path,
                         server_name if comparison != "client-reference" else None,
                     ),
                     label, output_dir, implementation,
@@ -404,12 +466,8 @@ def run_against_server(
                     "posix-reference-client" if comparison == "server-reference"
                     else ("posix-reference" if comparison == "client-reference"
                           else server_name),
-                    workload, size,
+                    workload, size, comparison, case_json_path,
                 )
-                result["comparison"] = comparison
-                # Public conformance runs preserve elapsed values for debugging,
-                # but no row produced here is a publishable performance sample.
-                result["performance_eligible"] = False
                 evidence.write(json.dumps(result, sort_keys=True) + "\n")
                 evidence.flush()
                 print(f"validated {label}")
@@ -546,6 +604,8 @@ def main() -> int:
                     servers[runtime], runtime, server_cases,
                     output_dir, evidence, server_evidence,
                 )
+
+        validate_artifact_ineligibility(output_dir)
 
         print(
             "TCP benchmark conformance passed in both attribution directions; "

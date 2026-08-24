@@ -5,7 +5,6 @@
 
 #include "bench_tcp_server_protocol.hpp"
 
-#include <atomic>
 #include <cstdio>
 #include <span>
 #include <vector>
@@ -65,8 +64,7 @@ task<void> serve_connection(tcp_stream stream, std::size_t maximum_record_size) 
     }
 }
 
-task<void> accept_loop(const bench::config& cfg, scheduler& sched,
-                       std::atomic<bool>& failed) {
+task<void> accept_loop(const bench::config& cfg, scheduler& sched) {
     tcp_options options;
     options.no_delay = true;
     options.reuse_addr = true;
@@ -75,8 +73,6 @@ task<void> accept_loop(const bench::config& cfg, scheduler& sched,
     if (!listener) {
         std::fprintf(stderr, "Elio benchmark server failed to bind port %u\n",
                      static_cast<unsigned>(cfg.port));
-        failed.store(true, std::memory_order_release);
-        failed.notify_one();
         co_return;
     }
 
@@ -109,23 +105,14 @@ int main(int argc, char* argv[]) {
     elio::log::logger::instance().set_level(elio::log::level::error);
     scheduler sched(1);
     sched.start();
-    std::atomic<bool> failed{false};
     try {
-        sched.go([&]() -> task<void> {
-            try {
-                co_await accept_loop(cfg, sched, failed);
-            } catch (...) {
-                // An unexpected accept-loop failure must not leave main
-                // permanently blocked.
-            }
-            failed.store(true, std::memory_order_release);
-            failed.notify_one();
+        auto completion = sched.go_joinable([&]() -> task<void> {
+            co_await accept_loop(cfg, sched);
         });
+        completion.wait_destroyed();
+        completion.await_resume();
     } catch (...) {
-        failed.store(true, std::memory_order_release);
-        failed.notify_one();
     }
-    failed.wait(false, std::memory_order_acquire);
     sched.shutdown();
     return 1;
 }

@@ -336,24 +336,16 @@ int main(int argc, char* argv[]) {
     std::ofstream(cfg.json_path, std::ios::trunc).close();
     scheduler scheduler(1);
     scheduler.start();
-    std::atomic<bool> done{false};
     std::atomic<bool> ok{true};
     try {
-        scheduler.go([&]() -> task<void> {
-            try {
-                co_await client_main(cfg, ok);
-            } catch (...) {
-                ok.store(false, std::memory_order_relaxed);
-            }
-            done.store(true, std::memory_order_release);
-            done.notify_one();
+        auto completion = scheduler.go_joinable([&]() -> task<void> {
+            co_await client_main(cfg, ok);
         });
+        completion.wait_destroyed();
+        completion.await_resume();
     } catch (...) {
         ok.store(false, std::memory_order_relaxed);
-        done.store(true, std::memory_order_release);
-        done.notify_one();
     }
-    done.wait(false, std::memory_order_acquire);
     scheduler.shutdown();
     return ok.load(std::memory_order_relaxed) ? 0 : 1;
 }

@@ -336,6 +336,12 @@ class TcpBenchmarkConformanceSummaryTests(unittest.TestCase):
                         results, malformed, manifest, status="passed"
                     )
 
+        failed = self.runner.build_conformance_summary(
+            results, duplicate, manifest, status="failed", error="duplicate trial"
+        )
+        self.assertEqual(failed["totals"]["server_evidence_cases"], 61)
+        self.assertEqual(failed["totals"]["valid_server_evidence_cases"], 61)
+
     def test_passed_summary_rejects_non_fixed_work(self):
         results, evidence, manifest = complete_fixture()
         for field, value in (

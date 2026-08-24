@@ -902,9 +902,14 @@ def build_conformance_summary(
                 value.get("performance_eligible") is True for value in results
             ),
             "expected_server_evidence": len(expected),
-            "server_evidence_cases": len(server_evidence),
+            "server_evidence_cases": sum(
+                1 for coordinate in expected_evidence
+                if len(evidence_indexed.get(coordinate, [])) == 1
+            ),
             "valid_server_evidence_cases": sum(
-                value.get("valid") is True for value in server_evidence
+                1 for coordinate in expected_evidence
+                if len(evidence_indexed.get(coordinate, [])) == 1
+                and evidence_indexed[coordinate][0].get("valid") is True
             ),
         },
         "axes": axes,

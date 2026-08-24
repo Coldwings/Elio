@@ -1,450 +1,328 @@
 /// @file bench_tcp_elio.cpp
-/// @brief TCP Loopback Benchmark using Elio (coroutine-based)
-///
-/// Server and client for measuring TCP ping-pong latency and streaming
-/// throughput on loopback. Compare with bench_tcp_libuv and bench_tcp_asio.
-///
-/// Usage: bench_tcp_elio -s  (server)
-///        bench_tcp_elio -c  (client, default)
+/// @brief Fair TCP loopback client adapter using Elio coroutines.
 
-#include <elio/elio.hpp>
 #include "bench_tcp_common.hpp"
 
-#include <algorithm>
+#include <elio/elio.hpp>
+
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <cerrno>
 #include <csignal>
-#include <cstring>
-#include <mutex>
+#include <cstdio>
+#include <fstream>
+#include <functional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
 using namespace elio;
 using namespace elio::coro;
-using namespace elio::runtime;
 using namespace elio::net;
+using namespace elio::runtime;
 
-static std::atomic<bool> g_running{true};
+namespace {
 
-// ---------------------------------------------------------------------------
-// Server: echo handler
-// ---------------------------------------------------------------------------
-
-static task<void> echo_handler(tcp_stream stream) {
-    char buf[65536];
-    while (g_running.load(std::memory_order_relaxed)) {
-        auto r = co_await stream.read(buf, sizeof(buf));
-        if (r.result <= 0) break;
-
-        auto w = co_await stream.write_exactly(
-            buf, static_cast<size_t>(r.result));
-        if (w.result <= 0) {
-            co_return;
-        }
-    }
-    co_return;
-}
-
-// ---------------------------------------------------------------------------
-// Server: accept loop
-// ---------------------------------------------------------------------------
-
-static task<void> server_main(const bench::config& cfg, scheduler& sched) {
-    tcp_options opts;
-    opts.no_delay = true;
-
-    auto listener = tcp_listener::bind(ipv4_address(cfg.port), opts);
-    if (!listener) {
-        std::fprintf(stderr, "Failed to bind port %d\n", cfg.port);
-        co_return;
-    }
-
-    std::printf("Elio server listening on port %d\n", cfg.port);
-
-    while (g_running.load(std::memory_order_relaxed)) {
-        auto stream = co_await listener->accept();
-        if (!stream) {
-            if (g_running.load(std::memory_order_relaxed)) {
-                std::fprintf(stderr, "Accept failed\n");
-            }
-            break;
-        }
-        stream->set_no_delay(true);
-
-        sched.go([s = std::move(*stream)]() mutable {
-            return echo_handler(std::move(s));
-        });
-    }
-
-    std::printf("Server shutting down\n");
-    co_return;
-}
-
-static task<bool> read_exact_cancellable(tcp_stream& stream, char* buf,
-                                         size_t n, cancel_token token) {
-    while (n > 0) {
-        if (token.is_cancelled()) {
-            co_return false;
-        }
-
-        auto result = co_await stream.read(buf, n, token);
-        if (result.result > 0) {
-            n -= result.result;
-            buf += result.result;
-        } else if (result.result == -ECANCELED) {
-            co_return false;
-        } else {
-            co_return false;
-        }
+task<bool> read_exact(tcp_stream& stream, std::span<uint8_t> bytes,
+                      cancel_token token) {
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+        auto operation = co_await stream.read(
+            bytes.data() + offset, bytes.size() - offset, token);
+        if (operation.result <= 0) co_return false;
+        offset += static_cast<std::size_t>(operation.result);
     }
     co_return true;
 }
 
-static task<bool> write_exact_cancellable(tcp_stream& stream, const char* buf,
-                                          size_t n, cancel_token token) {
-    while (n > 0) {
-        if (token.is_cancelled()) {
-            co_return false;
-        }
-
-        auto result = co_await stream.write(buf, n, token);
-        if (result.result > 0) {
-            n -= result.result;
-            buf += result.result;
-        } else if (result.result == -ECANCELED) {
-            co_return false;
-        } else {
-            co_return false;
-        }
+task<bool> write_exact(tcp_stream& stream, std::span<const uint8_t> bytes,
+                       cancel_token token) {
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+        auto operation = co_await stream.write(
+            bytes.data() + offset, bytes.size() - offset, token);
+        if (operation.result <= 0) co_return false;
+        offset += static_cast<std::size_t>(operation.result);
     }
     co_return true;
 }
 
-// ---------------------------------------------------------------------------
-// Client: ping-pong for one message size
-// ---------------------------------------------------------------------------
+struct phase_context {
+    tcp_stream& stream;
+    bench::phase phase;
+    uint64_t trial;
+    uint64_t target;
+    std::size_t write_size;
+    uint32_t credit_window;
+    bool collect_latency;
+    bench::counters& counters;
+    sync::semaphore credits;
+    cancel_source cancel;
+    std::vector<uint8_t> send;
+    std::vector<uint8_t> receive;
+    std::vector<std::chrono::steady_clock::time_point> send_times;
+    std::vector<uint64_t>* latency_samples;
+    std::chrono::steady_clock::time_point* phase_start;
+    std::chrono::steady_clock::time_point* phase_end;
+    uint64_t unacknowledged = 0;
+    bool failed = false;
 
-static task<void> client_pingpong(const bench::config& cfg,
-                                  size_t msg_size,
-                                  bench::pingpong_stats& out) {
-    auto resolved = co_await resolve_hostname(cfg.host, cfg.port);
-    if (!resolved) {
-        std::fprintf(stderr, "Resolve %s failed\n", cfg.host.c_str());
-        co_return;
+    phase_context(tcp_stream& stream_value, bench::phase phase_value,
+                  uint64_t trial_value, uint64_t target_value,
+                  std::size_t write_size_value, uint32_t credit_window_value,
+                  bool collect_latency_value, bench::counters& counters_value,
+                  std::vector<uint64_t>* latency_samples_value,
+                  std::chrono::steady_clock::time_point* phase_start_value,
+                  std::chrono::steady_clock::time_point* phase_end_value)
+        : stream(stream_value), phase(phase_value), trial(trial_value),
+          target(target_value), write_size(write_size_value),
+          credit_window(credit_window_value),
+          collect_latency(collect_latency_value), counters(counters_value),
+          credits(static_cast<int>(credit_window_value)), send(write_size_value),
+          receive(write_size_value),
+          send_times(collect_latency_value ? target_value : 0),
+          latency_samples(latency_samples_value),
+          phase_start(phase_start_value), phase_end(phase_end_value) {
+        if (!bench::initialize_record(std::span<uint8_t>(send))) {
+            throw std::invalid_argument("invalid TCP benchmark record size");
+        }
     }
 
+    void fail_transport() {
+        if (!failed) counters.transport_errors++;
+        failed = true;
+        cancel.cancel();
+        stream.shutdown_socket();
+    }
+};
+
+task<void> phase_writer(phase_context& ctx) {
+    try {
+        const auto token = ctx.cancel.get_token();
+        for (uint64_t sequence = 0; sequence < ctx.target; ++sequence) {
+            if (co_await ctx.credits.acquire(token) !=
+                cancel_result::completed) {
+                co_return;
+            }
+            if (!bench::stamp_record(std::span<uint8_t>(ctx.send), ctx.phase,
+                                     ctx.trial, sequence)) {
+                ctx.counters.payload_errors++;
+                ctx.failed = true;
+                ctx.cancel.cancel();
+                ctx.stream.shutdown_socket();
+                co_return;
+            }
+            if (ctx.collect_latency) {
+                ctx.send_times[sequence] = std::chrono::steady_clock::now();
+            }
+            if (sequence == 0 && ctx.phase_start != nullptr) {
+                *ctx.phase_start = std::chrono::steady_clock::now();
+            }
+            ++ctx.unacknowledged;
+            ctx.counters.observe_unacknowledged(ctx.unacknowledged);
+            ctx.counters.begin_write(ctx.write_size, 1, ctx.write_size);
+            if (!co_await write_exact(
+                    ctx.stream, std::span<const uint8_t>(ctx.send), token)) {
+                ctx.fail_transport();
+                co_return;
+            }
+            ctx.counters.complete_write(ctx.write_size, 1, ctx.write_size);
+        }
+    } catch (...) {
+        ctx.fail_transport();
+    }
+}
+
+task<void> phase_reader(phase_context& ctx) {
+    try {
+        const auto token = ctx.cancel.get_token();
+        for (uint64_t sequence = 0; sequence < ctx.target; ++sequence) {
+            if (!co_await read_exact(ctx.stream,
+                                     std::span<uint8_t>(ctx.receive), token)) {
+                ctx.fail_transport();
+                co_return;
+            }
+            ctx.counters.receive_record(ctx.write_size);
+            const auto validation = bench::validate_record(
+                std::span<const uint8_t>(ctx.receive), ctx.phase, ctx.trial,
+                sequence, ctx.write_size);
+            if (validation != bench::record_error::none) {
+                if (validation == bench::record_error::sequence) {
+                    ctx.counters.sequence_errors++;
+                } else if (validation == bench::record_error::phase) {
+                    ctx.counters.phase_errors++;
+                } else {
+                    ctx.counters.payload_errors++;
+                }
+                ctx.failed = true;
+                ctx.cancel.cancel();
+                ctx.stream.shutdown_socket();
+                co_return;
+            }
+            ctx.counters.verify_record(ctx.write_size);
+            if (ctx.unacknowledged == 0) {
+                ctx.counters.sequence_errors++;
+                ctx.failed = true;
+                ctx.cancel.cancel();
+                ctx.stream.shutdown_socket();
+                co_return;
+            }
+            --ctx.unacknowledged;
+            if (sequence + 1 == ctx.target && ctx.phase_end != nullptr) {
+                *ctx.phase_end = std::chrono::steady_clock::now();
+            }
+            if (ctx.collect_latency && ctx.latency_samples != nullptr) {
+                ctx.latency_samples->push_back(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() -
+                        ctx.send_times[sequence])
+                        .count()));
+            }
+            ctx.credits.release();
+        }
+    } catch (...) {
+        ctx.fail_transport();
+    }
+}
+
+task<bool> run_phase(tcp_stream& stream, bench::phase phase, uint64_t trial,
+                     uint64_t target, std::size_t write_size,
+                     uint32_t credit_window, bool collect_latency,
+                     bench::counters& counters,
+                     std::vector<uint64_t>* latency_samples,
+                     std::chrono::steady_clock::time_point* phase_start,
+                     std::chrono::steady_clock::time_point* phase_end) {
+    if (target == 0) co_return true;
+    phase_context context(stream, phase, trial, target, write_size,
+                          credit_window, collect_latency, counters,
+                          latency_samples, phase_start, phase_end);
+    auto* scheduler = get_current_scheduler();
+    try {
+        auto reader = scheduler->go_joinable(phase_reader, std::ref(context));
+        try {
+            auto writer = scheduler->go_joinable(phase_writer,
+                                                 std::ref(context));
+            co_await writer;
+        } catch (...) {
+            context.fail_transport();
+        }
+        co_await reader;
+    } catch (...) {
+        context.fail_transport();
+    }
+    co_return !context.failed;
+}
+
+task<bench::result> run_one(const bench::config& cfg,
+                            bench::workload workload,
+                            std::size_t write_size, uint64_t trial) {
+    bench::result result;
+    result.implementation = "elio";
+    if (!cfg.peer_implementation.empty()) {
+        result.peer = cfg.peer_implementation;
+    }
+    result.workload_type = workload;
+    result.trial = trial;
+    result.write_size = write_size;
+    result.credit_window = workload == bench::workload::latency
+                               ? 1U
+                               : cfg.credit_window;
+    result.warmup_expected_records = cfg.warmup_records;
+    result.measured_expected_records =
+        workload == bench::workload::bulk
+            ? cfg.bulk_bytes / cfg.chunk_bytes
+            : cfg.records;
+    if (workload == bench::workload::latency) {
+        result.latency_samples_ns.reserve(result.measured_expected_records);
+    }
+
+    auto resolved = co_await resolve_hostname(cfg.host, cfg.port);
+    if (!resolved) {
+        result.warmup.transport_errors++;
+        co_return result;
+    }
     auto stream = co_await tcp_connect(*resolved);
     if (!stream) {
-        std::fprintf(stderr, "Connect to %s:%d failed\n",
-                     cfg.host.c_str(), cfg.port);
-        co_return;
+        result.warmup.transport_errors++;
+        co_return result;
     }
     stream->set_no_delay(true);
 
-    std::vector<char> send_buf(msg_size, 'X');
-    std::vector<char> recv_buf(msg_size);
-
-    std::vector<uint64_t> latencies;
-    latencies.reserve(static_cast<size_t>(cfg.duration_s) * 200000);
-
-    cancel_source cancel;
-    std::atomic<bool> timed_out{false};
-    std::mutex timer_mutex;
-    std::condition_variable timer_cv;
-    bool timer_cancelled = false;
-
-    std::thread timer_thread([&]() {
-        std::unique_lock<std::mutex> lock(timer_mutex);
-        // This is a stall watchdog, not the normal phase boundary. Warmup and
-        // measurement end through the loop deadlines below; allow one extra
-        // measurement window (at least 5s) before declaring a real timeout.
-        const auto budget = bench::pingpong_watchdog_budget(cfg);
-        if (timer_cv.wait_for(lock, budget, [&]() {
-                return timer_cancelled;
-            })) {
-            return;
-        }
-        timed_out.store(true, std::memory_order_release);
-        cancel.cancel();
-        stream->shutdown_socket();
-    });
-
-    auto stop_timer = [&]() {
-        {
-            std::lock_guard<std::mutex> lock(timer_mutex);
-            timer_cancelled = true;
-        }
-        timer_cv.notify_one();
-        if (timer_thread.joinable()) {
-            timer_thread.join();
-        }
-    };
-
-    // Warmup phase
-    auto warmup_end = std::chrono::steady_clock::now() +
-                      std::chrono::seconds(cfg.warmup_s);
-    while (!timed_out.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < warmup_end) {
-        if (!co_await write_exact_cancellable(
-                *stream, send_buf.data(), msg_size, cancel.get_token())) {
-            stop_timer();
-            out.timed_out = timed_out.load(std::memory_order_acquire);
-            co_return;
-        }
-        if (!co_await read_exact_cancellable(
-                *stream, recv_buf.data(), msg_size, cancel.get_token())) {
-            stop_timer();
-            out.timed_out = timed_out.load(std::memory_order_acquire);
-            co_return;
-        }
+    const bool latency = workload == bench::workload::latency;
+    if (!co_await run_phase(*stream, bench::phase::warmup, trial,
+                            result.warmup_expected_records, write_size,
+                            result.credit_window, false, result.warmup,
+                            nullptr, nullptr, nullptr)) {
+        co_return result;
     }
+    result.warmup_drained = true;
 
-    latencies.clear();
-
-    // Measurement phase
-    auto measure_start = std::chrono::steady_clock::now();
-    auto measure_end   = measure_start + std::chrono::seconds(cfg.duration_s);
-    auto finish = [&]() {
-        double elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - measure_start).count();
-        out = bench::pingpong_stats::compute(latencies, elapsed);
-        out.timed_out = timed_out.load(std::memory_order_acquire);
-    };
-
-    while (!timed_out.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < measure_end) {
-        auto t0 = std::chrono::steady_clock::now();
-
-        if (!co_await write_exact_cancellable(
-                *stream, send_buf.data(), msg_size, cancel.get_token())) {
-            finish();
-            stop_timer();
-            co_return;
-        }
-        if (!co_await read_exact_cancellable(
-                *stream, recv_buf.data(), msg_size, cancel.get_token())) {
-            finish();
-            stop_timer();
-            co_return;
-        }
-
-        auto t1 = std::chrono::steady_clock::now();
-        latencies.push_back(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    std::chrono::steady_clock::time_point start;
+    std::chrono::steady_clock::time_point end;
+    if (!co_await run_phase(*stream, bench::phase::measured, trial,
+                            result.measured_expected_records, write_size,
+                            result.credit_window, latency, result.measured,
+                            &result.latency_samples_ns, &start, &end)) {
+        co_return result;
     }
-
-    stop_timer();
-    finish();
-    co_return;
+    result.elapsed_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start)
+            .count());
+    co_return result;
 }
 
-// ---------------------------------------------------------------------------
-// Client: streaming writer/reader tasks (standalone for go_joinable)
-// ---------------------------------------------------------------------------
-
-struct streaming_ctx {
-    tcp_stream* stream;
-    const char* send_buf;
-    size_t msg_size;
-    std::atomic<bool>* stop;
-    cancel_token token;
-};
-
-struct streaming_counters {
-    std::atomic<uint64_t> total_bytes{0};
-    std::atomic<uint64_t> total_msgs{0};
-};
-
-static task<void> streaming_reader(streaming_ctx* ctx, streaming_counters* ctr) {
-    constexpr size_t kReadBufSize = bench::kStreamingRecvBufferSize;
-    std::vector<char> recv_buf(kReadBufSize);
-    size_t recv_offset = 0;
-
-    while (!ctx->stop->load(std::memory_order_relaxed)) {
-        size_t avail = kReadBufSize - recv_offset;
-        auto r = co_await ctx->stream->read(
-            recv_buf.data() + recv_offset, avail, ctx->token);
-        if (r.result <= 0) {
-            co_return;
-        }
-        recv_offset += static_cast<size_t>(r.result);
-
-        const char* ptr = recv_buf.data();
-        while (recv_offset >= ctx->msg_size) {
-            ctr->total_bytes.fetch_add(ctx->msg_size, std::memory_order_relaxed);
-            ctr->total_msgs.fetch_add(1, std::memory_order_relaxed);
-            ptr += ctx->msg_size;
-            recv_offset -= ctx->msg_size;
-        }
-
-        if (recv_offset > 0) {
-            std::memmove(recv_buf.data(), ptr, recv_offset);
-        }
-    }
-    co_return;
+bool selected(const bench::config& cfg, bench::workload value) {
+    return cfg.type == bench::workload::all || cfg.type == value;
 }
 
-// ---------------------------------------------------------------------------
-// Client: streaming for one message size
-// ---------------------------------------------------------------------------
-
-static task<void> client_streaming(const bench::config& cfg,
-                                   size_t msg_size,
-                                   bench::streaming_stats& out) {
-    auto resolved = co_await resolve_hostname(cfg.host, cfg.port);
-    if (!resolved) {
-        std::fprintf(stderr, "Resolve %s failed\n", cfg.host.c_str());
-        co_return;
+bool publish(const bench::config& cfg, const bench::result& result) {
+    bench::print_human(result);
+    const std::string json = bench::to_json_line(result);
+    std::printf("%s\n", json.c_str());
+    std::string error;
+    if (!bench::append_jsonl(cfg.json_path, result, &error)) {
+        std::fprintf(stderr, "%s\n", error.c_str());
+        return false;
     }
-
-    auto stream = co_await tcp_connect(*resolved);
-    if (!stream) {
-        std::fprintf(stderr, "Connect to %s:%d failed\n",
-                     cfg.host.c_str(), cfg.port);
-        co_return;
-    }
-    stream->set_no_delay(true);
-
-    const int pipeline_depth = bench::clamped_pipeline_depth(cfg);
-    std::vector<char> send_buf(msg_size * static_cast<size_t>(pipeline_depth), 'X');
-
-    std::atomic<bool> stop{false};
-    streaming_counters counters;
-    cancel_source cancel;
-
-    streaming_ctx ctx{&*stream, send_buf.data(), msg_size, &stop,
-                      cancel.get_token()};
-
-    auto* sched = get_current_scheduler();
-    auto r_handle = sched->go_joinable(streaming_reader, &ctx, &counters);
-
-    std::atomic<uint64_t> measured_bytes{0};
-    std::atomic<uint64_t> measured_msgs{0};
-    std::mutex timer_mutex;
-    std::condition_variable timer_cv;
-    bool timer_cancelled = false;
-
-    std::thread timer_thread([&]() {
-        auto wait_or_cancel = [&](std::chrono::seconds duration) {
-            std::unique_lock<std::mutex> lock(timer_mutex);
-            return timer_cv.wait_for(lock, duration, [&]() {
-                return timer_cancelled;
-            });
-        };
-
-        if (wait_or_cancel(std::chrono::seconds(cfg.warmup_s))) {
-            return;
-        }
-
-        counters.total_bytes.store(0, std::memory_order_release);
-        counters.total_msgs.store(0, std::memory_order_release);
-
-        if (wait_or_cancel(std::chrono::seconds(cfg.duration_s))) {
-            return;
-        }
-
-        measured_bytes.store(
-            counters.total_bytes.load(std::memory_order_acquire),
-            std::memory_order_release);
-        measured_msgs.store(
-            counters.total_msgs.load(std::memory_order_acquire),
-            std::memory_order_release);
-        stop.store(true, std::memory_order_release);
-        cancel.cancel();
-        stream->shutdown_socket();
-    });
-
-    while (!stop.load(std::memory_order_acquire)) {
-        if (!co_await write_exact_cancellable(
-                *stream, send_buf.data(), send_buf.size(), cancel.get_token())) {
-            break;
-        }
-    }
-
-    if (!stop.load(std::memory_order_acquire)) {
-        measured_bytes.store(
-            counters.total_bytes.load(std::memory_order_acquire),
-            std::memory_order_release);
-        measured_msgs.store(
-            counters.total_msgs.load(std::memory_order_acquire),
-            std::memory_order_release);
-        stop.store(true, std::memory_order_release);
-        cancel.cancel();
-        stream->shutdown_socket();
-    }
-
-    co_await r_handle;
-
-    {
-        std::lock_guard<std::mutex> lock(timer_mutex);
-        timer_cancelled = true;
-    }
-    timer_cv.notify_one();
-    if (timer_thread.joinable()) {
-        timer_thread.join();
-    }
-
-    out = bench::streaming_stats::compute(
-        measured_bytes.load(std::memory_order_acquire),
-        measured_msgs.load(std::memory_order_acquire),
-        static_cast<double>(cfg.duration_s));
-    co_return;
+    return result.valid();
 }
 
-// ---------------------------------------------------------------------------
-// Client: drive all message sizes
-// ---------------------------------------------------------------------------
-
-static task<void> client_main(const bench::config& cfg,
-                              std::atomic<bool>& ok) {
-    bench::print_header("Elio", cfg);
-
-    bool do_pingpong  = (cfg.type == bench::config::test_type::pingpong ||
-                         cfg.type == bench::config::test_type::both);
-    bool do_streaming = (cfg.type == bench::config::test_type::streaming ||
-                         cfg.type == bench::config::test_type::both);
-
-    if (do_pingpong) {
-        bench::print_pingpong_table_header();
-        for (int i = 0; i < bench::kNumMessageSizes; ++i) {
-            size_t sz = bench::kMessageSizes[i];
-            bench::pingpong_stats stats;
-            co_await client_pingpong(cfg, sz, stats);
-            stats.print_row(sz);
-            if (const char* reason = bench::pingpong_failure_reason(stats)) {
-                bench::print_failure("Elio", "ping-pong", sz, reason);
-                ok.store(false, std::memory_order_release);
-            }
-            std::fflush(stdout);
+task<void> client_main(const bench::config& cfg, std::atomic<bool>& ok) {
+    if (selected(cfg, bench::workload::latency)) {
+        for (std::size_t size : bench::selected_message_sizes(cfg)) {
+            ok.store(publish(cfg, co_await run_one(
+                                      cfg, bench::workload::latency, size,
+                                      bench::selected_trial(
+                                          cfg, bench::workload::latency,
+                                          size))) &&
+                         ok.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
         }
-        std::printf("\n");
     }
-
-    if (do_streaming) {
-        bench::print_streaming_table_header();
-        for (int i = 0; i < bench::kNumMessageSizes; ++i) {
-            size_t sz = bench::kMessageSizes[i];
-            bench::streaming_stats stats;
-            co_await client_streaming(cfg, sz, stats);
-            stats.print_row(sz);
-            if (const char* reason = bench::streaming_failure_reason(stats)) {
-                bench::print_failure("Elio", "streaming", sz, reason);
-                ok.store(false, std::memory_order_release);
-            }
-            std::fflush(stdout);
+    if (selected(cfg, bench::workload::message)) {
+        for (std::size_t size : bench::selected_message_sizes(cfg)) {
+            ok.store(publish(cfg, co_await run_one(
+                                      cfg, bench::workload::message, size,
+                                      bench::selected_trial(
+                                          cfg, bench::workload::message,
+                                          size))) &&
+                         ok.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
         }
-        std::printf("\n");
     }
-
-    co_return;
+    if (selected(cfg, bench::workload::bulk)) {
+        ok.store(publish(cfg, co_await run_one(
+                                  cfg, bench::workload::bulk, cfg.chunk_bytes,
+                                  bench::selected_trial(
+                                      cfg, bench::workload::bulk,
+                                      cfg.chunk_bytes))) &&
+                     ok.load(std::memory_order_relaxed),
+                 std::memory_order_relaxed);
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+} // namespace
 
 int main(int argc, char* argv[]) {
     std::signal(SIGPIPE, SIG_IGN);
@@ -453,34 +331,25 @@ int main(int argc, char* argv[]) {
     try {
         cfg = bench::parse_args(argc, argv, "Elio");
     } catch (const bench::argument_error&) {
-        return 1;
+        return 2;
     }
 
-    scheduler sched(std::max(1, cfg.threads));
-    sched.start();
-
+    std::ofstream(cfg.json_path, std::ios::trunc).close();
+    scheduler scheduler(1);
+    scheduler.start();
     std::atomic<bool> done{false};
-    std::atomic<bool> client_ok{true};
-
-    if (cfg.run_mode == bench::config::mode::server) {
-        sched.go([&]() -> task<void> {
-            co_await server_main(cfg, sched);
-            done.store(true, std::memory_order_release);
-        });
-        while (!done.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::atomic<bool> ok{true};
+    scheduler.go([&]() -> task<void> {
+        try {
+            co_await client_main(cfg, ok);
+        } catch (...) {
+            ok.store(false, std::memory_order_relaxed);
         }
-    } else {
-        sched.go([&]() -> task<void> {
-            co_await client_main(cfg, client_ok);
-            done.store(true, std::memory_order_release);
-        });
-        while (!done.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+        done.store(true, std::memory_order_release);
+    });
+    while (!done.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-
-    g_running.store(false, std::memory_order_release);
-    sched.shutdown();
-    return client_ok.load(std::memory_order_acquire) ? 0 : 1;
+    scheduler.shutdown();
+    return ok.load(std::memory_order_relaxed) ? 0 : 1;
 }

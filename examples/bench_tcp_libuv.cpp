@@ -1,506 +1,339 @@
 /// @file bench_tcp_libuv.cpp
-/// @brief TCP Loopback Benchmark using libuv (callback-based)
-///
-/// Server and client for measuring TCP ping-pong latency and streaming
-/// throughput on loopback. Compare with bench_tcp_elio and bench_tcp_asio.
-///
-/// Usage: bench_tcp_libuv -s  (server)
-///        bench_tcp_libuv -c  (client, default)
+/// @brief Fair TCP loopback client adapter using libuv.
 
-#include <uv.h>
 #include "bench_tcp_common.hpp"
 
-#include <netdb.h>
-#include <sys/socket.h>
+#include <uv.h>
 
-#include <atomic>
+#include <netdb.h>
+
 #include <chrono>
-#include <cstdlib>
-#include <cstring>
 #include <csignal>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <span>
 #include <string>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-// Server
-// ---------------------------------------------------------------------------
+namespace {
 
-struct server_conn {
-    uv_tcp_t handle;
-    char     buf[65536];
+class fixed_work_session {
+public:
+    fixed_work_session(const bench::config& cfg, bench::workload workload,
+                       std::size_t write_size, uint64_t trial)
+        : cfg_(cfg), workload_(workload), write_size_(write_size),
+          trial_(trial), send_(write_size), receive_(write_size) {
+        if (!bench::initialize_record(std::span<uint8_t>(send_))) {
+            throw std::invalid_argument("invalid TCP benchmark record size");
+        }
+        result_.implementation = "libuv";
+        if (!cfg.peer_implementation.empty()) {
+            result_.peer = cfg.peer_implementation;
+        }
+        result_.workload_type = workload;
+        result_.trial = trial;
+        result_.write_size = write_size;
+        result_.credit_window = workload == bench::workload::latency
+                                    ? 1U
+                                    : cfg.credit_window;
+        result_.warmup_expected_records = cfg.warmup_records;
+        result_.measured_expected_records =
+            workload == bench::workload::bulk
+                ? cfg.bulk_bytes / cfg.chunk_bytes
+                : cfg.records;
+        if (workload == bench::workload::latency) {
+            result_.latency_samples_ns.reserve(
+                result_.measured_expected_records);
+        }
+    }
+
+    bench::result run() {
+        if (uv_loop_init(&loop_) != 0) {
+            result_.warmup.transport_errors++;
+            return result_;
+        }
+        uv_tcp_init(&loop_, &tcp_);
+        tcp_.data = this;
+        connect_.data = this;
+        write_.data = this;
+
+        sockaddr_in address{};
+        if (!resolve(address)) {
+            result_.warmup.transport_errors++;
+            uv_close(reinterpret_cast<uv_handle_t*>(&tcp_), nullptr);
+        } else {
+            const int rc = uv_tcp_connect(
+                &connect_, &tcp_,
+                reinterpret_cast<const sockaddr*>(&address), connect_callback);
+            if (rc != 0) {
+                result_.warmup.transport_errors++;
+                uv_close(reinterpret_cast<uv_handle_t*>(&tcp_), nullptr);
+            }
+        }
+        uv_run(&loop_, UV_RUN_DEFAULT);
+        uv_loop_close(&loop_);
+        return result_;
+    }
+
+private:
+    bool resolve(sockaddr_in& address) {
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        addrinfo* resolved = nullptr;
+        const std::string service = std::to_string(cfg_.port);
+        const int rc = getaddrinfo(cfg_.host.c_str(), service.c_str(), &hints,
+                                   &resolved);
+        if (rc != 0 || resolved == nullptr) return false;
+        std::memcpy(&address, resolved->ai_addr, sizeof(address));
+        freeaddrinfo(resolved);
+        return true;
+    }
+
+    bench::counters& current_counters() noexcept {
+        return phase_ == bench::phase::warmup ? result_.warmup
+                                               : result_.measured;
+    }
+
+    uint64_t target() const noexcept {
+        return phase_ == bench::phase::warmup
+                   ? result_.warmup_expected_records
+                   : result_.measured_expected_records;
+    }
+
+    void start_phase(bench::phase next) {
+        phase_ = next;
+        next_write_ = 0;
+        next_read_ = 0;
+        receive_offset_ = 0;
+        unacknowledged_ = 0;
+        if (target() == 0) {
+            finish_phase();
+            return;
+        }
+        maybe_start_write();
+    }
+
+    void maybe_start_write() {
+        if (done_ || write_active_ || next_write_ >= target() ||
+            unacknowledged_ >= result_.credit_window) {
+            return;
+        }
+        const uint64_t sequence = next_write_++;
+        if (!bench::stamp_record(std::span<uint8_t>(send_), phase_, trial_,
+                                 sequence)) {
+            current_counters().payload_errors++;
+            fail();
+            return;
+        }
+        if (phase_ == bench::phase::measured &&
+            workload_ == bench::workload::latency) {
+            latency_start_ = std::chrono::steady_clock::now();
+        }
+        if (phase_ == bench::phase::measured && sequence == 0) {
+            measure_start_ = std::chrono::steady_clock::now();
+        }
+        ++unacknowledged_;
+        auto& counters = current_counters();
+        counters.observe_unacknowledged(unacknowledged_);
+        counters.begin_write(write_size_, 1, write_size_);
+        write_active_ = true;
+        uv_buf_t buffer = uv_buf_init(
+            reinterpret_cast<char*>(send_.data()),
+            static_cast<unsigned int>(send_.size()));
+        const int rc = uv_write(&write_, reinterpret_cast<uv_stream_t*>(&tcp_),
+                                &buffer, 1, write_callback);
+        if (rc != 0) {
+            write_active_ = false;
+            counters.transport_errors++;
+            fail();
+        }
+    }
+
+    void on_write(int status) {
+        write_active_ = false;
+        auto& counters = current_counters();
+        if (status != 0) {
+            counters.transport_errors++;
+            fail();
+            return;
+        }
+        counters.complete_write(write_size_, 1, write_size_);
+        if (phase_complete()) {
+            finish_phase();
+            return;
+        }
+        maybe_start_write();
+    }
+
+    void on_read(ssize_t bytes) {
+        if (bytes == 0 || done_) return;
+        auto& counters = current_counters();
+        if (bytes < 0) {
+            counters.transport_errors++;
+            fail();
+            return;
+        }
+        receive_offset_ += static_cast<std::size_t>(bytes);
+        if (receive_offset_ < write_size_) return;
+        if (receive_offset_ != write_size_) {
+            counters.transport_errors++;
+            fail();
+            return;
+        }
+
+        counters.receive_record(write_size_);
+        const auto validation = bench::validate_record(
+            std::span<const uint8_t>(receive_), phase_, trial_, next_read_,
+            write_size_);
+        if (validation != bench::record_error::none) {
+            if (validation == bench::record_error::sequence) {
+                counters.sequence_errors++;
+            } else if (validation == bench::record_error::phase) {
+                counters.phase_errors++;
+            } else {
+                counters.payload_errors++;
+            }
+            fail();
+            return;
+        }
+        counters.verify_record(write_size_);
+        if (unacknowledged_ == 0) {
+            counters.sequence_errors++;
+            fail();
+            return;
+        }
+        --unacknowledged_;
+        ++next_read_;
+        if (phase_ == bench::phase::measured && next_read_ == target()) {
+            measure_end_ = std::chrono::steady_clock::now();
+        }
+        receive_offset_ = 0;
+        if (phase_ == bench::phase::measured &&
+            workload_ == bench::workload::latency) {
+            result_.latency_samples_ns.push_back(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - latency_start_)
+                    .count()));
+        }
+        if (phase_complete()) {
+            finish_phase();
+            return;
+        }
+        maybe_start_write();
+    }
+
+    bool phase_complete() const noexcept {
+        const auto& counters = phase_ == bench::phase::warmup
+                                   ? result_.warmup
+                                   : result_.measured;
+        return next_read_ == target() && next_write_ == target() &&
+               counters.write_completions == target() &&
+               unacknowledged_ == 0 && !write_active_;
+    }
+
+    void finish_phase() {
+        if (phase_ == bench::phase::warmup) {
+            result_.warmup_drained = true;
+            start_phase(bench::phase::measured);
+            return;
+        }
+        result_.elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                measure_end_ - measure_start_)
+                .count());
+        close();
+    }
+
+    void fail() { close(); }
+
+    void close() {
+        if (done_) return;
+        done_ = true;
+        uv_read_stop(reinterpret_cast<uv_stream_t*>(&tcp_));
+        if (!uv_is_closing(reinterpret_cast<uv_handle_t*>(&tcp_))) {
+            uv_close(reinterpret_cast<uv_handle_t*>(&tcp_), nullptr);
+        }
+    }
+
+    static void connect_callback(uv_connect_t* request, int status) {
+        auto* self = static_cast<fixed_work_session*>(request->data);
+        if (status != 0) {
+            self->result_.warmup.transport_errors++;
+            self->close();
+            return;
+        }
+        uv_tcp_nodelay(&self->tcp_, 1);
+        const int rc = uv_read_start(
+            reinterpret_cast<uv_stream_t*>(&self->tcp_), alloc_callback,
+            read_callback);
+        if (rc != 0) {
+            self->result_.warmup.transport_errors++;
+            self->close();
+            return;
+        }
+        self->start_phase(bench::phase::warmup);
+    }
+
+    static void alloc_callback(uv_handle_t* handle, std::size_t,
+                               uv_buf_t* buffer) {
+        auto* self = static_cast<fixed_work_session*>(handle->data);
+        buffer->base = reinterpret_cast<char*>(self->receive_.data() +
+                                               self->receive_offset_);
+        buffer->len = static_cast<unsigned int>(self->write_size_ -
+                                                self->receive_offset_);
+    }
+
+    static void read_callback(uv_stream_t* stream, ssize_t bytes,
+                              const uv_buf_t*) {
+        static_cast<fixed_work_session*>(stream->data)->on_read(bytes);
+    }
+
+    static void write_callback(uv_write_t* request, int status) {
+        static_cast<fixed_work_session*>(request->data)->on_write(status);
+    }
+
+    const bench::config& cfg_;
+    bench::workload workload_;
+    std::size_t write_size_;
+    uint64_t trial_;
+    uv_loop_t loop_{};
+    uv_tcp_t tcp_{};
+    uv_connect_t connect_{};
+    uv_write_t write_{};
+    bench::phase phase_ = bench::phase::warmup;
+    std::vector<uint8_t> send_;
+    std::vector<uint8_t> receive_;
+    std::size_t receive_offset_ = 0;
+    uint64_t next_write_ = 0;
+    uint64_t next_read_ = 0;
+    uint64_t unacknowledged_ = 0;
+    bool write_active_ = false;
+    bool done_ = false;
+    std::chrono::steady_clock::time_point measure_start_{};
+    std::chrono::steady_clock::time_point measure_end_{};
+    std::chrono::steady_clock::time_point latency_start_{};
+    bench::result result_;
 };
 
-struct echo_write_req {
-    uv_write_t    req;
-    std::vector<char> data;
-};
+bool selected(const bench::config& cfg, bench::workload value) {
+    return cfg.type == bench::workload::all || cfg.type == value;
+}
 
-static bool resolve_ipv4_host(const bench::config& cfg, sockaddr_in& addr) {
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    addrinfo* result = nullptr;
-    std::string service = std::to_string(cfg.port);
-    int rc = getaddrinfo(cfg.host.c_str(), service.c_str(), &hints, &result);
-    if (rc != 0 || result == nullptr) {
-        std::fprintf(stderr, "Resolve %s:%d failed: %s\n",
-                     cfg.host.c_str(), cfg.port, gai_strerror(rc));
+bool publish(const bench::config& cfg, const bench::result& result) {
+    bench::print_human(result);
+    const std::string json = bench::to_json_line(result);
+    std::printf("%s\n", json.c_str());
+    std::string error;
+    if (!bench::append_jsonl(cfg.json_path, result, &error)) {
+        std::fprintf(stderr, "%s\n", error.c_str());
         return false;
     }
-
-    addr = *reinterpret_cast<sockaddr_in*>(result->ai_addr);
-    freeaddrinfo(result);
-    return true;
+    return result.valid();
 }
 
-static void server_alloc_cb(uv_handle_t* handle, size_t /*suggested*/,
-                            uv_buf_t* buf) {
-    auto* conn = static_cast<server_conn*>(handle->data);
-    buf->base = conn->buf;
-    buf->len  = sizeof(conn->buf);
-}
-
-static void server_write_cb(uv_write_t* req, int /*status*/) {
-    delete reinterpret_cast<echo_write_req*>(req);
-}
-
-static void server_close_cb(uv_handle_t* handle) {
-    delete static_cast<server_conn*>(handle->data);
-}
-
-static void server_read_cb(uv_stream_t* stream, ssize_t nread,
-                           const uv_buf_t* buf) {
-    if (nread < 0) {
-        uv_close(reinterpret_cast<uv_handle_t*>(stream), server_close_cb);
-        return;
-    }
-
-    auto* wreq = new echo_write_req;
-    wreq->data.assign(buf->base, buf->base + nread);
-    uv_buf_t wbuf = uv_buf_init(wreq->data.data(),
-                                static_cast<unsigned int>(nread));
-    uv_write(&wreq->req, stream, &wbuf, 1, server_write_cb);
-}
-
-static void server_on_connection(uv_stream_t* server, int status) {
-    if (status < 0) return;
-
-    auto* conn = new server_conn;
-    conn->handle.data = conn;
-    uv_tcp_init(server->loop, &conn->handle);
-
-    if (uv_accept(server, reinterpret_cast<uv_stream_t*>(&conn->handle)) == 0) {
-        uv_tcp_nodelay(&conn->handle, 1);
-        uv_read_start(reinterpret_cast<uv_stream_t*>(&conn->handle),
-                      server_alloc_cb, server_read_cb);
-    } else {
-        uv_close(reinterpret_cast<uv_handle_t*>(&conn->handle), server_close_cb);
-    }
-}
-
-static int run_server(const bench::config& cfg) {
-    uv_loop_t loop;
-    uv_loop_init(&loop);
-
-    uv_tcp_t server;
-    uv_tcp_init(&loop, &server);
-
-    struct sockaddr_in addr;
-    uv_ip4_addr("0.0.0.0", cfg.port, &addr);
-    uv_tcp_bind(&server, reinterpret_cast<const struct sockaddr*>(&addr), 0);
-    uv_tcp_nodelay(&server, 1);
-
-    int r = uv_listen(reinterpret_cast<uv_stream_t*>(&server), 128,
-                      server_on_connection);
-    if (r) {
-        std::fprintf(stderr, "Listen error: %s\n", uv_strerror(r));
-        return 1;
-    }
-
-    std::printf("libuv server listening on port %d\n", cfg.port);
-    std::fflush(stdout);
-    uv_run(&loop, UV_RUN_DEFAULT);
-    uv_loop_close(&loop);
-    return 0;
-}
-
-// ---------------------------------------------------------------------------
-// Client: shared write request
-// ---------------------------------------------------------------------------
-
-struct write_req {
-    uv_write_t    req;
-    std::vector<char> data;
-    uv_buf_t buf;
-};
-
-// ---------------------------------------------------------------------------
-// Client: ping-pong
-// ---------------------------------------------------------------------------
-
-struct pp_client {
-    uv_tcp_t    tcp;
-    uv_timer_t  warmup_timer;
-    uv_timer_t  measure_timer;
-    uv_connect_t connect_req;
-
-    std::vector<char> send_buf;
-    std::vector<char> recv_buf;
-    size_t msg_size   = 0;
-    size_t recv_offset = 0;
-    bool measuring    = false;
-    bool done         = false;
-
-    std::chrono::steady_clock::time_point t0{};
-    std::vector<uint64_t> latencies;
-};
-
-static void pp_write_cb(uv_write_t* req, int /*status*/) {
-    delete reinterpret_cast<write_req*>(req);
-}
-
-static void pp_alloc_cb(uv_handle_t* handle, size_t /*suggested*/,
-                        uv_buf_t* buf) {
-    auto* c = static_cast<pp_client*>(handle->data);
-    buf->base = c->recv_buf.data() + c->recv_offset;
-    buf->len  = static_cast<unsigned int>(c->msg_size - c->recv_offset);
-}
-
-static void pp_close_cb(uv_handle_t* /*handle*/) {}
-
-static void pp_send(pp_client* c) {
-    c->t0 = std::chrono::steady_clock::now();
-    auto* wreq = new write_req;
-    wreq->data = c->send_buf;
-    wreq->buf = uv_buf_init(wreq->data.data(),
-                            static_cast<unsigned int>(c->msg_size));
-    uv_write(&wreq->req, reinterpret_cast<uv_stream_t*>(&c->tcp),
-             &wreq->buf, 1, pp_write_cb);
-}
-
-static void pp_read_cb(uv_stream_t* stream, ssize_t nread,
-                       const uv_buf_t* /*buf*/) {
-    auto* c = static_cast<pp_client*>(stream->data);
-    if (nread < 0 || c->done) {
-        if (!c->done) {
-            c->done = true;
-            uv_read_stop(stream);
-            uv_close(reinterpret_cast<uv_handle_t*>(&c->tcp), pp_close_cb);
-            uv_close(reinterpret_cast<uv_handle_t*>(&c->warmup_timer), pp_close_cb);
-            uv_close(reinterpret_cast<uv_handle_t*>(&c->measure_timer), pp_close_cb);
-        }
-        return;
-    }
-
-    c->recv_offset += nread;
-    if (c->recv_offset < c->msg_size) return;
-
-    auto now = std::chrono::steady_clock::now();
-    if (c->measuring) {
-        auto rtt = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now - c->t0).count();
-        c->latencies.push_back(rtt);
-    }
-
-    c->recv_offset = 0;
-    pp_send(c);
-}
-
-static void pp_warmup_timer_cb(uv_timer_t* timer) {
-    auto* c = static_cast<pp_client*>(timer->data);
-    c->measuring = true;
-    c->latencies.clear();
-    uv_timer_stop(timer);
-}
-
-static void pp_measure_timer_cb(uv_timer_t* timer) {
-    auto* c = static_cast<pp_client*>(timer->data);
-    c->done = true;
-    uv_read_stop(reinterpret_cast<uv_stream_t*>(&c->tcp));
-    uv_close(reinterpret_cast<uv_handle_t*>(&c->tcp), pp_close_cb);
-    uv_close(reinterpret_cast<uv_handle_t*>(&c->warmup_timer), pp_close_cb);
-    uv_close(reinterpret_cast<uv_handle_t*>(&c->measure_timer), pp_close_cb);
-}
-
-static void pp_connect_cb(uv_connect_t* req, int status) {
-    auto* c = static_cast<pp_client*>(req->data);
-    if (status < 0) {
-        std::fprintf(stderr, "Connect error: %s\n", uv_strerror(status));
-        c->done = true;
-        uv_close(reinterpret_cast<uv_handle_t*>(&c->tcp), pp_close_cb);
-        uv_close(reinterpret_cast<uv_handle_t*>(&c->warmup_timer), pp_close_cb);
-        uv_close(reinterpret_cast<uv_handle_t*>(&c->measure_timer), pp_close_cb);
-        return;
-    }
-
-    uv_tcp_nodelay(&c->tcp, 1);
-    c->tcp.data = c;
-
-    uv_read_start(reinterpret_cast<uv_stream_t*>(&c->tcp),
-                  pp_alloc_cb, pp_read_cb);
-    pp_send(c);
-}
-
-static bench::pingpong_stats run_client_pingpong(const bench::config& cfg,
-                                                  size_t msg_size) {
-    struct sockaddr_in addr;
-    if (!resolve_ipv4_host(cfg, addr)) {
-        return {};
-    }
-
-    uv_loop_t loop;
-    uv_loop_init(&loop);
-
-    pp_client c;
-    c.msg_size = msg_size;
-    c.send_buf.assign(msg_size, 'X');
-    c.recv_buf.resize(msg_size);
-
-    uv_tcp_init(&loop, &c.tcp);
-    c.tcp.data = &c;
-
-    uv_timer_init(&loop, &c.warmup_timer);
-    c.warmup_timer.data = &c;
-    uv_timer_start(&c.warmup_timer, pp_warmup_timer_cb,
-                   cfg.warmup_s * 1000, 0);
-
-    uv_timer_init(&loop, &c.measure_timer);
-    c.measure_timer.data = &c;
-    uv_timer_start(&c.measure_timer, pp_measure_timer_cb,
-                   (cfg.warmup_s + cfg.duration_s) * 1000, 0);
-
-    c.connect_req.data = &c;
-    uv_tcp_connect(&c.connect_req, &c.tcp,
-                   reinterpret_cast<const struct sockaddr*>(&addr),
-                   pp_connect_cb);
-
-    uv_run(&loop, UV_RUN_DEFAULT);
-
-    auto stats = bench::pingpong_stats::compute(
-        c.latencies, static_cast<double>(cfg.duration_s));
-
-    uv_loop_close(&loop);
-    return stats;
-}
-
-// ---------------------------------------------------------------------------
-// Client: streaming
-// ---------------------------------------------------------------------------
-
-struct st_client {
-    uv_tcp_t    tcp;
-    uv_timer_t  warmup_timer;
-    uv_timer_t  measure_timer;
-    uv_connect_t connect_req;
-
-    std::vector<char> send_buf;
-    std::vector<char> recv_buf;
-    size_t msg_size   = 0;
-    size_t recv_offset = 0;
-    int pipeline_depth = 16;
-    bool measuring    = false;
-    bool done         = false;
-
-    std::atomic<uint64_t> total_bytes{0};
-    std::atomic<uint64_t> total_msgs{0};
-};
-
-static void st_write_cb(uv_write_t* req, int status) {
-    auto* wreq = reinterpret_cast<write_req*>(req);
-    auto* c = static_cast<st_client*>(wreq->req.data);
-    delete wreq;
-    if (status < 0 || c->done) return;
-    // Send next to keep pipeline full
-    auto* nw = new write_req;
-    nw->data = c->send_buf;
-    nw->req.data = c;
-    nw->buf = uv_buf_init(nw->data.data(),
-                          static_cast<unsigned int>(c->msg_size));
-    uv_write(&nw->req, reinterpret_cast<uv_stream_t*>(&c->tcp),
-             &nw->buf, 1, st_write_cb);
-}
-
-static void st_alloc_cb(uv_handle_t* handle, size_t /*suggested*/,
-                        uv_buf_t* buf) {
-    auto* c = static_cast<st_client*>(handle->data);
-    buf->base = c->recv_buf.data() + c->recv_offset;
-    buf->len  = static_cast<unsigned int>(c->recv_buf.size() - c->recv_offset);
-}
-
-static void st_close_cb(uv_handle_t* /*handle*/) {}
-
-static void st_read_cb(uv_stream_t* stream, ssize_t nread,
-                       const uv_buf_t* /*buf*/) {
-    auto* c = static_cast<st_client*>(stream->data);
-    if (nread < 0 || c->done) {
-        if (!c->done) {
-            c->done = true;
-            uv_read_stop(stream);
-            uv_close(reinterpret_cast<uv_handle_t*>(&c->tcp), st_close_cb);
-            uv_close(reinterpret_cast<uv_handle_t*>(&c->warmup_timer), st_close_cb);
-            uv_close(reinterpret_cast<uv_handle_t*>(&c->measure_timer), st_close_cb);
-        }
-        return;
-    }
-
-    size_t total = c->recv_offset + static_cast<size_t>(nread);
-    const char* ptr = c->recv_buf.data();
-    while (total >= c->msg_size) {
-        if (c->measuring) {
-            c->total_bytes.fetch_add(c->msg_size, std::memory_order_relaxed);
-            c->total_msgs.fetch_add(1, std::memory_order_relaxed);
-        }
-        ptr += c->msg_size;
-        total -= c->msg_size;
-    }
-
-    c->recv_offset = total;
-    if (total > 0) {
-        std::memmove(c->recv_buf.data(), ptr, total);
-    }
-}
-
-static void st_warmup_timer_cb(uv_timer_t* timer) {
-    auto* c = static_cast<st_client*>(timer->data);
-    c->measuring = true;
-    c->total_bytes.store(0, std::memory_order_release);
-    c->total_msgs.store(0, std::memory_order_release);
-    uv_timer_stop(timer);
-}
-
-static void st_measure_timer_cb(uv_timer_t* timer) {
-    auto* c = static_cast<st_client*>(timer->data);
-    c->done = true;
-    uv_read_stop(reinterpret_cast<uv_stream_t*>(&c->tcp));
-    uv_close(reinterpret_cast<uv_handle_t*>(&c->tcp), st_close_cb);
-    uv_close(reinterpret_cast<uv_handle_t*>(&c->warmup_timer), st_close_cb);
-    uv_close(reinterpret_cast<uv_handle_t*>(&c->measure_timer), st_close_cb);
-}
-
-static void st_connect_cb(uv_connect_t* req, int status) {
-    auto* c = static_cast<st_client*>(req->data);
-    if (status < 0) {
-        std::fprintf(stderr, "Connect error: %s\n", uv_strerror(status));
-        c->done = true;
-        uv_close(reinterpret_cast<uv_handle_t*>(&c->tcp), st_close_cb);
-        uv_close(reinterpret_cast<uv_handle_t*>(&c->warmup_timer), st_close_cb);
-        uv_close(reinterpret_cast<uv_handle_t*>(&c->measure_timer), st_close_cb);
-        return;
-    }
-
-    uv_tcp_nodelay(&c->tcp, 1);
-    c->tcp.data = c;
-
-    uv_read_start(reinterpret_cast<uv_stream_t*>(&c->tcp),
-                  st_alloc_cb, st_read_cb);
-
-    // Kick off pipeline_depth concurrent writes
-    for (int i = 0; i < c->pipeline_depth; ++i) {
-        auto* wreq = new write_req;
-        wreq->data = c->send_buf;
-        wreq->req.data = c;
-        wreq->buf = uv_buf_init(wreq->data.data(),
-                                static_cast<unsigned int>(c->msg_size));
-        uv_write(&wreq->req, reinterpret_cast<uv_stream_t*>(&c->tcp),
-                 &wreq->buf, 1, st_write_cb);
-    }
-}
-
-static bench::streaming_stats run_client_streaming(const bench::config& cfg,
-                                                    size_t msg_size) {
-    struct sockaddr_in addr;
-    if (!resolve_ipv4_host(cfg, addr)) {
-        return {};
-    }
-
-    uv_loop_t loop;
-    uv_loop_init(&loop);
-
-    st_client c;
-    c.msg_size = msg_size;
-    c.send_buf.assign(msg_size, 'X');
-    c.recv_buf.resize(bench::kStreamingRecvBufferSize);
-    c.pipeline_depth = bench::clamped_pipeline_depth(cfg);
-
-    uv_tcp_init(&loop, &c.tcp);
-    c.tcp.data = &c;
-
-    uv_timer_init(&loop, &c.warmup_timer);
-    c.warmup_timer.data = &c;
-    uv_timer_start(&c.warmup_timer, st_warmup_timer_cb,
-                   cfg.warmup_s * 1000, 0);
-
-    uv_timer_init(&loop, &c.measure_timer);
-    c.measure_timer.data = &c;
-    uv_timer_start(&c.measure_timer, st_measure_timer_cb,
-                   (cfg.warmup_s + cfg.duration_s) * 1000, 0);
-
-    c.connect_req.data = &c;
-    uv_tcp_connect(&c.connect_req, &c.tcp,
-                   reinterpret_cast<const struct sockaddr*>(&addr),
-                   st_connect_cb);
-
-    uv_run(&loop, UV_RUN_DEFAULT);
-
-    auto stats = bench::streaming_stats::compute(
-        c.total_bytes.load(std::memory_order_acquire),
-        c.total_msgs.load(std::memory_order_acquire),
-        static_cast<double>(cfg.duration_s));
-
-    uv_loop_close(&loop);
-    return stats;
-}
-
-// ---------------------------------------------------------------------------
-// Client: drive all message sizes
-// ---------------------------------------------------------------------------
-
-static bool run_client(const bench::config& cfg) {
-    bench::print_header("libuv", cfg);
-
-    bool do_pingpong  = (cfg.type == bench::config::test_type::pingpong ||
-                         cfg.type == bench::config::test_type::both);
-    bool do_streaming = (cfg.type == bench::config::test_type::streaming ||
-                         cfg.type == bench::config::test_type::both);
-    bool ok = true;
-
-    if (do_pingpong) {
-        bench::print_pingpong_table_header();
-        for (int i = 0; i < bench::kNumMessageSizes; ++i) {
-            size_t sz = bench::kMessageSizes[i];
-            auto stats = run_client_pingpong(cfg, sz);
-            stats.print_row(sz);
-            if (const char* reason = bench::pingpong_failure_reason(stats)) {
-                bench::print_failure("libuv", "ping-pong", sz, reason);
-                ok = false;
-            }
-            std::fflush(stdout);
-        }
-        std::printf("\n");
-    }
-
-    if (do_streaming) {
-        bench::print_streaming_table_header();
-        for (int i = 0; i < bench::kNumMessageSizes; ++i) {
-            size_t sz = bench::kMessageSizes[i];
-            auto stats = run_client_streaming(cfg, sz);
-            stats.print_row(sz);
-            if (const char* reason = bench::streaming_failure_reason(stats)) {
-                bench::print_failure("libuv", "streaming", sz, reason);
-                ok = false;
-            }
-            std::fflush(stdout);
-        }
-        std::printf("\n");
-    }
-
-    return ok;
-}
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+} // namespace
 
 int main(int argc, char* argv[]) {
     std::signal(SIGPIPE, SIG_IGN);
@@ -508,12 +341,28 @@ int main(int argc, char* argv[]) {
     try {
         cfg = bench::parse_args(argc, argv, "libuv");
     } catch (const bench::argument_error&) {
-        return 1;
+        return 2;
     }
 
-    if (cfg.run_mode == bench::config::mode::server) {
-        return run_server(cfg);
-    } else {
-        return run_client(cfg) ? 0 : 1;
+    std::ofstream(cfg.json_path, std::ios::trunc).close();
+    bool ok = true;
+    auto run = [&](bench::workload workload, std::size_t size) {
+        fixed_work_session session(
+            cfg, workload, size, bench::selected_trial(cfg, workload, size));
+        ok = publish(cfg, session.run()) && ok;
+    };
+    if (selected(cfg, bench::workload::latency)) {
+        for (std::size_t size : bench::selected_message_sizes(cfg)) {
+            run(bench::workload::latency, size);
+        }
     }
+    if (selected(cfg, bench::workload::message)) {
+        for (std::size_t size : bench::selected_message_sizes(cfg)) {
+            run(bench::workload::message, size);
+        }
+    }
+    if (selected(cfg, bench::workload::bulk)) {
+        run(bench::workload::bulk, cfg.chunk_bytes);
+    }
+    return ok ? 0 : 1;
 }

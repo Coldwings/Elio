@@ -82,7 +82,9 @@ def git_dirty_state() -> bool | None:
     if inside.returncode != 0 or inside.stdout.strip() != "true":
         return None
     status = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=normal"],
+        # Build and artifact directories may intentionally live below the
+        # checkout. Only tracked-source changes make the tested revision dirty.
+        ["git", "status", "--porcelain", "--untracked-files=no"],
         text=True, capture_output=True, check=False,
     )
     if status.returncode != 0:

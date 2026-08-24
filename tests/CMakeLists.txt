@@ -358,6 +358,10 @@ if(Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/test_capture_test_evidence.py
     )
+    add_test(NAME tcp_benchmark_conformance_summary
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/test_tcp_benchmark_conformance_summary.py
+    )
 endif()
 
 add_executable(elio_rdma_cuda_lifetime_tests

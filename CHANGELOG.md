@@ -18,8 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logical write sizes, and at most one active write per stream. A separate
   controlled-host runner provides balanced, paired client-side and server-side
   comparisons with confidence intervals and fail-closed qualification; shared
-  public runners no longer publish cross-library rankings or enforce
-  performance ratios (#1145).
+  public runners expose correctness matrices and diagnostic latency/throughput
+  observations in Markdown and JSON summaries, but do not publish
+  cross-library rankings, ratios, or significance claims (#1145, #1147).
 - **Checked external stream adoption**: `tcp_stream::adopt(fd)` and
   `uds_stream::adopt(fd)` now set `O_NONBLOCK` before transferring ownership.
   Failure returns `std::nullopt` with the `fcntl()` error in `errno` and leaves

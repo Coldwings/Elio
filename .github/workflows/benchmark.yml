@@ -11,6 +11,7 @@ on:
       - 'examples/CMakeLists.txt'
       - 'tools/run-tcp-benchmark-conformance.py'
       - 'tools/run-tcp-performance-comparison.py'
+      - 'tests/unit/test_tcp_benchmark_conformance_summary.py'
       - 'CMakeLists.txt'
       - '*.cmake'
       - 'cmake/**'
@@ -28,6 +29,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install dependencies
+        id: dependencies
         run: |
           sudo tee /etc/apt/apt.conf.d/99-elio-ci-network >/dev/null <<'APT'
           Acquire::Retries "5";
@@ -52,12 +54,14 @@ jobs:
           retry_sudo apt-get install -y libuv1-dev liburing-dev g++-14
 
       - name: Check benchmark runner syntax
+        id: runner_syntax
         run: |
           python3 -m py_compile \
             tools/run-tcp-benchmark-conformance.py \
             tools/run-tcp-performance-comparison.py
 
       - name: Configure
+        id: configure
         run: |
           cmake -S . -B build-tcp-benchmark \
             -DCMAKE_BUILD_TYPE=Release \
@@ -72,6 +76,7 @@ jobs:
             -DELIO_BUILD_TCP_BENCHMARKS=ON
 
       - name: Build conformance targets
+        id: build
         run: |
           cmake --build build-tcp-benchmark \
             --target bench_tcp_reference bench_tcp_reference_client \
@@ -80,6 +85,7 @@ jobs:
             --parallel 2
 
       - name: Run fixed-work conformance smoke
+        id: conformance
         run: |
           python3 tools/run-tcp-benchmark-conformance.py \
             --reference-server ./build-tcp-benchmark/examples/bench_tcp_reference \
@@ -93,6 +99,7 @@ jobs:
             --output-dir tcp-benchmark-conformance
 
       - name: Upload conformance evidence
+        id: conformance_artifact
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -104,34 +111,33 @@ jobs:
       - name: Summary
         if: always()
         shell: bash
+        env:
+          DEPENDENCIES_OUTCOME: ${{ steps.dependencies.outcome }}
+          RUNNER_SYNTAX_OUTCOME: ${{ steps.runner_syntax.outcome }}
+          CONFIGURE_OUTCOME: ${{ steps.configure.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          CONFORMANCE_OUTCOME: ${{ steps.conformance.outcome }}
+          ARTIFACT_URL: ${{ steps.conformance_artifact.outputs.artifact-url }}
         run: |
           {
-            echo "## TCP loopback conformance smoke"
-            echo
-            echo "This public GitHub runner validates protocol conformance, fixed-work completion, accounting, and the single-writer invariant. It is not a controlled performance baseline, publishes no cross-library ranking, and applies no performance-ratio gate."
-            echo
-            if [[ -f tcp-benchmark-conformance/results.jsonl ]]; then
-              result_count=$(wc -l < tcp-benchmark-conformance/results.jsonl)
-              valid_count=$(grep -c '"valid": true' tcp-benchmark-conformance/results.jsonl || true)
-              ineligible_count=$(grep -c '"performance_eligible": false' tcp-benchmark-conformance/results.jsonl || true)
-              echo "Conformance cases: ${result_count}"
-              echo "Valid cases: ${valid_count}/${result_count}"
-              echo "Performance-eligible cases: $((result_count - ineligible_count))/${result_count} (expected 0)"
+            if [[ -f tcp-benchmark-conformance/summary.md ]]; then
+              cat tcp-benchmark-conformance/summary.md
             else
-              echo "Conformance results: missing"
+              echo "## TCP loopback conformance smoke"
+              echo
+              echo "> [!WARNING]"
+              echo "> The runner-generated summary is unavailable. No conformance result can be inferred from this fallback."
+              echo
+              echo "| Stage | Outcome |"
+              echo "|---|---|"
+              echo "| Dependencies | ${DEPENDENCIES_OUTCOME:-not-run} |"
+              echo "| Runner syntax | ${RUNNER_SYNTAX_OUTCOME:-not-run} |"
+              echo "| Configure | ${CONFIGURE_OUTCOME:-not-run} |"
+              echo "| Build | ${BUILD_OUTCOME:-not-run} |"
+              echo "| Conformance runner | ${CONFORMANCE_OUTCOME:-not-run} |"
             fi
-            echo
-            if [[ -f tcp-benchmark-conformance/server-evidence.jsonl ]]; then
-              server_count=$(wc -l < tcp-benchmark-conformance/server-evidence.jsonl)
-              server_valid_count=$(grep -c '"valid": true' tcp-benchmark-conformance/server-evidence.jsonl || true)
-              echo "Server-observed evidence: ${server_valid_count}/${server_count} valid"
-            else
-              echo "Server-observed evidence: missing"
-            fi
-            echo
-            if [[ -f tcp-benchmark-conformance/manifest.json ]]; then
-              echo "Reproducibility manifest: present"
-            else
-              echo "Reproducibility manifest: missing"
+            if [[ -n "${ARTIFACT_URL}" ]]; then
+              echo
+              echo "[Download the complete conformance evidence artifact](${ARTIFACT_URL}) (retained for 90 days)."
             fi
           } >> "$GITHUB_STEP_SUMMARY"

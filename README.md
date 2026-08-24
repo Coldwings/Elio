@@ -339,7 +339,9 @@ their corresponding feature targets.
   (`bench_tcp_libuv*` requires system libuv development files).
   `tools/run-tcp-benchmark-conformance.py` compares all clients against one
   reference server, all servers against one reference client, and verifies
-  cross-runtime interoperability and fixed-work accounting. The separate
+  cross-runtime interoperability and fixed-work accounting. Its Markdown and
+  JSON summaries present the correctness matrices and the observed diagnostic
+  latency/throughput values without ranking the runtimes. The separate
   `tools/run-tcp-performance-comparison.py` produces balanced, paired results
   only for a controlled dedicated host.
 
@@ -615,10 +617,15 @@ Results from a shared CI runner are conformance evidence only. They are not a
 controlled performance baseline and must not be used for cross-library
 rankings or percentage-level regression claims. Every result in that artifact
 is explicitly marked `performance_eligible=false`; any retained elapsed values
-are unscored diagnostic evidence. The artifact also includes server-observed
-`server-evidence.jsonl` counters, a reproducibility manifest, and each executed
-command. Real performance comparisons must be produced separately on a
-dedicated, controlled runner using the procedure in the tuning guide.
+are unscored diagnostic evidence. The generated `summary.md` and `summary.json`
+make the correctness totals, the client/server and cross-runtime matrices, and
+the diagnostic latency and throughput observations directly visible. They do
+not publish a winner, performance ratio, or significance claim. GitHub Actions
+also places the Markdown report in the job summary and links the complete
+artifact. The artifact includes server-observed `server-evidence.jsonl`
+counters, a reproducibility manifest, and each executed command. Real
+performance comparisons must be produced separately on a dedicated,
+controlled runner using the procedure in the tuning guide.
 
 On a dedicated Linux host, choose client and server CPU sets that are distinct
 physical cores (not SMT siblings), then run the separate comparison driver:

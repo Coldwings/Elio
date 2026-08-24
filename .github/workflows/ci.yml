@@ -43,6 +43,7 @@ jobs:
             - 'examples/CMakeLists.txt'
             - 'tools/run-tcp-benchmark-conformance.py'
             - 'tools/run-tcp-performance-comparison.py'
+            - 'tests/unit/test_tcp_benchmark_conformance_summary.py'
             - 'CMakeLists.txt'
             - '*.cmake'
             - 'cmake/**'
@@ -166,6 +167,7 @@ jobs:
           http2_option_requires_http
           package_version_compatibility
           non_linux_platform_rejected
+          tcp_benchmark_conformance_summary
           elio_fork_boundary
           elio_fork_boundary_asan
           "endpoint comp channel fds are made non-blocking"
@@ -180,7 +182,7 @@ jobs:
         done
 
         ctest --test-dir build --output-on-failure \
-          -R "^(package_rdma_cuda_export_metadata|rdma_cuda_example_api_metadata|package_liburing_export_metadata|package_threads_export_metadata|package_rdma_dependency_export_metadata|package_elio_compile_feature_export|http2_fetchcontent_cache_scope|http2_option_requires_http|package_version_compatibility|non_linux_platform_rejected|elio_fork_boundary|elio_fork_boundary_asan|endpoint comp channel fds are made non-blocking)$"
+          -R "^(package_rdma_cuda_export_metadata|rdma_cuda_example_api_metadata|package_liburing_export_metadata|package_threads_export_metadata|package_rdma_dependency_export_metadata|package_elio_compile_feature_export|http2_fetchcontent_cache_scope|http2_option_requires_http|package_version_compatibility|non_linux_platform_rejected|tcp_benchmark_conformance_summary|elio_fork_boundary|elio_fork_boundary_asan|endpoint comp channel fds are made non-blocking)$"
 
         for test_binary in ./build/tests/elio_rdma_cuda_lifetime_tests; do
           if [[ ! -x "${test_binary}" ]]; then
@@ -365,6 +367,7 @@ jobs:
       uses: actions/checkout@v7
 
     - name: Install dependencies
+      id: tcp_dependencies
       if: needs.changes.outputs.tcp_benchmark == 'true'
       run: |
         sudo tee /etc/apt/apt.conf.d/99-elio-ci-network >/dev/null <<'APT'
@@ -395,6 +398,7 @@ jobs:
           g++-14
 
     - name: Check TCP benchmark runner syntax
+      id: tcp_runner_syntax
       if: needs.changes.outputs.tcp_benchmark == 'true'
       run: |
         python3 -m py_compile \
@@ -402,6 +406,7 @@ jobs:
           tools/run-tcp-performance-comparison.py
 
     - name: Configure TCP benchmark build
+      id: tcp_configure
       if: needs.changes.outputs.tcp_benchmark == 'true'
       run: |
         cmake -B build-tcp-benchmark -G Ninja \
@@ -416,6 +421,7 @@ jobs:
           -DELIO_BUILD_TCP_BENCHMARKS=ON
 
     - name: Build TCP benchmark targets
+      id: tcp_build
       if: needs.changes.outputs.tcp_benchmark == 'true'
       run: |
         cmake --build build-tcp-benchmark \
@@ -425,6 +431,7 @@ jobs:
           --parallel 2
 
     - name: Run TCP benchmark conformance smoke
+      id: tcp_conformance
       if: needs.changes.outputs.tcp_benchmark == 'true'
       run: |
         python3 tools/run-tcp-benchmark-conformance.py \
@@ -439,9 +446,44 @@ jobs:
           --output-dir tcp-benchmark-conformance
 
     - name: Upload TCP benchmark conformance evidence
+      id: tcp_conformance_artifact
       if: always() && needs.changes.outputs.tcp_benchmark == 'true'
       uses: actions/upload-artifact@v7
       with:
         name: tcp-benchmark-conformance
         path: tcp-benchmark-conformance/
         if-no-files-found: warn
+
+    - name: Publish TCP benchmark conformance summary
+      if: always() && needs.changes.outputs.tcp_benchmark == 'true'
+      shell: bash
+      env:
+        DEPENDENCIES_OUTCOME: ${{ steps.tcp_dependencies.outcome }}
+        RUNNER_SYNTAX_OUTCOME: ${{ steps.tcp_runner_syntax.outcome }}
+        CONFIGURE_OUTCOME: ${{ steps.tcp_configure.outcome }}
+        BUILD_OUTCOME: ${{ steps.tcp_build.outcome }}
+        CONFORMANCE_OUTCOME: ${{ steps.tcp_conformance.outcome }}
+        ARTIFACT_URL: ${{ steps.tcp_conformance_artifact.outputs.artifact-url }}
+      run: |
+        {
+          if [[ -f tcp-benchmark-conformance/summary.md ]]; then
+            cat tcp-benchmark-conformance/summary.md
+          else
+            echo "## TCP loopback conformance smoke"
+            echo
+            echo "> [!WARNING]"
+            echo "> The runner-generated summary is unavailable. No conformance result can be inferred from this fallback."
+            echo
+            echo "| Stage | Outcome |"
+            echo "|---|---|"
+            echo "| Dependencies | ${DEPENDENCIES_OUTCOME:-not-run} |"
+            echo "| Runner syntax | ${RUNNER_SYNTAX_OUTCOME:-not-run} |"
+            echo "| Configure | ${CONFIGURE_OUTCOME:-not-run} |"
+            echo "| Build | ${BUILD_OUTCOME:-not-run} |"
+            echo "| Conformance runner | ${CONFORMANCE_OUTCOME:-not-run} |"
+          fi
+          if [[ -n "${ARTIFACT_URL}" ]]; then
+            echo
+            echo "[Download the complete conformance evidence artifact](${ARTIFACT_URL})."
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"

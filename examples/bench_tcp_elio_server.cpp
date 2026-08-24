@@ -110,7 +110,9 @@ int main(int argc, char* argv[]) {
             co_await accept_loop(cfg, sched);
         });
         completion.wait_destroyed();
-        completion.await_resume();
+        if (completion.is_ready()) {
+            completion.await_resume();
+        }
     } catch (...) {
     }
     sched.shutdown();

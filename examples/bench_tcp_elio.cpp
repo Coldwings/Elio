@@ -342,7 +342,12 @@ int main(int argc, char* argv[]) {
             co_await client_main(cfg, ok);
         });
         completion.wait_destroyed();
-        completion.await_resume();
+        if (completion.is_ready()) {
+            completion.await_resume();
+        } else {
+            // A destroyed frame without a published result is not success.
+            ok.store(false, std::memory_order_relaxed);
+        }
     } catch (...) {
         ok.store(false, std::memory_order_relaxed);
     }

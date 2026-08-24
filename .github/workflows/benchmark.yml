@@ -1,4 +1,4 @@
-name: TCP Loopback Benchmark
+name: TCP Loopback Benchmark Conformance
 
 on:
   push:
@@ -7,30 +7,20 @@ on:
       - 'include/**'
       - 'examples/bench_tcp_*.cpp'
       - 'examples/bench_tcp_common.hpp'
+      - 'examples/bench_tcp_server_protocol.hpp'
       - 'examples/CMakeLists.txt'
+      - 'tools/run-tcp-benchmark-conformance.py'
+      - 'tools/run-tcp-performance-comparison.py'
       - 'CMakeLists.txt'
       - '*.cmake'
       - 'cmake/**'
       - '.github/workflows/benchmark.yml'
   workflow_dispatch:
-    inputs:
-      duration:
-        description: 'Measurement duration per size (seconds)'
-        required: false
-        default: '5'
-      warmup:
-        description: 'Warmup per size (seconds)'
-        required: false
-        default: '2'
-      mode:
-        description: 'Test mode (pingpong|streaming|both)'
-        required: false
-        default: 'both'
 
 jobs:
-  benchmark:
+  conformance:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     permissions:
       contents: read
 
@@ -61,239 +51,53 @@ jobs:
           retry_sudo apt-get update
           retry_sudo apt-get install -y libuv1-dev liburing-dev g++-14
 
+      - name: Check benchmark runner syntax
+        run: |
+          python3 -m py_compile \
+            tools/run-tcp-benchmark-conformance.py \
+            tools/run-tcp-performance-comparison.py
+
       - name: Configure
         run: |
-          cmake -B build \
+          cmake -S . -B build-tcp-benchmark \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc-14 \
             -DCMAKE_CXX_COMPILER=g++-14 \
             -DELIO_ENABLE_DEBUG_METADATA=OFF \
             -DELIO_BUILD_TESTS=OFF \
+            -DELIO_BUILD_EXAMPLES=ON \
             -DELIO_ENABLE_TLS=OFF \
             -DELIO_ENABLE_HTTP=OFF \
             -DELIO_ENABLE_HTTP2=OFF \
             -DELIO_BUILD_TCP_BENCHMARKS=ON
 
-      - name: Build
+      - name: Build conformance targets
         run: |
-          cmake --build build \
-            --target bench_tcp_elio bench_tcp_libuv bench_tcp_asio \
+          cmake --build build-tcp-benchmark \
+            --target bench_tcp_reference bench_tcp_reference_client \
+              bench_tcp_elio bench_tcp_libuv bench_tcp_asio \
+              bench_tcp_elio_server bench_tcp_libuv_server bench_tcp_asio_server \
             --parallel 2
 
-      - name: Run benchmarks
-        shell: bash
+      - name: Run fixed-work conformance smoke
         run: |
-          set -euo pipefail
+          python3 tools/run-tcp-benchmark-conformance.py \
+            --reference-server ./build-tcp-benchmark/examples/bench_tcp_reference \
+            --reference-client ./build-tcp-benchmark/examples/bench_tcp_reference_client \
+            --elio-client ./build-tcp-benchmark/examples/bench_tcp_elio \
+            --libuv-client ./build-tcp-benchmark/examples/bench_tcp_libuv \
+            --asio-client ./build-tcp-benchmark/examples/bench_tcp_asio \
+            --elio-server ./build-tcp-benchmark/examples/bench_tcp_elio_server \
+            --libuv-server ./build-tcp-benchmark/examples/bench_tcp_libuv_server \
+            --asio-server ./build-tcp-benchmark/examples/bench_tcp_asio_server \
+            --output-dir tcp-benchmark-conformance
 
-          duration="${{ inputs.duration || '5' }}"
-          warmup="${{ inputs.warmup || '2' }}"
-          mode="${{ inputs.mode || 'both' }}"
-
-          if [[ ! "$duration" =~ ^[0-9]+$ || ! "$warmup" =~ ^[0-9]+$ ]]; then
-            echo "::error::duration and warmup must be non-negative integers"
-            exit 2
-          fi
-          duration=$((10#$duration))
-          warmup=$((10#$warmup))
-          if (( duration < 1 )); then
-            echo "::error::duration must be at least 1 second"
-            exit 2
-          fi
-
-          case "$mode" in
-            pingpong|streaming|both) ;;
-            *)
-              echo "::error::mode must be pingpong, streaming, or both"
-              exit 2
-              ;;
-          esac
-
-          message_size_count=4
-          phase_budget=$((duration + warmup))
-          pingpong_watchdog_grace=$duration
-          if (( pingpong_watchdog_grace < 5 )); then
-            pingpong_watchdog_grace=5
-          fi
-          pingpong_timeout=$(( (phase_budget + pingpong_watchdog_grace) * message_size_count ))
-          streaming_timeout=$(( phase_budget * message_size_count ))
-
-          case "$mode" in
-            pingpong)
-              client_timeout=$(( pingpong_timeout + 60 ))
-              ;;
-            streaming)
-              client_timeout=$(( streaming_timeout + 60 ))
-              ;;
-            both)
-              client_timeout=$(( pingpong_timeout + streaming_timeout + 60 ))
-              ;;
-          esac
-          if (( client_timeout < 60 )); then
-            client_timeout=60
-          fi
-
-          backend_count=3
-          job_timeout_s=$((30 * 60))
-          setup_margin_s=300
-          max_total_client_timeout=$((job_timeout_s - setup_margin_s))
-          if (( client_timeout * backend_count > max_total_client_timeout )); then
-            echo "::error::duration, warmup, and mode require up to $((client_timeout * backend_count))s of client timeout budget, which does not fit in the 30-minute job timeout with setup margin"
-            exit 2
-          fi
-
-          server_job_running() {
-            local pid="$1"
-            jobs -pr | grep -Fxq "$pid"
-          }
-
-          cleanup_server() {
-            local pid="${1:-}"
-            [[ -z "$pid" ]] && return 0
-
-            if server_job_running "$pid"; then
-              kill "$pid" 2>/dev/null || true
-              for _ in {1..20}; do
-                if ! server_job_running "$pid"; then
-                  wait "$pid" 2>/dev/null || true
-                  return 0
-                fi
-                sleep 0.2
-              done
-              if server_job_running "$pid"; then
-                kill -9 "$pid" 2>/dev/null || true
-              fi
-            fi
-            wait "$pid" 2>/dev/null || true
-          }
-
-          pick_free_port() {
-            python3 -c 'import socket; sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM); sock.bind(("127.0.0.1", 0)); print(sock.getsockname()[1]); sock.close()'
-          }
-
-          pick_distinct_port() {
-            local port
-            local existing
-            local used
-
-            while true; do
-              port="$(pick_free_port)"
-              used=0
-              for existing in "$@"; do
-                if [[ "$port" == "$existing" ]]; then
-                  used=1
-                  break
-                fi
-              done
-              if (( used == 0 )); then
-                echo "$port"
-                return 0
-              fi
-            done
-          }
-
-          ensure_port_free() {
-            local name="$1"
-            local port="$2"
-
-            if (: > "/dev/tcp/127.0.0.1/${port}") >/dev/null 2>&1; then
-              echo "::error title=${name} benchmark port busy::port ${port} already accepts connections before the benchmark server starts"
-              return 1
-            fi
-          }
-
-          wait_for_server() {
-            local pid="$1"
-            local port="$2"
-            local server_log="$3"
-
-            for _ in {1..20}; do
-              if ! server_job_running "$pid"; then
-                wait "$pid" 2>/dev/null || true
-                echo "::error::benchmark server exited before accepting connections"
-                cat "$server_log" || true
-                return 1
-              fi
-              if (: > "/dev/tcp/127.0.0.1/${port}") >/dev/null 2>&1; then
-                return 0
-              fi
-              sleep 0.25
-            done
-
-            echo "::error::benchmark server did not accept connections on port ${port}"
-            cat "$server_log" || true
-            return 1
-          }
-
-          run_backend() {
-            local name="$1"
-            local binary="$2"
-            local port="$3"
-            local result_file="$4"
-            local server_log="$5"
-            local server_pid
-
-            echo "::group::${name} TCP loopback benchmark"
-            echo "Using loopback port ${port}"
-            if ! ensure_port_free "$name" "$port"; then
-              echo "::endgroup::"
-              return 1
-            fi
-
-            "$binary" -s -p "$port" >"$server_log" 2>&1 &
-            server_pid=$!
-
-            if ! wait_for_server "$server_pid" "$port" "$server_log"; then
-              cleanup_server "$server_pid"
-              echo "::endgroup::"
-              return 1
-            fi
-
-            set +e
-            timeout --kill-after=10s "${client_timeout}s" \
-              "$binary" -c -H 127.0.0.1 -p "$port" \
-                -d "$duration" \
-                -w "$warmup" \
-                -m "$mode" \
-              | tee "$result_file"
-            local client_status=${PIPESTATUS[0]}
-            set -e
-
-            cleanup_server "$server_pid"
-
-            if (( client_status != 0 )); then
-              echo "::error title=${name} benchmark failed::client exited with status ${client_status} after timeout budget ${client_timeout}s"
-              echo "::endgroup::"
-              return "$client_status"
-            fi
-
-            echo "::endgroup::"
-            return 0
-          }
-
-          overall_status=0
-          elio_port="$(pick_free_port)"
-          libuv_port="$(pick_distinct_port "$elio_port")"
-          asio_port="$(pick_distinct_port "$elio_port" "$libuv_port")"
-          echo "Selected benchmark ports: Elio=${elio_port}, libuv=${libuv_port}, Asio=${asio_port}"
-
-          run_backend "Elio" ./build/examples/bench_tcp_elio "$elio_port" elio_results.txt elio_server.log || overall_status=$?
-          run_backend "libuv" ./build/examples/bench_tcp_libuv "$libuv_port" libuv_results.txt libuv_server.log || overall_status=$?
-          run_backend "Asio" ./build/examples/bench_tcp_asio "$asio_port" asio_results.txt asio_server.log || overall_status=$?
-
-          exit "$overall_status"
-
-      - name: Upload results
+      - name: Upload conformance evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: benchmark-results-${{ github.sha }}
-          path: |
-            elio_results.txt
-            elio_server.log
-            libuv_results.txt
-            libuv_server.log
-            asio_results.txt
-            asio_server.log
+          name: tcp-benchmark-conformance-${{ github.sha }}
+          path: tcp-benchmark-conformance/
           retention-days: 90
           if-no-files-found: warn
 
@@ -301,35 +105,33 @@ jobs:
         if: always()
         shell: bash
         run: |
-          append_result() {
-            local name="$1"
-            local result_file="$2"
-            local server_log="$3"
-
-            echo "### ${name}" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            if [[ -f "$result_file" ]]; then
-              cat "$result_file" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## TCP loopback conformance smoke"
+            echo
+            echo "This public GitHub runner validates protocol conformance, fixed-work completion, accounting, and the single-writer invariant. It is not a controlled performance baseline, publishes no cross-library ranking, and applies no performance-ratio gate."
+            echo
+            if [[ -f tcp-benchmark-conformance/results.jsonl ]]; then
+              result_count=$(wc -l < tcp-benchmark-conformance/results.jsonl)
+              valid_count=$(grep -c '"valid": true' tcp-benchmark-conformance/results.jsonl || true)
+              ineligible_count=$(grep -c '"performance_eligible": false' tcp-benchmark-conformance/results.jsonl || true)
+              echo "Conformance cases: ${result_count}"
+              echo "Valid cases: ${valid_count}/${result_count}"
+              echo "Performance-eligible cases: $((result_count - ineligible_count))/${result_count} (expected 0)"
             else
-              echo "No client results produced." >> $GITHUB_STEP_SUMMARY
+              echo "Conformance results: missing"
             fi
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "<details><summary>${name} server log</summary>" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            if [[ -s "$server_log" ]]; then
-              tail -n 120 "$server_log" >> $GITHUB_STEP_SUMMARY
+            echo
+            if [[ -f tcp-benchmark-conformance/server-evidence.jsonl ]]; then
+              server_count=$(wc -l < tcp-benchmark-conformance/server-evidence.jsonl)
+              server_valid_count=$(grep -c '"valid": true' tcp-benchmark-conformance/server-evidence.jsonl || true)
+              echo "Server-observed evidence: ${server_valid_count}/${server_count} valid"
             else
-              echo "No server log output." >> $GITHUB_STEP_SUMMARY
+              echo "Server-observed evidence: missing"
             fi
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "</details>" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          }
-
-          echo "## TCP Loopback Benchmark Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          append_result "Elio" elio_results.txt elio_server.log
-          append_result "libuv" libuv_results.txt libuv_server.log
-          append_result "Asio" asio_results.txt asio_server.log
+            echo
+            if [[ -f tcp-benchmark-conformance/manifest.json ]]; then
+              echo "Reproducibility manifest: present"
+            else
+              echo "Reproducibility manifest: missing"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

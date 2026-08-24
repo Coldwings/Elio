@@ -205,10 +205,24 @@ endif()
 # TCP loopback benchmarks: Elio vs libuv vs standalone Asio
 # ---------------------------------------------------------------------------
 if(ELIO_BUILD_TCP_BENCHMARKS)
+    # Dependency-neutral protocol peer shared by every client adapter.  Keeping
+    # the peer identical is part of the benchmark's cross-library contract.
+    add_executable(bench_tcp_reference bench_tcp_reference.cpp)
+    target_link_libraries(bench_tcp_reference PRIVATE pthread)
+    target_link_options(bench_tcp_reference PRIVATE ${STATIC_LINK_FLAGS})
+
+    add_executable(bench_tcp_reference_client bench_tcp_reference_client.cpp)
+    target_link_libraries(bench_tcp_reference_client PRIVATE pthread)
+    target_link_options(bench_tcp_reference_client PRIVATE ${STATIC_LINK_FLAGS})
+
     # Elio benchmark (always available when examples are built)
     add_executable(bench_tcp_elio bench_tcp_elio.cpp)
     target_link_libraries(bench_tcp_elio PRIVATE elio)
     target_link_options(bench_tcp_elio PRIVATE ${STATIC_LINK_FLAGS})
+
+    add_executable(bench_tcp_elio_server bench_tcp_elio_server.cpp)
+    target_link_libraries(bench_tcp_elio_server PRIVATE elio)
+    target_link_options(bench_tcp_elio_server PRIVATE ${STATIC_LINK_FLAGS})
 
     # libuv benchmark (gated on system library)
     if(LIBUV_INCLUDE_DIR AND LIBUV_LIBRARY)
@@ -216,6 +230,12 @@ if(ELIO_BUILD_TCP_BENCHMARKS)
         target_include_directories(bench_tcp_libuv PRIVATE ${LIBUV_INCLUDE_DIR})
         target_link_libraries(bench_tcp_libuv PRIVATE ${LIBUV_LIBRARY} pthread dl)
         target_link_options(bench_tcp_libuv PRIVATE ${STATIC_LINK_FLAGS})
+
+        add_executable(bench_tcp_libuv_server bench_tcp_libuv_server.cpp)
+        target_include_directories(bench_tcp_libuv_server PRIVATE ${LIBUV_INCLUDE_DIR})
+        target_link_libraries(bench_tcp_libuv_server PRIVATE
+            ${LIBUV_LIBRARY} pthread dl)
+        target_link_options(bench_tcp_libuv_server PRIVATE ${STATIC_LINK_FLAGS})
     endif()
 
     # Standalone Asio benchmark (gated on FetchContent target)
@@ -223,5 +243,9 @@ if(ELIO_BUILD_TCP_BENCHMARKS)
         add_executable(bench_tcp_asio bench_tcp_asio.cpp)
         target_link_libraries(bench_tcp_asio PRIVATE asio pthread)
         target_link_options(bench_tcp_asio PRIVATE ${STATIC_LINK_FLAGS})
+
+        add_executable(bench_tcp_asio_server bench_tcp_asio_server.cpp)
+        target_link_libraries(bench_tcp_asio_server PRIVATE asio pthread)
+        target_link_options(bench_tcp_asio_server PRIVATE ${STATIC_LINK_FLAGS})
     endif()
 endif()

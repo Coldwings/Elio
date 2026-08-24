@@ -89,7 +89,7 @@ cmake -S . -B build-rdma \
   -DELIO_ENABLE_RDMA_IBVERBS_TESTS=ON \
   -DELIO_ENABLE_RDMA_CUDA=ON
 
-# Optional TCP benchmark comparison targets
+# Optional TCP loopback conformance and comparison targets
 cmake -S . -B build-tcp-bench \
   -DCMAKE_BUILD_TYPE=Release \
   -DELIO_BUILD_EXAMPLES=ON \
@@ -106,7 +106,10 @@ Note: strict warning flags are applied only to Elio's tests/examples targets and
 Enable RDMA, ibverbs, RDMA CM, CUDA, and TCP benchmark options only when the
 corresponding system dependencies are installed. For TCP benchmark comparison
 builds, install the libuv development package if you need `bench_tcp_libuv`;
-without libuv, CMake skips that target.
+without libuv, CMake skips that target. The TCP clients all connect to the same
+dependency-neutral `bench_tcp_reference` peer. See the
+[Performance Tuning Guide](wiki/Performance-Tuning.md#fair-tcp-loopback-benchmark)
+before interpreting their measurements.
 
 ### Install And Use As A Package
 
@@ -331,9 +334,14 @@ their corresponding feature targets.
 - **RDMA** (`elio_rdma`, `elio_rdma_ibverbs`, `elio_rdma_cm`,
   `elio_rdma_cuda`): `rdma_pingpong_mock.cpp`, `rdma_req_resp_ibverbs.cpp`,
   `rdma_perf.cpp`, `rdma_gpu_bw.cpp`
-- **TCP benchmark comparison** (`ELIO_BUILD_TCP_BENCHMARKS=ON`):
-  `bench_tcp_elio.cpp`, `bench_tcp_libuv.cpp`, `bench_tcp_asio.cpp`
-  (`bench_tcp_libuv` requires system libuv development files)
+- **TCP benchmark comparison** (`ELIO_BUILD_TCP_BENCHMARKS=ON`): a POSIX
+  reference server/client plus Elio, libuv, and Asio client/server adapters
+  (`bench_tcp_libuv*` requires system libuv development files).
+  `tools/run-tcp-benchmark-conformance.py` compares all clients against one
+  reference server, all servers against one reference client, and verifies
+  cross-runtime interoperability and fixed-work accounting. The separate
+  `tools/run-tcp-performance-comparison.py` produces balanced, paired results
+  only for a controlled dedicated host.
 
 Build and run examples:
 ```bash
@@ -579,6 +587,76 @@ cmake --build . --target quick_benchmark microbench scheduler_service_benchmark 
 # Scalability test
 ./examples/scalability_test
 ```
+
+The optional TCP loopback suite uses equivalent fixed-work contracts in two
+separately attributable directions: Elio, libuv, and Asio clients against one
+reference server, and one reference client against the three runtime servers.
+Its short conformance run also checks cross-runtime interoperability and
+correctness, rather than relative speed:
+
+```bash
+cmake --build . --target bench_tcp_reference bench_tcp_reference_client \
+  bench_tcp_elio bench_tcp_elio_server \
+  bench_tcp_libuv bench_tcp_libuv_server \
+  bench_tcp_asio bench_tcp_asio_server
+python3 ../tools/run-tcp-benchmark-conformance.py \
+  --reference-server ./examples/bench_tcp_reference \
+  --reference-client ./examples/bench_tcp_reference_client \
+  --elio-client ./examples/bench_tcp_elio \
+  --elio-server ./examples/bench_tcp_elio_server \
+  --libuv-client ./examples/bench_tcp_libuv \
+  --libuv-server ./examples/bench_tcp_libuv_server \
+  --asio-client ./examples/bench_tcp_asio \
+  --asio-server ./examples/bench_tcp_asio_server \
+  --output-dir tcp-benchmark-conformance
+```
+
+Results from a shared CI runner are conformance evidence only. They are not a
+controlled performance baseline and must not be used for cross-library
+rankings or percentage-level regression claims. Every result in that artifact
+is explicitly marked `performance_eligible=false`; any retained elapsed values
+are unscored diagnostic evidence. The artifact also includes server-observed
+`server-evidence.jsonl` counters, a reproducibility manifest, and each executed
+command. Real performance comparisons must be produced separately on a
+dedicated, controlled runner using the procedure in the tuning guide.
+
+On a dedicated Linux host, choose client and server CPU sets that are distinct
+physical cores (not SMT siblings), then run the separate comparison driver:
+
+```bash
+python3 ../tools/run-tcp-performance-comparison.py \
+  --reference-server ./examples/bench_tcp_reference \
+  --reference-client ./examples/bench_tcp_reference_client \
+  --elio-client ./examples/bench_tcp_elio \
+  --elio-server ./examples/bench_tcp_elio_server \
+  --libuv-client ./examples/bench_tcp_libuv \
+  --libuv-server ./examples/bench_tcp_libuv_server \
+  --asio-client ./examples/bench_tcp_asio \
+  --asio-server ./examples/bench_tcp_asio_server \
+  --client-cpus 2 --server-cpus 4 \
+  --dedicated-host \
+  --build-metadata /var/tmp/elio-build-metadata.json \
+  --blocks 18 --seed 1145 \
+  --output-dir /var/tmp/elio-tcp-performance-1145
+```
+
+The driver measures both attribution axes, balances all six runtime orders,
+retains raw trials and linked server evidence, and reports median, MAD, IQR,
+and paired bootstrap intervals. It measures the reference peer's CPU headroom
+for every trial. A saturated reference peer, missing affinity or
+`--dedicated-host` assertion, or unverifiable CPU topology makes the affected
+baseline unqualified and suppresses comparison ratios. A 95% interval too
+wide to resolve a two-percentage-point effect is
+reported as `inconclusive_at_2_percent`. This driver is syntax-checked but is
+never executed by public GitHub CI. Affinity checks do not prove that the host
+is otherwise idle; load, frequency, thermal state, and background services
+remain the operator's responsibility. The build metadata file must be a JSON
+object recording the compiler/version, build type, flags, and relevant CMake
+options plus the exact `source_revision`; its contents and SHA-256 are retained
+in the manifest. Missing or revision-mismatched build metadata, fewer than 18
+blocks, or a measured phase shorter than the default
+250 ms makes the run diagnostic-only. The 250 ms value is a hard publication
+floor: `--minimum-measured-ms` may raise it but cannot lower it.
 
 See [Performance Tuning Guide](wiki/Performance-Tuning.md) for optimization tips.
 

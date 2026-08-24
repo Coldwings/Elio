@@ -758,6 +758,190 @@ cmake --build build-release --target bench_join_destroy_atomic --parallel 2
 taskset -c 2,3 ./build-release/examples/bench_join_destroy_atomic --smoke
 ```
 
+## Fair TCP Loopback Benchmark
+
+The optional TCP loopback suite exposes two separately attributable comparison
+axes. Elio, libuv, and standalone Asio clients connect to the same
+dependency-neutral `bench_tcp_reference` server. The dependency-neutral
+`bench_tcp_reference_client` separately drives the Elio, libuv, and Asio
+servers. Every pair uses the same versioned wire contract and fixed amount of
+work. Self-pair measurements combine both halves of the system and therefore
+must be labelled as integration results, not as isolated client or server
+scores.
+
+The suite defines three separate workloads:
+
+- `latency` keeps exactly one record outstanding. After a fully drained fixed
+  warm-up, each measured sample starts immediately before one complete record
+  write and ends only after the matching echoed record has been completely read
+  and validated. It reports RTT distribution statistics and records per second.
+- `message` measures logical record rate. Every record is one complete logical
+  write operation in every adapter. There is one writer per TCP stream and at
+  most one write operation in flight. `--credit-window` limits sent records
+  whose echoes have not yet been validated; it never creates overlapping writes
+  on the same stream.
+- `bulk` measures application-record throughput. Every adapter uses the same
+  explicit `--chunk-bytes` logical write size and transfers exactly
+  `--bulk-bytes`, including the 32-byte benchmark header in each chunk. It
+  reports MiB/s, not an invented I/O-operation count.
+
+All workloads preallocate their hot-path buffers, handle short reads and writes
+until the negotiated record or chunk is complete, and validate trial identity,
+sequence, payload, duplicates, loss, and ordering. Warm-up records are fully
+acknowledged before the measured clock starts. The clock stops only after the
+last measured echo is verified, so an implementation cannot improve its result
+by closing with unaccounted work in flight.
+
+The deterministic payload is initialized once and only the fixed header is
+stamped for each send. Receivers still inspect every payload byte. This keeps
+the integrity check exact without making bulk timing include per-chunk payload
+generation and hashing; dedicated runs should still confirm that neither
+reference peer is saturated by validation work.
+
+Each performance JSON result is self-describing and includes its schema
+version, implementation, measured role, peer, workload, configured unit size,
+target and verified counts, logical write submissions and completions,
+sent/received/verified records, verified bytes, and maximum same-stream write
+concurrency. `counter_scope=adapter` identifies client adapter counters. A
+server performance result uses `counter_scope=driver` because its interval and
+request-side counters come from the common POSIX reference client. The server
+process independently emits per-connection counters to
+`server-evidence.jsonl`; the runner checks those server-observed record/byte
+totals, integrity status, and write concurrency against the scheduled work.
+A valid result must obey all of the following relevant identities:
+
+```text
+configured phase records == write_submissions == write_completions
+configured phase records == sent_records == received_records == verified_records
+sent_bytes == received_bytes == verified_bytes == records * write_size_bytes
+max_write_operations_in_flight <= 1
+max_unacknowledged_records <= credit_window
+all integrity, write-size, record-per-write, and transport error counts == 0
+```
+
+Run the short conformance suite after building the eight optional targets:
+
+```bash
+python3 tools/run-tcp-benchmark-conformance.py \
+  --reference-server build-release/examples/bench_tcp_reference \
+  --reference-client build-release/examples/bench_tcp_reference_client \
+  --elio-client build-release/examples/bench_tcp_elio \
+  --elio-server build-release/examples/bench_tcp_elio_server \
+  --libuv-client build-release/examples/bench_tcp_libuv \
+  --libuv-server build-release/examples/bench_tcp_libuv_server \
+  --asio-client build-release/examples/bench_tcp_asio \
+  --asio-server build-release/examples/bench_tcp_asio_server \
+  --output-dir tcp-benchmark-conformance
+```
+
+This smoke run proves protocol compatibility, termination, validation, exact
+accounting, equivalent logical write sizes, and the single-writer invariant. It
+also saves a manifest with the revision, environment, executable hashes, and
+every executed command. Every `results.jsonl` row from this runner is marked
+`performance_eligible=false`; its elapsed fields remain useful for diagnosing a
+stalled or anomalous run but are unscored. It does not prove that one
+implementation is faster.
+
+### Producing A Performance Baseline
+
+Use dedicated, otherwise-idle hardware for publishable comparisons. Pin the
+reference peer and client to fixed, disjoint physical CPUs; record the CPU,
+kernel, compiler, build flags, socket settings, frequency policy, benchmark
+schema, and revision; and retain every raw JSON result. Keep workload
+parameters identical across implementations and avoid background frequency or
+thermal changes.
+
+After building all eight binaries, invoke the dedicated comparison runner (the
+CPU numbers below are examples; verify they are separate physical cores on the
+actual host):
+
+```bash
+python3 tools/run-tcp-performance-comparison.py \
+  --reference-server build-release/examples/bench_tcp_reference \
+  --reference-client build-release/examples/bench_tcp_reference_client \
+  --elio-client build-release/examples/bench_tcp_elio \
+  --elio-server build-release/examples/bench_tcp_elio_server \
+  --libuv-client build-release/examples/bench_tcp_libuv \
+  --libuv-server build-release/examples/bench_tcp_libuv_server \
+  --asio-client build-release/examples/bench_tcp_asio \
+  --asio-server build-release/examples/bench_tcp_asio_server \
+  --client-cpus 2 --server-cpus 4 \
+  --dedicated-host \
+  --build-metadata /var/tmp/elio-build-metadata.json \
+  --blocks 18 --seed 1145 \
+  --output-dir /var/tmp/elio-tcp-performance-1145
+```
+
+The runner rejects overlapping or SMT-sibling CPU selections and records the
+seed, exact randomized order, commands, environment, clean revision, runner and
+binary hashes, raw `trials.jsonl`, and label-linked
+`server-evidence.jsonl`. Omitting affinity intentionally selects smoke mode:
+all samples remain `performance_eligible=false` and no comparison ratio is
+published. `--dedicated-host` records the operator's assertion that the host is
+otherwise idle; without it, results are also smoke-only. A dirty worktree also
+makes the run unqualified. CPU isolation does
+not prove that the machine is otherwise idle; checking system load, frequency,
+thermal state, and background services remains the operator's responsibility.
+
+`/var/tmp/elio-build-metadata.json` is a caller-maintained JSON object kept
+outside the worktree so creating it cannot make the source revision dirty. At
+minimum, record
+the compiler name/version, build type, compile/link flags, and CMake options,
+for example:
+
+```json
+{
+  "compiler": "g++",
+  "compiler_version": "14.2.0",
+  "build_type": "Release",
+  "cxxflags": "-O3 -DNDEBUG",
+  "ldflags": "",
+  "cmake_options": {"ELIO_ENABLE_DEBUG_METADATA": "OFF"},
+  "source_revision": "full-git-head-sha"
+}
+```
+
+The runner stores both the object and its SHA-256. Omitting it is allowed for a
+smoke run but makes every result ineligible for publication; a supplied file
+with missing fields or a `source_revision` different from HEAD is rejected.
+Likewise, fewer than 18 blocks or a measured phase shorter than the default
+250 ms is diagnostic-only. The runner rejects `--minimum-measured-ms` values
+below 250; the option may only raise the publication floor. Increase the fixed
+work count when a case is too short.
+
+For each client-reference trial the runner conservatively divides the POSIX
+reference server's whole-connection process CPU time (including warm-up) by the
+client's measured-phase wall time. This can overstate server utilization and
+make a trial ineligible, but cannot hide reference-server saturation. For each
+server-reference trial it divides the POSIX reference client's measured-phase
+process CPU time by that same phase's wall time. The default 90% saturation
+limit is configurable with
+`--reference-peer-max-cpu-percent`; reaching it marks the trial ineligible and
+suppresses aggregate ratios instead of attributing the reference bottleneck to
+the runtime under test.
+
+Run at least 18 balanced blocks for every workload and parameter set. Each
+block runs all three implementations once; distribute the six possible process
+orders evenly so cache, temperature, and time drift are not confounded with one
+adapter. Report the raw block samples, medians and dispersion, plus paired
+confidence intervals for comparisons. Investigate outliers rather than
+silently deleting them, and do not infer a regression or advantage from a
+percentage smaller than the observed run-to-run noise.
+
+`summary.json` and `summary.md` report per implementation, role, workload, and
+size medians, MAD, and IQR plus paired bootstrap 95% intervals. If the interval
+cannot resolve a two-percentage-point effect, the result is explicitly
+`inconclusive_at_2_percent`. Any failed eligibility condition marks the group
+unqualified and suppresses its pairwise change and interval.
+
+GitHub-hosted public runners execute only the fixed-work conformance smoke.
+Their changing hardware, co-tenancy, frequency state, and run order make them
+unsuitable for stable performance ratios. The workflow therefore publishes no
+cross-library ranking and applies no timing or performance-ratio gate. A real
+performance comparison must be generated by a separate dedicated-runner
+invocation following the balanced-block procedure above; public conformance
+artifacts must never be promoted into that sample set.
+
 ## Network Performance
 
 ### Connection Pooling

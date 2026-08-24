@@ -1,461 +1,273 @@
 /// @file bench_tcp_asio.cpp
-/// @brief TCP Loopback Benchmark using standalone Asio (callback-based)
-///
-/// Server and client for measuring TCP ping-pong latency and streaming
-/// throughput on loopback. Compare with bench_tcp_elio and bench_tcp_libuv.
-///
-/// Usage: bench_tcp_asio -s  (server)
-///        bench_tcp_asio -c  (client, default)
+/// @brief Fair TCP loopback client adapter using standalone Asio.
 
-#include <asio.hpp>
 #include "bench_tcp_common.hpp"
 
-#include <sys/socket.h>
+#include <asio.hpp>
 
-#include <atomic>
+#include <algorithm>
 #include <chrono>
-#include <condition_variable>
-#include <cstdlib>
-#include <cstring>
 #include <csignal>
+#include <cstdio>
+#include <fstream>
 #include <memory>
-#include <mutex>
+#include <span>
 #include <string>
-#include <thread>
 #include <vector>
 
 using asio::ip::tcp;
 
-static bool connect_socket(asio::io_context& io,
-                           tcp::socket& socket,
-                           const std::string& host,
-                           uint16_t port) {
-    tcp::resolver resolver(io);
-    std::error_code ec;
-    auto endpoints = resolver.resolve(host, std::to_string(port), ec);
-    if (ec) {
-        std::fprintf(stderr, "Resolve %s:%d failed: %s\n",
-                     host.c_str(), port, ec.message().c_str());
-        return false;
-    }
+namespace {
 
-    asio::connect(socket, endpoints, ec);
-    if (ec) {
-        std::fprintf(stderr, "Connect to %s:%d failed: %s\n",
-                     host.c_str(), port, ec.message().c_str());
-        return false;
-    }
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Server: echo via Asio callbacks
-// ---------------------------------------------------------------------------
-
-class echo_session : public std::enable_shared_from_this<echo_session> {
+class fixed_work_session {
 public:
-    echo_session(tcp::socket socket) : socket_(std::move(socket)) {}
-
-    void start() {
-        asio::error_code ec;
-        socket_.set_option(tcp::no_delay(true), ec);
-        do_read();
-    }
-
-private:
-    void do_read() {
-        auto self = shared_from_this();
-        socket_.async_read_some(
-            asio::buffer(buf_, sizeof(buf_)),
-            [this, self](std::error_code ec, size_t length) {
-                if (!ec) {
-                    do_write(length);
-                }
-            });
-    }
-
-    void do_write(size_t length) {
-        auto self = shared_from_this();
-        asio::async_write(
-            socket_, asio::buffer(buf_, length),
-            [this, self](std::error_code ec, size_t /*length*/) {
-                if (!ec) {
-                    do_read();
-                }
-            });
-    }
-
-    tcp::socket socket_;
-    char buf_[65536];
-};
-
-static void run_server(const bench::config& cfg) {
-    asio::io_context io(cfg.threads);
-
-    tcp::acceptor acceptor(io,
-        tcp::endpoint(asio::ip::make_address("0.0.0.0"), cfg.port));
-    acceptor.set_option(tcp::no_delay(true));
-
-    std::function<void()> do_accept;
-    do_accept = [&]() {
-        acceptor.async_accept(
-            [&](std::error_code ec, tcp::socket socket) {
-                if (!ec) {
-                    std::make_shared<echo_session>(std::move(socket))->start();
-                }
-                do_accept();
-            });
-    };
-    do_accept();
-
-    std::printf("Asio server listening on port %d\n", cfg.port);
-
-    std::vector<std::thread> threads;
-    for (int i = 1; i < cfg.threads; ++i) {
-        threads.emplace_back([&io] { io.run(); });
-    }
-    io.run();
-    for (auto& t : threads) t.join();
-}
-
-// ---------------------------------------------------------------------------
-// Client: ping-pong
-// ---------------------------------------------------------------------------
-
-static void run_client_pingpong(const bench::config& cfg, size_t msg_size,
-                                bench::pingpong_stats& out) {
-    asio::io_context io;
-
-    tcp::socket socket(io);
-    if (!connect_socket(io, socket, cfg.host, cfg.port)) {
-        return;
-    }
-    socket.set_option(tcp::no_delay(true));
-
-    std::vector<char> send_buf(msg_size, 'X');
-    std::vector<char> recv_buf(msg_size);
-    std::atomic<bool> timed_out{false};
-    std::mutex timer_mutex;
-    std::condition_variable timer_cv;
-    bool timer_cancelled = false;
-
-    std::thread timer_thread([&]() {
-        std::unique_lock<std::mutex> lock(timer_mutex);
-        // This is a stall watchdog, not the normal phase boundary. Warmup and
-        // measurement end through the loop deadlines below; allow one extra
-        // measurement window (at least 5s) before declaring a real timeout.
-        const auto budget = bench::pingpong_watchdog_budget(cfg);
-        if (timer_cv.wait_for(lock, budget, [&]() {
-                return timer_cancelled;
-            })) {
-            return;
+    fixed_work_session(const bench::config& cfg, bench::workload workload,
+                       std::size_t write_size, uint64_t trial)
+        : cfg_(cfg), io_(), socket_(io_), workload_(workload),
+          write_size_(write_size), trial_(trial), send_(write_size),
+          receive_(write_size) {
+        if (!bench::initialize_record(std::span<uint8_t>(send_))) {
+            throw std::invalid_argument("invalid TCP benchmark record size");
         }
-        timed_out.store(true, std::memory_order_release);
-        ::shutdown(socket.native_handle(), SHUT_RDWR);
-    });
-
-    auto stop_timer = [&]() {
-        {
-            std::lock_guard<std::mutex> lock(timer_mutex);
-            timer_cancelled = true;
+        result_.implementation = "asio";
+        if (!cfg.peer_implementation.empty()) {
+            result_.peer = cfg.peer_implementation;
         }
-        timer_cv.notify_one();
-        if (timer_thread.joinable()) {
-            timer_thread.join();
-        }
-    };
-
-    // Helper: full write
-    auto write_all = [&](const char* data, size_t n) -> bool {
-        while (n > 0) {
-            if (timed_out.load(std::memory_order_acquire)) {
-                return false;
-            }
-            std::error_code wec;
-            size_t written = socket.write_some(asio::buffer(data, n), wec);
-            if (wec) {
-                return false;
-            }
-            n -= written;
-            data += written;
-        }
-        return true;
-    };
-
-    // Helper: full read
-    auto read_all = [&](char* data, size_t n) -> bool {
-        while (n > 0) {
-            if (timed_out.load(std::memory_order_acquire)) {
-                return false;
-            }
-            std::error_code rec;
-            size_t got = socket.read_some(asio::buffer(data, n), rec);
-            if (rec) {
-                return false;
-            }
-            n -= got;
-            data += got;
-        }
-        return true;
-    };
-
-    std::vector<uint64_t> latencies;
-    latencies.reserve(static_cast<size_t>(cfg.duration_s) * 200000);
-
-    // Warmup
-    auto warmup_end = std::chrono::steady_clock::now() +
-                      std::chrono::seconds(cfg.warmup_s);
-    while (!timed_out.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < warmup_end) {
-        if (!write_all(send_buf.data(), msg_size)) {
-            stop_timer();
-            out.timed_out = timed_out.load(std::memory_order_acquire);
-            return;
-        }
-        if (!read_all(recv_buf.data(), msg_size)) {
-            stop_timer();
-            out.timed_out = timed_out.load(std::memory_order_acquire);
-            return;
+        result_.workload_type = workload;
+        result_.trial = trial;
+        result_.write_size = write_size;
+        result_.credit_window = workload == bench::workload::latency
+                                    ? 1U
+                                    : cfg.credit_window;
+        result_.warmup_expected_records = cfg.warmup_records;
+        result_.measured_expected_records =
+            workload == bench::workload::bulk
+                ? cfg.bulk_bytes / cfg.chunk_bytes
+                : cfg.records;
+        if (workload == bench::workload::latency) {
+            result_.latency_samples_ns.reserve(
+                result_.measured_expected_records);
         }
     }
 
-    latencies.clear();
-
-    // Measurement
-    auto measure_start = std::chrono::steady_clock::now();
-    auto measure_end   = measure_start + std::chrono::seconds(cfg.duration_s);
-    auto finish = [&]() {
-        out = bench::pingpong_stats::compute(latencies,
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - measure_start).count());
-        out.timed_out = timed_out.load(std::memory_order_acquire);
-    };
-
-    while (!timed_out.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < measure_end) {
-        auto t0 = std::chrono::steady_clock::now();
-        if (!write_all(send_buf.data(), msg_size)) {
-            finish();
-            stop_timer();
-            return;
+    bench::result run() {
+        tcp::resolver resolver(io_);
+        std::error_code error;
+        const auto endpoints = resolver.resolve(
+            cfg_.host, std::to_string(cfg_.port), error);
+        if (!error) asio::connect(socket_, endpoints, error);
+        if (error) {
+            result_.warmup.transport_errors++;
+            return result_;
         }
-        if (!read_all(recv_buf.data(), msg_size)) {
-            finish();
-            stop_timer();
-            return;
-        }
-        auto t1 = std::chrono::steady_clock::now();
-        latencies.push_back(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-    }
-
-    stop_timer();
-    finish();
-}
-
-// ---------------------------------------------------------------------------
-// Client: streaming
-// ---------------------------------------------------------------------------
-
-class streaming_session
-    : public std::enable_shared_from_this<streaming_session> {
-public:
-    streaming_session(asio::io_context& io, const bench::config& cfg,
-                      size_t msg_size)
-        : io_(io)
-        , socket_(io)
-        , msg_size_(msg_size)
-        , pipeline_depth_(bench::clamped_pipeline_depth(cfg))
-        , send_buf_(msg_size, 'X')
-        , recv_buf_(bench::kStreamingRecvBufferSize)
-        , warmup_s_(cfg.warmup_s)
-        , duration_s_(cfg.duration_s)
-        , timer_(io)
-    {
-    }
-
-    void run(bench::streaming_stats& out, const std::string& host, uint16_t port) {
-        out_ref_ = &out;
-
-        auto self = shared_from_this();
-        if (!connect_socket(io_, socket_, host, port)) {
-            return;
-        }
-        socket_.set_option(tcp::no_delay(true));
-
-        warmup_end_ = std::chrono::steady_clock::now() +
-                      std::chrono::seconds(warmup_s_);
-        measuring_ = false;
-        stopped_   = false;
-
-        // Start reader
-        do_read();
-
-        // Start writer pipeline
-        for (int i = 0; i < pipeline_depth_; ++i) {
-            do_write();
+        socket_.set_option(tcp::no_delay(true), error);
+        if (error) {
+            result_.warmup.transport_errors++;
+            return result_;
         }
 
-        // Timer for phase transitions
-        schedule_phase_check();
-
+        start_phase(bench::phase::warmup);
         io_.run();
-
-        // Compute results
-        double elapsed = std::chrono::duration<double>(
-            measure_end_ - measure_start_).count();
-        out = bench::streaming_stats::compute(
-            total_bytes_.load(), total_msgs_.load(), elapsed);
+        return result_;
     }
 
 private:
-    void do_read() {
-        if (stopped_) return;
-        auto self = shared_from_this();
-        socket_.async_read_some(
-            asio::buffer(recv_buf_.data() + recv_offset_,
-                         recv_buf_.size() - recv_offset_),
-            [this, self](std::error_code ec, size_t length) {
-                if (ec) {
-                    stopped_ = true;
+    bench::counters& current_counters() noexcept {
+        return phase_ == bench::phase::warmup ? result_.warmup
+                                               : result_.measured;
+    }
+
+    uint64_t target() const noexcept {
+        return phase_ == bench::phase::warmup
+                   ? result_.warmup_expected_records
+                   : result_.measured_expected_records;
+    }
+
+    void start_phase(bench::phase next) {
+        phase_ = next;
+        next_write_ = 0;
+        next_read_ = 0;
+        unacknowledged_ = 0;
+        if (target() == 0) {
+            finish_phase();
+            return;
+        }
+        start_read();
+        maybe_start_write();
+    }
+
+    void start_read() {
+        if (done_ || read_active_ || next_read_ >= target()) return;
+        read_active_ = true;
+        asio::async_read(
+            socket_, asio::buffer(receive_),
+            [this](std::error_code error, std::size_t bytes) {
+                read_active_ = false;
+                auto& counters = current_counters();
+                if (error || bytes != write_size_) {
+                    counters.transport_errors++;
+                    fail();
                     return;
                 }
-                size_t total = recv_offset_ + length;
-                const char* ptr = recv_buf_.data();
-                while (total >= msg_size_) {
-                    if (measuring_) {
-                        total_bytes_.fetch_add(msg_size_,
-                                               std::memory_order_relaxed);
-                        total_msgs_.fetch_add(1, std::memory_order_relaxed);
+                counters.receive_record(bytes);
+                const auto validation = bench::validate_record(
+                    std::span<const uint8_t>(receive_), phase_, trial_,
+                    next_read_, write_size_);
+                if (validation != bench::record_error::none) {
+                    if (validation == bench::record_error::sequence) {
+                        counters.sequence_errors++;
+                    } else if (validation == bench::record_error::phase) {
+                        counters.phase_errors++;
+                    } else {
+                        counters.payload_errors++;
                     }
-                    ptr += msg_size_;
-                    total -= msg_size_;
-                }
-                recv_offset_ = total;
-                if (total > 0) {
-                    std::memmove(recv_buf_.data(), ptr, total);
-                }
-                do_read();
-            });
-    }
-
-    void do_write() {
-        if (stopped_) return;
-        auto self = shared_from_this();
-        asio::async_write(
-            socket_, asio::buffer(send_buf_.data(), msg_size_),
-            [this, self](std::error_code ec, size_t /*length*/) {
-                if (ec) {
-                    stopped_ = true;
+                    fail();
                     return;
                 }
-                do_write();  // Send next
+                counters.verify_record(bytes);
+                if (unacknowledged_ == 0) {
+                    counters.sequence_errors++;
+                    fail();
+                    return;
+                }
+                --unacknowledged_;
+                ++next_read_;
+                if (phase_ == bench::phase::measured &&
+                    next_read_ == target()) {
+                    measure_end_ = std::chrono::steady_clock::now();
+                }
+                if (phase_ == bench::phase::measured &&
+                    workload_ == bench::workload::latency) {
+                    result_.latency_samples_ns.push_back(
+                        static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - latency_start_)
+                                .count()));
+                }
+                if (phase_complete()) {
+                    finish_phase();
+                    return;
+                }
+                start_read();
+                maybe_start_write();
             });
     }
 
-    void schedule_phase_check() {
-        if (stopped_) return;
-        auto self = shared_from_this();
-        timer_.expires_after(std::chrono::milliseconds(100));
-        timer_.async_wait([this, self](std::error_code ec) {
-            if (ec || stopped_) return;
-            auto now = std::chrono::steady_clock::now();
-            if (!measuring_ && now >= warmup_end_) {
-                measuring_    = true;
-                measure_start_ = now;
-                measure_end_  = now + std::chrono::seconds(duration_s_);
-                total_bytes_.store(0, std::memory_order_release);
-                total_msgs_.store(0, std::memory_order_release);
-            }
-            if (measuring_ && now >= measure_end_) {
-                stopped_ = true;
-                std::error_code close_ec;
-                socket_.close(close_ec);
-                return;
-            }
-            schedule_phase_check();
-        });
+    void maybe_start_write() {
+        if (done_ || write_active_ || next_write_ >= target() ||
+            unacknowledged_ >= result_.credit_window) {
+            return;
+        }
+
+        const uint64_t sequence = next_write_++;
+        if (!bench::stamp_record(std::span<uint8_t>(send_), phase_, trial_,
+                                 sequence)) {
+            current_counters().payload_errors++;
+            fail();
+            return;
+        }
+        if (phase_ == bench::phase::measured &&
+            workload_ == bench::workload::latency) {
+            latency_start_ = std::chrono::steady_clock::now();
+        }
+        if (phase_ == bench::phase::measured && sequence == 0) {
+            measure_start_ = std::chrono::steady_clock::now();
+        }
+
+        ++unacknowledged_;
+        auto& counters = current_counters();
+        counters.observe_unacknowledged(unacknowledged_);
+        counters.begin_write(write_size_, 1, write_size_);
+        write_active_ = true;
+        asio::async_write(
+            socket_, asio::buffer(send_),
+            [this](std::error_code error, std::size_t bytes) {
+                write_active_ = false;
+                auto& counters = current_counters();
+                if (error || bytes != write_size_) {
+                    counters.transport_errors++;
+                    fail();
+                    return;
+                }
+                counters.complete_write(bytes, 1, write_size_);
+                if (phase_complete()) {
+                    finish_phase();
+                    return;
+                }
+                maybe_start_write();
+            });
     }
 
-    asio::io_context& io_;
-    tcp::socket    socket_;
-    size_t         msg_size_;
-    int            pipeline_depth_;
-    std::vector<char> send_buf_;
-    std::vector<char> recv_buf_;
-    size_t         recv_offset_ = 0;
-    std::atomic<uint64_t> total_bytes_{0};
-    std::atomic<uint64_t> total_msgs_{0};
-    bool           measuring_ = false;
-    bool           stopped_ = false;
-    int            warmup_s_;
-    int            duration_s_;
-    asio::steady_timer timer_;
-    std::chrono::steady_clock::time_point warmup_end_;
-    std::chrono::steady_clock::time_point measure_start_;
-    std::chrono::steady_clock::time_point measure_end_;
-    bench::streaming_stats* out_ref_ = nullptr;
+    bool phase_complete() const noexcept {
+        const auto& counters = phase_ == bench::phase::warmup
+                                   ? result_.warmup
+                                   : result_.measured;
+        return next_read_ == target() && next_write_ == target() &&
+               counters.write_completions == target() &&
+               unacknowledged_ == 0 && !write_active_ && !read_active_;
+    }
+
+    void finish_phase() {
+        if (phase_ == bench::phase::warmup) {
+            result_.warmup_drained = true;
+            start_phase(bench::phase::measured);
+            return;
+        }
+        result_.elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                measure_end_ - measure_start_)
+                .count());
+        done_ = true;
+        std::error_code ignored;
+        socket_.shutdown(tcp::socket::shutdown_both, ignored);
+        socket_.close(ignored);
+    }
+
+    void fail() {
+        done_ = true;
+        std::error_code ignored;
+        socket_.cancel(ignored);
+        socket_.close(ignored);
+    }
+
+    const bench::config& cfg_;
+    asio::io_context io_;
+    tcp::socket socket_;
+    bench::workload workload_;
+    std::size_t write_size_;
+    uint64_t trial_;
+    bench::phase phase_ = bench::phase::warmup;
+    std::vector<uint8_t> send_;
+    std::vector<uint8_t> receive_;
+    uint64_t next_write_ = 0;
+    uint64_t next_read_ = 0;
+    uint64_t unacknowledged_ = 0;
+    bool write_active_ = false;
+    bool read_active_ = false;
+    bool done_ = false;
+    std::chrono::steady_clock::time_point measure_start_{};
+    std::chrono::steady_clock::time_point measure_end_{};
+    std::chrono::steady_clock::time_point latency_start_{};
+    bench::result result_;
 };
 
-static void run_client_streaming(const bench::config& cfg, size_t msg_size,
-                                 bench::streaming_stats& out) {
-    auto session = std::make_shared<streaming_session>(
-        *new asio::io_context(), cfg, msg_size);
-    // Note: io_context leaked intentionally for simplicity in benchmark
-    session->run(out, cfg.host, cfg.port);
+bool selected(const bench::config& cfg, bench::workload value) {
+    return cfg.type == bench::workload::all || cfg.type == value;
 }
 
-// ---------------------------------------------------------------------------
-// Client: drive all message sizes
-// ---------------------------------------------------------------------------
-
-static bool run_client(const bench::config& cfg) {
-    bench::print_header("Asio", cfg);
-
-    bool do_pingpong  = (cfg.type == bench::config::test_type::pingpong ||
-                         cfg.type == bench::config::test_type::both);
-    bool do_streaming = (cfg.type == bench::config::test_type::streaming ||
-                         cfg.type == bench::config::test_type::both);
-    bool ok = true;
-
-    if (do_pingpong) {
-        bench::print_pingpong_table_header();
-        for (int i = 0; i < bench::kNumMessageSizes; ++i) {
-            size_t sz = bench::kMessageSizes[i];
-            bench::pingpong_stats stats;
-            run_client_pingpong(cfg, sz, stats);
-            stats.print_row(sz);
-            if (const char* reason = bench::pingpong_failure_reason(stats)) {
-                bench::print_failure("Asio", "ping-pong", sz, reason);
-                ok = false;
-            }
-            std::fflush(stdout);
-        }
-        std::printf("\n");
+bool publish(const bench::config& cfg, const bench::result& result) {
+    bench::print_human(result);
+    const std::string json = bench::to_json_line(result);
+    std::printf("%s\n", json.c_str());
+    std::string error;
+    if (!bench::append_jsonl(cfg.json_path, result, &error)) {
+        std::fprintf(stderr, "%s\n", error.c_str());
+        return false;
     }
-
-    if (do_streaming) {
-        bench::print_streaming_table_header();
-        for (int i = 0; i < bench::kNumMessageSizes; ++i) {
-            size_t sz = bench::kMessageSizes[i];
-            bench::streaming_stats stats;
-            run_client_streaming(cfg, sz, stats);
-            stats.print_row(sz);
-            if (const char* reason = bench::streaming_failure_reason(stats)) {
-                bench::print_failure("Asio", "streaming", sz, reason);
-                ok = false;
-            }
-            std::fflush(stdout);
-        }
-        std::printf("\n");
-    }
-
-    return ok;
+    return result.valid();
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
+} // namespace
 
 int main(int argc, char* argv[]) {
     std::signal(SIGPIPE, SIG_IGN);
@@ -463,13 +275,29 @@ int main(int argc, char* argv[]) {
     try {
         cfg = bench::parse_args(argc, argv, "Asio");
     } catch (const bench::argument_error&) {
-        return 1;
+        return 2;
     }
 
-    if (cfg.run_mode == bench::config::mode::server) {
-        run_server(cfg);
-    } else {
-        return run_client(cfg) ? 0 : 1;
+    std::ofstream(cfg.json_path, std::ios::trunc).close();
+    bool ok = true;
+    auto run = [&](bench::workload workload, std::size_t size) {
+        fixed_work_session session(
+            cfg, workload, size, bench::selected_trial(cfg, workload, size));
+        ok = publish(cfg, session.run()) && ok;
+    };
+
+    if (selected(cfg, bench::workload::latency)) {
+        for (std::size_t size : bench::selected_message_sizes(cfg)) {
+            run(bench::workload::latency, size);
+        }
     }
-    return 0;
+    if (selected(cfg, bench::workload::message)) {
+        for (std::size_t size : bench::selected_message_sizes(cfg)) {
+            run(bench::workload::message, size);
+        }
+    }
+    if (selected(cfg, bench::workload::bulk)) {
+        run(bench::workload::bulk, cfg.chunk_bytes);
+    }
+    return ok ? 0 : 1;
 }

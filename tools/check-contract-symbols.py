@@ -211,10 +211,11 @@ def class_bodies(cache: dict[str, str], owner: str, want_ns: tuple) -> list[str]
 def has_member(bodies: list[str], leaf: str) -> bool:
     """`leaf(` in declaration context at direct member scope (brace-depth 1
     relative to the owner body). Candidates whose last non-space predecessor
-    is `.`, `->`, or `:` (member call, mem-initializer) do not count."""
+    is `.`, `->`, `:`, or `,` (member call, mem-initializer at any position)
+    do not count."""
     leaf_pat = re.compile(rf"\b{re.escape(leaf)}\s*\(")
     for body in bodies:
-        depths = [0] * (len(body) + 1)
+        depths = [1] * (len(body) + 1)
         d = 1
         for idx, ch in enumerate(body):
             if ch == "{":
@@ -226,7 +227,7 @@ def has_member(bodies: list[str], leaf: str) -> bool:
             k = m.start() - 1
             while k >= 0 and body[k] in " \t\n":
                 k -= 1
-            if k >= 0 and body[k] in ".>:":
+            if k >= 0 and body[k] in ".,>:":
                 continue
             if depths[m.start()] == 1:
                 return True
@@ -310,6 +311,7 @@ def main() -> int:
             "struct Wrap { class Wrapped { public: void lock(); }; };\n"
             "struct W2 { using AliasInClass = int; };\n"
             "class WithCtor { public: int wait; WithCtor() : wait(0) {} };\n"
+            "class WithCtor2 { public: int s_; int wait; WithCtor2() : s_(0), wait(0) {} };\n"
             "#ifdef HOOKS\n"
             "class PpCtor { public: PpCtor() : a_{0} {\n"
             "#else\n"
@@ -343,6 +345,7 @@ def main() -> int:
             ("fake::Nested::wait", False, "member of nested class must not count"),
             ("fake::Hidden::wait", False, "member of detail type must not count"),
             ("fake::WithCtor::wait", False, "mem-initializer and data member must not count"),
+            ("fake::WithCtor2::wait", False, "non-first mem-initializer must not count"),
         ]
         for sym, want, why in cases:
             got = symbol_exists(sym, {"fake": dict(fake)})

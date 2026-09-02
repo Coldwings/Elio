@@ -24,10 +24,18 @@ by a broad module heading without checking the feature page or header comment.
   behavior for that path.
 - For ambiguous cases, clarify the contract first, then decide whether code
   changes are still required.
+- If this page (or any Elio documentation) conflicts with the code, treat the
+  conflict as a defect and report it (issue or discussion). Do not "fix" code
+  to match documentation, and do not silently update documentation to match
+  code. For rows under "Elio guarantees", presume the code regressed; for all
+  other documentation, presume the documentation is stale, pending triage.
 - Protocol input from peers is a library boundary. Application payload meaning
   after protocol parsing is an application boundary.
 - Low-level parser, buffer-view, and verbs-adjacent interfaces can have stricter
   caller preconditions than high-level helpers.
+- Rows state the current rule only. Rationale, history, and rejected
+  alternatives live in the linked case law (issue/PR discussions), not in
+  this page.
 
 ## Cross-Cutting Defaults
 

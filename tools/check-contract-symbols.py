@@ -6,16 +6,21 @@ symbols in a machine-extractable form, so a drift check (does the symbol still
 exist in the headers?) needs NO new anchor syntax. Scope: one pilot section.
 
 Resolution rules:
+- Text is normalized first: single-pass comment/string stripping, then
+  preprocessor handling (the first branch of every #if/#ifdef chain is kept,
+  later branches dropped, so brace accounting survives the duplicated-brace
+  pattern this repo uses in #ifdef constructors), then all directive lines
+  removed.
 - A namespace-level row (`sync::mutex`) requires a DEFINITION of the leaf
-  (class/struct/enum body, or using-alias) at the PUBLIC namespace path
-  (elio::<subdir>), in comment-, string-literal-, and `#include`-line-stripped
-  header text. Forward/friend declarations, template parameters, elaborated
-  type specifiers, and same-named types in nested namespaces (e.g. detail)
+  (class/struct/enum body, or using-alias) at DIRECT scope of the public
+  namespace path elio::<subdir> (namespace-relative brace depth 1).
+  Forward/friend declarations, template parameters, elaborated type
+  specifiers/return types, nested-namespace types, and nested-class members
   do not count.
-- A member row (`sync::condition_variable::wait`) additionally requires the
-  member name in declaration context (`name(` not preceded by `.` or `->`)
-  at DIRECT member scope of the owner class body (brace-depth 1) — nested
-  classes and member-function bodies do not count.
+- A member row (`sync::condition_variable::wait`) additionally requires
+  `leaf(` in declaration context (not preceded by `.`, `->`, or `:` — the
+  last excludes mem-initializers) at direct member scope (brace-depth 1) of
+  the owner class body.
 - Function-style rows (e.g. `runtime::current_worker_id()`) are not validated
   by this pilot; future work.
 
@@ -37,10 +42,10 @@ INCLUDE = REPO / "include" / "elio"
 SECTION = "Synchronization Primitives"
 
 
-def strip_header(text: str) -> str:
-    """Remove comments and string/char literals in ONE left-to-right pass
-    (a `//` inside a string literal must not start a comment). Newlines are
-    preserved so line-oriented structure survives."""
+def strip_comments_and_strings(text: str) -> str:
+    """Single left-to-right pass: comments and string/char literals become
+    spaces (a `//` inside a string literal must not start a comment).
+    Newlines are preserved."""
     out = []
     i, n = 0, len(text)
     while i < n:
@@ -72,8 +77,36 @@ def strip_header(text: str) -> str:
         else:
             out.append(text[i])
             i += 1
-    return "\n".join(l for l in "".join(out).splitlines()
-                     if not l.lstrip().startswith("#include"))
+    return "".join(out)
+
+
+def select_pp_branch(text: str) -> str:
+    """Keep the first branch of every #if/#ifdef/#ifndef chain and drop
+    #elif/#else branches, so brace accounting survives duplicated-brace
+    conditional patterns. All directive lines are removed afterwards."""
+    out = []
+    stack: list[bool] = []
+    active = True
+    for line in text.splitlines():
+        m = re.match(r"\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b", line)
+        if m:
+            d = m.group(1)
+            if d in ("if", "ifdef", "ifndef"):
+                stack.append(active)          # take the first branch
+            elif d in ("elif", "else"):
+                active = stack[-1] and False if stack else False
+            elif d == "endif":
+                active = stack.pop() if stack else True
+            out.append("")
+        elif line.lstrip().startswith("#"):
+            out.append("")                    # drop all other directives
+        else:
+            out.append(line if active else "")
+    return "\n".join(out)
+
+
+def strip_header(text: str) -> str:
+    return select_pp_branch(strip_comments_and_strings(text))
 
 
 def load_headers(subdir: str) -> dict[str, str]:
@@ -87,38 +120,49 @@ def load_headers(subdir: str) -> dict[str, str]:
 NS_TOKEN = re.compile(r"\bnamespace\s+([\w]+(?:::[\w]+)*)\s*\{|\bnamespace\s*\{|[{}]")
 
 
-def ns_path_at(text: str, pos: int) -> tuple:
-    """Cumulative namespace path enclosing `pos` (handles both
-    `namespace a::b {` and nested `namespace a { namespace b {`)."""
+def scope_at(text: str, pos: int) -> tuple[tuple, int]:
+    """(cumulative namespace path, brace depth within the innermost
+    namespace) at `pos`. Handles `namespace a::b {`, nested forms, and
+    anonymous namespaces."""
     path: list[str] = []
     stack: list[tuple | None] = []
+    depth = 0
     for t in NS_TOKEN.finditer(text, 0, max(0, pos)):
         tok = t.group(0)
         if tok == "{":
             stack.append(None)
+            depth += 1
         elif tok == "}":
-            parts = stack.pop() if stack else None
-            if parts:
+            entry = stack.pop() if stack else None
+            if entry:
+                parts, _ = entry
                 del path[-len(parts):]
+            depth -= 1
         else:
             parts = tuple(t.group(1).split("::")) if t.group(1) else ("<anon>",)
             path.extend(parts)
-            stack.append(parts)
-    return tuple(path)
+            stack.append((parts, depth))
+            depth += 1
+    ns_entry_depths = [d for e in stack if e for _, d in [e]]
+    rel = depth - ns_entry_depths[-1] if ns_entry_depths else depth
+    return tuple(path), rel
 
 
 def defn_candidates(text: str, name: str):
-    """Yield match positions where `name` appears in a type-definition or
-    using-alias context. `[^;{]*{` already excludes forward/friend
-    declarations; here we also reject positions reached from `<`, `,`, or `(`
-    (template parameter lists and elaborated type specifiers)."""
+    """Candidate type-definition/using-alias matches for `name`.
+    `[^;{]*{` excludes forward/friend declarations; candidates reached from
+    `<`, `,`, `(` (template parameters, elaborated specifiers) are rejected;
+    a `(` between name and `{` (elaborated return type with inline body)
+    is also rejected."""
     pat = re.compile(
-        rf"\b(?:class|struct|enum(?:\s+class)?)\s+{re.escape(name)}\b[^;{{]*\{{")
+        rf"\b(?:class|struct|enum(?:\s+class)?)\s+{re.escape(name)}\b([^;{{]*)\{{")
     for m in pat.finditer(text):
         k = m.start() - 1
         while k >= 0 and text[k] in " \t\n":
             k -= 1
         if k >= 0 and text[k] in "<,(":
+            continue
+        if "(" in m.group(1) or ")" in m.group(1):
             continue
         yield m
     for m in re.finditer(rf"\busing\s+{re.escape(name)}\s*=", text):
@@ -128,16 +172,17 @@ def defn_candidates(text: str, name: str):
 def has_definition(cache: dict[str, str], name: str, want_ns: tuple) -> bool:
     for text in cache.values():
         for m in defn_candidates(text, name):
-            if ns_path_at(text, m.start()) == want_ns:
+            path, rel = scope_at(text, m.start())
+            if path == want_ns and rel == 1:
                 return True
     return False
 
 
 def class_bodies(cache: dict[str, str], owner: str, want_ns: tuple) -> list[str]:
-    """Owner class/struct bodies (brace-matched on stripped text), only from
-    definitions at the public namespace path."""
+    """Owner class/struct bodies at direct scope of the public namespace
+    (brace-matched on normalized text)."""
     bodies = []
-    pat = re.compile(rf"\b(?:class|struct)\s+{re.escape(owner)}\b[^;{{]*\{{")
+    pat = re.compile(rf"\b(?:class|struct)\s+{re.escape(owner)}\b([^;{{]*)\{{")
     for text in cache.values():
         for m in pat.finditer(text):
             k = m.start() - 1
@@ -145,7 +190,10 @@ def class_bodies(cache: dict[str, str], owner: str, want_ns: tuple) -> list[str]
                 k -= 1
             if k >= 0 and text[k] in "<,(":
                 continue
-            if ns_path_at(text, m.start()) != want_ns:
+            if "(" in m.group(1) or ")" in m.group(1):
+                continue
+            path, rel = scope_at(text, m.start())
+            if path != want_ns or rel != 1:
                 continue
             i = text.index("{", m.end() - 1)
             depth = 0
@@ -161,9 +209,10 @@ def class_bodies(cache: dict[str, str], owner: str, want_ns: tuple) -> list[str]
 
 
 def has_member(bodies: list[str], leaf: str) -> bool:
-    """`leaf(` in declaration context (not preceded by `.`/`->`) at DIRECT
-    member scope of the owner body (brace-depth 1 relative to the body)."""
-    leaf_pat = re.compile(rf"(?<![.>])\b{re.escape(leaf)}\s*\(")
+    """`leaf(` in declaration context at direct member scope (brace-depth 1
+    relative to the owner body). Candidates whose last non-space predecessor
+    is `.`, `->`, or `:` (member call, mem-initializer) do not count."""
+    leaf_pat = re.compile(rf"\b{re.escape(leaf)}\s*\(")
     for body in bodies:
         depths = [0] * (len(body) + 1)
         d = 1
@@ -174,6 +223,11 @@ def has_member(bodies: list[str], leaf: str) -> bool:
                 d -= 1
             depths[idx + 1] = d
         for m in leaf_pat.finditer(body):
+            k = m.start() - 1
+            while k >= 0 and body[k] in " \t\n":
+                k -= 1
+            if k >= 0 and body[k] in ".>:":
+                continue
             if depths[m.start()] == 1:
                 return True
     return False
@@ -243,7 +297,7 @@ def main() -> int:
 
     if self_test:
         # fixture-level pins (deterministic, independent of repo contents)
-        fake = {"fake.hpp": (
+        fake = {"fake.hpp": strip_header(
             "namespace elio::fake {\n"
             "class Fwd;\n"
             "class Real { public: void wait(int); };\n"
@@ -252,6 +306,17 @@ def main() -> int:
             "using Alias = Real;\n"
             "void take(class Elab s) { (void)s; }\n"
             "template<class TpParam> struct helper { TpParam s; };\n"
+            "class ElabRet make_elab() { return {}; }\n"
+            "struct Wrap { class Wrapped { public: void lock(); }; };\n"
+            "struct W2 { using AliasInClass = int; };\n"
+            "class WithCtor { public: int wait; WithCtor() : wait(0) {} };\n"
+            "#ifdef HOOKS\n"
+            "class PpCtor { public: PpCtor() : a_{0} {\n"
+            "#else\n"
+            "class PpCtor { public: PpCtor() : b_{0} {\n"
+            "#endif\n"
+            "  } };\n"
+            "class AfterIfdef { public: void wait(int); };\n"
             "}\n"
             "namespace elio::fake::detail {\n"
             "class Hidden { public: void wait(int); };\n"
@@ -267,11 +332,17 @@ def main() -> int:
             ("fake::Alias", True, "using alias must count"),
             ("fake::Elab", False, "elaborated type specifier must not count"),
             ("fake::TpParam", False, "template parameter must not count"),
+            ("fake::ElabRet", False, "elaborated return type must not count"),
+            ("fake::Wrapped", False, "nested-class member must not count"),
+            ("fake::AliasInClass", False, "member-scope alias must not count"),
             ("fake::Hidden", False, "nested-namespace type must not count"),
             ("fake::AfterString", True, "string containing // must not corrupt parsing"),
+            ("fake::AfterIfdef", True, "duplicated-brace #ifdef ctor must not corrupt accounting"),
+            ("fake::AfterIfdef::wait", True, "member after #ifdef block must still resolve"),
             ("fake::Real::wait", True, "member declaration in owner body must count"),
             ("fake::Nested::wait", False, "member of nested class must not count"),
             ("fake::Hidden::wait", False, "member of detail type must not count"),
+            ("fake::WithCtor::wait", False, "mem-initializer and data member must not count"),
         ]
         for sym, want, why in cases:
             got = symbol_exists(sym, {"fake": dict(fake)})

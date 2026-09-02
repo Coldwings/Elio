@@ -82,6 +82,8 @@ by a broad module heading without checking the feature page or header comment.
 | `time::sleep_until()` | Wakes at or after the requested time point. It has the same backend-fallback and blocking-pool rejection behavior as `sleep_for()`. | Use a clock/source appropriate for the application deadline and handle fallback rejection when the blocking pool can be shut down independently. |
 | `time::yield()` | Reschedules the current coroutine according to scheduler policy. | Use it to cooperate, not to enforce ordering with other tasks. |
 
+Case law (frozen): `runtime::scheduler` retirement and drain semantics — #1079; free `spawn()` failure reporting — #1072.
+
 ## Server Lifecycle And Signals
 
 The runtime (`run()`/`ELIO_ASYNC_MAIN`) and server (`serve()`/`serve_all()`)
@@ -102,6 +104,8 @@ from the per-thread signal masks used to route shutdown signals through
 | `signal::signal_block_guard` | Restores the previous signal mask when destroyed according to RAII semantics. | Keep guard lifetime aligned with the critical section that needs the mask. |
 | `signal::wait_signal()` | Creates a temporary `signal_fd`, waits for one matching signal, and returns `signal_info` or throws on read failure. | Keep the chosen `io_context` alive and explicitly unblock signals later if automatic blocking is used. |
 | `signal::signal_name()` and `signal::signal_number()` | Convert between supported signal numbers and conventional short names. | Handle null/unknown conversion results; do not use names as a portable policy boundary across platforms. |
+
+Case law (frozen): process-wide `SIGPIPE` disposition at runtime/server entry — #1076.
 
 ## I/O, Networking, And Streams
 
@@ -150,6 +154,8 @@ requests does not make their higher-level ordering or object lifetime safe.
 | `net::stream` concept/helpers | Expose generic stream requirements for APIs that accept stream-like types. | Provide streams that satisfy the expected read/write/close contract for the consuming API. |
 | `io::io_op`, `io::io_request`, and `io::io_backend` | Define the low-level backend request/result contract used by concrete I/O backends. `io_context` does not expose mutable raw backend access. | Treat direct backend instances as standalone backend integration interfaces. Serialize and drive them yourself, and keep request-owned buffers, addresses, and op state alive according to the backend contract. |
 | `io::io_uring_backend` and `io::epoll_backend` | Normalize supported backend completions into Elio awaitable results and release operation ownership before resuming the continuation. | Select a backend supported by the kernel and deployment. Do not bypass owner-thread rules or infer stream/fd concurrency safety from backend queue acceptance. |
+
+Case law (frozen): `read_exactly()` early-EOF `-ENODATA` reporting — #1075.
 
 ## TLS
 
@@ -255,6 +261,8 @@ Names below use the convenience re-exports from `<elio/http/websocket.hpp>` and
 | `sync::spinlock_guard` | Releases the spinlock on guard destruction. | Keep the spinlock alive for the guard lifetime and keep the critical section short. |
 | `runtime::chase_lev_deque<T>` | Provides the scheduler's owner-push/pop and thief-steal work-queue behavior with documented memory-ordering guarantees. | Use owner-only and thief-only operations according to the Chase-Lev role contract. Do not use it as a general application queue unless you preserve those roles. |
 | `sync::LockfreeMPMCRing<T>` | Provides bounded MPMC `try_push()`/`try_pop()` operations and approximate diagnostic size/empty queries. | Use only nothrow-movable element types. Treat `size()`/`empty()` as approximate under contention and keep element ownership rules explicit. |
+
+Case law (frozen): `sync::semaphore` permit/cancellation handoff — #1078, #1094; `sync::condition_variable::wait` re-lock contract — #1073; `sync::channel<T>` observer and close semantics — #1077, #1096.
 
 ## Hash Functions
 

@@ -52,6 +52,9 @@ jobs:
           DRIFT_EXIT_CODE: ${{ steps.check.outputs.exit_code }}
         with:
           script: |
+            // The sentinel is report-only: it must never fail the workflow.
+            // Any API error is downgraded to a warning.
+            try {
             const fs = require('fs');
             const marker = '<!-- contract-drift-sentinel -->';
             const exitCode = process.env.DRIFT_EXIT_CODE || '0';
@@ -80,6 +83,8 @@ jobs:
               let kind;
               if (report.includes('usage error')) {
                 kind = 'checker usage error (sentinel workflow defect)';
+              } else if (report.includes('Traceback (most recent call last)')) {
+                kind = 'checker crash (sentinel infrastructure defect)';
               } else if (report.includes('section not found')) {
                 kind = 'contract section not found (format drift)';
               } else if (report.includes('no contract rows parsed')) {
@@ -154,4 +159,7 @@ jobs:
               core.info(`Resolved and closed #${existing.number}.`);
             } else {
               core.info('Clean run and no open sentinel issue; nothing to do.');
+            }
+            } catch (error) {
+              core.warning(`Contract drift sentinel reporting failed: ${error}`);
             }

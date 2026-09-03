@@ -73,9 +73,20 @@ jobs:
             );
 
             if (!clean) {
-              const kind = exitCode === '2'
-                ? 'usage error (contract table format drift)'
-                : 'documented symbols missing from the headers';
+              // Classify from the report text, not the exit code: the checker
+              // uses exit 1 for both missing symbols and format drift
+              // (section not found / zero parsed rows), and exit 2 only for a
+              // usage error in the caller (this workflow itself).
+              let kind;
+              if (report.includes('usage error')) {
+                kind = 'checker usage error (sentinel workflow defect)';
+              } else if (report.includes('section not found')) {
+                kind = 'contract section not found (format drift)';
+              } else if (report.includes('no contract rows parsed')) {
+                kind = 'contract table format drift (no rows parsed)';
+              } else {
+                kind = 'documented symbols missing from the headers';
+              }
               const body = [
                 marker,
                 '## Contract drift detected (report-only)',

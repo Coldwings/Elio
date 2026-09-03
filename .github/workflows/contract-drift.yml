@@ -1,0 +1,146 @@
+name: Contract Drift Sentinel
+
+# Report-only sentinel around tools/check-contract-symbols.py.
+#
+# When a documented contract symbol can no longer be resolved in the headers,
+# this workflow opens (or follows up on) an advisory issue. It never adds a
+# status check and never gates a PR: per the API contract governance rule,
+# doc-code conflicts are reported as defects and adjudicated by a maintainer,
+# not silently fixed in either direction and not blocked by CI.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Mondays 09:17 UTC (off the top of the hour).
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: contract-drift-sentinel
+  cancel-in-progress: false
+
+jobs:
+  sentinel:
+    name: Report-only contract drift check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Run contract symbol drift check
+        id: check
+        run: |
+          rc=0
+          python3 tools/check-contract-symbols.py \
+            --section "Synchronization Primitives" > drift-report.txt 2>&1 || rc=$?
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          cat drift-report.txt >> "$GITHUB_STEP_SUMMARY"
+          if [ "$rc" -eq 0 ]; then
+            echo "Contract rows resolve cleanly."
+          else
+            echo "::warning::Contract drift detected (checker exit code $rc); filing a report-only issue."
+          fi
+
+      - name: Open, update, or resolve the drift report issue
+        uses: actions/github-script@v8
+        env:
+          DRIFT_EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- contract-drift-sentinel -->';
+            const exitCode = process.env.DRIFT_EXIT_CODE || '0';
+            const clean = exitCode === '0';
+            const report = fs.readFileSync('drift-report.txt', 'utf8').trim();
+            const sha = context.sha;
+            const shortSha = sha.slice(0, 12);
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // Locate an open sentinel issue (never a PR, marker must be in the body).
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              ...context.repo,
+              state: 'open',
+              labels: 'contract',
+              per_page: 100,
+            });
+            const existing = openIssues.find(
+              (i) => !i.pull_request && (i.body || '').includes(marker),
+            );
+
+            if (!clean) {
+              const kind = exitCode === '2'
+                ? 'usage error (contract table format drift)'
+                : 'documented symbols missing from the headers';
+              const body = [
+                marker,
+                '## Contract drift detected (report-only)',
+                '',
+                'The contract drift sentinel (`tools/check-contract-symbols.py`) detected drift',
+                'against the *Synchronization Primitives* section of `wiki/API-Contracts.md`.',
+                '',
+                `- Signal: ${kind} (checker exit code ${exitCode})`,
+                `- Commit: ${sha}`,
+                `- Workflow run: ${runUrl}`,
+                '',
+                'Per the API contract governance rule, doc-code conflicts are reported as',
+                'defects and adjudicated by a maintainer. This issue is advisory and does',
+                'not block any change.',
+                '',
+                '```',
+                report,
+                '```',
+                '',
+              ].join('\n');
+
+              if (existing) {
+                await github.rest.issues.createComment({
+                  ...context.repo,
+                  issue_number: existing.number,
+                  body: [
+                    `Still drifting at ${shortSha} (exit code ${exitCode}). Workflow run: ${runUrl}`,
+                    '',
+                    '```',
+                    report,
+                    '```',
+                  ].join('\n'),
+                });
+                core.info(`Followed up on existing issue #${existing.number}.`);
+              } else {
+                const created = await github.rest.issues.create({
+                  ...context.repo,
+                  title: '[Contract] Symbol drift detected against API contract tables',
+                  body,
+                  labels: ['contract'],
+                });
+                core.info(`Opened issue #${created.data.number}.`);
+              }
+            } else if (existing) {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: existing.number,
+                body: [
+                  `The drift no longer reproduces at ${shortSha}: all contract rows resolve.`,
+                  'Closing automatically.',
+                  '',
+                  '```',
+                  report,
+                  '```',
+                  '',
+                  `Workflow run: ${runUrl}`,
+                ].join('\n'),
+              });
+              await github.rest.issues.update({
+                ...context.repo,
+                issue_number: existing.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              core.info(`Resolved and closed #${existing.number}.`);
+            } else {
+              core.info('Clean run and no open sentinel issue; nothing to do.');
+            }

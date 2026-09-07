@@ -47,7 +47,7 @@ jobs:
           fi
 
       - name: Open, update, or resolve the drift report issue
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           DRIFT_EXIT_CODE: ${{ steps.check.outputs.exit_code }}
         with:

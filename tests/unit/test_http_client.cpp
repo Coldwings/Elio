@@ -2657,6 +2657,85 @@ TEST_CASE("HTTP client with zero expect-continue timeout sends body immediately"
     REQUIRE(got_status == 200);
 }
 
+TEST_CASE("HTTP client bounds the expect-continue wait by the response deadline",
+          "[http][client][expect-continue]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
+    std::atomic<bool> server_saw_body{true};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> client_failed{false};
+    std::atomic<int> client_errno{0};
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
+        auto accum = co_await read_request_headers(*stream);
+        auto [headers, early_body] =
+            split_headers_and_early_body(std::move(accum));
+        (void)headers;
+
+        // Stay silent. The client must give up at read_timeout (1s), well
+        // before expect_continue_timeout (1.5s), close its side, and never
+        // send the body.
+        std::string late = std::move(early_body);
+        char buf[1024];
+        while (true) {
+            auto r = co_await stream->read(buf, sizeof(buf));
+            if (r.result <= 0) {
+                break;
+            }
+            late.append(buf, static_cast<size_t>(r.result));
+        }
+        server_saw_body = !late.empty();
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(1);
+        cfg.expect_continue_timeout = std::chrono::milliseconds(1500);
+        elio::http::client c(cfg);
+
+        elio::http::request req(elio::http::method::POST, "/");
+        req.set_body(std::string_view("payload"));
+        req.set_expect_continue();
+
+        auto target = elio::http::url::parse(make_url(port));
+        if (target) {
+            auto resp = co_await c.send(req, *target);
+            if (!resp) {
+                client_failed = true;
+                client_errno = errno;
+            }
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(server_accepted);
+    REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(client_failed);
+    REQUIRE(client_errno == ETIMEDOUT);
+    REQUIRE_FALSE(server_saw_body);
+}
+
 TEST_CASE("WebSocket client skips interim responses before upgrade",
           "[websocket][client][handshake][regression]") {
     SECTION("100 Continue before 101") {

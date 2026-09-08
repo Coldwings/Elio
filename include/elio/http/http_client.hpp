@@ -44,7 +44,10 @@ struct client_config : base_client_config {
     /// Deadline for waiting on an interim 100 Continue when a request uses
     /// request::set_expect_continue(). On expiry the body is sent anyway
     /// (RFC 9110 §10.1.1 fallback). A value <= 0 skips the wait: the body
-    /// is sent immediately after the headers.
+    /// is sent immediately after the headers. The wait is additionally
+    /// bounded by the absolute response deadline (read_timeout), whichever
+    /// expires first; response-deadline expiry fails the request with
+    /// ETIMEDOUT instead of triggering the fallback.
     std::chrono::milliseconds expect_continue_timeout{1000};
 
     client_config() {
@@ -590,11 +593,30 @@ private:
                     wait_parse = pr;
                     pending_response_bytes.clear();
                 } else {
-                    auto remaining =
-                        expect_deadline - std::chrono::steady_clock::now();
+                    const auto now = std::chrono::steady_clock::now();
+                    auto remaining = expect_deadline - now;
                     if (remaining.count() <= 0) {
                         send_body = true;  // Timeout fallback.
                         break;
+                    }
+                    // The wait is additionally bounded by the absolute
+                    // response deadline (read_timeout), whichever expires
+                    // first. Expect-timeout expiry falls back to sending
+                    // the body; response-deadline expiry fails the request
+                    // as a timeout instead — read_timeout is documented as
+                    // the request/response read deadline, so the expect
+                    // wait must not overrun it.
+                    const auto response_remaining = response_deadline - now;
+                    const bool response_deadline_first =
+                        deadline_enforced && response_remaining < remaining;
+                    if (response_deadline_first) {
+                        if (response_remaining.count() <= 0) {
+                            ELIO_LOG_ERROR("Total response timeout exceeded for {}:{}",
+                                           target.host, target.effective_port());
+                            errno = ETIMEDOUT;
+                            co_return std::nullopt;
+                        }
+                        remaining = response_remaining;
                     }
                     auto wait_expired =
                         std::make_shared<std::atomic<bool>>(false);
@@ -617,6 +639,12 @@ private:
 
                     if (wait_expired->load(std::memory_order_acquire) &&
                         read_result.result <= 0) {
+                        if (response_deadline_first) {
+                            ELIO_LOG_ERROR("Total response timeout exceeded for {}:{}",
+                                           target.host, target.effective_port());
+                            errno = ETIMEDOUT;
+                            co_return std::nullopt;
+                        }
                         send_body = true;  // Timeout fallback.
                         break;
                     }

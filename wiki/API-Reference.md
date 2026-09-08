@@ -2584,7 +2584,10 @@ response normally (any further interim 1xx responses are skipped). If the
 server answers with a final response first (for example `417 Expectation
 Failed`), the body is not sent and the response is consumed as usual. If the
 deadline expires first, the body is sent anyway (RFC 9110 §10.1.1 fallback).
-A value less than or equal to zero skips the wait entirely: the body is sent
+The wait is additionally bounded by the absolute response deadline
+(`read_timeout`), whichever expires first; response-deadline expiry fails the
+request with `ETIMEDOUT` instead of triggering the fallback. A value less
+than or equal to zero skips the wait entirely: the body is sent
 immediately after the headers. For redirects that preserve the request body
 (307/308 and method-preserving redirects), the Expect handshake re-runs per
 hop.

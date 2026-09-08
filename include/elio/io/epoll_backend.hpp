@@ -599,9 +599,14 @@ public:
         deferred_resume_entry to_resume{};
         bool found_entry = false;
 
+        // Only non-terminal ready ops may be claimed here. (Currently every
+        // ready-queue entry is terminal — see queue_ready_op — so this scan
+        // is defensive; the fd_state erasure below stays correct for any
+        // future non-terminal ready op.)
         auto ready_it = std::find_if(ready_ops_.begin(), ready_ops_.end(),
                                      [user_data](const pending_operation& op) {
-                                         return cancel_key_for(op) == user_data;
+                                         return !op.terminal_completion &&
+                                                cancel_key_for(op) == user_data;
                                      });
         if (ready_it != ready_ops_.end()) {
             int ready_fd = ready_it->req.fd;
@@ -724,6 +729,12 @@ private:
         std::coroutine_handle<> awaiter;
         bool synchronous = false;
         io_result precompleted_result{0, 0};
+        /// True for ready-queue entries whose result is already computed
+        /// (see queue_ready_op). cancel() must not claim them: the real
+        /// result wins over a later cancellation request, mirroring
+        /// io_uring's ASYNC_CANCEL completing -ENOENT on an
+        /// already-completed op while its CQE is delivered normally.
+        bool terminal_completion = false;
     };
     
     /// Cached result of fstat(2) for an fd. epoll_ctl rejects regular files
@@ -806,6 +817,10 @@ private:
 
     bool queue_ready_op(pending_operation op, io_result result) {
         op.precompleted_result = result;
+        // Every ready-queue result is already computed at queue time
+        // (inline regular-file syscall, precompleted connect, early
+        // rejection), so its completion is terminal against cancellation.
+        op.terminal_completion = true;
         ready_ops_.push_back(std::move(op));
         pending_count_++;
         notify();

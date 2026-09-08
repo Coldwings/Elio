@@ -42,7 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `async_poll_write` on regular files complete immediately as ready. Because
   these operations complete without a real suspension, cancellation tokens
   are no-ops for them under epoll (io_uring keeps them cancellable until
-  completion). The cached file type is invalidated as soon as the fd's
+  completion); inline completions are terminal, so a cancellation request
+  that arrives after the syscall executed cannot preempt the real result,
+  matching io_uring's already-completed behavior. The cached file type is
+  invalidated as soon as the fd's
   backend state becomes inert (last operation completed, cancellation, or
   close), so a recycled fd number is always re-probed. Backend prepare
   rejections now also surface the real errno (for example `-EPERM`) instead

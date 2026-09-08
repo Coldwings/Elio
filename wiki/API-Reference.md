@@ -1709,6 +1709,10 @@ syscall itself.
 Because these operations complete without a real suspension, cancellation
 tokens are no-ops for them under epoll, whereas the io_uring backend keeps
 the equivalent submission truly cancellable until its completion arrives.
+Once the inline syscall has executed, the completion is terminal: it wins
+over a cancellation request that arrives before the result is collected,
+mirroring io_uring's already-completed behavior where `ASYNC_CANCEL`
+reports `-ENOENT` and the real result is delivered.
 Timeout wrappers remain harmless because completion is immediate. The
 inline syscall may briefly block the worker on disk I/O, matching the batch
 I/O fallback above.

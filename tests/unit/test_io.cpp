@@ -1744,7 +1744,7 @@ TEST_CASE("epoll fd kind cache is invalidated when an fd number is recycled",
         unlink(tmpfile);
     }
 
-    SECTION("cancel of a queued ready op drops the fd state (raw backend)") {
+    SECTION("cancel attempt on a queued ready op still recycles cleanly (raw backend)") {
         epoll_backend backend;
 
         char tmpfile[] = "/tmp/elio_test_epoll_cxlkind_XXXXXX";
@@ -1753,8 +1753,7 @@ TEST_CASE("epoll fd kind cache is invalidated when an fd number is recycled",
 
         // Prime an inline write: the fd_state entry (kind=regular) is
         // created and the op is parked in the ready queue. A stack op_state
-        // with a null coroutine handle gives cancel() a matchable key; the
-        // claim itself safely goes nowhere.
+        // with a null coroutine handle gives cancel() a matchable key.
         op_state state;
         char byte = 'x';
         io_request wreq{};
@@ -1766,8 +1765,13 @@ TEST_CASE("epoll fd kind cache is invalidated when an fd number is recycled",
         wreq.state = &state;
         REQUIRE(backend.prepare(wreq));
 
-        // Cancel before any poll drains the ready queue.
+        // Ready-queue completions are terminal: cancel() declines to claim
+        // the op, poll() delivers the real result, and the delivery drops
+        // the now-inert fd_state entry.
         backend.cancel(tagged_op_state_user_data(&state));
+        REQUIRE(backend.has_pending());
+        REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+        REQUIRE(state.result == 1);
         REQUIRE(!backend.has_pending());
 
         // The fd_state entry must be gone: recycle the fd number for a pipe
@@ -1793,6 +1797,62 @@ TEST_CASE("epoll fd kind cache is invalidated when an fd number is recycled",
         REQUIRE(close(pipefd[0]) == 0);
         REQUIRE(close(pipefd[1]) == 0);
         unlink(tmpfile);
+    }
+}
+
+TEST_CASE("epoll precompleted ready results are terminal against cancellation",
+          "[io][epoll][cancel][regular]") {
+    SECTION("inline regular-file read result wins over cancellation") {
+        epoll_backend backend;
+
+        char tmpfile[] = "/tmp/elio_test_epoll_term_XXXXXX";
+        int fd = mkstemp(tmpfile);
+        REQUIRE(fd >= 0);
+        const char byte = 'x';
+        REQUIRE(::write(fd, &byte, 1) == 1);
+
+        // Prime an inline read: the syscall has already executed and the op
+        // is parked in the ready queue with its real result.
+        op_state state;
+        char buffer = 0;
+        io_request rreq{};
+        rreq.op = io_op::read;
+        rreq.fd = fd;
+        rreq.buffer = &buffer;
+        rreq.length = 1;
+        rreq.offset = 0;
+        rreq.state = &state;
+        REQUIRE(backend.prepare(rreq));
+
+        // Cancellation in the prepare→poll window must not claim the
+        // already-computed completion (mirrors io_uring's ASYNC_CANCEL
+        // completing -ENOENT on an already-completed op).
+        backend.cancel(tagged_op_state_user_data(&state));
+        REQUIRE(backend.has_pending());
+        REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+        REQUIRE(state.result == 1);
+        REQUIRE(buffer == 'x');
+
+        REQUIRE(::close(fd) == 0);
+        unlink(tmpfile);
+    }
+
+    SECTION("precompleted connect error result wins over cancellation") {
+        epoll_backend backend;
+
+        // An invalid fd fails the fcntl pre-check, so the connect op is
+        // parked in the ready queue with a precomputed -EBADF.
+        op_state state;
+        io_request creq{};
+        creq.op = io_op::connect;
+        creq.fd = -1;
+        creq.state = &state;
+        REQUIRE(backend.prepare(creq));
+
+        backend.cancel(tagged_op_state_user_data(&state));
+        REQUIRE(backend.has_pending());
+        REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+        REQUIRE(state.result == -EBADF);
     }
 }
 

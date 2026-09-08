@@ -8,6 +8,7 @@
 #include <elio/sync/event.hpp>
 #include <elio/net/resolve.hpp>
 #include <elio/net/tcp.hpp>
+#include <elio/net/uds.hpp>
 #include <elio/time/timer.hpp>
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
 #include <elio/tls/tls_stream.hpp>
@@ -1999,6 +2000,308 @@ TEST_CASE("epoll queued close accounting survives cancel-then-drain "
     REQUIRE(::close(pipe_a[0]) == 0);
     REQUIRE(::close(pipe_a[1]) == 0);
     REQUIRE(::close(pipe_b[1]) == 0);
+}
+
+TEST_CASE("epoll close fails a parked recv with -ECANCELED and cannot steal "
+          "from a recycled fd (raw backend)",
+          "[io][epoll][close][issue-1174]") {
+    epoll_backend backend;
+
+    int sv[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    const int old_fd = sv[0];
+
+    // Park a recv on the old connection, then queue a close behind it.
+    char old_buf[16] = {};
+    op_state st_recv{};
+    io_request rreq{};
+    rreq.op = io_op::recv;
+    rreq.fd = old_fd;
+    rreq.buffer = old_buf;
+    rreq.length = sizeof(old_buf);
+    rreq.state = &st_recv;
+    REQUIRE(backend.prepare(rreq));
+
+    op_state st_close{};
+    io_request creq{};
+    creq.op = io_op::close;
+    creq.fd = old_fd;
+    creq.state = &st_close;
+    REQUIRE(backend.prepare(creq));
+    REQUIRE(backend.pending_count() == 2);
+
+    REQUIRE(backend.submit() == 1);  // executes the queued close
+    REQUIRE(st_close.phase == op_state::phase_completed);
+    REQUIRE(st_close.result == 0);
+    REQUIRE(::fcntl(old_fd, F_GETFD) < 0);  // actually closed
+
+    // Recycle the fd number with a fresh connection and deliver a byte to
+    // the NEW peer before parking the new reader.
+    int sv2[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0);
+    // If the number was not recycled the scenario proves nothing.
+    REQUIRE(sv2[0] == old_fd);
+    REQUIRE(::write(sv2[1], "X", 1) == 1);
+
+    char new_buf[16] = {};
+    op_state st_new{};
+    io_request nreq{};
+    nreq.op = io_op::recv;
+    nreq.fd = sv2[0];
+    nreq.buffer = new_buf;
+    nreq.length = sizeof(new_buf);
+    nreq.state = &st_new;
+    REQUIRE(backend.prepare(nreq));
+
+    backend.poll(std::chrono::milliseconds(500));
+
+    // The close must have failed the old reader with -ECANCELED and it must
+    // NOT observe the new connection's byte. Pre-fix the stale recv fires
+    // against the recycled fd, steals "X", and starves the new reader
+    // (#1174).
+    CHECK(st_recv.phase == op_state::phase_completed);
+    CHECK(st_recv.result == -ECANCELED);
+    CHECK(old_buf[0] == '\0');
+    CHECK(st_new.phase == op_state::phase_completed);
+    CHECK(st_new.result == 1);
+    CHECK(new_buf[0] == 'X');
+
+    REQUIRE(::close(sv[1]) == 0);
+    REQUIRE(::close(sv2[0]) == 0);
+    REQUIRE(::close(sv2[1]) == 0);
+}
+
+TEST_CASE("epoll close fails only its own fd's parked ops and keeps sync-op "
+          "accounting consistent (raw backend)",
+          "[io][epoll][close][issue-1174]") {
+    epoll_backend backend;
+
+    int sv_a[2] = {-1, -1};
+    int sv_b[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv_a) == 0);
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv_b) == 0);
+
+    char buf_a = 0;
+    op_state st_recv_a{};
+    io_request rreq_a{};
+    rreq_a.op = io_op::recv;
+    rreq_a.fd = sv_a[0];
+    rreq_a.buffer = &buf_a;
+    rreq_a.length = 1;
+    rreq_a.state = &st_recv_a;
+    REQUIRE(backend.prepare(rreq_a));
+
+    op_state st_close_a{};
+    io_request creq_a{};
+    creq_a.op = io_op::close;
+    creq_a.fd = sv_a[0];
+    creq_a.state = &st_close_a;
+    REQUIRE(backend.prepare(creq_a));
+
+    char buf_b = 0;
+    op_state st_recv_b{};
+    io_request rreq_b{};
+    rreq_b.op = io_op::recv;
+    rreq_b.fd = sv_b[0];
+    rreq_b.buffer = &buf_b;
+    rreq_b.length = 1;
+    rreq_b.state = &st_recv_b;
+    REQUIRE(backend.prepare(rreq_b));
+
+    REQUIRE(backend.pending_count() == 3);
+
+    // poll() drains the queued close (no explicit submit): the close
+    // completes, the parked recv on the SAME fd is failed with -ECANCELED,
+    // and the parked recv on the OTHER fd is untouched.
+    REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+    REQUIRE(st_close_a.phase == op_state::phase_completed);
+    REQUIRE(st_close_a.result == 0);
+    REQUIRE(st_recv_a.phase == op_state::phase_completed);
+    REQUIRE(st_recv_a.result == -ECANCELED);
+    REQUIRE(st_recv_b.phase == op_state::phase_pending);
+    REQUIRE(buf_b == 0);
+    REQUIRE(backend.pending_count() == 1);
+
+    // Sync-op accounting must be exact: an under-counted pending_sync_ops_
+    // would make drain_sync_ops() skip this second queued close forever.
+    op_state st_close_b{};
+    io_request creq_b{};
+    creq_b.op = io_op::close;
+    creq_b.fd = sv_b[0];
+    creq_b.state = &st_close_b;
+    REQUIRE(backend.prepare(creq_b));
+    REQUIRE(backend.pending_count() == 2);
+
+    REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+    REQUIRE(st_close_b.phase == op_state::phase_completed);
+    REQUIRE(st_close_b.result == 0);
+    REQUIRE(st_recv_b.phase == op_state::phase_completed);
+    REQUIRE(st_recv_b.result == -ECANCELED);
+    REQUIRE(backend.pending_count() == 0);
+
+    REQUIRE(::close(sv_a[1]) == 0);
+    REQUIRE(::close(sv_b[1]) == 0);
+}
+
+TEST_CASE("epoll prepare repairs a phantom registration left by an "
+          "out-of-backend close (raw backend)",
+          "[io][epoll][close][issue-1174]") {
+    epoll_backend backend;
+
+    int sv[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    const int old_fd = sv[0];
+
+    char old_buf[16] = {};
+    op_state st_recv{};
+    io_request rreq{};
+    rreq.op = io_op::recv;
+    rreq.fd = old_fd;
+    rreq.buffer = old_buf;
+    rreq.length = sizeof(old_buf);
+    rreq.state = &st_recv;
+    REQUIRE(backend.prepare(rreq));
+
+    // Simulate an off-worker stream destructor: the fd is closed outside
+    // the backend, so the kernel drops the epoll registration while
+    // fd_states_ still claims it (phantom registered=true entry, #1174).
+    REQUIRE(::close(old_fd) == 0);
+
+    int sv2[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0);
+    // If the number was not recycled the scenario proves nothing.
+    REQUIRE(sv2[0] == old_fd);
+    REQUIRE(::write(sv2[1], "X", 1) == 1);
+
+    // The first prepare on the recycled fd must repair the phantom entry
+    // (EPOLL_CTL_MOD fails with ENOENT), fail the stale recv with
+    // -ECANCELED, and re-register from scratch — pre-fix the legitimate new
+    // op fails spuriously with -ENOENT.
+    char new_buf[16] = {};
+    op_state st_new{};
+    io_request nreq{};
+    nreq.op = io_op::recv;
+    nreq.fd = sv2[0];
+    nreq.buffer = new_buf;
+    nreq.length = sizeof(new_buf);
+    nreq.state = &st_new;
+    const bool prepared = backend.prepare(nreq);
+    INFO(std::string("new-op prepare last_result: ") +
+         std::to_string(epoll_backend::get_last_result().result));
+    REQUIRE(prepared);
+
+    REQUIRE(st_recv.phase == op_state::phase_completed);
+    REQUIRE(st_recv.result == -ECANCELED);
+    REQUIRE(old_buf[0] == '\0');
+
+    REQUIRE(backend.poll(std::chrono::milliseconds(500)) >= 1);
+    REQUIRE(st_new.phase == op_state::phase_completed);
+    REQUIRE(st_new.result == 1);
+    REQUIRE(new_buf[0] == 'X');
+
+    REQUIRE(::close(sv[1]) == 0);
+    REQUIRE(::close(sv2[0]) == 0);
+    REQUIRE(::close(sv2[1]) == 0);
+}
+
+TEST_CASE("epoll stream destructor fails a parked read with -ECANCELED and "
+          "the recycled fd registers fresh",
+          "[io][epoll][close][destructor][issue-1174]") {
+    worker_io_backend_guard backend_guard(io_context::backend_type::epoll);
+
+    int sv[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    const int old_fd = sv[0];
+
+    auto adopted = elio::net::uds_stream::adopt(sv[0]);
+    REQUIRE(adopted.has_value());
+    auto stream = std::make_unique<elio::net::uds_stream>(std::move(*adopted));
+
+    scheduler sched(1);
+    sched.start();
+    auto* worker_context = &sched.get_worker(0)->io_context();
+
+    std::atomic<bool> old_done{false};
+    std::atomic<int> old_result{INT_MIN};
+    char old_buf[16] = {};
+
+    sched.go([&]() -> task<void> {
+        auto r = co_await stream->read(old_buf, sizeof(old_buf));
+        old_result.store(r.result, std::memory_order_release);
+        old_done.store(true, std::memory_order_release);
+    });
+
+    // Wait until the read is actually parked in the worker's backend.
+    auto park_deadline = std::chrono::steady_clock::now() +
+                         elio::test::scaled_sec(5);
+    while (worker_context->pending_count() == 0 &&
+           std::chrono::steady_clock::now() < park_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(worker_context->pending_count() == 1);
+
+    // Destroy the stream on the worker (destructor close path): the parked
+    // read must resume exactly once with -ECANCELED (#1174). Pre-fix the
+    // destructor's raw ::close leaves the reader parked forever, so these
+    // are CHECKs: the run must continue to the recycled-fd phase below.
+    std::atomic<bool> destroyed{false};
+    sched.go([&]() -> task<void> {
+        stream.reset();
+        destroyed.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    auto deadline = std::chrono::steady_clock::now() + elio::test::scaled_sec(5);
+    while ((!destroyed.load(std::memory_order_acquire) ||
+            !old_done.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    CHECK(destroyed.load(std::memory_order_acquire));
+    CHECK(old_done.load(std::memory_order_acquire));
+    CHECK(old_result.load(std::memory_order_acquire) == -ECANCELED);
+    CHECK(old_buf[0] == '\0');
+
+    // Recycle the fd number: the new connection must register fresh. A
+    // phantom registered=true entry would fail legitimate new I/O with
+    // -ENOENT (#1174 destructor path).
+    int sv2[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0);
+    REQUIRE(sv2[0] == old_fd);
+
+    auto adopted2 = elio::net::uds_stream::adopt(sv2[0]);
+    REQUIRE(adopted2.has_value());
+    auto stream2 =
+        std::make_unique<elio::net::uds_stream>(std::move(*adopted2));
+
+    REQUIRE(::write(sv2[1], "X", 1) == 1);
+
+    std::atomic<bool> new_done{false};
+    std::atomic<int> new_result{INT_MIN};
+    char new_buf[16] = {};
+    sched.go([&]() -> task<void> {
+        auto r = co_await stream2->read(new_buf, sizeof(new_buf));
+        new_result.store(r.result, std::memory_order_release);
+        new_done.store(true, std::memory_order_release);
+    });
+
+    deadline = std::chrono::steady_clock::now() + elio::test::scaled_sec(5);
+    while (!new_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    INFO(std::string("new-stream read result: ") +
+         std::to_string(new_result.load(std::memory_order_acquire)));
+    REQUIRE(new_done.load(std::memory_order_acquire));
+    REQUIRE(new_result.load(std::memory_order_acquire) == 1);
+    REQUIRE(new_buf[0] == 'X');
+
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+    stream2.reset();
+    REQUIRE(::close(sv[1]) == 0);
+    REQUIRE(::close(sv2[1]) == 0);
 }
 
 TEST_CASE("epoll precompleted ready results are terminal against cancellation",

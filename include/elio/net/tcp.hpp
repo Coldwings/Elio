@@ -722,6 +722,13 @@ public:
     }
 
     /// Async close
+    ///
+    /// On both backends, close() (and the destructor) fails any I/O still
+    /// parked on this stream's fd with -ECANCELED, resuming each parked
+    /// awaiter exactly once. A stoppable reader/writer should still prefer
+    /// the cancellable overload plus token cancellation and await the
+    /// operation before closing; the stream must remain alive until parked
+    /// operations have resumed.
     auto close() {
         int fd = fd_;
         fd_ = -1;

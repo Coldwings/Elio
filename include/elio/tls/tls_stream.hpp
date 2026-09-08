@@ -44,6 +44,13 @@ enum class handshake_result {
 /// multiple concurrent readers, multiple concurrent writers, and
 /// shutdown/destruction against active I/O according to the higher-level
 /// protocol contract.
+///
+/// **Close contract:** on both backends, close()/destruction of the
+/// underlying transport fails any I/O still parked on the stream's fd with
+/// -ECANCELED, resuming each parked awaiter exactly once. A stoppable
+/// reader/writer should still prefer the cancellable overload plus token
+/// cancellation and await the operation before closing; the stream must
+/// remain alive until parked operations have resumed.
 class tls_stream {
 public:
     /// Create a TLS stream from an existing TCP stream

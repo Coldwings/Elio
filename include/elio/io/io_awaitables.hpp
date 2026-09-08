@@ -849,17 +849,31 @@ inline auto async_close(int fd) {
 }
 
 /// Close an fd from a non-coroutine context (e.g. a destructor) without
-/// racing in-flight io_uring SQEs against fd-table reuse.
+/// racing in-flight I/O against fd-table reuse.
 ///
 /// Strategy:
 ///   * If the caller is running on a worker thread that uses the io_uring
 ///     backend, submit ``IORING_OP_CLOSE`` fire-and-forget. The kernel orders
 ///     this op after any earlier-submitted SQE on the same fd, so no
 ///     concurrent recv/send/poll can ever observe a recycled fd.
-///   * Otherwise (epoll backend, or no current worker thread), fall back to
-///     synchronous ``::close``. Epoll is a userspace readiness model — there
-///     is no in-kernel SQE-vs-fd-reuse race to worry about — and a non-worker
-///     destruction site cannot have outstanding SQEs of its own.
+///   * If the caller is running on a worker thread that uses the epoll
+///     backend, close through the backend (``close_fd_from_owner``): every
+///     op still parked on the fd is failed with ``-ECANCELED`` (each awaiter
+///     resumed exactly once through the ``op_state`` claim path), the stale
+///     epoll registration and fd entry are dropped, and only then is the fd
+///     closed. A bare ``::close`` would leave a phantom ``registered=true``
+///     entry behind — the kernel drops the registration with the fd — so a
+///     recycled fd number would take the ``EPOLL_CTL_MOD`` branch and fail
+///     spuriously with ``-ENOENT``, and a parked op could fire against the
+///     recycled fd (#1174).
+///   * Otherwise (no current worker thread, or an SQ-exhausted io_uring
+///     backend), fall back to synchronous ``::close``. An off-worker caller
+///     cannot safely touch backend state, so an epoll fd entry left behind
+///     in that case is repaired lazily: the next ``prepare()`` for the
+///     recycled fd number observes ``EPOLL_CTL_MOD`` failing with ``ENOENT``,
+///     fails the stale queued ops with ``-ECANCELED``, and re-registers from
+///     scratch. Until such a prepare happens (or the backend is destroyed),
+///     an awaiter parked on the closed fd stays parked.
 ///
 /// Always succeeds at releasing the fd: the worst case is an SQ-exhausted
 /// io_uring backend where we transparently degrade to ``::close``.
@@ -867,19 +881,29 @@ inline void close_fd_for_destructor(int fd) noexcept {
     if (fd < 0) {
         return;
     }
-#if ELIO_HAS_IO_URING
     auto* worker = runtime::worker_thread::current();
     if (worker) {
         auto& ctx = worker->io_context();
+#if ELIO_HAS_IO_URING
         if (ctx.is_io_uring()) {
             auto* backend = static_cast<io_uring_backend*>(
                 ctx.operation_backend());
             if (backend && backend->submit_close_async(fd)) {
                 return;
             }
+        } else if (auto* backend = static_cast<epoll_backend*>(
+                       ctx.operation_backend())) {
+            backend->close_fd_from_owner(fd);
+            return;
         }
-    }
+#else
+        if (auto* backend = static_cast<epoll_backend*>(
+                ctx.operation_backend())) {
+            backend->close_fd_from_owner(fd);
+            return;
+        }
 #endif
+    }
     ::close(fd);
 }
 

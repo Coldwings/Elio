@@ -262,12 +262,6 @@ public:
         auto& state = state_it->second;
         bool is_sync = op.synchronous;
 
-        // Filled only by the phantom-registration repair below; resumed at
-        // the end of prepare(), after every entry mutation is done, because
-        // a woken stale awaiter may re-enter prepare()/cancel() and could
-        // erase this very entry.
-        std::vector<deferred_resume_entry> phantom_resumes;
-
         if (!is_sync && is_regular_file_candidate(req.op)) {
             // epoll_ctl rejects regular files with EPERM: they are always
             // ready, so there is nothing to wait for. Execute the syscall
@@ -328,28 +322,34 @@ public:
             int ret;
             if (state.registered) {
                 ret = epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, req.fd, &ev);
-                if (ret < 0 && errno == ENOENT) {
+                if (ret < 0 && (errno == ENOENT || errno == EPERM)) {
                     // Phantom registration (#1174): the fd was closed
                     // outside the backend (e.g. a raw ::close from an
-                    // off-worker stream destructor) and the kernel dropped
-                    // the epoll registration with it; the fd number has
-                    // since been recycled. Every op still queued in this
-                    // entry belongs to the dead fd — fail it with
-                    // -ECANCELED so it can never fire against the recycled
-                    // fd — then re-register from scratch. If the fresh ADD
-                    // fails (e.g. EPERM because the recycled fd is a
-                    // regular file whose cached fd_kind belonged to the old
-                    // fd), fail_registration drops the now-inert entry, so
-                    // the next prepare re-probes cleanly.
-                    fail_fd_state_ops(state, phantom_resumes);
-                    previous_events = 0;
-                    previous_registered = false;
-                    requested_events = events;
-                    ev.events = requested_events;
-                    ret = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, req.fd, &ev);
-                    if (ret == 0) {
-                        state.registered = true;
-                    }
+                    // off-worker stream destructor) and the fd number has
+                    // since been recycled, so the registered=true entry
+                    // belongs to a previous open file description. Both
+                    // MOD failures are sound phantom signatures:
+                    //  - ENOENT: no registration exists for the current fd
+                    //    (the kernel dropped it together with the old fd);
+                    //  - EPERM: MOD rejects the current fd as non-pollable,
+                    //    but ADD of a non-pollable fd can never have
+                    //    succeeded — an open file description's pollability
+                    //    is invariant over its lifetime, so our
+                    //    registered=true cannot refer to the current fd.
+                    // Every op still queued in this entry belongs to the
+                    // dead fd: fail it with -ECANCELED so it can never fire
+                    // against the recycled fd, drop the entry, wake the
+                    // claimed awaiters (only once no entry references
+                    // remain — they may re-enter prepare()/cancel()), then
+                    // retry this prepare from scratch so the recycled fd
+                    // re-probes its file type (#1164 inline path for
+                    // regular files) and registers cleanly. The retry
+                    // cannot recurse: the fresh entry starts unregistered.
+                    std::vector<deferred_resume_entry> stale_resumes;
+                    fail_fd_state_ops(state, stale_resumes);
+                    fd_states_.erase(state_it);
+                    resume_deferred(stale_resumes);
+                    return prepare(req);
                 }
             } else {
                 ret = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, req.fd, &ev);
@@ -387,9 +387,6 @@ public:
             ELIO_LOG_DEBUG("Prepared io_op::{} on fd={}",
                            static_cast<int>(req.op), req.fd);
         });
-        // Phantom-repair failures are claimed already; wake their awaiters
-        // only now that no entry references are in use anymore.
-        resume_deferred(phantom_resumes);
         return true;
     }
     

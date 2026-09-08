@@ -2204,6 +2204,141 @@ TEST_CASE("epoll prepare repairs a phantom registration left by an "
     REQUIRE(::close(sv2[1]) == 0);
 }
 
+TEST_CASE("epoll close of an fd with two queued closes executes one and "
+          "cancels the other (raw backend)",
+          "[io][epoll][close][issue-1174]") {
+    epoll_backend backend;
+
+    int pipefd[2] = {-1, -1};
+    REQUIRE(::pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) == 0);
+
+    op_state st_close_a{};
+    io_request creq_a{};
+    creq_a.op = io_op::close;
+    creq_a.fd = pipefd[0];
+    creq_a.state = &st_close_a;
+    REQUIRE(backend.prepare(creq_a));
+
+    op_state st_close_b{};
+    io_request creq_b{};
+    creq_b.op = io_op::close;
+    creq_b.fd = pipefd[0];
+    creq_b.state = &st_close_b;
+    REQUIRE(backend.prepare(creq_b));
+    REQUIRE(backend.pending_count() == 2);
+
+    // The first queued close executes and closes the fd; the second is
+    // failed with -ECANCELED (claimed, never executed) instead of hitting
+    // the fd again — and pending_sync_ops_ accounts for both.
+    REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+    REQUIRE(st_close_a.phase == op_state::phase_completed);
+    REQUIRE(st_close_a.result == 0);
+    REQUIRE(st_close_b.phase == op_state::phase_completed);
+    REQUIRE(st_close_b.result == -ECANCELED);
+    REQUIRE(::fcntl(pipefd[0], F_GETFD) < 0);  // closed exactly once
+    REQUIRE(backend.pending_count() == 0);
+
+    // Sync-op accounting must be exact after the cancellation: a later
+    // queued close on another fd still drains through poll().
+    int pipe_c[2] = {-1, -1};
+    REQUIRE(::pipe2(pipe_c, O_NONBLOCK | O_CLOEXEC) == 0);
+    op_state st_close_c{};
+    io_request creq_c{};
+    creq_c.op = io_op::close;
+    creq_c.fd = pipe_c[0];
+    creq_c.state = &st_close_c;
+    REQUIRE(backend.prepare(creq_c));
+    REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+    REQUIRE(st_close_c.phase == op_state::phase_completed);
+    REQUIRE(st_close_c.result == 0);
+    REQUIRE(backend.pending_count() == 0);
+
+    REQUIRE(::close(pipefd[1]) == 0);
+    REQUIRE(::close(pipe_c[1]) == 0);
+}
+
+TEST_CASE("epoll prepare repairs a phantom registration when the fd is "
+          "recycled as a regular file (raw backend)",
+          "[io][epoll][close][issue-1174]") {
+    epoll_backend backend;
+
+    int sv[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    const int old_fd = sv[0];
+
+    char old_buf[16] = {};
+    op_state st_read{};
+    io_request rreq{};
+    rreq.op = io_op::read;
+    rreq.fd = old_fd;
+    rreq.buffer = old_buf;
+    rreq.length = sizeof(old_buf);
+    rreq.state = &st_read;
+    REQUIRE(backend.prepare(rreq));
+
+    // Out-of-backend close (off-worker destructor simulation), then recycle
+    // the fd number with a NON-POLLABLE regular file. The parked read above
+    // cached fd_kind::other for the pollable socket, so the next prepare
+    // skips the fstat probe and EPOLL_CTL_MOD fails with EPERM, not ENOENT.
+    // EPERM-on-MOD is still a phantom signature: the registered=true entry
+    // can only belong to the dead pollable fd, because ADD of a
+    // non-pollable fd can never have succeeded (#1174).
+    REQUIRE(::close(old_fd) == 0);
+
+    char tmpfile[] = "/tmp/elio_test_epoll_phantom_XXXXXX";
+    const int fd = mkstemp(tmpfile);
+    REQUIRE(fd >= 0);
+    // If the number was not recycled the scenario proves nothing.
+    REQUIRE(fd == old_fd);
+    REQUIRE(::write(fd, "R", 1) == 1);
+
+    // The repair must fail the stale recv with -ECANCELED and retry the
+    // prepare from scratch, so the recycled regular file re-probes its
+    // type and flows through the inline regular-file path (#1164) instead
+    // of failing with -EPERM forever.
+    char new_buf = 0;
+    op_state st_new{};
+    io_request nreq{};
+    nreq.op = io_op::read;
+    nreq.fd = fd;
+    nreq.buffer = &new_buf;
+    nreq.length = 1;
+    nreq.offset = 0;
+    nreq.state = &st_new;
+    const bool prepared = backend.prepare(nreq);
+    INFO(std::string("recycled regular-file prepare last_result: ") +
+         std::to_string(epoll_backend::get_last_result().result));
+    REQUIRE(prepared);
+
+    REQUIRE(st_read.phase == op_state::phase_completed);
+    REQUIRE(st_read.result == -ECANCELED);
+    REQUIRE(old_buf[0] == '\0');
+
+    REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+    REQUIRE(st_new.phase == op_state::phase_completed);
+    REQUIRE(st_new.result == 1);
+    REQUIRE(new_buf == 'R');
+
+    // Subsequent prepares on the fd keep working (no permanent -EPERM).
+    char again_buf = 0;
+    op_state st_again{};
+    io_request areq{};
+    areq.op = io_op::read;
+    areq.fd = fd;
+    areq.buffer = &again_buf;
+    areq.length = 1;
+    areq.offset = 0;
+    areq.state = &st_again;
+    REQUIRE(backend.prepare(areq));
+    REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+    REQUIRE(st_again.result == 1);
+    REQUIRE(again_buf == 'R');
+
+    REQUIRE(::close(fd) == 0);
+    REQUIRE(::close(sv[1]) == 0);
+    unlink(tmpfile);
+}
+
 TEST_CASE("epoll stream destructor fails a parked read with -ECANCELED and "
           "the recycled fd registers fresh",
           "[io][epoll][close][destructor][issue-1174]") {

@@ -45,9 +45,11 @@ enum class handshake_result {
 /// shutdown/destruction against active I/O according to the higher-level
 /// protocol contract.
 ///
-/// **Close contract:** on both backends, close()/destruction of the
+/// **Close contract:** on the epoll backend, close()/destruction of the
 /// underlying transport fails any I/O still parked on the stream's fd with
-/// -ECANCELED, resuming each parked awaiter exactly once. A stoppable
+/// -ECANCELED, resuming each parked awaiter exactly once; on the io_uring
+/// backend, in-flight operations hold a kernel file reference and complete
+/// normally later against the old file description. A stoppable
 /// reader/writer should still prefer the cancellable overload plus token
 /// cancellation and await the operation before closing; the stream must
 /// remain alive until parked operations have resumed.

@@ -42,14 +42,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reader received bytes belonging to the new connection (cross-connection
   data exposure) while the new reader starved, and a destructor-time raw
   `close()` additionally left a phantom epoll registration that failed
-  legitimate new I/O on the recycled fd with `-ENOENT`. The backend now
-  fails every operation still queued for a closing fd with `-ECANCELED`
+  legitimate new I/O on the recycled fd with `-ENOENT`. The epoll backend
+  now fails every operation still queued for a closing fd with `-ECANCELED`
   (each awaiter resumed exactly once) and drops the fd entry before the fd
   number can be recycled; destructor-time closes on an epoll worker go
   through the backend, and a phantom registration left by an off-worker
   close is repaired lazily at the next `prepare()` on the recycled fd
-  number. The stream close contract is now documented for `tcp_stream`,
-  `uds_stream`, and `tls_stream` (#1174, #1169).
+  number (both the `ENOENT` and the `EPERM` modification-failure signatures
+  are recognized). Under io_uring, in-flight operations hold kernel file
+  references and complete normally against the old file description; only
+  the epoll backend fails parked ops on close. The stream close contract is
+  now documented for `tcp_stream`, `uds_stream`, and `tls_stream` (#1174,
+  #1169).
 - **Cross-worker `signal_fd::wait()`**: Awaiting a `signal::signal_fd` on a
   different scheduler worker than the one it was constructed on no longer
   throws `std::logic_error`. `wait()` now resolves its submission

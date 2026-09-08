@@ -2179,12 +2179,14 @@ public:
 // Retained aliases must not clear it or otherwise defeat non-blocking I/O
 // through status-flag changes.
 // close() transfers the descriptor to the async close operation and invalidates
-// the stream object. On both backends, close() and the destructor fail any I/O
-// still parked on the stream's fd with -ECANCELED, resuming each parked
-// awaiter exactly once; a stoppable reader/writer should still prefer the
-// cancellable overload plus token cancellation and await the operation before
-// closing, and the stream must remain alive until parked operations have
-// resumed. shutdown_socket() interrupts both socket directions without
+// the stream object. Under the epoll backend, close() and the destructor fail
+// any I/O still parked on the stream's fd with -ECANCELED, resuming each
+// parked awaiter exactly once; under io_uring, in-flight operations hold a
+// kernel file reference and complete normally later against the old file
+// description. A stoppable reader/writer should still prefer the cancellable
+// overload plus token cancellation and await the operation before closing,
+// and the stream must remain alive until parked operations have resumed.
+// shutdown_socket() interrupts both socket directions without
 // releasing the descriptor; shutdown(int) is the direct half-close wrapper.
 // Multiple reads, multiple writes, and close/shutdown racing with I/O require
 // external serialization.
@@ -2372,12 +2374,14 @@ read.
 UDS streams share the same concurrency contract as TCP streams: one reader and
 one writer may operate concurrently, but multiple concurrent reads, multiple
 concurrent writes, or a read racing with `close()` require external
-serialization. On both backends, `close()` and the destructor fail any I/O
-still parked on the stream's fd with `-ECANCELED`, resuming each parked
-awaiter exactly once; a stoppable reader/writer should still prefer the
-cancellable overload plus token cancellation and await the operation before
-closing, and the stream must remain alive until parked operations have
-resumed. `shutdown_socket()` interrupts both directions without releasing
+serialization. Under the epoll backend, `close()` and the destructor fail any
+I/O still parked on the stream's fd with `-ECANCELED`, resuming each parked
+awaiter exactly once; under io_uring, in-flight operations hold a kernel file
+reference and complete normally later against the old file description. A
+stoppable reader/writer should still prefer the cancellable overload plus
+token cancellation and await the operation before closing, and the stream
+must remain alive until parked operations have resumed.
+`shutdown_socket()` interrupts both directions without releasing
 the descriptor; `shutdown(int)` is the direct half-close wrapper. Buffer setters
 wrap `SO_RCVBUF` and `SO_SNDBUF`, while `set_pass_credentials()` wraps
 `SO_PASSCRED`.
@@ -3348,12 +3352,14 @@ Success reports the full requested count.
 `shutdown()` is the graceful TLS close path. It sends `close_notify` and waits
 for the peer's `close_notify` within the supplied wall-clock budget. Callers
 must still serialize shutdown and destruction against active reads/writes.
-On both backends, close()/destruction of the underlying transport fails any
-I/O still parked on the stream's fd with `-ECANCELED`, resuming each parked
-awaiter exactly once; a stoppable reader/writer should still prefer the
-cancellable overload plus token cancellation and await the operation before
-closing, and the stream must remain alive until parked operations have
-resumed. `shutdown_socket()` and `mark_externally_shut_down()` are
+Under the epoll backend, close()/destruction of the underlying transport
+fails any I/O still parked on the stream's fd with `-ECANCELED`, resuming
+each parked awaiter exactly once; under io_uring, in-flight operations hold
+a kernel file reference and complete normally later against the old file
+description. A stoppable reader/writer should still prefer the cancellable
+overload plus token cancellation and await the operation before closing,
+and the stream must remain alive until parked operations have resumed.
+`shutdown_socket()` and `mark_externally_shut_down()` are
 watchdog-oriented
 helpers for code that has already interrupted the underlying TCP socket and
 needs the stream to skip a later `SSL_shutdown()` write.

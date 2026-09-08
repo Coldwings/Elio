@@ -2624,6 +2624,44 @@ and the HTTP upgrade request read handled by `websocket::ws_server`. For
 the inbound TLS handshake. A value less than or equal to zero disables these
 server-side deadlines.
 
+### `context`
+
+HTTP request context passed to `http::server` route handlers.
+
+```cpp
+class context {
+public:
+    const request& req() const noexcept;
+    request& req() noexcept;
+    std::string_view client_addr() const noexcept;
+    std::string_view param(std::string_view name) const;
+    void set_param(std::string_view name, std::string_view value);
+    std::string query_param(std::string_view name) const;
+    const std::unordered_map<std::string, std::string>& params() const noexcept;
+
+    // Send an interim (1xx) response before the final response (awaitable)
+    /* awaitable */ send_interim(const response& resp);
+};
+```
+
+`send_interim()` writes an interim response on the connection before the
+handler returns the final response. The response status must be 1xx other
+than 101 Switching Protocols (an upgrade is never an interim response);
+anything else sets `errno = EINVAL` and returns `false`. Multiple interim
+responses may be sent, as RFC 9110 §15.2 permits. Body and framing headers
+are never serialized for 1xx statuses, so `response(status::continue_)`
+writes exactly `HTTP/1.1 100 Continue\r\n\r\n`.
+
+The context borrows its connection from the handler scope: it must not
+escape its handler (for example into a detached task), and interims can only
+be sent before the handler returns the final response.
+
+> **Note**: `http::server` reads the full request, including the body, before
+> dispatching to the handler. An explicit `100 Continue` sent with
+> `send_interim()` therefore cannot accelerate an `Expect: 100-continue`
+> client's first body send; it serves clients that pipeline or that wait for
+> an interim the application emits deliberately.
+
 ### `request`
 
 HTTP request message.

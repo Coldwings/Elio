@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HTTP server explicit interim responses**: `http::context::send_interim()`
+  lets a handler emit one or more interim 1xx responses (any 1xx status
+  except 101 Switching Protocols) on the connection before returning the
+  final response; other statuses fail with `errno = EINVAL` and a `false`
+  result. The context borrows its connection from the handler scope and must
+  not escape it. Note that `http::server` still reads the full request body
+  before dispatch, so an explicit `100 Continue` cannot accelerate an
+  `Expect: 100-continue` client's first body send (#1163).
 - **Fair TCP loopback benchmark protocol**: Replaced the non-equivalent
   per-adapter echo workloads with fixed-work latency, message-rate, and bulk
   contracts with separately attributable client-against-reference-server and

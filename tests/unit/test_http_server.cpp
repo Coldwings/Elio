@@ -1835,3 +1835,148 @@ TEST_CASE("HTTP server reads after partial buffered pipelined request",
     auto result = run_pipelined_exchange(first_write, second_write);
     require_two_ordered_responses(result);
 }
+
+TEST_CASE("HTTP server handler emits explicit interim responses",
+          "[http][server][interim]") {
+    std::atomic<int> continue_result{-1};
+    std::atomic<int> hints_result{-1};
+
+    router routes;
+    routes.post("/upload", [&](context& ctx) -> task<response> {
+        continue_result.store(co_await ctx.send_interim(
+                                  response(status::continue_)) ? 1 : 0,
+                              std::memory_order_release);
+        hints_result.store(co_await ctx.send_interim(
+                               response(status::early_hints)) ? 1 : 0,
+                           std::memory_order_release);
+        co_return response::ok("done");
+    });
+
+    server_config config;
+    config.enable_logging = false;
+    config.keep_alive_timeout = elio::test::scaled_sec(1);
+
+    server srv(std::move(routes), config);
+    const uint16_t port = reserve_loopback_port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] { return srv.is_running(); },
+                       elio::test::scaled_sec(2)));
+
+    const std::string request_bytes =
+        "POST /upload HTTP/1.1\r\n"
+        "Host: test\r\n"
+        "Expect: 100-continue\r\n"
+        "Content-Length: 4\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "data";
+
+    auto client = connect_loopback(port);
+    send_all(client.get(), request_bytes);
+    const auto bytes = read_until_close(client.get());
+    client.reset();
+
+    srv.stop();
+    try_wake_listener(port);
+
+    REQUIRE(wait_until([&] { return listen_done.load(std::memory_order_acquire); },
+                       elio::test::scaled_sec(2)));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+
+    REQUIRE(continue_result.load(std::memory_order_acquire) == 1);
+    REQUIRE(hints_result.load(std::memory_order_acquire) == 1);
+
+    const auto continue_pos = bytes.find("HTTP/1.1 100 Continue\r\n\r\n");
+    const auto hints_pos = bytes.find("HTTP/1.1 103 Early Hints\r\n\r\n");
+    const auto final_pos = bytes.find("HTTP/1.1 200 OK\r\n");
+    REQUIRE(continue_pos != std::string::npos);
+    REQUIRE(hints_pos != std::string::npos);
+    REQUIRE(final_pos != std::string::npos);
+    REQUIRE(continue_pos < hints_pos);
+    REQUIRE(hints_pos < final_pos);
+    // Each message appears exactly once; the 1xx blocks carry no body or
+    // framing headers.
+    REQUIRE(count_occurrences(bytes, "HTTP/1.1 ") == 3);
+}
+
+TEST_CASE("HTTP server send_interim rejects non-interim statuses",
+          "[http][server][interim]") {
+    std::atomic<int> upgrade_result{-1};
+    std::atomic<int> upgrade_errno{0};
+    std::atomic<int> ok_result{-1};
+    std::atomic<int> ok_errno{0};
+
+    router routes;
+    routes.get("/", [&](context& ctx) -> task<response> {
+        errno = 0;
+        const bool sent_upgrade = co_await ctx.send_interim(
+            response(status::switching_protocols));
+        upgrade_result.store(sent_upgrade ? 1 : 0, std::memory_order_release);
+        upgrade_errno.store(errno, std::memory_order_release);
+
+        errno = 0;
+        const bool sent_ok = co_await ctx.send_interim(response(status::ok));
+        ok_result.store(sent_ok ? 1 : 0, std::memory_order_release);
+        ok_errno.store(errno, std::memory_order_release);
+
+        co_return response::ok("done");
+    });
+
+    server_config config;
+    config.enable_logging = false;
+    config.keep_alive_timeout = elio::test::scaled_sec(1);
+
+    server srv(std::move(routes), config);
+    const uint16_t port = reserve_loopback_port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] { return srv.is_running(); },
+                       elio::test::scaled_sec(2)));
+
+    const std::string request_bytes =
+        "GET / HTTP/1.1\r\n"
+        "Host: test\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+
+    auto client = connect_loopback(port);
+    send_all(client.get(), request_bytes);
+    const auto bytes = read_until_close(client.get());
+    client.reset();
+
+    srv.stop();
+    try_wake_listener(port);
+
+    REQUIRE(wait_until([&] { return listen_done.load(std::memory_order_acquire); },
+                       elio::test::scaled_sec(2)));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+
+    REQUIRE(upgrade_result.load(std::memory_order_acquire) == 0);
+    REQUIRE(upgrade_errno.load(std::memory_order_acquire) == EINVAL);
+    REQUIRE(ok_result.load(std::memory_order_acquire) == 0);
+    REQUIRE(ok_errno.load(std::memory_order_acquire) == EINVAL);
+
+    // Neither rejected status reached the wire: the only message is the
+    // final 200 response.
+    REQUIRE(count_occurrences(bytes, "HTTP/1.1 ") == 1);
+    REQUIRE(bytes.find("HTTP/1.1 200 OK\r\n") != std::string::npos);
+}

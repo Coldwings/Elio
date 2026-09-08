@@ -15,6 +15,7 @@
 #include <sys/socket.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -81,8 +82,14 @@ perform_tls_handshake_with_timeout(tls::tls_stream& stream,
 /// HTTP request context passed to handlers
 class context {
 public:
-    context(request req, std::string_view client_addr)
-        : request_(std::move(req)), client_addr_(client_addr) {}
+    /// Type-erased writer used by send_interim(). The server installs one
+    /// per request; it writes the serialized bytes to the connection.
+    using interim_writer = std::function<coro::task<bool>(std::string_view)>;
+
+    context(request req, std::string_view client_addr,
+            interim_writer writer = {})
+        : request_(std::move(req)), client_addr_(client_addr),
+          interim_writer_(std::move(writer)) {}
     
     /// Get the request
     const request& req() const noexcept { return request_; }
@@ -119,11 +126,46 @@ public:
     const std::unordered_map<std::string, std::string>& params() const noexcept {
         return params_;
     }
-    
+
+    /// Send an interim (1xx) response before the final response.
+    ///
+    /// `resp` must carry a 1xx status other than 101 Switching Protocols
+    /// (a protocol upgrade is never an interim response); anything else
+    /// sets `errno = EINVAL` and returns false. Multiple interim responses
+    /// may be sent; RFC 9110 §15.2 permits any number of them. Body and
+    /// framing headers are never serialized for 1xx, so e.g.
+    /// `response(status::continue_)` writes exactly
+    /// "HTTP/1.1 100 Continue\r\n\r\n".
+    ///
+    /// The context borrows its connection from the request handler scope:
+    /// it must not escape its handler (e.g. into a detached task), and
+    /// interims can only be sent before the handler returns the final
+    /// response.
+    ///
+    /// Note: the server reads the full request (including the body) before
+    /// dispatching to the handler, so an explicit `100 Continue` sent here
+    /// cannot accelerate an `Expect: 100-continue` client's first body
+    /// send; it serves clients that pipeline or that wait for an interim
+    /// the application wants to emit deliberately.
+    coro::task<bool> send_interim(const response& resp) {
+        const auto code = resp.status_code();
+        if (code < 100 || code >= 200 ||
+            code == static_cast<uint16_t>(status::switching_protocols)) {
+            errno = EINVAL;
+            co_return false;
+        }
+        if (!interim_writer_) {
+            errno = ENOTSUP;
+            co_return false;
+        }
+        co_return co_await interim_writer_(resp.serialize());
+    }
+
 private:
     request request_;
     std::string client_addr_;
     std::unordered_map<std::string, std::string> params_;
+    interim_writer interim_writer_;
 };
 
 /// Handler function type
@@ -675,9 +717,28 @@ private:
                 co_return;
             }
 
-            // Create request and context
+            // Create request and context. The interim writer borrows
+            // `stream`; the context is confined to the handler scope below,
+            // so the reference cannot outlive the stream.
             auto req = request::from_parser(parser);
-            context ctx(std::move(req), client_addr);
+            context ctx(std::move(req), client_addr,
+                        [&stream](std::string_view data) -> coro::task<bool> {
+                            size_t sent = 0;
+                            while (sent < data.size()) {
+                                auto result = co_await stream.write(
+                                    data.data() + sent, data.size() - sent);
+                                if (result.result <= 0) {
+                                    ELIO_LOG_ERROR(
+                                        "Failed to send interim response: {}",
+                                        result.result == 0
+                                            ? "connection closed"
+                                            : strerror(-result.result));
+                                    co_return false;
+                                }
+                                sent += static_cast<size_t>(result.result);
+                            }
+                            co_return true;
+                        });
 
             // Log request
             if (config_.enable_logging) {

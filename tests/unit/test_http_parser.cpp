@@ -435,6 +435,38 @@ TEST_CASE("HTTP response parser - no-body statuses ignore advertised length", "[
     }
 }
 
+TEST_CASE("HTTP response parser - 205 with Content-Length: 0 completes before the next response",
+          "[http][parser][regression]") {
+    // A 205 pinned to Content-Length: 0 (#1161) must terminate at the
+    // header boundary so a pipelined successor response parses cleanly.
+    response_parser parser;
+
+    const std::string first =
+        "HTTP/1.1 205 Reset Content\r\n"
+        "Content-Length: 0\r\n"
+        "\r\n";
+    const std::string second =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "hi";
+
+    std::string wire = first + second;
+    auto [result, consumed] = parser.parse(wire);
+
+    REQUIRE(result == parse_result::complete);
+    REQUIRE(parser.get_status() == status::reset_content);
+    REQUIRE(parser.body().empty());
+    REQUIRE(consumed == first.size());
+
+    parser.reset();
+
+    auto [result2, consumed2] = parser.parse(wire.substr(consumed));
+    REQUIRE(result2 == parse_result::complete);
+    REQUIRE(parser.get_status() == status::ok);
+    REQUIRE(parser.body() == "hi");
+}
+
 TEST_CASE("HTTP response parser - HEAD response has no body", "[http][parser]") {
     response_parser parser;
     parser.set_request_method(method::HEAD);
@@ -1887,6 +1919,52 @@ TEST_CASE("HTTP response serialization", "[http][message]") {
         REQUIRE(serialized.find("Content-Length: 7\r\n") != std::string::npos);
         REQUIRE(serialized.find("Content-Length: 0") == std::string::npos);
         REQUIRE(serialized.find("\r\n\r\npayload") != std::string::npos);
+    }
+
+    SECTION("205 response pins Content-Length: 0") {
+        // RFC 9112 §6.3: 205 is not in the item 1 first-empty-line
+        // termination list, so an unframed 205 would fall through to
+        // close-delimited framing (item 8) and hang a keep-alive peer;
+        // the serializer pins Content-Length: 0 instead (#1161).
+        response resp(status::reset_content);
+
+        std::string serialized = resp.serialize();
+
+        REQUIRE(serialized.find("HTTP/1.1 205 Reset Content\r\n") !=
+                std::string::npos);
+        REQUIRE(serialized.find("Content-Length: 0\r\n") != std::string::npos);
+        REQUIRE(serialized.find("Transfer-Encoding: ") == std::string::npos);
+    }
+
+    SECTION("205 response pins Content-Length: 0 over caller-set length and drops body") {
+        response resp(status::reset_content, "reset-body", mime::text_plain);
+
+        std::string serialized = resp.serialize();
+
+        REQUIRE(serialized.find("Content-Length: 0\r\n") != std::string::npos);
+        REQUIRE(serialized.find("Content-Length: 10") == std::string::npos);
+        REQUIRE(serialized.find("reset-body") == std::string::npos);
+    }
+
+    SECTION("205 response strips caller-set Transfer-Encoding") {
+        response resp(status::reset_content);
+        resp.set_header("Transfer-Encoding", "chunked");
+
+        std::string serialized = resp.serialize();
+
+        REQUIRE(serialized.find("Transfer-Encoding: ") == std::string::npos);
+        REQUIRE(serialized.find("Content-Length: 0\r\n") != std::string::npos);
+    }
+
+    SECTION("205 response serializes identically twice") {
+        // serialize_impl pins the header on a copy; guard against a
+        // regression that mutates the stored header map.
+        response resp(status::reset_content, "reset-body", mime::text_plain);
+
+        std::string first = resp.serialize();
+        std::string second = resp.serialize();
+
+        REQUIRE(first == second);
     }
 
     SECTION("2xx CONNECT response carries no framing headers") {

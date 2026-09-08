@@ -34,6 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **205 Reset Content response framing**: `http::response` serialization now
+  pins `Content-Length: 0` on 205 responses (overwriting any caller-set
+  `Content-Length`) while still stripping `Transfer-Encoding` and dropping the
+  body. 205 is not in the RFC 9112 §6.3 item 1 first-empty-line termination
+  list, so an unframed 205 fell through to item 8 (close-delimited) and a
+  keep-alive peer waited for a connection close that never came; the body is
+  already dropped for 205, so `Content-Length: 0` is always truthful. 1xx,
+  204, 304, and 2xx responses to CONNECT continue to serialize without framing
+  headers. The pinned server-side expectation in
+  `tests/unit/test_http_server.cpp` ("HTTP server suppresses bodies for HEAD
+  and no-body statuses") was deliberately updated from requiring no
+  `Content-Length` to requiring `Content-Length: 0` (#1161).
 - **Empty HTTP response framing**: `http::response` serialization now emits
   `Content-Length: 0` for an empty body when the status allows a body and the
   caller set neither `Content-Length` nor `Transfer-Encoding`. This covers
@@ -45,7 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are still preserved verbatim, except in 2xx responses to CONNECT, where both
   `Content-Length` and `Transfer-Encoding` are stripped — including
   caller-set ones — as RFC 9110 §9.3.6 requires. Statuses that forbid a body
-  (1xx, 204, 205, 304) continue to serialize without framing headers (#1158).
+  (1xx, 204, 304) continue to serialize without framing headers; 205 is pinned
+  to `Content-Length: 0` as described in the entry above (#1158, #1161).
 - **Regular-file I/O under the epoll backend**: `async_read`, `async_write`,
   `async_readv`, and `async_writev` on regular files no longer fail with an
   `epoll_ctl` `EPERM` rejection under the epoll backend. The backend probes

@@ -262,11 +262,23 @@ private:
         // Headers
         auto serialized_headers = headers_;
         if (framing_forbidden) {
-            // Body-forbidden statuses (1xx/204/205/304) and 2xx responses
+            // Body-forbidden statuses (1xx/204/304) and 2xx responses
             // to CONNECT (RFC 9110 §9.3.6) must not carry framing headers,
             // even when the caller set them.
-            serialized_headers.remove("Content-Length");
             serialized_headers.remove("Transfer-Encoding");
+            if (status_ == status::reset_content) {
+                // 205 Reset Content is not in the RFC 9112 §6.3 item 1
+                // first-empty-line termination list, so a 205 without a
+                // length falls through to item 8 (close-delimited) and
+                // would hang a keep-alive peer; §6.3 says such messages
+                // SHOULD be length-delimited instead. RFC 9110 §15.3.6
+                // forbids content in a 205 and the body is never emitted
+                // for it, so Content-Length: 0 is always truthful. Pin it,
+                // overwriting any caller-set value.
+                serialized_headers.set_content_length(0);
+            } else {
+                serialized_headers.remove("Content-Length");
+            }
         } else if (body_.empty() &&
                    !serialized_headers.contains("Content-Length") &&
                    !serialized_headers.contains("Transfer-Encoding")) {

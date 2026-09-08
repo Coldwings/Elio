@@ -624,7 +624,11 @@ TEST_CASE("HTTP server suppresses bodies for HEAD and no-body statuses",
     REQUIRE(no_content.find("Content-Length: ") == std::string::npos);
     REQUIRE(no_content.find("no-content-body") == std::string::npos);
 
-    REQUIRE(reset_content.find("Content-Length: ") == std::string::npos);
+    // #1161: unlike 1xx/204/304, 205 is not in the RFC 9112 §6.3 item 1
+    // first-empty-line termination list, so the serializer pins
+    // Content-Length: 0 to keep the response length-delimited on
+    // keep-alive connections. The body itself is still dropped (#578).
+    REQUIRE(reset_content.find("Content-Length: 0\r\n") != std::string::npos);
     REQUIRE(reset_content.find("reset-content-body") == std::string::npos);
 
     REQUIRE(not_modified.find("Content-Length: ") == std::string::npos);

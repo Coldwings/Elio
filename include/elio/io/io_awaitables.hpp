@@ -870,9 +870,10 @@ inline auto async_close(int fd) {
 ///     backend), fall back to synchronous ``::close``. An off-worker caller
 ///     cannot safely touch backend state, so an epoll fd entry left behind
 ///     in that case is repaired lazily: the next ``prepare()`` for the
-///     recycled fd number observes ``EPOLL_CTL_MOD`` failing with ``ENOENT``,
-///     fails the stale queued ops with ``-ECANCELED``, and re-registers from
-///     scratch. Until such a prepare happens (or the backend is destroyed),
+///     recycled fd number observes ``EPOLL_CTL_MOD`` failing with ``ENOENT``
+///     (recycled into a different pollable file) or ``EPERM`` (recycled into
+///     a non-pollable file), fails the stale queued ops with ``-ECANCELED``,
+///     and re-registers from scratch. Until such a prepare happens (or the backend is destroyed),
 ///     an awaiter parked on the closed fd stays parked.
 ///
 /// Always succeeds at releasing the fd: the worst case is an SQ-exhausted

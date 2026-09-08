@@ -1955,6 +1955,52 @@ TEST_CASE("epoll async_close does not stall scheduler shutdown",
     REQUIRE(::close(pipefd[1]) == 0);
 }
 
+TEST_CASE("epoll queued close accounting survives cancel-then-drain "
+          "(raw backend)",
+          "[io][epoll][close][issue-1162]") {
+    epoll_backend backend;
+
+    int pipe_a[2] = {-1, -1};
+    int pipe_b[2] = {-1, -1};
+    REQUIRE(::pipe2(pipe_a, O_NONBLOCK | O_CLOEXEC) == 0);
+    REQUIRE(::pipe2(pipe_b, O_NONBLOCK | O_CLOEXEC) == 0);
+
+    op_state state_a;
+    io_request req_a{};
+    req_a.op = io_op::close;
+    req_a.fd = pipe_a[0];
+    req_a.state = &state_a;
+    REQUIRE(backend.prepare(req_a));
+
+    op_state state_b;
+    io_request req_b{};
+    req_b.op = io_op::close;
+    req_b.fd = pipe_b[0];
+    req_b.state = &state_b;
+    REQUIRE(backend.prepare(req_b));
+    REQUIRE(backend.pending_count() == 2);
+
+    // Cancelling a queued close claims it with -ECANCELED but does NOT close
+    // the fd; the remaining queued close must still drain through poll().
+    // Broken sync-op accounting (a drain skipped with close B queued) would
+    // leave pending_count() at 1 forever.
+    backend.cancel(tagged_op_state_user_data(&state_a));
+    REQUIRE(state_a.phase == op_state::phase_completed);
+    REQUIRE(state_a.result == -ECANCELED);
+    REQUIRE(::fcntl(pipe_a[0], F_GETFD) >= 0);  // still open
+    REQUIRE(backend.pending_count() == 1);
+
+    REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+    REQUIRE(state_b.phase == op_state::phase_completed);
+    REQUIRE(state_b.result == 0);
+    REQUIRE(::fcntl(pipe_b[0], F_GETFD) < 0);  // actually closed
+    REQUIRE(backend.pending_count() == 0);
+
+    REQUIRE(::close(pipe_a[0]) == 0);
+    REQUIRE(::close(pipe_a[1]) == 0);
+    REQUIRE(::close(pipe_b[1]) == 0);
+}
+
 TEST_CASE("epoll precompleted ready results are terminal against cancellation",
           "[io][epoll][cancel][regular]") {
     SECTION("inline regular-file read result wins over cancellation") {

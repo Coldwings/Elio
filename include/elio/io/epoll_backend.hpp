@@ -350,6 +350,9 @@ public:
         }
         
         state.pending_ops.push_back(std::move(op));
+        if (is_sync) {
+            pending_sync_ops_++;
+        }
         pending_count_++;
         detail::run_noexcept([&]() {
             ELIO_LOG_DEBUG("Prepared io_op::{} on fd={}",
@@ -607,6 +610,9 @@ public:
             if (it != state.pending_ops.end()) {
                 found_entry = claim_resume(it->req.state, it->awaiter,
                                            io_result{-ECANCELED, 0}, to_resume);
+                if (it->synchronous) {
+                    pending_sync_ops_--;
+                }
                 state.pending_ops.erase(it);
                 pending_count_--;
 
@@ -914,6 +920,11 @@ private:
     /// loops (scheduler workers, standalone run_*()) never call submit(), so
     /// they rely on this drain for sync-op completion (#1162).
     int drain_sync_ops() {
+        // poll() calls this on every pump; skip the O(total pending I/O)
+        // scan unless a close is actually queued.
+        if (pending_sync_ops_ == 0) {
+            return 0;
+        }
         int submitted = 0;
 
         // Collect handles to resume after processing all operations
@@ -939,6 +950,7 @@ private:
                     }
                     execute_sync_op(*it, &deferred_resumes);
                     it = state.pending_ops.erase(it);
+                    pending_sync_ops_--;
                     pending_count_--;
                     submitted++;
                     // The fd's lifetime ended: drop the entry (including the
@@ -1141,6 +1153,9 @@ private:
     std::vector<pending_operation> ready_ops_;            ///< Ops completed during prepare()
     timer_queue_t timer_queue_;                           ///< Timer queue for timeouts
     std::atomic<size_t> pending_count_{0};                ///< Number of pending operations (atomic for cross-thread reads)
+    /// Number of queued synchronous (close) operations. Owner-thread only;
+    /// lets drain_sync_ops() skip its full scan on the poll() hot path.
+    size_t pending_sync_ops_ = 0;
     int wake_fd_ = -1;  ///< eventfd for cross-thread wake-up
     static inline thread_local io_result last_result_{};
 };

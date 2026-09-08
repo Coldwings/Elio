@@ -2568,6 +2568,7 @@ struct client_config : base_client_config {
     size_t max_connections_per_host = 6;
     std::chrono::seconds pool_idle_timeout{60};
     size_t max_response_size = 16 * 1024 * 1024;
+    std::chrono::milliseconds expect_continue_timeout{1000};
     // Inherits all base_client_config fields.
 };
 ```
@@ -2575,6 +2576,18 @@ struct client_config : base_client_config {
 When `follow_redirects` is enabled, the client resolves `Location` values with
 `url::resolve_reference()`, rejects unsupported schemes, and rejects HTTPS to
 HTTP downgrades.
+
+`expect_continue_timeout` bounds the wait for an interim `100 Continue` when a
+request uses `request::set_expect_continue()` and has a body. If the server
+answers with `100 Continue`, the client sends the body and then processes the
+response normally (any further interim 1xx responses are skipped). If the
+server answers with a final response first (for example `417 Expectation
+Failed`), the body is not sent and the response is consumed as usual. If the
+deadline expires first, the body is sent anyway (RFC 9110 §10.1.1 fallback).
+A value less than or equal to zero skips the wait entirely: the body is sent
+immediately after the headers. For redirects that preserve the request body
+(307/308 and method-preserving redirects), the Expect handshake re-runs per
+hop.
 
 `websocket::client_config` and `sse::client_config` also inherit
 `base_client_config`, including timeout, read-buffer, TLS verification, DNS
@@ -2680,6 +2693,7 @@ public:
     void set_body(std::string&& body);
     void set_host(std::string_view host);
     void set_content_type(std::string_view type);
+    void set_expect_continue(bool on = true);
     headers& get_headers() noexcept;
     const headers& get_headers() const noexcept;
     
@@ -2691,6 +2705,10 @@ public:
     std::string_view body() const noexcept;
     std::string_view host() const;
     std::string_view content_type() const;
+    bool expect_continue() const noexcept;
+
+    std::string serialize_headers() const;
+    std::string serialize() const;
 };
 ```
 
@@ -2699,6 +2717,14 @@ public:
 `set_version()` accepts an empty value for the default `HTTP/1.1` serialization
 or a version token of the form `HTTP/<digits>.<digits>`; invalid values throw
 `std::invalid_argument`.
+
+`set_expect_continue()` sets or clears the `Expect: 100-continue` header
+together with the client-side sending flag. When the flag is enabled and the
+request has a body, `http::client::send()` transmits the headers first and
+waits (bounded by `client_config::expect_continue_timeout`) for an interim
+`100 Continue` before sending the body; see `client_config` for the fallback
+semantics. `serialize_headers()` returns the request line and headers without
+the body; `serialize()` shares it and appends the body.
 
 ### `headers`
 

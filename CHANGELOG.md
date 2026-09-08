@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not escape it. Note that `http::server` still reads the full request body
   before dispatch, so an explicit `100 Continue` cannot accelerate an
   `Expect: 100-continue` client's first body send (#1163).
+- **HTTP client `Expect: 100-continue` handshake**:
+  `http::request::set_expect_continue()` plus
+  `http::client_config::expect_continue_timeout` (default 1s) send the
+  request headers first and wait bounded for an interim `100 Continue`
+  before transmitting the body. A final response received first (for example
+  417) suppresses the body, a timeout sends the body anyway (RFC 9110
+  §10.1.1 fallback), and a timeout less than or equal to zero sends the body
+  immediately after the headers. Body-preserving redirects re-run the
+  handshake per hop. `http::request::serialize_headers()` exposes the
+  header-only serialization used by this flow (#1163).
 - **Fair TCP loopback benchmark protocol**: Replaced the non-equivalent
   per-adapter echo workloads with fixed-work latency, message-rate, and bulk
   contracts with separately attributable client-against-reference-server and

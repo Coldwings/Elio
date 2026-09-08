@@ -322,6 +322,35 @@ public:
             int ret;
             if (state.registered) {
                 ret = epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, req.fd, &ev);
+                if (ret < 0 && (errno == ENOENT || errno == EPERM)) {
+                    // Phantom registration (#1174): the fd was closed
+                    // outside the backend (e.g. a raw ::close from an
+                    // off-worker stream destructor) and the fd number has
+                    // since been recycled, so the registered=true entry
+                    // belongs to a previous open file description. Both
+                    // MOD failures are sound phantom signatures:
+                    //  - ENOENT: no registration exists for the current fd
+                    //    (the kernel dropped it together with the old fd);
+                    //  - EPERM: MOD rejects the current fd as non-pollable,
+                    //    but ADD of a non-pollable fd can never have
+                    //    succeeded — an open file description's pollability
+                    //    is invariant over its lifetime, so our
+                    //    registered=true cannot refer to the current fd.
+                    // Every op still queued in this entry belongs to the
+                    // dead fd: fail it with -ECANCELED so it can never fire
+                    // against the recycled fd, drop the entry, wake the
+                    // claimed awaiters (only once no entry references
+                    // remain — they may re-enter prepare()/cancel()), then
+                    // retry this prepare from scratch so the recycled fd
+                    // re-probes its file type (#1164 inline path for
+                    // regular files) and registers cleanly. The retry
+                    // cannot recurse: the fresh entry starts unregistered.
+                    std::vector<deferred_resume_entry> stale_resumes;
+                    fail_fd_state_ops(state, stale_resumes);
+                    fd_states_.erase(state_it);
+                    resume_deferred(stale_resumes);
+                    return prepare(req);
+                }
             } else {
                 ret = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, req.fd, &ev);
                 if (ret == 0) {
@@ -696,6 +725,37 @@ public:
         }
     }
 
+    /// Close ``fd`` from a destructor running on this backend's owner thread
+    /// (non-coroutine context, e.g. a stream destructor).
+    ///
+    /// A bare ::close would leave fd_states_ claiming the fd is still
+    /// registered — the kernel drops the epoll registration together with
+    /// the fd — so a recycled fd number would later take the EPOLL_CTL_MOD
+    /// branch and fail spuriously with -ENOENT, and any op still parked on
+    /// the entry could fire against the recycled fd (#1174). Fail every
+    /// parked op with -ECANCELED through the op_state claim path (each
+    /// awaiter resumed exactly once, same as cancel()), drop the
+    /// registration, erase the entry, then close. Owner-thread only: like
+    /// every other mutating backend operation, this must run on the thread
+    /// that polls this backend.
+    void close_fd_from_owner(int fd) noexcept {
+        std::vector<deferred_resume_entry> deferred_resumes;
+        auto state_it = fd_states_.find(fd);
+        if (state_it != fd_states_.end()) {
+            auto& state = state_it->second;
+            if (state.registered) {
+                epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+            }
+            fail_fd_state_ops(state, deferred_resumes);
+            fd_states_.erase(state_it);
+        }
+        ::close(fd);
+        // Resume after the entry is gone and the fd is closed: a woken
+        // awaiter may immediately prepare I/O on a recycled fd number and
+        // must observe a clean backend.
+        resume_deferred(deferred_resumes);
+    }
+
 private:
     struct pending_operation {
         io_request req;
@@ -915,6 +975,29 @@ private:
                                                std::vector<timer_entry>,
                                                std::greater<timer_entry>>;
     
+    /// Fail every op still queued in ``state`` with -ECANCELED through the
+    /// op_state claim path (each awaiter is resumed exactly once, same as
+    /// cancel()) and reset the entry to a never-registered, never-probed
+    /// condition. Used when the fd behind the entry is dead or about to be
+    /// closed: a surviving parked op would issue its syscall against
+    /// whatever fd number gets recycled into the slot (#1174). Callers must
+    /// either erase the entry or re-register the fd afterwards.
+    void fail_fd_state_ops(fd_state& state,
+                           std::vector<deferred_resume_entry>& deferred_resumes) {
+        for (auto& parked : state.pending_ops) {
+            enqueue_resume(parked.req.state, parked.awaiter,
+                           io_result{-ECANCELED, 0}, &deferred_resumes);
+            if (parked.synchronous) {
+                pending_sync_ops_--;
+            }
+            pending_count_--;
+        }
+        state.pending_ops.clear();
+        state.events = 0;
+        state.registered = false;
+        state.kind = fd_kind::unknown;
+    }
+
     /// Execute every queued synchronous operation (close) across all fds and
     /// resume their awaiters. Shared by submit() and poll(): poll()-driven
     /// loops (scheduler workers, standalone run_*()) never call submit(), so
@@ -934,39 +1017,48 @@ private:
         // Execute synchronous operations (like close)
         for (auto map_it = fd_states_.begin(); map_it != fd_states_.end();) {
             auto& state = map_it->second;
-            bool erase_entry = false;
-            auto it = state.pending_ops.begin();
-            while (it != state.pending_ops.end()) {
-                if (it->synchronous) {
-                    bool is_close = (it->req.op == io_op::close);
-                    // Deregister from epoll BEFORE closing the fd to prevent
-                    // a race where another thread reuses the fd number between
-                    // close() and EPOLL_CTL_DEL, causing stale registrations.
-                    if (is_close && state.registered) {
-                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, map_it->first,
-                                  nullptr);
-                        state.registered = false;
-                        state.events = 0;
-                    }
-                    execute_sync_op(*it, &deferred_resumes);
-                    it = state.pending_ops.erase(it);
-                    pending_sync_ops_--;
-                    pending_count_--;
-                    submitted++;
-                    // The fd's lifetime ended: drop the entry (including the
-                    // cached fd_kind) so a recycled fd number re-probes.
-                    if (is_close && state.pending_ops.empty()) {
-                        erase_entry = true;
-                    }
-                } else {
-                    ++it;
-                }
-            }
-            if (erase_entry) {
-                map_it = fd_states_.erase(map_it);
-            } else {
+            auto it = std::find_if(state.pending_ops.begin(),
+                                   state.pending_ops.end(),
+                                   [](const pending_operation& op) {
+                                       return op.synchronous;
+                                   });
+            if (it == state.pending_ops.end()) {
                 ++map_it;
+                continue;
             }
+
+            bool is_close = (it->req.op == io_op::close);
+            // Deregister from epoll BEFORE closing the fd to prevent
+            // a race where another thread reuses the fd number between
+            // close() and EPOLL_CTL_DEL, causing stale registrations.
+            if (is_close && state.registered) {
+                epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, map_it->first, nullptr);
+                state.registered = false;
+                state.events = 0;
+            }
+
+            // Move the op out before erasing it from the queue.
+            pending_operation op = std::move(*it);
+            state.pending_ops.erase(it);
+            pending_sync_ops_--;
+            pending_count_--;
+            submitted++;
+
+            if (is_close) {
+                // The fd's lifetime ends here. Fail every other queued op
+                // for this fd with -ECANCELED and drop the entry BEFORE
+                // ::close runs: a parked op that survived would later issue
+                // its syscall against whatever fd number gets recycled into
+                // this slot, letting the old connection's awaiter steal the
+                // new connection's data (#1174). Dropping the entry
+                // (including the cached fd_kind) also makes a recycled fd
+                // number re-register and re-probe from scratch.
+                fail_fd_state_ops(state, deferred_resumes);
+                map_it = fd_states_.erase(map_it);
+            }
+            execute_sync_op(op, &deferred_resumes);
+            // Non-close path: re-scan the same entry (map_it unchanged) for
+            // further queued sync ops.
         }
 
         // Resume coroutines after iteration is complete

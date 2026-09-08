@@ -61,6 +61,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skips interim 1xx responses (for example `100 Continue`) that precede the
   `101 Switching Protocols` upgrade response, under a cumulative byte cap,
   instead of failing the handshake with `EBADMSG` (#1163).
+- **epoll stale parked ops after fd close (cross-connection data exposure)**:
+  Under the epoll backend, an fd close (`async_close`, stream `close()`, or a
+  stream destructor) left I/O operations parked on that fd alive in the
+  backend. Once the fd number was recycled by a new connection, the stale
+  parked operation could fire against the recycled fd: the old connection's
+  reader received bytes belonging to the new connection (cross-connection
+  data exposure) while the new reader starved, and a destructor-time raw
+  `close()` additionally left a phantom epoll registration that failed
+  legitimate new I/O on the recycled fd with `-ENOENT`. The epoll backend
+  now fails every operation still queued for a closing fd with `-ECANCELED`
+  (each awaiter resumed exactly once) and drops the fd entry before the fd
+  number can be recycled; destructor-time stream closes on an epoll worker
+  go through the backend (listener closes keep their non-cancelling
+  contract), and a phantom registration left by an off-worker close is
+  repaired lazily at the next `prepare()` on the recycled fd
+  number (both the `ENOENT` and the `EPERM` modification-failure signatures
+  are recognized). Under io_uring, in-flight operations hold kernel file
+  references and complete normally against the old file description; only
+  the epoll backend fails parked ops on close. The stream close contract is
+  now documented for `tcp_stream`, `uds_stream`, and `tls_stream` (#1174,
+  #1169).
 - **Cross-worker `signal_fd::wait()`**: Awaiting a `signal::signal_fd` on a
   different scheduler worker than the one it was constructed on no longer
   throws `std::logic_error`. `wait()` now resolves its submission

@@ -44,6 +44,18 @@ enum class handshake_result {
 /// multiple concurrent readers, multiple concurrent writers, and
 /// shutdown/destruction against active I/O according to the higher-level
 /// protocol contract.
+///
+/// **Close contract:** on the epoll backend, close() — and destruction of
+/// the underlying transport on the stream's owning worker — fails any I/O
+/// still parked on the stream's fd with -ECANCELED, resuming each parked
+/// awaiter exactly once; destruction off the owning worker raw-closes the
+/// fd and leaves a parked op suspended until the recycled fd number is next
+/// prepared or the backend is destroyed. On the io_uring backend, in-flight
+/// operations hold a kernel file reference and complete normally later
+/// against the old file description. A stoppable reader/writer should still
+/// prefer the cancellable overload plus token cancellation and await the
+/// operation before closing; the stream must remain alive until parked
+/// operations have resumed.
 class tls_stream {
 public:
     /// Create a TLS stream from an existing TCP stream

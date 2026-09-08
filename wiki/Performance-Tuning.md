@@ -133,7 +133,7 @@ scheduler sched(4, wait_strategy::blocking());
 // Spins for 1000 iterations with yield, then blocks on I/O poll
 scheduler sched(4, wait_strategy::hybrid(1000));
 
-// Aggressive spinning - ultra-low latency (uses pause instruction)
+// Spin-then-block with pause instruction (identical to aggressive(1000))
 scheduler sched(4, wait_strategy::spinning(1000));
 
 // Custom strategy
@@ -150,8 +150,13 @@ scheduler sched(4, custom);
 |----------|-----------|--------------|----------|
 | `blocking()` | Lowest | ~1-10 μs | General workloads (default) |
 | `hybrid(N)` | Low-Medium | ~1-5 μs | Latency-sensitive with mixed load |
-| `spinning(N)` | High | ~100-500 ns | Ultra-low latency, dedicated CPUs |
-| `aggressive(N)` | Medium-High | ~100-1000 ns | Low latency, shared CPUs |
+| `spinning(N)` / `aggressive(N)` | Medium-High | ~100-1000 ns | Low latency; identical for equal N |
+
+`spinning(N)` and `aggressive(N)` both return `{N, false}` (N spin iterations
+with the CPU pause instruction), so they are exactly equivalent for equal N.
+Every strategy with `spin_iterations > 0` is spin-then-block: after the spin
+budget is exhausted the worker always falls back to the blocking I/O poll, so
+no strategy spins forever.
 
 The `spin_yield` flag controls whether the spin phase uses `std::this_thread::yield()` (true) or the CPU pause instruction (false). Yielding is friendlier to other threads but slightly slower.
 

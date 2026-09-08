@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **epoll `async_close` completion**: Under the epoll backend,
+  `io::async_close` now completes without an explicit `submit()` pump. Close
+  operations are queued as synchronous operations and previously only
+  executed inside `submit()`, which scheduler workers and the standalone
+  `run()`/`run_for()`/`run_until_complete()` drivers never call (they only
+  pump `poll()`), so the close never completed and `scheduler::shutdown()`
+  could not drain. The epoll backend now drains queued synchronous
+  operations at the top of `poll()`, matching the io_uring backend, whose
+  `poll()` auto-submits staged operations (#1162).
 - **Empty HTTP response framing**: `http::response` serialization now emits
   `Content-Length: 0` for an empty body when the status allows a body and the
   caller set neither `Content-Length` nor `Transfer-Encoding`. This covers

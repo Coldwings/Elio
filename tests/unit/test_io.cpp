@@ -130,6 +130,39 @@ private:
     op_state*& observed_state_;
 };
 
+class observed_close_awaitable : public io_awaitable_base {
+public:
+    observed_close_awaitable(int fd, op_state*& observed_state) noexcept
+        : fd_(fd), observed_state_(observed_state) {}
+
+    template<typename Promise>
+    void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        auto& ctx = current_io_context();
+
+        io_request req{};
+        req.op = io_op::close;
+        req.fd = fd_;
+        req.awaiter = awaiter;
+        req.state = setup_op_state(awaiter, ctx);
+        observed_state_ = req.state;
+        if (!prepare_op_state(ctx, req)) {
+            clear_op_state();
+            result_ = prepare_failure_result();
+            awaiter.resume();
+            return;
+        }
+    }
+
+    io_result await_resume() noexcept {
+        result_ = read_result_from_op_state();
+        return result_;
+    }
+
+private:
+    int fd_;
+    op_state*& observed_state_;
+};
+
 class retained_op_state_storage_guard {
 public:
     retained_op_state_storage_guard() = default;
@@ -1798,6 +1831,128 @@ TEST_CASE("epoll fd kind cache is invalidated when an fd number is recycled",
         REQUIRE(close(pipefd[1]) == 0);
         unlink(tmpfile);
     }
+}
+
+TEST_CASE("epoll poll() drains a queued sync close without an explicit submit "
+          "(standalone)",
+          "[io][epoll][close][issue-1162]") {
+    io_context ctx(io_context::backend_type::epoll);
+
+    int pipefd[2] = {-1, -1};
+    REQUIRE(::pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) == 0);
+
+    op_state state;
+    io_request creq{};
+    creq.op = io_op::close;
+    creq.fd = pipefd[0];
+    creq.state = &state;
+    REQUIRE(ctx.prepare(creq));
+    REQUIRE(ctx.pending_count() == 1);
+
+    // No explicit ctx.submit(): run_for() only pumps poll(), mirroring the
+    // scheduler worker loop and the standalone run()/run_until_complete()
+    // drivers. The queued synchronous close must still complete (#1162).
+    ctx.run_for(std::chrono::milliseconds(500));
+
+    REQUIRE(ctx.pending_count() == 0);
+    REQUIRE(state.phase == op_state::phase_completed);
+    REQUIRE(state.result == 0);
+
+    REQUIRE(::close(pipefd[1]) == 0);
+}
+
+TEST_CASE("epoll async_close completes on a scheduler worker without an "
+          "explicit submit",
+          "[io][epoll][close][scheduler][issue-1162]") {
+    worker_io_backend_guard backend_guard(io_context::backend_type::epoll);
+
+    int pipefd[2] = {-1, -1};
+    REQUIRE(::pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) == 0);
+
+    scheduler sched(1);
+    sched.start();
+    auto* worker_context = &sched.get_worker(0)->io_context();
+
+    std::atomic<bool> close_done{false};
+    std::atomic<int> close_result{-1};
+    op_state* close_state = nullptr;
+
+    sched.go([&]() -> task<void> {
+        auto result = co_await observed_close_awaitable(pipefd[0],
+                                                        close_state);
+        close_result.store(result.result, std::memory_order_release);
+        close_done.store(true, std::memory_order_release);
+    });
+
+    // Wait until the close is actually queued on the worker (or has already
+    // completed through the poll() drain).
+    auto queue_deadline = std::chrono::steady_clock::now() +
+                          elio::test::scaled_sec(5);
+    while (worker_context->pending_count() == 0 &&
+           !close_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < queue_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    if (!close_done.load(std::memory_order_acquire)) {
+        // Give the worker loop a generous window to prove the close cannot
+        // complete on its own, then post a watchdog that claims the queued
+        // op through the backend cancel path. The watchdog deliberately
+        // avoids timer awaitables: sleep_awaitable calls ctx.submit() after
+        // preparing its timeout, which would drain the queued close and
+        // mask the regression. Posting a plain coroutine does not submit.
+        std::this_thread::sleep_for(elio::test::scaled_ms(500));
+        sched.go([&]() -> task<void> {
+            if (!close_done.load(std::memory_order_acquire) &&
+                close_state != nullptr) {
+                current_io_context().cancel(
+                    tagged_op_state_user_data(close_state));
+            }
+            co_return;
+        });
+    }
+
+    auto deadline = std::chrono::steady_clock::now() +
+                    elio::test::scaled_sec(5);
+    while (!close_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    REQUIRE(close_done.load(std::memory_order_acquire));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+    REQUIRE(close_result.load(std::memory_order_acquire) == 0);
+
+    REQUIRE(::close(pipefd[1]) == 0);
+}
+
+TEST_CASE("epoll async_close does not stall scheduler shutdown",
+          "[io][epoll][close][scheduler][shutdown][issue-1162]") {
+    worker_io_backend_guard backend_guard(io_context::backend_type::epoll);
+
+    int pipefd[2] = {-1, -1};
+    REQUIRE(::pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) == 0);
+
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> close_done{false};
+    std::atomic<int> close_result{-1};
+    sched.go([&]() -> task<void> {
+        auto result = co_await async_close(pipefd[0]);
+        close_result.store(result.result, std::memory_order_release);
+        close_done.store(true, std::memory_order_release);
+    });
+
+    // A queued close that never completes would keep the task in flight
+    // until the timeout force-stops it, making shutdown() return false
+    // (#1162). With the poll() drain the close completes immediately and the
+    // graceful drain succeeds.
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+    REQUIRE(close_done.load(std::memory_order_acquire));
+    REQUIRE(close_result.load(std::memory_order_acquire) == 0);
+
+    REQUIRE(::close(pipefd[1]) == 0);
 }
 
 TEST_CASE("epoll precompleted ready results are terminal against cancellation",

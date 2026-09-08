@@ -362,59 +362,19 @@ public:
     /// For epoll, operations are "submitted" when they're added
     /// This just executes any synchronous operations
     int submit() override {
-        int submitted = 0;
-
-        // Collect handles to resume after processing all operations
-        // (avoids iterator invalidation if resumed coroutine calls prepare())
-        std::vector<deferred_resume_entry> deferred_resumes;
-
-        // Execute synchronous operations (like close)
-        for (auto map_it = fd_states_.begin(); map_it != fd_states_.end();) {
-            auto& state = map_it->second;
-            bool erase_entry = false;
-            auto it = state.pending_ops.begin();
-            while (it != state.pending_ops.end()) {
-                if (it->synchronous) {
-                    bool is_close = (it->req.op == io_op::close);
-                    // Deregister from epoll BEFORE closing the fd to prevent
-                    // a race where another thread reuses the fd number between
-                    // close() and EPOLL_CTL_DEL, causing stale registrations.
-                    if (is_close && state.registered) {
-                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, map_it->first,
-                                  nullptr);
-                        state.registered = false;
-                        state.events = 0;
-                    }
-                    execute_sync_op(*it, &deferred_resumes);
-                    it = state.pending_ops.erase(it);
-                    pending_count_--;
-                    submitted++;
-                    // The fd's lifetime ended: drop the entry (including the
-                    // cached fd_kind) so a recycled fd number re-probes.
-                    if (is_close && state.pending_ops.empty()) {
-                        erase_entry = true;
-                    }
-                } else {
-                    ++it;
-                }
-            }
-            if (erase_entry) {
-                map_it = fd_states_.erase(map_it);
-            } else {
-                ++map_it;
-            }
-        }
-
-        // Resume coroutines after iteration is complete
-        resume_deferred(deferred_resumes);
-
+        int submitted = drain_sync_ops();
         ELIO_LOG_DEBUG("Submitted {} synchronous operations", submitted);
         return submitted;
     }
-    
+
     /// Poll for completed operations
     int poll(std::chrono::milliseconds timeout) override {
-        int completions = 0;
+        // Drain queued synchronous ops (async_close) first. Scheduler workers
+        // and the standalone run()/run_for()/run_until_complete() loops only
+        // ever pump poll(), so without this a queued close would wait forever
+        // for an explicit submit() that never comes (#1162). This mirrors the
+        // io_uring backend, whose poll() auto-submits staged SQEs.
+        int completions = drain_sync_ops();
 
         // Collect handles to resume after processing all completions
         std::vector<deferred_resume_entry> deferred_resumes;
@@ -441,6 +401,13 @@ public:
 
             resume_deferred(deferred_resumes);
             ELIO_LOG_DEBUG("Processed {} ready completions", completions);
+            return completions;
+        }
+
+        if (completions > 0) {
+            // The sync-op drain above already delivered completions; return
+            // them without blocking in epoll_wait (same contract as the
+            // ready-op path). The caller re-polls if it wants to wait.
             return completions;
         }
 
@@ -942,6 +909,60 @@ private:
                                                std::vector<timer_entry>,
                                                std::greater<timer_entry>>;
     
+    /// Execute every queued synchronous operation (close) across all fds and
+    /// resume their awaiters. Shared by submit() and poll(): poll()-driven
+    /// loops (scheduler workers, standalone run_*()) never call submit(), so
+    /// they rely on this drain for sync-op completion (#1162).
+    int drain_sync_ops() {
+        int submitted = 0;
+
+        // Collect handles to resume after processing all operations
+        // (avoids iterator invalidation if resumed coroutine calls prepare())
+        std::vector<deferred_resume_entry> deferred_resumes;
+
+        // Execute synchronous operations (like close)
+        for (auto map_it = fd_states_.begin(); map_it != fd_states_.end();) {
+            auto& state = map_it->second;
+            bool erase_entry = false;
+            auto it = state.pending_ops.begin();
+            while (it != state.pending_ops.end()) {
+                if (it->synchronous) {
+                    bool is_close = (it->req.op == io_op::close);
+                    // Deregister from epoll BEFORE closing the fd to prevent
+                    // a race where another thread reuses the fd number between
+                    // close() and EPOLL_CTL_DEL, causing stale registrations.
+                    if (is_close && state.registered) {
+                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, map_it->first,
+                                  nullptr);
+                        state.registered = false;
+                        state.events = 0;
+                    }
+                    execute_sync_op(*it, &deferred_resumes);
+                    it = state.pending_ops.erase(it);
+                    pending_count_--;
+                    submitted++;
+                    // The fd's lifetime ended: drop the entry (including the
+                    // cached fd_kind) so a recycled fd number re-probes.
+                    if (is_close && state.pending_ops.empty()) {
+                        erase_entry = true;
+                    }
+                } else {
+                    ++it;
+                }
+            }
+            if (erase_entry) {
+                map_it = fd_states_.erase(map_it);
+            } else {
+                ++map_it;
+            }
+        }
+
+        // Resume coroutines after iteration is complete
+        resume_deferred(deferred_resumes);
+
+        return submitted;
+    }
+
     void execute_sync_op(pending_operation& op,
                          std::vector<deferred_resume_entry>* deferred_resumes = nullptr) {
         int result = 0;

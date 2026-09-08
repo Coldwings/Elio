@@ -1508,6 +1508,14 @@ cleanup. Work stealing and affinity migration cannot move the continuation
 while the pin is active. A retiring worker continues polling until both its
 backend pending count and active pin count are zero.
 
+Both built-in backends make `poll()` self-driving for staged work: the
+io_uring backend auto-submits staged SQEs from `poll()`, and the epoll
+backend drains queued synchronous operations (close) at the top of `poll()`.
+Poll-only drivers — scheduler worker loops and the standalone
+`run()`/`run_for()`/`run_until_complete()` helpers — therefore complete
+`async_close` without an explicit `submit()` call. `submit()` remains public
+and idempotent for raw-backend users that drive it manually.
+
 A directly constructed `io_context` is standalone. The caller must serialize
 access, poll it, and keep it alive for all pending operations. Scheduler
 coroutines must use their current worker context; they cannot submit through a

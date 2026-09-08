@@ -266,6 +266,17 @@ private:
         if (status_forbids_body) {
             serialized_headers.remove("Content-Length");
             serialized_headers.remove("Transfer-Encoding");
+        } else if (body_.empty() &&
+                   !serialized_headers.contains("Content-Length") &&
+                   !serialized_headers.contains("Transfer-Encoding")) {
+            // A body-allowed response with no body and no explicit framing
+            // headers must still declare an empty body; otherwise a
+            // keep-alive peer has no delimiter and waits for EOF.
+            // Checked on the status rather than include_body so HEAD
+            // responses also carry Content-Length: 0. A user-set
+            // Content-Length is kept verbatim and a user-set
+            // Transfer-Encoding is never combined with Content-Length.
+            serialized_headers.set_content_length(0);
         }
         result += serialized_headers.serialize();
         

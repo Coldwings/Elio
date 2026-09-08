@@ -1814,6 +1814,80 @@ TEST_CASE("HTTP response serialization", "[http][message]") {
         REQUIRE(serialized.find("Transfer-Encoding: ") == std::string::npos);
         REQUIRE(serialized.find("forbidden-body") == std::string::npos);
     }
+
+    SECTION("empty body-allowed responses emit Content-Length: 0") {
+        // Without an explicit body delimiter a keep-alive peer cannot tell
+        // where the response ends and waits for EOF (#1158).
+        response unauthorized(status::unauthorized);
+        REQUIRE(unauthorized.serialize().find("Content-Length: 0\r\n") !=
+                std::string::npos);
+
+        response redirect = response::redirect("https://example.com/next");
+        REQUIRE(redirect.serialize().find("HTTP/1.1 302 Found\r\n") !=
+                std::string::npos);
+        REQUIRE(redirect.serialize().find("Content-Length: 0\r\n") !=
+                std::string::npos);
+
+        response range_not_satisfiable(status::range_not_satisfiable);
+        REQUIRE(range_not_satisfiable.serialize().find(
+                    "Content-Length: 0\r\n") != std::string::npos);
+
+        response defaulted;
+        defaulted.set_status(status::unauthorized);
+        REQUIRE(defaulted.serialize().find("Content-Length: 0\r\n") !=
+                std::string::npos);
+    }
+
+    SECTION("empty HEAD response emits Content-Length: 0") {
+        response resp(status::ok);
+
+        std::string serialized = resp.serialize(method::HEAD);
+
+        REQUIRE(serialized.find("HTTP/1.1 200 OK\r\n") != std::string::npos);
+        REQUIRE(serialized.find("Content-Length: 0\r\n") != std::string::npos);
+    }
+
+    SECTION("user-set Content-Length on empty body is preserved verbatim") {
+        response resp(status::ok);
+        resp.set_header("Content-Length", "5");
+
+        std::string serialized = resp.serialize();
+
+        REQUIRE(serialized.find("Content-Length: 5\r\n") != std::string::npos);
+        REQUIRE(serialized.find("Content-Length: 0") == std::string::npos);
+    }
+
+    SECTION("user-set Transfer-Encoding suppresses Content-Length: 0") {
+        response resp(status::ok);
+        resp.set_header("Transfer-Encoding", "chunked");
+
+        std::string serialized = resp.serialize();
+
+        REQUIRE(serialized.find("Transfer-Encoding: chunked\r\n") !=
+                std::string::npos);
+        REQUIRE(serialized.find("Content-Length: ") == std::string::npos);
+    }
+
+    SECTION("empty 304 response still has no framing headers") {
+        response resp(status::not_modified);
+
+        std::string serialized = resp.serialize();
+
+        REQUIRE(serialized.find("HTTP/1.1 304 Not Modified\r\n") !=
+                std::string::npos);
+        REQUIRE(serialized.find("Content-Length: ") == std::string::npos);
+        REQUIRE(serialized.find("Transfer-Encoding: ") == std::string::npos);
+    }
+
+    SECTION("non-empty body response keeps its Content-Length") {
+        response resp(status::ok, "payload", mime::text_plain);
+
+        std::string serialized = resp.serialize();
+
+        REQUIRE(serialized.find("Content-Length: 7\r\n") != std::string::npos);
+        REQUIRE(serialized.find("Content-Length: 0") == std::string::npos);
+        REQUIRE(serialized.find("\r\n\r\npayload") != std::string::npos);
+    }
 }
 
 TEST_CASE("HTTP response from parser roundtrip", "[http][message]") {

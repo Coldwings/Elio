@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Empty HTTP response framing**: `http::response` serialization now emits
+  `Content-Length: 0` for an empty body when the status allows a body and the
+  caller set neither `Content-Length` nor `Transfer-Encoding`. This covers
+  `response(status)`, the default constructor plus `set_status()`, and the
+  `response::redirect()` factory, and also applies to HEAD responses of
+  body-allowed statuses. Previously such responses serialized without a body
+  delimiter, so a keep-alive peer could not tell where the response ended and
+  waited for a connection close that never came. User-supplied framing headers
+  are still preserved verbatim, and statuses that forbid a body (1xx, 204,
+  205, 304) continue to serialize without framing headers (#1158).
 - **Object-cache lazy task argument lifetime**: `object_cache::get()` now
   copies the key and stores a decayed copy or moved instance of the constructor
   callable before returning its lazy task. Storing the task for later await can

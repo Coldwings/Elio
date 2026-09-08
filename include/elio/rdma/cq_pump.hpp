@@ -40,7 +40,7 @@
 /// auto pump = [&]() -> elio::coro::task<void> {
 ///     co_await elio::rdma::cq_pump(
 ///         cq_channel_fd, disp,
-///         [&](elio::rdma::dispatcher& d) {
+///         [&](elio::rdma::dispatcher& d) noexcept {
 ///             // ibv_get_cq_event / ibv_poll_cq / d.deliver / ack /
 ///             // re-arm. Implementation owns the verbs sequence.
 ///         },

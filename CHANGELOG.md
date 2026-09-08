@@ -14,9 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   except 101 Switching Protocols) on the connection before returning the
   final response; other statuses fail with `errno = EINVAL` and a `false`
   result. The context borrows its connection from the handler scope and must
-  not escape it. Note that `http::server` still reads the full request body
-  before dispatch, so an explicit `100 Continue` cannot accelerate an
-  `Expect: 100-continue` client's first body send (#1163).
+  not escape it. Contexts dispatched without a connection writer (for
+  example `websocket::ws_server` plain-HTTP fallback routes) fail
+  `send_interim()` with `errno = ENOTSUP` instead. Note that `http::server`
+  still reads the full request body before dispatch, so an explicit
+  `100 Continue` cannot accelerate an `Expect: 100-continue` client's first
+  body send (#1163).
 - **HTTP client `Expect: 100-continue` handshake**:
   `http::request::set_expect_continue()` plus
   `http::client_config::expect_continue_timeout` (default 1s) send the
@@ -26,12 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §10.1.1 fallback), and a timeout less than or equal to zero sends the body
   immediately after the headers. Body-preserving redirects re-run the
   handshake per hop. `http::request::serialize_headers()` exposes the
-  header-only serialization used by this flow (#1163).
-- **WebSocket client handshake interim-1xx tolerance**: `ws_client` now
-  skips interim 1xx responses (for example `100 Continue`) that precede the
-  `101 Switching Protocols` upgrade response, under a cumulative byte cap,
-  instead of failing the handshake with `EBADMSG` (#1163).
-
+  header-only serialization used by this flow; the setter owns the `Expect`
+  header, and a bodyless request never serializes it (RFC 9110 §10.1.1)
+  (#1163).
 - **Fair TCP loopback benchmark protocol**: Replaced the non-equivalent
   per-adapter echo workloads with fixed-work latency, message-rate, and bulk
   contracts with separately attributable client-against-reference-server and
@@ -57,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **WebSocket client handshake interim-1xx tolerance**: `ws_client` now
+  skips interim 1xx responses (for example `100 Continue`) that precede the
+  `101 Switching Protocols` upgrade response, under a cumulative byte cap,
+  instead of failing the handshake with `EBADMSG` (#1163).
 - **Cross-worker `signal_fd::wait()`**: Awaiting a `signal::signal_fd` on a
   different scheduler worker than the one it was constructed on no longer
   throws `std::logic_error`. `wait()` now resolves its submission

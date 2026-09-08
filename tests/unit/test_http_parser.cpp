@@ -980,6 +980,26 @@ TEST_CASE("HTTP request serialization", "[http][message]") {
 
         REQUIRE(serialized.find("GET /search?q=test&page=1 HTTP/1.1\r\n") != std::string::npos);
     }
+
+    SECTION("Expect 100-continue is only serialized with a body") {
+        // RFC 9110 §10.1.1: a client MUST NOT send Expect without content.
+        request bodyless(method::GET, "/ping");
+        bodyless.set_host("example.com");
+        bodyless.set_expect_continue();
+        REQUIRE(bodyless.serialize_headers().find("Expect") == std::string::npos);
+        REQUIRE(bodyless.serialize().find("Expect") == std::string::npos);
+
+        request with_body(method::POST, "/upload");
+        with_body.set_host("example.com");
+        with_body.set_body(std::string_view("payload"));
+        with_body.set_expect_continue();
+        REQUIRE(with_body.serialize_headers().find("Expect: 100-continue\r\n") != std::string::npos);
+        REQUIRE(with_body.serialize().find("Expect: 100-continue\r\n") != std::string::npos);
+
+        // The setter owns the Expect header: disabling removes it outright.
+        with_body.set_expect_continue(false);
+        REQUIRE(with_body.serialize().find("Expect") == std::string::npos);
+    }
 }
 
 // Security regression tests --------------------------------------------------

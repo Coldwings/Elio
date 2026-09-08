@@ -91,6 +91,12 @@ public:
     /// client_config::expect_continue_timeout) for an interim 100 Continue
     /// before sending the body. The flag only controls client sending; it
     /// is not derived from a parsed Expect header.
+    ///
+    /// This setter owns the Expect header: enabling overwrites any existing
+    /// Expect value, and disabling removes the header outright, including a
+    /// caller-set custom value. The header is only serialized when the
+    /// request actually has a body — RFC 9110 §10.1.1 forbids sending
+    /// Expect: 100-continue without content.
     void set_expect_continue(bool on = true) {
         expect_continue_ = on;
         if (on) {
@@ -127,8 +133,16 @@ public:
         result += version;
         result += "\r\n";
 
-        // Headers
-        result += headers_.serialize();
+        // Headers. A bodyless request must not advertise
+        // Expect: 100-continue (RFC 9110 §10.1.1); drop the setter-managed
+        // header only for that case.
+        if (expect_continue_ && body_.empty()) {
+            auto no_expect = headers_;
+            no_expect.remove("Expect");
+            result += no_expect.serialize();
+        } else {
+            result += headers_.serialize();
+        }
 
         // End of headers
         result += "\r\n";

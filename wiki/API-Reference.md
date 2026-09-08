@@ -2667,7 +2667,10 @@ writes exactly `HTTP/1.1 100 Continue\r\n\r\n`.
 
 The context borrows its connection from the handler scope: it must not
 escape its handler (for example into a detached task), and interims can only
-be sent before the handler returns the final response.
+be sent before the handler returns the final response. Contexts dispatched
+without a connection writer — for example the plain-HTTP fallback routes of
+`websocket::ws_server` — cannot send interims: `send_interim()` then sets
+`errno = ENOTSUP` and returns `false`, and the final response is unaffected.
 
 > **Note**: `http::server` reads the full request, including the body, before
 > dispatching to the handler. An explicit `100 Continue` sent with
@@ -2719,12 +2722,16 @@ or a version token of the form `HTTP/<digits>.<digits>`; invalid values throw
 `std::invalid_argument`.
 
 `set_expect_continue()` sets or clears the `Expect: 100-continue` header
-together with the client-side sending flag. When the flag is enabled and the
-request has a body, `http::client::send()` transmits the headers first and
-waits (bounded by `client_config::expect_continue_timeout`) for an interim
-`100 Continue` before sending the body; see `client_config` for the fallback
-semantics. `serialize_headers()` returns the request line and headers without
-the body; `serialize()` shares it and appends the body.
+together with the client-side sending flag. The setter owns the `Expect`
+header: enabling overwrites any existing value and disabling removes the
+header outright. When the flag is enabled and the request has a body,
+`http::client::send()` transmits the headers first and waits (bounded by
+`client_config::expect_continue_timeout`) for an interim `100 Continue`
+before sending the body; see `client_config` for the fallback semantics. A
+bodyless request never serializes the `Expect` header (RFC 9110 §10.1.1
+forbids `Expect` without content). `serialize_headers()` returns the request
+line and headers without the body; `serialize()` shares it and appends the
+body.
 
 ### `headers`
 

@@ -1980,3 +1980,67 @@ TEST_CASE("HTTP server send_interim rejects non-interim statuses",
     REQUIRE(count_occurrences(bytes, "HTTP/1.1 ") == 1);
     REQUIRE(bytes.find("HTTP/1.1 200 OK\r\n") != std::string::npos);
 }
+
+TEST_CASE("WebSocket server fallback HTTP context rejects send_interim with ENOTSUP",
+          "[http][websocket][server][interim]") {
+    std::atomic<int> interim_result{-1};
+    std::atomic<int> interim_errno{0};
+
+    elio::http::websocket::ws_router routes;
+    routes.get("/plain", [&](context& ctx) -> task<response> {
+        errno = 0;
+        const bool sent = co_await ctx.send_interim(
+            response(status::continue_));
+        interim_result.store(sent ? 1 : 0, std::memory_order_release);
+        interim_errno.store(errno, std::memory_order_release);
+        co_return response::ok("plain");
+    });
+
+    server_config config;
+    config.enable_logging = false;
+    config.keep_alive_timeout = elio::test::scaled_sec(1);
+
+    elio::http::websocket::ws_server srv(std::move(routes), config);
+    const uint16_t port = reserve_loopback_port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+        co_return;
+    });
+
+    REQUIRE(wait_until([&] { return srv.is_running(); },
+                       elio::test::scaled_sec(2)));
+
+    // A plain (non-upgrade) request is dispatched through the ws_server's
+    // fallback HTTP path, whose context has no connection writer.
+    const std::string request_bytes =
+        "GET /plain HTTP/1.1\r\n"
+        "Host: test\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+
+    auto client = connect_loopback(port);
+    send_all(client.get(), request_bytes);
+    const auto bytes = read_until_close(client.get());
+    client.reset();
+
+    srv.stop();
+    try_wake_listener(port);
+
+    REQUIRE(wait_until([&] { return listen_done.load(std::memory_order_acquire); },
+                       elio::test::scaled_sec(2)));
+    REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+
+    REQUIRE(interim_result.load(std::memory_order_acquire) == 0);
+    REQUIRE(interim_errno.load(std::memory_order_acquire) == ENOTSUP);
+
+    // No interim reached the wire; the final response goes out normally.
+    REQUIRE(count_occurrences(bytes, "HTTP/1.1 ") == 1);
+    REQUIRE(bytes.find("HTTP/1.1 200 OK\r\n") != std::string::npos);
+    REQUIRE(bytes.find("plain") != std::string::npos);
+}

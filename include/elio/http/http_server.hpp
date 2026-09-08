@@ -140,7 +140,10 @@ public:
     /// The context borrows its connection from the request handler scope:
     /// it must not escape its handler (e.g. into a detached task), and
     /// interims can only be sent before the handler returns the final
-    /// response.
+    /// response. Contexts dispatched without a connection writer — e.g.
+    /// the plain-HTTP fallback routes of `websocket::ws_server` — cannot
+    /// send interims: send_interim() then sets `errno = ENOTSUP` and
+    /// returns false, and the final response is unaffected.
     ///
     /// Note: the server reads the full request (including the body) before
     /// dispatching to the handler, so an explicit `100 Continue` sent here

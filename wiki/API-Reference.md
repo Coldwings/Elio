@@ -2842,7 +2842,7 @@ enum class status {
 };
 
 // Get reason phrase for status
-const char* status_reason(status s);
+constexpr std::string_view status_reason(status s) noexcept;
 ```
 
 ---

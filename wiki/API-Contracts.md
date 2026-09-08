@@ -135,7 +135,7 @@ requests does not make their higher-level ordering or object lifetime safe.
 | `io::async_sendmsg()` | Submits one socket scatter-gather send over the supplied `iovec` array and reports actual transfer or errno. It is not a general `sendmsg(2)` wrapper for destination addresses or ancillary/control data. It suppresses process-level `SIGPIPE` where the platform provides per-call suppression. | Keep the socket fd, `iovec` array, and referenced buffers alive until completion. Handle short socket writes, transient readiness errors, and protocol-level retry/advance logic. |
 | `io::async_accept()` | Submits one accept operation and returns the accepted fd in `io_result::result` on success. | Keep the listening fd, optional address storage, and optional `socklen_t` storage alive until completion. Close or wrap the accepted fd on every success path. |
 | `io::async_connect()` | Submits one connect operation for the supplied fd and sockaddr. Cancellable overloads honor the provided token at the documented wait points. The epoll backend rejects a blocking socket with `-EINVAL` before calling `connect(2)` so a scheduler worker cannot block. On epoll, a connect that resolves synchronously (immediate success, `EISCONN`, or a pre-check failure) completes as a terminal result: it wins over a cancellation request that arrives before the result is collected, mirroring io_uring's `ASYNC_CANCEL` `-ENOENT` behavior. | Keep the fd and sockaddr storage valid until completion. When epoll may be selected, set `O_NONBLOCK` before submission and do not clear it until completion. Check the result before using the socket as connected. |
-| `io::async_close()` | Submits fd close through the backend where supported and reports the close result. | Do not reuse or close the same fd concurrently through another path. Treat close ordering with in-flight operations as caller-owned unless a higher-level wrapper documents safe teardown. |
+| `io::async_close()` | Submits fd close through the backend where supported and reports the close result. Completion is guaranteed on every built-in backend without an explicit `submit()` pump: the io_uring backend auto-submits staged operations from `poll()`, and the epoll backend drains queued synchronous close operations at the top of `poll()`, so scheduler workers and the standalone `run()`/`run_for()`/`run_until_complete()` drivers all complete the close and `scheduler::shutdown()` can drain. | Do not reuse or close the same fd concurrently through another path. Treat close ordering with in-flight operations as caller-owned unless a higher-level wrapper documents safe teardown. |
 | `io::async_poll_read()` and `io::async_poll_write()` | Wait for readiness according to the active backend and return readiness/error status. Cancellable overloads honor the provided token. On a regular file under the epoll backend they complete immediately as ready instead of registering with epoll. | Keep the fd alive while polling and re-check the actual operation result after readiness. |
 | `io::batch_read_segment` and `io::batch_write_segment` | Describe per-segment file offsets, buffers, and lengths for batch helpers. | Ensure segment buffers remain valid and that overlapping output regions are intentional and externally synchronized. |
 | `io::batch_read()` and `io::batch_write()` | Copy segment descriptors at awaitable construction, submit supported file segments, and return one result per segment in input order. Current-position segments are executed in order. | Interpret partial success per segment; do not assume the batch is atomic as a group. Keep the buffers referenced by each copied segment alive until completion. |
@@ -175,6 +175,15 @@ surfaces the real errno", "epoll regular-file probe failure surfaces fstat
 errno", "epoll fd kind cache is invalidated when an fd number is recycled",
 and "Regular file current-offset and poll operations with forced epoll
 backend" in `tests/unit/test_io.cpp`.
+
+Case law (frozen): `async_close` must complete under the epoll backend from
+poll()-driven loops (scheduler workers, standalone `run()`/`run_for()`/
+`run_until_complete()`) without an explicit `submit()` call; the epoll
+backend drains queued synchronous close operations at the top of `poll()` —
+#1162. Regression coverage: "epoll poll() drains a queued sync close without
+an explicit submit (standalone)", "epoll async_close completes on a scheduler
+worker without an explicit submit", and "epoll async_close does not stall
+scheduler shutdown" in `tests/unit/test_io.cpp`.
 
 ## TLS
 

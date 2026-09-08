@@ -1829,11 +1829,15 @@ API.
 
 Async-friendly signalfd wrapper.
 
-`signal_fd` retains the `io_context` selected at construction. Construct and
-await it on the same scheduler worker. A directly constructed standalone
-context may be used only when the caller also serializes and polls that context;
-standard waits reject crossing between standalone and scheduler execution or
-between scheduler workers.
+`signal_fd` retains the `io_context` selected at construction, but `wait()`
+resolves its submission context per call: on a scheduler worker the read is
+submitted to the CURRENT worker's `io_context` (the awaiting coroutine's
+worker), so a descriptor constructed on one worker may be awaited on another;
+off-worker the construction-time context is used. A directly constructed
+standalone context may be used only when the caller also serializes and polls
+that context. At most one `wait()` may be pending on a `signal_fd` at a time
+(single-waiter rule); concurrent waits from two workers are not supported and
+can silently lose one of the waiters.
 
 ```cpp
 class signal_fd {

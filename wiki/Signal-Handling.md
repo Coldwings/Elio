@@ -126,11 +126,15 @@ if (rc != 0) {
 
 Async-friendly signalfd wrapper.
 
-The object retains the `io_context` selected at construction. For scheduler
-use, construct and await it on the same worker; pending waits pin that worker's
-backend until completion or cleanup. Do not construct it against a standalone
-context and later await it in a scheduler coroutine. Standalone use requires
-the caller to serialize and poll that context.
+The object retains the `io_context` selected at construction, but `wait()`
+resolves its submission context per call: on a scheduler worker the pending
+read is submitted to the CURRENT worker's `io_context` (the awaiting
+coroutine's worker), so a descriptor constructed on one worker may be awaited
+on another; off-worker the construction-time context is used. A pending wait
+pins the resolving worker's backend until completion or cleanup. Standalone
+use requires the caller to serialize and poll that context. Only one `wait()`
+may be pending on a `signal_fd` at a time (single-waiter rule); concurrent
+waits from two workers are not supported and can silently lose one waiter.
 
 ```cpp
 // Create with automatic blocking

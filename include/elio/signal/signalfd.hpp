@@ -207,6 +207,13 @@ public:
 
     template<typename Promise>
     void await_suspend(std::coroutine_handle<Promise> awaiter) {
+        // Resolve the io_context per call. On a scheduler worker the read is
+        // submitted to the CURRENT worker's context — the same model as
+        // io::async_recv/async_send — so awaiting a signal_fd constructed on
+        // another worker is legal. Off-worker the construction-time context
+        // is kept, preserving the standalone-io_context driving contract.
+        io::io_context& ctx = resolve_io_context();
+
         io::io_request req{};
         req.op = io::io_op::read;
         req.fd = fd_;
@@ -214,9 +221,9 @@ public:
         req.length = sizeof(siginfo_);
         req.offset = -1;
         req.awaiter = awaiter;
-        req.state = setup_op_state(awaiter, ctx_);
+        req.state = setup_op_state(awaiter, ctx);
 
-        if (!prepare_op_state(ctx_, req)) {
+        if (!prepare_op_state(ctx, req)) {
             clear_op_state();
             result_ = io::io_result{-EAGAIN, 0};
             awaiter.resume();
@@ -233,6 +240,13 @@ public:
     }
 
 private:
+    io::io_context& resolve_io_context() noexcept {
+        if (auto* worker = runtime::worker_thread::current()) {
+            return worker->io_context();
+        }
+        return ctx_;
+    }
+
     io::io_context& ctx_;
     int fd_;
     signalfd_siginfo siginfo_{};
@@ -244,11 +258,23 @@ private:
 /// created. This blocking is acquire-only: signal_fd never restores or
 /// unblocks the calling thread's mask. Callers must explicitly unblock signals
 /// after all users that require them blocked have finished.
+///
+/// io_context resolution rule for wait(): on a scheduler worker the pending
+/// read is submitted to the CURRENT worker's io_context (the awaiting
+/// coroutine's worker), so a signal_fd constructed on one worker may be
+/// awaited on another. Off-worker (standalone driving) the construction-time
+/// context is used, and the caller must serialize and poll that context.
+///
+/// SINGLE-WAITER rule: at most one wait() may be pending on a signal_fd at
+/// any time. Concurrent waits from two workers are not supported and can
+/// silently lose one of the waiters.
 class signal_fd {
 public:
     /// Construct a signal_fd for the given signal set
     /// @param signals The set of signals to handle
-    /// @param ctx Optional I/O context (defaults to the current worker's context)
+    /// @param ctx I/O context used for waits issued off-worker (defaults to
+    ///        the current worker's context). On a scheduler worker, wait()
+    ///        resolves the CURRENT worker's context per call instead.
     /// @param auto_block If true (default), automatically block the signals
     /// @throws std::system_error if automatic signal blocking or signalfd creation fails
     explicit signal_fd(const signal_set& signals,
@@ -328,6 +354,9 @@ public:
     const signal_set& signals() const noexcept { return signals_; }
     
     /// Wait for a signal asynchronously
+    /// On a scheduler worker the read is submitted to the CURRENT worker's
+    /// io_context; off-worker the construction-time context is used. Only one
+    /// wait may be pending at a time (single-waiter rule).
     /// @return Awaitable that yields signal_info when a signal is received
     auto wait() {
         return signal_wait_awaitable(*ctx_, fd_);
@@ -430,6 +459,11 @@ private:
 /// @return task that yields signal_info when a signal is received
 /// @note Automatic blocking is acquire-only. Explicitly unblock the signal set
 ///       after no descriptor or worker depends on it.
+/// @note The default ctx argument captures the io_context of the thread that
+///       creates the task, not the worker that later awaits it. On a scheduler
+///       worker signal_fd::wait() resolves the CURRENT worker's context per
+///       call, so this is safe; the captured ctx is only used when the wait
+///       is driven off-worker. The single-waiter rule applies.
 inline coro::task<signal_info> wait_signal(const signal_set& signals,
                                            io::io_context& ctx = io::current_io_context(),
                                            bool auto_block = true) {

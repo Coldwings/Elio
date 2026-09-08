@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cross-worker `signal_fd::wait()`**: Awaiting a `signal::signal_fd` on a
+  different scheduler worker than the one it was constructed on no longer
+  throws `std::logic_error`. `wait()` now resolves its submission
+  `io_context` per call: on a scheduler worker the read is submitted to the
+  awaiting coroutine's current worker context (the same model as
+  `io::async_recv`/`io::async_send`); off-worker waits keep the
+  construction-time context, preserving the standalone-`io_context` driving
+  contract. At most one `wait()` may be pending per `signal_fd` at a time
+  (single-waiter rule) (#1167).
 - **205 Reset Content response framing**: `http::response` serialization now
   pins `Content-Length: 0` on 205 responses (overwriting any caller-set
   `Content-Length`) while still stripping `Transfer-Encoding` and dropping the

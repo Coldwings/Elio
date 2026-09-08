@@ -1717,6 +1717,18 @@ Timeout wrappers remain harmless because completion is immediate. The
 inline syscall may briefly block the worker on disk I/O, matching the batch
 I/O fallback above.
 
+Inline execution is the deliberate default, not an oversight: a page-cache
+hit completes in microseconds, while a thread-pool round trip costs an order
+of magnitude more on every operation, and the genuinely asynchronous
+alternative for buffered file I/O is io_uring itself (the primary backend).
+The cases where an inline syscall can block for longer are specific: cold
+page-in from slow media, network or FUSE filesystems, `O_DIRECT` files,
+buffered writes under writeback throttling, and memory-reclaim stalls. The
+`fstat` probe cannot distinguish these from local-disk files. Workloads that
+expect them should move the affected file I/O into `elio::spawn_blocking`
+(or an equivalent blocking-pool facility) at the application layer rather
+than issuing it directly on a scheduler worker under the epoll backend.
+
 ### File Helpers
 
 High-level coroutine functions for common file operations:

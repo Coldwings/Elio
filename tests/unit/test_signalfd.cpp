@@ -2,11 +2,15 @@
 #include <elio/signal/signalfd.hpp>
 #include <elio/coro/task.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/runtime/spawn.hpp>
+#include <elio/runtime/affinity.hpp>
 #include <elio/io/io_context.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <initializer_list>
+#include <memory>
+#include <stdexcept>
 #include <thread>
 
 using namespace elio::signal;
@@ -351,6 +355,75 @@ TEST_CASE("signal_fd multiple signals", "[signal][signal_fd]") {
     REQUIRE(count == 2);
     REQUIRE(got_usr1);
     REQUIRE(got_usr2);
+}
+
+TEST_CASE("signal_fd wait resolves to the awaiting worker's io_context",
+          "[signal][signal_fd][regression]") {
+    scoped_thread_signal_mask mask_guard({SIGUSR1});
+    std::atomic<bool> waiter_armed{false};
+    std::atomic<bool> waiter_done{false};
+    std::atomic<bool> caught_logic_error{false};
+    std::atomic<int> observed_signo{0};
+    std::atomic<size_t> ctor_worker{SIZE_MAX};
+    std::atomic<size_t> wait_worker{SIZE_MAX};
+
+    // Block SIGUSR1 in main BEFORE scheduler start so workers inherit the mask
+    signal_set sigs{SIGUSR1};
+    sigset_t old_mask;
+    sigs.block(&old_mask);
+
+    // Waits on worker 1 for a signal_fd constructed on worker 0. Before the
+    // per-call io_context resolution fix (#1167), this threw logic_error
+    // because the construction-time context belongs to another worker.
+    auto waiter_task = [&](std::shared_ptr<signal_fd> sigfd) -> task<void> {
+        wait_worker = elio::current_worker_id();
+        waiter_armed.store(true, std::memory_order_release);
+        try {
+            auto info = co_await sigfd->wait();
+            if (info) {
+                observed_signo = info->signo;
+            }
+        } catch (const std::logic_error&) {
+            caught_logic_error.store(true, std::memory_order_release);
+        }
+        waiter_done.store(true, std::memory_order_release);
+    };
+
+    auto root_task = [&]() -> task<void> {
+        // Construction-time context is worker 0's io_context
+        auto sigfd = std::make_shared<signal_fd>(sigs, current_io_context(), false);
+        ctor_worker = elio::current_worker_id();
+        elio::go_to(1, waiter_task, sigfd);
+        co_return;
+    };
+
+    scheduler sched(2);
+    sched.start();
+    elio::go_to(0, root_task);
+
+    // Wait until the waiter is armed on worker 1, give it a moment to submit
+    // the read, then raise the signal
+    for (int i = 0; i < 200 && !waiter_armed.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    REQUIRE(waiter_armed.load());
+    std::this_thread::sleep_for(50ms);
+    kill(getpid(), SIGUSR1);
+
+    for (int i = 0; i < 200 && !waiter_done.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+
+    sched.shutdown();
+
+    // Restore signal mask
+    pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
+
+    REQUIRE(waiter_done.load());
+    REQUIRE(ctor_worker.load() == 0);
+    REQUIRE(wait_worker.load() == 1);
+    REQUIRE_FALSE(caught_logic_error.load());
+    REQUIRE(observed_signo.load() == SIGUSR1);
 }
 
 TEST_CASE("signal_info", "[signal][signal_info]") {

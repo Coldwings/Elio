@@ -59,8 +59,11 @@ private:
     int fd_;
 };
 
-/// Read entire file content into a string
-/// Returns nullopt if file cannot be opened or read
+/// Read a file's content into a string, in chunks.
+/// An engaged result contains the bytes actually read; it is not a
+/// completeness guarantee: a read failure after bytes were accumulated
+/// still returns the partial content. Returns nullopt only when the file
+/// cannot be opened or the first read fails before any bytes are produced.
 inline coro::task<std::optional<std::string>> read_file(const std::string& path) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {

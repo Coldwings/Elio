@@ -1742,7 +1742,10 @@ than issuing it directly on a scheduler worker under the epoll backend.
 High-level coroutine functions for common file operations:
 
 ```cpp
-// Read entire file into a string
+// Read a file into a string. An engaged result holds the bytes actually
+// read (not a completeness guarantee: a read failure after bytes were
+// accumulated still returns partial content). nullopt only when open
+// fails or the first read fails before any bytes are produced.
 std::optional<std::string> content = co_await read_file("/path/to/file.txt");
 
 // Write string to file (creates/truncates)

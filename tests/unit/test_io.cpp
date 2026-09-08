@@ -2801,17 +2801,23 @@ TEST_CASE("uds_listener cancel(token) wakes a parked accept before close",
         auto listener = uds_listener::bind(addr);
         REQUIRE(listener.has_value());
 
-        scheduler sched(1);
-        sched.start();
-
-        auto& worker_io = sched.get_worker(0)->io_context();
-        const size_t baseline_pending = worker_io.pending_count();
-
+        // Declare every object the coroutine captures BEFORE the scheduler:
+        // destruction is reverse-declaration order, so the scheduler is
+        // destroyed first and tears down the (possibly still parked) accept
+        // coroutine while the captures are still alive. If a bounded REQUIRE
+        // above failed mid-flight, the reverse order would let the backend
+        // resume the coroutine into already-destroyed captures (UB).
         cancel_source source;
         std::atomic<bool> started{false};
         std::atomic<bool> done{false};
         std::atomic<int> observed_errno{0};
         std::atomic<bool> accepted_stream{true};
+
+        scheduler sched(1);
+        sched.start();
+
+        auto& worker_io = sched.get_worker(0)->io_context();
+        const size_t baseline_pending = worker_io.pending_count();
 
         sched.go([&]() -> task<void> {
             started.store(true, std::memory_order_release);

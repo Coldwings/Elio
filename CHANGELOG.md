@@ -45,9 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legitimate new I/O on the recycled fd with `-ENOENT`. The epoll backend
   now fails every operation still queued for a closing fd with `-ECANCELED`
   (each awaiter resumed exactly once) and drops the fd entry before the fd
-  number can be recycled; destructor-time closes on an epoll worker go
-  through the backend, and a phantom registration left by an off-worker
-  close is repaired lazily at the next `prepare()` on the recycled fd
+  number can be recycled; destructor-time stream closes on an epoll worker
+  go through the backend (listener closes keep their non-cancelling
+  contract), and a phantom registration left by an off-worker close is
+  repaired lazily at the next `prepare()` on the recycled fd
   number (both the `ENOENT` and the `EPERM` modification-failure signatures
   are recognized). Under io_uring, in-flight operations hold kernel file
   references and complete normally against the old file description; only

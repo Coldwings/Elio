@@ -723,14 +723,17 @@ public:
 
     /// Async close
     ///
-    /// On the epoll backend, close() (and the destructor) fails any I/O
-    /// still parked on this stream's fd with -ECANCELED, resuming each
-    /// parked awaiter exactly once. On the io_uring backend, in-flight
-    /// operations hold a kernel file reference and complete normally later
-    /// against the old file description; they are not failed. A stoppable
-    /// reader/writer should still prefer the cancellable overload plus
-    /// token cancellation and await the operation before closing; the
-    /// stream must remain alive until parked operations have resumed.
+    /// On the epoll backend, close() — and destruction on the stream's
+    /// owning worker — fails any I/O still parked on this stream's fd with
+    /// -ECANCELED, resuming each parked awaiter exactly once; destruction
+    /// off the owning worker raw-closes the fd and leaves a parked op
+    /// suspended until the recycled fd number is next prepared or the
+    /// backend is destroyed. On the io_uring backend, in-flight operations
+    /// hold a kernel file reference and complete normally later against the
+    /// old file description; they are not failed. A stoppable reader/writer
+    /// should still prefer the cancellable overload plus token cancellation
+    /// and await the operation before closing; the stream must remain alive
+    /// until parked operations have resumed.
     auto close() {
         int fd = fd_;
         fd_ = -1;
@@ -787,7 +790,7 @@ private:
     /// plain ``::close`` only for non-worker teardown.
     void close_sync() {
         if (fd_ >= 0) {
-            io::close_fd_for_destructor(fd_);
+            io::close_stream_fd_for_destructor(fd_);
             fd_ = -1;
         }
     }

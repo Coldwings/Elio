@@ -2179,11 +2179,14 @@ public:
 // Retained aliases must not clear it or otherwise defeat non-blocking I/O
 // through status-flag changes.
 // close() transfers the descriptor to the async close operation and invalidates
-// the stream object. Under the epoll backend, close() and the destructor fail
-// any I/O still parked on the stream's fd with -ECANCELED, resuming each
-// parked awaiter exactly once; under io_uring, in-flight operations hold a
-// kernel file reference and complete normally later against the old file
-// description. A stoppable reader/writer should still prefer the cancellable
+// the stream object. Under the epoll backend, close() and destruction on the
+// stream's owning worker fail any I/O still parked on the stream's fd with
+// -ECANCELED, resuming each parked awaiter exactly once; destruction off the
+// owning worker raw-closes the fd and leaves a parked op suspended until the
+// recycled fd number is next prepared or the backend is destroyed. Under
+// io_uring, in-flight operations hold a kernel file reference and complete
+// normally later against the old file description. A stoppable reader/writer
+// should still prefer the cancellable
 // overload plus token cancellation and await the operation before closing,
 // and the stream must remain alive until parked operations have resumed.
 // shutdown_socket() interrupts both socket directions without
@@ -2374,9 +2377,12 @@ read.
 UDS streams share the same concurrency contract as TCP streams: one reader and
 one writer may operate concurrently, but multiple concurrent reads, multiple
 concurrent writes, or a read racing with `close()` require external
-serialization. Under the epoll backend, `close()` and the destructor fail any
-I/O still parked on the stream's fd with `-ECANCELED`, resuming each parked
-awaiter exactly once; under io_uring, in-flight operations hold a kernel file
+serialization. Under the epoll backend, `close()` and destruction on the
+stream's owning worker fail any I/O still parked on the stream's fd with
+`-ECANCELED`, resuming each parked awaiter exactly once; destruction off the
+owning worker raw-closes the fd and leaves a parked op suspended until the
+recycled fd number is next prepared or the backend is destroyed. Under
+io_uring, in-flight operations hold a kernel file
 reference and complete normally later against the old file description. A
 stoppable reader/writer should still prefer the cancellable overload plus
 token cancellation and await the operation before closing, and the stream
@@ -3352,9 +3358,12 @@ Success reports the full requested count.
 `shutdown()` is the graceful TLS close path. It sends `close_notify` and waits
 for the peer's `close_notify` within the supplied wall-clock budget. Callers
 must still serialize shutdown and destruction against active reads/writes.
-Under the epoll backend, close()/destruction of the underlying transport
-fails any I/O still parked on the stream's fd with `-ECANCELED`, resuming
-each parked awaiter exactly once; under io_uring, in-flight operations hold
+Under the epoll backend, `close()` and destruction of the underlying
+transport on the stream's owning worker fail any I/O still parked on the
+stream's fd with `-ECANCELED`, resuming each parked awaiter exactly once;
+destruction off the owning worker raw-closes the fd and leaves a parked op
+suspended until the recycled fd number is next prepared or the backend is
+destroyed. Under io_uring, in-flight operations hold
 a kernel file reference and complete normally later against the old file
 description. A stoppable reader/writer should still prefer the cancellable
 overload plus token cancellation and await the operation before closing,

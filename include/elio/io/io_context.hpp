@@ -67,6 +67,7 @@ private:
     friend class batch_read_awaitable;
     friend class batch_write_awaitable;
     friend void close_fd_for_destructor(int fd) noexcept;
+    friend void close_stream_fd_for_destructor(int fd) noexcept;
 
     static std::unique_ptr<io_context> make_worker_owned(
         size_t worker_id,

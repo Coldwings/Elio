@@ -42,8 +42,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body-allowed statuses. Previously such responses serialized without a body
   delimiter, so a keep-alive peer could not tell where the response ended and
   waited for a connection close that never came. User-supplied framing headers
-  are still preserved verbatim, and statuses that forbid a body (1xx, 204,
-  205, 304) continue to serialize without framing headers (#1158).
+  are still preserved verbatim, except in 2xx responses to CONNECT, where both
+  `Content-Length` and `Transfer-Encoding` are stripped — including
+  caller-set ones — as RFC 9110 §9.3.6 requires. Statuses that forbid a body
+  (1xx, 204, 205, 304) continue to serialize without framing headers (#1158).
 - **Object-cache lazy task argument lifetime**: `object_cache::get()` now
   copies the key and stores a decayed copy or moved instance of the constructor
   callable before returning its lazy task. Storing the task for later await can

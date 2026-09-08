@@ -2883,6 +2883,11 @@ public:
 a closed/failed connection, callers choose retry, backoff, replay, and
 application session restoration policy.
 
+During the upgrade handshake, interim 1xx responses (for example
+`100 Continue`) that precede the `101 Switching Protocols` are skipped under a
+cumulative byte cap; the handshake completes on the 101 and fails with
+`EBADMSG` for any other final status.
+
 ### `websocket::ws_connection`
 
 Server-side WebSocket connection passed to route handlers.

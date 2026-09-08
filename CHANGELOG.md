@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   immediately after the headers. Body-preserving redirects re-run the
   handshake per hop. `http::request::serialize_headers()` exposes the
   header-only serialization used by this flow (#1163).
+- **WebSocket client handshake interim-1xx tolerance**: `ws_client` now
+  skips interim 1xx responses (for example `100 Continue`) that precede the
+  `101 Switching Protocols` upgrade response, under a cumulative byte cap,
+  instead of failing the handshake with `EBADMSG` (#1163).
+
 - **Fair TCP loopback benchmark protocol**: Replaced the non-equivalent
   per-adapter echo workloads with fixed-work latency, message-rate, and bulk
   contracts with separately attributable client-against-reference-server and

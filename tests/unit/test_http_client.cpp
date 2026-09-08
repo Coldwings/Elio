@@ -2656,3 +2656,37 @@ TEST_CASE("HTTP client with zero expect-continue timeout sends body immediately"
     REQUIRE(server_got_body);
     REQUIRE(got_status == 200);
 }
+
+TEST_CASE("WebSocket client skips interim responses before upgrade",
+          "[websocket][client][handshake][regression]") {
+    SECTION("100 Continue before 101") {
+        require_websocket_handshake_response_accepted(
+            [](std::string_view accept) {
+                return std::string(
+                    "HTTP/1.1 100 Continue\r\n"
+                    "\r\n"
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Accept: ") +
+                       std::string(accept) + "\r\n\r\n";
+            });
+    }
+
+    SECTION("100 and 103 before 101") {
+        require_websocket_handshake_response_accepted(
+            [](std::string_view accept) {
+                return std::string(
+                    "HTTP/1.1 100 Continue\r\n"
+                    "\r\n"
+                    "HTTP/1.1 103 Early Hints\r\n"
+                    "Link: </style.css>; rel=preload; as=style\r\n"
+                    "\r\n"
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Accept: ") +
+                       std::string(accept) + "\r\n\r\n";
+            });
+    }
+}

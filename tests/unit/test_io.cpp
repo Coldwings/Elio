@@ -1367,6 +1367,203 @@ TEST_CASE("File operations with epoll", "[io][epoll][file]") {
     unlink(tmpfile);
 }
 
+TEST_CASE("Regular file async read/write with forced epoll backend",
+          "[io][epoll][file][regular]") {
+    // epoll_ctl rejects regular files with EPERM, so the epoll backend must
+    // execute read/write on them inline instead of registering with epoll.
+    worker_io_backend_guard backend_guard(io_context::backend_type::epoll);
+
+    char tmpfile[] = "/tmp/elio_test_epoll_reg_XXXXXX";
+    int fd = mkstemp(tmpfile);
+    REQUIRE(fd >= 0);
+
+    const char* data = "regular file payload via epoll inline path";
+    const size_t data_len = strlen(data);
+
+    std::atomic<bool> completed{false};
+    io_result write_result{};
+    io_result read_result{};
+    std::array<char, 128> buffer{};
+
+    scheduler sched(1);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        write_result = co_await async_write(fd, data, data_len, 0);
+        read_result = co_await async_read(fd, buffer.data(), buffer.size(), 0);
+        completed.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0;
+         i < 100 && !completed.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(write_result.result == static_cast<int>(data_len));
+    REQUIRE(read_result.result == static_cast<int>(data_len));
+    REQUIRE(std::string(buffer.data(), data_len) == data);
+
+    REQUIRE(close(fd) == 0);
+    unlink(tmpfile);
+}
+
+TEST_CASE("Regular file async readv/writev with forced epoll backend",
+          "[io][epoll][file][regular]") {
+    worker_io_backend_guard backend_guard(io_context::backend_type::epoll);
+
+    char tmpfile[] = "/tmp/elio_test_epoll_regv_XXXXXX";
+    int fd = mkstemp(tmpfile);
+    REQUIRE(fd >= 0);
+
+    std::array<char, 5> w1{'h', 'e', 'l', 'l', 'o'};
+    std::array<char, 6> w2{' ', 'w', 'o', 'r', 'l', 'd'};
+    struct iovec wiov[2] = {
+        {w1.data(), w1.size()},
+        {w2.data(), w2.size()},
+    };
+    std::array<char, 5> r1{};
+    std::array<char, 6> r2{};
+    struct iovec riov[2] = {
+        {r1.data(), r1.size()},
+        {r2.data(), r2.size()},
+    };
+
+    std::atomic<bool> completed{false};
+    io_result write_result{};
+    io_result read_result{};
+
+    scheduler sched(1);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        write_result = co_await async_writev(fd, wiov, 2);
+        // The vectored awaitables use the current file position; rewind so
+        // the read observes what was just written.
+        (void)lseek(fd, 0, SEEK_SET);
+        read_result = co_await async_readv(fd, riov, 2);
+        completed.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0;
+         i < 100 && !completed.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(write_result.result == 11);
+    REQUIRE(read_result.result == 11);
+    auto actual = std::string(r1.data(), r1.size()) +
+                  std::string(r2.data(), r2.size());
+    REQUIRE(actual == "hello world");
+
+    REQUIRE(close(fd) == 0);
+    unlink(tmpfile);
+}
+
+TEST_CASE("Pipe async read/write still works with forced epoll backend",
+          "[io][epoll][pipe]") {
+    // Regression guard: the regular-file inline path must not change the
+    // normal epoll readiness path for pollable fds.
+    worker_io_backend_guard backend_guard(io_context::backend_type::epoll);
+
+    int pipefd[2] = {-1, -1};
+    REQUIRE(pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) == 0);
+
+    const char* msg = "epoll pipe regression guard";
+    const size_t msg_len = strlen(msg);
+
+    std::atomic<bool> completed{false};
+    io_result write_result{};
+    io_result read_result{};
+    std::array<char, 64> buffer{};
+
+    scheduler sched(1);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        write_result = co_await async_write(pipefd[1], msg, msg_len);
+        read_result = co_await async_read(pipefd[0], buffer.data(),
+                                          buffer.size());
+        completed.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0;
+         i < 100 && !completed.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(write_result.result == static_cast<int>(msg_len));
+    REQUIRE(read_result.result == static_cast<int>(msg_len));
+    REQUIRE(std::string(buffer.data(), msg_len) == msg);
+
+    REQUIRE(close(pipefd[0]) == 0);
+    REQUIRE(close(pipefd[1]) == 0);
+}
+
+TEST_CASE("epoll prepare failure surfaces the real errno",
+          "[io][epoll][error]") {
+    worker_io_backend_guard backend_guard(io_context::backend_type::epoll);
+
+    // Directories pass fstat but do not support poll(2), so epoll_ctl still
+    // rejects them with EPERM. The awaitable must surface -EPERM rather than
+    // a generic -EAGAIN that would invite an infinite retry loop.
+    int fd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    REQUIRE(fd >= 0);
+
+    std::atomic<bool> completed{false};
+    io_result read_result{};
+    std::array<char, 16> buffer{};
+
+    scheduler sched(1);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        read_result = co_await async_read(fd, buffer.data(), buffer.size());
+        completed.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0;
+         i < 100 && !completed.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(read_result.result == -EPERM);
+
+    REQUIRE(close(fd) == 0);
+}
+
+TEST_CASE("epoll regular-file probe failure surfaces fstat errno",
+          "[io][epoll][error]") {
+    worker_io_backend_guard backend_guard(io_context::backend_type::epoll);
+
+    // An invalid fd fails the fstat probe before any epoll registration; the
+    // awaitable must surface the probe's -EBADF rather than a generic
+    // -EAGAIN. (-1 can never be recycled by the runtime, unlike a recently
+    // closed fd number.)
+    std::atomic<bool> completed{false};
+    io_result read_result{};
+    std::array<char, 16> buffer{};
+
+    scheduler sched(1);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        read_result = co_await async_read(-1, buffer.data(), buffer.size());
+        completed.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0;
+         i < 100 && !completed.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(read_result.result == -EBADF);
+}
+
 TEST_CASE("Socket pair with epoll", "[io][epoll][socket]") {
     int sv[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);

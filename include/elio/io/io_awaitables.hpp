@@ -279,6 +279,17 @@ protected:
         return result_;
     }
 
+    /// Result to publish when the backend rejects an operation at prepare
+    /// time. Backends record the failing errno in the thread-local completion
+    /// slot before returning false (e.g. epoll_backend::fail_registration
+    /// publishes the real epoll_ctl errno such as EPERM), so surface it
+    /// instead of a blanket -EAGAIN that would invite infinite retry loops.
+    /// Falls back to -EAGAIN when the backend published no error.
+    static io_result prepare_failure_result() noexcept {
+        io_result published = detail::get_last_completion_result();
+        return published.result < 0 ? published : io_result{-EAGAIN, 0};
+    }
+
 };
 
 /// Awaitable for async read operations
@@ -307,7 +318,7 @@ public:
 
         if (!prepare_op_state(ctx, req)) {
             clear_op_state();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -353,7 +364,7 @@ public:
 
         if (!prepare_op_state(ctx, req)) {
             clear_op_state();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -397,7 +408,7 @@ public:
 
         if (!prepare_op_state(ctx, req)) {
             clear_op_state();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -441,7 +452,7 @@ public:
 
         if (!prepare_op_state(ctx, req)) {
             clear_op_state();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -487,7 +498,7 @@ public:
 
         if (!prepare_op_state(ctx, req)) {
             clear_op_state();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -535,7 +546,7 @@ public:
 
         if (!prepare_op_state(ctx, req)) {
             clear_op_state();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -571,7 +582,7 @@ public:
 
         if (!prepare_op_state(ctx, req)) {
             clear_op_state();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -611,7 +622,7 @@ public:
 
         if (!prepare_op_state(ctx, req)) {
             clear_op_state();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -653,7 +664,7 @@ public:
 
         if (!prepare_op_state(ctx, req)) {
             clear_op_state();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -700,7 +711,7 @@ public:
 
         if (!prepare_op_state(ctx, req)) {
             clear_op_state();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -738,7 +749,7 @@ public:
 
         if (!prepare_op_state(ctx, req)) {
             clear_op_state();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -1442,7 +1453,7 @@ public:
             clear_op_state();
             state->op = nullptr;
             cancel_registration_.unregister();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -1564,7 +1575,7 @@ public:
             clear_op_state();
             state->op = nullptr;
             cancel_registration_.unregister();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -1681,7 +1692,7 @@ public:
             clear_op_state();
             state->op = nullptr;
             cancel_registration_.unregister();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }
@@ -1792,7 +1803,7 @@ public:
             clear_op_state();
             state->op = nullptr;
             cancel_registration_.unregister();
-            result_ = io_result{-EAGAIN, 0};
+            result_ = prepare_failure_result();
             awaiter.resume();
             return;
         }

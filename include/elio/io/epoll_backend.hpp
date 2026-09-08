@@ -8,6 +8,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <algorithm>
@@ -180,6 +181,9 @@ public:
 
             case io_op::sendmsg:
                 if (!req.msg) {
+                    // Awaitables read the published slot on prepare failure;
+                    // keep the historical -EAGAIN for this rejection.
+                    detail::set_last_completion_result(io_result{-EAGAIN, 0});
                     return false;
                 }
                 events |= EPOLLOUT;
@@ -246,6 +250,7 @@ public:
                 
             case io_op::cancel:
             case io_op::none:
+                detail::set_last_completion_result(io_result{-EAGAIN, 0});
                 return false;
         }
         
@@ -256,7 +261,38 @@ public:
         }
         auto& state = state_it->second;
         bool is_sync = op.synchronous;
-        
+
+        if (!is_sync && is_regular_file_candidate(req.op)) {
+            // epoll_ctl rejects regular files with EPERM: they are always
+            // ready, so there is nothing to wait for. Execute the syscall
+            // inline and complete through the ready-op queue instead.
+            if (state.kind == fd_kind::unknown) {
+                struct stat st{};
+                if (::fstat(req.fd, &st) < 0) {
+                    // Reject at prepare time like fail_registration does:
+                    // publish the real errno so the awaitable surfaces it
+                    // instead of a generic -EAGAIN.
+                    int err = errno;
+                    io_result result{-err, 0};
+                    last_result_ = result;
+                    detail::set_last_completion_result(result);
+                    detail::run_noexcept([&]() {
+                        ELIO_LOG_WARNING("fstat failed for fd {}: {}",
+                                         req.fd, strerror(err));
+                    });
+                    if (state.pending_ops.empty() && !state.registered) {
+                        fd_states_.erase(state_it);
+                    }
+                    return false;
+                }
+                state.kind = S_ISREG(st.st_mode) ? fd_kind::regular
+                                                 : fd_kind::other;
+            }
+            if (state.kind == fd_kind::regular) {
+                return queue_inline_regular_file_op(std::move(op));
+            }
+        }
+
         if (!is_sync) {
             // Register with epoll
             uint32_t previous_events = state.events;
@@ -649,10 +685,24 @@ private:
         io_result precompleted_result{0, 0};
     };
     
+    /// Cached result of fstat(2) for an fd. epoll_ctl rejects regular files
+    /// with EPERM, so read/write-family operations on them must bypass epoll
+    /// registration entirely (see prepare()).
+    enum class fd_kind : uint8_t {
+        unknown = 0,  ///< Not yet probed
+        regular,      ///< S_ISREG: execute inline, never epoll_ctl
+        other         ///< Pollable via epoll (socket, pipe, ...)
+    };
+
     struct fd_state {
         std::vector<pending_operation> pending_ops;
         uint32_t events = 0;
         bool registered = false;
+        /// Probed lazily on the first read/write-family op and cached for the
+        /// lifetime of this entry, matching the existing registered/events
+        /// state: an fd must not be recycled to a different file type behind
+        /// the backend's back.
+        fd_kind kind = fd_kind::unknown;
     };
     
     /// Timer entry for the timer queue
@@ -718,6 +768,99 @@ private:
         pending_count_++;
         notify();
         return true;
+    }
+
+    /// Operations whose fd may be a regular file and therefore must bypass
+    /// epoll registration. recv/send/accept/connect/sendmsg are excluded:
+    /// they are only meaningful on sockets.
+    static bool is_regular_file_candidate(io_op op) noexcept {
+        switch (op) {
+            case io_op::read:
+            case io_op::write:
+            case io_op::readv:
+            case io_op::writev:
+            case io_op::poll_read:
+            case io_op::poll_write:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// Execute a read/write-family operation on a regular file inline and
+    /// complete it through the ready-op queue. Regular files are always
+    /// readable/writable, so epoll readiness is meaningless; the inline
+    /// syscall may block briefly on disk I/O, which matches the existing
+    /// batch_read/batch_write epoll fallback. Because the op completes at
+    /// submission time, cancellation is a no-op for it (unlike io_uring,
+    /// where the equivalent SQE remains cancellable until its CQE arrives).
+    bool queue_inline_regular_file_op(pending_operation op) {
+        int result = 0;
+        bool syscall_result = false;
+
+        switch (op.req.op) {
+            case io_op::read:
+                if (op.req.offset >= 0) {
+                    result = static_cast<int>(::pread(op.req.fd, op.req.buffer,
+                                                      op.req.length, op.req.offset));
+                } else {
+                    result = static_cast<int>(::read(op.req.fd, op.req.buffer,
+                                                     op.req.length));
+                }
+                syscall_result = true;
+                break;
+
+            case io_op::write:
+                if (op.req.offset >= 0) {
+                    result = static_cast<int>(::pwrite(op.req.fd, op.req.buffer,
+                                                       op.req.length, op.req.offset));
+                } else {
+                    result = static_cast<int>(::write(op.req.fd, op.req.buffer,
+                                                      op.req.length));
+                }
+                syscall_result = true;
+                break;
+
+            case io_op::readv:
+                if (op.req.offset >= 0) {
+                    result = static_cast<int>(::preadv(op.req.fd, op.req.iovecs,
+                                                       static_cast<int>(op.req.iovec_count),
+                                                       op.req.offset));
+                } else {
+                    result = static_cast<int>(::readv(op.req.fd, op.req.iovecs,
+                                                      static_cast<int>(op.req.iovec_count)));
+                }
+                syscall_result = true;
+                break;
+
+            case io_op::writev:
+                if (op.req.offset >= 0) {
+                    result = static_cast<int>(::pwritev(op.req.fd, op.req.iovecs,
+                                                        static_cast<int>(op.req.iovec_count),
+                                                        op.req.offset));
+                } else {
+                    result = static_cast<int>(::writev(op.req.fd, op.req.iovecs,
+                                                       static_cast<int>(op.req.iovec_count)));
+                }
+                syscall_result = true;
+                break;
+
+            case io_op::poll_read:
+            case io_op::poll_write:
+                // A regular file is always ready for both directions.
+                result = 0;
+                break;
+
+            default:
+                result = -ENOTSUP;
+                break;
+        }
+
+        if (syscall_result && result < 0) {
+            result = -errno;
+        }
+
+        return queue_ready_op(std::move(op), io_result{result, 0});
     }
 
     static void enqueue_resume(op_state* state,

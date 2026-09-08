@@ -34,6 +34,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Regular-file I/O under the epoll backend**: `async_read`, `async_write`,
+  `async_readv`, and `async_writev` on regular files no longer fail with an
+  `epoll_ctl` `EPERM` rejection under the epoll backend. The backend probes
+  the file type once per fd with `fstat` and executes regular-file operations
+  inline at submission, completing immediately; `async_poll_read` and
+  `async_poll_write` on regular files complete immediately as ready. Because
+  these operations complete without a real suspension, cancellation tokens
+  are no-ops for them under epoll (io_uring keeps them cancellable until
+  completion). Backend prepare rejections now also surface the real errno
+  (for example `-EPERM`) instead of a generic `-EAGAIN` (#1159).
 - **Object-cache lazy task argument lifetime**: `object_cache::get()` now
   copies the key and stores a decayed copy or moved instance of the constructor
   callable before returning its lazy task. Storing the task for later await can

@@ -309,6 +309,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Clarified the `uds_listener` shutdown boundary, aligning it with the
+  `tcp_listener` contract from #1013: `close()` invalidates future accepts but
+  does not cancel an accept already submitted to the I/O backend, so a parked
+  plain `accept()` never wakes on `close()` under either the io_uring or the
+  epoll backend. Stoppable accept loops must use `accept(coro::cancel_token)`,
+  request cancellation, await completion, and only then close or destroy the
+  listener (#1168).
 - Documented that `run()`/`ELIO_ASYNC_MAIN` and `serve()`/`serve_all()` install
   process-wide `SIG_IGN` for `SIGPIPE` through independent one-time entry paths.
   Elio does not save or restore the previous disposition; embedders that need a

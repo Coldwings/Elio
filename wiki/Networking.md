@@ -264,7 +264,7 @@ coro::task<void> handle_client(uds_stream stream) {
     co_return;
 }
 
-coro::task<void> server(const unix_address& addr) {
+coro::task<void> server(const unix_address& addr, coro::cancel_token stop_token) {
     auto* sched = runtime::scheduler::current();
 
     uds_options opts;
@@ -276,14 +276,27 @@ coro::task<void> server(const unix_address& addr) {
         co_return;
     }
 
-    while (true) {
-        auto stream = co_await listener->accept();
-        if (!stream) continue;
+    while (!stop_token.is_cancelled()) {
+        auto stream = co_await listener->accept(stop_token);
+        if (!stream) {
+            if (stop_token.is_cancelled()) break;
+            continue;
+        }
 
         sched->go(handle_client, std::move(*stream));
     }
+
+    // The cancellable accept has resumed, so closing no longer races it.
+    listener->close();
 }
 ```
+
+Like `tcp_listener`, `uds_listener::close()` invalidates the listener but does
+not cancel an `accept()` already submitted to the I/O backend. To stop a
+server, pass a token to `accept()`, request cancellation from the lifecycle
+owner, await the server task, and only then close or destroy the listener. A
+flag by itself is not enough because the loop cannot re-check it while
+suspended in `accept()`.
 
 ### UDS Client
 

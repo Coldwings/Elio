@@ -8,6 +8,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <algorithm>
@@ -180,6 +181,9 @@ public:
 
             case io_op::sendmsg:
                 if (!req.msg) {
+                    // Awaitables read the published slot on prepare failure;
+                    // keep the historical -EAGAIN for this rejection.
+                    detail::set_last_completion_result(io_result{-EAGAIN, 0});
                     return false;
                 }
                 events |= EPOLLOUT;
@@ -246,6 +250,7 @@ public:
                 
             case io_op::cancel:
             case io_op::none:
+                detail::set_last_completion_result(io_result{-EAGAIN, 0});
                 return false;
         }
         
@@ -256,7 +261,38 @@ public:
         }
         auto& state = state_it->second;
         bool is_sync = op.synchronous;
-        
+
+        if (!is_sync && is_regular_file_candidate(req.op)) {
+            // epoll_ctl rejects regular files with EPERM: they are always
+            // ready, so there is nothing to wait for. Execute the syscall
+            // inline and complete through the ready-op queue instead.
+            if (state.kind == fd_kind::unknown) {
+                struct stat st{};
+                if (::fstat(req.fd, &st) < 0) {
+                    // Reject at prepare time like fail_registration does:
+                    // publish the real errno so the awaitable surfaces it
+                    // instead of a generic -EAGAIN.
+                    int err = errno;
+                    io_result result{-err, 0};
+                    last_result_ = result;
+                    detail::set_last_completion_result(result);
+                    detail::run_noexcept([&]() {
+                        ELIO_LOG_WARNING("fstat failed for fd {}: {}",
+                                         req.fd, strerror(err));
+                    });
+                    if (state.pending_ops.empty() && !state.registered) {
+                        fd_states_.erase(state_it);
+                    }
+                    return false;
+                }
+                state.kind = S_ISREG(st.st_mode) ? fd_kind::regular
+                                                 : fd_kind::other;
+            }
+            if (state.kind == fd_kind::regular) {
+                return queue_inline_regular_file_op(std::move(op));
+            }
+        }
+
         if (!is_sync) {
             // Register with epoll
             uint32_t previous_events = state.events;
@@ -333,7 +369,9 @@ public:
         std::vector<deferred_resume_entry> deferred_resumes;
 
         // Execute synchronous operations (like close)
-        for (auto& [fd, state] : fd_states_) {
+        for (auto map_it = fd_states_.begin(); map_it != fd_states_.end();) {
+            auto& state = map_it->second;
+            bool erase_entry = false;
             auto it = state.pending_ops.begin();
             while (it != state.pending_ops.end()) {
                 if (it->synchronous) {
@@ -342,7 +380,8 @@ public:
                     // a race where another thread reuses the fd number between
                     // close() and EPOLL_CTL_DEL, causing stale registrations.
                     if (is_close && state.registered) {
-                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, map_it->first,
+                                  nullptr);
                         state.registered = false;
                         state.events = 0;
                     }
@@ -350,9 +389,19 @@ public:
                     it = state.pending_ops.erase(it);
                     pending_count_--;
                     submitted++;
+                    // The fd's lifetime ended: drop the entry (including the
+                    // cached fd_kind) so a recycled fd number re-probes.
+                    if (is_close && state.pending_ops.empty()) {
+                        erase_entry = true;
+                    }
                 } else {
                     ++it;
                 }
+            }
+            if (erase_entry) {
+                map_it = fd_states_.erase(map_it);
+            } else {
+                ++map_it;
             }
         }
 
@@ -379,6 +428,15 @@ public:
                                op.precompleted_result, &deferred_resumes);
                 pending_count_--;
                 completions++;
+                // Inline-completed ops (e.g. regular-file read/write) never
+                // occupy their fd_state entry; drop it once inert so a
+                // recycled fd number re-probes its file type.
+                auto state_it = fd_states_.find(op.req.fd);
+                if (state_it != fd_states_.end() &&
+                    state_it->second.pending_ops.empty() &&
+                    !state_it->second.registered) {
+                    fd_states_.erase(state_it);
+                }
             }
 
             resume_deferred(deferred_resumes);
@@ -505,11 +563,14 @@ public:
                     }
                 }
                 
-                // Update epoll registration if no more pending ops for this fd
-                if (state.pending_ops.empty() && state.registered) {
-                    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                    state.registered = false;
-                    state.events = 0;
+                // Drop the entry once it becomes inert (no pending ops, no
+                // epoll registration): keeping it would let a recycled fd
+                // number observe a stale cached fd_kind.
+                if (state.pending_ops.empty()) {
+                    if (state.registered) {
+                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                    }
+                    fd_states_.erase(it);
                 }
             }
         
@@ -538,37 +599,58 @@ public:
         deferred_resume_entry to_resume{};
         bool found_entry = false;
 
+        // Only non-terminal ready ops may be claimed here. (Currently every
+        // ready-queue entry is terminal — see queue_ready_op — so this scan
+        // is defensive; the fd_state erasure below stays correct for any
+        // future non-terminal ready op.)
         auto ready_it = std::find_if(ready_ops_.begin(), ready_ops_.end(),
                                      [user_data](const pending_operation& op) {
-                                         return cancel_key_for(op) == user_data;
+                                         return !op.terminal_completion &&
+                                                cancel_key_for(op) == user_data;
                                      });
         if (ready_it != ready_ops_.end()) {
+            int ready_fd = ready_it->req.fd;
             found_entry = claim_resume(ready_it->req.state, ready_it->awaiter,
                                        io_result{-ECANCELED, 0}, to_resume);
             ready_ops_.erase(ready_it);
             pending_count_--;
+            // Mirror the poll() ready-op loop: the cancelled inline op's
+            // fd_state entry is now inert, so drop it here as well —
+            // otherwise nothing would ever observe it again and a recycled
+            // fd number would see the stale cached fd_kind.
+            auto state_it = fd_states_.find(ready_fd);
+            if (state_it != fd_states_.end() &&
+                state_it->second.pending_ops.empty() &&
+                !state_it->second.registered) {
+                fd_states_.erase(state_it);
+            }
             goto found;
         }
         
         // Search in fd_states first
-        for (auto& [fd, state] : fd_states_) {
-            auto it = std::find_if(state.pending_ops.begin(), 
+        for (auto state_it = fd_states_.begin();
+             state_it != fd_states_.end(); ++state_it) {
+            auto& state = state_it->second;
+            auto it = std::find_if(state.pending_ops.begin(),
                                     state.pending_ops.end(),
                                     [user_data](const pending_operation& op) {
                                         return cancel_key_for(op) == user_data;
                                     });
-            
+
             if (it != state.pending_ops.end()) {
                 found_entry = claim_resume(it->req.state, it->awaiter,
                                            io_result{-ECANCELED, 0}, to_resume);
                 state.pending_ops.erase(it);
                 pending_count_--;
-                
-                // Cleanup if no more pending ops
-                if (state.pending_ops.empty() && state.registered) {
-                    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                    state.registered = false;
-                    state.events = 0;
+
+                // Drop the entry once inert so a recycled fd number never
+                // observes a stale cached fd_kind.
+                if (state.pending_ops.empty()) {
+                    if (state.registered) {
+                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, state_it->first,
+                                  nullptr);
+                    }
+                    fd_states_.erase(state_it);
                 }
                 goto found;
             }
@@ -647,12 +729,33 @@ private:
         std::coroutine_handle<> awaiter;
         bool synchronous = false;
         io_result precompleted_result{0, 0};
+        /// True for ready-queue entries whose result is already computed
+        /// (see queue_ready_op). cancel() must not claim them: the real
+        /// result wins over a later cancellation request, mirroring
+        /// io_uring's ASYNC_CANCEL completing -ENOENT on an
+        /// already-completed op while its CQE is delivered normally.
+        bool terminal_completion = false;
     };
     
+    /// Cached result of fstat(2) for an fd. epoll_ctl rejects regular files
+    /// with EPERM, so read/write-family operations on them must bypass epoll
+    /// registration entirely (see prepare()).
+    enum class fd_kind : uint8_t {
+        unknown = 0,  ///< Not yet probed
+        regular,      ///< S_ISREG: execute inline, never epoll_ctl
+        other         ///< Pollable via epoll (socket, pipe, ...)
+    };
+
     struct fd_state {
         std::vector<pending_operation> pending_ops;
         uint32_t events = 0;
         bool registered = false;
+        /// Probed lazily on the first read/write-family op and cached while
+        /// the entry lives. The entry is dropped as soon as it becomes inert
+        /// (last op completed in poll(), cancellation, close-op execution in
+        /// submit(), or inline ready-op completion), so a recycled fd number
+        /// always re-probes its file type.
+        fd_kind kind = fd_kind::unknown;
     };
     
     /// Timer entry for the timer queue
@@ -714,10 +817,107 @@ private:
 
     bool queue_ready_op(pending_operation op, io_result result) {
         op.precompleted_result = result;
+        // Every ready-queue result is already computed at queue time
+        // (inline regular-file syscall, precompleted connect, early
+        // rejection), so its completion is terminal against cancellation.
+        op.terminal_completion = true;
         ready_ops_.push_back(std::move(op));
         pending_count_++;
         notify();
         return true;
+    }
+
+    /// Operations whose fd may be a regular file and therefore must bypass
+    /// epoll registration. recv/send/accept/connect/sendmsg are excluded:
+    /// they are only meaningful on sockets.
+    static bool is_regular_file_candidate(io_op op) noexcept {
+        switch (op) {
+            case io_op::read:
+            case io_op::write:
+            case io_op::readv:
+            case io_op::writev:
+            case io_op::poll_read:
+            case io_op::poll_write:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// Execute a read/write-family operation on a regular file inline and
+    /// complete it through the ready-op queue. Regular files are always
+    /// readable/writable, so epoll readiness is meaningless; the inline
+    /// syscall may block briefly on disk I/O, which matches the existing
+    /// batch_read/batch_write epoll fallback. Because the op completes at
+    /// submission time, cancellation is a no-op for it (unlike io_uring,
+    /// where the equivalent SQE remains cancellable until its CQE arrives).
+    bool queue_inline_regular_file_op(pending_operation op) {
+        int result = 0;
+        bool syscall_result = false;
+
+        switch (op.req.op) {
+            case io_op::read:
+                if (op.req.offset >= 0) {
+                    result = static_cast<int>(::pread(op.req.fd, op.req.buffer,
+                                                      op.req.length, op.req.offset));
+                } else {
+                    result = static_cast<int>(::read(op.req.fd, op.req.buffer,
+                                                     op.req.length));
+                }
+                syscall_result = true;
+                break;
+
+            case io_op::write:
+                if (op.req.offset >= 0) {
+                    result = static_cast<int>(::pwrite(op.req.fd, op.req.buffer,
+                                                       op.req.length, op.req.offset));
+                } else {
+                    result = static_cast<int>(::write(op.req.fd, op.req.buffer,
+                                                      op.req.length));
+                }
+                syscall_result = true;
+                break;
+
+            case io_op::readv:
+                if (op.req.offset >= 0) {
+                    result = static_cast<int>(::preadv(op.req.fd, op.req.iovecs,
+                                                       static_cast<int>(op.req.iovec_count),
+                                                       op.req.offset));
+                } else {
+                    result = static_cast<int>(::readv(op.req.fd, op.req.iovecs,
+                                                      static_cast<int>(op.req.iovec_count)));
+                }
+                syscall_result = true;
+                break;
+
+            case io_op::writev:
+                if (op.req.offset >= 0) {
+                    result = static_cast<int>(::pwritev(op.req.fd, op.req.iovecs,
+                                                        static_cast<int>(op.req.iovec_count),
+                                                        op.req.offset));
+                } else {
+                    result = static_cast<int>(::writev(op.req.fd, op.req.iovecs,
+                                                       static_cast<int>(op.req.iovec_count)));
+                }
+                syscall_result = true;
+                break;
+
+            case io_op::poll_read:
+            case io_op::poll_write:
+                // A regular file is always ready for both directions.
+                result = 0;
+                break;
+
+            default:
+                result = -ENOTSUP;
+                break;
+        }
+
+        if (syscall_result && result < 0) {
+            result = -errno;
+        }
+
+        return queue_ready_op(std::move(op), io_result{result, 0});
     }
 
     static void enqueue_resume(op_state* state,

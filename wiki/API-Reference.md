@@ -1565,7 +1565,9 @@ void await_suspend(std::coroutine_handle<Promise> awaiter) {
 
     if (!prepare_op_state(ctx, req)) {
         clear_op_state();
-        result_ = io_result{-EAGAIN, 0};
+        // Surfaces the errno the backend published for the rejection
+        // (e.g. -EPERM from epoll_ctl), falling back to -EAGAIN.
+        result_ = prepare_failure_result();
         awaiter.resume();
         return;
     }
@@ -1690,6 +1692,42 @@ auto results = co_await batch_write(fd, segments);
 **Fallback:** When io_uring is unavailable (epoll backend), positioned
 segments fall back to sequential synchronous `pread`/`pwrite`.
 Current-position segments use ordered `read()` / `write()` calls.
+
+**Regular files under epoll:** `epoll_ctl` rejects regular files with
+`EPERM` because they are always ready, so under the epoll backend the
+single-shot operations `async_read`, `async_write`, `async_readv`, and
+`async_writev` on a regular file never register with epoll. Instead they
+execute `pread`/`pwrite`/`preadv`/`pwritev` (or the current-position
+variants) inline at submission and complete immediately;
+`async_poll_read`/`async_poll_write` on a regular file complete immediately
+as ready. The file type is probed once per fd with `fstat` and cached; the
+cache is invalidated whenever the fd's backend state becomes inert (last
+operation completed, cancellation, or close), so a recycled fd number is
+always re-probed. An `O_PATH` regular file passes the probe but cannot be
+read or written; operations on it fail inline with `-EBADF` from the
+syscall itself.
+Because these operations complete without a real suspension, cancellation
+tokens are no-ops for them under epoll, whereas the io_uring backend keeps
+the equivalent submission truly cancellable until its completion arrives.
+Once the inline syscall has executed, the completion is terminal: it wins
+over a cancellation request that arrives before the result is collected,
+mirroring io_uring's already-completed behavior where `ASYNC_CANCEL`
+reports `-ENOENT` and the real result is delivered.
+Timeout wrappers remain harmless because completion is immediate. The
+inline syscall may briefly block the worker on disk I/O, matching the batch
+I/O fallback above.
+
+Inline execution is the deliberate default, not an oversight: a page-cache
+hit completes in microseconds, while a thread-pool round trip costs an order
+of magnitude more on every operation, and the genuinely asynchronous
+alternative for buffered file I/O is io_uring itself (the primary backend).
+The cases where an inline syscall can block for longer are specific: cold
+page-in from slow media, network or FUSE filesystems, `O_DIRECT` files,
+buffered writes under writeback throttling, and memory-reclaim stalls. The
+`fstat` probe cannot distinguish these from local-disk files. Workloads that
+expect them should move the affected file I/O into `elio::spawn_blocking`
+(or an equivalent blocking-pool facility) at the application layer rather
+than issuing it directly on a scheduler worker under the epoll backend.
 
 ### File Helpers
 

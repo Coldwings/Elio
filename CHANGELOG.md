@@ -46,6 +46,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Content-Length` and `Transfer-Encoding` are stripped — including
   caller-set ones — as RFC 9110 §9.3.6 requires. Statuses that forbid a body
   (1xx, 204, 205, 304) continue to serialize without framing headers (#1158).
+- **Regular-file I/O under the epoll backend**: `async_read`, `async_write`,
+  `async_readv`, and `async_writev` on regular files no longer fail with an
+  `epoll_ctl` `EPERM` rejection under the epoll backend. The backend probes
+  the file type once per fd with `fstat` and executes regular-file operations
+  inline at submission, completing immediately; `async_poll_read` and
+  `async_poll_write` on regular files complete immediately as ready. Because
+  these operations complete without a real suspension, cancellation tokens
+  are no-ops for them under epoll (io_uring keeps them cancellable until
+  completion); inline completions are terminal, so a cancellation request
+  that arrives after the syscall executed cannot preempt the real result,
+  matching io_uring's already-completed behavior. The cached file type is
+  invalidated as soon as the fd's
+  backend state becomes inert (last operation completed, cancellation, or
+  close), so a recycled fd number is always re-probed. Backend prepare
+  rejections now also surface the real errno (for example `-EPERM`) instead
+  of a generic `-EAGAIN` (#1159).
 - **Object-cache lazy task argument lifetime**: `object_cache::get()` now
   copies the key and stores a decayed copy or moved instance of the constructor
   callable before returning its lazy task. Storing the task for later await can

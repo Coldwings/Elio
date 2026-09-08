@@ -6,6 +6,7 @@
 #include <elio/coro/frame.hpp>
 
 #include <atomic>
+#include <cerrno>
 #include <coroutine>
 #include <cstdint>
 #include <vector>
@@ -359,6 +360,9 @@ public:
         if (!detail::io_uring_prepare_request_is_valid(req)) {
             ELIO_LOG_ERROR("Invalid io_uring prepare request: {}",
                            static_cast<int>(req.op));
+            // Awaitables read the published slot on prepare failure;
+            // keep the historical -EAGAIN for this rejection.
+            detail::set_last_completion_result(io_result{-EAGAIN, 0});
             return false;
         }
 
@@ -372,6 +376,7 @@ public:
             sqe = io_uring_get_sqe(&ring_);
             if (!sqe) {
                 ELIO_LOG_WARNING("io_uring SQ still full after flush");
+                detail::set_last_completion_result(io_result{-EAGAIN, 0});
                 return false;
             }
         }
@@ -475,6 +480,7 @@ public:
                 
             default:
                 ELIO_LOG_ERROR("Unknown io_op: {}", static_cast<int>(req.op));
+                detail::set_last_completion_result(io_result{-EAGAIN, 0});
                 return false;
         }
         
@@ -1036,7 +1042,12 @@ public:
         throw std::runtime_error("io_uring not available on this system");
     }
     
-    bool prepare(const io_request&) override { return false; }
+    bool prepare(const io_request&) override {
+        // Awaitables read the published slot on prepare failure; keep the
+        // historical -EAGAIN for this rejection.
+        detail::set_last_completion_result(io_result{-EAGAIN, 0});
+        return false;
+    }
     int submit() override { return -1; }
     int poll(std::chrono::milliseconds) override { return 0; }
     bool has_pending() const noexcept override { return false; }

@@ -2238,8 +2238,21 @@ public:
 
     int fd() const noexcept;
     const unix_address& local_address() const noexcept;
-};
 
+    // Close after all pending accepts have completed or been cancelled.
+    void close();
+};
+```
+
+`close()` invalidates the listener and prevents later accepts from succeeding.
+It does not cancel an `accept()` that has already been submitted to the active
+I/O backend: a parked plain `accept()` never wakes on `close()` under either
+the io_uring or the epoll backend. A stoppable service loop should use the
+cancellable overload, request cancellation, await the loop task, and only then
+close or destroy the listener. The listener must remain alive until the
+pending accept resumes.
+
+```cpp
 class uds_stream {
 public:
     // Compatibility constructor; does not report O_NONBLOCK setup failure.

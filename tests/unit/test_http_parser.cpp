@@ -459,12 +459,23 @@ TEST_CASE("HTTP response parser - 205 with Content-Length: 0 completes before th
     REQUIRE(parser.body().empty());
     REQUIRE(consumed == first.size());
 
+    // The parser retains the pipelined successor in its internal buffer and
+    // reset() deliberately does not clear it. Extract the remainder with
+    // take_remaining() so the second parse sees those bytes exactly once;
+    // re-feeding wire.substr(consumed) instead would append a duplicate
+    // that bytes_remaining() below is there to catch.
+    std::string remainder = parser.take_remaining();
+    REQUIRE(remainder == second);
+    REQUIRE(parser.bytes_remaining() == 0);
+
     parser.reset();
 
-    auto [result2, consumed2] = parser.parse(wire.substr(consumed));
+    auto [result2, consumed2] = parser.parse(remainder);
     REQUIRE(result2 == parse_result::complete);
+    REQUIRE(consumed2 == remainder.size());
     REQUIRE(parser.get_status() == status::ok);
     REQUIRE(parser.body() == "hi");
+    REQUIRE(parser.bytes_remaining() == 0);
 }
 
 TEST_CASE("HTTP response parser - HEAD response has no body", "[http][parser]") {
@@ -1965,6 +1976,20 @@ TEST_CASE("HTTP response serialization", "[http][message]") {
         std::string second = resp.serialize();
 
         REQUIRE(first == second);
+    }
+
+    SECTION("205 response to CONNECT carries no framing headers") {
+        // A 205 is also a 2xx: a successful CONNECT switches to tunnel
+        // mode, and the RFC 9110 §9.3.6 prohibition of both framing
+        // headers takes precedence over the 205 Content-Length: 0 pin.
+        response resp(status::reset_content);
+
+        std::string serialized = resp.serialize(method::CONNECT);
+
+        REQUIRE(serialized.find("HTTP/1.1 205 Reset Content\r\n") !=
+                std::string::npos);
+        REQUIRE(serialized.find("Content-Length: ") == std::string::npos);
+        REQUIRE(serialized.find("Transfer-Encoding: ") == std::string::npos);
     }
 
     SECTION("2xx CONNECT response carries no framing headers") {

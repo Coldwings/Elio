@@ -231,20 +231,26 @@ public:
     std::string serialize() const {
         const bool status_forbids_body =
             detail::status_forbids_response_body(status_);
-        return serialize_impl(!status_forbids_body, status_forbids_body);
+        return serialize_impl(!status_forbids_body, status_forbids_body,
+                              /*connect_tunnel=*/false);
     }
 
     /// Serialize response for a specific request method.  HEAD responses and
     /// statuses that cannot carry a response body serialize headers only.
     std::string serialize(method request_method) const {
+        const auto code = static_cast<uint16_t>(status_);
+        const bool connect_tunnel = request_method == method::CONNECT &&
+                                    code >= 200 && code < 300;
         return serialize_impl(
             !detail::response_body_forbidden(request_method, status_),
-            detail::response_framing_forbidden(request_method, status_));
+            detail::response_framing_forbidden(request_method, status_),
+            connect_tunnel);
     }
 
 private:
     std::string serialize_impl(bool include_body,
-                               bool framing_forbidden) const {
+                               bool framing_forbidden,
+                               bool connect_tunnel) const {
         std::string result;
         
         // Status line
@@ -266,7 +272,7 @@ private:
             // to CONNECT (RFC 9110 §9.3.6) must not carry framing headers,
             // even when the caller set them.
             serialized_headers.remove("Transfer-Encoding");
-            if (status_ == status::reset_content) {
+            if (status_ == status::reset_content && !connect_tunnel) {
                 // 205 Reset Content is not in the RFC 9112 §6.3 item 1
                 // first-empty-line termination list, so a 205 without a
                 // length falls through to item 8 (close-delimited) and
@@ -274,7 +280,9 @@ private:
                 // SHOULD be length-delimited instead. RFC 9110 §15.3.6
                 // forbids content in a 205 and the body is never emitted
                 // for it, so Content-Length: 0 is always truthful. Pin it,
-                // overwriting any caller-set value.
+                // overwriting any caller-set value. A 205 to a successful
+                // CONNECT is excepted: the tunnel-mode prohibition of
+                // RFC 9110 §9.3.6 takes precedence over the pin.
                 serialized_headers.set_content_length(0);
             } else {
                 serialized_headers.remove("Content-Length");

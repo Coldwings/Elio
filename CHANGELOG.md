@@ -42,7 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keep-alive peer waited for a connection close that never came; the body is
   already dropped for 205, so `Content-Length: 0` is always truthful. 1xx,
   204, 304, and 2xx responses to CONNECT continue to serialize without framing
-  headers. The pinned server-side expectation in
+  headers; a 205 answering a successful CONNECT is excepted from the pin,
+  because the tunnel-mode prohibition of RFC 9110 §9.3.6 takes precedence. The pinned server-side expectation in
   `tests/unit/test_http_server.cpp` ("HTTP server suppresses bodies for HEAD
   and no-body statuses") was deliberately updated from requiring no
   `Content-Length` to requiring `Content-Length: 0` (#1161).

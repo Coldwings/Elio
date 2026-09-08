@@ -1888,6 +1888,47 @@ TEST_CASE("HTTP response serialization", "[http][message]") {
         REQUIRE(serialized.find("Content-Length: 0") == std::string::npos);
         REQUIRE(serialized.find("\r\n\r\npayload") != std::string::npos);
     }
+
+    SECTION("2xx CONNECT response carries no framing headers") {
+        // RFC 9110 §9.3.6: a successful CONNECT response switches to tunnel
+        // mode and MUST NOT contain Content-Length or Transfer-Encoding.
+        response resp(status::ok);
+
+        std::string serialized = resp.serialize(method::CONNECT);
+
+        REQUIRE(serialized.find("HTTP/1.1 200 OK\r\n") != std::string::npos);
+        REQUIRE(serialized.find("Content-Length: ") == std::string::npos);
+        REQUIRE(serialized.find("Transfer-Encoding: ") == std::string::npos);
+    }
+
+    SECTION("2xx CONNECT response strips user-set framing headers") {
+        response resp(status::ok);
+        resp.set_header("Content-Length", "5");
+
+        std::string serialized = resp.serialize(method::CONNECT);
+
+        REQUIRE(serialized.find("Content-Length: ") == std::string::npos);
+        REQUIRE(serialized.find("Transfer-Encoding: ") == std::string::npos);
+    }
+
+    SECTION("non-2xx CONNECT response keeps normal framing") {
+        response resp(status::method_not_allowed);
+
+        std::string serialized = resp.serialize(method::CONNECT);
+
+        REQUIRE(serialized.find("HTTP/1.1 405 Method Not Allowed\r\n") !=
+                std::string::npos);
+        REQUIRE(serialized.find("Content-Length: 0\r\n") != std::string::npos);
+    }
+
+    SECTION("2xx CONNECT response with body strips framing headers") {
+        response resp(status::ok, "tunnel-bytes", mime::text_plain);
+
+        std::string serialized = resp.serialize(method::CONNECT);
+
+        REQUIRE(serialized.find("Content-Length: ") == std::string::npos);
+        REQUIRE(serialized.find("Transfer-Encoding: ") == std::string::npos);
+    }
 }
 
 TEST_CASE("HTTP response from parser roundtrip", "[http][message]") {

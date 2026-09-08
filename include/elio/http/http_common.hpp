@@ -448,6 +448,18 @@ inline constexpr bool response_body_forbidden(method request_method,
            status_forbids_response_body(response_status);
 }
 
+/// True when no Content-Length or Transfer-Encoding may appear in the
+/// response: body-forbidden statuses, and any 2xx response to CONNECT,
+/// which switches to tunnel mode (RFC 9110 §9.3.6 prohibits both framing
+/// headers there, even when set by the caller).
+inline constexpr bool response_framing_forbidden(method request_method,
+                                                 status response_status) noexcept {
+    const auto code = static_cast<uint16_t>(response_status);
+    return status_forbids_response_body(response_status) ||
+           (request_method == method::CONNECT &&
+            code >= 200 && code < 300);
+}
+
 } // namespace detail
 
 /// Case-insensitive hash for headers using FNV-1a.

@@ -604,10 +604,21 @@ public:
                                          return cancel_key_for(op) == user_data;
                                      });
         if (ready_it != ready_ops_.end()) {
+            int ready_fd = ready_it->req.fd;
             found_entry = claim_resume(ready_it->req.state, ready_it->awaiter,
                                        io_result{-ECANCELED, 0}, to_resume);
             ready_ops_.erase(ready_it);
             pending_count_--;
+            // Mirror the poll() ready-op loop: the cancelled inline op's
+            // fd_state entry is now inert, so drop it here as well —
+            // otherwise nothing would ever observe it again and a recycled
+            // fd number would see the stale cached fd_kind.
+            auto state_it = fd_states_.find(ready_fd);
+            if (state_it != fd_states_.end() &&
+                state_it->second.pending_ops.empty() &&
+                !state_it->second.registered) {
+                fd_states_.erase(state_it);
+            }
             goto found;
         }
         

@@ -1743,6 +1743,57 @@ TEST_CASE("epoll fd kind cache is invalidated when an fd number is recycled",
         REQUIRE(close(pipefd[1]) == 0);
         unlink(tmpfile);
     }
+
+    SECTION("cancel of a queued ready op drops the fd state (raw backend)") {
+        epoll_backend backend;
+
+        char tmpfile[] = "/tmp/elio_test_epoll_cxlkind_XXXXXX";
+        int fd = mkstemp(tmpfile);
+        REQUIRE(fd >= 0);
+
+        // Prime an inline write: the fd_state entry (kind=regular) is
+        // created and the op is parked in the ready queue. A stack op_state
+        // with a null coroutine handle gives cancel() a matchable key; the
+        // claim itself safely goes nowhere.
+        op_state state;
+        char byte = 'x';
+        io_request wreq{};
+        wreq.op = io_op::write;
+        wreq.fd = fd;
+        wreq.buffer = &byte;
+        wreq.length = 1;
+        wreq.offset = 0;
+        wreq.state = &state;
+        REQUIRE(backend.prepare(wreq));
+
+        // Cancel before any poll drains the ready queue.
+        backend.cancel(tagged_op_state_user_data(&state));
+        REQUIRE(!backend.has_pending());
+
+        // The fd_state entry must be gone: recycle the fd number for a pipe
+        // and verify the read takes the epoll readiness path rather than a
+        // stale kind=regular inline read.
+        REQUIRE(::close(fd) == 0);
+        int pipefd[2] = {-1, -1};
+        REQUIRE(pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) == 0);
+        REQUIRE(pipefd[0] == fd);
+
+        io_request rreq{};
+        rreq.op = io_op::read;
+        rreq.fd = pipefd[0];
+        rreq.buffer = &byte;
+        rreq.length = 1;
+        REQUIRE(backend.prepare(rreq));
+
+        // Nothing is readable yet, so nothing may complete inline.
+        REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 0);
+        REQUIRE(::write(pipefd[1], &byte, 1) == 1);
+        REQUIRE(backend.poll(std::chrono::milliseconds(100)) == 1);
+
+        REQUIRE(close(pipefd[0]) == 0);
+        REQUIRE(close(pipefd[1]) == 0);
+        unlink(tmpfile);
+    }
 }
 
 TEST_CASE("Regular file current-offset and poll operations with forced epoll backend",

@@ -2576,6 +2576,7 @@ struct client_config : base_client_config {
     size_t max_connections_per_host = 6;
     std::chrono::seconds pool_idle_timeout{60};
     size_t max_response_size = 16 * 1024 * 1024;
+    std::chrono::milliseconds expect_continue_timeout{1000};
     // Inherits all base_client_config fields.
 };
 ```
@@ -2583,6 +2584,21 @@ struct client_config : base_client_config {
 When `follow_redirects` is enabled, the client resolves `Location` values with
 `url::resolve_reference()`, rejects unsupported schemes, and rejects HTTPS to
 HTTP downgrades.
+
+`expect_continue_timeout` bounds the wait for an interim `100 Continue` when a
+request uses `request::set_expect_continue()` and has a body. If the server
+answers with `100 Continue`, the client sends the body and then processes the
+response normally (any further interim 1xx responses are skipped). If the
+server answers with a final response first (for example `417 Expectation
+Failed`), the body is not sent and the response is consumed as usual. If the
+deadline expires first, the body is sent anyway (RFC 9110 §10.1.1 fallback).
+The wait is additionally bounded by the absolute response deadline
+(`read_timeout`), whichever expires first; response-deadline expiry fails the
+request with `ETIMEDOUT` instead of triggering the fallback. A value less
+than or equal to zero skips the wait entirely: the body is sent
+immediately after the headers. For redirects that preserve the request body
+(307/308 and method-preserving redirects), the Expect handshake re-runs per
+hop.
 
 `websocket::client_config` and `sse::client_config` also inherit
 `base_client_config`, including timeout, read-buffer, TLS verification, DNS
@@ -2632,6 +2648,47 @@ and the HTTP upgrade request read handled by `websocket::ws_server`. For
 the inbound TLS handshake. A value less than or equal to zero disables these
 server-side deadlines.
 
+### `context`
+
+HTTP request context passed to `http::server` route handlers.
+
+```cpp
+class context {
+public:
+    const request& req() const noexcept;
+    request& req() noexcept;
+    std::string_view client_addr() const noexcept;
+    std::string_view param(std::string_view name) const;
+    void set_param(std::string_view name, std::string_view value);
+    std::string query_param(std::string_view name) const;
+    const std::unordered_map<std::string, std::string>& params() const noexcept;
+
+    // Send an interim (1xx) response before the final response (awaitable)
+    /* awaitable */ send_interim(const response& resp);
+};
+```
+
+`send_interim()` writes an interim response on the connection before the
+handler returns the final response. The response status must be 1xx other
+than 101 Switching Protocols (an upgrade is never an interim response);
+anything else sets `errno = EINVAL` and returns `false`. Multiple interim
+responses may be sent, as RFC 9110 §15.2 permits. Body and framing headers
+are never serialized for 1xx statuses, so `response(status::continue_)`
+writes exactly `HTTP/1.1 100 Continue\r\n\r\n`.
+
+The context borrows its connection from the handler scope: it must not
+escape its handler (for example into a detached task), and interims can only
+be sent before the handler returns the final response. Contexts dispatched
+without a connection writer — for example the plain-HTTP fallback routes of
+`websocket::ws_server` — cannot send interims: `send_interim()` then sets
+`errno = ENOTSUP` and returns `false`, and the final response is unaffected.
+
+> **Note**: `http::server` reads the full request, including the body, before
+> dispatching to the handler. An explicit `100 Continue` sent with
+> `send_interim()` therefore cannot accelerate an `Expect: 100-continue`
+> client's first body send; it serves clients that pipeline or that wait for
+> an interim the application emits deliberately.
+
 ### `request`
 
 HTTP request message.
@@ -2650,6 +2707,7 @@ public:
     void set_body(std::string&& body);
     void set_host(std::string_view host);
     void set_content_type(std::string_view type);
+    void set_expect_continue(bool on = true);
     headers& get_headers() noexcept;
     const headers& get_headers() const noexcept;
     
@@ -2661,6 +2719,10 @@ public:
     std::string_view body() const noexcept;
     std::string_view host() const;
     std::string_view content_type() const;
+    bool expect_continue() const noexcept;
+
+    std::string serialize_headers() const;
+    std::string serialize() const;
 };
 ```
 
@@ -2669,6 +2731,18 @@ public:
 `set_version()` accepts an empty value for the default `HTTP/1.1` serialization
 or a version token of the form `HTTP/<digits>.<digits>`; invalid values throw
 `std::invalid_argument`.
+
+`set_expect_continue()` sets or clears the `Expect: 100-continue` header
+together with the client-side sending flag. The setter owns the `Expect`
+header: enabling overwrites any existing value and disabling removes the
+header outright. When the flag is enabled and the request has a body,
+`http::client::send()` transmits the headers first and waits (bounded by
+`client_config::expect_continue_timeout`) for an interim `100 Continue`
+before sending the body; see `client_config` for the fallback semantics. A
+bodyless request never serializes the `Expect` header (RFC 9110 §10.1.1
+forbids `Expect` without content). `serialize_headers()` returns the request
+line and headers without the body; `serialize()` shares it and appends the
+body.
 
 ### `headers`
 
@@ -2826,6 +2900,11 @@ public:
 `connect()` is one connection attempt. If it fails or a later operation observes
 a closed/failed connection, callers choose retry, backoff, replay, and
 application session restoration policy.
+
+During the upgrade handshake, interim 1xx responses (for example
+`100 Continue`) that precede the `101 Switching Protocols` are skipped under a
+cumulative byte cap; the handshake completes on the 101 and fails with
+`EBADMSG` for any other final status.
 
 ### `websocket::ws_connection`
 

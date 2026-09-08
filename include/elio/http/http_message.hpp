@@ -84,16 +84,41 @@ public:
         if (query_.empty()) return path_.empty() ? "/" : path_;
         return (path_.empty() ? "/" : path_) + "?" + query_;
     }
-    
+
+    /// Enable/disable the Expect: 100-continue handshake for this request.
+    /// When enabled and the request has a body, http::client sends the
+    /// headers first, then waits (bounded by
+    /// client_config::expect_continue_timeout) for an interim 100 Continue
+    /// before sending the body. The flag only controls client sending; it
+    /// is not derived from a parsed Expect header.
+    ///
+    /// This setter owns the Expect header: enabling overwrites any existing
+    /// Expect value, and disabling removes the header outright, including a
+    /// caller-set custom value. The header is only serialized when the
+    /// request actually has a body — RFC 9110 §10.1.1 forbids sending
+    /// Expect: 100-continue without content.
+    void set_expect_continue(bool on = true) {
+        expect_continue_ = on;
+        if (on) {
+            headers_.set("Expect", "100-continue");
+        } else {
+            headers_.remove("Expect");
+        }
+    }
+
+    /// Whether Expect: 100-continue sending is enabled
+    bool expect_continue() const noexcept { return expect_continue_; }
+
     /// Parse query string parameters
     std::unordered_map<std::string, std::string> query_params() const {
         return parse_query_string(query_);
     }
-    
-    /// Serialize request to string (HTTP/1.1 format)
-    std::string serialize() const {
+
+    /// Serialize request line and headers only (HTTP/1.1 format, no body).
+    /// serialize() shares this and appends the body.
+    std::string serialize_headers() const {
         std::string result;
-        
+
         // Request line
         result += method_to_string(method_);
         result += ' ';
@@ -107,18 +132,30 @@ public:
         detail::validate_http_version(version);
         result += version;
         result += "\r\n";
-        
-        // Headers
-        result += headers_.serialize();
-        
+
+        // Headers. A bodyless request must not advertise
+        // Expect: 100-continue (RFC 9110 §10.1.1); drop the setter-managed
+        // header only for that case.
+        if (expect_continue_ && body_.empty()) {
+            auto no_expect = headers_;
+            no_expect.remove("Expect");
+            result += no_expect.serialize();
+        } else {
+            result += headers_.serialize();
+        }
+
         // End of headers
         result += "\r\n";
-        
-        // Body
+
+        return result;
+    }
+
+    /// Serialize request to string (HTTP/1.1 format)
+    std::string serialize() const {
+        auto result = serialize_headers();
         if (!body_.empty()) {
             result += body_;
         }
-        
         return result;
     }
     
@@ -141,6 +178,7 @@ private:
     std::string version_ = "HTTP/1.1";
     headers headers_;
     std::string body_;
+    bool expect_continue_ = false;
 };
 
 /// HTTP response

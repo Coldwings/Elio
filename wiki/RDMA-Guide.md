@@ -300,13 +300,18 @@ scheduler.go([&]() -> elio::coro::task<void> {
 });
 ```
 
-The pump checks the cancel token before and after each poll. To stop
-cleanly:
+The pump checks the cancel token before and after each poll, and the
+blocked poll itself is registered with the token. To stop cleanly, just
+cancel:
 
 ```cpp
 pump_stop.cancel();
-// Then write a wake byte to the fd to unblock the in-flight poll.
 ```
+
+Cancellation also aborts an in-flight poll — no synthetic wake byte or
+other fd wakeup is needed. Afterwards, join/await the pump task before
+tearing down, and keep the completion-channel fd and the dispatcher
+alive until the pump task has completed.
 
 ### Manual: drive dispatcher.deliver directly
 

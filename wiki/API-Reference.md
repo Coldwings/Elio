@@ -4035,7 +4035,8 @@ public:
     level get_level() const;
     
     template<typename... Args>
-    void log(level lvl, const char* fmt, Args&&... args);
+    void log(level lvl, const char* file, int line,
+             fmt::format_string<Args...> fmt_str, Args&&... args);
 };
 
 enum class level {
@@ -4045,6 +4046,11 @@ enum class level {
     error
 };
 ```
+
+Ordinary callers should use the `ELIO_LOG_INFO` / `ELIO_LOG_WARNING` /
+`ELIO_LOG_ERROR` macros (and `ELIO_LOG_DEBUG` when `ELIO_DEBUG` is defined)
+from `elio/log/macros.hpp`; they supply `__FILE__` and `__LINE__`
+automatically.
 
 ---
 

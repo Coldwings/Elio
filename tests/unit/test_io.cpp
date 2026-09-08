@@ -2983,6 +2983,91 @@ TEST_CASE("UDS listener bind and accept", "[uds][listener]") {
     }
 }
 
+TEST_CASE("uds_listener cancel(token) wakes a parked accept before close",
+          "[uds][listener][cancel][contract][regression]") {
+    // Characterization test for the documented shutdown contract (#1168):
+    // close() does not cancel an accept already submitted to the backend, so
+    // a stoppable accept loop must cancel its token, await the pending
+    // accept, and only then close the listener. This pins that workaround on
+    // both backends: if cancellation ever stops waking a parked accept, the
+    // bounded wait below times out and the test fails.
+    auto run_case = [&](std::optional<io_context::backend_type> forced_backend) {
+        std::optional<worker_io_backend_guard> backend_guard;
+        if (forced_backend.has_value()) {
+            backend_guard.emplace(*forced_backend);
+        }
+
+        auto addr = unix_address::abstract(
+            "elio_test_uds_accept_cancel_" + std::to_string(getpid()));
+        auto listener = uds_listener::bind(addr);
+        REQUIRE(listener.has_value());
+
+        // Declare every object the coroutine captures BEFORE the scheduler:
+        // destruction is reverse-declaration order, so the scheduler is
+        // destroyed first and tears down the (possibly still parked) accept
+        // coroutine while the captures are still alive. If a bounded REQUIRE
+        // above failed mid-flight, the reverse order would let the backend
+        // resume the coroutine into already-destroyed captures (UB).
+        cancel_source source;
+        std::atomic<bool> started{false};
+        std::atomic<bool> done{false};
+        std::atomic<int> observed_errno{0};
+        std::atomic<bool> accepted_stream{true};
+
+        scheduler sched(1);
+        sched.start();
+
+        auto& worker_io = sched.get_worker(0)->io_context();
+        const size_t baseline_pending = worker_io.pending_count();
+
+        sched.go([&]() -> task<void> {
+            started.store(true, std::memory_order_release);
+            errno = 0;
+            auto stream = co_await listener->accept(source.get_token());
+            accepted_stream.store(stream.has_value(), std::memory_order_relaxed);
+            observed_errno.store(errno, std::memory_order_relaxed);
+            done.store(true, std::memory_order_release);
+            co_return;
+        });
+
+        // Barrier: wait until the parked accept is registered as a pending
+        // operation with the worker's I/O backend (no bare sleeps).
+        bool parked = false;
+        for (int i = 0; i < 500 && !parked; ++i) {
+            parked = started.load(std::memory_order_acquire) &&
+                     worker_io.pending_count() > baseline_pending;
+            if (!parked) {
+                std::this_thread::sleep_for(elio::test::scaled_ms(10));
+            }
+        }
+        REQUIRE(parked);
+        REQUIRE_FALSE(done.load(std::memory_order_acquire));
+
+        source.cancel();
+
+        for (int i = 0; i < 500 && !done.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(elio::test::scaled_ms(10));
+        }
+        REQUIRE(done.load(std::memory_order_acquire));
+
+        // Per the documented contract, close() only after the pending accept
+        // has resumed.
+        listener->close();
+        REQUIRE(sched.shutdown(elio::test::scaled_ms(5000)));
+
+        REQUIRE_FALSE(accepted_stream.load(std::memory_order_relaxed));
+        REQUIRE(observed_errno.load(std::memory_order_relaxed) == ECANCELED);
+    };
+
+    SECTION("default backend") {
+        run_case(std::nullopt);
+    }
+
+    SECTION("forced epoll backend") {
+        run_case(io_context::backend_type::epoll);
+    }
+}
+
 TEST_CASE("UDS bind validates address before side effects",
           "[uds][listener][contract]") {
     std::string dir = "/tmp/elio_uds_overlong_" + std::to_string(getpid());

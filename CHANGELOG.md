@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cross-worker `signal_fd::wait()`**: Awaiting a `signal::signal_fd` on a
+  different scheduler worker than the one it was constructed on no longer
+  throws `std::logic_error`. `wait()` now resolves its submission
+  `io_context` per call: on a scheduler worker the read is submitted to the
+  awaiting coroutine's current worker context (the same model as
+  `io::async_recv`/`io::async_send`); off-worker waits keep the
+  construction-time context, preserving the standalone-`io_context` driving
+  contract. At most one `wait()` may be pending per `signal_fd` at a time
+  (single-waiter rule) (#1167).
 - **epoll `async_close` completion**: Under the epoll backend,
   `io::async_close` now completes without an explicit `submit()` pump. Close
   operations are queued as synchronous operations and previously only
@@ -318,6 +327,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Clarified the `uds_listener` shutdown boundary, aligning it with the
+  `tcp_listener` contract from #1013: `close()` invalidates future accepts but
+  does not cancel an accept already submitted to the I/O backend, so a parked
+  plain `accept()` never wakes on `close()` under either the io_uring or the
+  epoll backend. Stoppable accept loops must use `accept(coro::cancel_token)`,
+  request cancellation, await completion, and only then close or destroy the
+  listener (#1168).
 - Documented that `run()`/`ELIO_ASYNC_MAIN` and `serve()`/`serve_all()` install
   process-wide `SIG_IGN` for `SIGPIPE` through independent one-time entry paths.
   Elio does not save or restore the previous disposition; embedders that need a

@@ -1700,7 +1700,12 @@ single-shot operations `async_read`, `async_write`, `async_readv`, and
 execute `pread`/`pwrite`/`preadv`/`pwritev` (or the current-position
 variants) inline at submission and complete immediately;
 `async_poll_read`/`async_poll_write` on a regular file complete immediately
-as ready. The file type is probed once per fd with `fstat` and cached.
+as ready. The file type is probed once per fd with `fstat` and cached; the
+cache is invalidated whenever the fd's backend state becomes inert (last
+operation completed, cancellation, or close), so a recycled fd number is
+always re-probed. An `O_PATH` regular file passes the probe but cannot be
+read or written; operations on it fail inline with `-EBADF` from the
+syscall itself.
 Because these operations complete without a real suspension, cancellation
 tokens are no-ops for them under epoll, whereas the io_uring backend keeps
 the equivalent submission truly cancellable until its completion arrives.

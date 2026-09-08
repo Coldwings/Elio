@@ -171,8 +171,10 @@ no-op cancellation there, while io_uring keeps them cancellable — #1159.
 Regression coverage: "Regular file async read/write with forced epoll backend",
 "Regular file async readv/writev with forced epoll backend", "Pipe async
 read/write still works with forced epoll backend", "epoll prepare failure
-surfaces the real errno", and "epoll regular-file probe failure surfaces fstat
-errno" in `tests/unit/test_io.cpp`.
+surfaces the real errno", "epoll regular-file probe failure surfaces fstat
+errno", "epoll fd kind cache is invalidated when an fd number is recycled",
+and "Regular file current-offset and poll operations with forced epoll
+backend" in `tests/unit/test_io.cpp`.
 
 ## TLS
 

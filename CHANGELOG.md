@@ -42,8 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `async_poll_write` on regular files complete immediately as ready. Because
   these operations complete without a real suspension, cancellation tokens
   are no-ops for them under epoll (io_uring keeps them cancellable until
-  completion). Backend prepare rejections now also surface the real errno
-  (for example `-EPERM`) instead of a generic `-EAGAIN` (#1159).
+  completion). The cached file type is invalidated as soon as the fd's
+  backend state becomes inert (last operation completed, cancellation, or
+  close), so a recycled fd number is always re-probed. Backend prepare
+  rejections now also surface the real errno (for example `-EPERM`) instead
+  of a generic `-EAGAIN` (#1159).
 - **Object-cache lazy task argument lifetime**: `object_cache::get()` now
   copies the key and stores a decayed copy or moved instance of the constructor
   callable before returning its lazy task. Storing the task for later await can

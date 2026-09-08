@@ -369,7 +369,9 @@ public:
         std::vector<deferred_resume_entry> deferred_resumes;
 
         // Execute synchronous operations (like close)
-        for (auto& [fd, state] : fd_states_) {
+        for (auto map_it = fd_states_.begin(); map_it != fd_states_.end();) {
+            auto& state = map_it->second;
+            bool erase_entry = false;
             auto it = state.pending_ops.begin();
             while (it != state.pending_ops.end()) {
                 if (it->synchronous) {
@@ -378,7 +380,8 @@ public:
                     // a race where another thread reuses the fd number between
                     // close() and EPOLL_CTL_DEL, causing stale registrations.
                     if (is_close && state.registered) {
-                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, map_it->first,
+                                  nullptr);
                         state.registered = false;
                         state.events = 0;
                     }
@@ -386,9 +389,19 @@ public:
                     it = state.pending_ops.erase(it);
                     pending_count_--;
                     submitted++;
+                    // The fd's lifetime ended: drop the entry (including the
+                    // cached fd_kind) so a recycled fd number re-probes.
+                    if (is_close && state.pending_ops.empty()) {
+                        erase_entry = true;
+                    }
                 } else {
                     ++it;
                 }
+            }
+            if (erase_entry) {
+                map_it = fd_states_.erase(map_it);
+            } else {
+                ++map_it;
             }
         }
 
@@ -415,6 +428,15 @@ public:
                                op.precompleted_result, &deferred_resumes);
                 pending_count_--;
                 completions++;
+                // Inline-completed ops (e.g. regular-file read/write) never
+                // occupy their fd_state entry; drop it once inert so a
+                // recycled fd number re-probes its file type.
+                auto state_it = fd_states_.find(op.req.fd);
+                if (state_it != fd_states_.end() &&
+                    state_it->second.pending_ops.empty() &&
+                    !state_it->second.registered) {
+                    fd_states_.erase(state_it);
+                }
             }
 
             resume_deferred(deferred_resumes);
@@ -541,11 +563,14 @@ public:
                     }
                 }
                 
-                // Update epoll registration if no more pending ops for this fd
-                if (state.pending_ops.empty() && state.registered) {
-                    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                    state.registered = false;
-                    state.events = 0;
+                // Drop the entry once it becomes inert (no pending ops, no
+                // epoll registration): keeping it would let a recycled fd
+                // number observe a stale cached fd_kind.
+                if (state.pending_ops.empty()) {
+                    if (state.registered) {
+                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+                    }
+                    fd_states_.erase(it);
                 }
             }
         
@@ -587,24 +612,29 @@ public:
         }
         
         // Search in fd_states first
-        for (auto& [fd, state] : fd_states_) {
-            auto it = std::find_if(state.pending_ops.begin(), 
+        for (auto state_it = fd_states_.begin();
+             state_it != fd_states_.end(); ++state_it) {
+            auto& state = state_it->second;
+            auto it = std::find_if(state.pending_ops.begin(),
                                     state.pending_ops.end(),
                                     [user_data](const pending_operation& op) {
                                         return cancel_key_for(op) == user_data;
                                     });
-            
+
             if (it != state.pending_ops.end()) {
                 found_entry = claim_resume(it->req.state, it->awaiter,
                                            io_result{-ECANCELED, 0}, to_resume);
                 state.pending_ops.erase(it);
                 pending_count_--;
-                
-                // Cleanup if no more pending ops
-                if (state.pending_ops.empty() && state.registered) {
-                    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-                    state.registered = false;
-                    state.events = 0;
+
+                // Drop the entry once inert so a recycled fd number never
+                // observes a stale cached fd_kind.
+                if (state.pending_ops.empty()) {
+                    if (state.registered) {
+                        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, state_it->first,
+                                  nullptr);
+                    }
+                    fd_states_.erase(state_it);
                 }
                 goto found;
             }
@@ -698,10 +728,11 @@ private:
         std::vector<pending_operation> pending_ops;
         uint32_t events = 0;
         bool registered = false;
-        /// Probed lazily on the first read/write-family op and cached for the
-        /// lifetime of this entry, matching the existing registered/events
-        /// state: an fd must not be recycled to a different file type behind
-        /// the backend's back.
+        /// Probed lazily on the first read/write-family op and cached while
+        /// the entry lives. The entry is dropped as soon as it becomes inert
+        /// (last op completed in poll(), cancellation, close-op execution in
+        /// submit(), or inline ready-op completion), so a recycled fd number
+        /// always re-probes its file type.
         fd_kind kind = fd_kind::unknown;
     };
     

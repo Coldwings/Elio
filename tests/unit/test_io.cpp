@@ -1564,6 +1564,242 @@ TEST_CASE("epoll regular-file probe failure surfaces fstat errno",
     REQUIRE(read_result.result == -EBADF);
 }
 
+TEST_CASE("epoll fd kind cache is invalidated when an fd number is recycled",
+          "[io][epoll][file][regular][recycle]") {
+    worker_io_backend_guard backend_guard(io_context::backend_type::epoll);
+
+    SECTION("regular file fd recycled as a pipe") {
+        char tmpfile[] = "/tmp/elio_test_epoll_recycA_XXXXXX";
+        int fd = mkstemp(tmpfile);
+        REQUIRE(fd >= 0);
+
+        int pipe_read_end = -1;
+        int pipe_write_end = -1;
+        bool reused = false;
+        std::atomic<bool> reader_done{false};
+        std::atomic<bool> writer_done{false};
+        io_result file_write{};
+        io_result pipe_read{};
+        std::array<char, 4> buffer{};
+
+        scheduler sched(1);
+        sched.start();
+
+        sched.go([&]() -> task<void> {
+            const char byte = 'k';
+            file_write = co_await async_write(fd, &byte, 1, 0);
+            // Raw close: the inline-path completion above has already made
+            // the fd_state entry inert, so the cached kind=regular must not
+            // survive into the recycled fd.
+            (void)::close(fd);
+            // Linux allocates the lowest free fd number, which is the one
+            // just closed.
+            int pipefd[2] = {-1, -1};
+            if (pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) == 0) {
+                pipe_read_end = pipefd[0];
+                pipe_write_end = pipefd[1];
+                reused = (pipe_read_end == fd);
+                // A stale kind=regular cache would execute ::read inline
+                // here and report -EAGAIN on the empty non-blocking pipe
+                // instead of waiting for readiness.
+                pipe_read = co_await async_read(pipe_read_end, buffer.data(),
+                                                1);
+            }
+            reader_done.store(true, std::memory_order_release);
+        });
+
+        sched.go([&]() -> task<void> {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(200));
+            if (pipe_write_end >= 0) {
+                const char byte = 'k';
+                (void)co_await async_write(pipe_write_end, &byte, 1);
+            }
+            writer_done.store(true, std::memory_order_release);
+        });
+
+        for (int i = 0;
+             i < 200 && !(reader_done.load(std::memory_order_acquire) &&
+                          writer_done.load(std::memory_order_acquire));
+             ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        sched.shutdown();
+        REQUIRE(reader_done.load(std::memory_order_acquire));
+        REQUIRE(writer_done.load(std::memory_order_acquire));
+        REQUIRE(file_write.result == 1);
+        REQUIRE(reused);
+        REQUIRE(pipe_read.result == 1);
+        REQUIRE(buffer[0] == 'k');
+
+        REQUIRE(close(pipe_read_end) == 0);
+        REQUIRE(close(pipe_write_end) == 0);
+        unlink(tmpfile);
+    }
+
+    SECTION("socket fd recycled as a regular file") {
+        int sv[2] = {-1, -1};
+        REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                           0, sv) == 0);
+        const char* seed = "seed";
+        REQUIRE(::send(sv[1], seed, strlen(seed), 0) ==
+                static_cast<ssize_t>(strlen(seed)));
+
+        char tmpfile[] = "/tmp/elio_test_epoll_recycB_XXXXXX";
+        const char* payload = "recycled payload";
+        const size_t payload_len = strlen(payload);
+
+        int recycled_fd = -1;
+        bool reused = false;
+        std::atomic<bool> completed{false};
+        io_result sock_read{};
+        io_result file_write{};
+        io_result file_read{};
+        std::array<char, 16> buffer{};
+        std::array<char, 32> verify{};
+
+        scheduler sched(1);
+        sched.start();
+
+        sched.go([&]() -> task<void> {
+            sock_read = co_await async_read(sv[0], buffer.data(),
+                                            buffer.size());
+            (void)::close(sv[0]);
+            (void)::close(sv[1]);
+            recycled_fd = mkstemp(tmpfile);
+            reused = (recycled_fd == sv[0]);
+            if (recycled_fd >= 0) {
+                // A stale kind=other cache would register the regular file
+                // with epoll and fail the write with -EPERM.
+                file_write = co_await async_write(recycled_fd, payload,
+                                                  payload_len, 0);
+                file_read = co_await async_read(recycled_fd, verify.data(),
+                                                verify.size(), 0);
+            }
+            completed.store(true, std::memory_order_release);
+        });
+
+        for (int i = 0;
+             i < 100 && !completed.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        sched.shutdown();
+        REQUIRE(completed.load(std::memory_order_acquire));
+        REQUIRE(sock_read.result == static_cast<int>(strlen(seed)));
+        REQUIRE(reused);
+        REQUIRE(file_write.result == static_cast<int>(payload_len));
+        REQUIRE(file_read.result == static_cast<int>(payload_len));
+        REQUIRE(std::string(verify.data(), payload_len) == payload);
+
+        REQUIRE(close(recycled_fd) == 0);
+        unlink(tmpfile);
+    }
+
+    SECTION("close op drops the cached fd kind (raw backend)") {
+        epoll_backend backend;
+
+        char tmpfile[] = "/tmp/elio_test_epoll_clskind_XXXXXX";
+        int fd = mkstemp(tmpfile);
+        REQUIRE(fd >= 0);
+
+        // Prime kind=regular with an inline write (stays in the ready queue;
+        // no poll yet, so the entry survives until the close op runs).
+        char byte = 'x';
+        io_request wreq{};
+        wreq.op = io_op::write;
+        wreq.fd = fd;
+        wreq.buffer = &byte;
+        wreq.length = 1;
+        wreq.offset = 0;
+        REQUIRE(backend.prepare(wreq));
+
+        io_request creq{};
+        creq.op = io_op::close;
+        creq.fd = fd;
+        REQUIRE(backend.prepare(creq));
+        REQUIRE(backend.submit() == 1);
+
+        // Recycle the fd number for a pipe.
+        int pipefd[2] = {-1, -1};
+        REQUIRE(pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) == 0);
+        REQUIRE(pipefd[0] == fd);
+
+        io_request rreq{};
+        rreq.op = io_op::read;
+        rreq.fd = pipefd[0];
+        rreq.buffer = &byte;
+        rreq.length = 1;
+        REQUIRE(backend.prepare(rreq));
+
+        // Only the primed inline write is ready; a stale kind=regular entry
+        // would also have completed the pipe read inline with -EAGAIN.
+        REQUIRE(backend.poll(std::chrono::milliseconds(0)) == 1);
+        // Data arrives; the readiness-driven read completes.
+        REQUIRE(::write(pipefd[1], &byte, 1) == 1);
+        REQUIRE(backend.poll(std::chrono::milliseconds(100)) == 1);
+
+        REQUIRE(close(pipefd[0]) == 0);
+        REQUIRE(close(pipefd[1]) == 0);
+        unlink(tmpfile);
+    }
+}
+
+TEST_CASE("Regular file current-offset and poll operations with forced epoll backend",
+          "[io][epoll][file][regular]") {
+    worker_io_backend_guard backend_guard(io_context::backend_type::epoll);
+
+    char tmpfile[] = "/tmp/elio_test_epoll_regoff_XXXXXX";
+    int fd = mkstemp(tmpfile);
+    REQUIRE(fd >= 0);
+
+    const char* data = "offset-tracking payload";
+    const size_t data_len = strlen(data);
+
+    std::atomic<bool> completed{false};
+    io_result write_result{};
+    io_result poll_read_result{};
+    io_result poll_write_result{};
+    io_result read_result{};
+    io_result eof_result{};
+    off_t offset_after_write = -1;
+    std::array<char, 64> buffer{};
+
+    scheduler sched(1);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        // offset = -1 uses (and must advance) the current file position.
+        write_result = co_await async_write(fd, data, data_len);
+        offset_after_write = lseek(fd, 0, SEEK_CUR);
+        // A regular file is always ready; both polls complete immediately.
+        poll_read_result = co_await async_poll_read(fd);
+        poll_write_result = co_await async_poll_write(fd);
+        (void)lseek(fd, 0, SEEK_SET);
+        read_result = co_await async_read(fd, buffer.data(), buffer.size());
+        // The previous read advanced the position to EOF.
+        eof_result = co_await async_read(fd, buffer.data(), buffer.size());
+        completed.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0;
+         i < 100 && !completed.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+    REQUIRE(completed.load(std::memory_order_acquire));
+    REQUIRE(write_result.result == static_cast<int>(data_len));
+    REQUIRE(offset_after_write == static_cast<off_t>(data_len));
+    REQUIRE(poll_read_result.result == 0);
+    REQUIRE(poll_write_result.result == 0);
+    REQUIRE(read_result.result == static_cast<int>(data_len));
+    REQUIRE(std::string(buffer.data(), data_len) == data);
+    REQUIRE(eof_result.result == 0);
+
+    REQUIRE(close(fd) == 0);
+    unlink(tmpfile);
+}
+
 TEST_CASE("Socket pair with epoll", "[io][epoll][socket]") {
     int sv[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);

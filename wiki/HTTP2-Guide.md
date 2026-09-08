@@ -244,19 +244,32 @@ not implement HTTP/2 tunneling.
 
 ## Cancellation
 
-```cpp
-coro::task<void> cancellable_request() {
-    h2_client client;
+`h2_client` does not currently support per-request cancellation via
+`cancel_token`, and task-level cancellation cannot interrupt an in-flight
+HTTP/2 request either: the session read chain is tokenless
+(`http2_session::process()` → `tls_stream::read` → `tcp::poll_read()` →
+plain `async_poll_awaitable`), so there is no token registration to abort.
 
-    // Note: h2_client does not currently support per-request cancellation
-    // via cancel_token. Use task-level cancellation instead.
+The effective abort mechanism is the timeout watchdog. Bound requests with
+a finite `read_timeout` (and `connect_timeout`) in `h2_client_config`:
+
+```cpp
+coro::task<void> bounded_request() {
+    h2_client client;
+    client.config().read_timeout = std::chrono::seconds(10);
+
+    // On read_timeout expiry the watchdog shuts down the socket and the
+    // request fails with ETIMEDOUT (returns std::nullopt).
     auto resp = co_await client.get("https://slow-api.example.com/");
 
     if (!resp) {
-        std::cout << "Request failed" << std::endl;
+        std::cout << "Request failed (errno=" << errno << ")" << std::endl;
     }
 }
 ```
+
+As everywhere in Elio, a cancellation request remains cooperative — it is
+not a force-stop of the in-flight operation.
 
 ## Connection Management
 

@@ -182,7 +182,7 @@ Case law (frozen): `read_exactly()` early-EOF `-ENODATA` reporting — #1075.
 | `http::url` | Parses and exposes supported URL components according to HTTP client rules. | Validate application-specific scheme, host, path, query, and credential policy. |
 | `http::headers` | Stores header fields and provides documented lookup/serialization behavior. | Do not rely on it for application authorization or semantic validation. Avoid adding invalid or unsafe header names/values. |
 | `http::request` | Represents parsed or constructed HTTP requests and preserves method, target, headers, and body fields. | Validate routes, methods, authorization, content type, and body schema in application code. |
-| `http::response` | Represents and serializes status, headers, and body framing generated through Elio APIs. | Choose status, redirects, cache headers, and payload content safely. Do not expose secrets through response fields. |
+| `http::response` | Represents and serializes status, headers, and body framing generated through Elio APIs. An empty-body response whose status allows a body serializes with `Content-Length: 0` unless the caller already set `Content-Length` or `Transfer-Encoding`; statuses that forbid a body (1xx, 204, 205, 304) and 2xx responses to CONNECT serialize without either framing header (RFC 9110 §9.3.6). | Choose status, redirects, cache headers, and payload content safely. Do not expose secrets through response fields. |
 | `http::method`, `method_to_string()`, and `string_to_method()` | Provide supported method enum values and exact token conversion. | Handle `std::nullopt` for unknown methods and apply application method policy before dispatch. |
 | `http::status` and `status_reason()` | Provide supported status values and reason strings. Response serialization omits bodies for status/method combinations that HTTP forbids. | Choose statuses appropriate to the application and do not treat reason strings or serialization rules as authorization or cache policy. |
 | `http::headers`, `http::url`, `http::request`, and `http::response` mutators/serializers | Reject or fail to parse syntax that Elio's public HTTP message types cannot safely represent or serialize. Throwing setters report invalid caller-supplied values through `std::invalid_argument`. | Validate application-specific semantics separately. Do not pass unchecked external strings into constructors, setters, or serializers that document strict syntax. |
@@ -193,6 +193,8 @@ Case law (frozen): `read_exactly()` early-EOF `-ENODATA` reporting — #1075.
 | `http::client` | Performs connection setup, optional TLS, request serialization, response parsing, redirect behavior, and timeout handling according to config. | Check response status and errors. Decide retries, authentication, idempotency, redirect trust, and payload validation. |
 | `http::base_client_config` | Defines shared timeout, size, and behavior settings for client operations. | Set values appropriate for target endpoints and threat model. |
 | `http::client_config` | Extends base client settings with HTTP/1.1 client-specific options. | Keep configured defaults aligned with application retry/redirect/security policy. |
+
+Case law (frozen): `http::response` empty-body framing (`Content-Length: 0`) — #1158.
 
 ## HTTP/2
 

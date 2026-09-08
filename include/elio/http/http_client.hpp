@@ -41,6 +41,14 @@ struct client_config : base_client_config {
     /// API/JSON responses; bump it deliberately for endpoints that legitimately
     /// return larger bodies.
     size_t max_response_size = 16 * 1024 * 1024;  ///< Max response body size (16 MiB)
+    /// Deadline for waiting on an interim 100 Continue when a request uses
+    /// request::set_expect_continue(). On expiry the body is sent anyway
+    /// (RFC 9110 §10.1.1 fallback). A value <= 0 skips the wait: the body
+    /// is sent immediately after the headers. The wait is additionally
+    /// bounded by the absolute response deadline (read_timeout), whichever
+    /// expires first; response-deadline expiry fails the request with
+    /// ETIMEDOUT instead of triggering the fallback.
+    std::chrono::milliseconds expect_continue_timeout{1000};
 
     client_config() {
         user_agent = "elio-http/1.0";
@@ -356,6 +364,55 @@ private:
         return code >= 100 && code < 200;
     }
 
+    /// Write the whole buffer to the connection, optionally bounded by
+    /// `io_deadline`. read_timeout doubles as the send deadline: a stalled
+    /// write to a malicious server is the same liveness problem as a
+    /// stalled read, so the same bound applies. The watchdog shutdown(2)s
+    /// the fd to abort an in-flight write on timeout. Returns true on
+    /// success; on failure sets errno (ECANCELED / ETIMEDOUT / connection
+    /// error) and returns false.
+    static coro::task<bool>
+    write_request_data(connection& conn, std::string_view data,
+                       const url& target,
+                       std::chrono::nanoseconds io_deadline,
+                       bool deadline_enforced,
+                       runtime::scheduler* sched,
+                       const coro::cancel_token& token) {
+        io::io_result write_result{};
+        if (deadline_enforced) {
+            auto timed_out = std::make_shared<std::atomic<bool>>(false);
+            coro::cancel_source ws_cancel;
+            auto watchdog = arm_io_watchdog(sched, conn.fd(), io_deadline,
+                                            ws_cancel.get_token(), timed_out);
+            write_result = co_await conn.write_all(data, token);
+            ws_cancel.cancel();
+            co_await watchdog;
+            if (timed_out->load(std::memory_order_acquire)) {
+                conn.mark_externally_shut_down();
+                ELIO_LOG_ERROR("Write to {}:{} timed out after {}s",
+                               target.host, target.effective_port(),
+                               std::chrono::duration_cast<std::chrono::seconds>(io_deadline).count());
+                errno = ETIMEDOUT;
+                co_return false;
+            }
+        } else {
+            write_result = co_await conn.write_all(data, token);
+        }
+        if (write_result.result <= 0) {
+            if (write_result.result == -ECANCELED && token.is_cancelled()) {
+                detail::abort_stream_io(conn);
+                errno = ECANCELED;
+                co_return false;
+            }
+            ELIO_LOG_ERROR("Failed to send request: {}",
+                           write_result.result == 0 ? "connection closed"
+                                                    : strerror(-write_result.result));
+            errno = write_result.result == 0 ? ECONNRESET : -write_result.result;
+            co_return false;
+        }
+        co_return true;
+    }
+
     static bool is_auto_follow_redirect(status s) noexcept {
         switch (s) {
         case status::moved_permanently:
@@ -411,10 +468,16 @@ private:
             req.set_header("Connection", "keep-alive");
         }
 
-        // Serialize and send request
+        // Serialize and send request. With Expect: 100-continue and a
+        // non-empty body, only the headers go out first; the body is held
+        // back until the server answers with an interim 100 Continue, a
+        // final response (body suppressed), or the fallback timeout
+        // expires (body sent anyway).
+        const bool defer_body = req.expect_continue() && !req.body().empty();
         std::string request_data;
         try {
-            request_data = req.serialize();
+            request_data = defer_body ? req.serialize_headers()
+                                      : req.serialize();
         } catch (const std::invalid_argument& ex) {
             ELIO_LOG_ERROR("Invalid outbound HTTP request: {}", ex.what());
             errno = EINVAL;
@@ -439,42 +502,9 @@ private:
         const auto response_deadline =
             std::chrono::steady_clock::now() + io_deadline;
 
-        // ---- write the request, optionally bounded by read_timeout -------
-        // We re-use read_timeout for the send phase: send_timeout is not
-        // currently configurable, but a stalled write to a malicious server
-        // is the same liveness problem as a stalled read, so the same bound
-        // applies. The watchdog shutdown(2)s the fd to abort an in-flight
-        // write on timeout.
-        io::io_result write_result{};
-        if (deadline_enforced) {
-            auto timed_out = std::make_shared<std::atomic<bool>>(false);
-            coro::cancel_source ws_cancel;
-            auto watchdog = arm_io_watchdog(sched, conn.fd(), io_deadline,
-                                            ws_cancel.get_token(), timed_out);
-            write_result = co_await conn.write_all(request_data, token);
-            ws_cancel.cancel();
-            co_await watchdog;
-            if (timed_out->load(std::memory_order_acquire)) {
-                conn.mark_externally_shut_down();
-                ELIO_LOG_ERROR("Write to {}:{} timed out after {}s",
-                               target.host, target.effective_port(),
-                               std::chrono::duration_cast<std::chrono::seconds>(io_deadline).count());
-                errno = ETIMEDOUT;
-                co_return std::nullopt;
-            }
-        } else {
-            write_result = co_await conn.write_all(request_data, token);
-        }
-        if (write_result.result <= 0) {
-            if (write_result.result == -ECANCELED && token.is_cancelled()) {
-                detail::abort_stream_io(conn);
-                errno = ECANCELED;
-                co_return std::nullopt;
-            }
-            ELIO_LOG_ERROR("Failed to send request: {}",
-                           write_result.result == 0 ? "connection closed"
-                                                    : strerror(-write_result.result));
-            errno = write_result.result == 0 ? ECONNRESET : -write_result.result;
+        if (!co_await write_request_data(conn, request_data, target,
+                                         io_deadline, deadline_enforced,
+                                         sched, token)) {
             co_return std::nullopt;
         }
 
@@ -487,6 +517,190 @@ private:
         std::string pending_response_bytes;
         size_t current_response_bytes = 0;
         size_t skipped_informational_bytes = 0;
+
+        if (defer_body) {
+            // Bounded wait for 100 Continue (or a final response) before
+            // sending the body. The same response_parser is used here and
+            // in the main loop below, so bytes consumed while waiting feed
+            // straight into normal response processing. Unlike the
+            // fd-shutdown watchdog used elsewhere, this wait cancels only
+            // its own read: on timeout the connection must stay usable so
+            // the body can still be sent (RFC 9110 §10.1.1 fallback).
+            const bool wait_bounded =
+                sched != nullptr &&
+                config_.expect_continue_timeout.count() > 0;
+            bool send_body = !wait_bounded;  // <=0: send immediately
+            bool final_seen = false;
+            const auto expect_deadline =
+                std::chrono::steady_clock::now() +
+                config_.expect_continue_timeout;
+            auto wait_cancel = std::make_shared<coro::cancel_source>();
+            auto cancel_forward = token.on_cancel(
+                [wait_cancel] { wait_cancel->cancel(); });
+
+            while (wait_bounded && !send_body && !final_seen) {
+                if (parser.is_complete()) {
+                    auto code = parser.status_code();
+                    if (code == static_cast<uint16_t>(status::continue_)) {
+                        send_body = true;
+                        break;
+                    }
+                    if (!is_informational_status(code) ||
+                        code == static_cast<uint16_t>(status::switching_protocols)) {
+                        // Final response before any body bytes: do not send
+                        // the body. A 101 is final here too; the main loop
+                        // below rejects it with EBADMSG.
+                        final_seen = true;
+                        break;
+                    }
+
+                    // Another interim (e.g. 103 Early Hints): skip it and
+                    // keep waiting, with the same cumulative cap as the
+                    // main loop.
+                    if (current_response_bytes >
+                        config_.max_response_size - skipped_informational_bytes) {
+                        ELIO_LOG_ERROR("Informational responses from {}:{} exceed "
+                                       "max_response_size ({} > {})",
+                                       target.host,
+                                       target.effective_port(),
+                                       skipped_informational_bytes + current_response_bytes,
+                                       config_.max_response_size);
+                        errno = EMSGSIZE;
+                        co_return std::nullopt;
+                    }
+                    skipped_informational_bytes += current_response_bytes;
+                    pending_response_bytes = parser.take_remaining();
+                    parser.reset();
+                    parser.set_request_method(req.get_method());
+                    current_response_bytes = 0;
+                    continue;
+                }
+
+                if (parser.has_error()) {
+                    break;  // Reported uniformly after the main loop.
+                }
+
+                // Check cancellation before read
+                if (token.is_cancelled()) {
+                    errno = ECANCELED;
+                    co_return std::nullopt;
+                }
+
+                parse_result wait_parse = parse_result::need_more;
+                if (!pending_response_bytes.empty()) {
+                    auto [pr, consumed] = parser.parse(pending_response_bytes);
+                    current_response_bytes += consumed;
+                    wait_parse = pr;
+                    pending_response_bytes.clear();
+                } else {
+                    const auto now = std::chrono::steady_clock::now();
+                    auto remaining = expect_deadline - now;
+                    if (remaining.count() <= 0) {
+                        send_body = true;  // Timeout fallback.
+                        break;
+                    }
+                    // The wait is additionally bounded by the absolute
+                    // response deadline (read_timeout), whichever expires
+                    // first. Expect-timeout expiry falls back to sending
+                    // the body; response-deadline expiry fails the request
+                    // as a timeout instead — read_timeout is documented as
+                    // the request/response read deadline, so the expect
+                    // wait must not overrun it.
+                    const auto response_remaining = response_deadline - now;
+                    const bool response_deadline_first =
+                        deadline_enforced && response_remaining < remaining;
+                    if (response_deadline_first) {
+                        if (response_remaining.count() <= 0) {
+                            ELIO_LOG_ERROR("Total response timeout exceeded for {}:{}",
+                                           target.host, target.effective_port());
+                            errno = ETIMEDOUT;
+                            co_return std::nullopt;
+                        }
+                        remaining = response_remaining;
+                    }
+                    auto wait_expired =
+                        std::make_shared<std::atomic<bool>>(false);
+                    coro::cancel_source watchdog_cancel;
+                    auto watchdog = sched->go_joinable(
+                        [remaining, wait_expired, wait_cancel,
+                         wtok = watchdog_cancel.get_token()]() -> coro::task<void> {
+                            auto r = co_await elio::time::sleep_for(remaining, wtok);
+                            if (r == coro::cancel_result::completed) {
+                                wait_expired->store(true, std::memory_order_release);
+                                wait_cancel->cancel();
+                            }
+                            co_return;
+                        });
+                    io::io_result read_result =
+                        co_await conn.read(buffer.data(), buffer.size(),
+                                           wait_cancel->get_token());
+                    watchdog_cancel.cancel();
+                    co_await watchdog;
+
+                    if (wait_expired->load(std::memory_order_acquire) &&
+                        read_result.result <= 0) {
+                        if (response_deadline_first) {
+                            ELIO_LOG_ERROR("Total response timeout exceeded for {}:{}",
+                                           target.host, target.effective_port());
+                            errno = ETIMEDOUT;
+                            co_return std::nullopt;
+                        }
+                        send_body = true;  // Timeout fallback.
+                        break;
+                    }
+                    // A read that won the race against the expiry is
+                    // parsed normally below; the deadline check at the
+                    // top of the next iteration applies the fallback.
+                    if (read_result.result <= 0) {
+                        if (read_result.result == -ECANCELED &&
+                            token.is_cancelled()) {
+                            detail::abort_stream_io(conn);
+                            errno = ECANCELED;
+                            co_return std::nullopt;
+                        }
+                        ELIO_LOG_ERROR("Failed to read response: {}",
+                                       read_result.result == 0
+                                           ? "connection closed"
+                                           : strerror(-read_result.result));
+                        errno = read_result.result == 0
+                                    ? ECONNRESET
+                                    : -read_result.result;
+                        co_return std::nullopt;
+                    }
+
+                    auto [pr, consumed] = parser.parse(std::string_view(
+                        buffer.data(),
+                        static_cast<size_t>(read_result.result)));
+                    current_response_bytes += consumed;
+                    wait_parse = pr;
+                }
+
+                if (wait_parse == parse_result::error) {
+                    ELIO_LOG_ERROR("Response parse error: {}",
+                                   parser.error_message());
+                    errno = EBADMSG;
+                    co_return std::nullopt;
+                }
+
+                if (parser.bytes_buffered() > config_.max_response_size) {
+                    ELIO_LOG_ERROR("Response from {}:{} exceeds max_response_size "
+                                   "({} > {})",
+                                   target.host, target.effective_port(),
+                                   parser.bytes_buffered(),
+                                   config_.max_response_size);
+                    errno = EMSGSIZE;
+                    co_return std::nullopt;
+                }
+            }
+
+            if (send_body && !final_seen) {
+                if (!co_await write_request_data(conn, req.body(), target,
+                                                 io_deadline, deadline_enforced,
+                                                 sched, token)) {
+                    co_return std::nullopt;
+                }
+            }
+        }
 
         while (true) {
             if (parser.is_complete()) {
@@ -709,6 +923,11 @@ private:
                         auto ct = req.content_type();
                         if (!ct.empty()) {
                             redirect_req.set_content_type(ct);
+                        }
+                        // The Expect handshake only makes sense while the
+                        // body travels with the redirect; it re-runs per hop.
+                        if (req.expect_continue()) {
+                            redirect_req.set_expect_continue();
                         }
                     }
                     

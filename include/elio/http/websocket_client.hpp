@@ -460,6 +460,9 @@ private:
         parser.set_max_headers(config_.max_headers);
         parser.set_max_header_size(config_.max_header_size);
         size_t total_read = 0;
+        size_t current_message_bytes = 0;
+        size_t skipped_informational_bytes = 0;
+        std::string pending_handshake_bytes;
         const size_t header_buffer_limit =
             http::detail::saturated_response_header_buffer_limit(
                 config_.max_headers, config_.max_header_size);
@@ -468,11 +471,55 @@ private:
             sched != nullptr && config_.read_timeout.count() > 0;
         const auto response_deadline =
             std::chrono::steady_clock::now() + config_.read_timeout;
-        while (!parser.is_complete() && !parser.has_error()) {
+        while (true) {
+            // Interim 1xx responses (e.g. 100 Continue) may precede the 101
+            // Switching Protocols that completes the upgrade (RFC 9110
+            // §15.2). Skip them — 101 is the goal, not an interim here —
+            // with a cumulative byte cap so a peer cannot loop interims
+            // forever. Any other status ends the loop and is rejected by
+            // the status check below.
+            if (parser.is_complete()) {
+                const auto code = parser.status_code();
+                if (code < 100 || code >= 200) {
+                    break;
+                }
+                if (code == static_cast<uint16_t>(status::switching_protocols)) {
+                    break;
+                }
+                if (current_message_bytes >
+                    header_buffer_limit - skipped_informational_bytes) {
+                    ELIO_LOG_ERROR("WebSocket handshake informational responses too large");
+                    errno = EMSGSIZE;
+                    co_return false;
+                }
+                skipped_informational_bytes += current_message_bytes;
+                pending_handshake_bytes = parser.take_remaining();
+                parser.reset();
+                current_message_bytes = 0;
+            }
+
+            if (parser.has_error()) {
+                break;
+            }
+
             if (token.is_cancelled()) {
                 errno = ECANCELED;
                 stream_.disconnect();
                 co_return false;
+            }
+
+            // Replay bytes pipelined behind a skipped interim before
+            // reading more from the socket.
+            if (!pending_handshake_bytes.empty()) {
+                auto [pres, consumed] = parser.parse(pending_handshake_bytes);
+                current_message_bytes += consumed;
+                pending_handshake_bytes.clear();
+                if (pres == parse_result::error) {
+                    ELIO_LOG_ERROR("Failed to parse WebSocket handshake response");
+                    errno = EBADMSG;
+                    co_return false;
+                }
+                continue;
             }
 
             io::io_result read_result{};
@@ -525,7 +572,7 @@ private:
 
             auto [pres, consumed] = parser.parse(
                 std::string_view(buffer_.data(), static_cast<size_t>(read_result.result)));
-            (void)consumed;
+            current_message_bytes += consumed;
 
             if (pres == parse_result::error) {
                 ELIO_LOG_ERROR("Failed to parse WebSocket handshake response");

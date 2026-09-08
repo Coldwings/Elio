@@ -34,6 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Empty HTTP response framing**: `http::response` serialization now emits
+  `Content-Length: 0` for an empty body when the status allows a body and the
+  caller set neither `Content-Length` nor `Transfer-Encoding`. This covers
+  `response(status)`, the default constructor plus `set_status()`, and the
+  `response::redirect()` factory, and also applies to HEAD responses of
+  body-allowed statuses. Previously such responses serialized without a body
+  delimiter, so a keep-alive peer could not tell where the response ended and
+  waited for a connection close that never came. User-supplied framing headers
+  are still preserved verbatim, except in 2xx responses to CONNECT, where both
+  `Content-Length` and `Transfer-Encoding` are stripped — including
+  caller-set ones — as RFC 9110 §9.3.6 requires. Statuses that forbid a body
+  (1xx, 204, 205, 304) continue to serialize without framing headers (#1158).
 - **Regular-file I/O under the epoll backend**: `async_read`, `async_write`,
   `async_readv`, and `async_writev` on regular files no longer fail with an
   `epoll_ctl` `EPERM` rejection under the epoll backend. The backend probes

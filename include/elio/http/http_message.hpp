@@ -237,16 +237,14 @@ public:
     /// Serialize response for a specific request method.  HEAD responses and
     /// statuses that cannot carry a response body serialize headers only.
     std::string serialize(method request_method) const {
-        const bool status_forbids_body =
-            detail::status_forbids_response_body(status_);
         return serialize_impl(
             !detail::response_body_forbidden(request_method, status_),
-            status_forbids_body);
+            detail::response_framing_forbidden(request_method, status_));
     }
 
 private:
     std::string serialize_impl(bool include_body,
-                               bool status_forbids_body) const {
+                               bool framing_forbidden) const {
         std::string result;
         
         // Status line
@@ -263,9 +261,23 @@ private:
         
         // Headers
         auto serialized_headers = headers_;
-        if (status_forbids_body) {
+        if (framing_forbidden) {
+            // Body-forbidden statuses (1xx/204/205/304) and 2xx responses
+            // to CONNECT (RFC 9110 §9.3.6) must not carry framing headers,
+            // even when the caller set them.
             serialized_headers.remove("Content-Length");
             serialized_headers.remove("Transfer-Encoding");
+        } else if (body_.empty() &&
+                   !serialized_headers.contains("Content-Length") &&
+                   !serialized_headers.contains("Transfer-Encoding")) {
+            // A body-allowed response with no body and no explicit framing
+            // headers must still declare an empty body; otherwise a
+            // keep-alive peer has no delimiter and waits for EOF.
+            // Checked on the status rather than include_body so HEAD
+            // responses also carry Content-Length: 0. A user-set
+            // Content-Length is kept verbatim and a user-set
+            // Transfer-Encoding is never combined with Content-Length.
+            serialized_headers.set_content_length(0);
         }
         result += serialized_headers.serialize();
         

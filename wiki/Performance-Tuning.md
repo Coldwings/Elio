@@ -1025,19 +1025,29 @@ instructions on coroutine resume or steal paths.
 
 ### Logging Overhead
 
-Debug logging has overhead; disable in production:
+Debug logging has overhead; keep it out of production builds:
 
 ```cpp
-// Set at compile time
-// cmake -DELIO_ENABLE_DEBUG_METADATA=OFF ..
+// Compile time: ELIO_LOG_DEBUG is compiled in only when ELIO_DEBUG is
+// *defined* (log/macros.hpp uses #ifdef). Simply leave ELIO_DEBUG
+// undefined to compile debug logging out entirely.
+// NOTE: defining ELIO_DEBUG=0 is NOT sufficient - #ifdef tests
+// definedness, so debug logs would still be compiled in.
 
-// Or at runtime
+// Runtime: filter by level (applies to whatever was compiled in)
 elio::log::logger::instance().set_level(elio::log::level::warning);
 ```
 
 ### Coroutine Stack Tracing
 
-Use virtual stack for debugging without significant overhead:
+Use virtual stack for debugging without significant overhead. Coroutine
+frame metadata is controlled by the dedicated `ELIO_ENABLE_DEBUG_METADATA`
+CMake option (it does not affect logging):
+
+```bash
+# Enable coroutine frame metadata
+cmake -DELIO_ENABLE_DEBUG_METADATA=ON ..
+```
 
 ```cpp
 // Enable in debug builds only

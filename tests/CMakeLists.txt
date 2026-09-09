@@ -64,6 +64,8 @@ endif()
 # Add HTTP tests (no TLS dependency for parser tests)
 list(APPEND TEST_SOURCES
     unit/test_http_parser.cpp
+    unit/test_http_response_decoder.cpp
+    unit/test_http_response_reader.cpp
 )
 if(TARGET elio_http)
     list(APPEND TEST_SOURCES

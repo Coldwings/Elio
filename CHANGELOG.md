@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Incremental HTTP response receive**: added `http::response_decoder` and
+  move-only `http::response_reader` with separate header/body/completion/handoff
+  events, borrowed body views, bounded metadata, and a reusable receive buffer.
+  The ordinary HTTP client and SSE now share response framing; server-side
+  producer/writer redesign remains a later phase (#1192, related to #1191).
+
 - **HTTP server explicit interim responses**: `http::context::send_interim()`
   lets a handler emit one or more interim 1xx responses (any 1xx status
   except 101 Switching Protocols) on the connection before returning the
@@ -56,6 +62,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thresholds on shared runners (#1015).
 
 ### Fixed
+
+- **Expect final-header handling**: final response headers suppress a pending
+  upload without waiting for the response body, and ordinary/Expect responses
+  now share EOF and incremental framing handling (#1192).
+- **SSE HTTP framing**: real chunk framing is decoded before event parsing,
+  Content-Length is enforced, and truncated framing fails instead of being
+  silently treated as an unframed event stream. SSE setup accepts bounded
+  preceding interims (`max_informational_responses`, default 16; zero disallows
+  them) and retains coalesced body bytes for `receive()` (#1192).
 
 - **`sse_server` example sends honest SSE headers**: the example hand-rolled
   a literal header block advertising `Connection: keep-alive` with no
@@ -258,6 +273,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not return stale io_uring state when both backends were compiled in. (#982)
 
 ### Changed
+
+- **HTTP response receive compatibility**: unsupported transfer-coding stacks
+  such as `gzip, chunked` are rejected; accumulating `response_parser` exposes
+  partial chunk body before trailing framing validation. Callers must check
+  final completion. Existing consumed/reset/remaining conventions are retained.
+  See `wiki/Migrating-to-0.6.md` for strict SSE framing and borrowed-view migration
+  guidance (#1192).
 
 - **Free spawn-function scheduler contract**: Documented that `elio::go()`,
   `elio::go_to()`, and `elio::spawn()` select only the calling thread's

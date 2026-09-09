@@ -14,6 +14,7 @@
 // http::server in the loop.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <elio/http/http_client.hpp>
 #include <elio/http/sse.hpp>
@@ -22,6 +23,7 @@
 #include <elio/runtime/affinity.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/time/timer.hpp>
+#include <elio/sync/event.hpp>
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
 #include <elio/tls/tls_context.hpp>
 #endif
@@ -2423,6 +2425,7 @@ TEST_CASE("HTTP client sends request body only after 100 Continue",
 
 TEST_CASE("HTTP client withholds request body when server answers final response",
           "[http][client][expect-continue]") {
+    const bool close_delimited = GENERATE(false, true);
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
     REQUIRE(listener.has_value());
     uint16_t port = listener->local_address().port();
@@ -2450,12 +2453,16 @@ TEST_CASE("HTTP client withholds request body when server answers final response
         server_saw_early_body = !early_body.empty();
 
         // Reject the expectation outright: the client must not send the body.
-        std::string resp =
-            "HTTP/1.1 417 Expectation Failed\r\n"
-            "Content-Length: 0\r\n"
-            "Connection: close\r\n"
-            "\r\n";
-        co_await stream->write(resp);
+        std::string resp = "HTTP/1.1 417 Expectation Failed\r\n";
+        if (!close_delimited) resp += "Content-Length: 0\r\n";
+        resp += "Connection: close\r\n\r\n";
+        if (close_delimited) resp += "upload rejected";
+        co_await stream->write_exactly(resp.data(), resp.size());
+        if (close_delimited) {
+            // Normal EOF terminates this response, while keeping the read
+            // direction open to detect an incorrectly transmitted upload.
+            ::shutdown(stream->fd(), SHUT_WR);
+        }
 
         // The client closes its side after the final response; any body
         // bytes showing up before EOF mean the gating failed.
@@ -2505,6 +2512,95 @@ TEST_CASE("HTTP client withholds request body when server answers final response
     REQUIRE_FALSE(server_saw_late_body);
     REQUIRE(got_status == 417);
 }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+TEST_CASE("HTTP final headers suppress upload while the final body is still pending",
+          "[http][client][expect-continue][issue-1192]") {
+    using namespace elio::http::detail;
+    struct hook_guard {
+        hook_guard() {
+            final_headers_seen_for_test.store(false);
+            client_response_read_staged_for_test.store(false);
+            observe_client_response_read_entry_for_test.store(true);
+            expire_expect_after_headers_for_test.store(true);
+        }
+        ~hook_guard() {
+            expire_expect_after_headers_for_test.store(false);
+            observe_client_response_read_entry_for_test.store(false);
+        }
+    } hooks;
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    const auto port = listener->local_address().port();
+    scheduler sched(2);
+    sched.start();
+    elio::sync::event release_body;
+    std::atomic<int> server_fd{-1};
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> received_rejection{false};
+    std::atomic<bool> early_body{false};
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        if (!stream) { server_done = true; co_return; }
+        auto [headers, body] = split_headers_and_early_body(
+            co_await read_request_headers(*stream));
+        early_body = !body.empty();
+        server_fd = stream->fd();
+        const std::string wire =
+            "HTTP/1.1 417 Rejected\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
+        co_await stream->write_exactly(wire.data(), wire.size());
+        co_await release_body.wait();
+        co_await stream->write_exactly("no", 2);
+        server_done = true;
+    });
+    sched.go([&]() -> task<void> {
+        elio::http::client_config cfg;
+        cfg.read_timeout = std::chrono::seconds(10);
+        cfg.expect_continue_timeout = std::chrono::seconds(10);
+        elio::http::client client(cfg);
+        elio::http::request req(elio::http::method::POST, "/");
+        req.set_body(std::string_view("must-not-be-uploaded"));
+        req.set_expect_continue();
+        auto target = elio::http::url::parse(make_url(port));
+        if (target) {
+            auto resp = co_await client.send(req, *target);
+            received_rejection = resp && resp->status_code() == 417 && resp->body() == "no";
+        }
+        client_done = true;
+    });
+    // The hook expires Expect only after final headers. The final body stays
+    // behind a barrier until the client has staged its next read, so a broken
+    // gate necessarily uploads before this observation. Sleeps only poll the
+    // observer; elapsed time is not used to cause the tested interleaving.
+    bool staged = false;
+    for (int i = 0; i < 500; ++i) {
+        staged = final_headers_seen_for_test.load() &&
+                 client_response_read_staged_for_test.load();
+        if (staged || client_done) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    char unexpected[64];
+    ssize_t received = -1;
+    int receive_error = 0;
+    if (server_fd >= 0) {
+        received = ::recv(server_fd.load(), unexpected, sizeof(unexpected), MSG_DONTWAIT);
+        receive_error = errno;
+    }
+    release_body.set();
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    sched.shutdown();
+    REQUIRE(staged);
+    REQUIRE_FALSE(early_body);
+    REQUIRE(received == -1);
+    REQUIRE((receive_error == EAGAIN || receive_error == EWOULDBLOCK));
+    REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(received_rejection);
+}
+#endif
 
 TEST_CASE("HTTP client sends request body after expect-continue timeout",
           "[http][client][expect-continue]") {

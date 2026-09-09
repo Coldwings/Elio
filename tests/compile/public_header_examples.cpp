@@ -17,6 +17,35 @@ using namespace elio;
 
 namespace public_header_examples {
 
+// Keep the borrowing example in wiki/HTTP-Streaming.md compiler-checked.
+elio::coro::task<bool> forward_body(
+    elio::net::stream& source, elio::net::stream& sink,
+    elio::coro::cancel_token token) {
+    using namespace elio::http;
+    response_reader reader;
+    reader.set_request_method(method::GET);
+    size_t interims = 0;
+    for (;;) {
+        if (token.is_cancelled()) co_return false;
+        const auto part = co_await reader.read(source, token);
+        if (!part.success()) co_return false;
+        if (part.event == response_event::body) {
+            const auto sent = co_await sink.write_exactly(
+                part.body.data(), part.body.size(), token);
+            if (sent.result < 0 ||
+                static_cast<size_t>(sent.result) != part.body.size()) {
+                co_return false;
+            }
+        } else if (part.event == response_event::protocol_handoff) {
+            co_return false;
+        } else if (part.event == response_event::message_complete) {
+            if (reader.decoder().status_code() >= 200) co_return true;
+            if (++interims > 16 || !reader.next_response()) co_return false;
+            reader.set_request_method(method::GET);
+        }
+    }
+}
+
 coro::task<int> compute() {
     co_return 42;
 }

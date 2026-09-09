@@ -379,6 +379,17 @@ public:
         resp.body_ = parser.body();
         return resp;
     }
+
+    /// Materialize a received response without regenerating its wire headers.
+    /// The caller supplies the decoded body; no transfer decoding happens here.
+    static response from_decoder(const response_decoder& decoder, std::string body) {
+        response resp;
+        resp.status_ = decoder.get_status();
+        resp.version_ = decoder.version();
+        resp.headers_ = decoder.get_headers();
+        resp.body_ = std::move(body);
+        return resp;
+    }
     
     // Convenience factory methods
     

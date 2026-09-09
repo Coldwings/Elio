@@ -22,6 +22,13 @@ class io_awaitable_base;
 class batch_read_awaitable;
 class batch_write_awaitable;
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace detail {
+inline std::atomic<unsigned> reject_cancel_admissions_for_test{0};
+inline std::atomic<unsigned> cancel_admission_attempts_for_test{0};
+}  // namespace detail
+#endif
+
 /// Unified I/O context interface.
 ///
 /// A scheduler-owned context is bound to exactly one worker. Its backend must
@@ -198,6 +205,14 @@ public:
 
     bool cancel(void* user_data) {
         validate_mutable_access();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        detail::cancel_admission_attempts_for_test.fetch_add(1, std::memory_order_relaxed);
+        auto remaining = detail::reject_cancel_admissions_for_test.load(std::memory_order_acquire);
+        while (remaining != 0) {
+            if (detail::reject_cancel_admissions_for_test.compare_exchange_weak(
+                    remaining, remaining - 1, std::memory_order_acq_rel)) return false;
+        }
+#endif
         return backend_->cancel(user_data);
     }
 

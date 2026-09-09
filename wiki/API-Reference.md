@@ -710,6 +710,15 @@ are not rolled back, and a backend that cannot actively abort accepted work may
 wait for natural completion. A task-level token only affects operations that
 receive or inspect it.
 
+Built-in I/O/timer callbacks for registered waits on a live owner worker reserve
+their abort handoff before I/O submission. Requesting cancellation does not
+require a fresh abort-executor allocation or an ordinary task-overflow enqueue.
+Temporary backend admission rejection retains the request for owner-thread
+retry until admission or original-operation retirement. This does not change
+the exception contract of user callbacks, guarantee progress under arbitrary
+allocation failure, or make cancellation a hard completion deadline. See the
+`io_context` ownership and retirement rules below.
+
 ### Structured Combinators
 
 ```cpp
@@ -1529,12 +1538,30 @@ drain accounting and complete on the backend owner, but cannot install an Elio
 task execution-context pin. A custom coroutine runtime that independently
 re-enqueues such a suspended handle must preserve that owner itself.
 
-Built-in token-aware I/O, timer, TCP, and UDS awaiters retire the raw backend
-cancellation key before their base-class orphan transfer can release the
-associated `op_state`. A cancel executor that was queued but had not yet claimed
-the key becomes a no-op; an executor that already claimed it finishes key use on
-the backend owner without waiting in awaiter teardown. This prevents allocation
-address reuse from redirecting an old cancellation to a new operation.
+Built-in token-aware I/O, timer, TCP, and UDS awaiters reserve an intrusive
+owner-worker maintenance request and its lifetime ownership before registration
+and submission. Their cancellation callbacks publish that request without a new
+executor allocation or the ordinary task queue's allocating overflow path.
+Temporary backend cancellation-admission failure leaves the request pending;
+the owner retries after driving backend progress. Admission stops retries, while
+the original operation's completion remains responsible for resumption.
+
+Each attempt checks backend ownership/context generation and arbitrates use of
+the cancellation key against permanent retirement. Awaiters retire that key
+before their base-class orphan transfer can release the associated `op_state`.
+Retirement makes queued retries no-ops; an already executing attempt finishes
+its key use on the owner without blocking awaiter teardown. Releasing an attempt
+does not reopen a retired key. This prevents address reuse from redirecting an
+old cancellation to a new operation. Graceful drain and retiring workers service
+pending maintenance. Epoll removes a cancelled timer from its heap in place,
+without allocating a replacement queue or discarding unrelated timers.
+
+These guarantees apply to registered operations on a live scheduler owner, not
+standalone cross-thread cancellation or forced worker/frame destruction. Setup
+can fail before submission; unrelated allocation failures and throwing user
+callbacks retain their existing contracts. Neither cancellation admission nor
+a timeout rolls back I/O side effects or permits releasing borrowed resources
+before operation cleanup completes.
 
 I/O pinning protects backend ownership only. It does not serialize concurrent
 operations on the same stream or fd. Follow the concrete stream contract and

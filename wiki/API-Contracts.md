@@ -125,6 +125,24 @@ callers must prevent overlapping reads, overlapping writes, close-versus-I/O
 races, and other conflicting mutable access. Backend acceptance of multiple
 requests does not make their higher-level ordering or object lifetime safe.
 
+For registered built-in cancellable I/O and timer waits on a live owner worker,
+Elio reserves the abort handoff before submission. The library cancellation
+callback publishes owner-worker maintenance without allocating a new abort
+executor or using the ordinary task queue's allocating overflow path. Temporary
+backend admission failure retains abort intent until admission succeeds or the
+original operation retires. Retries preserve owner affinity, context generation,
+and permanent cancellation-key retirement; an old request cannot target a new
+operation that reused its address. Graceful drain and worker retirement service
+this maintenance. Epoll timer cancellation removes entries in place without an
+allocating queue rebuild (#1202).
+
+This is not an arbitrary-out-of-memory progress guarantee: registration/setup
+may allocate before submission, user callbacks may still throw, and backend
+admission does not guarantee immediate abort or overwrite an established
+completion. It does not add cross-thread cancellation to standalone contexts
+or make forced shutdown/frame destruction safe. Keep resources alive until the
+awaited operation and cleanup finish.
+
 | Interface | Elio guarantees | Caller must guarantee |
 |-----------|-----------------|-----------------------|
 | `io::io_context` | Owns an I/O backend and exposes stable owner/generation diagnostics. Mutating operations (`prepare`, `submit`, `poll`, and `cancel`) reject access outside the exact scheduler owner thread by throwing `std::logic_error`; `notify()` is the non-throwing cross-thread wakeup entry. A submitted operation pins an Elio task continuation to that owner until normal completion, cancellation completion, prepare failure, or orphan cleanup. Token-aware built-in awaiters retire their operation key before frame teardown can transfer an orphaned `op_state` to backend cleanup, so a queued cancellation cannot target a later operation that reused the address. All standard awaitables retain context-level drain accounting, including when awaited by a non-Elio coroutine promise. Resize drain keeps polling while backend work or operation pins remain. The legacy static `get_last_result()` reports the most recent completion published by either built-in backend on the calling thread. | Keep the context, file descriptors, request storage, and buffers valid until completion unless ownership transfer is documented. Drive and serialize a standalone context yourself, and do not mutate it from a scheduler worker. Custom coroutine runtimes that independently re-enqueue a suspended handle must preserve the owner worker while its I/O is pending. Read `get_last_result()` from the resumed completion path before another context on the same thread publishes a newer result. |

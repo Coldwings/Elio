@@ -1907,6 +1907,60 @@ inline void worker_thread::drain_inbox() noexcept {
     }
 }
 
+inline void worker_thread::service_maintenance() noexcept {
+    if (maintenance_count_.load(std::memory_order_acquire) == 0) return;
+
+    if (!maintenance_retry_batch_) {
+        maintenance_retry_batch_ = std::exchange(maintenance_retry_, nullptr);
+    }
+    if (maintenance_retry_batch_) {
+        // No key claim survives this poll: it may complete the original
+        // operation and retire/reuse its address before the next attempt.
+        io_context_->poll(std::chrono::milliseconds(0));
+    }
+    auto service_batch = [this](detail::owner_maintenance*& batch) {
+        for (size_t remaining = 64; batch && remaining != 0; --remaining) {
+            auto* node = batch;
+            batch = node->next;
+            auto keep_alive = std::move(node->keep_alive);
+            if (node->attempt(*node)) {
+                keep_alive.reset();
+                maintenance_count_.fetch_sub(1, std::memory_order_release);
+            } else {
+                node->keep_alive = std::move(keep_alive);
+                node->next = maintenance_retry_;
+                maintenance_retry_ = node;
+            }
+        }
+    };
+    service_batch(maintenance_retry_batch_);
+    if (!maintenance_batch_) {
+        maintenance_batch_ = maintenance_incoming_.exchange(
+            nullptr, std::memory_order_acquire);
+    }
+    service_batch(maintenance_batch_);
+}
+
+inline void worker_thread::abandon_maintenance() noexcept {
+    // Forced stop is not a promise to complete pending I/O. Once admission
+    // closes and owner polling ends, release control nodes without touching
+    // their opaque cancellation keys. Graceful shutdown drains them first.
+    auto release = [this](detail::owner_maintenance*& batch) {
+        while (batch) {
+            auto* node = batch;
+            batch = node->next;
+            auto keep_alive = std::move(node->keep_alive);
+            keep_alive.reset();
+            maintenance_count_.fetch_sub(1, std::memory_order_release);
+        }
+    };
+    auto* incoming = maintenance_incoming_.exchange(nullptr, std::memory_order_acquire);
+    release(incoming);
+    release(maintenance_batch_);
+    release(maintenance_retry_batch_);
+    release(maintenance_retry_);
+}
+
 inline void worker_thread::run() {
     // Block common signals on this worker thread so they are delivered via
     // signalfd rather than invoking the default disposition (which may
@@ -1927,6 +1981,7 @@ inline void worker_thread::run() {
     io_context_->bind_owner_thread();
 
     while (running_.load(std::memory_order_relaxed)) {
+        service_maintenance();
         if (draining_.load(std::memory_order_acquire)) [[unlikely]] {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
             if (detail::hold_draining_worker_for_test.load(
@@ -1945,11 +2000,15 @@ inline void worker_thread::run() {
             redistribute_tasks(scheduler_);
             if (io_context_->pending_count() == 0 &&
                 io_context_->active_pin_count() == 0) {
+                bool retired = false;
                 {
                     std::lock_guard<std::mutex> lock(schedule_mutex_);
-                    running_.store(false, std::memory_order_release);
+                    if (maintenance_count_.load(std::memory_order_acquire) == 0) {
+                        running_.store(false, std::memory_order_release);
+                        retired = true;
+                    }
                 }
-                break;
+                if (retired) break;
             }
             reset_submission_wake_before_poll();
             if (has_external_submission()) {
@@ -2011,6 +2070,7 @@ inline void worker_thread::run() {
     // single-thread fast path of pop_local() races with those stealers.
     const bool retiring = scheduler_->is_running();
     while (true) {
+        service_maintenance();
         drain_inbox();
         void* addr = queue_->pop();
         if (!addr) break;
@@ -2036,6 +2096,8 @@ inline void worker_thread::run() {
         }
     }
     
+    abandon_maintenance();
+
     // Clear the references when done
     io_context_->unbind_owner_thread();
     scheduler::current_scheduler_ = nullptr;

@@ -282,23 +282,8 @@ public:
         // Register cancellation callback. The lambda captures only the
         // shared_ptr — never `this` — so it stays valid even if the
         // awaitable is destroyed mid-flight on another thread.
-        cancel_registration_ = token_.on_cancel([state]() {
-            state->cancelled.store(true, std::memory_order_release);
-            if (!state->worker) {
-                return;
-            }
-            // Schedule the actual io_context::cancel() on the worker that
-            // owns the ring. We set affinity to prevent stealing — this
-            // task accesses worker-local io_context and must run on the
-            // correct worker.
-            auto exec = io::detail::make_io_cancel_executor(
-                state, /*allow_epoll_cancel=*/true);
-            if (auto* promise = coro::get_promise_base(exec.handle.address())) {
-                promise->set_affinity(state->worker->worker_id());
-                promise->set_worker_local();
-                promise->detach_from_parent();
-            }
-            state->worker->schedule_or_destroy(exec.handle);
+        cancel_registration_ = token_.on_cancel([state]() noexcept {
+            io::detail::request_io_cancel(state);
         });
 #ifdef ELIO_RUNTIME_TEST_HOOKS
         detail::cancellable_sleep_registered_for_test.store(
@@ -343,6 +328,7 @@ public:
                     cancel_registration_.unregister();
                 })) {
             ctx->submit();
+            io::detail::recheck_io_cancel(state);
             return true;  // Suspend (wait for timeout to complete)
         }
 

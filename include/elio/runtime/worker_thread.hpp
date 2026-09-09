@@ -18,8 +18,21 @@ namespace elio::runtime {
 
 class scheduler;
 
+namespace detail {
+// Allocated with the operation, not with its cancellation request. Only the
+// owner reads next/keep_alive after publication; attempt returns false when
+// admission must be retried after a backend poll.
+struct owner_maintenance {
+    owner_maintenance* next = nullptr;
+    bool (*attempt)(owner_maintenance&) = nullptr;
+    std::shared_ptr<void> keep_alive;
+};
+}  // namespace detail
+
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 namespace detail {
+inline std::atomic<bool> force_task_inbox_full_for_test{false};
+inline std::atomic<bool> fail_task_overflow_allocation_for_test{false};
 inline std::atomic<bool> pause_overflow_transfer_for_test{false};
 inline std::atomic<bool> overflow_transfer_paused_for_test{false};
 inline std::atomic<bool> pause_queue_snapshot_for_test{false};
@@ -101,6 +114,12 @@ public:
             if (!running_.load(std::memory_order_acquire)) {
                 return push_result::stopped;
             }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (detail::force_task_inbox_full_for_test.load(
+                    std::memory_order_acquire)) {
+                return push_result::full;
+            }
+#endif
             if (!inbox_->push(handle.address())) {
                 return push_result::full;
             }
@@ -151,6 +170,12 @@ public:
             }
             {
                 std::lock_guard<std::mutex> overflow_lock(overflow_mutex_);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (detail::fail_task_overflow_allocation_for_test.load(
+                        std::memory_order_acquire)) {
+                    throw std::bad_alloc();
+                }
+#endif
                 overflow_.push_back(handle.address());
                 overflow_size_.fetch_add(1, std::memory_order_release);
             }
@@ -183,6 +208,21 @@ public:
         if (!schedule(handle) && handle) {
             handle.destroy();
         }
+    }
+
+    // Internal control work bypasses the allocating task queues. The caller
+    // publishes each node once and supplies its pre-existing lifetime hold.
+    [[nodiscard]] bool submit_maintenance(detail::owner_maintenance& node) noexcept {
+        std::lock_guard<std::mutex> lock(schedule_mutex_);
+        if (!running_.load(std::memory_order_acquire)) return false;
+        maintenance_count_.fetch_add(1, std::memory_order_release);
+        auto* head = maintenance_incoming_.load(std::memory_order_relaxed);
+        do {
+            node.next = head;
+        } while (!maintenance_incoming_.compare_exchange_weak(
+            head, &node, std::memory_order_release, std::memory_order_relaxed));
+        wake_for_submission();
+        return true;
     }
     
     /// Schedule a task from owner thread - pushes directly to local deque
@@ -239,6 +279,7 @@ public:
 #endif
         total += inbox_->size_approx();
         total += overflow_size_.load(std::memory_order_acquire);
+        total += maintenance_count_.load(std::memory_order_acquire);
         return total;
     }
 
@@ -380,7 +421,9 @@ private:
 
     [[nodiscard]] bool has_external_submission() const noexcept {
         return !inbox_->empty() ||
-            overflow_size_.load(std::memory_order_acquire) > 0;
+            overflow_size_.load(std::memory_order_acquire) > 0 ||
+            maintenance_incoming_.load(std::memory_order_acquire) != nullptr ||
+            maintenance_batch_ != nullptr;
     }
 
     void leave_draining_mode() noexcept {
@@ -389,6 +432,8 @@ private:
 
     void run();
     void drain_inbox() noexcept;
+    void service_maintenance() noexcept;
+    void abandon_maintenance() noexcept;
     void service_competing_work() noexcept;
     [[nodiscard]] bool run_or_redistribute_retiring_task(
         scheduler* sched, std::coroutine_handle<> handle) noexcept;
@@ -413,6 +458,12 @@ private:
     // handle in that batch has been published to queue_. This may briefly
     // overcount work, but it must never let idle detection miss accepted work.
     std::atomic<size_t> overflow_size_{0};
+    std::atomic<detail::owner_maintenance*> maintenance_incoming_{nullptr};
+    detail::owner_maintenance* maintenance_batch_ = nullptr;
+    detail::owner_maintenance* maintenance_retry_ = nullptr;
+    detail::owner_maintenance* maintenance_retry_batch_ = nullptr;
+    // Includes an executing attempt until its keep-alive has been released.
+    std::atomic<size_t> maintenance_count_{0};
     std::atomic<bool> draining_{false};
     // Only the owner mutates the local counters. Relaxed atomic stores publish
     // exact monotonic snapshots without a read-modify-write instruction.

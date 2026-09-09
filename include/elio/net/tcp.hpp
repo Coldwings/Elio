@@ -956,18 +956,8 @@ public:
                 state->context_generation = ctx.generation();
                 cancel_state_ = state;
 
-                cancel_registration_ = token_.on_cancel([state]() {
-                    state->cancelled.store(true, std::memory_order_release);
-                    if (!state->worker) {
-                        return;
-                    }
-                    auto exec = io::detail::make_io_cancel_executor(state, true);
-                    if (auto* promise = coro::get_promise_base(exec.handle.address())) {
-                        promise->set_affinity(state->worker->worker_id());
-                        promise->set_worker_local();
-                        promise->detach_from_parent();
-                    }
-                    state->worker->schedule_or_destroy(exec.handle);
+                cancel_registration_ = token_.on_cancel([state]() noexcept {
+                    io::detail::request_io_cancel(state);
                 });
 
                 if (token_.is_cancelled()) {
@@ -1013,6 +1003,7 @@ public:
                 result_ = io::io_result{-EAGAIN, 0};
                 return false;  // Don't suspend, resume immediately
             }
+            io::detail::recheck_io_cancel(cancel_state_);
             return true;  // Suspend, will be resumed by completion handler
         }
 
@@ -1189,18 +1180,8 @@ public:
             state->context_generation = ctx.generation();
             cancel_state_ = state;
 
-            cancel_registration_ = token_.on_cancel([state]() {
-                state->cancelled.store(true, std::memory_order_release);
-                if (!state->worker) {
-                    return;
-                }
-                auto exec = io::detail::make_io_cancel_executor(state, true);
-                if (auto* promise = coro::get_promise_base(exec.handle.address())) {
-                    promise->set_affinity(state->worker->worker_id());
-                    promise->set_worker_local();
-                    promise->detach_from_parent();
-                }
-                state->worker->schedule_or_destroy(exec.handle);
+            cancel_registration_ = token_.on_cancel([state]() noexcept {
+                io::detail::request_io_cancel(state);
             });
 
             if (token_.is_cancelled()) {
@@ -1283,10 +1264,7 @@ public:
             result_ = io::io_result{-EAGAIN, 0};
             return false;  // Don't suspend, resume immediately
         }
-        if (cancel_state_ &&
-            cancel_state_->cancelled.load(std::memory_order_acquire)) {
-            ctx.cancel(io::tagged_op_state_user_data(req.state));
-        }
+        io::detail::recheck_io_cancel(cancel_state_);
         // No explicit submit: poll() auto-submits at the top of its loop
         return true;  // Suspend, will be resumed by completion handler
     }

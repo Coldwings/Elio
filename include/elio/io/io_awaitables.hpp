@@ -67,6 +67,7 @@ inline std::atomic<bool> pause_io_cancel_executor_before_claim_for_test{false};
 inline std::atomic<bool> io_cancel_executor_paused_before_claim_for_test{false};
 inline std::atomic<bool> pause_io_cancel_executor_after_claim_for_test{false};
 inline std::atomic<bool> io_cancel_executor_paused_after_claim_for_test{false};
+inline std::atomic<bool> fail_io_cancel_executor_allocation_for_test{false};
 
 inline void pause_io_cancel_executor_for_test(
     std::atomic<bool>& pause,
@@ -84,9 +85,9 @@ inline void pause_io_cancel_executor_for_test(
 #endif
 
 /// Arbitrates a cancellation-key use against awaiter teardown. This gate never
-/// waits: once the executor wins it is already running on the backend owner, so
-/// that owner cannot poll and free an orphaned op_state before cancel() has
-/// consumed the key. If teardown wins, a queued executor must not use the key.
+/// waits: the owner cannot poll and free an orphaned op_state during one
+/// synchronous cancel() attempt. A refused attempt releases its claim before
+/// polling; retirement is permanent, including when it races with that release.
 class io_cancel_key_gate {
 public:
     [[nodiscard]] bool try_claim_for_executor() noexcept {
@@ -95,7 +96,9 @@ public:
             pause_io_cancel_executor_before_claim_for_test,
             io_cancel_executor_paused_before_claim_for_test);
 #endif
-        if (terminal_or_claimed_.exchange(true, std::memory_order_acq_rel)) {
+        unsigned expected = 0;
+        if (!state_.compare_exchange_strong(
+                expected, executing, std::memory_order_acq_rel)) {
             return false;
         }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
@@ -107,17 +110,25 @@ public:
     }
 
     void retire() noexcept {
-        (void)terminal_or_claimed_.exchange(true, std::memory_order_acq_rel);
+        state_.fetch_or(retired, std::memory_order_acq_rel);
+    }
+
+    void release_attempt() noexcept {
+        unsigned expected = executing;
+        (void)state_.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel);
     }
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     [[nodiscard]] bool closed_for_test() const noexcept {
-        return terminal_or_claimed_.load(std::memory_order_acquire);
+        return state_.load(std::memory_order_acquire) != 0;
     }
 #endif
 
 private:
-    std::atomic<bool> terminal_or_claimed_{false};
+    static constexpr unsigned executing = 1;
+    static constexpr unsigned retired = 2;
+    std::atomic<unsigned> state_{0};
 };
 
 inline constexpr int socket_no_sigpipe_flag =
@@ -1325,16 +1336,16 @@ inline auto batch_write(int fd, std::span<const batch_write_segment> segments) {
 namespace detail {
 
 /// Shared cancellation state used by generic I/O, timers, TCP, and UDS.
-struct io_cancel_state {
+struct io_cancel_state : runtime::detail::owner_maintenance {
+    io_cancel_state() noexcept;
     io_context* ctx = nullptr;
     std::coroutine_handle<> awaiter;
     runtime::worker_thread* worker = nullptr;
     uint64_t context_generation = 0;
     op_state* op = nullptr;
-    /// Exactly one of awaiter teardown or the owner-worker executor may claim
-    /// permission to make the final use of ``op`` as a cancellation key.
     io_cancel_key_gate key_gate;
     std::atomic<bool> cancelled{false};
+    std::atomic<bool> maintenance_published{false};
 };
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
@@ -1365,13 +1376,72 @@ inline void retire_io_cancel_key(
     }
 }
 
-/// Fire-and-forget coroutine that executes io_context::cancel() on the worker
-/// that owns the ring. Self-destroys via suspend_never on final_suspend.
-///
-/// The executor is worker-local maintenance work: its affinity identifies the
-/// backend owner and the scheduler must never run it on another worker.
+inline bool attempt_io_cancel(io_cancel_state& state) {
+    if (!state.key_gate.try_claim_for_executor()) return true;
+    if (!state.ctx || (state.worker &&
+        (&state.worker->io_context() != state.ctx ||
+         state.worker->io_context().generation() != state.context_generation))) {
+        state.key_gate.retire();
+        return true;
+    }
+    // A selected callback may publish while await_suspend is still preparing
+    // the operation. Only explicit retirement, not a null key, ends its intent.
+    if (!state.op) {
+        state.key_gate.release_attempt();
+        return false;
+    }
+    if (state.ctx->cancel(tagged_op_state_user_data(state.op))) {
+        state.key_gate.retire();
+        return true;
+    }
+    state.key_gate.release_attempt();
+    return false;
+}
+
+inline io_cancel_state::io_cancel_state() noexcept {
+    attempt = [](runtime::detail::owner_maintenance& node) {
+        return attempt_io_cancel(static_cast<io_cancel_state&>(node));
+    };
+}
+
+inline void request_io_cancel(const std::shared_ptr<io_cancel_state>& state) noexcept {
+    state->cancelled.store(true, std::memory_order_release);
+    if (!state->worker || state->maintenance_published.exchange(
+            true, std::memory_order_acq_rel)) return;
+    state->keep_alive = state;
+    if (!state->worker->submit_maintenance(*state)) {
+        state->keep_alive.reset();
+    }
+}
+
+inline void recheck_io_cancel(std::shared_ptr<io_cancel_state> state) {
+    if (!state || !state->cancelled.load(std::memory_order_acquire)) return;
+    if (state->worker) {
+        request_io_cancel(state);
+    } else {
+        // Standalone cancellation may resume and destroy the awaitable inline;
+        // retain this copy even when the caller passed its state_ member.
+        (void)attempt_io_cancel(*state);
+    }
+}
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+// Historical deterministic lifetime tests explicitly hold an executor frame.
+// Production cancellation never constructs or schedules this adapter.
 struct io_cancel_executor {
     struct promise_type : public coro::promise_base {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        static void* operator new(std::size_t size) {
+            if (fail_io_cancel_executor_allocation_for_test.load(
+                    std::memory_order_acquire)) {
+                throw std::bad_alloc();
+            }
+            return ::operator new(size);
+        }
+        static void operator delete(void* address) noexcept {
+            ::operator delete(address);
+        }
+#endif
         io_cancel_executor get_return_object() {
             auto handle =
                 std::coroutine_handle<promise_type>::from_promise(*this);
@@ -1388,38 +1458,12 @@ struct io_cancel_executor {
 inline io_cancel_executor make_io_cancel_executor(
     std::shared_ptr<io_cancel_state> state,
     bool allow_epoll_cancel = false) {
-    if (!state->key_gate.try_claim_for_executor()) {
-        co_return;
-    }
-    if (state->worker &&
-        (&state->worker->io_context() != state->ctx ||
-         state->worker->io_context().generation() !=
-             state->context_generation)) {
-        co_return;
-    }
-    if (state->ctx && state->op) {
-#if ELIO_HAS_IO_URING
-        if (state->ctx->is_io_uring()) {
-            state->ctx->cancel(tagged_op_state_user_data(state->op));
-        } else if (allow_epoll_cancel) {
-            state->ctx->cancel(tagged_op_state_user_data(state->op));
-        } else {
-            ELIO_LOG_WARNING(
-                "cancellable I/O: epoll backend does not support async cancel "
-                "(fd reuse race risk); cancel_token is no-op");
-        }
-#else
-        if (allow_epoll_cancel) {
-            state->ctx->cancel(tagged_op_state_user_data(state->op));
-        } else {
-            ELIO_LOG_WARNING(
-                "cancellable I/O: epoll backend does not support async cancel "
-                "(fd reuse race risk); cancel_token is no-op");
-        }
-#endif
+    if (allow_epoll_cancel || (state->ctx && state->ctx->is_io_uring())) {
+        (void)attempt_io_cancel(*state);
     }
     co_return;
 }
+#endif
 
 inline io_result finalize_cancellable_io_result(
     bool cancelled_without_backend_completion,
@@ -1492,19 +1536,8 @@ public:
         state_ = state;
 
         // Register cancel callback
-        cancel_registration_ = token_.on_cancel([state]() {
-            state->cancelled.store(true, std::memory_order_release);
-            if (!state->worker) {
-                return;
-            }
-            auto exec = detail::make_io_cancel_executor(
-                state, /*allow_epoll_cancel=*/true);
-            if (auto* promise = coro::get_promise_base(exec.handle.address())) {
-                promise->set_affinity(state->worker->worker_id());
-                promise->set_worker_local();
-                promise->detach_from_parent();
-            }
-            state->worker->schedule_or_destroy(exec.handle);
+        cancel_registration_ = token_.on_cancel([state]() noexcept {
+            detail::request_io_cancel(state);
         });
 
         // Check again after registration
@@ -1546,9 +1579,7 @@ public:
         // Post-registration race: cancel may have fired between on_cancel()
         // and setting state->op above. Re-check after prepare so the backend
         // can actually find the staged operation and abort it.
-        if (state->cancelled.load(std::memory_order_acquire)) {
-            ctx.cancel(tagged_op_state_user_data(req.state));
-        }
+        detail::recheck_io_cancel(state);
     }
 
     cancellable_io_result await_resume() noexcept {
@@ -1627,19 +1658,8 @@ public:
         state->context_generation = ctx.generation();
         state_ = state;
 
-        cancel_registration_ = token_.on_cancel([state]() {
-            state->cancelled.store(true, std::memory_order_release);
-            if (!state->worker) {
-                return;
-            }
-            auto exec = detail::make_io_cancel_executor(
-                state, /*allow_epoll_cancel=*/true);
-            if (auto* promise = coro::get_promise_base(exec.handle.address())) {
-                promise->set_affinity(state->worker->worker_id());
-                promise->set_worker_local();
-                promise->detach_from_parent();
-            }
-            state->worker->schedule_or_destroy(exec.handle);
+        cancel_registration_ = token_.on_cancel([state]() noexcept {
+            detail::request_io_cancel(state);
         });
 
         if (token_.is_cancelled()) {
@@ -1686,9 +1706,7 @@ public:
         // Post-registration race: cancel may have fired between on_cancel()
         // and setting state->op above. Re-check after prepare so the backend
         // can actually find the staged operation and abort it.
-        if (state->cancelled.load(std::memory_order_acquire)) {
-            ctx.cancel(tagged_op_state_user_data(req.state));
-        }
+        detail::recheck_io_cancel(state);
     }
 
     cancellable_io_result await_resume() noexcept {
@@ -1758,19 +1776,8 @@ public:
         state->context_generation = ctx.generation();
         state_ = state;
 
-        cancel_registration_ = token_.on_cancel([state]() {
-            state->cancelled.store(true, std::memory_order_release);
-            if (!state->worker) {
-                return;
-            }
-            auto exec = detail::make_io_cancel_executor(
-                state, /*allow_epoll_cancel=*/true);
-            if (auto* promise = coro::get_promise_base(exec.handle.address())) {
-                promise->set_affinity(state->worker->worker_id());
-                promise->set_worker_local();
-                promise->detach_from_parent();
-            }
-            state->worker->schedule_or_destroy(exec.handle);
+        cancel_registration_ = token_.on_cancel([state]() noexcept {
+            detail::request_io_cancel(state);
         });
 
         if (token_.is_cancelled()) {
@@ -1806,9 +1813,7 @@ public:
         // Post-registration race: cancel may have fired between on_cancel()
         // and setting state->op above. Re-check after prepare so the backend
         // can actually find the staged operation and abort it.
-        if (state->cancelled.load(std::memory_order_acquire)) {
-            ctx.cancel(tagged_op_state_user_data(req.state));
-        }
+        detail::recheck_io_cancel(state);
     }
 
     cancellable_io_result await_resume() noexcept {
@@ -1871,19 +1876,8 @@ public:
         state->context_generation = ctx.generation();
         state_ = state;
 
-        cancel_registration_ = token_.on_cancel([state]() {
-            state->cancelled.store(true, std::memory_order_release);
-            if (!state->worker) {
-                return;
-            }
-            auto exec = detail::make_io_cancel_executor(
-                state, /*allow_epoll_cancel=*/true);
-            if (auto* promise = coro::get_promise_base(exec.handle.address())) {
-                promise->set_affinity(state->worker->worker_id());
-                promise->set_worker_local();
-                promise->detach_from_parent();
-            }
-            state->worker->schedule_or_destroy(exec.handle);
+        cancel_registration_ = token_.on_cancel([state]() noexcept {
+            detail::request_io_cancel(state);
         });
 
         if (token_.is_cancelled()) {
@@ -1915,11 +1909,9 @@ public:
         }
 
         // Post-registration race: cancel may have fired between on_cancel()
-        // and setting state->op above. Re-check and submit async cancel
-        // inline so the poll op is actually aborted.
-        if (state->cancelled.load(std::memory_order_acquire)) {
-            ctx.cancel(tagged_op_state_user_data(req.state));
-        }
+        // and setting state->op above. Re-check through the retained intent
+        // so refused backend admission cannot lose the cancellation.
+        detail::recheck_io_cancel(state);
     }
 
     cancellable_io_result await_resume() noexcept {

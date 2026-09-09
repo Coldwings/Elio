@@ -5714,6 +5714,18 @@ TEST_CASE("I/O cancel key retirement and executor claim never wait",
         REQUIRE(remained_paused);
         REQUIRE(claimed.load(std::memory_order_acquire));
         REQUIRE(finished.load(std::memory_order_acquire));
+        gate.release_attempt();
+        REQUIRE_FALSE(gate.try_claim_for_executor());
+    }
+
+    SECTION("an unretired refused attempt can retry") {
+        elio::io::detail::io_cancel_key_gate gate;
+        REQUIRE(gate.try_claim_for_executor());
+        gate.release_attempt();
+        REQUIRE(gate.try_claim_for_executor());
+        gate.retire();
+        gate.release_attempt();
+        REQUIRE_FALSE(gate.try_claim_for_executor());
     }
 }
 
@@ -5735,10 +5747,15 @@ TEST_CASE("retired timer cancel executor ignores a reused op_state address",
     auto* old_address = old_state->op;
     REQUIRE(ctx.pending_count() == 1);
 
-    // A selected callback normally creates this executor on the owner worker.
-    // Standalone contexts have no worker, so keep the identical executor frame
-    // suspended explicitly to make the queued-before-run window deterministic.
+    // Production uses a preallocated owner-maintenance node. This test-only
+    // coroutine adapter delays the same cancellation attempt for a standalone
+    // context, making the refused-attempt-to-retry window deterministic.
     source.cancel();
+    elio::io::detail::reject_cancel_admissions_for_test.store(1);
+    const bool refused = !elio::io::detail::attempt_io_cancel(*old_state);
+    elio::io::detail::reject_cancel_admissions_for_test.store(0);
+    REQUIRE(refused);
+    REQUIRE_FALSE(old_state->key_gate.closed_for_test());
     auto stale_executor =
         elio::io::detail::make_io_cancel_executor(old_state, true);
 
@@ -5771,7 +5788,11 @@ TEST_CASE("retired timer cancel executor ignores a reused op_state address",
     REQUIRE(elio::io::detail::reused_op_state_storage_for_test == old_address);
     REQUIRE(ctx.pending_count() == 1);
 
+    const auto attempts_before_stale =
+        elio::io::detail::cancel_admission_attempts_for_test.load();
     stale_executor.handle.resume();
+    REQUIRE(elio::io::detail::cancel_admission_attempts_for_test.load() ==
+            attempts_before_stale);
     REQUIRE(ctx.pending_count() == 1);
     REQUIRE_FALSE(current_handle.done());
 
@@ -5846,6 +5867,62 @@ TEST_CASE("forced generic cancellable receive destruction retires its key",
 
     ::close(sockets[0]);
     ::close(sockets[1]);
+}
+
+TEST_CASE("standalone cancellation recheck owns state across inline teardown",
+          "[io][cancel][timer][reentrant][lifetime]") {
+    io_context ctx(io_context::backend_type::epoll);
+    cancel_source source;
+    auto holder = std::make_unique<std::shared_ptr<elio::io::detail::io_cancel_state>>();
+    std::weak_ptr<elio::io::detail::io_cancel_state> weak;
+    bool alive_in_continuation = false;
+    cancel_result result = cancel_result::completed;
+    auto body = [&]() -> task<void> {
+        result = co_await elio::time::cancellable_sleep_awaitable(
+            ctx, std::chrono::hours(1), source.get_token());
+        holder.reset();
+        alive_in_continuation = !weak.expired();
+    };
+    auto operation = body();
+    auto handle = elio::coro::detail::task_access::handle(operation);
+    elio::io::detail::capture_next_io_cancel_state_for_test(*holder);
+    handle.resume();
+    REQUIRE(*holder);
+    weak = *holder;
+    source.cancel();
+    elio::io::detail::recheck_io_cancel(*holder);
+    REQUIRE(handle.done());
+    REQUIRE(result == cancel_result::cancelled);
+    REQUIRE(alive_in_continuation);
+    REQUIRE(weak.expired());
+    REQUIRE(ctx.pending_count() == 0);
+}
+
+TEST_CASE("epoll timer cancellation preserves unrelated heap entries",
+          "[io][cancel][timer][lifetime]") {
+    io_context ctx(io_context::backend_type::epoll);
+    std::array<cancel_source, 3> sources;
+    std::array<cancel_result, 3> results{};
+    std::array<std::shared_ptr<elio::io::detail::io_cancel_state>, 3> states;
+    std::array<std::optional<task<void>>, 3> operations;
+    auto body = [&](size_t index) -> task<void> {
+        results[index] = co_await elio::time::cancellable_sleep_awaitable(
+            ctx, std::chrono::hours(index + 1), sources[index].get_token());
+    };
+    for (size_t index = 0; index < operations.size(); ++index) {
+        operations[index].emplace(body(index));
+        elio::io::detail::capture_next_io_cancel_state_for_test(states[index]);
+        elio::coro::detail::task_access::handle(*operations[index]).resume();
+    }
+    REQUIRE(ctx.pending_count() == 3);
+    size_t remaining = 3;
+    for (size_t index : {size_t{1}, size_t{0}, size_t{2}}) {
+        sources[index].cancel();
+        elio::io::detail::recheck_io_cancel(states[index]);
+        REQUIRE(elio::coro::detail::task_access::handle(*operations[index]).done());
+        REQUIRE(results[index] == cancel_result::cancelled);
+        REQUIRE(ctx.pending_count() == --remaining);
+    }
 }
 
 void fill_socket_send_buffer(int fd) {
@@ -6520,7 +6597,9 @@ TEST_CASE("plain TCP writev resumes borrowed progress after peer drain",
 
 TEST_CASE("socket writev cancellation wakes a backpressured send without peer drain",
           "[io][tcp][writev][cancel][epoll-cancel-regression]") {
-    auto run = [&](io_context::backend_type backend) {
+    auto run = [&](io_context::backend_type backend, bool fail_allocation = false,
+                   bool queue_pressure = false, unsigned admission_failures = 0,
+                   bool retire_worker = false) {
         worker_io_backend_guard guard(backend);
         int sockets[2] = {-1, -1};
         REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
@@ -6532,11 +6611,13 @@ TEST_CASE("socket writev cancellation wakes a backpressured send without peer dr
         cancel_source source;
         std::atomic<bool> done{false};
         io_result result{-EINPROGRESS, 0};
-        scheduler sched(1);
+        scheduler sched(retire_worker ? 2 : 1);
         sched.start();
-        auto& context = sched.get_worker(0)->io_context();
+        const size_t owner_id = retire_worker ? 1 : 0;
+        auto* owner = sched.get_worker(owner_id);
+        auto& context = owner->io_context();
         const auto baseline = context.pending_count();
-        sched.go([&]() -> task<void> {
+        sched.go_to(owner_id, [&]() -> task<void> {
             result = co_await stream.writev(vectors, 2, source.get_token());
             done.store(true, std::memory_order_release);
         });
@@ -6544,9 +6625,46 @@ TEST_CASE("socket writev cancellation wakes a backpressured send without peer dr
             return context.pending_count() > baseline;
         });
         const bool completed_before_cancel = done.load(std::memory_order_acquire);
-        source.cancel();
+        std::atomic<bool> suspension_returned{false};
+        sched.go_to(owner_id, [&]() -> task<void> {
+            suspension_returned.store(true, std::memory_order_release);
+            co_return;
+        });
+        const bool owner_passed_setup = wait_for_io_cancel_test([&] {
+            return suspension_returned.load(std::memory_order_acquire);
+        });
+        if (retire_worker) sched.set_thread_count(1);
+        auto& inbox_full = elio::runtime::detail::force_task_inbox_full_for_test;
+        auto& overflow_failure =
+            elio::runtime::detail::fail_task_overflow_allocation_for_test;
+        auto probe = elio::io::detail::make_io_cancel_executor(
+            std::make_shared<elio::io::detail::io_cancel_state>(), true);
+        inbox_full.store(queue_pressure, std::memory_order_release);
+        overflow_failure.store(queue_pressure, std::memory_order_release);
+        bool task_admission_rejected = true;
+        if (queue_pressure) {
+            task_admission_rejected = !owner->schedule(probe.handle);
+        }
+        if (!queue_pressure || task_admission_rejected) probe.handle.destroy();
+        auto& reject_admissions = elio::io::detail::reject_cancel_admissions_for_test;
+        auto& attempts = elio::io::detail::cancel_admission_attempts_for_test;
+        const auto attempts_before = attempts.load();
+        reject_admissions.store(admission_failures, std::memory_order_release);
+        auto& allocation_failure =
+            elio::io::detail::fail_io_cancel_executor_allocation_for_test;
+        allocation_failure.store(fail_allocation, std::memory_order_release);
+        bool cancellation_threw = false;
+        try {
+            source.cancel();
+        } catch (const std::bad_alloc&) {
+            cancellation_threw = true;
+        }
+        allocation_failure.store(false, std::memory_order_release);
         const bool cancelled_without_drain =
             wait_for_io_cancel_test([&] { return done.load(); });
+        inbox_full.store(false, std::memory_order_release);
+        overflow_failure.store(false, std::memory_order_release);
+        reject_admissions.store(0, std::memory_order_release);
         if (!cancelled_without_drain) {
             // Failure cleanup only: never close the writer fd under an
             // outstanding operation. Peer shutdown may release a broken test.
@@ -6555,9 +6673,13 @@ TEST_CASE("socket writev cancellation wakes a backpressured send without peer dr
         const bool stopped = sched.shutdown(elio::test::scaled_ms(5000));
         ::close(sockets[1]);
         REQUIRE(parked);
+        REQUIRE(owner_passed_setup);
+        REQUIRE(task_admission_rejected);
         REQUIRE_FALSE(completed_before_cancel);
+        CHECK_FALSE(cancellation_threw);
         REQUIRE(cancelled_without_drain);
         REQUIRE(stopped);
+        REQUIRE(attempts.load() == attempts_before + admission_failures + 1);
         REQUIRE(result.result == -ECANCELED);
         REQUIRE(context.pending_count() == baseline);
         for (size_t i = 0; i < original.size(); ++i) {
@@ -6566,6 +6688,142 @@ TEST_CASE("socket writev cancellation wakes a backpressured send without peer dr
         }
         // Safe after the awaited operation and its cancellation cleanup.
         payload.fill('r');
+    };
+    SECTION("forced epoll") { run(io_context::backend_type::epoll); }
+    SECTION("epoll cancellation does not allocate an executor") {
+        run(io_context::backend_type::epoll, true);
+    }
+    SECTION("epoll cancellation bypasses a full inbox and failed overflow allocation") {
+        run(io_context::backend_type::epoll, false, true);
+    }
+    SECTION("epoll cancellation retries refused admission without peer drain") {
+        run(io_context::backend_type::epoll, false, false, 2);
+    }
+    SECTION("retiring epoll owner drains retained cancellation intent") {
+        run(io_context::backend_type::epoll, false, false, 2, true);
+    }
+#if ELIO_HAS_IO_URING
+    SECTION("forced io_uring when available") {
+        if (!io_uring_backend::is_available()) SKIP("io_uring unavailable");
+        run(io_context::backend_type::io_uring);
+    }
+    SECTION("io_uring cancellation bypasses allocation and task queue pressure") {
+        if (!io_uring_backend::is_available()) SKIP("io_uring unavailable");
+        run(io_context::backend_type::io_uring, true, true, 2);
+    }
+#endif
+}
+
+TEST_CASE("graceful shutdown drains more than one owner maintenance batch",
+          "[io][cancel][timer][drain][admission]") {
+    worker_io_backend_guard guard(io_context::backend_type::epoll);
+    constexpr size_t count = 130;
+    std::array<cancel_source, count> sources;
+    std::atomic<size_t> completed{0};
+    std::atomic<size_t> cancelled{0};
+    std::atomic<bool> staged{false};
+    scheduler sched(1);
+    sched.start();
+    auto* owner = sched.get_worker(0);
+    auto& context = owner->io_context();
+    for (size_t index = 0; index < count; ++index) {
+        sched.go([&, index]() -> task<void> {
+            auto result = co_await elio::time::sleep_for(
+                std::chrono::hours(1), sources[index].get_token());
+            if (result == cancel_result::cancelled) cancelled.fetch_add(1);
+            completed.fetch_add(1, std::memory_order_release);
+        });
+    }
+    const bool parked = wait_for_io_cancel_test([&] { return context.pending_count() == count; });
+    sched.go([&]() -> task<void> {
+        staged.store(true, std::memory_order_release);
+        co_return;
+    });
+    const bool passed_setup = wait_for_io_cancel_test([&] { return staged.load(); });
+    auto& pause = elio::io::detail::pause_io_cancel_executor_before_claim_for_test;
+    auto& paused = elio::io::detail::io_cancel_executor_paused_before_claim_for_test;
+    pause.store(true, std::memory_order_release);
+    sources[0].cancel();
+    const bool held = wait_for_io_cancel_test([&] { return paused.load(); });
+    for (size_t index = 1; index < count; ++index) sources[index].cancel();
+    const auto queued = owner->queue_size();
+    pause.store(false, std::memory_order_release);
+    pause.notify_all();
+    const bool stopped = sched.shutdown(elio::test::scaled_ms(5000));
+    REQUIRE(parked);
+    REQUIRE(passed_setup);
+    REQUIRE(held);
+    REQUIRE(queued >= count);
+    REQUIRE(stopped);
+    REQUIRE(completed.load() == count);
+    REQUIRE(cancelled.load() == count);
+    REQUIRE(context.pending_count() == 0);
+    REQUIRE(owner->queue_size() == 0);
+}
+
+TEST_CASE("natural completion retires an owner cancellation retry",
+          "[io][cancel][lifetime][admission]") {
+    auto run = [](io_context::backend_type backend) {
+        worker_io_backend_guard guard(backend);
+        int sockets[2] = {-1, -1};
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+        tcp_stream stream(sockets[0]);
+        cancel_source source;
+        char received = 0;
+        std::atomic<bool> staged{false};
+        std::atomic<bool> done{false};
+        std::weak_ptr<elio::io::detail::io_cancel_state> weak;
+        cancellable_io_result result{};
+        unsigned attempts_at_completion = 0;
+        scheduler sched(1);
+        sched.start();
+        auto& context = sched.get_worker(0)->io_context();
+        sched.go([&]() -> task<void> {
+            std::shared_ptr<elio::io::detail::io_cancel_state> state;
+            elio::io::detail::capture_next_io_cancel_state_for_test(state);
+            result = co_await async_recv(stream.fd(), &received, 1, 0, source.get_token());
+            weak = state;
+            state.reset();
+            attempts_at_completion =
+                elio::io::detail::cancel_admission_attempts_for_test.load();
+            done.store(true, std::memory_order_release);
+        });
+        const bool parked = wait_for_io_cancel_test([&] {
+            return context.pending_count() == 1;
+        });
+        sched.go([&]() -> task<void> {
+            staged.store(true, std::memory_order_release);
+            co_return;
+        });
+        const bool passed_setup = wait_for_io_cancel_test([&] { return staged.load(); });
+        auto& reject = elio::io::detail::reject_cancel_admissions_for_test;
+        auto& attempts = elio::io::detail::cancel_admission_attempts_for_test;
+        const auto before = attempts.load();
+        reject.store(std::numeric_limits<unsigned>::max(), std::memory_order_release);
+        source.cancel();
+        const bool refused = wait_for_io_cancel_test([&] { return attempts.load() > before; });
+        const char byte = 'n';
+        const auto sent = ::send(sockets[1], &byte, 1, MSG_NOSIGNAL);
+        const bool completed = wait_for_io_cancel_test([&] { return done.load(); });
+        reject.store(0, std::memory_order_release);
+        if (!completed) ::shutdown(sockets[1], SHUT_RDWR);
+        // Graceful shutdown must include the retained retry even though the
+        // original operation has already completed and removed its I/O pin.
+        const bool stopped = sched.shutdown(elio::test::scaled_ms(5000));
+        ::close(sockets[1]);
+        REQUIRE(parked);
+        REQUIRE(passed_setup);
+        REQUIRE(refused);
+        REQUIRE(sent == 1);
+        REQUIRE(completed);
+        REQUIRE(stopped);
+        REQUIRE(result.io.result == 1);
+        REQUIRE_FALSE(result.was_cancelled());
+        REQUIRE(received == byte);
+        REQUIRE(attempts.load() == attempts_at_completion);
+        REQUIRE(weak.expired());
+        REQUIRE(context.pending_count() == 0);
+        received = 'r';
     };
     SECTION("forced epoll") { run(io_context::backend_type::epoll); }
 #if ELIO_HAS_IO_URING

@@ -658,26 +658,15 @@ public:
             }
         }
         
-        // Search in timer queue - need to rebuild queue without the cancelled entry
-        if (!timer_queue_.empty()) {
-            std::vector<timer_entry> remaining;
-            while (!timer_queue_.empty()) {
-                auto entry = timer_queue_.top();
-                timer_queue_.pop();
-                // Match against cancel_key (tagged op_state or awaiter address)
-                if (entry.cancel_key == user_data) {
-                    found_entry = claim_resume(entry.state, entry.awaiter,
-                                               io_result{-ECANCELED, 0}, to_resume)
-                                  || found_entry;
-                    pending_count_--;
-                    // Don't add back to remaining
-                } else {
-                    remaining.push_back(entry);
-                }
-            }
-            // Rebuild queue
-            for (auto& e : remaining) {
-                timer_queue_.push(std::move(e));
+        // Erase in the existing heap storage: cancellation must not allocate
+        // a replacement vector after its cooperative winner is committed.
+        {
+            timer_entry entry{};
+            while (timer_queue_.erase_key(user_data, entry)) {
+                found_entry = claim_resume(entry.state, entry.awaiter,
+                                           io_result{-ECANCELED, 0}, to_resume)
+                              || found_entry;
+                pending_count_--;
             }
         }
     found:
@@ -971,9 +960,21 @@ private:
     }
     
     /// Min-heap priority queue for timers
-    using timer_queue_t = std::priority_queue<timer_entry, 
-                                               std::vector<timer_entry>,
-                                               std::greater<timer_entry>>;
+    class timer_queue_t : public std::priority_queue<
+        timer_entry, std::vector<timer_entry>, std::greater<timer_entry>> {
+    public:
+        bool erase_key(void* key, timer_entry& removed) noexcept {
+            auto it = std::find_if(c.begin(), c.end(), [key](const auto& entry) {
+                return entry.cancel_key == key;
+            });
+            if (it == c.end()) return false;
+            removed = *it;
+            *it = c.back();
+            c.pop_back();
+            std::make_heap(c.begin(), c.end(), comp);
+            return true;
+        }
+    };
     
     /// Fail every op still queued in ``state`` with -ECANCELED through the
     /// op_state claim path (each awaiter is resumed exactly once, same as

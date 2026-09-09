@@ -69,6 +69,19 @@ closing the connection.
 - `join_handle::request_cancel()` is a best-effort request, not forced frame
   destruction. Pass `this_coro::cancel_token()` into every wait that should
   react and handle cancellation callback exceptions where callbacks may throw.
+- Built-in cancellable I/O and timer waits reserve their owner-worker abort
+  handoff before submission. For registered operations on a live worker,
+  cancellation no longer needs a freshly allocated abort executor or the
+  ordinary task queue's allocating overflow path. Temporary backend admission
+  rejection retains abort intent until admission or original-operation
+  retirement; owner/context checks and permanent key retirement prevent stale
+  retries from targeting reused operation storage. Epoll timer cancellation
+  removes the timer in place without rebuilding an allocating queue (#1202).
+  No signature change is required. Continue awaiting cleanup before releasing
+  buffers, descriptors, or task frames. This does not make user callbacks
+  non-throwing, guarantee progress under arbitrary allocation failure, or add
+  standalone cross-thread cancellation or safe forced shutdown. Registration
+  and setup may still allocate before submission.
 - `mutex`, `shared_mutex`, `semaphore`, `event`, `condition_variable`, and
   `channel` have explicit cancellable wait overloads. Existing no-token
   overloads retain their prior result shapes.

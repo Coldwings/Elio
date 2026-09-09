@@ -663,9 +663,8 @@ public:
     bool cancel(void* user_data) override {
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
         if (!sqe) {
-            // Try a flush + retry, mirroring prepare(). A cancel that
-            // can't be queued is silently dropped (caller will likely
-            // observe normal completion or be torn down).
+            // Try a flush + retry, mirroring prepare(). False means no cancel
+            // SQE was admitted; the owner maintenance path retains its intent.
             (void)io_uring_submit(&ring_);
             sqe = io_uring_get_sqe(&ring_);
             if (!sqe) {

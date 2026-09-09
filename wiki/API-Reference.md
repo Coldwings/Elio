@@ -2835,6 +2835,9 @@ marker does not override the framing rules of body-forbidden statuses
 
 ### HTTP Enums
 
+For response decoder events and pull-reader signatures, see the following
+incremental receive section.
+
 ```cpp
 enum class method {
     GET, HEAD, POST, PUT, DELETE_, CONNECT, OPTIONS, TRACE, PATCH
@@ -2857,6 +2860,126 @@ enum class status {
 // Get reason phrase for status
 constexpr std::string_view status_reason(status s) noexcept;
 ```
+
+---
+
+## Incremental HTTP Response Receive (`elio::http`)
+
+Include `<elio/http/http_parser.hpp>` for `response_decoder` and the
+accumulating `response_parser`; include `<elio/http/http_response_reader.hpp>`
+for the pull reader. See [[HTTP Streaming]] for lifetime rules and examples.
+
+```cpp
+enum class response_event {
+    need_more, headers_complete, body, message_complete, protocol_handoff, error
+};
+
+struct response_decode_result {
+    response_event event = response_event::need_more;
+    size_t consumed = 0;
+    std::string_view body;
+};
+
+class response_decoder {
+public:
+    void set_max_headers(size_t max) noexcept;
+    void set_max_header_size(size_t max) noexcept;
+    void set_request_method(method value) noexcept;
+    void reset();
+    response_decode_result decode(std::string_view input);
+    response_decode_result finish_eof();
+    status get_status() const noexcept;
+    uint16_t status_code() const noexcept;
+    std::string_view version() const noexcept;
+    std::string_view reason() const noexcept;
+    const headers& get_headers() const noexcept;
+    headers& get_headers() noexcept;
+    std::string_view error_message() const noexcept;
+    bool headers_complete() const noexcept;
+    bool is_complete() const noexcept;
+    bool has_error() const noexcept;
+    bool limit_exceeded() const noexcept;
+    bool is_close_delimited() const noexcept;
+    size_t bytes_buffered() const noexcept;
+};
+
+struct response_read_result {
+    response_event event = response_event::need_more;
+    std::string_view body;
+    int error = 0;
+    bool success() const noexcept; // error == 0, not message completeness
+};
+
+class response_reader {
+public:
+    explicit response_reader(size_t buffer_size = 8192);
+    response_reader(response_reader&&);
+    response_reader& operator=(response_reader&&);
+    const response_decoder& decoder() const noexcept;
+    void set_max_headers(size_t max) noexcept;
+    void set_max_header_size(size_t max) noexcept;
+    void set_request_method(method value) noexcept;
+    void reset();
+    template<typename Stream>
+    coro::task<response_read_result> read(
+        Stream& stream, coro::cancel_token token = {});
+    template<typename Receive>
+    coro::task<response_read_result> read_with(
+        Receive& receive, coro::cancel_token token = {});
+    bool next_response();
+    size_t bytes_remaining() const noexcept;
+    size_t message_bytes() const noexcept;
+    std::string_view remaining() const noexcept;
+    bool reached_eof() const noexcept;
+};
+```
+
+The decoder emits headers before body, even when both arrive in one input.
+`consumed` is relative only to that input. Drain events, including with empty
+input, until `need_more` or a terminal event; terminal events repeat without
+consuming more input. A decoder body view borrows the input. A reader body
+view borrows its receive buffer and is valid only until the next reader
+operation, move, or destruction. Neither stores an accumulating body buffer.
+Do not move a reader during an active operation. A moved-from reader is usable
+only for destruction or assignment. A zero receive-buffer size is normalized
+to one byte; the default is 8192 bytes.
+
+Configure limits and request method before decoding. Defaults are 100 header
+field lines and 8192 bytes per metadata line, excluding CRLF; the line bound
+also applies to status, chunk-size, and trailer lines. Duplicate field lines
+count, and trailers share the header count. The existing `kMaxChunkSize`
+limit is 1 GiB per declared chunk. `bytes_buffered()` counts only pending
+framing-line bytes, not owned parsed headers or delivered body. Neither low-level
+receiver imposes an aggregate body-byte limit. Ordinary `http::client` separately
+caps accumulated final body and cumulative interim wire bytes using
+`max_response_size`; these are separate budgets, not a combined total.
+
+`Stream::read(data, size, token)` must be readiness-aware and return an
+`io::io_result`. `read_with()` accepts a callback invoked as
+`receive(void*, size_t)`, returning an awaitable `io::io_result`; it must obey
+the supplied buffer bounds and end its buffer access before completion. The
+callback owns its deadline and in-flight cancellation policy; the reader's
+token is not passed as an extra callback argument. Short reads and `EINTR`
+are handled internally. Other transport errors are returned as positive
+`error` values without resetting framing state. Framing errors are terminal
+until reset. The reader does not close, pool, reconnect, or replay a connection.
+
+`next_response()` succeeds only after a `message_complete` event and retains
+unread transport bytes. It refuses pending, erroneous, and handed-off messages.
+`reset()` instead discards all receive state for a new connection. Both retain
+configured limits and clear the request method; reapply it for the next response.
+`message_bytes()` counts accepted wire bytes for the current message, including
+framing, saturates at `SIZE_MAX`, and resets on either operation. `remaining()`
+exposes unread wire bytes, not decoded body; protocol handoff requires the
+caller's own upgrade/tunnel validation.
+
+`response_parser` remains the accumulating adapter, not a second response
+framing implementation. Its legacy consumed count includes retired bytes from
+earlier feeds, and its `reset()` retains unread input. Chunk body progress is
+now visible before trailing CRLF validation. Check completion, not just a
+nonempty body. `response::from_decoder(const response_decoder&, std::string)`
+constructs an owning response from metadata and an explicitly accumulated body;
+the caller must establish successful final completion before using it.
 
 ---
 
@@ -3130,6 +3253,7 @@ struct client_config : http::base_client_config {
     bool auto_reconnect = true;
     size_t max_reconnect_attempts = 0;
     size_t max_event_buffer_size = 1024 * 1024;
+    size_t max_informational_responses = 16;
     std::string last_event_id;
 };
 ```
@@ -3168,6 +3292,20 @@ uses `client_config::auto_reconnect` / `max_reconnect_attempts` for
 receive-driven reconnect behavior after an established stream fails while not
 closed. Initial `connect()` failures are single attempts; callers own retry and
 background reconnect policy for initial connection establishment.
+
+`connect()` succeeds on valid final `200` / `text/event-stream` headers; it
+does not wait for the complete body. `receive()` incrementally consumes HTTP
+body slices, removing chunk framing and honoring Content-Length. It never
+interprets bytes beyond the declared body as events. `max_informational_responses`
+caps preceding non-101 interim responses at 16 by default; zero disallows them,
+and exceeding the cap fails connection setup with `EMSGSIZE`. Each message
+still has the configured metadata limits, and the absolute header deadline
+covers the entire interim sequence. With automatic reconnect disabled, normal
+HTTP body completion returns `std::nullopt` with `errno = 0`; malformed or
+truncated framing returns `EBADMSG`. Events already delivered are not retracted.
+The per-`receive()` token remains effective through receive-driven reconnect
+backoff and connection/header setup, alongside the original connection token.
+It does not replace or permanently cancel that original token.
 
 ### `sse::sse_connect`
 

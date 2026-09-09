@@ -98,6 +98,40 @@ below when upgrading from 0.5.x.
 
 ## Upgrade Checklist
 
+### HTTP Response Receive Changes
+
+- HTTP and SSE now share incremental response framing. SSE enforces a truthful
+  Content-Length, decodes real HTTP chunks, and treats truncated framing as an
+  error. Replace fixtures that set CL/TE but send unrelated raw event bytes;
+  see [[WebSocket SSE]] for valid wire examples.
+- SSE `connect()` completes on final headers, not event/body completion.
+  Retrieve piggybacked events through `receive()`. Preceding interim responses
+  are capped by `sse::client_config::max_informational_responses` (16 by default;
+  zero disallows interims). With reconnect disabled, clean HTTP completion
+  returns no event with `errno = 0`; framing truncation reports `EBADMSG`.
+- Unsupported response transfer-coding stacks such as `gzip, chunked` are
+  rejected. Elio does not expose a partially transfer-decoded stream as if all
+  transfer codings were removed. Content-Encoding handling is separate.
+- The accumulating `response_parser` now exposes partial chunk payload before
+  trailing CRLF validation. Require successful completion before treating its
+  body as a valid complete response. Its consumed count still includes retired
+  bytes from earlier calls; `reset()` still retains unread input.
+- New `response_decoder` instead reports consumption only from the supplied
+  input and borrows body slices from it. New `response_reader` exposes slices
+  until its next operation, move, or destruction; copy only if longer ownership
+  is needed. Use `next_response()` to retain interim-tail bytes and `reset()`
+  to discard receive state for a new connection. Reapply request method after
+  either reset. See [[HTTP Streaming]] for migration and ownership details.
+- Final response headers received during an Expect wait suppress the upload
+  immediately, including when the rejection response body arrives later or
+  uses close delimiting. EOF processing is shared with ordinary responses.
+
+The outgoing producer/writer redesign in
+[#1191](https://github.com/Coldwings/Elio/issues/1191) is a separate pending phase;
+these receive changes do not change existing server serialization contracts.
+
+### General Checklist
+
 1. Replace task copies and implicit lvalue handoffs with explicit moves.
 2. Remove direct `vthread_stack` allocator use while preserving any logical
    virtual-stack/debugging integrations you need.
@@ -112,6 +146,8 @@ below when upgrading from 0.5.x.
 7. Audit process creation paths against the documented fork boundary.
 8. Run normal, ASAN, and TSAN validation for application-specific adapters and
    cancellation callbacks.
+9. Check HTTP/SSE fixtures for truthful framing and review borrowed response
+   body lifetimes before adopting the pull reader.
 
 See [[API Contracts]] for the authoritative guarantee/responsibility inventory
 and the `0.6.0` section of `CHANGELOG.md` for the complete change list.

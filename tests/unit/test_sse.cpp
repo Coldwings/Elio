@@ -6,6 +6,7 @@
 #include <elio/coro/cancel_token.hpp>
 #include <elio/coro/this_coro.hpp>
 #include <elio/time/timer.hpp>
+#include <elio/sync/event.hpp>
 
 #include "../test_main.cpp"
 
@@ -836,13 +837,9 @@ TEST_CASE("SSE JSON data", "[sse][json]") {
 //      sse_connection now holds a per-connection coroutine mutex that
 //      serializes writes inside send_raw().
 //
-//   2. SSE responses MUST be parsed headers-only.  An upstream that wraps the
-//      stream in `Content-Length: N` (or chunked) used to cause the generic
-//      response_parser to consume real SSE event bytes as the HTTP body, so
-//      the first events disappeared into parser.take_body().  do_connect()
-//      now feeds only the bytes up to and including `\r\n\r\n` to the
-//      response parser and forwards everything after the delimiter to the
-//      SSE event parser.
+//   2. SSE events are incremental HTTP body data. The HTTP decoder must
+//      preserve piggybacked events while enforcing Content-Length and
+//      removing chunk framing before passing payload to the SSE parser.
 //
 //   3. receive(token) must observe BOTH the per-call token and the
 //      connect-time token.  The previous selection logic was inverted and
@@ -1346,8 +1343,7 @@ TEST_CASE("sse_connection serializes concurrent send_event calls",
     REQUIRE(beta_seen == kRoundsPerSender);
 }
 
-TEST_CASE("sse_client does not eat events into HTTP body even when the "
-          "server lies about Content-Length",
+TEST_CASE("sse_client delivers events incrementally with Content-Length",
           "[sse][client][regression]") {
     using namespace elio;
     using namespace elio::net;
@@ -1395,9 +1391,8 @@ TEST_CASE("sse_client does not eat events into HTTP body even when the "
             co_return observed;
         }
 
-        // Misbehaving server: declares a bogus Content-Length and then sends
-        // SSE events.  Pre-fix, response_parser would consume the first
-        // `Content-Length` bytes of the body and the events would be lost.
+        // Declaring a body length must not force whole-body accumulation
+        // before the first event is visible.
         std::string body =
             "event: greet\ndata: hello\n\n"
             "event: tick\ndata: 1\n\n"
@@ -1406,7 +1401,7 @@ TEST_CASE("sse_client does not eat events into HTTP body even when the "
         std::string headers =
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/event-stream\r\n"
-            "Content-Length: " + std::to_string(body.size() * 4) + "\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
             "Cache-Control: no-cache\r\n"
             "\r\n";
 
@@ -1482,6 +1477,123 @@ TEST_CASE("sse_client does not eat events into HTTP body even when the "
     REQUIRE(client_completion.value->got[1].data == "1");
     REQUIRE(client_completion.value->got[2].type == "tick");
     REQUIRE(client_completion.value->got[2].data == "2");
+}
+
+TEST_CASE("sse_client decodes HTTP framing before SSE events",
+          "[sse][client][framing]") {
+    using namespace elio;
+    using namespace elio::net;
+    using namespace elio::runtime;
+
+    struct framing_case {
+        std::string wire;
+        size_t events;
+        int error;
+        bool connected = true;
+    };
+    const std::string body = "id: 42\ndata: \xE4\xBD\xA0\xE5\xA5\xBD\n\n";
+    const std::string headers =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n";
+    std::string chunked;
+    // Chunk boundaries deliberately split the SSE field names, UTF-8 and
+    // event delimiter. Payload framing must never appear in event data.
+    for (const char byte : body) {
+        chunked += "1;foo=bar\r\n";
+        chunked.push_back(byte);
+        chunked += "\r\n";
+    }
+    const std::vector<framing_case> cases{
+        {"HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n" +
+         headers + "Transfer-Encoding: chunked\r\n\r\n" +
+         chunked + "0\r\nX-End: yes\r\n\r\n", 1, 0},
+        {headers + "Content-Length: " + std::to_string(body.size()) +
+         "\r\n\r\n" + body + "data: must-not-be-dispatched\n\n", 1, 0},
+        {headers + "Content-Length: " + std::to_string(body.size() + 1) +
+         "\r\n\r\n" + body, 1, EBADMSG},
+        {headers + "Transfer-Encoding: chunked\r\n\r\n" +
+         chunked, 1, EBADMSG},
+        {headers + "Transfer-Encoding: chunked\r\n\r\n" +
+         body, 0, EBADMSG},
+        {headers + "\r\n" + body, 1, 0},
+        {"HTTP/1.1 101 Switching Protocols\r\n\r\n", 0, EBADMSG, false},
+        {"HTTP/1.1 103 Early Hints\r\n\r\n"
+         "HTTP/1.1 103 Early Hints\r\n\r\n", 0, EMSGSIZE, false}
+    };
+    for (const auto& fixture : cases) {
+        for (const size_t buffer_size : {size_t{1}, size_t{4096}}) {
+            CAPTURE(fixture.wire, buffer_size);
+            auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+            REQUIRE(listener.has_value());
+            const auto port = listener->local_address().port();
+            scheduler sched(2);
+            sched.start();
+            std::atomic<bool> server_done{false};
+            std::atomic<bool> client_done{false};
+            struct observation {
+                bool connected = false;
+                std::vector<event> events;
+                std::string last_id;
+                int error = 0;
+            };
+            auto server_root = sched.go_joinable([&]() -> coro::task<bool> {
+                auto stream = co_await listener->accept();
+                if (!stream) {
+                    server_done.store(true);
+                    co_return false;
+                }
+                const auto request = co_await read_request_headers(*stream);
+                const bool sent = !request.empty() &&
+                    co_await write_all(*stream, fixture.wire);
+                co_await stream->close();
+                server_done.store(true);
+                co_return sent;
+            });
+            auto client_root = sched.go_joinable([&]() -> coro::task<observation> {
+                observation result;
+                client_config config;
+                config.auto_reconnect = false;
+                config.read_buffer_size = buffer_size;
+                config.max_informational_responses = 1;
+                sse_client original(config);
+                result.connected = co_await original.connect(
+                    "http://127.0.0.1:" + std::to_string(port) + "/events");
+                result.error = errno;
+                // Moving after connect must retain buffered body and decoder
+                // state without leaving an internal pointer to the old stream.
+                sse_client client(std::move(original));
+                if (result.connected) {
+                    while (auto next = co_await client.receive()) {
+                        result.events.push_back(std::move(*next));
+                    }
+                    result.error = errno;
+                    result.last_id = client.last_event_id();
+                }
+                co_await client.close();
+                client_done.store(true);
+                co_return result;
+            });
+            const bool finished = wait_for([&] {
+                return server_done.load() && client_done.load();
+            });
+            const bool stopped = sched.shutdown(elio::test::scaled_sec(5));
+            auto server = collect_join(server_root);
+            auto client = collect_join(client_root);
+            REQUIRE(finished);
+            REQUIRE(stopped);
+            REQUIRE(server.exception == nullptr);
+            REQUIRE(client.exception == nullptr);
+            REQUIRE(server.value.has_value());
+            REQUIRE(*server.value);
+            REQUIRE(client.value.has_value());
+            REQUIRE(client.value->connected == fixture.connected);
+            REQUIRE(client.value->events.size() == fixture.events);
+            REQUIRE(client.value->error == fixture.error);
+            if (fixture.events) {
+                REQUIRE(client.value->events.front().data == "\xE4\xBD\xA0\xE5\xA5\xBD");
+                REQUIRE(client.value->last_id == "42");
+            }
+        }
+    }
 }
 
 TEST_CASE("sse_client enforces configured response header limits before "
@@ -1938,6 +2050,112 @@ TEST_CASE("sse_client rejects non-event-stream responses",
     REQUIRE(client_completion.value->connect_errno == EBADMSG);
     REQUIRE_FALSE(client_completion.value->still_connected);
 }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+TEST_CASE("sse_client receive token cancels a staged reconnect header read",
+          "[sse][cancel][framing][regression]") {
+    using namespace elio;
+    using namespace elio::net;
+    using namespace elio::runtime;
+    struct observer_guard {
+        ~observer_guard() {
+            http::detail::observe_client_response_read_entry_for_test.store(false);
+        }
+    } observer;
+    http::detail::observe_client_response_read_entry_for_test.store(false);
+    http::detail::client_response_read_staged_for_test.store(false);
+
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    const auto port = listener->local_address().port();
+    scheduler sched(2);
+    sched.start();
+    coro::cancel_source receive_cancel;
+    coro::cancel_source connection_cancel;
+    coro::cancel_source cleanup_cancel;
+    sync::event release_server;
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    struct observation {
+        bool connected = false;
+        bool first_event = false;
+        bool cancelled = false;
+    };
+    auto server_root = sched.go_joinable([&]() -> coro::task<bool> {
+        auto first = co_await listener->accept(cleanup_cancel.get_token());
+        if (!first) {
+            server_done.store(true);
+            co_return false;
+        }
+        const auto request = co_await read_request_headers(*first);
+        const std::string body = "retry: 0\ndata: initial\n\n";
+        const bool sent = !request.empty() && co_await write_all(*first,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body);
+        // Finite Content-Length ends the message without requiring TCP EOF.
+        auto second = co_await listener->accept(cleanup_cancel.get_token());
+        bool requested = false;
+        if (second) {
+            requested = !(co_await read_request_headers(*second)).empty();
+            co_await release_server.wait();
+            co_await second->close();
+        }
+        co_await first->close();
+        server_done.store(true);
+        co_return sent && requested;
+    });
+    auto client_root = sched.go_joinable([&]() -> coro::task<observation> {
+        observation result;
+        client_config config;
+        config.default_retry_ms = 1;
+        config.max_reconnect_attempts = 1;
+        sse_client client(config);
+        result.connected = co_await client.connect(
+            "http://127.0.0.1:" + std::to_string(port) + "/events",
+            connection_cancel.get_token());
+        if (result.connected) {
+            const auto initial = co_await client.receive();
+            result.first_event = initial && initial->data == "initial";
+            http::detail::client_response_read_staged_for_test.store(false);
+            http::detail::observe_client_response_read_entry_for_test.store(true);
+            const auto next = co_await client.receive(receive_cancel.get_token());
+            result.cancelled = !next && errno == ECANCELED;
+        }
+        release_server.set();
+        co_await client.close();
+        client_done.store(true);
+        co_return result;
+    });
+    const bool staged = wait_for([] {
+        return http::detail::client_response_read_staged_for_test.load();
+    });
+    receive_cancel.cancel();
+    const bool returned = wait_for([&] { return client_done.load(); });
+    // Cleanup is separate from the assertion: the receive token must suffice,
+    // and the connection token is cancelled only after that observation.
+    connection_cancel.cancel();
+    cleanup_cancel.cancel();
+    release_server.set();
+    const bool finished = wait_for([&] {
+        return server_done.load() && client_done.load();
+    });
+    const bool stopped = sched.shutdown(elio::test::scaled_sec(5));
+    auto server = collect_join(server_root);
+    auto client = collect_join(client_root);
+    REQUIRE(staged);
+    REQUIRE(returned);
+    REQUIRE(finished);
+    REQUIRE(stopped);
+    REQUIRE(server.exception == nullptr);
+    REQUIRE(client.exception == nullptr);
+    REQUIRE(server.value.has_value());
+    REQUIRE(*server.value);
+    REQUIRE(client.value.has_value());
+    REQUIRE(client.value->connected);
+    REQUIRE(client.value->first_event);
+    REQUIRE(client.value->cancelled);
+}
+#endif
 
 TEST_CASE("sse_client receive(token) observes the per-call cancel token",
           "[sse][cancel][regression]") {

@@ -2,6 +2,7 @@
 
 #include <elio/http/http_common.hpp>
 #include <elio/http/http_parser.hpp>
+#include <elio/http/http_response_reader.hpp>
 #include <elio/http/http_message.hpp>
 #include <elio/http/client_base.hpp>
 #include <elio/net/stream.hpp>
@@ -27,6 +28,15 @@
 #include <stdexcept>
 
 namespace elio::http {
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace detail {
+// Expire only the Expect clock after final headers, allowing a regression to
+// hold the final body behind a barrier without relying on timer scheduling.
+inline std::atomic<bool> expire_expect_after_headers_for_test{false};
+inline std::atomic<bool> final_headers_seen_for_test{false};
+} // namespace detail
+#endif
 
 /// HTTP client configuration
 struct client_config : base_client_config {
@@ -508,346 +518,145 @@ private:
             co_return std::nullopt;
         }
 
-        // Read and parse response
-        std::vector<char> buffer(config_.read_buffer_size);
-        response_parser parser;
-        parser.set_max_headers(config_.max_headers);
-        parser.set_max_header_size(config_.max_header_size);
-        parser.set_request_method(req.get_method());
-        std::string pending_response_bytes;
-        size_t current_response_bytes = 0;
+        // One incremental decoder handles both the Expect gate and the final
+        // response. Headers-complete is distinct from body/message completion.
+        response_reader reader(config_.read_buffer_size);
+        reader.set_max_headers(config_.max_headers);
+        reader.set_max_header_size(config_.max_header_size);
+        reader.set_request_method(req.get_method());
+        std::string response_body;
         size_t skipped_informational_bytes = 0;
+        bool body_pending = defer_body;
+        const bool expect_bounded = sched != nullptr &&
+            config_.expect_continue_timeout.count() > 0;
+        auto expect_deadline = std::chrono::steady_clock::now() +
+            config_.expect_continue_timeout;
+        bool expect_expired = false;
 
-        if (defer_body) {
-            // Bounded wait for 100 Continue (or a final response) before
-            // sending the body. The same response_parser is used here and
-            // in the main loop below, so bytes consumed while waiting feed
-            // straight into normal response processing. Unlike the
-            // fd-shutdown watchdog used elsewhere, this wait cancels only
-            // its own read: on timeout the connection must stay usable so
-            // the body can still be sent (RFC 9110 §10.1.1 fallback).
-            const bool wait_bounded =
-                sched != nullptr &&
-                config_.expect_continue_timeout.count() > 0;
-            bool send_body = !wait_bounded;  // <=0: send immediately
-            bool final_seen = false;
-            const auto expect_deadline =
-                std::chrono::steady_clock::now() +
-                config_.expect_continue_timeout;
-            auto wait_cancel = std::make_shared<coro::cancel_source>();
-            auto cancel_forward = token.on_cancel(
-                [wait_cancel] { wait_cancel->cancel(); });
-
-            while (wait_bounded && !send_body && !final_seen) {
-                if (parser.is_complete()) {
-                    auto code = parser.status_code();
-                    if (code == static_cast<uint16_t>(status::continue_)) {
-                        send_body = true;
-                        break;
-                    }
-                    if (!is_informational_status(code) ||
-                        code == static_cast<uint16_t>(status::switching_protocols)) {
-                        // Final response before any body bytes: do not send
-                        // the body. A 101 is final here too; the main loop
-                        // below rejects it with EBADMSG.
-                        final_seen = true;
-                        break;
-                    }
-
-                    // Another interim (e.g. 103 Early Hints): skip it and
-                    // keep waiting, with the same cumulative cap as the
-                    // main loop.
-                    if (current_response_bytes >
-                        config_.max_response_size - skipped_informational_bytes) {
-                        ELIO_LOG_ERROR("Informational responses from {}:{} exceed "
-                                       "max_response_size ({} > {})",
-                                       target.host,
-                                       target.effective_port(),
-                                       skipped_informational_bytes + current_response_bytes,
-                                       config_.max_response_size);
-                        errno = EMSGSIZE;
-                        co_return std::nullopt;
-                    }
-                    skipped_informational_bytes += current_response_bytes;
-                    pending_response_bytes = parser.take_remaining();
-                    parser.reset();
-                    parser.set_request_method(req.get_method());
-                    current_response_bytes = 0;
-                    continue;
-                }
-
-                if (parser.has_error()) {
-                    break;  // Reported uniformly after the main loop.
-                }
-
-                // Check cancellation before read
-                if (token.is_cancelled()) {
-                    errno = ECANCELED;
-                    co_return std::nullopt;
-                }
-
-                parse_result wait_parse = parse_result::need_more;
-                if (!pending_response_bytes.empty()) {
-                    auto [pr, consumed] = parser.parse(pending_response_bytes);
-                    current_response_bytes += consumed;
-                    wait_parse = pr;
-                    pending_response_bytes.clear();
-                } else {
-                    const auto now = std::chrono::steady_clock::now();
-                    auto remaining = expect_deadline - now;
-                    if (remaining.count() <= 0) {
-                        send_body = true;  // Timeout fallback.
-                        break;
-                    }
-                    // The wait is additionally bounded by the absolute
-                    // response deadline (read_timeout), whichever expires
-                    // first. Expect-timeout expiry falls back to sending
-                    // the body; response-deadline expiry fails the request
-                    // as a timeout instead — read_timeout is documented as
-                    // the request/response read deadline, so the expect
-                    // wait must not overrun it.
-                    const auto response_remaining = response_deadline - now;
-                    const bool response_deadline_first =
-                        deadline_enforced && response_remaining < remaining;
-                    if (response_deadline_first) {
-                        if (response_remaining.count() <= 0) {
-                            ELIO_LOG_ERROR("Total response timeout exceeded for {}:{}",
-                                           target.host, target.effective_port());
-                            errno = ETIMEDOUT;
-                            co_return std::nullopt;
-                        }
-                        remaining = response_remaining;
-                    }
-                    auto wait_expired =
-                        std::make_shared<std::atomic<bool>>(false);
-                    coro::cancel_source watchdog_cancel;
-                    auto watchdog = sched->go_joinable(
-                        [remaining, wait_expired, wait_cancel,
-                         wtok = watchdog_cancel.get_token()]() -> coro::task<void> {
-                            auto r = co_await elio::time::sleep_for(remaining, wtok);
-                            if (r == coro::cancel_result::completed) {
-                                wait_expired->store(true, std::memory_order_release);
-                                wait_cancel->cancel();
-                            }
-                            co_return;
-                        });
-                    io::io_result read_result =
-                        co_await conn.read(buffer.data(), buffer.size(),
-                                           wait_cancel->get_token());
-                    watchdog_cancel.cancel();
-                    co_await watchdog;
-
-                    if (wait_expired->load(std::memory_order_acquire) &&
-                        read_result.result <= 0) {
-                        if (response_deadline_first) {
-                            ELIO_LOG_ERROR("Total response timeout exceeded for {}:{}",
-                                           target.host, target.effective_port());
-                            errno = ETIMEDOUT;
-                            co_return std::nullopt;
-                        }
-                        send_body = true;  // Timeout fallback.
-                        break;
-                    }
-                    // A read that won the race against the expiry is
-                    // parsed normally below; the deadline check at the
-                    // top of the next iteration applies the fallback.
-                    if (read_result.result <= 0) {
-                        if (read_result.result == -ECANCELED &&
-                            token.is_cancelled()) {
-                            detail::abort_stream_io(conn);
-                            errno = ECANCELED;
-                            co_return std::nullopt;
-                        }
-                        ELIO_LOG_ERROR("Failed to read response: {}",
-                                       read_result.result == 0
-                                           ? "connection closed"
-                                           : strerror(-read_result.result));
-                        errno = read_result.result == 0
-                                    ? ECONNRESET
-                                    : -read_result.result;
-                        co_return std::nullopt;
-                    }
-
-                    auto [pr, consumed] = parser.parse(std::string_view(
-                        buffer.data(),
-                        static_cast<size_t>(read_result.result)));
-                    current_response_bytes += consumed;
-                    wait_parse = pr;
-                }
-
-                if (wait_parse == parse_result::error) {
-                    ELIO_LOG_ERROR("Response parse error: {}",
-                                   parser.error_message());
-                    errno = EBADMSG;
-                    co_return std::nullopt;
-                }
-
-                if (parser.bytes_buffered() > config_.max_response_size) {
-                    ELIO_LOG_ERROR("Response from {}:{} exceeds max_response_size "
-                                   "({} > {})",
-                                   target.host, target.effective_port(),
-                                   parser.bytes_buffered(),
-                                   config_.max_response_size);
-                    errno = EMSGSIZE;
-                    co_return std::nullopt;
-                }
+        auto send_pending_body = [&]() -> coro::task<bool> {
+            if (!body_pending) co_return true;
+            body_pending = false;
+            const auto remaining = response_deadline - std::chrono::steady_clock::now();
+            if (deadline_enforced && remaining <= std::chrono::steady_clock::duration::zero()) {
+                errno = ETIMEDOUT;
+                co_return false;
             }
-
-            if (send_body && !final_seen) {
-                if (!co_await write_request_data(conn, req.body(), target,
-                                                 io_deadline, deadline_enforced,
-                                                 sched, token)) {
-                    co_return std::nullopt;
-                }
-            }
+            co_return co_await write_request_data(conn, req.body(), target,
+                deadline_enforced ? remaining : io_deadline, deadline_enforced, sched, token);
+        };
+        if (body_pending && !expect_bounded && !co_await send_pending_body()) {
+            co_return std::nullopt;
         }
 
+        // Read policy owns only deadlines and transport I/O, never HTTP state.
+        // An Expect timeout cancels this read rather than shutting down the fd.
+        auto receive = [&](void* data, size_t size) -> coro::task<io::io_result> {
+            expect_expired = false;
+            const auto now = std::chrono::steady_clock::now();
+            if (deadline_enforced && now >= response_deadline) {
+                co_return io::io_result{-ETIMEDOUT, 0};
+            }
+            const bool waiting_expect = body_pending && expect_bounded;
+            if (waiting_expect && now >= expect_deadline) {
+                expect_expired = true;
+                co_return io::io_result{-ETIMEDOUT, 0};
+            }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            detail::arm_client_response_read_observer_for_test();
+#endif
+            if (!deadline_enforced && !waiting_expect) {
+                co_return co_await conn.read(data, size, token);
+            }
+            const bool expect_first = waiting_expect &&
+                (!deadline_enforced || expect_deadline < response_deadline);
+            const auto deadline = expect_first ? expect_deadline : response_deadline;
+            auto read_cancel = std::make_shared<coro::cancel_source>();
+            auto forward = token.on_cancel([read_cancel] { read_cancel->cancel(); });
+            auto expired = std::make_shared<std::atomic<bool>>(false);
+            coro::cancel_source watchdog_cancel;
+            auto watchdog = sched->go_joinable(
+                [deadline, expired, read_cancel,
+                 stop = watchdog_cancel.get_token()]() -> coro::task<void> {
+                    auto result = co_await elio::time::sleep_for(
+                        deadline - std::chrono::steady_clock::now(), stop);
+                    if (result == coro::cancel_result::completed) {
+                        expired->store(true, std::memory_order_release);
+                        read_cancel->cancel();
+                    }
+                });
+            auto result = co_await conn.read(data, size, read_cancel->get_token());
+            watchdog_cancel.cancel();
+            co_await watchdog;
+            if (expired->load(std::memory_order_acquire)) {
+                // Preserve bytes read concurrently with the Expect timeout:
+                // they might contain final headers that suppress the upload.
+                if (expect_first && result.result > 0) co_return result;
+                expect_expired = expect_first;
+                co_return io::io_result{-ETIMEDOUT, 0};
+            }
+            co_return result;
+        };
+
         while (true) {
-            if (parser.is_complete()) {
-                auto code = parser.status_code();
-                if (!is_informational_status(code)) {
-                    break;
-                }
-
-                if (code == static_cast<uint16_t>(status::switching_protocols)) {
-                    ELIO_LOG_ERROR("Unexpected HTTP 101 Switching Protocols response");
-                    errno = EBADMSG;
-                    co_return std::nullopt;
-                }
-
-                if (current_response_bytes >
-                    config_.max_response_size - skipped_informational_bytes) {
-                    ELIO_LOG_ERROR("Informational responses from {}:{} exceed "
-                                   "max_response_size ({} > {})",
-                                   target.host,
-                                   target.effective_port(),
-                                   skipped_informational_bytes + current_response_bytes,
-                                   config_.max_response_size);
-                    errno = EMSGSIZE;
-                    co_return std::nullopt;
-                }
-
-                skipped_informational_bytes += current_response_bytes;
-                pending_response_bytes = parser.take_remaining();
-                parser.reset();
-                parser.set_request_method(req.get_method());
-                current_response_bytes = 0;
-                continue;
-            }
-
-            if (parser.has_error()) {
-                break;
-            }
-
-            // Check cancellation before read
             if (token.is_cancelled()) {
                 errno = ECANCELED;
                 co_return std::nullopt;
             }
-
-            parse_result result = parse_result::need_more;
-
-            if (!pending_response_bytes.empty()) {
-                auto [parse_result_value, consumed] = parser.parse(pending_response_bytes);
-                current_response_bytes += consumed;
-                result = parse_result_value;
-                pending_response_bytes.clear();
-            } else {
-                io::io_result read_result{};
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-                detail::arm_client_response_read_observer_for_test();
-#endif
-                std::shared_ptr<std::atomic<bool>> read_timed_out;
-                if (deadline_enforced) {
-                    // Use remaining time from the absolute response deadline
-                    // rather than a fresh per-read timeout.  This prevents a
-                    // slowloris-style server from keeping the connection alive
-                    // indefinitely by trickling data just before each per-read
-                    // deadline expires.
-                    auto remaining = response_deadline - std::chrono::steady_clock::now();
-                    if (remaining.count() <= 0) {
-                        ELIO_LOG_ERROR("Total response timeout exceeded for {}:{}",
-                                       target.host, target.effective_port());
-                        errno = ETIMEDOUT;
-                        co_return std::nullopt;
-                    }
-                    read_timed_out = std::make_shared<std::atomic<bool>>(false);
-                    coro::cancel_source ws_cancel;
-                    auto watchdog = arm_io_watchdog(sched, conn.fd(), remaining,
-                                                    ws_cancel.get_token(),
-                                                    read_timed_out);
-                    read_result = co_await conn.read(buffer.data(), buffer.size(),
-                                                    token);
-                    ws_cancel.cancel();
-                    co_await watchdog;
-                    if (read_timed_out->load(std::memory_order_acquire)) {
-                        conn.mark_externally_shut_down();
-                        ELIO_LOG_ERROR("Read from {}:{} timed out after {}s",
-                                       target.host, target.effective_port(),
-                                       std::chrono::duration_cast<std::chrono::seconds>(io_deadline).count());
-                        errno = ETIMEDOUT;
-                        co_return std::nullopt;
-                    }
-                } else {
-                    read_result = co_await conn.read(buffer.data(), buffer.size(),
-                                                    token);
+            auto part = co_await reader.read_with(receive, token);
+            if (!part.success()) {
+                if (expect_expired && body_pending && !token.is_cancelled()) {
+                    if (!co_await send_pending_body()) co_return std::nullopt;
+                    continue;
                 }
-
-                if (read_result.result <= 0) {
-                    if (read_result.result == -ECANCELED && token.is_cancelled()) {
-                        detail::abort_stream_io(conn);
-                        errno = ECANCELED;
-                        co_return std::nullopt;
-                    }
-                    if (read_result.result == 0) {
-                        auto [eof_result, consumed] = parser.finish_eof();
-                        (void)consumed;
-                        if (eof_result == parse_result::complete) {
-                            continue;  // Let the loop inspect final vs interim.
-                        }
-                    }
-                    ELIO_LOG_ERROR("Failed to read response: {}",
-                                  read_result.result == 0 ? "connection closed" : strerror(-read_result.result));
-                    errno = read_result.result == 0 ? ECONNRESET : -read_result.result;
+                errno = part.error;
+                co_return std::nullopt;
+            }
+            const auto code = reader.decoder().status_code();
+            if (part.event == response_event::headers_complete) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (!is_informational_status(code) &&
+                    detail::expire_expect_after_headers_for_test.load(std::memory_order_acquire)) {
+                    expect_deadline = std::chrono::steady_clock::now();
+                    detail::client_response_read_staged_for_test.store(false, std::memory_order_release);
+                    detail::final_headers_seen_for_test.store(true, std::memory_order_release);
+                }
+#endif
+                if (code == static_cast<uint16_t>(status::switching_protocols)) {
+                    errno = EBADMSG;
                     co_return std::nullopt;
                 }
-
-                auto [parse_result_value, consumed] = parser.parse(
-                    std::string_view(buffer.data(), read_result.result));
-                current_response_bytes += consumed;
-                result = parse_result_value;
-            }
-
-            if (result == parse_result::error) {
-                ELIO_LOG_ERROR("Response parse error: {}", parser.error_message());
+                if (!is_informational_status(code)) {
+                    body_pending = false; // Final headers suppress the upload.
+                } else if (code == static_cast<uint16_t>(status::continue_)) {
+                    if (!co_await send_pending_body()) co_return std::nullopt;
+                }
+            } else if (part.event == response_event::body) {
+                if (part.body.size() > config_.max_response_size -
+                    std::min(response_body.size(), config_.max_response_size)) {
+                    errno = EMSGSIZE;
+                    co_return std::nullopt;
+                }
+                response_body.append(part.body);
+            } else if (part.event == response_event::protocol_handoff) {
+                // Ordinary clients never transfer ownership to a tunnel.
                 errno = EBADMSG;
                 co_return std::nullopt;
-            }
-
-            // Cap the total in-parser footprint (un-consumed buffered bytes
-            // plus already-extracted body). Without this a hostile server can
-            // stream a multi-GiB body — chunked or with a forged Content-Length —
-            // and OOM the client. The parser also enforces a per-chunk cap
-            // (kMaxChunkSize) but a TE-chunked stream can still aggregate
-            // arbitrarily many small chunks; that aggregate is bounded here.
-            if (parser.bytes_buffered() > config_.max_response_size) {
-                ELIO_LOG_ERROR("Response from {}:{} exceeds max_response_size "
-                               "({} > {})",
-                               target.host, target.effective_port(),
-                               parser.bytes_buffered(),
-                               config_.max_response_size);
-                errno = EMSGSIZE;
-                co_return std::nullopt;
+            } else if (part.event == response_event::message_complete) {
+                if (!is_informational_status(code)) break;
+                if (reader.message_bytes() > config_.max_response_size -
+                    skipped_informational_bytes) {
+                    errno = EMSGSIZE;
+                    co_return std::nullopt;
+                }
+                skipped_informational_bytes += reader.message_bytes();
+                if (!reader.next_response()) {
+                    errno = EBADMSG;
+                    co_return std::nullopt;
+                }
+                reader.set_request_method(req.get_method());
             }
         }
-
-        if (parser.has_error()) {
-            ELIO_LOG_ERROR("Response parse error: {}", parser.error_message());
-            errno = EBADMSG;
-            co_return std::nullopt;
-        }
-
-        auto resp = response::from_parser(parser);
+        auto resp = response::from_decoder(reader.decoder(), std::move(response_body));
 
         // Return connection to pool only when (a) keep-alive is allowed by
         // the response, (b) the parser is in the complete state, and (c) no
@@ -856,10 +665,11 @@ private:
         // response — pooling the conn would let those bytes be misread as the
         // head of the next response (response-splitting). On any failure of
         // these conditions the connection is simply dropped on scope exit.
-        if (parser.is_complete() &&
-            !parser.is_close_delimited() &&
-            parser.bytes_remaining() == 0 &&
-            parser.get_headers().keep_alive(parser.version())) {
+        if (reader.decoder().is_complete() &&
+            !reader.decoder().is_close_delimited() &&
+            !reader.reached_eof() &&
+            reader.bytes_remaining() == 0 &&
+            reader.decoder().get_headers().keep_alive(reader.decoder().version())) {
             pool_.release(target.host, target.effective_port(), target.is_secure(), std::move(conn));
         }
         

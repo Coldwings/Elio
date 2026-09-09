@@ -12,6 +12,7 @@
 #include <elio/http/sse_server.hpp>
 #include <elio/http/http_common.hpp>
 #include <elio/http/http_parser.hpp>
+#include <elio/http/http_response_reader.hpp>
 #include <elio/http/client_base.hpp>
 #include <elio/net/stream.hpp>
 #include <elio/io/io_context.hpp>
@@ -36,6 +37,7 @@ struct client_config : http::base_client_config {
     bool auto_reconnect = true;                   ///< Enable auto-reconnection
     size_t max_reconnect_attempts = 0;            ///< Max reconnect attempts (0 = unlimited)
     size_t max_event_buffer_size = 1024 * 1024;   ///< Max pending SSE line/event buffer bytes
+    size_t max_informational_responses = 16;      ///< Cap interims before the final response
     std::string last_event_id;                    ///< Initial Last-Event-ID
 
     client_config() {
@@ -346,11 +348,10 @@ public:
         : config_(config)
         , tls_ctx_(tls::tls_mode::client)
         , last_event_id_(config.last_event_id)
-        , parser_(config.max_event_buffer_size, config.last_event_id) {
+        , parser_(config.max_event_buffer_size, config.last_event_id)
+        , response_reader_(config.read_buffer_size) {
         // Setup TLS context using shared utility
         http::init_client_tls_context(tls_ctx_, config_.verify_certificate);
-
-        buffer_.resize(config_.read_buffer_size);
     }
     
     /// Destructor
@@ -475,53 +476,63 @@ private:
             if (cancelled()) {
                 read_cancel->cancel();
             }
-            auto result = co_await read(buffer_.data(), buffer_.size(),
-                                        read_cancel->get_token());
-
-            if (result.result <= 0) {
-                if (result.result == -ECANCELED && cancelled()) {
+            auto fragment = co_await response_reader_.read(stream_, read_cancel->get_token());
+            if (fragment.event == http::response_event::body && fragment.success()) {
+                parser_.parse(fragment.body);
+                if (parser_.failed()) {
+                    errno = EBADMSG;
+                    state_ = client_state::disconnected;
+                    co_return std::nullopt;
+                }
+                sync_last_event_id_from_parser();
+                continue;
+            }
+            {
+                const int terminal_error = fragment.error;
+                if (terminal_error == ECANCELED && cancelled()) {
                     errno = ECANCELED;
                     co_return std::nullopt;
                 }
-                if (result.result == 0) {
-                    ELIO_LOG_DEBUG("SSE connection closed by server");
+                if (terminal_error == 0) {
+                    ELIO_LOG_DEBUG("SSE response completed");
                 } else {
-                    ELIO_LOG_ERROR("SSE read error: {}", strerror(-result.result));
+                    ELIO_LOG_ERROR("SSE read error: {}", strerror(terminal_error));
                 }
 
                 // Check cancellation before reconnect
                 if (cancelled()) {
                     state_ = client_state::disconnected;
+                    errno = ECANCELED;
                     co_return std::nullopt;
                 }
 
                 // Handle reconnection
                 if (config_.auto_reconnect && state_ != client_state::closed) {
                     state_ = client_state::reconnecting;
-                    bool reconnected = co_await try_reconnect();
+                    bool reconnected = co_await try_reconnect(read_cancel->get_token());
                     if (reconnected) {
                         continue;
                     }
+                    state_ = client_state::disconnected;
+                    co_return std::nullopt;
                 }
 
                 state_ = client_state::disconnected;
+                errno = terminal_error;
                 co_return std::nullopt;
             }
 
-            parser_.parse(std::string_view(buffer_.data(),
-                                           static_cast<size_t>(result.result)));
-            if (parser_.failed()) {
-                ELIO_LOG_ERROR("SSE parse error: {}", parser_.error_message());
-                state_ = client_state::disconnected;
-                co_return std::nullopt;
-            }
-            sync_last_event_id_from_parser();
         }
 
         co_return std::nullopt;
     }
 
-    coro::task<bool> do_connect() {
+    coro::task<bool> do_connect(coro::cancel_token operation_token = {}) {
+        auto combined = std::make_shared<coro::cancel_source>();
+        auto forward = [combined] { combined->cancel(); };
+        auto connection_cancel = token_.on_cancel(forward);
+        auto operation_cancel = operation_token.on_cancel(std::move(forward));
+        const auto connect_token = combined->get_token();
         ELIO_LOG_DEBUG("Connecting to SSE endpoint {}:{}{}",
                       url_.host, url_.effective_port(), url_.path);
 
@@ -549,7 +560,7 @@ private:
             config_.resolve_options,
             config_.rotate_resolved_addresses,
             config_.connect_timeout,
-            token_);
+            connect_token);
         if (!conn_result) {
             state_ = client_state::disconnected;
             co_return false;
@@ -589,10 +600,10 @@ private:
         
         request += "\r\n";
         
-        auto send_result = co_await write_exactly(request.data(), request.size(),
-                                                  token_);
+        auto send_result = co_await stream_.write_exactly(
+            request.data(), request.size(), connect_token);
         if (send_result.result != static_cast<ssize_t>(request.size())) {
-            if (send_result.result == -ECANCELED && token_.is_cancelled()) {
+            if (send_result.result == -ECANCELED && connect_token.is_cancelled()) {
                 http::detail::abort_stream_io(stream_);
                 errno = ECANCELED;
                 co_return fail_connect();
@@ -602,150 +613,97 @@ private:
             co_return fail_connect();
         }
         
-        // Read response headers.
-        //
-        // SSE responses MUST be parsed headers-only.  Some misbehaving
-        // proxies wrap an SSE stream in a `Content-Length: N` or
-        // `Transfer-Encoding: chunked` envelope; if we let the generic
-        // `response_parser` consume the stream, it eats real SSE event
-        // bytes as the HTTP "body" and the first events vanish into
-        // `parser.take_body()` — `response_data.substr(consumed)` would
-        // then drop the bytes we just lost.  Instead, delimit the header
-        // block manually with `\r\n\r\n` and feed every byte after the
-        // delimiter directly to the SSE event parser.
-        std::string response_data;
-        response_data.reserve(1024);
+        // Headers and subsequent SSE payload share a bounded HTTP decoder.
+        // Bytes coalesced with the final headers stay in the reader until
+        // receive() requests them; transfer framing never reaches event_parser.
+        response_reader_ = http::response_reader(config_.read_buffer_size);
+        const auto& decoder = response_reader_.decoder();
+        response_reader_.set_max_headers(config_.max_headers);
+        response_reader_.set_max_header_size(config_.max_header_size);
+        response_reader_.set_request_method(method::GET);
         auto* sched = runtime::scheduler::current();
         const bool deadline_enforced =
             sched != nullptr && config_.read_timeout.count() > 0;
         const auto response_deadline =
             std::chrono::steady_clock::now() + config_.read_timeout;
 
-        while (true) {
-            if (token_.is_cancelled()) {
-                errno = ECANCELED;
-                co_return fail_connect();
-            }
-
-            io::io_result read_result{};
+        auto receive_headers = [&](void* data, size_t size)
+            -> coro::task<io::io_result> {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
             http::detail::arm_client_response_read_observer_for_test();
 #endif
-            if (deadline_enforced) {
-                auto remaining =
-                    response_deadline - std::chrono::steady_clock::now();
-                if (remaining.count() <= 0) {
-                    ELIO_LOG_ERROR("SSE response headers timed out after {}s",
-                                   config_.read_timeout.count());
-                    errno = ETIMEDOUT;
-                    co_return fail_connect();
-                }
-
-                auto timed_out = std::make_shared<std::atomic<bool>>(false);
-                coro::cancel_source watchdog_cancel;
-                auto watchdog = http::detail::arm_fd_shutdown_watchdog(
-                    sched, stream_.fd(), remaining,
-                    watchdog_cancel.get_token(), timed_out);
-                read_result = co_await read(buffer_.data(), buffer_.size(),
-                                            token_);
-                watchdog_cancel.cancel();
-                co_await watchdog;
-                if (timed_out->load(std::memory_order_acquire)) {
-                    stream_.mark_externally_shut_down();
-                    ELIO_LOG_ERROR("SSE response headers timed out after {}s",
-                                   config_.read_timeout.count());
-                    errno = ETIMEDOUT;
-                    co_return fail_connect();
-                }
-            } else {
-                read_result = co_await read(buffer_.data(), buffer_.size(),
-                                            token_);
+            if (!deadline_enforced) {
+                co_return co_await stream_.read(data, size, connect_token);
             }
+            const auto remaining =
+                response_deadline - std::chrono::steady_clock::now();
+            if (remaining.count() <= 0) co_return io::io_result{-ETIMEDOUT, 0};
+            auto timed_out = std::make_shared<std::atomic<bool>>(false);
+            coro::cancel_source watchdog_cancel;
+            auto watchdog = http::detail::arm_fd_shutdown_watchdog(
+                sched, stream_.fd(), remaining,
+                watchdog_cancel.get_token(), timed_out);
+            auto result = co_await stream_.read(data, size, connect_token);
+            watchdog_cancel.cancel();
+            co_await watchdog;
+            if (timed_out->load(std::memory_order_acquire)) {
+                stream_.mark_externally_shut_down();
+                co_return io::io_result{-ETIMEDOUT, 0};
+            }
+            co_return result;
+        };
 
-            if (read_result.result <= 0) {
-                if (read_result.result == -ECANCELED && token_.is_cancelled()) {
+        size_t informational_responses = 0;
+        for (;;) {
+            if (connect_token.is_cancelled()) {
+                errno = ECANCELED;
+                co_return fail_connect();
+            }
+            const auto fragment =
+                co_await response_reader_.read_with(receive_headers, connect_token);
+            if (!fragment.success()) {
+                if (fragment.error == ECANCELED && connect_token.is_cancelled()) {
                     http::detail::abort_stream_io(stream_);
-                    errno = ECANCELED;
-                    co_return fail_connect();
                 }
-                ELIO_LOG_ERROR("Failed to read SSE response");
-                errno = read_result.result == 0 ? ECONNRESET : -read_result.result;
+                errno = fragment.error;
                 co_return fail_connect();
             }
-
-            response_data.append(buffer_.data(), static_cast<size_t>(read_result.result));
-
-            if (::elio::http::detail::response_header_limits_exceeded(
-                    response_data, config_.max_headers,
-                    config_.max_header_size)) {
-                ELIO_LOG_ERROR("SSE response headers too large");
-                errno = EMSGSIZE;
-                co_return fail_connect();
-            }
-
-            auto header_end = response_data.find("\r\n\r\n");
-            if (header_end != std::string::npos) {
-                size_t header_block_size = header_end + 4;
-
-                // Parse only the header block (status line + headers + CRLF
-                // CRLF terminator).  If the server advertises a body via
-                // Content-Length / Transfer-Encoding we deliberately ignore
-                // it — feeding only the header section keeps response_parser
-                // from consuming any SSE event bytes.  The parser will
-                // typically return need_more (it expected a body), but
-                // status_ and headers_ are already populated by then.
-                response_parser parser;
-                parser.set_max_headers(config_.max_headers);
-                parser.set_max_header_size(config_.max_header_size);
-                auto [result, consumed] = parser.parse(
-                    std::string_view(response_data).substr(0, header_block_size));
-                (void)consumed;
-
-                if (result == parse_result::error) {
-                    ELIO_LOG_ERROR("Failed to parse SSE response: {}",
-                                   parser.error_message());
+            if (fragment.event == http::response_event::headers_complete) {
+                const auto code = decoder.status_code();
+                if (code >= 100 && code < 200 && code != 101) {
+                    if (++informational_responses > config_.max_informational_responses) {
+                        errno = EMSGSIZE;
+                        co_return fail_connect();
+                    }
+                    continue;
+                }
+                if (decoder.get_status() != status::ok) {
+                    ELIO_LOG_ERROR("SSE request failed: {}", code);
                     errno = EBADMSG;
                     co_return fail_connect();
                 }
-
-                // Check status code
-                if (parser.get_status() != status::ok) {
-                    ELIO_LOG_ERROR("SSE request failed: {}",
-                                  static_cast<int>(parser.get_status()));
-                    errno = EBADMSG;
-                    co_return fail_connect();
-                }
-
-                // Check content type
-                auto content_type = parser.get_headers().get("Content-Type");
-                std::string_view media_type = content_type;
-                if (auto semicolon = media_type.find(';');
+                auto media_type = decoder.get_headers().get("Content-Type");
+                if (const auto semicolon = media_type.find(';');
                     semicolon != std::string_view::npos) {
                     media_type = media_type.substr(0, semicolon);
                 }
                 media_type = http::detail::trim_ows(media_type);
                 if (!http::detail::ascii_iequals(media_type, SSE_CONTENT_TYPE)) {
-                    ELIO_LOG_ERROR("Unexpected SSE Content-Type: {}", content_type);
+                    ELIO_LOG_ERROR("Unexpected SSE Content-Type: {}", media_type);
                     errno = EBADMSG;
                     co_return fail_connect();
                 }
-
-                // Anything past the header delimiter is SSE event data,
-                // regardless of what the server claimed about the body.
-                if (header_block_size < response_data.size()) {
-                    parser_.parse(std::string_view(response_data)
-                                      .substr(header_block_size));
-                    if (parser_.failed()) {
-                        ELIO_LOG_ERROR("SSE parse error: {}",
-                                       parser_.error_message());
-                        errno = EBADMSG;
-                        co_return fail_connect();
-                    }
-                    sync_last_event_id_from_parser();
-                }
-
                 break;
             }
+            if (fragment.event == http::response_event::message_complete &&
+                decoder.status_code() >= 100 && decoder.status_code() < 200) {
+                if (response_reader_.next_response()) {
+                    response_reader_.set_request_method(method::GET);
+                    continue;
+                }
+            }
+            errno = EBADMSG;
+            co_return fail_connect();
         }
         
         state_ = client_state::connected;
@@ -756,7 +714,7 @@ private:
         co_return true;
     }
     
-    coro::task<bool> try_reconnect() {
+    coro::task<bool> try_reconnect(coro::cancel_token operation_token) {
         // Reset parser but keep last_event_id
         parser_.reset();
 
@@ -778,7 +736,8 @@ private:
         size_t attempts = 0;
         while (state_ == client_state::reconnecting) {
             // Check for cancellation
-            if (token_.is_cancelled()) {
+            if (token_.is_cancelled() || operation_token.is_cancelled()) {
+                errno = ECANCELED;
                 co_return false;
             }
             
@@ -794,8 +753,9 @@ private:
             
             // Wait before reconnecting (cancellable)
             auto result = co_await elio::time::sleep_for(
-                std::chrono::milliseconds(retry_ms), token_);
+                std::chrono::milliseconds(retry_ms), operation_token);
             if (result == coro::cancel_result::cancelled) {
+                errno = ECANCELED;
                 co_return false;
             }
             
@@ -805,7 +765,7 @@ private:
             
             // Try to connect
             state_ = client_state::connecting;
-            if (co_await do_connect()) {
+            if (co_await do_connect(operation_token)) {
                 co_return true;
             }
             
@@ -826,28 +786,6 @@ private:
         last_event_id_.assign(id.begin(), id.end());
     }
     
-    coro::task<io::io_result> read(void* buf, size_t len) {
-        co_return co_await stream_.read(buf, len);
-    }
-
-    coro::task<io::io_result> read(void* buf, size_t len,
-                                   coro::cancel_token token) {
-        co_return co_await stream_.read(buf, len, std::move(token));
-    }
-
-    coro::task<io::io_result> write(const void* buf, size_t len) {
-        co_return co_await stream_.write(buf, len);
-    }
-
-    coro::task<io::io_result> write_exactly(const void* buf, size_t len) {
-        co_return co_await stream_.write_exactly(buf, len);
-    }
-
-    coro::task<io::io_result> write_exactly(const void* buf, size_t len,
-                                            coro::cancel_token token) {
-        co_return co_await stream_.write_exactly(buf, len, std::move(token));
-    }
-    
     client_config config_;
     tls::tls_context tls_ctx_;
     net::stream stream_;
@@ -857,7 +795,7 @@ private:
     std::string last_event_id_;
     client_state state_ = client_state::disconnected;
     event_parser parser_;
-    std::vector<char> buffer_;
+    http::response_reader response_reader_;
     int current_retry_ms_ = 0;  ///< Persisted backoff value across reconnection cycles
 };
 

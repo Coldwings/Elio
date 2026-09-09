@@ -303,8 +303,52 @@ passed to `connect()` aborts pending TCP connect, TLS handshake, request write,
 and response header reads. Cancelling the token passed to `receive()` aborts a
 blocked WebSocket frame or SSE event read. Cancellation returns `false` or
 `std::nullopt` and sets `errno` to `ECANCELED`.
+For SSE, the per-receive token also covers automatic reconnect backoff and
+connection setup initiated by that receive call; the original connect token
+remains independently effective.
 
 ### SSE Event Format
+
+SSE is the decoded HTTP body, not the raw bytes immediately after response
+headers. The client supports Content-Length, chunked transfer encoding, and
+close-delimited bodies. It removes chunk metadata before event parsing and
+stops at the declared body boundary. `connect()` returns after valid final
+headers; `receive()` processes any body bytes that arrived in the same read.
+
+For example, this escaped HTTP/1.1 response contains one `data: hi` event;
+the chunk length `a` counts the ten payload bytes, not its framing:
+
+```text
+HTTP/1.1 200 OK\r\n
+Content-Type: text/event-stream\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+a\r\n
+data: hi\n\n
+\r\n
+0\r\n
+\r\n
+```
+
+Equivalently, a finite stream can send `Content-Length: 10` followed by
+`data: hi\n\n`, without the chunk-size or chunk-delimiter bytes. Never label
+raw SSE data as chunked without encoding real HTTP chunks, and never advertise
+a guessed Content-Length. Chunk boundaries can split event fields or UTF-8
+bytes; they do not define event boundaries.
+
+`sse::client_config::max_informational_responses` defaults to 16; zero disallows
+preceding interims. The existing absolute header deadline covers all interims.
+The client rejects 101 as an SSE response. With automatic reconnect disabled,
+normal body completion returns `std::nullopt` and `errno = 0`; truncated length
+or chunk framing returns `EBADMSG`. Previously delivered events remain delivered.
+With reconnect enabled, completion/failure follows the configured receive-driven
+reconnect policy and `Last-Event-ID` handling; this is not exactly-once delivery.
+
+These receive changes do not replace the current server helpers:
+`build_sse_response()` still prepares a close-delimited response with
+`Connection: close`. The broader outgoing writer redesign remains tracked by
+[#1191](https://github.com/Coldwings/Elio/issues/1191). See [[HTTP Streaming]]
+for the shared reader's buffer lifetime and error contracts.
 
 SSE events are formatted as text with specific fields:
 

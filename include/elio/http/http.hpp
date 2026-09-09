@@ -16,6 +16,7 @@
 
 #include <elio/http/http_common.hpp>
 #include <elio/http/http_parser.hpp>
+#include <elio/http/http_response_reader.hpp>
 #include <elio/http/http_message.hpp>
 #include <elio/http/http_server.hpp>
 #include <elio/http/http_client.hpp>

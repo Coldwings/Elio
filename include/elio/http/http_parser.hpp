@@ -714,497 +714,379 @@ private:
     size_t header_count_ = 0;
 };
 
-/// HTTP response parser
-class response_parser {
+/// One increment of response framing progress.
+enum class response_event {
+    need_more,
+    headers_complete,
+    body,
+    message_complete,
+    protocol_handoff,
+    error
+};
+
+struct response_decode_result {
+    response_event event = response_event::need_more;
+    /// Bytes accepted from this call's input, never from an earlier call.
+    size_t consumed = 0;
+    /// Borrowed from this call's input; invalidated when that input changes.
+    std::string_view body;
+};
+
+/// Incremental HTTP/1 response framing decoder. Payload is never buffered:
+/// each body event borrows a slice of the supplied input. Only framing lines
+/// and parsed headers are owned. Drain events (including with empty input)
+/// until need_more before reading again; retain any unconsumed input.
+class response_decoder {
 public:
-    response_parser() = default;
-
-    /// Set maximum number of headers allowed (default: 100)
     void set_max_headers(size_t max) noexcept { max_headers_ = max; }
-
-    /// Set maximum size of a single header line in bytes (default: 8192)
     void set_max_header_size(size_t max) noexcept { max_header_size_ = max; }
+    void set_request_method(method value) noexcept { request_method_ = value; }
 
-    /// Set the request method whose response is being parsed. This lets the
-    /// parser apply response-body rules for HEAD responses.
-    void set_request_method(method m) noexcept { request_method_ = m; }
-
-    /// Reset parser state
     void reset() {
-        state_ = parse_state::status_line;
+        state_ = state::status_line;
         status_ = status::ok;
         version_.clear();
         reason_.clear();
         headers_.clear();
-        body_.clear();
-        content_length_ = 0;
-        body_received_ = 0;
-        chunked_ = false;
-        close_delimited_ = false;
-        chunk_size_ = 0;
+        line_.clear();
         error_message_.clear();
+        remaining_ = 0;
         header_count_ = 0;
+        headers_complete_ = false;
+        close_delimited_ = false;
+        handoff_ = false;
+        limit_exceeded_ = false;
         request_method_.reset();
     }
 
-    /// Parse incoming data
-    /// @param data Data to parse
-    /// @return Parse result and number of bytes consumed
-    std::pair<parse_result, size_t> parse(std::string_view data) {
-        size_t consumed = 0;
-        buffer_ += data;
-        
-        while (!buffer_.empty() && state_ != parse_state::complete && state_ != parse_state::error) {
-            size_t before = buffer_.size();
-            
-            switch (state_) {
-                case parse_state::status_line:
-                    if (!parse_status_line()) {
-                        consumed += before - buffer_.size();
-                        if (state_ == parse_state::error) {
-                            return {parse_result::error, consumed};
-                        }
-                        return {parse_result::need_more, consumed};
-                    }
-                    break;
-                    
-                case parse_state::headers:
-                    if (!parse_headers()) {
-                        consumed += before - buffer_.size();
-                        if (state_ == parse_state::error) {
-                            return {parse_result::error, consumed};
-                        }
-                        return {parse_result::need_more, consumed};
-                    }
-                    break;
-                    
-                case parse_state::body:
-                    if (!parse_body()) {
-                        consumed += before - buffer_.size();
-                        return {parse_result::need_more, consumed};
-                    }
-                    break;
-                    
-                case parse_state::chunk_size:
-                    if (!parse_chunk_size()) {
-                        consumed += before - buffer_.size();
-                        return {parse_result::need_more, consumed};
-                    }
-                    break;
-                    
-                case parse_state::chunk_data:
-                    if (!parse_chunk_data()) {
-                        consumed += before - buffer_.size();
-                        return {parse_result::need_more, consumed};
-                    }
-                    break;
-                    
-                case parse_state::chunk_trailer:
-                    if (!parse_chunk_trailer()) {
-                        consumed += before - buffer_.size();
-                        return {parse_result::need_more, consumed};
-                    }
-                    break;
-                    
-                default:
-                    break;
+    response_decode_result decode(std::string_view input) {
+        size_t used = 0;
+        for (;;) {
+            if (state_ == state::error) return {response_event::error, used, {}};
+            if (state_ == state::complete) {
+                return {handoff_ ? response_event::protocol_handoff
+                                 : response_event::message_complete, used, {}};
             }
-            
-            consumed += before - buffer_.size();
-        }
+            if (state_ == state::fixed_body || state_ == state::close_body ||
+                state_ == state::chunk_body) {
+                if (input.empty()) return {response_event::need_more, used, {}};
+                const size_t count = state_ == state::close_body
+                    ? input.size() : std::min(remaining_, input.size());
+                const auto payload = input.substr(0, count);
+                if (state_ != state::close_body) {
+                    remaining_ -= count;
+                    if (remaining_ == 0) {
+                        state_ = state_ == state::fixed_body
+                            ? state::complete : state::chunk_cr;
+                    }
+                }
+                return {response_event::body, used + count, payload};
+            }
+            if (state_ == state::chunk_cr || state_ == state::chunk_lf) {
+                if (input.empty()) return {response_event::need_more, used, {}};
+                const bool cr = state_ == state::chunk_cr;
+                if (input.front() != (cr ? '\r' : '\n')) {
+                    fail("Missing CRLF after chunk data");
+                    continue;
+                }
+                ++used;
+                input.remove_prefix(1);
+                state_ = cr ? state::chunk_lf : state::chunk_size;
+                continue;
+            }
 
-        // Mirror request_parser: surface error-state from the chunked
-        // sub-parsers as parse_result::error.
-        if (state_ == parse_state::error) {
-            return {parse_result::error, consumed};
+            // Only protocol metadata is copied. A split CRLF requires at
+            // most max_header_size + 2 bytes, independent of payload size.
+            if (input.empty()) return {response_event::need_more, used, {}};
+            const char ch = input.front();
+            input.remove_prefix(1);
+            ++used;
+            if (!line_.empty() && line_.back() == '\r' && ch != '\n') {
+                fail("Invalid framing line ending");
+                continue;
+            }
+            if (ch == '\n') {
+                if (line_.empty() || line_.back() != '\r') {
+                    fail("Invalid framing line ending");
+                    continue;
+                }
+                line_.pop_back();
+                const bool header_boundary =
+                    state_ == state::headers && line_.empty();
+                process_line(line_);
+                line_.clear();
+                if (has_error()) continue;
+                if (header_boundary) {
+                    headers_complete_ = true;
+                    return {response_event::headers_complete, used, {}};
+                }
+                continue;
+            }
+            if (ch != '\r' && line_.size() >= max_header_size_) {
+                fail_limit(state_ == state::status_line ? "Status line too long" :
+                     state_ == state::chunk_size ? "Chunk size line too long" :
+                     state_ == state::trailers ? "Trailer line too long" :
+                     "Header line too long");
+                continue;
+            }
+            line_.push_back(ch);
         }
-        if (state_ == parse_state::complete) {
-            return {parse_result::complete, consumed};
-        }
-
-        return {parse_result::need_more, consumed};
     }
 
-    /// Finish parsing when the peer closes the connection.
-    ///
-    /// Close-delimited HTTP/1 responses do not become complete until EOF. For
-    /// fixed-length or chunked responses, EOF before completion is a parse
-    /// error because the advertised framing was truncated.
-    std::pair<parse_result, size_t> finish_eof() {
-        if (state_ == parse_state::error) {
-            return {parse_result::error, 0};
+    response_decode_result finish_eof() {
+        if (state_ == state::close_body) state_ = state::complete;
+        if (!is_complete() && !has_error()) {
+            fail("Connection closed before response complete");
         }
-        if (state_ == parse_state::complete) {
-            return {parse_result::complete, 0};
-        }
-        if (close_delimited_ && state_ == parse_state::body) {
-            state_ = parse_state::complete;
-            return {parse_result::complete, 0};
-        }
-        set_error("Connection closed before response complete");
-        return {parse_result::error, 0};
+        return decode({});
     }
 
-    /// Get parsed status
     status get_status() const noexcept { return status_; }
-    
-    /// Get status code as integer
     uint16_t status_code() const noexcept { return static_cast<uint16_t>(status_); }
-    
-    /// Get HTTP version
     std::string_view version() const noexcept { return version_; }
-    
-    /// Get reason phrase
     std::string_view reason() const noexcept { return reason_; }
-    
-    /// Get parsed headers
     const headers& get_headers() const noexcept { return headers_; }
     headers& get_headers() noexcept { return headers_; }
-    
-    /// Get parsed body
-    std::string_view body() const noexcept { return body_; }
-    
-    /// Take ownership of body
-    std::string take_body() { return std::move(body_); }
-    
-    /// Get error message
     std::string_view error_message() const noexcept { return error_message_; }
-    
-    /// Check if response is complete
-    bool is_complete() const noexcept { return state_ == parse_state::complete; }
-
-    /// Check if there's an error
-    bool has_error() const noexcept { return state_ == parse_state::error; }
-
-    /// True when this response body is delimited only by connection close.
+    bool headers_complete() const noexcept { return headers_complete_; }
+    bool is_complete() const noexcept { return state_ == state::complete; }
+    bool has_error() const noexcept { return state_ == state::error; }
+    bool limit_exceeded() const noexcept { return limit_exceeded_; }
     bool is_close_delimited() const noexcept { return close_delimited_; }
-
-    /// Move out any unconsumed bytes still sitting in the parser's internal
-    /// buffer.  Used after a protocol upgrade (e.g. WebSocket client receiving
-    /// the 101 response with a piggybacked frame in the same TCP segment).
-    /// After this call the internal buffer is empty.
-    std::string take_remaining() {
-        std::string out = std::move(buffer_);
-        buffer_.clear();
-        return out;
-    }
-
-    /// Bytes currently held by the parser (un-consumed buffered input plus
-    /// any body bytes already extracted into body_). The HTTP client uses this
-    /// to enforce client_config::max_response_size after every read so a
-    /// hostile server cannot OOM the client by streaming a huge body.
-    size_t bytes_buffered() const noexcept {
-        return buffer_.size() + body_.size();
-    }
-
-    /// Bytes still sitting in the parser's input buffer that were NOT consumed
-    /// by the parsed message. After is_complete() is true, a non-zero value
-    /// means the server pipelined extra bytes after the response (e.g. a
-    /// response-splitting payload). The HTTP client uses this to refuse to
-    /// return such a connection to the keep-alive pool: those bytes would
-    /// otherwise be misread as the head of the next response.
-    size_t bytes_remaining() const noexcept {
-        return buffer_.size();
-    }
+    /// Pending framing bytes only; parsed header storage is separately
+    /// bounded by max_headers and max_header_size. No body storage exists.
+    size_t bytes_buffered() const noexcept { return line_.size(); }
 
 private:
-    bool response_body_forbidden() const noexcept {
-        if (request_method_ && *request_method_ == method::HEAD) {
-            return true;
-        }
+    friend class response_parser;
+    enum class state {
+        status_line, headers, fixed_body, close_body, chunk_size, chunk_body,
+        chunk_cr, chunk_lf, trailers, complete, error
+    };
 
-        return detail::status_forbids_response_body(status_);
+    void fail(std::string_view message) {
+        error_message_ = message;
+        state_ = state::error;
     }
 
-    bool parse_status_line() {
-        auto line_end = buffer_.find("\r\n");
-        if (line_end == std::string::npos) {
-            return false;
-        }
-        
-        std::string_view line(buffer_.data(), line_end);
-        
-        // Parse version
-        auto space1 = line.find(' ');
-        if (space1 == std::string_view::npos) {
-            set_error("Invalid status line: no version");
-            return false;
-        }
-        
-        version_ = line.substr(0, space1);
-        if (version_.empty() || !detail::is_valid_http_version(version_)) {
-            set_error("Invalid HTTP version");
-            return false;
-        }
-        
-        // Parse status code
-        auto status_start = space1 + 1;
-        auto space2 = line.find(' ', status_start);
-        std::string_view status_str;
-        if (space2 == std::string_view::npos) {
-            status_str = line.substr(status_start);
-        } else {
-            status_str = line.substr(status_start, space2 - status_start);
-            reason_ = line.substr(space2 + 1);
-        }
-        
-        uint16_t code = 0;
-        auto status_begin = status_str.data();
-        auto status_end = status_begin + status_str.size();
-        auto [ptr, ec] = std::from_chars(status_begin, status_end, code);
-        if (status_str.size() != 3 || ec != std::errc{} || ptr != status_end) {
-            set_error("Invalid status code");
-            return false;
-        }
-        status_ = static_cast<status>(code);
-        
-        buffer_.erase(0, line_end + 2);
-        state_ = parse_state::headers;
-        return true;
-    }
-    
-    bool parse_headers() {
-        while (true) {
-            auto line_end = buffer_.find("\r\n");
-            if (line_end == std::string::npos) {
-                if (detail::buffered_line_size(buffer_) > max_header_size_) {
-                    set_error("Header line too long");
-                }
-                return false;
-            }
-
-            if (line_end == 0) {
-                // Empty line - end of headers
-                buffer_.erase(0, 2);
-
-                // Same RFC 7230 §3.3.3 rule applies to responses: a server
-                // returning both Transfer-Encoding and Content-Length is
-                // suspect — silently picking one enables response smuggling
-                // through downstream proxies.
-                bool has_te = headers_.contains("Transfer-Encoding");
-                bool has_cl = headers_.contains("Content-Length");
-
-                if (response_body_forbidden()) {
-                    state_ = parse_state::complete;
-                    return true;
-                }
-
-                if (has_te && has_cl) {
-                    set_error("Both Transfer-Encoding and Content-Length present");
-                    return false;
-                }
-
-                if (has_te) {
-                    if (!headers_.is_chunked()) {
-                        set_error("Unsupported Transfer-Encoding (chunked must be final)");
-                        return false;
-                    }
-                    chunked_ = true;
-                    state_ = parse_state::chunk_size;
-                } else if (has_cl) {
-                    auto len = headers_.content_length();
-                    if (!len) {
-                        set_error("Invalid Content-Length");
-                        return false;
-                    }
-                    content_length_ = *len;
-                    if (content_length_ > 0) {
-                        state_ = parse_state::body;
-                    } else {
-                        state_ = parse_state::complete;
-                    }
-                } else {
-                    // Response body length is determined by connection close.
-                    close_delimited_ = true;
-                    state_ = parse_state::body;
-                }
-                return true;
-            }
-
-            std::string_view line(buffer_.data(), line_end);
-
-            // DoS protection: enforce per-line length limit
-            if (line_end > max_header_size_) {
-                set_error("Header line too long");
-                return false;
-            }
-
-            // Parse header
-            auto colon = line.find(':');
-            if (colon == std::string_view::npos) {
-                set_error("Invalid header line");
-                return false;
-            }
-
-            auto name = line.substr(0, colon);
-            auto value = detail::trim_ows(line.substr(colon + 1));
-
-            if (!detail::is_valid_header_name(name)) {
-                set_error("Invalid header name");
-                return false;
-            }
-            if (!detail::is_valid_header_value(value)) {
-                set_error("Invalid header value");
-                return false;
-            }
-            if (detail::ascii_iequals(name, "Content-Length")) {
-                if (headers_.contains("Content-Length") &&
-                    detail::trim_ows(headers_.get("Content-Length")) != value) {
-                    set_error("Conflicting Content-Length headers");
-                    return false;
-                }
-            }
-
-            // DoS protection: enforce header count limit. Uses a dedicated
-            // counter rather than headers_.size() because the underlying map
-            // overwrites duplicate names, so size() only counts unique keys.
-            if (header_count_ >= max_headers_) {
-                set_error("Too many headers");
-                return false;
-            }
-
-            ++header_count_;
-            headers_.add(name, value);
-            buffer_.erase(0, line_end + 2);
-        }
+    void fail_limit(std::string_view message) {
+        limit_exceeded_ = true;
+        fail(message);
     }
 
-    bool parse_body() {
-        if (close_delimited_) {
-            body_received_ += buffer_.size();
-            body_.append(buffer_.data(), buffer_.size());
-            buffer_.clear();
-            return true;
-        }
-
-        size_t remaining = content_length_ - body_received_;
-        size_t available = std::min(remaining, buffer_.size());
-
-        body_.append(buffer_.data(), available);
-        buffer_.erase(0, available);
-        body_received_ += available;
-        
-        if (body_received_ >= content_length_) {
-            state_ = parse_state::complete;
-            return true;
-        }
-        
-        return false;
-    }
-    
-    bool parse_chunk_size() {
-        auto line_end = buffer_.find("\r\n");
-        if (line_end == std::string::npos) {
-            if (detail::buffered_line_size(buffer_) > max_header_size_) {
-                set_error("Chunk size line too long");
-                return true;
+    void process_line(std::string_view line) {
+        if (state_ == state::status_line) {
+            const auto first = line.find(' ');
+            if (first == std::string_view::npos) {
+                fail("Invalid status line: no version");
+                return;
             }
-            return false;
-        }
-        if (line_end > max_header_size_) {
-            set_error("Chunk size line too long");
-            return true;
-        }
-
-        std::string_view line(buffer_.data(), line_end);
-
-        // See request_parser::parse_chunk_size for the full rationale on
-        // the overflow guard and kMaxChunkSize clamp.
-        std::string_view error;
-        if (!detail::parse_chunk_size_line(line, chunk_size_, error)) {
-            set_error(error);
-            return true;
-        }
-
-        buffer_.erase(0, line_end + 2);
-
-        if (chunk_size_ == 0) {
-            state_ = parse_state::chunk_trailer;
-        } else {
-            state_ = parse_state::chunk_data;
-        }
-
-        return true;
-    }
-
-    bool parse_chunk_data() {
-        if (buffer_.size() < chunk_size_ + 2) {
-            return false;
-        }
-
-        // Validate trailing CRLF per RFC 7230 §4.1
-        if (buffer_[chunk_size_] != '\r' || buffer_[chunk_size_ + 1] != '\n') {
-            set_error("Missing CRLF after chunk data");
-            return true;
-        }
-
-        body_.append(buffer_.data(), chunk_size_);
-        buffer_.erase(0, chunk_size_ + 2);
-
-        state_ = parse_state::chunk_size;
-        return true;
-    }
-    
-    bool parse_chunk_trailer() {
-        auto line_end = buffer_.find("\r\n");
-        if (line_end == std::string::npos) {
-            if (detail::buffered_line_size(buffer_) > max_header_size_) {
-                set_error("Trailer line too long");
-                return true;
+            if (!detail::is_valid_http_version(line.substr(0, first))) {
+                fail("Invalid HTTP version");
+                return;
             }
-            return false;
+            version_ = line.substr(0, first);
+            auto rest = line.substr(first + 1);
+            const auto space = rest.find(' ');
+            const auto code = rest.substr(0, space);
+            uint16_t number = 0;
+            const auto [end, ec] =
+                std::from_chars(code.data(), code.data() + code.size(), number);
+            if (code.size() != 3 || ec != std::errc{} ||
+                end != code.data() + code.size()) {
+                fail("Invalid status code");
+                return;
+            }
+            status_ = static_cast<status>(number);
+            if (space != std::string_view::npos) reason_ = rest.substr(space + 1);
+            state_ = state::headers;
+            return;
         }
-        
-        if (line_end == 0) {
-            buffer_.erase(0, 2);
-            state_ = parse_state::complete;
-            return true;
+        if (state_ == state::chunk_size) {
+            std::string_view error;
+            if (!detail::parse_chunk_size_line(line, remaining_, error)) {
+                fail(error);
+                return;
+            }
+            state_ = remaining_ == 0 ? state::trailers : state::chunk_body;
+            return;
         }
-
-        if (line_end > max_header_size_) {
-            set_error("Trailer line too long");
-            return true;
+        if (state_ == state::trailers) {
+            if (line.empty()) {
+                state_ = state::complete;
+            } else if (header_count_ >= max_headers_) {
+                fail_limit("Too many headers");
+            } else if (!detail::validate_chunk_trailer_line(line)) {
+                fail("Invalid trailer header");
+            } else {
+                ++header_count_;
+            }
+            return;
+        }
+        if (line.empty()) {
+            select_framing();
+            return;
+        }
+        const auto colon = line.find(':');
+        if (colon == std::string_view::npos) {
+            fail("Invalid header line");
+            return;
+        }
+        const auto name = line.substr(0, colon);
+        const auto value = detail::trim_ows(line.substr(colon + 1));
+        if (!detail::is_valid_header_name(name)) {
+            fail("Invalid header name");
+            return;
+        }
+        if (!detail::is_valid_header_value(value)) {
+            fail("Invalid header value");
+            return;
+        }
+        if (detail::ascii_iequals(name, "Content-Length") &&
+            headers_.contains("Content-Length") &&
+            detail::trim_ows(headers_.get("Content-Length")) != value) {
+            fail("Conflicting Content-Length headers");
+            return;
         }
         if (header_count_ >= max_headers_) {
-            set_error("Too many headers");
-            return true;
+            fail_limit("Too many headers");
+            return;
         }
-
-        std::string_view line(buffer_.data(), line_end);
-        if (!detail::validate_chunk_trailer_line(line)) {
-            set_error("Invalid trailer header");
-            return true;
-        }
-
         ++header_count_;
-        buffer_.erase(0, line_end + 2);
-        return true;
+        headers_.add(name, value);
     }
-    
-    void set_error(std::string_view msg) {
-        state_ = parse_state::error;
-        error_message_ = msg;
+
+    void select_framing() {
+        const auto code = status_code();
+        handoff_ = code == 101 ||
+            (request_method_ == method::CONNECT && code >= 200 && code < 300);
+        if (handoff_ || request_method_ == method::HEAD ||
+            detail::status_forbids_response_body(status_)) {
+            state_ = state::complete;
+            return;
+        }
+        const bool has_te = headers_.contains("Transfer-Encoding");
+        const bool has_cl = headers_.contains("Content-Length");
+        if (has_te && has_cl) {
+            fail("Both Transfer-Encoding and Content-Length present");
+        } else if (has_te) {
+            // No other transfer coding is implemented. Merely accepting
+            // a final chunked token would expose still-encoded payload.
+            if (!detail::ascii_iequals(
+                    detail::trim_ows(headers_.get("Transfer-Encoding")), "chunked")) {
+                fail("Unsupported Transfer-Encoding");
+                return;
+            }
+            state_ = state::chunk_size;
+        } else if (has_cl) {
+            const auto length = headers_.content_length();
+            if (!length) {
+                fail("Invalid Content-Length");
+                return;
+            }
+            remaining_ = *length;
+            state_ = remaining_ == 0 ? state::complete : state::fixed_body;
+        } else {
+            close_delimited_ = true;
+            state_ = state::close_body;
+        }
     }
-    
-    parse_state state_ = parse_state::status_line;
+
+    state state_ = state::status_line;
     status status_ = status::ok;
     std::string version_;
     std::string reason_;
     headers headers_;
-    std::string body_;
-    std::string buffer_;
-    size_t content_length_ = 0;
-    size_t body_received_ = 0;
-    bool chunked_ = false;
-    bool close_delimited_ = false;
-    size_t chunk_size_ = 0;
+    std::string line_;
     std::string error_message_;
     std::optional<method> request_method_;
-
-    // DoS protection limits
+    size_t remaining_ = 0;
     size_t max_headers_ = 100;
     size_t max_header_size_ = 8192;
     size_t header_count_ = 0;
+    bool headers_complete_ = false;
+    bool close_delimited_ = false;
+    bool handoff_ = false;
+    bool limit_exceeded_ = false;
+};
+
+/// Accumulating compatibility adapter. For borrowed incremental payload use
+/// response_decoder instead. Unlike decoder::consumed, parse().second counts
+/// bytes retired from old AND new buffered input. reset() preserves remaining
+/// input, and callers must not re-feed that input without take_remaining().
+/// Chunk payload is accumulated incrementally, before its trailing CRLF is
+/// validated. A partial body is not proof of a complete, valid response.
+class response_parser {
+public:
+    void set_max_headers(size_t max) noexcept { decoder_.set_max_headers(max); }
+    void set_max_header_size(size_t max) noexcept { decoder_.set_max_header_size(max); }
+    void set_request_method(method value) noexcept { decoder_.set_request_method(value); }
+
+    void reset() {
+        buffer_.insert(0, decoder_.line_);
+        decoder_.reset();
+        body_.clear();
+    }
+
+    std::pair<parse_result, size_t> parse(std::string_view data) {
+        const size_t old_pending = decoder_.bytes_buffered();
+        buffer_.append(data);
+        size_t offset = 0;
+        for (;;) {
+            auto result = decoder_.decode(std::string_view(buffer_).substr(offset));
+            offset += result.consumed;
+            if (result.event == response_event::body) body_.append(result.body);
+            if (result.event == response_event::need_more ||
+                result.event == response_event::error ||
+                result.event == response_event::message_complete ||
+                result.event == response_event::protocol_handoff) break;
+        }
+        buffer_.erase(0, offset);
+        // Incomplete framing lines remain unretired until the next feed.
+        const size_t consumed = old_pending + offset - decoder_.bytes_buffered();
+        return {result_kind(), consumed};
+    }
+
+    std::pair<parse_result, size_t> finish_eof() {
+        decoder_.finish_eof();
+        return {result_kind(), 0};
+    }
+
+    status get_status() const noexcept { return decoder_.get_status(); }
+    uint16_t status_code() const noexcept { return decoder_.status_code(); }
+    std::string_view version() const noexcept { return decoder_.version(); }
+    std::string_view reason() const noexcept { return decoder_.reason(); }
+    const headers& get_headers() const noexcept { return decoder_.get_headers(); }
+    headers& get_headers() noexcept { return decoder_.get_headers(); }
+    std::string_view body() const noexcept { return body_; }
+    std::string take_body() { return std::move(body_); }
+    std::string_view error_message() const noexcept { return decoder_.error_message(); }
+    bool headers_complete() const noexcept { return decoder_.headers_complete(); }
+    bool is_complete() const noexcept { return decoder_.is_complete(); }
+    bool has_error() const noexcept { return decoder_.has_error(); }
+    bool is_close_delimited() const noexcept { return decoder_.is_close_delimited(); }
+    std::string take_remaining() {
+        std::string out = std::move(decoder_.line_);
+        decoder_.line_.clear();
+        out += buffer_;
+        buffer_.clear();
+        return out;
+    }
+    size_t bytes_buffered() const noexcept {
+        return body_.size() + bytes_remaining();
+    }
+    size_t bytes_remaining() const noexcept {
+        return decoder_.bytes_buffered() + buffer_.size();
+    }
+
+private:
+    parse_result result_kind() const noexcept {
+        return has_error() ? parse_result::error :
+               is_complete() ? parse_result::complete : parse_result::need_more;
+    }
+    response_decoder decoder_;
+    std::string body_;
+    std::string buffer_;
 };
 
 } // namespace elio::http

@@ -2863,7 +2863,7 @@ body.
 ### CONNECT Request Parsing
 
 `request_parser` accepts CONNECT authority-form (`host:port`, or `[IP-literal]:port`),
-with a nonempty URI host and explicit decimal port1..65535. IPv6 and RFC3986
+with a nonempty URI host and explicit decimal port in 1..65535. IPv6 and RFC 3986
 IPvFuture bracket syntax are validated; unbracketed names use URI reg-name
 grammar, not a DNS-only policy. Raw case, trailing dots, percent triplets,
 brackets and leading port zeros are preserved in `path()`; `query()` and `body()`

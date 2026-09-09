@@ -7,6 +7,8 @@
 #include "../../runtime/scheduler.hpp"
 
 #include <cstdint>
+#include <array>
+#include <cassert>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -88,14 +90,29 @@ public:
     // Read or modify only under mutex. All methods below acquire mutex and
     // therefore must be called outside the SSL/state critical section.
     uint64_t generation = 0;
+
+    // Only called under mutex, including the actual SSL dispatch section.
+    int operation_error() const noexcept {
+        return output.error() ? output.error() : output_retired_ ? ESHUTDOWN : 0;
+    }
+
+    void retire_output() noexcept {
+        std::lock_guard lock(mutex);
+        output_retired_ = true;
+    }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     void* read_publish_context = nullptr;
     void (*before_read_publish)(void*) = nullptr;
     bool output_active_for_test() const noexcept { return pump_active_; }
+    void set_output_active_for_test(bool active) noexcept {
+        std::lock_guard lock(mutex);
+        pump_active_ = active;
+    }
 #endif
 
     void notify_progress() noexcept {
         wake_list ready;
+        std::array<wake_ptr, 2> settled;
         std::shared_ptr<coro::cancel_source> reader;
         {
             std::lock_guard lock(mutex);
@@ -103,9 +120,19 @@ public:
             reader = read_poll_;
             ready.splice(ready.end(), waiters_);
             for (const auto& wake : ready) wake->claim_notification();
+            if (!pump_active_) {
+                for (size_t i = 0; i < cleanup_slots_.size(); ++i) {
+                    auto& slot = cleanup_slots_[i];
+                    if (!slot.registered) continue;
+                    slot.registered = false;
+                    settled[i] = wake_ptr(shared_from_this(), &slot.wake);
+                    slot.wake.claim_notification();
+                }
+            }
         }
         cancel_noexcept(reader);
         for (const auto& wake : ready) wake->schedule_claimed();
+        for (const auto& wake : settled) if (wake) wake->schedule_claimed();
     }
 
     coro::task<io::io_result> wait_change(uint64_t observed, coro::cancel_token token) {
@@ -153,7 +180,7 @@ public:
     void start_output() noexcept {
         {
             std::lock_guard lock(mutex);
-            if (pump_active_ || output.error() || !output.pending_bytes()) return;
+            if (pump_active_ || operation_error() || !output.pending_bytes()) return;
             pump_active_ = true;
         }
         try {
@@ -213,18 +240,47 @@ public:
         notify_progress();
     }
 
-    coro::task<void> settle_output() {
-        auto self = shared_from_this();
-        for (;;) {
-            uint64_t observed;
-            {
-                std::lock_guard lock(mutex);
-                if (!pump_active_) co_return;
-                observed = generation;
-            }
-            // This cleanup wait intentionally ignores caller cancellation.
-            (void)co_await wait_change(observed, {});
+    class output_settlement {
+    public:
+        explicit output_settlement(std::shared_ptr<tls_transport> owner) noexcept
+            : owner_(std::move(owner)) {}
+        output_settlement(output_settlement&&) noexcept = default;
+        output_settlement(const output_settlement&) = delete;
+        ~output_settlement() { if (wake_) wake_->abandon(); }
+        bool await_ready() const noexcept {
+            std::lock_guard lock(owner_->mutex);
+            return !owner_->pump_active_;
         }
+        bool await_suspend(std::coroutine_handle<> handle) noexcept {
+            {
+                std::lock_guard lock(owner_->mutex);
+                if (!owner_->pump_active_) return false;
+                // Settlement is terminal (failure or whole-session retirement).
+                // At most the one reader and one writer can be outstanding;
+                // no successor pump may start after either of them settles.
+                assert(owner_->operation_error());
+                for (auto& slot : owner_->cleanup_slots_) {
+                    if (slot.used) continue;
+                    slot.used = true;
+                    slot.registered = true;
+                    wake_ = wake_ptr(owner_, &slot.wake); // alias, no allocation
+                    slot.wake.set_handle_blocked(handle);
+                    break;
+                }
+                assert(wake_ && "TLS operation concurrency contract violated");
+                if (!wake_) std::terminate();
+            }
+            auto wake = wake_;
+            return wake->unblock_after_publish();
+        }
+        void await_resume() const noexcept {}
+    private:
+        std::shared_ptr<tls_transport> owner_;
+        wake_ptr wake_;
+    };
+
+    output_settlement settle_output() noexcept {
+        return output_settlement(shared_from_this());
     }
 
 private:
@@ -297,6 +353,13 @@ private:
     std::shared_ptr<coro::cancel_source> read_poll_;
     coro::cancel_source pump_cancel_;
     bool pump_active_ = false;
+    bool output_retired_ = false;
+    struct cleanup_slot {
+        sync::detail::wake_state wake;
+        bool used = false;
+        bool registered = false;
+    };
+    std::array<cleanup_slot, 2> cleanup_slots_;
 };
 
 } // namespace elio::tls::detail

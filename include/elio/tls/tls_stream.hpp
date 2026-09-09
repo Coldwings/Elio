@@ -39,6 +39,7 @@ struct tls_dispatch_test_hooks {
     void* context = nullptr;
     tls_test_call_result (*dispatch)(void*, tls_test_operation, const void*, size_t) noexcept = nullptr;
     coro::task<io::io_result> (*readiness)(void*, tls_test_operation, bool, coro::cancel_token) = nullptr;
+    void (*after_handshake_retry)(void*) noexcept = nullptr;
 };
 struct tls_shutdown_test_state {
     int ssl_shutdown_flags;
@@ -123,6 +124,7 @@ public:
     tls_stream(tls_stream&& other) noexcept
         : transport_(std::move(other.transport_))
         , ssl_(std::exchange(other.ssl_, nullptr))
+        , write_retry_exclusive_(std::exchange(other.write_retry_exclusive_, false))
         , mode_(other.mode_)
         , handshake_complete_(std::exchange(other.handshake_complete_, false))
         , shutdown_sent_(std::exchange(other.shutdown_sent_, false))
@@ -134,6 +136,7 @@ public:
             release_ssl();
             transport_ = std::move(other.transport_);
             ssl_ = std::exchange(other.ssl_, nullptr);
+            write_retry_exclusive_ = std::exchange(other.write_retry_exclusive_, false);
             mode_ = other.mode_;
             handshake_complete_ = std::exchange(other.handshake_complete_, false);
             shutdown_sent_ = std::exchange(other.shutdown_sent_, false);
@@ -164,8 +167,13 @@ public:
     coro::task<bool> handshake(coro::cancel_token token) {
         int exception_error = EIO;
         try {
+            if (token.is_cancelled()) { errno = ECANCELED; co_return false; }
             for (;;) {
-                if (token.is_cancelled()) { errno = ECANCELED; co_return false; }
+                if (token.is_cancelled()) {
+                    co_await fail_io(ECANCELED);
+                    errno = transport_error();
+                    co_return false;
+                }
                 const auto step = call_ssl([&] {
                     return mode_ == tls_mode::client ? SSL_connect(ssl_) : SSL_accept(ssl_);
                 });
@@ -184,6 +192,10 @@ public:
                     errno = -ready.result;
                     co_return false;
                 }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (dispatch_test_hooks_ && dispatch_test_hooks_->after_handshake_retry)
+                    dispatch_test_hooks_->after_handshake_retry(dispatch_test_hooks_->context);
+#endif
             }
         } catch (const std::bad_alloc&) { exception_error = ENOMEM; }
         catch (...) {}
@@ -528,6 +540,7 @@ public:
             try { co_await std::move(*watchdog); }
             catch (...) { transport_->fail(EIO); }
         }
+        transport_->retire_output();
         co_await transport_->settle_output();
         handshake_complete_ = false;
     }
@@ -671,7 +684,7 @@ private:
 
     int transport_error() const {
         auto lock = lock_ssl_state();
-        return transport_->output.error();
+        return transport_->operation_error();
     }
 
     coro::task<io::io_result> fail_io(int error) {
@@ -701,7 +714,7 @@ private:
         {
             auto lock = lock_ssl_state();
             step.observed = transport_->generation;
-            if (transport_->output.error()) return {-1, SSL_ERROR_SYSCALL};
+            if (transport_->operation_error()) return {-1, SSL_ERROR_SYSCALL};
             if (write_retry_exclusive_) {
                 step.ret = -1;
                 step.err = retry_owner_blocked;
@@ -736,7 +749,7 @@ private:
         {
             auto lock = lock_ssl_state();
             step.observed = transport_->generation;
-            if (transport_->output.error()) return {-1, SSL_ERROR_SYSCALL};
+            if (transport_->operation_error()) return {-1, SSL_ERROR_SYSCALL};
             const auto before = input_snapshot();
 #ifdef ELIO_RUNTIME_TEST_HOOKS
             if (dispatch_test_hooks_ && dispatch_test_hooks_->dispatch) {
@@ -773,7 +786,7 @@ private:
         ssl_call_result step;
         {
             auto lock = lock_ssl_state();
-            if (transport_->output.error()) return {-1, SSL_ERROR_SYSCALL};
+            if (transport_->operation_error()) return {-1, SSL_ERROR_SYSCALL};
             ERR_clear_error();
             step.ret = fn();
             step.err = (step.ret < 0 || (step.ret == 0 && zero_is_error))
@@ -801,14 +814,9 @@ private:
         // We never wait for the peer's close_notify in the destructor,
         // since that would require async I/O.
         //
-        // Skip SSL_shutdown when the underlying socket is already known
-        // to be unusable. SSL_shutdown's BIO writes via send(2); on a
-        // half-closed socket that produces EPIPE and, on OpenSSL builds
-        // that don't set MSG_NOSIGNAL (older OpenSSL, musl, etc.),
-        // delivers SIGPIPE to the process. We avoid the write entirely
-        // when (a) somebody else (e.g. a slow-loris watchdog) called
-        // ``shutdown_socket()`` / ``mark_externally_shut_down()`` on us,
-        // or (b) the kernel reports a pending socket error.
+        // Never re-enter SSL after a fatal result or an unfinished exclusive
+        // retry. Known-dead sockets also cannot benefit from a closing alert;
+        // the custom output BIO separately uses MSG_NOSIGNAL for every send.
         if (handshake_complete_ && !shutdown_sent_ && !write_retry_exclusive_ &&
             !transport_->output.error() &&
             !is_socket_closed_or_dead()) {

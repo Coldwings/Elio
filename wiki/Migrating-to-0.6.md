@@ -344,6 +344,8 @@ delivery. Serialize it with reads/writes. Destruction aborts owned output, does
 not asynchronously finish normal shutdown, and never makes forced destruction
 of an active caller coroutine safe. This API is not directional half-close or
 CONNECT tunnel support.
+After whole-session shutdown the transport is retired; establish a new stream
+for another TLS session rather than calling `handshake()` on the closed one.
 
 ## Task Ownership And Virtual Threads
 

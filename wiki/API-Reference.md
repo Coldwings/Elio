@@ -3916,6 +3916,10 @@ budgets. Failure or expiry starts abort processing and drains owned I/O before
 returning, so cleanup can extend beyond that budget. The legacy `task<void>`
 result does not establish lossless peer delivery. This is not a directional
 half-close API; CONNECT directional-close support is not implemented here.
+Whole-session shutdown retires the transport; this object has no TLS-session
+reset or re-handshake API. Terminal output settlement uses two pre-reserved
+notification slots for the permitted reader/writer pair, without allocating
+new cleanup waiters.
 
 Callers must serialize shutdown/destruction against public reads/writes, request
 cancellation where needed, and await those operations before releasing stream

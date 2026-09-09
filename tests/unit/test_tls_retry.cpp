@@ -9,9 +9,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <coroutine>
 #include <cstring>
+#include <exception>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -219,6 +222,130 @@ TEST_CASE("TLS pending WANT_READ write allows eligible SSL reads", "[tls][retry]
 TEST_CASE("TLS pending read does not exclude SSL writes", "[tls][retry][issue-1215]") {
     for (bool cancellable : {false, true})
         exercise_retry(operation::read, SSL_ERROR_WANT_READ, true, cancellable);
+}
+
+namespace {
+struct handshake_cancel_progress {
+    coro::cancel_source cancel;
+    std::atomic<bool> queued{false};
+    std::atomic<bool> cancelled_after_progress{false};
+    unsigned sends = 0;
+
+    static ssize_t send(void* opaque, int fd, const void* data, size_t size, int flags) {
+        auto& state = *static_cast<handshake_cancel_progress*>(opaque);
+        // Queue a real encrypted handshake flight; its pump uses native I/O.
+        if (state.sends++ == 0) { errno = EAGAIN; return -1; }
+        return ::send(fd, data, size, flags);
+    }
+    static void allocate(void* opaque, bool payload) noexcept {
+        if (payload) static_cast<handshake_cancel_progress*>(opaque)->queued.store(true, std::memory_order_release);
+    }
+    static void after_retry(void* opaque) noexcept {
+        auto& state = *static_cast<handshake_cancel_progress*>(opaque);
+        // Ignore initial readability before SSL_accept generates its flight.
+        // Cancel only after a successful production retry and queued output.
+        if (state.queued.load(std::memory_order_acquire)) {
+            state.cancelled_after_progress.store(true, std::memory_order_release);
+            state.cancel.cancel();
+        }
+    }
+};
+
+void exercise_handshake_progress_cancel(io::io_context::backend_type backend,
+                                        tls::tls_version version) {
+    CAPTURE(backend, version);
+    struct backend_scope {
+        io::io_context::backend_type previous;
+        ~backend_scope() { runtime::detail::worker_io_backend_for_test.store(previous); }
+    } restore{runtime::detail::worker_io_backend_for_test.exchange(backend)};
+    std::array<int, 2> sockets{-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()) == 0);
+    net::tcp_stream server_tcp(sockets[0]);
+    net::tcp_stream peer_tcp(sockets[1]);
+    tls::tls_context server_context(tls::tls_mode::server, version);
+    tls::tls_context peer_context(tls::tls_mode::client, version);
+    REQUIRE(retry_certificate(server_context));
+    peer_context.set_verify_mode(tls::verify_mode::none);
+    tls::tls_stream server(std::move(server_tcp), server_context);
+    tls::tls_stream peer(std::move(peer_tcp), peer_context);
+    handshake_cancel_progress progress;
+    tls::detail::tls_dispatch_test_hooks hooks{
+        &progress, nullptr, nullptr, handshake_cancel_progress::after_retry};
+    server.set_dispatch_test_hooks(&hooks);
+    server.set_output_test_hooks({&progress, handshake_cancel_progress::send,
+                                  handshake_cancel_progress::allocate});
+    runtime::scheduler scheduler(2);
+    scheduler.start();
+    std::atomic<bool> joined{false};
+    bool server_result = true;
+    bool launch_failed = false;
+    bool operation_threw = false;
+    scheduler.go([&]() -> coro::task<void> {
+        std::array<std::optional<coro::join_handle<void>>, 2> tasks;
+        try {
+            tasks[0].emplace(scheduler.go_joinable([&]() -> coro::task<void> {
+                server_result = co_await server.handshake(progress.cancel.get_token());
+            }));
+            tasks[1].emplace(scheduler.go_joinable([&]() -> coro::task<void> {
+                (void)co_await peer.handshake(progress.cancel.get_token());
+            }));
+        } catch (...) {
+            launch_failed = true;
+            progress.cancel.cancel();
+        }
+        for (auto& task : tasks) {
+            if (task) {
+                try { co_await std::move(*task); } catch (...) { operation_threw = true; }
+            }
+        }
+        joined.store(true, std::memory_order_release);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + test::scaled_ms(15000);
+    while (!joined.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    const bool completed = joined.load(std::memory_order_acquire);
+    if (!completed) {
+        progress.cancel.cancel();
+        server.shutdown_socket();
+        peer.shutdown_socket();
+    }
+    // Never destroy the hook, cancellation source or streams before cleanup.
+    if (!scheduler.shutdown(test::scaled_ms(15000))) std::terminate();
+    server.set_dispatch_test_hooks(nullptr);
+    server.set_output_test_hooks({});
+    const auto result = server.shutdown_state_for_test();
+    const auto peer_state = peer.shutdown_state_for_test();
+    server.shutdown_socket();
+    peer.shutdown_socket();
+    REQUIRE(completed);
+    REQUIRE(joined.load(std::memory_order_acquire));
+    REQUIRE_FALSE(launch_failed);
+    REQUIRE_FALSE(operation_threw);
+    REQUIRE(progress.queued.load(std::memory_order_acquire));
+    REQUIRE(progress.cancelled_after_progress.load(std::memory_order_acquire));
+    REQUIRE_FALSE(server_result);
+    REQUIRE_FALSE(server.is_handshake_complete());
+    REQUIRE(result.transport_error == ECANCELED);
+    REQUIRE_FALSE(result.pump_active);
+    REQUIRE_FALSE(peer_state.pump_active);
+}
+}
+
+TEST_CASE("TLS handshake cancellation after retry progress settles ciphertext output",
+          "[tls][handshake][cancel][issue-1215]") {
+    auto versions = [](io::io_context::backend_type backend) {
+        SECTION("TLS 1.2") { exercise_handshake_progress_cancel(backend, tls::tls_version::tls_1_2); }
+        SECTION("TLS 1.3") { exercise_handshake_progress_cancel(backend, tls::tls_version::tls_1_3); }
+    };
+    SECTION("forced epoll") { versions(io::io_context::backend_type::epoll); }
+    SECTION("forced io_uring") {
+#if ELIO_HAS_IO_URING
+        if (!io::io_uring_backend::is_available()) SKIP("io_uring unavailable on this host");
+        versions(io::io_context::backend_type::io_uring);
+#else
+        SKIP("io_uring support is not compiled");
+#endif
+    }
 }
 
 TEST_CASE("TLS retry wait exception terminates the pending owner and deferred reader", "[tls][retry][issue-1215]") {

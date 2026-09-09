@@ -407,6 +407,13 @@ TEST_CASE("TLS 1.2 extreme finish deadlines saturate before cancellation",
             coro::cancel_source close_cancel;
             net::write_finish_result finished;
             std::atomic<bool> close_done{false};
+            std::atomic<int64_t> requested_timer_ns{0};
+            fixture.server->set_shutdown_timer_duration_test_hook(&requested_timer_ns,
+                [](void* context, std::chrono::steady_clock::duration interval) {
+                    static_cast<std::atomic<int64_t>*>(context)->store(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(interval).count(),
+                        std::memory_order_release);
+                });
             bool alert_observed = false;
             bool pending_before_cancel = false;
             fixture.run([&]() -> coro::task<void> {
@@ -424,7 +431,8 @@ TEST_CASE("TLS 1.2 extreme finish deadlines saturate before cancellation",
                     while (!close_done.load(std::memory_order_acquire) &&
                            !fixture.cancel.is_cancelled()) {
                         const auto state = fixture.server->shutdown_state_for_test();
-                        if ((state.ssl_shutdown_flags & SSL_SENT_SHUTDOWN) != 0) {
+                        if ((state.ssl_shutdown_flags & SSL_SENT_SHUTDOWN) != 0 &&
+                            requested_timer_ns.load(std::memory_order_acquire) > 0) {
                             alert_observed = true;
                             pending_before_cancel = !close_done.load(std::memory_order_acquire);
                             break;
@@ -437,6 +445,11 @@ TEST_CASE("TLS 1.2 extreme finish deadlines saturate before cancellation",
             });
             REQUIRE(alert_observed);
             REQUIRE(pending_before_cancel);
+            // The observer sees the actual interval passed to sleep_for. The
+            // old deadline-now interval is near the clock limit, not one hour.
+            REQUIRE(requested_timer_ns.load() > 0);
+            REQUIRE(requested_timer_ns.load() <=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::hours(1)).count());
             REQUIRE(finished.scope == net::close_scope::whole_session);
             REQUIRE(finished.error == ECANCELED);
             REQUIRE_FALSE(finished.peer_end_observed);

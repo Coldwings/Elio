@@ -105,6 +105,11 @@ public:
     void set_shutdown_timer_test_hook(void (*hook)()) noexcept {
         shutdown_timer_test_hook_ = hook;
     }
+    void set_shutdown_timer_duration_test_hook(
+        void* context, void (*hook)(void*, std::chrono::steady_clock::duration)) noexcept {
+        shutdown_timer_duration_context_ = context;
+        shutdown_timer_duration_hook_ = hook;
+    }
     detail::tls_finish_test_state finish_state_for_test() const {
         auto lock = lock_ssl_state();
         return {close_.write_closed, close_.peer_closed, close_.whole,
@@ -754,7 +759,8 @@ private:
                     ticket = std::make_shared<close_watchdog_ticket>(transport_);
                     watchdog.emplace(elio::spawn(close_watchdog(ticket, deadline, *cancel
 #ifdef ELIO_RUNTIME_TEST_HOOKS
-                        , shutdown_timer_test_hook_
+                        , shutdown_timer_test_hook_, shutdown_timer_duration_context_,
+                        shutdown_timer_duration_hook_
 #endif
                         )));
                     ticket.reset();
@@ -874,7 +880,8 @@ private:
         std::shared_ptr<close_watchdog_ticket> ticket,
         std::chrono::steady_clock::time_point deadline, coro::cancel_source cancel
 #ifdef ELIO_RUNTIME_TEST_HOOKS
-        , void (*timer_hook)()
+        , void (*timer_hook)(), void* duration_context,
+        void (*duration_hook)(void*, std::chrono::steady_clock::duration)
 #endif
     ) {
         ticket->entered.store(true, std::memory_order_release);
@@ -885,11 +892,22 @@ private:
 #ifdef ELIO_RUNTIME_TEST_HOOKS
             if (timer_hook) timer_hook();
 #endif
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline ||
-                co_await time::sleep_for(deadline - now, cancel.get_token()) ==
-                    coro::cancel_result::completed)
-                error = ETIMEDOUT;
+            for (;;) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) { error = ETIMEDOUT; break; }
+                // Relative timer registration samples its own later "now".
+                // Passing a near-clock-limit interval can overflow there even
+                // when our absolute deadline was saturated safely. Keep ample
+                // registration headroom without resetting the session budget.
+                const auto interval = std::min(deadline - now,
+                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                        std::chrono::hours(1)));
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (duration_hook) duration_hook(duration_context, interval);
+#endif
+                const auto waited = co_await time::sleep_for(interval, cancel.get_token());
+                if (waited == coro::cancel_result::cancelled) break;
+            }
         } catch (const std::bad_alloc&) { error = ENOMEM; }
         catch (...) { error = EIO; }
         if (error) {
@@ -1148,6 +1166,8 @@ private:
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     detail::tls_dispatch_test_hooks* dispatch_test_hooks_ = nullptr;
     void (*shutdown_timer_test_hook_)() = nullptr;
+    void* shutdown_timer_duration_context_ = nullptr;
+    void (*shutdown_timer_duration_hook_)(void*, std::chrono::steady_clock::duration) = nullptr;
 #endif
     SSL* ssl_ = nullptr;
     bool write_retry_exclusive_ = false;

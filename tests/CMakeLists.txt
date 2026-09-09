@@ -107,6 +107,7 @@ endif()
 if(TARGET elio_http AND TARGET elio_tls)
     add_library(elio_public_header_examples OBJECT
         compile/http_common_standalone.cpp
+        compile/http_streaming_migration.cpp
         compile/public_header_examples.cpp
     )
     target_link_libraries(elio_public_header_examples PRIVATE

@@ -42,6 +42,213 @@ lifetime. On shutdown, request `stop()`, await listeners, then drain sessions
 before destroying server/TLS state. Cancellation cannot forcibly destroy a
 noncooperative producer. See [[HTTP Streaming]] for the complete boundaries.
 
+### Framing Setters And Checked Lengths
+
+The examples below use `using namespace elio;` and `using namespace
+elio::http;`. Current-side counterparts, including the necessary headers,
+live in `tests/compile/http_streaming_migration.cpp`. Historical snippets
+explain the migration only; snippets using removed APIs are explicitly not
+compiled against the current library.
+
+Before: response body setters generated or replaced the length header. Code
+could accidentally depend on a body change repairing an old assertion:
+
+```cpp
+// Historical behavior; the calls still compile, but the assumption is obsolete.
+auto value = response::ok("old");
+value.set_header("Content-Length", "3");
+value.set_body(std::string_view("longer"));
+// Previously: the setter replaced Content-Length with 6.
+```
+
+After: remove an obsolete assertion deliberately and let preparation derive
+the new length. Alternatively, set a new truthful assertion yourself. With no
+manual assertion, `response::ok()` is an empty complete response and sends
+`Content-Length: 0`; it does not reserve a future streaming body.
+
+```cpp
+response changed_body() {
+    auto value = response::ok("old");
+    value.set_header("Content-Length", "3");
+    value.set_body(std::string_view("longer"));
+    value.get_headers().remove("Content-Length");
+    return value; // sending derives Content-Length: 6 without changing metadata
+}
+```
+
+Leaving the old `3` assertion in place makes ordinary `serialize()` throw
+`std::invalid_argument`. The same invalid reply fails server send preflight
+before final bytes; it is not silently repaired or sent as a second response.
+For explicit serialization, distinguish invalid input from allocation failure:
+
+```cpp
+bool stale_length_is_rejected() {
+    auto value = response::ok("old");
+    value.set_header("Content-Length", "3");
+    value.set_body(std::string_view("longer"));
+    try {
+        (void)value.serialize();
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+    return false;
+}
+```
+
+Before, a manual `Transfer-Encoding: chunked` could be mistaken for an encoder
+selection. It was not safe to attach that header to an ordinary body and then
+send unencoded payload. After, ordinary final preflight rejects manual TE;
+choose unknown-length production instead:
+
+```cpp
+streaming_response chunked_reply() {
+    return streaming_response(status::ok,
+        [data = std::string("hello")](body_writer& writer,
+            coro::cancel_token token) -> coro::task<send_result> {
+            co_return co_await writer.write(data, token);
+        }); // HTTP/1.1 selects chunked; HTTP/1.0 selects close delimiting
+}
+```
+
+### Received Headers Are Not Outgoing Encoder Instructions
+
+Before, directly reserializing an accumulated chunked response could preserve
+TE while writing its already-decoded payload without chunk framing. That was
+an unsafe forwarding idiom, not a wire-format guarantee:
+
+```cpp
+// Historical unsafe idiom; not a valid current chunked forwarding operation.
+auto received = response::from_parser(parser);
+auto wire = received.serialize();
+```
+
+After, require successful receive completion first. For a complete ordinary
+GET response whose body has already been transfer-decoded, explicitly remove
+received TE and the length assertion when choosing fresh complete-body framing:
+
+```cpp
+std::string serialize_decoded_body(response received) {
+    received.get_headers().remove("Transfer-Encoding");
+    received.get_headers().remove("Content-Length");
+    return received.serialize(); // derives CL from decoded complete body
+}
+```
+
+The by-value parameter leaves the original received response unchanged.
+Neither `from_parser()` nor `from_decoder()` performs this normalization
+implicitly, and `from_decoder()` expects an already-decoded body. Do not use
+this example for HEAD/304 representation metadata or protocol handoff. It is
+not a general proxy implementation: other hop-by-hop headers, content
+encoding, application policy and trust boundaries remain caller duties.
+
+### Replace Close Markers And Header-Only SSE
+
+Before (removed API; intentionally non-compiling with the current library):
+
+```text
+response headers(status::ok);
+headers.set_close_delimited();
+headers.set_header("Connection", "close");
+// Application separately sends headers and raw body bytes.
+```
+
+After, close delimiting belongs to an unknown-length streaming response. Do
+not supply CL or TE; the shared plan emits `Connection: close` and prevents
+reuse. Use automatic framing unless close delimiting is actually required:
+
+```cpp
+streaming_response close_delimited_reply() {
+    return streaming_response(status::ok,
+        [data = std::string("hello")](body_writer& writer,
+            coro::cancel_token token) -> coro::task<send_result> {
+            co_return co_await writer.write(data, token);
+        }, std::nullopt, response_transfer::close_delimited);
+}
+```
+
+Before (removed helper; intentionally non-compiling with the current library):
+
+```text
+auto headers = sse::build_sse_response();
+// Application separately drives a raw sse_connection after sending headers.
+```
+
+After, register an owned SSE producer as a normal HTTP route. Ordinary
+`task<response>` handlers still work through router adapters; only an explicitly
+named `handler_func` must now return `task<reply>`. There is no task covariance.
+
+```cpp
+void register_migrated_routes(router& routes) {
+    routes.get("/ordinary", [](context&) -> coro::task<response> {
+        co_return response::ok("ordinary");
+    });
+    handler_func selected = [](context&) -> coro::task<reply> {
+        co_return chunked_reply();
+    };
+    routes.get("/stream", std::move(selected));
+    routes.get("/events", [](context&) {
+        return sse::make_streaming_response(
+            [](sse::event_writer& writer, coro::cancel_token token) -> coro::task<send_result> {
+                const auto sent = co_await writer.send_data("hello", token);
+                if (!sent.success()) co_return sent;
+                co_return send_result{};
+            });
+    });
+}
+```
+
+The factory adds no CORS permission. Set any application-authorized CORS
+headers on the returned response before selection; never add raw socket
+writes alongside the managed SSE writer.
+
+### Borrowed Buffers And Failure Propagation
+
+Before, code directly managing a transport had to advance partial `iovec`
+progress itself; attempting that same remainder/replay loop around the new
+HTTP writer would mix two different completion contracts. Likewise, returning
+an ordinary error response after starting raw output cannot repair that output.
+
+After, a logical HTTP body write completes all submitted slices or fails.
+Keep both the buffers and descriptor storage alive until its await returns,
+including cancellation cleanup. Reuse them only after that boundary:
+
+```cpp
+coro::task<send_result> borrowed_write(body_writer& writer, coro::cancel_token token) {
+    std::string first = "hello ";
+    std::string second = "world";
+    const std::array<body_buffer, 2> parts{{
+        {first.data(), first.size()}, {second.data(), second.size()}}};
+    const auto sent = co_await writer.writev(std::span<const body_buffer>(parts), token);
+    if (!sent.success()) co_return sent;
+    first.assign("safe to reuse after the awaited operation and cleanup");
+    co_return sent;
+}
+```
+
+Pass the supplied token into source waits as well as writes. There is no
+public `finish()`: successful producer return delegates finalization to the
+server, which still checks the writer and declared length. A failed write
+stays terminal even if its result is ignored or a producer catches an
+allocation exception. A source error after headers must also be propagated:
+
+```cpp
+streaming_response failing_source() {
+    return streaming_response(status::ok,
+        [](body_writer& writer, coro::cancel_token token) -> coro::task<send_result> {
+            const auto sent = co_await writer.write("prefix", token);
+            if (!sent.success()) co_return sent;
+            // Simulates a source error discovered after final headers.
+            co_return send_result{send_errc::producer_error, EIO};
+        });
+}
+```
+
+This is an intentionally failing response, not a retry recipe: the prefix may
+already be visible, the normal chunk terminator is not deliberately emitted,
+and the connection is not reusable. Open/authorize sources before returning
+a streaming reply when failure should instead select an ordinary error status.
+See [[HTTP Streaming]] for the pre-/post-header recovery state table.
+
 Elio 0.6 changes coroutine ownership, cancellation, structured concurrency,
 worker-local I/O enforcement, and several runtime contracts. Review the items
 below when upgrading from 0.5.x.
@@ -209,9 +416,11 @@ closing the connection.
   immediately, including when the rejection response body arrives later or
   uses close delimiting. EOF processing is shared with ordinary responses.
 
-The outgoing producer/writer redesign in
-[#1191](https://github.com/Coldwings/Elio/issues/1191) is a separate pending phase;
-these receive changes do not change existing server serialization contracts.
+Receive-side migration and the implemented outgoing producer/writer are
+separate parts of [#1191](https://github.com/Coldwings/Elio/issues/1191). Apply
+the HTTP complete/streaming migration above as well: server serialization now
+uses shared framing preflight, and the old close marker/SSE header helper are
+removed.
 
 ### General Checklist
 

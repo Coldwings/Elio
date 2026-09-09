@@ -6,6 +6,7 @@ on:
       - 'include/**'
       - 'tests/**'
       - 'examples/sse_server.cpp'
+      - 'examples/http_streaming_server.cpp'
       - '**/CMakeLists.txt'
       - 'cmake/**'
       - 'wiki/HTTP-Streaming.md'
@@ -20,6 +21,7 @@ on:
       - 'include/**'
       - 'tests/**'
       - 'examples/sse_server.cpp'
+      - 'examples/http_streaming_server.cpp'
       - '**/CMakeLists.txt'
       - 'cmake/**'
       - 'wiki/HTTP-Streaming.md'
@@ -58,7 +60,7 @@ jobs:
             -DPython3_EXECUTABLE="$RUNNER_TEMP/http-peer-env/bin/python"
       - name: Compile peer and documented examples
         id: build
-        run: cmake --build build-http-peer --target elio_http_streaming_peer elio_http_streaming_cost_probe elio_http_streaming_transport_tests elio_public_header_examples sse_server --parallel 2
+        run: cmake --build build-http-peer --target elio_http_streaming_peer elio_http_streaming_cost_probe elio_http_streaming_transport_tests elio_public_header_examples sse_server http_streaming_server --parallel 2
       - name: Validate against h11
         id: peer
         run: |
@@ -66,6 +68,12 @@ jobs:
           "$RUNNER_TEMP/http-peer-env/bin/python" tests/integration/http_streaming_peer.py \
             --server build-http-peer/tests/elio_http_streaming_peer \
             > http-peer-results/result.json 2> http-peer-results/runtime.log
+      - name: Run canonical streaming example
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          "$RUNNER_TEMP/http-peer-env/bin/python" tests/integration/http_streaming_example.py \
+            --server build-http-peer/examples/http_streaming_server \
+            --output-dir http-peer-results/canonical-example
       - name: Measure scoped HTTP allocation and borrowing invariants
         if: always() && steps.build.outcome == 'success'
         id: cost
@@ -107,6 +115,17 @@ jobs:
                   lines.append(f"| {row['scenario']} | {row['status']} | {row['body_bytes']} |")
           else:
               lines.append('No successful scenario report; inspect failed steps and retained logs.')
+          canonical = Path('http-peer-results/canonical-example/result.json')
+          lines += ['', '### Canonical streaming example', '']
+          if canonical.exists():
+              example = json.loads(canonical.read_text())
+              lines += ['| Scenario | Result |', '| --- | --- |']
+              for row in example['scenarios']:
+                  lines.append(f"| {row['scenario']} | {'passed' if row['passed'] else 'failed'} |")
+              if not example['success']:
+                  lines.append('Example failed; inspect retained result and process logs.')
+          else:
+              lines.append('Not run or no completed report; not a passing example.')
           lines += ['', '### HTTP-layer allocation probe', '',
                     'Controlled discard sink, no network. Prepared payload storage and malloc-family bypasses are excluded.',
                     'Cumulative C++ allocation requests are not peak memory, transport throughput, or end-to-end copy totals.', '',

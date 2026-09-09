@@ -76,6 +76,21 @@ waits for transport and watchdog cleanup. It is not a hard upper bound on return
 time. Coroutine-frame allocation can throw before returning a task; the writer
 still becomes terminal, even if the producer catches that exception.
 
+### Selection, Failure And Recovery
+
+| Stage / event | Server behavior | Application responsibility |
+| --- | --- | --- |
+| Handler has not selected a final reply | A standard exception invokes the configured error handler, or selects 500; a failing error handler or non-standard exception selects 500. | Open/validate sources and choose recoverable application errors here. Previously sent interim responses do not constitute a final response. |
+| A reply is selected but preflight rejects its framing | No final response bytes are emitted; the connection closes without selecting a replacement reply. | Supply coherent metadata. Preflight rejection is not a request to retry or call the error handler. |
+| Final headers are being sent | The final selection is sealed; write failure terminates the response and disables reuse. | Do not send another final status or an interim response through the sealed context. |
+| Producer runs after final headers | Successful logical writes complete their submitted bytes; a producer exception/error or terminal write failure ends the response. | Keep borrowed storage alive through awaited cleanup, propagate failure and do not replay the response. A local exception catch cannot revive a failed writer. |
+| Producer returns successfully and writer has not failed | The server verifies the declared length and completes the selected framing. A previously failed writer remains terminal even if its result was ignored. | Do not call a competing finish operation or assume producer return alone proves response success. |
+| Timeout/cancellation wins while I/O is in flight | Further submission stops; the server waits for cleanup before releasing borrowed state. Partial or even complete peer receipt remains possible. | Reuse buffers only after the awaited operation returns; handle business-level retry/idempotency separately. |
+
+The error-handler fallback belongs to handler execution, not to every later
+failure. In particular, neither preflight failure nor producer failure appends
+a replacement 500 response. Destruction does not finish a response implicitly.
+
 ## Sending Costs And Shutdown Boundaries
 
 The HTTP writer uses bounded iovec cursors and small chunk metadata, not a
@@ -280,6 +295,38 @@ does not promise application-level atomicity or infer that a 4xx/5xx status is
 application success.
 
 ## Validation Map
+
+### Canonical Sending Example
+
+Build `http_streaming_server` with HTTP/TLS examples enabled and run it with a
+configured regular file:
+
+```sh
+./build/examples/http_streaming_server --port 8080 --file ./sample.bin
+```
+
+It binds only to loopback; the request URL cannot select a filesystem path.
+Open/type/size validation precedes reply selection, while file reads use a
+64 KiB borrowed buffer on the blocking pool. Keep the source contents stable
+during a response: a measured file length is not an immutable file snapshot.
+Shrinking the file can fail the producer after headers have started.
+
+| Request | Demonstrated contract |
+| --- | --- |
+| `GET /empty` | Complete empty response with truthful length |
+| `GET /file` | Known-length file producer with bounded storage and awaited backpressure |
+| `HEAD /file` | Same representation length, no producer invocation or body read |
+| `GET /file-invocations` | Observable count for checking HEAD suppression |
+| `GET /failure` | Prefix followed by producer failure; no successful chunk terminator or replacement response |
+| `GET /cancel`, followed by SIGINT/SIGTERM | Token-aware producer and signal-driven listener/session drain |
+
+`http_streaming_example.py` runs these behaviors with a generated file and
+retained process logs in the focused CI workflow. Migration snippets have their
+own compiler-checked current-side translation unit,
+`tests/compile/http_streaming_migration.cpp`. The managed SSE example is
+`examples/sse_server.cpp`; its event sink uses the same writer lifecycle.
+
+### Evidence By Surface
 
 Sending and receiving have separate evidence. A passed plain-loopback peer test
 does not establish TLS, backend, sanitizer, or throughput coverage.

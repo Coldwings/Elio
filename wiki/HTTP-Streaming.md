@@ -385,3 +385,57 @@ results must still be checked for the current PR head before merging.
 
 See [[API Contracts]], [[API Reference]], [[WebSocket SSE]], and
 [[Migrating to 0.6]] for related contracts and migration instructions.
+
+## Real TCP/TLS Diagnostics
+
+The opt-in `ELIO_BUILD_HTTP_METRICS` fixture reports six sequential coordinates:
+TCP and TLS, each with complete, known-length streaming and chunked responses.
+The `transport-metrics` job builds it in Release mode and publishes a readable
+table with raw JSON and process logs. These are diagnostic observations with
+`performance_eligible=false`, not rankings or a shared-runner regression gate.
+
+Each coordinate uses a separate Elio server process and pinned h11 0.16.0
+client. One connection carries an excluded warmup, sixteen verified 4 MiB
+responses, then a small ordinary response proving the last measured response
+left a reusable boundary. Streaming modes submit sequential borrowed 64 KiB
+slices; complete responses submit an owned body. These different submission
+shapes are part of the workload, not an assertion that the modes are equivalent
+implementations or that one is faster.
+
+Reported throughput is **verified loopback pipeline throughput**: decoded body
+bytes divided by client monotonic elapsed time from the first measured request
+through final message validation. Requests, socket transfers, TLS, h11 parsing
+and incremental integrity verification are included. The client can be the
+bottleneck; this does not measure isolated server capacity. Startup, certificate
+generation, connection/handshake, warmup and the final reuse probe are excluded.
+
+Server CPU is the sum of process CPU intervals around measured `send_response`
+calls, including server process activity during those intervals. Prepared body
+storage and response setup are outside those windows. Client CPU uses the
+separate client process over its measured interval and includes parsing,
+decryption and verification. CPU scopes differ from the wall-clock scope and
+must not be interpreted as a common utilization denominator.
+
+Wire trial identifiers, sequence numbers, framing, body length/digest, sender
+completion and final connection reuse are checked before a coordinate passes.
+Missing, duplicate or mismatched evidence is incomplete, not a successful row.
+The reports retain build and transport metadata; shared-runner state and peer
+verification costs remain limitations. The controlled-sink allocation probe
+above is a separate measurement: it does not provide TCP/TLS allocation totals,
+and these transport timings do not prove end-to-end zero-copy.
+
+For a local run, configure an out-of-source Release build with tests, HTTP and
+TLS enabled and `-DELIO_BUILD_HTTP_METRICS=ON`. Install `h11==0.16.0` into an
+isolated Python environment and select it through `Python3_EXECUTABLE`. Build
+`elio_http_streaming_metrics_server`, run the
+`http_streaming_metrics_report_tests` CTest, then invoke:
+
+```sh
+python tests/integration/http_streaming_metrics.py \
+  --server /path/to/build/tests/elio_http_streaming_metrics_server \
+  --output-dir /path/to/results
+```
+
+The driver requires the OpenSSL command-line tool for a local test certificate.
+It uses bounded deadlines and preserves failure evidence. No throughput number
+or small timing fluctuation determines conformance success.

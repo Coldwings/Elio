@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HTTP transport diagnostics**: optional TCP/TLS complete, known-length and
+  chunked loopback measurements with independent h11 body verification,
+  separately scoped server/client CPU, attributable evidence and readable CI
+  summaries. Shared-runner timings are diagnostic, not rankings or performance
+  gates (#1200).
+
 - **Owned HTTP/SSE streaming replies**: metadata-only `response_head`, move-only
   `streaming_response`/`reply`, server-scoped borrowed `body_writer`, and a shared
   framing/send executor. Logical writes handle partial progress internally,

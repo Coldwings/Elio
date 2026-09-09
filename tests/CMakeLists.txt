@@ -137,6 +137,37 @@ if(ELIO_BUILD_HTTP_INTEROP_TESTS)
     set_tests_properties(http_streaming_interop PROPERTIES TIMEOUT 90)
 endif()
 
+option(ELIO_BUILD_HTTP_METRICS "Build real HTTP TCP/TLS diagnostic fixture (requires h11==0.16.0)" OFF)
+if(ELIO_BUILD_HTTP_METRICS)
+    if(NOT TARGET elio_http OR NOT TARGET elio_tls)
+        message(FATAL_ERROR "HTTP metrics require HTTP and TLS targets")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_executable(elio_http_streaming_metrics_server integration/http_streaming_metrics_server.cpp)
+    target_link_libraries(elio_http_streaming_metrics_server PRIVATE elio_http elio_tls)
+    execute_process(COMMAND git rev-parse HEAD WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        OUTPUT_VARIABLE ELIO_HTTP_METRICS_HEAD OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE ELIO_HTTP_METRICS_HEAD_RESULT ERROR_QUIET)
+    if(NOT ELIO_HTTP_METRICS_HEAD_RESULT EQUAL 0)
+        set(ELIO_HTTP_METRICS_HEAD "unknown")
+    endif()
+    execute_process(COMMAND git status --porcelain WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        OUTPUT_VARIABLE ELIO_HTTP_METRICS_STATUS OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE ELIO_HTTP_METRICS_STATUS_RESULT ERROR_QUIET)
+    if(ELIO_HTTP_METRICS_STATUS_RESULT EQUAL 0 AND ELIO_HTTP_METRICS_STATUS STREQUAL "")
+        set(ELIO_HTTP_METRICS_DIRTY "false")
+    else()
+        set(ELIO_HTTP_METRICS_DIRTY "true")
+    endif()
+    target_compile_definitions(elio_http_streaming_metrics_server PRIVATE
+        ELIO_HTTP_METRICS_BUILD_TYPE="$<CONFIG>"
+        ELIO_HTTP_METRICS_BUILD_HEAD="${ELIO_HTTP_METRICS_HEAD}"
+        ELIO_HTTP_METRICS_BUILD_DIRTY=${ELIO_HTTP_METRICS_DIRTY})
+    add_test(NAME http_streaming_metrics_report_tests
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/test_http_streaming_metrics.py)
+    set_tests_properties(http_streaming_metrics_report_tests PROPERTIES TIMEOUT 30)
+endif()
+
 # RDMA abstraction tests (only when ELIO_ENABLE_RDMA=ON).
 # Header-only; no extra libraries required for the dispatcher / op_state
 # slice — the mock backend (S3+) and any real ibverbs backend are

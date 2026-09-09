@@ -14,6 +14,7 @@ on:
       - 'wiki/API-Reference.md'
       - 'wiki/Migrating-to-0.6.md'
       - 'wiki/WebSocket-SSE.md'
+      - 'wiki/HTTP2-Guide.md'
       - '.github/workflows/http-streaming.yml'
   push:
     branches: [main]
@@ -29,6 +30,7 @@ on:
       - 'wiki/API-Reference.md'
       - 'wiki/Migrating-to-0.6.md'
       - 'wiki/WebSocket-SSE.md'
+      - 'wiki/HTTP2-Guide.md'
       - '.github/workflows/http-streaming.yml'
   workflow_dispatch:
 
@@ -74,6 +76,13 @@ jobs:
           "$RUNNER_TEMP/http-peer-env/bin/python" tests/integration/http_streaming_example.py \
             --server build-http-peer/examples/http_streaming_server \
             --output-dir http-peer-results/canonical-example
+      - name: Run actual SSE example and graceful stop
+        if: always() && steps.build.outcome == 'success'
+        id: sse
+        run: |
+          "$RUNNER_TEMP/http-peer-env/bin/python" tests/integration/sse_example_smoke.py \
+            --server build-http-peer/examples/sse_server \
+            --output-dir http-peer-results/sse-example
       - name: Measure scoped HTTP allocation and borrowing invariants
         if: always() && steps.build.outcome == 'success'
         id: cost
@@ -98,6 +107,7 @@ jobs:
         env:
           PEER_OUTCOME: ${{ steps.peer.outcome }}
           COST_OUTCOME: ${{ steps.cost.outcome }}
+          SSE_OUTCOME: ${{ steps.sse.outcome }}
         run: |
           python3 - <<'PY'
           import json, os
@@ -126,6 +136,19 @@ jobs:
                   lines.append('Example failed; inspect retained result and process logs.')
           else:
               lines.append('Not run or no completed report; not a passing example.')
+          lines += ['', '### Actual SSE demo smoke', '',
+                    'Runs examples/sse_server.cpp, not the finite SSE peer fixture.',
+                    f"Demo step: {os.environ['SSE_OUTCOME'] or 'not run'}", '']
+          sse = Path('http-peer-results/sse-example/result.json')
+          if sse.exists():
+              example = json.loads(sse.read_text())
+              lines += ['| Scenario | Result |', '| --- | --- |']
+              for row in example['scenarios']:
+                  lines.append(f"| {row['scenario']} | {'passed' if row['passed'] else 'failed'} |")
+              if not example['success']:
+                  lines.append('SSE demo failed; inspect retained result and process logs.')
+          else:
+              lines.append('Not run or no completed report; not a passing SSE demo.')
           lines += ['', '### HTTP-layer allocation probe', '',
                     'Controlled discard sink, no network. Prepared payload storage and malloc-family bypasses are excluded.',
                     'Cumulative C++ allocation requests are not peak memory, transport throughput, or end-to-end copy totals.', '',

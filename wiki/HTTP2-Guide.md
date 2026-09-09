@@ -2,6 +2,14 @@
 
 Elio provides full HTTP/2 client support via the nghttp2 library. This guide covers HTTP/2 usage, configuration, and best practices.
 
+The server-owned `streaming_response` / `body_writer` APIs described in
+[HTTP Streaming](HTTP-Streaming.md) are HTTP/1 server APIs; they do not add an
+HTTP/2 server or an HTTP/2 streaming-upload API. Their chunked and close-delimited
+transfer policies are HTTP/1 wire framing, not HTTP/2 DATA-frame or flow-control
+settings. HTTP/2 framing remains managed by nghttp2 through the HTTP/2 client
+interfaces below. Shared response metadata and complete-body types do not make
+HTTP/1 transfer policy portable across protocols.
+
 ## Overview
 
 HTTP/2 offers several advantages over HTTP/1.1:

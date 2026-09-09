@@ -154,9 +154,19 @@ responsibility.
 
 - The first Copilot review is automatically triggered when a PR is opened; do
   not immediately comment just to request the first review.
-- If a PR is updated and a new Copilot review is needed, comment with
-  `@copilot` and explicitly ask for review only, not direct code changes.
-- Do not use `@copilot-pull-request-reviewer`.
+- Request Copilot re-review through the PR's Reviewers control or the review
+  request API, not an issue/review comment mentioning `@copilot`. Such mentions
+  invoke the coding agent and can produce commits even when the text asks for
+  review only. Do not use an `@copilot-pull-request-reviewer` comment either.
+- With `gh`, use `gh api --method POST
+  repos/Coldwings/Elio/pulls/<number>/requested_reviewers
+  -f 'reviewers[]=copilot-pull-request-reviewer[bot]'`.
+  Verify a new review-request/work-start event or current-head review; an HTTP
+  success response alone is not proof that review started. The REST response
+  may omit the bot from `requested_reviewers` even after accepting the request.
+- Keep replies to review findings as ordinary explanatory comments. Re-request
+  review separately through the reviewer mechanism, and require the resulting
+  review to cover the current PR head before treating it as a merge verdict.
 - If Copilot is unavailable or over quota, use independent read-only agent
   review instead. Post the useful review findings as normal GitHub PR comments.
 - Review comments posted to GitHub should focus on actionable code, contract,

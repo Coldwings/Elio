@@ -138,6 +138,33 @@ public:
         return write(data.data(), data.size(), std::move(token));
     }
 
+    /// Borrowed scatter/gather write; positive progress may be partial.
+    /// TLS uses a scalar borrowed-slice fallback without concatenation.
+    coro::task<io::io_result> writev(struct iovec* parts, size_t count) {
+        if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
+            co_return co_await tcp->writev(parts, count);
+        }
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+            co_return co_await tls->writev(parts, count);
+        }
+#endif
+        co_return io::io_result{-ENOTCONN, 0};
+    }
+
+    coro::task<io::io_result> writev(struct iovec* parts, size_t count,
+                                    coro::cancel_token token) {
+        if (auto* tcp = std::get_if<tcp_stream>(&stream_)) {
+            co_return co_await tcp->writev(parts, count, token);
+        }
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_)) {
+            co_return co_await tls->writev(parts, count, token);
+        }
+#endif
+        co_return io::io_result{-ENOTCONN, 0};
+    }
+
     /// Read exactly ``length`` bytes into ``buffer``.
     ///
     /// Loops over partial reads until ``length`` bytes have been stored, a

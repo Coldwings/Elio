@@ -46,6 +46,13 @@ elio::coro::task<bool> forward_body(
     }
 }
 
+coro::task<io::io_result> borrowed_vector_write(
+    net::stream& stream, struct iovec* parts, size_t count,
+    coro::cancel_token token) {
+    auto progress = co_await stream.writev(parts, count, token);
+    co_return progress;
+}
+
 coro::task<int> compute() {
     co_return 42;
 }

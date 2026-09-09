@@ -102,7 +102,7 @@ struct order_fixture {
     }
 };
 
-void order_case(backend_type backend) {
+void order_case(backend_type backend, bool expire_immediately) {
     order_fixture f(backend);
     REQUIRE(order_certificate(f.context));
     std::array<int, 2> sockets{-1, -1};
@@ -114,7 +114,9 @@ void order_case(backend_type backend) {
     const timeval socket_timeout{15, 0};
     REQUIRE(::setsockopt(f.peer_fd, SOL_SOCKET, SO_RCVTIMEO, &socket_timeout, sizeof(socket_timeout)) == 0);
     REQUIRE(::setsockopt(f.peer_fd, SOL_SOCKET, SO_SNDTIMEO, &socket_timeout, sizeof(socket_timeout)) == 0);
-    f.server.emplace(std::move(server_socket), f.context);
+    tls::tls_stream_options options;
+    if (expire_immediately) options.session_close_timeout = std::chrono::milliseconds(0);
+    f.server.emplace(std::move(server_socket), f.context, options);
     f.peer_context.reset(SSL_CTX_new(TLS_client_method()));
     REQUIRE(f.peer_context);
     REQUIRE(SSL_CTX_set_min_proto_version(f.peer_context.get(), TLS1_2_VERSION) == 1);
@@ -150,9 +152,11 @@ void order_case(backend_type backend) {
     if (allocated && writer_parked) {
         close_sent = SSL_shutdown(f.peer.get());
         f.scheduler.go(f.read());
-        alert_queued = order_wait([&] {
-            return (f.server->shutdown_state_for_test().ssl_shutdown_flags & SSL_SENT_SHUTDOWN) != 0;
-        });
+        if (!expire_immediately) {
+            alert_queued = order_wait([&] {
+                return (f.server->shutdown_state_for_test().ssl_shutdown_flags & SSL_SENT_SHUTDOWN) != 0;
+            });
+        }
         if (alert_queued) {
             std::array<char, 16384> bytes{};
             // At most one payload and one close alert; extra bytes fail too.
@@ -173,9 +177,19 @@ void order_case(backend_type backend) {
     REQUIRE(writer_parked);
     CHECK(committed.accepted_ciphertext > committed.drained_ciphertext);
     REQUIRE(close_sent == 0);
-    REQUIRE(alert_queued);
     REQUIRE(completed);
     CHECK_FALSE(f.threw.load(std::memory_order_acquire));
+    if (expire_immediately) {
+        // Do not read the raw peer after abort or infer delivery from a socket
+        // prefix. Expiry must settle both operations without emitting an alert.
+        CHECK(f.written.result == -ETIMEDOUT);
+        CHECK(f.read_result.result == -ETIMEDOUT);
+        CHECK(state.transport_error == ETIMEDOUT);
+        CHECK((state.ssl_shutdown_flags & SSL_SENT_SHUTDOWN) == 0);
+        CHECK_FALSE(state.pump_active);
+        return;
+    }
+    REQUIRE(alert_queued);
     CHECK(received == f.payload);
     CHECK(final_error == SSL_ERROR_ZERO_RETURN);
     CHECK(f.written.result == 16384);
@@ -187,11 +201,15 @@ void order_case(backend_type backend) {
 
 TEST_CASE("TLS 1.2 peer closure preserves committed ciphertext before its alert",
           "[tls][finish][order][issue-1217]") {
-    SECTION("epoll") { order_case(backend_type::epoll); }
+    SECTION("epoll") {
+        SECTION("committed prefix drains") { order_case(backend_type::epoll, false); }
+        SECTION("automatic close immediately expires") { order_case(backend_type::epoll, true); }
+    }
     SECTION("io_uring") {
 #if ELIO_HAS_IO_URING
         if (!io::io_uring_backend::is_available()) SKIP("io_uring unavailable on this host");
-        order_case(backend_type::io_uring);
+        SECTION("committed prefix drains") { order_case(backend_type::io_uring, false); }
+        SECTION("automatic close immediately expires") { order_case(backend_type::io_uring, true); }
 #else
         SKIP("io_uring support is not compiled");
 #endif

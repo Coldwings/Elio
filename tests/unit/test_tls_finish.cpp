@@ -2,6 +2,7 @@
 
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS && defined(ELIO_RUNTIME_TEST_HOOKS)
 #include <elio/tls/tls_stream.hpp>
+#include <elio/net/stream.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/sync/event.hpp>
 #include <openssl/evp.h>
@@ -54,8 +55,15 @@ bool finish_certificate(tls::tls_context& context) {
         SSL_CTX_use_PrivateKey(context.native_handle(), key.get()) == 1;
 }
 
-struct finish_fixture {
+struct finish_backend_guard {
     backend_type previous;
+    explicit finish_backend_guard(backend_type backend)
+        : previous(runtime::detail::worker_io_backend_for_test.exchange(backend)) {}
+    ~finish_backend_guard() { runtime::detail::worker_io_backend_for_test.store(previous); }
+};
+
+struct finish_fixture {
+    finish_backend_guard backend_guard;
     tls::tls_context server_context;
     tls::tls_context client_context;
     std::optional<tls::tls_stream> server;
@@ -65,7 +73,7 @@ struct finish_fixture {
 
     finish_fixture(backend_type backend, tls::tls_version version,
                    size_t server_budget = 1024 * 1024)
-        : previous(runtime::detail::worker_io_backend_for_test.exchange(backend))
+        : backend_guard(backend)
         , server_context(tls::tls_mode::server, version)
         , client_context(tls::tls_mode::client, version) {
         REQUIRE(finish_certificate(server_context));
@@ -99,7 +107,6 @@ struct finish_fixture {
     ~finish_fixture() {
         abort();
         if (!scheduler.shutdown(test::scaled_ms(15000))) std::terminate();
-        runtime::detail::worker_io_backend_for_test.store(previous);
     }
 
     void abort() {
@@ -294,19 +301,23 @@ TEST_CASE("TLS 1.2 write finish reports a withheld peer close timeout",
     });
 }
 
-TEST_CASE("TLS write finish contains close alert allocation failure",
+TEST_CASE("TLS write finish contains close alert resource failure",
           "[tls][finish][failure][issue-1217]") {
     finish_backends([](backend_type backend) {
         finish_versions([&](tls::tls_version version) {
-            finish_fixture fixture(backend, version, 0);
+            int expected_error = ENOBUFS;
+            SECTION("payload budget exhausted") { expected_error = ENOBUFS; }
+            SECTION("payload allocation fails") { expected_error = ENOMEM; }
+            finish_fixture fixture(backend, version, expected_error == ENOBUFS ? 0 : 1024 * 1024);
             fixture.server->set_output_test_hooks({nullptr,
-                +[](void*, int, const void*, size_t, int) -> ssize_t { errno = EAGAIN; return -1; }, nullptr});
+                +[](void*, int, const void*, size_t, int) -> ssize_t { errno = EAGAIN; return -1; },
+                expected_error == ENOMEM ? +[](void*, bool payload) { if (payload) throw std::bad_alloc(); } : nullptr});
             net::write_finish_result finished;
             fixture.run([&]() -> coro::task<void> {
                 finished = co_await fixture.server->finish_write();
             });
             fixture.server->set_output_test_hooks({});
-            REQUIRE(finished.error == ENOBUFS);
+            REQUIRE(finished.error == expected_error);
             REQUIRE_FALSE(finished.local_end_flushed);
             REQUIRE_FALSE(fixture.server->shutdown_state_for_test().pump_active);
         });
@@ -427,6 +438,31 @@ TEST_CASE("TLS 1.2 close cancellation settles an independently tokened reader",
         REQUIRE(read_result.result == -ECANCELED);
         REQUIRE_FALSE(fixture.cancel.is_cancelled());
         REQUIRE_FALSE(fixture.server->shutdown_state_for_test().pump_active);
+    });
+}
+
+TEST_CASE("TLS-backed common stream forwards directional finish and reverse reads",
+          "[tls][finish][net][issue-1217]") {
+    finish_backends([](backend_type backend) {
+        finish_fixture fixture(backend, tls::tls_version::tls_1_3);
+        net::stream wrapped(std::move(*fixture.server));
+        net::write_finish_result finished;
+        std::array<io::io_result, 3> results{};
+        char byte = 0;
+        fixture.run([&]() -> coro::task<void> {
+            finished = co_await wrapped.finish_write(fixture.cancel.get_token(), std::chrono::milliseconds(0));
+            char peer_byte = 0;
+            results[0] = co_await fixture.client->read(&peer_byte, 1, fixture.cancel.get_token());
+            results[1] = co_await fixture.client->write("w", 1, fixture.cancel.get_token());
+            results[2] = co_await wrapped.read(&byte, 1, fixture.cancel.get_token());
+        });
+        REQUIRE(finished.scope == net::close_scope::write_direction);
+        REQUIRE(finished.error == 0);
+        REQUIRE(finished.local_end_flushed);
+        REQUIRE(results[0].result == 0);
+        REQUIRE(results[1].result == 1);
+        REQUIRE(results[2].result == 1);
+        REQUIRE(byte == 'w');
     });
 }
 #endif

@@ -287,7 +287,9 @@ Bind an `ibv_comp_channel` fd to your scheduler's io_context:
 elio::rdma::dispatcher disp;
 elio::coro::cancel_source pump_stop;
 
-scheduler.go([&]() -> elio::coro::task<void> {
+// go_joinable returns a coro::join_handle<void> so teardown can wait
+// for the pump task (plain scheduler.go(...) returns void).
+auto pump = scheduler.go_joinable([&]() -> elio::coro::task<void> {
     co_await elio::rdma::cq_pump(
         comp_channel->fd, disp,
         [&](elio::rdma::dispatcher& d) noexcept {
@@ -309,9 +311,21 @@ pump_stop.cancel();
 ```
 
 Cancellation also aborts an in-flight poll — no synthetic wake byte or
-other fd wakeup is needed. Afterwards, join/await the pump task before
-tearing down, and keep the completion-channel fd and the dispatcher
-alive until the pump task has completed.
+other fd wakeup is needed. Then wait for the pump task to finish before
+tearing down, keeping the completion-channel fd and the dispatcher alive
+until it completes:
+
+```cpp
+// From a coroutine:
+co_await pump;
+// From a plain thread (e.g. main):
+pump.wait_destroyed();
+```
+
+If the pump was launched fire-and-forget with `scheduler.go(...)` instead,
+`scheduler::shutdown()` waits for already-accepted tasks to drain — but
+cancel the loop first, since shutdown alone does not stop a long-running
+pump.
 
 ### Manual: drive dispatcher.deliver directly
 

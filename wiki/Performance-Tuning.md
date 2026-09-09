@@ -149,8 +149,15 @@ scheduler sched(4, custom);
 | Strategy | CPU Usage | Wake Latency | Use Case |
 |----------|-----------|--------------|----------|
 | `blocking()` | Lowest | ~1-10 μs | General workloads (default) |
-| `hybrid(N)` | Low-Medium | ~1-5 μs | Latency-sensitive with mixed load |
-| `spinning(N)` / `aggressive(N)` | Medium-High | ~100-1000 ns | Low latency; identical for equal N |
+| `hybrid(N)` | Scales with N | Scales with N | Latency-sensitive with mixed load |
+| `spinning(N)` / `aggressive(N)` | Scales with N | Scales with N | Low latency; identical for equal N |
+
+The CPU/latency characteristics of the parameterized presets are not fixed
+properties: `N == 0` degenerates to `blocking()` (the worker goes straight
+to the blocking poll), and larger N spends progressively longer spinning
+before blocking. The actual trade-off depends on N, the workload, and the
+I/O backend, so measure with your own N rather than relying on generic
+numbers.
 
 `spinning(N)` and `aggressive(N)` both return `{N, false}` (N spin iterations
 with the CPU pause instruction), so they are exactly equivalent for equal N.

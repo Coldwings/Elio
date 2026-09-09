@@ -337,7 +337,12 @@ inline response build_sse_response() {
     response resp(status::ok);
     resp.set_header("Content-Type", SSE_CONTENT_TYPE);
     resp.set_header("Cache-Control", "no-cache");
-    resp.set_header("Connection", "keep-alive");
+    resp.set_header("Connection", "close");
+    // SSE events stream until connection close, so the response must opt
+    // out of the automatic Content-Length: 0 pin and declare honest
+    // close-delimited framing (RFC 9112 §6.3 item 8); keep-alive reuse of
+    // the connection is impossible.
+    resp.set_close_delimited();
     // Allow CORS for EventSource from any origin
     resp.set_header("Access-Control-Allow-Origin", "*");
     return resp;

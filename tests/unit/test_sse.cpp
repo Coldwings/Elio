@@ -639,8 +639,40 @@ TEST_CASE("SSE response building", "[sse][response]") {
         REQUIRE(resp.get_status() == elio::http::status::ok);
         REQUIRE(resp.header("Content-Type") == SSE_CONTENT_TYPE);
         REQUIRE(resp.header("Cache-Control") == "no-cache");
-        REQUIRE(resp.header("Connection") == "keep-alive");
+        // The event stream ends at connection close, so keep-alive is
+        // impossible and the header must say so honestly.
+        REQUIRE(resp.header("Connection") == "close");
         REQUIRE(resp.header("Access-Control-Allow-Origin") == "*");
+        REQUIRE(resp.close_delimited());
+    }
+    
+    SECTION("build_sse_response wire is close-delimited and streams events") {
+        auto resp = build_sse_response();
+        auto wire = resp.serialize();
+        
+        // No framing headers: the body is delimited by connection close
+        // (RFC 9112 §6.3 item 8). Regression test for #1177: the #1158
+        // empty-body Content-Length: 0 pin silently truncated SSE streams.
+        REQUIRE(wire.find("Content-Length") == std::string::npos);
+        REQUIRE(wire.find("Transfer-Encoding") == std::string::npos);
+        
+        auto event_bytes = serialize_event(event::message("hello"));
+        
+        elio::http::response_parser parser;
+        auto [r1, c1] = parser.parse(wire + event_bytes);
+        REQUIRE(r1 == elio::http::parse_result::need_more);
+        REQUIRE(c1 == wire.size() + event_bytes.size());
+        REQUIRE(parser.is_close_delimited());
+        REQUIRE_FALSE(parser.is_complete());
+        // The event bytes land in the body instead of trailing a
+        // zero-length pinned response.
+        REQUIRE(parser.body() == event_bytes);
+        
+        auto [r2, c2] = parser.finish_eof();
+        REQUIRE(r2 == elio::http::parse_result::complete);
+        REQUIRE(c2 == 0);
+        REQUIRE(parser.is_complete());
+        REQUIRE(parser.body() == event_bytes);
     }
 }
 

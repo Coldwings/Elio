@@ -240,7 +240,21 @@ public:
     
     /// Set content type
     void set_content_type(std::string_view type) { headers_.set_content_type(type); }
-    
+
+    /// Opt in/out of close-delimited body framing (RFC 9112 §6.3 item 8).
+    /// When enabled, serialize() emits no framing headers for this response:
+    /// the automatic `Content-Length: 0` pin for an empty body is skipped and
+    /// no `Transfer-Encoding` is injected, so the body runs until connection
+    /// close and keep-alive reuse of the connection is impossible. Intended
+    /// for streaming responses such as SSE. Pair it with an explicit
+    /// `Connection: close` header (via set_header) so the peer knows the
+    /// connection will not be reused; serialize() deliberately never writes
+    /// the Connection header itself. The marker does not override the
+    /// framing rules of body-forbidden statuses (1xx/204/304/205) or 2xx
+    /// responses to CONNECT.
+    void set_close_delimited(bool v = true) noexcept { close_delimited_ = v; }
+    bool close_delimited() const noexcept { return close_delimited_; }
+
     /// Check if response indicates success (2xx)
     bool is_success() const noexcept {
         auto code = static_cast<uint16_t>(status_);
@@ -325,7 +339,8 @@ private:
             } else {
                 serialized_headers.remove("Content-Length");
             }
-        } else if (body_.empty() &&
+        } else if (!close_delimited_ &&
+                   body_.empty() &&
                    !serialized_headers.contains("Content-Length") &&
                    !serialized_headers.contains("Transfer-Encoding")) {
             // A body-allowed response with no body and no explicit framing
@@ -335,6 +350,9 @@ private:
             // responses also carry Content-Length: 0. A user-set
             // Content-Length is kept verbatim and a user-set
             // Transfer-Encoding is never combined with Content-Length.
+            // Responses that opted into close-delimited framing
+            // (set_close_delimited) skip the pin: their body is delimited
+            // by connection close (RFC 9112 §6.3 item 8).
             serialized_headers.set_content_length(0);
         }
         result += serialized_headers.serialize();
@@ -406,6 +424,7 @@ private:
     std::string version_ = "HTTP/1.1";
     headers headers_;
     std::string body_;
+    bool close_delimited_ = false;
 };
 
 } // namespace elio::http

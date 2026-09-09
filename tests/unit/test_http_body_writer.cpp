@@ -261,6 +261,42 @@ TEST_CASE("body writer completed write is not retroactively cancelled", "[http][
 }
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
+TEST_CASE("body writer completed write is not retroactively timed out", "[http][body_writer]") {
+    controlled_body_stream stream;
+    std::function<void()> expire;
+    {
+        auto writer = http::detail::body_writer_access::create(stream, body_plan(6));
+        open_writer(writer, stream);
+        stream.max_progress = 1;
+        http::detail::capture_next_body_write_timeout_for_test(expire);
+        const auto result = run_body_operation(writer.write("abc"));
+        REQUIRE(result.success());
+        REQUIRE(result.confirmed_body_bytes == 3);
+        REQUIRE(stream.cleaned);
+        REQUIRE(expire);
+        REQUIRE(http::detail::next_body_write_timeout_for_test == nullptr);
+
+        // The captured callback owns the operation arbitration state, not its
+        // coroutine frame. Deliver it only after that frame has been destroyed.
+        expire();
+        REQUIRE_FALSE(stream.cancelled);
+        REQUIRE(stream.calls == 3);
+        REQUIRE(http::detail::body_writer_access::result(writer).success());
+        REQUIRE(run_body_operation(writer.write("def")).success());
+        REQUIRE(run_body_operation(http::detail::body_writer_access::finish(writer)).success());
+        REQUIRE(http::detail::body_writer_access::result(writer).confirmed_body_bytes == 6);
+        REQUIRE(stream.wire == "abcdef");
+    }
+    // A queued callback may also outlive the writer; its shared state must not
+    // retain access to the writer, transport, or caller-owned body buffers.
+    const auto calls = stream.calls;
+    expire();
+    REQUIRE_FALSE(stream.cancelled);
+    REQUIRE(stream.calls == calls);
+    REQUIRE(stream.wire == "abcdef");
+    expire = {};
+}
+
 TEST_CASE("body writer setup allocation failures are sticky and suppress terminators", "[http][body_writer]") {
     using site = http::detail::body_write_allocation_site;
     for (const auto failure_site : {site::arbitration, site::session_registration, site::operation_registration}) {

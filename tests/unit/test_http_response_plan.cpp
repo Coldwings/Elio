@@ -65,6 +65,60 @@ TEST_CASE("response head owns only validated metadata", "[http][response_plan]")
     REQUIRE_THROWS_AS(head.set_version("HTTP/1.1\r\n"), std::invalid_argument);
 }
 
+TEST_CASE("complete response copies and moves preserve framing assertions", "[http][response_plan]") {
+    response original(status::created, "body");
+    original.set_header("Content-Length", "4");
+    original.set_header("X-Owner", "original");
+    original.set_representation_length(42);
+    const auto expected = prepare_response(original, complete(4), method::GET, "HTTP/1.1", true);
+    REQUIRE(expected.success());
+
+    const auto verify = [&](const response& value) {
+        REQUIRE(value.body() == "body");
+        REQUIRE(value.status_code() == 201);
+        REQUIRE(value.header("Content-Length") == "4");
+        REQUIRE(value.header("X-Owner") == "original");
+        REQUIRE(value.representation_length() == 42);
+        const auto plan = prepare_response(value, complete(value.body().size()), method::GET, "HTTP/1.1", true);
+        REQUIRE(plan.success());
+        REQUIRE(plan.header_block == expected.header_block);
+        REQUIRE(plan.framing == expected.framing);
+        REQUIRE(plan.expected_body_bytes == expected.expected_body_bytes);
+        REQUIRE(plan.invoke_producer == expected.invoke_producer);
+        REQUIRE(plan.reusable == expected.reusable);
+        // GET asserts transferred length; HEAD instead asserts representation
+        // length, so retaining both metadata values must retain this conflict.
+        require_invalid(prepare_response(value, complete(4), method::HEAD, "HTTP/1.1", true));
+        auto normalized = value;
+        normalized.get_headers().remove("Content-Length");
+        const auto head = prepare_response(normalized, complete(4), method::HEAD, "HTTP/1.1", true);
+        REQUIRE(head.success());
+        REQUIRE(has_header(head, "Content-Length: 42"));
+        REQUIRE(head.framing == response_framing::none);
+        REQUIRE_FALSE(head.invoke_producer);
+    };
+
+    response copied(original);
+    response assigned = response::ok("obsolete");
+    assigned.set_header("Content-Length", "8");
+    assigned.set_representation_length(99);
+    assigned = original;
+    original.set_body(std::string_view("changed"));
+    original.set_header("X-Owner", "changed");
+    original.set_representation_length(99);
+    require_invalid(prepare_response(original, complete(original.body().size()), method::GET, "HTTP/1.1", true));
+    verify(copied);
+    verify(assigned);
+
+    response moved(std::move(copied));
+    response move_assigned = response::ok("obsolete");
+    move_assigned.set_header("Content-Length", "8");
+    move_assigned.set_representation_length(99);
+    move_assigned = std::move(assigned);
+    verify(moved);
+    verify(move_assigned);
+}
+
 TEST_CASE("reply owns a move-only producer and shares metadata representation",
           "[http][response_plan]") {
     response ordinary = response::ok("body");

@@ -6225,7 +6225,8 @@ TEST_CASE("socket writev validates vectors before submission",
     iovec overflow[2]{
         {&byte, static_cast<size_t>(INT32_MAX)}, {&byte, 1}
     };
-    std::array<io_result, 9> results{};
+    std::array<io_result, 11> results{};
+    elio::net::stream empty_stream;
     std::atomic<bool> done{false};
     scheduler sched(1);
     sched.start();
@@ -6240,6 +6241,8 @@ TEST_CASE("socket writev validates vectors before submission",
         results[6] = co_await stream.writev(nullptr, 1, cancelled.get_token());
         results[7] = co_await stream.writev(nullptr, 0, cancelled.get_token());
         results[8] = co_await stream.writev(overflow, 2);
+        results[9] = co_await empty_stream.writev(nullptr, 0, active.get_token());
+        results[10] = co_await empty_stream.writev(nullptr, 0, cancelled.get_token());
         done.store(true, std::memory_order_release);
     });
     const bool finished = wait_for_io_cancel_test([&] { return done.load(); });
@@ -6259,6 +6262,8 @@ TEST_CASE("socket writev validates vectors before submission",
     REQUIRE(results[6].result == -ECANCELED);
     REQUIRE(results[7].result == -ECANCELED);
     REQUIRE(results[8].result == -EOVERFLOW);
+    REQUIRE(results[9].result == -ENOTCONN);
+    REQUIRE(results[10].result == -ENOTCONN);
     REQUIRE(bytes == -1);
     REQUIRE((receive_errno == EAGAIN || receive_errno == EWOULDBLOCK));
 }

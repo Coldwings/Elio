@@ -2467,8 +2467,10 @@ intermediate buffer. No single syscall or TLS record is promised. Each call
 accepts at most 1024 vectors and INT32_MAX aggregate bytes; invalid count,
 nonempty null array/segment, and overflow fail before submission with EINVAL,
 EFAULT, and EOVERFLOW respectively (negative in `io_result::result`). Empty
-input succeeds with zero on a connected stream. An already-cancelled token
-takes precedence; a disconnected `net::stream` returns ENOTCONN. Caller code
+input succeeds with zero on a connected stream. With a transport present, an
+already-cancelled token takes precedence over input validation. An empty
+`net::stream` with no transport variant returns ENOTCONN even if the token is
+cancelled, matching scalar read/write dispatch. Caller code
 owns vector advancement and keeps the stream alive through completion.
 
 ---

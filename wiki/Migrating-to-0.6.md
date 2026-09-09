@@ -21,8 +21,10 @@ the next call. TLS writes a borrowed nonempty slice rather than joining the
 payload into an intermediate buffer. Zero-length entries are skipped. A single
 call accepts at most 1024 descriptors and INT32_MAX aggregate bytes; split
 larger logical writes. An already-cancelled token returns ECANCELED even for
-empty input. Without cancellation, empty input succeeds with zero on a
-connected stream; a disconnected `net::stream` returns ENOTCONN.
+empty input when a transport is present. Without cancellation, empty input
+succeeds with zero on a connected stream. An empty `net::stream` with no
+transport variant returns ENOTCONN even if the supplied token is cancelled,
+matching its scalar read/write dispatch behavior.
 
 Low-level `io::async_sendmsg(fd, parts, count, flags, token)` is also available,
 but remains a single backend attempt: readiness and short-write handling are

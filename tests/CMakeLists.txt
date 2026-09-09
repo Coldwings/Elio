@@ -83,6 +83,7 @@ endif()
 # context setup for HTTPS connections.
 if(TARGET elio_tls)
     list(APPEND TEST_SOURCES
+        unit/test_tls_retry.cpp
         unit/test_http_client.cpp
     )
 endif()

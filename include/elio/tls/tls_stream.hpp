@@ -27,6 +27,21 @@
 
 namespace elio::tls {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace detail {
+enum class tls_test_operation { read, write };
+struct tls_test_call_result {
+    int ret;
+    int error;
+};
+struct tls_dispatch_test_hooks {
+    void* context = nullptr;
+    tls_test_call_result (*dispatch)(void*, tls_test_operation, const void*, size_t) noexcept = nullptr;
+    coro::task<io::io_result> (*readiness)(void*, tls_test_operation, bool, coro::cancel_token) = nullptr;
+};
+} // namespace detail
+#endif
+
 /// TLS handshake result
 enum class handshake_result {
     success,
@@ -58,6 +73,11 @@ enum class handshake_result {
 /// operations have resumed.
 class tls_stream {
 public:
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    void set_dispatch_test_hooks(detail::tls_dispatch_test_hooks* hooks) noexcept {
+        dispatch_test_hooks_ = hooks;
+    }
+#endif
     /// Create a TLS stream from an existing TCP stream
     /// @param tcp The underlying TCP stream (takes ownership)
     /// @param ctx TLS context to use
@@ -267,10 +287,18 @@ public:
         }
         
         while (true) {
-            auto step = call_ssl([&]() {
-                return SSL_read(ssl_, buffer, static_cast<int>(length));
-            });
+            auto step = call_read(buffer, length);
             int ret = step.ret;
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (test_retry(step.err)) {
+                const auto result = co_await dispatch_test_hooks_->readiness(
+                    dispatch_test_hooks_->context, detail::tls_test_operation::read,
+                    step.err == SSL_ERROR_WANT_READ, {});
+                if (result.result < 0) co_return result;
+                continue;
+            }
+#endif
             
             if (ret > 0) {
                 co_return io::io_result{ret, 0};
@@ -327,10 +355,18 @@ public:
                 co_return io::io_result{-ECANCELED, 0};
             }
 
-            auto step = call_ssl([&]() {
-                return SSL_read(ssl_, buffer, static_cast<int>(length));
-            });
+            auto step = call_read(buffer, length);
             int ret = step.ret;
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (test_retry(step.err)) {
+                const auto result = co_await dispatch_test_hooks_->readiness(
+                    dispatch_test_hooks_->context, detail::tls_test_operation::read,
+                    step.err == SSL_ERROR_WANT_READ, token);
+                if (result.result < 0) co_return result;
+                continue;
+            }
+#endif
 
             if (ret > 0) {
                 co_return io::io_result{ret, 0};
@@ -389,10 +425,18 @@ public:
         }
         
         while (true) {
-            auto step = call_ssl([&]() {
-                return SSL_write(ssl_, buffer, static_cast<int>(length));
-            });
+            auto step = call_write(buffer, length);
             int ret = step.ret;
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (test_retry(step.err)) {
+                const auto result = co_await dispatch_test_hooks_->readiness(
+                    dispatch_test_hooks_->context, detail::tls_test_operation::write,
+                    step.err == SSL_ERROR_WANT_READ, {});
+                if (result.result < 0) co_return result;
+                continue;
+            }
+#endif
             
             if (ret > 0) {
                 co_return io::io_result{ret, 0};
@@ -439,10 +483,18 @@ public:
                 co_return io::io_result{-ECANCELED, 0};
             }
 
-            auto step = call_ssl([&]() {
-                return SSL_write(ssl_, buffer, static_cast<int>(length));
-            });
+            auto step = call_write(buffer, length);
             int ret = step.ret;
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (test_retry(step.err)) {
+                const auto result = co_await dispatch_test_hooks_->readiness(
+                    dispatch_test_hooks_->context, detail::tls_test_operation::write,
+                    step.err == SSL_ERROR_WANT_READ, token);
+                if (result.result < 0) co_return result;
+                continue;
+            }
+#endif
 
             if (ret > 0) {
                 co_return io::io_result{ret, 0};
@@ -894,10 +946,41 @@ public:
     }
     
 private:
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    bool test_retry(int error) const noexcept {
+        return (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) &&
+            dispatch_test_hooks_ && dispatch_test_hooks_->readiness;
+    }
+#endif
+
     struct ssl_call_result {
         int ret = 0;
         int err = SSL_ERROR_NONE;
     };
+
+    ssl_call_result call_read(void* buffer, size_t length) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (dispatch_test_hooks_ && dispatch_test_hooks_->dispatch) {
+            auto lock = lock_ssl_state();
+            const auto result = dispatch_test_hooks_->dispatch(dispatch_test_hooks_->context,
+                detail::tls_test_operation::read, buffer, length);
+            return {result.ret, result.error};
+        }
+#endif
+        return call_ssl([&] { return SSL_read(ssl_, buffer, static_cast<int>(length)); });
+    }
+
+    ssl_call_result call_write(const void* buffer, size_t length) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (dispatch_test_hooks_ && dispatch_test_hooks_->dispatch) {
+            auto lock = lock_ssl_state();
+            const auto result = dispatch_test_hooks_->dispatch(dispatch_test_hooks_->context,
+                detail::tls_test_operation::write, buffer, length);
+            return {result.ret, result.error};
+        }
+#endif
+        return call_ssl([&] { return SSL_write(ssl_, buffer, static_cast<int>(length)); });
+    }
 
     std::unique_lock<std::mutex> lock_ssl_state() const {
         return std::unique_lock<std::mutex>(*ssl_mutex_);
@@ -988,6 +1071,9 @@ private:
     }
     
     net::tcp_stream tcp_;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    detail::tls_dispatch_test_hooks* dispatch_test_hooks_ = nullptr;
+#endif
     SSL* ssl_ = nullptr;
     std::shared_ptr<std::mutex> ssl_mutex_{std::make_shared<std::mutex>()};
     tls_mode mode_ = tls_mode::client;

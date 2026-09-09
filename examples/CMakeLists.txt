@@ -14,6 +14,18 @@ add_executable(hello_world hello_world.cpp)
 target_link_libraries(hello_world PRIVATE elio)
 target_link_options(hello_world PRIVATE ${STATIC_LINK_FLAGS})
 
+add_executable(first_coroutine first_coroutine.cpp)
+target_link_libraries(first_coroutine PRIVATE elio)
+target_link_options(first_coroutine PRIVATE ${STATIC_LINK_FLAGS})
+if(ELIO_BUILD_TESTS)
+    add_test(NAME readme_first_coroutine
+        COMMAND ${CMAKE_COMMAND}
+            -DROOT=${PROJECT_SOURCE_DIR}
+            -DEXAMPLE=$<TARGET_FILE:first_coroutine>
+            -P ${PROJECT_SOURCE_DIR}/tests/cmake/readme_first_coroutine.cmake)
+    set_tests_properties(readme_first_coroutine PROPERTIES TIMEOUT 30)
+endif()
+
 add_executable(chained_coroutines chained_coroutines.cpp)
 target_link_libraries(chained_coroutines PRIVATE elio)
 target_link_options(chained_coroutines PRIVATE ${STATIC_LINK_FLAGS})

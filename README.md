@@ -178,28 +178,22 @@ coro::task<int> compute() {
 }
 
 // Main coroutine that awaits other coroutines
-coro::task<void> main_task() {
+coro::task<int> main_task() {
     int result = co_await compute();
     std::cout << "Result: " << result << std::endl;
+    co_return 0;
 }
 
 int main() {
-    // Create scheduler with 4 worker threads
-    runtime::scheduler sched(4);
-    sched.start();
-    
-    // Spawn the main task (pass callable, not invoked task)
-    sched.go(main_task);
-    
-    // Wait for completion
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    
-    // Clean shutdown
-    sched.shutdown();
-    
-    return 0;
+    return elio::run(main_task);
 }
 ```
+
+`elio::run()` starts the scheduler, waits for the root coroutine to complete,
+and shuts down the scheduler before returning its result. The synchronous
+entry thread waits for actual completion; no fixed delay or worker-thread
+sleep is needed. The same program is built as
+[`first_coroutine`](examples/first_coroutine.cpp).
 
 ## Documentation
 

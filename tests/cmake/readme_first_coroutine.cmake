@@ -23,6 +23,7 @@ if(NOT snippet STREQUAL example)
 endif()
 execute_process(COMMAND "${EXAMPLE}" RESULT_VARIABLE result
     OUTPUT_VARIABLE output ERROR_VARIABLE errors TIMEOUT 20)
-if(NOT result STREQUAL "0" OR NOT output MATCHES "Result: 42")
+string(STRIP "${output}" stripped_output)
+if(NOT result STREQUAL "0" OR NOT stripped_output STREQUAL "Result: 42")
     message(FATAL_ERROR "First coroutine did not complete successfully: ${result}\n${output}\n${errors}")
 endif()

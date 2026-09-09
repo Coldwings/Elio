@@ -69,7 +69,7 @@ jobs:
       - name: Compile and run the exact README example
         run: |
           cmake --build "$RUNNER_TEMP/readme-build" --target first_coroutine --parallel 2
-          ctest --test-dir "$RUNNER_TEMP/readme-build" -R '^readme_first_coroutine$' --output-on-failure
+          ctest --test-dir "$RUNNER_TEMP/readme-build" -R '^readme_first_coroutine$' --no-tests=error --output-on-failure
 
   build-and-test:
     needs: changes
@@ -190,6 +190,7 @@ jobs:
           package_version_compatibility
           non_linux_platform_rejected
           tcp_benchmark_conformance_summary
+          readme_first_coroutine
           elio_fork_boundary
           elio_fork_boundary_asan
           "endpoint comp channel fds are made non-blocking"

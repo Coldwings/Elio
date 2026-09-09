@@ -123,7 +123,8 @@ public:
     /// Advance after a completed interim/final response, retaining bytes from
     /// the same transport read. Do not use this for a protocol handoff.
     /// Returns false without changing state if the current message is pending,
-    /// malformed, or a handoff. Reapply request method after a successful reset.
+    /// malformed, or a handoff. Reapply request method after this returns true;
+    /// both next_response() and reset() clear the method context.
     bool next_response() {
         if (!completed_ || decoder_.has_error() || handoff_) {
             return false;

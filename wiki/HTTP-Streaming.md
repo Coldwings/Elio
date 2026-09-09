@@ -78,8 +78,9 @@ ordinary `http::client` refuses reuse for close-delimited responses or buffered
 bytes after a final response.
 
 HEAD has no delivered body even if Content-Length advertises representation
-size. Informational/204/304 responses complete at their header boundary. Other
-responses use Content-Length, supported chunked encoding, or connection close.
+size. Informational/204/304 responses complete at their header boundary. Elio
+also treats 205 as bodyless. Other responses use Content-Length, supported
+chunked encoding, or connection close.
 Only the single `chunked` transfer coding is implemented; stacks such as
 `gzip, chunked` are rejected, not partially decoded and mislabeled as body.
 This is separate from application handling of Content-Encoding.

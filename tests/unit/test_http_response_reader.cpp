@@ -136,12 +136,14 @@ TEST_CASE("HTTP response reader retains partial framing across an interrupted re
     auto interrupted = complete_inline(reader.read_with(receive));
     REQUIRE(interrupted.error == ECANCELED);
     REQUIRE_FALSE(reader.decoder().has_error());
-    REQUIRE(complete_inline(reader.read_with(receive)).event == response_event::headers_complete);
-    REQUIRE(complete_inline(reader.read_with(receive)).body == "ok");
-    REQUIRE(complete_inline(reader.read_with(receive)).event == response_event::message_complete);
-    REQUIRE(reader.remaining() == "NEXT");
+    response_reader moved(std::move(reader));
+    REQUIRE(complete_inline(moved.read_with(receive)).event == response_event::headers_complete);
+    REQUIRE(complete_inline(moved.read_with(receive)).body == "ok");
+    REQUIRE(complete_inline(moved.read_with(receive)).event == response_event::message_complete);
+    REQUIRE(moved.remaining() == "NEXT");
     REQUIRE(step == 3);
 
+    reader = std::move(moved);
     reader.reset();
     REQUIRE_FALSE(reader.reached_eof());
     REQUIRE(reader.message_bytes() == 0);

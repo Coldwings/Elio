@@ -484,6 +484,34 @@ public:
         return write(data.data(), data.size(), std::move(token));
     }
 
+    /// Borrowed-vector fallback: write the first nonempty slice, without
+    /// concatenating payload. May return short progress; no record count is
+    /// promised. The caller advances the vector cursor after a positive result.
+    coro::task<io::io_result> writev(struct iovec* parts, size_t count) {
+        auto bounds = net::detail::validate_stream_iovecs(parts, count);
+        if (bounds.result <= 0) co_return bounds;
+        for (size_t i = 0; i < count; ++i) {
+            if (parts[i].iov_len != 0) {
+                co_return co_await write(parts[i].iov_base, parts[i].iov_len);
+            }
+        }
+        co_return io::io_result{0, 0};
+    }
+
+    /// Same borrowed-vector semantics, with cancellation forwarded to write.
+    coro::task<io::io_result> writev(struct iovec* parts, size_t count,
+                                    coro::cancel_token token) {
+        if (token.is_cancelled()) co_return io::io_result{-ECANCELED, 0};
+        auto bounds = net::detail::validate_stream_iovecs(parts, count);
+        if (bounds.result <= 0) co_return bounds;
+        for (size_t i = 0; i < count; ++i) {
+            if (parts[i].iov_len != 0) {
+                co_return co_await write(parts[i].iov_base, parts[i].iov_len, token);
+            }
+        }
+        co_return io::io_result{0, 0};
+    }
+
     /// Read exactly ``length`` bytes into ``buffer``.
     ///
     /// Loops over partial reads until ``length`` bytes have been stored, a

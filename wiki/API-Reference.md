@@ -2147,8 +2147,10 @@ public:
     /* awaitable */ write_exactly(std::string_view data);
     /* awaitable */ write_exactly(std::string_view data, coro::cancel_token token);
     
-    // Scatter-gather socket write attempt (awaitable) - may return a short write
-    /* awaitable */ writev(struct iovec* iovecs, size_t count);
+    // Readiness-aware borrowed scatter/gather - may return a short write
+    coro::task<io::io_result> writev(struct iovec* iovecs, size_t count);
+    coro::task<io::io_result> writev(struct iovec* iovecs, size_t count,
+                                   coro::cancel_token token);
     
     // Poll for readability (awaitable)
     /* awaitable */ poll_read();
@@ -2449,6 +2451,27 @@ public:
 `net::stream::read_exactly()` preserves the active TCP or TLS transport's
 exact-length result: EOF before the requested byte count is reported as
 `io_result::result == -ENODATA`.
+
+TCP, TLS and `net::stream` also expose:
+
+```cpp
+coro::task<io::io_result> writev(struct iovec* parts, size_t count);
+coro::task<io::io_result> writev(struct iovec* parts, size_t count,
+                               coro::cancel_token token);
+```
+
+These borrow descriptors and payload until completion and may return positive
+short progress. TCP waits for readiness and retries EINTR internally. TLS
+submits the first nonempty borrowed slice, without joining payload into an
+intermediate buffer. No single syscall or TLS record is promised. Each call
+accepts at most 1024 vectors and INT32_MAX aggregate bytes; invalid count,
+nonempty null array/segment, and overflow fail before submission with EINVAL,
+EFAULT, and EOVERFLOW respectively (negative in `io_result::result`). Empty
+input succeeds with zero on a connected stream. With a transport present, an
+already-cancelled token takes precedence over input validation. An empty
+`net::stream` with no transport variant returns ENOTCONN even if the token is
+cancelled, matching scalar read/write dispatch. Caller code
+owns vector advancement and keeps the stream alive through completion.
 
 ---
 

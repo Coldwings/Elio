@@ -42,6 +42,25 @@ struct tcp_options {
 
 namespace detail {
 
+inline io::io_result validate_stream_iovecs(const struct iovec* parts,
+                                           size_t count) noexcept {
+    // Linux limits one sendmsg to 1024 vectors. io_result has a signed
+    // 32-bit byte count; reject overflow before any bytes are submitted.
+    if (count > 1024) return {-EINVAL, 0};
+    if (count != 0 && parts == nullptr) return {-EFAULT, 0};
+    size_t total = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (parts[i].iov_len != 0 && parts[i].iov_base == nullptr) {
+            return {-EFAULT, 0};
+        }
+        if (parts[i].iov_len > static_cast<size_t>(INT32_MAX) - total) {
+            return {-EOVERFLOW, 0};
+        }
+        total += parts[i].iov_len;
+    }
+    return {static_cast<int32_t>(total), 0};
+}
+
 inline void apply_tcp_socket_options(int fd, int family, const tcp_options& opts) noexcept {
     if (opts.reuse_addr) {
         int flag = 1;
@@ -525,9 +544,42 @@ public:
         return write(str.data(), str.size(), std::move(token));
     }
 
-    /// Async writev (scatter-gather write)
-    auto writev(struct iovec* iovecs, size_t count) {
-        return io::async_sendmsg(fd_, iovecs, count);
+    /// Readiness-aware scatter/gather write. Descriptors and payload remain
+    /// borrowed and unchanged through completion. Positive progress may be
+    /// short; this is not an exact-length write. Empty input succeeds with 0.
+    coro::task<io::io_result> writev(struct iovec* iovecs, size_t count) {
+        auto bounds = detail::validate_stream_iovecs(iovecs, count);
+        if (bounds.result <= 0) co_return bounds;
+        while (true) {
+            auto result = co_await io::async_sendmsg(fd_, iovecs, count);
+            if (result.result == -EAGAIN || result.result == -EWOULDBLOCK) {
+                auto ready = co_await io::async_poll_write(fd_);
+                if (ready.result < 0 && ready.result != -EINTR) co_return ready;
+                continue;
+            }
+            if (result.result == -EINTR) continue;
+            co_return result;
+        }
+    }
+
+    /// Cancellation is cooperative; positive backend completion remains
+    /// progress even if cancellation races it. No buffer access outlives return.
+    coro::task<io::io_result> writev(struct iovec* iovecs, size_t count,
+                                    coro::cancel_token token) {
+        if (token.is_cancelled()) co_return io::io_result{-ECANCELED, 0};
+        auto bounds = detail::validate_stream_iovecs(iovecs, count);
+        if (bounds.result <= 0) co_return bounds;
+        while (true) {
+            if (token.is_cancelled()) co_return io::io_result{-ECANCELED, 0};
+            auto result = co_await io::async_sendmsg(fd_, iovecs, count, 0, token);
+            if (result.io.result == -EAGAIN || result.io.result == -EWOULDBLOCK) {
+                auto ready = co_await io::async_poll_write(fd_, token);
+                if (ready.io.result < 0 && ready.io.result != -EINTR) co_return ready.io;
+                continue;
+            }
+            if (result.io.result == -EINTR) continue;
+            co_return result.io;
+        }
     }
 
     /// Wait for socket to be readable

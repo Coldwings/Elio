@@ -3311,6 +3311,22 @@ TEST_CASE("socket stream writes report errors without SIGPIPE",
         REQUIRE_FALSE(probe.saw_sigpipe());
     }
 
+    SECTION("tcp_stream cancellable writev") {
+        cancel_source source;
+        auto result =
+            run_socket_write_after_peer_read_shutdown<tcp_stream>(
+                [&](tcp_stream& stream) -> task<io_result> {
+                    char first = 'a';
+                    char second = 'b';
+                    struct iovec iov[2] = {
+                        {&first, sizeof(first)}, {&second, sizeof(second)}
+                    };
+                    co_return co_await stream.writev(iov, 2, source.get_token());
+                });
+        REQUIRE(result.error_code() == EPIPE);
+        REQUIRE_FALSE(probe.saw_sigpipe());
+    }
+
     SECTION("uds_stream writev") {
         auto result =
             run_socket_write_after_peer_read_shutdown<uds_stream>(
@@ -6194,6 +6210,372 @@ TEST_CASE("Cancellable poll_write cancelled during wait without writability",
     close(efd);
 }
 
+TEST_CASE("socket writev validates vectors before submission",
+          "[io][tcp][writev][cancel]") {
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+    tcp_stream stream(sockets[0]);
+    cancel_source active;
+    cancel_source cancelled;
+    cancelled.cancel();
+    char byte = 'x';
+    std::array<iovec, 1025> too_many{};
+    iovec null_payload{nullptr, 1};
+    iovec empty_payload{nullptr, 0};
+    iovec overflow[2]{
+        {&byte, static_cast<size_t>(INT32_MAX)}, {&byte, 1}
+    };
+    std::array<io_result, 11> results{};
+    elio::net::stream empty_stream;
+    std::atomic<bool> done{false};
+    scheduler sched(1);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        results[0] = co_await stream.writev(nullptr, 0, active.get_token());
+        results[1] = co_await stream.writev(&empty_payload, 1, active.get_token());
+        results[2] = co_await stream.writev(nullptr, 1, active.get_token());
+        results[3] = co_await stream.writev(&null_payload, 1, active.get_token());
+        results[4] = co_await stream.writev(too_many.data(), too_many.size(), active.get_token());
+        results[5] = co_await stream.writev(overflow, 2, active.get_token());
+        // Cancellation precedes vector validation and the empty-write shortcut.
+        results[6] = co_await stream.writev(nullptr, 1, cancelled.get_token());
+        results[7] = co_await stream.writev(nullptr, 0, cancelled.get_token());
+        results[8] = co_await stream.writev(overflow, 2);
+        results[9] = co_await empty_stream.writev(nullptr, 0, active.get_token());
+        results[10] = co_await empty_stream.writev(nullptr, 0, cancelled.get_token());
+        done.store(true, std::memory_order_release);
+    });
+    const bool finished = wait_for_io_cancel_test([&] { return done.load(); });
+    const bool stopped = sched.shutdown(elio::test::scaled_ms(5000));
+    char received = 0;
+    const auto bytes = ::recv(sockets[1], &received, 1, MSG_DONTWAIT);
+    const int receive_errno = errno;
+    ::close(sockets[1]);
+    REQUIRE(finished);
+    REQUIRE(stopped);
+    REQUIRE(results[0].result == 0);
+    REQUIRE(results[1].result == 0);
+    REQUIRE(results[2].result == -EFAULT);
+    REQUIRE(results[3].result == -EFAULT);
+    REQUIRE(results[4].result == -EINVAL);
+    REQUIRE(results[5].result == -EOVERFLOW);
+    REQUIRE(results[6].result == -ECANCELED);
+    REQUIRE(results[7].result == -ECANCELED);
+    REQUIRE(results[8].result == -EOVERFLOW);
+    REQUIRE(results[9].result == -ENOTCONN);
+    REQUIRE(results[10].result == -ENOTCONN);
+    REQUIRE(bytes == -1);
+    REQUIRE((receive_errno == EAGAIN || receive_errno == EWOULDBLOCK));
+}
+
+TEST_CASE("socket writev sends borrowed fragments without modifying descriptors",
+          "[io][tcp][writev]") {
+    auto run = [&](bool unified, bool cancellable) {
+        int sockets[2] = {-1, -1};
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+        std::string prefix = "head:";
+        std::string payload = "payload";
+        std::string suffix = "\r\n";
+        const std::string expected = prefix + payload + suffix;
+        iovec vectors[] = {
+            {nullptr, 0}, {prefix.data(), prefix.size()},
+            {payload.data(), payload.size()}, {nullptr, 0},
+            {suffix.data(), suffix.size()}
+        };
+        const std::array<iovec, 5> original{
+            vectors[0], vectors[1], vectors[2], vectors[3], vectors[4]
+        };
+        tcp_stream tcp(sockets[0]);
+        elio::net::stream generic;
+        if (unified) generic = elio::net::stream(std::move(tcp));
+        cancel_source source;
+        io_result result{-EINPROGRESS, 0};
+        const iovec* submitted = nullptr;
+        std::atomic<bool> done{false};
+        scheduler sched(1);
+        sched.start();
+        sched.go([&]() -> task<void> {
+            if (cancellable) {
+                elio::io::detail::capture_next_sendmsg_iovecs_for_test(submitted);
+            }
+            if (unified) {
+                if (cancellable) {
+                    result = co_await generic.writev(vectors, 5, source.get_token());
+                } else {
+                    result = co_await generic.writev(vectors, 5);
+                }
+            } else {
+                if (cancellable) {
+                    result = co_await tcp.writev(vectors, 5, source.get_token());
+                } else {
+                    result = co_await tcp.writev(vectors, 5);
+                }
+            }
+            done.store(true, std::memory_order_release);
+        });
+        const bool finished = wait_for_io_cancel_test([&] { return done.load(); });
+        const bool stopped = sched.shutdown(elio::test::scaled_ms(5000));
+        std::array<char, 64> bytes{};
+        const auto count = ::recv(sockets[1], bytes.data(), bytes.size(), MSG_DONTWAIT);
+        ::close(sockets[1]);
+        REQUIRE(finished);
+        REQUIRE(stopped);
+        if (cancellable) REQUIRE(submitted == vectors);
+        REQUIRE(result.result == static_cast<int32_t>(expected.size()));
+        REQUIRE(count == static_cast<ssize_t>(expected.size()));
+        REQUIRE(std::string_view(bytes.data(), static_cast<size_t>(count)) == expected);
+        for (size_t i = 0; i < original.size(); ++i) {
+            REQUIRE(vectors[i].iov_base == original[i].iov_base);
+            REQUIRE(vectors[i].iov_len == original[i].iov_len);
+        }
+        REQUIRE(prefix == "head:");
+        REQUIRE(payload == "payload");
+        REQUIRE(suffix == "\r\n");
+    };
+    SECTION("tcp token") { run(false, true); }
+    SECTION("tcp no token") { run(false, false); }
+    SECTION("unified token") { run(true, true); }
+    SECTION("unified no token") { run(true, false); }
+}
+
+TEST_CASE("Cancellable sendmsg completes and already-cancelled sendmsg sends nothing",
+          "[io][cancel][writev]") {
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+    char first[] = "hello";
+    char second[] = " world";
+    iovec vectors[]{{first, 5}, {second, 6}};
+    cancel_source active;
+    cancel_source cancelled;
+    cancelled.cancel();
+    cancellable_io_result sent{};
+    cancellable_io_result skipped{};
+    const iovec* submitted = nullptr;
+    std::atomic<bool> done{false};
+    scheduler sched(1);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        skipped = co_await async_sendmsg(sockets[0], vectors, 2, 0, cancelled.get_token());
+        elio::io::detail::capture_next_sendmsg_iovecs_for_test(submitted);
+        sent = co_await async_sendmsg(sockets[0], vectors, 2, 0, active.get_token());
+        done.store(true, std::memory_order_release);
+    });
+    const bool finished = wait_for_io_cancel_test([&] { return done.load(); });
+    const bool stopped = sched.shutdown(elio::test::scaled_ms(5000));
+    char bytes[64]{};
+    const auto count = ::recv(sockets[1], bytes, sizeof(bytes), MSG_DONTWAIT);
+    ::close(sockets[0]);
+    ::close(sockets[1]);
+    REQUIRE(finished);
+    REQUIRE(stopped);
+    REQUIRE(skipped.was_cancelled());
+    REQUIRE(submitted == vectors);
+    REQUIRE(skipped.error_code() == ECANCELED);
+    REQUIRE(sent.success());
+    REQUIRE_FALSE(sent.was_cancelled());
+    REQUIRE(sent.bytes_transferred() == 11);
+    REQUIRE(count == 11);
+    REQUIRE(std::string_view(bytes, static_cast<size_t>(count)) == "hello world");
+}
+
+TEST_CASE("Cancellable sendmsg completion wins over cancellation before resume",
+          "[io][cancel][writev][regression]") {
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+    tcp_stream sender(sockets[0]);
+    tcp_stream receiver(sockets[1]);
+    char first[] = "hello";
+    char second[] = " world";
+    iovec vectors[]{{first, 5}, {second, 6}};
+    cancel_source source;
+    auto operation = async_sendmsg(sender.fd(), vectors, 2, 0, source.get_token());
+    REQUIRE_FALSE(operation.await_ready());
+    operation.await_suspend(std::noop_coroutine());
+    default_io_context().run_for(elio::test::scaled_ms(1000));
+    REQUIRE_FALSE(default_io_context().has_pending());
+    // The backend has completed, but result consumption has not happened.
+    // Cancellation in this interval must not turn transmitted bytes into an error.
+    source.cancel();
+    auto result = operation.await_resume();
+    REQUIRE(result.success());
+    REQUIRE_FALSE(result.was_cancelled());
+    REQUIRE(result.bytes_transferred() == 11);
+    char bytes[16]{};
+    REQUIRE(::recv(receiver.fd(), bytes, sizeof(bytes), MSG_DONTWAIT) == 11);
+    REQUIRE(std::string_view(bytes, 11) == "hello world");
+}
+
+TEST_CASE("socket writev returns positive short progress under bounded capacity",
+          "[io][tcp][writev]") {
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+    const int small = 4096;
+    REQUIRE(::setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF,
+                         &small, sizeof(small)) == 0);
+    tcp_stream stream(sockets[0]);
+    std::string prefix(4096, 'a');
+    std::string suffix(128 * 1024, 'b');
+    const std::string expected = prefix + suffix;
+    iovec vectors[]{{prefix.data(), prefix.size()}, {suffix.data(), suffix.size()}};
+    std::vector<char> bytes(expected.size());
+    cancel_source source;
+    io_result result{-EINPROGRESS, 0};
+    std::atomic<bool> done{false};
+    scheduler sched(1);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        result = co_await stream.writev(vectors, 2, source.get_token());
+        done.store(true, std::memory_order_release);
+    });
+    // No reader runs before writev returns: this must return partial progress,
+    // not implicitly turn into writev_exactly and wait for all vector bytes.
+    const bool finished = wait_for_io_cancel_test([&] { return done.load(); });
+    source.cancel();
+    const bool stopped = sched.shutdown(elio::test::scaled_ms(5000));
+    const auto received = ::recv(sockets[1], bytes.data(), bytes.size(), MSG_DONTWAIT);
+    ::close(sockets[1]);
+    REQUIRE(finished);
+    REQUIRE(stopped);
+    REQUIRE(result.result > 0);
+    REQUIRE(static_cast<size_t>(result.result) < expected.size());
+    REQUIRE(received == result.result);
+    REQUIRE(std::string_view(bytes.data(), static_cast<size_t>(received)) ==
+            std::string_view(expected).substr(0, static_cast<size_t>(received)));
+    REQUIRE(vectors[0].iov_base == prefix.data());
+    REQUIRE(vectors[0].iov_len == prefix.size());
+    REQUIRE(vectors[1].iov_base == suffix.data());
+    REQUIRE(vectors[1].iov_len == suffix.size());
+}
+
+TEST_CASE("plain TCP writev resumes borrowed progress after peer drain",
+          "[io][tcp][writev][regression]") {
+    auto run = [&](io_context::backend_type backend) {
+        worker_io_backend_guard guard(backend);
+        int sockets[2] = {-1, -1};
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+        fill_socket_send_buffer(sockets[0]);
+        tcp_stream stream(sockets[0]);
+        std::array<char, 128> payload{};
+        payload.fill('v');
+        iovec vectors[]{{payload.data(), 64}, {payload.data() + 64, 64}};
+        std::atomic<bool> done{false};
+        io_result result{-EINPROGRESS, 0};
+        scheduler sched(1);
+        sched.start();
+        auto& context = sched.get_worker(0)->io_context();
+        const auto baseline = context.pending_count();
+        sched.go([&]() -> task<void> {
+            result = co_await stream.writev(vectors, 2);
+            done.store(true, std::memory_order_release);
+        });
+        const bool parked = wait_for_io_cancel_test([&] {
+            return context.pending_count() > baseline;
+        });
+        const bool early = done.load(std::memory_order_acquire);
+        std::array<char, 4096> received{};
+        size_t payload_bytes = 0;
+        bool unexpected_byte = false;
+        const auto deadline = std::chrono::steady_clock::now() + elio::test::scaled_ms(5000);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto count = ::recv(sockets[1], received.data(), received.size(), MSG_DONTWAIT);
+            if (count > 0) {
+                for (ssize_t i = 0; i < count; ++i) {
+                    if (received[static_cast<size_t>(i)] == 'v') ++payload_bytes;
+                    else if (received[static_cast<size_t>(i)] != 0) unexpected_byte = true;
+                }
+            } else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                break;
+            }
+            if (done.load(std::memory_order_acquire) && result.result > 0 &&
+                payload_bytes == static_cast<size_t>(result.result)) break;
+            if (done.load(std::memory_order_acquire) && result.result <= 0) break;
+            std::this_thread::yield();
+        }
+        const bool completed = done.load(std::memory_order_acquire);
+        if (!completed) ::shutdown(sockets[1], SHUT_RDWR);
+        const bool stopped = sched.shutdown(elio::test::scaled_ms(5000));
+        ::close(sockets[1]);
+        REQUIRE(parked);
+        REQUIRE_FALSE(early);
+        REQUIRE(completed);
+        REQUIRE(stopped);
+        REQUIRE(result.result > 0);
+        REQUIRE(result.result <= 128);
+        REQUIRE(payload_bytes == static_cast<size_t>(result.result));
+        REQUIRE_FALSE(unexpected_byte);
+        REQUIRE(context.pending_count() == baseline);
+        REQUIRE(vectors[0].iov_base == payload.data());
+        REQUIRE(vectors[1].iov_base == payload.data() + 64);
+        REQUIRE(vectors[0].iov_len == 64);
+        REQUIRE(vectors[1].iov_len == 64);
+    };
+    SECTION("forced epoll") { run(io_context::backend_type::epoll); }
+#if ELIO_HAS_IO_URING
+    SECTION("forced io_uring when available") {
+        if (!io_uring_backend::is_available()) SKIP("io_uring unavailable");
+        run(io_context::backend_type::io_uring);
+    }
+#endif
+}
+
+TEST_CASE("socket writev cancellation wakes a backpressured send without peer drain",
+          "[io][tcp][writev][cancel][epoll-cancel-regression]") {
+    auto run = [&](io_context::backend_type backend) {
+        worker_io_backend_guard guard(backend);
+        int sockets[2] = {-1, -1};
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+        fill_socket_send_buffer(sockets[0]);
+        tcp_stream stream(sockets[0]);
+        std::array<char, 128> payload{};
+        iovec vectors[]{{payload.data(), 64}, {payload.data() + 64, 64}};
+        const std::array<iovec, 2> original{vectors[0], vectors[1]};
+        cancel_source source;
+        std::atomic<bool> done{false};
+        io_result result{-EINPROGRESS, 0};
+        scheduler sched(1);
+        sched.start();
+        auto& context = sched.get_worker(0)->io_context();
+        const auto baseline = context.pending_count();
+        sched.go([&]() -> task<void> {
+            result = co_await stream.writev(vectors, 2, source.get_token());
+            done.store(true, std::memory_order_release);
+        });
+        const bool parked = wait_for_io_cancel_test([&] {
+            return context.pending_count() > baseline;
+        });
+        const bool completed_before_cancel = done.load(std::memory_order_acquire);
+        source.cancel();
+        const bool cancelled_without_drain =
+            wait_for_io_cancel_test([&] { return done.load(); });
+        if (!cancelled_without_drain) {
+            // Failure cleanup only: never close the writer fd under an
+            // outstanding operation. Peer shutdown may release a broken test.
+            ::shutdown(sockets[1], SHUT_RD);
+        }
+        const bool stopped = sched.shutdown(elio::test::scaled_ms(5000));
+        ::close(sockets[1]);
+        REQUIRE(parked);
+        REQUIRE_FALSE(completed_before_cancel);
+        REQUIRE(cancelled_without_drain);
+        REQUIRE(stopped);
+        REQUIRE(result.result == -ECANCELED);
+        REQUIRE(context.pending_count() == baseline);
+        for (size_t i = 0; i < original.size(); ++i) {
+            REQUIRE(vectors[i].iov_base == original[i].iov_base);
+            REQUIRE(vectors[i].iov_len == original[i].iov_len);
+        }
+        // Safe after the awaited operation and its cancellation cleanup.
+        payload.fill('r');
+    };
+    SECTION("forced epoll") { run(io_context::backend_type::epoll); }
+#if ELIO_HAS_IO_URING
+    SECTION("forced io_uring when available") {
+        if (!io_uring_backend::is_available()) SKIP("io_uring unavailable");
+        run(io_context::backend_type::io_uring);
+    }
+#endif
+}
+
 TEST_CASE("Cancellable send completes normally", "[io][cancel]") {
     int sv[2];
     REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) == 0);
@@ -6434,6 +6816,102 @@ TEST_CASE("Cancellable connect cancelled during epoll wait",
 }
 
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+TEST_CASE("TLS writev validates without handshake and cancellation wins",
+          "[tls][writev][cancel]") {
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+    elio::tls::tls_context context(elio::tls::tls_mode::client);
+    context.set_verify_mode(elio::tls::verify_mode::none);
+    elio::tls::tls_stream stream{tcp_stream(sockets[0]), context};
+    cancel_source active;
+    cancel_source cancelled;
+    cancelled.cancel();
+    char byte = 'x';
+    iovec invalid{nullptr, 1};
+    iovec overflow[]{{&byte, static_cast<size_t>(INT32_MAX)}, {&byte, 1}};
+    std::array<io_result, 5> results{};
+    std::atomic<bool> done{false};
+    scheduler sched(1);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        results[0] = co_await stream.writev(nullptr, 0, active.get_token());
+        results[1] = co_await stream.writev(&invalid, 1, active.get_token());
+        results[2] = co_await stream.writev(overflow, 2, active.get_token());
+        results[3] = co_await stream.writev(nullptr, 1, cancelled.get_token());
+        results[4] = co_await stream.writev(nullptr, 0, cancelled.get_token());
+        done.store(true, std::memory_order_release);
+    });
+    const bool finished = wait_for_io_cancel_test([&] { return done.load(); });
+    active.cancel();
+    if (!finished) ::shutdown(sockets[1], SHUT_RDWR);
+    const bool stopped = sched.shutdown(elio::test::scaled_ms(5000));
+    char received = 0;
+    const auto count = ::recv(sockets[1], &received, 1, MSG_DONTWAIT);
+    const int receive_errno = errno;
+    ::close(sockets[1]);
+    REQUIRE(finished);
+    REQUIRE(stopped);
+    REQUIRE(results[0].result == 0);
+    REQUIRE(results[1].result == -EFAULT);
+    REQUIRE(results[2].result == -EOVERFLOW);
+    REQUIRE(results[3].result == -ECANCELED);
+    REQUIRE(results[4].result == -ECANCELED);
+    REQUIRE(count == -1);
+    REQUIRE((receive_errno == EAGAIN || receive_errno == EWOULDBLOCK));
+}
+
+TEST_CASE("TLS writev returns first nonempty borrowed slice progress",
+          "[tls][writev]") {
+    int sockets[2] = {-1, -1};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+    elio::tls::tls_context server_context(elio::tls::tls_mode::server);
+    REQUIRE(install_test_certificate(server_context));
+    elio::tls::tls_context client_context(elio::tls::tls_mode::client);
+    client_context.set_verify_mode(elio::tls::verify_mode::none);
+    elio::tls::tls_stream server{tcp_stream(sockets[0]), server_context};
+    elio::tls::tls_stream client{tcp_stream(sockets[1]), client_context};
+    std::string first = "abc";
+    std::string second = "def";
+    iovec vectors[]{{nullptr, 0}, {first.data(), first.size()},
+                    {second.data(), second.size()}};
+    std::array<char, 3> bytes{};
+    cancel_source source;
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    bool handshake = false;
+    io_result sent{-EINPROGRESS, 0};
+    io_result received{-EINPROGRESS, 0};
+    scheduler sched(2);
+    sched.start();
+    sched.go([&]() -> task<void> {
+        handshake = co_await server.handshake(source.get_token());
+        if (handshake) {
+            received = co_await server.read_exactly(
+                bytes.data(), bytes.size(), source.get_token());
+        }
+        server_done.store(true, std::memory_order_release);
+    });
+    sched.go([&]() -> task<void> {
+        sent = co_await client.writev(vectors, 3, source.get_token());
+        client_done.store(true, std::memory_order_release);
+    });
+    const bool finished = wait_for_io_cancel_test([&] {
+        return server_done.load() && client_done.load();
+    });
+    source.cancel();
+    const bool stopped = sched.shutdown(elio::test::scaled_ms(5000));
+    REQUIRE(finished);
+    REQUIRE(stopped);
+    REQUIRE(handshake);
+    REQUIRE(sent.result == 3);
+    REQUIRE(received.result == 3);
+    REQUIRE(std::string_view(bytes.data(), bytes.size()) == first);
+    REQUIRE(vectors[1].iov_base == first.data());
+    REQUIRE(vectors[1].iov_len == first.size());
+    REQUIRE(vectors[2].iov_base == second.data());
+    REQUIRE(vectors[2].iov_len == second.size());
+}
+
 TEST_CASE("TLS shutdown timeout cancels silent peer readiness wait",
           "[tls][shutdown][timeout][poll-cancel-regression]") {
     int sv[2];

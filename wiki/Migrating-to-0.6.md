@@ -4,6 +4,34 @@ Elio 0.6 changes coroutine ownership, cancellation, structured concurrency,
 worker-local I/O enforcement, and several runtime contracts. Review the items
 below when upgrading from 0.5.x.
 
+## Borrowed Scatter/Gather Stream Writes
+
+TCP `writev()` now returns `task<io_result>` and handles readiness/EINTR
+internally, matching scalar `write()`. Existing `co_await stream.writev(...)`
+usage remains valid; code storing the old concrete raw-awaitable type must
+change. A token overload is available on TCP, TLS and `net::stream`:
+
+```cpp
+auto progress = co_await stream.writev(parts, count, token);
+```
+
+Keep the descriptor array and all payload bytes alive and unchanged until
+completion. Positive progress may be short: advance your vector cursor before
+the next call. TLS writes a borrowed nonempty slice rather than joining the
+payload into an intermediate buffer. Zero-length entries are skipped. A single
+call accepts at most 1024 descriptors and INT32_MAX aggregate bytes; split
+larger logical writes. An already-cancelled token returns ECANCELED even for
+empty input when a transport is present. Without cancellation, empty input
+succeeds with zero on a connected stream. An empty `net::stream` with no
+transport variant returns ENOTCONN even if the supplied token is cancelled,
+matching its scalar read/write dispatch behavior.
+
+Low-level `io::async_sendmsg(fd, parts, count, flags, token)` is also available,
+but remains a single backend attempt: readiness and short-write handling are
+its caller's responsibility. Cancellation can race positive progress and does
+not undo bytes already transmitted. Await cleanup before reusing buffers or
+closing the connection.
+
 ## Task Ownership And Virtual Threads
 
 - `coro::task<T>` is move-only. Move unstarted tasks into containers, return

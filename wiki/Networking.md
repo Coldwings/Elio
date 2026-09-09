@@ -206,13 +206,14 @@ Both `tcp_listener::bind()` and `tcp_connect()` accept any of the three address 
 
 For efficient writing of multiple buffers without copying, use `writev()`. Both `tcp_stream` and `uds_stream` support this method.
 
-`writev()` performs one scatter-gather write attempt and may return a positive
-short write or a transient readiness error. On platforms with per-call
-`SIGPIPE` suppression, socket writes report peer-close failures as errno-style
-results instead of requiring process-wide signal handling. If a protocol
-message must be delivered completely, loop over the remaining bytes, poll and
-retry on transient readiness errors, and advance the `iovec` array as bytes are
-accepted.
+`tcp_stream::writev()` handles interrupted writes and transient readiness
+internally, waiting for writability instead of returning `EAGAIN` for caller
+retry. It may still return a positive short write: complete-message protocols
+must advance the borrowed `iovec` slices and submit the remaining bytes.
+`uds_stream::writev()` remains a single-attempt operation; its callers must also
+handle interruption and poll/retry transient readiness errors. On platforms
+with per-call `SIGPIPE` suppression, socket writes report peer-close failures
+as errno-style results instead of requiring process-wide signal handling.
 
 ```cpp
 coro::task<void> send_message(tcp_stream& stream) {

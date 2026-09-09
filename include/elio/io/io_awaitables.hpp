@@ -34,6 +34,18 @@ inline io_context& current_io_context() noexcept {
 namespace detail {
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
+inline thread_local const struct iovec** next_sendmsg_iovecs_for_test = nullptr;
+
+inline void capture_next_sendmsg_iovecs_for_test(const struct iovec*& observed) noexcept {
+    next_sendmsg_iovecs_for_test = &observed;
+}
+
+inline void publish_sendmsg_iovecs_for_test(const struct iovec* parts) noexcept {
+    auto* observed = next_sendmsg_iovecs_for_test;
+    next_sendmsg_iovecs_for_test = nullptr;
+    if (observed) *observed = parts;
+}
+
 inline thread_local std::atomic<bool>*
     next_cancellable_recv_staged_for_test = nullptr;
 
@@ -1568,6 +1580,8 @@ private:
 /// Awaitable for cancellable async send operations
 class cancellable_async_send_awaitable : public io_awaitable_base {
 public:
+    struct scatter_gather_tag {};
+
     cancellable_async_send_awaitable(int fd, const void* buffer,
                                       size_t length, int flags,
                                       coro::cancel_token token) noexcept
@@ -1577,6 +1591,16 @@ public:
         , length_(length)
         , flags_(detail::with_socket_no_sigpipe(flags))
         , token_(std::move(token)) {}
+
+    cancellable_async_send_awaitable(scatter_gather_tag, int fd, struct iovec* iovecs,
+                                      size_t count, int flags,
+                                      coro::cancel_token token) noexcept
+        : cancellable_async_send_awaitable(fd, static_cast<const void*>(nullptr),
+                                           0, flags, std::move(token)) {
+        iovecs_ = iovecs;
+        iovec_count_ = count;
+        vectored_ = true;
+    }
 
     ~cancellable_async_send_awaitable() noexcept {
         detail::retire_io_cancel_key(state_);
@@ -1627,13 +1651,23 @@ public:
         }
 
         io_request req{};
-        req.op = io_op::send;
+        req.op = vectored_ ? io_op::sendmsg : io_op::send;
         req.fd = fd_;
         req.buffer = const_cast<void*>(buffer_);
         req.length = length_;
         req.socket_flags = flags_;
         req.awaiter = awaiter;
         req.state = setup_op_state(awaiter, ctx);
+        if (vectored_) {
+            req.iovecs = iovecs_;
+            req.iovec_count = iovec_count_;
+            req.state->msg.msg_iov = iovecs_;
+            req.state->msg.msg_iovlen = iovec_count_;
+            req.msg = &req.state->msg;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            detail::publish_sendmsg_iovecs_for_test(req.msg->msg_iov);
+#endif
+        }
         state->op = req.state;
 
         if (!prepare_op_state(ctx, req, [&]() noexcept {
@@ -1681,6 +1715,9 @@ private:
     coro::cancel_token::registration cancel_registration_;
     std::shared_ptr<detail::io_cancel_state> state_;
     bool already_cancelled_before_setup_ = false;
+    struct iovec* iovecs_ = nullptr;
+    size_t iovec_count_ = 0;
+    bool vectored_ = false;
 };
 
 /// Awaitable for cancellable async connect operations
@@ -1941,6 +1978,15 @@ inline auto async_send(int fd, const void* buffer,
                        size_t length, int flags, coro::cancel_token token) {
     return cancellable_async_send_awaitable(fd, buffer, length, flags,
                                              std::move(token));
+}
+
+/// Socket scatter/gather send. Borrow descriptors and payload until completion;
+/// like async_send, this low-level operation may return short progress/EAGAIN.
+inline auto async_sendmsg(int fd, struct iovec* iovecs, size_t count,
+                         int flags, coro::cancel_token token) {
+    return cancellable_async_send_awaitable(
+        cancellable_async_send_awaitable::scatter_gather_tag{}, fd, iovecs, count, flags,
+                                           std::move(token));
 }
 
 /// Create a cancellable async connect awaitable

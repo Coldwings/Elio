@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The ordinary HTTP client and SSE now share response framing; server-side
   producer/writer redesign remains a later phase (#1192, related to #1191).
 
+- **Cancellable borrowed scatter/gather writes**: token-aware `io::async_sendmsg`
+  and TCP/TLS/`net::stream::writev` without payload concatenation. TCP `writev`
+  now handles readiness and EINTR internally and returns `task<io_result>`;
+  positive progress may still be partial. TLS uses a borrowed-slice fallback.
+  See the 0.6 migration guide for bounds and lifetime requirements (#1194).
 - **HTTP server explicit interim responses**: `http::context::send_interim()`
   lets a handler emit one or more interim 1xx responses (any 1xx status
   except 101 Switching Protocols) on the connection before returning the

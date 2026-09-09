@@ -534,7 +534,7 @@ auto listener = net::uds_listener::bind(addr);
 
 ### Scatter-Gather Frame Writing
 
-The RPC framework uses scatter-gather I/O (`writev`) plus retry handling to write complete frames efficiently. Each `writev()` call is still a single write attempt and may return a positive short write; the RPC protocol layer advances the iovec array and retries until the header, already-serialized contiguous payload buffer, and optional checksum are written. This:
+The RPC framework uses scatter-gather I/O (`writev`) plus progress handling to write complete frames efficiently. A `writev()` call may return a positive short write; the RPC protocol layer advances the iovec array and submits the remainder until the header, already-serialized contiguous payload buffer, and optional checksum are written. TCP handles interruption and transient readiness internally. The RPC retry loop also supports single-attempt streams, such as UDS, which can expose those conditions. This:
 
 - Reduces the number of syscalls when the kernel accepts the whole frame in one attempt
 - Minimizes context switching under high concurrency
@@ -546,7 +546,9 @@ Custom stream types used with `rpc::rpc_stream` must still provide the full RPC
 stream surface: `read_exactly()`, `write_exactly()`, `writev()`, `poll_write()`,
 and `is_valid()`. The exact-length helpers are used for full-frame reads and
 cancellable contiguous writes; `writev()` and `poll_write()` remain required for
-the scatter-gather fast path and its readiness retry loop.
+the scatter-gather fast path and its readiness retry loop for streams that
+expose transient readiness errors. TCP callers do not need an additional
+readiness retry around `tcp_stream::writev()` itself.
 
 ### Zero-Copy Deserialization
 

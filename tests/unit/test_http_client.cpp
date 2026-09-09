@@ -29,8 +29,10 @@
 #endif
 
 #include <atomic>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <thread>
@@ -113,15 +115,50 @@ std::string make_ws_ipv6_url(uint16_t port, std::string_view path = "/ws") {
 
 // Read a single request from the stream (until "\r\n\r\n"). Used by the
 // fake server to know when to start writing its response.
-task<std::string> read_request_headers(elio::net::tcp_stream& s) {
+struct request_read_observation {
+    std::string bytes;
+    elio::io::io_result last_read{-EINPROGRESS, 0};
+    size_t reads = 0;
+    bool headers_complete = false;
+};
+
+template<typename Stream>
+task<std::string> read_request_headers(
+    Stream& s, request_read_observation* observation = nullptr) {
     std::string accum;
     char buf[1024];
     while (accum.find("\r\n\r\n") == std::string::npos) {
         auto r = co_await s.read(buf, sizeof(buf));
-        if (r.result <= 0) co_return accum;
+        if (observation) {
+            observation->last_read = r;
+            ++observation->reads;
+        }
+        if (r.result <= 0) break;
         accum.append(buf, static_cast<size_t>(r.result));
     }
+    if (observation) {
+        observation->bytes = accum;
+        observation->headers_complete = accum.find("\r\n\r\n") != std::string::npos;
+    }
     co_return accum;
+}
+
+std::string escaped_request_preview(std::string_view bytes, size_t limit = 1024) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::string preview;
+    const auto count = std::min(bytes.size(), limit);
+    for (size_t i = 0; i < count; ++i) {
+        const auto byte = static_cast<unsigned char>(bytes[i]);
+        if (byte >= 0x20 && byte <= 0x7e && byte != '\\' && byte != '"') {
+            preview.push_back(static_cast<char>(byte));
+        } else {
+            preview += "\\x";
+            preview.push_back(hex[byte >> 4]);
+            preview.push_back(hex[byte & 15]);
+        }
+    }
+    if (count != bytes.size()) preview += "...[truncated]";
+    return preview;
 }
 
 task<std::string> read_request_headers(elio::net::tcp_stream& s,
@@ -189,6 +226,7 @@ void require_websocket_handshake_response_rejected(
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_failed{false};
     std::atomic<int> client_errno{0};
+    request_read_observation request_observation;
 
     sched.go([&]() -> task<void> {
         auto stream = co_await listener->accept();
@@ -197,7 +235,7 @@ void require_websocket_handshake_response_rejected(
             server_done = true;
             co_return;
         }
-        auto headers = co_await read_request_headers(*stream);
+        auto headers = co_await read_request_headers(*stream, &request_observation);
         auto key = request_header_value(headers, "Sec-WebSocket-Key");
         server_key_present = !key.empty();
         if (key.empty()) {
@@ -231,6 +269,26 @@ void require_websocket_handshake_response_rejected(
 
     sched.shutdown();
 
+    INFO("handshake rejected helper: port=" << port
+         << " server_done=" << server_done.load()
+         << " accepted=" << server_accepted.load()
+         << " key_present=" << server_key_present.load()
+         << " client_done=" << client_done.load()
+         << " client_failed=" << client_failed.load()
+         << " client_errno=" << client_errno.load()
+         << " expected_errno=" << expected_errno);
+    // The release/acquire publication through server_done makes non-atomic
+    // diagnostic storage safe to inspect even on an unsuccessful shutdown.
+    std::string request_diagnostic = "server has not published request observations";
+    if (server_done.load(std::memory_order_acquire)) {
+        request_diagnostic = "read_count=" + std::to_string(request_observation.reads) +
+            " last_read=" + std::to_string(request_observation.last_read.result) +
+            " flags=" + std::to_string(request_observation.last_read.flags) +
+            " headers_complete=" + std::to_string(request_observation.headers_complete) +
+            " bytes=" + std::to_string(request_observation.bytes.size()) +
+            " preview=" + escaped_request_preview(request_observation.bytes);
+    }
+    INFO(request_diagnostic);
     REQUIRE(client_done);
     REQUIRE(server_done);
     REQUIRE(server_accepted);
@@ -348,6 +406,50 @@ split_headers_and_early_body(std::string accum) {
 }
 
 } // namespace
+
+TEST_CASE("HTTP request fixture retains complete and interrupted read observations",
+          "[http][client][diagnostics][issue-1197]") {
+    struct scripted_stream {
+        std::vector<std::string> fragments;
+        size_t next = 0;
+        int terminal = 0;
+
+        task<elio::io::io_result> read(void* buffer, size_t capacity) {
+            if (next == fragments.size()) {
+                co_return elio::io::io_result{terminal, 0};
+            }
+            const auto& fragment = fragments[next++];
+            REQUIRE(fragment.size() <= capacity);
+            std::memcpy(buffer, fragment.data(), fragment.size());
+            co_return elio::io::io_result{static_cast<int32_t>(fragment.size()), 0};
+        }
+    };
+    const bool complete = GENERATE(false, true);
+    const int terminal = GENERATE(0, -ECONNRESET);
+    scripted_stream stream{{"GET / HTTP/1.1\r\nSec-WebSocket-", "Key: fixture"}, 0, terminal};
+    if (complete) stream.fragments.back() += "\r\n\r\npiggyback";
+    request_read_observation observation;
+    auto operation = read_request_headers(stream, &observation);
+    auto handle = elio::coro::detail::task_access::handle(operation);
+    handle.resume();
+    REQUIRE(handle.done());
+    const auto received = operation.await_resume();
+    REQUIRE(received == stream.fragments[0] + stream.fragments[1]);
+    REQUIRE(observation.bytes == received);
+    REQUIRE(observation.headers_complete == complete);
+    REQUIRE(observation.reads == (complete ? 2 : 3));
+    REQUIRE(observation.last_read.result ==
+            (complete ? static_cast<int32_t>(stream.fragments.back().size()) : terminal));
+    REQUIRE(observation.last_read.flags == 0);
+}
+
+TEST_CASE("HTTP request diagnostic preview escapes controls and bounds output",
+          "[http][client][diagnostics][issue-1197]") {
+    const std::string bytes("a\r\n\0\\\"\xff", 7);
+    REQUIRE(escaped_request_preview(bytes) == "a\\x0d\\x0a\\x00\\x5c\\x22\\xff");
+    REQUIRE(escaped_request_preview(bytes, 2) == "a\\x0d...[truncated]");
+    REQUIRE(escaped_request_preview({}).empty());
+}
 
 TEST_CASE("HTTP client rejects invalid outbound request inputs",
           "[http][client][security]") {

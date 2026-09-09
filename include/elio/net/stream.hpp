@@ -34,8 +34,9 @@ namespace elio::net {
 /// TCP-backed streams allow one reader and one writer concurrently, matching
 /// `tcp_stream`. After the handshake completes, TLS-backed streams also allow
 /// one read-side operation and one write-side operation to overlap while
-/// waiting for socket readiness; `tls_stream` serializes direct OpenSSL
-/// `SSL*` state access internally. Multiple concurrent reads, multiple
+/// waiting for socket readiness; `tls_stream` serializes OpenSSL dispatch and
+/// retry ownership internally. TLS writes can return at most 16 KiB of short
+/// progress; use `write_exactly()` for complete output. Multiple reads, multiple
 /// concurrent writes, handshake-starting operations, or `close()` racing with
 /// any read/write operation require external serialization for all variants.
 class stream {

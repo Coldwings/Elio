@@ -84,6 +84,7 @@ struct retry_script {
     bool interleaved = false;
     bool arguments_stable = true;
     bool direction_correct = true;
+    bool fail_wait = false;
     const void* original_buffer = nullptr;
     size_t original_length = 0;
     std::string_view payload;
@@ -131,11 +132,13 @@ struct retry_script {
         script.direction_correct &= kind == script.pending_operation &&
             for_read == (script.pending_error == SSL_ERROR_WANT_READ);
         co_await gate{script};
+        if (script.fail_wait) throw std::bad_alloc();
         co_return io::io_result{1, 0};
     }
 };
 
-void exercise_retry(operation pending, int error, bool allow_interleaving, bool cancellable) {
+void exercise_retry(operation pending, int error, bool allow_interleaving, bool cancellable,
+                    bool fail_wait = false) {
     CAPTURE(pending, error, cancellable);
     std::array<int, 2> sockets{-1, -1};
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()) == 0);
@@ -153,6 +156,7 @@ void exercise_retry(operation pending, int error, bool allow_interleaving, bool 
     std::array<char, 16> input{};
     retry_script script{pending, error};
     script.payload = payload;
+    script.fail_wait = fail_wait;
     tls::detail::tls_dispatch_test_hooks hooks{
         &script, retry_script::dispatch, retry_script::readiness};
     server.set_dispatch_test_hooks(&hooks);
@@ -182,6 +186,14 @@ void exercise_retry(operation pending, int error, bool allow_interleaving, bool 
 
     REQUIRE(writer_done);
     REQUIRE(reader_done);
+    if (fail_wait) {
+        CHECK(writer.await_resume().result == -ENOMEM);
+        CHECK(reader.await_resume().result == -ENOMEM);
+        CHECK(script.pending_calls == 1);
+        CHECK(script.other_calls == 0);
+        CHECK_FALSE(interleaved_before_retry);
+        return;
+    }
     CHECK(writer.await_resume().result == static_cast<int>(payload.size()));
     CHECK(reader.await_resume().result == 1);
     CHECK(parked);
@@ -207,4 +219,9 @@ TEST_CASE("TLS pending WANT_READ write allows eligible SSL reads", "[tls][retry]
 TEST_CASE("TLS pending read does not exclude SSL writes", "[tls][retry][issue-1215]") {
     for (bool cancellable : {false, true})
         exercise_retry(operation::read, SSL_ERROR_WANT_READ, true, cancellable);
+}
+
+TEST_CASE("TLS retry wait exception terminates the pending owner and deferred reader", "[tls][retry][issue-1215]") {
+    for (bool cancellable : {false, true})
+        exercise_retry(operation::write, SSL_ERROR_WANT_WRITE, false, cancellable, true);
 }

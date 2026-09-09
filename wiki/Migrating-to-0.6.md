@@ -312,6 +312,39 @@ its caller's responsibility. Cancellation can race positive progress and does
 not undo bytes already transmitted. Await cleanup before reusing buffers or
 closing the connection.
 
+## TLS Duplex Output And Close Budgets
+
+TLS low-level `write()` may now return positive short progress of at most
+16 KiB, even for a larger input. TLS `writev()` likewise returns progress from
+the first nonempty slice. Use `co_await stream.write_exactly(data, size, token)`
+when a complete logical write is required. HTTP `body_writer` already handles
+partial progress; no new application retry loop is required there.
+
+The optional third `tls_stream` constructor argument accepts
+`tls_stream_options{.ciphertext_budget = 1024 * 1024}`; 1 MiB is the default.
+This on-demand budget covers retained custom-BIO ciphertext payload, including
+consumed block prefixes and outstanding drain leases until the full block is
+freed. It excludes queue metadata, OpenSSL and kernel memory. Direct output
+avoids the queue when possible; no caller plaintext is retained by a background
+output pump. `ENOBUFS` or `ENOMEM` is terminal, not a request to retry with a
+larger budget on the same connection. The first transport failure stays sticky,
+and operations ending in transport failure await owned output-I/O cleanup
+before returning.
+
+Read success need not wait for unrelated ciphertext output; handshake success
+establishes local TLS state but final control records may still be draining.
+Neither result proves peer receipt. Keep the stream and borrowed plaintext
+alive through public operations even though internal transport ownership now
+retains the physical descriptor through pending internal I/O cleanup.
+
+Legacy `shutdown()` still returns `task<void>`. Its default is now one 5-second
+whole-session close budget, not a new budget for each retry. Expiry starts abort
+and cleanup; it does not promise return within exactly 5 seconds or lossless
+delivery. Serialize it with reads/writes. Destruction aborts owned output, does
+not asynchronously finish normal shutdown, and never makes forced destruction
+of an active caller coroutine safe. This API is not directional half-close or
+CONNECT tunnel support.
+
 ## Task Ownership And Virtual Threads
 
 - `coro::task<T>` is move-only. Move unstarted tasks into containers, return

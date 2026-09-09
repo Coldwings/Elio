@@ -548,6 +548,13 @@ public:
         return write_exactly(str.data(), str.size(), std::move(token));
     }
 
+    /// Interpret a zero-byte read without closing the reverse write direction.
+    /// An error return from read is not authenticated EOF, regardless of scope.
+    net::close_scope read_end_scope() const {
+        auto lock = lock_ssl_state();
+        return close_.whole ? net::close_scope::whole_session : net::close_scope::write_direction;
+    }
+
     /// Finish this endpoint's write side. TLS 1.3 keeps the reverse direction
     /// open and ignores timeout; TLS 1.2 closes the session under one budget.
     /// Success confirms local ciphertext drainage, not peer application receipt.

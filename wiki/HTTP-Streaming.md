@@ -18,9 +18,10 @@ zero-copy guarantee.
 storage without generating Content-Length in the metadata. `response_head`
 contains metadata only. A move-only `streaming_response` owns its producer and
 declares either a known byte count or an unknown length. `reply` is the variant
-of complete and streaming responses.
+of complete, streaming, and tunnel responses. Tunnel acceptance has a separate
+handoff lifecycle described below; it is not an ordinary response body.
 
-Router registrations accept synchronous or `task` results of all three reply
+Router registrations accept synchronous or `task` results of all four reply
 shapes through explicit adapters. Registered handler callables are copyable;
 the producer returned by a handler may be move-only. A context remains alive
 through producer execution and send cleanup. Once the handler selects its final
@@ -38,6 +39,105 @@ returns, including failure cleanup. Never detach a write, escape the writer,
 or use it concurrently. Empty writes do not end the response. Only successful
 producer return delegates final framing to the server; there is no public
 `finish()` operation.
+
+## CONNECT Tunnel Handoff
+
+Register `router.connect(handler)` for authority-form CONNECT requests. The
+handler receives `(context&, connect_authority_view)`; the authority contains
+borrowed `raw` and `host` spellings plus a parsed `uint16_t port`. This is a
+dedicated authority handler, not a path route. Syntax validation does not
+authorize, resolve, percent-decode, or connect to the destination. Copy `raw`
+and `host` into owning strings if they must outlive the handler/session context;
+copying a view does not extend the lifetime of its backing storage.
+
+Return an ordinary non-2xx response to reject a CONNECT, or a `tunnel_response`
+owning a callable with signature
+`task<tunnel_result>(tunnel_stream&, coro::cancel_token)` to accept it. The
+session callable may be move-only. A tunnel response defaults to 200 and may
+customize its response head, but acceptance requires HTTP/1.0 or HTTP/1.1,
+CONNECT, a 2xx status, and neither Content-Length nor Transfer-Encoding.
+An ordinary complete/streaming 2xx CONNECT reply is rejected by the sender;
+do not use an empty ordinary response to establish a tunnel.
+
+The server completely writes the acceptance head before invoking the session,
+at most once. It moves the parser's captured post-header bytes into the scoped
+`tunnel_stream`; reads consume this binary prefix once before reading the
+transport. Those bytes are never passed to a second HTTP parser. No HTTP body
+producer, chunk encoder, or final chunk marker participates. Acceptance ends
+HTTP processing permanently; the connection is never returned to HTTP reuse.
+Rejected CONNECT requests also close conservatively, so speculative tunnel
+bytes cannot become a following HTTP request.
+
+The view is noncopyable/nonmovable and borrows the original TCP or TLS transport.
+One reader may overlap one write-side operation. The callback must join all
+operations it starts before returning; neither the view nor active operations
+may escape. Keep write payload and iovec descriptor storage valid and immutable
+until the await returns. `write()` and `writev()` complete the submitted slices
+or return a terminal error with `accepted_bytes` and `uncertain_attempt`.
+Confirmed positive progress is retained. An attempted but unconfirmed suffix
+is not known to be lost, so do not replay it automatically. Completion means
+local transport acceptance, not peer application receipt.
+Failed reads and output finish report the view's first terminal error, so
+cancellation used to clean up a sibling does not hide the original failure.
+Successful positive read/write progress remains available for accounting.
+
+Handoff does not materialize tunnel plaintext as an HTTP body or aggregate
+write payloads. The parser prefix was already captured and is moved into the
+view; subsequent reads copy its bytes into caller storage. TLS still has its
+own cryptographic buffers and bounded ciphertext staging. This is not a claim
+of zero-copy TLS or zero allocation.
+
+### Optional Bounded Relay
+
+Tunnel `read`, `write`, `writev` and `finish_output` entries may throw before a
+task is returned if frame construction fails. They first retain a terminal error
+and request sibling cancellation. Catching the exception cannot restore the
+view: join overlapping work before releasing its buffers or ending the callback.
+An allocation failure creating the nested vector operation inside an already
+started scalar write is returned as a structured `ENOMEM` failure, with zero
+accepted bytes and no uncertain transport attempt. Cancellation remains
+cooperative; neither failure form permits destruction of live coroutine frames.
+
+`relay(tunnel_stream&, net::stream&, relay_options{}, token)` uses exactly two
+fixed payload buffers, each `relay_options::buffer_size` bytes (64 KiB by
+default). It owns and joins both directional tasks, including cancellation,
+exceptions and partial child-launch failure. It does not resolve or connect
+the upstream, add a total-lifetime timer, or impose a reverse-half-close timer.
+
+TCP and TLS 1.3 directional EOF finishes the opposite destination's output
+without cancelling healthy reverse traffic. `read_end_scope()` describes the
+observed closure, rather than requiring applications to branch on TLS version.
+TLS 1.2 whole-session closure instead stops the relay after close coordination
+and joined cleanup. A writer encountering normal whole-session `ESHUTDOWN`
+joins the existing destination close driver before stopping its sibling; it
+must not cancel that driver while its response alert is still draining.
+
+TLS 1.2 freezes new plaintext submission at closure. Already BIO-accepted
+ciphertext is committed: it remains ordered before the close alert, not dropped
+or reordered around it. One whole-session close deadline, five seconds by
+default, covers that process; repeated joins do not restart it. Resource
+exhaustion, an unsafe unfinished SSL write retry, cancellation or expiry can
+abort closure. Neither `session_closed` nor a successful close result promises
+that all reverse plaintext was forwarded. The five-second budget does not
+limit normal TCP/TLS 1.3 reverse-half-close lifetime.
+
+Relay direction results distinguish source bytes read, bytes confirmed by
+successful destination writes, and uncertain failed attempts. Counter overflow
+is terminal. `completed` and `session_closed` are normal termination categories,
+not delivery acknowledgments or application-level success. Internal sibling
+stop is distinguished from the external cancellation/failure that selected the
+relay result.
+The relay also observes inherited task cancellation before starting either
+direction. A child-startup exception remains a failure even if its cleanup
+cancels another child; that internal cancellation does not hide the cause.
+
+See [the canonical CONNECT proxy example](https://github.com/Coldwings/Elio/blob/main/examples/http_connect_proxy.cpp).
+Authorization, allowed destinations/ports, DNS resolution and rebinding policy,
+upstream connection policy, resource limits and application deadlines remain
+caller responsibilities. For an HTTPS proxy the tunnel retains the original
+outer TLS connection; it never detaches a plaintext socket. Inner TLS bytes
+remain opaque tunnel payload. Selecting TLS for an upstream leg is an explicit
+application choice, not an automatic consequence of CONNECT or port 443.
 
 ## Framing And Failure
 

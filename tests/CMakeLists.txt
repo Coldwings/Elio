@@ -75,6 +75,10 @@ list(APPEND TEST_SOURCES
 if(TARGET elio_http)
     list(APPEND TEST_SOURCES
         unit/test_http_server.cpp
+        unit/test_http_tunnel_dispatch.cpp
+        unit/test_http_tunnel_transport.cpp
+        unit/test_http_tunnel.cpp
+        unit/test_http_tunnel_relay.cpp
         unit/test_http_streaming_server.cpp
         unit/test_http_streaming_transport.cpp
     )
@@ -116,6 +120,9 @@ if(TARGET elio_http AND TARGET elio_tls)
     add_library(elio_public_header_examples OBJECT
         compile/http_common_standalone.cpp
         compile/http_streaming_migration.cpp
+        compile/http_tunnel_standalone.cpp
+        compile/http_tunnel_response_standalone.cpp
+        compile/http_tunnel_relay_standalone.cpp
         compile/public_header_examples.cpp
     )
     target_link_libraries(elio_public_header_examples PRIVATE
@@ -133,6 +140,13 @@ if(ELIO_BUILD_HTTP_INTEROP_TESTS)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_executable(elio_http_streaming_peer integration/http_streaming_peer_server.cpp)
     target_link_libraries(elio_http_streaming_peer PRIVATE elio_http elio_tls)
+    add_executable(elio_http_connect_peer integration/http_connect_peer_server.cpp)
+    target_link_libraries(elio_http_connect_peer PRIVATE elio_http elio_tls)
+    add_test(NAME http_connect_interop
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/http_connect_peer.py
+            --server $<TARGET_FILE:elio_http_connect_peer>
+            --output-root ${CMAKE_CURRENT_BINARY_DIR}/http-connect-evidence)
+    set_tests_properties(http_connect_interop PROPERTIES TIMEOUT 360)
     add_executable(elio_http_streaming_cost_probe integration/http_streaming_cost_probe.cpp)
     target_link_libraries(elio_http_streaming_cost_probe PRIVATE elio)
     add_test(NAME http_streaming_cost_probe COMMAND elio_http_streaming_cost_probe)

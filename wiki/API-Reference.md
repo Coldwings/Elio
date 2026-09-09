@@ -2145,12 +2145,17 @@ struct write_finish_result {
 coro::task<net::write_finish_result> finish_write(
     coro::cancel_token token = {},
     std::chrono::milliseconds timeout = std::chrono::milliseconds(5000));
+// Interpret a nonempty read operation that returned zero (not a failed read):
+net::close_scope read_end_scope() const;
 ```
 
 One reader may overlap; serialize other writers and lifetime changes. TCP
 performs `SHUT_WR`, internally retries EINTR, and ignores the timeout. TLS 1.3
 preserves reading; TLS 1.2 automatically closes the session under the timeout.
 The result reports closure scope and observations, not proof of peer delivery.
+`read_end_scope()` reports directional EOF for TCP/TLS 1.3, or the selected
+whole-session closure for TLS 1.2. It does not itself close output, probe
+transport capabilities, or turn an error/zero-length read into authenticated EOF.
 See [Finishing Stream Output](API-Contracts#finishing-stream-output) for
 automatic TLS 1.2 closure, ordered ciphertext draining and failure semantics.
 
@@ -2901,8 +2906,105 @@ Transfer-Encoding or nonzero Content-Length is rejected when headers complete,
 without waiting for request content; CL:0 is allowed. `take_remaining()` moves
 out post-header bytes exactly once for the next protocol. Host cardinality
 checks remain unchanged, and Host is not a replacement tunnel destination.
-Resolution and access policy belong to the application. This parser contract
-does not provide server tunnel acceptance or HTTP/2 CONNECT support.
+Resolution and access policy belong to the application. Parsing alone does not
+accept a tunnel; use the separate HTTP/1 server API below. HTTP/2 CONNECT is not
+included.
+
+### CONNECT Routing And Sessions
+
+Declared in `http_tunnel.hpp`, `http_tunnel_response.hpp` and
+`http_tunnel_relay.hpp`, and available through the HTTP umbrella header:
+
+```cpp
+struct connect_authority_view {
+    std::string_view raw, host;
+    uint16_t port;
+};
+// router.connect(handler): handler(context&, connect_authority_view)
+// accepts response, streaming_response, tunnel_response, reply, or task of each.
+
+enum class tunnel_end {
+    completed, session_closed, cancelled, timed_out, transport_error,
+    invalid_response, invalid_state, callback_error
+};
+struct tunnel_direction_result {
+    uint64_t source_bytes = 0, accepted_bytes = 0;
+    bool uncertain_write = false;
+};
+struct tunnel_result {
+    tunnel_end end = tunnel_end::completed;
+    int error = 0;
+    tunnel_direction_result client_to_upstream, upstream_to_client;
+    bool success() const noexcept;
+};
+struct tunnel_write_result {
+    uint64_t accepted_bytes = 0;
+    int error = 0;
+    bool uncertain_attempt = false;
+    bool success() const noexcept;
+};
+class tunnel_stream { // Noncopyable/nonmovable; provided only to the session.
+public:
+    coro::task<io::io_result> read(void*, size_t, coro::cancel_token = {});
+    coro::task<tunnel_write_result> write(const void*, size_t, coro::cancel_token = {});
+    coro::task<tunnel_write_result> write(std::string_view, coro::cancel_token = {});
+    coro::task<tunnel_write_result> writev(std::span<const iovec>, coro::cancel_token = {});
+    coro::task<net::write_finish_result> finish_output(coro::cancel_token = {});
+    net::close_scope read_end_scope() const;
+    int error() const noexcept;
+};
+class tunnel_response : public response_head {
+public:
+    template<class Session> tunnel_response(response_head, Session&&);
+    template<class Session> tunnel_response(status, Session&&);
+    template<class Session> explicit tunnel_response(Session&&); // Default 200.
+    // Move-only; Session returns task<tunnel_result>(tunnel_stream&, cancel_token).
+};
+struct relay_options { size_t buffer_size = 64 * 1024; };
+coro::task<tunnel_result> relay(tunnel_stream&, net::stream&,
+    relay_options = {}, coro::cancel_token = {});
+```
+
+`raw` preserves the authority spelling; `host` removes IP-literal brackets but
+does not decode percent escapes or resolve names. Views borrow request storage.
+The dedicated CONNECT handler bypasses path matching. Authorize and establish
+the upstream before accepting; a non-2xx ordinary response rejects the request.
+
+Server dispatch requires a 2xx tunnel response without CL/TE for an HTTP/1
+CONNECT request. It writes the head before invoking the owned callable at most
+once, moves parser read-ahead into the view, and never resumes HTTP parsing or
+reuse. Ordinary `send_response()` rejects this alternative and ordinary 2xx
+CONNECT replies. A moved-from or already invoked session cannot run again.
+
+One read may overlap one write-side operation; the callback must join its own
+tasks before returning. Writes complete all supplied slices or return confirmed
+progress plus an uncertain failed attempt. Payloads and descriptors stay
+borrowed through cleanup; there is no aggregate plaintext output buffer or
+automatic replay. `success()` on `tunnel_result` recognizes `completed` and
+`session_closed`; neither means peer receipt or complete reverse forwarding.
+
+`read`, `write`, `writev` and `finish_output` can throw before returning a task
+if coroutine-frame construction fails. Their entry wrappers first make the view
+terminal (`ENOMEM` for allocation failure, otherwise `EIO`) and request sibling
+cancellation, then rethrow. Catching that exception does not make the view reusable:
+still join every overlapping task before releasing its buffers or returning from
+the session. A scalar write whose nested vector-operation frame fails after its
+task has started instead returns a structured failure with no accepted bytes or
+uncertain transport attempt. These guarantees do not promise progress under
+arbitrary memory exhaustion or permit forced coroutine-frame destruction.
+
+The optional relay owns two fixed buffers and joins both directional tasks on
+every exit, including launch failure. Normal directional EOF preserves reverse
+traffic. Whole-session EOF/finish coordinates normal closure before internal
+sibling stop; external cancellation and transport failures remain distinct
+result causes. `read_end_scope()` describes an observed EOF, not a transport
+capability and not evidence of authenticated EOF after an error. For TLS 1.2
+it may also identify the already selected whole-close state when coordinating
+normal `ESHUTDOWN` from the other direction.
+
+See [HTTP Streaming](HTTP-Streaming.md#connect-tunnel-handoff) for the TLS 1.2
+commitment boundary, five-second whole-close budget and caller-owned security
+policy. High-level HTTP client CONNECT support is not added by this server API.
 
 ### `headers`
 
@@ -2987,7 +3089,7 @@ public:
     response_transfer transfer() const noexcept;
     // Move-only; owns the producer, not externally referenced payload.
 };
-using reply = std::variant<response, streaming_response>;
+using reply = std::variant<response, streaming_response, tunnel_response>;
 ```
 
 Metadata defaults to 200 / HTTP/1.1 and no representation length. Version setters

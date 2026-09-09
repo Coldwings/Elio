@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Owned HTTP/1 CONNECT tunnels**: dedicated authority routing,
+  `tunnel_response` sessions, scoped borrowed `tunnel_stream` I/O and an optional
+  two-buffer, cancel-and-join relay. Acceptance preserves parser read-ahead once
+  and exits HTTP permanently. TCP/TLS 1.3 preserve healthy reverse traffic;
+  TLS 1.2 uses coordinated whole-session closure. Destination authorization,
+  DNS/upstream policy and inner TLS remain application responsibilities (#1208).
+- **Breaking reply alternative**: `http::reply` now includes `tunnel_response`.
+  Update exhaustive visitors; ordinary 2xx CONNECT replies cannot substitute
+  for the server-owned handoff. Failed attempted tunnel writes report
+  uncertainty, not proof of an unsent/replayable suffix.
+
 - **Protocol-aware stream output completion**: `finish_write()` on TCP, TLS
   and the common stream reports directional versus whole-session closure.
   TCP/TLS 1.3 retain reading; TLS 1.2 automatically closes the session under

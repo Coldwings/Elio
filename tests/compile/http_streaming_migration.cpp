@@ -2,6 +2,7 @@
 // Historical removed APIs deliberately do not appear in this translation unit.
 #include <elio/http/http_server.hpp>
 #include <elio/http/sse_writer.hpp>
+#include <elio/http/http_tunnel_relay.hpp>
 
 #include <array>
 #include <cerrno>
@@ -15,6 +16,27 @@
 namespace http_streaming_migration {
 using namespace elio;
 using namespace elio::http;
+
+void register_connect(router& routes, uint16_t allowed_port) {
+    routes.connect([allowed_port](context& ctx, connect_authority_view target)
+        -> coro::task<reply> {
+        if (target.host != "127.0.0.1" || target.port != allowed_port)
+            co_return response(status::forbidden, "Destination is not allowed");
+        auto upstream = co_await net::tcp_connect(
+            net::ipv4_address("127.0.0.1", allowed_port), ctx.cancel_token());
+        if (!upstream) co_return response(status::bad_gateway, "Upstream failed");
+        co_return tunnel_response(
+            [owned = net::stream(std::move(*upstream))]
+            (tunnel_stream& client, coro::cancel_token token) mutable -> coro::task<tunnel_result> {
+                co_return co_await relay(client, owned, {}, token);
+            });
+    });
+}
+
+// An exhaustive visitor must include tunnel_response after the reply migration.
+response_head& selected_head(reply& selected) {
+    return std::visit([](auto& value) -> response_head& { return value; }, selected);
+}
 
 response changed_body() {
     auto value = response::ok("old");

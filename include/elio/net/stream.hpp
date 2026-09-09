@@ -281,6 +281,16 @@ public:
         return write_exactly(data.data(), data.size(), std::move(token));
     }
 
+    /// Scope of a zero-byte read, not a capability probe or a replacement for
+    /// checking read errors. Does not close this endpoint's write direction.
+    close_scope read_end_scope() const {
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (const auto* tls = std::get_if<tls::tls_stream>(&stream_))
+            return tls->read_end_scope();
+#endif
+        return close_scope::write_direction;
+    }
+
     /// Finish output using the negotiated transport's closure semantics.
     /// Serialize with writers/lifetime changes; one reader may overlap.
     coro::task<write_finish_result> finish_write(

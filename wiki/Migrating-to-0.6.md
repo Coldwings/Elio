@@ -14,6 +14,29 @@ and drains the already BIO-accepted ciphertext prefix and alert within
 
 ## HTTP Complete And Streaming Replies
 
+`http::reply` now has a third alternative, `tunnel_response`. Update exhaustive
+visitors and code that assumes every non-complete reply is streaming. Ordinary
+`send_response()` rejects tunnel replies and ordinary 2xx CONNECT responses;
+use `router.connect()` plus a `tunnel_response` for server-owned acceptance.
+Return an ordinary non-2xx response for rejection. Registrations accept
+`response`, `streaming_response`, `tunnel_response` or `reply`, including their
+`task` forms; a registered handler remains copyable while its returned session
+callable may be move-only.
+
+Replace manual socket extraction, acceptance-header writes and post-CONNECT
+parser loops with the scoped `tunnel_stream` callback. The server writes the
+head first and supplies captured binary read-ahead exactly once. Keep payloads,
+descriptors and the view alive through joined operations; full tunnel writes
+report confirmed bytes plus uncertainty on failure, not a replayable suffix.
+Handle task-construction exceptions as well as awaited results: tunnel operation
+entry can throw before returning a task. It still terminalizes the view and
+requests cancellation of overlapping work. After catching, join that work before
+releasing its borrowed buffers; do not resume tunnel I/O or destroy live frames.
+Use the optional two-buffer `relay()` only after applying application-specific
+authorization and upstream connection policy. See
+[CONNECT handoff](HTTP-Streaming.md#connect-tunnel-handoff) and
+[the proxy example](https://github.com/Coldwings/Elio/blob/main/examples/http_connect_proxy.cpp).
+
 For direct `prepare_response` callers, `body_description::length` defaults to
 `std::nullopt`, not zero. `{.kind = response_body_kind::streaming}` therefore
 describes an unknown-length stream. Supply `.length = uint64_t{0}` explicitly
@@ -27,7 +50,8 @@ authorities, Transfer-Encoding and positive Content-Length are rejected before
 request-body accumulation. CL:0 remains accepted. Read the preserved authority
 from `path()` and retain post-header bytes via `take_remaining()` when owning a
 low-level handoff. Syntax acceptance does not resolve or authorize the target,
-and this correction alone does not add a server tunnel API.
+and low-level parsing alone does not perform a tunnel handoff. The server-owned
+API above supplies that separate lifecycle; HTTP/2 CONNECT is not included.
 
 `response` now owns a complete body; its constructors and `set_body()` no longer
 generate Content-Length in metadata. The shared outgoing plan derives that

@@ -1106,7 +1106,8 @@ private:
         
         // Check for WebSocket upgrade
         std::unordered_map<std::string, std::string> ws_params;
-        auto* ws_route = router_.find_ws_route(req.path(), ws_params);
+        auto* ws_route = req.get_method() == method::CONNECT
+            ? nullptr : router_.find_ws_route(req.path(), ws_params);
         
         if (ws_route) {
             // Handle WebSocket upgrade
@@ -1200,11 +1201,17 @@ private:
             context ctx(std::move(req), client_addr, {}, token);
             
             std::unordered_map<std::string, std::string> params;
-            auto* http_route = router_.find_route(ctx.req().get_method(), 
-                                                   ctx.req().path(), params);
+            auto* http_route = ctx.req().get_method() == method::CONNECT
+                ? nullptr : router_.find_route(ctx.req().get_method(), ctx.req().path(), params);
             
             reply resp;
-            if (http_route) {
+            if (ctx.req().get_method() == method::CONNECT) {
+                try {
+                    if (router_.connect_handler())
+                        resp = co_await router_.connect_handler()(ctx);
+                    else resp = response(status::not_implemented, "CONNECT handler not configured");
+                } catch (...) { resp = response::internal_error(); }
+            } else if (http_route) {
                 for (const auto& [name, value] : params) {
                     ctx.set_param(name, value);
                 }
@@ -1222,8 +1229,8 @@ private:
             }
             
             http::detail::context_access::seal_final_response(ctx);
-            co_await http::send_response(stream, resp, ctx.req().get_method(),
-                ctx.req().version(), false, token, http_config_.write_timeout);
+            co_await http::detail::dispatch_reply(stream, resp, parser,
+                false, token, http_config_.write_timeout);
         }
     }
     

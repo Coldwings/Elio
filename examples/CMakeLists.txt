@@ -163,6 +163,10 @@ if(TARGET elio_http)
     target_link_libraries(http_streaming_server PRIVATE elio_http)
     target_link_options(http_streaming_server PRIVATE ${STATIC_LINK_FLAGS})
 
+    add_executable(http_connect_proxy http_connect_proxy.cpp)
+    target_link_libraries(http_connect_proxy PRIVATE elio_http)
+    target_link_options(http_connect_proxy PRIVATE ${STATIC_LINK_FLAGS})
+
     add_executable(http_client http_client.cpp)
     target_link_libraries(http_client PRIVATE elio_http)
     target_link_options(http_client PRIVATE ${STATIC_LINK_FLAGS})

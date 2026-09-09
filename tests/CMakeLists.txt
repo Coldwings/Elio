@@ -10,6 +10,7 @@ set(TEST_SOURCES
     test_main.cpp
     test_watchdog.cpp
     unit/test_bench_tcp_common.cpp
+    unit/test_http_metrics_supervision.cpp
     unit/test_logger.cpp
     unit/test_virtual_stack.cpp
     unit/test_frame_allocation.cpp

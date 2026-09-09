@@ -1,4 +1,6 @@
 // Fixed-work real-transport diagnostic, not an isolated server-capacity benchmark.
+#include "http_metrics_supervision.hpp"
+
 #include <elio/http/http_parser.hpp>
 #include <elio/http/http_response_sender.hpp>
 #include <elio/net/tcp.hpp>
@@ -352,11 +354,11 @@ int main(int argc, char** argv) {
         const char* supervision_cause = "none";
         while (finished.wait_for(5ms) != std::future_status::ready) {
             const auto phase_deadline = control.phase_deadline.load();
-            if (std::chrono::steady_clock::now() >= total_deadline ||
-                (phase_deadline && monotonic_ns() >= phase_deadline)) {
+            const bool trial_expired = std::chrono::steady_clock::now() >= total_deadline;
+            if (trial_expired || test::http_metrics::try_claim_expired_phase(
+                    control.phase_deadline, phase_deadline, monotonic_ns())) {
                 expired = true;
-                supervision_cause = std::chrono::steady_clock::now() >= total_deadline
-                    ? "trial_deadline" : "phase_deadline";
+                supervision_cause = trial_expired ? "trial_deadline" : "phase_deadline";
                 control.stop.cancel();
                 break;
             }

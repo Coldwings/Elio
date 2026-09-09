@@ -301,6 +301,68 @@ TEST_CASE("TLS 1.2 write finish reports a withheld peer close timeout",
     });
 }
 
+TEST_CASE("TLS 1.2 extreme finish deadlines saturate before cancellation",
+          "[tls][finish][timeout][issue-1217]") {
+    finish_backends([](backend_type backend) {
+        SECTION("maximum duration remains pending until explicitly cancelled") {
+            finish_fixture fixture(backend, tls::tls_version::tls_1_2);
+            coro::cancel_source close_cancel;
+            net::write_finish_result finished;
+            std::atomic<bool> close_done{false};
+            bool alert_observed = false;
+            bool pending_before_cancel = false;
+            fixture.run([&]() -> coro::task<void> {
+                std::optional<coro::join_handle<void>> child;
+                auto close = [&]() -> coro::task<void> {
+                    finished = co_await fixture.server->finish_write(
+                        close_cancel.get_token(), std::chrono::milliseconds::max());
+                    close_done.store(true, std::memory_order_release);
+                };
+                try {
+                    child.emplace(elio::spawn(close()));
+                    // The peer deliberately performs no reads or close. Observe
+                    // real SSL progress past the deadline check, not elapsed
+                    // wall time, before issuing our separate cancellation.
+                    while (!close_done.load(std::memory_order_acquire) &&
+                           !fixture.cancel.is_cancelled()) {
+                        const auto state = fixture.server->shutdown_state_for_test();
+                        if ((state.ssl_shutdown_flags & SSL_SENT_SHUTDOWN) != 0) {
+                            alert_observed = true;
+                            pending_before_cancel = !close_done.load(std::memory_order_acquire);
+                            break;
+                        }
+                        co_await time::yield();
+                    }
+                    close_cancel.cancel();
+                } catch (...) { fixture.abort(); }
+                if (child) co_await std::move(*child);
+            });
+            REQUIRE(alert_observed);
+            REQUIRE(pending_before_cancel);
+            REQUIRE(finished.scope == net::close_scope::whole_session);
+            REQUIRE(finished.error == ECANCELED);
+            REQUIRE_FALSE(finished.peer_end_observed);
+            REQUIRE_FALSE(fixture.cancel.is_cancelled());
+            REQUIRE_FALSE(fixture.server->shutdown_state_for_test().pump_active);
+        }
+        SECTION("minimum negative duration normalizes to immediate expiry") {
+            finish_fixture fixture(backend, tls::tls_version::tls_1_2);
+            net::write_finish_result finished;
+            fixture.run([&]() -> coro::task<void> {
+                finished = co_await fixture.server->finish_write(
+                    fixture.cancel.get_token(), std::chrono::milliseconds::min());
+            });
+            REQUIRE(finished.scope == net::close_scope::whole_session);
+            REQUIRE(finished.error == ETIMEDOUT);
+            REQUIRE_FALSE(finished.local_end_flushed);
+            REQUIRE_FALSE(finished.peer_end_observed);
+            const auto state = fixture.server->shutdown_state_for_test();
+            REQUIRE((state.ssl_shutdown_flags & SSL_SENT_SHUTDOWN) == 0);
+            REQUIRE_FALSE(state.pump_active);
+        }
+    });
+}
+
 TEST_CASE("TLS write finish contains close alert resource failure",
           "[tls][finish][failure][issue-1217]") {
     finish_backends([](backend_type backend) {

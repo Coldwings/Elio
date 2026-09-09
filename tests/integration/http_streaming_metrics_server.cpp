@@ -108,6 +108,17 @@ struct evidence {
     bool success = false;
     std::string tls_version = "none";
     std::string tls_cipher = "none";
+    std::string error;
+    const char* error_type = "none";
+    const char* stage = "accept";
+    std::string request_phase;
+    size_t request_sequence = 0;
+    size_t request_bytes = 0;
+    bool request_complete = false;
+    bool read_result_available = false;
+    io::io_result last_read{};
+    int64_t request_started_ns = 0;
+    int64_t request_elapsed_ns = 0;
 };
 
 // Only the main thread supervises deadlines; it does not touch the stream.
@@ -122,17 +133,29 @@ struct supervision {
 template<typename Stream>
 coro::task<void> read_request(Stream& stream, const options& config,
                               std::string_view phase, size_t sequence,
-                              supervision& control) {
+                              supervision& control, evidence& result) {
     control.start_bounded_phase();
+    result.stage = "request_read";
+    result.request_phase = phase;
+    result.request_sequence = sequence;
+    result.request_bytes = 0;
+    result.request_complete = false;
+    result.read_result_available = false;
+    result.request_started_ns = monotonic_ns();
     request_parser parser;
     parser.set_max_headers(16);
     parser.set_max_header_size(1024);
     std::array<char, 2048> buffer{};
     size_t received = 0;
     while (!parser.is_complete()) {
+        result.read_result_available = false;
         const auto input = co_await stream.read(buffer.data(), buffer.size(), control.stop.get_token());
+        result.last_read = input;
+        result.read_result_available = true;
+        result.request_elapsed_ns = monotonic_ns() - result.request_started_ns;
         if (input.result <= 0) throw std::runtime_error("request read failed");
         received += static_cast<size_t>(input.result);
+        result.request_bytes = received;
         if (received > 8192) throw std::runtime_error("request exceeds fixture limit");
         const auto parsed = parser.parse({buffer.data(), static_cast<size_t>(input.result)});
         if (parsed.first == parse_result::error) throw std::runtime_error("invalid request");
@@ -148,6 +171,7 @@ coro::task<void> read_request(Stream& stream, const options& config,
         !headers.keep_alive("HTTP/1.1")) {
         throw std::runtime_error("request does not match fixed trial sequence");
     }
+    result.request_complete = true;
 }
 
 template<typename Stream>
@@ -159,7 +183,8 @@ coro::task<void> send_trial(Stream& stream, const options& config,
         const bool probe = index == measured_responses + 1;
         const char* phase = probe ? "probe" : measured ? "measure" : "warmup";
         const size_t sequence = measured ? index - 1 : 0;
-        co_await read_request(stream, config, phase, sequence, control);
+        co_await read_request(stream, config, phase, sequence, control, result);
+        result.stage = "response_send";
 
         // Source storage and selected-reply construction are outside the
         // measured send interval. The shared complete body is not recopied.
@@ -221,6 +246,7 @@ coro::task<void> run_connection(net::tcp_listener& listener, const options& conf
             ~abandon_tls() { stream.shutdown_socket(); }
         } cleanup{stream};
         // Accept and handshake share the original startup budget.
+        result.stage = "tls_handshake";
         if (!co_await stream.handshake(control.stop.get_token())) throw std::runtime_error("TLS handshake failed");
         result.tls_version = stream.version();
         result.tls_cipher = stream.cipher();
@@ -245,7 +271,8 @@ std::string json_quote(std::string_view value) {
     return result + '"';
 }
 
-void print_result(const options& config, const evidence& result, const char* backend) {
+void print_result(const options& config, const evidence& result, const char* backend,
+                  const char* supervision_cause) {
     std::printf("{\"event\":\"result\",\"trial\":%s,\"transport\":%s,\"mode\":%s,"
         "\"measured_count\":%zu,\"confirmed_body_bytes\":%llu,\"server_cpu_ns\":%llu,"
         "\"success\":%s,\"probe_success\":%s,\"body_bytes\":%zu,\"stream_block_bytes\":%zu,"
@@ -269,7 +296,22 @@ void print_result(const options& config, const evidence& result, const char* bac
             static_cast<unsigned long long>(row.sent.result.confirmed_body_bytes),
             static_cast<unsigned long long>(row.cpu_ns), static_cast<int>(row.sent.result.error), row.sent.result.transport_error);
     }
-    std::puts("]}");
+    std::fputs("]", stdout);
+    if (!result.success) {
+        std::printf(",\"failure\":{\"stage\":%s,\"error_type\":%s,\"error\":%s,"
+            "\"supervision_cause\":%s,\"request_phase\":%s,\"request_sequence\":%zu,"
+            "\"request_bytes\":%zu,\"request_complete\":%s,\"request_elapsed_ns\":%lld,\"read_result\":",
+            json_quote(result.stage).c_str(), json_quote(result.error_type).c_str(),
+            json_quote(result.error).c_str(), json_quote(supervision_cause).c_str(),
+            json_quote(result.request_phase).c_str(), result.request_sequence, result.request_bytes,
+            result.request_complete ? "true" : "false", static_cast<long long>(result.request_elapsed_ns));
+        if (result.read_result_available)
+            std::printf("{\"result\":%d,\"flags\":%u}", result.last_read.result,
+                        static_cast<unsigned>(result.last_read.flags));
+        else std::fputs("null", stdout);
+        std::fputs("}", stdout);
+    }
+    std::puts("}");
 }
 } // namespace
 
@@ -307,11 +349,14 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         const auto total_deadline = std::chrono::steady_clock::now() + 60s;
         bool expired = false;
+        const char* supervision_cause = "none";
         while (finished.wait_for(5ms) != std::future_status::ready) {
             const auto phase_deadline = control.phase_deadline.load();
             if (std::chrono::steady_clock::now() >= total_deadline ||
                 (phase_deadline && monotonic_ns() >= phase_deadline)) {
                 expired = true;
+                supervision_cause = std::chrono::steady_clock::now() >= total_deadline
+                    ? "trial_deadline" : "phase_deadline";
                 control.stop.cancel();
                 break;
             }
@@ -321,21 +366,39 @@ int main(int argc, char** argv) {
             // The enclosing driver retains this explicit failure and process exit.
             std::fputs("metrics fixture cancellation cleanup exceeded budget\n", stderr);
             std::fflush(stderr);
+            // supervision_cause is one of the fixed literals above. Keep this
+            // emergency record allocation-free before terminating live work.
+            std::printf("{\"event\":\"failure\",\"error_type\":\"cleanup_timeout\",\"supervision_cause\":\"%s\"}\n",
+                        supervision_cause);
+            std::fflush(stdout);
             std::_Exit(3);
         }
         try { finished.get(); }
+        catch (const std::bad_alloc& error) {
+            std::fprintf(stderr, "metrics fixture: %s\n", error.what());
+            result.success = false;
+            result.error = error.what();
+            result.error_type = "std::bad_alloc";
+        }
         catch (const std::exception& error) {
             std::fprintf(stderr, "metrics fixture: %s\n", error.what());
             result.success = false;
+            result.error = error.what();
+            result.error_type = "std::exception";
         }
-        catch (...) { result.success = false; }
+        catch (...) { result.success = false; result.error_type = "unknown_exception"; }
         if (expired) result.success = false;
+        if (!result.request_complete && !result.read_result_available && result.request_started_ns)
+            result.request_elapsed_ns = monotonic_ns() - result.request_started_ns;
         if (!scheduler.shutdown(10s)) {
             std::fputs("metrics fixture scheduler failed to drain\n", stderr);
             std::fflush(stderr);
+            std::printf("{\"event\":\"failure\",\"error_type\":\"scheduler_cleanup_timeout\",\"supervision_cause\":\"%s\"}\n",
+                        supervision_cause);
+            std::fflush(stdout);
             std::_Exit(4);
         }
-        print_result(config, result, backend);
+        print_result(config, result, backend, supervision_cause);
         if (result.success) std::puts("{\"event\":\"stopped\"}");
         return result.success ? 0 : 1;
     } catch (const std::exception& error) {

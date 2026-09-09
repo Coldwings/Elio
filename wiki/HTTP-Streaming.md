@@ -426,6 +426,30 @@ must not be interpreted as a common utilization denominator.
 Wire trial identifiers, sequence numbers, framing, body length/digest, sender
 completion and final connection reuse are checked before a coordinate passes.
 Missing, duplicate or mismatched evidence is incomplete, not a successful row.
+On a client request failure, `client.json` retains `failed_response` with the
+trial, phase, sequence, parsed-final-header state, received HTTP plaintext bytes,
+decoded body bytes, elapsed nanoseconds, operation and exception type/message.
+`plaintext_bytes` counts bytes returned by TCP/TLS `recv`, including HTTP headers
+and framing; `body_bytes` counts only h11-decoded body events. Partial headers or
+unparsed bytes can therefore increase the former without increasing the latter.
+These fields are diagnostics, not additional verified responses or throughput.
+
+Failed server result events include a `failure` object with the active stage,
+expected request phase/sequence, received request bytes, request completion and
+elapsed time, the last returned read result/flags (or null if that await did not
+return), exception category/message, and whether phase or trial supervision
+expired. The request fields describe the last request, including when the
+failure occurs during its response send. If cancellation cleanup itself cannot
+finish, a separate failure event retains the supervision cause without reading
+coroutine-owned evidence concurrently. Raw stdout and stderr remain unchanged
+artifacts alongside parsed JSON. Diagnostics neither extend deadlines nor turn
+partial evidence into successful coverage.
+
+The intermittent TLS timeout tracked in
+[#1219](https://github.com/Coldwings/Elio/issues/1219) remains an unresolved
+investigation; improved evidence retention is not a root-cause correction or
+proof that later passing runs exclude a library, fixture or infrastructure
+defect.
 The reports retain build and transport metadata; shared-runner state and peer
 verification costs remain limitations. The controlled-sink allocation probe
 above is a separate measurement: it does not provide TCP/TLS allocation totals,

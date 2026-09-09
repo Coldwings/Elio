@@ -103,6 +103,19 @@ class Peer:
         self.socket.close()
 
     def request(self, trial, phase, sequence, mode, expected_digest, deadline):
+        started = time.monotonic_ns()
+        progress = {"trial": trial, "phase": phase, "sequence": sequence,
+                    "headers_seen": False, "plaintext_bytes": 0, "body_bytes": 0,
+                    "operation": "request_write"}
+        self.failed_response = None
+        try:
+            return self._request(trial, phase, sequence, mode, expected_digest, deadline, progress)
+        except Exception as error:
+            self.failed_response = {**progress, "elapsed_ns": max(0, time.monotonic_ns() - started),
+                                    "error_type": type(error).__name__, "error": str(error)}
+            raise
+
+    def _request(self, trial, phase, sequence, mode, expected_digest, deadline, progress):
         expected_bytes = 2 if phase == "probe" else BODY_BYTES
         expected_framing = "chunked" if mode == "chunked" and phase != "probe" else "content_length"
         event = h11.Request(method=b"GET", target=b"/", headers=[
@@ -112,6 +125,7 @@ class Peer:
             self.socket.settimeout(remaining(deadline))
             self.socket.sendall(data)
         received = 0
+        progress["operation"] = "response_read"
         digest = hashlib.sha256()
         response = None
         eof = False
@@ -122,11 +136,13 @@ class Peer:
                 require(not eof, "decoder requested input after EOF")
                 self.socket.settimeout(remaining(deadline))
                 data = self.socket.recv(BLOCK_BYTES)
+                progress["plaintext_bytes"] += len(data)
                 eof = not data
                 self.protocol.receive_data(data)
             elif isinstance(event, h11.Response):
                 require(response is None, "multiple final responses")
                 response = event
+                progress["headers_seen"] = True
                 require(event.status_code == 200 and event.http_version == b"1.1", "unexpected status/version")
                 headers = unique_headers(event.headers)
                 for name, value in ((b"x-trial-id", trial), (b"x-phase", phase),
@@ -143,6 +159,7 @@ class Peer:
             elif isinstance(event, h11.Data):
                 require(response is not None, "body before final headers")
                 received += len(event.data)
+                progress["body_bytes"] = received
                 require(received <= expected_bytes, "body exceeds fixed workload")
                 digest.update(event.data)
             elif isinstance(event, h11.EndOfMessage):
@@ -249,6 +266,9 @@ def run_coordinate(server, output, planned, certificate, key, args, expected_dig
             client["success"] = True
         except Exception as error:
             client["error"] = str(error)
+            client["error_type"] = type(error).__name__
+            if peer is not None and getattr(peer, "failed_response", None) is not None:
+                client["failed_response"] = peer.failed_response
         finally:
             if peer is not None:
                 peer.close()

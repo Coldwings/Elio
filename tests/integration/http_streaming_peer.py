@@ -34,7 +34,7 @@ class Peer:
     def close(self):
         self.socket.close()
 
-    def request(self, path, method=b"GET", truncated=False):
+    def request(self, path, method=b"GET", truncated=False, expected_status=200):
         deadline = time.monotonic() + self.timeout
         self.socket.settimeout(self.timeout)
         request = h11.Request(method=method, target=path.encode("ascii"),
@@ -67,7 +67,7 @@ class Peer:
             elif isinstance(event, h11.Response):
                 require(response is None, f"{path}: duplicate final response")
                 response = event
-                require(event.status_code == 200, f"{path}: status {event.status_code}")
+                require(event.status_code == expected_status, f"{path}: status {event.status_code}")
             elif isinstance(event, h11.Data):
                 body.extend(event.data)
             elif isinstance(event, h11.EndOfMessage):
@@ -131,6 +131,20 @@ def validate(port, timeout):
                 require(headers.get(b"content-type") == b"text/event-stream", "SSE media type")
             rows.append({"scenario": path, "method": method.decode(), "status": "passed",
                          "body_bytes": len(body), "connection": "shared-sequential"})
+        for path, status, length in [
+            ("/no-content", 204, None),
+            ("/reset-content", 205, b"0"),
+            ("/not-modified", 304, b"42"),
+        ]:
+            response, body, wire = peer.request(path, expected_status=status)
+            headers = dict(response.headers)
+            require(not body, f"{path}: body-forbidden response delivered payload")
+            require(wire.endswith(b"\r\n\r\n"), f"{path}: bytes after final headers")
+            require(headers.get(b"content-length") == length, f"{path}: length metadata")
+            require(b"transfer-encoding" not in headers, f"{path}: unexpected transfer coding")
+            require(headers.get(b"connection", b"").lower() != b"close", f"{path}: reuse disabled")
+            rows.append({"scenario": path, "method": "GET", "status": "passed",
+                         "body_bytes": 0, "connection": "shared-sequential"})
     finally:
         peer.close()
     peer = Peer(port, timeout)

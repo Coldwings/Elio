@@ -17,6 +17,13 @@ int main() {
     std::atomic<unsigned> head_invocations{0};
     router routes;
     routes.get("/ordinary", [](context&) { return response::ok("hello world"); });
+    routes.get("/no-content", [](context&) { return response(status::no_content, "not sent"); });
+    routes.get("/reset-content", [](context&) { return response(status::reset_content, "not sent"); });
+    routes.get("/not-modified", [](context&) {
+        response result(status::not_modified, "not sent");
+        result.set_representation_length(42);
+        return result;
+    });
     auto produce = [](body_writer& writer, coro::cancel_token token) -> coro::task<send_result> {
         auto result = co_await writer.write("hello ", token);
         if (!result.success()) co_return result;

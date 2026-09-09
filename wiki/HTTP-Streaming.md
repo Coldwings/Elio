@@ -262,6 +262,46 @@ application success.
 
 ## Validation Map
 
+Sending and receiving have separate evidence. A passed plain-loopback peer test
+does not establish TLS, backend, sanitizer, or throughput coverage.
+
+- `test_http_response_plan.cpp`: method/status/version framing, explicit length
+  assertions, serializer parity, metadata preservation and move-only ownership.
+- `test_http_body_writer.cpp`: controlled short writes, borrowed pointer lifetime,
+  terminal arbitration, late completion, watchdog cleanup and allocation-failure
+  checkpoints. Checkpoints are not a replacement for real allocator/sanitizer
+  execution.
+- `test_http_response_sender.cpp`: ordinary and owned producer execution, HEAD
+  suppression, repeat dispatch, producer failure and length enforcement.
+- `test_http_streaming_server.cpp` and `test_http_server.cpp`: route adapters,
+  context lifetime/sealing, raw wire, connection reuse and cooperative stop.
+- `test_http_streaming_transport.cpp`: real loopback TCP/TLS writes against a
+  non-draining peer, cancellation/timeout after observed pending I/O, sticky
+  failure, no finalizer write and buffer reuse after cleanup. Forced epoll and
+  io_uring cases report unavailable backends explicitly.
+- `test_sse_writer.cpp`: multiline/UTF-8 and metadata validation, fixed descriptor
+  batches, borrowed source identity, sticky failure and factory ownership.
+- `http_streaming_peer.py` with `http_streaming_peer_server.cpp`: pinned h11
+  0.16.0 validates plain HTTP/1.1 sequential connection reuse, complete/known/
+  chunked replies, HEAD producer suppression, 204/205/304 metadata, finite SSE
+  and truncated failure.
+  Enable `ELIO_BUILD_HTTP_INTEROP_TESTS` and install the exact peer version in
+  the selected Python environment; CTest runs `http_streaming_interop`.
+- `http_streaming_cost_probe.cpp`: complete/known/chunked sends of prepared
+  64 KiB and 4 MiB bodies into a controlled, nonbuffering sink. Counts successful
+  C++ allocation requests on the measuring thread and checks exact in-order
+  borrowed source coverage and bounded iovecs. Excludes prepared source storage,
+  malloc/custom allocator bypasses, other threads and transport/kernel buffers.
+  Cumulative allocation bytes are not peak memory or throughput. Pointer
+  coverage proves borrowed transport inputs, not absence of every possible
+  intermediate copy; control/coroutine allocations remain observable.
+
+The `HTTP streaming contracts` workflow also runs for relevant wiki edits and
+compiles public-header and SSE examples. It publishes a per-scenario table and
+retains peer logs. Its scope is conformance, not performance ranking; sanitizer
+coverage belongs to the main Debug matrix, not this focused peer job. Runtime
+results must still be checked for the current PR head before merging.
+
 - `test_http_response_decoder.cpp`: pointer identity, partial large chunks,
   every split/bytewise framing, EOF, limits, HEAD, handoff and adapter semantics.
 - `test_http_response_reader.cpp`: reusable-buffer pulls, error/EOF handling,

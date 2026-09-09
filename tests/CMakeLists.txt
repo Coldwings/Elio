@@ -75,6 +75,7 @@ if(TARGET elio_http)
     list(APPEND TEST_SOURCES
         unit/test_http_server.cpp
         unit/test_http_streaming_server.cpp
+        unit/test_http_streaming_transport.cpp
     )
 endif()
 
@@ -122,6 +123,12 @@ if(ELIO_BUILD_HTTP_INTEROP_TESTS)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_executable(elio_http_streaming_peer integration/http_streaming_peer_server.cpp)
     target_link_libraries(elio_http_streaming_peer PRIVATE elio_http elio_tls)
+    add_executable(elio_http_streaming_cost_probe integration/http_streaming_cost_probe.cpp)
+    target_link_libraries(elio_http_streaming_cost_probe PRIVATE elio)
+    add_test(NAME http_streaming_cost_probe COMMAND elio_http_streaming_cost_probe)
+    add_executable(elio_http_streaming_transport_tests unit/test_http_streaming_transport.cpp)
+    target_link_libraries(elio_http_streaming_transport_tests PRIVATE elio_http elio_tls Catch2::Catch2WithMain)
+    target_compile_definitions(elio_http_streaming_transport_tests PRIVATE ELIO_DEBUG ELIO_RUNTIME_TEST_HOOKS)
     add_test(NAME http_streaming_interop
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/http_streaming_peer.py
             --server $<TARGET_FILE:elio_http_streaming_peer>)

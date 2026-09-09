@@ -57,7 +57,8 @@ jobs:
             -DELIO_BUILD_HTTP_INTEROP_TESTS=ON \
             -DPython3_EXECUTABLE="$RUNNER_TEMP/http-peer-env/bin/python"
       - name: Compile peer and documented examples
-        run: cmake --build build-http-peer --target elio_http_streaming_peer elio_public_header_examples sse_server --parallel 2
+        id: build
+        run: cmake --build build-http-peer --target elio_http_streaming_peer elio_http_streaming_cost_probe elio_http_streaming_transport_tests elio_public_header_examples sse_server --parallel 2
       - name: Validate against h11
         id: peer
         run: |
@@ -65,14 +66,36 @@ jobs:
           "$RUNNER_TEMP/http-peer-env/bin/python" tests/integration/http_streaming_peer.py \
             --server build-http-peer/tests/elio_http_streaming_peer \
             > http-peer-results/result.json 2> http-peer-results/runtime.log
+      - name: Measure scoped HTTP allocation and borrowing invariants
+        if: always() && steps.build.outcome == 'success'
+        id: cost
+        run: |
+          mkdir -p http-peer-results
+          build-http-peer/tests/elio_http_streaming_cost_probe \
+            > http-peer-results/cost.json 2> http-peer-results/cost.log
+      - name: Validate real transport lifecycle by backend
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          mkdir -p http-peer-results
+          status=0
+          for backend in epoll io_uring; do
+            build-http-peer/tests/elio_http_streaming_transport_tests \
+              --section "forced $backend" --rng-seed 652314797 --reporter junit \
+              --out "http-peer-results/transport-$backend.xml" \
+              > "http-peer-results/transport-$backend.log" 2>&1 || status=1
+          done
+          exit "$status"
       - name: Publish readable conformance summary
         if: always()
         env:
           PEER_OUTCOME: ${{ steps.peer.outcome }}
+          COST_OUTCOME: ${{ steps.cost.outcome }}
         run: |
           python3 - <<'PY'
           import json, os
+          import xml.etree.ElementTree as ET
           from pathlib import Path
+          incomplete_transport = False
           report = Path('http-peer-results/result.json')
           lines = ['## HTTP streaming interoperability', '',
                    'Peer: h11 0.16.0. Plain loopback only; not a performance comparison.', '',
@@ -84,8 +107,42 @@ jobs:
                   lines.append(f"| {row['scenario']} | {row['status']} | {row['body_bytes']} |")
           else:
               lines.append('No successful scenario report; inspect failed steps and retained logs.')
+          lines += ['', '### HTTP-layer allocation probe', '',
+                    'Controlled discard sink, no network. Prepared payload storage and malloc-family bypasses are excluded.',
+                    'Cumulative C++ allocation requests are not peak memory, transport throughput, or end-to-end copy totals.', '',
+                    f"Probe step: {os.environ['COST_OUTCOME'] or 'not run'}", '']
+          cost = Path('http-peer-results/cost.json')
+          if cost.exists() and cost.stat().st_size:
+              data = json.loads(cost.read_text())
+              lines += ['| Mode | Body bytes | C++ allocations | Largest request | Payload-sized allocations |',
+                        '| --- | ---: | ---: | ---: | ---: |']
+              for row in data['rows']:
+                  lines.append(f"| {row['mode']} | {row['body_bytes']} | {row['allocation_calls']} | {row['largest_allocation_bytes']} | {row['payload_sized_allocations']} |")
+          lines += ['', '### Real TCP/TLS cancellation and timeout', '',
+                    '| Forced backend | Result |', '| --- | --- |']
+          for backend in ('epoll', 'io_uring'):
+              report = Path(f'http-peer-results/transport-{backend}.xml')
+              outcome = 'not run / no report'
+              if report.exists() and report.stat().st_size:
+                  cases = ET.parse(report).getroot().findall('.//testcase')
+                  if any(c.find('failure') is not None or c.find('error') is not None for c in cases):
+                      outcome = 'failed'
+                  elif any(c.find('skipped') is not None for c in cases):
+                      outcome = 'skipped (see backend availability evidence)'
+                  else:
+                      expected = {f'HTTP sender cleans up real backpressured borrowed TCP and TLS writes/forced {backend}/{scenario}'
+                                  for scenario in ('TCP cancellation', 'TCP timeout', 'TLS cancellation', 'TLS timeout')}
+                      observed = [c.get('name') for c in cases]
+                      if len(observed) == 4 and set(observed) == expected:
+                          outcome = 'passed (4/4 scenarios)'
+                      else:
+                          outcome = 'incomplete scenario coverage'
+                          incomplete_transport = True
+              lines.append(f'| {backend} | {outcome} |')
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
               output.write('\n'.join(lines) + '\n')
+          if incomplete_transport:
+              raise SystemExit('Transport report did not cover each expected scenario exactly once')
           PY
       - name: Retain peer evidence
         if: always()

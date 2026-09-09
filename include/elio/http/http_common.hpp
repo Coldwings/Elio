@@ -15,6 +15,13 @@
 
 namespace elio::http {
 
+/// Borrowed validated CONNECT destination; spelling is not decoded or resolved.
+struct connect_authority_view {
+    std::string_view raw;
+    std::string_view host; // Brackets excluded for IP literals.
+    uint16_t port;
+};
+
 namespace detail {
 
 /// Returns true if `c` is a "tchar" per RFC 7230 §3.2.6 (the set of byte
@@ -123,6 +130,17 @@ inline bool is_valid_connect_authority(std::string_view target) noexcept {
         }
     }
     return true;
+}
+
+inline std::optional<connect_authority_view> parse_connect_authority(std::string_view target) noexcept {
+    if (!is_valid_connect_authority(target)) return std::nullopt;
+    const auto colon = target.rfind(':');
+    auto host = target.substr(0, colon);
+    if (host.front() == '[') host = host.substr(1, host.size() - 2);
+    uint16_t port = 0;
+    const auto text = target.substr(colon + 1);
+    (void)std::from_chars(text.data(), text.data() + text.size(), port);
+    return connect_authority_view{target, host, port};
 }
 
 inline bool is_valid_request_target_component(std::string_view component) noexcept {

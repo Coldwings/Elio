@@ -147,6 +147,10 @@ completed close. TLS 1.2 remaining reverse plaintext may be discarded while
 waiting for the peer alert; an unfinished SSL write retry instead forces a
 terminal `ECANCELED`. TLS read EOF never treats raw socket truncation as an
 authenticated peer alert. Handshake-history state is not a writability probe.
+After a nonempty read returns zero, `read_end_scope()` identifies directional
+EOF versus coordinated whole-session closure without closing the write side.
+It is not a capability probe and must not be used to reinterpret a negative
+read result or a zero-length operation as authenticated EOF.
 Legacy TLS `shutdown()` and common-stream `close()` remain serialized
 whole-session operations, not reader-concurrent output completion.
 
@@ -285,7 +289,7 @@ a regular file (raw backend)" in `tests/unit/test_io.cpp`.
 | `http::response_reader` and `http::response_read_result` | Pull decoder events through one reusable receive buffer; expose positive error codes, including `EMSGSIZE` for configured metadata-limit violations and `EBADMSG` for malformed/truncated framing. Preserve unread bytes across `next_response()`; `reset()` discards them. Neither method performs connection I/O. | Serialize operations; keep the supplied stream and any `read_with()` callback alive throughout the await. Consume or copy borrowed body views before the next operation, move, or destruction. Own deadlines, connection pooling/close, handoff validation, and retry policy; use a readiness-aware transport and never retain the supplied receive buffer after an operation ends. |
 | `http::response_parser` | Accumulates body events from the shared response decoder. `parse().second` counts retired bytes from previous and current input; `reset()` retains unconsumed input, while `take_remaining()` extracts it. Partial chunk payload may be exposed before its trailing framing is validated. | Require successful message completion before treating the accumulated message as valid. Do not re-feed retained bytes without first extracting them, and apply an aggregate body limit when using this low-level accumulating adapter. |
 | `http::server_config` | Applies configured request size, header, body, keep-alive, timeout, and session limits at the documented layer. `max_request_size` caps aggregate HTTP request bytes for line, headers, and body; WebSocket frame bytes after a completed upgrade are outside that HTTP cap. | Choose limits that match deployment risk and expected traffic. A disabled or unlimited setting is caller policy. |
-| `http::router`, `http::route`, and handler registration | Match routes and normalize exactly response, streaming_response, reply, or task of each to task<reply>; all convenience verbs and not-found registration share adapters. | Use copyable handlers; an owned streaming producer may be move-only. Validate authorization and retain captures through use. |
+| `http::router`, `http::route`, and handler registration | Match routes and normalize response, streaming_response, tunnel_response, reply, or task of each to task<reply>. Dedicated router.connect receives a validated authority view instead of path matching. | Use copyable handlers; an owned streaming producer or tunnel session may be move-only. Validate authorization and retain captures through use. |
 | `http::context` | Lives through handler selection, producer execution and send cleanup; exposes session cancel_token(). send_interim supports 1xx except 101 before selection; invalid status fails EINVAL, absent writer ENOTSUP, and sealed context EALREADY. Full request reading precedes dispatch. | Do not escape request/producer scope or overlap interims. A selected producer cannot send more interims. Pass cancellation tokens into waits. Explicit 100 cannot accelerate the initial body of an Expect-waiting request. |
 | `http::server` and `make_server()` | Share ordinary final framing and retain context through producer cleanup. stop cooperatively cancels listeners and sessions; retained sources cover accept/spawn races and connection counters unwind on exceptions. | Keep server, scheduler, TLS context and captures alive: stop, await every listener task, then wait for active_connections() == 0 before destruction. Count zero alone cannot exclude a future accepted spawn. Token-ignoring producers can delay cleanup; never forcibly destroy active frames. |
 | `http::client` | Performs connection setup, optional TLS, request serialization, response parsing, redirect behavior, and timeout handling according to config. | Check response status and errors. Decide retries, authentication, idempotency, redirect trust, and payload validation. |
@@ -339,6 +343,35 @@ Case law (frozen): 100-continue support is scoped to three pieces — explicit s
 | `http::h2_client_config` | Applies configured connect/read deadlines, per-stream response body/header limits, and HTTP/2 settings where supported. Header count and name/value-byte limits cover final headers plus trailers; discarded informational blocks reset accounting. | Choose finite limits/settings that match peer behavior and workload. |
 | `http::h2_session` | Encapsulates nghttp2 session interaction and translates protocol validation to Elio result paths. A response-header limit breach rejects before copying, resets only the offending stream with `ENHANCE_YOUR_CALM`, and reports `EMSGSIZE`. | Treat direct session use as lower-level than `h2_client`; preserve stream/session ownership and callback lifetimes. Configure both response-header limits when overriding session defaults. |
 | nghttp2 package integration | Uses the configured bundled or system nghttp2 provider for HTTP/2 protocol handling. | Provide the dependency through the documented source, package, or install mode. Handle provider-specific deployment constraints. |
+
+## HTTP/1 CONNECT Ownership
+
+| Interface | Elio guarantees | Caller must guarantee |
+|-----------|-----------------|-----------------------|
+| `router.connect()` / `connect_authority_view` | Dedicated authority dispatch with raw spelling, unbracketed host view and parsed explicit port; no implicit DNS or upstream connection. | Authorize destinations and ports, apply DNS/rebinding policy, and retain borrowed views only within request/context lifetime. |
+| `tunnel_response` / server dispatch | Own a move-only, single-use session; validate CONNECT, HTTP/1 and 2xx acceptance without CL/TE; completely send headers before callback; move read-ahead once and permanently exit HTTP processing. Ordinary 2xx CONNECT replies are not accepted as substitutes. | Return a non-2xx ordinary response for rejection. Do preflight authorization/upstream work before accepting; do not attempt another HTTP final response after handoff. |
+| `tunnel_stream` | Nonmovable scoped view over the original TCP/TLS transport, prefix-first binary reads, borrowed full writes/writev and protocol-aware output finish. Failures retain confirmed progress and flag uncertain attempted output. | Allow at most one reader plus one write-side operation; retain descriptors/payloads until cleanup and join every task before callback return. Never escape the view or replay an uncertain suffix as known unsent data. |
+| `relay()` | Two fixed payload buffers; owned directional tasks with cancel-and-join cleanup even after partial launch failure. Directional EOF does not cancel healthy reverse traffic; normal whole-session closure has a distinct result. | Supply the already selected/connected upstream and any application deadlines/resource policy. Treat accepted-byte counts as local write confirmation, not peer receipt; `session_closed` does not imply lossless reverse delivery. |
+
+An HTTPS proxy tunnel retains its original outer TLS stream. Inner TLS, if any,
+is opaque payload; neither CONNECT nor port 443 selects upstream TLS for the
+application. The handoff adds no intermediate plaintext HTTP body or aggregate
+write buffer. Parser read-ahead already exists and is moved into the scoped
+view; consuming that prefix and optional relay buffers still involves copies.
+OpenSSL and bounded ciphertext staging remain separate transport storage.
+
+TLS 1.2 closure freezes unsubmitted plaintext. Already BIO-accepted ciphertext
+is committed and remains in record order before the response alert. The
+single whole-close budget defaults to five seconds and is not restarted by
+joining an existing close. Capacity exhaustion, an unfinished SSL retry,
+cancellation or timeout can require terminal abort rather than graceful close.
+No counterpart five-second reverse-half-close timer applies to TCP/TLS 1.3.
+The relay joins a destination's active whole-close driver before treating
+normal `ESHUTDOWN` as a reason to stop its sibling.
+
+These are API/ownership contracts, not claims of exhaustive backend or peer
+conformance testing. See [HTTP Streaming](HTTP-Streaming.md#connect-tunnel-handoff)
+and the canonical `examples/http_connect_proxy.cpp` usage.
 
 ## WebSocket And SSE
 

@@ -10,6 +10,14 @@ The **WebSocket** implementation follows RFC 6455, including frame masking for a
 
 ## WebSocket
 
+HTTP CONNECT is a separate 2xx tunnel handoff, not a WebSocket 101 upgrade or
+an SSE body. A WebSocket server's ordinary HTTP fallback uses the shared reply
+dispatcher and can host `router.connect()`; CONNECT is not eligible for its
+WebSocket-upgrade path. After successful CONNECT acceptance, the scoped session
+owns opaque tunnel I/O until completion and HTTP parsing never resumes. See
+[CONNECT handoff](HTTP-Streaming.md#connect-tunnel-handoff) for authority routing,
+borrowed buffers, TLS closure and caller-owned proxy authorization policy.
+
 WebSocket provides full-duplex communication channels over a single TCP connection.
 
 ### WebSocket Server

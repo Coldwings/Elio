@@ -4,6 +4,7 @@
 #include <elio/http/http_parser.hpp>
 #include <elio/http/http_message.hpp>
 #include <elio/http/http_response_sender.hpp>
+#include <elio/http/http_reply_dispatch.hpp>
 #include <elio/net/tcp.hpp>
 #include <elio/tls/tls_stream.hpp>
 #include <elio/io/io_context.hpp>
@@ -199,6 +200,7 @@ struct context_access {
 
 template<typename Result>
 concept handler_result = std::same_as<Result, response> || std::same_as<Result, streaming_response> ||
+    std::same_as<Result, tunnel_response> || std::same_as<Result, coro::task<tunnel_response>> ||
     std::same_as<Result, reply> || std::same_as<Result, coro::task<response>> ||
     std::same_as<Result, coro::task<streaming_response>> || std::same_as<Result, coro::task<reply>>;
 
@@ -214,6 +216,7 @@ handler_func adapt_handler(Handler handler) {
     return [handler = std::move(handler)](context& ctx) mutable -> coro::task<reply> {
         using result_type = std::invoke_result_t<Handler&, context&>;
         if constexpr (std::same_as<result_type, response> || std::same_as<result_type, streaming_response> ||
+                      std::same_as<result_type, tunnel_response> ||
                       std::same_as<result_type, reply>) {
             co_return reply{std::invoke(handler, ctx)};
         } else {
@@ -372,6 +375,28 @@ public:
         add_route(method::OPTIONS, pattern, std::move(handler));
     }
 
+    /// Register a destination-policy handler independently of path patterns.
+    /// Authority views borrow the context; resolution/authorization stay local.
+    template<class Handler>
+        requires std::copy_constructible<std::decay_t<Handler>> &&
+            detail::handler_result<std::invoke_result_t<Handler&, context&, connect_authority_view>>
+    void connect(Handler handler) {
+        connect_handler_ = [handler = std::move(handler)](context& ctx) mutable -> coro::task<reply> {
+            const auto authority = detail::parse_connect_authority(ctx.req().path());
+            if (!authority) co_return reply{response::bad_request("Invalid CONNECT authority")};
+            using result_type = std::invoke_result_t<Handler&, context&, connect_authority_view>;
+            if constexpr (std::same_as<result_type, response> ||
+                          std::same_as<result_type, streaming_response> ||
+                          std::same_as<result_type, tunnel_response> || std::same_as<result_type, reply>) {
+                co_return reply{std::invoke(handler, ctx, *authority)};
+            } else {
+                co_return reply{co_await std::invoke(handler, ctx, *authority)};
+            }
+        };
+    }
+
+    const handler_func& connect_handler() const noexcept { return connect_handler_; }
+
     /// Find matching route for request
     const route* find_route(method m, std::string_view path, 
                            std::unordered_map<std::string, std::string>& params) const {
@@ -385,6 +410,7 @@ public:
     
 private:
     std::vector<route> routes_;
+    handler_func connect_handler_;
 };
 
 /// HTTP server configuration
@@ -843,8 +869,8 @@ private:
             }
 
             // Send response
-            auto sent = co_await http::send_response(stream, resp,
-                parser.get_method(), parser.version(), keep_alive, token, config_.write_timeout);
+            auto sent = co_await detail::dispatch_reply(stream, resp, parser,
+                keep_alive, token, config_.write_timeout);
 
             if (!sent.success() || !sent.reusable) {
                 break;
@@ -856,6 +882,10 @@ private:
     
     /// Route a request to the appropriate handler
     coro::task<reply> route_request(context& ctx) {
+        if (ctx.req().get_method() == method::CONNECT) {
+            if (router_.connect_handler()) co_return co_await router_.connect_handler()(ctx);
+            co_return response(status::not_implemented, "CONNECT handler not configured");
+        }
         std::unordered_map<std::string, std::string> params;
         auto* route = router_.find_route(ctx.req().get_method(), ctx.req().path(), params);
         

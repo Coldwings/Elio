@@ -807,6 +807,9 @@ public:
         }
     }
 
+    /// Scope of a zero-byte read: TCP EOF ends only the peer's write direction.
+    close_scope read_end_scope() const noexcept { return close_scope::write_direction; }
+
     /// Finish local output while preserving the read direction. Serialize with
     /// other writers and lifetime changes; one reader may remain active.
     /// TCP ignores timeout. Pre-cancellation leaves the socket unchanged.

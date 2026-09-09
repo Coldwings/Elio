@@ -22,6 +22,8 @@
 - **File Helpers**: High-level async read/write/append operations
 - **TCP Networking**: async client/server with connection management
 - **HTTP/1.1**: full client and server implementation
+- **HTTP CONNECT**: server-owned tunnel handoff and bounded duplex relay,
+  including HTTPS proxies ([guide](wiki/HTTP-Streaming.md#connect-tunnel-handoff))
 - **HTTP/2**: HTTPS client built on nghttp2 with HPACK and stream handling
 - **WebSocket**: bidirectional real-time communication (RFC 6455)
 - **Server-Sent Events**: server-to-client event streaming
@@ -324,7 +326,7 @@ their corresponding feature targets.
   `rpc_client_example.cpp`, `async_file_io.cpp`
 - **HTTP/TLS protocols** (`elio_http` / `elio_http2`): `http_server.cpp`,
   `http_client.cpp`, `http2_client.cpp`, `websocket_server.cpp`,
-  `websocket_client.cpp`, `sse_server.cpp`, `sse_client.cpp`
+  `websocket_client.cpp`, `sse_server.cpp`, `sse_client.cpp`, `http_connect_proxy.cpp`
 - **RDMA** (`elio_rdma`, `elio_rdma_ibverbs`, `elio_rdma_cm`,
   `elio_rdma_cuda`): `rdma_pingpong_mock.cpp`, `rdma_req_resp_ibverbs.cpp`,
   `rdma_perf.cpp`, `rdma_gpu_bw.cpp`

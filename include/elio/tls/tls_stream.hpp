@@ -16,6 +16,7 @@
 
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <cerrno>

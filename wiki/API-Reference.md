@@ -3033,6 +3033,14 @@ CONNECT; they require separate interim/handoff handling. These special bodyless
 rules precede producer configuration. Reuse combines caller permission,
 response Connection policy and framing; nonreuse emits Connection: close.
 
+These length selections follow status precedence, including for HEAD requests.
+For ordinary HEAD, manual CL alone cannot supply a missing representation/body
+length: it must agree with the selected length. For 304, manual CL can supply
+metadata when no explicit representation length is set. In either case, the
+caller is responsible for the truth of the advertised representation size.
+Preflight validates supplied values and their consistency, not the size that a
+corresponding GET would actually produce. No producer is run for verification.
+
 `write`/`writev` are sequential borrowed operations: descriptors and payload
 stay immutable/alive until await returns after transport/watchdog cleanup.
 Empty writes are no-ops only on an open, noncancelled writer. Positive short

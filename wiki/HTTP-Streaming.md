@@ -57,6 +57,13 @@ or conflicting assertions and manually supplied Transfer-Encoding are rejected
 before final output. Ordinary final planning rejects 1xx and successful CONNECT;
 interims and WebSocket 101 handoff have separate paths.
 
+Representation metadata is a caller assertion, not a verified hypothetical
+GET result. Subject to status precedence, HEAD selects explicit representation
+length, then known body length; manual CL must match and is not a fallback for
+an unknown length. A 304 instead selects explicit representation length, then
+manual CL. The caller must supply the correct selected-representation size:
+Elio checks syntax/consistency without invoking the suppressed producer.
+
 Logical writes absorb short writes and EINTR; readiness-aware transports handle
 EAGAIN without busy spinning. No caller remainder retry or whole-response replay
 is required or supported. An unrecoverable error permanently terminates the

@@ -40,6 +40,13 @@ this decision. HEAD/304 representation metadata can be supplied through
 than overwritten. Interim/101/tunnel serialization is a separate headers-only
 path, not an ordinary final reply.
 
+Moving a HEAD/304 length from a manual header to
+`set_representation_length()` does not establish its accuracy. Keep that value
+consistent with the corresponding selected GET representation. Elio checks
+framing consistency but does not generate the hypothetical GET body to verify
+it. Ordinary HEAD with unknown body length requires explicit representation
+metadata if CL is to be advertised; unlike 304, manual CL alone is rejected.
+
 Never detach or concurrently use a writer. Borrowed buffers and descriptors
 remain alive through each write and its cleanup. Context survives producer
 execution, but `send_interim()` returns `EALREADY` after final selection.

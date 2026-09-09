@@ -478,6 +478,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Clarified caller responsibility for truthful HEAD/304 representation lengths:
+  framing validation checks syntax and consistency, not a hypothetical GET's
+  actual output. Existing HEAD/304 length-selection rules are unchanged.
+
 - Clarified the `uds_listener` shutdown boundary, aligning it with the
   `tcp_listener` contract from #1013: `close()` invalidates future accepts but
   does not cancel an accept already submitted to the I/O backend, so a parked

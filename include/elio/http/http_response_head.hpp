@@ -33,6 +33,9 @@ public:
     std::optional<uint64_t> representation_length() const noexcept {
         return representation_length_;
     }
+    /// Caller asserts the size of the corresponding selected representation.
+    /// Preflight checks framing consistency, not whether a hypothetical GET
+    /// would produce this size; it does not invoke the producer to verify it.
     void set_representation_length(std::optional<uint64_t> value) noexcept {
         representation_length_ = value;
     }

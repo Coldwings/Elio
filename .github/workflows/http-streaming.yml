@@ -219,7 +219,7 @@ jobs:
       - name: Compile real transport fixture
         run: cmake --build "$RUNNER_TEMP/http-metrics-build" --target elio_http_streaming_metrics_server --parallel 2
       - name: Test evidence validation
-        run: ctest --test-dir "$RUNNER_TEMP/http-metrics-build" -R '^http_streaming_metrics_report_tests$' --output-on-failure
+        run: ctest --test-dir "$RUNNER_TEMP/http-metrics-build" -R '^http_streaming_metrics_(report|failure)_tests$' --output-on-failure
       - name: Measure verified loopback pipelines
         run: |
           "$RUNNER_TEMP/http-metrics-env/bin/python" tests/integration/http_streaming_metrics.py \
@@ -239,5 +239,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: http-streaming-transport-metrics
-          path: ${{ runner.temp }}/http-metrics-results/
+          path: |
+            ${{ runner.temp }}/http-metrics-results/
+            ${{ runner.temp }}/http-metrics-build/tests/http-metrics-failures/
           if-no-files-found: ignore

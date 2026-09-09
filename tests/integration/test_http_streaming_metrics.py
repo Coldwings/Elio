@@ -59,6 +59,20 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(summary["rows"][0]["pipeline_mib_per_second"], 64)
         self.assertIn("6/6", metrics.render_summary(summary))
 
+    def test_partial_response_diagnostics_never_count_as_success(self):
+        self.clients[0]["success"] = False
+        self.clients[0]["error"] = "socket receive timed out"
+        self.clients[0]["failed_response"] = {
+            "trial": self.planned[0]["trial"], "phase": "measure", "sequence": 10,
+            "headers_seen": True, "plaintext_bytes": 1234, "body_bytes": 1024,
+            "elapsed_ns": 1_000_000_000, "error_type": "TimeoutError"}
+        summary = self.summary()
+        self.assertFalse(summary["success"])
+        self.assertEqual(summary["covered_coordinates"], 5)
+        self.assertNotIn("pipeline_mib_per_second", summary["rows"][0])
+        self.assertNotIn("verified_body_bytes", summary["rows"][0])
+        self.assertFalse(summary["performance_eligible"])
+
     def test_server_order_does_not_determine_attribution(self):
         self.servers.reverse()
         self.assertTrue(self.summary()["success"])
@@ -342,6 +356,53 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(peer.socket.offset, len(wire))
         self.assertLessEqual(peer.socket.max_read, metrics.BLOCK_BYTES)
         self.assertEqual(clock.now, deadline)
+
+    def test_receive_timeout_retains_partial_headers_or_decoded_body(self):
+        wire = self.response()
+        for fragment, headers_seen, body_bytes in ((wire[:12], False, 0),
+                                                   (wire[:-1], True, 1)):
+            with self.subTest(headers_seen=headers_seen):
+                clock = SimpleNamespace(now=10.0)
+
+                class TimeoutSocket(MemorySocket):
+                    def __init__(self):
+                        super().__init__(fragment)
+                        self.calls = 0
+                        self.timeouts = []
+                        self.timeout = None
+
+                    def settimeout(self, timeout):
+                        self.timeout = timeout
+
+                    def recv(self, size):
+                        self.calls += 1
+                        self.timeouts.append(self.timeout)
+                        if self.calls == 1:
+                            clock.now = 10.25
+                            return super().recv(size)
+                        clock.now = 11.0
+                        raise TimeoutError("simulated receive timeout")
+
+                peer = self.peer(wire)
+                peer.socket = TimeoutSocket()
+                completed = []
+                with mock.patch.object(metrics.time, "monotonic", side_effect=lambda: clock.now), \
+                        mock.patch.object(metrics.time, "monotonic_ns",
+                                          side_effect=lambda: int(clock.now * 1_000_000_000)):
+                    with self.assertRaisesRegex(TimeoutError, "simulated receive timeout"):
+                        completed.append(self.request(peer, deadline=11.0))
+                failure = peer.failed_response
+                self.assertEqual(completed, [])
+                self.assertEqual((failure["trial"], failure["phase"], failure["sequence"]),
+                                 ("trial", "probe", 0))
+                self.assertEqual(failure["headers_seen"], headers_seen)
+                self.assertEqual(failure["plaintext_bytes"], len(fragment))
+                self.assertEqual(failure["body_bytes"], body_bytes)
+                self.assertEqual(failure["elapsed_ns"], 1_000_000_000)
+                self.assertEqual(failure["error_type"], "TimeoutError")
+                self.assertEqual(failure["operation"], "response_read")
+                self.assertEqual(peer.socket.timeouts, [1.0, 0.75])
+                self.assertNotIn("sha256", failure)
 
     def test_json_rejects_duplicates_nonfinite_and_partial_line(self):
         with tempfile.TemporaryDirectory() as temporary:

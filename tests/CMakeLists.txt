@@ -171,6 +171,11 @@ if(ELIO_BUILD_HTTP_METRICS)
     add_test(NAME http_streaming_metrics_report_tests
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/test_http_streaming_metrics.py)
     set_tests_properties(http_streaming_metrics_report_tests PROPERTIES TIMEOUT 30)
+    add_test(NAME http_streaming_metrics_failure_tests
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/http_streaming_metrics_failures.py
+            --server $<TARGET_FILE:elio_http_streaming_metrics_server>
+            --output-root ${CMAKE_CURRENT_BINARY_DIR}/http-metrics-failures)
+    set_tests_properties(http_streaming_metrics_failure_tests PROPERTIES TIMEOUT 150)
 endif()
 
 # RDMA abstraction tests (only when ELIO_ENABLE_RDMA=ON).

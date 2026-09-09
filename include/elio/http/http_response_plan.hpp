@@ -12,7 +12,8 @@ enum class response_framing { none, content_length, chunked, close_delimited };
 
 struct body_description {
     response_body_kind kind = response_body_kind::complete;
-    std::optional<uint64_t> length = uint64_t{0};
+    // Unknown for streaming; complete bodies require an explicit length.
+    std::optional<uint64_t> length = std::nullopt;
     response_transfer transfer = response_transfer::automatic;
 };
 

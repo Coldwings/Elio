@@ -2433,8 +2433,10 @@ Type-erased wrapper over `tcp_stream` and, when TLS support is enabled,
 TCP-backed streams allow one reader and one writer concurrently, matching
 `tcp_stream`. After the handshake completes, TLS-backed streams also allow one
 read-side operation and one write-side operation to overlap while waiting for
-socket readiness; `tls_stream` serializes direct OpenSSL `SSL*` state access
-internally. Multiple concurrent reads, multiple concurrent writes,
+socket readiness; `tls_stream` serializes OpenSSL dispatch and retry ownership
+internally. TLS-backed writes inherit the 16 KiB short-progress ceiling and
+bounded ciphertext storage described below; use `write_exactly()` for a complete
+logical write. Multiple concurrent reads, multiple concurrent writes,
 handshake-starting operations, or `close()` racing with any read/write operation
 require external serialization for all variants.
 
@@ -2802,8 +2804,8 @@ connections even after their accept loop exits. Before destroying the server
 or referenced TLS/handler resources: stop, await every listener task, then
 wait for `active_connections() == 0`. A zero count before listener completion
 does not rule out an accept/spawn race. Token-ignoring work can delay cleanup.
-TLS close-notify retains its existing bounded shutdown timeout; it has no
-session-token overload.
+TLS close-notify uses the whole-session close budget (default 5 seconds), with
+cleanup allowed to outlast it; it has no session-token overload.
 
 ### `request`
 
@@ -3810,17 +3812,21 @@ public:
 
 TLS-wrapped TCP stream.
 
-After the TLS handshake completes, `tls_stream` serializes direct OpenSSL
-`SSL*` state access internally. One read-side operation and one write-side
+After the TLS handshake completes, `tls_stream` serializes OpenSSL dispatch
+and retry ownership internally. One read-side operation and one write-side
 operation may overlap while either side is suspended on socket readiness.
 Callers must still serialize handshake-starting operations, multiple concurrent
 reads, multiple concurrent writes, and shutdown/destruction against active I/O
 at the protocol layer.
 
 ```cpp
+struct tls_stream_options {
+    size_t ciphertext_budget = 1024 * 1024;
+};
+
 class tls_stream {
 public:
-    tls_stream(net::tcp_stream tcp, tls_context& ctx);
+    tls_stream(net::tcp_stream tcp, tls_context& ctx, tls_stream_options options = {});
     
     // Set SNI hostname
     void set_hostname(std::string_view hostname);
@@ -3829,9 +3835,9 @@ public:
     /* awaitable */ handshake();
     /* awaitable */ handshake(coro::cancel_token token);
 
-    // Graceful TLS close_notify with a bounded wait (awaitable)
-    /* awaitable */ shutdown(std::chrono::milliseconds timeout =
-                                 std::chrono::milliseconds(2000));
+    // Whole-session close budget; return may take longer for I/O cleanup.
+    coro::task<void> shutdown(std::chrono::milliseconds timeout =
+                                 std::chrono::milliseconds(5000));
     
     // Read decrypted data (awaitable)
     /* awaitable */ read(void* buffer, size_t size);
@@ -3881,19 +3887,59 @@ public:
 `io_result::result == -ENODATA`, matching the TCP and UDS exact-length helpers.
 Success reports the full requested count.
 
-`shutdown()` is the graceful TLS close path. It sends `close_notify` and waits
-for the peer's `close_notify` within the supplied wall-clock budget. Callers
-must still serialize shutdown and destruction against active reads/writes.
-Under the epoll backend, `close()` and destruction of the underlying
-transport on the stream's owning worker fail any I/O still parked on the
-stream's fd with `-ECANCELED`, resuming each parked awaiter exactly once;
-destruction off the owning worker raw-closes the fd and leaves a parked op
-suspended until the recycled fd number is next prepared or the backend is
-destroyed. Under io_uring, in-flight operations hold
-a kernel file reference and complete normally later against the old file
-description. A stoppable reader/writer should still prefer the cancellable
-overload plus token cancellation and await the operation before closing,
-and the stream must remain alive until parked operations have resumed.
+Low-level `write()` can return positive short progress, at most 16 KiB per
+call. `writev()` applies this to its first nonempty slice. Use `write_exactly()`
+or explicitly advance after short progress; HTTP `body_writer` already manages
+this internally. Keep plaintext buffers valid through the awaited operation.
+
+Ciphertext goes directly to the nonblocking socket when there is no queued
+prefix. Backpressure retains only the unsent ciphertext in an owned output BIO;
+an internal pump drains it without accessing SSL or caller plaintext. There is
+no application-body aggregation or background plaintext queue. A successful
+read does not wait for unrelated outgoing ciphertext. Handshake success means
+local TLS establishment, not peer receipt: final handshake/control records may
+still be owned by that output pump.
+
+`ciphertext_budget` limits retained output-BIO payload allocations, defaults to
+1 MiB, and is allocated on demand. A partially consumed block and an in-flight
+drain lease retain their full payload allocation charge until the block is
+freed. Queue metadata, OpenSSL storage, kernel buffers and caller buffers are
+outside this limit. It is neither a total-memory bound nor a system-wide
+zero-copy claim. Capacity exhaustion is terminal `ENOBUFS`, allocation failure
+is terminal `ENOMEM`, and the first transport error stays sticky. An operation
+ending in transport failure cancels owned output work and awaits its I/O-lease
+cleanup before returning; bytes already sent cannot be rolled back.
+
+`shutdown()` sends `close_notify` and waits for the peer's `close_notify` under
+one whole-session budget, default 5 seconds, separate from application I/O
+budgets. Failure or expiry starts abort processing and drains owned I/O before
+returning, so cleanup can extend beyond that budget. The legacy `task<void>`
+result does not establish lossless peer delivery. This is not a directional
+half-close API; CONNECT directional-close support is not implemented here.
+Whole-session shutdown retires the transport; this object has no TLS-session
+reset or re-handshake API. Terminal output settlement uses two pre-reserved
+notification slots for the permitted reader/writer pair, without allocating
+new cleanup waiters.
+
+Cancellation detected by the operation's initial cancellation check is local
+to that call. After it passes that check, subsequently observed cancellation
+terminates the whole connection with sticky `ECANCELED`, including an overlapping
+sibling with a different token. Await both operations; do not retry on that
+connection. A completion that wins the race may still succeed, and cancellation
+cannot roll back transmitted bytes. The exact helpers also check cancellation
+between completed slices; cancellation at that boundary has no unfinished SSL
+operation and does not itself abort the stream.
+
+Moved-from streams support destruction, reassignment, `fd()`/`tcp()` queries
+(descriptor -1), `is_handshake_complete()` (false), and inert `shutdown()` /
+`shutdown_socket()`. Other operations require a live, unmoved stream.
+
+Callers must serialize shutdown/destruction against public reads/writes, request
+cancellation where needed, and await those operations before releasing stream
+or plaintext storage. Destruction aborts the owned ciphertext pump; it does not
+asynchronously finish normal shutdown or authorize forced coroutine-frame
+destruction. Internal transport ownership retains the physical descriptor
+through outstanding I/O cleanup on both backends.
 `shutdown_socket()` and `mark_externally_shut_down()` are
 watchdog-oriented
 helpers for code that has already interrupted the underlying TCP socket and

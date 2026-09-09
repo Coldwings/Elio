@@ -1,6 +1,7 @@
 #pragma once
 
 #include <elio/tls/tls_context.hpp>
+#include <elio/tls/detail/tls_transport.hpp>
 #include <elio/net/tcp.hpp>
 #include <elio/net/resolve.hpp>
 #include <elio/io/io_context.hpp>
@@ -27,6 +28,27 @@
 
 namespace elio::tls {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace detail {
+enum class tls_test_operation { read, write };
+struct tls_test_call_result {
+    int ret;
+    int error;
+};
+struct tls_dispatch_test_hooks {
+    void* context = nullptr;
+    tls_test_call_result (*dispatch)(void*, tls_test_operation, const void*, size_t) noexcept = nullptr;
+    coro::task<io::io_result> (*readiness)(void*, tls_test_operation, bool, coro::cancel_token) = nullptr;
+    void (*after_handshake_retry)(void*) noexcept = nullptr;
+};
+struct tls_shutdown_test_state {
+    int ssl_shutdown_flags;
+    int transport_error;
+    bool pump_active;
+};
+} // namespace detail
+#endif
+
 /// TLS handshake result
 enum class handshake_result {
     success,
@@ -35,103 +57,97 @@ enum class handshake_result {
     error
 };
 
+struct tls_stream_options {
+    // Retained custom-BIO ciphertext payload; excludes OpenSSL/control overhead.
+    size_t ciphertext_budget = 1024 * 1024;
+};
+
 /// TLS stream wrapping a TCP connection with SSL/TLS encryption
 ///
-/// **Thread safety:** after the TLS handshake completes, direct ``SSL*`` state
-/// access is serialized internally so one read-side operation and one
-/// write-side operation may overlap while they are suspended on socket
-/// readiness. Callers must still serialize handshake-starting operations,
-/// multiple concurrent readers, multiple concurrent writers, and
-/// shutdown/destruction against active I/O according to the higher-level
-/// protocol contract.
+/// **Thread safety:** after handshake, one reader and one writer may overlap.
+/// SSL dispatch and pending-write retry ownership are serialized internally.
+/// Callers serialize handshake, multiple readers/writers, moves and destruction
+/// against public operations, and keep borrowed buffers alive until completion.
 ///
-/// **Close contract:** on the epoll backend, close() — and destruction of
-/// the underlying transport on the stream's owning worker — fails any I/O
-/// still parked on the stream's fd with -ECANCELED, resuming each parked
-/// awaiter exactly once; destruction off the owning worker raw-closes the
-/// fd and leaves a parked op suspended until the recycled fd number is next
-/// prepared or the backend is destroyed. On the io_uring backend, in-flight
-/// operations hold a kernel file reference and complete normally later
-/// against the old file description. A stoppable reader/writer should still
-/// prefer the cancellable overload plus token cancellation and await the
-/// operation before closing; the stream must remain alive until parked
-/// operations have resumed.
+/// **Output lifetime:** an internal pump owns only ciphertext and transport
+/// state, not this SSL object or caller plaintext. Failed operations abort and
+/// await its I/O leases. Destruction requests abort, never asynchronous normal
+/// finalization; transport ownership survives outstanding internal cleanup.
+/// Cancellation does not authorize destruction of active public task frames.
 class tls_stream {
 public:
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    void set_dispatch_test_hooks(detail::tls_dispatch_test_hooks* hooks) noexcept {
+        dispatch_test_hooks_ = hooks;
+    }
+    void set_output_test_hooks(detail::output_bio_state::test_hooks hooks) {
+        auto lock = lock_ssl_state();
+        transport_->output.set_test_hooks(hooks);
+    }
+    detail::tls_shutdown_test_state shutdown_state_for_test() const {
+        auto lock = lock_ssl_state();
+        return {SSL_get_shutdown(ssl_), transport_->output.error(),
+                transport_->output_active_for_test()};
+    }
+    void set_shutdown_timer_test_hook(void (*hook)()) noexcept {
+        shutdown_timer_test_hook_ = hook;
+    }
+#endif
     /// Create a TLS stream from an existing TCP stream
     /// @param tcp The underlying TCP stream (takes ownership)
     /// @param ctx TLS context to use
-    tls_stream(net::tcp_stream tcp, tls_context& ctx)
-        : tcp_(std::move(tcp)) {
+    tls_stream(net::tcp_stream tcp, tls_context& ctx, tls_stream_options options = {})
+        : transport_(std::make_shared<detail::tls_transport>(
+              std::move(tcp), options.ciphertext_budget)) {
         ssl_ = SSL_new(ctx.native_handle());
-        if (!ssl_) {
-            throw std::runtime_error("Failed to create SSL object");
+        if (!ssl_) throw std::runtime_error("Failed to create SSL object");
+        if (SSL_set_fd(ssl_, transport_->tcp.fd()) != 1) {
+            SSL_free(std::exchange(ssl_, nullptr));
+            throw std::runtime_error("Failed to attach TLS input");
         }
-        
-        // Set the file descriptor
-        SSL_set_fd(ssl_, tcp_.fd());
-        
-        // Set mode based on context
-        if (ctx.mode() == tls_mode::client) {
-            SSL_set_connect_state(ssl_);
-        } else {
-            SSL_set_accept_state(ssl_);
+        BIO* output = transport_->output.make_bio();
+        if (!output) {
+            SSL_free(std::exchange(ssl_, nullptr));
+            throw std::bad_alloc();
         }
-        
+        SSL_set0_wbio(ssl_, output);
+        SSL_set_mode(ssl_, SSL_MODE_ENABLE_PARTIAL_WRITE);
         mode_ = ctx.mode();
+        if (mode_ == tls_mode::client) SSL_set_connect_state(ssl_);
+        else SSL_set_accept_state(ssl_);
     }
-    
-    /// Destructor
-    ~tls_stream() { release_ssl(); }
 
-    // Non-copyable
+    ~tls_stream() { release_ssl(); }
     tls_stream(const tls_stream&) = delete;
     tls_stream& operator=(const tls_stream&) = delete;
 
-    // Movable
     tls_stream(tls_stream&& other) noexcept
-        : tcp_(std::move(other.tcp_))
-        , ssl_(other.ssl_)
-        , ssl_mutex_(std::move(other.ssl_mutex_))
+        : transport_(std::move(other.transport_))
+        , ssl_(std::exchange(other.ssl_, nullptr))
+        , write_retry_exclusive_(std::exchange(other.write_retry_exclusive_, false))
         , mode_(other.mode_)
-        , handshake_complete_(other.handshake_complete_)
-        , shutdown_sent_(other.shutdown_sent_)
-        , externally_shut_down_(
-              other.externally_shut_down_.load(std::memory_order_acquire)) {
-        if (!ssl_mutex_) {
-            ssl_mutex_ = std::make_shared<std::mutex>();
-        }
-        other.ssl_ = nullptr;
-        other.ssl_mutex_ = std::make_shared<std::mutex>();
-        other.handshake_complete_ = false;
-        other.shutdown_sent_ = false;
-        other.externally_shut_down_.store(false, std::memory_order_release);
-    }
+        , handshake_complete_(std::exchange(other.handshake_complete_, false))
+        , shutdown_sent_(std::exchange(other.shutdown_sent_, false))
+        , externally_shut_down_(other.externally_shut_down_.load(std::memory_order_acquire))
+        , hostname_(std::move(other.hostname_)) {}
 
     tls_stream& operator=(tls_stream&& other) noexcept {
         if (this != &other) {
             release_ssl();
-            tcp_ = std::move(other.tcp_);
-            ssl_ = other.ssl_;
-            ssl_mutex_ = std::move(other.ssl_mutex_);
-            if (!ssl_mutex_) {
-                ssl_mutex_ = std::make_shared<std::mutex>();
-            }
+            transport_ = std::move(other.transport_);
+            ssl_ = std::exchange(other.ssl_, nullptr);
+            write_retry_exclusive_ = std::exchange(other.write_retry_exclusive_, false);
             mode_ = other.mode_;
-            handshake_complete_ = other.handshake_complete_;
-            shutdown_sent_ = other.shutdown_sent_;
+            handshake_complete_ = std::exchange(other.handshake_complete_, false);
+            shutdown_sent_ = std::exchange(other.shutdown_sent_, false);
             externally_shut_down_.store(
                 other.externally_shut_down_.load(std::memory_order_acquire),
                 std::memory_order_release);
-            other.ssl_ = nullptr;
-            other.ssl_mutex_ = std::make_shared<std::mutex>();
-            other.handshake_complete_ = false;
-            other.shutdown_sent_ = false;
-            other.externally_shut_down_.store(false, std::memory_order_release);
+            hostname_ = std::move(other.hostname_);
         }
         return *this;
     }
-    
+
     /// Set SNI hostname (for client connections)
     void set_hostname(std::string_view hostname) {
         hostname_ = std::string(hostname);
@@ -144,335 +160,137 @@ public:
         X509_VERIFY_PARAM_set1_host(param, hostname_.c_str(), hostname_.size());
     }
     
-    /// Perform TLS handshake asynchronously
-    /// @return true on success, false on error (check errno)
-    coro::task<bool> handshake() {
-        while (true) {
-            auto step = call_ssl([&]() {
-                return (mode_ == tls_mode::client) ? SSL_connect(ssl_)
-                                                   : SSL_accept(ssl_);
-            });
-            int ret = step.ret;
-            
-            if (ret == 1) {
-                handshake_complete_ = true;
-                ELIO_LOG_DEBUG("TLS handshake complete (protocol: {}, cipher: {})",
-                              SSL_get_version(ssl_), SSL_get_cipher_name(ssl_));
-                co_return true;
-            }
-            
-            int err = step.err;
-            
-            if (err == SSL_ERROR_WANT_READ) {
-                auto result = co_await tcp_.poll_read();
-                if (result.result < 0) {
-                    errno = -result.result;
-                    co_return false;
-                }
-            } else if (err == SSL_ERROR_WANT_WRITE) {
-                auto result = co_await tcp_.poll_write();
-                if (result.result < 0) {
-                    errno = -result.result;
-                    co_return false;
-                }
-            } else {
-                // Handshake failed
-                long verify_err = SSL_get_verify_result(ssl_);
-                if (verify_err != X509_V_OK) {
-                    ELIO_LOG_ERROR("TLS certificate verification failed: {} ({})", 
-                                  X509_verify_cert_error_string(verify_err), verify_err);
-                }
-                ELIO_LOG_ERROR("TLS handshake failed: {}", get_ssl_error_string(err));
-                errno = err;
-                co_return false;
-            }
-        }
-    }
+    /// Perform the local TLS handshake; the owned output pump also drives
+    /// final handshake/control records without retaining caller buffers.
+    coro::task<bool> handshake() { return handshake({}); }
 
-    /// Perform TLS handshake asynchronously, cancellable by token
-    /// @return true on success, false on error or cancellation (check errno)
     coro::task<bool> handshake(coro::cancel_token token) {
-        while (true) {
-            if (token.is_cancelled()) {
-                errno = ECANCELED;
-                co_return false;
+        int exception_error = EIO;
+        try {
+            if (token.is_cancelled()) { errno = ECANCELED; co_return false; }
+            for (;;) {
+                if (token.is_cancelled()) {
+                    co_await fail_io(ECANCELED);
+                    errno = transport_error();
+                    co_return false;
+                }
+                const auto step = call_ssl([&] {
+                    return mode_ == tls_mode::client ? SSL_connect(ssl_) : SSL_accept(ssl_);
+                });
+                if (const int error = transport_error()) {
+                    co_await fail_io(error);
+                    errno = error;
+                    co_return false;
+                }
+                if (step.ret == 1) {
+                    handshake_complete_ = true;
+                    co_return true;
+                }
+                const auto ready = co_await retry_io(step, token);
+                if (ready.result < 0) {
+                    co_await fail_io(-ready.result);
+                    errno = -ready.result;
+                    co_return false;
+                }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (dispatch_test_hooks_ && dispatch_test_hooks_->after_handshake_retry)
+                    dispatch_test_hooks_->after_handshake_retry(dispatch_test_hooks_->context);
+#endif
             }
-
-            auto step = call_ssl([&]() {
-                return (mode_ == tls_mode::client) ? SSL_connect(ssl_)
-                                                   : SSL_accept(ssl_);
-            });
-            int ret = step.ret;
-
-            if (ret == 1) {
-                handshake_complete_ = true;
-                ELIO_LOG_DEBUG("TLS handshake complete (protocol: {}, cipher: {})",
-                              SSL_get_version(ssl_), SSL_get_cipher_name(ssl_));
-                co_return true;
-            }
-
-            int err = step.err;
-
-            if (err == SSL_ERROR_WANT_READ) {
-                auto result = co_await tcp_.poll_read(token);
-                if (result.was_cancelled() || result.io.result == -ECANCELED) {
-                    errno = ECANCELED;
-                    co_return false;
-                }
-                if (result.io.result < 0) {
-                    errno = -result.io.result;
-                    co_return false;
-                }
-            } else if (err == SSL_ERROR_WANT_WRITE) {
-                auto result = co_await tcp_.poll_write(token);
-                if (result.was_cancelled() || result.io.result == -ECANCELED) {
-                    errno = ECANCELED;
-                    co_return false;
-                }
-                if (result.io.result < 0) {
-                    errno = -result.io.result;
-                    co_return false;
-                }
-            } else {
-                // Handshake failed
-                long verify_err = SSL_get_verify_result(ssl_);
-                if (verify_err != X509_V_OK) {
-                    ELIO_LOG_ERROR("TLS certificate verification failed: {} ({})",
-                                  X509_verify_cert_error_string(verify_err), verify_err);
-                }
-                ELIO_LOG_ERROR("TLS handshake failed: {}", get_ssl_error_string(err));
-                errno = err;
-                co_return false;
-            }
-        }
+        } catch (const std::bad_alloc&) { exception_error = ENOMEM; }
+        catch (...) {}
+        transport_->fail(exception_error);
+        co_await transport_->settle_output();
+        errno = transport_error();
+        co_return false;
     }
-    
-    /// Read data asynchronously
-    /// @param buffer Buffer to read into
-    /// @param length Maximum bytes to read
-    /// @return Number of bytes read, or negative error code
+
+    /// Read one available plaintext slice. Successful reads do not wait for
+    /// outgoing control records: the owned ciphertext pump keeps those moving.
     coro::task<io::io_result> read(void* buffer, size_t length) {
-        if (length > static_cast<size_t>(INT32_MAX)) {
-            co_return io::io_result{-EOVERFLOW, 0};
-        }
-        if (length == 0) {
-            co_return io::io_result{0, 0};
-        }
-
-        if (!handshake_complete_) {
-            auto hs = co_await handshake();
-            if (!hs) {
-                co_return io::io_result{-errno, 0};
-            }
-        }
-        
-        while (true) {
-            auto step = call_ssl([&]() {
-                return SSL_read(ssl_, buffer, static_cast<int>(length));
-            });
-            int ret = step.ret;
-            
-            if (ret > 0) {
-                co_return io::io_result{ret, 0};
-            }
-            
-            if (ret == 0) {
-                // Connection closed
-                int err = step.err;
-                if (err == SSL_ERROR_ZERO_RETURN) {
-                    // Clean shutdown
-                    co_return io::io_result{0, 0};
-                }
-                co_return io::io_result{-EIO, 0};
-            }
-            
-            int err = step.err;
-            
-            if (err == SSL_ERROR_WANT_READ) {
-                auto result = co_await tcp_.poll_read();
-                if (result.result < 0) {
-                    co_return result;
-                }
-            } else if (err == SSL_ERROR_WANT_WRITE) {
-                auto result = co_await tcp_.poll_write();
-                if (result.result < 0) {
-                    co_return result;
-                }
-            } else {
-                ELIO_LOG_ERROR("TLS read error: {}", get_ssl_error_string(err));
-                co_return io::io_result{-EIO, 0};
-            }
-        }
+        return read(buffer, length, {});
     }
 
-    /// Read data asynchronously, cancellable by ``token``.
     coro::task<io::io_result> read(void* buffer, size_t length,
                                    coro::cancel_token token) {
-        if (length > static_cast<size_t>(INT32_MAX)) {
-            co_return io::io_result{-EOVERFLOW, 0};
-        }
-        if (length == 0) {
-            co_return io::io_result{0, 0};
-        }
-
-        if (!handshake_complete_) {
-            auto hs = co_await handshake(token);
-            if (!hs) {
+        int exception_error = EIO;
+        try {
+            if (length > static_cast<size_t>(INT32_MAX))
+                co_return io::io_result{-EOVERFLOW, 0};
+            if (!length) co_return io::io_result{0, 0};
+            if (token.is_cancelled()) co_return io::io_result{-ECANCELED, 0};
+            if (!handshake_complete_ && !(co_await handshake(token)))
                 co_return io::io_result{-errno, 0};
+            for (;;) {
+                if (const int error = transport_error()) co_return co_await fail_io(error);
+                if (token.is_cancelled()) co_return co_await fail_io(ECANCELED);
+                const auto step = call_read(buffer, length);
+                if (const int error = transport_error()) co_return co_await fail_io(error);
+                if (step.ret > 0) co_return io::io_result{step.ret, 0};
+                if (step.err == SSL_ERROR_ZERO_RETURN) co_return io::io_result{0, 0};
+                io::io_result ready;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (test_retry(step.err)) {
+                    ready = co_await dispatch_test_hooks_->readiness(
+                        dispatch_test_hooks_->context, detail::tls_test_operation::read,
+                        step.err == SSL_ERROR_WANT_READ, token);
+                } else
+#endif
+                ready = co_await retry_io(step, token);
+                if (ready.result < 0) co_return co_await fail_io(-ready.result);
             }
-        }
-
-        while (true) {
-            if (token.is_cancelled()) {
-                co_return io::io_result{-ECANCELED, 0};
-            }
-
-            auto step = call_ssl([&]() {
-                return SSL_read(ssl_, buffer, static_cast<int>(length));
-            });
-            int ret = step.ret;
-
-            if (ret > 0) {
-                co_return io::io_result{ret, 0};
-            }
-
-            if (ret == 0) {
-                int err = step.err;
-                if (err == SSL_ERROR_ZERO_RETURN) {
-                    co_return io::io_result{0, 0};
-                }
-                co_return io::io_result{-EIO, 0};
-            }
-
-            int err = step.err;
-
-            if (err == SSL_ERROR_WANT_READ) {
-                auto result = co_await tcp_.poll_read(token);
-                if (result.was_cancelled() || result.io.result == -ECANCELED) {
-                    co_return io::io_result{-ECANCELED, 0};
-                }
-                if (result.io.result < 0) {
-                    co_return result.io;
-                }
-            } else if (err == SSL_ERROR_WANT_WRITE) {
-                auto result = co_await tcp_.poll_write(token);
-                if (result.was_cancelled() || result.io.result == -ECANCELED) {
-                    co_return io::io_result{-ECANCELED, 0};
-                }
-                if (result.io.result < 0) {
-                    co_return result.io;
-                }
-            } else {
-                ELIO_LOG_ERROR("TLS read error: {}", get_ssl_error_string(err));
-                co_return io::io_result{-EIO, 0};
-            }
-        }
+        } catch (const std::bad_alloc&) { exception_error = ENOMEM; }
+        catch (...) {}
+        transport_->fail(exception_error);
+        co_await transport_->settle_output();
+        co_return io::io_result{-transport_error(), 0};
     }
-    
-    /// Write data asynchronously
-    /// @param buffer Data to write
-    /// @param length Number of bytes to write
-    /// @return Number of bytes written, or negative error code
+
+    /// Write at most one application-record-sized plaintext slice. A positive
+    /// result means its ciphertext reached the socket, not merely the BIO queue.
     coro::task<io::io_result> write(const void* buffer, size_t length) {
-        if (length > static_cast<size_t>(INT32_MAX)) {
-            co_return io::io_result{-EOVERFLOW, 0};
-        }
-        if (length == 0) {
-            co_return io::io_result{0, 0};
-        }
-
-        if (!handshake_complete_) {
-            auto hs = co_await handshake();
-            if (!hs) {
-                co_return io::io_result{-errno, 0};
-            }
-        }
-        
-        while (true) {
-            auto step = call_ssl([&]() {
-                return SSL_write(ssl_, buffer, static_cast<int>(length));
-            });
-            int ret = step.ret;
-            
-            if (ret > 0) {
-                co_return io::io_result{ret, 0};
-            }
-            
-            int err = step.err;
-            
-            if (err == SSL_ERROR_WANT_READ) {
-                auto result = co_await tcp_.poll_read();
-                if (result.result < 0) {
-                    co_return result;
-                }
-            } else if (err == SSL_ERROR_WANT_WRITE) {
-                auto result = co_await tcp_.poll_write();
-                if (result.result < 0) {
-                    co_return result;
-                }
-            } else {
-                ELIO_LOG_ERROR("TLS write error: {}", get_ssl_error_string(err));
-                co_return io::io_result{-EIO, 0};
-            }
-        }
+        return write(buffer, length, {});
     }
 
-    /// Write data asynchronously, cancellable by ``token``.
     coro::task<io::io_result> write(const void* buffer, size_t length,
                                     coro::cancel_token token) {
-        if (length > static_cast<size_t>(INT32_MAX)) {
-            co_return io::io_result{-EOVERFLOW, 0};
-        }
-        if (length == 0) {
-            co_return io::io_result{0, 0};
-        }
-
-        if (!handshake_complete_) {
-            auto hs = co_await handshake(token);
-            if (!hs) {
+        int exception_error = EIO;
+        try {
+            if (length > static_cast<size_t>(INT32_MAX))
+                co_return io::io_result{-EOVERFLOW, 0};
+            if (!length) co_return io::io_result{0, 0};
+            if (token.is_cancelled()) co_return io::io_result{-ECANCELED, 0};
+            if (!handshake_complete_ && !(co_await handshake(token)))
                 co_return io::io_result{-errno, 0};
-            }
-        }
-
-        while (true) {
-            if (token.is_cancelled()) {
-                co_return io::io_result{-ECANCELED, 0};
-            }
-
-            auto step = call_ssl([&]() {
-                return SSL_write(ssl_, buffer, static_cast<int>(length));
-            });
-            int ret = step.ret;
-
-            if (ret > 0) {
-                co_return io::io_result{ret, 0};
-            }
-
-            int err = step.err;
-
-            if (err == SSL_ERROR_WANT_READ) {
-                auto result = co_await tcp_.poll_read(token);
-                if (result.was_cancelled() || result.io.result == -ECANCELED) {
-                    co_return io::io_result{-ECANCELED, 0};
+            length = std::min<size_t>(length, 16384);
+            for (;;) {
+                if (const int error = transport_error()) co_return co_await fail_io(error);
+                if (token.is_cancelled()) co_return co_await fail_io(ECANCELED);
+                const auto step = call_write(buffer, length);
+                if (const int error = transport_error()) co_return co_await fail_io(error);
+                if (step.ret > 0) {
+                    auto flushed = co_await transport_->flush_to(step.watermark, token);
+                    if (flushed.result < 0) co_return co_await fail_io(-flushed.result);
+                    co_return io::io_result{step.ret, 0};
                 }
-                if (result.io.result < 0) {
-                    co_return result.io;
-                }
-            } else if (err == SSL_ERROR_WANT_WRITE) {
-                auto result = co_await tcp_.poll_write(token);
-                if (result.was_cancelled() || result.io.result == -ECANCELED) {
-                    co_return io::io_result{-ECANCELED, 0};
-                }
-                if (result.io.result < 0) {
-                    co_return result.io;
-                }
-            } else {
-                ELIO_LOG_ERROR("TLS write error: {}", get_ssl_error_string(err));
-                co_return io::io_result{-EIO, 0};
+                io::io_result ready;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (test_retry(step.err)) {
+                    ready = co_await dispatch_test_hooks_->readiness(
+                        dispatch_test_hooks_->context, detail::tls_test_operation::write,
+                        step.err == SSL_ERROR_WANT_READ, token);
+                } else
+#endif
+                ready = co_await retry_io(step, token);
+                if (ready.result < 0) co_return co_await fail_io(-ready.result);
             }
-        }
+        } catch (const std::bad_alloc&) { exception_error = ENOMEM; }
+        catch (...) {}
+        transport_->fail(exception_error);
+        co_await transport_->settle_output();
+        co_return io::io_result{-transport_error(), 0};
     }
-    
+
     /// Write string data
     coro::task<io::io_result> write(std::string_view data) {
         return write(data.data(), data.size());
@@ -669,156 +487,64 @@ public:
         return write_exactly(str.data(), str.size(), std::move(token));
     }
 
-    /// Perform TLS shutdown.
-    ///
-    /// Splits the handshake into two phases:
-    ///   1. Send our ``close_notify`` (loop on WANT_WRITE).
-    ///   2. Wait for the peer's ``close_notify`` (loop on WANT_READ).
-    ///
-    /// A wall-clock budget bounds the wait so a misbehaving peer cannot stall
-    /// the caller indefinitely. The default budget of 2 seconds matches the
-    /// guidance in TLS implementations; pass a longer duration if needed.
-    /// If the underlying socket was already shut down externally, shutdown()
-    /// abandons close_notify instead of writing to a half-closed socket.
+    /// Complete whole-session TLS shutdown under one close budget. Timeout
+    /// begins abort processing, not asynchronous destruction of pending I/O.
+    /// This legacy void API does not report peer receipt or lossless delivery.
     coro::task<void> shutdown(std::chrono::milliseconds timeout =
-                                  std::chrono::milliseconds(2000)) {
-        if (!ssl_ || !handshake_complete_) {
-            co_return;
-        }
-        auto abandon_if_socket_dead = [&]() noexcept {
-            if (!is_socket_closed_or_dead()) {
-                return false;
-            }
+                                  std::chrono::milliseconds(5000)) {
+        if (!ssl_ || !handshake_complete_) co_return;
+        if (is_socket_closed_or_dead() || transport_error()) {
+            transport_->fail(ECANCELED);
+            co_await transport_->settle_output();
             handshake_complete_ = false;
-            return true;
-        };
-        if (abandon_if_socket_dead()) {
             co_return;
         }
-
-        using namespace std::chrono_literals;
-
         const auto deadline = std::chrono::steady_clock::now() + timeout;
-        auto remaining = [&]() {
-            return std::chrono::steady_clock::now() < deadline;
-        };
-        auto poll_until_deadline = [&](bool for_read) -> coro::task<io::io_result> {
-            if (!remaining()) {
-                co_return io::io_result{-ETIMEDOUT, 0};
-            }
-
-            coro::cancel_source poll_cancel;
-            auto watchdog = elio::spawn([deadline, &poll_cancel]() -> coro::task<void> {
-                const auto now = std::chrono::steady_clock::now();
-                if (now >= deadline) {
-                    poll_cancel.cancel();
-                    co_return;
+        std::optional<coro::cancel_source> cancel;
+        std::optional<coro::join_handle<void>> watchdog;
+        std::shared_ptr<close_watchdog_ticket> ticket;
+        int error = 0;
+        try {
+            cancel.emplace();
+            ticket = std::make_shared<close_watchdog_ticket>(transport_);
+            watchdog.emplace(elio::spawn(close_watchdog(
+                ticket, deadline, *cancel
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                , shutdown_timer_test_hook_
+#endif
+                )));
+            ticket.reset();
+            for (;;) {
+                if (const int failed = transport_error()) { error = failed; break; }
+                if (cancel->is_cancelled()) { error = ETIMEDOUT; break; }
+                auto step = call_ssl([&] { return SSL_shutdown(ssl_); }, false);
+                auto flushed = co_await transport_->flush_to(step.watermark, cancel->get_token());
+                if (flushed.result < 0) {
+                    error = -flushed.result;
+                    break;
                 }
-
-                auto result = co_await time::sleep_for(
-                    deadline - now, poll_cancel.get_token());
-                if (result == coro::cancel_result::completed) {
-                    poll_cancel.cancel();
+                if (step.ret >= 0) shutdown_sent_ = true;
+                if (step.ret == 1) break;
+                // Zero completes only our alert. Retry SSL before polling: the
+                // peer's alert can already be buffered above the socket BIO.
+                if (step.ret == 0) continue;
+                auto ready = co_await retry_io(step, cancel->get_token());
+                if (ready.result < 0) {
+                    error = -ready.result;
+                    break;
                 }
-            });
-
-            io::cancellable_io_result poll{};
-            if (for_read) {
-                poll = co_await tcp_.poll_read(poll_cancel.get_token());
-            } else {
-                poll = co_await tcp_.poll_write(poll_cancel.get_token());
             }
-
-            poll_cancel.cancel();
-            co_await watchdog;
-
-            if (poll.was_cancelled() || poll.io.result == -ECANCELED) {
-                co_return io::io_result{-ETIMEDOUT, 0};
-            }
-            co_return poll.io;
-        };
-
-        // Phase 1: emit our close_notify. ``SSL_shutdown`` returning 0 means
-        // our alert has been queued/sent (peer's not yet observed); 1 means
-        // both sides have already exchanged close_notify. WANT_WRITE means
-        // the underlying socket can't accept more data right now — poll and
-        // retry. WANT_READ at this stage is unusual but possible when there
-        // is still inbound data buffered to drain.
-        while (remaining()) {
-            if (abandon_if_socket_dead()) {
-                co_return;
-            }
-            auto step = call_ssl([&]() {
-                return SSL_shutdown(ssl_);
-            }, false);
-            int ret = step.ret;
-            if (ret >= 0) {
-                shutdown_sent_ = true;
-                if (ret == 1) {
-                    handshake_complete_ = false;
-                    co_return;
-                }
-                break;  // ret == 0: our close_notify is out, fall through to phase 2
-            }
-            int err = step.err;
-            if (err == SSL_ERROR_WANT_WRITE) {
-                auto poll = co_await poll_until_deadline(false);
-                if (poll.result < 0) {
-                    handshake_complete_ = false;
-                    co_return;
-                }
-            } else if (err == SSL_ERROR_WANT_READ) {
-                auto poll = co_await poll_until_deadline(true);
-                if (poll.result < 0) {
-                    handshake_complete_ = false;
-                    co_return;
-                }
-            } else {
-                // Hard error — abandon shutdown.
-                handshake_complete_ = false;
-                co_return;
-            }
+        } catch (const std::bad_alloc&) { error = ENOMEM; }
+        catch (...) { error = EIO; }
+        if (error) transport_->fail(error);
+        ticket.reset();
+        if (cancel) { try { cancel->cancel(); } catch (...) { transport_->fail(EIO); } }
+        if (watchdog) {
+            try { co_await std::move(*watchdog); }
+            catch (...) { transport_->fail(EIO); }
         }
-
-        if (!shutdown_sent_) {
-            // Timed out before our alert went out.
-            handshake_complete_ = false;
-            co_return;
-        }
-
-        // Phase 2: wait for peer's close_notify. Each non-progress loop
-        // iteration must consume time from the wall-clock budget so a
-        // chatty peer that keeps producing WANT_READ/WANT_WRITE cycles
-        // can't keep us here forever.
-        while (remaining()) {
-            if (abandon_if_socket_dead()) {
-                co_return;
-            }
-            auto step = call_ssl([&]() {
-                return SSL_shutdown(ssl_);
-            }, false);
-            int ret = step.ret;
-            if (ret == 1) {
-                break;
-            }
-            if (ret == 0) {
-                // Our close_notify is out, peer's hasn't arrived yet.
-                auto poll = co_await poll_until_deadline(true);
-                if (poll.result < 0) break;
-                continue;
-            }
-            int err = step.err;
-            if (err == SSL_ERROR_WANT_READ) {
-                auto poll = co_await poll_until_deadline(true);
-                if (poll.result < 0) break;
-            } else if (err == SSL_ERROR_WANT_WRITE) {
-                auto poll = co_await poll_until_deadline(false);
-                if (poll.result < 0) break;
-            } else {
-                break;
-            }
-        }
-
+        transport_->retire_output();
+        co_await transport_->settle_output();
         handshake_complete_ = false;
     }
     
@@ -847,10 +573,14 @@ public:
     }
     
     /// Get underlying file descriptor
-    int fd() const noexcept { return tcp_.fd(); }
+    int fd() const noexcept { return transport_ ? transport_->tcp.fd() : -1; }
 
     /// Get underlying TCP stream (const)
-    const net::tcp_stream& tcp() const noexcept { return tcp_; }
+    const net::tcp_stream& tcp() const noexcept {
+        if (transport_) return transport_->tcp;
+        static const net::tcp_stream disconnected(-1);
+        return disconnected;
+    }
 
     /// Check if handshake is complete
     bool is_handshake_complete() const noexcept { return handshake_complete_; }
@@ -876,8 +606,8 @@ public:
     /// needs to interrupt a pending recv on a different thread.
     void shutdown_socket() noexcept {
         mark_externally_shut_down();
-        if (int fd = tcp_.fd(); fd >= 0) {
-            ::shutdown(fd, SHUT_RDWR);
+        if (int descriptor = fd(); descriptor >= 0) {
+            ::shutdown(descriptor, SHUT_RDWR);
         }
     }
     
@@ -894,24 +624,188 @@ public:
     }
     
 private:
+    struct close_watchdog_ticket {
+        explicit close_watchdog_ticket(std::shared_ptr<detail::tls_transport> value)
+            : transport(std::move(value)) {}
+        ~close_watchdog_ticket() {
+            if (!entered.load(std::memory_order_acquire)) transport->fail(EIO);
+        }
+        std::shared_ptr<detail::tls_transport> transport;
+        std::atomic<bool> entered{false};
+    };
+
+    static coro::task<void> close_watchdog(
+        std::shared_ptr<close_watchdog_ticket> ticket,
+        std::chrono::steady_clock::time_point deadline, coro::cancel_source cancel
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        , void (*timer_hook)()
+#endif
+    ) {
+        ticket->entered.store(true, std::memory_order_release);
+        auto transport = ticket->transport;
+        ticket.reset();
+        int error = 0;
+        try {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (timer_hook) timer_hook();
+#endif
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline ||
+                co_await time::sleep_for(deadline - now, cancel.get_token()) ==
+                    coro::cancel_result::completed)
+                error = ETIMEDOUT;
+        } catch (const std::bad_alloc&) { error = ENOMEM; }
+        catch (...) { error = EIO; }
+        if (error) {
+            // Failure to arm the deadline must also terminate the close wait.
+            transport->fail(error);
+            try { cancel.cancel(); } catch (...) {}
+        }
+    }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    bool test_retry(int error) const noexcept {
+        return (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) &&
+            dispatch_test_hooks_ && dispatch_test_hooks_->readiness;
+    }
+#endif
+
+    static constexpr int retry_owner_blocked = -1001;
     struct ssl_call_result {
         int ret = 0;
         int err = SSL_ERROR_NONE;
+        uint64_t observed = 0;
+        uint64_t watermark = 0;
     };
 
+    struct ssl_input_snapshot {
+        uint64_t bytes;
+        OSSL_HANDSHAKE_STATE state;
+        int plaintext;
+        int buffered;
+        bool operator==(const ssl_input_snapshot&) const = default;
+    };
+
+    ssl_input_snapshot input_snapshot() const noexcept {
+        return {BIO_number_read(SSL_get_rbio(ssl_)), SSL_get_state(ssl_),
+                SSL_pending(ssl_), SSL_has_pending(ssl_)};
+    }
+
+    int transport_error() const {
+        auto lock = lock_ssl_state();
+        return transport_->operation_error();
+    }
+
+    coro::task<io::io_result> fail_io(int error) {
+        transport_->fail(error);
+        co_await transport_->settle_output();
+        co_return io::io_result{-transport_error(), 0};
+    }
+
+    coro::task<io::io_result> retry_io(ssl_call_result step, coro::cancel_token token) {
+        if (step.err == retry_owner_blocked)
+            co_return co_await transport_->wait_change(step.observed, token);
+        if (step.err == SSL_ERROR_WANT_READ)
+            co_return co_await transport_->wait_read(step.observed, token);
+        if (step.err == SSL_ERROR_WANT_WRITE) {
+            // The custom output BIO never reports capacity retry. Preserve the
+            // OpenSSL retry contract if another supported SSL layer requests it.
+            auto flushed = co_await transport_->flush_to(step.watermark, token);
+            if (flushed.result < 0) co_return flushed;
+            co_return co_await transport_->wait_write(token);
+        }
+        co_return io::io_result{-EIO, 0};
+    }
+
+    ssl_call_result call_read(void* buffer, size_t length) {
+        ssl_call_result step;
+        bool progress = false;
+        {
+            auto lock = lock_ssl_state();
+            step.observed = transport_->generation;
+            if (transport_->operation_error()) return {-1, SSL_ERROR_SYSCALL};
+            if (write_retry_exclusive_) {
+                step.ret = -1;
+                step.err = retry_owner_blocked;
+                return step;
+            }
+            const auto before = input_snapshot();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (dispatch_test_hooks_ && dispatch_test_hooks_->dispatch) {
+                const auto result = dispatch_test_hooks_->dispatch(dispatch_test_hooks_->context,
+                    detail::tls_test_operation::read, buffer, length);
+                step.ret = result.ret;
+                step.err = result.error;
+            } else
+#endif
+            {
+                ERR_clear_error();
+                step.ret = SSL_read(ssl_, buffer, static_cast<int>(length));
+                step.err = step.ret > 0 ? SSL_ERROR_NONE : SSL_get_error(ssl_, step.ret);
+            }
+            step.watermark = transport_->output.accepted_bytes();
+            progress = step.ret > 0 || step.err == SSL_ERROR_ZERO_RETURN ||
+                before != input_snapshot();
+        }
+        transport_->start_output();
+        if (progress) transport_->notify_progress();
+        return step;
+    }
+
+    ssl_call_result call_write(const void* buffer, size_t length) {
+        ssl_call_result step;
+        bool progress;
+        {
+            auto lock = lock_ssl_state();
+            step.observed = transport_->generation;
+            if (transport_->operation_error()) return {-1, SSL_ERROR_SYSCALL};
+            const auto before = input_snapshot();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (dispatch_test_hooks_ && dispatch_test_hooks_->dispatch) {
+                const auto result = dispatch_test_hooks_->dispatch(dispatch_test_hooks_->context,
+                    detail::tls_test_operation::write, buffer, length);
+                step.ret = result.ret;
+                step.err = result.error;
+            } else
+#endif
+            {
+                ERR_clear_error();
+                step.ret = SSL_write(ssl_, buffer, static_cast<int>(length));
+                step.err = step.ret > 0 ? SSL_ERROR_NONE : SSL_get_error(ssl_, step.ret);
+            }
+            const bool was_exclusive = write_retry_exclusive_;
+            write_retry_exclusive_ = step.err == SSL_ERROR_WANT_WRITE;
+            // A persistent pending-plaintext level is not new progress: using
+            // it as a notification would turn WANT_READ into a self-wake loop.
+            progress = step.ret > 0 || (was_exclusive && !write_retry_exclusive_) ||
+                before != input_snapshot();
+            step.watermark = transport_->output.accepted_bytes();
+        }
+        transport_->start_output();
+        if (progress) transport_->notify_progress();
+        return step;
+    }
+
     std::unique_lock<std::mutex> lock_ssl_state() const {
-        return std::unique_lock<std::mutex>(*ssl_mutex_);
+        return std::unique_lock<std::mutex>(transport_->mutex);
     }
 
     template<typename F>
     ssl_call_result call_ssl(F&& fn, bool zero_is_error = true) {
-        auto lock = lock_ssl_state();
-        ERR_clear_error();
-        int ret = fn();
-        int err = (ret < 0 || (ret == 0 && zero_is_error))
-            ? SSL_get_error(ssl_, ret)
-            : SSL_ERROR_NONE;
-        return {ret, err};
+        ssl_call_result step;
+        {
+            auto lock = lock_ssl_state();
+            if (transport_->operation_error()) return {-1, SSL_ERROR_SYSCALL};
+            ERR_clear_error();
+            step.ret = fn();
+            step.err = (step.ret < 0 || (step.ret == 0 && zero_is_error))
+                ? SSL_get_error(ssl_, step.ret) : SSL_ERROR_NONE;
+            step.observed = transport_->generation;
+            step.watermark = transport_->output.accepted_bytes();
+        }
+        transport_->start_output();
+        if (step.ret > 0) transport_->notify_progress();
+        return step;
     }
 
     void release_ssl() noexcept {
@@ -929,21 +823,19 @@ private:
         // We never wait for the peer's close_notify in the destructor,
         // since that would require async I/O.
         //
-        // Skip SSL_shutdown when the underlying socket is already known
-        // to be unusable. SSL_shutdown's BIO writes via send(2); on a
-        // half-closed socket that produces EPIPE and, on OpenSSL builds
-        // that don't set MSG_NOSIGNAL (older OpenSSL, musl, etc.),
-        // delivers SIGPIPE to the process. We avoid the write entirely
-        // when (a) somebody else (e.g. a slow-loris watchdog) called
-        // ``shutdown_socket()`` / ``mark_externally_shut_down()`` on us,
-        // or (b) the kernel reports a pending socket error.
-        if (handshake_complete_ && !shutdown_sent_ &&
+        // Never re-enter SSL after a fatal result or an unfinished exclusive
+        // retry. Known-dead sockets also cannot benefit from a closing alert;
+        // the custom output BIO separately uses MSG_NOSIGNAL for every send.
+        if (handshake_complete_ && !shutdown_sent_ && !write_retry_exclusive_ &&
+            !transport_->output.error() &&
             !is_socket_closed_or_dead()) {
             ERR_clear_error();
             (void)SSL_shutdown(ssl_);
         }
         SSL_free(ssl_);
         ssl_ = nullptr;
+        lock.unlock();
+        transport_->fail(ECANCELED);
     }
 
     /// Cheap probe that returns true when the underlying socket is either
@@ -955,7 +847,7 @@ private:
         if (externally_shut_down_.load(std::memory_order_acquire)) {
             return true;
         }
-        int fd = tcp_.fd();
+        int fd = transport_->tcp.fd();
         if (fd < 0) {
             return true;
         }
@@ -987,9 +879,13 @@ private:
         }
     }
     
-    net::tcp_stream tcp_;
+    std::shared_ptr<detail::tls_transport> transport_;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    detail::tls_dispatch_test_hooks* dispatch_test_hooks_ = nullptr;
+    void (*shutdown_timer_test_hook_)() = nullptr;
+#endif
     SSL* ssl_ = nullptr;
-    std::shared_ptr<std::mutex> ssl_mutex_{std::make_shared<std::mutex>()};
+    bool write_retry_exclusive_ = false;
     tls_mode mode_ = tls_mode::client;
     bool handshake_complete_ = false;
     bool shutdown_sent_ = false;  ///< True once our close_notify has been queued.

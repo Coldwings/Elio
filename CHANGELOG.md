@@ -92,6 +92,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TLS duplex retry/output ownership**: coordinate OpenSSL retry ordering and
+  drain backpressured ciphertext through bounded owned storage without a
+  background caller-plaintext queue. `tls_stream_options::ciphertext_budget`
+  defaults to 1 MiB; capacity/allocation failures are terminal and owned I/O is
+  cleaned up before failed operations return. Low-level writes can return short
+  progress capped at 16 KiB; use `write_exactly()` for complete writes (#1215).
+  Legacy whole-session `shutdown()` now has one default 5-second close budget,
+  with abort cleanup allowed to outlast it; this is not directional half-close.
+  Cancellation observed after the initial cancellation check terminates the
+  connection and overlapping operations; initially detected cancellation is local.
+
 - **HTTP body-description defaults**: omitted streaming length now means
   unknown instead of silently declaring zero. Direct preflight callers must
   explicitly supply complete-body lengths, including zero; unspecified complete

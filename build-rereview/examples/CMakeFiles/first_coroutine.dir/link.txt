@@ -1,0 +1,1 @@
+/usr/bin/c++ -g -static-libgcc -static-libstdc++ -Wl,--dependency-file=CMakeFiles/first_coroutine.dir/link.d CMakeFiles/first_coroutine.dir/first_coroutine.cpp.o -o first_coroutine  ../_deps/fmt-build/libfmtd.a

@@ -1,0 +1,1 @@
+/usr/bin/c++ -g -static-libgcc -static-libstdc++ -Wl,--dependency-file=CMakeFiles/scheduler_service_benchmark.dir/link.d CMakeFiles/scheduler_service_benchmark.dir/scheduler_service_benchmark.cpp.o -o scheduler_service_benchmark  ../_deps/fmt-build/libfmtd.a

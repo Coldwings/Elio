@@ -9,6 +9,14 @@ for a known-empty stream or complete body. A default complete description
 without a length is invalid and returns `EINVAL` without generated headers.
 Ordinary `response` sending already supplies its actual body length.
 
+CONNECT request parsing now requires a valid authority with an explicit
+destination port: use `CONNECT example.com:443`, not `CONNECT /`. Invalid
+authorities, Transfer-Encoding and positive Content-Length are rejected before
+request-body accumulation. CL:0 remains accepted. Read the preserved authority
+from `path()` and retain post-header bytes via `take_remaining()` when owning a
+low-level handoff. Syntax acceptance does not resolve or authorize the target,
+and this correction alone does not add a server tunnel API.
+
 `response` now owns a complete body; its constructors and `set_body()` no longer
 generate Content-Length in metadata. The shared outgoing plan derives that
 length when sending or serializing. A manually supplied Content-Length remains

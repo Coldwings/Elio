@@ -2860,6 +2860,23 @@ forbids `Expect` without content). `serialize_headers()` returns the request
 line and headers without the body; `serialize()` shares it and appends the
 body.
 
+### CONNECT Request Parsing
+
+`request_parser` accepts CONNECT authority-form (`host:port`, or `[IP-literal]:port`),
+with a nonempty URI host and explicit decimal port in 1..65535. IPv6 and RFC 3986
+IPvFuture bracket syntax are validated; unbracketed names use URI reg-name
+grammar, not a DNS-only policy. Raw case, trailing dots, percent triplets,
+brackets and leading port zeros are preserved in `path()`; `query()` and `body()`
+are empty. Userinfo, path/query/fragment, invalid escapes/literals and invalid
+ports are rejected. Scoped IPv6 zone identifiers are outside this URI grammar.
+
+Transfer-Encoding or nonzero Content-Length is rejected when headers complete,
+without waiting for request content; CL:0 is allowed. `take_remaining()` moves
+out post-header bytes exactly once for the next protocol. Host cardinality
+checks remain unchanged, and Host is not a replacement tunnel destination.
+Resolution and access policy belong to the application. This parser contract
+does not provide server tunnel acceptance or HTTP/2 CONNECT support.
+
 ### `headers`
 
 Case-insensitive HTTP header collection used by `request` and `response`.

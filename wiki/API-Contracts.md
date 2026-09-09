@@ -257,6 +257,20 @@ a regular file (raw backend)" in `tests/unit/test_io.cpp`.
 | `http::client_config` | Extends base client settings with HTTP/1.1 client-specific options. | Keep configured defaults aligned with application retry/redirect/security policy. |
 | `http::request::set_expect_continue()` | When enabled on a request with a body, the client sends the headers first and waits up to `client_config::expect_continue_timeout` for an interim `100 Continue` before sending the body. A final response received first (for example 417) suppresses the body; a timeout sends the body anyway; a timeout less than or equal to zero sends the body immediately after the headers. The wait is additionally bounded by the absolute response deadline (`read_timeout`), and response-deadline expiry fails the request with `ETIMEDOUT` instead of triggering the fallback. Further interim 1xx responses are skipped under the documented cumulative cap, and body-preserving redirects re-run the handshake per hop. | Choose a timeout appropriate for the endpoint and treat the fallback paths (final response without 100, timeout) as normal operation; servers are not required to honor `Expect`. |
 
+### CONNECT Request Boundary
+
+CONNECT request parsing requires authority-form: a nonempty URI host and an
+explicit decimal destination port in 1..65535. It preserves the raw authority
+in `path()` without query splitting or host normalization. Valid URI reg-names
+(including percent-encoded spelling) and bracketed IPv6/IPvFuture literals are
+syntax, not a promise of DNS resolution, address-family support or authorization.
+CONNECT rejects Transfer-Encoding and nonzero Content-Length at the header
+boundary; a valid CL:0 is accepted. Following bytes remain in `take_remaining()`
+for a separate tunnel handoff, never in the request body. Parsing a valid
+CONNECT does not itself establish a tunnel; ordinary final sending still
+rejects successful CONNECT. Caller destination policy must use the request
+target, not substitute an independently interpreted Host header.
+
 ### Managed HTTP/1 Sending
 
 For HEAD/304, the caller must ensure advertised representation length matches

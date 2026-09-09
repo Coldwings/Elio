@@ -419,6 +419,10 @@ private:
             set_error("Invalid request-target");
             return false;
         }
+        if (method_ == method::CONNECT && !detail::is_valid_connect_authority(uri)) {
+            set_error("Invalid CONNECT authority");
+            return false;
+        }
 
         // Reject NUL bytes and bare control characters (0x01-0x1F, 0x7F)
         // in the request-target.  These can cause log injection, path
@@ -485,6 +489,24 @@ private:
                         set_error("HTTP/1.1 requests require exactly one Host header");
                         return false;
                     }
+                }
+
+                // CONNECT ends at its headers. Preserve any following bytes
+                // for the tunnel handoff instead of accumulating request content.
+                if (method_ == method::CONNECT) {
+                    if (has_te) {
+                        set_error("CONNECT request cannot use Transfer-Encoding");
+                        return false;
+                    }
+                    if (has_cl) {
+                        const auto length = headers_.content_length();
+                        if (!length || *length != 0) {
+                            set_error("CONNECT request cannot have content");
+                            return false;
+                        }
+                    }
+                    state_ = parse_state::complete;
+                    return true;
                 }
 
                 // Transfer-Encoding takes precedence over (a missing)

@@ -97,6 +97,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicitly supply complete-body lengths, including zero; unspecified complete
   descriptions are rejected before header generation.
 
+- **CONNECT request boundary**: validate authority-form hosts and explicit
+  destination ports before query splitting, reject request transfer coding and
+  nonzero lengths at the headers, and retain post-header tunnel bytes without
+  body accumulation. Valid authority spelling and ordinary targets are preserved.
+
 - **Retained owner-worker cancellation requests**: built-in registered I/O and
   timer waits reserve abort handoff state before submission, avoiding fresh
   abort-executor and ordinary task-overflow allocation in their cancellation

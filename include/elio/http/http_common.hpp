@@ -10,6 +10,8 @@
 #include <cctype>
 #include <cstdint>
 #include <stdexcept>
+#include <array>
+#include <arpa/inet.h>
 
 namespace elio::http {
 
@@ -62,6 +64,65 @@ inline bool has_request_target_forbidden_char(std::string_view value) noexcept {
 
 inline bool is_valid_request_target(std::string_view target) noexcept {
     return !target.empty() && !has_request_target_forbidden_char(target);
+}
+
+inline constexpr bool connect_host_char(unsigned char c) noexcept {
+    // RFC 3986 unreserved / sub-delims; percent-encoding is checked separately.
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~' ||
+           c == '!' || c == '$' || c == '&' || c == '\'' || c == '(' || c == ')' ||
+           c == '*' || c == '+' || c == ',' || c == ';' || c == '=';
+}
+
+inline constexpr bool connect_hex_digit(unsigned char c) noexcept {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+inline bool is_valid_connect_authority(std::string_view target) noexcept {
+    const auto separator = target.rfind(':');
+    if (separator == std::string_view::npos || separator == 0) return false;
+    const auto host = target.substr(0, separator);
+    const auto port_text = target.substr(separator + 1);
+    if (port_text.empty()) return false;
+    uint16_t port = 0;
+    const auto [end, error] = std::from_chars(
+        port_text.data(), port_text.data() + port_text.size(), port);
+    if (error != std::errc{} || end != port_text.data() + port_text.size() || port == 0) {
+        return false;
+    }
+
+    if (host.front() == '[') {
+        if (host.size() < 3 || host.back() != ']') return false;
+        const auto literal = host.substr(1, host.size() - 2);
+        if (literal.front() == 'v' || literal.front() == 'V') {
+            size_t pos = 1;
+            while (pos < literal.size() && connect_hex_digit(literal[pos])) ++pos;
+            if (pos == 1 || pos == literal.size() || literal[pos] != '.') return false;
+            if (++pos == literal.size()) return false;
+            for (; pos < literal.size(); ++pos) {
+                if (!connect_host_char(literal[pos]) && literal[pos] != ':') return false;
+            }
+            return true;
+        }
+        std::array<char, INET6_ADDRSTRLEN> text{};
+        if (literal.size() >= text.size()) return false;
+        std::copy(literal.begin(), literal.end(), text.begin());
+        in6_addr address{};
+        return ::inet_pton(AF_INET6, text.data(), &address) == 1;
+    }
+
+    // Preserve reg-name spelling. Syntax acceptance is not DNS resolution or
+    // permission to decode escapes into a different destination authority.
+    for (size_t pos = 0; pos < host.size(); ++pos) {
+        if (host[pos] == '%') {
+            if (host.size() - pos < 3 || !connect_hex_digit(host[pos + 1]) ||
+                !connect_hex_digit(host[pos + 2])) return false;
+            pos += 2;
+        } else if (!connect_host_char(host[pos])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 inline bool is_valid_request_target_component(std::string_view component) noexcept {

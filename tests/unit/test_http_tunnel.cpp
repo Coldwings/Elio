@@ -3,6 +3,7 @@
 #include <elio/sync/event.hpp>
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <stdexcept>

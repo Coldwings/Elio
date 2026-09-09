@@ -2,8 +2,10 @@
 #include <elio/http/http_tunnel_relay.hpp>
 #include <elio/sync/event.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <future>
 
 namespace {

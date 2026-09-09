@@ -3,6 +3,7 @@
 #include <elio/sync/event.hpp>
 #include "../test_main.cpp"
 #include <atomic>
+#include <cstring>
 #include <future>
 #include <poll.h>
 #include <thread>

@@ -3,6 +3,7 @@
 #include <elio/http/http_response_sender.hpp>
 #include <elio/http/http_parser.hpp>
 #include <elio/http/http_tunnel.hpp>
+#include <optional>
 
 namespace elio::http::detail {
 

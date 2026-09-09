@@ -178,14 +178,12 @@ private:
 
         // Check if this is an SSE request
         if (req.path() == "/events" || req.path() == "/sse") {
-            // Send SSE headers
+            // Send SSE headers. build_sse_response() declares honest
+            // close-delimited framing (no Content-Length/Transfer-Encoding,
+            // Connection: close) since SSE events stream until the
+            // connection closes.
             std::string headers =
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/event-stream\r\n"
-                "Cache-Control: no-cache\r\n"
-                "Connection: keep-alive\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
-                "\r\n";
+                elio::http::sse::build_sse_response().serialize();
 
             auto write_result =
                 co_await stream.write_exactly(headers.data(), headers.size());

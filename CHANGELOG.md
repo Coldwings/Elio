@@ -57,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`sse_server` example sends honest SSE headers**: the example hand-rolled
+  a literal header block advertising `Connection: keep-alive` with no
+  `Content-Length`/`Transfer-Encoding` (a close-delimited body per RFC 9112
+  §6.3 item 8 cannot be keep-alive-reused); it now uses
+  `sse::build_sse_response().serialize()`, which declares honest
+  close-delimited framing and `Connection: close` (#1189).
 - **SSE responses stream again (close-delimited opt-out)**: the #1158/#1161
   empty-body `Content-Length: 0` pin also fired for `sse::build_sse_response()`,
   whose body is intentionally empty at header time — the pinned

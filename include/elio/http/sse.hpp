@@ -15,23 +15,38 @@
 /// @example SSE Server Example
 /// @code
 /// #include <elio/elio.hpp>
+/// #include <elio/http/http.hpp>
 /// #include <elio/http/sse.hpp>
 ///
 /// using namespace elio;
 /// using namespace elio::http::sse;
 ///
-/// // SSE endpoint handler
-/// coro::task<void> event_stream(sse_connection& conn) {
+/// // Server-owned producer: borrowed event data stays alive through each await.
+/// coro::task<http::send_result> event_stream(event_writer& out,
+///                                          coro::cancel_token token) {
 ///     int count = 0;
-///     while (conn.is_active()) {
-///         // Send event every second
-///         co_await time::sleep_for(std::chrono::seconds(1));
-///         co_await conn.send_event("counter", std::to_string(++count));
+///     while (!token.is_cancelled()) {
+///         const auto data = std::to_string(++count);
+///         const auto sent = co_await out.send_event({{}, "counter", data}, token);
+///         if (!sent.success()) co_return sent;
+///         const auto waited = co_await time::sleep_for(std::chrono::seconds(1), token);
+///         if (waited == coro::cancel_result::cancelled) break;
 ///     }
+///     co_return http::send_result{http::send_errc::cancelled, ECANCELED};
 /// }
 ///
-/// // Note: Full SSE server integration requires custom HTTP handler
-/// // See examples/sse_server.cpp for complete example
+/// coro::task<void> server_main() {
+///     http::router routes;
+///     routes.get("/events", [](http::context&) {
+///         return make_streaming_response(event_stream);
+///     });
+///     http::server server(std::move(routes));
+///     const auto address = net::socket_address(net::ipv4_address(8080));
+///     co_await elio::serve(server, [&] { return server.listen(address); });
+/// }
+/// // Block shutdown signals before starting scheduler threads, as shown in
+/// // examples/sse_server.cpp. serve() joins the listener and drains sessions;
+/// // never detach an event_writer or write HTTP framing manually.
 /// @endcode
 ///
 /// @example SSE Client Example
@@ -59,6 +74,7 @@
 /// @endcode
 
 #include <elio/http/sse_server.hpp>
+#include <elio/http/sse_writer.hpp>
 #include <elio/http/sse_client.hpp>
 
 namespace elio {

@@ -9,11 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Owned HTTP/SSE streaming replies**: metadata-only `response_head`, move-only
+  `streaming_response`/`reply`, server-scoped borrowed `body_writer`, and a shared
+  framing/send executor. Logical writes handle partial progress internally,
+  enforce declared lengths, and keep cancellation/timeout failures terminal
+  through I/O cleanup. HTTP routes accept synchronous and asynchronous complete
+  or streaming replies. `sse::event_writer` encodes borrowed event slices through
+  the shared sender; the SSE example now uses normal HTTP routes (#1195).
+  Managed `event_view::id` distinguishes omission (`nullopt`/`{}`) from a
+  present empty borrowed view, which explicitly resets Last-Event-ID.
+  Use `nullopt` when migrating empty-string omission sentinels.
+
+- **Breaking HTTP framing migration**: complete-response body setters no longer
+  mutate Content-Length; explicit CL is validated and arbitrary TE rejected.
+  Explicit string serialization uses the same final-response preflight. Removed
+  `response::set_close_delimited()`/`close_delimited()` and the headers-only
+  `sse::build_sse_response()` helper; streaming transfer policy and the owned SSE
+  producer factory replace them. See `wiki/Migrating-to-0.6.md` (#1195).
+
 - **Incremental HTTP response receive**: added `http::response_decoder` and
   move-only `http::response_reader` with separate header/body/completion/handoff
   events, borrowed body views, bounded metadata, and a reusable receive buffer.
-  The ordinary HTTP client and SSE now share response framing; server-side
-  producer/writer redesign remains a later phase (#1192, related to #1191).
+  The ordinary HTTP client and SSE now share response framing (#1192, related
+  to #1191).
 
 - **Cancellable borrowed scatter/gather writes**: token-aware `io::async_sendmsg`
   and TCP/TLS/`net::stream::writev` without payload concatenation. TCP `writev`

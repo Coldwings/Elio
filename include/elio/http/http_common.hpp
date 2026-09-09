@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <cstdint>
 #include <stdexcept>
 
 namespace elio::http {

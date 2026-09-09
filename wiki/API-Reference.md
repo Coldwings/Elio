@@ -2699,6 +2699,7 @@ struct server_config {
     std::chrono::seconds keep_alive_timeout{30};
     size_t max_keep_alive_requests = 100;
     bool enable_logging = true;
+    std::chrono::milliseconds write_timeout{0};
     size_t max_headers = 100;
     size_t max_header_size = 8192;
 };
@@ -2721,6 +2722,11 @@ and the HTTP upgrade request read handled by `websocket::ws_server`. For
 the inbound TLS handshake. A value less than or equal to zero disables these
 server-side deadlines.
 
+`write_timeout` defaults to zero (disabled) to avoid silently introducing a
+new outbound deadline. Positive values bound each logical final-header, body
+write or final-marker operation, including all its partial-write retries.
+It is not a producer, whole-response or SSE-session deadline.
+
 ### `context`
 
 HTTP request context passed to `http::server` route handlers.
@@ -2728,6 +2734,10 @@ HTTP request context passed to `http::server` route handlers.
 ```cpp
 class context {
 public:
+    using interim_writer = std::function<coro::task<bool>(std::string_view)>;
+    context(request, std::string_view client_addr,
+            interim_writer = {}, coro::cancel_token = {});
+    coro::cancel_token cancel_token() const noexcept;
     const request& req() const noexcept;
     request& req() noexcept;
     std::string_view client_addr() const noexcept;
@@ -2737,7 +2747,7 @@ public:
     const std::unordered_map<std::string, std::string>& params() const noexcept;
 
     // Send an interim (1xx) response before the final response (awaitable)
-    /* awaitable */ send_interim(const response& resp);
+    coro::task<bool> send_interim(const response& resp);
 };
 ```
 
@@ -2749,9 +2759,10 @@ responses may be sent, as RFC 9110 §15.2 permits. Body and framing headers
 are never serialized for 1xx statuses, so `response(status::continue_)`
 writes exactly `HTTP/1.1 100 Continue\r\n\r\n`.
 
-The context borrows its connection from the handler scope: it must not
-escape its handler (for example into a detached task), and interims can only
-be sent before the handler returns the final response. Contexts dispatched
+The context remains alive through handler selection, the selected producer,
+and send cleanup. It must not escape that scope (for example into a detached
+task). Final selection seals interims: subsequent `send_interim()` calls fail
+with `EALREADY`, including calls from the producer. Contexts dispatched
 without a connection writer — for example the plain-HTTP fallback routes of
 `websocket::ws_server` — cannot send interims: `send_interim()` then sets
 `errno = ENOTSUP` and returns `false`, and the final response is unaffected.
@@ -2761,6 +2772,38 @@ without a connection writer — for example the plain-HTTP fallback routes of
 > `send_interim()` therefore cannot accelerate an `Expect: 100-continue`
 > client's first body send; it serves clients that pipeline or that wait for
 > an interim the application emits deliberately.
+
+### Router Return Types and Server Shutdown
+
+```cpp
+using handler_func = std::function<coro::task<reply>(context&)>;
+using sync_handler_func = std::function<response(context&)>;
+// Constrained Handler returns exactly one of:
+// response, streaming_response, reply, task<response>,
+// task<streaming_response>, task<reply>.
+template<typename Handler>
+void router::add_route(method, std::string_view pattern, Handler);
+// get/post/put/del/patch/options use the same supported handler shapes.
+template<typename Handler>
+void server::set_not_found_handler(Handler);
+void server::stop();
+size_t server::active_connections() const noexcept;
+```
+
+Stored handler callables must be copyable; a streaming response's owned
+producer may be move-only. The server and WebSocket ordinary HTTP fallback
+use the same reply sender; successful WebSocket upgrades remain a separate
+protocol handoff. Pass `ctx.cancel_token()` or the supplied producer token
+into cancellation-aware waits.
+
+`stop()` requests cooperative listener/session cancellation, not a join or
+forced frame destruction. Retained cancellation sources cover accepted
+connections even after their accept loop exits. Before destroying the server
+or referenced TLS/handler resources: stop, await every listener task, then
+wait for `active_connections() == 0`. A zero count before listener completion
+does not rule out an accept/spawn race. Token-ignoring work can delay cleanup.
+TLS close-notify retains its existing bounded shutdown timeout; it has no
+session-token overload.
 
 ### `request`
 
@@ -2842,46 +2885,176 @@ individually.
 `get_all()` returns every cookie field line. Conflicting duplicate
 `Content-Length` values throw `std::invalid_argument`.
 
-### `response`
+### Response Metadata, Complete Bodies and Streaming
 
-HTTP response message.
+Headers: `<elio/http/http_response_head.hpp>`, `http_message.hpp`,
+`http_streaming_response.hpp`, `http_reply.hpp`, `http_body_writer.hpp`, and
+`http_response_sender.hpp` (under `elio/http/`).
 
 ```cpp
-class response {
+class response_head {
 public:
-    uint16_t status_code() const noexcept;
+    response_head();
+    explicit response_head(status);
     status get_status() const noexcept;
+    uint16_t status_code() const noexcept;
+    void set_status(status) noexcept;
     std::string_view version() const noexcept;
+    void set_version(std::string_view);
     headers& get_headers() noexcept;
     const headers& get_headers() const noexcept;
-    
-    std::string_view header(std::string_view name) const;
-    std::string_view content_type() const;
-    std::string_view body() const noexcept;
-    
-    void set_status(status s) noexcept;
-    void set_version(std::string_view version);
+    std::string_view header(std::string_view) const;
     void set_header(std::string_view name, std::string_view value);
-    void set_body(std::string_view body);
-    void set_body(std::string&& body);
-    void set_content_type(std::string_view type);
-    void set_close_delimited(bool v = true) noexcept;
-    bool close_delimited() const noexcept;
+    std::string_view content_type() const;
+    void set_content_type(std::string_view);
+    std::optional<uint64_t> representation_length() const noexcept;
+    void set_representation_length(std::optional<uint64_t>) noexcept;
+    bool is_success() const noexcept;
+    bool is_redirect() const noexcept;
+    bool is_client_error() const noexcept;
+    bool is_server_error() const noexcept;
 };
+class response : public response_head {
+public:
+    response();
+    explicit response(status);
+    response(status, std::string_view body, std::string_view content_type = mime::text_plain);
+    std::string_view body() const noexcept;
+    void set_body(std::string_view);
+    void set_body(std::string&&);
+    std::string serialize() const;
+    std::string serialize(method request_method) const;
+    static response from_parser(response_parser&);
+    static response from_decoder(const response_decoder&, std::string body);
+    // Existing ok/json/html/not_found/bad_request/internal_error/redirect factories.
+};
+enum class response_transfer { automatic, close_delimited };
+class streaming_response : public response_head {
+public:
+    template<typename Producer>
+    streaming_response(response_head, Producer&&,
+        std::optional<uint64_t> length = std::nullopt,
+        response_transfer transfer = response_transfer::automatic);
+    template<typename Producer>
+    streaming_response(status, Producer&&,
+        std::optional<uint64_t> length = std::nullopt,
+        response_transfer transfer = response_transfer::automatic);
+    std::optional<uint64_t> body_length() const noexcept;
+    response_transfer transfer() const noexcept;
+    // Move-only; owns the producer, not externally referenced payload.
+};
+using reply = std::variant<response, streaming_response>;
 ```
 
-`set_version()` follows the same validation rules as `request::set_version()`.
+Metadata defaults to 200 / HTTP/1.1 and no representation length. Version setters
+validate syntax; final preflight supports HTTP/1.0 and HTTP/1.1 only.
+`response` body setters do not create or update Content-Length. Manual CL is
+an assertion checked against selected framing. Ordinary `serialize()` uses
+the shared preflight and throws `std::invalid_argument` for invalid CL/TE;
+it explicitly materializes a string, unlike the borrowed server send path.
+Informational 1xx/101 and successful CONNECT use a distinct headers-only
+serialization branch, stripping prohibited framing fields.
 
-`set_close_delimited()` opts the response into close-delimited body framing
-(RFC 9112 §6.3 item 8): serialization then emits no framing headers — the
-automatic `Content-Length: 0` pin for an empty body is skipped and no
-`Transfer-Encoding` is injected — so the body runs until connection close
-and keep-alive reuse of the connection is impossible. It is intended for
-streaming responses such as SSE (`sse::build_sse_response()` sets it). Pair
-it with an explicit `Connection: close` header via `set_header()`;
-serialization deliberately never writes the `Connection` header itself. The
-marker does not override the framing rules of body-forbidden statuses
-(1xx/204/304/205) or 2xx responses to CONNECT.
+`from_parser()`/`from_decoder()` preserve received headers and decoded body.
+Before reserializing a received chunked body, explicitly remove
+`Transfer-Encoding`; remove or update any stale CL if changing payload.
+No implicit normalization hides this responsibility. Complete-response
+`set_close_delimited()`/`close_delimited()` are removed.
+
+The producer is callable as
+`coro::task<send_result>(body_writer&, coro::cancel_token)` and may be move-only.
+It executes at most once and returns success or failure; it has no public
+finish step. HEAD/bodyless replies skip it. Captures, selected reply and
+borrowed data must remain valid through execution and cleanup; do not move
+the reply or escape its writer during sending.
+
+### Framing Preflight and Send Results
+
+```cpp
+enum class response_body_kind { complete, streaming };
+enum class response_framing { none, content_length, chunked, close_delimited };
+struct body_description {
+    response_body_kind kind = response_body_kind::complete;
+    std::optional<uint64_t> length = uint64_t{0};
+    response_transfer transfer = response_transfer::automatic;
+};
+struct response_plan {
+    std::string header_block;
+    response_framing framing = response_framing::none;
+    std::optional<uint64_t> expected_body_bytes;
+    bool invoke_producer = false;
+    bool reusable = false;
+    int error = 0; // positive errno
+    bool success() const noexcept;
+};
+response_plan prepare_response(const response_head&, body_description,
+    method request_method, std::string_view request_version, bool allow_reuse);
+
+enum class send_errc { none, invalid_response, length_mismatch, invalid_state,
+    cancelled, timed_out, transport_error, producer_error };
+struct send_result {
+    send_errc error = send_errc::none;
+    int transport_error = 0;
+    uint64_t confirmed_body_bytes = 0;
+    bool success() const noexcept;
+};
+struct body_buffer { const void* data = nullptr; size_t size = 0; };
+class body_writer { // noncopyable, nonmovable; supplied by sender only
+public:
+    coro::task<send_result> write(std::string_view, coro::cancel_token = {});
+    coro::task<send_result> writev(std::span<const body_buffer>, coro::cancel_token = {});
+};
+struct response_send_result {
+    send_result result;
+    bool reusable = false;
+    bool success() const noexcept;
+};
+template<typename Stream>
+coro::task<response_send_result> send_response(Stream&, reply&, method,
+    std::string_view request_version, bool allow_reuse,
+    coro::cancel_token = {}, std::chrono::nanoseconds write_timeout = {});
+```
+
+Preflight emits no final header bytes on error (allocation may throw). Complete
+bodies require known length. Known streaming length uses CL; unknown length
+uses chunked for HTTP/1.1 or close delimiting for HTTP/1.0. Explicit close requires
+unknown length and no manual CL. Response HTTP/1.1 is clamped for a request HTTP/1.0.
+Explicit TE and malformed/conflicting CL fail; identical duplicate CL lines
+already canonicalized by `headers` have no recoverable duplicate history.
+
+HEAD chooses representation length then known body length, suppressing actual
+bytes. 304 uses representation length or validated manual metadata CL, never
+the stored body length. 204 suppresses framing; 205 emits CL 0 and rejects a
+nonzero manual assertion. Ordinary final sending rejects 1xx/101 and successful
+CONNECT; they require separate interim/handoff handling. These special bodyless
+rules precede producer configuration. Reuse combines caller permission,
+response Connection policy and framing; nonreuse emits Connection: close.
+
+`write`/`writev` are sequential borrowed operations: descriptors and payload
+stay immutable/alive until await returns after transport/watchdog cleanup.
+Empty writes are no-ops only on an open, noncancelled writer. Positive short
+writes and EINTR are retried internally; readiness-aware transports handle
+EAGAIN without an application retry loop. Bounded descriptor scratch and
+chunks of at most 1 GiB do not imply zero allocations, zero-copy TLS, or stable
+chunk/syscall boundaries. No payload-sized staging buffer or output queue is
+introduced by body_writer.
+
+Known-length overrun fails before that write sends bytes; underproduction
+fails internal finalization. First failure terminates the writer, including
+ignored failures. Each logical write has one success/timeout/cancel/error
+winner and one deadline across retries. Late positive completion may increase
+cumulative diagnostic body-byte counts but does not rewrite its winner.
+Failure may follow visible wire effects: no rollback or whole-response replay.
+State/setup allocation errors report sticky ENOMEM; task-frame allocation
+can instead throw after marking failure because returning an error task also
+requires allocation. Catching that exception does not reopen the writer.
+
+For direct `send_response`, retain stream/reply through await and close on
+failure or `reusable == false`; the function does not own pooling or closing.
+The supplied stream must provide readiness-aware
+`writev(iovec*, size_t, coro::cancel_token)` returning `coro::task<io::io_result>`.
+Positive write timeouts require a current scheduler (otherwise ENOTSUP).
+See [HTTP Streaming](HTTP-Streaming.md) for lifecycle and migration details.
 
 ### HTTP Enums
 
@@ -3278,22 +3451,64 @@ public:
 SSE sends are serialized by the connection object. Application code owns event
 schema, authorization, replay, and duplicate-handling policy.
 
-### `sse::sse_endpoint` and Response Helpers
+### Managed SSE Event Production
+
+Declared in `<elio/http/sse_writer.hpp>` and exported by `<elio/http/sse.hpp>`.
+
+```cpp
+struct event_view {
+    std::optional<std::string_view> id;
+    std::string_view type;
+    std::string_view data;
+    int retry = -1;
+};
+class event_writer { // factory-provided sink; no public constructor/copy
+public:
+    send_result result() const noexcept;
+    coro::task<send_result> send_event(event_view, coro::cancel_token = {});
+    coro::task<send_result> send_data(std::string_view, coro::cancel_token = {});
+    coro::task<send_result> send_comment(std::string_view, coro::cancel_token = {});
+};
+template<typename Producer>
+http::streaming_response make_streaming_response(Producer&&);
+// Producer: task<send_result>(event_writer&, cancel_token), possibly move-only.
+```
+
+The factory provides a sequential producer-scoped event_writer. It sets
+Content-Type: text/event-stream and Cache-Control: no-cache, not CORS policy.
+Default HTTP/1.1 framing is chunked; HTTP/1.0 uses close delimiting.
+The server owns response completion. Do not construct or escape the sink,
+overlap sends, or add independent raw socket writes/heartbeat writers.
+
+Event fields remain borrowed and immutable through send completion. An absent
+id (`std::nullopt` or `{}`) is omitted, preserving the receiver's Last-Event-ID.
+A present empty id (`std::string_view{}` or `""`) emits `id:\n`, clearing it.
+The optional stores presence and a borrowed view, not an owned string.
+Empty type and negative retry are omitted; data is always emitted.
+CR, LF and CRLF delimit data/comment lines. Invalid CR/LF/NUL in a present id
+or type fails before event output. Bounded descriptor batches avoid an
+event-sized encoded string; a logical event can span multiple body writes.
+The first failure is sticky even if the producer ignores its result. Frame
+allocation may throw after recording a terminal error.
+
+### Legacy Raw SSE Endpoint
+
+`sse_connection` above serializes raw SSE bytes, not managed HTTP chunks.
+Use it only when independently owning compatible HTTP framing and connection
+lifetime; never attach it to a managed body_writer response.
 
 ```cpp
 using sse_handler_func = std::function<coro::task<void>(sse_connection&)>;
-
 class sse_endpoint {
 public:
-    explicit sse_endpoint(sse_handler_func handler);
+    explicit sse_endpoint(sse_handler_func);
     const sse_handler_func& handler() const;
 };
-
-http::response build_sse_response();
 ```
 
-`build_sse_response()` prepares the HTTP headers for an SSE stream. Applications
-still own routing and handler lifetime.
+The endpoint only stores a raw-stream handler, not an HTTP router reply.
+`build_sse_response()` has been removed; migrate managed routes to
+`make_streaming_response()` instead of sending headers separately.
 
 ### `sse::client_config`
 

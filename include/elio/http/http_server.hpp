@@ -3,6 +3,7 @@
 #include <elio/http/http_common.hpp>
 #include <elio/http/http_parser.hpp>
 #include <elio/http/http_message.hpp>
+#include <elio/http/http_response_sender.hpp>
 #include <elio/net/tcp.hpp>
 #include <elio/tls/tls_stream.hpp>
 #include <elio/io/io_context.hpp>
@@ -17,6 +18,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <concepts>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -32,6 +34,8 @@ namespace elio::http {
 
 namespace detail {
 
+struct context_access;
+
 struct tls_handshake_result {
     bool ok = false;
     bool timed_out = false;
@@ -39,17 +43,19 @@ struct tls_handshake_result {
 
 inline coro::task<tls_handshake_result>
 perform_tls_handshake_with_timeout(tls::tls_stream& stream,
-                                   std::chrono::seconds timeout) {
+                                   std::chrono::seconds timeout,
+                                   coro::cancel_token token = {}) {
     auto* sched = runtime::scheduler::current();
     if (!sched || timeout.count() <= 0) {
         tls_handshake_result result;
-        result.ok = co_await stream.handshake();
+        result.ok = co_await stream.handshake(token);
         co_return result;
     }
 
     auto timed_out = std::make_shared<std::atomic<bool>>(false);
     auto handshake_done = std::make_shared<std::atomic<bool>>(false);
     auto cancel_src = std::make_shared<coro::cancel_source>();
+    auto forward = token.on_cancel([cancel_src] { cancel_src->cancel(); });
     auto* stream_ptr = &stream;
 
     auto watchdog = sched->go_joinable(
@@ -87,9 +93,11 @@ public:
     using interim_writer = std::function<coro::task<bool>(std::string_view)>;
 
     context(request req, std::string_view client_addr,
-            interim_writer writer = {})
+            interim_writer writer = {}, coro::cancel_token token = {})
         : request_(std::move(req)), client_addr_(client_addr),
-          interim_writer_(std::move(writer)) {}
+          interim_writer_(std::move(writer)), token_(std::move(token)) {}
+
+    coro::cancel_token cancel_token() const noexcept { return token_; }
     
     /// Get the request
     const request& req() const noexcept { return request_; }
@@ -137,8 +145,8 @@ public:
     /// `response(status::continue_)` writes exactly
     /// "HTTP/1.1 100 Continue\r\n\r\n".
     ///
-    /// The context borrows its connection from the request handler scope:
-    /// it must not escape its handler (e.g. into a detached task), and
+    /// The context lives through the selected producer and its send cleanup;
+    /// it must not escape that request scope (e.g. into a detached task), and
     /// interims can only be sent before the handler returns the final
     /// response. Contexts dispatched without a connection writer — e.g.
     /// the plain-HTTP fallback routes of `websocket::ws_server` — cannot
@@ -151,6 +159,10 @@ public:
     /// send; it serves clients that pipeline or that wait for an interim
     /// the application wants to emit deliberately.
     coro::task<bool> send_interim(const response& resp) {
+        if (final_selected_) {
+            errno = EALREADY;
+            co_return false;
+        }
         const auto code = resp.status_code();
         if (code < 100 || code >= 200 ||
             code == static_cast<uint16_t>(status::switching_protocols)) {
@@ -165,17 +177,51 @@ public:
     }
 
 private:
+    friend struct detail::context_access;
     request request_;
     std::string client_addr_;
     std::unordered_map<std::string, std::string> params_;
     interim_writer interim_writer_;
+    coro::cancel_token token_;
+    bool final_selected_ = false;
 };
 
 /// Handler function type
-using handler_func = std::function<coro::task<response>(context&)>;
+using handler_func = std::function<coro::task<reply>(context&)>;
 
 /// Synchronous handler function type
 using sync_handler_func = std::function<response(context&)>;
+
+namespace detail {
+struct context_access {
+    static void seal_final_response(context& ctx) noexcept { ctx.final_selected_ = true; }
+};
+
+template<typename Result>
+concept handler_result = std::same_as<Result, response> || std::same_as<Result, streaming_response> ||
+    std::same_as<Result, reply> || std::same_as<Result, coro::task<response>> ||
+    std::same_as<Result, coro::task<streaming_response>> || std::same_as<Result, coro::task<reply>>;
+
+template<typename Handler>
+concept response_handler = std::copy_constructible<std::decay_t<Handler>> &&
+    requires(std::decay_t<Handler>& handler, context& ctx) {
+        requires handler_result<std::invoke_result_t<std::decay_t<Handler>&, context&>>;
+        std::invoke(handler, ctx);
+    };
+
+template<response_handler Handler>
+handler_func adapt_handler(Handler handler) {
+    return [handler = std::move(handler)](context& ctx) mutable -> coro::task<reply> {
+        using result_type = std::invoke_result_t<Handler&, context&>;
+        if constexpr (std::same_as<result_type, response> || std::same_as<result_type, streaming_response> ||
+                      std::same_as<result_type, reply>) {
+            co_return reply{std::invoke(handler, ctx)};
+        } else {
+            co_return reply{co_await std::invoke(handler, ctx)};
+        }
+    };
+}
+} // namespace detail
 
 /// Path segment kind for route matching
 enum class segment_kind {
@@ -290,54 +336,42 @@ public:
         routes_.push_back(std::move(r));
     }
     
-    /// Add a route with sync handler
-    void add_route(method m, std::string_view pattern, sync_handler_func handler) {
-        add_route(m, pattern, [h = std::move(handler)](context& ctx) -> coro::task<response> {
-            co_return h(ctx);
-        });
+    /// Normalize explicitly supported synchronous and asynchronous reply types.
+    template<detail::response_handler Handler>
+    void add_route(method m, std::string_view pattern, Handler handler) {
+        add_route(m, pattern, detail::adapt_handler(std::move(handler)));
     }
-    
-    /// Convenience methods for common HTTP methods
-    void get(std::string_view pattern, handler_func handler) {
+
+    template<detail::response_handler Handler>
+    void get(std::string_view pattern, Handler handler) {
         add_route(method::GET, pattern, std::move(handler));
     }
-    
-    void get(std::string_view pattern, sync_handler_func handler) {
-        add_route(method::GET, pattern, std::move(handler));
-    }
-    
-    void post(std::string_view pattern, handler_func handler) {
+
+    template<detail::response_handler Handler>
+    void post(std::string_view pattern, Handler handler) {
         add_route(method::POST, pattern, std::move(handler));
     }
-    
-    void post(std::string_view pattern, sync_handler_func handler) {
-        add_route(method::POST, pattern, std::move(handler));
-    }
-    
-    void put(std::string_view pattern, handler_func handler) {
+
+    template<detail::response_handler Handler>
+    void put(std::string_view pattern, Handler handler) {
         add_route(method::PUT, pattern, std::move(handler));
     }
-    
-    void put(std::string_view pattern, sync_handler_func handler) {
-        add_route(method::PUT, pattern, std::move(handler));
-    }
-    
-    void del(std::string_view pattern, handler_func handler) {
+
+    template<detail::response_handler Handler>
+    void del(std::string_view pattern, Handler handler) {
         add_route(method::DELETE_, pattern, std::move(handler));
     }
-    
-    void del(std::string_view pattern, sync_handler_func handler) {
-        add_route(method::DELETE_, pattern, std::move(handler));
-    }
-    
-    void patch(std::string_view pattern, handler_func handler) {
+
+    template<detail::response_handler Handler>
+    void patch(std::string_view pattern, Handler handler) {
         add_route(method::PATCH, pattern, std::move(handler));
     }
-    
-    void options(std::string_view pattern, handler_func handler) {
+
+    template<detail::response_handler Handler>
+    void options(std::string_view pattern, Handler handler) {
         add_route(method::OPTIONS, pattern, std::move(handler));
     }
-    
+
     /// Find matching route for request
     const route* find_route(method m, std::string_view path, 
                            std::unordered_map<std::string, std::string>& params) const {
@@ -363,6 +397,7 @@ struct server_config {
     std::chrono::seconds keep_alive_timeout{30};  ///< Request and inbound TLS handshake timeout
     size_t max_keep_alive_requests = 100;         ///< Max requests per connection
     bool enable_logging = true;                   ///< Log requests
+    std::chrono::milliseconds write_timeout{0};    ///< Per logical write; <= 0 disables, never a whole-response deadline
 
     // DoS protection limits
     size_t max_headers = 100;                     ///< Max number of request headers
@@ -377,8 +412,9 @@ public:
         : router_(std::move(r)), config_(config) {}
     
     /// Set 404 handler
-    void set_not_found_handler(handler_func handler) {
-        not_found_handler_ = std::move(handler);
+    template<detail::response_handler Handler>
+    void set_not_found_handler(Handler handler) {
+        not_found_handler_ = detail::adapt_handler(std::move(handler));
     }
     
     /// Set error handler
@@ -405,7 +441,8 @@ public:
         return listen_tls_impl(addr, tls_ctx, opts, start_epoch);
     }
 
-    /// Stop the server
+    /// Cooperatively cancel accepts and active sessions, including producers.
+    /// This does not wait for cleanup or authorize destroying coroutine frames.
     void stop() {
         cancel_active_accepts();
     }
@@ -414,13 +451,28 @@ public:
     bool is_running() const noexcept { return running_; }
 
     /// Return the number of in-flight connection handlers.  Callers that
-    /// destroy the server after stop() should wait until this returns 0
-    /// to avoid use-after-free on router_, config_, etc.
+    /// destroy the server after stop() must first await every listener task,
+    /// then wait until this returns 0. A listener can still be between accept
+    /// and connection registration when an earlier zero count is observed.
     size_t active_connections() const noexcept {
         return active_connections_.load(std::memory_order_acquire);
     }
 
 private:
+    struct connection_lifetime {
+        server& owner;
+        std::shared_ptr<coro::cancel_source> source;
+        // Retain the listener source after its accept loop exits. A stop that
+        // races with spawn still reaches this session through the same token.
+        connection_lifetime(server& server, std::shared_ptr<coro::cancel_source> stop)
+            : owner(server), source(std::move(stop)) {
+            owner.active_connections_.fetch_add(1, std::memory_order_relaxed);
+        }
+        ~connection_lifetime() {
+            owner.active_connections_.fetch_sub(1, std::memory_order_release);
+        }
+    };
+
     coro::task<void> listen_impl(const net::socket_address& addr,
                                  const net::tcp_options& opts,
                                  size_t start_epoch) {
@@ -458,9 +510,9 @@ private:
             }
 
             // Spawn connection handler (tracked for graceful shutdown)
-            active_connections_.fetch_add(1, std::memory_order_relaxed);
-            sched->go([this, s = std::move(*stream_result)]() mutable {
-                return handle_connection_guarded(std::move(s));
+            auto lifetime = std::make_shared<connection_lifetime>(*this, accept_source);
+            sched->go([this, s = std::move(*stream_result), lifetime]() mutable {
+                return handle_connection_guarded(std::move(s), lifetime);
             });
         }
     }
@@ -509,26 +561,26 @@ private:
             }
 
             // Track in-flight connections for graceful shutdown
-            active_connections_.fetch_add(1, std::memory_order_relaxed);
-            sched->go([this, s = std::move(*stream_result), tls_ctx_ptr]() mutable {
-                return handle_tls_connection_guarded(std::move(s), *tls_ctx_ptr);
+            auto lifetime = std::make_shared<connection_lifetime>(*this, accept_source);
+            sched->go([this, s = std::move(*stream_result), tls_ctx_ptr, lifetime]() mutable {
+                return handle_tls_connection_guarded(std::move(s), *tls_ctx_ptr, lifetime);
             });
         }
     }
     /// Guard wrapper that decrements the active-connection counter on exit.
-    coro::task<void> handle_connection_guarded(net::tcp_stream stream) {
-        co_await handle_connection(std::move(stream));
-        active_connections_.fetch_sub(1, std::memory_order_relaxed);
+    coro::task<void> handle_connection_guarded(net::tcp_stream stream,
+                                              std::shared_ptr<connection_lifetime> lifetime) {
+        co_await handle_connection(std::move(stream), lifetime->source->get_token());
     }
 
     /// Guard wrapper for TLS connections.
-    coro::task<void> handle_tls_connection_guarded(net::tcp_stream tcp, tls::tls_context& tls_ctx) {
-        co_await handle_tls_connection(std::move(tcp), tls_ctx);
-        active_connections_.fetch_sub(1, std::memory_order_relaxed);
+    coro::task<void> handle_tls_connection_guarded(net::tcp_stream tcp, tls::tls_context& tls_ctx,
+                                                 std::shared_ptr<connection_lifetime> lifetime) {
+        co_await handle_tls_connection(std::move(tcp), tls_ctx, lifetime->source->get_token());
     }
 
     /// Handle a plain HTTP connection
-    coro::task<void> handle_connection(net::tcp_stream stream) {
+    coro::task<void> handle_connection(net::tcp_stream stream, coro::cancel_token token) {
         auto peer = stream.peer_address();
         std::string client_addr = peer ? peer->to_string() : "unknown";
         
@@ -536,7 +588,7 @@ private:
             ELIO_LOG_DEBUG("HTTP connection from {}", client_addr);
         }
         
-        co_await handle_requests(stream, client_addr);
+        co_await handle_requests(stream, client_addr, token);
         
         if (config_.enable_logging) {
             ELIO_LOG_DEBUG("HTTP connection closed: {}", client_addr);
@@ -544,7 +596,8 @@ private:
     }
     
     /// Handle a TLS HTTP connection
-    coro::task<void> handle_tls_connection(net::tcp_stream tcp, tls::tls_context& tls_ctx) {
+    coro::task<void> handle_tls_connection(net::tcp_stream tcp, tls::tls_context& tls_ctx,
+                                          coro::cancel_token token) {
         auto peer = tcp.peer_address();
         std::string client_addr = peer ? peer->to_string() : "unknown";
         
@@ -554,7 +607,7 @@ private:
         
         tls::tls_stream stream(std::move(tcp), tls_ctx);
         auto hs_result = co_await detail::perform_tls_handshake_with_timeout(
-            stream, config_.keep_alive_timeout);
+            stream, config_.keep_alive_timeout, token);
         if (!hs_result.ok) {
             if (hs_result.timed_out) {
                 ELIO_LOG_ERROR("TLS handshake timed out for {}", client_addr);
@@ -564,9 +617,10 @@ private:
             co_return;
         }
         
-        co_await handle_requests(stream, client_addr);
+        co_await handle_requests(stream, client_addr, token);
         
-        co_await stream.shutdown();
+        if (token.is_cancelled()) stream.shutdown_socket();
+        else co_await stream.shutdown();
         
         if (config_.enable_logging) {
             ELIO_LOG_DEBUG("HTTPS connection closed: {}", client_addr);
@@ -575,15 +629,16 @@ private:
     
     /// Handle HTTP requests on a stream (templated for TCP/TLS)
     template<typename Stream>
-    coro::task<void> handle_requests(Stream& stream, const std::string& client_addr) {
+    coro::task<void> handle_requests(Stream& stream, const std::string& client_addr,
+                                    coro::cancel_token token) {
         auto* sched = runtime::scheduler::current();
-        std::vector<char> buffer(config_.read_buffer_size);
+        std::vector<char> buffer(std::max<size_t>(1, config_.read_buffer_size));
         request_parser parser;
         parser.set_max_headers(config_.max_headers);
         parser.set_max_header_size(config_.max_header_size);
         size_t request_count = 0;
 
-        while (running_ && request_count < config_.max_keep_alive_requests) {
+        while (running_ && !token.is_cancelled() && request_count < config_.max_keep_alive_requests) {
             parser.reset();
 
             // Slow-loris watchdog: each request is allowed at most
@@ -653,7 +708,7 @@ private:
                 co_await stop_watchdog();
                 auto resp = response(status::payload_too_large, "Payload Too Large");
                 resp.set_header("Connection", "close");
-                co_await this->send_response(stream, resp, parser.get_method());
+                co_await send_error_response(stream, std::move(resp), parser.get_method(), parser.version(), token);
                 sent_response = true;
                 co_return;
             };
@@ -663,7 +718,7 @@ private:
                 if (parse_buffered) {
                     parse_buffered = false;
                 } else {
-                    auto result = co_await stream.read(buffer.data(), buffer.size());
+                    auto result = co_await stream.read(buffer.data(), buffer.size(), token);
 
                     if (timed_out->load(std::memory_order_acquire)) {
                         early_exit = true;
@@ -704,7 +759,7 @@ private:
                     co_await stop_watchdog();
                     auto resp = response::bad_request(parser.error_message());
                     resp.set_header("Connection", "close");
-                    co_await send_response(stream, resp, parser.get_method());
+                    co_await send_error_response(stream, std::move(resp), parser.get_method(), parser.version(), token);
                     sent_response = true;
                     co_return;
                 }
@@ -721,15 +776,15 @@ private:
             }
 
             // Create request and context. The interim writer borrows
-            // `stream`; the context is confined to the handler scope below,
+            // `stream`; context survives handler selection and producer cleanup,
             // so the reference cannot outlive the stream.
             auto req = request::from_parser(parser);
             context ctx(std::move(req), client_addr,
-                        [&stream](std::string_view data) -> coro::task<bool> {
+                        [&stream, token](std::string_view data) -> coro::task<bool> {
                             size_t sent = 0;
                             while (sent < data.size()) {
                                 auto result = co_await stream.write(
-                                    data.data() + sent, data.size() - sent);
+                                    data.data() + sent, data.size() - sent, token);
                                 if (result.result <= 0) {
                                     ELIO_LOG_ERROR(
                                         "Failed to send interim response: {}",
@@ -741,7 +796,7 @@ private:
                                 sent += static_cast<size_t>(result.result);
                             }
                             co_return true;
-                        });
+                        }, token);
 
             // Log request
             if (config_.enable_logging) {
@@ -753,7 +808,7 @@ private:
             }
 
             // Route request
-            response resp;
+            reply resp;
             try {
                 resp = co_await route_request(ctx);
             } catch (const std::exception& e) {
@@ -768,32 +823,30 @@ private:
                 } else {
                     resp = response::internal_error();
                 }
+            } catch (...) {
+                resp = response::internal_error();
             }
 
-            // Check keep-alive: honour both the request AND the response
-            // Connection headers, plus the server-side max-requests limit.
+            detail::context_access::seal_final_response(ctx);
+
+            // Supply external reuse permission only. The shared response plan
+            // also applies response Connection headers and selected framing.
             bool keep_alive = parser.get_headers().keep_alive(parser.version());
-            if (keep_alive) {
-                keep_alive = resp.get_headers().keep_alive(parser.version());
-            }
             // If this is the last allowed request, signal close so the
             // client does not pipeline into a connection we are about to
             // abandon (RFC 7230 §6.6).
             if (keep_alive && request_count + 1 >= config_.max_keep_alive_requests) {
                 keep_alive = false;
             }
-            if (!running_) {
+            if (!running_ || token.is_cancelled()) {
                 keep_alive = false;
-            }
-            if (!keep_alive) {
-                resp.set_header("Connection", "close");
             }
 
             // Send response
-            bool send_ok = co_await send_response(stream, resp,
-                                                  ctx.req().get_method());
+            auto sent = co_await http::send_response(stream, resp,
+                parser.get_method(), parser.version(), keep_alive, token, config_.write_timeout);
 
-            if (!send_ok || !keep_alive) {
+            if (!sent.success() || !sent.reusable) {
                 break;
             }
 
@@ -802,7 +855,7 @@ private:
     }
     
     /// Route a request to the appropriate handler
-    coro::task<response> route_request(context& ctx) {
+    coro::task<reply> route_request(context& ctx) {
         std::unordered_map<std::string, std::string> params;
         auto* route = router_.find_route(ctx.req().get_method(), ctx.req().path(), params);
         
@@ -822,27 +875,15 @@ private:
         co_return response::not_found();
     }
     
-    /// Send HTTP response.  Returns true if the entire response was written
-    /// successfully, false on write failure (truncated / broken stream).
     template<typename Stream>
-    coro::task<bool> send_response(Stream& stream,
-                                   const response& resp,
-                                   std::optional<method> request_method = std::nullopt) {
-        auto data = request_method ? resp.serialize(*request_method)
-                                   : resp.serialize();
-
-        size_t sent = 0;
-        while (sent < data.size()) {
-            auto result = co_await stream.write(data.data() + sent, data.size() - sent);
-            if (result.result <= 0) {
-                ELIO_LOG_ERROR("Failed to send HTTP response: {}",
-                               result.result == 0 ? "connection closed"
-                                                  : strerror(-result.result));
-                co_return false;
-            }
-            sent += result.result;
-        }
-        co_return true;
+    coro::task<void> send_error_response(Stream& stream, response resp,
+                                         method request_method, std::string_view version,
+                                         coro::cancel_token token) {
+        reply selected{std::move(resp)};
+        // A malformed request may not yet have a usable version.
+        if (version != "HTTP/1.0" && version != "HTTP/1.1") version = "HTTP/1.1";
+        (void)co_await http::send_response(stream, selected, request_method, version,
+                                          false, std::move(token), config_.write_timeout);
     }
 
     std::shared_ptr<coro::cancel_source> begin_accept_loop(size_t start_epoch) {

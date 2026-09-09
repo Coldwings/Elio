@@ -309,6 +309,15 @@ remains independently effective.
 
 ### SSE Event Format
 
+For managed responses, `sse::event_view::id` is an
+`std::optional<std::string_view>`. Omission (`std::nullopt` or `{}`) preserves
+the receiver's Last-Event-ID. An engaged empty view (`std::string_view{}` or
+`""`) emits `id:\n` and clears it; later events omitting id retain that cleared
+state. For example, `writer.send_event({std::string_view{}, {}, "reset"})`
+sends an explicit reset with data. `send_data()` omits id. These fields remain
+borrowed through completion; presence adds no owned string or allocation.
+This does not change legacy raw `sse_connection` serialization.
+
 SSE is the decoded HTTP body, not the raw bytes immediately after response
 headers. The client supports Content-Length, chunked transfer encoding, and
 close-delimited bodies. It removes chunk metadata before event parsing and
@@ -344,11 +353,22 @@ or chunk framing returns `EBADMSG`. Previously delivered events remain delivered
 With reconnect enabled, completion/failure follows the configured receive-driven
 reconnect policy and `Last-Event-ID` handling; this is not exactly-once delivery.
 
-These receive changes do not replace the current server helpers:
-`build_sse_response()` still prepares a close-delimited response with
-`Connection: close`. The broader outgoing writer redesign remains tracked by
-[#1191](https://github.com/Coldwings/Elio/issues/1191). See [[HTTP Streaming]]
-for the shared reader's buffer lifetime and error contracts.
+For outgoing SSE, return `sse::make_streaming_response(producer)` from an HTTP
+route. The owned producer receives `sse::event_writer&` and a cancellation token,
+and returns `task<send_result>`. Await and check every event write; successful
+producer return delegates final HTTP framing to the server. Unknown-length
+HTTP/1.1 streams use real chunks by default. The event writer borrows data and
+field slices through each await without concatenating a complete event body.
+It rejects CR/LF/NUL in id/type before emitting the event; data and comments
+support multiline input. Do not use writers concurrently or retain them after
+producer return.
+
+`build_sse_response()` is removed. The new factory supplies Content-Type and
+Cache-Control but does not grant CORS permission or force Connection: close.
+Set cross-origin policy explicitly when needed. Legacy raw-stream
+`sse_connection` cannot be used to bypass the managed HTTP writer. See
+`examples/sse_server.cpp`, [[HTTP Streaming]], and [[Migrating to 0.6]] for
+complete examples, framing policy, borrowing, and cancellation boundaries.
 
 SSE events are formatted as text with specific fields:
 

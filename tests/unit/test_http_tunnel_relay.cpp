@@ -67,6 +67,8 @@ struct relay_fake {
 };
 
 coro::task<void> release_finish(relay_fake* stream, coro::cancel_token token) {
+    // Exercise an existing reader, not a child cancelled before read entry.
+    (void)co_await stream->read_entered.wait(token);
     (void)co_await stream->finish_entered.wait(token);
     stream->finish_release.set();
 }
@@ -110,6 +112,22 @@ tunnel_result run_fake_relay(relay_fake& client, relay_fake& upstream,
 }
 }
 
+TEST_CASE("Tunnel close fixture waits for reader entry before releasing finish", "[http][tunnel][relay]") {
+    relay_fake stream;
+    stream.finish_entered.set();
+    auto release = release_finish(&stream, {});
+    auto handle = coro::detail::task_access::handle(release);
+    handle.resume();
+    const bool waited_for_reader = !handle.done();
+    const bool released_early = stream.finish_release.is_set();
+    stream.read_entered.set();
+    if (!handle.done()) std::terminate();
+    release.await_resume();
+    CHECK(waited_for_reader);
+    CHECK_FALSE(released_early);
+    CHECK(stream.finish_release.is_set());
+}
+
 TEST_CASE("Tunnel relay keeps a healthy reverse direction after directional EOF", "[http][tunnel][relay]") {
     relay_fake client, upstream;
     upstream.input = std::string("r\0everse", 8);
@@ -135,6 +153,7 @@ TEST_CASE("Tunnel relay joins whole-session close before cancelling its reader",
     CHECK(result.end == tunnel_end::session_closed);
     CHECK(result.error == 0);
     CHECK(client.finished.load());
+    CHECK(client.reads.load() == 1);
     CHECK(client.read_returned.load());
     CHECK_FALSE(client.early_cancel.load());
     CHECK(result.upstream_to_client.accepted_bytes == 0);

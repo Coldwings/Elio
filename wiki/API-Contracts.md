@@ -117,6 +117,39 @@ Case law (frozen): process-wide `SIGPIPE` disposition at runtime/server entry â€
 
 ## I/O, Networking, And Streams
 
+### Finishing Stream Output
+
+`tcp_stream`, `tls_stream`, and `net::stream` provide `finish_write(token,
+timeout)`. Serialize it with other writers and lifetime changes; one reader
+may overlap. TCP and TLS 1.3 finish the write direction and preserve reading.
+TLS 1.2 automatically closes the whole session instead, without a caller
+version branch or an unsupported-half-close error. TLS 1.2 peer closure also
+starts session closure using `tls_stream_options::session_close_timeout`
+(default five seconds).
+
+Session closure freezes new plaintext writes. Already BIO-accepted ciphertext
+is an ordered committed prefix: do not discard it and then send a new TLS
+alert. The fixed prefix and alert drain within the session budget; failure
+terminates the transport. TCP/TLS 1.3 ignore the explicit timeout; TLS 1.2 uses
+one whole-session budget. Timeout starts cooperative abort and awaited cleanup,
+not forced frame destruction.
+
+`write_finish_result` reports `scope`, positive errno `error`,
+`local_end_flushed`, and `peer_end_observed`. Zero error is not peer receipt or
+lossless relay completion. TCP conservatively reports no observed peer end.
+Pre-cancelled TCP calls leave the socket unchanged. Disconnected TCP returns
+`EBADF`; an empty common stream returns `ENOTCONN`, with write-direction scope.
+TLS finish requires a completed handshake. A pre-cancelled finish before any
+closure begins is local; cancellation while joining an already-selected close
+can terminate that session. Repeated finish observes current sticky failure.
+After normal close, nonempty writes report `ESHUTDOWN` without poisoning the
+completed close. TLS 1.2 remaining reverse plaintext may be discarded while
+waiting for the peer alert; an unfinished SSL write retry instead forces a
+terminal `ECANCELED`. TLS read EOF never treats raw socket truncation as an
+authenticated peer alert. Handshake-history state is not a writability probe.
+Legacy TLS `shutdown()` and common-stream `close()` remain serialized
+whole-session operations, not reader-concurrent output completion.
+
 Worker/backend ownership and object-level concurrency are separate contracts.
 Elio prevents a continuation with pending worker-local I/O from migrating away
 from the backend owner. It does not serialize operations on a stream, listener,

@@ -1,5 +1,17 @@
 # Migrating To 0.6
 
+## Finishing Stream Output
+
+Use `co_await stream.finish_write(token)` to finish application output without
+branching on TCP versus negotiated TLS version. TCP/TLS 1.3 preserve reading;
+TLS 1.2 closes the session normally, not as an unsupported half-close error.
+The result reports scope, error and observed closure, not peer receipt or
+lossless relay completion. One reader may overlap; serialize other writers
+and lifetime changes. TLS 1.2 peer closure also freezes new plaintext writes
+and drains the already BIO-accepted ciphertext prefix and alert within
+`tls_stream_options::session_close_timeout` (five seconds by default). Legacy
+`shutdown()`/`close()` remain separate serialized whole-close APIs.
+
 ## HTTP Complete And Streaming Replies
 
 For direct `prepare_response` callers, `body_description::length` defaults to

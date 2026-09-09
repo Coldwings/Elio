@@ -32,6 +32,7 @@ set(TEST_SOURCES
     unit/test_channel_close.cpp
     unit/test_channel_success.cpp
     unit/test_close_wake.cpp
+    unit/test_stream_finish.cpp
     unit/test_simple_channel.cpp
     unit/test_cancel_token.cpp
     unit/test_cancellation_context.cpp
@@ -88,6 +89,8 @@ if(TARGET elio_tls)
         unit/test_tls_duplex.cpp
         unit/test_tls_transport.cpp
         unit/test_tls_shutdown.cpp
+        unit/test_tls_finish.cpp
+        unit/test_tls_finish_order.cpp
         unit/test_http_client.cpp
     )
 endif()

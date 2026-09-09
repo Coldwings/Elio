@@ -22,8 +22,10 @@ struct wait_strategy {
         return {0, false};
     }
 
-    /// Pure spinning - lowest latency but burns CPU
-    /// Use only when latency is critical and CPU is dedicated
+    /// Spin-then-block with the CPU pause instruction - low latency during
+    /// idle bursts. Identical to aggressive(N) for equal N: both return
+    /// {iterations, false}. Like every non-blocking strategy, the worker
+    /// falls back to a blocking I/O poll once the spin budget is exhausted.
     static constexpr wait_strategy spinning(size_t iterations) noexcept {
         return {iterations, false};
     }

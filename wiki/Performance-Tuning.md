@@ -133,7 +133,7 @@ scheduler sched(4, wait_strategy::blocking());
 // Spins for 1000 iterations with yield, then blocks on I/O poll
 scheduler sched(4, wait_strategy::hybrid(1000));
 
-// Aggressive spinning - ultra-low latency (uses pause instruction)
+// Spin-then-block with pause instruction (identical to aggressive(1000))
 scheduler sched(4, wait_strategy::spinning(1000));
 
 // Custom strategy
@@ -149,9 +149,21 @@ scheduler sched(4, custom);
 | Strategy | CPU Usage | Wake Latency | Use Case |
 |----------|-----------|--------------|----------|
 | `blocking()` | Lowest | ~1-10 μs | General workloads (default) |
-| `hybrid(N)` | Low-Medium | ~1-5 μs | Latency-sensitive with mixed load |
-| `spinning(N)` | High | ~100-500 ns | Ultra-low latency, dedicated CPUs |
-| `aggressive(N)` | Medium-High | ~100-1000 ns | Low latency, shared CPUs |
+| `hybrid(N)` | Scales with N | Scales with N | Latency-sensitive with mixed load |
+| `spinning(N)` / `aggressive(N)` | Scales with N | Scales with N | Low latency; identical for equal N |
+
+The CPU/latency characteristics of the parameterized presets are not fixed
+properties: `N == 0` degenerates to `blocking()` (the worker goes straight
+to the blocking poll), and larger N spends progressively longer spinning
+before blocking. The actual trade-off depends on N, the workload, and the
+I/O backend, so measure with your own N rather than relying on generic
+numbers.
+
+`spinning(N)` and `aggressive(N)` both return `{N, false}` (N spin iterations
+with the CPU pause instruction), so they are exactly equivalent for equal N.
+Every strategy with `spin_iterations > 0` is spin-then-block: after the spin
+budget is exhausted the worker always falls back to the blocking I/O poll, so
+no strategy spins forever.
 
 The `spin_yield` flag controls whether the spin phase uses `std::this_thread::yield()` (true) or the CPU pause instruction (false). Yielding is friendlier to other threads but slightly slower.
 
@@ -1020,19 +1032,29 @@ instructions on coroutine resume or steal paths.
 
 ### Logging Overhead
 
-Debug logging has overhead; disable in production:
+Debug logging has overhead; keep it out of production builds:
 
 ```cpp
-// Set at compile time
-// cmake -DELIO_ENABLE_DEBUG_METADATA=OFF ..
+// Compile time: ELIO_LOG_DEBUG is compiled in only when ELIO_DEBUG is
+// *defined* (log/macros.hpp uses #ifdef). Simply leave ELIO_DEBUG
+// undefined to compile debug logging out entirely.
+// NOTE: defining ELIO_DEBUG=0 is NOT sufficient - #ifdef tests
+// definedness, so debug logs would still be compiled in.
 
-// Or at runtime
+// Runtime: filter by level (applies to whatever was compiled in)
 elio::log::logger::instance().set_level(elio::log::level::warning);
 ```
 
 ### Coroutine Stack Tracing
 
-Use virtual stack for debugging without significant overhead:
+Use virtual stack for debugging without significant overhead. Coroutine
+frame metadata is controlled by the dedicated `ELIO_ENABLE_DEBUG_METADATA`
+CMake option (it does not affect logging):
+
+```bash
+# Enable coroutine frame metadata
+cmake -DELIO_ENABLE_DEBUG_METADATA=ON ..
+```
 
 ```cpp
 // Enable in debug builds only

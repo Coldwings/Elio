@@ -58,7 +58,7 @@ Every frame carries the following debug metadata with no additional allocation:
 
 | Field | Description |
 |-------|-------------|
-| `debug_id_` | Unique monotonic identifier assigned at creation |
+| `debug_id_` | Unique identifier, allocated lazily: the field stays 0 until the first `id()` call materializes it. IDs are handed out from per-thread batches of 1024 drawn from a global counter, so they are unique but not globally monotonic across threads. The debugger tools read the raw field without calling `id()`, so frames whose ID was never requested display ID 0 |
 | `debug_state_` | Current state: created, running, suspended, completed, or failed |
 | `debug_worker_id_` | Index of the worker thread the frame is assigned to (or 0xFFFFFFFF if unassigned) |
 | `debug_location_` | Source location struct (type `debug_location`) with members `file`, `function`, `line`, set via manual `set_location()` |

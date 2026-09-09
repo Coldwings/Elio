@@ -1742,7 +1742,10 @@ than issuing it directly on a scheduler worker under the epoll backend.
 High-level coroutine functions for common file operations:
 
 ```cpp
-// Read entire file into a string
+// Read a file into a string. An engaged result holds the bytes actually
+// read (not a completeness guarantee: a read failure after bytes were
+// accumulated still returns partial content). nullopt only when open
+// fails or the first read fails before any bytes are produced.
 std::optional<std::string> content = co_await read_file("/path/to/file.txt");
 
 // Write string to file (creates/truncates)
@@ -2839,7 +2842,7 @@ enum class status {
 };
 
 // Get reason phrase for status
-const char* status_reason(status s);
+constexpr std::string_view status_reason(status s) noexcept;
 ```
 
 ---
@@ -4035,7 +4038,8 @@ public:
     level get_level() const;
     
     template<typename... Args>
-    void log(level lvl, const char* fmt, Args&&... args);
+    void log(level lvl, const char* file, int line,
+             fmt::format_string<Args...> fmt_str, Args&&... args);
 };
 
 enum class level {
@@ -4045,6 +4049,11 @@ enum class level {
     error
 };
 ```
+
+Ordinary callers should use the `ELIO_LOG_INFO` / `ELIO_LOG_WARNING` /
+`ELIO_LOG_ERROR` macros (and `ELIO_LOG_DEBUG` when `ELIO_DEBUG` is defined)
+from `elio/log/macros.hpp`; they supply `__FILE__` and `__LINE__`
+automatically.
 
 ---
 

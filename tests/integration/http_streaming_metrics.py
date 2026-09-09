@@ -313,6 +313,11 @@ def validate_pair(planned, client, server, expected_digest):
         require(server["tls_version"] == client.get("tls_version") and
                 server["tls_cipher"] == client.get("tls_cipher") and server["tls_version"] != "none",
                 "TLS metadata mismatch")
+    else:
+        require(all(evidence.get(name) == "none"
+                    for evidence in (client, server)
+                    for name in ("tls_version", "tls_cipher")),
+                "plain TCP evidence must report TLS version and cipher as none")
     for value, name in ((client.get("elapsed_ns"), "elapsed"), (client.get("client_cpu_ns"), "client CPU"),
                         (server.get("server_cpu_ns"), "server CPU")):
         require(integer(value, 1), f"invalid {name} clock interval")
@@ -364,6 +369,12 @@ def build_summary(planned, clients, servers, expected_digest):
         matched_servers = [s for s in servers if isinstance(s, dict) and s.get("trial") == item.get("trial")]
         if len(matched_clients) != 1 or len(matched_servers) != 1:
             row["errors"].append("expected exactly one client and one server row")
+            if len(matched_clients) == 1:
+                client = matched_clients[0]
+                if (all(client.get(key) == item.get(key)
+                        for key in ("trial", "transport", "mode")) and
+                        isinstance(client.get("error"), str) and client["error"]):
+                    row["errors"].append(f"client: {client['error']}")
         elif plan_valid:
             try:
                 client, server = matched_clients[0], matched_servers[0]

@@ -78,6 +78,35 @@ class EvidenceTests(unittest.TestCase):
         self.servers.pop()
         self.assertEqual(self.summary()["covered_coordinates"], 5)
 
+    def test_missing_server_preserves_attributable_client_failure(self):
+        failure = "server exited before readiness"
+        self.clients[0]["success"] = False
+        self.clients[0]["error"] = failure
+        self.servers.pop(0)
+        summary = self.summary()
+        self.assertFalse(summary["success"])
+        self.assertEqual(summary["covered_coordinates"], 5)
+        self.assertEqual(summary["rows"][0]["status"], "incomplete")
+        self.assertIn("expected exactly one client and one server row",
+                      summary["rows"][0]["errors"])
+        self.assertIn(f"client: {failure}", summary["rows"][0]["errors"])
+        self.assertIn(f"tcp/complete: client: {failure}",
+                      metrics.render_summary(summary))
+
+    def test_ambiguous_client_failure_is_not_attributed(self):
+        self.clients[0]["error"] = "ambiguous startup failure"
+        self.clients.append(copy.deepcopy(self.clients[0]))
+        self.servers.pop(0)
+        self.assertNotIn("ambiguous startup failure",
+                         metrics.render_summary(self.summary()))
+
+    def test_wrong_coordinate_client_failure_is_not_attributed(self):
+        self.clients[0]["error"] = "wrong coordinate startup failure"
+        self.clients[0]["transport"] = "tls"
+        self.servers.pop(0)
+        self.assertNotIn("wrong coordinate startup failure",
+                         metrics.render_summary(self.summary()))
+
     def test_wrong_trial_is_not_attributable(self):
         self.servers[0]["trial"] = "foreign"
         summary = self.summary()
@@ -145,6 +174,22 @@ class EvidenceTests(unittest.TestCase):
     def test_tls_metadata_must_match_observed_session(self):
         self.clients[3]["tls_cipher"] = "wrong-cipher"
         self.assertFalse(self.summary()["success"])
+
+    def test_plain_tcp_requires_none_tls_metadata_on_both_sides(self):
+        for label, evidence in (("client", self.clients[0]),
+                                ("server", self.servers[0])):
+            for field in ("tls_version", "tls_cipher"):
+                for value in ("TLSv1.3", "", None):
+                    with self.subTest(side=label, field=field, value=value):
+                        evidence[field] = value
+                        summary = self.summary()
+                        self.assertFalse(summary["success"])
+                        self.assertEqual(summary["covered_coordinates"], 5)
+                    evidence[field] = "none"
+                with self.subTest(side=label, field=field, missing=True):
+                    del evidence[field]
+                    self.assertFalse(self.summary()["success"])
+                evidence[field] = "none"
 
     def test_debug_build_not_reported_as_release_measurement(self):
         self.servers[0]["build_type"] = "Debug"
@@ -248,9 +293,55 @@ class ProtocolTests(unittest.TestCase):
                                             time.monotonic() + 2)
 
     def test_response_deadline_does_not_reset_on_partial_reads(self):
-        with mock.patch.object(metrics.time, "monotonic", side_effect=[n / 10 for n in range(100)]):
+        clock = SimpleNamespace(now=10.0)
+        deadline = 11.0
+        wire = self.response()
+
+        class PartialSocket(MemorySocket):
+            def __init__(self, response):
+                super().__init__(response)
+                self.fragments = []
+                self.receive_timeouts = []
+                self.timeout = None
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def recv(self, size):
+                if len(self.fragments) >= 2:
+                    raise AssertionError("unexpected receive beyond the original deadline")
+                self.max_read = max(size, self.max_read)
+                self.receive_timeouts.append(self.timeout)
+                # Decode one body byte before the final byte reaches the deadline.
+                end = len(self.wire) - 1 if not self.fragments else len(self.wire)
+                data = self.wire[self.offset:min(end, self.offset + size)]
+                self.offset += len(data)
+                self.fragments.append(data)
+                clock.now = 10.25 if len(self.fragments) == 1 else deadline
+                return data
+
+        peer = self.peer(wire)
+        peer.socket = PartialSocket(wire)
+        decoded_body = []
+        original_next_event = peer.protocol.next_event
+
+        def observe_event():
+            event = original_next_event()
+            if isinstance(event, metrics.h11.Data):
+                decoded_body.append(bytes(event.data))
+            return event
+
+        with mock.patch.object(metrics.time, "monotonic", side_effect=lambda: clock.now), \
+                mock.patch.object(peer.protocol, "next_event", side_effect=observe_event):
             with self.assertRaisesRegex(ValueError, "deadline"):
-                self.request(self.peer(self.response()), deadline=0.2)
+                self.request(peer, deadline=deadline)
+
+        self.assertEqual(peer.socket.fragments, [wire[:-1], wire[-1:]])
+        self.assertEqual(decoded_body[:1], [b"o"])
+        self.assertEqual(peer.socket.receive_timeouts, [1.0, 0.75])
+        self.assertEqual(peer.socket.offset, len(wire))
+        self.assertLessEqual(peer.socket.max_read, metrics.BLOCK_BYTES)
+        self.assertEqual(clock.now, deadline)
 
     def test_json_rejects_duplicates_nonfinite_and_partial_line(self):
         with tempfile.TemporaryDirectory() as temporary:

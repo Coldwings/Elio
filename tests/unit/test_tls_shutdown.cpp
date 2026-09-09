@@ -147,6 +147,8 @@ void exercise_shutdown(backend_type backend, tls::tls_version version, bool peer
         try {
             tasks[0].emplace(scheduler.go_joinable([&]() -> coro::task<void> {
                 co_await start.wait();
+                if (timer_failure == 3)
+                    runtime::detail::fail_next_join_state_allocation_for_test.store(true);
                 if (peer_closes) co_await server.shutdown();
                 else co_await server.shutdown(test::scaled_ms(1000));
                 close_returned[0] = true;
@@ -210,7 +212,8 @@ void exercise_shutdown(backend_type backend, tls::tls_version version, bool peer
         REQUIRE((peer_state.ssl_shutdown_flags & SSL_SENT_SHUTDOWN) != 0);
         REQUIRE((peer_state.ssl_shutdown_flags & SSL_RECEIVED_SHUTDOWN) != 0);
     } else {
-        const int expected_error = timer_failure == 1 ? ENOMEM : timer_failure == 2 ? EIO : ETIMEDOUT;
+        const int expected_error = (timer_failure == 1 || timer_failure == 3)
+            ? ENOMEM : timer_failure == 2 ? EIO : ETIMEDOUT;
         REQUIRE(server_state.transport_error == expected_error);
         REQUIRE((server_state.ssl_shutdown_flags & SSL_RECEIVED_SHUTDOWN) == 0);
         REQUIRE_FALSE(close_returned[1]);
@@ -252,6 +255,7 @@ TEST_CASE("TLS shutdown contains timer setup failure and settles output", "[tls]
     auto failures = [](backend_type backend) {
         SECTION("allocation failure") { shutdown_versions(backend, false, 1); }
         SECTION("other timer failure") { shutdown_versions(backend, false, 2); }
+        SECTION("watchdog join-state allocation failure") { shutdown_versions(backend, false, 3); }
     };
     SECTION("forced epoll") { failures(backend_type::epoll); }
     SECTION("forced io_uring") {

@@ -3921,6 +3921,19 @@ reset or re-handshake API. Terminal output settlement uses two pre-reserved
 notification slots for the permitted reader/writer pair, without allocating
 new cleanup waiters.
 
+Cancellation detected by the operation's initial cancellation check is local
+to that call. After it passes that check, subsequently observed cancellation
+terminates the whole connection with sticky `ECANCELED`, including an overlapping
+sibling with a different token. Await both operations; do not retry on that
+connection. A completion that wins the race may still succeed, and cancellation
+cannot roll back transmitted bytes. The exact helpers also check cancellation
+between completed slices; cancellation at that boundary has no unfinished SSL
+operation and does not itself abort the stream.
+
+Moved-from streams support destruction, reassignment, `fd()`/`tcp()` queries
+(descriptor -1), `is_handshake_complete()` (false), and inert `shutdown()` /
+`shutdown_socket()`. Other operations require a live, unmoved stream.
+
 Callers must serialize shutdown/destruction against public reads/writes, request
 cancellation where needed, and await those operations before releasing stream
 or plaintext storage. Destruction aborts the owned ciphertext pump; it does not

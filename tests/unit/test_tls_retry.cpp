@@ -130,19 +130,20 @@ struct retry_script {
     };
 
     static coro::task<io::io_result> readiness(
-        void* context, operation kind, bool for_read, coro::cancel_token) {
+        void* context, operation kind, bool for_read, coro::cancel_token token) {
         auto& script = *static_cast<retry_script*>(context);
         script.direction_correct &= kind == script.pending_operation &&
             for_read == (script.pending_error == SSL_ERROR_WANT_READ);
         co_await gate{script};
         if (script.fail_wait) throw std::bad_alloc();
+        if (token.is_cancelled()) co_return io::io_result{-ECANCELED, 0};
         co_return io::io_result{1, 0};
     }
 };
 
 void exercise_retry(operation pending, int error, bool allow_interleaving, bool cancellable,
-                    bool fail_wait = false) {
-    CAPTURE(pending, error, cancellable);
+                    bool fail_wait = false, unsigned cancel_mode = 0) {
+    CAPTURE(pending, error, cancellable, cancel_mode);
     std::array<int, 2> sockets{-1, -1};
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()) == 0);
     net::tcp_stream server_tcp(sockets[0]);
@@ -164,8 +165,11 @@ void exercise_retry(operation pending, int error, bool allow_interleaving, bool 
         &script, retry_script::dispatch, retry_script::readiness};
     server.set_dispatch_test_hooks(&hooks);
     coro::cancel_source cancel;
+    coro::cancel_source independent_reader_cancel;
+    if (cancel_mode == 2) cancel.cancel();
+    const auto reader_token = cancel_mode ? independent_reader_cancel.get_token() : cancel.get_token();
     auto writer = cancellable ? server.write(payload, cancel.get_token()) : server.write(payload);
-    auto reader = cancellable ? server.read(input.data(), input.size(), cancel.get_token())
+    auto reader = cancellable ? server.read(input.data(), input.size(), reader_token)
                               : server.read(input.data(), input.size());
     auto writer_handle = coro::detail::task_access::handle(writer);
     auto reader_handle = coro::detail::task_access::handle(reader);
@@ -177,18 +181,44 @@ void exercise_retry(operation pending, int error, bool allow_interleaving, bool 
     // Advance the submitted reader/writer, not an observation waiting for an
     // SSL_read call: correctly deferred SSL dispatch must not hang this test.
     const bool interleaved_before_retry = script.interleaved;
+    const bool sibling_deferred = !reader_handle.done();
+    if (cancel_mode == 1) cancel.cancel();
     if (script.continuation) {
         auto resume = std::exchange(script.continuation, {});
         resume.resume();
     }
     const bool writer_done = writer_handle.done();
     const bool reader_done = reader_handle.done();
+    const auto transport_state = server.shutdown_state_for_test();
     server.set_dispatch_test_hooks(nullptr);
     server.shutdown_socket();
     peer.shutdown_socket();
 
     REQUIRE(writer_done);
     REQUIRE(reader_done);
+    if (cancel_mode) {
+        CHECK(writer.await_resume().result == -ECANCELED);
+        CHECK_FALSE(independent_reader_cancel.is_cancelled());
+        CHECK_FALSE(interleaved_before_retry);
+        CHECK_FALSE(transport_state.pump_active);
+        if (cancel_mode == 1) {
+            CHECK(parked);
+            CHECK(sibling_deferred);
+            CHECK(reader.await_resume().result == -ECANCELED);
+            CHECK(transport_state.transport_error == ECANCELED);
+            CHECK(script.pending_calls == 1);
+            CHECK(script.other_calls == 0);
+            CHECK(input[0] == '\0');
+        } else {
+            CHECK_FALSE(parked);
+            CHECK(reader.await_resume().result == 1);
+            CHECK(transport_state.transport_error == 0);
+            CHECK(script.pending_calls == 0);
+            CHECK(script.other_calls == 1);
+            CHECK(input[0] == 'r');
+        }
+        return;
+    }
     if (fail_wait) {
         CHECK(writer.await_resume().result == -ENOMEM);
         CHECK(reader.await_resume().result == -ENOMEM);
@@ -212,6 +242,16 @@ void exercise_retry(operation pending, int error, bool allow_interleaving, bool 
 TEST_CASE("TLS pending WANT_WRITE excludes intervening SSL reads", "[tls][retry][issue-1215]") {
     for (bool cancellable : {false, true})
         exercise_retry(operation::write, SSL_ERROR_WANT_WRITE, false, cancellable);
+}
+
+TEST_CASE("TLS cancellation after dispatch terminates an independently tokened sibling",
+          "[tls][retry][cancel][issue-1215]") {
+    exercise_retry(operation::write, SSL_ERROR_WANT_WRITE, false, true, false, 1);
+}
+
+TEST_CASE("TLS precancelled write leaves independent read and connection healthy",
+          "[tls][retry][cancel][issue-1215]") {
+    exercise_retry(operation::write, SSL_ERROR_WANT_WRITE, false, true, false, 2);
 }
 
 TEST_CASE("TLS pending WANT_READ write allows eligible SSL reads", "[tls][retry][issue-1215]") {

@@ -25,9 +25,9 @@ class tls_transport : public std::enable_shared_from_this<tls_transport> {
 
     struct launch_ticket {
         std::shared_ptr<tls_transport> owner;
-        bool entered = false;
+        std::atomic<bool> entered{false};
         ~launch_ticket() {
-            if (entered) return;
+            if (entered.load(std::memory_order_acquire)) return;
             // scheduler::go destroys rejected tasks without throwing.
             owner->fail(ECANCELED);
             {
@@ -183,21 +183,27 @@ public:
             if (pump_active_ || operation_error() || !output.pending_bytes()) return;
             pump_active_ = true;
         }
+        int error = EIO;
+        // Retain submission ownership across the catch. The scheduler may
+        // destroy a rejected task inside its own catch before rethrowing.
+        std::shared_ptr<launch_ticket> ticket;
         try {
             auto* scheduler = runtime::scheduler::current();
             if (!scheduler) throw std::runtime_error("TLS output requires a scheduler");
             auto self = shared_from_this();
-            auto ticket = std::make_unique<launch_ticket>();
+            ticket = std::make_shared<launch_ticket>();
             ticket->owner = self;
-            scheduler->go(pump(std::move(self), std::move(ticket)));
-        } catch (...) {
-            fail(ENOMEM);
-            {
-                std::lock_guard lock(mutex);
-                pump_active_ = false;
-            }
-            notify_progress();
+            scheduler->go(pump(std::move(self), ticket));
+            return;
+        } catch (const std::bad_alloc&) {
+            error = ENOMEM;
+        } catch (...) {}
+        fail(error);
+        {
+            std::lock_guard lock(mutex);
+            pump_active_ = false;
         }
+        notify_progress();
     }
 
     coro::task<io::io_result> wait_write(coro::cancel_token token) {
@@ -289,8 +295,8 @@ private:
     }
 
     static coro::task<void> pump(std::shared_ptr<tls_transport> self,
-                               std::unique_ptr<launch_ticket> ticket) {
-        ticket->entered = true;
+                               std::shared_ptr<launch_ticket> ticket) {
+        ticket->entered.store(true, std::memory_order_release);
         ticket.reset();
         try {
             for (;;) {

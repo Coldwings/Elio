@@ -502,16 +502,18 @@ public:
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         std::optional<coro::cancel_source> cancel;
         std::optional<coro::join_handle<void>> watchdog;
+        std::shared_ptr<close_watchdog_ticket> ticket;
         int error = 0;
         try {
             cancel.emplace();
-            auto ticket = std::make_unique<close_watchdog_ticket>(transport_);
+            ticket = std::make_shared<close_watchdog_ticket>(transport_);
             watchdog.emplace(elio::spawn(close_watchdog(
-                std::move(ticket), deadline, *cancel
+                ticket, deadline, *cancel
 #ifdef ELIO_RUNTIME_TEST_HOOKS
                 , shutdown_timer_test_hook_
 #endif
                 )));
+            ticket.reset();
             for (;;) {
                 if (const int failed = transport_error()) { error = failed; break; }
                 if (cancel->is_cancelled()) { error = ETIMEDOUT; break; }
@@ -535,6 +537,7 @@ public:
         } catch (const std::bad_alloc&) { error = ENOMEM; }
         catch (...) { error = EIO; }
         if (error) transport_->fail(error);
+        ticket.reset();
         if (cancel) { try { cancel->cancel(); } catch (...) { transport_->fail(EIO); } }
         if (watchdog) {
             try { co_await std::move(*watchdog); }
@@ -573,7 +576,11 @@ public:
     int fd() const noexcept { return transport_ ? transport_->tcp.fd() : -1; }
 
     /// Get underlying TCP stream (const)
-    const net::tcp_stream& tcp() const noexcept { return transport_->tcp; }
+    const net::tcp_stream& tcp() const noexcept {
+        if (transport_) return transport_->tcp;
+        static const net::tcp_stream disconnected(-1);
+        return disconnected;
+    }
 
     /// Check if handshake is complete
     bool is_handshake_complete() const noexcept { return handshake_complete_; }
@@ -599,8 +606,8 @@ public:
     /// needs to interrupt a pending recv on a different thread.
     void shutdown_socket() noexcept {
         mark_externally_shut_down();
-        if (int fd = transport_->tcp.fd(); fd >= 0) {
-            ::shutdown(fd, SHUT_RDWR);
+        if (int descriptor = fd(); descriptor >= 0) {
+            ::shutdown(descriptor, SHUT_RDWR);
         }
     }
     
@@ -620,19 +627,21 @@ private:
     struct close_watchdog_ticket {
         explicit close_watchdog_ticket(std::shared_ptr<detail::tls_transport> value)
             : transport(std::move(value)) {}
-        ~close_watchdog_ticket() { if (!entered) transport->fail(EIO); }
+        ~close_watchdog_ticket() {
+            if (!entered.load(std::memory_order_acquire)) transport->fail(EIO);
+        }
         std::shared_ptr<detail::tls_transport> transport;
-        bool entered = false;
+        std::atomic<bool> entered{false};
     };
 
     static coro::task<void> close_watchdog(
-        std::unique_ptr<close_watchdog_ticket> ticket,
+        std::shared_ptr<close_watchdog_ticket> ticket,
         std::chrono::steady_clock::time_point deadline, coro::cancel_source cancel
 #ifdef ELIO_RUNTIME_TEST_HOOKS
         , void (*timer_hook)()
 #endif
     ) {
-        ticket->entered = true;
+        ticket->entered.store(true, std::memory_order_release);
         auto transport = ticket->transport;
         ticket.reset();
         int error = 0;

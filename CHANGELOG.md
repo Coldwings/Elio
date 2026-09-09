@@ -100,6 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   progress capped at 16 KiB; use `write_exactly()` for complete writes (#1215).
   Legacy whole-session `shutdown()` now has one default 5-second close budget,
   with abort cleanup allowed to outlast it; this is not directional half-close.
+  Cancellation observed after the initial cancellation check terminates the
+  connection and overlapping operations; initially detected cancellation is local.
 
 - **HTTP body-description defaults**: omitted streaming length now means
   unknown instead of silently declaring zero. Direct preflight callers must

@@ -331,6 +331,13 @@ larger budget on the same connection. The first transport failure stays sticky,
 and operations ending in transport failure await owned output-I/O cleanup
 before returning.
 
+TLS cancellation now has an explicit connection boundary: cancellation detected
+by the initial cancellation check is operation-local; cancellation observed
+after that check is terminal for the connection and its overlapping reader/writer,
+even when the sibling uses another token. Await both, then establish a new
+stream. Completed slices are not rolled back. Exact helpers' cancellation checks
+between completed slices remain local because no SSL operation is unfinished.
+
 Read success need not wait for unrelated ciphertext output; handshake success
 establishes local TLS state but final control records may still be draining.
 Neither result proves peer receipt. Keep the stream and borrowed plaintext

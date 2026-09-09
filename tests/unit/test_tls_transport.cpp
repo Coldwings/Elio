@@ -2,6 +2,7 @@
 
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS && defined(ELIO_RUNTIME_TEST_HOOKS)
 #include <elio/tls/detail/tls_transport.hpp>
+#include <elio/tls/tls_stream.hpp>
 
 namespace {
 using elio::tls::detail::tls_transport;
@@ -92,7 +93,7 @@ TEST_CASE("TLS output launch failure releases pump ownership and wakes waiters",
     REQUIRE(handle.done());
     CHECK(parked);
     CHECK(wait.await_resume().result == 0);
-    CHECK(transport->output.error() != 0);
+    CHECK(transport->output.error() == EIO);
     CHECK_FALSE(transport->output_active_for_test());
     auto settled = transport->settle_output();
     REQUIRE(settled.await_ready());
@@ -129,5 +130,31 @@ TEST_CASE("TLS terminal output settlement reserves both waiters without allocati
     CHECK(allocation_unused);
     CHECK(elio::sync::detail::wake_state_allocations_for_test.load() == allocations);
     CHECK(transport->output.error() == ENOMEM);
+}
+
+TEST_CASE("TLS moved-from transport queries and socket shutdown remain inert", "[tls][transport][move][issue-1215]") {
+    int sockets[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+    elio::net::tcp_stream source_tcp(sockets[0]);
+    elio::net::tcp_stream peer(sockets[1]);
+    elio::tls::tls_context context(elio::tls::tls_mode::client);
+    elio::tls::tls_stream source(std::move(source_tcp), context);
+    const int descriptor = source.fd();
+    elio::tls::tls_stream target(std::move(source));
+    CHECK(source.fd() == -1);
+    CHECK(source.tcp().fd() == -1);
+    CHECK_FALSE(source.is_handshake_complete());
+    source.shutdown_socket();
+    auto close = source.shutdown();
+    auto handle = task_access::handle(close);
+    handle.resume();
+    REQUIRE(handle.done());
+    close.await_resume();
+    CHECK(target.fd() == descriptor);
+    source = std::move(target);
+    CHECK(target.fd() == -1);
+    CHECK(target.tcp().fd() == -1);
+    target.shutdown_socket();
+    CHECK(source.fd() == descriptor);
 }
 #endif

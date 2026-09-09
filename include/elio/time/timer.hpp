@@ -260,23 +260,18 @@ public:
         }
         ctx_ = ctx;
 
-        // Allocate the shared cancel state. The cancel callback and the
-        // fire-and-forget cancel-executor coroutine each take their own
-        // shared_ptr ref so they can outlive `*this` safely. The previous
-        // implementation captured `this` in the cancel executor; once
-        // PR #71 made workers park in `poll(-1)`, the natural timer CQE
-        // and the cancel inbox entry could be processed in the same poll
-        // cycle, leaving the executor running after the awaitable's
-        // destructor and producing a UAF on `self->ctx_` / `self->awaiter_`.
+        // Reserve shared cancellation state and its owner-maintenance node
+        // before registration. The callback captures state, never `this`;
+        // publication adds a lifetime hold through admission or retirement,
+        // including when backend cancellation destroys this awaitable inline.
         auto state = io::detail::make_io_cancel_state();
         state->ctx = ctx;
         state->awaiter = awaiter;
         state->worker = runtime::worker_thread::current();
         state->context_generation = ctx->generation();
-        // ``op`` is set below once setup_op_state succeeds. The cancel
-        // executor uses it as the SQE-matching key (tagged user_data) so
-        // it cancels the right entry even though the SQE no longer keys
-        // off the raw coroutine handle.
+        // ``op`` is set below once setup_op_state succeeds. Owner maintenance
+        // uses its tagged key rather than the raw coroutine handle, and
+        // permanent retirement prevents later retries from reusing the key.
         state_ = state;
 
         // Register cancellation callback. The lambda captures only the
@@ -297,8 +292,8 @@ public:
         // unregister() below is then a no-op, which is fine.
         if (token_.is_cancelled()) {
             cancel_registration_.unregister();
-            // Retire the cancellation key so an executor already queued on the
-            // worker cannot use it after this awaiter returns inline.
+            // Retire the key so pending owner maintenance cannot use it
+            // after this awaiter returns inline.
             io::detail::retire_io_cancel_key(state);
             return false;  // Resume immediately (do not suspend)
         }
@@ -309,8 +304,8 @@ public:
         req.length = static_cast<size_t>(duration_ns_);
         req.awaiter = awaiter;
         // Owner-controlled op_state: same UAF protection as
-        // sleep_awaitable. The pointer is stashed in shared_state so the
-        // cancel executor can pass the matching tagged user_data to
+        // sleep_awaitable. The pointer is stashed in shared state so owner
+        // maintenance can pass the matching tagged user_data to
         // io_context::cancel().
         req.state = setup_op_state(awaiter, *ctx);
         state->op = req.state;
@@ -378,8 +373,8 @@ public:
         cancel_registration_.unregister();
         bool was_cancelled = already_cancelled_before_setup_;
         if (state_) {
-            // Retire before the awaitable can be destroyed. A queued executor
-            // that has not claimed the gate must not reuse this op_state key.
+            // Retire before the awaitable can be destroyed. Pending owner
+            // maintenance must not retry this op_state key after retirement.
             io::detail::retire_io_cancel_key(state_);
             was_cancelled = was_cancelled ||
                             state_->cancelled.load(std::memory_order_acquire);

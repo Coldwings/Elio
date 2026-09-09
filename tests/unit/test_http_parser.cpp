@@ -1237,7 +1237,7 @@ TEST_CASE("HTTP message versions reject invalid serialization bytes",
     REQUIRE(resp.serialize().starts_with("HTTP/1.1 200 OK\r\n"));
 
     REQUIRE_NOTHROW(resp.set_version("HTTP/2.0"));
-    REQUIRE(resp.serialize().starts_with("HTTP/2.0 200 OK\r\n"));
+    REQUIRE_THROWS_AS(resp.serialize(), std::invalid_argument);
 
     REQUIRE_THROWS_AS(resp.set_version("HTTP/1.1\r\nInjected: yes"),
                       std::invalid_argument);
@@ -1818,7 +1818,8 @@ TEST_CASE("HTTP response creation", "[http][message]") {
         REQUIRE(resp.status_code() == 200);
         REQUIRE(resp.body() == "Hello, World!");
         REQUIRE(resp.get_headers().content_type() == "text/plain");
-        REQUIRE(resp.get_headers().content_length().value() == 13);
+        REQUIRE_FALSE(resp.get_headers().content_length().has_value());
+        REQUIRE(resp.serialize().find("Content-Length: 13\r\n") != std::string::npos);
     }
 
     SECTION("JSON response") {
@@ -1868,7 +1869,6 @@ TEST_CASE("HTTP response serialization", "[http][message]") {
 
     SECTION("no-body response status omits body bytes and framing headers") {
         response resp(status::no_content, "forbidden-body", mime::text_plain);
-        resp.set_header("Transfer-Encoding", "chunked");
 
         std::string serialized = resp.serialize();
 
@@ -1876,6 +1876,8 @@ TEST_CASE("HTTP response serialization", "[http][message]") {
         REQUIRE(serialized.find("Content-Length: ") == std::string::npos);
         REQUIRE(serialized.find("Transfer-Encoding: ") == std::string::npos);
         REQUIRE(serialized.find("forbidden-body") == std::string::npos);
+        resp.set_header("Transfer-Encoding", "chunked");
+        REQUIRE_THROWS_AS(resp.serialize(), std::invalid_argument);
     }
 
     SECTION("empty body-allowed responses emit Content-Length: 0") {
@@ -1910,25 +1912,20 @@ TEST_CASE("HTTP response serialization", "[http][message]") {
         REQUIRE(serialized.find("Content-Length: 0\r\n") != std::string::npos);
     }
 
-    SECTION("user-set Content-Length on empty body is preserved verbatim") {
+    SECTION("user-set Content-Length must match the complete body") {
         response resp(status::ok);
         resp.set_header("Content-Length", "5");
 
-        std::string serialized = resp.serialize();
-
-        REQUIRE(serialized.find("Content-Length: 5\r\n") != std::string::npos);
-        REQUIRE(serialized.find("Content-Length: 0") == std::string::npos);
+        REQUIRE_THROWS_AS(resp.serialize(), std::invalid_argument);
+        REQUIRE(resp.header("Content-Length") == "5");
     }
 
-    SECTION("user-set Transfer-Encoding suppresses Content-Length: 0") {
+    SECTION("user-set Transfer-Encoding does not activate an encoder") {
         response resp(status::ok);
         resp.set_header("Transfer-Encoding", "chunked");
 
-        std::string serialized = resp.serialize();
-
-        REQUIRE(serialized.find("Transfer-Encoding: chunked\r\n") !=
-                std::string::npos);
-        REQUIRE(serialized.find("Content-Length: ") == std::string::npos);
+        REQUIRE_THROWS_AS(resp.serialize(), std::invalid_argument);
+        REQUIRE(resp.header("Transfer-Encoding") == "chunked");
     }
 
     SECTION("empty 304 response still has no framing headers") {
@@ -1967,7 +1964,7 @@ TEST_CASE("HTTP response serialization", "[http][message]") {
         REQUIRE(serialized.find("Transfer-Encoding: ") == std::string::npos);
     }
 
-    SECTION("205 response pins Content-Length: 0 over caller-set length and drops body") {
+    SECTION("205 drops body but rejects an explicitly conflicting length") {
         response resp(status::reset_content, "reset-body", mime::text_plain);
 
         std::string serialized = resp.serialize();
@@ -1975,16 +1972,15 @@ TEST_CASE("HTTP response serialization", "[http][message]") {
         REQUIRE(serialized.find("Content-Length: 0\r\n") != std::string::npos);
         REQUIRE(serialized.find("Content-Length: 10") == std::string::npos);
         REQUIRE(serialized.find("reset-body") == std::string::npos);
+        resp.set_header("Content-Length", "10");
+        REQUIRE_THROWS_AS(resp.serialize(), std::invalid_argument);
     }
 
-    SECTION("205 response strips caller-set Transfer-Encoding") {
+    SECTION("205 rejects caller-set Transfer-Encoding") {
         response resp(status::reset_content);
         resp.set_header("Transfer-Encoding", "chunked");
 
-        std::string serialized = resp.serialize();
-
-        REQUIRE(serialized.find("Transfer-Encoding: ") == std::string::npos);
-        REQUIRE(serialized.find("Content-Length: 0\r\n") != std::string::npos);
+        REQUIRE_THROWS_AS(resp.serialize(), std::invalid_argument);
     }
 
     SECTION("205 response serializes identically twice") {

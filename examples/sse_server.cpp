@@ -20,220 +20,66 @@
 
 #include <atomic>
 #include <chrono>
-#include <mutex>
+#include <cerrno>
+#include <string>
 
 using namespace elio;
 using namespace elio::http;
 using namespace elio::http::sse;
 
-// Global counter for events
+// Global counter for this demo; Last-Event-ID is logged, not replayed.
 std::atomic<uint64_t> g_event_counter{0};
 
-// Running flag for SSE streams
-std::atomic<bool> g_sse_active{true};
-
-/// SSE event stream handler - sends periodic events
-coro::task<void> event_stream(net::tcp_stream& stream) {
-    // Create SSE connection
-    sse_connection conn(&stream);
-
+/// The server owns this producer and its event_writer until completion.
+coro::task<send_result> event_stream(event_writer& out, coro::cancel_token token) {
     ELIO_LOG_INFO("SSE client connected");
-
-    // Send initial retry interval
-    co_await conn.send_retry(3000);  // 3 seconds
-
-    // Send events until client disconnects or server stops
     uint64_t local_counter = 0;
-    while (conn.is_active() && g_sse_active) {
+    while (!token.is_cancelled()) {
         ++local_counter;
-        uint64_t event_id = ++g_event_counter;
-
-        // Send different event types
+        const auto event_id = ++g_event_counter;
+        const auto id = std::to_string(event_id);
+        std::string data;
+        send_result sent;
         switch (local_counter % 4) {
-            case 0: {
-                // Simple data event
-                event evt = event::with_id(
-                    std::to_string(event_id),
-                    "Counter: " + std::to_string(local_counter)
-                );
-                co_await conn.send(evt);
+            case 0:
+                data = "Counter: " + std::to_string(local_counter);
+                sent = co_await out.send_event({id, {}, data}, token);
                 break;
-            }
-
-            case 1: {
-                // Typed event (e.g., for different data streams)
-                event evt = event::full(
-                    std::to_string(event_id),
-                    "heartbeat",
-                    R"({"alive":true,"timestamp":)" +
-                        std::to_string(std::chrono::system_clock::now()
-                            .time_since_epoch().count()) + "}",
-                    -1
-                );
-                co_await conn.send(evt);
+            case 1:
+                data = R"({"alive":true,"timestamp":)" +
+                    std::to_string(std::chrono::system_clock::now()
+                        .time_since_epoch().count()) + "}";
+                // Advertise the initial reconnect interval on the first event.
+                sent = co_await out.send_event(
+                    {id, "heartbeat", data, local_counter == 1 ? 3000 : -1}, token);
                 break;
-            }
-
-            case 2: {
-                // JSON data event
-                std::string json = R"({"type":"update","count":)" +
-                                   std::to_string(local_counter) +
-                                   R"(,"id":")" + std::to_string(event_id) + R"("})";
-                co_await conn.send_event("data", json);
+            case 2:
+                data = R"({"type":"update","count":)" +
+                    std::to_string(local_counter) + R"(,"id":")" + id + R"("})";
+                sent = co_await out.send_event({{}, "data", data}, token);
                 break;
-            }
-
-            case 3: {
-                // Keep-alive comment (doesn't trigger client event)
-                co_await conn.send_comment("keep-alive");
+            case 3:
+                sent = co_await out.send_comment("keep-alive", token);
                 break;
-            }
         }
-
-        // Wait before sending next event
-        co_await time::sleep_for(std::chrono::seconds(1));
+        // id/data remain alive through the await; no detached writer or raw
+        // transport access is needed, and a failed send is never replayed.
+        if (!sent.success()) co_return sent;
+        if (co_await time::sleep_for(std::chrono::seconds(1), token) ==
+            coro::cancel_result::cancelled) {
+            co_return send_result{send_errc::cancelled, ECANCELED};
+        }
     }
-
-    ELIO_LOG_INFO("SSE client disconnected");
+    co_return send_result{send_errc::cancelled, ECANCELED};
 }
 
-/// Custom HTTP server that handles SSE endpoints
-class sse_http_server {
-public:
-    explicit sse_http_server(router r, server_config config = {})
-        : router_(std::move(r)), config_(config) {}
-
-    coro::task<void> listen(const net::socket_address& addr) {
-        auto* sched = runtime::scheduler::current();
-        if (!sched) {
-            ELIO_LOG_ERROR("SSE server must be started from within a scheduler context");
-            co_return;
-        }
-
-        auto listener_result = net::tcp_listener::bind(addr);
-        if (!listener_result) {
-            ELIO_LOG_ERROR("Failed to bind SSE server: {}", strerror(errno));
-            co_return;
-        }
-
-        ELIO_LOG_INFO("SSE server listening on {}", addr.to_string());
-
-        auto& listener = *listener_result;
-        auto accept_token = reset_accept_cancel_source();
-        running_ = true;
-
-        while (running_) {
-            auto stream_result = co_await listener.accept(accept_token);
-            if (accept_token.is_cancelled()) {
-                break;
-            }
-            if (!stream_result) {
-                if (running_) {
-                    ELIO_LOG_ERROR("Accept error: {}", strerror(errno));
-                }
-                continue;
-            }
-
-            sched->go([this, stream = std::move(*stream_result)]() mutable {
-                return handle_connection(std::move(stream));
-            });
-        }
+streaming_response events_handler(context& ctx) {
+    const auto last_id = ctx.req().header("Last-Event-ID");
+    if (!last_id.empty()) {
+        ELIO_LOG_INFO("Client reconnecting with Last-Event-ID: {}", last_id);
     }
-
-    void stop() {
-        running_ = false;
-        g_sse_active = false;
-        cancel_active_accept();
-    }
-
-private:
-    coro::cancel_token reset_accept_cancel_source() {
-        std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
-        accept_cancel_source_ = coro::cancel_source{};
-        return accept_cancel_source_.get_token();
-    }
-
-    void cancel_active_accept() {
-        std::lock_guard<std::mutex> lock(accept_cancel_mutex_);
-        accept_cancel_source_.cancel();
-    }
-
-    coro::task<void> handle_connection(net::tcp_stream stream) {
-        std::vector<char> buffer(config_.read_buffer_size);
-        request_parser parser;
-
-        // Read HTTP request
-        while (!parser.is_complete() && !parser.has_error()) {
-            auto result = co_await stream.read(buffer.data(), buffer.size());
-            if (result.result <= 0) co_return;
-
-            auto [parse_result, consumed] = parser.parse(
-                std::string_view(buffer.data(), result.result));
-            if (parse_result == parse_result::error) co_return;
-        }
-
-        if (parser.has_error()) co_return;
-
-        auto req = request::from_parser(parser);
-
-        // Check if this is an SSE request
-        if (req.path() == "/events" || req.path() == "/sse") {
-            // Send SSE headers. build_sse_response() declares honest
-            // close-delimited framing (no Content-Length/Transfer-Encoding,
-            // Connection: close) since SSE events stream until the
-            // connection closes.
-            std::string headers =
-                elio::http::sse::build_sse_response().serialize();
-
-            auto write_result =
-                co_await stream.write_exactly(headers.data(), headers.size());
-            if (write_result.result <= 0) co_return;
-
-            // Get Last-Event-ID if present
-            auto last_id = req.header("Last-Event-ID");
-            if (!last_id.empty()) {
-                ELIO_LOG_INFO("Client reconnecting with Last-Event-ID: {}", last_id);
-            }
-
-            // Handle SSE stream
-            co_await event_stream(stream);
-        } else {
-            // Handle as regular HTTP
-            auto peer = stream.peer_address();
-            std::string client_addr = peer ? peer->to_string() : "unknown";
-            context ctx(std::move(req), client_addr);
-
-            std::unordered_map<std::string, std::string> params;
-            auto* route = router_.find_route(ctx.req().get_method(),
-                                              ctx.req().path(), params);
-
-            response resp;
-            if (route) {
-                for (const auto& [name, value] : params) {
-                    ctx.set_param(name, value);
-                }
-                try {
-                    resp = co_await route->handler(ctx);
-                } catch (const std::exception& e) {
-                    resp = response::internal_error();
-                }
-            } else {
-                resp = response::not_found();
-            }
-
-            auto data = resp.serialize();
-            auto write_result =
-                co_await stream.write_exactly(data.data(), data.size());
-            if (write_result.result <= 0) co_return;
-        }
-    }
-
-    router router_;
-    server_config config_;
-    std::atomic<bool> running_{false};
-    std::mutex accept_cancel_mutex_;
-    coro::cancel_source accept_cancel_source_;
-};
+    return make_streaming_response(event_stream);
+}
 
 // HTTP handler: Serve test page
 coro::task<response> index_handler([[maybe_unused]] context& ctx) {
@@ -372,12 +218,14 @@ coro::task<int> async_main(int argc, char* argv[]) {
     router r;
     r.get("/", index_handler);
     r.get("/info", info_handler);
+    r.get("/events", events_handler);
+    r.get("/sse", events_handler);
 
     // Create SSE-enabled server
     server_config config;
     config.enable_logging = true;
 
-    sse_http_server srv(std::move(r), config);
+    http::server srv(std::move(r), config);
 
     auto bind_addr = net::socket_address(net::ipv4_address(port));
 
@@ -387,7 +235,8 @@ coro::task<int> async_main(int argc, char* argv[]) {
     ELIO_LOG_INFO("Press Ctrl+C to stop");
 
     // Start server and wait for shutdown signal
-    // elio::serve() waits for masked shutdown signals and stops the server
+    // serve() requests stop, joins the listener, and drains active sessions.
+    // srv and its route-owned producers stay alive through cancellation cleanup.
     co_await elio::serve(srv, [&]() { return srv.listen(bind_addr); });
 
     co_return 0;

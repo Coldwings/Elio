@@ -2,6 +2,8 @@
 
 #include <elio/http/http_common.hpp>
 #include <elio/http/http_parser.hpp>
+#include <elio/http/http_response_head.hpp>
+#include <elio/http/http_response_plan.hpp>
 
 #include <string>
 #include <string_view>
@@ -182,200 +184,76 @@ private:
 };
 
 /// HTTP response
-class response {
+class response : public response_head {
 public:
     response() = default;
     
     /// Create a response with status
-    explicit response(status s) : status_(s) {}
+    explicit response(status s) : response_head(s) {}
     
     /// Create a response with status and body
     response(status s, std::string_view body, std::string_view content_type = mime::text_plain)
-        : status_(s), body_(body) {
-        headers_.set_content_type(content_type);
-        headers_.set_content_length(body_.size());
+        : response_head(s), body_(body) {
+        get_headers().set_content_type(content_type);
     }
     
-    /// Get/set status
-    status get_status() const noexcept { return status_; }
-    void set_status(status s) noexcept { status_ = s; }
-    
-    /// Get status code as integer
-    uint16_t status_code() const noexcept { return static_cast<uint16_t>(status_); }
-    
-    /// Get/set HTTP version
-    std::string_view version() const noexcept { return version_; }
-    void set_version(std::string_view v) {
-        detail::validate_http_version(v);
-        version_ = v;
-    }
-    
-    /// Get/set headers
-    const headers& get_headers() const noexcept { return headers_; }
-    headers& get_headers() noexcept { return headers_; }
-    
-    /// Set a header
-    void set_header(std::string_view name, std::string_view value) {
-        headers_.set(name, value);
-    }
-    
-    /// Get a header
-    std::string_view header(std::string_view name) const {
-        return headers_.get(name);
-    }
-    
-    /// Get/set body
+    /// Body storage only; framing length is derived when preparing output.
+    /// Explicit Content-Length remains an assertion, not setter-owned state.
     std::string_view body() const noexcept { return body_; }
     void set_body(std::string_view b) { 
         body_ = b; 
-        headers_.set_content_length(body_.size());
     }
     void set_body(std::string&& b) { 
         body_ = std::move(b);
-        headers_.set_content_length(body_.size());
     }
     
-    /// Get content type
-    std::string_view content_type() const { return headers_.content_type(); }
-    
-    /// Set content type
-    void set_content_type(std::string_view type) { headers_.set_content_type(type); }
+    /// Materialize a final response using the same framing preflight as the
+    /// server. Invalid framing assertions throw std::invalid_argument.
+    /// Received transfer-coded messages must be explicitly normalized by the
+    /// caller (remove Transfer-Encoding) before serializing their decoded body.
+    std::string serialize() const { return serialize(method::GET); }
 
-    /// Opt in/out of close-delimited body framing (RFC 9112 §6.3 item 8).
-    /// When enabled, serialize() emits no framing headers for this response:
-    /// the automatic `Content-Length: 0` pin for an empty body is skipped and
-    /// no `Transfer-Encoding` is injected, so the body runs until connection
-    /// close and keep-alive reuse of the connection is impossible. Intended
-    /// for streaming responses such as SSE. Pair it with an explicit
-    /// `Connection: close` header (via set_header) so the peer knows the
-    /// connection will not be reused; serialize() deliberately never writes
-    /// the Connection header itself. The marker does not override the
-    /// framing rules of body-forbidden statuses (1xx/204/304/205) or 2xx
-    /// responses to CONNECT.
-    void set_close_delimited(bool v = true) noexcept { close_delimited_ = v; }
-    bool close_delimited() const noexcept { return close_delimited_; }
-
-    /// Check if response indicates success (2xx)
-    bool is_success() const noexcept {
-        auto code = static_cast<uint16_t>(status_);
-        return code >= 200 && code < 300;
-    }
-    
-    /// Check if response is a redirect (3xx)
-    bool is_redirect() const noexcept {
-        auto code = static_cast<uint16_t>(status_);
-        return code >= 300 && code < 400;
-    }
-    
-    /// Check if response is a client error (4xx)
-    bool is_client_error() const noexcept {
-        auto code = static_cast<uint16_t>(status_);
-        return code >= 400 && code < 500;
-    }
-    
-    /// Check if response is a server error (5xx)
-    bool is_server_error() const noexcept {
-        auto code = static_cast<uint16_t>(status_);
-        return code >= 500 && code < 600;
-    }
-    
-    /// Serialize response to string (HTTP/1.1 format)
-    std::string serialize() const {
-        const bool status_forbids_body =
-            detail::status_forbids_response_body(status_);
-        return serialize_impl(!status_forbids_body, status_forbids_body,
-                              /*connect_tunnel=*/false);
-    }
-
-    /// Serialize response for a specific request method.  HEAD responses and
-    /// statuses that cannot carry a response body serialize headers only.
+    /// HEAD and bodyless statuses emit headers only. Informational responses,
+    /// upgrades and successful CONNECT use a separate headers-only path.
     std::string serialize(method request_method) const {
-        const auto code = static_cast<uint16_t>(status_);
-        const bool connect_tunnel = request_method == method::CONNECT &&
-                                    code >= 200 && code < 300;
-        return serialize_impl(
-            !detail::response_body_forbidden(request_method, status_),
-            detail::response_framing_forbidden(request_method, status_),
-            connect_tunnel);
+        const auto code = status_code();
+        if ((code >= 100 && code < 200) ||
+            (request_method == method::CONNECT && code >= 200 && code < 300)) {
+            return serialize_protocol_headers();
+        }
+        const auto wire_version = version().empty() ? std::string_view("HTTP/1.1") : version();
+        auto plan = prepare_response(*this,
+            {response_body_kind::complete, body_.size(), response_transfer::automatic},
+            request_method, wire_version, get_headers().keep_alive(wire_version));
+        if (!plan.success()) throw std::invalid_argument("Invalid outbound HTTP response framing");
+        if (plan.framing != response_framing::none) plan.header_block += body_;
+        return std::move(plan.header_block);
     }
 
 private:
-    std::string serialize_impl(bool include_body,
-                               bool framing_forbidden,
-                               bool connect_tunnel) const {
-        std::string result;
-        
-        // Status line
-        std::string_view version =
-            version_.empty() ? std::string_view("HTTP/1.1")
-                             : std::string_view(version_);
-        detail::validate_http_version(version);
-        result += version;
-        result += ' ';
-        result += std::to_string(static_cast<uint16_t>(status_));
-        result += ' ';
-        result += status_reason(status_);
-        result += "\r\n";
-        
-        // Headers
-        auto serialized_headers = headers_;
-        if (framing_forbidden) {
-            // Body-forbidden statuses (1xx/204/304) and 2xx responses
-            // to CONNECT (RFC 9110 §9.3.6) must not carry framing headers,
-            // even when the caller set them.
-            serialized_headers.remove("Transfer-Encoding");
-            if (status_ == status::reset_content && !connect_tunnel) {
-                // 205 Reset Content is not in the RFC 9112 §6.3 item 1
-                // first-empty-line termination list, so a 205 without a
-                // length falls through to item 8 (close-delimited) and
-                // would hang a keep-alive peer; §6.3 says such messages
-                // SHOULD be length-delimited instead. RFC 9110 §15.3.6
-                // forbids content in a 205 and the body is never emitted
-                // for it, so Content-Length: 0 is always truthful. Pin it,
-                // overwriting any caller-set value. A 205 to a successful
-                // CONNECT is excepted: the tunnel-mode prohibition of
-                // RFC 9110 §9.3.6 takes precedence over the pin.
-                serialized_headers.set_content_length(0);
-            } else {
-                serialized_headers.remove("Content-Length");
-            }
-        } else if (!close_delimited_ &&
-                   body_.empty() &&
-                   !serialized_headers.contains("Content-Length") &&
-                   !serialized_headers.contains("Transfer-Encoding")) {
-            // A body-allowed response with no body and no explicit framing
-            // headers must still declare an empty body; otherwise a
-            // keep-alive peer has no delimiter and waits for EOF.
-            // Checked on the status rather than include_body so HEAD
-            // responses also carry Content-Length: 0. A user-set
-            // Content-Length is kept verbatim and a user-set
-            // Transfer-Encoding is never combined with Content-Length.
-            // Responses that opted into close-delimited framing
-            // (set_close_delimited) skip the pin: their body is delimited
-            // by connection close (RFC 9112 §6.3 item 8).
-            serialized_headers.set_content_length(0);
+    std::string serialize_protocol_headers() const {
+        const auto wire_version = version().empty() ? std::string_view("HTTP/1.1") : version();
+        if (wire_version != "HTTP/1.0" && wire_version != "HTTP/1.1") {
+            throw std::invalid_argument("Unsupported outbound HTTP version");
         }
-        result += serialized_headers.serialize();
-        
-        // End of headers
-        result += "\r\n";
-        
-        // Body
-        if (include_body && !body_.empty()) {
-            result += body_;
-        }
-        
-        return result;
+        auto wire_headers = get_headers();
+        // This branch never participates in ordinary final-body framing:
+        // 1xx/101 and successful CONNECT prohibit both length and transfer coding.
+        wire_headers.remove("Content-Length");
+        wire_headers.remove("Transfer-Encoding");
+        return std::string(wire_version) + ' ' + std::to_string(status_code()) + ' ' +
+            std::string(status_reason(get_status())) + "\r\n" + wire_headers.serialize() + "\r\n";
     }
 
 public:
     
-    /// Create from parser
+    /// Preserve received metadata and decoded body. Transfer-Encoding remains
+    /// received metadata, not permission to emit decoded bytes with that coding.
     static response from_parser(response_parser& parser) {
         response resp;
-        resp.status_ = parser.get_status();
-        resp.version_ = parser.version();
-        resp.headers_ = parser.get_headers();
+        resp.set_status(parser.get_status());
+        resp.set_version(parser.version());
+        resp.get_headers() = parser.get_headers();
         resp.body_ = parser.body();
         return resp;
     }
@@ -384,9 +262,9 @@ public:
     /// The caller supplies the decoded body; no transfer decoding happens here.
     static response from_decoder(const response_decoder& decoder, std::string body) {
         response resp;
-        resp.status_ = decoder.get_status();
-        resp.version_ = decoder.version();
-        resp.headers_ = decoder.get_headers();
+        resp.set_status(decoder.get_status());
+        resp.set_version(decoder.version());
+        resp.get_headers() = decoder.get_headers();
         resp.body_ = std::move(body);
         return resp;
     }
@@ -431,11 +309,7 @@ public:
     }
     
 private:
-    status status_ = status::ok;
-    std::string version_ = "HTTP/1.1";
-    headers headers_;
     std::string body_;
-    bool close_delimited_ = false;
 };
 
 } // namespace elio::http

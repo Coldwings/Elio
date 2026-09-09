@@ -13,6 +13,7 @@
 #include <elio/http/websocket_frame.hpp>
 #include <elio/http/websocket_handshake.hpp>
 #include <elio/http/http_server.hpp>
+#include <elio/http/http_response_sender.hpp>
 #include <elio/http/http_parser.hpp>
 #include <elio/net/tcp.hpp>
 #include <elio/tls/tls_stream.hpp>
@@ -828,7 +829,8 @@ public:
         return listen_tls_impl(addr, tls_ctx, opts, start_epoch);
     }
 
-    /// Stop the server
+    /// Cancel accepts and pre-upgrade/HTTP fallback sessions cooperatively.
+    /// Already-upgraded WebSocket handlers keep their own shutdown contract.
     void stop() {
         cancel_active_accepts();
     }
@@ -837,8 +839,8 @@ public:
     bool is_running() const noexcept { return running_; }
 
     /// Return the number of in-flight connection handlers.  Callers that
-    /// destroy the server after stop() should wait until this returns 0
-    /// to avoid use-after-free on router_, http_config_, etc.
+    /// destroy the server after stop() must await every listener task before
+    /// waiting for this count to reach 0, including upgraded WebSocket handlers.
     size_t active_connections() const noexcept {
         return active_connections_.load(std::memory_order_acquire);
     }
@@ -881,9 +883,9 @@ private:
             }
 
             // Spawn connection handler (tracked for graceful shutdown)
-            active_connections_.fetch_add(1, std::memory_order_relaxed);
-            sched->go([this, s = std::move(*stream_result)]() mutable {
-                return handle_connection_guarded(std::move(s));
+            auto guard = std::make_shared<active_connection_guard>(active_connections_);
+            sched->go([this, s = std::move(*stream_result), accept_source, guard]() mutable {
+                return handle_connection_guarded(std::move(s), accept_source, guard);
             });
         }
     }
@@ -929,9 +931,9 @@ private:
             }
 
             // Spawn TLS connection handler (tracked for graceful shutdown)
-            active_connections_.fetch_add(1, std::memory_order_relaxed);
-            sched->go([this, s = std::move(*stream_result), tls_ctx_ptr]() mutable {
-                return handle_tls_connection_guarded(std::move(s), *tls_ctx_ptr);
+            auto guard = std::make_shared<active_connection_guard>(active_connections_);
+            sched->go([this, s = std::move(*stream_result), tls_ctx_ptr, accept_source, guard]() mutable {
+                return handle_tls_connection_guarded(std::move(s), *tls_ctx_ptr, accept_source, guard);
             });
         }
     }
@@ -939,7 +941,9 @@ private:
     class active_connection_guard {
     public:
         explicit active_connection_guard(std::atomic<size_t>& active) noexcept
-            : active_(active) {}
+            : active_(active) {
+            active_.fetch_add(1, std::memory_order_relaxed);
+        }
 
         ~active_connection_guard() {
             active_.fetch_sub(1, std::memory_order_relaxed);
@@ -953,20 +957,24 @@ private:
     };
 
     /// Guard wrapper that decrements the active-connection counter on exit.
-    coro::task<void> handle_connection_guarded(net::tcp_stream stream) {
-        active_connection_guard guard(active_connections_);
-        co_await handle_connection(std::move(stream));
+    coro::task<void> handle_connection_guarded(net::tcp_stream stream,
+                                               std::shared_ptr<coro::cancel_source> source,
+                                               std::shared_ptr<active_connection_guard> guard) {
+        (void)guard;
+        co_await handle_connection(std::move(stream), source->get_token());
     }
 
     /// Guard wrapper for TLS connections.
     coro::task<void> handle_tls_connection_guarded(net::tcp_stream tcp,
-                                                   tls::tls_context& tls_ctx) {
-        active_connection_guard guard(active_connections_);
-        co_await handle_tls_connection(std::move(tcp), tls_ctx);
+                                                   tls::tls_context& tls_ctx,
+                                                   std::shared_ptr<coro::cancel_source> source,
+                                                   std::shared_ptr<active_connection_guard> guard) {
+        (void)guard;
+        co_await handle_tls_connection(std::move(tcp), tls_ctx, source->get_token());
     }
 
     /// Handle a plain connection
-    coro::task<void> handle_connection(net::tcp_stream stream) {
+    coro::task<void> handle_connection(net::tcp_stream stream, coro::cancel_token token) {
         auto peer = stream.peer_address();
         std::string client_addr = peer ? peer->to_string() : "unknown";
         
@@ -974,11 +982,12 @@ private:
             ELIO_LOG_DEBUG("Connection from {}", client_addr);
         }
         
-        co_await handle_request(stream, client_addr);
+        co_await handle_request(stream, client_addr, token);
     }
     
     /// Handle a TLS connection
-    coro::task<void> handle_tls_connection(net::tcp_stream tcp, tls::tls_context& tls_ctx) {
+    coro::task<void> handle_tls_connection(net::tcp_stream tcp, tls::tls_context& tls_ctx,
+                                           coro::cancel_token token) {
         auto peer = tcp.peer_address();
         std::string client_addr = peer ? peer->to_string() : "unknown";
         
@@ -988,7 +997,7 @@ private:
         
         tls::tls_stream stream(std::move(tcp), tls_ctx);
         auto hs_result = co_await http::detail::perform_tls_handshake_with_timeout(
-            stream, http_config_.keep_alive_timeout);
+            stream, http_config_.keep_alive_timeout, token);
         if (!hs_result.ok) {
             if (hs_result.timed_out) {
                 ELIO_LOG_ERROR("TLS handshake timed out for {}", client_addr);
@@ -998,14 +1007,15 @@ private:
             co_return;
         }
         
-        co_await handle_request(stream, client_addr);
+        co_await handle_request(stream, client_addr, token);
         
         co_await stream.shutdown();
     }
     
     /// Handle HTTP request (check for WebSocket upgrade)
     template<typename Stream>
-    coro::task<void> handle_request(Stream& stream, const std::string& client_addr) {
+    coro::task<void> handle_request(Stream& stream, const std::string& client_addr,
+                                    coro::cancel_token token) {
         auto* sched = runtime::scheduler::current();
         std::vector<char> buffer(http_config_.read_buffer_size);
         request_parser parser;
@@ -1043,7 +1053,7 @@ private:
         // Read HTTP request
         size_t current_request_size = 0;
         while (!parser.is_complete() && !parser.has_error()) {
-            auto result = co_await stream.read(buffer.data(), buffer.size());
+            auto result = co_await stream.read(buffer.data(), buffer.size(), token);
 
             if (timed_out->load(std::memory_order_acquire)) {
                 co_await stop_watchdog();
@@ -1070,7 +1080,9 @@ private:
                 co_await stop_watchdog();
                 auto resp = response(status::payload_too_large, "Payload Too Large");
                 resp.set_header("Connection", "close");
-                co_await send_response(stream, resp, parser.get_method());
+                reply selected{std::move(resp)};
+                co_await http::send_response(stream, selected, parser.get_method(),
+                    parser.version(), false, token, http_config_.write_timeout);
                 co_return;
             }
 
@@ -1099,7 +1111,9 @@ private:
             if (!upgrade.success) {
                 ELIO_LOG_WARNING("WebSocket upgrade failed: {}", upgrade.error);
                 auto resp = response::bad_request(upgrade.error);
-                co_await send_response(stream, resp, req.get_method());
+                reply selected{std::move(resp)};
+                co_await http::send_response(stream, selected, req.get_method(),
+                    req.version(), false, token, http_config_.write_timeout);
                 co_return;
             }
             
@@ -1112,7 +1126,7 @@ private:
             // Send upgrade response
             auto ws_key = req.header("Sec-WebSocket-Key");
             auto resp = build_upgrade_response(ws_key, upgrade.accepted_protocol);
-            co_await send_response(stream, resp, req.get_method());
+            if (!co_await send_upgrade_response(stream, resp, token)) co_return;
 
             if (http_config_.enable_logging) {
                 ELIO_LOG_INFO("WebSocket upgrade: {} from {}", req.path(), client_addr);
@@ -1179,13 +1193,13 @@ private:
             }
         } else {
             // Handle as regular HTTP request
-            context ctx(std::move(req), client_addr);
+            context ctx(std::move(req), client_addr, {}, token);
             
             std::unordered_map<std::string, std::string> params;
             auto* http_route = router_.find_route(ctx.req().get_method(), 
                                                    ctx.req().path(), params);
             
-            response resp;
+            reply resp;
             if (http_route) {
                 for (const auto& [name, value] : params) {
                     ctx.set_param(name, value);
@@ -1195,31 +1209,27 @@ private:
                 } catch (const std::exception& e) {
                     ELIO_LOG_ERROR("HTTP handler exception: {}", e.what());
                     resp = response::internal_error();
+                } catch (...) {
+                    ELIO_LOG_ERROR("HTTP handler unknown exception");
+                    resp = response::internal_error();
                 }
             } else {
                 resp = response::not_found();
             }
             
-            co_await send_response(stream, resp, ctx.req().get_method());
+            http::detail::context_access::seal_final_response(ctx);
+            co_await http::send_response(stream, resp, ctx.req().get_method(),
+                ctx.req().version(), false, token, http_config_.write_timeout);
         }
     }
     
-    /// Send HTTP response
+    // A successful 101 transfers protocol ownership, not an ordinary final body.
     template<typename Stream>
-    coro::task<void> send_response(Stream& stream,
-                                   const response& resp,
-                                   std::optional<method> request_method = std::nullopt) {
-        auto data = request_method ? resp.serialize(*request_method)
-                                   : resp.serialize();
-        
-        size_t sent = 0;
-        while (sent < data.size()) {
-            auto result = co_await stream.write(data.data() + sent, data.size() - sent);
-            if (result.result <= 0) {
-                break;
-            }
-            sent += result.result;
-        }
+    coro::task<bool> send_upgrade_response(Stream& stream, const response& resp,
+                                           coro::cancel_token token) {
+        const auto data = resp.serialize();
+        const auto result = co_await stream.write_exactly(data.data(), data.size(), token);
+        co_return result.result >= 0 && static_cast<size_t>(result.result) == data.size();
     }
 
     std::shared_ptr<coro::cancel_source> begin_accept_loop(size_t start_epoch) {

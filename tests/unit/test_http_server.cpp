@@ -209,34 +209,6 @@ size_t count_occurrences(std::string_view haystack, std::string_view needle) {
     return count;
 }
 
-std::string read_two_ok_responses(int fd) {
-    std::string out;
-    char buf[1024];
-    auto deadline = std::chrono::steady_clock::now() + elio::test::scaled_sec(3);
-
-    while (std::chrono::steady_clock::now() < deadline &&
-           count_occurrences(out, "HTTP/1.1 200 OK") < 2) {
-        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
-        if (n > 0) {
-            out.append(buf, static_cast<size_t>(n));
-            continue;
-        }
-        if (n == 0) {
-            break;
-        }
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;
-        }
-        INFO("recv failed: " << std::strerror(errno));
-        REQUIRE(false);
-    }
-
-    return out;
-}
-
 std::string read_until_close(int fd) {
     std::string out;
     char buf[1024];
@@ -408,7 +380,9 @@ pipeline_result run_pipelined_exchange(std::string_view first_write,
             send_all(client.get(), second_write);
         }
 
-        response_bytes = read_two_ok_responses(client.get());
+        // The second request asks for close. A status line alone does not
+        // establish that its independently transmitted body has arrived.
+        response_bytes = read_until_close(client.get());
         client.reset();
 
         saw_both_paths = wait_until([&] {
@@ -1979,6 +1953,95 @@ TEST_CASE("HTTP server send_interim rejects non-interim statuses",
     // final 200 response.
     REQUIRE(count_occurrences(bytes, "HTTP/1.1 ") == 1);
     REQUIRE(bytes.find("HTTP/1.1 200 OK\r\n") != std::string::npos);
+}
+
+TEST_CASE("WebSocket HTTP fallback owns and frames streaming replies",
+          "[http][websocket][server][streaming][issue-1195]") {
+    enum class scenario { normal, head, failure, stop };
+    auto selected = scenario::normal;
+    SECTION("successful producer") {}
+    SECTION("HEAD skips producer") { selected = scenario::head; }
+    SECTION("producer failure omits terminator") { selected = scenario::failure; }
+    SECTION("stop cancels producer and drains session") { selected = scenario::stop; }
+
+    std::atomic<bool> entered{false};
+    std::atomic<bool> context_valid{false};
+    std::atomic<int> interim_error{0};
+    elio::http::websocket::ws_router routes;
+    routes.add_route(selected == scenario::head ? method::HEAD : method::GET,
+        "/stream", [&](context& ctx) {
+            return streaming_response(status::ok,
+                [&, payload = std::make_unique<std::string>("hello")]
+                (body_writer& writer, cancel_token token) -> task<send_result> {
+                    entered.store(true, std::memory_order_release);
+                    context_valid.store(ctx.req().path() == "/stream", std::memory_order_release);
+                    errno = 0;
+                    const bool interim = co_await ctx.send_interim(response(status::continue_));
+                    interim_error.store(interim ? 0 : errno, std::memory_order_release);
+                    if (selected == scenario::stop) {
+                        co_await elio::time::sleep_for(1h, token);
+                        co_return send_result{send_errc::cancelled, ECANCELED};
+                    }
+                    auto result = co_await writer.write(*payload, token);
+                    if (!result.success()) co_return result;
+                    if (selected == scenario::failure) {
+                        co_return send_result{send_errc::producer_error};
+                    }
+                    co_return result;
+                });
+        });
+    server_config config;
+    config.enable_logging = false;
+    config.keep_alive_timeout = elio::test::scaled_sec(2);
+    elio::http::websocket::ws_server srv(std::move(routes), config);
+    const auto port = reserve_loopback_port();
+    scheduler sched(2);
+    sched.start();
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+    });
+    const bool started = wait_until([&] { return srv.is_running(); }, elio::test::scaled_sec(2));
+    std::string bytes;
+    bool producer_started = true;
+    if (started) {
+        auto client = connect_loopback(port);
+        send_all(client.get(), selected == scenario::head
+            ? "HEAD /stream HTTP/1.1\r\nHost: test\r\n\r\n"
+            : "GET /stream HTTP/1.1\r\nHost: test\r\n\r\n");
+        if (selected == scenario::stop) {
+            producer_started = wait_until([&] { return entered.load(std::memory_order_acquire); },
+                                           elio::test::scaled_sec(2));
+            srv.stop();
+        }
+        bytes = read_until_close(client.get());
+    }
+    srv.stop();
+    const bool drained = wait_until([&] {
+        return listen_done.load(std::memory_order_acquire) && srv.active_connections() == 0;
+    }, elio::test::scaled_sec(3));
+    const bool shutdown_ok = sched.shutdown(elio::test::scaled_sec(5));
+    REQUIRE(started);
+    REQUIRE(producer_started);
+    REQUIRE(drained);
+    REQUIRE(shutdown_ok);
+    REQUIRE(count_occurrences(bytes, "HTTP/1.1 ") == 1);
+    REQUIRE(bytes.find("Connection: close\r\n") != std::string::npos);
+    const auto boundary = bytes.find("\r\n\r\n");
+    REQUIRE(boundary != std::string::npos);
+    const auto body = bytes.substr(boundary + 4);
+    if (selected == scenario::head) {
+        REQUIRE_FALSE(entered.load());
+        REQUIRE(body.empty());
+    } else {
+        REQUIRE(context_valid.load());
+        REQUIRE(interim_error.load() == EALREADY);
+        REQUIRE(bytes.find("Transfer-Encoding: chunked\r\n") != std::string::npos);
+        if (selected == scenario::normal) REQUIRE(body == "5\r\nhello\r\n0\r\n\r\n");
+        if (selected == scenario::failure) REQUIRE(body == "5\r\nhello\r\n");
+        if (selected == scenario::stop) REQUIRE(body.empty());
+    }
 }
 
 TEST_CASE("WebSocket server fallback HTTP context rejects send_interim with ENOTSUP",

@@ -1,0 +1,96 @@
+name: HTTP streaming contracts
+
+on:
+  pull_request:
+    paths:
+      - 'include/**'
+      - 'tests/**'
+      - 'examples/sse_server.cpp'
+      - '**/CMakeLists.txt'
+      - 'cmake/**'
+      - 'wiki/HTTP-Streaming.md'
+      - 'wiki/API-Contracts.md'
+      - 'wiki/API-Reference.md'
+      - 'wiki/Migrating-to-0.6.md'
+      - 'wiki/WebSocket-SSE.md'
+      - '.github/workflows/http-streaming.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'include/**'
+      - 'tests/**'
+      - 'examples/sse_server.cpp'
+      - '**/CMakeLists.txt'
+      - 'cmake/**'
+      - 'wiki/HTTP-Streaming.md'
+      - 'wiki/API-Contracts.md'
+      - 'wiki/API-Reference.md'
+      - 'wiki/Migrating-to-0.6.md'
+      - 'wiki/WebSocket-SSE.md'
+      - '.github/workflows/http-streaming.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  peer-and-examples:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build and pinned peer dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev liburing-dev python3-venv
+          python3 -m venv "$RUNNER_TEMP/http-peer-env"
+          "$RUNNER_TEMP/http-peer-env/bin/pip" install h11==0.16.0
+      - name: Configure focused build
+        run: |
+          cmake -S . -B build-http-peer -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DELIO_BUILD_TESTS=ON -DELIO_BUILD_SANITIZER_TESTS=OFF \
+            -DELIO_BUILD_EXAMPLES=ON -DELIO_ENABLE_TLS=ON \
+            -DELIO_ENABLE_HTTP=ON -DELIO_ENABLE_HTTP2=OFF \
+            -DELIO_ENABLE_RDMA=OFF -DELIO_BUILD_TCP_BENCHMARKS=OFF \
+            -DELIO_ENABLE_DEVELOPER_WARNINGS=ON -DELIO_WARNINGS_AS_ERRORS=ON \
+            -DELIO_BUILD_HTTP_INTEROP_TESTS=ON \
+            -DPython3_EXECUTABLE="$RUNNER_TEMP/http-peer-env/bin/python"
+      - name: Compile peer and documented examples
+        run: cmake --build build-http-peer --target elio_http_streaming_peer elio_public_header_examples sse_server --parallel 2
+      - name: Validate against h11
+        id: peer
+        run: |
+          mkdir -p http-peer-results
+          "$RUNNER_TEMP/http-peer-env/bin/python" tests/integration/http_streaming_peer.py \
+            --server build-http-peer/tests/elio_http_streaming_peer \
+            > http-peer-results/result.json 2> http-peer-results/runtime.log
+      - name: Publish readable conformance summary
+        if: always()
+        env:
+          PEER_OUTCOME: ${{ steps.peer.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = Path('http-peer-results/result.json')
+          lines = ['## HTTP streaming interoperability', '',
+                   'Peer: h11 0.16.0. Plain loopback only; not a performance comparison.', '',
+                   f"Validation step: {os.environ['PEER_OUTCOME'] or 'not run'}", '']
+          if report.exists() and report.stat().st_size:
+              data = json.loads(report.read_text())
+              lines += ['| Scenario | Result | Decoded body bytes |', '| --- | --- | ---: |']
+              for row in data['scenarios']:
+                  lines.append(f"| {row['scenario']} | {row['status']} | {row['body_bytes']} |")
+          else:
+              lines.append('No successful scenario report; inspect failed steps and retained logs.')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write('\n'.join(lines) + '\n')
+          PY
+      - name: Retain peer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-streaming-peer
+          path: http-peer-results/
+          if-no-files-found: ignore

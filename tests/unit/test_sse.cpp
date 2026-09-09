@@ -634,22 +634,24 @@ TEST_CASE("SSE event parsing", "[sse][parser]") {
 // ============================================================================
 
 TEST_CASE("SSE response building", "[sse][response]") {
-    SECTION("build_sse_response has correct headers") {
-        auto resp = build_sse_response();
+    SECTION("managed SSE response has explicit metadata and no eager framing") {
+        auto resp = make_streaming_response(
+            [](event_writer&, elio::coro::cancel_token) -> elio::coro::task<elio::http::send_result> {
+                co_return elio::http::send_result{};
+            });
         
         REQUIRE(resp.get_status() == elio::http::status::ok);
         REQUIRE(resp.header("Content-Type") == SSE_CONTENT_TYPE);
         REQUIRE(resp.header("Cache-Control") == "no-cache");
-        // The event stream ends at connection close, so keep-alive is
-        // impossible and the header must say so honestly.
-        REQUIRE(resp.header("Connection") == "close");
-        REQUIRE(resp.header("Access-Control-Allow-Origin") == "*");
-        REQUIRE(resp.close_delimited());
+        REQUIRE(resp.header("Connection").empty());
+        REQUIRE(resp.header("Access-Control-Allow-Origin").empty());
+        REQUIRE_FALSE(resp.body_length().has_value());
+        REQUIRE(resp.header("Content-Length").empty());
     }
     
-    SECTION("build_sse_response wire is close-delimited and streams events") {
-        auto resp = build_sse_response();
-        auto wire = resp.serialize();
+    SECTION("legacy close-delimited peer wire still streams events until EOF") {
+        const std::string wire = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            "Connection: close\r\n\r\n";
         
         // No framing headers: the body is delimited by connection close
         // (RFC 9112 §6.3 item 8). Regression test for #1177: the #1158

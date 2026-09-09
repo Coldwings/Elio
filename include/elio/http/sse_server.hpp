@@ -332,27 +332,11 @@ private:
     sync::mutex send_mutex_;  ///< Serializes frame writes; see send_raw().
 };
 
-/// Build SSE response headers
-inline response build_sse_response() {
-    response resp(status::ok);
-    resp.set_header("Content-Type", SSE_CONTENT_TYPE);
-    resp.set_header("Cache-Control", "no-cache");
-    resp.set_header("Connection", "close");
-    // SSE events stream until connection close, so the response must opt
-    // out of the automatic Content-Length: 0 pin and declare honest
-    // close-delimited framing (RFC 9112 §6.3 item 8); keep-alive reuse of
-    // the connection is impossible.
-    resp.set_close_delimited();
-    // Allow CORS for EventSource from any origin
-    resp.set_header("Access-Control-Allow-Origin", "*");
-    return resp;
-}
-
 /// SSE handler function type (receives connection, manages event loop)
 using sse_handler_func = std::function<coro::task<void>(sse_connection&)>;
 
-/// SSE endpoint helper for use with HTTP router
-/// This is a helper to create SSE handlers compatible with the HTTP server
+/// Legacy raw-stream handler holder; not an HTTP router response.
+/// Use make_streaming_response() from sse_writer.hpp for managed HTTP framing.
 class sse_endpoint {
 public:
     /// Create an SSE endpoint with a handler
@@ -365,17 +349,5 @@ public:
 private:
     sse_handler_func handler_;
 };
-
-/// Create an SSE response and handler for use with the HTTP server
-/// Usage in router:
-/// ```cpp
-/// router.get("/events", [](context& ctx) -> coro::task<response> {
-///     // This endpoint should be handled specially for SSE
-///     co_return sse::build_sse_response();
-/// });
-/// ```
-/// 
-/// For full SSE support, use the ws_server (WebSocket server) which
-/// can be extended to support SSE, or handle SSE at a lower level.
 
 } // namespace elio::http::sse

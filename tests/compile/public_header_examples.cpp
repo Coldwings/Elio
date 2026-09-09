@@ -1,5 +1,6 @@
 #include <elio/elio.hpp>
 #include <elio/http/http.hpp>
+#include <elio/http/sse_writer.hpp>
 #include <elio/http/websocket.hpp>
 #include <elio/rpc/rpc.hpp>
 #include <elio/tls/tls.hpp>
@@ -16,6 +17,22 @@
 using namespace elio;
 
 namespace public_header_examples {
+
+void managed_http_streams(http::router& routes) {
+    routes.get("/bytes", [](http::context&) {
+        return http::streaming_response(http::status::ok,
+            [data = std::make_unique<std::string>("borrowed")](
+                http::body_writer& writer, coro::cancel_token token) -> coro::task<http::send_result> {
+                co_return co_await writer.write(*data, token);
+            }, 8);
+    });
+    routes.get("/events", [](http::context&) {
+        return http::sse::make_streaming_response(
+            [](http::sse::event_writer& writer, coro::cancel_token token) -> coro::task<http::send_result> {
+                co_return co_await writer.send_data("hello", token);
+            });
+    });
+}
 
 // Keep the borrowing example in wiki/HTTP-Streaming.md compiler-checked.
 elio::coro::task<bool> forward_body(

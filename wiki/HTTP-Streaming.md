@@ -8,10 +8,110 @@ SSE clients incrementally parse those slices as events. This is the receive
 phase of [#1191](https://github.com/Coldwings/Elio/issues/1191), tracked in
 [#1192](https://github.com/Coldwings/Elio/issues/1192).
 
-The proposed server-managed producer/writer and unified outgoing framing plan
-are **not implemented by this phase**. Existing response serialization and SSE
-server APIs retain their current contracts; this page does not promise an
-outgoing zero-copy writer, new cancellation semantics, or HTTP/2 streaming.
+The sending path uses a shared response plan and server-managed producer/writer
+lifecycle. This is HTTP/1 behavior, not an HTTP/2 streaming API or an end-to-end
+zero-copy guarantee.
+
+## Outgoing Response Ownership
+
+`response` owns a complete body. Its constructors and `set_body()` change body
+storage without generating Content-Length in the metadata. `response_head`
+contains metadata only. A move-only `streaming_response` owns its producer and
+declares either a known byte count or an unknown length. `reply` is the variant
+of complete and streaming responses.
+
+Router registrations accept synchronous or `task` results of all three reply
+shapes through explicit adapters. Registered handler callables are copyable;
+the producer returned by a handler may be move-only. A context remains alive
+through producer execution and send cleanup. Once the handler selects its final
+reply, `send_interim()` is sealed and returns false with `EALREADY`.
+
+The server invokes a producer at most once. HEAD and body-forbidden statuses
+skip it. Open files, authorize access, and do work that can change final status
+before returning a streaming response. A failure after headers cannot be repaired
+by sending another final response on that connection.
+
+The producer receives `body_writer&` and a cooperative cancellation token. It
+returns `task<send_result>`. Each `write`/`writev` is sequential and borrowed:
+keep both descriptor storage and payload valid and immutable until the await
+returns, including failure cleanup. Never detach a write, escape the writer,
+or use it concurrently. Empty writes do not end the response. Only successful
+producer return delegates final framing to the server; there is no public
+`finish()` operation.
+
+## Framing And Failure
+
+| Response | Effective framing |
+| --- | --- |
+| Complete body or known-length stream | Derived/declared Content-Length, with exact byte-count enforcement |
+| Unknown-length HTTP/1.1 stream | Chunked |
+| Unknown-length HTTP/1.0 stream | Close-delimited, no connection reuse |
+| Explicit close-delimited stream | No CL/TE, no connection reuse; only for unknown length |
+| HEAD | No body or producer invocation; length describes the representation |
+| 204 | No body or framing length |
+| 205 | No body, Content-Length: 0 |
+| 304 | No body; optional explicitly supplied representation length |
+
+Manual Content-Length is a validated assertion, not an encoder switch. Invalid
+or conflicting assertions and manually supplied Transfer-Encoding are rejected
+before final output. Ordinary final planning rejects 1xx and successful CONNECT;
+interims and WebSocket 101 handoff have separate paths.
+
+Logical writes absorb short writes and EINTR; readiness-aware transports handle
+EAGAIN without busy spinning. No caller remainder retry or whole-response replay
+is required or supported. An unrecoverable error permanently terminates the
+writer. Too-long production is rejected before sending the excess; too-short
+production fails finalization. Failure prevents deliberate emission of a normal
+chunk terminator and prevents HTTP connection reuse.
+
+`confirmed_body_bytes` is cumulative diagnostic progress, not a replay offset.
+It can increase when an underlying completion arrives after timeout wins.
+The winning cancellation/timeout/error result remains terminal; already-sent
+bytes cannot be rolled back and may already have reached the peer.
+
+`server_config::write_timeout` defaults to zero (disabled). Positive values apply
+to each logical write under one original deadline across partial progress, not
+to the whole response or an SSE stream. Timeout requests abort; return still
+waits for transport and watchdog cleanup. It is not a hard upper bound on return
+time. Coroutine-frame allocation can throw before returning a task; the writer
+still becomes terminal, even if the producer catches that exception.
+
+## Sending Costs And Shutdown Boundaries
+
+The HTTP writer uses bounded iovec cursors and small chunk metadata, not a
+body-sized serialization buffer. TCP uses scatter/gather; TLS consumes borrowed
+segments through its scalar encrypted-write path. TLS record/encryption buffers,
+kernel copies, and coroutine/control allocations remain separate costs. This
+contract does not claim allocation-free writes or one syscall/chunk/record per
+logical write. No hidden queue retains body bytes between calls.
+
+`stop()` cooperatively cancels HTTP sessions and producers; a producer ignoring
+its token cannot be safely forcibly destroyed. Before destroying a server or its
+TLS context, request stop, await all listener tasks, and then wait for active
+connections to reach zero. A zero count observed before listener completion
+does not exclude an accepted connection about to be registered.
+
+WebSocket ordinary HTTP fallback uses the same sender but does not reuse the
+connection. Once 101 has successfully handed ownership to WebSocket, its handler
+retains its separate shutdown contract. HTTP producer cancellation is not a
+promise to terminate upgraded handlers. TLS close-notify also retains its
+existing bounded shutdown timeout rather than a new hard cancellation guarantee.
+
+## Managed SSE
+
+Return `sse::make_streaming_response(producer)` from a normal route. Its producer
+receives a scoped sequential `sse::event_writer&` and cancellation token.
+`send_event(event_view)`, `send_data(string_view)`, and `send_comment(string_view)`
+borrow field slices through completion and use bounded descriptors for line
+prefixes/delimiters. HTTP chunking is applied by the shared writer, not by the
+SSE producer. Invalid id/type control characters fail before event output;
+ignored sink failures still prevent successful response finalization.
+
+The factory supplies `Content-Type: text/event-stream` and `Cache-Control:
+no-cache`. It does not grant cross-origin access by default. Set an appropriate
+CORS policy explicitly. The former `build_sse_response()` header-only helper is
+removed. Legacy raw-stream `sse_connection` is not a managed HTTP body writer and
+must not be used to bypass framing on a managed response.
 
 ## Data Path And Ownership
 

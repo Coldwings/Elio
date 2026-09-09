@@ -66,10 +66,15 @@ list(APPEND TEST_SOURCES
     unit/test_http_parser.cpp
     unit/test_http_response_decoder.cpp
     unit/test_http_response_reader.cpp
+    unit/test_http_response_plan.cpp
+    unit/test_http_body_writer.cpp
+    unit/test_http_response_sender.cpp
+    unit/test_sse_writer.cpp
 )
 if(TARGET elio_http)
     list(APPEND TEST_SOURCES
         unit/test_http_server.cpp
+        unit/test_http_streaming_server.cpp
     )
 endif()
 
@@ -107,6 +112,20 @@ if(TARGET elio_http AND TARGET elio_tls)
         elio_http
         elio_tls
     )
+endif()
+
+option(ELIO_BUILD_HTTP_INTEROP_TESTS "Build HTTP streaming interoperability fixture (requires h11==0.16.0)" OFF)
+if(ELIO_BUILD_HTTP_INTEROP_TESTS)
+    if(NOT TARGET elio_http OR NOT TARGET elio_tls)
+        message(FATAL_ERROR "HTTP interoperability tests require HTTP and TLS targets")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_executable(elio_http_streaming_peer integration/http_streaming_peer_server.cpp)
+    target_link_libraries(elio_http_streaming_peer PRIVATE elio_http elio_tls)
+    add_test(NAME http_streaming_interop
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/integration/http_streaming_peer.py
+            --server $<TARGET_FILE:elio_http_streaming_peer>)
+    set_tests_properties(http_streaming_interop PROPERTIES TIMEOUT 90)
 endif()
 
 # RDMA abstraction tests (only when ELIO_ENABLE_RDMA=ON).

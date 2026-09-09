@@ -1,5 +1,47 @@
 # Migrating To 0.6
 
+## HTTP Complete And Streaming Replies
+
+`response` now owns a complete body; its constructors and `set_body()` no longer
+generate Content-Length in metadata. The shared outgoing plan derives that
+length when sending or serializing. A manually supplied Content-Length remains
+a checked assertion: changing the body does not silently replace it.
+
+`streaming_response` owns a producer and an optional declared byte count.
+Unknown HTTP/1.1 streams default to chunked; explicit close delimiting belongs
+to this streaming transfer policy. `reply` is the move-only variant. Router
+callbacks accept either concrete response or `reply`, synchronously or through
+`task`. Explicitly named `handler_func` now returns `task<reply>`; callbacks
+returning `task<response>` still work through registration adapters.
+
+The complete-response `set_close_delimited()`/`close_delimited()` and
+`sse::build_sse_response()` are removed. Do not substitute a Transfer-Encoding
+header or raw writes after an ordinary response. Return
+`sse::make_streaming_response(producer)` from the route; the producer takes a
+scoped `sse::event_writer&` and cancellation token and returns `task<send_result>`.
+See `examples/sse_server.cpp` for a compilable migration. CORS permission must
+now be set explicitly. The new event writer rejects CR/LF/NUL in id/type instead
+of silently omitting invalid fields as the legacy serializer did.
+
+`response::serialize()` remains an explicit string-materialization operation;
+invalid CL/TE framing throws `std::invalid_argument`. Server sending avoids
+that body-sized string. Received responses preserve original headers: explicitly
+remove Transfer-Encoding before reserializing decoded chunked content, along
+with any obsolete Content-Length assertion. No implicit normalization hides
+this decision. HEAD/304 representation metadata can be supplied through
+`set_representation_length()`; an explicit nonzero CL on 205 is rejected rather
+than overwritten. Interim/101/tunnel serialization is a separate headers-only
+path, not an ordinary final reply.
+
+Never detach or concurrently use a writer. Borrowed buffers and descriptors
+remain alive through each write and its cleanup. Context survives producer
+execution, but `send_interim()` returns `EALREADY` after final selection.
+Recoverable short-write progress is internal; terminal errors do not authorize
+replay. Per-write timeout defaults to disabled and is independent of producer
+lifetime. On shutdown, request `stop()`, await listeners, then drain sessions
+before destroying server/TLS state. Cancellation cannot forcibly destroy a
+noncooperative producer. See [[HTTP Streaming]] for the complete boundaries.
+
 Elio 0.6 changes coroutine ownership, cancellation, structured concurrency,
 worker-local I/O enforcement, and several runtime contracts. Review the items
 below when upgrading from 0.5.x.

@@ -193,3 +193,51 @@ jobs:
           name: http-streaming-peer
           path: http-peer-results/
           if-no-files-found: ignore
+
+  transport-metrics:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install diagnostic dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev liburing-dev python3-venv openssl
+          python3 -m venv "$RUNNER_TEMP/http-metrics-env"
+          "$RUNNER_TEMP/http-metrics-env/bin/pip" install h11==0.16.0
+      - name: Configure release diagnostic fixture
+        run: |
+          cmake -S . -B "$RUNNER_TEMP/http-metrics-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DELIO_BUILD_TESTS=ON -DELIO_BUILD_SANITIZER_TESTS=OFF \
+            -DELIO_BUILD_EXAMPLES=OFF -DELIO_ENABLE_TLS=ON \
+            -DELIO_ENABLE_HTTP=ON -DELIO_ENABLE_HTTP2=OFF \
+            -DELIO_ENABLE_RDMA=OFF -DELIO_BUILD_TCP_BENCHMARKS=OFF \
+            -DELIO_ENABLE_DEVELOPER_WARNINGS=ON -DELIO_WARNINGS_AS_ERRORS=ON \
+            -DELIO_BUILD_HTTP_METRICS=ON \
+            -DPython3_EXECUTABLE="$RUNNER_TEMP/http-metrics-env/bin/python"
+      - name: Compile real transport fixture
+        run: cmake --build "$RUNNER_TEMP/http-metrics-build" --target elio_http_streaming_metrics_server --parallel 2
+      - name: Test evidence validation
+        run: ctest --test-dir "$RUNNER_TEMP/http-metrics-build" -R '^http_streaming_metrics_report_tests$' --output-on-failure
+      - name: Measure verified loopback pipelines
+        run: |
+          "$RUNNER_TEMP/http-metrics-env/bin/python" tests/integration/http_streaming_metrics.py \
+            --server "$RUNNER_TEMP/http-metrics-build/tests/elio_http_streaming_metrics_server" \
+            --output-dir "$RUNNER_TEMP/http-metrics-results"
+      - name: Publish diagnostic summary
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/http-metrics-results/summary.md"; then
+            cat "$RUNNER_TEMP/http-metrics-results/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '## HTTP transport diagnostics: no completed report' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Inspect failed steps; missing evidence is not a passing coordinate.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Retain real transport evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-streaming-transport-metrics
+          path: ${{ runner.temp }}/http-metrics-results/
+          if-no-files-found: ignore

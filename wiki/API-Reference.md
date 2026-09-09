@@ -2129,6 +2129,31 @@ listener. The listener must remain alive until the pending accept resumes.
 
 ### `tcp_stream`
 
+Output completion is shared with `tls_stream` and `net::stream`:
+
+```cpp
+namespace elio::net {
+enum class close_scope { write_direction, whole_session };
+struct write_finish_result {
+    close_scope scope = close_scope::write_direction;
+    int error = 0;
+    bool local_end_flushed = false;
+    bool peer_end_observed = false;
+};
+}
+// Member on tcp_stream, tls_stream and net::stream:
+coro::task<net::write_finish_result> finish_write(
+    coro::cancel_token token = {},
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(5000));
+```
+
+One reader may overlap; serialize other writers and lifetime changes. TCP
+performs `SHUT_WR`, internally retries EINTR, and ignores the timeout. TLS 1.3
+preserves reading; TLS 1.2 automatically closes the session under the timeout.
+The result reports closure scope and observations, not proof of peer delivery.
+See [Finishing Stream Output](API-Contracts#finishing-stream-output) for
+automatic TLS 1.2 closure, ordered ciphertext draining and failure semantics.
+
 TCP connection.
 
 ```cpp
@@ -3822,6 +3847,7 @@ at the protocol layer.
 ```cpp
 struct tls_stream_options {
     size_t ciphertext_budget = 1024 * 1024;
+    std::chrono::milliseconds session_close_timeout{5000};
 };
 
 class tls_stream {
@@ -3838,6 +3864,11 @@ public:
     // Whole-session close budget; return may take longer for I/O cleanup.
     coro::task<void> shutdown(std::chrono::milliseconds timeout =
                                  std::chrono::milliseconds(5000));
+
+    // Write-side operation; may overlap one reader after handshake.
+    coro::task<net::write_finish_result> finish_write(
+        coro::cancel_token token = {},
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(5000));
     
     // Read decrypted data (awaitable)
     /* awaitable */ read(void* buffer, size_t size);
@@ -3915,11 +3946,29 @@ one whole-session budget, default 5 seconds, separate from application I/O
 budgets. Failure or expiry starts abort processing and drains owned I/O before
 returning, so cleanup can extend beyond that budget. The legacy `task<void>`
 result does not establish lossless peer delivery. This is not a directional
-half-close API; CONNECT directional-close support is not implemented here.
+half-close API; use `finish_write()` for protocol-aware output completion.
+The HTTP CONNECT handoff is a separate feature, not supplied by TLS closure.
 Whole-session shutdown retires the transport; this object has no TLS-session
 reset or re-handshake API. Terminal output settlement uses two pre-reserved
 notification slots for the permitted reader/writer pair, without allocating
 new cleanup waiters.
+
+`finish_write()` requires a completed handshake. It leaves
+`is_handshake_complete()` as handshake history, not a test for a usable write
+direction. Nonempty writes after normal output closure return `ESHUTDOWN`
+without changing a successful close into a transport failure. TLS 1.2 closure
+also ends application reads: remaining reverse plaintext is discarded while
+processing the peer's alert under the same absolute deadline. The small discard
+scratch is not an application queue or a lossless forwarding guarantee.
+An unfinished SSL write retry prevents graceful TLS 1.2 closure and produces
+terminal `ECANCELED`, never an SSL call with substituted retry arguments.
+Repeated finish calls report current sticky failure and closure observations;
+they neither reopen output nor restart an existing session deadline.
+
+TLS 1.2 automatic closure uses `session_close_timeout` when a read first
+observes the authenticated peer alert. Explicit finish uses its timeout if it
+selects session closure first. TLS 1.3 ignores both session-close timers during
+independent write closure and keeps reverse reads available.
 
 Cancellation detected by the operation's initial cancellation check is local
 to that call. After it passes that check, subsequently observed cancellation

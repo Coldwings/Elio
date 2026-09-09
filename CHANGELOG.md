@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Protocol-aware stream output completion**: `finish_write()` on TCP, TLS
+  and the common stream reports directional versus whole-session closure.
+  TCP/TLS 1.3 retain reading; TLS 1.2 automatically closes the session under
+  a default five-second budget. One reader may overlap; zero error does not
+  promise peer delivery or lossless relay completion.
+
 - **HTTP transport diagnostics**: optional TCP/TLS complete, known-length and
   chunked loopback measurements with independent h11 body verification,
   separately scoped server/client CPU, attributable evidence and readable CI

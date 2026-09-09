@@ -39,6 +39,7 @@ namespace elio::net {
 /// progress; use `write_exactly()` for complete output. Multiple reads, multiple
 /// concurrent writes, handshake-starting operations, or `close()` racing with
 /// any read/write operation require external serialization for all variants.
+/// `finish_write()` is a write-side operation and may overlap one reader.
 class stream {
 public:
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
@@ -278,6 +279,21 @@ public:
     coro::task<io::io_result> write_all(std::string_view data,
                                         coro::cancel_token token) {
         return write_exactly(data.data(), data.size(), std::move(token));
+    }
+
+    /// Finish output using the negotiated transport's closure semantics.
+    /// Serialize with writers/lifetime changes; one reader may overlap.
+    coro::task<write_finish_result> finish_write(
+        coro::cancel_token token = {},
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
+        if (auto* tls = std::get_if<tls::tls_stream>(&stream_))
+            co_return co_await tls->finish_write(std::move(token), timeout);
+#endif
+        if (auto* tcp = std::get_if<tcp_stream>(&stream_))
+            co_return co_await tcp->finish_write(std::move(token), timeout);
+        co_return write_finish_result{close_scope::write_direction,
+            token.is_cancelled() ? ECANCELED : ENOTCONN};
     }
 
     /// Close/shutdown the stream

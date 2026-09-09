@@ -5,6 +5,8 @@
 #include <elio/coro/task.hpp>
 #include <elio/log/macros.hpp>
 #include <elio/net/detail/fd.hpp>
+#include <elio/net/stream_close.hpp>
+#include <chrono>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -300,6 +302,7 @@ private:
 /// distinct coroutines (mirroring the kernel's full-duplex socket semantics):
 /// concurrent ``read``/``poll_read`` from coroutine A and concurrent
 /// ``write``/``writev``/``poll_write`` from coroutine B is well-defined.
+/// ``finish_write`` may replace that writer while the reader remains active.
 /// Issuing two concurrent reads, two concurrent writes, or a read alongside
 /// a ``close``/``shutdown`` on the same instance is undefined behaviour
 /// unless externally serialised. The same contract applies to
@@ -802,6 +805,24 @@ public:
         if (fd_ >= 0) {
             ::shutdown(fd_, SHUT_RDWR);
         }
+    }
+
+    /// Finish local output while preserving the read direction. Serialize with
+    /// other writers and lifetime changes; one reader may remain active.
+    /// TCP ignores timeout. Pre-cancellation leaves the socket unchanged.
+    coro::task<write_finish_result> finish_write(
+        coro::cancel_token token = {},
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+        (void)timeout;
+        if (token.is_cancelled())
+            co_return write_finish_result{close_scope::write_direction, ECANCELED};
+        if (fd_ < 0)
+            co_return write_finish_result{close_scope::write_direction, EBADF};
+        int result;
+        do { result = ::shutdown(fd_, SHUT_WR); } while (result < 0 && errno == EINTR);
+        if (result < 0)
+            co_return write_finish_result{close_scope::write_direction, errno};
+        co_return write_finish_result{close_scope::write_direction, 0, true, false};
     }
 
     /// Half-close one direction of the TCP connection without releasing the fd.

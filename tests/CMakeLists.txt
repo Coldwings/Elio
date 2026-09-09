@@ -106,6 +106,7 @@ endif()
 # This object target compiles once and intentionally is not linked or executed.
 if(TARGET elio_http AND TARGET elio_tls)
     add_library(elio_public_header_examples OBJECT
+        compile/http_common_standalone.cpp
         compile/public_header_examples.cpp
     )
     target_link_libraries(elio_public_header_examples PRIVATE

@@ -141,6 +141,11 @@ prefixes/delimiters. HTTP chunking is applied by the shared writer, not by the
 SSE producer. Invalid id/type control characters fail before event output;
 ignored sink failures still prevent successful response finalization.
 
+`event_view::id` distinguishes absence from an empty value: `std::nullopt` or
+`{}` omits id, while `std::string_view{}` or `""` emits `id:\n` to clear the
+receiver's Last-Event-ID. Subsequent omitted IDs preserve that cleared state.
+The optional borrows its string view; `send_data()` continues to omit id.
+
 The factory supplies `Content-Type: text/event-stream` and `Cache-Control:
 no-cache`. It does not grant cross-origin access by default. Set an appropriate
 CORS policy explicitly. The former `build_sse_response()` header-only helper is

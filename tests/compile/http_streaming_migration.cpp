@@ -76,6 +76,15 @@ void register_migrated_routes(router& routes) {
     });
 }
 
+coro::task<send_result> migrated_sse_id(sse::event_writer& writer,
+                                      std::string_view id, coro::cancel_token token) {
+    const auto sent = co_await writer.send_event(
+        {id.empty() ? std::nullopt : std::optional<std::string_view>{id}, {}, "data"},
+        token);
+    if (!sent.success()) co_return sent;
+    co_return co_await writer.send_event({std::string_view{}, {}, "reset"}, token);
+}
+
 coro::task<send_result> borrowed_write(body_writer& writer, coro::cancel_token token) {
     std::string first = "hello ";
     std::string second = "world";

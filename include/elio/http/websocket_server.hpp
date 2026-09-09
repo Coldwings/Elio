@@ -1081,8 +1081,12 @@ private:
                 auto resp = response(status::payload_too_large, "Payload Too Large");
                 resp.set_header("Connection", "close");
                 reply selected{std::move(resp)};
+                auto version = parser.version();
+                if (version != "HTTP/1.0" && version != "HTTP/1.1") {
+                    version = "HTTP/1.1";
+                }
                 co_await http::send_response(stream, selected, parser.get_method(),
-                    parser.version(), false, token, http_config_.write_timeout);
+                    version, false, token, http_config_.write_timeout);
                 co_return;
             }
 

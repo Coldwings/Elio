@@ -1,10 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <elio/http/sse_writer.hpp>
+#include <elio/http/sse_client.hpp>
 #include <elio/http/http_response_sender.hpp>
 #include <elio/http/http_parser.hpp>
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <memory>
 #include <string>
@@ -81,6 +83,9 @@ TEST_CASE("SSE writer borrows fields and normalizes multiline payload",
     REQUIRE(id_borrowed);
     REQUIRE(type_borrowed);
     REQUIRE(data_borrowed);
+    REQUIRE(id == "42");
+    REQUIRE(type == "update");
+    REQUIRE(data == "alpha\r\nbeta\rgamma\n");
     REQUIRE(decoded_sse_body(transport.wire) ==
             "id: 42\nevent: update\nretry: 123\ndata: alpha\ndata: beta\ndata: gamma\ndata: \n\n");
     REQUIRE(transport.wire.find("Transfer-Encoding: chunked\r\n") != std::string::npos);
@@ -115,6 +120,51 @@ TEST_CASE("SSE writer emits empty fields comments and bounded multiline batches"
     REQUIRE(decoded_sse_body(transport.wire) == expected);
 }
 
+TEST_CASE("SSE writer distinguishes omitted id from explicit empty id reset",
+          "[http][sse][sse_writer]") {
+    std::string id = "42";
+    const auto* original_id_storage = id.data();
+    sse_test_transport transport;
+    reply selected = sse::make_streaming_response(
+        [&](sse::event_writer& out, elio::coro::cancel_token token)
+            -> elio::coro::task<send_result> {
+            auto result = co_await out.send_data("omitted", token);
+            if (!result.success()) co_return result;
+            result = co_await out.send_event({id, {}, "set"}, token);
+            if (!result.success()) co_return result;
+            result = co_await out.send_event(
+                {std::string_view{}, {}, "reset"}, token);
+            if (!result.success()) co_return result;
+            co_return co_await out.send_event({{}, {}, "kept"}, token);
+        });
+    const auto sent = complete_sse_task(
+        send_response(transport, selected, method::GET, "HTTP/1.1", true));
+    REQUIRE(sent.success());
+    REQUIRE(sent.reusable);
+    const auto body = decoded_sse_body(transport.wire);
+    REQUIRE(body ==
+            "data: omitted\n\n"
+            "id: 42\ndata: set\n\n"
+            "id:\ndata: reset\n\n"
+            "data: kept\n\n");
+
+    sse::event_parser receiver(sse::event_parser::default_max_buffer_size, "seed");
+    std::string_view remaining = body;
+    const std::array<std::string_view, 4> expected_ids{"seed", "42", "", ""};
+    for (const auto expected_id : expected_ids) {
+        const auto boundary = remaining.find("\n\n");
+        REQUIRE(boundary != std::string_view::npos);
+        REQUIRE(receiver.parse(remaining.substr(0, boundary + 2)) == 1);
+        REQUIRE(receiver.has_event());
+        REQUIRE(receiver.get_event().has_value());
+        REQUIRE(receiver.last_event_id() == expected_id);
+        remaining.remove_prefix(boundary + 2);
+    }
+    REQUIRE(remaining.empty());
+    REQUIRE(id == "42");
+    REQUIRE(id.data() == original_id_storage);
+}
+
 TEST_CASE("SSE writer invalid fields fail before event output and stay terminal",
           "[http][sse][sse_writer]") {
     const auto bad = GENERATE(std::string("bad\rvalue"), std::string("bad\nvalue"), std::string("bad\0value", 9));
@@ -125,7 +175,7 @@ TEST_CASE("SSE writer invalid fields fail before event output and stay terminal"
     reply selected = sse::make_streaming_response(
         [&](sse::event_writer& out, elio::coro::cancel_token token) -> elio::coro::task<send_result> {
             first = co_await out.send_event(
-                {invalid_id ? std::string_view(bad) : std::string_view{},
+                {invalid_id ? std::optional<std::string_view>{bad} : std::nullopt,
                  invalid_id ? std::string_view{} : std::string_view(bad), "must not send"}, token);
             second = co_await out.send_comment("also must not send", token);
             co_return send_result{}; // Ignoring the error must not complete the response.

@@ -3457,7 +3457,7 @@ Declared in `<elio/http/sse_writer.hpp>` and exported by `<elio/http/sse.hpp>`.
 
 ```cpp
 struct event_view {
-    std::string_view id;
+    std::optional<std::string_view> id;
     std::string_view type;
     std::string_view data;
     int retry = -1;
@@ -3480,10 +3480,13 @@ Default HTTP/1.1 framing is chunked; HTTP/1.0 uses close delimiting.
 The server owns response completion. Do not construct or escape the sink,
 overlap sends, or add independent raw socket writes/heartbeat writers.
 
-Event fields remain borrowed and immutable through send completion. Empty
-id/type are omitted and negative retry is omitted; data is always emitted.
-CR, LF and CRLF delimit data/comment lines. Invalid CR/LF/NUL in id/type
-fails the event before it emits bytes. Bounded descriptor batches avoid an
+Event fields remain borrowed and immutable through send completion. An absent
+id (`std::nullopt` or `{}`) is omitted, preserving the receiver's Last-Event-ID.
+A present empty id (`std::string_view{}` or `""`) emits `id:\n`, clearing it.
+The optional stores presence and a borrowed view, not an owned string.
+Empty type and negative retry are omitted; data is always emitted.
+CR, LF and CRLF delimit data/comment lines. Invalid CR/LF/NUL in a present id
+or type fails before event output. Bounded descriptor batches avoid an
 event-sized encoded string; a logical event can span multiple body writes.
 The first failure is sticky even if the producer ignores its result. Frame
 allocation may throw after recording a terminal error.

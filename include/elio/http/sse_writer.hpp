@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <functional>
 #include <new>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <type_traits>
@@ -18,9 +19,10 @@ namespace elio::http::sse {
 namespace detail { struct event_writer_access; }
 
 /// Borrowed event fields, valid and immutable through send_event completion.
-/// Empty id/type are omitted; negative retry is omitted. Data is always emitted.
+/// Absent id is omitted; present empty id resets Last-Event-ID.
+/// Empty type and negative retry are omitted. Data is always emitted.
 struct event_view {
-    std::string_view id;
+    std::optional<std::string_view> id;
     std::string_view type;
     std::string_view data;
     int retry = -1;
@@ -73,7 +75,7 @@ private:
 
     coro::task<send_result> encode_event(event_view value, coro::cancel_token token) {
         if (!result_.success()) co_return result_;
-        if (invalid_field(value.id) || invalid_field(value.type)) {
+        if ((value.id && invalid_field(*value.id)) || invalid_field(value.type)) {
             result_.error = send_errc::invalid_response;
             result_.transport_error = EINVAL;
             co_return result_;
@@ -85,7 +87,7 @@ private:
             fields[count++] = {text.data(), text.size()};
             fields[count++] = {"\n", 1};
         };
-        if (!value.id.empty()) field("id: ", value.id);
+        if (value.id) field(value.id->empty() ? "id:" : "id: ", *value.id);
         if (!value.type.empty()) field("event: ", value.type);
         std::array<char, 24> retry{};
         if (value.retry >= 0) {

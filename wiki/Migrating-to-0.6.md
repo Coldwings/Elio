@@ -201,6 +201,15 @@ The factory adds no CORS permission. Set any application-authorized CORS
 headers on the returned response before selection; never add raw socket
 writes alongside the managed SSE writer.
 
+Managed SSE `event_view::id` uses `std::optional<std::string_view>` to
+distinguish omission from an explicit Last-Event-ID reset. `{}` and
+`std::nullopt` omit id; an empty string/view emits `id:\n` and resets it.
+Use `std::nullopt` instead of an empty-string sentinel when omission is intended.
+For a possibly empty ID that should retain the legacy omission behavior, use
+`id.empty() ? std::nullopt : std::optional<std::string_view>{id}`.
+Nonempty IDs remain borrowed, and `send_data()` omits id. Data is always
+emitted: this API does not introduce an id-only event operation.
+
 ### Borrowed Buffers And Failure Propagation
 
 Before, code directly managing a transport had to advance partial `iovec`

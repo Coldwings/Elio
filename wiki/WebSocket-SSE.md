@@ -309,6 +309,15 @@ remains independently effective.
 
 ### SSE Event Format
 
+For managed responses, `sse::event_view::id` is an
+`std::optional<std::string_view>`. Omission (`std::nullopt` or `{}`) preserves
+the receiver's Last-Event-ID. An engaged empty view (`std::string_view{}` or
+`""`) emits `id:\n` and clears it; later events omitting id retain that cleared
+state. For example, `writer.send_event({std::string_view{}, {}, "reset"})`
+sends an explicit reset with data. `send_data()` omits id. These fields remain
+borrowed through completion; presence adds no owned string or allocation.
+This does not change legacy raw `sse_connection` serialization.
+
 SSE is the decoded HTTP body, not the raw bytes immediately after response
 headers. The client supports Content-Length, chunked transfer encoding, and
 close-delimited bodies. It removes chunk metadata before event parsing and

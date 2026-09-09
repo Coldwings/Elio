@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through I/O cleanup. HTTP routes accept synchronous and asynchronous complete
   or streaming replies. `sse::event_writer` encodes borrowed event slices through
   the shared sender; the SSE example now uses normal HTTP routes (#1195).
+  Managed `event_view::id` distinguishes omission (`nullopt`/`{}`) from a
+  present empty borrowed view, which explicitly resets Last-Event-ID.
+  Use `nullopt` when migrating empty-string omission sentinels.
 
 - **Breaking HTTP framing migration**: complete-response body setters no longer
   mutate Content-Length; explicit CL is validated and arbitrary TE rejected.

@@ -18,6 +18,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -1659,6 +1660,59 @@ TEST_CASE("WebSocket server enforces max_request_size across consumed upgrade by
     REQUIRE(wait_until([&] { return listen_done.load(std::memory_order_acquire); },
                        elio::test::scaled_sec(2)));
     REQUIRE(sched.shutdown(elio::test::scaled_sec(5)));
+}
+
+TEST_CASE("WebSocket server sends 413 before the request line is complete",
+          "[websocket][server][limits][regression]") {
+    elio::http::websocket::ws_router routes;
+    server_config config;
+    config.enable_logging = false;
+    config.read_buffer_size = 32;
+    config.max_request_size = 64;
+    elio::http::websocket::ws_server srv(std::move(routes), config);
+    const auto port = reserve_loopback_port();
+    scheduler sched(2);
+    sched.start();
+    std::atomic<bool> listen_done{false};
+    sched.go([&]() -> task<void> {
+        co_await srv.listen(elio::net::ipv4_address("127.0.0.1", port));
+        listen_done.store(true, std::memory_order_release);
+    });
+    const bool started = wait_until([&] { return srv.is_running(); },
+                                    elio::test::scaled_sec(2));
+    std::string wire;
+    bool peer_closed = false;
+    std::exception_ptr exchange_error;
+    unique_fd client;
+    try {
+        if (started) {
+            client = connect_loopback(port);
+            // Exceed the cap without supplying a version or a CRLF.
+            send_all(client.get(), "GET /" + std::string(64, 'x'));
+            wire = read_until_close(client.get());
+            peer_closed = wait_until([&] {
+                char byte;
+                return ::recv(client.get(), &byte, 1, MSG_DONTWAIT) == 0;
+            }, elio::test::scaled_sec(2));
+        }
+    } catch (...) {
+        exchange_error = std::current_exception();
+    }
+    client.reset();
+    srv.stop();
+    try_wake_listener(port);
+    const bool listener_stopped = wait_until([&] {
+        return listen_done.load(std::memory_order_acquire);
+    }, elio::test::scaled_sec(2));
+    const bool stopped = sched.shutdown(elio::test::scaled_sec(5));
+    if (exchange_error) std::rethrow_exception(exchange_error);
+    REQUIRE(started);
+    REQUIRE(listener_stopped);
+    REQUIRE(stopped);
+    REQUIRE(wire.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
+    REQUIRE(wire.find("\r\nConnection: close\r\n") != std::string::npos);
+    REQUIRE(wire.ends_with("\r\n\r\nPayload Too Large"));
+    REQUIRE(peer_closed);
 }
 
 TEST_CASE("WebSocket server excludes pipelined frame bytes from request size",

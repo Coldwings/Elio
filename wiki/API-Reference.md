@@ -2975,7 +2975,7 @@ enum class response_body_kind { complete, streaming };
 enum class response_framing { none, content_length, chunked, close_delimited };
 struct body_description {
     response_body_kind kind = response_body_kind::complete;
-    std::optional<uint64_t> length = uint64_t{0};
+    std::optional<uint64_t> length = std::nullopt;
     response_transfer transfer = response_transfer::automatic;
 };
 struct response_plan {
@@ -3016,7 +3016,10 @@ coro::task<response_send_result> send_response(Stream&, reply&, method,
 ```
 
 Preflight emits no final header bytes on error (allocation may throw). Complete
-bodies require known length. Known streaming length uses CL; unknown length
+bodies require an explicitly supplied length, including zero for an empty body.
+`body_description::length` defaults to `std::nullopt`: an omitted streaming
+length is unknown, while a default complete description is invalid. Known
+streaming length uses CL; unknown length
 uses chunked for HTTP/1.1 or close delimiting for HTTP/1.0. Explicit close requires
 unknown length and no manual CL. Response HTTP/1.1 is clamped for a request HTTP/1.0.
 Explicit TE and malformed/conflicting CL fail; identical duplicate CL lines

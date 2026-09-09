@@ -2,6 +2,13 @@
 
 ## HTTP Complete And Streaming Replies
 
+For direct `prepare_response` callers, `body_description::length` defaults to
+`std::nullopt`, not zero. `{.kind = response_body_kind::streaming}` therefore
+describes an unknown-length stream. Supply `.length = uint64_t{0}` explicitly
+for a known-empty stream or complete body. A default complete description
+without a length is invalid and returns `EINVAL` without generated headers.
+Ordinary `response` sending already supplies its actual body length.
+
 `response` now owns a complete body; its constructors and `set_body()` no longer
 generate Content-Length in metadata. The shared outgoing plan derives that
 length when sending or serializing. A manually supplied Content-Length remains

@@ -7,6 +7,54 @@
 
 using namespace elio::http;
 
+TEST_CASE("Public body descriptions distinguish omitted and zero length",
+          "[http][response_plan][issue-1210]") {
+    SECTION("Omitted streaming length is unknown") {
+        const body_description unknown{.kind = response_body_kind::streaming};
+        CHECK_FALSE(unknown.length.has_value());
+        for (const auto version : {"HTTP/1.1", "HTTP/1.0"}) {
+            CAPTURE(version);
+            const auto plan = prepare_response(response_head{}, unknown, method::GET, version, true);
+            REQUIRE(plan.success());
+            CHECK(plan.invoke_producer);
+            CHECK_FALSE(plan.expected_body_bytes.has_value());
+            CHECK(plan.header_block.find("Content-Length:") == std::string::npos);
+            if (std::string_view(version) == "HTTP/1.1") {
+                CHECK(plan.framing == response_framing::chunked);
+                CHECK(plan.reusable);
+                CHECK(plan.header_block.find("Transfer-Encoding: chunked\r\n") != std::string::npos);
+            } else {
+                CHECK(plan.framing == response_framing::close_delimited);
+                CHECK_FALSE(plan.reusable);
+                CHECK(plan.header_block.find("Transfer-Encoding:") == std::string::npos);
+                CHECK(plan.header_block.find("Connection: close\r\n") != std::string::npos);
+            }
+        }
+    }
+    SECTION("Explicit zero describes a known empty body") {
+        for (const auto kind : {response_body_kind::complete, response_body_kind::streaming}) {
+            CAPTURE(kind);
+            const body_description empty{.kind = kind, .length = uint64_t{0}};
+            const auto plan = prepare_response(response_head{}, empty, method::GET, "HTTP/1.1", true);
+            REQUIRE(plan.success());
+            CHECK(plan.framing == response_framing::content_length);
+            CHECK(plan.expected_body_bytes == uint64_t{0});
+            CHECK(plan.invoke_producer == (kind == response_body_kind::streaming));
+            CHECK(plan.header_block.find("Content-Length: 0\r\n") != std::string::npos);
+        }
+    }
+    SECTION("Complete descriptions require an explicit length") {
+        const body_description unspecified;
+        CHECK(unspecified.kind == response_body_kind::complete);
+        CHECK_FALSE(unspecified.length.has_value());
+        const auto rejected = prepare_response(
+            response_head{}, unspecified, method::GET, "HTTP/1.1", true);
+        CHECK_FALSE(rejected.success());
+        CHECK(rejected.error == EINVAL);
+        CHECK(rejected.header_block.empty());
+    }
+}
+
 TEST_CASE("Response body setters leave framing assertions to preparation",
           "[http][response][plan][issue-1195]") {
     auto message = response::ok("one");

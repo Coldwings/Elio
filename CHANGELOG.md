@@ -92,6 +92,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HTTP body-description defaults**: omitted streaming length now means
+  unknown instead of silently declaring zero. Direct preflight callers must
+  explicitly supply complete-body lengths, including zero; unspecified complete
+  descriptions are rejected before header generation.
+
 - **Retained owner-worker cancellation requests**: built-in registered I/O and
   timer waits reserve abort handoff state before submission, avoiding fresh
   abort-executor and ordinary task-overflow allocation in their cancellation

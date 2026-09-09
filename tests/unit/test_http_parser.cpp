@@ -124,7 +124,9 @@ TEST_CASE("HTTP request parser reports consumed bytes before need_more",
 TEST_CASE("HTTP request parser - all methods", "[http][parser]") {
     auto test_method = [](const char* method_str, method expected) {
         request_parser parser;
-        std::string request = std::string(method_str) + " / HTTP/1.1\r\nHost: test\r\n\r\n";
+        const auto target = expected == method::CONNECT ? "test:443" : "/";
+        std::string request = std::string(method_str) + " " + target +
+                              " HTTP/1.1\r\nHost: test\r\n\r\n";
         auto [result, consumed] = parser.parse(request);
         REQUIRE(result == parse_result::complete);
         REQUIRE(parser.get_method() == expected);
@@ -139,6 +141,90 @@ TEST_CASE("HTTP request parser - all methods", "[http][parser]") {
     test_method("OPTIONS", method::OPTIONS);
     test_method("CONNECT", method::CONNECT);
     test_method("TRACE", method::TRACE);
+}
+
+TEST_CASE("CONNECT preserves valid authority spelling", "[http][parser][connect][issue-1209]") {
+    for (const std::string_view target : {
+             "Example.COM.:443", "a%2Fb%2fc:00080", "a!$&'()*+,;=._~-z:1",
+             "192.0.2.1:65535", "999.1.1.1:443", "[::1]:443", "[2001:DB8::1]:443",
+             "[::ffff:192.0.2.1]:443", "[v1.a:B]:443", "[VF.X-._~!$&'()*+,;=:]:443"}) {
+        CAPTURE(target);
+        request_parser parser;
+        const std::string wire = "CONNECT " + std::string(target) +
+                                 " HTTP/1.1\r\nHost: different.example\r\n\r\n";
+        REQUIRE(parser.parse(wire).first == parse_result::complete);
+        CHECK(parser.path() == target);
+        CHECK(parser.query().empty());
+        CHECK(parser.body().empty());
+        CHECK(parser.take_remaining().empty());
+    }
+}
+
+TEST_CASE("CONNECT rejects malformed authority", "[http][parser][connect][issue-1209]") {
+    for (const std::string_view target : {
+             "/", "example.com", ":443", "example.com:", "example.com:0",
+             "example.com:65536", "example.com:999999999999999999999999",
+             "example.com:+443", "example.com:-1", "example.com:4x",
+             "user@example.com:443", "example.com:443/path", "example.com:443?q",
+             "example.com:443#fragment", "bad%:443", "bad%2:443", "bad%GG:443",
+             "bad\\host:443", "::1:443", "[::1:443", "::1]:443", "[]:443", "[::1]x:443",
+             "[:::1]:443", "[1:2:3:4:5:6:7:8:9]:443", "[::ffff:999.0.0.1]:443",
+             "[fe80::1%25eth0]:443", "[v.a]:443", "[v1.]:443", "[vG.a]:443"}) {
+        CAPTURE(target);
+        request_parser parser;
+        const std::string wire = "CONNECT " + std::string(target) +
+                                 " HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        CHECK(parser.parse(wire).first == parse_result::error);
+        CHECK(parser.body().empty());
+    }
+}
+
+TEST_CASE("CONNECT rejects request content at the header boundary",
+          "[http][parser][connect][issue-1209]") {
+    for (const std::string_view framing : {
+             "Content-Length: 1\r\n", "Content-Length: 999999\r\n",
+             "Transfer-Encoding: chunked\r\n", "Transfer-Encoding: identity\r\n",
+             "Transfer-Encoding: chunked\r\nContent-Length: 0\r\n"}) {
+        CAPTURE(framing);
+        request_parser parser;
+        const std::string headers = "CONNECT example.com:443 HTTP/1.1\r\n"
+                                    "Host: example.com\r\n" + std::string(framing);
+        REQUIRE(parser.parse(headers).first != parse_result::complete);
+        CHECK(parser.parse("\r\n").first == parse_result::error);
+        CHECK(parser.body().empty());
+    }
+}
+
+TEST_CASE("CONNECT fragmented headers retain binary tunnel prefix exactly once",
+          "[http][parser][connect][issue-1209]") {
+    constexpr char prefix_bytes[] = "\0\xff\r\nGET /opaque";
+    const std::string prefix(prefix_bytes, sizeof(prefix_bytes) - 1);
+    for (const std::string_view framing : {"", "Content-Length: 0\r\n"}) {
+        const std::string headers = "CONNECT [::1]:443 HTTP/1.1\r\n"
+                                    "Host: localhost\r\n" + std::string(framing) + "\r\n";
+        for (size_t split = 0; split < headers.size(); ++split) {
+            CAPTURE(framing, split);
+            request_parser parser;
+            REQUIRE(parser.parse(std::string_view(headers).substr(0, split)).first ==
+                    parse_result::need_more);
+            REQUIRE(parser.parse(headers.substr(split) + prefix).first == parse_result::complete);
+            CHECK(parser.path() == "[::1]:443");
+            CHECK(parser.query().empty());
+            CHECK(parser.body().empty());
+            CHECK(parser.buffered_input_size() == prefix.size());
+            CHECK(parser.take_remaining() == prefix);
+            CHECK(parser.take_remaining().empty());
+        }
+    }
+}
+
+TEST_CASE("CONNECT validation does not change ordinary target parsing",
+          "[http][parser][connect][issue-1209]") {
+    request_parser parser;
+    REQUIRE(parser.parse("GET /path?q=value HTTP/1.1\r\nHost: test\r\n\r\n").first ==
+            parse_result::complete);
+    CHECK(parser.path() == "/path");
+    CHECK(parser.query() == "q=value");
 }
 
 TEST_CASE("HTTP request parser - invalid request", "[http][parser]") {

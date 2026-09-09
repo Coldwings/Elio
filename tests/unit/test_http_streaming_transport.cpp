@@ -11,6 +11,7 @@
 #include "../test_main.cpp"
 
 #include <arpa/inet.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <array>
@@ -137,9 +138,13 @@ void exercise_backpressure(runtime::scheduler& sched, Stream& stream, int peer_f
     // extra pending operation distinguishes actual socket backpressure from
     // merely seeing that timer before any transport submission.
     const bool parked = await_observation([&] {
-        return done.load(std::memory_order_acquire) ||
-            (observed.borrowed.load() && observed.active.load() &&
-             context.pending_count() > baseline + (timeout ? 1u : 0u));
+        if (done.load(std::memory_order_acquire)) return true;
+        if (!observed.borrowed.load() || !observed.active.load() ||
+            context.pending_count() <= baseline + (timeout ? 1u : 0u)) return false;
+        // Pending can mean only that a send was submitted. Require the
+        // underlying socket to have exhausted writable capacity as well.
+        pollfd writable{stream.fd(), POLLOUT, 0};
+        return ::poll(&writable, 1, 0) == 0;
     });
     const bool completed_before_interrupt = done.load(std::memory_order_acquire);
     if (!timeout) source.cancel();

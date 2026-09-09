@@ -145,6 +145,15 @@ def validate(port, timeout):
             require(headers.get(b"connection", b"").lower() != b"close", f"{path}: reuse disabled")
             rows.append({"scenario": path, "method": "GET", "status": "passed",
                          "body_bytes": 0, "connection": "shared-sequential"})
+        # A bodyless message ends at headers. A subsequent response exposes
+        # delayed illegal payload and proves the final 304 actually allows reuse.
+        response, body, _ = peer.request("/ordinary")
+        headers = dict(response.headers)
+        require(body == b"hello world" and headers.get(b"content-length") == b"11",
+                "ordinary response after bodyless statuses failed")
+        require(b"transfer-encoding" not in headers, "unexpected framing after bodyless statuses")
+        rows.append({"scenario": "/ordinary-after-bodyless", "method": "GET", "status": "passed",
+                     "body_bytes": len(body), "connection": "shared-sequential"})
     finally:
         peer.close()
     peer = Peer(port, timeout)

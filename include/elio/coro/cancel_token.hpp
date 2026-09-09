@@ -614,11 +614,13 @@ public:
     /// The correct pattern is to give the io awaitable its own ``cancel_token``
     /// at construction (see ``time::sleep_for(duration, token)`` /
     /// ``cancellable_sleep_awaitable``). That implementation registers
-    /// ``on_cancel`` on the token and, from the cancel callback, schedules a
-    /// fire-and-forget coroutine onto the awaiter's worker that submits an
-    /// ``IORING_OP_ASYNC_CANCEL`` SQE via ``io_context::cancel``. The kernel
-    /// then delivers exactly one terminal CQE, and the existing op_state
-    /// CAS resolves the cancel-vs-completion race correctly.
+    /// ``on_cancel`` on the token and publishes a preallocated maintenance
+    /// request to the awaiter's owner worker, retaining shared state until
+    /// cancellation admission or operation retirement. The owner retries
+    /// temporary admission rejection through ``io_context::cancel`` without
+    /// keeping a key claim across backend polling. The original operation's
+    /// completion path and op_state CAS own exactly-once resumption on both
+    /// backends; the cancellation callback never resumes the awaiter itself.
     ///
     /// For non-io use cases, prefer ``on_cancel(callable)`` and have the
     /// coroutine poll an ``event`` / atomic flag, or wake via ``channel`` /

@@ -68,6 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Retained owner-worker cancellation requests**: built-in registered I/O and
+  timer waits reserve abort handoff state before submission, avoiding fresh
+  abort-executor and ordinary task-overflow allocation in their cancellation
+  callbacks. Temporary backend admission rejection retains intent for retry
+  until admission or original-operation retirement. Owner/context checks and
+  permanent key retirement protect against stale retries; graceful drain and
+  worker retirement service the maintenance path. Epoll timer cancellation
+  removes entries in place without an allocating queue rebuild. This does not
+  change throwing user callbacks, guarantee arbitrary-OOM progress, or permit
+  forced frame destruction (#1202).
+
 - **Expect final-header handling**: final response headers suppress a pending
   upload without waiting for the response body, and ordinary/Expect responses
   now share EOF and incremental framing handling (#1192).

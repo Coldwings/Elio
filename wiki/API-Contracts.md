@@ -259,6 +259,12 @@ a regular file (raw backend)" in `tests/unit/test_io.cpp`.
 
 ### Managed HTTP/1 Sending
 
+For HEAD/304, the caller must ensure advertised representation length matches
+the corresponding selected representation. Neither `set_representation_length()`
+nor a manually supplied Content-Length proves that fact. Elio checks numeric
+header syntax and consistency with its framing plan; it does not execute a
+hypothetical GET or invoke a suppressed producer to verify representation size.
+
 | Interface | Elio guarantees | Caller must guarantee |
 |-----------|-----------------|-----------------------|
 | `http::response_head`, `http::streaming_response`, and `http::reply` | Separate metadata, complete body storage and owned single-use production. HEAD/bodyless replies skip the producer; successful production permits server-owned finalization only if the writer remains successful. | Keep borrowed captures alive and do not move/destroy the selected reply while sending. Producer failure is terminal, not a retry instruction. |

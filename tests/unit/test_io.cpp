@@ -6447,6 +6447,77 @@ TEST_CASE("socket writev returns positive short progress under bounded capacity"
     REQUIRE(vectors[1].iov_len == suffix.size());
 }
 
+TEST_CASE("plain TCP writev resumes borrowed progress after peer drain",
+          "[io][tcp][writev][regression]") {
+    auto run = [&](io_context::backend_type backend) {
+        worker_io_backend_guard guard(backend);
+        int sockets[2] = {-1, -1};
+        REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets) == 0);
+        fill_socket_send_buffer(sockets[0]);
+        tcp_stream stream(sockets[0]);
+        std::array<char, 128> payload{};
+        payload.fill('v');
+        iovec vectors[]{{payload.data(), 64}, {payload.data() + 64, 64}};
+        std::atomic<bool> done{false};
+        io_result result{-EINPROGRESS, 0};
+        scheduler sched(1);
+        sched.start();
+        auto& context = sched.get_worker(0)->io_context();
+        const auto baseline = context.pending_count();
+        sched.go([&]() -> task<void> {
+            result = co_await stream.writev(vectors, 2);
+            done.store(true, std::memory_order_release);
+        });
+        const bool parked = wait_for_io_cancel_test([&] {
+            return context.pending_count() > baseline;
+        });
+        const bool early = done.load(std::memory_order_acquire);
+        std::array<char, 4096> received{};
+        size_t payload_bytes = 0;
+        bool unexpected_byte = false;
+        const auto deadline = std::chrono::steady_clock::now() + elio::test::scaled_ms(5000);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto count = ::recv(sockets[1], received.data(), received.size(), MSG_DONTWAIT);
+            if (count > 0) {
+                for (ssize_t i = 0; i < count; ++i) {
+                    if (received[static_cast<size_t>(i)] == 'v') ++payload_bytes;
+                    else if (received[static_cast<size_t>(i)] != 0) unexpected_byte = true;
+                }
+            } else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                break;
+            }
+            if (done.load(std::memory_order_acquire) && result.result > 0 &&
+                payload_bytes == static_cast<size_t>(result.result)) break;
+            if (done.load(std::memory_order_acquire) && result.result <= 0) break;
+            std::this_thread::yield();
+        }
+        const bool completed = done.load(std::memory_order_acquire);
+        if (!completed) ::shutdown(sockets[1], SHUT_RDWR);
+        const bool stopped = sched.shutdown(elio::test::scaled_ms(5000));
+        ::close(sockets[1]);
+        REQUIRE(parked);
+        REQUIRE_FALSE(early);
+        REQUIRE(completed);
+        REQUIRE(stopped);
+        REQUIRE(result.result > 0);
+        REQUIRE(result.result <= 128);
+        REQUIRE(payload_bytes == static_cast<size_t>(result.result));
+        REQUIRE_FALSE(unexpected_byte);
+        REQUIRE(context.pending_count() == baseline);
+        REQUIRE(vectors[0].iov_base == payload.data());
+        REQUIRE(vectors[1].iov_base == payload.data() + 64);
+        REQUIRE(vectors[0].iov_len == 64);
+        REQUIRE(vectors[1].iov_len == 64);
+    };
+    SECTION("forced epoll") { run(io_context::backend_type::epoll); }
+#if ELIO_HAS_IO_URING
+    SECTION("forced io_uring when available") {
+        if (!io_uring_backend::is_available()) SKIP("io_uring unavailable");
+        run(io_context::backend_type::io_uring);
+    }
+#endif
+}
+
 TEST_CASE("socket writev cancellation wakes a backpressured send without peer drain",
           "[io][tcp][writev][cancel][epoll-cancel-regression]") {
     auto run = [&](io_context::backend_type backend) {

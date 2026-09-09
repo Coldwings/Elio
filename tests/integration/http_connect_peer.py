@@ -30,9 +30,13 @@ def alarm_handler(_signal, _frame):
     raise TimeoutError("absolute coordinate deadline exceeded")
 
 
+TLS13_FIN_PROBE = b"elio-tls13-directional-close"
+
+
 class Upstream:
-    def __init__(self, trailer, certificate=None, key=None):
+    def __init__(self, trailer, certificate=None, key=None, directional_probe=False):
         self.trailer = trailer
+        self.directional_probe = directional_probe
         self.security = None
         if certificate is not None:
             self.security = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -64,14 +68,19 @@ class Upstream:
                         require(self.security is not None, "unexpected TLS input to plaintext upstream")
                         peer = self.security.wrap_socket(peer, server_side=True)
                         self.active = peer
+                    initial = bytearray()
                     while not self.stop.is_set():
                         data = peer.recv(65536)
                         if not data:
                             if inner_tls:
                                 peer.unwrap().close()
-                            elif self.trailer:
-                                peer.sendall(self.trailer)
+                            else:
+                                trailer = b"AFTER-FIN" if self.directional_probe and initial == TLS13_FIN_PROBE else self.trailer
+                                if trailer:
+                                    peer.sendall(trailer)
                             break
+                        if len(initial) < len(TLS13_FIN_PROBE):
+                            initial.extend(data[:len(TLS13_FIN_PROBE) - len(initial)])
                         peer.sendall(data)
                 except OSError as error:
                     if not self.stop.is_set() and not (isinstance(error, ConnectionResetError) and not self.trailer):
@@ -96,6 +105,7 @@ class Upstream:
         finally:
             self.thread.join(6)
         require(not self.thread.is_alive(), "upstream thread failed to join")
+        require(not self.errors, f"upstream errors after join: {self.errors}")
 
 
 class InnerTLS:
@@ -145,6 +155,32 @@ class InnerTLS:
             received.extend(chunk)
         require(bytes(received) == payload, "inner TLS plaintext mismatch")
         self.operation(self.ssl.unwrap)
+
+
+class DirectionalTLS13(InnerTLS):
+    """Verified outer TLS with independently observable write-side closure."""
+    def sendall(self, payload):
+        offset = 0
+        while offset < len(payload):
+            offset += self.operation(self.ssl.write, payload[offset:])
+
+    def recv(self, length):
+        try:
+            return self.operation(self.ssl.read, length)
+        except ssl.SSLZeroReturnError:
+            return b""
+
+    def finish_output(self):
+        try:
+            self.ssl.unwrap()
+        except ssl.SSLWantReadError:
+            require(self.outgoing.pending > 0, "missing local TLS close_notify")
+            self.flush()
+            return
+        raise RuntimeError("peer closed before directional reverse-data check")
+
+    def close(self):
+        self.peer.close()
 
 
 def exact(peer, length, prefix=b""):
@@ -201,7 +237,8 @@ def coordinate(args, frontend, transport, certificate, key):
     peer = None
     signal.alarm(40)
     try:
-        upstream = Upstream(b"AFTER-FIN" if transport == "tcp" else b"", certificate, key)
+        upstream = Upstream(b"AFTER-FIN" if transport == "tcp" else b"", certificate, key,
+                            directional_probe=transport == "tls13")
         command = [str(args.server), "--frontend", frontend, "--transport", transport,
                    "--upstream-port", str(upstream.port), "--cert", str(certificate), "--key", str(key)]
         (directory / "invocation.json").write_text(json.dumps(command, indent=2))
@@ -253,6 +290,22 @@ def coordinate(args, frontend, transport, certificate, key):
         inner.echo(bytes(range(256)) * 31)
         row["checks"].append("verified-inner-TLS13-with-coalesced-ClientHello")
         peer.close()
+        if transport == "tls13":
+            peer = socket.create_connection(("127.0.0.1", port), 5)
+            peer.settimeout(5)
+            peer = DirectionalTLS13(peer, certificate)
+            peer.operation(peer.ssl.do_handshake)
+            require(peer.ssl.version() == "TLSv1.3", "wrong directional outer TLS version")
+            event, prefix = request_head(peer, authority, TLS13_FIN_PROBE)
+            require(event.status_code == 200, "directional TLS CONNECT rejected")
+            require(exact(peer, len(TLS13_FIN_PROBE), prefix) == TLS13_FIN_PROBE,
+                    "directional TLS initial echo mismatch")
+            peer.finish_output()
+            # The upstream generates this trailer only after observing EOF.
+            require(exact(peer, 9) == b"AFTER-FIN", "TLS13 discarded reverse data after local close_notify")
+            require(peer.recv(1) == b"", "missing authenticated peer TLS close_notify")
+            row["checks"].append("outer-TLS13-half-close-preserves-reverse-before-peer-alert")
+            peer.close()
         peer = connect_socket(port, transport, certificate)
         event, _ = request_head(peer, "denied.example:443")
         require(event.status_code == 403, "unauthorized authority was accepted")
@@ -344,13 +397,14 @@ def main():
         for frontend, transport in coordinates[len(rows):]:
             rows.append({"frontend": frontend, "transport": transport, "success": False, "checks": [], "error": str(error)})
     summary = {"performance_eligible": False, "expected": 6, "passed": sum(row["success"] for row in rows),
-               "not_covered": ["TLS directional reverse-data-after-close", "backpressure stress"], "coordinates": rows}
+               "not_covered": ["TCP/TLS backpressure stress in this peer suite"], "coordinates": rows}
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     lines = ["# CONNECT interoperability", "", "Correctness checks only; performance_eligible=false.", "",
              "| Frontend | Transport | Result | Error |", "|---|---|---|---|"]
     lines += [f"| {r['frontend']} | {r['transport']} | {'PASS' if r['success'] else 'FAIL'} | {r['error'].replace('|', '/')} |" for r in rows]
     lines += ["", "Inner TLS 1.3 is verified independently over each outer transport.",
-              "Not covered: TLS reverse-data-after-close, backpressure stress."]
+              "Outer TLS1.3 reverse delivery after local close_notify is checked for both frontends.",
+              "TLS1.2 does not promise directional half-close. This peer suite does not stress backpressure; TCP has separate native unit coverage."]
     (args.output_dir / "summary.md").write_text("\n".join(lines) + "\n")
     return 0 if summary["passed"] == 6 else 1
 

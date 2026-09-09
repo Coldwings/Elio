@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <elio/http/http_tunnel_response.hpp>
+#include <elio/sync/event.hpp>
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -43,6 +44,84 @@ template<typename T> T immediate(coro::task<T> task) {
     if (!handle.done()) std::terminate();
     return task.await_resume();
 }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace {
+struct allocation_reader : tunnel_fake {
+    sync::event never;
+    bool entered = false, cleaned = false;
+    coro::task<io::io_result> read(void*, size_t, coro::cancel_token token) {
+        entered = true;
+        const auto result = co_await never.wait(token);
+        cleaned = true;
+        co_return io::io_result{result == coro::cancel_result::cancelled ? -ECANCELED : 0, 0};
+    }
+};
+void fail_tunnel_frame(void* context, http::detail::tunnel_frame frame) {
+    if (frame == *static_cast<http::detail::tunnel_frame*>(context)) throw std::bad_alloc();
+}
+}
+
+TEST_CASE("Tunnel task construction failure terminalizes and cancels an overlapping reader", "[http][tunnel][allocation]") {
+    using frame = http::detail::tunnel_frame;
+    for (auto site : {frame::read, frame::single_write, frame::vector_write, frame::finish}) {
+        allocation_reader fake;
+        auto stream = http::detail::tunnel_stream_access::create(fake);
+        char byte{};
+        auto reader = stream.read(&byte, 1);
+        auto handle = coro::detail::task_access::handle(reader);
+        handle.resume();
+        const bool parked = fake.entered && !handle.done();
+        stream.set_frame_test_hook(&site, fail_tunnel_frame);
+        bool threw = false;
+        try {
+            if (site == frame::read) (void)stream.read(&byte, 1);
+            else if (site == frame::single_write) (void)stream.write("x");
+            else if (site == frame::vector_write) {
+                iovec part{&byte, 1};
+                (void)stream.writev(std::span<const iovec>(&part, 1));
+            } else (void)stream.finish_output();
+        } catch (const std::bad_alloc&) { threw = true; }
+        // Standalone event cancellation resumes inline. Release the fake gate
+        // on regression so assertion failure never unwinds a live reader.
+        const bool cancelled_reader = handle.done();
+        if (!cancelled_reader) fake.never.set();
+        if (!handle.done()) std::terminate();
+        const auto read = reader.await_resume();
+        CHECK(parked);
+        CHECK(threw);
+        CHECK(cancelled_reader);
+        CHECK(stream.error() == ENOMEM);
+        CHECK(fake.cleaned);
+        CHECK(read.result == -ENOMEM);
+        CHECK(fake.wire.empty());
+    }
+}
+
+TEST_CASE("Tunnel scalar write reports nested operation frame allocation failure", "[http][tunnel][allocation]") {
+    allocation_reader fake;
+    auto stream = http::detail::tunnel_stream_access::create(fake);
+    char byte{};
+    auto reader = stream.read(&byte, 1);
+    auto handle = coro::detail::task_access::handle(reader);
+    handle.resume();
+    auto site = http::detail::tunnel_frame::vector_write;
+    stream.set_frame_test_hook(&site, fail_tunnel_frame);
+    const auto result = immediate(stream.write("x"));
+    const bool cancelled_reader = handle.done();
+    if (!cancelled_reader) fake.never.set();
+    if (!handle.done()) std::terminate();
+    const auto read = reader.await_resume();
+    CHECK(result.error == ENOMEM);
+    CHECK(cancelled_reader);
+    CHECK(result.accepted_bytes == 0);
+    CHECK_FALSE(result.uncertain_attempt);
+    CHECK(stream.error() == ENOMEM);
+    CHECK(fake.cleaned);
+    CHECK(read.result == -ENOMEM);
+    CHECK(fake.wire.empty());
+}
+#endif
 }
 
 TEST_CASE("Tunnel read-ahead is binary and consumed once before transport reads", "[http][tunnel]") {

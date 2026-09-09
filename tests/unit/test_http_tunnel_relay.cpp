@@ -17,9 +17,11 @@ struct relay_fake {
     sync::event read_entered, finish_entered, finish_release, close_done;
     std::atomic<bool> finished{false}, read_returned{false}, early_cancel{false};
     std::atomic<unsigned> reads{0};
+    int read_error = 0, write_error = 0;
 
     coro::task<io::io_result> read(void* buffer, size_t count, coro::cancel_token token) {
         reads.fetch_add(1);
+        if (read_error) co_return io::io_result{-read_error, 0};
         auto registration = token.on_cancel([this] {
             if (whole && !finished.load()) early_cancel.store(true);
         });
@@ -37,6 +39,7 @@ struct relay_fake {
         co_return io::io_result{static_cast<int32_t>(count), 0};
     }
     coro::task<io::io_result> write(const void* buffer, size_t count, coro::cancel_token token) {
+        if (write_error) co_return io::io_result{-write_error, 0};
         if (whole) co_return io::io_result{-ESHUTDOWN, 0};
         if (token.is_cancelled()) co_return io::io_result{-ECANCELED, 0};
         count = std::min<size_t>(count, 1);
@@ -134,6 +137,64 @@ TEST_CASE("Tunnel relay joins whole-session close before cancelling its reader",
     CHECK_FALSE(client.early_cancel.load());
     CHECK(result.upstream_to_client.accepted_bytes == 0);
     CHECK(result.upstream_to_client.uncertain_write);
+}
+
+TEST_CASE("Tunnel relay preserves write failure through inline reader cancellation", "[http][tunnel][relay]") {
+    relay_fake client, upstream;
+    client.held_read = true;
+    client.write_error = EIO;
+    upstream.input = "x";
+    auto client_view = http::detail::tunnel_stream_access::create(client);
+    auto upstream_view = http::detail::tunnel_stream_access::create(upstream);
+    http::detail::tunnel_relay_state state;
+    char outbound[2]{}, inbound[2]{};
+    auto first = http::detail::relay_direction(&state, &client_view, &upstream_view,
+        outbound, sizeof(outbound), &state.result.client_to_upstream);
+    auto first_handle = coro::detail::task_access::handle(first);
+    first_handle.resume();
+    const bool parked = !first_handle.done();
+    auto second = http::detail::relay_direction(&state, &upstream_view, &client_view,
+        inbound, sizeof(inbound), &state.result.upstream_to_client);
+    auto second_handle = coro::detail::task_access::handle(second);
+    // Without a scheduler, the fake event resumes cancellation inline. The
+    // reader therefore selects the relay result before the failed write returns.
+    second_handle.resume();
+    if (!first_handle.done() || !second_handle.done()) std::terminate();
+    first.await_resume(); second.await_resume();
+    CHECK(parked);
+    CHECK(state.result.end == tunnel_end::transport_error);
+    CHECK(state.result.error == EIO);
+    CHECK(client.read_returned.load());
+    CHECK(state.result.upstream_to_client.source_bytes == 1);
+    CHECK(state.result.upstream_to_client.accepted_bytes == 0);
+    CHECK(state.result.upstream_to_client.uncertain_write);
+}
+
+TEST_CASE("Tunnel relay preserves read failure through inline finish cancellation", "[http][tunnel][relay]") {
+    relay_fake client, upstream;
+    upstream.whole = true;
+    upstream.read_error = EIO;
+    auto client_view = http::detail::tunnel_stream_access::create(client);
+    auto upstream_view = http::detail::tunnel_stream_access::create(upstream);
+    http::detail::tunnel_relay_state state;
+    char outbound[2]{}, inbound[2]{};
+    auto first = http::detail::relay_direction(&state, &client_view, &upstream_view,
+        outbound, sizeof(outbound), &state.result.client_to_upstream);
+    auto first_handle = coro::detail::task_access::handle(first);
+    first_handle.resume();
+    const bool parked = !first_handle.done();
+    auto second = http::detail::relay_direction(&state, &upstream_view, &client_view,
+        inbound, sizeof(inbound), &state.result.upstream_to_client);
+    auto second_handle = coro::detail::task_access::handle(second);
+    second_handle.resume();
+    if (!first_handle.done() || !second_handle.done()) std::terminate();
+    first.await_resume(); second.await_resume();
+    CHECK(parked);
+    CHECK(state.result.end == tunnel_end::transport_error);
+    CHECK(state.result.error == EIO);
+    CHECK_FALSE(upstream.finished.load());
+    CHECK(state.result.client_to_upstream.source_bytes == 0);
+    CHECK(state.result.upstream_to_client.source_bytes == 0);
 }
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS

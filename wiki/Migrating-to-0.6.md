@@ -28,6 +28,10 @@ parser loops with the scoped `tunnel_stream` callback. The server writes the
 head first and supplies captured binary read-ahead exactly once. Keep payloads,
 descriptors and the view alive through joined operations; full tunnel writes
 report confirmed bytes plus uncertainty on failure, not a replayable suffix.
+Handle task-construction exceptions as well as awaited results: tunnel operation
+entry can throw before returning a task. It still terminalizes the view and
+requests cancellation of overlapping work. After catching, join that work before
+releasing its borrowed buffers; do not resume tunnel I/O or destroy live frames.
 Use the optional two-buffer `relay()` only after applying application-specific
 authorization and upstream connection policy. See
 [CONNECT handoff](HTTP-Streaming.md#connect-tunnel-handoff) and

@@ -2983,6 +2983,16 @@ borrowed through cleanup; there is no aggregate plaintext output buffer or
 automatic replay. `success()` on `tunnel_result` recognizes `completed` and
 `session_closed`; neither means peer receipt or complete reverse forwarding.
 
+`read`, `write`, `writev` and `finish_output` can throw before returning a task
+if coroutine-frame construction fails. Their entry wrappers first make the view
+terminal (`ENOMEM` for allocation failure, otherwise `EIO`) and request sibling
+cancellation, then rethrow. Catching that exception does not make the view reusable:
+still join every overlapping task before releasing its buffers or returning from
+the session. A scalar write whose nested vector-operation frame fails after its
+task has started instead returns a structured failure with no accepted bytes or
+uncertain transport attempt. These guarantees do not promise progress under
+arbitrary memory exhaustion or permit forced coroutine-frame destruction.
+
 The optional relay owns two fixed buffers and joins both directional tasks on
 every exit, including launch failure. Normal directional EOF preserves reverse
 traffic. Whole-session EOF/finish coordinates normal closure before internal

@@ -77,6 +77,9 @@ or return a terminal error with `accepted_bytes` and `uncertain_attempt`.
 Confirmed positive progress is retained. An attempted but unconfirmed suffix
 is not known to be lost, so do not replay it automatically. Completion means
 local transport acceptance, not peer application receipt.
+Failed reads and output finish report the view's first terminal error, so
+cancellation used to clean up a sibling does not hide the original failure.
+Successful positive read/write progress remains available for accounting.
 
 Handoff does not materialize tunnel plaintext as an HTTP body or aggregate
 write payloads. The parser prefix was already captured and is moved into the
@@ -85,6 +88,15 @@ own cryptographic buffers and bounded ciphertext staging. This is not a claim
 of zero-copy TLS or zero allocation.
 
 ### Optional Bounded Relay
+
+Tunnel `read`, `write`, `writev` and `finish_output` entries may throw before a
+task is returned if frame construction fails. They first retain a terminal error
+and request sibling cancellation. Catching the exception cannot restore the
+view: join overlapping work before releasing its buffers or ending the callback.
+An allocation failure creating the nested vector operation inside an already
+started scalar write is returned as a structured `ENOMEM` failure, with zero
+accepted bytes and no uncertain transport attempt. Cancellation remains
+cooperative; neither failure form permits destruction of live coroutine frames.
 
 `relay(tunnel_stream&, net::stream&, relay_options{}, token)` uses exactly two
 fixed payload buffers, each `relay_options::buffer_size` bytes (64 KiB by

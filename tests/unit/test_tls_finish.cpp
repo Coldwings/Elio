@@ -206,6 +206,104 @@ TEST_CASE("TLS 1.3 write finish retains the reverse reader without a close timer
     });
 }
 
+TEST_CASE("TLS 1.3 tiny reads retain the payload tail across peer finish and reverse writes",
+          "[tls][finish][issue-1217]") {
+    finish_backends([](backend_type backend) {
+        finish_fixture fixture(backend, tls::tls_version::tls_1_3);
+        std::array<char, 257> payload{};
+        for (size_t i = 0; i < payload.size(); ++i)
+            payload[i] = static_cast<char>(i % 127);
+        std::array<char, 257> received{};
+        std::array<char, 2> reverse{};
+        sync::event peer_finished;
+        net::write_finish_result peer_end, local_end;
+        io::io_result first_read{}, local_eof{}, peer_eof{};
+        std::array<io::io_result, 2> reverse_writes{};
+        size_t sent = 0, consumed = 0, reverse_consumed = 0;
+        bool peer_threw = false, local_threw = false;
+        fixture.run([&]() -> coro::task<void> {
+            std::optional<coro::join_handle<void>> peer;
+            auto peer_work = [&]() -> coro::task<void> {
+                try {
+                    while (sent < payload.size()) {
+                        const auto result = co_await fixture.client->write(
+                            payload.data() + sent, payload.size() - sent,
+                            fixture.cancel.get_token());
+                        if (result.result <= 0) { fixture.abort(); break; }
+                        sent += static_cast<size_t>(result.result);
+                    }
+                    peer_end = co_await fixture.client->finish_write(fixture.cancel.get_token());
+                    // Both application ciphertext and the real close_notify
+                    // have flushed before the receiver starts its tiny reads.
+                    peer_finished.set();
+                    while (reverse_consumed < reverse.size()) {
+                        const auto result = co_await fixture.client->read(
+                            reverse.data() + reverse_consumed, 1, fixture.cancel.get_token());
+                        if (result.result <= 0) { fixture.abort(); break; }
+                        reverse_consumed += static_cast<size_t>(result.result);
+                    }
+                    char extra = 0;
+                    peer_eof = co_await fixture.client->read(&extra, 1, fixture.cancel.get_token());
+                } catch (...) {
+                    peer_threw = true;
+                    fixture.abort();
+                    peer_finished.set();
+                }
+            };
+            try {
+                peer.emplace(elio::spawn(peer_work()));
+                const auto ready = co_await peer_finished.wait(fixture.cancel.get_token());
+                if (ready == coro::cancel_result::cancelled) {
+                    fixture.abort();
+                } else {
+                    first_read = co_await fixture.server->read(
+                        received.data(), 1, fixture.cancel.get_token());
+                    if (first_read.result > 0) consumed = static_cast<size_t>(first_read.result);
+                    // Interleave a local SSL_write while the peer's payload
+                    // remains only partly consumed, then write again after EOF.
+                    reverse_writes[0] = co_await fixture.server->write(
+                        "a", 1, fixture.cancel.get_token());
+                    while (consumed < received.size()) {
+                        const auto result = co_await fixture.server->read(
+                            received.data() + consumed, 1, fixture.cancel.get_token());
+                        if (result.result <= 0) { fixture.abort(); break; }
+                        consumed += static_cast<size_t>(result.result);
+                    }
+                    char extra = 0;
+                    local_eof = co_await fixture.server->read(&extra, 1, fixture.cancel.get_token());
+                    reverse_writes[1] = co_await fixture.server->write(
+                        "b", 1, fixture.cancel.get_token());
+                    local_end = co_await fixture.server->finish_write(fixture.cancel.get_token());
+                }
+            } catch (...) {
+                local_threw = true;
+                fixture.abort();
+            }
+            if (peer) co_await std::move(*peer);
+        });
+        REQUIRE_FALSE(peer_threw);
+        REQUIRE_FALSE(local_threw);
+        REQUIRE(sent == payload.size());
+        REQUIRE(peer_end.error == 0);
+        REQUIRE(peer_end.scope == net::close_scope::write_direction);
+        REQUIRE(peer_end.local_end_flushed);
+        REQUIRE(first_read.result == 1);
+        REQUIRE(consumed == payload.size());
+        REQUIRE(received == payload);
+        REQUIRE(local_eof.result == 0);
+        REQUIRE(reverse_writes[0].result == 1);
+        REQUIRE(reverse_writes[1].result == 1);
+        REQUIRE(reverse_consumed == reverse.size());
+        REQUIRE(reverse[0] == 'a');
+        REQUIRE(reverse[1] == 'b');
+        REQUIRE(local_end.error == 0);
+        REQUIRE(local_end.scope == net::close_scope::write_direction);
+        REQUIRE(local_end.local_end_flushed);
+        REQUIRE(local_end.peer_end_observed);
+        REQUIRE(peer_eof.result == 0);
+    });
+}
+
 TEST_CASE("TLS 1.2 write finish and concurrent read share automatic session closure",
           "[tls][finish][issue-1217]") {
     finish_backends([](backend_type backend) {

@@ -212,7 +212,9 @@ size_t request_content_length(std::string_view headers) {
 void require_websocket_handshake_response_rejected(
     const std::function<std::string(std::string_view)>& make_response,
     int expected_errno = EBADMSG,
-    elio::http::websocket::client_config cfg = {}) {
+    elio::http::websocket::client_config cfg = {},
+    bool invalid_first_frame = false,
+    bool require_receive_rejection = false) {
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
     REQUIRE(listener.has_value());
     uint16_t port = listener->local_address().port();
@@ -226,10 +228,17 @@ void require_websocket_handshake_response_rejected(
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_failed{false};
     std::atomic<int> client_errno{0};
+    std::atomic<bool> client_closed{false};
+    std::atomic<bool> rejected_during_receive{false};
+    std::atomic<int> observed_close_code{0};
+    elio::sync::event client_finished;
+    elio::coro::cancel_source cleanup;
     request_read_observation request_observation;
+    elio::io::io_result response_write{-EINPROGRESS, 0};
+    size_t response_size = 0;
 
     sched.go([&]() -> task<void> {
-        auto stream = co_await listener->accept();
+        auto stream = co_await listener->accept(cleanup.get_token());
         server_accepted = stream.has_value();
         if (!stream) {
             server_done = true;
@@ -245,8 +254,33 @@ void require_websocket_handshake_response_rejected(
 
         auto accept = elio::http::websocket::compute_websocket_accept(key);
         auto response = make_response(accept);
-        co_await stream->write(response);
-        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        response_size = response.size();
+        response_write = co_await stream->write_exactly(response, cleanup.get_token());
+        if (response_write.result == static_cast<ssize_t>(response_size)) {
+            co_await client_finished.wait(cleanup.get_token());
+            if (invalid_first_frame && !cleanup.is_cancelled()) {
+                elio::http::websocket::frame_parser close_parser;
+                close_parser.set_role(elio::http::websocket::endpoint_role::server);
+                char close_bytes[128];
+                while (!close_parser.next_frame_is_control_frame()) {
+                    auto r = co_await stream->read(
+                        close_bytes, sizeof(close_bytes), cleanup.get_token());
+                    if (r.result <= 0) break;
+                    if (close_parser.parse(
+                            reinterpret_cast<const uint8_t*>(close_bytes),
+                            static_cast<size_t>(r.result)) < 0) break;
+                }
+                auto frame = close_parser.get_next_control_frame();
+                if (frame && frame->first == elio::http::websocket::opcode::close &&
+                    frame->second.size() == 2) {
+                    // Inspect the actual wire code: parse_close_payload maps
+                    // malformed payloads to protocol_error as well.
+                    observed_close_code =
+                        (static_cast<unsigned char>(frame->second[0]) << 8) |
+                        static_cast<unsigned char>(frame->second[1]);
+                }
+            }
+        }
         stream->shutdown_socket();
         server_done = true;
     });
@@ -255,18 +289,25 @@ void require_websocket_handshake_response_rejected(
         cfg.read_timeout = std::chrono::seconds(2);
         elio::http::websocket::ws_client client(cfg);
 
-        bool ok = co_await client.connect(make_ws_url(port));
+        bool ok = co_await client.connect(make_ws_url(port), cleanup.get_token());
         if (!ok) {
             client_failed = true;
             client_errno = errno;
+        } else if (invalid_first_frame) {
+            auto message = co_await client.receive(cleanup.get_token());
+            rejected_during_receive = !message.has_value();
+            client_failed = !message.has_value();
         }
+        client_closed = client.state() == elio::http::websocket::connection_state::closed;
         client_done = true;
+        client_finished.set();
     });
 
     for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    cleanup.cancel();
     sched.shutdown();
 
     INFO("handshake rejected helper: port=" << port
@@ -275,6 +316,9 @@ void require_websocket_handshake_response_rejected(
          << " key_present=" << server_key_present.load()
          << " client_done=" << client_done.load()
          << " client_failed=" << client_failed.load()
+         << " rejected_during_receive=" << rejected_during_receive.load()
+         << " client_closed=" << client_closed.load()
+         << " close_code=" << observed_close_code.load()
          << " client_errno=" << client_errno.load()
          << " expected_errno=" << expected_errno);
     // The release/acquire publication through server_done makes non-atomic
@@ -286,15 +330,31 @@ void require_websocket_handshake_response_rejected(
             " flags=" + std::to_string(request_observation.last_read.flags) +
             " headers_complete=" + std::to_string(request_observation.headers_complete) +
             " bytes=" + std::to_string(request_observation.bytes.size()) +
-            " preview=" + escaped_request_preview(request_observation.bytes);
+            " preview=" + escaped_request_preview(request_observation.bytes) +
+            " response_bytes=" + std::to_string(response_size) +
+            " write_result=" + std::to_string(response_write.result) +
+            " write_flags=" + std::to_string(response_write.flags);
     }
     INFO(request_diagnostic);
     REQUIRE(client_done);
     REQUIRE(server_done);
     REQUIRE(server_accepted);
     REQUIRE(server_key_present);
+    REQUIRE(response_write.result == static_cast<ssize_t>(response_size));
     REQUIRE(client_failed);
-    REQUIRE(client_errno == expected_errno);
+    REQUIRE(client_closed);
+    if (rejected_during_receive) {
+        REQUIRE(invalid_first_frame);
+    } else {
+        REQUIRE(client_errno == expected_errno);
+    }
+    if (invalid_first_frame) {
+        REQUIRE(observed_close_code == static_cast<int>(
+            elio::http::websocket::close_code::protocol_error));
+    }
+    if (require_receive_rejection) {
+        REQUIRE(rejected_during_receive);
+    }
 }
 
 void require_websocket_handshake_response_accepted(
@@ -313,9 +373,13 @@ void require_websocket_handshake_response_accepted(
     std::atomic<bool> client_done{false};
     std::atomic<bool> client_connected{false};
     std::atomic<int> client_errno{0};
+    elio::sync::event client_finished;
+    elio::coro::cancel_source cleanup;
+    elio::io::io_result response_write{-EINPROGRESS, 0};
+    size_t response_size = 0;
 
     sched.go([&]() -> task<void> {
-        auto stream = co_await listener->accept();
+        auto stream = co_await listener->accept(cleanup.get_token());
         server_accepted = stream.has_value();
         if (!stream) {
             server_done = true;
@@ -331,8 +395,11 @@ void require_websocket_handshake_response_accepted(
 
         auto accept = elio::http::websocket::compute_websocket_accept(key);
         auto response = make_response(accept);
-        co_await stream->write(response);
-        co_await elio::time::sleep_for(std::chrono::milliseconds(100));
+        response_size = response.size();
+        response_write = co_await stream->write_exactly(response, cleanup.get_token());
+        if (response_write.result == static_cast<ssize_t>(response_size)) {
+            co_await client_finished.wait(cleanup.get_token());
+        }
         stream->shutdown_socket();
         server_done = true;
     });
@@ -341,24 +408,30 @@ void require_websocket_handshake_response_accepted(
         cfg.read_timeout = std::chrono::seconds(2);
         elio::http::websocket::ws_client client(cfg);
 
-        bool ok = co_await client.connect(make_ws_url(port));
+        bool ok = co_await client.connect(make_ws_url(port), cleanup.get_token());
         client_connected = ok;
         if (!ok) {
             client_errno = errno;
         }
         client_done = true;
+        client_finished.set();
     });
 
     for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    cleanup.cancel();
     sched.shutdown();
 
     REQUIRE(client_done);
     REQUIRE(server_done);
     REQUIRE(server_accepted);
     REQUIRE(server_key_present);
+    INFO("response bytes=" << response_size
+         << " write_result=" << response_write.result
+         << " write_flags=" << response_write.flags);
+    REQUIRE(response_write.result == static_cast<ssize_t>(response_size));
     REQUIRE(client_connected);
     REQUIRE(client_errno == 0);
 }
@@ -1057,7 +1130,7 @@ TEST_CASE("WebSocket client rejects invalid pipelined first frame after handshak
                     reinterpret_cast<const char*>(masked_server_frame.data()),
                     masked_server_frame.size());
                 return response;
-            });
+            }, EBADMSG, {}, true);
     }
 
     SECTION("partial invalid opcode") {
@@ -1072,8 +1145,29 @@ TEST_CASE("WebSocket client rejects invalid pipelined first frame after handshak
                 response += "\r\n\r\n";
                 response.push_back(static_cast<char>(0x83));
                 return response;
-            });
+            }, EBADMSG, {}, true);
     }
+}
+
+TEST_CASE("WebSocket client rejects invalid first frame with one-byte reads",
+          "[websocket][client][handshake][security][regression]") {
+    elio::http::websocket::client_config cfg;
+    // Each HTTP header byte is read separately, so connect() cannot consume
+    // the invalid frame byte as a buffered HTTP-parser tail.
+    cfg.read_buffer_size = 1;
+    require_websocket_handshake_response_rejected(
+        [](std::string_view accept) {
+            std::string response =
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Accept: ";
+            response += accept;
+            response += "\r\n\r\n";
+            response.push_back(static_cast<char>(0x83));
+            return response;
+        },
+        EBADMSG, cfg, true, true);
 }
 
 TEST_CASE("WebSocket client clears parser state between connection attempts",

@@ -85,6 +85,25 @@ kernel copies, and coroutine/control allocations remain separate costs. This
 contract does not claim allocation-free writes or one syscall/chunk/record per
 logical write. No hidden queue retains body bytes between calls.
 
+### Extension Boundaries
+
+The initial writer accepts borrowed memory, not file ranges. A producer can
+currently read a file into a bounded reusable buffer and await each write.
+Direct file transfer remains a future transport capability, not a promise of
+this release. Its design boundary is a writer operation carrying an owned or
+borrowed file handle plus explicit offset/count, dispatched to a capable
+transport or an explicitly bounded fallback. It must share the existing length
+accounting, framing, deadline arbitration and cleanup-before-return rules;
+it must not bypass the writer by writing raw bytes to its underlying socket.
+TLS and unsupported backends must not silently claim a zero-copy path. This
+extension does not require changing producer ownership or adding a detached
+send queue; the exact public signature remains deferred.
+
+Outgoing trailers are also deferred: the server emits the normal empty trailer
+section when it successfully finishes a chunked response. Setting a `Trailer`
+header does not supply trailer values or create a trailer callback. Receive-side
+trailer parsing is a separate capability and does not imply a sending API.
+
 `stop()` cooperatively cancels HTTP sessions and producers; a producer ignoring
 its token cannot be safely forcibly destroyed. Before destroying a server or its
 TLS context, request stop, await all listener tasks, and then wait for active

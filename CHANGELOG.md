@@ -57,6 +57,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SSE responses stream again (close-delimited opt-out)**: the #1158/#1161
+  empty-body `Content-Length: 0` pin also fired for `sse::build_sse_response()`,
+  whose body is intentionally empty at header time — the pinned
+  `Content-Length: 0` made peers treat the SSE response as complete at the
+  header boundary and every streamed event became trailing garbage,
+  silently breaking SSE. `http::response` gains an explicit opt-in
+  close-delimited framing marker, `set_close_delimited()` /
+  `close_delimited()`: when set, serialization skips the `Content-Length: 0`
+  pin and emits no framing headers, so the body runs until connection close
+  (RFC 9112 §6.3 item 8) and keep-alive reuse is impossible. The marker is
+  strictly opt-in — the empty-200, 205, and CONNECT framing rules are
+  unchanged. `sse::build_sse_response()` now sets the marker and honestly
+  advertises `Connection: close` instead of `keep-alive`; the HTTP server
+  honors the response `Connection` header, and the response parser plus HTTP
+  client already handle close-delimited responses (complete only at EOF,
+  never pooled) (#1177, regression introduced by #1158/#1161).
 - **WebSocket client handshake interim-1xx tolerance**: `ws_client` now
   skips interim 1xx responses (for example `100 Continue`) that precede the
   `101 Switching Protocols` upgrade response, under a cumulative byte cap,

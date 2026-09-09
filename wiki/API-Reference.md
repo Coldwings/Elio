@@ -2812,10 +2812,23 @@ public:
     void set_body(std::string_view body);
     void set_body(std::string&& body);
     void set_content_type(std::string_view type);
+    void set_close_delimited(bool v = true) noexcept;
+    bool close_delimited() const noexcept;
 };
 ```
 
 `set_version()` follows the same validation rules as `request::set_version()`.
+
+`set_close_delimited()` opts the response into close-delimited body framing
+(RFC 9112 §6.3 item 8): serialization then emits no framing headers — the
+automatic `Content-Length: 0` pin for an empty body is skipped and no
+`Transfer-Encoding` is injected — so the body runs until connection close
+and keep-alive reuse of the connection is impossible. It is intended for
+streaming responses such as SSE (`sse::build_sse_response()` sets it). Pair
+it with an explicit `Connection: close` header via `set_header()`;
+serialization deliberately never writes the `Connection` header itself. The
+marker does not override the framing rules of body-forbidden statuses
+(1xx/204/304/205) or 2xx responses to CONNECT.
 
 ### HTTP Enums
 

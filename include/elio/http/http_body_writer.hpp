@@ -34,6 +34,10 @@ inline thread_local std::function<void()>* next_body_write_timeout_for_test = nu
 inline void capture_next_body_write_timeout_for_test(std::function<void()>& expire) {
     next_body_write_timeout_for_test = &expire;
 }
+inline thread_local std::function<void()>* next_body_write_internal_error_for_test = nullptr;
+inline void capture_next_body_write_internal_error_for_test(std::function<void()>& fail) {
+    next_body_write_internal_error_for_test = &fail;
+}
 enum class body_write_allocation_site { none, single_frame, operation_frame, arbitration, session_registration, operation_registration };
 inline thread_local body_write_allocation_site fail_body_write_allocation_for_test = body_write_allocation_site::none;
 inline void body_write_allocation_checkpoint_for_test(body_write_allocation_site site) {
@@ -82,6 +86,10 @@ private:
         }
         void interrupt(winner value) {
             if (claim(value)) stop_io.cancel();
+        }
+        void watchdog_failed(int error) {
+            failure_errno.store(error, std::memory_order_relaxed);
+            interrupt(winner::error);
         }
     };
 
@@ -203,13 +211,15 @@ private:
             if (auto* hook = std::exchange(detail::next_body_write_timeout_for_test, nullptr)) {
                 *hook = [state] { state->interrupt(winner::timed_out); };
             }
+            if (auto* hook = std::exchange(detail::next_body_write_internal_error_for_test, nullptr)) {
+                *hook = [state] { state->watchdog_failed(ENOMEM); };
+            }
 #endif
             if (timed) {
                 stop_watchdog.emplace();
                 auto* scheduler = runtime::scheduler::current();
                 if (!scheduler) {
-                    transport_error = ENOTSUP;
-                    state->claim(winner::error);
+                    if (state->claim(winner::error)) transport_error = ENOTSUP;
                 } else {
                     watchdog.emplace(scheduler->go_joinable(
                         [state, deadline, stop = stop_watchdog->get_token()]() -> coro::task<void> {
@@ -217,10 +227,9 @@ private:
                                 auto result = co_await time::sleep_for(deadline - std::chrono::steady_clock::now(), stop);
                                 if (result == coro::cancel_result::completed) state->interrupt(winner::timed_out);
                             } catch (const std::bad_alloc&) {
-                                state->failure_errno.store(ENOMEM, std::memory_order_relaxed);
-                                state->interrupt(winner::error);
+                                state->watchdog_failed(ENOMEM);
                             } catch (...) {
-                                state->interrupt(winner::error);
+                                state->watchdog_failed(EIO);
                             }
                         }));
                 }
@@ -268,15 +277,13 @@ private:
                     auto sent = co_await transport_(stream_, vectors.data() + first, count - first, state->stop_io.get_token());
                     if (sent.result < 0) {
                         if (sent.result == -EINTR) continue;
-                        transport_error = sent.error_code();
                         // Readiness-aware transports must consume EAGAIN
                         // internally. Retrying it here would busy-poll.
-                        state->claim(winner::error);
+                        if (state->claim(winner::error)) transport_error = sent.error_code();
                         break;
                     }
                     if (sent.result == 0) {
-                        transport_error = EPIPE;
-                        state->claim(winner::error);
+                        if (state->claim(winner::error)) transport_error = EPIPE;
                         break;
                     }
                     size_t progress = static_cast<size_t>(sent.result);
@@ -289,8 +296,7 @@ private:
                         if (vectors[first].iov_len == 0) ++first;
                     }
                     if (progress) {
-                        transport_error = EIO;
-                        state->claim(winner::error);
+                        if (state->claim(winner::error)) transport_error = EIO;
                         break;
                     }
                 }
@@ -299,11 +305,9 @@ private:
             if (timed && std::chrono::steady_clock::now() >= deadline) state->interrupt(winner::timed_out);
             state->claim(winner::success);
         } catch (const std::bad_alloc&) {
-            transport_error = ENOMEM;
-            if (state) state->claim(winner::error);
+            if (!state || state->claim(winner::error)) transport_error = ENOMEM;
         } catch (...) {
-            transport_error = EIO;
-            if (state) state->claim(winner::error);
+            if (!state || state->claim(winner::error)) transport_error = EIO;
         }
         // Neither a winner nor cancellation authorizes asynchronous frame
         // destruction. Every transport await above completed before this join.
@@ -313,8 +317,7 @@ private:
             catch (...) {
                 // Preserve any terminal winner, including success; a late
                 // watchdog cleanup failure cannot undo wire completion.
-                state->claim(winner::error);
-                transport_error = EIO;
+                if (state->claim(winner::error)) transport_error = EIO;
             }
         }
         session_registration = {};

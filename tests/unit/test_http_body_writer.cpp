@@ -5,6 +5,7 @@
 #include <deque>
 #include <functional>
 #include <future>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -356,6 +357,48 @@ TEST_CASE("body writer coroutine frame failures stay terminal even if producer c
             REQUIRE(stream.calls == 0);
             REQUIRE(stream.wire.empty());
         }
+    }
+}
+
+TEST_CASE("body writer preserves winning internal error through transport cleanup",
+          "[http][body_writer]") {
+    for (const int mode : {0, 1, 2, 3, 4, 5}) {
+        CAPTURE(mode);
+        controlled_body_stream stream;
+        auto writer = http::detail::body_writer_access::create(stream, body_plan(3));
+        open_writer(writer, stream);
+        stream.hold = true;
+        const int cleanup_results[]{-ECANCELED, -EIO, 0, 3, 0, 0};
+        stream.results = {cleanup_results[mode]};
+        stream.before_completion = [mode] {
+            if (mode == 4) throw std::bad_alloc();
+            if (mode == 5) throw std::runtime_error("cleanup failure");
+        };
+        std::function<void()> fail;
+        http::detail::capture_next_body_write_internal_error_for_test(fail);
+        const std::string bytes = "abc";
+        auto operation = writer.write(bytes);
+        auto handle = coro::detail::task_access::handle(operation);
+        handle.resume();
+        REQUIRE_FALSE(handle.done());
+        REQUIRE(stream.pending);
+        REQUIRE(fail);
+        fail();
+        REQUIRE(stream.cancelled);
+        REQUIRE_FALSE(handle.done());
+        REQUIRE_FALSE(stream.cleaned);
+        REQUIRE(stream.pending_vectors[0].iov_base == bytes.data());
+        stream.pending.resume();
+        REQUIRE(handle.done());
+        const auto result = operation.await_resume();
+        REQUIRE(result.error == send_errc::transport_error);
+        REQUIRE(result.transport_error == ENOMEM);
+        REQUIRE(result.confirmed_body_bytes == (mode == 3 ? 3 : 0));
+        REQUIRE(stream.cleaned);
+        REQUIRE(stream.calls == 1);
+        REQUIRE(run_body_operation(
+            http::detail::body_writer_access::finish(writer)).transport_error == ENOMEM);
+        REQUIRE(stream.calls == 1);
     }
 }
 

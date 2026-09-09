@@ -177,8 +177,14 @@ streaming_response make_streaming_response(Producer&& producer) {
         [owned = std::forward<Producer>(producer)](
             body_writer& writer, coro::cancel_token token) mutable -> coro::task<send_result> {
             auto events = detail::event_writer_access::create(writer);
-            const auto produced = co_await std::invoke(owned, events, std::move(token));
-            co_return events.result().success() ? produced : events.result();
+            try {
+                const auto produced = co_await std::invoke(owned, events, std::move(token));
+                co_return events.result().success() ? produced : events.result();
+            } catch (...) {
+                // A later producer exception cannot replace the first sink failure.
+                if (events.result().success()) throw;
+                co_return events.result();
+            }
         });
 }
 

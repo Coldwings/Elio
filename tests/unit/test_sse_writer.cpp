@@ -9,6 +9,7 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -186,6 +187,43 @@ TEST_CASE("SSE writer invalid fields fail before event output and stay terminal"
     REQUIRE(second.error == first.error);
     REQUIRE(sent.result.error == first.error);
     REQUIRE_FALSE(sent.reusable);
+    const auto end = transport.wire.find("\r\n\r\n");
+    REQUIRE(end != std::string::npos);
+    REQUIRE(transport.wire.size() == end + 4);
+}
+
+TEST_CASE("SSE factory preserves recorded failure when producer throws",
+          "[http][sse][sse_writer]") {
+    const int mode = GENERATE(0, 1, 2);
+    sse_test_transport transport;
+    send_result first;
+    size_t calls_before_throw = 0;
+    reply selected = sse::make_streaming_response(
+        [&](sse::event_writer& out, elio::coro::cancel_token token)
+            -> elio::coro::task<send_result> {
+            if (mode == 1) {
+                first = co_await out.send_event({"bad\nid", {}, "discard"}, token);
+            } else if (mode == 2) {
+                first = co_await out.send_event({{}, "bad\ntype", "discard"}, token);
+            }
+            calls_before_throw = transport.calls;
+            throw std::runtime_error("producer failed after optional sink failure");
+        });
+    const auto sent = complete_sse_task(
+        send_response(transport, selected, method::GET, "HTTP/1.1", true));
+    if (mode == 0) {
+        REQUIRE(first.success());
+        REQUIRE(sent.result.error == send_errc::producer_error);
+        REQUIRE(sent.result.transport_error == 0);
+    } else {
+        REQUIRE(first.error == send_errc::invalid_response);
+        REQUIRE(first.transport_error == EINVAL);
+        REQUIRE(sent.result.error == first.error);
+        REQUIRE(sent.result.transport_error == first.transport_error);
+    }
+    REQUIRE_FALSE(sent.reusable);
+    REQUIRE(sent.result.confirmed_body_bytes == 0);
+    REQUIRE(transport.calls == calls_before_throw);
     const auto end = transport.wire.find("\r\n\r\n");
     REQUIRE(end != std::string::npos);
     REQUIRE(transport.wire.size() == end + 4);

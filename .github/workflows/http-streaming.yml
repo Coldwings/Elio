@@ -220,7 +220,7 @@ jobs:
           PY
       - name: Retain peer evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: http-streaming-peer
           path: http-peer-results/
@@ -268,7 +268,7 @@ jobs:
           fi
       - name: Retain real transport evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: http-streaming-transport-metrics
           path: |

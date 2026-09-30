@@ -327,7 +327,7 @@ their corresponding feature targets.
   `rpc_client_example.cpp`, `async_file_io.cpp`, `positional_file_io.cpp`,
   `file_persistence.cpp`
 - **HTTP/TLS protocols** (`elio_http` / `elio_http2`): `http_server.cpp`,
-  `http_client.cpp`, `http2_client.cpp`, `websocket_server.cpp`,
+  `http_client.cpp`, `http_client_result.cpp`, `http2_client.cpp`, `websocket_server.cpp`,
   `websocket_client.cpp`, `sse_server.cpp`, `sse_client.cpp`, `http_connect_proxy.cpp`
 - **RDMA** (`elio_rdma`, `elio_rdma_ibverbs`, `elio_rdma_cm`,
   `elio_rdma_cuda`): `rdma_pingpong_mock.cpp`, `rdma_req_resp_ibverbs.cpp`,

@@ -2802,6 +2802,14 @@ public:
     /* awaitable */ send(request& req, const url& target);
     /* awaitable */ send(request& req, const url& target, coro::cancel_token token);
 
+    coro::task<client_result<response>> get_result(
+        std::string_view url, coro::cancel_token token = {});
+    coro::task<client_result<response>> request_result(
+        method m, std::string_view url, std::string_view body = {},
+        std::string_view content_type = {}, coro::cancel_token token = {});
+    coro::task<client_result<response>> send_result(
+        request& req, const url& target, coro::cancel_token token = {});
+
     // Configure TLS and client options
     tls::tls_context& tls_context() noexcept;
     client_config& config() noexcept;
@@ -2819,6 +2827,65 @@ public:
                      coro::cancel_token token,
                      std::string_view content_type = mime::application_form_urlencoded);
 ```
+
+#### Owned HTTP Client Errors
+
+Opt in by replacing `get()` with `get_result()`, `send()` with `send_result()`,
+or using `request_result()` for any supported method. The content type is not
+automatically chosen by `request_result()`; pass it when required. Existing
+optional-returning methods retain their signatures and map a failed value to
+an empty optional plus `errno`. Capture that legacy errno immediately.
+
+```cpp
+enum class client_stage {
+    target, resolve, acquire, connect, tls, request, headers, body, framing
+};
+struct client_error {
+    std::error_code code;
+    client_stage stage;
+};
+template<class T> using client_result = std::variant<T, client_error>;
+
+auto result = co_await c.get_result(endpoint, token);
+if (auto* failure = std::get_if<client_error>(&result)) {
+    report_failure(failure->stage, failure->code);
+} else {
+    handle_response(std::get<response>(result)); // 401/404/503 are responses.
+}
+```
+
+All operational codes are positive errno values in `std::generic_category()`;
+an unavailable/nonpositive cause is represented as `EIO`. Metadata is fixed-size
+and owned: it contains no borrowed views, URLs, authorization data, or diagnostic
+strings. It remains valid after the request/client is destroyed or `errno`
+changes. This is not a promise that existing debug logging redacts requests.
+
+| Stage | Boundary |
+|-------|----------|
+| `target` | URL/scheme/target validation, or cancellation before URL setup |
+| `resolve` | Address resolution failure or cancellation at that boundary |
+| `acquire` | Cancellation before connection acquisition |
+| `connect` | TCP connection failure, cancellation, or connect deadline |
+| `tls` | TLS context validation, handshake failure/cancellation/deadline |
+| `request` | Request/header validation, serialization, or request write failure/cancellation/deadline |
+| `headers` | Transport failure, cancellation, or deadline before final headers complete |
+| `body` | Transport failure, cancellation, or deadline after headers; aggregate body limit (`EMSGSIZE`) |
+| `framing` | Decoder errors (including malformed/truncated input), unsupported protocol handoff, or aggregate informational-response framing limit |
+
+`ECANCELED` reports explicit cancellation, `ETIMEDOUT` a configured deadline,
+and malformed/truncated framing uses `EBADMSG`. Decoder size limits can use
+`EMSGSIZE`. TLS errors preserve the TLS stream's positive errno mapping rather
+than embedding OpenSSL diagnostics. A race can still be won by actual I/O
+completion, and stages do not prescribe retry/replay policy. Redirect processing,
+pool reuse rules, configured budgets, and the existing DNS wait behavior are
+unchanged; the connect budget begins after resolution.
+
+The same vocabulary is available in `client_connect_result()` and
+`connection_pool::acquire_result()`; their optional counterparts remain adapters.
+These are not universally nonthrowing APIs: allocation, TLS setup, scheduler
+admission, and programming exceptions may propagate. Keep clients, request/URL
+objects, caches/TLS contexts, and borrowed string inputs alive through awaited
+return, and serialize mutable client use.
 
 ### `base_client_config`
 

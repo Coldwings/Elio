@@ -9,6 +9,7 @@
 /// - Connection utility functions
 
 #include <elio/net/stream.hpp>
+#include <elio/http/client_result.hpp>
 #include <elio/net/resolve.hpp>
 #include <elio/tls/tls_context.hpp>
 #include <elio/coro/cancel_token.hpp>
@@ -213,9 +214,9 @@ inline void init_client_tls_context(tls::tls_context& ctx, bool verify_certifica
 /// @param secure If true, use TLS
 /// @param tls_ctx TLS context (required if secure)
 /// @param connect_timeout TCP connect + TLS handshake timeout; <=0 disables
-/// @return Connected stream or std::nullopt on error
-inline coro::task<std::optional<net::stream>>
-client_connect(std::string_view host, uint16_t port, bool secure,
+/// @return Connected stream or owned operational error; setup exceptions may throw.
+inline coro::task<client_result<net::stream>>
+client_connect_result(std::string_view host, uint16_t port, bool secure,
                tls::tls_context* tls_ctx,
                net::resolve_options resolve_opts = net::default_cached_resolve_options(),
                bool rotate_resolved_addresses = true,
@@ -223,18 +224,16 @@ client_connect(std::string_view host, uint16_t port, bool secure,
                coro::cancel_token token = {}) {
 
     if (token.is_cancelled()) {
-        errno = ECANCELED;
-        co_return std::nullopt;
+        co_return detail::make_client_error(ECANCELED, client_stage::resolve);
     }
 
     auto addresses = co_await net::resolve_all(host, port, resolve_opts);
     if (token.is_cancelled()) {
-        errno = ECANCELED;
-        co_return std::nullopt;
+        co_return detail::make_client_error(ECANCELED, client_stage::resolve);
     }
     if (addresses.empty()) {
-        ELIO_LOG_ERROR("Failed to resolve {}:{}: {}", host, port, strerror(errno));
-        co_return std::nullopt;
+        co_return detail::make_client_error(errno ? errno : EHOSTUNREACH,
+                                            client_stage::resolve);
     }
 
     size_t offset = rotate_resolved_addresses
@@ -276,69 +275,52 @@ client_connect(std::string_view host, uint16_t port, bool secure,
         co_return;
     };
 
-    auto stop_watchdog_preserving_errno = [&]() -> coro::task<void> {
-        int saved_errno = errno;
-        co_await stop_watchdog();
-        errno = saved_errno;
-        co_return;
-    };
-
-    auto check_timeout = [&]() -> bool {
+    auto stopped_error = [&](client_stage stage) -> std::optional<client_error> {
         if (timed_out->load(std::memory_order_acquire)) {
-            errno = ETIMEDOUT;
-            return true;
+            return detail::make_client_error(ETIMEDOUT, stage);
         }
-        return false;
+        if (token.is_cancelled()) {
+            return detail::make_client_error(ECANCELED, stage);
+        }
+        return std::nullopt;
     };
 
-    auto check_cancelled = [&]() -> bool {
-        if (token.is_cancelled()) {
-            errno = ECANCELED;
-            return true;
-        }
-        return false;
-    };
+    auto last_error = detail::make_client_error(ECONNREFUSED, client_stage::connect);
 
     if (secure) {
         if (!tls_ctx) {
-            errno = EINVAL;
-            co_await stop_watchdog_preserving_errno();
-            ELIO_LOG_ERROR("TLS context required for secure connection to {}:{}", host, port);
-            co_return std::nullopt;
+            co_await stop_watchdog();
+            co_return detail::make_client_error(EINVAL, client_stage::tls);
         }
 
         for (size_t i = 0; i < addresses.size(); ++i) {
             const auto& addr = addresses[(offset + i) % addresses.size()];
             std::optional<net::tcp_stream> tcp;
             tcp = co_await net::tcp_connect(addr, op_cancel_src->get_token());
-            if (check_timeout()) {
-                co_await stop_watchdog_preserving_errno();
-                co_return std::nullopt;
-            }
-            if (check_cancelled()) {
+            const int tcp_error = tcp ? 0 : (errno ? errno : ECONNREFUSED);
+            if (auto error = stopped_error(client_stage::connect)) {
                 if (tcp) {
                     tcp->shutdown_socket();
                 }
-                co_await stop_watchdog_preserving_errno();
-                co_return std::nullopt;
+                co_await stop_watchdog();
+                co_return *error;
             }
             if (!tcp) {
+                last_error = detail::make_client_error(tcp_error, client_stage::connect);
                 continue;
             }
 
             tls::tls_stream tls_stream(std::move(*tcp), *tls_ctx);
             tls_stream.set_hostname(host);
             auto hs = co_await tls_stream.handshake(op_cancel_src->get_token());
-            if (check_timeout()) {
-                co_await stop_watchdog_preserving_errno();
-                co_return std::nullopt;
-            }
-            if (check_cancelled()) {
+            const int tls_error = hs ? 0 : (errno ? errno : EIO);
+            if (auto error = stopped_error(client_stage::tls)) {
                 tls_stream.shutdown_socket();
-                co_await stop_watchdog_preserving_errno();
-                co_return std::nullopt;
+                co_await stop_watchdog();
+                co_return *error;
             }
             if (!hs) {
+                last_error = detail::make_client_error(tls_error, client_stage::tls);
                 continue;
             }
 
@@ -346,39 +328,48 @@ client_connect(std::string_view host, uint16_t port, bool secure,
             co_return net::stream(std::move(tls_stream));
         }
 
-        int connect_errno = errno ? errno : ECONNREFUSED;
         co_await stop_watchdog();
-        errno = connect_errno;
-        ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(errno));
-        co_return std::nullopt;
+        co_return last_error;
     } else {
         for (size_t i = 0; i < addresses.size(); ++i) {
             const auto& addr = addresses[(offset + i) % addresses.size()];
             std::optional<net::tcp_stream> result;
             result = co_await net::tcp_connect(addr, op_cancel_src->get_token());
-            if (check_timeout()) {
-                co_await stop_watchdog_preserving_errno();
-                co_return std::nullopt;
-            }
-            if (check_cancelled()) {
+            const int tcp_error = result ? 0 : (errno ? errno : ECONNREFUSED);
+            if (auto error = stopped_error(client_stage::connect)) {
                 if (result) {
                     result->shutdown_socket();
                 }
-                co_await stop_watchdog_preserving_errno();
-                co_return std::nullopt;
+                co_await stop_watchdog();
+                co_return *error;
             }
             if (result) {
                 co_await stop_watchdog();
                 co_return net::stream(std::move(*result));
             }
+            last_error = detail::make_client_error(tcp_error, client_stage::connect);
         }
 
-        int connect_errno = errno ? errno : ECONNREFUSED;
         co_await stop_watchdog();
-        errno = connect_errno;
-        ELIO_LOG_ERROR("Failed to connect to {}:{}: {}", host, port, strerror(errno));
+        co_return last_error;
+    }
+}
+
+/// Compatibility wrapper; capture errno immediately on an empty result.
+inline coro::task<std::optional<net::stream>>
+client_connect(std::string_view host, uint16_t port, bool secure,
+               tls::tls_context* tls_ctx,
+               net::resolve_options resolve_opts = net::default_cached_resolve_options(),
+               bool rotate_resolved_addresses = true,
+               std::chrono::nanoseconds connect_timeout = std::chrono::nanoseconds::zero(),
+               coro::cancel_token token = {}) {
+    auto result = co_await client_connect_result(host, port, secure, tls_ctx,
+        resolve_opts, rotate_resolved_addresses, connect_timeout, std::move(token));
+    if (const auto* error = std::get_if<client_error>(&result)) {
+        errno = error->code.value();
         co_return std::nullopt;
     }
+    co_return std::move(std::get<net::stream>(result));
 }
 
 } // namespace elio::http

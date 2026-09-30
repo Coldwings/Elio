@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Owned HTTP client errors**: additive `get_result`, `request_result`, and
+  `send_result` APIs retain positive error codes and failure stages in bounded
+  values. Normal non-2xx statuses remain responses; optional/errno adapters,
+  configured timeout budgets, and caller retry responsibilities are preserved.
+  Setup/allocation/programming exceptions may still propagate (#1232).
+
 - **Positional file transfers over borrowed spans**: `io::pread_some`,
   `pread_exactly`, `pwrite_some`, and `pwrite_exactly` report transferred bytes
   alongside EOF, errors, or between-operation cancellation. Exact helpers retain

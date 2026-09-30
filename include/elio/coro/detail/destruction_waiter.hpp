@@ -41,6 +41,14 @@ public:
         if (std::forward<Ready>(ready)()) {
             return false;
         }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (pause_registration_for_test.load(std::memory_order_acquire)) {
+            registration_paused_for_test.store(true, std::memory_order_release);
+            while (pause_registration_for_test.load(std::memory_order_acquire)) {
+                pause_registration_for_test.wait(true, std::memory_order_acquire);
+            }
+        }
+#endif
         observations_.push_back(observer);
         observer->position = std::prev(observations_.end());
         observer->linked = true;
@@ -89,6 +97,8 @@ public:
     }
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
+    inline static std::atomic<bool> pause_registration_for_test{false};
+    inline static std::atomic<bool> registration_paused_for_test{false};
     inline static std::atomic<size_t> registered_count_for_test{0};
 
     size_t pending_count_for_test() {

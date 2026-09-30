@@ -87,6 +87,21 @@ task<void> observe_on_worker(join_destroyed_awaitable observer,
     resumed.store(true, std::memory_order_release);
 }
 
+task<void> observe_teardown_on_worker(join_destroyed_awaitable observer,
+                                      const int& teardown_value,
+                                      std::atomic<int>& value_after_wait,
+                                      std::atomic<bool>& resumed,
+                                      scheduler* expected_scheduler,
+                                      std::atomic<bool>& correct_domain) {
+    co_await std::move(observer);
+    // Record the teardown write before shutdown can independently join the
+    // producer. This must be visible through the destruction await itself.
+    value_after_wait.store(teardown_value, std::memory_order_release);
+    correct_domain.store(scheduler::current() == expected_scheduler,
+                         std::memory_order_release);
+    resumed.store(true, std::memory_order_release);
+}
+
 struct destruction_pause_guard {
     ~destruction_pause_guard() { release(); }
     void release() const noexcept {
@@ -94,6 +109,16 @@ struct destruction_pause_guard {
         pause_before_detached_frame_destroy_for_test.store(
             false, std::memory_order_release);
         pause_before_detached_frame_destroy_for_test.notify_all();
+    }
+};
+
+struct registration_pause_guard {
+    ~registration_pause_guard() { release(); }
+    void release() const noexcept {
+        using elio::coro::detail::destruction_waiters;
+        destruction_waiters::pause_registration_for_test.store(
+            false, std::memory_order_release);
+        destruction_waiters::pause_registration_for_test.notify_all();
     }
 };
 
@@ -194,6 +219,44 @@ TEST_CASE("concurrent async observer installation retains one live list",
     state->wait_destroyed();
     REQUIRE(state->is_destroyed());
     REQUIRE(state->async_destruction_waiters() == installed.front());
+}
+
+TEST_CASE("destruction publication sees registration past its readiness check",
+          "[task][join_handle][destroyed_async][race][registration]") {
+    using elio::coro::detail::destruction_waiters;
+    scheduler sched(1);
+    sched.start();
+    auto state = std::make_shared<join_state<void>>();
+    join_handle<void> handle(state);
+    registration_pause_guard pause;
+    destruction_waiters::registration_paused_for_test.store(false, std::memory_order_release);
+    destruction_waiters::pause_registration_for_test.store(true, std::memory_order_release);
+    std::atomic<bool> resumed{false};
+    std::atomic<bool> domain{false};
+    auto observer = sched.go_joinable(
+        observe_on_worker(handle.wait_destroyed_async(), resumed, &sched, domain));
+    const bool registering = wait_until([] {
+        return destruction_waiters::registration_paused_for_test.load(
+            std::memory_order_acquire);
+    });
+    std::thread producer([state] { state->mark_destroyed(); });
+    // The producer has closed registration but cannot take the list lock until
+    // the in-progress registration has fully published its waiter slot.
+    const bool closed = wait_until([&] { return state->is_destroyed(); });
+    const bool returned_before = resumed.load(std::memory_order_acquire);
+    pause.release();
+    producer.join();
+    const bool returned = wait_until([&] { return resumed.load(std::memory_order_acquire); });
+    const bool stopped = sched.shutdown(scaled_sec(5));
+    destruction_waiters::registration_paused_for_test.store(false, std::memory_order_release);
+    REQUIRE(registering);
+    REQUIRE(closed);
+    REQUIRE_FALSE(returned_before);
+    REQUIRE(returned);
+    REQUIRE(stopped);
+    REQUIRE(domain.load(std::memory_order_acquire));
+    REQUIRE_NOTHROW(observer.await_resume());
+    REQUIRE(state->async_destruction_waiters()->pending_count_for_test() == 0);
 }
 
 TEST_CASE("async destruction observers own state independently of join handles",
@@ -365,9 +428,11 @@ TEST_CASE("async destruction does not return at result readiness",
     });
     std::atomic<bool> resumed{false};
     std::atomic<bool> domain{false};
+    std::atomic<int> value_after_wait{-1};
     destruction_waiters::registered_count_for_test.store(0, std::memory_order_release);
     auto observer = sched.go_joinable_to(
-        1, observe_on_worker(child.wait_destroyed_async(), resumed, &sched, domain));
+        1, observe_teardown_on_worker(child.wait_destroyed_async(), teardown_value,
+                                      value_after_wait, resumed, &sched, domain));
     const bool registered = wait_until([&] {
         return destruction_waiters::registered_count_for_test.load(
                    std::memory_order_acquire) == 1;
@@ -388,6 +453,7 @@ TEST_CASE("async destruction does not return at result readiness",
     REQUIRE(returned);
     REQUIRE(stopped);
     REQUIRE(domain.load(std::memory_order_acquire));
+    REQUIRE(value_after_wait.load(std::memory_order_acquire) == 42);
     REQUIRE(teardown_value == 42);
     if (fail) {
         REQUIRE_THROWS_AS(child.await_resume(), std::runtime_error);

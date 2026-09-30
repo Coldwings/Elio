@@ -313,12 +313,15 @@ observers may wait concurrently, independently of the existing result waiter.
 Teardown writes are visible after a successful await.
 
 An already-destroyed handle completes immediately, even outside a scheduler.
-A pending wait requires a live calling-thread Elio scheduler or throws
-`std::logic_error`. Registration may allocate and propagate allocation failure.
+A pending wait requires a current calling-thread Elio scheduler; if none is set,
+registration throws `std::logic_error`. Registration may allocate and propagate
+allocation failure.
 The continuation resumes in the scheduler domain where it registered, not the
-observed task's domain. Keep that scheduler and the coroutine's owner alive until
-the observation completes. Do not move an awaitable while its suspension is
-active or destroy its coroutine after scheduling ownership has been claimed.
+observed task's domain. Keeping that scheduler alive and running, and the
+coroutine's owner alive, until observation completes is a caller precondition;
+registration does not check the scheduler's running state. Do not move an
+awaitable while its suspension is active or destroy its coroutine after
+scheduling ownership has been claimed.
 Destroying a still-registered observer removes its registration, including a
 selected wake that has not yet been claimed.
 

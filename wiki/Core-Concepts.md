@@ -537,6 +537,16 @@ auto result = co_await stream.write(data, len);
 auto stream = co_await listener.accept();
 ```
 
+### Positional File Transfers
+
+For regular files, `io::pread_some`/`pwrite_some` and
+`io::pread_exactly`/`pwrite_exactly` transfer positional regions through borrowed
+byte spans. Exact success means the whole span transferred; EOF, error, or
+between-operation cancellation retains prior byte progress in
+`file_transfer_result`. Keep the FD and buffer alive until normal awaited return.
+These helpers do not abandon an admitted operation on cancellation, do not add
+a deadline, and retain the backend's existing regular-file execution policy.
+
 ### Timer Awaitables
 
 ```cpp

@@ -1,12 +1,18 @@
 #include <catch2/catch_test_macros.hpp>
+#include <elio/io/file_helpers.hpp>
 #include <elio/io/file_transfer.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include "../test_main.cpp"
 
 #include <array>
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <vector>
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 namespace {
 
@@ -63,6 +69,54 @@ file_transfer_result transfer(recorded_io& io, std::span<std::byte> buffer,
     return run_immediate(elio::io::detail::transfer_file_range<Write>(
         42, buffer, offset, exact, std::move(token), injected_operation{io}));
 }
+
+struct held_io {
+    std::span<std::byte> buffer;
+    std::coroutine_handle<> continuation;
+    int32_t result = 0;
+    size_t calls = 0;
+
+    void complete(int32_t count) {
+        result = count;
+        if (count > 0) {
+            std::fill_n(buffer.begin(), count, std::byte{0x5a});
+        }
+        continuation.resume();
+    }
+};
+
+struct held_operation {
+    held_io& io;
+
+    struct awaitable {
+        held_io& io;
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(std::coroutine_handle<> continuation) const noexcept {
+            io.continuation = continuation;
+        }
+        elio::io::io_result await_resume() const noexcept { return {io.result, 0}; }
+    };
+
+    awaitable operator()(int, std::span<std::byte> buffer, int64_t) {
+        ++io.calls;
+        io.buffer = buffer;
+        return {io};
+    }
+};
+
+class transfer_backend_guard {
+public:
+    explicit transfer_backend_guard(elio::io::io_context::backend_type backend)
+        : previous_(elio::runtime::detail::worker_io_backend_for_test.exchange(
+              backend, std::memory_order_acq_rel)) {}
+    ~transfer_backend_guard() {
+        elio::runtime::detail::worker_io_backend_for_test.store(
+            previous_, std::memory_order_release);
+    }
+
+private:
+    elio::io::io_context::backend_type previous_;
+};
 
 } // namespace
 
@@ -249,4 +303,144 @@ TEST_CASE("file transfer requests fit the signed backend result width",
     REQUIRE(io.requests[1].length == 17);
     REQUIRE(io.requests[1].offset == static_cast<int64_t>(chunk));
     REQUIRE(io.requests[1].buffer == buffer.data() + chunk);
+}
+
+TEST_CASE("malformed file completions cannot corrupt transfer cursors",
+          "[io][file_transfer]") {
+    std::array<std::byte, 8> buffer{};
+    recorded_io io{{}, {}};
+    SECTION("count larger than request") { io.results = {9}; }
+    SECTION("unrepresentable errno") {
+        io.results = {std::numeric_limits<int32_t>::min()};
+    }
+    const auto result = transfer<false>(io, buffer);
+    REQUIRE(result.transferred == 0);
+    REQUIRE(result.end == transfer_end::error);
+    REQUIRE(result.error.value() == EIO);
+    REQUIRE(io.requests.size() == 1);
+}
+
+TEST_CASE("file transfer cancellation waits for admitted borrowed-buffer access",
+          "[io][file_transfer][cancel][lifetime]") {
+    std::array<std::byte, 8> buffer{};
+    cancel_source source;
+    held_io io{};
+    auto operation = elio::io::detail::transfer_file_range<false>(
+        42, std::span<std::byte>(buffer), 0, true, source.get_token(), held_operation{io});
+    const auto handle = elio::coro::detail::task_access::handle(operation);
+    handle.resume();
+    REQUIRE(io.calls == 1);
+    REQUIRE_FALSE(handle.done());
+    source.cancel();
+    REQUIRE_FALSE(handle.done());
+    REQUIRE(buffer[0] == std::byte{});
+
+    int32_t completion = 3;
+    SECTION("short progress stops before another operation") {}
+    SECTION("final progress remains successful") { completion = 8; }
+    SECTION("terminal kernel error remains visible") { completion = -EIO; }
+    io.complete(completion);
+    REQUIRE(handle.done());
+    const auto result = operation.await_resume();
+    REQUIRE(io.calls == 1);
+    REQUIRE(result.transferred == static_cast<size_t>(std::max(completion, 0)));
+    if (completion == 3) {
+        REQUIRE(result.end == transfer_end::cancelled);
+        REQUIRE(result.error.value() == ECANCELED);
+    } else if (completion == 8) {
+        REQUIRE(result.end == transfer_end::complete);
+        REQUIRE_FALSE(result.error);
+    } else {
+        REQUIRE(result.end == transfer_end::error);
+        REQUIRE(result.error.value() == EIO);
+    }
+    if (completion > 0) {
+        REQUIRE(buffer[static_cast<size_t>(completion) - 1] == std::byte{0x5a});
+    }
+}
+
+TEST_CASE("positional file helpers preserve real backend data and outcomes",
+          "[io][file_transfer][file][backend]") {
+    using backend_type = elio::io::io_context::backend_type;
+    auto run = [](backend_type backend) {
+        transfer_backend_guard backend_guard(backend);
+        char path[] = "/tmp/elio_file_transfer_XXXXXX";
+        elio::io::fd_guard fd(::mkstemp(path));
+        REQUIRE(fd.get() >= 0);
+        struct path_guard {
+            const char* path;
+            ~path_guard() { ::unlink(path); }
+        } cleanup{path};
+        elio::io::fd_guard readonly(::open(path, O_RDONLY));
+        REQUIRE(readonly.get() >= 0);
+        REQUIRE(::lseek(fd.get(), 9, SEEK_SET) == 9);
+
+        std::array<std::byte, 64> payload{};
+        for (size_t i = 0; i < payload.size(); ++i) {
+            payload[i] = static_cast<std::byte>(i + 1);
+        }
+        const std::array<std::byte, 4> patch{
+            std::byte{0xa1}, std::byte{0xa2}, std::byte{0xa3}, std::byte{0xa4}};
+        std::array<std::byte, 64> readback{};
+        std::array<std::byte, 128> short_read{};
+        std::array<std::byte, 128> eof_read{};
+        std::array<file_transfer_result, 8> results{};
+        backend_type observed = backend_type::auto_detect;
+        bool completed = false;
+        elio::runtime::scheduler sched(1);
+        sched.start();
+        sched.go([&]() -> elio::coro::task<void> {
+            observed = elio::io::current_io_context().get_backend_type();
+            results[0] = co_await elio::io::pwrite_exactly(fd.get(), payload, 37);
+            results[1] = co_await elio::io::pwrite_some(fd.get(), patch, 42);
+            results[2] = co_await elio::io::pread_exactly(fd.get(), readback, 37);
+            results[3] = co_await elio::io::pread_some(fd.get(), short_read, 95);
+            results[4] = co_await elio::io::pread_exactly(fd.get(), eof_read, 37);
+            results[5] = co_await elio::io::pread_some(fd.get(), short_read, 101);
+            results[6] = co_await elio::io::pread_exactly(-1, readback, 0);
+            results[7] = co_await elio::io::pwrite_exactly(readonly.get(), payload, 0);
+            completed = true;
+        });
+        const bool drained = sched.shutdown(elio::test::scaled_ms(5000));
+        REQUIRE(drained);
+        REQUIRE(completed);
+        REQUIRE(observed == backend);
+        for (size_t i = 0; i < 4; ++i) {
+            REQUIRE(results[i].end == transfer_end::complete);
+            REQUIRE_FALSE(results[i].error);
+        }
+        REQUIRE(results[0].transferred == payload.size());
+        REQUIRE(results[1].transferred == patch.size());
+        REQUIRE(results[2].transferred == readback.size());
+        REQUIRE(results[3].transferred == 6);
+        auto expected = payload;
+        std::copy(patch.begin(), patch.end(), expected.begin() + 5);
+        REQUIRE(readback == expected);
+        REQUIRE(std::equal(short_read.begin(), short_read.begin() + 6,
+                           expected.end() - 6));
+        REQUIRE(results[4].end == transfer_end::eof);
+        REQUIRE(results[4].transferred == expected.size());
+        REQUIRE_FALSE(results[4].error);
+        REQUIRE(std::equal(expected.begin(), expected.end(), eof_read.begin()));
+        REQUIRE(results[5].end == transfer_end::eof);
+        REQUIRE(results[5].transferred == 0);
+        REQUIRE_FALSE(results[5].error);
+        for (size_t i = 6; i < 8; ++i) {
+            REQUIRE(results[i].end == transfer_end::error);
+            REQUIRE(results[i].transferred == 0);
+            REQUIRE(results[i].error == std::error_code(EBADF, std::generic_category()));
+        }
+        REQUIRE(::lseek(fd.get(), 0, SEEK_CUR) == 9);
+        struct stat metadata{};
+        REQUIRE(::fstat(fd.get(), &metadata) == 0);
+        REQUIRE(metadata.st_size == 101);
+    };
+
+    SECTION("forced epoll") { run(backend_type::epoll); }
+#if ELIO_HAS_IO_URING
+    SECTION("forced io_uring when available") {
+        if (!elio::io::io_uring_backend::is_available()) SKIP("io_uring unavailable");
+        run(backend_type::io_uring);
+    }
+#endif
 }

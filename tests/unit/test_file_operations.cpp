@@ -129,6 +129,7 @@ public:
         if (!supports_file_operation(request.op)) return wake_.prepare(request);
         if (pending_) return false;
         pending_ = request;
+        pending_count_.store(1, std::memory_order_release);
         control_.admitted.store(true, std::memory_order_release);
         return true;
     }
@@ -139,6 +140,7 @@ public:
         }
         const auto request = *pending_;
         pending_.reset();
+        pending_count_.store(0, std::memory_order_release);
         struct stat metadata{};
         if (::fstat(request.fd, &metadata) != 0) control_.fd_error.store(errno);
         auto* state = request.state;
@@ -158,8 +160,12 @@ public:
         }
         return 1;
     }
-    bool has_pending() const noexcept override { return pending_.has_value() || wake_.has_pending(); }
-    size_t pending_count() const noexcept override { return (pending_ ? 1 : 0) + wake_.pending_count(); }
+    bool has_pending() const noexcept override {
+        return pending_count_.load(std::memory_order_acquire) != 0 || wake_.has_pending();
+    }
+    size_t pending_count() const noexcept override {
+        return pending_count_.load(std::memory_order_acquire) + wake_.pending_count();
+    }
     bool cancel(void* data) override { return wake_.cancel(data); }
     void notify() noexcept override { wake_.notify(); }
     void drain_notify() override { wake_.drain_notify(); }
@@ -167,6 +173,7 @@ private:
     native_control& control_;
     elio::io::epoll_backend wake_;
     std::optional<elio::io::io_request> pending_;
+    std::atomic<size_t> pending_count_{0};
 };
 
 std::atomic<native_control*> active_native_control{nullptr};

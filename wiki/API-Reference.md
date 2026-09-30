@@ -1861,7 +1861,7 @@ See the runnable [positional transfer example](https://github.com/Coldwings/Elio
 ### File Synchronization, Allocation, and Truncation
 
 Include `<elio/io/file_operations.hpp>` or the umbrella header. These FD-based
-coroutines require a running scheduler; they never create standalone threads or
+coroutines require a running scheduler worker; they never create standalone threads or
 silently run the potentially slow syscall on a scheduler worker.
 
 ```cpp
@@ -1906,11 +1906,16 @@ Fallback admission bounds the existing shared pool queue to `max_queued` at the
 point of submission; running work is bounded by the fixed pool threads. It is
 not a separate queue, a global application memory limit, or a bound on native
 I/O. Saturation or unavailable admission returns `error`/`EAGAIN`. A zero or
-`SIZE_MAX` limit is invalid (`EINVAL`). No scheduler returns `ENOTSUP`; there is
+`SIZE_MAX` limit is invalid (`EINVAL`). Outside a running scheduler worker,
+including the external thread that called `scheduler::start()`, calls return
+`ENOTSUP` without selecting the standalone I/O context; there is
 no detached-thread fallback. Ordinary `spawn_blocking()` behavior is unchanged.
 The underlying `blocking_pool::submit_bounded(work, limit)` rejects non-pooled
 mode or unavailable/full queues, leaves rejected work untouched, and never
 creates per-call threads; ordinary `submit()` keeps its existing behavior.
+If pool teardown drains queued work on a scheduler worker, that file operation
+returns `error`/`EAGAIN` without invoking the syscall. Generic pool shutdown
+behavior is unchanged.
 
 Offsets/range ends and truncation lengths must fit both `int64_t` and native
 `off_t` (`EOVERFLOW` otherwise). Zero-length allocation and invalid sync modes

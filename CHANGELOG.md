@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `allocate_file_range`, and `truncate_file` return terminal status/error values
   captured on the executing thread. Native io_uring paths use runtime opcode
   probing (and consumer-header detection for truncation); otherwise a running
-  scheduler uses bounded fixed-pool admission. Queued work may skip a syscall
-  after explicit cancellation, but admitted native/running blocking calls finish
+  scheduler worker uses bounded fixed-pool admission. Worker-side teardown rejects
+  queued inline dispatch rather than running file syscalls there. Queued work may
+  skip a syscall after explicit cancellation, but admitted native/running calls finish
   with their actual result. No standalone threads, worker-inline fallback,
   deadline, rollback, or multi-file transaction guarantee is added (#1233).
 

@@ -807,7 +807,7 @@ if (!synced) co_return synced.error_value();
 // Application-side metadata publication and directory sync follow separately.
 ```
 
-These operations require a running scheduler. Native capabilities are probed;
+These operations require a running scheduler worker. Native capabilities are probed;
 fallback work uses bounded fixed-pool admission. Queued cancellation can skip
 dispatch, but running syscalls still complete before normal return. No deadline,
 rollback, or transaction guarantee is supplied. Keep the FD open and unrecycled,

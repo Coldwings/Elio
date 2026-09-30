@@ -176,6 +176,24 @@ TEST_CASE("already cancelled file operations never invoke a syscall",
     REQUIRE(result.error_value() == ECANCELED);
 }
 
+TEST_CASE("a scheduler starting thread is not a file-operation worker",
+          "[io][file_operations][context]") {
+    syscall_control control;
+    hook_guard hooks(control);
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    REQUIRE(elio::runtime::get_current_scheduler() == &scheduler);
+    REQUIRE(elio::runtime::worker_thread::current() == nullptr);
+    file_status result;
+    SECTION("sync") { result = run_immediate(elio::io::sync_file(42)); }
+    SECTION("allocate") { result = run_immediate(elio::io::allocate_file_range(42, 0, 0, 8)); }
+    SECTION("truncate") { result = run_immediate(elio::io::truncate_file(42, 8)); }
+    REQUIRE(result.end == file_operation_end::error);
+    REQUIRE(result.error_value() == ENOTSUP);
+    REQUIRE_FALSE(control.entered.load(std::memory_order_acquire));
+    REQUIRE(scheduler.shutdown(elio::test::scaled_ms(5000)));
+}
+
 TEST_CASE("file operations use native capabilities or bounded off-worker syscalls",
           "[io][file_operations][backend][file]") {
     auto run = [](io_context::backend_type backend, bool force_fallback = false) {
@@ -319,14 +337,18 @@ TEST_CASE("running file calls preserve completion and delay graceful shutdown",
     const bool entered = wait_for([&] { return control.entered.load(std::memory_order_acquire); });
     source.cancel();
     const bool early = done.load(std::memory_order_acquire);
-    std::atomic<bool> shutdown_started{false}, shutdown_done{false};
+    elio::runtime::detail::graceful_admission_closed_for_test.store(
+        false, std::memory_order_release);
+    std::atomic<bool> shutdown_done{false};
     bool drained = false;
     std::thread shutdown([&] {
-        shutdown_started.store(true, std::memory_order_release);
         drained = scheduler.shutdown();
         shutdown_done.store(true, std::memory_order_release);
     });
-    const bool started = wait_for([&] { return shutdown_started.load(std::memory_order_acquire); });
+    const bool started = wait_for([&] {
+        return elio::runtime::detail::graceful_admission_closed_for_test.load(
+            std::memory_order_acquire);
+    });
     const bool early_shutdown = shutdown_done.load(std::memory_order_acquire);
     errno = ENOSPC;
     control.unblock();
@@ -345,6 +367,55 @@ TEST_CASE("running file calls preserve completion and delay graceful shutdown",
         REQUIRE(result.error == std::error_code(EIO, std::generic_category()));
     }
     REQUIRE(control.calls[0].load() == 1);
+}
+
+TEST_CASE("worker-side pool teardown rejects queued file syscalls",
+          "[io][file_operations][shutdown][blocking]") {
+    backend_guard backend_choice(io_context::backend_type::epoll);
+    syscall_control control;
+    control.block = true;
+    hook_guard hooks(control);
+    elio::coro::cancel_source source;
+    bool cancel_queued = false;
+    SECTION("uncancelled queued work reports rejection") {}
+    SECTION("queued cancellation retains precedence") { cancel_queued = true; }
+    file_status running, queued;
+    bool queued_done = false, shutdown_done = false;
+    elio::runtime::scheduler scheduler(1, elio::runtime::wait_strategy::blocking(), 1);
+    release_guard release{control};
+    scheduler.start();
+    scheduler.go([&]() -> task<void> {
+        running = co_await elio::io::sync_file(42);
+    });
+    const bool entered = wait_for([&] { return control.entered.load(std::memory_order_acquire); });
+    scheduler.go([&]() -> task<void> {
+        queued = co_await elio::io::sync_file(43, file_sync_mode::data_only, source.get_token());
+        queued_done = true;
+    });
+    auto* pool = scheduler.get_blocking_pool();
+    const bool parked = wait_for([&] { return pool->queued_count_for_test() == 1; });
+    if (cancel_queued) source.cancel();
+    scheduler.go([&]() -> task<void> {
+        // This is the same pool drain invoked by worker-side shutdown_force,
+        // but keeps the scheduler alive so its returned value is observable.
+        pool->shutdown();
+        shutdown_done = true;
+        co_return;
+    });
+    const bool stopped = wait_for([&] { return pool->stopped_for_test(); });
+    control.unblock();
+    const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
+    REQUIRE(entered);
+    REQUIRE(parked);
+    REQUIRE(stopped);
+    REQUIRE(drained);
+    REQUIRE(shutdown_done);
+    REQUIRE(queued_done);
+    REQUIRE(running);
+    REQUIRE(queued.end == (cancel_queued ? file_operation_end::cancelled : file_operation_end::error));
+    REQUIRE(queued.error_value() == (cancel_queued ? ECANCELED : EAGAIN));
+    REQUIRE(control.calls[0].load() == 1);
+    REQUIRE_FALSE(control.on_worker.load(std::memory_order_acquire));
 }
 
 TEST_CASE("bounded pool admission does not create standalone per-call threads",

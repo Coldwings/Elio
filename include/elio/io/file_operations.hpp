@@ -143,7 +143,7 @@ inline coro::task<file_status> dispatch_file_operation(
         co_return file_operation_failure(ECANCELED, file_operation_end::cancelled);
     }
     auto* scheduler = runtime::get_current_scheduler();
-    if (!scheduler || !scheduler->is_running()) {
+    if (!runtime::worker_thread::current() || !scheduler || !scheduler->is_running()) {
         co_return file_operation_failure(ENOTSUP);
     }
 
@@ -160,6 +160,12 @@ inline coro::task<file_status> dispatch_file_operation(
         if (token.is_cancelled()) {
             return file_operation_failure(ECANCELED, file_operation_end::cancelled);
         }
+        // Pool shutdown can drain queued work on its caller. Reject that
+        // dispatch if a scheduler worker initiated teardown; never run a
+        // potentially blocking file syscall on the scheduler worker itself.
+        if (runtime::worker_thread::current()) {
+            return file_operation_failure(EAGAIN);
+        }
         // This check is the dispatch boundary; later cancellation does not
         // interrupt the syscall or overwrite its actual terminal result.
         return execute_file_syscall(request);
@@ -174,7 +180,7 @@ inline coro::task<file_status> dispatch_file_operation(
 
 } // namespace detail
 
-/// FD-based operations require a running scheduler. Native capabilities are
+/// FD-based operations require a running scheduler worker. Native capabilities are
 /// probed; unsupported native paths use bounded fixed-pool admission, never
 /// inline worker syscalls or detached threads. Keep the borrowed FD open and
 /// unrecycled until normal awaited return. Cancellation may skip queued work,

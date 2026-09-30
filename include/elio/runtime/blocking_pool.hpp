@@ -95,6 +95,10 @@ public:
     }
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
+    [[nodiscard]] bool stopped_for_test() const noexcept {
+        return state_->stopped.load(std::memory_order_acquire);
+    }
+
     [[nodiscard]] size_t queued_count_for_test() const {
         auto state = state_;
         std::lock_guard<std::mutex> lock(state->mutex);

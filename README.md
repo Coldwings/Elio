@@ -9,7 +9,7 @@
 ## Features
 
 - **C++20 Stackless Coroutines** with `task<T>` type
-- **Ergonomic Task Spawning**: `go()` for fire-and-forget, `spawn()` for joinable tasks
+- **Ergonomic Task Spawning**: `go()` for fire-and-forget, `spawn()` for joinable tasks, and non-consuming cancellable/deadline result observation
 - **Structured Concurrency**: scheduler-bound `task_group` and lexical `task_scope()` with cancellation, failure propagation, and bounded child concurrency
 - **Virtual Stack Tracking** for natural exception propagation
 - **Work-Stealing Scheduler** with lock-free Chase-Lev deques
@@ -315,7 +315,7 @@ available when `ELIO_BUILD_EXAMPLES=ON`; protocol and RDMA examples also require
 their corresponding feature targets.
 
 - **Coroutine/runtime**: `hello_world.cpp`, `chained_coroutines.cpp`,
-  `exception_handling.cpp`, `join_destroyed_async.cpp`, `parallel_tasks.cpp`,
+  `exception_handling.cpp`, `join_destroyed_async.cpp`, `join_wait.cpp`, `parallel_tasks.cpp`,
   `dynamic_threads.cpp`,
   `autoscaler_example.cpp`, `thread_affinity.cpp`, `signal_handling.cpp`,
   `debug_test.cpp`

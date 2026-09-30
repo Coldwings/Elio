@@ -17,6 +17,7 @@
 #include "coro/task_execution_context.hpp"
 #include "coro/promise_base.hpp"
 #include "coro/task.hpp"
+#include "coro/join_wait.hpp"
 #include "coro/task_group.hpp"
 #include "coro/awaitable_base.hpp"
 #include "coro/frame.hpp"

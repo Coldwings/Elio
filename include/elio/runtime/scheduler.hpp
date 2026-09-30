@@ -135,6 +135,7 @@ namespace detail {
 class scheduler {
     friend class worker_thread;  // Allow workers to set current_scheduler_
     friend class elio::coro::task_group;
+    friend struct elio::coro::detail::join_wait_access;
     friend void schedule_handle(std::coroutine_handle<> handle) noexcept;
     
 public:
@@ -1738,6 +1739,11 @@ inline void schedule_destruction_waiter(
         }
         std::this_thread::yield();
     }
+}
+
+inline void schedule_join_observer(
+    scheduler* owner, std::coroutine_handle<> handle) noexcept {
+    schedule_destruction_waiter(owner, handle);
 }
 
 inline void report_detached_exception(std::exception_ptr ex) noexcept {

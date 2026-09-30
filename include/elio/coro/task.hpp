@@ -3,6 +3,7 @@
 #include "promise_base.hpp"
 #include "detail/completion_waiter.hpp"
 #include "detail/destruction_waiter.hpp"
+#include "detail/join_observation.hpp"
 #include <cassert>
 #include <cstdint>
 #include <coroutine>
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <memory>
 #include <stdexcept>
+#include <chrono>
 
 namespace elio::runtime {
 class scheduler;  // Forward declaration
@@ -155,10 +157,16 @@ struct join_state_base {
 
     ~join_state_base() {
         delete observer_list(destruction_state_.load(std::memory_order_relaxed));
+        delete result_observers_.load(std::memory_order_relaxed);
     }
 
     alignas(64) completion_waiter_slot waiter_;
     std::atomic<bool> completed_{false};
+    static constexpr unsigned result_ready = 1;
+    static constexpr unsigned direct_observer = 2;
+    static constexpr unsigned bounded_observer = 4;
+    static constexpr unsigned observer_mask = direct_observer | bounded_observer;
+    std::atomic<unsigned> completion_flags_{0};
     // The low bit closes registration; the remaining bits own a lazily
     // allocated observer list. One atomic prevents a lost wake between list
     // installation and a concurrent destruction publication.
@@ -166,6 +174,15 @@ struct join_state_base {
 
     void complete() {
         completed_.store(true, std::memory_order_release);
+        const auto previous = completion_flags_.fetch_or(
+            result_ready, std::memory_order_acq_rel);
+        if ((previous & observer_mask) == bounded_observer) {
+            if (auto* observers = result_observers_.load(std::memory_order_acquire)) {
+                if (auto observation = observers->observer.load(std::memory_order_acquire)) {
+                    observation->notify(join_observation::outcome::completed);
+                }
+            }
+        }
         auto wake = waiter_.take();
         auto waiter = wake.claim();
         if (waiter) {
@@ -233,6 +250,43 @@ struct join_state_base {
         });
     }
 
+    [[nodiscard]] bool reserve_result_observer(unsigned kind) noexcept {
+        auto flags = completion_flags_.load(std::memory_order_acquire);
+        for (;;) {
+            if ((flags & observer_mask) != 0) return false;
+            if (completion_flags_.compare_exchange_weak(flags, flags | kind,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                return true;
+            }
+        }
+    }
+
+    void release_result_observer() noexcept {
+        completion_flags_.fetch_and(~observer_mask, std::memory_order_release);
+    }
+
+    join_observer_control* install_result_observer(
+            const std::shared_ptr<join_observation>& observation) {
+        auto* observers = result_observers_.load(std::memory_order_acquire);
+        if (!observers) {
+            auto candidate = std::make_unique<join_observer_control>();
+            auto* address = candidate.get();
+            if (result_observers_.compare_exchange_strong(observers, address,
+                    std::memory_order_release, std::memory_order_acquire)) {
+                observers = candidate.release();
+            }
+        }
+        observers->observer.store(observation, std::memory_order_release);
+        // This RMW and complete()'s RMW form one total-order handshake. If
+        // installation wins, completion acquires the published node; otherwise
+        // this acquire observes readiness. Two release stores/loads can miss both.
+        const auto flags = completion_flags_.fetch_or(0, std::memory_order_acq_rel);
+        if ((flags & result_ready) != 0) {
+            observation->notify(join_observation::outcome::completed);
+        }
+        return observers;
+    }
+
     destruction_waiters* async_destruction_waiters() {
         auto observed = destruction_state_.load(std::memory_order_acquire);
         if (observed == destruction_alive) {
@@ -283,7 +337,13 @@ private:
     }
 
     const std::shared_ptr<task_execution_context> execution_context_;
+    std::atomic<join_observer_control*> result_observers_{nullptr};
 };
+
+task<join_wait_outcome> observe_join_result(
+    std::shared_ptr<join_state_base> state,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    cancel_token token);
 
 class join_destroyed_awaitable final {
 public:
@@ -401,11 +461,19 @@ public:
     explicit join_handle(std::shared_ptr<detail::join_state<T>> state) noexcept
         : state_(std::move(state)), waiter_(state_->waiter_) {}
 
-    join_handle(join_handle&&) noexcept = default;
+    ~join_handle() { release_registration(); }
+
+    join_handle(join_handle&& other) noexcept
+        : state_(std::move(other.state_)), waiter_(std::move(other.waiter_)),
+          reserved_(std::exchange(other.reserved_, false)),
+          busy_(std::exchange(other.busy_, false)) {}
     join_handle& operator=(join_handle&& other) noexcept {
         if (this != &other) {
+            release_registration();
             waiter_ = std::move(other.waiter_);
             state_ = std::move(other.state_);
+            reserved_ = std::exchange(other.reserved_, false);
+            busy_ = std::exchange(other.busy_, false);
         }
         return *this;
     }
@@ -420,6 +488,11 @@ public:
     bool await_suspend(std::coroutine_handle<> awaiter) noexcept {
         // Keep a local copy of the shared_ptr to prevent use-after-free.
         auto state = state_;
+        if (!state->reserve_result_observer(detail::join_state_base::direct_observer)) {
+            busy_ = true;
+            return false;
+        }
+        reserved_ = true;
         return state->set_waiter(waiter_, awaiter);
     }
 
@@ -427,6 +500,10 @@ public:
         // Pin join_state through get_value(). If it rethrows, the exception
         // runtime, not this local, keeps the object alive through its handlers.
         auto state = state_;
+        if (std::exchange(busy_, false)) {
+            throw std::logic_error("join handle already has a pending result observer");
+        }
+        release_registration();
         return state->get_value();
     }
 
@@ -472,9 +549,26 @@ public:
         return detail::join_destroyed_awaitable(state_);
     }
 
+    /// Non-consuming result-readiness observation; include coro/join_wait.hpp.
+    /// Initial precedence is ready, cancelled, then expired deadline. Pending
+    /// waits require a running observing scheduler and reject concurrent pending
+    /// result waits. Timeout/cancellation never cancels the observed task.
+    /// The returned single-use task pins state independently of this handle.
+    [[nodiscard]] task<join_wait_outcome> wait(cancel_token token = {}) const;
+    [[nodiscard]] task<join_wait_outcome> wait_until(
+        std::chrono::steady_clock::time_point deadline, cancel_token token = {}) const;
+
 private:
+    void release_registration() noexcept {
+        if (std::exchange(reserved_, false)) {
+            waiter_ = detail::completion_waiter(state_->waiter_);
+            state_->release_result_observer();
+        }
+    }
     std::shared_ptr<detail::join_state<T>> state_;
     detail::completion_waiter waiter_;
+    bool reserved_ = false;
+    bool busy_ = false;
 };
 
 /// Specialization for void
@@ -485,11 +579,19 @@ public:
     explicit join_handle(std::shared_ptr<detail::join_state<void>> state) noexcept
         : state_(std::move(state)), waiter_(state_->waiter_) {}
     
-    join_handle(join_handle&&) noexcept = default;
+    ~join_handle() { release_registration(); }
+
+    join_handle(join_handle&& other) noexcept
+        : state_(std::move(other.state_)), waiter_(std::move(other.waiter_)),
+          reserved_(std::exchange(other.reserved_, false)),
+          busy_(std::exchange(other.busy_, false)) {}
     join_handle& operator=(join_handle&& other) noexcept {
         if (this != &other) {
+            release_registration();
             waiter_ = std::move(other.waiter_);
             state_ = std::move(other.state_);
+            reserved_ = std::exchange(other.reserved_, false);
+            busy_ = std::exchange(other.busy_, false);
         }
         return *this;
     }
@@ -505,6 +607,11 @@ public:
         // Keep a local copy of the shared_ptr to prevent use-after-free.
         // See join_handle<T>::await_suspend for detailed explanation.
         auto state = state_;
+        if (!state->reserve_result_observer(detail::join_state_base::direct_observer)) {
+            busy_ = true;
+            return false;
+        }
+        reserved_ = true;
         return state->set_waiter(waiter_, awaiter);
     }
 
@@ -512,6 +619,10 @@ public:
         // Pin join_state through get_value(). If it rethrows, the exception
         // runtime, not this local, keeps the object alive through its handlers.
         auto state = state_;
+        if (std::exchange(busy_, false)) {
+            throw std::logic_error("join handle already has a pending result observer");
+        }
+        release_registration();
         state->get_value();
     }
 
@@ -551,9 +662,22 @@ public:
         return detail::join_destroyed_awaitable(state_);
     }
 
+    /// See the primary template's non-consuming observation contract.
+    [[nodiscard]] task<join_wait_outcome> wait(cancel_token token = {}) const;
+    [[nodiscard]] task<join_wait_outcome> wait_until(
+        std::chrono::steady_clock::time_point deadline, cancel_token token = {}) const;
+
 private:
+    void release_registration() noexcept {
+        if (std::exchange(reserved_, false)) {
+            waiter_ = detail::completion_waiter(state_->waiter_);
+            state_->release_result_observer();
+        }
+    }
     std::shared_ptr<detail::join_state<void>> state_;
     detail::completion_waiter waiter_;
+    bool reserved_ = false;
+    bool busy_ = false;
 };
 
 template<typename T>

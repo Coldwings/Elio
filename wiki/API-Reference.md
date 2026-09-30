@@ -286,6 +286,12 @@ public:
     // Check if the spawned task has completed (non-blocking)
     bool is_ready() const noexcept;
 
+    // Non-consuming observation (include elio/coro/join_wait.hpp)
+    task<join_wait_outcome> wait(cancel_token token = {}) const;
+    task<join_wait_outcome> wait_until(
+        std::chrono::steady_clock::time_point deadline,
+        cancel_token token = {}) const;
+
     // Observe or wait for coroutine-frame destruction
     bool is_destroyed() const noexcept;
     void wait_destroyed() const;
@@ -366,6 +372,56 @@ not forcibly destroy the task, roll back side effects, or guarantee prompt
 completion. Foreign coroutine promises, separately spawned tasks, and explicit
 token arguments remain independent unless deliberately bridged. Registered
 cancellation callback exceptions are rethrown after callback dispatch.
+
+#### Bounded result observation
+
+`co_await handle.wait(token)` and `co_await handle.wait_until(deadline, token)`
+return `coro::join_wait_outcome::{completed, timed_out, cancelled}`. Include
+`elio/coro/join_wait.hpp` (also included by `elio/elio.hpp`). `completed` means
+the result is ready, including an exceptional result; it neither consumes `T`
+nor rethrows the child failure. Consume the result separately with `co_await
+handle` or `await_resume()`, and use a destruction barrier separately when needed.
+
+Initial precedence is result-ready, explicit-token-cancelled, then expired
+steady-clock deadline. Those fast paths work outside a scheduler. A pending
+observation requires a running scheduler worker; otherwise it throws
+`std::logic_error`. Its continuation stays in the observing scheduler domain,
+even when the child completes elsewhere. Keep that scheduler and the observer's
+coroutine owner alive until the observation returns.
+
+Only one pending result observation, whether direct `co_await handle` or a new
+wait, may register at a time. A second pending registration throws
+`std::logic_error`; independent destruction observers are unaffected. Once
+registered, completion, cancellation, deadline dispatch, and setup failure
+arbitrate through one terminal transition. A later event cannot replace the
+winner. Deadline dispatch is cooperative, not a physical-time return guarantee.
+Allocation, timer setup, and timer failures can propagate if they win. The
+implementation observes result publication through registration rather than
+periodic `is_ready()` checks; timer backend fallback behavior is unchanged.
+
+Timeout or cancellation removes only the result observer. It does not request
+child cancellation, destroy a child frame, modify its result, or transfer task
+ownership. Private timer work is cancelled and normally drained before return.
+Internal cancellation cleanup does not wait for unrelated user callbacks to
+finish dispatching. Retry observation after departure, then consume the eventual
+result. The default token does not implicitly cancel this wait when the caller's
+task is cancelled; pass `this_coro::cancel_token()` explicitly for that policy.
+
+These factories copy shared join state before returning their lazy, single-use
+task. The original handle can then move or be discarded without invalidating the
+observation. Do not use a moved-from handle or concurrently mutate it while
+creating an observation. Normal observer removal does not make destruction of
+an actively resumed or scheduling-owned coroutine safe; forced shutdown retains
+the existing task/I/O lifetime restrictions.
+
+Applications that leave work running after a bounded wait must own its inputs,
+bound outstanding work, and retain an eventual result/failure and drain policy.
+Requesting cooperative cancellation is a separate application decision, not a
+side effect of waiting. The runnable [owned-background example](https://github.com/Coldwings/Elio/blob/main/examples/join_wait.cpp)
+keeps the handle and owned inputs after timeout, observes the eventual result,
+and awaits final frame destruction. Returning immediately instead requires an
+application-owned background owner; discarding a handle alone is not a drain or
+failure-reporting policy. Existing `with_timeout` still drains its losing child.
 
 ### `task_group` and `task_scope()`
 

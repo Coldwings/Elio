@@ -42,6 +42,17 @@ if(ELIO_BUILD_TESTS)
     add_dependencies(test_all join_destroyed_async)
 endif()
 
+add_executable(join_wait join_wait.cpp)
+target_link_libraries(join_wait PRIVATE elio)
+target_link_options(join_wait PRIVATE ${STATIC_LINK_FLAGS})
+if(ELIO_BUILD_TESTS)
+    add_test(NAME join_wait_example COMMAND join_wait)
+    set_tests_properties(join_wait_example PROPERTIES
+        TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "Timed out without stopping owned work: yes; eventual result: 22")
+    add_dependencies(test_all join_wait)
+endif()
+
 add_executable(exception_handling exception_handling.cpp)
 target_link_libraries(exception_handling PRIVATE elio)
 target_link_options(exception_handling PRIVATE ${STATIC_LINK_FLAGS})

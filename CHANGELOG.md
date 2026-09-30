@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bounded joinable-result observation**: `join_handle<T>::wait()` and
+  `wait_until()` observe readiness without consuming results, propagating child
+  exceptions, or cancelling the task. Explicit cancellation/deadlines select one
+  stable outcome, safely remove the observer, and drain private timers. Pending
+  waits require a running observing worker and reject concurrent result waits;
+  factories pin state across later handle movement. Final frame destruction,
+  background ownership, and structured timeout drain remain separate (#1230).
+
 - **Owned HTTP client errors**: additive `get_result`, `request_result`, and
   `send_result` APIs retain positive error codes and failure stages in bounded
   values. Normal non-2xx statuses remain responses; optional/errno adapters,

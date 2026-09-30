@@ -267,6 +267,7 @@ TEST_CASE("HTTP streaming client decodes bounded fragmented payloads", "[http][c
     require_backend(backend);
     const bool encrypted = GENERATE(false, true);
     const auto framing = GENERATE(0, 1, 2);
+    CAPTURE(static_cast<int>(backend), encrypted, framing);
     http::client_config config;
     config.max_response_size = 1;
     config.read_buffer_size = 7;
@@ -274,7 +275,9 @@ TEST_CASE("HTTP streaming client decodes bounded fragmented payloads", "[http][c
     const std::string payload(65539, 'r');
     body_observation observation;
     bool headers_ok = false;
+    int payload_written = 0;
     http::client_result<std::monostate> result;
+    const auto started = std::chrono::steady_clock::now();
     fixture.run([&]() -> coro::task<void> {
         auto stream = co_await fixture.accept();
         if (!stream) throw std::runtime_error("server accept failed");
@@ -287,7 +290,7 @@ TEST_CASE("HTTP streaming client decodes bounded fragmented payloads", "[http][c
             (void)co_await stream->write_all(std::string_view(&byte, 1), fixture.stop.get_token());
         }
         if (framing == 1) (void)co_await stream->write_all("10003\r\n", fixture.stop.get_token());
-        (void)co_await stream->write_all(payload, fixture.stop.get_token());
+        payload_written = (co_await stream->write_all(payload, fixture.stop.get_token())).result;
         if (framing == 1) {
             (void)co_await stream->write_all("\r\n0\r\nX-End: yes\r\n\r\n", fixture.stop.get_token());
         }
@@ -302,6 +305,10 @@ TEST_CASE("HTTP streaming client decodes bounded fragmented payloads", "[http][c
                 co_await consume(body, token, observation);
             });
     });
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    const auto error_stage = observation.error ? static_cast<int>(observation.error->stage) : -1;
+    CAPTURE(elapsed, observation.reads, observation.bytes.size(), payload_written, error_stage);
     REQUIRE(headers_ok);
     REQUIRE(result_error(result) == 0);
     REQUIRE(observation.bytes == payload);

@@ -61,6 +61,22 @@ coro::task<int> async_main(int argc, char* argv[]) {
 ELIO_ASYNC_MAIN(async_main)
 ```
 
+## Waiting for Spawned Capture Teardown
+
+[`examples/join_destroyed_async.cpp`](https://github.com/Coldwings/Elio/blob/main/examples/join_destroyed_async.cpp)
+is a runnable example of the distinction between task result readiness and final
+capture destruction. Await the result first, then
+`co_await handle.wait_destroyed_async()` before releasing resources the callable
+borrows. This second await does not consume the result, cancel the task, or occupy
+a blocking-pool thread. Pending observers require a live Elio scheduler; normal
+drain, not forced frame destruction, establishes the capture lifetime boundary.
+
+```bash
+cmake --build build --target join_destroyed_async --parallel 2
+./build/examples/join_destroyed_async
+# Result: 42, captures released: yes
+```
+
 ## TCP Echo Server
 
 A concurrent TCP server that echoes data back to clients, using signalfd for graceful shutdown:

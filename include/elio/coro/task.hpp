@@ -2,6 +2,7 @@
 
 #include "promise_base.hpp"
 #include "detail/completion_waiter.hpp"
+#include "detail/destruction_waiter.hpp"
 #include <cassert>
 #include <cstdint>
 #include <coroutine>
@@ -44,6 +45,8 @@ inline std::atomic<std::uint32_t>
     join_destroyed_wait_count_for_test{0};
 inline std::atomic<std::uint32_t>
     join_destroyed_notify_count_for_test{0};
+inline std::atomic<bool> pause_join_destroyed_observer_install_for_test{false};
+inline std::atomic<bool> join_destroyed_observer_install_paused_for_test{false};
 #endif
 
 struct final_awaiter {
@@ -136,10 +139,11 @@ struct task_access {
 };
 
 struct join_state_base {
-    static constexpr std::uint32_t destruction_alive = 0;
-    static constexpr std::uint32_t destruction_destroyed = 1;
+    static constexpr std::uintptr_t destruction_alive = 0;
+    static constexpr std::uintptr_t destruction_destroyed = 1;
 
-    static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+    static_assert(std::atomic<std::uintptr_t>::is_always_lock_free);
+    static_assert(alignof(destruction_waiters) >= 2);
 
     join_state_base()
         : execution_context_(detail::make_task_execution_context()) {}
@@ -149,9 +153,16 @@ struct join_state_base {
         : execution_context_(require_execution_context(
               std::move(execution_context))) {}
 
+    ~join_state_base() {
+        delete observer_list(destruction_state_.load(std::memory_order_relaxed));
+    }
+
     alignas(64) completion_waiter_slot waiter_;
     std::atomic<bool> completed_{false};
-    std::atomic<std::uint32_t> destruction_state_{destruction_alive};
+    // The low bit closes registration; the remaining bits own a lazily
+    // allocated observer list. One atomic prevents a lost wake between list
+    // installation and a concurrent destruction publication.
+    std::atomic<std::uintptr_t> destruction_state_{destruction_alive};
 
     void complete() {
         completed_.store(true, std::memory_order_release);
@@ -163,18 +174,21 @@ struct join_state_base {
     }
 
     void mark_destroyed() noexcept {
-        destruction_state_.store(
-            destruction_destroyed, std::memory_order_release);
+        const auto previous = destruction_state_.fetch_or(
+            destruction_destroyed, std::memory_order_acq_rel);
 #ifdef ELIO_RUNTIME_TEST_HOOKS
         join_destroyed_notify_count_for_test.fetch_add(
             1, std::memory_order_relaxed);
 #endif
         destruction_state_.notify_all();
+        if (auto* observers = observer_list(previous)) {
+            observers->notify_destroyed();
+        }
     }
 
     void wait_destroyed() {
-        while (destruction_state_.load(std::memory_order_acquire) ==
-               destruction_alive) {
+        auto observed = destruction_state_.load(std::memory_order_acquire);
+        while ((observed & destruction_destroyed) == 0) {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
             join_destroyed_wait_count_for_test.fetch_add(
                 1, std::memory_order_relaxed);
@@ -193,13 +207,14 @@ struct join_state_base {
             }
 #endif
             destruction_state_.wait(
-                destruction_alive, std::memory_order_acquire);
+                observed, std::memory_order_acquire);
+            observed = destruction_state_.load(std::memory_order_acquire);
         }
     }
 
     [[nodiscard]] bool is_destroyed() const noexcept {
-        return destruction_state_.load(std::memory_order_acquire) ==
-            destruction_destroyed;
+        return (destruction_state_.load(std::memory_order_acquire) &
+                destruction_destroyed) != 0;
     }
 
     [[nodiscard]] bool is_completed() const noexcept {
@@ -218,7 +233,46 @@ struct join_state_base {
         });
     }
 
+    destruction_waiters* async_destruction_waiters() {
+        auto observed = destruction_state_.load(std::memory_order_acquire);
+        if (observed == destruction_alive) {
+            auto candidate = std::make_unique<destruction_waiters>();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (pause_join_destroyed_observer_install_for_test.load(
+                    std::memory_order_acquire)) {
+                join_destroyed_observer_install_paused_for_test.store(
+                    true, std::memory_order_release);
+                while (pause_join_destroyed_observer_install_for_test.load(
+                        std::memory_order_acquire)) {
+                    pause_join_destroyed_observer_install_for_test.wait(
+                        true, std::memory_order_acquire);
+                }
+            }
+#endif
+            const auto address = reinterpret_cast<std::uintptr_t>(candidate.get());
+            if (destruction_state_.compare_exchange_strong(
+                    observed, address, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                (void)candidate.release();
+                observed = address;
+            }
+        }
+        // A null list with the closed bit set means destruction won before
+        // installation. Its acquire observation is already a teardown barrier.
+        return observer_list(observed);
+    }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    bool has_async_destruction_waiters_for_test() const noexcept {
+        return observer_list(destruction_state_.load(std::memory_order_acquire)) != nullptr;
+    }
+#endif
+
 private:
+    static destruction_waiters* observer_list(std::uintptr_t state) noexcept {
+        return reinterpret_cast<destruction_waiters*>(state & ~destruction_destroyed);
+    }
+
     static std::shared_ptr<task_execution_context> require_execution_context(
         std::shared_ptr<task_execution_context> context) {
         if (!context) {
@@ -229,6 +283,66 @@ private:
     }
 
     const std::shared_ptr<task_execution_context> execution_context_;
+};
+
+class join_destroyed_awaitable final {
+public:
+    explicit join_destroyed_awaitable(
+        std::shared_ptr<join_state_base> state) noexcept
+        : state_(std::move(state)) {
+        assert(state_ && "cannot observe an empty join handle");
+    }
+
+    ~join_destroyed_awaitable() {
+        if (observer_) {
+            observers_->abandon(observer_);
+        }
+    }
+
+    join_destroyed_awaitable(const join_destroyed_awaitable&) = delete;
+    join_destroyed_awaitable& operator=(const join_destroyed_awaitable&) = delete;
+    join_destroyed_awaitable(join_destroyed_awaitable&& other) noexcept
+        : state_(std::move(other.state_))
+        , observers_(std::exchange(other.observers_, nullptr))
+        , observer_(std::move(other.observer_)) {}
+    join_destroyed_awaitable& operator=(join_destroyed_awaitable&&) = delete;
+
+    [[nodiscard]] bool await_ready() const noexcept {
+        return state_->is_destroyed();
+    }
+
+    bool await_suspend(std::coroutine_handle<> handle) {
+        auto state = state_;
+        if (state->is_destroyed()) {
+            return false;
+        }
+        auto* owner = runtime::get_current_scheduler();
+        if (!owner) {
+            throw std::logic_error(
+                "pending join destruction wait requires an Elio scheduler");
+        }
+        observers_ = state->async_destruction_waiters();
+        if (!observers_) {
+            return false;
+        }
+        observer_ = std::make_shared<destruction_waiters::observation>(owner);
+        // Do not access this awaiter after publication: the observer may be
+        // resumed and destroyed by another worker before this call returns.
+        return observers_->register_waiter(observer_, handle, [state] {
+            return state->is_destroyed();
+        });
+    }
+
+    void await_resume() const noexcept {
+        const bool destroyed = state_->is_destroyed();
+        assert(destroyed);
+        (void)destroyed;
+    }
+
+private:
+    std::shared_ptr<join_state_base> state_;
+    destruction_waiters* observers_ = nullptr;
+    std::shared_ptr<destruction_waiters::observation> observer_;
 };
 
 template<typename T>
@@ -349,6 +463,15 @@ public:
         state_->wait_destroyed();
     }
 
+    /// Observe frame teardown without blocking, cancelling, or consuming the
+    /// result. Each awaitable owns its state; multiple observers are allowed.
+    /// Pending waits require a live calling-thread scheduler, which must remain
+    /// alive until they finish. Forced shutdown retains its existing limits.
+    [[nodiscard("co_await join_handle::wait_destroyed_async()")]]
+    detail::join_destroyed_awaitable wait_destroyed_async() const noexcept {
+        return detail::join_destroyed_awaitable(state_);
+    }
+
 private:
     std::shared_ptr<detail::join_state<T>> state_;
     detail::completion_waiter waiter_;
@@ -420,6 +543,12 @@ public:
     /// may wait concurrently; scheduler workers must not block here.
     void wait_destroyed() const {
         state_->wait_destroyed();
+    }
+
+    /// Coroutine-side destruction observer; see the primary template's contract.
+    [[nodiscard("co_await join_handle::wait_destroyed_async()")]]
+    detail::join_destroyed_awaitable wait_destroyed_async() const noexcept {
+        return detail::join_destroyed_awaitable(state_);
     }
 
 private:

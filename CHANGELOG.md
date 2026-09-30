@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Asynchronous joinable-task destruction observation**:
+  `join_handle<T>::wait_destroyed_async()` waits for the same normal-frame
+  teardown publication as the external blocking wait without polling or using
+  the blocking pool. Independent observers retain shared state across handle
+  movement and resume in their registration scheduler domain. Results and
+  cooperative cancellation remain separate; forced-shutdown limits are unchanged
+  (#1227).
+
 - **Owned HTTP/1 CONNECT tunnels**: dedicated authority routing,
   `tunnel_response` sessions, scoped borrowed `tunnel_stream` I/O and an optional
   two-buffer, cancel-and-join relay. Acceptance preserves parser read-ahead once

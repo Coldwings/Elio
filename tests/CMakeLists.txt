@@ -16,6 +16,7 @@ set(TEST_SOURCES
     unit/test_frame_allocation.cpp
     unit/test_task_execution_context.cpp
     unit/test_task.cpp
+    unit/test_join_destroyed_async.cpp
     unit/test_task_group.cpp
     unit/test_awaitable_base.cpp
     unit/test_chase_lev_deque.cpp

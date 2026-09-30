@@ -248,6 +248,16 @@ coro::task<void> parallel_example() {
 }
 ```
 
+Result readiness does not imply that the spawned root's parameters or callable
+captures have been destroyed. When releasing resources they borrow, separately
+`co_await handle.wait_destroyed_async()` after observing the result (also on an
+exception path). The destruction await supports multiple observers, does not
+consume the result or request cancellation, and retains its state if the original
+handle later moves. Pending observation requires a live Elio scheduler and resumes
+in that registration domain. Keep the scheduler running through normal drain;
+forced shutdown does not turn this into safe asynchronous frame/I/O destruction.
+The blocking `wait_destroyed()` remains available only to external threads.
+
 Each `spawn()` call has an independent cancellation context. A join handle can
 request cancellation without retaining or addressing the coroutine frame:
 
@@ -264,6 +274,7 @@ coro::task<void> controller() {
     auto handle = elio::spawn(background_request);
     handle.request_cancel();
     co_await handle;  // Still join: cancellation is not forced destruction.
+    co_await handle.wait_destroyed_async();
 }
 ```
 

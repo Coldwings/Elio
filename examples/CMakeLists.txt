@@ -30,6 +30,16 @@ add_executable(chained_coroutines chained_coroutines.cpp)
 target_link_libraries(chained_coroutines PRIVATE elio)
 target_link_options(chained_coroutines PRIVATE ${STATIC_LINK_FLAGS})
 
+add_executable(join_destroyed_async join_destroyed_async.cpp)
+target_link_libraries(join_destroyed_async PRIVATE elio)
+target_link_options(join_destroyed_async PRIVATE ${STATIC_LINK_FLAGS})
+if(ELIO_BUILD_TESTS)
+    add_test(NAME join_destroyed_async_example COMMAND join_destroyed_async)
+    set_tests_properties(join_destroyed_async_example PROPERTIES
+        TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "Result: 42, captures released: yes")
+endif()
+
 add_executable(exception_handling exception_handling.cpp)
 target_link_libraries(exception_handling PRIVATE elio)
 target_link_options(exception_handling PRIVATE ${STATIC_LINK_FLAGS})

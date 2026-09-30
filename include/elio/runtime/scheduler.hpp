@@ -1724,6 +1724,22 @@ inline void schedule_handle(std::coroutine_handle<> handle) noexcept {
     }
 }
 
+inline void schedule_destruction_waiter(
+    scheduler* owner, std::coroutine_handle<> handle) noexcept {
+    if (scheduler::current() == owner) {
+        schedule_handle(handle);
+        return;
+    }
+    // A child can finish on another scheduler or during external teardown.
+    // Never borrow the notifier's scheduler for this observer's continuation.
+    while (owner->is_running()) {
+        if (owner->try_schedule(handle)) {
+            return;
+        }
+        std::this_thread::yield();
+    }
+}
+
 inline void report_detached_exception(std::exception_ptr ex) noexcept {
     if (!ex) return;
     auto* sched = scheduler::current();

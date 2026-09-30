@@ -214,6 +214,47 @@ struct write_failure_guard {
     }
     ~write_failure_guard() { elio::http::detail::request_write_result_for_test.store(nullptr); }
 };
+
+client_result<response> run_stalled_tls_handshake(bool cancel) {
+    auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    const auto target = "https://127.0.0.1:" + std::to_string(listener->local_address().port()) + "/";
+    elio::http::client_config config;
+    config.connect_timeout = cancel ? std::chrono::seconds::zero() : std::chrono::seconds(1);
+    config.read_timeout = std::chrono::seconds::zero();
+    elio::http::client client(config);
+    elio::coro::cancel_source cleanup;
+    elio::sync::event release_server;
+    std::atomic<bool> client_hello{false}, done{false};
+    std::exception_ptr failure;
+    client_result<response> result;
+    elio::runtime::scheduler scheduler(2);
+    scheduler.start();
+    scheduler.go([&]() -> task<void> {
+        auto stream = co_await listener->accept(cleanup.get_token());
+        if (!stream) co_return;
+        std::array<char, 1024> buffer{};
+        const auto received = co_await stream->read(buffer.data(), buffer.size(), cleanup.get_token());
+        client_hello.store(received.result > 0, std::memory_order_release);
+        (void)co_await release_server.wait(cleanup.get_token());
+    });
+    scheduler.go([&]() -> task<void> {
+        try { result = co_await client.get_result(target, cleanup.get_token()); }
+        catch (...) { failure = std::current_exception(); }
+        done.store(true, std::memory_order_release);
+    });
+    const bool entered = wait_for([&] { return client_hello.load(std::memory_order_acquire); });
+    if (cancel) cleanup.cancel();
+    const bool completed = wait_for([&] { return done.load(std::memory_order_acquire); });
+    cleanup.cancel();
+    release_server.set();
+    const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
+    REQUIRE(drained);
+    REQUIRE(entered);
+    REQUIRE(completed);
+    REQUIRE_FALSE(failure);
+    return result;
+}
 } // namespace
 
 TEST_CASE("HTTP result errors own bounded target metadata", "[http][http_client_result]") {
@@ -395,6 +436,16 @@ TEST_CASE("HTTP invalid TLS peer reports TLS stage", "[http][http_client_result]
     const auto error = std::get<client_error>(result);
     REQUIRE(error.code.value() > 0);
     REQUIRE(error.stage == client_stage::tls);
+}
+
+TEST_CASE("HTTP TLS cancellation and connect deadline retain TLS stage",
+          "[http][http_client_result][tls][cancel][timeout]") {
+    SECTION("explicit cancellation") {
+        require_failure(run_stalled_tls_handshake(true), ECANCELED, client_stage::tls);
+    }
+    SECTION("configured connect deadline") {
+        require_failure(run_stalled_tls_handshake(false), ETIMEDOUT, client_stage::tls);
+    }
 }
 
 TEST_CASE("HTTP value API does not swallow exceptional failures", "[http][http_client_result][exception]") {

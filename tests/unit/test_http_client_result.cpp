@@ -59,7 +59,9 @@ task<std::string> read_headers(elio::net::tcp_stream& stream, elio::coro::cancel
     co_return request;
 }
 
-enum class request_api { get, method_general, custom };
+enum class request_api {
+    get, method_general, custom, method_empty, method_untyped_empty, legacy_empty
+};
 
 std::atomic<elio::coro::cancel_source*> interim_cancel_source{nullptr};
 void cancel_after_interim_headers(uint16_t code) {
@@ -120,6 +122,17 @@ client_result<response> run_wire_response(std::string_view wire,
             if (api == request_api::method_general) {
                 result = co_await client.request_result(elio::http::method::POST, target,
                     "data", elio::http::mime::text_plain, cleanup.get_token());
+            } else if (api == request_api::method_empty ||
+                       api == request_api::method_untyped_empty) {
+                const auto content_type = api == request_api::method_empty
+                    ? elio::http::mime::application_json : std::string_view{};
+                result = co_await client.request_result(elio::http::method::POST, target,
+                    {}, content_type, cleanup.get_token());
+            } else if (api == request_api::legacy_empty) {
+                auto response = co_await client.post(target, {}, cleanup.get_token(),
+                    elio::http::mime::application_json);
+                if (response) result = std::move(*response);
+                else result = elio::http::detail::make_client_error(errno, client_stage::request);
             } else if (api == request_api::custom) {
                 elio::http::request request(elio::http::method::POST, "/");
                 request.set_body(std::string_view("data"));
@@ -396,6 +409,26 @@ TEST_CASE("HTTP custom and method-general value APIs send requests", "[http][htt
     REQUIRE(captured.starts_with("POST / HTTP/1.1\r\n"));
     REQUIRE(captured.find("Content-Type: text/plain\r\n") != std::string::npos);
     REQUIRE(captured.find("Content-Length: 4\r\n") != std::string::npos);
+}
+
+TEST_CASE("HTTP value API honors typed empty representations without changing legacy wire output",
+          "[http][http_client_result][request]") {
+    const auto api = GENERATE(request_api::method_empty,
+                             request_api::method_untyped_empty, request_api::legacy_empty);
+    std::string captured;
+    const auto result = run_wire_response(
+        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        {}, false, nullptr, false, api, &captured);
+    REQUIRE(std::holds_alternative<response>(result));
+    REQUIRE(std::get<response>(result).status_code() == 401);
+    REQUIRE(captured.starts_with("POST / HTTP/1.1\r\n"));
+    if (api == request_api::method_empty) {
+        REQUIRE(captured.find("Content-Type: application/json\r\n") != std::string::npos);
+        REQUIRE(captured.find("Content-Length: 0\r\n") != std::string::npos);
+    } else {
+        REQUIRE(captured.find("Content-Type:") == std::string::npos);
+        REQUIRE(captured.find("Content-Length:") == std::string::npos);
+    }
 }
 
 TEST_CASE("HTTP interim headers do not establish body cancellation stage",

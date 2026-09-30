@@ -324,6 +324,14 @@ public:
                                                           std::string_view body = {},
                                                           std::string_view content_type = {},
                                                           coro::cancel_token token = {}) {
+        return request_url_result(m, url_str, body, content_type, std::move(token), true);
+    }
+
+private:
+    coro::task<client_result<response>> request_url_result(
+            method m, std::string_view url_str, std::string_view body,
+            std::string_view content_type, coro::cancel_token token,
+            bool honor_empty_representation) {
         // Check if already cancelled
         if (token.is_cancelled()) {
             co_return detail::make_client_error(ECANCELED, client_stage::target);
@@ -349,7 +357,7 @@ public:
         request req(m, parsed->path_with_query());
         req.set_host(parsed->host_authority());
         
-        if (!body.empty()) {
+        if (!body.empty() || (honor_empty_representation && !content_type.empty())) {
             req.set_body(body);
             if (!content_type.empty()) {
                 req.set_content_type(content_type);
@@ -363,7 +371,6 @@ public:
         co_return co_await send_request(req, *parsed, 0, std::move(token));
     }
 
-private:
     static std::optional<response> optional_response(client_result<response> result) {
         if (const auto* error = std::get_if<client_error>(&result)) {
             errno = error->code.value();
@@ -374,8 +381,10 @@ private:
 
     coro::task<std::optional<response>> request_url(method m, std::string_view url_str,
             std::string_view body, std::string_view content_type, coro::cancel_token token) {
-        co_return optional_response(co_await request_result(
-            m, url_str, body, content_type, std::move(token)));
+        // Preserve legacy empty-body serialization; the value API honors an
+        // explicit content type even for a zero-length representation.
+        co_return optional_response(co_await request_url_result(
+            m, url_str, body, content_type, std::move(token), false));
     }
     
     /// Spawn a watchdog that shutdown(2)s `fd` after `timeout` elapses,

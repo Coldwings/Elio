@@ -2832,7 +2832,9 @@ public:
 
 Opt in by replacing `get()` with `get_result()`, `send()` with `send_result()`,
 or using `request_result()` for any supported method. The content type is not
-automatically chosen by `request_result()`; pass it when required. Existing
+automatically chosen by `request_result()`; pass it when required. An explicit
+nonempty type is emitted even for an empty body, together with `Content-Length: 0`.
+An empty body without a type remains bodyless. Existing
 optional-returning methods retain their signatures and map a failed value to
 an empty optional plus `errno`. Capture that legacy errno immediately.
 

@@ -141,6 +141,72 @@ task<void> raw_node_observer(
     co_await elio::coro::detail::join_observation_awaitable(std::move(node));
     returned.store(true, std::memory_order_release);
 }
+
+template<typename T>
+void check_duplicate_direct_awaiters() {
+    auto state = std::make_shared<join_state<T>>();
+    join_handle<T> handle(state);
+    struct direct_result {
+        std::exception_ptr failure;
+        int value = 0;
+        std::atomic<bool> done{false};
+    } first, second;
+    auto& pause = elio::coro::detail::pause_join_direct_rejection_for_test;
+    struct unpause_guard {
+        std::atomic<bool>& pause;
+        ~unpause_guard() {
+            pause.store(false, std::memory_order_release);
+            pause.notify_all();
+        }
+    };
+    scheduler sched(2);
+    unpause_guard release{pause};
+    pause.store(true, std::memory_order_release);
+    auto await_direct = [&](direct_result& result) -> task<void> {
+        try {
+            auto& result_handle = handle;
+            if constexpr (std::is_void_v<T>) co_await result_handle;
+            else result.value = co_await result_handle;
+        } catch (...) { result.failure = std::current_exception(); }
+        result.done.store(true, std::memory_order_release);
+    };
+    sched.start();
+    sched.go_to(0, await_direct(first));
+    const bool first_registered = wait_for([&] {
+        return (state->result_observer_flags_for_test() &
+                join_state<T>::observer_mask) == join_state<T>::direct_observer;
+    });
+    sched.go_to(1, await_direct(second));
+    const bool rejection_paused = wait_for([] {
+        return elio::coro::detail::join_direct_rejection_paused_for_test.load(
+            std::memory_order_acquire);
+    });
+    sched.go_to(0, [&]() -> task<void> {
+        if constexpr (std::is_void_v<T>) state->set_value();
+        else state->set_value(41);
+        co_return;
+    });
+    const bool first_finished = wait_for([&] {
+        return first.done.load(std::memory_order_acquire);
+    });
+    const bool second_still_parked = !second.done.load(std::memory_order_acquire);
+    pause.store(false, std::memory_order_release);
+    pause.notify_all();
+    const bool second_finished = wait_for([&] {
+        return second.done.load(std::memory_order_acquire);
+    });
+    const bool drained = sched.shutdown(elio::test::scaled_ms(5000));
+    REQUIRE(drained);
+    REQUIRE(first_registered);
+    REQUIRE(rejection_paused);
+    REQUIRE(first_finished);
+    REQUIRE(second_still_parked);
+    REQUIRE(second_finished);
+    REQUIRE_FALSE(first.failure);
+    REQUIRE(second.failure);
+    REQUIRE_THROWS_AS(std::rethrow_exception(second.failure), std::logic_error);
+    if constexpr (!std::is_void_v<T>) REQUIRE(first.value == 41);
+}
 } // namespace
 
 TEST_CASE("join readiness initial precedence is ready then cancelled then expired",
@@ -461,7 +527,7 @@ TEST_CASE("join result waits reject both directions of concurrent registration",
     const unsigned first_mode = bounded_first ? join_state<int>::bounded_observer :
                                                join_state<int>::direct_observer;
     const bool registered = wait_for([&] {
-        return (state->completion_flags_.load(std::memory_order_acquire) &
+        return (state->result_observer_flags_for_test() &
                 join_state<int>::observer_mask) == first_mode;
     });
     if (bounded_first) start_direct();
@@ -492,6 +558,13 @@ TEST_CASE("join result waits reject both directions of concurrent registration",
         REQUIRE_FALSE(direct_failure);
         REQUIRE(direct_value == 37);
     }
+}
+
+TEST_CASE("duplicate direct join rejection stays local while the first awaiter resumes",
+          "[task][join_handle][join_wait][contract][regression]") {
+    const bool void_result = GENERATE(false, true);
+    if (void_result) check_duplicate_direct_awaiters<void>();
+    else check_duplicate_direct_awaiters<int>();
 }
 
 TEST_CASE("join readiness factory retains state after the original handle is discarded",
@@ -720,7 +793,7 @@ TEST_CASE("join readiness rejects another bounded pending observation",
     sched.start();
     sched.go(record_observation(handle.wait(cancellation.get_token()), first));
     const bool registered = wait_for([&] {
-        return (state->completion_flags_.load(std::memory_order_acquire) &
+        return (state->result_observer_flags_for_test() &
                 join_state<void>::observer_mask) == join_state<void>::bounded_observer;
     });
     sched.go(record_observation(handle.wait(), second));

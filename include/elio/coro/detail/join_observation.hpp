@@ -93,7 +93,7 @@ private:
     std::exception_ptr failure_;
 };
 
-struct join_observer_control final {
+struct alignas(8) join_observer_control final {
     std::atomic<std::shared_ptr<join_observation>> observer;
 };
 

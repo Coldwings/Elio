@@ -201,6 +201,16 @@ if(TARGET elio_http)
     target_link_libraries(http_client PRIVATE elio_http)
     target_link_options(http_client PRIVATE ${STATIC_LINK_FLAGS})
 
+    add_executable(http_client_result http_client_result.cpp)
+    target_link_libraries(http_client_result PRIVATE elio_http)
+    target_link_options(http_client_result PRIVATE ${STATIC_LINK_FLAGS})
+    if(ELIO_BUILD_TESTS)
+        add_test(NAME http_client_result_example COMMAND http_client_result)
+        set_tests_properties(http_client_result_example PROPERTIES TIMEOUT 30
+            PASS_REGULAR_EXPRESSION "HTTP status: 503; owned error: 22 at target")
+        add_dependencies(test_all http_client_result)
+    endif()
+
     # HTTP/2 example (requires elio_http2 target)
     if(TARGET elio_http2)
         add_executable(http2_client http2_client.cpp)

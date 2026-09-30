@@ -291,6 +291,13 @@ ELIO_ASYNC_MAIN(async_main)
 
 ## HTTP Client
 
+`http_client_result.cpp` is an offline loopback example of owned error values
+and normal non-2xx responses. Build/run `http_client_result` with HTTP enabled:
+it retains an invalid-target error while a local peer returns HTTP 503, without
+reading `errno` or requiring external DNS/network access. Use
+`std::get_if<http::client_error>()` to distinguish failure from a response;
+retry/idempotency policy remains application-owned.
+
 Making HTTP requests with various methods:
 
 ```cpp

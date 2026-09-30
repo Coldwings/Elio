@@ -289,6 +289,7 @@ public:
     // Observe or wait for coroutine-frame destruction
     bool is_destroyed() const noexcept;
     void wait_destroyed() const;
+    auto wait_destroyed_async() const noexcept; // Single-use awaitable, void result
 
     // Cooperative, best-effort cancellation request
     void request_cancel() const;
@@ -302,6 +303,31 @@ must wait until a normally completed wrapper has released its frame parameters,
 callable, arguments, and captures. Multiple external threads may wait at once;
 one release publication from final frame destruction wakes all of them.
 Scheduler workers must not call this blocking API.
+
+Use `co_await handle.wait_destroyed_async()` for the same destruction publication
+without blocking a worker or occupying the blocking pool. It does not consume the
+result, rethrow the task's exception, or request cancellation. Each call creates
+an independent, move-only, single-use awaitable that pins the shared join state;
+the original handle may subsequently move or be discarded. Multiple destruction
+observers may wait concurrently, independently of the existing result waiter.
+Teardown writes are visible after a successful await.
+
+An already-destroyed handle completes immediately, even outside a scheduler.
+A pending wait requires a live calling-thread Elio scheduler or throws
+`std::logic_error`. Registration may allocate and propagate allocation failure.
+The continuation resumes in the scheduler domain where it registered, not the
+observed task's domain. Keep that scheduler and the coroutine's owner alive until
+the observation completes. Do not move an awaitable while its suspension is
+active or destroy its coroutine after scheduling ownership has been claimed.
+Destroying a still-registered observer removes its registration, including a
+selected wake that has not yet been claimed.
+
+This is not a cancellation/deadline API. A task that never terminates can keep an
+observer waiting. Forced shutdown retains its existing restrictions: neither
+destruction observer makes asynchronous frame destruction safe, joins abandoned
+kernel I/O, or promises normal parameter-teardown ordering on a forced-destruction
+path. Use cooperative stop plus normal task drain before releasing borrowed
+resources.
 
 **Example:**
 ```cpp
@@ -320,9 +346,15 @@ coro::task<void> main_task() {
     
     // Await the result
     int result = co_await handle;
+    co_await handle.wait_destroyed_async();
     std::cout << "Result: " << result << std::endl;
 }
 ```
+
+See the runnable [capture-teardown example](https://github.com/Coldwings/Elio/blob/main/examples/join_destroyed_async.cpp).
+If result observation throws, retain the exception, perform the destruction await
+outside the catch handler, then release borrowed resources and propagate/report
+the exception. A destruction await does not replace result/error observation.
 
 `request_cancel()` publishes through state shared with the spawned task; it does
 not access the coroutine frame and remains valid after frame destruction. The

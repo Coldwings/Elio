@@ -315,7 +315,8 @@ available when `ELIO_BUILD_EXAMPLES=ON`; protocol and RDMA examples also require
 their corresponding feature targets.
 
 - **Coroutine/runtime**: `hello_world.cpp`, `chained_coroutines.cpp`,
-  `exception_handling.cpp`, `parallel_tasks.cpp`, `dynamic_threads.cpp`,
+  `exception_handling.cpp`, `join_destroyed_async.cpp`, `parallel_tasks.cpp`,
+  `dynamic_threads.cpp`,
   `autoscaler_example.cpp`, `thread_affinity.cpp`, `signal_handling.cpp`,
   `debug_test.cpp`
 - **Benchmarks**: `benchmark.cpp`, `quick_benchmark.cpp`, `microbench.cpp`,

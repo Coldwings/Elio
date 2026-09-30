@@ -1027,7 +1027,7 @@ TEST_CASE("join destruction state uses a native lock-free width",
     INFO("join_state_base bytes: " << sizeof(join_state_base));
     INFO("join_state<void> bytes: " << sizeof(join_state<void>));
     INFO("join_state<uint64_t> bytes: " << sizeof(join_state<uint64_t>));
-    STATIC_REQUIRE(std::atomic<std::uint32_t>::is_always_lock_free);
+    STATIC_REQUIRE(std::atomic<std::uintptr_t>::is_always_lock_free);
     STATIC_REQUIRE(sizeof(join_state_base) <= 128);
     STATIC_REQUIRE(sizeof(join_state<void>) <= 128);
     STATIC_REQUIRE(sizeof(join_state<uint64_t>) <= 128);

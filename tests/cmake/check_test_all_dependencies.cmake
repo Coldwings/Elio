@@ -14,7 +14,7 @@ project(elio_test_all_dependency_probe LANGUAGES CXX)
 add_subdirectory("${ELIO_SOURCE_DIR}" elio)
 
 set(_expected elio_tests elio_file_transfer_header elio_fork_boundary_tests
-    elio_rdma_cuda_lifetime_tests)
+    elio_rdma_cuda_lifetime_tests elio_test_watchdog_probe_normal)
 if(NOT ELIO_ENABLE_RDMA_IBVERBS)
     list(APPEND _expected elio_rdma_ibverbs_backend_stub_tests)
 endif()
@@ -22,7 +22,8 @@ if(ELIO_BUILD_EXAMPLES)
     list(APPEND _expected first_coroutine join_destroyed_async positional_file_io)
 endif()
 if(ELIO_BUILD_SANITIZER_TESTS)
-    list(APPEND _expected elio_tests_asan elio_tests_tsan elio_fork_boundary_tests_asan)
+    list(APPEND _expected elio_tests_asan elio_tests_tsan elio_fork_boundary_tests_asan
+        elio_test_watchdog_probe_asan elio_test_watchdog_probe_tsan)
 endif()
 if(ELIO_BUILD_HTTP_INTEROP_TESTS)
     list(APPEND _expected elio_http_streaming_peer elio_http_connect_peer

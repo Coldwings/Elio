@@ -2998,7 +2998,9 @@ rejected with nonterminal `EALREADY` without changing the admitted read; scope
 serialization/join requirements still apply. Borrowed destination access
 ends before each awaited return, including cancellation/error return.
 
-A root token and each read's token both participate. The absolute per-hop
+A root token and each read's token both participate while incomplete. Explicit
+completion takes precedence over later read cancellation; root cancellation
+still fails the outer exchange and prevents reuse. The absolute per-hop
 response I/O deadline is retained across pulls, not extended per read; it is not
 a total DNS/setup/handler budget. Early exit, exceptions, incomplete consumption,
 framing failure and cancellation close rather than pool the connection. Observe

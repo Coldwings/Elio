@@ -267,12 +267,17 @@ TEST_CASE("HTTP streaming client decodes bounded fragmented payloads", "[http][c
     require_backend(backend);
     const bool encrypted = GENERATE(false, true);
     const auto framing = GENERATE(0, 1, 2);
-    CAPTURE(static_cast<int>(backend), encrypted, framing);
+    const bool fragmented = GENERATE(false, true);
+    CAPTURE(static_cast<int>(backend), encrypted, framing, fragmented);
+    // Keep tiny-fragment decoding separate from large-body coverage: neither
+    // contract requires tens of thousands of pulls within a fixed I/O budget.
+    const std::string payload(fragmented ? 257 : 65539, 'r');
+    const std::string range = "bytes 0-" + std::to_string(payload.size() - 1) +
+        "/" + std::to_string(payload.size());
     http::client_config config;
     config.max_response_size = 1;
-    config.read_buffer_size = 7;
+    config.read_buffer_size = fragmented ? 7 : 4096;
     exchange_fixture fixture(backend, encrypted, config);
-    const std::string payload(65539, 'r');
     body_observation observation;
     bool headers_ok = false;
     int payload_written = 0;
@@ -282,14 +287,17 @@ TEST_CASE("HTTP streaming client decodes bounded fragmented payloads", "[http][c
         auto stream = co_await fixture.accept();
         if (!stream) throw std::runtime_error("server accept failed");
         (void)co_await request_headers(*stream, fixture.stop.get_token());
-        std::string head = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-65538/65539\r\n";
+        std::string head = "HTTP/1.1 206 Partial Content\r\nContent-Range: " + range + "\r\n";
         if (framing == 0) head += "Content-Length: " + std::to_string(payload.size()) + "\r\n";
         if (framing == 1) head += "Transfer-Encoding: chunked\r\n";
         head += "Connection: close\r\n\r\n";
         for (char byte : head) {
             (void)co_await stream->write_all(std::string_view(&byte, 1), fixture.stop.get_token());
         }
-        if (framing == 1) (void)co_await stream->write_all("10003\r\n", fixture.stop.get_token());
+        if (framing == 1) {
+            const std::string_view chunk_size = fragmented ? "101\r\n" : "10003\r\n";
+            (void)co_await stream->write_all(chunk_size, fixture.stop.get_token());
+        }
         payload_written = (co_await stream->write_all(payload, fixture.stop.get_token())).result;
         if (framing == 1) {
             (void)co_await stream->write_all("\r\n0\r\nX-End: yes\r\n\r\n", fixture.stop.get_token());
@@ -301,8 +309,8 @@ TEST_CASE("HTTP streaming client decodes bounded fragmented payloads", "[http][c
             fixture.target, {}, [&](const http::response& head, http::response_body_reader& body,
                                     coro::cancel_token token) -> coro::task<void> {
                 headers_ok = head.status_code() == 206 && head.body().empty() &&
-                    head.header("Content-Range") == "bytes 0-65538/65539";
-                co_await consume(body, token, observation);
+                    head.header("Content-Range") == range;
+                co_await consume(body, token, observation, fragmented ? 3 : 257);
             });
     });
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -587,6 +595,135 @@ TEST_CASE("HTTP streaming client keeps errors sticky and honors independent limi
     if (invoked) {
         REQUIRE(sticky);
         REQUIRE_FALSE(observation.complete);
+    }
+}
+
+TEST_CASE("HTTP streaming completion precedes later read cancellation",
+          "[http][client][streaming][cancel][completion][pool]") {
+    const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
+    require_backend(backend);
+    const bool encrypted = GENERATE(false, true);
+    const bool cancel_scope = GENERATE(false, true);
+    CAPTURE(static_cast<int>(backend), encrypted, cancel_scope);
+    exchange_fixture fixture(backend, encrypted);
+    coro::cancel_source scope_cancel;
+    body_observation first;
+    body_observation second;
+    bool repeated_completion = false;
+    bool reader_not_poisoned = false;
+    bool buffer_untouched = false;
+    bool first_closed = false;
+    bool second_request_seen = false;
+    int first_error = 0;
+    int second_error = 0;
+    fixture.run([&]() -> coro::task<void> {
+        auto stream = co_await fixture.accept();
+        if (!stream) throw std::runtime_error("server accept failed");
+        (void)co_await request_headers(*stream, fixture.stop.get_token());
+        (void)co_await stream->write_all("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst",
+                                        fixture.stop.get_token());
+        auto next = co_await request_headers(*stream, fixture.stop.get_token());
+        first_closed = next.empty();
+        if (first_closed) {
+            http::detail::abort_stream_io(*stream);
+            stream = co_await fixture.accept();
+            if (!stream) throw std::runtime_error("second server accept failed");
+            next = co_await request_headers(*stream, fixture.stop.get_token());
+        }
+        second_request_seen = next.starts_with("GET /range ");
+        (void)co_await stream->write_all(
+            "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecond",
+            fixture.stop.get_token());
+        http::detail::abort_stream_io(*stream);
+    }, [&](http::client& client) -> coro::task<void> {
+        auto result = co_await client.with_response(http::request(http::method::GET, "/range"),
+            fixture.target, scope_cancel.get_token(),
+            [&](const http::response&, http::response_body_reader& body,
+                coro::cancel_token token) -> coro::task<void> {
+                co_await consume(body, token, first);
+                if (cancel_scope) scope_cancel.cancel();
+                coro::cancel_source later_read;
+                later_read.cancel();
+                std::array<char, 5> buffer;
+                buffer.fill('r');
+                auto repeated = co_await body.read_into(std::span<char>(buffer), later_read.get_token());
+                auto empty = co_await body.read_into(std::span<char>{}, later_read.get_token());
+                const auto* progress = std::get_if<http::body_read_progress>(&repeated);
+                const auto* empty_progress = std::get_if<http::body_read_progress>(&empty);
+                repeated_completion = progress && empty_progress && progress->complete &&
+                    empty_progress->complete && progress->transferred == 0 &&
+                    empty_progress->transferred == 0 && body.complete();
+                reader_not_poisoned = !body.error();
+                buffer_untouched = std::all_of(buffer.begin(), buffer.end(),
+                                              [](char value) { return value == 'r'; });
+            });
+        first_error = result_error(result);
+        result = co_await client.with_response(http::request(http::method::GET, "/range"),
+            fixture.target, fixture.stop.get_token(),
+            [&](const http::response&, http::response_body_reader& body,
+                coro::cancel_token token) -> coro::task<void> {
+                co_await consume(body, token, second);
+            });
+        second_error = result_error(result);
+    });
+    REQUIRE(first.bytes == "first");
+    REQUIRE(first.complete);
+    REQUIRE(repeated_completion);
+    REQUIRE(reader_not_poisoned);
+    REQUIRE(buffer_untouched);
+    REQUIRE(first_error == (cancel_scope ? ECANCELED : 0));
+    REQUIRE(first_closed == cancel_scope);
+    REQUIRE(second_error == 0);
+    REQUIRE(second_request_seen);
+    REQUIRE(second.bytes == "second");
+    REQUIRE(second.complete);
+    REQUIRE(fixture.accepted == (cancel_scope ? 2 : 1));
+}
+
+TEST_CASE("HTTP streaming client rejects protocol handoffs before invoking the handler",
+          "[http][client][streaming][handoff]") {
+    const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
+    require_backend(backend);
+    const bool encrypted = GENERATE(false, true);
+    const auto code = GENERATE(101, 200, 204, 299, 403);
+    const bool consumes = GENERATE(false, true);
+    CAPTURE(static_cast<int>(backend), encrypted, code, consumes);
+    exchange_fixture fixture(backend, encrypted);
+    const bool handoff = code != 403;
+    bool invoked = false;
+    bool closed = false;
+    body_observation body_read;
+    http::client_result<std::monostate> result;
+    fixture.run([&]() -> coro::task<void> {
+        auto stream = co_await fixture.accept();
+        if (!stream) throw std::runtime_error("server accept failed");
+        (void)co_await request_headers(*stream, fixture.stop.get_token());
+        const auto headers = "HTTP/1.1 " + std::to_string(code) + " Response\r\n";
+        const auto wire = handoff ? headers + "\r\nopaque tunnel bytes"
+            : headers + "Content-Length: 6\r\nConnection: close\r\n\r\ndenied";
+        (void)co_await stream->write_all(wire, fixture.stop.get_token());
+        char byte;
+        closed = (co_await stream->read(&byte, 1, fixture.stop.get_token())).result <= 0;
+        http::detail::abort_stream_io(*stream);
+    }, [&](http::client& client) -> coro::task<void> {
+        auto request = http::request(code == 101 ? http::method::GET : http::method::CONNECT,
+                                     code == 101 ? "/range" : "example.test:443");
+        result = co_await client.with_response(std::move(request), fixture.target,
+            fixture.stop.get_token(),
+            [&](const http::response&, http::response_body_reader& body,
+                coro::cancel_token token) -> coro::task<void> {
+                invoked = true;
+                if (consumes) co_await consume(body, token, body_read);
+            });
+    });
+    REQUIRE(closed);
+    REQUIRE(invoked == !handoff);
+    REQUIRE(result_error(result) == (handoff ? EBADMSG : 0));
+    if (handoff) {
+        REQUIRE(std::get<http::client_error>(result).stage == http::client_stage::framing);
+    } else if (consumes) {
+        REQUIRE(body_read.bytes == "denied");
+        REQUIRE(body_read.complete);
     }
 }
 

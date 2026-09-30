@@ -65,7 +65,9 @@ if (const auto* failure = std::get_if<http::client_error>(&result)) {
 observed explicitly, normally by a final zero-byte read with `complete=true`
 after the payload. An empty destination consumes nothing and returns zero with
 the currently known completion flag: zero alone is not EOF. Repeated completion
-is stable. Keep destination storage valid until the awaited read returns,
+is stable and precedes a later read-token cancellation. Cancelling the root
+exchange still fails the outer operation and prevents pooling. Keep destination
+storage valid until the awaited read returns,
 including errors/cancellation; no destination access survives that return.
 
 There is no background body pump, unbounded prefetch queue, or full-body
@@ -126,8 +128,10 @@ promptly cancellable. An application can propagate cancellation into its own
 waits, but structured cancellation still awaits normal completion and cannot
 promise a physical upper bound on return time.
 
-The root token always participates in body reads, even if a read passes an empty
-token; a per-read token adds cancellation rather than replacing the root.
+While incomplete, the root token always participates in body reads, even if a
+read passes an empty token; a per-read token adds cancellation rather than
+replacing the root. Once completion is observed, subsequent reads return stable
+EOF, even with a cancelled token; root cancellation still fails the outer exchange.
 Cancellation is cooperative, may race with positive progress, and does not undo
 bytes delivered in earlier calls. Read transport/watchdog state is settled before
 return. Do not asynchronously destroy a live reader, handler, or coroutine frame.

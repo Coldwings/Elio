@@ -554,7 +554,8 @@ private:
                         detail::final_headers_seen_for_test.store(true, std::memory_order_release);
                     }
 #endif
-                    if (code == static_cast<uint16_t>(status::switching_protocols)) {
+                    if (code == static_cast<uint16_t>(status::switching_protocols) ||
+                        (request_method_ == method::CONNECT && code >= 200 && code < 300)) {
                         co_return detail::make_client_error(EBADMSG, client_stage::framing);
                     }
                     if (!is_informational_status(code)) {

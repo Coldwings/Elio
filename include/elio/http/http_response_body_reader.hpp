@@ -83,12 +83,13 @@ private:
         } lease{reading_};
 
         if (error_) co_return *error_;
+        if (complete_) co_return body_read_progress{0, true};
         if (scope_token_.is_cancelled() || token.is_cancelled()) {
             error_ = detail::make_client_error(ECANCELED, client_stage::body);
             co_return *error_;
         }
-        if (complete_ || capacity == 0) {
-            co_return body_read_progress{0, complete_};
+        if (capacity == 0) {
+            co_return body_read_progress{0, false};
         }
 
         auto cancelled = std::make_shared<coro::cancel_source>();

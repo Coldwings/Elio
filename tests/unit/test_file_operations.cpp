@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <elio/io/file_operations.hpp>
 #include <elio/io/file_helpers.hpp>
 #include "../test_main.cpp"
@@ -89,6 +90,103 @@ struct hook_guard {
 struct release_guard {
     syscall_control& control;
     ~release_guard() { control.unblock(); }
+};
+
+struct native_control {
+    uint8_t capabilities = elio::io::detail::native_file_sync |
+        elio::io::detail::native_file_allocate | elio::io::detail::native_file_truncate;
+    int32_t result = 0;
+    std::atomic<bool> admitted{false}, release{false};
+    std::atomic<elio::io::io_backend*> backend{nullptr};
+    std::atomic<unsigned> completions{0};
+    std::atomic<int> fd_error{0};
+    std::atomic<bool> resume_failed{false};
+
+    void unblock() noexcept {
+        if (!release.exchange(true, std::memory_order_acq_rel)) {
+            if (auto* owner = backend.load(std::memory_order_acquire)) owner->notify();
+        }
+    }
+};
+
+// Simulate backend admission/completion without depending on kernel io_uring.
+// Non-file operations and cross-thread wakeups retain the real epoll path.
+class controlled_file_backend : public elio::io::io_backend {
+public:
+    explicit controlled_file_backend(native_control& control) : control_(control) {
+        control_.backend.store(this, std::memory_order_release);
+    }
+    ~controlled_file_backend() override {
+        control_.backend.store(nullptr, std::memory_order_release);
+    }
+    bool supports_file_operation(io_op operation) const noexcept override {
+        const auto bit = operation == io_op::file_sync ? elio::io::detail::native_file_sync
+            : operation == io_op::file_allocate ? elio::io::detail::native_file_allocate
+            : operation == io_op::file_truncate ? elio::io::detail::native_file_truncate : 0;
+        return (control_.capabilities & bit) != 0;
+    }
+    bool prepare(const elio::io::io_request& request) override {
+        if (!supports_file_operation(request.op)) return wake_.prepare(request);
+        if (pending_) return false;
+        pending_ = request;
+        control_.admitted.store(true, std::memory_order_release);
+        return true;
+    }
+    int submit() override { return wake_.submit(); }
+    int poll(std::chrono::milliseconds timeout) override {
+        if (!pending_ || !control_.release.load(std::memory_order_acquire)) {
+            return wake_.poll(timeout);
+        }
+        const auto request = *pending_;
+        pending_.reset();
+        struct stat metadata{};
+        if (::fstat(request.fd, &metadata) != 0) control_.fd_error.store(errno);
+        auto* state = request.state;
+        const auto handle = state->handle;
+        state->result = control_.result;
+        state->flags = 0;
+        state->operation_guard.release();
+        uint8_t expected = elio::io::op_state::phase_pending;
+        if (!state->phase.compare_exchange_strong(expected, elio::io::op_state::phase_completed,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            delete state;
+            return 1;
+        }
+        control_.completions.fetch_add(1, std::memory_order_relaxed);
+        if (!elio::runtime::get_current_scheduler()->try_schedule(handle)) {
+            control_.resume_failed.store(true, std::memory_order_release);
+        }
+        return 1;
+    }
+    bool has_pending() const noexcept override { return pending_.has_value() || wake_.has_pending(); }
+    size_t pending_count() const noexcept override { return (pending_ ? 1 : 0) + wake_.pending_count(); }
+    bool cancel(void* data) override { return wake_.cancel(data); }
+    void notify() noexcept override { wake_.notify(); }
+    void drain_notify() override { wake_.drain_notify(); }
+private:
+    native_control& control_;
+    elio::io::epoll_backend wake_;
+    std::optional<elio::io::io_request> pending_;
+};
+
+std::atomic<native_control*> active_native_control{nullptr};
+elio::io::io_backend* make_controlled_backend(size_t) {
+    return new controlled_file_backend(*active_native_control.load(std::memory_order_acquire));
+}
+struct native_factory_guard {
+    explicit native_factory_guard(native_control& control) {
+        active_native_control.store(&control, std::memory_order_release);
+        elio::io::detail::worker_backend_factory_for_test.store(
+            make_controlled_backend, std::memory_order_release);
+    }
+    ~native_factory_guard() {
+        elio::io::detail::worker_backend_factory_for_test.store(nullptr, std::memory_order_release);
+        active_native_control.store(nullptr, std::memory_order_release);
+    }
+};
+struct native_release_guard {
+    native_control& control;
+    ~native_release_guard() { control.unblock(); }
 };
 
 struct backend_guard {
@@ -426,6 +524,90 @@ TEST_CASE("bounded pool admission does not create standalone per-call threads",
     REQUIRE(static_cast<bool>(work));
     pool.shutdown();
 }
+
+TEST_CASE("native file completion wins over cancellation after admission",
+          "[io][file_operations][native][cancel]") {
+    const auto operation = GENERATE(io_op::file_sync, io_op::file_allocate, io_op::file_truncate);
+    const int32_t completion = GENERATE(int32_t{0}, int32_t{-EIO});
+    char path[] = "/tmp/elio_native_file_ops_XXXXXX";
+    elio::io::fd_guard fd(::mkstemp(path));
+    REQUIRE(fd.get() >= 0);
+    REQUIRE(::unlink(path) == 0);
+    syscall_control fallback;
+    hook_guard hooks(fallback);
+    native_control control;
+    control.result = completion;
+    native_factory_guard factory(control);
+    elio::coro::cancel_source source;
+    file_status result;
+    std::atomic<bool> done{false};
+    elio::runtime::scheduler scheduler(1);
+    native_release_guard release{control};
+    scheduler.start();
+    scheduler.go([&]() -> task<void> {
+        if (operation == io_op::file_sync) {
+            result = co_await elio::io::sync_file(fd.get(), file_sync_mode::data_only, source.get_token());
+        } else if (operation == io_op::file_allocate) {
+            result = co_await elio::io::allocate_file_range(fd.get(), 0, 0, 8, source.get_token());
+        } else {
+            result = co_await elio::io::truncate_file(fd.get(), 8, source.get_token());
+        }
+        done.store(true, std::memory_order_release);
+    });
+    const bool admitted = wait_for([&] { return control.admitted.load(std::memory_order_acquire); });
+    source.cancel();
+    const bool early = done.load(std::memory_order_acquire);
+    struct stat metadata{};
+    const bool fd_valid_while_held = ::fstat(fd.get(), &metadata) == 0;
+    control.unblock();
+    const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
+    REQUIRE(admitted);
+    REQUIRE_FALSE(early);
+    REQUIRE(fd_valid_while_held);
+    REQUIRE(drained);
+    REQUIRE(done.load(std::memory_order_acquire));
+    REQUIRE(result.end == (completion == 0 ? file_operation_end::complete : file_operation_end::error));
+    REQUIRE(result.error_value() == (completion == 0 ? 0 : EIO));
+    REQUIRE(control.completions.load() == 1);
+    REQUIRE(control.fd_error.load() == 0);
+    REQUIRE_FALSE(control.resume_failed.load());
+    REQUIRE_FALSE(fallback.entered.load(std::memory_order_acquire));
+}
+
+#if ELIO_HAS_IO_URING
+TEST_CASE("a null native probe disables every file capability and selects fallback",
+          "[io][file_operations][capability][blocking]") {
+    native_control control;
+    control.capabilities = elio::io::detail::native_file_capabilities(nullptr);
+    REQUIRE(control.capabilities == 0);
+    native_factory_guard factory(control);
+    syscall_control fallback;
+    hook_guard hooks(fallback);
+    std::array<bool, 3> capabilities{};
+    std::array<file_status, 4> results{};
+    elio::runtime::scheduler scheduler(1, elio::runtime::wait_strategy::blocking(), 1);
+    scheduler.start();
+    scheduler.go([&]() -> task<void> {
+        auto& context = elio::io::current_io_context();
+        capabilities = {context.supports_file_operation(io_op::file_sync),
+                        context.supports_file_operation(io_op::file_allocate),
+                        context.supports_file_operation(io_op::file_truncate)};
+        results[0] = co_await elio::io::sync_file(42);
+        results[1] = co_await elio::io::allocate_file_range(42, 0, 0, 8);
+        results[2] = co_await elio::io::truncate_file(42, 8);
+        results[3] = co_await elio::io::sync_file(42, file_sync_mode::data_only, {}, {.max_queued = 0});
+    });
+    REQUIRE(scheduler.shutdown(elio::test::scaled_ms(5000)));
+    for (bool capability : capabilities) REQUIRE_FALSE(capability);
+    for (size_t index = 0; index < 3; ++index) {
+        REQUIRE(results[index]);
+        REQUIRE(fallback.calls[index].load() == 1);
+    }
+    REQUIRE(results[3].error_value() == EINVAL);
+    REQUIRE_FALSE(fallback.on_worker.load(std::memory_order_acquire));
+    REQUIRE_FALSE(control.admitted.load(std::memory_order_acquire));
+}
+#endif
 
 #if ELIO_HAS_IO_URING
 namespace truncate_header_mock {

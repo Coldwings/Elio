@@ -155,6 +155,10 @@ inline bool prepare_native_file_truncate(Sqe* sqe, int fd, int64_t length) noexc
     }
 }
 
+inline constexpr uint8_t native_file_sync = 1;
+inline constexpr uint8_t native_file_allocate = 2;
+inline constexpr uint8_t native_file_truncate = 4;
+
 inline bool io_uring_prepare_request_is_valid(const io_request& req) noexcept {
     switch (req.op) {
         case io_op::none:
@@ -272,6 +276,21 @@ struct batch_state {
 
 namespace elio::io {
 
+namespace detail {
+inline uint8_t native_file_capabilities(const io_uring_probe* probe) noexcept {
+    if (!probe) return 0;
+    uint8_t capabilities = 0;
+    if (io_uring_opcode_supported(probe, IORING_OP_FSYNC)) capabilities |= native_file_sync;
+    if (io_uring_opcode_supported(probe, IORING_OP_FALLOCATE)) capabilities |= native_file_allocate;
+    io_uring_sqe truncate_sqe{};
+    if (prepare_native_file_truncate(&truncate_sqe, -1, 0) &&
+            io_uring_opcode_supported(probe, truncate_sqe.opcode)) {
+        capabilities |= native_file_truncate;
+    }
+    return capabilities;
+}
+} // namespace detail
+
 class io_uring_backend;
 
 /// io_uring backend implementation
@@ -340,20 +359,9 @@ public:
             throw std::runtime_error("failed to install io_uring wake poll");
         }
 
-        if (auto* probe = io_uring_get_probe_ring(&ring_)) {
-            if (io_uring_opcode_supported(probe, IORING_OP_FSYNC)) {
-                native_file_ops_ |= native_sync;
-            }
-            if (io_uring_opcode_supported(probe, IORING_OP_FALLOCATE)) {
-                native_file_ops_ |= native_allocate;
-            }
-            io_uring_sqe truncate_sqe{};
-            if (detail::prepare_native_file_truncate(&truncate_sqe, -1, 0) &&
-                    io_uring_opcode_supported(probe, truncate_sqe.opcode)) {
-                native_file_ops_ |= native_truncate;
-            }
-            io_uring_free_probe(probe);
-        }
+        auto* probe = io_uring_get_probe_ring(&ring_);
+        native_file_ops_ = detail::native_file_capabilities(probe);
+        if (probe) io_uring_free_probe(probe);
     }
     
     /// Destructor
@@ -387,9 +395,9 @@ public:
     
     bool supports_file_operation(io_op operation) const noexcept override {
         switch (operation) {
-            case io_op::file_sync: return (native_file_ops_ & native_sync) != 0;
-            case io_op::file_allocate: return (native_file_ops_ & native_allocate) != 0;
-            case io_op::file_truncate: return (native_file_ops_ & native_truncate) != 0;
+            case io_op::file_sync: return (native_file_ops_ & detail::native_file_sync) != 0;
+            case io_op::file_allocate: return (native_file_ops_ & detail::native_file_allocate) != 0;
+            case io_op::file_truncate: return (native_file_ops_ & detail::native_file_truncate) != 0;
             default: return false;
         }
     }
@@ -1081,9 +1089,6 @@ public:
     
 private:
     struct io_uring ring_;                     ///< io_uring instance
-    static constexpr uint8_t native_sync = 1;
-    static constexpr uint8_t native_allocate = 2;
-    static constexpr uint8_t native_truncate = 4;
     uint8_t native_file_ops_ = 0;
     std::atomic<size_t> pending_ops_;          ///< Number of pending operations
     int wake_fd_ = -1;  ///< eventfd for cross-thread wake-up

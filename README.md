@@ -324,7 +324,8 @@ their corresponding feature targets.
   `scalability_test.cpp`, `bench_channel.cpp`
 - **TCP/UDS/RPC/file I/O**: `tcp_echo_server.cpp`, `tcp_echo_client.cpp`,
   `uds_echo_server.cpp`, `uds_echo_client.cpp`, `rpc_server_example.cpp`,
-  `rpc_client_example.cpp`, `async_file_io.cpp`, `positional_file_io.cpp`
+  `rpc_client_example.cpp`, `async_file_io.cpp`, `positional_file_io.cpp`,
+  `file_persistence.cpp`
 - **HTTP/TLS protocols** (`elio_http` / `elio_http2`): `http_server.cpp`,
   `http_client.cpp`, `http2_client.cpp`, `websocket_server.cpp`,
   `websocket_client.cpp`, `sse_server.cpp`, `sse_client.cpp`, `http_connect_proxy.cpp`

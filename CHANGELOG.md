@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regular-file inline policy are unchanged; no deadline or durability guarantee
   is added (#1231).
 
+- **Coroutine file persistence and allocation**: `io::sync_file`,
+  `allocate_file_range`, and `truncate_file` return terminal status/error values
+  captured on the executing thread. Native io_uring paths use runtime opcode
+  probing (and consumer-header detection for truncation); otherwise a running
+  scheduler worker uses bounded fixed-pool admission. Worker-side teardown rejects
+  queued inline dispatch rather than running file syscalls there. Queued work may
+  skip a syscall after explicit cancellation, but admitted native/running calls finish
+  with their actual result. No standalone threads, worker-inline fallback,
+  deadline, rollback, or multi-file transaction guarantee is added (#1233).
+
 - **Asynchronous joinable-task destruction observation**:
   `join_handle<T>::wait_destroyed_async()` waits for the same normal-frame
   teardown publication as the external blocking wait without polling or using

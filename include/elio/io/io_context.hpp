@@ -26,6 +26,8 @@ class batch_write_awaitable;
 namespace detail {
 inline std::atomic<unsigned> reject_cancel_admissions_for_test{0};
 inline std::atomic<unsigned> cancel_admission_attempts_for_test{0};
+using worker_backend_factory = io_backend* (*)(size_t);
+inline std::atomic<worker_backend_factory> worker_backend_factory_for_test{nullptr};
 }  // namespace detail
 #endif
 
@@ -137,6 +139,19 @@ private:
         : identity_(std::make_shared<detail::io_context_identity>(
               owner_worker_id,
               next_generation_.fetch_add(1, std::memory_order_relaxed))) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (owner_worker_id != detail::NO_IO_CONTEXT_OWNER) {
+            if (auto factory = detail::worker_backend_factory_for_test.load(
+                    std::memory_order_acquire)) {
+                backend_.reset(factory(owner_worker_id));
+                if (backend_) {
+                    backend_type_ = backend_->is_io_uring()
+                        ? backend_type::io_uring : backend_type::epoll;
+                    return;
+                }
+            }
+        }
+#endif
         switch (type) {
             case backend_type::auto_detect:
 #if ELIO_HAS_IO_URING
@@ -270,6 +285,10 @@ public:
 
     bool is_io_uring() const noexcept {
         return backend_->is_io_uring();
+    }
+
+    [[nodiscard]] bool supports_file_operation(io_op operation) const noexcept {
+        return backend_->supports_file_operation(operation);
     }
 
 private:

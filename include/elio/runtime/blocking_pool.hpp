@@ -77,6 +77,35 @@ public:
         return true;
     }
 
+    /// Bounded queue admission; never creates per-call threads. A rejection
+    /// leaves task untouched. Running calls are bounded by the fixed workers.
+    [[nodiscard]] bool submit_bounded(std::function<void()>&& task, size_t queue_limit) {
+        auto state = state_;
+        if (state->num_threads == 0) return false;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->stopped.load(std::memory_order_relaxed) ||
+                    state->queue.size() >= queue_limit) {
+                return false;
+            }
+            state->queue.push_back(std::move(task));
+        }
+        state->cv.notify_one();
+        return true;
+    }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    [[nodiscard]] bool stopped_for_test() const noexcept {
+        return state_->stopped.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] size_t queued_count_for_test() const {
+        auto state = state_;
+        std::lock_guard<std::mutex> lock(state->mutex);
+        return state->queue.size();
+    }
+#endif
+
     // Graceful shutdown: signals stop, wakes all workers, joins threads.
     // Any tasks left in the queue after the workers exit are drained inline
     // on the calling thread. This catches the race where a submit happened

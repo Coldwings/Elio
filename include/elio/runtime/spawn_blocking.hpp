@@ -6,6 +6,7 @@
 #include <coroutine>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -14,6 +15,12 @@
 
 namespace elio {
 namespace detail {
+
+class blocking_admission_error : public std::runtime_error {
+public:
+    blocking_admission_error()
+        : std::runtime_error("bounded blocking admission is unavailable") {}
+};
 
 // Three-state resume claim protocol.
 //
@@ -75,9 +82,12 @@ struct blocking_state<void> {
 template<typename T, typename F>
 class blocking_awaitable {
 public:
-    explicit blocking_awaitable(F&& f) : func_(std::forward<F>(f)) {}
+    explicit blocking_awaitable(F&& f,
+            size_t queue_limit = std::numeric_limits<size_t>::max())
+        : func_(std::forward<F>(f)), queue_limit_(queue_limit) {}
     blocking_awaitable(blocking_awaitable&& other) noexcept
-        : func_(std::move(other.func_)), state_(std::move(other.state_)) {}
+        : func_(std::move(other.func_)), state_(std::move(other.state_)),
+          queue_limit_(other.queue_limit_) {}
     blocking_awaitable(const blocking_awaitable&) = delete;
     blocking_awaitable& operator=(const blocking_awaitable&) = delete;
 
@@ -178,7 +188,10 @@ public:
         if (sched) {
             if (sched->is_running()) {
                 if (auto* pool = sched->get_blocking_pool()) {
-                    if (pool->submit(std::move(work))) {
+                    const bool accepted = queue_limit_ == std::numeric_limits<size_t>::max()
+                        ? pool->submit(std::move(work))
+                        : pool->submit_bounded(std::move(work), queue_limit_);
+                    if (accepted) {
                         return true;
                     }
                 }
@@ -187,8 +200,17 @@ public:
             // A scheduler-bound coroutine must not migrate to a detached
             // thread when its pool is unavailable. Continue on the current
             // worker and surface a deterministic rejection from await_resume.
-            state->exception = std::make_exception_ptr(std::runtime_error(
-                "spawn_blocking rejected: scheduler blocking pool is unavailable"));
+            if (queue_limit_ == std::numeric_limits<size_t>::max()) {
+                state->exception = std::make_exception_ptr(std::runtime_error(
+                    "spawn_blocking rejected: scheduler blocking pool is unavailable"));
+            } else {
+                state->exception = std::make_exception_ptr(blocking_admission_error{});
+            }
+            return false;
+        }
+
+        if (queue_limit_ != std::numeric_limits<size_t>::max()) {
+            state->exception = std::make_exception_ptr(blocking_admission_error{});
             return false;
         }
 
@@ -211,6 +233,7 @@ public:
 private:
     F func_;
     std::shared_ptr<blocking_state<T>> state_;
+    size_t queue_limit_;
 };
 
 }  // namespace detail

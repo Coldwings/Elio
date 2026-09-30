@@ -50,6 +50,7 @@
 #include "io/io_awaitables.hpp"
 #include "io/file_helpers.hpp"
 #include "io/file_transfer.hpp"
+#include "io/file_operations.hpp"
 
 // Networking
 #include "net/tcp.hpp"

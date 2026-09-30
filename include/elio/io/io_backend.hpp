@@ -131,7 +131,10 @@ enum class io_op : uint8_t {
     cancel,
     poll_read,    ///< Wait for socket to be readable
     poll_write,   ///< Wait for socket to be writable
-    sendmsg       ///< Scatter-gather socket send
+    sendmsg,      ///< Scatter-gather socket send
+    file_sync,
+    file_allocate,
+    file_truncate
 };
 
 /// I/O operation result
@@ -197,6 +200,10 @@ struct io_request {
     // For timeout operations - pointer to awaiter's local timespec to avoid data races
     // This is a void* to avoid including linux/time_types.h here
     void* timeout_ts;
+
+    // Native file synchronization/allocation flags.
+    int file_flags = 0;
+    uint64_t file_length = 0;
 };
 
 /// Abstract I/O backend interface
@@ -204,6 +211,9 @@ struct io_request {
 class io_backend {
 public:
     virtual ~io_backend() = default;
+
+    /// Native file-operation capability, not filesystem-level support.
+    virtual bool supports_file_operation(io_op) const noexcept { return false; }
 
     /// Prepare an I/O operation (does not submit yet)
     /// @param req The I/O request to prepare

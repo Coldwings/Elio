@@ -248,6 +248,12 @@ public:
                 return true;
             }
                 
+            case io_op::file_sync:
+            case io_op::file_allocate:
+            case io_op::file_truncate:
+                detail::set_last_completion_result(io_result{-EOPNOTSUPP, 0});
+                return false;
+
             case io_op::cancel:
             case io_op::none:
                 detail::set_last_completion_result(io_result{-EAGAIN, 0});

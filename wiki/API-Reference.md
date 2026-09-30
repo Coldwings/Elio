@@ -1858,6 +1858,90 @@ Whole-path `read_file()` and its partial-content behavior are unchanged.
 
 See the runnable [positional transfer example](https://github.com/Coldwings/Elio/blob/main/examples/positional_file_io.cpp).
 
+### File Synchronization, Allocation, and Truncation
+
+Include `<elio/io/file_operations.hpp>` or the umbrella header. These FD-based
+coroutines require a running scheduler worker; they never create standalone threads or
+silently run the potentially slow syscall on a scheduler worker.
+
+```cpp
+enum class file_sync_mode { data_only, data_and_metadata };
+enum class file_operation_end { complete, error, cancelled };
+struct file_status {
+    file_operation_end end;
+    std::error_code error;
+    explicit operator bool() const noexcept; // end == complete
+    int error_value() const noexcept;
+};
+struct file_operation_options {
+    size_t max_queued = 256; // Finite positive shared-pool admission limit
+};
+
+coro::task<file_status> sync_file(
+    int fd, file_sync_mode mode = file_sync_mode::data_and_metadata,
+    coro::cancel_token token = {}, file_operation_options options = {});
+coro::task<file_status> allocate_file_range(
+    int fd, int flags, uint64_t offset, uint64_t length,
+    coro::cancel_token token = {}, file_operation_options options = {});
+coro::task<file_status> truncate_file(
+    int fd, uint64_t length, coro::cancel_token token = {},
+    file_operation_options options = {});
+```
+
+`data_only` selects `fdatasync`; `data_and_metadata` selects `fsync`. Allocation
+passes Linux `fallocate` flags through to the kernel, including hole punching
+with `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`. Truncation selects `ftruncate`.
+Each call provides only that syscall's guarantee, not directory durability,
+multi-file atomicity, resize serialization, or crash recovery.
+
+The active io_uring ring is probed for supported opcodes. Truncation also needs
+the helper in the consumer's liburing headers; older headers safely select the
+blocking path without an exported producer-version assumption. Native SQEs
+force asynchronous kernel execution. A missing/failed probe or unsupported
+opcode selects the scheduler's fixed blocking pool. Once native I/O is admitted,
+its terminal error (including `EINVAL` or filesystem unsupported flags) is
+returned without replaying the operation through another mechanism.
+
+Fallback admission bounds the existing shared pool queue to `max_queued` at the
+point of submission; running work is bounded by the fixed pool threads. It is
+not a separate queue, a global application memory limit, or a bound on native
+I/O. Saturation or unavailable admission returns `error`/`EAGAIN`. A zero or
+`SIZE_MAX` limit is invalid (`EINVAL`). After validation and the pre-cancellation
+check, a call outside a running scheduler worker, including the external thread
+that called `scheduler::start()`, returns `ENOTSUP` without selecting the
+standalone I/O context. An otherwise valid, already-cancelled call instead returns
+`cancelled`/`ECANCELED`, even without a scheduler. There is
+no detached-thread fallback. Ordinary `spawn_blocking()` behavior is unchanged.
+The underlying `blocking_pool::submit_bounded(work, limit)` rejects non-pooled
+mode or unavailable/full queues, leaves rejected work untouched, and never
+creates per-call threads; ordinary `submit()` keeps its existing behavior.
+If pool teardown drains queued work on a scheduler worker, that file operation
+returns `error`/`EAGAIN` without invoking the syscall. Generic pool shutdown
+behavior is unchanged.
+
+Offsets/range ends and truncation lengths must fit both `int64_t` and native
+`off_t` (`EOVERFLOW` otherwise). Zero-length allocation and invalid sync modes
+return `EINVAL`. Validation precedes cancellation and dispatch. Syscall errors
+are captured on the execution thread and returned with `std::generic_category()`;
+callers never need to read another thread's `errno`.
+
+Cancellation is explicit, not implicitly inherited from the enclosing task. An
+already-cancelled token, or a queued fallback cancelled before its dispatch
+check, yields `cancelled`/`ECANCELED` without invoking that syscall. Queued
+cancellation may wait until dequeue before returning. After native admission or
+the fallback dispatch check, cancellation does not interrupt the operation or
+rewrite success/kernel error. No deadline is provided. Running blocking calls
+may delay normal return and graceful scheduler shutdown.
+
+Keep the borrowed FD open and unrecycled until normal awaited return. Forced
+frame destruction or forced shutdown is not a substitute for that barrier.
+Cancellation is not rollback, and an error after dispatch does not prove that
+no side effects occurred. Allocation/format policy, writable descriptors,
+concurrent resize exclusion, and persistence ordering remain application work.
+The deliberate epoll regular-file read/write inline policy is unchanged.
+
+See the runnable [file persistence example](https://github.com/Coldwings/Elio/blob/main/examples/file_persistence.cpp).
+
 ### File Helpers
 
 High-level coroutine functions for common file operations:

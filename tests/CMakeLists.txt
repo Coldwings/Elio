@@ -135,6 +135,7 @@ if(TARGET elio_http AND TARGET elio_tls)
     add_library(elio_public_header_examples OBJECT
         compile/http_common_standalone.cpp
         compile/http_streaming_migration.cpp
+        compile/http_streaming_client_constraints.cpp
         compile/http_tunnel_standalone.cpp
         compile/http_tunnel_response_standalone.cpp
         compile/http_tunnel_relay_standalone.cpp

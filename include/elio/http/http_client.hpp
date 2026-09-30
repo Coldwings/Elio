@@ -320,15 +320,16 @@ public:
     /// Owns request, target, and handler before lazy execution. Keep this client
     /// alive and unmoved through awaited return. The handler receives final
     /// headers (response.body() is empty), a scoped body reader, and the token.
+    /// The token argument is read-only; by-value handlers receive a copy.
     /// It must await all reads before returning. Early return closes rather
     /// than drains; exceptions close the exchange and propagate unchanged.
     /// read_timeout retains its original per-hop I/O deadline across body
     /// pulls, but does not preempt handler code or include DNS/connect time.
     template<typename Handler>
         requires std::invocable<Handler&, const response&, response_body_reader&,
-                                coro::cancel_token> &&
+                                const coro::cancel_token&> &&
                  std::same_as<std::invoke_result_t<Handler&, const response&,
-                     response_body_reader&, coro::cancel_token>, coro::task<void>>
+                     response_body_reader&, const coro::cancel_token&>, coro::task<void>>
     coro::task<client_result<std::monostate>> with_response(
             request req, url target, coro::cancel_token token, Handler handler,
             streaming_response_options options = {}) {
@@ -847,7 +848,7 @@ private:
                 }, token, options.max_body_size);
             std::exception_ptr failure;
             try {
-                co_await std::invoke(handler, std::as_const(head), body, token);
+                co_await std::invoke(handler, std::as_const(head), body, std::as_const(token));
             } catch (...) {
                 failure = std::current_exception();
             }

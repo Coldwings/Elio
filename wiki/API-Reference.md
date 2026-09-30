@@ -2995,7 +2995,9 @@ task may escape; serialize and await all started reads before handler return.
 do not advance framing; zero bytes without `complete=true` are not EOF. Positive
 short reads are normal, and terminal errors remain sticky. Concurrent entry is
 rejected with nonterminal `EALREADY` without changing the admitted read; scope
-serialization/join requirements still apply. Borrowed destination access
+serialization/join requirements still apply. The handler's token argument is a
+const lvalue: by-value and const-reference token parameters are supported.
+Borrowed destination access
 ends before each awaited return, including cancellation/error return.
 
 A root token and each read's token both participate while incomplete. Explicit

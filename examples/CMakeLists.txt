@@ -169,6 +169,7 @@ target_link_options(positional_file_io PRIVATE ${STATIC_LINK_FLAGS})
 if(ELIO_BUILD_TESTS)
     add_test(NAME positional_file_io_example COMMAND positional_file_io)
     set_tests_properties(positional_file_io_example PROPERTIES TIMEOUT 30)
+    add_dependencies(test_all positional_file_io)
 endif()
 
 # HTTP examples (requires elio_http target)

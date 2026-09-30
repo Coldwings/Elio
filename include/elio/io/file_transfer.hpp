@@ -2,6 +2,7 @@
 
 #include "io_awaitables.hpp"
 #include <elio/coro/task.hpp>
+#include <elio/runtime/scheduler.hpp>
 
 #include <algorithm>
 #include <cerrno>

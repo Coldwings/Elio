@@ -6,6 +6,12 @@ if(ELIO_ENABLE_DEVELOPER_WARNINGS)
     endif()
 endif()
 
+add_executable(elio_file_transfer_header compile/test_file_transfer_header.cpp)
+target_link_libraries(elio_file_transfer_header PRIVATE elio)
+target_compile_definitions(elio_file_transfer_header PRIVATE ELIO_DEBUG)
+add_test(NAME file_transfer_direct_header COMMAND elio_file_transfer_header)
+set_tests_properties(file_transfer_direct_header PROPERTIES TIMEOUT 30)
+
 set(TEST_SOURCES
     test_main.cpp
     test_watchdog.cpp

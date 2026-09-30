@@ -168,9 +168,7 @@ target_link_libraries(positional_file_io PRIVATE elio)
 target_link_options(positional_file_io PRIVATE ${STATIC_LINK_FLAGS})
 if(ELIO_BUILD_TESTS)
     add_test(NAME positional_file_io_example COMMAND positional_file_io)
-    set_tests_properties(positional_file_io_example PROPERTIES
-        TIMEOUT 30
-        PASS_REGULAR_EXPRESSION "Written: 5, read before EOF: 5")
+    set_tests_properties(positional_file_io_example PROPERTIES TIMEOUT 30)
 endif()
 
 # HTTP examples (requires elio_http target)

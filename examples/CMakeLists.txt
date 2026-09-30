@@ -24,6 +24,7 @@ if(ELIO_BUILD_TESTS)
             -DEXAMPLE=$<TARGET_FILE:first_coroutine>
             -P ${PROJECT_SOURCE_DIR}/tests/cmake/readme_first_coroutine.cmake)
     set_tests_properties(readme_first_coroutine PROPERTIES TIMEOUT 30)
+    add_dependencies(test_all first_coroutine)
 endif()
 
 add_executable(chained_coroutines chained_coroutines.cpp)
@@ -38,6 +39,7 @@ if(ELIO_BUILD_TESTS)
     set_tests_properties(join_destroyed_async_example PROPERTIES
         TIMEOUT 30
         PASS_REGULAR_EXPRESSION "Result: 42, captures released: yes")
+    add_dependencies(test_all join_destroyed_async)
 endif()
 
 add_executable(exception_handling exception_handling.cpp)

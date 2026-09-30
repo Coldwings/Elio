@@ -52,6 +52,7 @@ set(TEST_SOURCES
     unit/test_spawn_blocking_uaf.cpp
     unit/test_affinity.cpp
     unit/test_io.cpp
+    unit/test_resolve_wait.cpp
     unit/test_file_transfer.cpp
     unit/test_file_operations.cpp
     unit/test_batch_io.cpp

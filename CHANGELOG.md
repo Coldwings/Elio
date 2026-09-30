@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Positional file transfers over borrowed spans**: `io::pread_some`,
+  `pread_exactly`, `pwrite_some`, and `pwrite_exactly` report transferred bytes
+  alongside EOF, errors, or between-operation cancellation. Exact helpers retain
+  progress after later failure, validate offset ranges before I/O, and never
+  abandon an admitted operation. Descriptor/buffer ownership and the epoll
+  regular-file inline policy are unchanged; no deadline or durability guarantee
+  is added (#1231).
+
 - **Asynchronous joinable-task destruction observation**:
   `join_handle<T>::wait_destroyed_async()` waits for the same normal-frame
   teardown publication as the external blocking wait without polling or using

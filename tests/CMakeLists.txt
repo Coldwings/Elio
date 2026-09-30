@@ -6,6 +6,12 @@ if(ELIO_ENABLE_DEVELOPER_WARNINGS)
     endif()
 endif()
 
+add_executable(elio_file_transfer_header compile/test_file_transfer_header.cpp)
+target_link_libraries(elio_file_transfer_header PRIVATE elio)
+target_compile_definitions(elio_file_transfer_header PRIVATE ELIO_DEBUG)
+add_test(NAME file_transfer_direct_header COMMAND elio_file_transfer_header)
+set_tests_properties(file_transfer_direct_header PROPERTIES TIMEOUT 30)
+
 set(TEST_SOURCES
     test_main.cpp
     test_watchdog.cpp
@@ -26,6 +32,7 @@ set(TEST_SOURCES
     unit/test_spawn_blocking_uaf.cpp
     unit/test_affinity.cpp
     unit/test_io.cpp
+    unit/test_file_transfer.cpp
     unit/test_batch_io.cpp
     unit/test_sync.cpp
     unit/test_intrusive_list.cpp
@@ -242,7 +249,7 @@ endif()
 
 # Standalone process-boundary test. Keeping this outside Catch2 guarantees that
 # its first fork occurs before any Elio runtime has existed in the process.
-set(ELIO_ADDITIONAL_TEST_TARGETS)
+set(ELIO_ADDITIONAL_TEST_TARGETS elio_file_transfer_header)
 add_executable(elio_fork_boundary_tests fork_boundary_tests.cpp)
 target_link_libraries(elio_fork_boundary_tests PRIVATE elio)
 target_compile_definitions(elio_fork_boundary_tests PRIVATE ELIO_DEBUG)

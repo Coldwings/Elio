@@ -1799,6 +1799,65 @@ expect them should move the affected file I/O into `elio::spawn_blocking`
 (or an equivalent blocking-pool facility) at the application layer rather
 than issuing it directly on a scheduler worker under the epoll backend.
 
+### Positional File Transfers
+
+Include `<elio/io/file_transfer.hpp>` or `<elio/elio.hpp>`. These additive helpers
+borrow a regular-file descriptor and caller-owned byte spans; they do not open a
+path, allocate a payload-sized buffer, or change the descriptor's current offset.
+
+```cpp
+enum class transfer_end { complete, eof, error, cancelled };
+struct file_transfer_result {
+    size_t transferred;
+    transfer_end end;
+    std::error_code error;
+};
+
+coro::task<file_transfer_result> pread_some(
+    int fd, std::span<std::byte> out, uint64_t offset,
+    coro::cancel_token token = {});
+coro::task<file_transfer_result> pread_exactly(
+    int fd, std::span<std::byte> out, uint64_t offset,
+    coro::cancel_token token = {});
+coro::task<file_transfer_result> pwrite_some(
+    int fd, std::span<const std::byte> in, uint64_t offset,
+    coro::cancel_token token = {});
+coro::task<file_transfer_result> pwrite_exactly(
+    int fd, std::span<const std::byte> in, uint64_t offset,
+    coro::cancel_token token = {});
+```
+
+- Some helpers stop after the first positive completion, which may be short.
+  Exact success means `transferred == span.size()`. Both retain progress when a
+  later operation fails or cancellation stops the next iteration.
+- Read EOF returns `eof` with no error, including zero bytes when already at EOF.
+  A zero-progress nonempty write returns `error`/`EIO`. Errors use
+  `std::generic_category()`; cancellation returns `cancelled`/`ECANCELED`.
+- The whole requested `[offset, offset + size)` range must fit both `int64_t`
+  and native `off_t`; otherwise `EOVERFLOW` is returned before any submission.
+  At a valid offset, an empty span succeeds without I/O even with a cancelled
+  token. Requests are split to fit the signed backend completion width.
+- `EINTR` retries the uncompleted range. `EAGAIN` is terminal, not a readiness
+  loop. These are regular-file APIs, not socket/pipe exact-transfer helpers.
+- A supplied token is observed only before each raw operation. It does not
+  cancel an admitted operation: final success or a kernel error remains visible
+  if cancellation arrives during that operation. There is no deadline overload
+  or prompt-cancellation guarantee, and enclosing-task cancellation is not
+  implicitly inherited. Normal awaited return ends submitted buffer access;
+  forced frame destruction or forced shutdown does not provide that guarantee.
+- Keep the FD open/unrecycled, output storage alive, and input storage alive and
+  unchanged until return. Writes require no `O_APPEND`; applications own buffer
+  synchronization, alignment, concurrent truncation/resize exclusion, format
+  validation, flush/durability policy, and crash consistency. No rollback,
+  transaction atomicity, stable-file snapshot, or durability is promised.
+
+These helpers use the existing active I/O context and standalone driving rules.
+The io_uring and epoll policies above remain unchanged; exact bookkeeping does
+not turn epoll's inline regular-file syscalls into native asynchronous I/O.
+Whole-path `read_file()` and its partial-content behavior are unchanged.
+
+See the runnable [positional transfer example](https://github.com/Coldwings/Elio/blob/main/examples/positional_file_io.cpp).
+
 ### File Helpers
 
 High-level coroutine functions for common file operations:

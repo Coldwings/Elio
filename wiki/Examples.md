@@ -763,6 +763,35 @@ coro::task<void> file_operations() {
 }
 ```
 
+### Positional Transfers into Borrowed Buffers
+
+[`examples/positional_file_io.cpp`](https://github.com/Coldwings/Elio/blob/main/examples/positional_file_io.cpp)
+writes an exact region of a temporary regular file, then reads a larger region
+and observes both the bytes transferred and EOF. It keeps the descriptor and
+buffers alive across the awaited calls and removes the temporary filename.
+
+```cpp
+std::array<char, 64> header{};
+auto result = co_await io::pread_exactly(
+    fd, std::as_writable_bytes(std::span(header)), offset);
+if (result.end != io::transfer_end::complete) {
+    // Decide whether partial bytes are useful or EOF is a format-level error.
+    report_incomplete_header(result.transferred, result.end, result.error);
+}
+```
+
+`pread_some`/`pwrite_some` stop after one positive completion; exact helpers
+retain byte progress after later errors. Optional tokens stop only before the
+next operation, without abandoning admitted I/O or adding a deadline. Keep the
+regular-file FD open and unrecycled until return; writes require no `O_APPEND`.
+Exact transfer does not imply durability, atomicity, or a stable-file snapshot,
+and the existing epoll inline execution policy still applies.
+
+```bash
+cmake --build build --target positional_file_io --parallel 2
+./build/examples/positional_file_io
+```
+
 ### Batch I/O
 
 Read multiple file regions. Explicit offsets can be batched through io_uring;

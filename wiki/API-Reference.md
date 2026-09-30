@@ -1906,9 +1906,11 @@ Fallback admission bounds the existing shared pool queue to `max_queued` at the
 point of submission; running work is bounded by the fixed pool threads. It is
 not a separate queue, a global application memory limit, or a bound on native
 I/O. Saturation or unavailable admission returns `error`/`EAGAIN`. A zero or
-`SIZE_MAX` limit is invalid (`EINVAL`). Outside a running scheduler worker,
-including the external thread that called `scheduler::start()`, calls return
-`ENOTSUP` without selecting the standalone I/O context; there is
+`SIZE_MAX` limit is invalid (`EINVAL`). After validation and the pre-cancellation
+check, a call outside a running scheduler worker, including the external thread
+that called `scheduler::start()`, returns `ENOTSUP` without selecting the
+standalone I/O context. An otherwise valid, already-cancelled call instead returns
+`cancelled`/`ECANCELED`, even without a scheduler. There is
 no detached-thread fallback. Ordinary `spawn_blocking()` behavior is unchanged.
 The underlying `blocking_pool::submit_bounded(work, limit)` rejects non-pooled
 mode or unavailable/full queues, leaves rejected work untouched, and never

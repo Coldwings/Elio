@@ -26,6 +26,7 @@ set(TEST_SOURCES
     unit/test_spawn_blocking_uaf.cpp
     unit/test_affinity.cpp
     unit/test_io.cpp
+    unit/test_file_transfer.cpp
     unit/test_batch_io.cpp
     unit/test_sync.cpp
     unit/test_intrusive_list.cpp

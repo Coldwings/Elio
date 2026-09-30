@@ -72,11 +72,15 @@ struct timer_hook_guard {
 struct destruction_setup_control {
     std::atomic<bool> entered{false};
     bool fail_allocation = false;
+    size_t worker_id = elio::coro::NO_AFFINITY;
 };
 std::atomic<destruction_setup_control*> active_destruction_setup{nullptr};
 
 void controlled_destruction_setup() {
     auto* control = active_destruction_setup.load(std::memory_order_acquire);
+    if (auto* worker = elio::runtime::worker_thread::current()) {
+        control->worker_id = worker->worker_id();
+    }
     control->entered.store(true, std::memory_order_release);
     if (control->fail_allocation) throw std::bad_alloc();
 }
@@ -575,6 +579,7 @@ TEST_CASE("join timer frame drain and exceptional cleanup preserve ownership",
     destruction_setup_hook_guard setup_hooks(setup);
     observation_result result;
     std::atomic<bool> marker{false};
+    std::atomic<size_t> marker_worker{elio::coro::NO_AFFINITY};
     auto& pause = elio::coro::detail::pause_before_detached_frame_destroy_for_test;
     struct frame_release_guard {
         std::atomic<bool>& pause;
@@ -600,11 +605,18 @@ TEST_CASE("join timer frame drain and exceptional cleanup preserve ownership",
     const bool cleanup_started = wait_for([&] {
         return setup.entered.load(std::memory_order_acquire);
     });
-    sched.go([&]() -> task<void> {
-        marker.store(true, std::memory_order_release);
-        co_return;
+    const bool valid_worker = cleanup_started && setup.worker_id < 2;
+    if (valid_worker) {
+        sched.go_to(setup.worker_id, [&]() -> task<void> {
+            marker_worker.store(elio::runtime::worker_thread::current()->worker_id(),
+                                std::memory_order_relaxed);
+            marker.store(true, std::memory_order_release);
+            co_return;
+        });
+    }
+    const bool marked = valid_worker && wait_for([&] {
+        return marker.load(std::memory_order_acquire);
     });
-    const bool marked = wait_for([&] { return marker.load(std::memory_order_acquire); });
     bool exceptional_returned = false;
     if (fail_allocation) {
         exceptional_returned = wait_for([&] { return result.done.load(std::memory_order_acquire); });
@@ -623,7 +635,9 @@ TEST_CASE("join timer frame drain and exceptional cleanup preserve ownership",
     REQUIRE(entered);
     REQUIRE(frame_paused);
     REQUIRE(cleanup_started);
+    REQUIRE(valid_worker);
     REQUIRE(marked);
+    REQUIRE(marker_worker.load(std::memory_order_acquire) == setup.worker_id);
     REQUIRE(timer_retains_state);
     REQUIRE(completion_won);
     REQUIRE(returned);

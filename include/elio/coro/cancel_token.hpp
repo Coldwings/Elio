@@ -33,6 +33,7 @@ enum class cancel_result {
 namespace detail {
 
 class cancellation_context;
+struct join_wait_access;
 struct cancel_state;
 
 inline thread_local const void* current_callback_dispatcher = nullptr;
@@ -648,6 +649,7 @@ public:
 private:
     friend class cancel_source;
     friend class detail::cancellation_context;
+    friend struct detail::join_wait_access;
 
     template<typename F>
     [[nodiscard]] detail::task_parent_registration

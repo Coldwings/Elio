@@ -19,9 +19,29 @@ using elio::http::client_error;
 using elio::http::client_result;
 using elio::http::client_stage;
 using elio::http::response;
+using backend_type = elio::io::io_context::backend_type;
 
 static_assert(std::is_trivially_copyable_v<client_error>);
 static_assert(sizeof(client_error) <= 32);
+
+struct result_backend_guard {
+    explicit result_backend_guard(backend_type backend)
+        : previous(elio::runtime::detail::worker_io_backend_for_test.exchange(backend)) {}
+    ~result_backend_guard() {
+        elio::runtime::detail::worker_io_backend_for_test.store(previous);
+    }
+    backend_type previous;
+};
+
+void require_result_backend(backend_type backend) {
+#if ELIO_HAS_IO_URING
+    if (backend == backend_type::io_uring && !elio::io::io_uring_backend::is_available()) {
+        SKIP("io_uring unavailable on this host");
+    }
+#else
+    if (backend == backend_type::io_uring) SKIP("io_uring support is not compiled");
+#endif
+}
 
 bool wait_for(const std::function<bool()>& predicate) {
     const auto deadline = std::chrono::steady_clock::now() + elio::test::scaled_ms(5000);
@@ -164,6 +184,7 @@ client_result<response> run_wire_response(std::string_view wire,
 struct response_observer_guard {
     response_observer_guard() {
         elio::http::detail::client_response_read_staged_for_test.store(false);
+        elio::http::detail::response_read_stage_for_test.store(client_stage::headers);
         elio::http::detail::observe_client_response_read_entry_for_test.store(true);
     }
     ~response_observer_guard() {
@@ -178,26 +199,30 @@ client_result<response> run_stalled_response(bool body, bool cancel) {
     elio::http::client_config config;
     config.read_timeout = cancel ? std::chrono::seconds::zero() : std::chrono::seconds(1);
     elio::http::client client(config);
-    elio::coro::cancel_source cleanup;
+    elio::coro::cancel_source client_cancel;
+    elio::coro::cancel_source peer_cleanup;
     elio::sync::event release_server;
     response_observer_guard observer;
     client_result<response> result;
     std::exception_ptr failure;
     std::atomic<bool> done{false};
+    elio::coro::cancel_result peer_release = elio::coro::cancel_result::cancelled;
+    bool peer_saw_result = false;
     elio::runtime::scheduler scheduler(2);
     scheduler.start();
     scheduler.go([&]() -> task<void> {
-        auto stream = co_await listener->accept(cleanup.get_token());
+        auto stream = co_await listener->accept(peer_cleanup.get_token());
         if (!stream) co_return;
-        co_await read_headers(*stream, cleanup.get_token());
+        co_await read_headers(*stream, peer_cleanup.get_token());
         if (body) {
             (void)co_await stream->write_exactly(
-                "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nx", cleanup.get_token());
+                "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nx", peer_cleanup.get_token());
         }
-        (void)co_await release_server.wait(cleanup.get_token());
+        peer_release = co_await release_server.wait(peer_cleanup.get_token());
+        peer_saw_result = done.load(std::memory_order_acquire);
     });
     scheduler.go([&]() -> task<void> {
-        try { result = co_await client.get_result(target, cleanup.get_token()); }
+        try { result = co_await client.get_result(target, client_cancel.get_token()); }
         catch (...) { failure = std::current_exception(); }
         done.store(true, std::memory_order_release);
     });
@@ -207,15 +232,20 @@ client_result<response> run_stalled_response(bool body, bool cancel) {
             expected_stage && elio::http::detail::client_response_read_staged_for_test.load(
                 std::memory_order_acquire);
     });
-    if (cancel) cleanup.cancel();
+    if (cancel) client_cancel.cancel();
     const bool completed = wait_for([&] { return done.load(std::memory_order_acquire); });
-    cleanup.cancel();
+    client_cancel.cancel();
+    // A peer reset must not compete with the client cancellation under test.
     release_server.set();
+    if (!staged || !completed) peer_cleanup.cancel();
     const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
     REQUIRE(drained);
     REQUIRE(staged);
     REQUIRE(completed);
     REQUIRE_FALSE(failure);
+    CAPTURE(body, cancel, peer_saw_result);
+    REQUIRE(peer_release == elio::coro::cancel_result::completed);
+    REQUIRE(peer_saw_result);
     return result;
 }
 
@@ -236,36 +266,44 @@ client_result<response> run_stalled_tls_handshake(bool cancel) {
     config.connect_timeout = cancel ? std::chrono::seconds::zero() : std::chrono::seconds(1);
     config.read_timeout = std::chrono::seconds::zero();
     elio::http::client client(config);
-    elio::coro::cancel_source cleanup;
+    elio::coro::cancel_source client_cancel;
+    elio::coro::cancel_source peer_cleanup;
     elio::sync::event release_server;
     std::atomic<bool> client_hello{false}, done{false};
+    elio::coro::cancel_result peer_release = elio::coro::cancel_result::cancelled;
+    bool peer_saw_result = false;
     std::exception_ptr failure;
     client_result<response> result;
     elio::runtime::scheduler scheduler(2);
     scheduler.start();
     scheduler.go([&]() -> task<void> {
-        auto stream = co_await listener->accept(cleanup.get_token());
+        auto stream = co_await listener->accept(peer_cleanup.get_token());
         if (!stream) co_return;
         std::array<char, 1024> buffer{};
-        const auto received = co_await stream->read(buffer.data(), buffer.size(), cleanup.get_token());
+        const auto received = co_await stream->read(buffer.data(), buffer.size(), peer_cleanup.get_token());
         client_hello.store(received.result > 0, std::memory_order_release);
-        (void)co_await release_server.wait(cleanup.get_token());
+        peer_release = co_await release_server.wait(peer_cleanup.get_token());
+        peer_saw_result = done.load(std::memory_order_acquire);
     });
     scheduler.go([&]() -> task<void> {
-        try { result = co_await client.get_result(target, cleanup.get_token()); }
+        try { result = co_await client.get_result(target, client_cancel.get_token()); }
         catch (...) { failure = std::current_exception(); }
         done.store(true, std::memory_order_release);
     });
     const bool entered = wait_for([&] { return client_hello.load(std::memory_order_acquire); });
-    if (cancel) cleanup.cancel();
+    if (cancel) client_cancel.cancel();
     const bool completed = wait_for([&] { return done.load(std::memory_order_acquire); });
-    cleanup.cancel();
+    client_cancel.cancel();
     release_server.set();
+    if (!entered || !completed) peer_cleanup.cancel();
     const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
     REQUIRE(drained);
     REQUIRE(entered);
     REQUIRE(completed);
     REQUIRE_FALSE(failure);
+    CAPTURE(cancel, peer_saw_result);
+    REQUIRE(peer_release == elio::coro::cancel_result::completed);
+    REQUIRE(peer_saw_result);
     return result;
 }
 } // namespace
@@ -473,6 +511,10 @@ TEST_CASE("HTTP invalid TLS peer reports TLS stage", "[http][http_client_result]
 
 TEST_CASE("HTTP TLS cancellation and connect deadline retain TLS stage",
           "[http][http_client_result][tls][cancel][timeout]") {
+    const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
+    require_result_backend(backend);
+    result_backend_guard guard(backend);
+    CAPTURE(static_cast<int>(backend));
     SECTION("explicit cancellation") {
         require_failure(run_stalled_tls_handshake(true), ECANCELED, client_stage::tls);
     }
@@ -490,11 +532,19 @@ TEST_CASE("HTTP value API does not swallow exceptional failures", "[http][http_c
 }
 
 TEST_CASE("HTTP response cancellation reports the active read stage", "[http][http_client_result][cancel]") {
+    const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
+    require_result_backend(backend);
+    result_backend_guard guard(backend);
+    CAPTURE(static_cast<int>(backend));
     SECTION("headers") { require_failure(run_stalled_response(false, true), ECANCELED, client_stage::headers); }
     SECTION("body") { require_failure(run_stalled_response(true, true), ECANCELED, client_stage::body); }
 }
 
 TEST_CASE("HTTP response deadline reports the active read stage", "[http][http_client_result][timeout]") {
+    const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
+    require_result_backend(backend);
+    result_backend_guard guard(backend);
+    CAPTURE(static_cast<int>(backend));
     SECTION("headers") { require_failure(run_stalled_response(false, false), ETIMEDOUT, client_stage::headers); }
     SECTION("body") { require_failure(run_stalled_response(true, false), ETIMEDOUT, client_stage::body); }
 }

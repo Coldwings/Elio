@@ -252,9 +252,32 @@ if(TARGET elio_rdma_ibverbs AND TARGET elio_rdma_cm)
     )
 endif()
 
+set(ELIO_ADDITIONAL_TEST_TARGETS elio_file_transfer_header)
+set(_elio_watchdog_variants normal)
+if(ELIO_BUILD_SANITIZER_TESTS)
+    list(APPEND _elio_watchdog_variants asan tsan)
+endif()
+foreach(_variant IN LISTS _elio_watchdog_variants)
+    set(_target elio_test_watchdog_probe_${_variant})
+    add_executable(${_target} test_watchdog.cpp compile/test_watchdog_probe.cpp)
+    if(_variant STREQUAL "asan")
+        target_compile_options(${_target} PRIVATE -fsanitize=address -g -fno-omit-frame-pointer)
+        target_link_options(${_target} PRIVATE -fsanitize=address)
+    elseif(_variant STREQUAL "tsan")
+        target_compile_options(${_target} PRIVATE -fsanitize=thread -g -fno-omit-frame-pointer)
+        target_link_options(${_target} PRIVATE -fsanitize=thread)
+    endif()
+    list(APPEND ELIO_ADDITIONAL_TEST_TARGETS ${_target})
+    add_test(NAME test_watchdog_signal_safety_${_variant}
+        COMMAND ${CMAKE_COMMAND}
+            -DELIO_WATCHDOG_PROBE=$<TARGET_FILE:${_target}>
+            -DELIO_WATCHDOG_VARIANT=${_variant}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_test_watchdog.cmake)
+    set_tests_properties(test_watchdog_signal_safety_${_variant} PROPERTIES TIMEOUT 45)
+endforeach()
+
 # Standalone process-boundary test. Keeping this outside Catch2 guarantees that
 # its first fork occurs before any Elio runtime has existed in the process.
-set(ELIO_ADDITIONAL_TEST_TARGETS elio_file_transfer_header)
 add_executable(elio_fork_boundary_tests fork_boundary_tests.cpp)
 target_link_libraries(elio_fork_boundary_tests PRIVATE elio)
 target_compile_definitions(elio_fork_boundary_tests PRIVATE ELIO_DEBUG)
@@ -578,15 +601,16 @@ set_tests_properties(test_all_dependency_graph PROPERTIES TIMEOUT 120)
 if(ELIO_BUILD_SANITIZER_TESTS)
     add_custom_target(test_asan
         COMMAND ${CMAKE_CTEST_COMMAND}
-            -R "^(elio_tests_asan\\..*|elio_fork_boundary_asan)$"
+            -R "^(elio_tests_asan\\..*|elio_fork_boundary_asan|test_watchdog_signal_safety_asan)$"
             --output-on-failure
-        DEPENDS elio_tests_asan elio_fork_boundary_tests_asan
+        DEPENDS elio_tests_asan elio_fork_boundary_tests_asan elio_test_watchdog_probe_asan
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     )
 
     add_custom_target(test_tsan
-        COMMAND ${CMAKE_CTEST_COMMAND} -R "^elio_tests_tsan\\." --output-on-failure
-        DEPENDS elio_tests_tsan
+        COMMAND ${CMAKE_CTEST_COMMAND}
+            -R "^(elio_tests_tsan\\..*|test_watchdog_signal_safety_tsan)$" --output-on-failure
+        DEPENDS elio_tests_tsan elio_test_watchdog_probe_tsan
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     )
 endif()

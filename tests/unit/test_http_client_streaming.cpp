@@ -518,8 +518,8 @@ TEST_CASE("HTTP streaming client reuses only completely consumed responses",
         first_write_result = (co_await stream->write_all(first_wire, fixture.stop.get_token())).result;
         if (disposition >= 4) (void)co_await stream->finish_write(fixture.stop.get_token());
         auto next = co_await request_headers(*stream, fixture.stop.get_token());
-        (void)co_await first_result_ready.wait(fixture.stop.get_token());
-        if (!first_result_expected) co_return;
+        const auto first_ready = co_await first_result_ready.wait(fixture.stop.get_token());
+        if (first_ready != coro::cancel_result::completed || !first_result_expected) co_return;
         if (discard) {
             first_closed = next.empty();
             http::detail::abort_stream_io(*stream);

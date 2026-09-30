@@ -57,6 +57,22 @@ endif()
 if(ELIO_CHECK_RDMA)
     list(APPEND _variants rdma_integration)
 endif()
+set(_parent_args)
+if(ELIO_PARENT_CMAKE_GENERATOR)
+    list(APPEND _parent_args -G "${ELIO_PARENT_CMAKE_GENERATOR}")
+endif()
+foreach(_name IN ITEMS CMAKE_MAKE_PROGRAM CMAKE_CXX_COMPILER
+        CMAKE_TOOLCHAIN_FILE CMAKE_SYSROOT CMAKE_FIND_ROOT_PATH CMAKE_PREFIX_PATH
+        OPENSSL_INCLUDE_DIR OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY
+        _IBVERBS_INC_PATH _IBVERBS_LIB_PATH Python3_EXECUTABLE
+        CMAKE_DISABLE_FIND_PACKAGE_Python3)
+    if(DEFINED ELIO_PARENT_${_name} AND
+       NOT "${ELIO_PARENT_${_name}}" STREQUAL "" AND
+       NOT "${ELIO_PARENT_${_name}}" MATCHES "-NOTFOUND$")
+        string(REPLACE ";" "\\;" _value "${ELIO_PARENT_${_name}}")
+        list(APPEND _parent_args "-D${_name}=${_value}")
+    endif()
+endforeach()
 foreach(_variant IN LISTS _variants)
     set(_examples OFF)
     set(_sanitizers OFF)
@@ -72,6 +88,7 @@ foreach(_variant IN LISTS _variants)
     endif()
     execute_process(COMMAND "${CMAKE_COMMAND}"
         -S "${ELIO_BINARY_DIR}/source" -B "${ELIO_BINARY_DIR}/${_variant}"
+        ${_parent_args}
         -DELIO_SOURCE_DIR=${ELIO_SOURCE_DIR}
         -DFETCHCONTENT_SOURCE_DIR_FMT=${ELIO_FMT_SOURCE_DIR}
         -DFETCHCONTENT_SOURCE_DIR_CATCH2=${ELIO_CATCH2_SOURCE_DIR}

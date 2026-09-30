@@ -534,14 +534,32 @@ foreach(_elio_test_target IN ITEMS
     endif()
 endforeach()
 
+set(_elio_check_http_graph OFF)
+if(TARGET elio_http AND Python3_Interpreter_FOUND)
+    set(_elio_check_http_graph ON)
+endif()
 add_test(NAME test_all_dependency_graph
     COMMAND ${CMAKE_COMMAND}
         -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}
         -DELIO_BINARY_DIR=${CMAKE_BINARY_DIR}/tests/cmake/test_all_dependencies
         -DELIO_FMT_SOURCE_DIR=${fmt_SOURCE_DIR}
         -DELIO_CATCH2_SOURCE_DIR=${catch2_SOURCE_DIR}
-        -DELIO_CHECK_HTTP=$<BOOL:$<TARGET_EXISTS:elio_http>>
+        -DELIO_CHECK_HTTP=${_elio_check_http_graph}
         -DELIO_CHECK_RDMA=$<BOOL:$<TARGET_EXISTS:elio_rdma_ibverbs>>
+        "-DELIO_PARENT_CMAKE_GENERATOR=${CMAKE_GENERATOR}"
+        "-DELIO_PARENT_CMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DELIO_PARENT_CMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        "-DELIO_PARENT_CMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+        "-DELIO_PARENT_CMAKE_SYSROOT=${CMAKE_SYSROOT}"
+        "-DELIO_PARENT_CMAKE_FIND_ROOT_PATH=${CMAKE_FIND_ROOT_PATH}"
+        "-DELIO_PARENT_CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}"
+        "-DELIO_PARENT_OPENSSL_INCLUDE_DIR=${OPENSSL_INCLUDE_DIR}"
+        "-DELIO_PARENT_OPENSSL_SSL_LIBRARY=${OPENSSL_SSL_LIBRARY}"
+        "-DELIO_PARENT_OPENSSL_CRYPTO_LIBRARY=${OPENSSL_CRYPTO_LIBRARY}"
+        "-DELIO_PARENT__IBVERBS_INC_PATH=${_IBVERBS_INC_PATH}"
+        "-DELIO_PARENT__IBVERBS_LIB_PATH=${_IBVERBS_LIB_PATH}"
+        "-DELIO_PARENT_Python3_EXECUTABLE=${Python3_EXECUTABLE}"
+        "-DELIO_PARENT_CMAKE_DISABLE_FIND_PACKAGE_Python3=${CMAKE_DISABLE_FIND_PACKAGE_Python3}"
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_test_all_dependencies.cmake)
 set_tests_properties(test_all_dependency_graph PROPERTIES TIMEOUT 120)
 

@@ -69,6 +69,31 @@ struct timer_hook_guard {
     }
 };
 
+struct destruction_setup_control {
+    std::atomic<bool> entered{false};
+    bool fail_allocation = false;
+};
+std::atomic<destruction_setup_control*> active_destruction_setup{nullptr};
+
+void controlled_destruction_setup() {
+    auto* control = active_destruction_setup.load(std::memory_order_acquire);
+    control->entered.store(true, std::memory_order_release);
+    if (control->fail_allocation) throw std::bad_alloc();
+}
+
+struct destruction_setup_hook_guard {
+    explicit destruction_setup_hook_guard(destruction_setup_control& control) {
+        active_destruction_setup.store(&control, std::memory_order_release);
+        elio::coro::detail::join_destroyed_observer_setup_for_test.store(
+            controlled_destruction_setup, std::memory_order_release);
+    }
+    ~destruction_setup_hook_guard() {
+        elio::coro::detail::join_destroyed_observer_setup_for_test.store(
+            nullptr, std::memory_order_release);
+        active_destruction_setup.store(nullptr, std::memory_order_release);
+    }
+};
+
 struct release_guard {
     timer_control& control;
     ~release_guard() {
@@ -253,6 +278,43 @@ TEST_CASE("pending join readiness requires an observing scheduler worker",
     state->set_value(9);
     REQUIRE(run_immediately(std::move(observation)) == join_wait_outcome::completed);
     REQUIRE(moved.await_resume() == 9);
+}
+
+TEST_CASE("token-less join readiness remains pending after observing-task cancellation",
+          "[task][join_handle][join_wait][cancel_token][regression]") {
+    auto state = std::make_shared<join_state<int>>();
+    join_handle<int> handle(state);
+    observation_result result;
+    std::atomic<bool> marker{false};
+    scheduler sched(1);
+    sched.start();
+    auto observer = sched.go_joinable(record_observation(handle.wait(), result));
+    const bool registered = wait_for([&] {
+        return !state->result_observer_for_test().expired();
+    });
+    observer.request_cancel();
+    sched.go([&]() -> task<void> {
+        marker.store(true, std::memory_order_release);
+        co_return;
+    });
+    const bool marked = wait_for([&] { return marker.load(std::memory_order_acquire); });
+    const bool returned_before_child = result.done.load(std::memory_order_acquire);
+    state->set_value(53);
+    const bool returned = wait_for([&] { return result.done.load(std::memory_order_acquire); });
+    const bool drained = sched.shutdown(elio::test::scaled_ms(5000));
+    REQUIRE(drained);
+    REQUIRE(registered);
+    REQUIRE(marked);
+    REQUIRE(observer.is_cancellation_requested());
+    REQUIRE_FALSE(returned_before_child);
+    REQUIRE(returned);
+    REQUIRE_FALSE(result.failure);
+    REQUIRE(result.value == join_wait_outcome::completed);
+    REQUIRE(result.returns.load(std::memory_order_acquire) == 1);
+    REQUIRE_FALSE(handle.is_cancellation_requested());
+    REQUIRE(handle.await_resume() == 53);
+    REQUIRE_NOTHROW(observer.await_resume());
+    REQUIRE(observer.is_destroyed());
 }
 
 TEST_CASE("join readiness completion cancellation and deadline have one stable winner",
@@ -499,6 +561,89 @@ TEST_CASE("join readiness drains its private timer before returning",
     REQUIRE(result.value == join_wait_outcome::completed);
     REQUIRE(control.settled.load(std::memory_order_acquire));
     REQUIRE(handle.await_resume() == 31);
+}
+
+TEST_CASE("join timer frame drain and exceptional cleanup preserve ownership",
+          "[task][join_handle][join_wait][lifecycle][exception][regression]") {
+    const bool fail_allocation = GENERATE(false, true);
+    auto state = std::make_shared<join_state<int>>();
+    join_handle<int> handle(state);
+    timer_control control;
+    timer_hook_guard timer_hooks(control);
+    destruction_setup_control setup;
+    setup.fail_allocation = fail_allocation;
+    destruction_setup_hook_guard setup_hooks(setup);
+    observation_result result;
+    std::atomic<bool> marker{false};
+    auto& pause = elio::coro::detail::pause_before_detached_frame_destroy_for_test;
+    struct frame_release_guard {
+        std::atomic<bool>& pause;
+        ~frame_release_guard() {
+            pause.store(false, std::memory_order_release);
+            pause.notify_all();
+        }
+    };
+    scheduler sched(2);
+    release_guard release_timer{control};
+    frame_release_guard release_frame{pause};
+    pause.store(true, std::memory_order_release);
+    sched.start();
+    sched.go(record_observation(handle.wait_until(
+        std::chrono::steady_clock::now() + elio::test::scaled_sec(10)), result));
+    const bool entered = wait_for([&] { return control.entered.load(std::memory_order_acquire); });
+    auto lifetime = state->result_observer_for_test();
+    state->set_value(47);
+    const bool frame_paused = wait_for([] {
+        return elio::coro::detail::detached_frame_destroy_paused_for_test.load(
+            std::memory_order_acquire);
+    });
+    const bool cleanup_started = wait_for([&] {
+        return setup.entered.load(std::memory_order_acquire);
+    });
+    sched.go([&]() -> task<void> {
+        marker.store(true, std::memory_order_release);
+        co_return;
+    });
+    const bool marked = wait_for([&] { return marker.load(std::memory_order_acquire); });
+    bool exceptional_returned = false;
+    if (fail_allocation) {
+        exceptional_returned = wait_for([&] { return result.done.load(std::memory_order_acquire); });
+    }
+    const bool returned_before_destroy = result.done.load(std::memory_order_acquire);
+    const bool timer_retains_state = !lifetime.expired();
+    bool completion_won = false;
+    if (auto node = lifetime.lock()) {
+        completion_won = node->result() == join_wait_outcome::completed;
+    }
+    pause.store(false, std::memory_order_release);
+    pause.notify_all();
+    const bool returned = wait_for([&] { return result.done.load(std::memory_order_acquire); });
+    const bool drained = sched.shutdown(elio::test::scaled_ms(5000));
+    REQUIRE(drained);
+    REQUIRE(entered);
+    REQUIRE(frame_paused);
+    REQUIRE(cleanup_started);
+    REQUIRE(marked);
+    REQUIRE(timer_retains_state);
+    REQUIRE(completion_won);
+    REQUIRE(returned);
+    REQUIRE(result.returns.load(std::memory_order_acquire) == 1);
+    REQUIRE(control.cancelled.load(std::memory_order_acquire));
+    REQUIRE(control.settled.load(std::memory_order_acquire));
+    REQUIRE(lifetime.expired());
+    REQUIRE_FALSE(handle.is_cancellation_requested());
+    REQUIRE(handle.await_resume() == 47);
+    if (fail_allocation) {
+        REQUIRE(exceptional_returned);
+        REQUIRE(returned_before_destroy);
+        REQUIRE(result.failure);
+        REQUIRE_THROWS_AS(std::rethrow_exception(result.failure), std::bad_alloc);
+        REQUIRE_FALSE(result.value);
+    } else {
+        REQUIRE_FALSE(returned_before_destroy);
+        REQUIRE_FALSE(result.failure);
+        REQUIRE(result.value == join_wait_outcome::completed);
+    }
 }
 
 TEST_CASE("join result waits reject both directions of concurrent registration",

@@ -51,6 +51,7 @@ inline std::atomic<bool> pause_join_destroyed_observer_install_for_test{false};
 inline std::atomic<bool> join_destroyed_observer_install_paused_for_test{false};
 inline std::atomic<bool> pause_join_direct_rejection_for_test{false};
 inline std::atomic<bool> join_direct_rejection_paused_for_test{false};
+inline std::atomic<void(*)()> join_destroyed_observer_setup_for_test{nullptr};
 
 inline void pause_join_direct_rejection_if_requested_for_test() noexcept {
     if (pause_join_direct_rejection_for_test.load(std::memory_order_acquire)) {
@@ -339,6 +340,14 @@ struct join_state_base {
         return completion_state_.load(std::memory_order_acquire) & result_flags;
     }
 
+    std::weak_ptr<join_observation> result_observer_for_test() const noexcept {
+        if (auto* observers = result_observer_list(
+                completion_state_.load(std::memory_order_acquire))) {
+            return observers->observer.load(std::memory_order_acquire);
+        }
+        return {};
+    }
+
     bool has_async_destruction_waiters_for_test() const noexcept {
         return observer_list(destruction_state_.load(std::memory_order_acquire)) != nullptr;
     }
@@ -410,6 +419,12 @@ public:
             throw std::logic_error(
                 "pending join destruction wait requires an Elio scheduler");
         }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = join_destroyed_observer_setup_for_test.load(
+                std::memory_order_acquire)) {
+            hook();
+        }
+#endif
         observers_ = state->async_destruction_waiters();
         if (!observers_) {
             return false;

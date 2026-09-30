@@ -263,6 +263,12 @@ endif()
 # pretending TSAN can validate inherited-runtime continuation.
 
 # Standard test executable
+# Compile the controlled SSE writer suite against core only even when the main
+# test target enables TLS, so accidental client dependencies cannot hide there.
+add_library(elio_core_sse_writer_compile OBJECT unit/test_sse_writer.cpp)
+target_link_libraries(elio_core_sse_writer_compile PRIVATE elio Catch2::Catch2)
+target_compile_definitions(elio_core_sse_writer_compile PRIVATE ELIO_DEBUG)
+
 add_executable(elio_tests ${TEST_SOURCES})
 target_link_libraries(elio_tests PRIVATE elio Catch2::Catch2WithMain)
 if(TARGET elio_http)

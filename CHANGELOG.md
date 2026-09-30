@@ -117,6 +117,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Core-only SSE writer test build**: keep transport-independent writer/wire
+  assertions available with TLS disabled, gate client receiver round-trip checks
+  on the TLS feature, and compile the writer suite against the core target even
+  in TLS-enabled builds to catch accidental feature dependencies (#1234).
+
 - **TLS duplex retry/output ownership**: coordinate OpenSSL retry ordering and
   drain backpressured ciphertext through bounded owned storage without a
   background caller-plaintext queue. `tls_stream_options::ciphertext_budget`

@@ -1,7 +1,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <elio/http/sse_writer.hpp>
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
 #include <elio/http/sse_client.hpp>
+#endif
 #include <elio/http/http_response_sender.hpp>
 #include <elio/http/http_parser.hpp>
 
@@ -149,6 +151,7 @@ TEST_CASE("SSE writer distinguishes omitted id from explicit empty id reset",
             "id:\ndata: reset\n\n"
             "data: kept\n\n");
 
+#if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
     sse::event_parser receiver(sse::event_parser::default_max_buffer_size, "seed");
     std::string_view remaining = body;
     const std::array<std::string_view, 4> expected_ids{"seed", "42", "", ""};
@@ -162,6 +165,7 @@ TEST_CASE("SSE writer distinguishes omitted id from explicit empty id reset",
         remaining.remove_prefix(boundary + 2);
     }
     REQUIRE(remaining.empty());
+#endif
     REQUIRE(id == "42");
     REQUIRE(id.data() == original_id_storage);
 }

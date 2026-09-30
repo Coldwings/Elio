@@ -222,6 +222,16 @@ if(TARGET elio_http)
         add_dependencies(test_all http_client_result)
     endif()
 
+    add_executable(http_streaming_client http_streaming_client.cpp)
+    target_link_libraries(http_streaming_client PRIVATE elio_http)
+    target_link_options(http_streaming_client PRIVATE ${STATIC_LINK_FLAGS})
+    if(ELIO_BUILD_TESTS)
+        add_test(NAME http_streaming_client_example COMMAND http_streaming_client)
+        set_tests_properties(http_streaming_client_example PROPERTIES TIMEOUT 30
+            PASS_REGULAR_EXPRESSION "Streamed range: 65536 bytes; response body not aggregated")
+        add_dependencies(test_all http_streaming_client)
+    endif()
+
     # HTTP/2 example (requires elio_http2 target)
     if(TARGET elio_http2)
         add_executable(http2_client http2_client.cpp)

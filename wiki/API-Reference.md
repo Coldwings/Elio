@@ -2877,6 +2877,12 @@ public:
     coro::task<client_result<response>> send_result(
         request& req, const url& target, coro::cancel_token token = {});
 
+    // Handler: task<void>(const response&, response_body_reader&, cancel_token).
+    template<typename Handler>
+    coro::task<client_result<std::monostate>> with_response(
+        request req, url target, coro::cancel_token token, Handler handler,
+        streaming_response_options options = {});
+
     // Configure TLS and client options
     tls::tls_context& tls_context() noexcept;
     client_config& config() noexcept;
@@ -2958,6 +2964,55 @@ These are not universally nonthrowing APIs: allocation, TLS setup, scheduler
 admission, and programming exceptions may propagate. Keep clients, request/URL
 objects, caches/TLS contexts, and borrowed string inputs alive through awaited
 return, and serialize mutable client use.
+
+#### Scoped Streaming Client Results
+
+```cpp
+struct streaming_response_options {
+    size_t max_body_size = std::numeric_limits<size_t>::max();
+    size_t max_informational_bytes = 16 * 1024 * 1024;
+};
+struct body_read_progress {
+    size_t transferred = 0;
+    bool complete = false;
+};
+using body_read_result = client_result<body_read_progress>;
+class response_body_reader { // Noncopyable/nonmovable; only within the handler.
+public:
+    coro::task<body_read_result> read_into(std::span<char>, coro::cancel_token = {});
+    coro::task<body_read_result> read_into(std::span<std::byte>, coro::cancel_token = {});
+    bool complete() const noexcept;
+    const std::optional<client_error>& error() const noexcept;
+};
+```
+
+`with_response` owns its request, target, and possibly move-only handler before
+lazy execution. Keep the client alive/unmoved and its configuration stable through
+awaited return. The handler receives final initial headers with an empty body,
+then explicitly pulls payload through a scoped reader. Neither reader nor read
+task may escape; serialize and await all started reads before handler return.
+`complete()` and `error()` are inspected only between reads. Empty destinations
+do not advance framing; zero bytes without `complete=true` are not EOF. Positive
+short reads are normal, and terminal errors remain sticky. Concurrent entry is
+rejected with nonterminal `EALREADY` without changing the admitted read; scope
+serialization/join requirements still apply. The handler's token argument is a
+const lvalue: by-value and const-reference token parameters are supported.
+Borrowed destination access
+ends before each awaited return, including cancellation/error return.
+
+A root token and each read's token both participate while incomplete. Explicit
+completion takes precedence over later read cancellation; root cancellation
+still fails the outer exchange and prevents reuse. The absolute per-hop
+response I/O deadline is retained across pulls, not extended per read; it is not
+a total DNS/setup/handler budget. Early exit, exceptions, incomplete consumption,
+framing failure and cancellation close rather than pool the connection. Observe
+explicit complete=true before successful reuse is possible. The outer result is
+an empty success value or owned operational error; ignored read errors still
+fail it, while handler exceptions propagate. Success does not validate a range
+or turn a non-2xx status into an error. Streaming follows accepted redirects at
+headers without aggregating/draining their bodies. See
+[HTTP Streaming](HTTP-Streaming.md#scoped-client-response-consumption) for precise
+buffer, limit, timeout, cancellation, and disposition boundaries.
 
 ### `base_client_config`
 
@@ -3660,6 +3715,9 @@ framing-line bytes, not owned parsed headers or delivered body. Neither low-leve
 receiver imposes an aggregate body-byte limit. Ordinary `http::client` separately
 caps accumulated final body and cumulative interim wire bytes using
 `max_response_size`; these are separate budgets, not a combined total.
+`client::with_response` instead uses separate streaming payload/interim options
+and retains only bounded scratch/framing storage; it does not impose the buffered
+body limit or claim transport-to-destination zero-copy.
 
 `Stream::read(data, size, token)` must be readiness-aware and return an
 `io::io_result`. `read_with()` accepts a callback invoked as

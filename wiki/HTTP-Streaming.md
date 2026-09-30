@@ -3,14 +3,141 @@
 ## Implemented Scope
 
 Elio's HTTP/1 receive path provides a shared incremental response decoder and
-a pull reader. Ordinary HTTP clients explicitly accumulate its body slices;
-SSE clients incrementally parse those slices as events. This is the receive
+a pull reader. Buffered HTTP calls explicitly accumulate its body slices;
+`client::with_response` consumes them under a pool-integrated scoped handler;
+SSE clients incrementally parse them as events. This is the receive
 phase of [#1191](https://github.com/Coldwings/Elio/issues/1191), tracked in
 [#1192](https://github.com/Coldwings/Elio/issues/1192).
 
 The sending path uses a shared response plan and server-managed producer/writer
 lifecycle. This is HTTP/1 behavior, not an HTTP/2 streaming API or an end-to-end
 zero-copy guarantee.
+
+## Scoped Client Response Consumption
+
+Include `<elio/http/http_client.hpp>` and link `elio_http`. Use
+`client::with_response(request, target, token, handler, options)` when final
+headers must be checked before downloading a body, or when existing application
+storage should receive the payload without a second response-sized allocation.
+The operation owns the request, URL, and handler before lazy execution. A handler
+may be move-only and returns exactly `coro::task<void>`; it is called once for the
+selected final response, after supported redirects and informational responses.
+The client itself must stay alive and unmoved through normal awaited return.
+Keep its mutable configuration and TLS setup stable during an exchange.
+
+The handler receives `const response&`, `response_body_reader&`, and a cooperative
+token. The response owns a snapshot of the final initial headers; its body is
+empty, and later chunk trailers do not mutate that snapshot. Neither argument
+may escape the handler. Serialize reads and await every started read before
+returning; a detached operation is not made safe by cancellation or a destructor.
+
+```cpp
+http::streaming_response_options options;
+options.max_body_size = destination.size();
+auto result = co_await client.with_response(req, target, token,
+    [&](const http::response& head, http::response_body_reader& body,
+        coro::cancel_token child) -> coro::task<void> {
+        if (!accept_range(head)) co_return; // Caller validates status/Content-Range.
+        size_t done = 0;
+        char extra;
+        for (;;) {
+            auto remaining = destination.subspan(done); // std::span<char>
+            auto buffer = remaining.empty() ? std::span<char>(&extra, 1) : remaining;
+            auto read = co_await body.read_into(buffer, child);
+            if (std::holds_alternative<http::client_error>(read)) co_return;
+            auto progress = std::get<http::body_read_progress>(read);
+            if (progress.transferred > remaining.size()) co_return;
+            done += progress.transferred;
+            if (progress.complete) {
+                validate_range_length(done); // Application assertion, not an HTTP retry.
+                co_return;
+            }
+        }
+    }, options);
+if (const auto* failure = std::get_if<http::client_error>(&result)) {
+    report_failure(failure->stage, failure->code);
+}
+```
+
+`read_into` accepts `std::span<char>` or `std::span<std::byte>` and returns
+`client_result<body_read_progress>`, where progress contains `transferred` and
+`complete`. Reads can be short; one call does not fill a range. Completion is
+observed explicitly, normally by a final zero-byte read with `complete=true`
+after the payload. An empty destination consumes nothing and returns zero with
+the currently known completion flag: zero alone is not EOF. Repeated completion
+is stable and precedes a later read-token cancellation. Cancelling the root
+exchange still fails the outer operation and prevents pooling. Keep destination
+storage valid until the awaited read returns,
+including errors/cancellation; no destination access survives that return.
+
+There is no background body pump, unbounded prefetch queue, or full-body
+aggregation. HTTP copies a bounded decoder-scratch fragment into the destination;
+a partially consumed fragment stays in that scratch until its suffix is copied.
+The next decoder/transport pull happens only when that fragment is exhausted
+and the handler requests another read. A positive-progress call does not perform
+another receive. Kernel socket buffers and TLS cryptographic/staging buffers are
+separate costs; this is not end-to-end zero-copy or zero allocation.
+
+| Limit | Scope |
+| --- | --- |
+| `client_config::max_headers`, `max_header_size` | Bounded parsed metadata/framing lines, including chunk trailers |
+| `client_config::read_buffer_size` | One reusable HTTP scratch buffer; zero normalizes to one byte |
+| `streaming_response_options::max_body_size` | Total decoded payload admitted by the reader; defaults to `SIZE_MAX`, not a memory reservation |
+| `streaming_response_options::max_informational_bytes` | Cumulative informational-response wire bytes; defaults to 16 MiB |
+| `client_config::max_response_size` | Existing buffered calls only: final body and a separate interim wire-byte budget |
+
+Exceeding a payload limit rejects the whole newly decoded fragment before copying
+it into the destination. Prior successful read progress remains application-owned.
+Terminal operational failures are owned `client_error` values and remain sticky; the outer
+exchange reports a failed read even if the handler ignores it. Setup/allocation
+exceptions can propagate. A handler exception closes the connection and propagates
+unchanged, rather than becoming an HTTP status or generic operational error.
+Concurrent read entry is rejected with `EALREADY` without changing the admitted
+read; this diagnostic does not relax the serialize-and-join scope requirements.
+Non-2xx statuses are still valid HTTP responses. A successful outer `monostate`
+means the handler/exchange completed without an operational error, not that an
+application range was accepted or completely downloaded.
+
+Only explicit successful message completion, full consumption, valid keep-alive
+framing, no EOF/close-delimited body, and no ambiguous buffered wire suffix permit
+pool reuse. Merely consuming the advertised byte count without observing completion
+does not suffice. Early handler return, exceptions, failed reads, cancellation,
+incomplete consumption, and intermediate redirect responses close instead of
+draining/pooling. A framing error cannot be repaired by a later read.
+Redirect status/method and HTTPS-downgrade rules match buffered calls, but streaming
+follows an accepted redirect at headers and closes its unconsumed body; it does
+not download that body before proceeding. The caller retains authentication,
+application retries, range validation, and idempotency policy.
+
+### Client Deadline And Cancellation Scope
+
+The existing positive `read_timeout` establishes an absolute response I/O deadline
+for each hop after acquisition, before initial request sending. Body pulls reuse
+that deadline instead of restarting a timeout. Initial request writes use the
+existing write watchdog; deferred Expect uploads use the remaining response
+budget. The Expect deadline bounds only the pre-upload wait, is capped by the
+response deadline, and is disabled once final headers arrive. A response-deadline
+expiry fails rather than sending the fallback upload.
+
+This is not a total exchange/handler timer: DNS and TCP/TLS setup are outside
+that read deadline, redirects establish a new hop deadline, and application
+computation/idle waits are not preempted. Already-buffered payload can be copied
+without a new network wait or timer. `connect_timeout` remains the existing
+post-resolution TCP/TLS setup budget; this API does not make legacy DNS waiting
+promptly cancellable. An application can propagate cancellation into its own
+waits, but structured cancellation still awaits normal completion and cannot
+promise a physical upper bound on return time.
+
+While incomplete, the root token always participates in body reads, even if a
+read passes an empty token; a per-read token adds cancellation rather than
+replacing the root. Once completion is observed, subsequent reads return stable
+EOF, even with a cancelled token; root cancellation still fails the outer exchange.
+Cancellation is cooperative, may race with positive progress, and does not undo
+bytes delivered in earlier calls. Read transport/watchdog state is settled before
+return. Do not asynchronously destroy a live reader, handler, or coroutine frame.
+
+See [the canonical range-read example](https://github.com/Coldwings/Elio/blob/main/examples/http_streaming_client.cpp).
+Buffered `send/get` and their limits remain available for small complete responses.
 
 ## Outgoing Response Ownership
 

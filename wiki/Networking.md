@@ -461,6 +461,17 @@ HTTP, WebSocket, and SSE client configs inherit `base_client_config`, including
 read buffer sizing, TLS certificate verification, DNS resolve/cache options,
 address rotation across resolved endpoints, and response-header limits.
 
+For pool-integrated incremental body consumption, use
+`client::with_response(req, target, token, handler, options)` instead of a buffered
+`send/get`. It owns request/target/handler, delivers final headers with an empty
+body, and gives the handler a scoped `response_body_reader` accepting borrowed
+`std::span<char>`/`std::span<std::byte>`. Reads report short progress, explicit
+completion, or owned errors. Await all reads before the handler ends; early exit,
+failure, or cancellation closes rather than reuses the connection. Streaming
+payload limits are independent of buffered `max_response_size`. See
+[HTTP Streaming](HTTP-Streaming.md#scoped-client-response-consumption) for deadline,
+ownership, backpressure, and safe reuse rules and a canonical range-read example.
+
 ### HTTP Server
 
 ```cpp

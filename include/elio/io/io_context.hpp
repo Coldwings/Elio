@@ -272,6 +272,10 @@ public:
         return backend_->is_io_uring();
     }
 
+    [[nodiscard]] bool supports_file_operation(io_op operation) const noexcept {
+        return backend_->supports_file_operation(operation);
+    }
+
 private:
     std::unique_ptr<io_backend> backend_;
     backend_type backend_type_ = backend_type::auto_detect;

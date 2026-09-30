@@ -792,6 +792,32 @@ cmake --build build --target positional_file_io --parallel 2
 ./build/examples/positional_file_io
 ```
 
+### File Persistence Operations
+
+[`examples/file_persistence.cpp`](https://github.com/Coldwings/Elio/blob/main/examples/file_persistence.cpp)
+allocates a temporary file where supported, truncates it, and synchronizes it
+before releasing the descriptor. The example treats filesystem allocation
+capability errors explicitly and keeps the FD alive across awaited calls.
+
+```cpp
+auto resized = co_await io::truncate_file(fd, new_length, token);
+if (!resized) co_return resized.error_value();
+auto synced = co_await io::sync_file(fd, io::file_sync_mode::data_only, token);
+if (!synced) co_return synced.error_value();
+// Application-side metadata publication and directory sync follow separately.
+```
+
+These operations require a running scheduler. Native capabilities are probed;
+fallback work uses bounded fixed-pool admission. Queued cancellation can skip
+dispatch, but running syscalls still complete before normal return. No deadline,
+rollback, or transaction guarantee is supplied. Keep the FD open and unrecycled,
+and handle `EAGAIN` admission rejection according to application policy.
+
+```bash
+cmake --build build --target file_persistence --parallel 2
+./build/examples/file_persistence
+```
+
 ### Batch I/O
 
 Read multiple file regions. Explicit offsets can be batched through io_uring;

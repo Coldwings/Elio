@@ -33,6 +33,7 @@ set(TEST_SOURCES
     unit/test_affinity.cpp
     unit/test_io.cpp
     unit/test_file_transfer.cpp
+    unit/test_file_operations.cpp
     unit/test_batch_io.cpp
     unit/test_sync.cpp
     unit/test_intrusive_list.cpp
@@ -254,6 +255,13 @@ add_executable(elio_fork_boundary_tests fork_boundary_tests.cpp)
 target_link_libraries(elio_fork_boundary_tests PRIVATE elio)
 target_compile_definitions(elio_fork_boundary_tests PRIVATE ELIO_DEBUG)
 list(APPEND ELIO_ADDITIONAL_TEST_TARGETS elio_fork_boundary_tests)
+
+add_executable(elio_file_operations_header compile/test_file_operations_header.cpp)
+target_link_libraries(elio_file_operations_header PRIVATE elio)
+target_compile_definitions(elio_file_operations_header PRIVATE ELIO_DEBUG)
+list(APPEND ELIO_ADDITIONAL_TEST_TARGETS elio_file_operations_header)
+add_test(NAME file_operations_direct_header COMMAND elio_file_operations_header)
+set_tests_properties(file_operations_direct_header PROPERTIES TIMEOUT 30)
 
 if(ELIO_BUILD_SANITIZER_TESTS)
     add_executable(elio_fork_boundary_tests_asan fork_boundary_tests.cpp)

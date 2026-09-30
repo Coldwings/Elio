@@ -143,6 +143,18 @@ inline bool io_uring_poll_can_block(bool submissions_ready,
     return submissions_ready && wake_poll_pending;
 }
 
+// Dependent lookup detects the consumer's actual liburing headers, including
+// backports, without exporting a producer-build version decision in a package.
+template<typename Sqe>
+inline bool prepare_native_file_truncate(Sqe* sqe, int fd, int64_t length) noexcept {
+    if constexpr (requires { io_uring_prep_ftruncate(sqe, fd, length); }) {
+        io_uring_prep_ftruncate(sqe, fd, length);
+        return true;
+    } else {
+        return false;
+    }
+}
+
 inline bool io_uring_prepare_request_is_valid(const io_request& req) noexcept {
     switch (req.op) {
         case io_op::none:
@@ -161,6 +173,9 @@ inline bool io_uring_prepare_request_is_valid(const io_request& req) noexcept {
         case io_op::cancel:
         case io_op::poll_read:
         case io_op::poll_write:
+        case io_op::file_sync:
+        case io_op::file_allocate:
+        case io_op::file_truncate:
             return true;
         case io_op::sendmsg:
             return req.msg != nullptr;
@@ -324,6 +339,21 @@ public:
             io_uring_queue_exit(&ring_);
             throw std::runtime_error("failed to install io_uring wake poll");
         }
+
+        if (auto* probe = io_uring_get_probe_ring(&ring_)) {
+            if (io_uring_opcode_supported(probe, IORING_OP_FSYNC)) {
+                native_file_ops_ |= native_sync;
+            }
+            if (io_uring_opcode_supported(probe, IORING_OP_FALLOCATE)) {
+                native_file_ops_ |= native_allocate;
+            }
+            io_uring_sqe truncate_sqe{};
+            if (detail::prepare_native_file_truncate(&truncate_sqe, -1, 0) &&
+                    io_uring_opcode_supported(probe, truncate_sqe.opcode)) {
+                native_file_ops_ |= native_truncate;
+            }
+            io_uring_free_probe(probe);
+        }
     }
     
     /// Destructor
@@ -355,8 +385,22 @@ public:
     io_uring_backend(io_uring_backend&&) = delete;
     io_uring_backend& operator=(io_uring_backend&&) = delete;
     
+    bool supports_file_operation(io_op operation) const noexcept override {
+        switch (operation) {
+            case io_op::file_sync: return (native_file_ops_ & native_sync) != 0;
+            case io_op::file_allocate: return (native_file_ops_ & native_allocate) != 0;
+            case io_op::file_truncate: return (native_file_ops_ & native_truncate) != 0;
+            default: return false;
+        }
+    }
+
     /// Prepare an I/O operation
     bool prepare(const io_request& req) override {
+        if ((req.op == io_op::file_sync || req.op == io_op::file_allocate ||
+             req.op == io_op::file_truncate) && !supports_file_operation(req.op)) {
+            detail::set_last_completion_result(io_result{-EOPNOTSUPP, 0});
+            return false;
+        }
         if (!detail::io_uring_prepare_request_is_valid(req)) {
             ELIO_LOG_ERROR("Invalid io_uring prepare request: {}",
                            static_cast<int>(req.op));
@@ -390,6 +434,23 @@ public:
         }
         
         switch (req.op) {
+            case io_op::file_sync:
+                io_uring_prep_fsync(sqe, req.fd,
+                    req.file_flags != 0 ? IORING_FSYNC_DATASYNC : 0);
+                sqe->flags |= IOSQE_ASYNC;
+                break;
+
+            case io_op::file_allocate:
+                io_uring_prep_fallocate(sqe, req.fd, req.file_flags,
+                    static_cast<off_t>(req.offset), static_cast<off_t>(req.file_length));
+                sqe->flags |= IOSQE_ASYNC;
+                break;
+
+            case io_op::file_truncate:
+                (void)detail::prepare_native_file_truncate(sqe, req.fd, req.offset);
+                sqe->flags |= IOSQE_ASYNC;
+                break;
+
             case io_op::read:
                 if (req.offset >= 0) {
                     io_uring_prep_read(sqe, req.fd, req.buffer,
@@ -1020,6 +1081,10 @@ public:
     
 private:
     struct io_uring ring_;                     ///< io_uring instance
+    static constexpr uint8_t native_sync = 1;
+    static constexpr uint8_t native_allocate = 2;
+    static constexpr uint8_t native_truncate = 4;
+    uint8_t native_file_ops_ = 0;
     std::atomic<size_t> pending_ops_;          ///< Number of pending operations
     int wake_fd_ = -1;  ///< eventfd for cross-thread wake-up
     bool wake_poll_pending_ = false; ///< Wake SQE is staged or kernel-owned

@@ -7,6 +7,7 @@ on:
       - 'tests/**'
       - 'examples/sse_server.cpp'
       - 'examples/http_streaming_server.cpp'
+      - 'examples/http_streaming_client.cpp'
       - 'examples/http_connect_proxy.cpp'
       - '**/CMakeLists.txt'
       - 'cmake/**'
@@ -24,6 +25,7 @@ on:
       - 'tests/**'
       - 'examples/sse_server.cpp'
       - 'examples/http_streaming_server.cpp'
+      - 'examples/http_streaming_client.cpp'
       - 'examples/http_connect_proxy.cpp'
       - '**/CMakeLists.txt'
       - 'cmake/**'
@@ -64,7 +66,7 @@ jobs:
             -DPython3_EXECUTABLE="$RUNNER_TEMP/http-peer-env/bin/python"
       - name: Compile peer and documented examples
         id: build
-        run: cmake --build build-http-peer --target elio_http_streaming_peer elio_http_connect_peer elio_http_streaming_cost_probe elio_http_streaming_transport_tests elio_public_header_examples sse_server http_streaming_server http_connect_proxy --parallel 2
+        run: cmake --build build-http-peer --target elio_http_streaming_peer elio_http_connect_peer elio_http_streaming_cost_probe elio_http_streaming_transport_tests elio_public_header_examples sse_server http_streaming_server http_streaming_client http_connect_proxy --parallel 2
       - name: Validate against h11
         id: peer
         run: |
@@ -78,6 +80,14 @@ jobs:
           "$RUNNER_TEMP/http-peer-env/bin/python" tests/integration/http_streaming_example.py \
             --server build-http-peer/examples/http_streaming_server \
             --output-dir http-peer-results/canonical-example
+      - name: Run canonical streaming client example
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          mkdir -p http-peer-results
+          set -o pipefail
+          ctest --test-dir build-http-peer -R '^http_streaming_client_example$' \
+            --no-tests=error --output-on-failure 2>&1 \
+            | tee http-peer-results/client-example.log
       - name: Validate independent CONNECT peers
         if: always() && steps.build.outcome == 'success'
         run: |

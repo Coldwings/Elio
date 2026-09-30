@@ -518,9 +518,50 @@ endif()
 # Add custom targets for convenience
 add_custom_target(test_all
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS elio_tests ${ELIO_ADDITIONAL_TEST_TARGETS}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
+add_dependencies(test_all elio_tests ${ELIO_ADDITIONAL_TEST_TARGETS})
+
+# CTest also invokes these executables directly or through script fixtures.
+# Optional targets must not introduce dependencies when their feature is off.
+foreach(_elio_test_target IN ITEMS
+    elio_tests_asan elio_tests_tsan
+    elio_http_streaming_peer elio_http_connect_peer
+    elio_http_streaming_cost_probe elio_http_streaming_transport_tests
+    elio_http_streaming_metrics_server elio_rdma_integration_tests)
+    if(TARGET ${_elio_test_target})
+        add_dependencies(test_all ${_elio_test_target})
+    endif()
+endforeach()
+
+set(_elio_check_http_graph OFF)
+if(TARGET elio_http AND Python3_Interpreter_FOUND)
+    set(_elio_check_http_graph ON)
+endif()
+add_test(NAME test_all_dependency_graph
+    COMMAND ${CMAKE_COMMAND}
+        -DELIO_SOURCE_DIR=${PROJECT_SOURCE_DIR}
+        -DELIO_BINARY_DIR=${CMAKE_BINARY_DIR}/tests/cmake/test_all_dependencies
+        -DELIO_FMT_SOURCE_DIR=${fmt_SOURCE_DIR}
+        -DELIO_CATCH2_SOURCE_DIR=${catch2_SOURCE_DIR}
+        -DELIO_CHECK_HTTP=${_elio_check_http_graph}
+        -DELIO_CHECK_RDMA=$<BOOL:$<TARGET_EXISTS:elio_rdma_ibverbs>>
+        "-DELIO_PARENT_CMAKE_GENERATOR=${CMAKE_GENERATOR}"
+        "-DELIO_PARENT_CMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DELIO_PARENT_CMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        "-DELIO_PARENT_CMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
+        "-DELIO_PARENT_CMAKE_SYSROOT=${CMAKE_SYSROOT}"
+        "-DELIO_PARENT_CMAKE_FIND_ROOT_PATH=${CMAKE_FIND_ROOT_PATH}"
+        "-DELIO_PARENT_CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}"
+        "-DELIO_PARENT_OPENSSL_INCLUDE_DIR=${OPENSSL_INCLUDE_DIR}"
+        "-DELIO_PARENT_OPENSSL_SSL_LIBRARY=${OPENSSL_SSL_LIBRARY}"
+        "-DELIO_PARENT_OPENSSL_CRYPTO_LIBRARY=${OPENSSL_CRYPTO_LIBRARY}"
+        "-DELIO_PARENT__IBVERBS_INC_PATH=${_IBVERBS_INC_PATH}"
+        "-DELIO_PARENT__IBVERBS_LIB_PATH=${_IBVERBS_LIB_PATH}"
+        "-DELIO_PARENT_Python3_EXECUTABLE=${Python3_EXECUTABLE}"
+        "-DELIO_PARENT_CMAKE_DISABLE_FIND_PACKAGE_Python3=${CMAKE_DISABLE_FIND_PACKAGE_Python3}"
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_test_all_dependencies.cmake)
+set_tests_properties(test_all_dependency_graph PROPERTIES TIMEOUT 120)
 
 if(ELIO_BUILD_SANITIZER_TESTS)
     add_custom_target(test_asan

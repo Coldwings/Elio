@@ -125,6 +125,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Complete `test_all` build prerequisites**: registered examples, sanitizer
+  suites, and enabled HTTP/RDMA fixtures are built before unfiltered CTest.
+  Disabled targets and unregistered benchmark/stress programs remain excluded;
+  configure-only matrix checks protect the dependency graph (#1238).
+
 - **Core-only SSE writer test build**: keep transport-independent writer/wire
   assertions available with TLS disabled, gate client receiver round-trip checks
   on the TLS feature, and compile the writer suite against the core target even

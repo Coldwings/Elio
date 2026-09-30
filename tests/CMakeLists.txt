@@ -249,7 +249,7 @@ endif()
 
 # Standalone process-boundary test. Keeping this outside Catch2 guarantees that
 # its first fork occurs before any Elio runtime has existed in the process.
-set(ELIO_ADDITIONAL_TEST_TARGETS)
+set(ELIO_ADDITIONAL_TEST_TARGETS elio_file_transfer_header)
 add_executable(elio_fork_boundary_tests fork_boundary_tests.cpp)
 target_link_libraries(elio_fork_boundary_tests PRIVATE elio)
 target_compile_definitions(elio_fork_boundary_tests PRIVATE ELIO_DEBUG)

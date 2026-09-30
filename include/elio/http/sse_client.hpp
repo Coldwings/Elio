@@ -639,13 +639,9 @@ private:
                 response_deadline - std::chrono::steady_clock::now();
             if (remaining.count() <= 0) co_return io::io_result{-ETIMEDOUT, 0};
             auto timed_out = std::make_shared<std::atomic<bool>>(false);
-            coro::cancel_source watchdog_cancel;
-            auto watchdog = http::detail::arm_fd_shutdown_watchdog(
-                sched, stream_.fd(), remaining,
-                watchdog_cancel.get_token(), timed_out);
-            auto result = co_await stream_.read(data, size, connect_token);
-            watchdog_cancel.cancel();
-            co_await watchdog;
+            auto result = co_await http::detail::await_fd_operation_with_watchdog(
+                [&] { return stream_.read(data, size, connect_token); },
+                sched, stream_.fd(), remaining, timed_out);
             if (timed_out->load(std::memory_order_acquire)) {
                 stream_.mark_externally_shut_down();
                 co_return io::io_result{-ETIMEDOUT, 0};

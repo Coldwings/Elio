@@ -387,32 +387,6 @@ private:
             m, url_str, body, content_type, std::move(token), false));
     }
     
-    /// Spawn a watchdog that shutdown(2)s `fd` after `timeout` elapses,
-    /// mirroring rpc_session::read_frame_with_deadline. The returned
-    /// join_handle must be awaited after the IO completes; the caller
-    /// cancels `cancel_src` so the watchdog wakes early on success.
-    /// `timed_out` is set to true iff the deadline fired before the IO
-    /// completed.
-    static coro::join_handle<void>
-    arm_io_watchdog(runtime::scheduler* sched,
-                    int fd,
-                    std::chrono::nanoseconds timeout,
-                    coro::cancel_token watchdog_token,
-                    std::shared_ptr<std::atomic<bool>> timed_out) {
-        return sched->go_joinable(
-            [fd, timeout, tok = std::move(watchdog_token),
-             flag = std::move(timed_out)]() -> coro::task<void> {
-                auto r = co_await elio::time::sleep_for(timeout, tok);
-                if (r == coro::cancel_result::completed) {
-                    flag->store(true, std::memory_order_release);
-                    if (fd >= 0) {
-                        ::shutdown(fd, SHUT_RDWR);
-                    }
-                }
-                co_return;
-            });
-    }
-
     static bool is_informational_status(uint16_t code) noexcept {
         return code >= 100 && code < 200;
     }
@@ -443,12 +417,9 @@ private:
 #endif
         if (deadline_enforced) {
             auto timed_out = std::make_shared<std::atomic<bool>>(false);
-            coro::cancel_source ws_cancel;
-            auto watchdog = arm_io_watchdog(sched, conn.fd(), io_deadline,
-                                            ws_cancel.get_token(), timed_out);
-            write_result = co_await conn.write_all(data, token);
-            ws_cancel.cancel();
-            co_await watchdog;
+            write_result = co_await detail::await_fd_operation_with_watchdog(
+                [&] { return conn.write_all(data, token); },
+                sched, conn.fd(), io_deadline, timed_out);
             if (timed_out->load(std::memory_order_acquire)) {
                 conn.mark_externally_shut_down();
                 ELIO_LOG_ERROR("Write to {}:{} timed out after {}s",

@@ -300,6 +300,14 @@ a regular file (raw backend)" in `tests/unit/test_io.cpp`.
 | `http::client_config` | Extends base client settings with HTTP/1.1 client-specific options. | Keep configured defaults aligned with application retry/redirect/security policy. |
 | `http::request::set_expect_continue()` | When enabled on a request with a body, the client sends the headers first and waits up to `client_config::expect_continue_timeout` for an interim `100 Continue` before sending the body. A final response received first (for example 417) suppresses the body; a timeout sends the body anyway; a timeout less than or equal to zero sends the body immediately after the headers. The wait is additionally bounded by the absolute response deadline (`read_timeout`), and response-deadline expiry fails the request with `ETIMEDOUT` instead of triggering the fallback. Further interim 1xx responses are skipped under the documented cumulative cap, and body-preserving redirects re-run the handshake per hop. | Choose a timeout appropriate for the endpoint and treat the fallback paths (final response without 100, timeout) as normal operation; servers are not required to honor `Expect`. |
 
+HTTP-family client deadline watchdogs are library-owned. HTTP request writes
+and WebSocket/SSE response-header reads cancel and join every admitted
+FD-accessing watchdog before returning normally or propagating an operation
+exception. Creating the I/O task is part of this protected region. The original
+operation exception takes precedence over a secondary cleanup exception.
+This does not authorize forced frame destruction or make cancellation immediate;
+callers must keep clients and borrowed inputs alive through awaited cleanup.
+
 ### CONNECT Request Boundary
 
 CONNECT request parsing requires authority-form: a nonempty URI host and an

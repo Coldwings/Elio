@@ -538,14 +538,9 @@ private:
                 }
 
                 auto timed_out = std::make_shared<std::atomic<bool>>(false);
-                coro::cancel_source watchdog_cancel;
-                auto watchdog = http::detail::arm_fd_shutdown_watchdog(
-                    sched, stream_.fd(), remaining,
-                    watchdog_cancel.get_token(), timed_out);
-                read_result = co_await read(buffer_.data(), buffer_.size(),
-                                            token);
-                watchdog_cancel.cancel();
-                co_await watchdog;
+                read_result = co_await http::detail::await_fd_operation_with_watchdog(
+                    [&] { return read(buffer_.data(), buffer_.size(), token); },
+                    sched, stream_.fd(), remaining, timed_out);
                 if (timed_out->load(std::memory_order_acquire)) {
                     stream_.mark_externally_shut_down();
                     ELIO_LOG_ERROR("WebSocket handshake response timed out after {}s",

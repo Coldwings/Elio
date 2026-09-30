@@ -428,6 +428,114 @@ TEST_CASE("HTTP streaming client reuses only completely consumed responses",
     if (!abandon && !throws) REQUIRE(first.bytes == (disposition == 5 ? "fi" : "first"));
 }
 
+TEST_CASE("HTTP streaming concurrent entry rejects only the competing read",
+          "[http][client][streaming][concurrent][pool]") {
+    const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
+    require_backend(backend);
+    const bool encrypted = GENERATE(false, true);
+    CAPTURE(static_cast<int>(backend), encrypted);
+    exchange_fixture fixture(backend, encrypted);
+    response_observer_guard observer;
+    sync::event first_parked;
+    sync::event competing_read_finished;
+    std::atomic<bool> first_started{false};
+    bool parked = false;
+    int competing_error = 0;
+    bool competing_buffer_untouched = false;
+    bool admitted_read_succeeded = false;
+    bool reader_not_poisoned = false;
+    bool second_request_seen = false;
+    body_observation first;
+    body_observation second;
+    int first_error = 0;
+    int second_error = 0;
+    fixture.run([&]() -> coro::task<void> {
+        auto stream = co_await fixture.accept();
+        if (!stream) throw std::runtime_error("server accept failed");
+        (void)co_await request_headers(*stream, fixture.stop.get_token());
+        (void)co_await stream->write_all("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+                                        fixture.stop.get_token());
+        // Withhold all payload until the competing call has returned. The
+        // admitted read cannot finish successfully before that diagnostic.
+        (void)co_await competing_read_finished.wait(fixture.stop.get_token());
+        (void)co_await stream->write_all("first", fixture.stop.get_token());
+        auto next = co_await request_headers(*stream, fixture.stop.get_token());
+        second_request_seen = next.starts_with("GET /range ");
+        (void)co_await stream->write_all(
+            "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecond",
+            fixture.stop.get_token());
+        http::detail::abort_stream_io(*stream);
+    }, [&](http::client& client) -> coro::task<void> {
+        auto result = co_await client.with_response(http::request(http::method::GET, "/range"),
+            fixture.target, fixture.stop.get_token(),
+            [&](const http::response&, http::response_body_reader& body,
+                coro::cancel_token token) -> coro::task<void> {
+                std::array<char, 5> admitted_buffer{};
+                auto admitted = fixture.sched.go_joinable([&]() -> coro::task<http::body_read_result> {
+                    first_started.store(true, std::memory_order_release);
+                    co_return co_await body.read_into(std::span<char>(admitted_buffer), token);
+                });
+                std::exception_ptr failure;
+                try {
+                    (void)co_await first_parked.wait(token);
+                    std::array<char, 5> rejected_buffer;
+                    rejected_buffer.fill('r');
+                    auto rejected = co_await body.read_into(std::span<char>(rejected_buffer), token);
+                    if (const auto* error = std::get_if<http::client_error>(&rejected)) {
+                        competing_error = error->code.value();
+                    }
+                    competing_buffer_untouched = std::all_of(
+                        rejected_buffer.begin(), rejected_buffer.end(), [](char value) { return value == 'r'; });
+                } catch (...) {
+                    failure = std::current_exception();
+                }
+                competing_read_finished.set();
+                http::body_read_result read;
+                try { read = co_await admitted; }
+                catch (...) { if (!failure) failure = std::current_exception(); }
+                co_await admitted.wait_destroyed_async();
+                if (failure) std::rethrow_exception(failure);
+                if (const auto* progress = std::get_if<http::body_read_progress>(&read)) {
+                    admitted_read_succeeded = progress->transferred > 0 &&
+                        progress->transferred <= admitted_buffer.size() &&
+                        std::string_view(admitted_buffer.data(), progress->transferred) ==
+                            std::string_view("first").substr(0, progress->transferred);
+                    if (admitted_read_succeeded) {
+                        first.bytes.append(admitted_buffer.data(), progress->transferred);
+                    }
+                }
+                reader_not_poisoned = !body.error(); // The admitted read has settled.
+                co_await consume(body, token, first);
+            });
+        first_error = result_error(result);
+        result = co_await client.with_response(http::request(http::method::GET, "/range"),
+            fixture.target, fixture.stop.get_token(),
+            [&](const http::response&, http::response_body_reader& body,
+                coro::cancel_token token) -> coro::task<void> {
+                co_await consume(body, token, second);
+            });
+        second_error = result_error(result);
+    }, [&] {
+        parked = observe([&] {
+            return first_started.load(std::memory_order_acquire) && body_read_parked(fixture);
+        });
+        first_parked.set();
+    });
+    REQUIRE(parked);
+    REQUIRE(competing_error == EALREADY);
+    REQUIRE(competing_buffer_untouched);
+    REQUIRE(admitted_read_succeeded);
+    REQUIRE(reader_not_poisoned);
+    REQUIRE(first_error == 0);
+    REQUIRE(first.bytes == "first");
+    REQUIRE(first.complete);
+    REQUIRE(second_error == 0);
+    REQUIRE(second_request_seen);
+    REQUIRE(second.bytes == "second");
+    REQUIRE(second.complete);
+    REQUIRE(fixture.accepted == 1);
+}
+
 TEST_CASE("HTTP streaming client keeps errors sticky and honors independent limits",
           "[http][client][streaming][limits]") {
     const auto failure = GENERATE(0, 1, 2, 3);

@@ -195,6 +195,166 @@ TEST_CASE("DNS admission state survives its configuration owner",
         std::make_shared<dns_admission_state>(0)));
 }
 
+TEST_CASE("DNS lookup admission and queued departure have one phase winner",
+          "[dns][resolve_wait][queued][race][regression]") {
+    SECTION("lookup wins before departure") {
+        dns_job_state state;
+        REQUIRE(state.begin_lookup());
+        state.depart();
+        REQUIRE(state.phase_for_test() == dns_job_state::phase::running);
+        REQUIRE_FALSE(state.begin_lookup());
+    }
+    SECTION("departure wins before lookup") {
+        dns_job_state state;
+        state.depart();
+        REQUIRE_FALSE(state.begin_lookup());
+        REQUIRE(state.phase_for_test() == dns_job_state::phase::discarded);
+    }
+    SECTION("simultaneous contenders preserve either legal winner") {
+        for (size_t attempt = 0; attempt < 64; ++attempt) {
+            dns_job_state state;
+            std::atomic<bool> start{false};
+            std::atomic<bool> release{false};
+            bool admitted = false;
+            std::vector<std::thread> threads;
+            thread_drain_guard guard{threads, start, release};
+            threads.emplace_back([&] {
+                hold_until_released(start);
+                admitted = state.begin_lookup();
+            });
+            threads.emplace_back([&] {
+                hold_until_released(start);
+                state.depart();
+            });
+            guard.drain();
+            REQUIRE(state.phase_for_test() == (admitted
+                ? dns_job_state::phase::running : dns_job_state::phase::discarded));
+            REQUIRE_FALSE(state.begin_lookup());
+            state.depart();
+            REQUIRE(state.phase_for_test() == (admitted
+                ? dns_job_state::phase::running : dns_job_state::phase::discarded));
+            state.retire();
+            state.depart();
+            REQUIRE_FALSE(state.begin_lookup());
+            REQUIRE(state.phase_for_test() == dns_job_state::phase::retired);
+        }
+    }
+}
+
+TEST_CASE("rejected DNS submission releases all caller-owned work and capacity",
+          "[dns][resolve_wait][admission][overload][lifetime][regression]") {
+    enum class rejection { no_workers, stopped, full_queue };
+    const auto reason = GENERATE(rejection::no_workers, rejection::stopped,
+                                rejection::full_queue);
+    elio::runtime::blocking_pool pool(reason == rejection::no_workers ? 0 : 1);
+    lookup_control lookup;
+    std::atomic<bool> blocker_entered{false};
+    std::atomic<bool> blocker_release{false};
+    lookup_guard guard(lookup, [&] {
+        release_flag(blocker_release);
+        pool.shutdown();
+    });
+    if (reason == rejection::stopped) {
+        pool.shutdown();
+    } else if (reason == rejection::full_queue) {
+        std::function<void()> blocker = [&] {
+            release_flag(blocker_entered);
+            hold_until_released(blocker_release);
+        };
+        REQUIRE(pool.submit_bounded(std::move(blocker), 1));
+        REQUIRE(wait_for([&] { return blocker_entered.load(std::memory_order_acquire); }));
+        std::function<void()> filler = [] {};
+        REQUIRE(pool.submit_bounded(std::move(filler), 1));
+        filler = nullptr;
+        REQUIRE(pool.queued_count_for_test() == 1);
+    }
+
+    auto capacity = std::make_shared<dns_admission_state>(1);
+    auto job = try_make_owned_dns_job("rejected.example", 80, capacity);
+    REQUIRE(job);
+    auto state = job->state();
+    std::weak_ptr<elio::net::detail::owned_dns_job> weak_job = job;
+    std::weak_ptr<dns_job_state> weak_state = state;
+    std::weak_ptr<elio::coro::detail::join_state<dns_lookup_result>> weak_result =
+        state->result_state();
+    std::function<void()> work = [job = std::move(job)] { job->run(); };
+    REQUIRE_FALSE(pool.submit_bounded(std::move(work), 1));
+    REQUIRE(work);
+    REQUIRE_FALSE(weak_job.expired());
+    REQUIRE(capacity->outstanding() == 1);
+    REQUIRE(state->phase_for_test() == dns_job_state::phase::queued);
+    REQUIRE_FALSE(state->result_state()->is_completed());
+    state->depart();
+    work = nullptr;
+    REQUIRE(weak_job.expired());
+    REQUIRE(capacity->outstanding() == 0);
+    state.reset();
+    REQUIRE(weak_state.expired());
+    REQUIRE(weak_result.expired());
+    REQUIRE(lookup.calls.load() == 0);
+    {
+        auto replacement = try_make_owned_dns_job("replacement.example", 80, capacity);
+        REQUIRE(replacement);
+        REQUIRE(capacity->outstanding() == 1);
+    }
+    REQUIRE(capacity->outstanding() == 0);
+}
+
+TEST_CASE("repeated queued DNS departure cannot evade outstanding admission limits",
+          "[dns][resolve_wait][queued][admission][stress][regression]") {
+    elio::runtime::blocking_pool pool(1);
+    lookup_control lookup;
+    std::atomic<bool> blocker_entered{false};
+    std::atomic<bool> blocker_release{false};
+    lookup_guard guard(lookup, [&] {
+        release_flag(blocker_release);
+        pool.shutdown();
+    });
+    release_flag(lookup.release);
+    auto capacity = std::make_shared<dns_admission_state>(3);
+    for (size_t round = 0; round < 4; ++round) {
+        blocker_entered.store(false, std::memory_order_release);
+        blocker_release.store(false, std::memory_order_release);
+        std::function<void()> blocker = [&] {
+            release_flag(blocker_entered);
+            hold_until_released(blocker_release);
+        };
+        REQUIRE(pool.submit_bounded(std::move(blocker), 3));
+        REQUIRE(wait_for([&] { return blocker_entered.load(std::memory_order_acquire); }));
+        std::vector<std::weak_ptr<elio::net::detail::owned_dns_job>> weak_jobs;
+        std::vector<std::weak_ptr<dns_job_state>> weak_states;
+        std::vector<std::weak_ptr<elio::coro::detail::join_state<dns_lookup_result>>> weak_results;
+        for (size_t index = 0; index < 3; ++index) {
+            auto job = try_make_owned_dns_job("departed.queued.example", 80, capacity);
+            REQUIRE(job);
+            auto state = job->state();
+            weak_jobs.push_back(job);
+            weak_states.push_back(state);
+            weak_results.push_back(state->result_state());
+            std::function<void()> work = [job = std::move(job)] { job->run(); };
+            REQUIRE(pool.submit_bounded(std::move(work), 3));
+            work = nullptr;
+            state->depart();
+            REQUIRE(state->phase_for_test() == dns_job_state::phase::discarded);
+        }
+        for (size_t attempt = 0; attempt < 64; ++attempt) {
+            REQUIRE_FALSE(try_make_owned_dns_job("overloaded.example", 80, capacity));
+            REQUIRE(capacity->outstanding() == 3);
+            REQUIRE(pool.queued_count_for_test() == 3);
+        }
+        REQUIRE(lookup.calls.load() == 0);
+        release_flag(blocker_release);
+        REQUIRE(wait_for([&] { return capacity->outstanding() == 0; }));
+        REQUIRE(pool.queued_count_for_test() == 0);
+        REQUIRE(lookup.calls.load() == 0);
+        for (size_t index = 0; index < weak_jobs.size(); ++index) {
+            REQUIRE(weak_jobs[index].expired());
+            REQUIRE(weak_states[index].expired());
+            REQUIRE(weak_results[index].expired());
+        }
+    }
+}
+
 TEST_CASE("queued DNS departure retains capacity and skips libc work",
           "[dns][resolve_wait][queued][cancellation][regression]") {
     elio::runtime::blocking_pool pool(1);
@@ -341,4 +501,72 @@ TEST_CASE("owned DNS completion publishes a value or exception only once",
         REQUIRE(result.addresses.size() == 1);
         REQUIRE(result.addresses.front().port() == 443);
     }
+}
+
+TEST_CASE("scheduler shutdown drains a still-blocked departed DNS producer",
+          "[dns][resolve_wait][running][shutdown][lifetime][regression]") {
+    const bool throw_failure = GENERATE(false, true);
+    scheduler sched(2);
+    lookup_control lookup;
+    lookup.throw_failure = throw_failure;
+    std::vector<std::thread> shutdown_threads;
+    std::atomic<bool> shutdown_returned{false};
+    bool drained = false;
+    lookup_guard guard(lookup, [&] {
+        for (auto& thread : shutdown_threads) {
+            if (thread.joinable()) thread.join();
+        }
+        sched.shutdown();
+    });
+    sched.start();
+    auto capacity = std::make_shared<dns_admission_state>(1);
+    auto job = try_make_owned_dns_job("departed.shutdown.example", 80, capacity);
+    REQUIRE(job);
+    auto state = job->state();
+    std::weak_ptr<elio::net::detail::owned_dns_job> weak_job = job;
+    std::weak_ptr<dns_job_state> weak_state = state;
+    std::weak_ptr<elio::coro::detail::join_state<dns_lookup_result>> weak_result =
+        state->result_state();
+    auto* pool = sched.get_blocking_pool();
+    REQUIRE(pool);
+    std::function<void()> work = [job = std::move(job)] { job->run(); };
+    REQUIRE(pool->submit_bounded(std::move(work), 1));
+    work = nullptr;
+    REQUIRE(wait_for([&] { return lookup.entered.load(std::memory_order_acquire); }));
+
+    cancel_source source;
+    auto observer = sched.go_joinable([state, token = source.get_token()]() -> task<join_wait_outcome> {
+        co_return co_await observe_job(state, token);
+    });
+    source.cancel();
+    REQUIRE(wait_for([&] { return observer.await_ready(); }));
+    REQUIRE(observer.await_resume() == join_wait_outcome::cancelled);
+    observer.wait_destroyed();
+    state.reset();
+    REQUIRE(sched.active_tasks() == 0);
+
+    shutdown_threads.emplace_back([&] {
+        drained = sched.shutdown();
+        release_flag(shutdown_returned);
+    });
+    REQUIRE(wait_for([&] { return pool->stopped_for_test(); }));
+    REQUIRE_FALSE(shutdown_returned.load(std::memory_order_acquire));
+    REQUIRE_FALSE(lookup.release.load(std::memory_order_acquire));
+    REQUIRE(sched.is_running());
+    REQUIRE(capacity->outstanding() == 1);
+    REQUIRE_FALSE(try_make_owned_dns_job("overloaded.example", 80, capacity));
+    REQUIRE_FALSE(weak_job.expired());
+    REQUIRE_FALSE(weak_state.expired());
+    REQUIRE_FALSE(weak_result.expired());
+
+    release_flag(lookup.release);
+    shutdown_threads.front().join();
+    REQUIRE(shutdown_returned.load(std::memory_order_acquire));
+    REQUIRE(drained);
+    REQUIRE_FALSE(sched.is_running());
+    REQUIRE(lookup.calls.load() == 1);
+    REQUIRE(capacity->outstanding() == 0);
+    REQUIRE(weak_job.expired());
+    REQUIRE(weak_state.expired());
+    REQUIRE(weak_result.expired());
 }

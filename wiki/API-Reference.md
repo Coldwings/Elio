@@ -280,7 +280,7 @@ public:
     
     // Awaitable interface (use with co_await)
     bool await_ready() const noexcept;
-    bool await_suspend(std::coroutine_handle<> awaiter) noexcept;
+    bool await_suspend(std::coroutine_handle<> awaiter);
     T await_resume();  // Returns result or rethrows exception
     
     // Check if the spawned task has completed (non-blocking)
@@ -391,11 +391,22 @@ coroutine owner alive until the observation returns.
 
 Only one pending result observation, whether direct `co_await handle` or a new
 wait, may register at a time. A second pending registration throws
-`std::logic_error`; independent destruction observers are unaffected. Once
-registered, completion, cancellation, deadline dispatch, and setup failure
+`std::logic_error`; independent destruction observers are unaffected.
+
+Result consumption remains single-owner, including an already-ready handle:
+do not consume its result while another consuming await is still active. The
+pending-registration rejection is not a concurrent multi-consumer guarantee.
+
+Once registered, completion, cancellation, deadline dispatch, and setup failure
 arbitrate through one terminal transition. A later event cannot replace the
 winner. Deadline dispatch is cooperative, not a physical-time return guarantee.
-Allocation, timer setup, and timer failures can propagate if they win. The
+Allocation during setup, timer setup, and timer failures can propagate if they
+win the terminal transition. Cleanup exceptions are separate: allocating the
+private timer's frame-destruction observer can fail after an outcome was
+selected. That failure may propagate rather than return the selected outcome;
+it does not change the child's result. Internal timer state remains runtime-owned,
+so keep the scheduler alive through its eventual cleanup. Successful returns
+complete the private timer's result and frame-destruction barriers. The
 implementation observes result publication through registration rather than
 periodic `is_ready()` checks; timer backend fallback behavior is unchanged.
 

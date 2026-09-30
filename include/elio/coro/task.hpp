@@ -580,6 +580,9 @@ public:
     /// waits require a running observing scheduler and reject concurrent pending
     /// result waits. Timeout/cancellation never cancels the observed task.
     /// The returned single-use task pins state independently of this handle.
+    /// Result consumption stays single-owner, even for already-ready handles.
+    /// Cleanup allocation failure can throw after a winner was selected; keep
+    /// the scheduler alive until runtime-owned private timer cleanup completes.
     [[nodiscard]] task<join_wait_outcome> wait(cancel_token token = {}) const;
     [[nodiscard]] task<join_wait_outcome> wait_until(
         std::chrono::steady_clock::time_point deadline, cancel_token token = {}) const;

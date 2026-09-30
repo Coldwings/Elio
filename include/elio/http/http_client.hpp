@@ -743,18 +743,24 @@ private:
                     const bool method_preserved =
                         redirect_method == req.get_method() &&
                         resp.get_status() != status::see_other;
-                    if ((resp.get_status() == status::temporary_redirect ||
-                         resp.get_status() == status::permanent_redirect ||
-                         method_preserved) &&
-                        !req.body().empty()) {
-                        redirect_req.set_body(req.body());
+                    if (resp.get_status() == status::temporary_redirect ||
+                        resp.get_status() == status::permanent_redirect ||
+                        method_preserved) {
+                        if (!req.body().empty()) {
+                            redirect_req.set_body(req.body());
+                        } else if (req.get_headers().content_length() == size_t{0}) {
+                            // Empty and absent representations are distinct;
+                            // preserve only a valid explicit zero length.
+                            redirect_req.set_header("Content-Length",
+                                req.get_headers().get("Content-Length"));
+                        }
                         auto ct = req.content_type();
                         if (!ct.empty()) {
                             redirect_req.set_content_type(ct);
                         }
                         // The Expect handshake only makes sense while the
                         // body travels with the redirect; it re-runs per hop.
-                        if (req.expect_continue()) {
+                        if (!req.body().empty() && req.expect_continue()) {
                             redirect_req.set_expect_continue();
                         }
                     }

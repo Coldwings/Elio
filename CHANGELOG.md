@@ -147,6 +147,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closed/recycled descriptor after normal exceptional return; the original
   operation exception is retained (#1241).
 
+- **Empty HTTP representations across redirects**: preserve explicit content
+  type and length metadata on method-preserving redirects, including 307/308.
+  Originally bodyless requests stay bodyless; method-changing redirects retain
+  their existing content-dropping behavior (#1251).
+
 - **Complete `test_all` build prerequisites**: registered examples, sanitizer
   suites, and enabled HTTP/RDMA fixtures are built before unfiltered CTest.
   Disabled targets and unregistered benchmark/stress programs remain excluded;

@@ -2882,6 +2882,9 @@ unchanged; the connect budget begins after resolution.
 
 The same vocabulary is available in `client_connect_result()` and
 `connection_pool::acquire_result()`; their optional counterparts remain adapters.
+Pool acquisition preserves the legacy immediate-completion rule: a fresh cached
+connection is returned before checking an already-cancelled token. Without a
+usable cached connection, pre-cancellation returns `ECANCELED` at `acquire`.
 These are not universally nonthrowing APIs: allocation, TLS setup, scheduler
 admission, and programming exceptions may propagate. Keep clients, request/URL
 objects, caches/TLS contexts, and borrowed string inputs alive through awaited

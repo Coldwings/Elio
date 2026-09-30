@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <elio/http/http_client.hpp>
+#include <elio/io/file_helpers.hpp>
 #include <elio/sync/event.hpp>
 #include "../test_main.cpp"
 
@@ -46,19 +48,46 @@ client_error require_failure(const client_result<response>& result, int error, c
     return failure;
 }
 
-task<void> read_headers(elio::net::tcp_stream& stream, elio::coro::cancel_token token) {
+task<std::string> read_headers(elio::net::tcp_stream& stream, elio::coro::cancel_token token) {
     std::string request;
     std::array<char, 1024> buffer{};
     while (request.find("\r\n\r\n") == std::string::npos && request.size() < 16384) {
         const auto received = co_await stream.read(buffer.data(), buffer.size(), token);
-        if (received.result <= 0) co_return;
+        if (received.result <= 0) break;
         request.append(buffer.data(), static_cast<size_t>(received.result));
     }
+    co_return request;
 }
+
+enum class request_api { get, method_general, custom };
+
+std::atomic<elio::coro::cancel_source*> interim_cancel_source{nullptr};
+void cancel_after_interim_headers(uint16_t code) {
+    if (code == 100 || code == 103) {
+        if (auto* source = interim_cancel_source.load(std::memory_order_acquire)) source->cancel();
+    }
+}
+struct interim_cancel_guard {
+    interim_cancel_guard(elio::coro::cancel_source& source, bool enabled) : enabled_(enabled) {
+        if (enabled_) {
+            interim_cancel_source.store(&source);
+            elio::http::detail::response_headers_for_test.store(cancel_after_interim_headers);
+        }
+    }
+    ~interim_cancel_guard() {
+        if (enabled_) {
+            elio::http::detail::response_headers_for_test.store(nullptr);
+            interim_cancel_source.store(nullptr);
+        }
+    }
+    bool enabled_;
+};
 
 client_result<response> run_wire_response(std::string_view wire,
         const std::function<void(elio::http::client_config&)>& configure = {},
-        bool secure = false, std::exception_ptr* raised = nullptr) {
+        bool secure = false, std::exception_ptr* raised = nullptr,
+        bool cancel_interim = false, request_api api = request_api::get,
+        std::string* captured_request = nullptr) {
     auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
     REQUIRE(listener);
     const auto target = std::string(secure ? "https://127.0.0.1:" : "http://127.0.0.1:") +
@@ -68,6 +97,7 @@ client_result<response> run_wire_response(std::string_view wire,
     if (configure) configure(config);
     elio::http::client client(config);
     elio::coro::cancel_source cleanup;
+    interim_cancel_guard interim(cleanup, cancel_interim);
     client_result<response> result;
     bool accepted = false;
     std::atomic<bool> client_done{false};
@@ -78,13 +108,28 @@ client_result<response> run_wire_response(std::string_view wire,
         auto stream = co_await listener->accept(cleanup.get_token());
         accepted = stream.has_value();
         if (!stream) co_return;
-        if (!secure) co_await read_headers(*stream, cleanup.get_token());
+        if (!secure) {
+            auto request = co_await read_headers(*stream, cleanup.get_token());
+            if (captured_request) *captured_request = std::move(request);
+        }
         (void)co_await stream->write_exactly(wire, cleanup.get_token());
         stream->shutdown_socket();
     });
     scheduler.go([&]() -> task<void> {
         try {
-            result = co_await client.get_result(target, cleanup.get_token());
+            if (api == request_api::method_general) {
+                result = co_await client.request_result(elio::http::method::POST, target,
+                    "data", elio::http::mime::text_plain, cleanup.get_token());
+            } else if (api == request_api::custom) {
+                elio::http::request request(elio::http::method::POST, "/");
+                request.set_body(std::string_view("data"));
+                request.set_content_type(elio::http::mime::text_plain);
+                auto parsed = elio::http::url::parse(target);
+                if (!parsed) throw std::logic_error("invalid fixture URL");
+                result = co_await client.send_result(request, *parsed, cleanup.get_token());
+            } else {
+                result = co_await client.get_result(target, cleanup.get_token());
+            }
         } catch (...) {
             failure = std::current_exception();
         }
@@ -118,7 +163,7 @@ client_result<response> run_stalled_response(bool body, bool cancel) {
     REQUIRE(listener);
     const auto target = "http://127.0.0.1:" + std::to_string(listener->local_address().port()) + "/";
     elio::http::client_config config;
-    config.read_timeout = std::chrono::seconds(1);
+    config.read_timeout = cancel ? std::chrono::seconds::zero() : std::chrono::seconds(1);
     elio::http::client client(config);
     elio::coro::cancel_source cleanup;
     elio::sync::event release_server;
@@ -213,6 +258,31 @@ TEST_CASE("HTTP pool pre-cancellation has acquisition stage", "[http][http_clien
     REQUIRE(std::get<client_error>(result).stage == client_stage::acquire);
 }
 
+TEST_CASE("HTTP cached acquisition preserves completion before pre-cancellation",
+          "[http][http_client_result][cancel][pool]") {
+    const bool legacy = GENERATE(false, true);
+    std::array<int, 2> sockets{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sockets.data()) == 0);
+    elio::net::tcp_stream cached(sockets[0]);
+    elio::io::fd_guard peer(sockets[1]);
+    elio::http::connection_pool pool;
+    const int original = cached.fd();
+    pool.release("cached.invalid", 80, false, elio::net::stream(std::move(cached)));
+    elio::coro::cancel_source source;
+    source.cancel();
+    if (legacy) {
+        const auto result = run_immediate(pool.acquire("cached.invalid", 80, false,
+            nullptr, {}, source.get_token()));
+        REQUIRE(result);
+        REQUIRE(result->fd() == original);
+    } else {
+        const auto result = run_immediate(pool.acquire_result("cached.invalid", 80, false,
+            nullptr, {}, source.get_token()));
+        REQUIRE(std::holds_alternative<elio::net::stream>(result));
+        REQUIRE(std::get<elio::net::stream>(result).fd() == original);
+    }
+}
+
 TEST_CASE("HTTP request setup validation returns owned errors", "[http][http_client_result]") {
     elio::http::client_config config;
     config.user_agent = "agent\r\nInjected: value";
@@ -272,6 +342,27 @@ TEST_CASE("HTTP non-success status remains a response value", "[http][http_clien
     REQUIRE(std::holds_alternative<response>(result));
     REQUIRE(std::get<response>(result).get_status() == elio::http::status::service_unavailable);
     REQUIRE(std::get<response>(result).body() == "bus");
+}
+
+TEST_CASE("HTTP custom and method-general value APIs send requests", "[http][http_client_result]") {
+    const auto api = GENERATE(request_api::method_general, request_api::custom);
+    std::string captured;
+    const auto result = run_wire_response(
+        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        {}, false, nullptr, false, api, &captured);
+    REQUIRE(std::holds_alternative<response>(result));
+    REQUIRE(std::get<response>(result).status_code() == 401);
+    REQUIRE(captured.starts_with("POST / HTTP/1.1\r\n"));
+    REQUIRE(captured.find("Content-Type: text/plain\r\n") != std::string::npos);
+    REQUIRE(captured.find("Content-Length: 4\r\n") != std::string::npos);
+}
+
+TEST_CASE("HTTP interim headers do not establish body cancellation stage",
+          "[http][http_client_result][cancel][interim]") {
+    const auto code = GENERATE(100, 103);
+    const auto wire = "HTTP/1.1 " + std::to_string(code) + " Interim\r\n\r\n";
+    const auto result = run_wire_response(wire, {}, false, nullptr, true);
+    require_failure(result, ECANCELED, client_stage::headers);
 }
 
 TEST_CASE("HTTP decoder failures retain framing stage", "[http][http_client_result][framing]") {

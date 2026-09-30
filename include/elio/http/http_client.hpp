@@ -39,6 +39,8 @@ inline std::atomic<bool> final_headers_seen_for_test{false};
 using request_write_hook = io::io_result (*)(std::string_view);
 inline std::atomic<request_write_hook> request_write_result_for_test{nullptr};
 inline std::atomic<client_stage> response_read_stage_for_test{client_stage::headers};
+using response_headers_hook = void (*)(uint16_t);
+inline std::atomic<response_headers_hook> response_headers_for_test{nullptr};
 } // namespace detail
 #endif
 
@@ -88,9 +90,6 @@ public:
                                                    std::chrono::nanoseconds connect_timeout =
                                                        std::chrono::nanoseconds::zero(),
                                                    coro::cancel_token token = {}) {
-        if (token.is_cancelled()) {
-            co_return detail::make_client_error(ECANCELED, client_stage::acquire);
-        }
         std::string key = make_key(host, port, secure);
         auto& shard = shard_for(key);
 
@@ -117,6 +116,9 @@ public:
         }
         if (conn.has_value()) {
             co_return std::move(*conn);
+        }
+        if (token.is_cancelled()) {
+            co_return detail::make_client_error(ECANCELED, client_stage::acquire);
         }
 
         // Create new connection using client_connect utility
@@ -406,6 +408,11 @@ private:
         return code >= 100 && code < 200;
     }
 
+    static client_stage response_read_stage(const response_decoder& decoder) noexcept {
+        return decoder.headers_complete() && !is_informational_status(decoder.status_code())
+            ? client_stage::body : client_stage::headers;
+    }
+
     /// Write the whole buffer to the connection, optionally bounded by
     /// `io_deadline`. read_timeout doubles as the send deadline: a stalled
     /// write to a malicious server is the same liveness problem as a
@@ -591,7 +598,7 @@ private:
             if (detail::observe_client_response_read_entry_for_test.load(std::memory_order_acquire)) {
                 detail::client_response_read_staged_for_test.store(false, std::memory_order_release);
                 detail::response_read_stage_for_test.store(
-                    reader.decoder().headers_complete() ? client_stage::body : client_stage::headers,
+                    response_read_stage(reader.decoder()),
                     std::memory_order_release);
             }
             detail::arm_client_response_read_observer_for_test();
@@ -632,7 +639,7 @@ private:
         while (true) {
             if (token.is_cancelled()) {
                 co_return detail::make_client_error(ECANCELED,
-                    reader.decoder().headers_complete() ? client_stage::body : client_stage::headers);
+                    response_read_stage(reader.decoder()));
             }
             auto part = co_await reader.read_with(receive, token);
             if (!part.success()) {
@@ -641,12 +648,15 @@ private:
                     continue;
                 }
                 const auto stage = reader.decoder().has_error() ? client_stage::framing
-                    : (reader.decoder().headers_complete() ? client_stage::body : client_stage::headers);
+                    : response_read_stage(reader.decoder());
                 co_return detail::make_client_error(part.error, stage);
             }
             const auto code = reader.decoder().status_code();
             if (part.event == response_event::headers_complete) {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (auto hook = detail::response_headers_for_test.load(std::memory_order_acquire)) {
+                    hook(code);
+                }
                 if (!is_informational_status(code) &&
                     detail::expire_expect_after_headers_for_test.load(std::memory_order_acquire)) {
                     expect_deadline = std::chrono::steady_clock::now();

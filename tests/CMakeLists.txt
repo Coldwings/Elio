@@ -107,6 +107,7 @@ if(TARGET elio_tls)
         unit/test_tls_finish_order.cpp
         unit/test_http_client.cpp
         unit/test_http_client_result.cpp
+        unit/test_http_fd_watchdog.cpp
     )
 endif()
 

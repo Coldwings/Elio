@@ -25,6 +25,8 @@
 #include <string>
 #include <string_view>
 #include <chrono>
+#include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -42,6 +44,10 @@ namespace detail {
 // same synchronization contract.
 inline std::atomic<bool> observe_client_response_read_entry_for_test{false};
 inline std::atomic<bool> client_response_read_staged_for_test{false};
+using fd_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
+    std::chrono::nanoseconds, coro::cancel_token);
+inline std::atomic<fd_watchdog_wait_hook> fd_watchdog_wait_for_test{nullptr};
+inline std::atomic<size_t> fd_watchdog_shutdowns_for_test{0};
 
 inline void arm_client_response_read_observer_for_test() noexcept {
     if (observe_client_response_read_entry_for_test.load(
@@ -82,15 +88,56 @@ arm_fd_shutdown_watchdog(runtime::scheduler* sched,
     return sched->go_joinable(
         [fd, timeout, tok = std::move(watchdog_token),
          flag = std::move(timed_out)]() -> coro::task<void> {
-            auto r = co_await elio::time::sleep_for(timeout, tok);
+            coro::cancel_result r;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = fd_watchdog_wait_for_test.load(std::memory_order_acquire)) {
+                r = co_await hook(timeout, tok);
+            } else
+#endif
+            {
+                r = co_await elio::time::sleep_for(timeout, tok);
+            }
             if (r == coro::cancel_result::completed) {
                 flag->store(true, std::memory_order_release);
                 if (fd >= 0) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                    fd_watchdog_shutdowns_for_test.fetch_add(1, std::memory_order_relaxed);
+#endif
                     ::shutdown(fd, SHUT_RDWR);
                 }
             }
             co_return;
         });
+}
+
+// Admit the watchdog inside this frame, before invoking the factory. Creating
+// the operation task can itself throw, so accepting a pre-built task is unsafe.
+template<typename OperationFactory>
+coro::task<io::io_result> await_fd_operation_with_watchdog(
+        OperationFactory operation, runtime::scheduler* scheduler, int fd,
+        std::chrono::nanoseconds timeout, std::shared_ptr<std::atomic<bool>> timed_out) {
+    coro::cancel_source stop;
+    auto watchdog = arm_fd_shutdown_watchdog(
+        scheduler, fd, timeout, stop.get_token(), std::move(timed_out));
+    io::io_result result{};
+    std::exception_ptr failure;
+    try {
+        result = co_await std::invoke(operation);
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    try {
+        stop.cancel();
+    } catch (...) {
+        if (!failure) failure = std::current_exception();
+    }
+    try {
+        co_await watchdog;
+    } catch (...) {
+        if (!failure) failure = std::current_exception();
+    }
+    if (failure) std::rethrow_exception(failure);
+    co_return result;
 }
 
 inline void abort_stream_io(net::stream& stream) noexcept {

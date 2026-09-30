@@ -141,6 +141,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **HTTP-based client watchdog cleanup**: request writes and WebSocket/SSE
+  response-header reads cancel and join their FD watchdog before propagating
+  operation-creation or awaited exceptions. A stale timeout cannot reach a
+  closed/recycled descriptor after normal exceptional return; the original
+  operation exception is retained (#1241).
+
 - **Complete `test_all` build prerequisites**: registered examples, sanitizer
   suites, and enabled HTTP/RDMA fixtures are built before unfiltered CTest.
   Disabled targets and unregistered benchmark/stress programs remain excluded;

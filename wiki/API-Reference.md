@@ -2940,6 +2940,12 @@ When `follow_redirects` is enabled, the client resolves `Location` values with
 `url::resolve_reference()`, rejects unsupported schemes, and rejects HTTPS to
 HTTP downgrades.
 
+Method-preserving redirects retain the payload, content type, and explicitly
+supplied zero-length representation metadata. They do not invent a length for
+an originally bodyless request. Redirects that change POST to GET (301/302),
+and 303 content-dropping redirects, omit representation metadata; 303 retains
+HEAD as HEAD. A bodyless request never advertises `Expect: 100-continue`.
+
 `expect_continue_timeout` bounds the wait for an interim `100 Continue` when a
 request uses `request::set_expect_continue()` and has a body. If the server
 answers with `100 Continue`, the client sends the body and then processes the

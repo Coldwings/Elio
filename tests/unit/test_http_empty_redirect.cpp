@@ -7,16 +7,20 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <variant>
 
 namespace {
 using elio::coro::task;
 using elio::http::method;
 using elio::http::request;
 
-enum class representation { typed_empty, length_only, type_only, payload, bodyless, legacy_empty };
+enum class representation {
+    typed_empty, length_only, type_only, payload, bodyless, legacy_empty, value_empty
+};
 
 template<typename Predicate>
 bool wait_for(Predicate predicate) {
@@ -36,7 +40,8 @@ task<request> receive_request(elio::net::tcp_stream& stream, elio::coro::cancel_
         const auto received = co_await stream.read(buffer.data(), buffer.size(), token);
         if (received.result <= 0) throw std::runtime_error("fixture request ended before completion");
         received_bytes += static_cast<size_t>(received.result);
-        const auto [state, consumed] = parser.parse(buffer.data(), static_cast<size_t>(received.result));
+        const auto [state, consumed] = parser.parse(
+            std::string_view(buffer.data(), static_cast<size_t>(received.result)));
         (void)consumed;
         if (state == elio::http::parse_result::error) {
             throw std::runtime_error("invalid fixture request");
@@ -102,10 +107,17 @@ std::array<request, 2> run_redirect(int code, method original_method,
     });
     scheduler.go([&]() -> task<void> {
         try {
-            const auto response = shape == representation::legacy_empty
-                ? co_await client.post(endpoint, {}, cleanup.get_token(),
-                                       elio::http::mime::application_json)
-                : co_await client.send(original, *target, cleanup.get_token());
+            std::optional<elio::http::response> response;
+            if (shape == representation::value_empty) {
+                auto result = co_await client.request_result(original_method, endpoint, {},
+                    elio::http::mime::application_json, cleanup.get_token());
+                if (auto* value = std::get_if<elio::http::response>(&result)) response = std::move(*value);
+            } else if (shape == representation::legacy_empty) {
+                response = co_await client.post(endpoint, {}, cleanup.get_token(),
+                    elio::http::mime::application_json);
+            } else {
+                response = co_await client.send(original, *target, cleanup.get_token());
+            }
             if (response) status_code = response->status_code();
         } catch (...) {
             client_failure = std::current_exception();
@@ -165,10 +177,10 @@ TEST_CASE("HTTP POST redirects preserve or drop empty representations according 
           "[http][client][empty_redirect]") {
     const int code = GENERATE(301, 302, 303, 307, 308);
     const auto shape = GENERATE(representation::typed_empty, representation::bodyless,
-                               representation::legacy_empty);
+                               representation::legacy_empty, representation::value_empty);
     const auto requests = run_redirect(code, method::POST, shape);
-    const auto original_shape = shape == representation::legacy_empty
-        ? representation::bodyless : shape;
+    const auto original_shape = shape == representation::legacy_empty ? representation::bodyless :
+        shape == representation::value_empty ? representation::typed_empty : shape;
     const bool preserved = code == 307 || code == 308;
     REQUIRE(requests[0].get_method() == method::POST);
     REQUIRE(requests[1].get_method() == (preserved ? method::POST : method::GET));

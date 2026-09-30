@@ -748,9 +748,9 @@ private:
                         method_preserved) {
                         if (!req.body().empty()) {
                             redirect_req.set_body(req.body());
-                        } else if (req.get_headers().contains("Content-Length")) {
+                        } else if (req.get_headers().content_length() == size_t{0}) {
                             // Empty and absent representations are distinct;
-                            // preserve an explicit length without inventing one.
+                            // preserve only a valid explicit zero length.
                             redirect_req.set_header("Content-Length",
                                 req.get_headers().get("Content-Length"));
                         }

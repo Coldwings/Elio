@@ -170,8 +170,14 @@ jobs:
       shell: bash
       run: |
         set -o pipefail
-        ./build/tests/elio_tests_tsan --reporter compact --abort 2>&1 \
-          | tee test-logs/catch-tsan.log
+        # Keep every test and its original timeout; the new deadline matrix
+        # must not consume the existing suite's process-wide watchdog budget.
+        ./build/tests/elio_tests_tsan '~[http_client_streaming]' \
+          --reporter compact --durations yes --abort 2>&1 \
+          | tee test-logs/catch-tsan-core.log
+        ./build/tests/elio_tests_tsan '[http_client_streaming]' \
+          --reporter compact --durations yes --abort 2>&1 \
+          | tee test-logs/catch-tsan-http-client-streaming.log
       env:
         TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:log_path=${{ github.workspace }}/test-logs/tsan-${{ matrix.arch.name }}-${{ matrix.build_type }}
 

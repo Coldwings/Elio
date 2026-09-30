@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <elio/http/http_client.hpp>
+#include <elio/io/io_awaitables.hpp>
 #include <elio/sync/event.hpp>
 #include <elio/tls/tls_stream.hpp>
 #include <openssl/evp.h>
@@ -27,6 +28,14 @@ struct backend_guard {
         : previous(runtime::detail::worker_io_backend_for_test.exchange(backend)) {}
     ~backend_guard() { runtime::detail::worker_io_backend_for_test.store(previous); }
     backend_type previous;
+};
+
+struct empty_probe {
+    int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    ~empty_probe() { if (fd >= 0) ::close(fd); }
+    empty_probe() = default;
+    empty_probe(const empty_probe&) = delete;
+    empty_probe& operator=(const empty_probe&) = delete;
 };
 
 void require_backend(backend_type backend) {
@@ -73,6 +82,21 @@ bool install_certificate(tls::tls_context& context) {
         SSL_CTX_check_private_key(context.native_handle()) == 1;
 }
 
+coro::task<int> peek_client_payload(net::tcp_stream& stream, coro::cancel_token token) {
+    char first;
+    for (;;) {
+        auto read = co_await io::async_recv(stream.fd(), &first, 1, MSG_PEEK, token);
+        if (read.was_cancelled()) co_return -ECANCELED;
+        if (read.io.result == -EINTR) continue;
+        if (read.io.result != -EAGAIN && read.io.result != -EWOULDBLOCK) {
+            co_return read.io.result;
+        }
+        auto ready = co_await stream.poll_read(token);
+        if (ready.was_cancelled()) co_return -ECANCELED;
+        if (ready.io.result < 0) co_return ready.io.result;
+    }
+}
+
 struct exchange_fixture {
     exchange_fixture(backend_type backend, bool encrypted,
                      http::client_config config = {})
@@ -88,13 +112,35 @@ struct exchange_fixture {
     }
 
     coro::task<std::optional<net::stream>> accept() {
-        auto tcp = co_await listener->accept(stop.get_token());
-        if (!tcp) co_return std::nullopt;
-        ++accepted;
-        if (!encrypted) co_return net::stream(std::move(*tcp));
-        tls::tls_stream secure(std::move(*tcp), server_tls);
-        if (!co_await secure.handshake(stop.get_token())) co_return std::nullopt;
-        co_return net::stream(std::move(secure));
+        for (;;) {
+            auto tcp = co_await listener->accept(stop.get_token());
+            if (!tcp) {
+                accept_error = errno;
+                accept_stage = "tcp";
+                co_return std::nullopt;
+            }
+            // Local port probes can arrive before the fixture's client. Peek
+            // before TLS so neither a ClientHello nor HTTP bytes are consumed.
+            const auto payload = co_await peek_client_payload(*tcp, stop.get_token());
+            if (payload == 0) {
+                ++empty_connections;
+                continue;
+            }
+            if (payload < 0) {
+                accept_error = -payload;
+                accept_stage = "peek";
+                co_return std::nullopt;
+            }
+            ++accepted;
+            if (!encrypted) co_return net::stream(std::move(*tcp));
+            tls::tls_stream secure(std::move(*tcp), server_tls);
+            if (!co_await secure.handshake(stop.get_token())) {
+                accept_error = errno;
+                accept_stage = "tls";
+                co_return std::nullopt;
+            }
+            co_return net::stream(std::move(secure));
+        }
     }
 
     template<typename Server, typename Consumer>
@@ -123,7 +169,8 @@ struct exchange_fixture {
         if (!done) stop.cancel();
         REQUIRE(sched.shutdown(test::scaled_ms(5000)));
         CAPTURE(server_done.load(), client_done.load(),
-                static_cast<bool>(server_failure), static_cast<bool>(client_failure));
+                static_cast<bool>(server_failure), static_cast<bool>(client_failure),
+                accepted, empty_connections, accept_error, accept_stage, client_diagnostic);
         REQUIRE(done);
         if (server_failure) std::rethrow_exception(server_failure);
         if (client_failure) std::rethrow_exception(client_failure);
@@ -138,13 +185,31 @@ struct exchange_fixture {
     http::url target;
     coro::cancel_source stop;
     size_t accepted = 0;
+    size_t empty_connections = 0;
+    int accept_error = 0;
+    std::string_view accept_stage;
+    std::string client_diagnostic;
 };
 
-coro::task<std::string> request_headers(net::stream& stream, coro::cancel_token token) {
+struct request_read_observation {
+    int last_result = 0;
+    size_t reads = 0;
+    int64_t elapsed_ms = 0;
+};
+
+coro::task<std::string> request_headers(net::stream& stream, coro::cancel_token token,
+                                      request_read_observation* observation = nullptr) {
     std::string bytes;
     std::array<char, 1024> buffer;
+    const auto started = std::chrono::steady_clock::now();
     while (bytes.find("\r\n\r\n") == std::string::npos) {
         auto read = co_await stream.read(buffer.data(), buffer.size(), token);
+        if (observation) {
+            observation->last_result = read.result;
+            ++observation->reads;
+            observation->elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count();
+        }
         if (read.result <= 0) break;
         bytes.append(buffer.data(), static_cast<size_t>(read.result));
     }
@@ -262,7 +327,52 @@ struct watchdog_failure_guard {
 };
 } // namespace
 
-TEST_CASE("HTTP streaming client decodes bounded fragmented payloads", "[http][client][streaming]") {
+TEST_CASE("HTTP streaming fixture ignores empty connections before admitting the client",
+          "[http][client][streaming][http_client_streaming][fixture]") {
+    const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
+    require_backend(backend);
+    const bool encrypted = GENERATE(false, true);
+    CAPTURE(static_cast<int>(backend), encrypted);
+    http::client_config config;
+    config.connect_timeout = test::scaled_sec(2);
+    exchange_fixture fixture(backend, encrypted, config);
+    empty_probe probe;
+    REQUIRE(probe.fd >= 0);
+    const auto address = net::ipv4_address("127.0.0.1", fixture.target.port).to_sockaddr();
+    // Queue the unrelated connection before either scheduler worker starts.
+    REQUIRE(::connect(probe.fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    REQUIRE(::shutdown(probe.fd, SHUT_WR) == 0);
+
+    bool own_request_seen = false;
+    body_observation body;
+    http::client_result<std::monostate> result;
+    fixture.run([&]() -> coro::task<void> {
+        auto stream = co_await fixture.accept();
+        if (!stream) throw std::runtime_error("server accept failed");
+        const auto headers = co_await request_headers(*stream, fixture.stop.get_token());
+        own_request_seen = headers.starts_with("GET /range ");
+        (void)co_await stream->write_all(
+            "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nhealthy",
+            fixture.stop.get_token());
+        http::detail::abort_stream_io(*stream);
+    }, [&](http::client& client) -> coro::task<void> {
+        result = co_await client.with_response(http::request(http::method::GET, "/range"),
+            fixture.target, {}, [&](const http::response&, http::response_body_reader& reader,
+                                    coro::cancel_token token) -> coro::task<void> {
+                co_await consume(reader, token, body);
+            });
+    });
+    CAPTURE(own_request_seen, fixture.accepted, fixture.empty_connections,
+            result_error(result), body.bytes.size());
+    REQUIRE(result_error(result) == 0);
+    REQUIRE(own_request_seen);
+    REQUIRE(body.bytes == "healthy");
+    REQUIRE(body.complete);
+    REQUIRE(fixture.accepted == 1);
+    REQUIRE(fixture.empty_connections >= 1);
+}
+
+TEST_CASE("HTTP streaming client decodes bounded fragmented payloads", "[http][client][streaming][http_client_streaming]") {
     const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
     require_backend(backend);
     const bool encrypted = GENERATE(false, true);
@@ -326,7 +436,7 @@ TEST_CASE("HTTP streaming client decodes bounded fragmented payloads", "[http][c
 }
 
 TEST_CASE("HTTP streaming client delivers headers before body and pauses consumption",
-          "[http][client][streaming][backpressure]") {
+          "[http][client][streaming][http_client_streaming][backpressure]") {
     exchange_fixture fixture(backend_type::epoll, false);
     sync::event header_handler;
     sync::event release_body;
@@ -371,7 +481,7 @@ TEST_CASE("HTTP streaming client delivers headers before body and pauses consump
 }
 
 TEST_CASE("HTTP streaming client reuses only completely consumed responses",
-          "[http][client][streaming][pool]") {
+          "[http][client][streaming][http_client_streaming][pool]") {
     const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
     require_backend(backend);
     const bool encrypted = GENERATE(false, true);
@@ -389,19 +499,27 @@ TEST_CASE("HTTP streaming client reuses only completely consumed responses",
     body_observation second;
     int first_error = 0;
     int second_error = 0;
+    size_t first_request_size = 0;
+    request_read_observation first_request_read;
+    int first_write_result = 0;
+    bool first_result_expected = false;
+    sync::event first_result_ready;
     fixture.run([&]() -> coro::task<void> {
         auto stream = co_await fixture.accept();
         if (!stream) throw std::runtime_error("server accept failed");
-        (void)co_await request_headers(*stream, fixture.stop.get_token());
+        first_request_size = (co_await request_headers(*stream, fixture.stop.get_token(),
+                                                     &first_request_read)).size();
         const std::string first_response = disposition == 4
             ? "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nfirst"
             : "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
         std::string first_wire = first_response;
         if (disposition != 4) first_wire += disposition == 5 ? "fi" : "first";
         if (disposition == 3) first_wire += "unexpected";
-        (void)co_await stream->write_all(first_wire, fixture.stop.get_token());
+        first_write_result = (co_await stream->write_all(first_wire, fixture.stop.get_token())).result;
         if (disposition >= 4) (void)co_await stream->finish_write(fixture.stop.get_token());
         auto next = co_await request_headers(*stream, fixture.stop.get_token());
+        (void)co_await first_result_ready.wait(fixture.stop.get_token());
+        if (!first_result_expected) co_return;
         if (discard) {
             first_closed = next.empty();
             http::detail::abort_stream_io(*stream);
@@ -423,9 +541,18 @@ TEST_CASE("HTTP streaming client reuses only completely consumed responses",
                     if (!abandon) co_await consume(body, token, first);
                 });
             first_error = result_error(result);
+            fixture.client_diagnostic = "first_error=" + std::to_string(first_error);
+            if (const auto* error = std::get_if<http::client_error>(&result)) {
+                fixture.client_diagnostic += "; stage=" +
+                    std::to_string(static_cast<int>(error->stage));
+            }
         } catch (const std::runtime_error& error) {
             exception_preserved = std::string(error.what()) == "application rejection";
         }
+        first_result_expected = throws ? exception_preserved :
+            first_error == (disposition == 5 ? EBADMSG : 0);
+        first_result_ready.set();
+        if (!first_result_expected) co_return;
         auto result = co_await client.with_response(http::request(http::method::GET, "/range"),
             fixture.target, {}, [&](const http::response&, http::response_body_reader& body,
                                     coro::cancel_token token) -> coro::task<void> {
@@ -433,6 +560,10 @@ TEST_CASE("HTTP streaming client reuses only completely consumed responses",
             });
         second_error = result_error(result);
     });
+    CAPTURE(first_error, second_error, fixture.client_diagnostic, fixture.accepted,
+            fixture.accept_error, fixture.accept_stage, first_request_size,
+            first_request_read.last_result, first_request_read.reads, first_request_read.elapsed_ms,
+            first_write_result, first.bytes.size(), first.reads, first.complete);
     REQUIRE(first_error == (disposition == 5 ? EBADMSG : 0));
     REQUIRE(second_error == 0);
     REQUIRE(exception_preserved == throws);
@@ -444,7 +575,7 @@ TEST_CASE("HTTP streaming client reuses only completely consumed responses",
 }
 
 TEST_CASE("HTTP streaming concurrent entry rejects only the competing read",
-          "[http][client][streaming][concurrent][pool]") {
+          "[http][client][streaming][http_client_streaming][concurrent][pool]") {
     const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
     require_backend(backend);
     const bool encrypted = GENERATE(false, true);
@@ -552,7 +683,7 @@ TEST_CASE("HTTP streaming concurrent entry rejects only the competing read",
 }
 
 TEST_CASE("HTTP streaming client keeps errors sticky and honors independent limits",
-          "[http][client][streaming][limits]") {
+          "[http][client][streaming][http_client_streaming][limits]") {
     const auto failure = GENERATE(0, 1, 2, 3);
     http::client_config config;
     if (failure == 2) config.max_header_size = 32;
@@ -599,7 +730,7 @@ TEST_CASE("HTTP streaming client keeps errors sticky and honors independent limi
 }
 
 TEST_CASE("HTTP streaming completion precedes later read cancellation",
-          "[http][client][streaming][cancel][completion][pool]") {
+          "[http][client][streaming][http_client_streaming][cancel][completion][pool]") {
     const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
     require_backend(backend);
     const bool encrypted = GENERATE(false, true);
@@ -681,7 +812,7 @@ TEST_CASE("HTTP streaming completion precedes later read cancellation",
 }
 
 TEST_CASE("HTTP streaming client rejects protocol handoffs before invoking the handler",
-          "[http][client][streaming][handoff]") {
+          "[http][client][streaming][http_client_streaming][handoff]") {
     const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
     require_backend(backend);
     const bool encrypted = GENERATE(false, true);
@@ -728,7 +859,7 @@ TEST_CASE("HTTP streaming client rejects protocol handoffs before invoking the h
 }
 
 TEST_CASE("HTTP streaming cancellation settles reads before borrowed buffer reuse",
-          "[http][client][streaming][cancel]") {
+          "[http][client][streaming][http_client_streaming][cancel]") {
     const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
     require_backend(backend);
     const bool encrypted = GENERATE(false, true);
@@ -795,7 +926,7 @@ TEST_CASE("HTTP streaming cancellation settles reads before borrowed buffer reus
 }
 
 TEST_CASE("HTTP streaming body reads retain the original response deadline",
-          "[http][client][streaming][timeout]") {
+          "[http][client][streaming][http_client_streaming][timeout]") {
     const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
     require_backend(backend);
     const bool encrypted = GENERATE(false, true);
@@ -849,7 +980,7 @@ TEST_CASE("HTTP streaming body reads retain the original response deadline",
 }
 
 TEST_CASE("HTTP streaming Expect uses the shared interim and final response policy",
-          "[http][client][streaming][expect]") {
+          "[http][client][streaming][http_client_streaming][expect]") {
     const auto mode = GENERATE(0, 1, 2, 3);
     http::client_config config;
     config.expect_continue_timeout = mode == 2 ? std::chrono::milliseconds{0}
@@ -931,7 +1062,7 @@ TEST_CASE("HTTP streaming Expect uses the shared interim and final response poli
 }
 
 TEST_CASE("HTTP streaming operation owns lazy inputs and follows redirects before callback",
-          "[http][client][streaming][redirect][lifetime]") {
+          "[http][client][streaming][http_client_streaming][redirect][lifetime]") {
     const auto code = GENERATE(302, 303, 307, 308);
     exchange_fixture fixture(backend_type::epoll, false);
     std::array<std::string, 2> requests;
@@ -994,7 +1125,7 @@ TEST_CASE("HTTP streaming operation owns lazy inputs and follows redirects befor
 }
 
 TEST_CASE("HTTP streaming watchdog exceptions settle a pending read before propagation",
-          "[http][client][streaming][exception][watchdog]") {
+          "[http][client][streaming][http_client_streaming][exception][watchdog]") {
     const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
     require_backend(backend);
     const bool encrypted = GENERATE(false, true);

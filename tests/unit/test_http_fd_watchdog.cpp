@@ -48,9 +48,11 @@ struct socket_pair {
 struct watchdog_control {
     elio::sync::event entered;
     elio::sync::event release;
+    elio::sync::event settled;
     std::atomic<bool> finished{false};
     std::atomic<bool> cancelled{false};
     bool throw_after_cancel = false;
+    bool hold_after_cancel = false;
 };
 
 std::atomic<watchdog_control*> active_control{nullptr};
@@ -62,6 +64,9 @@ task<cancel_result> controlled_wait(std::chrono::nanoseconds,
     control->entered.set();
     auto result = co_await control->release.wait(std::move(token));
     control->cancelled.store(result == cancel_result::cancelled, std::memory_order_release);
+    if (result == cancel_result::cancelled && control->hold_after_cancel) {
+        co_await control->settled.wait();
+    }
     control->finished.store(true, std::memory_order_release);
     if (result == cancel_result::cancelled && control->throw_after_cancel) {
         throw std::logic_error("secondary watchdog failure");
@@ -85,8 +90,11 @@ struct watchdog_hook_guard {
 // Declared after the scheduler so every exit releases the controlled timer
 // before scheduler destruction, including a failed main-thread assertion.
 struct release_guard {
-    elio::sync::event& event;
-    ~release_guard() { event.set(); }
+    watchdog_control& control;
+    ~release_guard() {
+        control.release.set();
+        control.settled.set();
+    }
 };
 
 enum class exception_site { task_creation, suspended_operation };
@@ -127,7 +135,7 @@ TEST_CASE("FD watchdog is joined before propagating operation exceptions",
     std::atomic<bool> done{false};
     bool finished_at_return = false;
     elio::runtime::scheduler scheduler(2);
-    release_guard release{control.release};
+    release_guard release{control};
     scheduler.start();
     scheduler.go([&]() -> task<void> {
         try {
@@ -182,7 +190,7 @@ TEST_CASE("FD watchdog cleanup preserves successful and failed I/O results",
     std::atomic<bool> done{false};
     bool finished_at_return = false;
     elio::runtime::scheduler scheduler(2);
-    release_guard release{control.release};
+    release_guard release{control};
     scheduler.start();
     scheduler.go([&]() -> task<void> {
         try {
@@ -223,31 +231,33 @@ TEST_CASE("FD watchdog expiry still interrupts stalled I/O",
     auto timed_out = std::make_shared<std::atomic<bool>>(false);
     elio::io::io_result result{-EIO, 0};
     std::exception_ptr failure;
-    std::atomic<bool> read_entered{false};
+    elio::coro::cancel_source cleanup;
+    std::atomic<bool> read_staged{false};
     std::atomic<bool> done{false};
     char buffer = 0;
     elio::runtime::scheduler scheduler(2);
-    release_guard release{control.release};
+    release_guard release{control};
     scheduler.start();
     scheduler.go([&]() -> task<void> {
         try {
             result = co_await elio::http::detail::await_fd_operation_with_watchdog(
                 [&]() -> task<elio::io::io_result> {
                     co_await control.entered.wait();
-                    read_entered.store(true, std::memory_order_release);
-                    co_return co_await stream.read(&buffer, 1);
+                    elio::io::detail::arm_next_cancellable_recv_staged_for_test(read_staged);
+                    co_return co_await stream.read(&buffer, 1, cleanup.get_token());
                 }, &scheduler, stream.fd(), std::chrono::hours(1), timed_out);
         } catch (...) {
             failure = std::current_exception();
         }
         done.store(true, std::memory_order_release);
     });
-    const bool entered = wait_for([&] { return read_entered.load(std::memory_order_acquire); });
+    const bool staged = wait_for([&] { return read_staged.load(std::memory_order_acquire); });
     control.release.set();
     const bool completed = wait_for([&] { return done.load(std::memory_order_acquire); });
+    cleanup.cancel();
     const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
     REQUIRE(drained);
-    REQUIRE(entered);
+    REQUIRE(staged);
     REQUIRE(completed);
     REQUIRE_FALSE(failure);
     REQUIRE(result.result == 0);
@@ -258,4 +268,50 @@ TEST_CASE("FD watchdog expiry still interrupts stalled I/O",
     const char sent = 'x';
     REQUIRE(::send(sockets.descriptors[0], &sent, 1, MSG_NOSIGNAL) == -1);
     REQUIRE(errno == EPIPE);
+}
+
+TEST_CASE("FD watchdog exception propagation waits beyond cancellation delivery",
+          "[http][watchdog][exception][join]") {
+    socket_pair sockets;
+    watchdog_control control;
+    control.hold_after_cancel = true;
+    watchdog_hook_guard hook(control);
+    auto timed_out = std::make_shared<std::atomic<bool>>(false);
+    std::exception_ptr failure;
+    std::atomic<bool> done{false};
+    // With one worker, a cancel-only helper would finish its caller before
+    // the watchdog publishes cancellation. A real join instead yields to it.
+    elio::runtime::scheduler scheduler(1);
+    release_guard release{control};
+    scheduler.start();
+    scheduler.go([&]() -> task<void> {
+        try {
+            (void)co_await elio::http::detail::await_fd_operation_with_watchdog(
+                []() -> task<elio::io::io_result> { throw std::bad_alloc(); },
+                &scheduler, sockets.descriptors[0], std::chrono::hours(1), timed_out);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        done.store(true, std::memory_order_release);
+    });
+    const bool cancellation_delivered = wait_for([&] {
+        return control.cancelled.load(std::memory_order_acquire);
+    });
+    const bool returned_before_settlement = done.load(std::memory_order_acquire);
+    const bool finished_before_settlement = control.finished.load(std::memory_order_acquire);
+    control.release.set();
+    control.settled.set();
+    const bool completed = wait_for([&] { return done.load(std::memory_order_acquire); });
+    const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
+    REQUIRE(drained);
+    REQUIRE(cancellation_delivered);
+    REQUIRE_FALSE(returned_before_settlement);
+    REQUIRE_FALSE(finished_before_settlement);
+    REQUIRE(completed);
+    REQUIRE(control.finished.load(std::memory_order_acquire));
+    REQUIRE(failure);
+    REQUIRE_THROWS_AS(std::rethrow_exception(failure), std::bad_alloc);
+    REQUIRE_FALSE(timed_out->load(std::memory_order_acquire));
+    REQUIRE(elio::http::detail::fd_watchdog_shutdowns_for_test.load() == 0);
+    require_socket_usable(sockets.descriptors[0], sockets.descriptors[1]);
 }

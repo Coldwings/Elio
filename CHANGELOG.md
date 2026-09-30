@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pool-integrated HTTP/1 response consumption**: `client::with_response`
+  owns its request/target/handler and delivers final headers before a scoped
+  `response_body_reader`. Borrowed-span reads report short progress, completion,
+  or owned errors without accumulating the full body. Payload/interim limits
+  are separate from scratch RAM and existing buffered limits. Original per-hop
+  I/O deadlines and Expect/redirect policy are shared; early exit, cancellation,
+  or failure closes instead of pooling. No total-exchange timer, application
+  retry policy, escaping lease, or end-to-end zero-copy guarantee is added
+  (#1228).
+
 - **Bounded joinable-result observation**: `join_handle<T>::wait()` and
   `wait_until()` observe readiness without consuming results, propagating child
   exceptions, or cancelling the task. Explicit cancellation/deadlines select one

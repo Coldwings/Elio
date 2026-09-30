@@ -3,6 +3,7 @@
 #include <elio/http/http_common.hpp>
 #include <elio/http/http_parser.hpp>
 #include <elio/http/http_response_reader.hpp>
+#include <elio/http/http_response_body_reader.hpp>
 #include <elio/http/http_message.hpp>
 #include <elio/http/client_base.hpp>
 #include <elio/net/stream.hpp>
@@ -24,8 +25,12 @@
 #include <mutex>
 #include <unordered_map>
 #include <chrono>
+#include <concepts>
+#include <exception>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 
 namespace elio::http {
 
@@ -41,6 +46,11 @@ inline std::atomic<request_write_hook> request_write_result_for_test{nullptr};
 inline std::atomic<client_stage> response_read_stage_for_test{client_stage::headers};
 using response_headers_hook = void (*)(uint16_t);
 inline std::atomic<response_headers_hook> response_headers_for_test{nullptr};
+using response_deadline_hook = void (*)(std::chrono::steady_clock::time_point);
+inline std::atomic<response_deadline_hook> response_deadline_for_test{nullptr};
+using response_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
+    std::chrono::nanoseconds, coro::cancel_token, client_stage);
+inline std::atomic<response_watchdog_wait_hook> response_watchdog_wait_for_test{nullptr};
 } // namespace detail
 #endif
 
@@ -50,12 +60,9 @@ struct client_config : base_client_config {
     bool follow_redirects = true;                 ///< Auto-follow redirects
     size_t max_connections_per_host = 6;          ///< Max connections per host
     std::chrono::seconds pool_idle_timeout{60};   ///< Idle connection timeout
-    /// Hard cap on the total bytes a single response may occupy in the
-    /// parser. Mirrors server_config::max_request_size on the server side.
-    /// A hostile or buggy server can otherwise stream gigabytes through
-    /// response_parser and OOM the client. 16 MiB is large enough for typical
-    /// API/JSON responses; bump it deliberately for endpoints that legitimately
-    /// return larger bodies.
+    /// Buffered APIs cap the accumulated final body and, separately, the
+    /// cumulative informational wire bytes. with_response uses its own options
+    /// for these limits and never allocates a body-sized receive buffer.
     size_t max_response_size = 16 * 1024 * 1024;  ///< Max response body size (16 MiB)
     /// Deadline for waiting on an interim 100 Continue when a request uses
     /// request::set_expect_continue(). On expiry the body is sent anyway
@@ -309,6 +316,25 @@ public:
             std::string_view url_str, coro::cancel_token token = {}) {
         return request_result(method::GET, url_str, "", "", std::move(token));
     }
+
+    /// Owns request, target, and handler before lazy execution. Keep this client
+    /// alive and unmoved through awaited return. The handler receives final
+    /// headers (response.body() is empty), a scoped body reader, and the token.
+    /// It must await all reads before returning. Early return closes rather
+    /// than drains; exceptions close the exchange and propagate unchanged.
+    /// read_timeout retains its original per-hop I/O deadline across body
+    /// pulls, but does not preempt handler code or include DNS/connect time.
+    template<typename Handler>
+        requires std::invocable<Handler&, const response&, response_body_reader&,
+                                coro::cancel_token> &&
+                 std::same_as<std::invoke_result_t<Handler&, const response&,
+                     response_body_reader&, coro::cancel_token>, coro::task<void>>
+    coro::task<client_result<std::monostate>> with_response(
+            request req, url target, coro::cancel_token token, Handler handler,
+            streaming_response_options options = {}) {
+        return with_response_impl(std::move(req), std::move(target), std::move(token),
+                                  std::move(handler), options);
+    }
     
     /// Get TLS context for configuration
     tls::tls_context& tls_context() noexcept { return tls_ctx_; }
@@ -458,223 +484,418 @@ private:
         }
     }
 
-    /// Send request with redirect handling
-    coro::task<client_result<response>> send_request(request& req, const url& target,
-                                                           size_t redirect_count,
-                                                           coro::cancel_token token) {
-        // Check if cancelled
-        if (token.is_cancelled()) {
-            co_return detail::make_client_error(ECANCELED, client_stage::acquire);
+    class exchange_state final {
+    public:
+        exchange_state(connection conn, const client_config& config, const url& target,
+                       method request_method, std::string_view request_body, bool defer_body,
+                       size_t informational_limit)
+            : conn_(std::move(conn)), config_(config), target_(target),
+              reader_(config.read_buffer_size), request_method_(request_method),
+              request_body_(request_body), informational_limit_(informational_limit),
+              body_pending_(defer_body),
+              scheduler_(runtime::scheduler::current()),
+              deadline_enforced_(scheduler_ && config.read_timeout.count() > 0),
+              io_deadline_(config.read_timeout),
+              response_deadline_(std::chrono::steady_clock::now() + io_deadline_),
+              expect_bounded_(scheduler_ && config.expect_continue_timeout.count() > 0) {
+            reader_.set_max_headers(config.max_headers);
+            reader_.set_max_header_size(config.max_header_size);
+            reader_.set_request_method(request_method_);
         }
 
-        if (!detail::is_valid_url_input(target.host_authority()) ||
-            !detail::is_valid_request_target(req.path_with_query())) {
-            ELIO_LOG_ERROR("Invalid outbound HTTP request target");
-            co_return detail::make_client_error(EINVAL, client_stage::target);
+        exchange_state(const exchange_state&) = delete;
+        exchange_state& operator=(const exchange_state&) = delete;
+        exchange_state(exchange_state&&) = delete;
+        exchange_state& operator=(exchange_state&&) = delete;
+
+        coro::task<std::optional<client_error>> send_initial(
+                std::string_view data, coro::cancel_token token) {
+            if (auto error = co_await write_request_data(conn_, data, target_,
+                    io_deadline_, deadline_enforced_, scheduler_, token)) {
+                co_return error;
+            }
+            expect_deadline_ = std::chrono::steady_clock::now() +
+                config_.expect_continue_timeout;
+            if (body_pending_ && !expect_bounded_) {
+                co_return co_await send_pending_body(token);
+            }
+            co_return std::nullopt;
         }
 
-        // Get connection from pool. connect_timeout is enforced inside the
-        // shared client_connect path for TCP connect and TLS handshake.
-        auto conn_result = co_await pool_.acquire_result(target.host, target.effective_port(),
-                                                target.is_secure(), &tls_ctx_,
-                                                config_.connect_timeout, token);
-        if (const auto* error = std::get_if<client_error>(&conn_result)) {
-            co_return *error;
+        coro::task<client_result<response_read_result>> next(coro::cancel_token token) {
+            auto receive = [this, token](void* data, size_t size) {
+                return receive_data(data, size, token);
+            };
+            while (true) {
+                if (token.is_cancelled()) {
+                    co_return detail::make_client_error(ECANCELED,
+                        response_read_stage(reader_.decoder()));
+                }
+                auto part = co_await reader_.read_with(receive, token);
+                if (!part.success()) {
+                    if (expect_expired_ && body_pending_ && !token.is_cancelled()) {
+                        if (auto error = co_await send_pending_body(token)) co_return *error;
+                        continue;
+                    }
+                    const auto stage = reader_.decoder().has_error() ? client_stage::framing
+                        : response_read_stage(reader_.decoder());
+                    co_return detail::make_client_error(part.error, stage);
+                }
+                const auto code = reader_.decoder().status_code();
+                if (part.event == response_event::headers_complete) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                    if (auto hook = detail::response_headers_for_test.load(std::memory_order_acquire)) {
+                        hook(code);
+                    }
+                    if (!is_informational_status(code) &&
+                        detail::expire_expect_after_headers_for_test.load(std::memory_order_acquire)) {
+                        expect_deadline_ = std::chrono::steady_clock::now();
+                        detail::client_response_read_staged_for_test.store(false, std::memory_order_release);
+                        detail::final_headers_seen_for_test.store(true, std::memory_order_release);
+                    }
+#endif
+                    if (code == static_cast<uint16_t>(status::switching_protocols)) {
+                        co_return detail::make_client_error(EBADMSG, client_stage::framing);
+                    }
+                    if (!is_informational_status(code)) {
+                        body_pending_ = false;
+                        co_return part;
+                    }
+                    if (code == static_cast<uint16_t>(status::continue_)) {
+                        if (auto error = co_await send_pending_body(token)) co_return *error;
+                    }
+                } else if (part.event == response_event::protocol_handoff) {
+                    co_return detail::make_client_error(EBADMSG, client_stage::framing);
+                } else if (part.event == response_event::message_complete) {
+                    if (!is_informational_status(code)) co_return part;
+                    if (reader_.message_bytes() > informational_limit_ -
+                        skipped_informational_bytes_) {
+                        co_return detail::make_client_error(EMSGSIZE, client_stage::framing);
+                    }
+                    skipped_informational_bytes_ += reader_.message_bytes();
+                    if (!reader_.next_response()) {
+                        co_return detail::make_client_error(EBADMSG, client_stage::framing);
+                    }
+                    reader_.set_request_method(request_method_);
+                } else if (part.event == response_event::body) {
+                    co_return part;
+                }
+            }
         }
 
-        auto conn = std::move(std::get<connection>(conn_result));
+        const response_reader& reader() const noexcept { return reader_; }
 
-        // Ensure Host header is set
-        if (req.header("Host").empty()) {
-            req.set_host(target.host_authority());
+        bool reusable() const {
+            return reader_.decoder().is_complete() &&
+                !reader_.decoder().is_close_delimited() && !reader_.reached_eof() &&
+                reader_.bytes_remaining() == 0 &&
+                reader_.decoder().get_headers().keep_alive(reader_.decoder().version());
         }
 
-        // Add keep-alive header
-        if (!req.get_headers().contains("Connection")) {
-            req.set_header("Connection", "keep-alive");
-        }
+        connection take_connection() noexcept { return std::move(conn_); }
+        void abort() noexcept { detail::abort_stream_io(conn_); }
 
-        // Serialize and send request. With Expect: 100-continue and a
-        // non-empty body, only the headers go out first; the body is held
-        // back until the server answers with an interim 100 Continue, a
-        // final response (body suppressed), or the fallback timeout
-        // expires (body sent anyway).
-        const bool defer_body = req.expect_continue() && !req.body().empty();
-        std::string request_data;
-        try {
-            request_data = defer_body ? req.serialize_headers()
-                                      : req.serialize();
-        } catch (const std::invalid_argument& ex) {
-            ELIO_LOG_ERROR("Invalid outbound HTTP request: {}", ex.what());
-            co_return detail::make_client_error(EINVAL, client_stage::request);
-        }
-
-        ELIO_LOG_DEBUG("Sending request to {}:{}\n{}", target.host, target.effective_port(), request_data);
-
-        // Check cancellation before write
-        if (token.is_cancelled()) {
-            co_return detail::make_client_error(ECANCELED, client_stage::request);
-        }
-
-        auto* sched = runtime::scheduler::current();
-        const bool deadline_enforced =
-            sched != nullptr && config_.read_timeout.count() > 0;
-        const auto io_deadline = config_.read_timeout;
-
-        // Compute an absolute deadline for the entire response so that a
-        // slowloris-style server cannot reset the timer on every byte.
-        const auto response_deadline =
-            std::chrono::steady_clock::now() + io_deadline;
-
-        if (auto error = co_await write_request_data(conn, request_data, target,
-                                         io_deadline, deadline_enforced,
-                                         sched, token)) {
-            co_return *error;
-        }
-
-        // One incremental decoder handles both the Expect gate and the final
-        // response. Headers-complete is distinct from body/message completion.
-        response_reader reader(config_.read_buffer_size);
-        reader.set_max_headers(config_.max_headers);
-        reader.set_max_header_size(config_.max_header_size);
-        reader.set_request_method(req.get_method());
-        std::string response_body;
-        size_t skipped_informational_bytes = 0;
-        bool body_pending = defer_body;
-        const bool expect_bounded = sched != nullptr &&
-            config_.expect_continue_timeout.count() > 0;
-        auto expect_deadline = std::chrono::steady_clock::now() +
-            config_.expect_continue_timeout;
-        bool expect_expired = false;
-
-        auto send_pending_body = [&]() -> coro::task<std::optional<client_error>> {
-            if (!body_pending) co_return std::nullopt;
-            body_pending = false;
-            const auto remaining = response_deadline - std::chrono::steady_clock::now();
-            if (deadline_enforced && remaining <= std::chrono::steady_clock::duration::zero()) {
+    private:
+        coro::task<std::optional<client_error>> send_pending_body(
+                const coro::cancel_token& token) {
+            if (!body_pending_) co_return std::nullopt;
+            body_pending_ = false;
+            const auto remaining = response_deadline_ - std::chrono::steady_clock::now();
+            if (deadline_enforced_ && remaining <= std::chrono::steady_clock::duration::zero()) {
                 co_return detail::make_client_error(ETIMEDOUT, client_stage::request);
             }
-            co_return co_await write_request_data(conn, req.body(), target,
-                deadline_enforced ? remaining : io_deadline, deadline_enforced, sched, token);
-        };
-        if (body_pending && !expect_bounded) {
-            if (auto error = co_await send_pending_body()) co_return *error;
+            co_return co_await write_request_data(conn_, request_body_, target_,
+                deadline_enforced_ ? remaining : io_deadline_, deadline_enforced_, scheduler_, token);
         }
 
-        // Read policy owns only deadlines and transport I/O, never HTTP state.
-        // An Expect timeout cancels this read rather than shutting down the fd.
-        auto receive = [&](void* data, size_t size) -> coro::task<io::io_result> {
-            expect_expired = false;
+        coro::task<io::io_result> receive_data(void* data, size_t size,
+                                             coro::cancel_token token) {
+            expect_expired_ = false;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::response_deadline_for_test.load(std::memory_order_acquire)) {
+                hook(response_deadline_);
+            }
+#endif
             const auto now = std::chrono::steady_clock::now();
-            if (deadline_enforced && now >= response_deadline) {
+            if (deadline_enforced_ && now >= response_deadline_) {
                 co_return io::io_result{-ETIMEDOUT, 0};
             }
-            const bool waiting_expect = body_pending && expect_bounded;
-            if (waiting_expect && now >= expect_deadline) {
-                expect_expired = true;
+            const bool waiting_expect = body_pending_ && expect_bounded_;
+            if (waiting_expect && now >= expect_deadline_) {
+                expect_expired_ = true;
                 co_return io::io_result{-ETIMEDOUT, 0};
             }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
             if (detail::observe_client_response_read_entry_for_test.load(std::memory_order_acquire)) {
                 detail::client_response_read_staged_for_test.store(false, std::memory_order_release);
                 detail::response_read_stage_for_test.store(
-                    response_read_stage(reader.decoder()),
-                    std::memory_order_release);
+                    response_read_stage(reader_.decoder()), std::memory_order_release);
             }
             detail::arm_client_response_read_observer_for_test();
 #endif
-            if (!deadline_enforced && !waiting_expect) {
-                co_return co_await conn.read(data, size, token);
+            if (!deadline_enforced_ && !waiting_expect) {
+                co_return co_await conn_.read(data, size, token);
             }
             const bool expect_first = waiting_expect &&
-                (!deadline_enforced || expect_deadline < response_deadline);
-            const auto deadline = expect_first ? expect_deadline : response_deadline;
+                (!deadline_enforced_ || expect_deadline_ < response_deadline_);
+            const auto deadline = expect_first ? expect_deadline_ : response_deadline_;
             auto read_cancel = std::make_shared<coro::cancel_source>();
             auto forward = token.on_cancel([read_cancel] { read_cancel->cancel(); });
             auto expired = std::make_shared<std::atomic<bool>>(false);
             coro::cancel_source watchdog_cancel;
-            auto watchdog = sched->go_joinable(
+            auto watchdog = scheduler_->go_joinable(
                 [deadline, expired, read_cancel,
+                 stage = response_read_stage(reader_.decoder()),
                  stop = watchdog_cancel.get_token()]() -> coro::task<void> {
-                    auto result = co_await elio::time::sleep_for(
-                        deadline - std::chrono::steady_clock::now(), stop);
+                    coro::cancel_result result;
+                    try {
+                        const auto remaining = deadline - std::chrono::steady_clock::now();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                        if (auto hook = detail::response_watchdog_wait_for_test.load(
+                                std::memory_order_acquire)) {
+                            result = co_await hook(remaining, stop, stage);
+                        } else
+#endif
+                        {
+                            (void)stage;
+                            result = co_await elio::time::sleep_for(remaining, stop);
+                        }
+                    } catch (...) {
+                        // A failed timer must release its sibling read. Keep
+                        // that exception even if cancellation callbacks fail.
+                        auto failure = std::current_exception();
+                        try { read_cancel->cancel(); } catch (...) {}
+                        std::rethrow_exception(failure);
+                    }
                     if (result == coro::cancel_result::completed) {
                         expired->store(true, std::memory_order_release);
                         read_cancel->cancel();
                     }
                 });
-            auto result = co_await conn.read(data, size, read_cancel->get_token());
-            watchdog_cancel.cancel();
-            co_await watchdog;
+            io::io_result result{};
+            std::exception_ptr failure;
+            try {
+                result = co_await conn_.read(data, size, read_cancel->get_token());
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            try {
+                watchdog_cancel.cancel();
+            } catch (...) {
+                if (!failure) failure = std::current_exception();
+            }
+            try {
+                co_await watchdog;
+            } catch (...) {
+                if (!failure) failure = std::current_exception();
+            }
+            try {
+                co_await watchdog.wait_destroyed_async();
+            } catch (...) {
+                if (!failure) failure = std::current_exception();
+            }
+            if (failure) std::rethrow_exception(failure);
             if (expired->load(std::memory_order_acquire)) {
-                // Preserve bytes read concurrently with the Expect timeout:
-                // they might contain final headers that suppress the upload.
                 if (expect_first && result.result > 0) co_return result;
-                expect_expired = expect_first;
+                expect_expired_ = expect_first;
                 co_return io::io_result{-ETIMEDOUT, 0};
             }
             co_return result;
-        };
+        }
+
+        connection conn_;
+        const client_config& config_;
+        const url& target_;
+        response_reader reader_;
+        method request_method_;
+        std::string_view request_body_;
+        size_t informational_limit_;
+        size_t skipped_informational_bytes_ = 0;
+        bool body_pending_;
+        runtime::scheduler* scheduler_;
+        bool deadline_enforced_;
+        std::chrono::nanoseconds io_deadline_;
+        std::chrono::steady_clock::time_point response_deadline_;
+        bool expect_bounded_;
+        std::chrono::steady_clock::time_point expect_deadline_{};
+        bool expect_expired_ = false;
+    };
+
+    coro::task<client_result<std::unique_ptr<exchange_state>>> prepare_exchange(
+            request& req, const url& target, coro::cancel_token token,
+            size_t informational_limit) {
+        if (token.is_cancelled()) {
+            co_return detail::make_client_error(ECANCELED, client_stage::acquire);
+        }
+        if (!detail::is_valid_url_input(target.host_authority()) ||
+            !detail::is_valid_request_target(req.path_with_query())) {
+            ELIO_LOG_ERROR("Invalid outbound HTTP request target");
+            co_return detail::make_client_error(EINVAL, client_stage::target);
+        }
+        auto conn_result = co_await pool_.acquire_result(target.host, target.effective_port(),
+            target.is_secure(), &tls_ctx_, config_.connect_timeout, token);
+        if (const auto* error = std::get_if<client_error>(&conn_result)) co_return *error;
+        auto conn = std::move(std::get<connection>(conn_result));
+        if (req.header("Host").empty()) req.set_host(target.host_authority());
+        if (!req.get_headers().contains("Connection")) {
+            req.set_header("Connection", "keep-alive");
+        }
+        const bool defer_body = req.expect_continue() && !req.body().empty();
+        std::string request_data;
+        try {
+            request_data = defer_body ? req.serialize_headers() : req.serialize();
+        } catch (const std::invalid_argument& ex) {
+            ELIO_LOG_ERROR("Invalid outbound HTTP request: {}", ex.what());
+            co_return detail::make_client_error(EINVAL, client_stage::request);
+        }
+        ELIO_LOG_DEBUG("Sending request to {}:{}\n{}", target.host,
+                       target.effective_port(), request_data);
+        if (token.is_cancelled()) {
+            co_return detail::make_client_error(ECANCELED, client_stage::request);
+        }
+        auto exchange = std::make_unique<exchange_state>(std::move(conn), config_, target,
+            req.get_method(), req.body(), defer_body, informational_limit);
+        if (auto error = co_await exchange->send_initial(request_data, token)) co_return *error;
+        co_return std::move(exchange);
+    }
+
+    struct redirect_request {
+        request req;
+        url target;
+    };
+
+    std::optional<redirect_request> make_redirect(
+            const request& req, const url& target, const response& resp,
+            size_t redirect_count) const {
+        if (!config_.follow_redirects || !is_auto_follow_redirect(resp.get_status()) ||
+            redirect_count >= config_.max_redirects) return std::nullopt;
+        auto location = resp.header("Location");
+        if (location.empty()) return std::nullopt;
+        ELIO_LOG_DEBUG("Following redirect to: {}", location);
+        if (!detail::is_valid_url_input(location)) {
+            ELIO_LOG_WARNING("Rejecting invalid redirect Location: {}", location);
+            return std::nullopt;
+        }
+        auto redirect_url = url::resolve_reference(target, location);
+        if (!redirect_url) return std::nullopt;
+        if (!detail::is_supported_http_url_scheme(redirect_url->scheme)) {
+            ELIO_LOG_WARNING("Rejecting unsupported redirect scheme: {}", redirect_url->scheme);
+            return std::nullopt;
+        }
+        if (target.is_secure() && !redirect_url->is_secure()) {
+            ELIO_LOG_WARNING("Rejecting insecure redirect from HTTPS to HTTP: {}", location);
+            return std::nullopt;
+        }
+        method redirect_method = req.get_method();
+        if ((resp.get_status() == status::see_other && req.get_method() != method::HEAD) ||
+            ((resp.get_status() == status::moved_permanently || resp.get_status() == status::found) &&
+             req.get_method() == method::POST)) {
+            redirect_method = method::GET;
+        }
+        request redirect_req(redirect_method, redirect_url->path_with_query());
+        redirect_req.set_host(redirect_url->host_authority());
+        if (!config_.user_agent.empty()) redirect_req.set_header("User-Agent", config_.user_agent);
+        const bool method_preserved = redirect_method == req.get_method() &&
+            resp.get_status() != status::see_other;
+        if (resp.get_status() == status::temporary_redirect ||
+            resp.get_status() == status::permanent_redirect || method_preserved) {
+            if (!req.body().empty()) {
+                redirect_req.set_body(req.body());
+            } else if (req.get_headers().content_length() == size_t{0}) {
+                redirect_req.set_header("Content-Length", req.get_headers().get("Content-Length"));
+            }
+            if (!req.content_type().empty()) redirect_req.set_content_type(req.content_type());
+            if (!req.body().empty() && req.expect_continue()) redirect_req.set_expect_continue();
+        }
+        return redirect_request{std::move(redirect_req), std::move(*redirect_url)};
+    }
+
+    template<typename Handler>
+    coro::task<client_result<std::monostate>> with_response_impl(
+            request req, url target, coro::cancel_token token, Handler handler,
+            streaming_response_options options) {
+        if (!detail::is_supported_http_url_scheme(target.scheme)) {
+            co_return detail::make_client_error(EINVAL, client_stage::target);
+        }
+        for (size_t redirects = 0;; ++redirects) {
+            auto prepared = co_await prepare_exchange(req, target, token,
+                                                      options.max_informational_bytes);
+            if (const auto* error = std::get_if<client_error>(&prepared)) co_return *error;
+            auto exchange = std::move(std::get<std::unique_ptr<exchange_state>>(prepared));
+            while (true) {
+                auto next = co_await exchange->next(token);
+                if (const auto* error = std::get_if<client_error>(&next)) {
+                    exchange->abort();
+                    co_return *error;
+                }
+                if (std::get<response_read_result>(next).event == response_event::headers_complete) break;
+            }
+            auto head = response::from_decoder(exchange->reader().decoder(), {});
+            if (auto redirect = make_redirect(req, target, head, redirects)) {
+                // The state borrows the current request/target; retire it before
+                // replacing either, and never pool an unconsumed redirect body.
+                exchange->abort();
+                exchange.reset();
+                req = std::move(redirect->req);
+                target = std::move(redirect->target);
+                continue;
+            }
+            response_body_reader body(
+                [state = exchange.get()](coro::cancel_token read_token) {
+                    return state->next(std::move(read_token));
+                }, token, options.max_body_size);
+            std::exception_ptr failure;
+            try {
+                co_await std::invoke(handler, std::as_const(head), body, token);
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            if (failure) {
+                exchange->abort();
+                std::rethrow_exception(failure);
+            }
+            if (body.error()) {
+                exchange->abort();
+                co_return *body.error();
+            }
+            if (token.is_cancelled()) {
+                exchange->abort();
+                co_return detail::make_client_error(ECANCELED, client_stage::body);
+            }
+            if (body.complete() && exchange->reusable()) {
+                pool_.release(target.host, target.effective_port(), target.is_secure(),
+                              exchange->take_connection());
+            } else {
+                exchange->abort();
+            }
+            co_return std::monostate{};
+        }
+    }
+
+    /// Send request with redirect handling
+    coro::task<client_result<response>> send_request(request& req, const url& target,
+                                                           size_t redirect_count,
+                                                           coro::cancel_token token) {
+        auto prepared = co_await prepare_exchange(req, target, token, config_.max_response_size);
+        if (const auto* error = std::get_if<client_error>(&prepared)) co_return *error;
+        auto exchange = std::move(std::get<std::unique_ptr<exchange_state>>(prepared));
+        std::string response_body;
 
         while (true) {
-            if (token.is_cancelled()) {
-                co_return detail::make_client_error(ECANCELED,
-                    response_read_stage(reader.decoder()));
-            }
-            auto part = co_await reader.read_with(receive, token);
-            if (!part.success()) {
-                if (expect_expired && body_pending && !token.is_cancelled()) {
-                    if (auto error = co_await send_pending_body()) co_return *error;
-                    continue;
-                }
-                const auto stage = reader.decoder().has_error() ? client_stage::framing
-                    : response_read_stage(reader.decoder());
-                co_return detail::make_client_error(part.error, stage);
-            }
-            const auto code = reader.decoder().status_code();
-            if (part.event == response_event::headers_complete) {
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-                if (auto hook = detail::response_headers_for_test.load(std::memory_order_acquire)) {
-                    hook(code);
-                }
-                if (!is_informational_status(code) &&
-                    detail::expire_expect_after_headers_for_test.load(std::memory_order_acquire)) {
-                    expect_deadline = std::chrono::steady_clock::now();
-                    detail::client_response_read_staged_for_test.store(false, std::memory_order_release);
-                    detail::final_headers_seen_for_test.store(true, std::memory_order_release);
-                }
-#endif
-                if (code == static_cast<uint16_t>(status::switching_protocols)) {
-                    co_return detail::make_client_error(EBADMSG, client_stage::framing);
-                }
-                if (!is_informational_status(code)) {
-                    body_pending = false; // Final headers suppress the upload.
-                } else if (code == static_cast<uint16_t>(status::continue_)) {
-                    if (auto error = co_await send_pending_body()) co_return *error;
-                }
-            } else if (part.event == response_event::body) {
+            auto next = co_await exchange->next(token);
+            if (const auto* error = std::get_if<client_error>(&next)) co_return *error;
+            auto part = std::get<response_read_result>(next);
+            if (part.event == response_event::body) {
                 if (part.body.size() > config_.max_response_size -
                     std::min(response_body.size(), config_.max_response_size)) {
                     co_return detail::make_client_error(EMSGSIZE, client_stage::body);
                 }
                 response_body.append(part.body);
-            } else if (part.event == response_event::protocol_handoff) {
-                // Ordinary clients never transfer ownership to a tunnel.
-                co_return detail::make_client_error(EBADMSG, client_stage::framing);
             } else if (part.event == response_event::message_complete) {
-                if (!is_informational_status(code)) break;
-                if (reader.message_bytes() > config_.max_response_size -
-                    skipped_informational_bytes) {
-                    co_return detail::make_client_error(EMSGSIZE, client_stage::framing);
-                }
-                skipped_informational_bytes += reader.message_bytes();
-                if (!reader.next_response()) {
-                    co_return detail::make_client_error(EBADMSG, client_stage::framing);
-                }
-                reader.set_request_method(req.get_method());
+                break;
             }
         }
-        auto resp = response::from_decoder(reader.decoder(), std::move(response_body));
+        auto resp = response::from_decoder(exchange->reader().decoder(), std::move(response_body));
 
         // Return connection to pool only when (a) keep-alive is allowed by
         // the response, (b) the parser is in the complete state, and (c) no
@@ -683,91 +904,14 @@ private:
         // response — pooling the conn would let those bytes be misread as the
         // head of the next response (response-splitting). On any failure of
         // these conditions the connection is simply dropped on scope exit.
-        if (reader.decoder().is_complete() &&
-            !reader.decoder().is_close_delimited() &&
-            !reader.reached_eof() &&
-            reader.bytes_remaining() == 0 &&
-            reader.decoder().get_headers().keep_alive(reader.decoder().version())) {
-            pool_.release(target.host, target.effective_port(), target.is_secure(), std::move(conn));
+        if (exchange->reusable()) {
+            pool_.release(target.host, target.effective_port(), target.is_secure(),
+                          exchange->take_connection());
         }
         
-        // Handle redirects
-        if (config_.follow_redirects &&
-            is_auto_follow_redirect(resp.get_status()) &&
-            redirect_count < config_.max_redirects) {
-            auto location = resp.header("Location");
-            if (!location.empty()) {
-                ELIO_LOG_DEBUG("Following redirect to: {}", location);
-
-                if (!detail::is_valid_url_input(location)) {
-                    ELIO_LOG_WARNING("Rejecting invalid redirect Location: {}",
-                                     location);
-                    co_return resp;
-                }
-                
-                auto redirect_url = url::resolve_reference(target, location);
-                
-                if (redirect_url) {
-                    if (!detail::is_supported_http_url_scheme(redirect_url->scheme)) {
-                        ELIO_LOG_WARNING("Rejecting unsupported redirect scheme: {}",
-                                         redirect_url->scheme);
-                        co_return resp;
-                    }
-
-                    // Reject HTTPS -> HTTP downgrades to prevent SSL stripping
-                    if (target.is_secure() && !redirect_url->is_secure()) {
-                        ELIO_LOG_WARNING("Rejecting insecure redirect from HTTPS to HTTP: {}",
-                                         location);
-                        co_return resp;
-                    }
-
-                    // Change method to GET for 303, except HEAD must remain
-                    // HEAD so its response-body semantics are preserved.
-                    method redirect_method = req.get_method();
-                    if ((resp.get_status() == status::see_other &&
-                         req.get_method() != method::HEAD) ||
-                        ((resp.get_status() == status::moved_permanently || 
-                          resp.get_status() == status::found) && 
-                         req.get_method() == method::POST)) {
-                        redirect_method = method::GET;
-                    }
-                    
-                    request redirect_req(redirect_method, redirect_url->path_with_query());
-                    redirect_req.set_host(redirect_url->host_authority());
-                    if (!config_.user_agent.empty()) {
-                        redirect_req.set_header("User-Agent", config_.user_agent);
-                    }
-                    
-                    // Keep the payload whenever redirect handling preserves
-                    // the original method. 303 intentionally switches to GET.
-                    const bool method_preserved =
-                        redirect_method == req.get_method() &&
-                        resp.get_status() != status::see_other;
-                    if (resp.get_status() == status::temporary_redirect ||
-                        resp.get_status() == status::permanent_redirect ||
-                        method_preserved) {
-                        if (!req.body().empty()) {
-                            redirect_req.set_body(req.body());
-                        } else if (req.get_headers().content_length() == size_t{0}) {
-                            // Empty and absent representations are distinct;
-                            // preserve only a valid explicit zero length.
-                            redirect_req.set_header("Content-Length",
-                                req.get_headers().get("Content-Length"));
-                        }
-                        auto ct = req.content_type();
-                        if (!ct.empty()) {
-                            redirect_req.set_content_type(ct);
-                        }
-                        // The Expect handshake only makes sense while the
-                        // body travels with the redirect; it re-runs per hop.
-                        if (!req.body().empty() && req.expect_continue()) {
-                            redirect_req.set_expect_continue();
-                        }
-                    }
-                    
-                    co_return co_await send_request(redirect_req, *redirect_url, redirect_count + 1, token);
-                }
-            }
+        if (auto redirect = make_redirect(req, target, resp, redirect_count)) {
+            co_return co_await send_request(redirect->req, redirect->target,
+                                          redirect_count + 1, token);
         }
         
         co_return resp;

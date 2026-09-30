@@ -291,6 +291,21 @@ ELIO_ASYNC_MAIN(async_main)
 
 ## HTTP Client
 
+For a self-contained HTTP/1 range read into caller storage without mandatory
+response-body aggregation, see
+[`examples/http_streaming_client.cpp`](https://github.com/Coldwings/Elio/blob/main/examples/http_streaming_client.cpp).
+It validates final status/Content-Range before pulling body bytes, preserves
+borrowed buffer lifetime, observes explicit framing completion, and settles its
+owned loopback peer. Its 64 KiB streamed body exceeds the configured 1 KiB
+buffered-response limit. HTTP scratch-to-destination copying remains; see
+[HTTP Streaming](HTTP-Streaming.md#scoped-client-response-consumption).
+
+```bash
+cmake --build build --target http_streaming_client --parallel 2
+./build/examples/http_streaming_client
+# Streamed range: 65536 bytes; response body not aggregated
+```
+
 `http_client_result.cpp` is an offline loopback example of owned error values
 and normal non-2xx responses. Build/run `http_client_result` with HTTP enabled:
 it retains an invalid-target error while a local peer returns HTTP 503, without

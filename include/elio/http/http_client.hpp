@@ -80,6 +80,58 @@ struct client_config : base_client_config {
     }
 };
 
+/// Construction-only TLS policy builder for http::transport.
+///
+/// The builder exposes TLS policy mutators before publication without handing
+/// callbacks a mutable reference to the transport's published tls_context.
+/// A const native handle is available for diagnostics, but retained callbacks
+/// cannot keep a mutable SSL_CTX* through this API.
+class transport_tls_config {
+public:
+    explicit transport_tls_config(bool verify_certificate = true)
+        : ctx_(tls::tls_mode::client) {
+        init_client_tls_context(ctx_, verify_certificate);
+    }
+
+    transport_tls_config(const transport_tls_config&) = delete;
+    transport_tls_config& operator=(const transport_tls_config&) = delete;
+    transport_tls_config(transport_tls_config&&) = delete;
+    transport_tls_config& operator=(transport_tls_config&&) = delete;
+
+    bool load_certificate(std::string_view cert_file) {
+        return ctx_.load_certificate(cert_file);
+    }
+
+    bool load_private_key(std::string_view key_file, std::string_view password = {}) {
+        return ctx_.load_private_key(key_file, password);
+    }
+
+    bool load_verify_locations(std::string_view ca_file = {},
+                               std::string_view ca_path = {}) {
+        return ctx_.load_verify_locations(ca_file, ca_path);
+    }
+
+    bool use_default_verify_paths() { return ctx_.use_default_verify_paths(); }
+    void set_verify_mode(tls::verify_mode mode) { ctx_.set_verify_mode(mode); }
+    bool set_alpn_protocols(std::string_view protocols) {
+        return ctx_.set_alpn_protocols(protocols);
+    }
+    bool set_ciphers(std::string_view ciphers) { return ctx_.set_ciphers(ciphers); }
+    bool set_ciphersuites(std::string_view ciphersuites) {
+        return ctx_.set_ciphersuites(ciphersuites);
+    }
+
+    const SSL_CTX* native_handle() const noexcept { return ctx_.native_handle(); }
+    tls::tls_mode mode() const noexcept { return ctx_.mode(); }
+
+private:
+    friend class transport;
+
+    tls::tls_context release_context() && noexcept { return std::move(ctx_); }
+
+    tls::tls_context ctx_;
+};
+
 /// Immutable connection-establishment and pooling configuration owned by
 /// http::transport. Request policy stays on http::client.
 struct transport_config {
@@ -91,8 +143,9 @@ struct transport_config {
     size_t max_connections_per_host = 6;          ///< Max retained idle connections per host
     std::chrono::seconds pool_idle_timeout{60};   ///< Idle connection timeout
     /// Optional construction-time TLS customization. It runs after Elio's
-    /// default client TLS initialization and before the transport is published.
-    std::function<void(tls::tls_context&)> configure_tls;
+    /// default client TLS initialization on a builder that is moved into the
+    /// transport only after this callback returns.
+    std::function<void(transport_tls_config&)> configure_tls;
 
     transport_config() = default;
 
@@ -251,11 +304,7 @@ public:
     explicit transport(transport_config config = {})
         : config_(std::move(config))
         , pool_(config_)
-        , tls_ctx_(tls::tls_mode::client) {
-        init_client_tls_context(tls_ctx_, config_.verify_certificate);
-        if (config_.configure_tls) {
-            config_.configure_tls(tls_ctx_);
-        }
+        , tls_ctx_(make_tls_context(config_)) {
         settled_.set();
     }
 
@@ -336,6 +385,14 @@ public:
 
 private:
     friend class client;
+
+    static tls::tls_context make_tls_context(const transport_config& config) {
+        transport_tls_config tls_config(config.verify_certificate);
+        if (config.configure_tls) {
+            config.configure_tls(tls_config);
+        }
+        return std::move(tls_config).release_context();
+    }
 
     class operation_lease {
     public:

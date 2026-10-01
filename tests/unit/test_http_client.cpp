@@ -1944,11 +1944,13 @@ TEST_CASE("HTTP transport configure_tls runs once after default TLS setup",
           "[http][client][transport][issue-1245]") {
     std::atomic<unsigned> callback_calls{0};
     std::atomic<long> observed_verify_mode{0};
+    const void* callback_config_object = nullptr;
 
     elio::http::transport_config cfg;
     cfg.verify_certificate = true;
-    cfg.configure_tls = [&](elio::tls::tls_context& ctx) {
+    cfg.configure_tls = [&](elio::http::transport_tls_config& ctx) {
         callback_calls.fetch_add(1, std::memory_order_relaxed);
+        callback_config_object = &ctx;
         observed_verify_mode.store(
             SSL_CTX_get_verify_mode(ctx.native_handle()),
             std::memory_order_relaxed);
@@ -1962,6 +1964,7 @@ TEST_CASE("HTTP transport configure_tls runs once after default TLS setup",
     REQUIRE(callback_calls.load(std::memory_order_relaxed) == 1);
     REQUIRE((observed_verify_mode.load(std::memory_order_relaxed) & SSL_VERIFY_PEER) != 0);
     REQUIRE(SSL_CTX_get_verify_mode(shared->tls_context().native_handle()) == SSL_VERIFY_NONE);
+    REQUIRE(callback_config_object != static_cast<const void*>(&shared->tls_context()));
     REQUIRE(&first.tls_context() == &second.tls_context());
     REQUIRE(first.tls_context().native_handle() == shared->tls_context().native_handle());
 }

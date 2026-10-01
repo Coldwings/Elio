@@ -61,8 +61,10 @@ elio::http::client metadata(shared, metadata_policy);
 
 Breaking HTTP/1 TLS customization change: `client::tls_context()` and
 `transport::tls_context()` now expose only a const diagnostics view. Use
-`transport_cfg.configure_tls` for custom trust roots, ciphers, or native TLS
-policy before constructing the transport. If resolver, DNS, TLS verification, or
+`transport_cfg.configure_tls` with the construction-only
+`http::transport_tls_config` builder for custom trust roots or ciphers before
+constructing the transport. The builder does not expose a mutable native handle
+that can be retained after publication. If resolver, DNS, TLS verification, or
 pooling policy changes, create a new transport and move new clients to it; do
 not expect existing idle or in-flight connections to migrate across policy
 domains. `transport::clear()` drops idle pooled connections only.

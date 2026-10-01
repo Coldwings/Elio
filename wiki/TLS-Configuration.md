@@ -269,7 +269,7 @@ coro::task<void> inspect_connection() {
 
 ```cpp
 http::transport_config transport_config;
-transport_config.configure_tls = [](tls_context& tls_ctx) {
+transport_config.configure_tls = [](http::transport_tls_config& tls_ctx) {
     tls_ctx.load_verify_locations("/path/to/custom-ca.crt");
 };
 
@@ -281,10 +281,12 @@ auto resp = co_await client.get("https://example.com/");
 
 HTTP/1 transports seal their active TLS context at construction so shared
 clients cannot mutate a published security identity. Use
-`transport_config::configure_tls` before constructing the transport. This is a
-breaking HTTP/1 client migration from older `client.tls_context().load_*` or
-`set_*` customization calls. WebSocket, SSE, and HTTP/2 clients continue to
-expose mutable per-client TLS contexts.
+`transport_config::configure_tls` before constructing the transport. The
+callback receives `http::transport_tls_config`, a construction-only builder that
+forwards common TLS policy mutators and exposes only a const native handle for
+diagnostics. This is a breaking HTTP/1 client migration from older
+`client.tls_context().load_*` or `set_*` customization calls. WebSocket, SSE,
+and HTTP/2 clients continue to expose mutable per-client TLS contexts.
 
 ### HTTP/2 Client TLS Configuration
 

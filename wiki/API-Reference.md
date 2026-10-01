@@ -2981,6 +2981,21 @@ construction/assignment is deleted so sharing remains explicit through
 ### `transport_config` and `transport`
 
 ```cpp
+class transport_tls_config {
+public:
+    bool load_certificate(std::string_view cert_file);
+    bool load_private_key(std::string_view key_file, std::string_view password = {});
+    bool load_verify_locations(std::string_view ca_file = {},
+                               std::string_view ca_path = {});
+    bool use_default_verify_paths();
+    void set_verify_mode(tls::verify_mode mode);
+    bool set_alpn_protocols(std::string_view protocols);
+    bool set_ciphers(std::string_view ciphers);
+    bool set_ciphersuites(std::string_view ciphersuites);
+    const SSL_CTX* native_handle() const noexcept;
+    tls::tls_mode mode() const noexcept;
+};
+
 struct transport_config {
     bool verify_certificate = true;
     net::resolve_options resolve_options = net::default_cached_resolve_options();
@@ -2989,7 +3004,7 @@ struct transport_config {
     std::shared_ptr<net::resolve_domain> dns_domain;
     size_t max_connections_per_host = 6;
     std::chrono::seconds pool_idle_timeout{60};
-    std::function<void(tls::tls_context&)> configure_tls;
+    std::function<void(transport_tls_config&)> configure_tls;
 
     transport_config();
     explicit transport_config(const client_config& config);
@@ -3032,12 +3047,14 @@ the client request policy plus the per-acquisition `connect_timeout`; it does
 not mutate resolver, DNS, TLS verification, or pool identity. Publish a new
 transport to change those connection-policy domains.
 `transport_config::configure_tls` runs once during transport construction after
-default client TLS initialization; use it for custom trust roots, ciphers, or
-other native TLS policy before the transport is published. `client::tls_context()`
-and `transport::tls_context()` return a const view of the sealed active context
-for diagnostics. This is a breaking HTTP/1 client migration from the previous
-mutable accessor; WebSocket, SSE, and HTTP/2 keep their mutable per-client TLS
-context APIs.
+default client TLS initialization; use the supplied `transport_tls_config`
+builder for custom trust roots or ciphers before the transport is published.
+The builder forwards common TLS policy mutators but exposes only a const native
+handle for diagnostics, so callbacks cannot retain mutable access to the
+published context. `client::tls_context()` and `transport::tls_context()` return
+a const view of the sealed active context for diagnostics. This is a breaking
+HTTP/1 client migration from the previous mutable accessor; WebSocket, SSE, and
+HTTP/2 keep their mutable per-client TLS context APIs.
 
 `transport::clear()` drops idle pooled connections. Active or dialing operations
 continue normally. `transport::shutdown()` marks the transport closed, drops idle

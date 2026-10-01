@@ -51,6 +51,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   facade; each TLS layer keeps independent SNI, verification, ALPN, session and
   close state (#1244).
 
+- **Immutable HTTP route identity**: each HTTP/1 exchange now carries one
+  owned route plan through dialing, idle lookup, and return. Structured keys
+  compare normalized authorities and complete route/security/resolution values,
+  so hash collisions cannot authorize reuse. Redirects resolve new plans and
+  replacement transports keep separate published policy domains. Proxy and
+  layered-TLS identity fields are modeled conservatively per origin; their
+  connectors remain separate features. Legacy standalone pool adapters retain
+  their stable caller-policy contract in a separate namespace. HTTP/1 diagnostics
+  no longer log serialized requests or complete redirect URLs (#1246).
+
 - **Pool-integrated HTTP/1 response consumption**: `client::with_response`
   owns its request/target/handler and delivers final headers before a scoped
   `response_body_reader`. Borrowed-span reads report short progress, completion,

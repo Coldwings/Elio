@@ -276,12 +276,17 @@ public:
             uint64_t observed;
             {
                 std::lock_guard lock(mutex);
-                if (output.error()) co_return io::io_result{-output.error(), 0};
                 if (output.drained_bytes() >= watermark) co_return io::io_result{0, 0};
+                if (output.error()) co_return io::io_result{-output.error(), 0};
                 observed = generation;
             }
             auto result = co_await wait_change(observed, token);
-            if (result.result < 0) co_return result;
+            if (result.result < 0) {
+                std::lock_guard lock(mutex);
+                if (output.drained_bytes() >= watermark) co_return io::io_result{0, 0};
+                if (output.error()) co_return io::io_result{-output.error(), 0};
+                co_return result;
+            }
         }
     }
 

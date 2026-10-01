@@ -4517,13 +4517,16 @@ public:
 ### `basic_tls_stream` and `tls_stream`
 
 TLS wrapper over a move-owned asynchronous byte stream. The existing
-`tls_stream` name remains the TCP facade:
+`tls_stream` name remains the concrete TCP facade:
 
 ```cpp
-template<typename Lower = net::tcp_stream>
+template<typename Lower>
 class basic_tls_stream;
 
-using tls_stream = basic_tls_stream<net::tcp_stream>;
+class tls_stream : public basic_tls_stream<net::tcp_stream> {
+public:
+    using basic_tls_stream<net::tcp_stream>::basic_tls_stream;
+};
 ```
 
 After the TLS handshake completes, TLS streams serialize OpenSSL dispatch and

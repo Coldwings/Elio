@@ -82,8 +82,9 @@ struct tls_stream_options {
 };
 
 /// TLS stream wrapping an async byte stream with SSL/TLS encryption.
-/// ``tls_stream`` remains the TCP facade alias for
-/// ``basic_tls_stream<net::tcp_stream>``.
+/// ``tls_stream`` remains the concrete TCP facade deriving from
+/// ``basic_tls_stream<net::tcp_stream>``; code that needs another lower
+/// transport instantiates ``basic_tls_stream<Lower>`` directly.
 ///
 /// **Thread safety:** after handshake, one reader and one writer may overlap.
 /// SSL dispatch and pending-write retry ownership are serialized internally.

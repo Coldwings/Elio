@@ -360,6 +360,31 @@ TEST_CASE("TLS transport drains short lower writes before racing cancellation",
     CHECK(transport->output.drained_bytes() == 6);
 }
 
+TEST_CASE("TLS transport lets completed publication beat write cancellation",
+          "[tls][transport][generic][issue-1244]") {
+    auto state = std::make_shared<scripted_lower_state>();
+    state->writes.push_back(elio::io::io_result{6, 0});
+    elio::coro::cancel_source cancel;
+    state->callback_context = &cancel;
+    state->after_positive_write = cancel_source_callback;
+    auto transport = make_scripted_transport(state);
+    std::unique_ptr<BIO, decltype(&BIO_free)> output(transport->output.make_bio(), BIO_free);
+    REQUIRE(output);
+    REQUIRE(BIO_write(output.get(), "abcdef", 6) == 6);
+
+    elio::io::io_result flushed{};
+    run_transport_on_scheduler([&]() -> elio::coro::task<void> {
+        flushed = co_await transport->flush_to(6, cancel.get_token());
+    });
+
+    CHECK(flushed.result == 0);
+    CHECK(cancel.is_cancelled());
+    CHECK(state->write_calls == 1);
+    CHECK(text_of(state->written_bytes) == "abcdef");
+    CHECK(transport->output.error() == 0);
+    CHECK(transport->output.drained_bytes() == 6);
+}
+
 TEST_CASE("TLS transport treats lower zero writes as terminal no-progress failure",
           "[tls][transport][generic][issue-1244]") {
     auto state = std::make_shared<scripted_lower_state>();

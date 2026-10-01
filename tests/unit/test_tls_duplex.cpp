@@ -391,6 +391,14 @@ struct non_descriptor_fd_probe {
     const char* fd() const noexcept { return "not a descriptor"; }
 };
 
+struct throwing_fd_conversion_probe {
+    struct descriptor {
+        operator int() const { return 7; }
+    };
+
+    descriptor fd() const noexcept { return {}; }
+};
+
 template<typename Stream>
 concept exposes_fd = requires(const Stream& stream) {
     stream.fd();
@@ -544,12 +552,15 @@ TEST_CASE("TLS stream ignores unsafe diagnostic lower fd hooks", "[tls][generic]
     STATIC_REQUIRE(net::publishing_byte_stream<throwing_fd_stream>);
     STATIC_REQUIRE(!tls::detail::noexcept_int_fd<throwing_fd_stream>);
     STATIC_REQUIRE(!tls::detail::noexcept_int_fd<non_descriptor_fd_probe>);
+    STATIC_REQUIRE(!tls::detail::noexcept_int_fd<throwing_fd_conversion_probe>);
     tls::tls_context context(tls::tls_mode::client);
     tls::basic_tls_stream<throwing_fd_stream> stream(throwing_fd_stream{}, context);
     CHECK(stream.fd() == -1);
 }
 
 TEST_CASE("TLS stream can wrap fd-less async byte streams", "[tls][generic][issue-1244]") {
+    STATIC_REQUIRE(!std::is_same_v<tls::tls_stream, tls::basic_tls_stream<net::tcp_stream>>);
+    STATIC_REQUIRE(std::is_base_of_v<tls::basic_tls_stream<net::tcp_stream>, tls::tls_stream>);
     STATIC_REQUIRE(!exposes_fd<fdless_tcp_stream>);
     STATIC_REQUIRE(net::publishing_byte_stream<fdless_tcp_stream>);
     STATIC_REQUIRE(net::publishing_byte_stream<tls::tls_stream>);

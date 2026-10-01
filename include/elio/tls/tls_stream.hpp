@@ -105,7 +105,8 @@ concept tls_lower_stream =
 
 template<typename Lower>
 concept noexcept_int_fd = requires(const Lower& stream) {
-    { stream.fd() } noexcept -> std::convertible_to<int>;
+    { stream.fd() } noexcept;
+    { static_cast<int>(stream.fd()) } noexcept -> std::same_as<int>;
 };
 
 template<typename Lower>
@@ -1279,7 +1280,15 @@ private:
     std::string hostname_;  // Store hostname for SNI and verification
 };
 
-using tls_stream = basic_tls_stream<net::tcp_stream>;
+class tls_stream : public basic_tls_stream<net::tcp_stream> {
+public:
+    using basic_tls_stream<net::tcp_stream>::basic_tls_stream;
+
+    tls_stream(const tls_stream&) = delete;
+    tls_stream& operator=(const tls_stream&) = delete;
+    tls_stream(tls_stream&&) noexcept = default;
+    tls_stream& operator=(tls_stream&&) noexcept = default;
+};
 
 /// Connect to a TLS server
 /// @param ctx TLS context (client mode)

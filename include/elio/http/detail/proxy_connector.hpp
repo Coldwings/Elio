@@ -12,6 +12,7 @@ namespace elio::http::detail {
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 inline std::atomic<void (*)(connect_tls_stream&)> tunnel_ready_for_test{nullptr};
+inline std::atomic<void (*)(connect_tls_stream&, int)> tunnel_handshake_failed_for_test{nullptr};
 #endif
 
 inline coro::task<client_result<route_connection>> finish_proxy_setup(
@@ -38,6 +39,10 @@ inline coro::task<client_result<route_connection>> finish_proxy_setup(
     const auto handshake = co_await inner.handshake(token);
     const auto error = handshake ? 0 : (errno ? errno : EIO);
     if (!handshake) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = tunnel_handshake_failed_for_test.load(std::memory_order_acquire))
+            hook(inner, error);
+#endif
         inner.shutdown_socket();
         co_await inner.abort_and_settle();
         co_return make_client_error(error, client_stage::tls);

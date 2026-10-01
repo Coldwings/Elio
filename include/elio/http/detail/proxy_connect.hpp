@@ -6,11 +6,20 @@
 #include <elio/http/http_response_reader.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <optional>
 #include <vector>
 
 namespace elio::http::detail {
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+enum class proxy_connect_step { writing, written, reading, received };
+inline std::atomic<void (*)(proxy_connect_step, size_t, int,
+    std::optional<std::chrono::steady_clock::time_point>)> proxy_connect_progress_for_test{nullptr};
+using proxy_write_wait_hook = coro::task<void> (*)(coro::cancel_token);
+inline std::atomic<proxy_write_wait_hook> proxy_connect_write_wait_for_test{nullptr};
+#endif
 
 // The connector owns stream/profile and its whole-setup watchdog through this
 // await. The helper neither pools a rejected channel nor restarts the budget.
@@ -36,7 +45,21 @@ coro::task<client_result<std::vector<char>>> negotiate_connect(Stream& stream,
     size_t offset = 0;
     while (offset < bytes.size()) {
         if (auto error = stopped()) co_return *error;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = proxy_connect_progress_for_test.load(std::memory_order_acquire))
+            hook(proxy_connect_step::writing, offset, 0, deadline);
+        if (auto hook = proxy_connect_write_wait_for_test.load(std::memory_order_acquire)) {
+            co_await hook(token);
+            if (auto error = stopped()) co_return *error;
+        }
+#endif
         auto written = co_await stream.write(bytes.data() + offset, bytes.size() - offset, token);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = proxy_connect_progress_for_test.load(std::memory_order_acquire))
+            hook(proxy_connect_step::written, offset + (written.result > 0 ?
+                static_cast<size_t>(written.result) : 0), written.result < 0 ? -written.result : 0,
+                deadline);
+#endif
         if (written.result == -EINTR) continue;
         if (written.result <= 0)
             co_return make_client_error(written.result < 0 ? -written.result : EIO,
@@ -57,7 +80,17 @@ coro::task<client_result<std::vector<char>>> negotiate_connect(Stream& stream,
         if (received_bytes >= proxy.limits.max_response_bytes)
             co_return io::io_result{-EMSGSIZE, 0};
         size = std::min(size, proxy.limits.max_response_bytes - received_bytes);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = proxy_connect_progress_for_test.load(std::memory_order_acquire))
+            hook(proxy_connect_step::reading, received_bytes, 0, deadline);
+#endif
         auto received = co_await stream.read(data, size, token);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = proxy_connect_progress_for_test.load(std::memory_order_acquire))
+            hook(proxy_connect_step::received, received_bytes + (received.result > 0 ?
+                static_cast<size_t>(received.result) : 0), received.result < 0 ? -received.result : 0,
+                deadline);
+#endif
         if (received.result > 0) {
             if (static_cast<size_t>(received.result) > size)
                 co_return io::io_result{-EOVERFLOW, 0};

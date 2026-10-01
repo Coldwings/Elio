@@ -102,37 +102,105 @@ void install_certificate(elio::tls::tls_context& context, temporary_pem& ca,
         throw std::runtime_error("proxy certificate publication failed");
 }
 
+struct request_read_observation {
+    size_t bytes = 0;
+    int terminal_error = 0;
+    bool complete = false;
+};
+
 template<typename Stream>
-task<std::optional<request>> receive_request(Stream& stream, elio::coro::cancel_token token) {
+task<std::optional<request>> receive_request(Stream& stream, elio::coro::cancel_token token,
+                                           request_read_observation* observed = nullptr) {
     request_parser parser;
     std::array<char, 4096> bytes{};
     while (!parser.is_complete()) {
         const auto received = co_await stream.read(bytes.data(), bytes.size(), token);
-        if (received.result <= 0) co_return std::nullopt;
+        if (received.result <= 0) {
+            if (observed) observed->terminal_error = received.result < 0 ? -received.result : 0;
+            co_return std::nullopt;
+        }
+        if (observed) observed->bytes += static_cast<size_t>(received.result);
         const auto [parsed, consumed] = parser.parse(
             std::string_view(bytes.data(), static_cast<size_t>(received.result)));
         (void)consumed;
         if (parsed == parse_result::error) throw std::runtime_error("proxy fixture request parse failed");
     }
+    if (observed) observed->complete = true;
     co_return request::from_parser(parser);
 }
 
 struct observed_route {
     size_t accepted = 0;
+    int accept_error = 0;
+    request_read_observation connect_read;
     std::vector<request> requests;
     std::string sni;
     bool handshake = false;
+    int server_handshake_error = 0;
+    size_t client_handshake_failures = 0;
+    int client_handshake_error = 0;
+    long client_verification = X509_V_OK;
+    size_t client_connect_written = 0;
+    size_t client_connect_received = 0;
+    int client_connect_error = 0;
+    bool client_connect_writing = false;
+    bool client_connect_reading = false;
+    std::optional<std::chrono::steady_clock::time_point> client_setup_deadline;
 };
+
+std::atomic<observed_route*> authentication_observed{nullptr};
+
+void observe_handshake_failure(detail::connect_tls_stream& inner, int error) {
+    auto& observed = *authentication_observed.load();
+    ++observed.client_handshake_failures;
+    observed.client_handshake_error = error;
+    observed.client_verification = inner.verify_result();
+}
+
+void observe_connect_progress(detail::proxy_connect_step step, size_t bytes, int error,
+        std::optional<std::chrono::steady_clock::time_point> deadline) {
+    auto& observed = *authentication_observed.load();
+    observed.client_setup_deadline = deadline;
+    if (step == detail::proxy_connect_step::writing) observed.client_connect_writing = true;
+    if (step == detail::proxy_connect_step::written) observed.client_connect_written = bytes;
+    if (step == detail::proxy_connect_step::reading) observed.client_connect_reading = true;
+    if (step == detail::proxy_connect_step::received) observed.client_connect_received = bytes;
+    if (error) observed.client_connect_error = error;
+}
+
+struct authentication_hooks {
+    explicit authentication_hooks(observed_route& observed) {
+        authentication_observed.store(&observed);
+        detail::tunnel_handshake_failed_for_test.store(observe_handshake_failure);
+        detail::proxy_connect_progress_for_test.store(observe_connect_progress);
+    }
+    ~authentication_hooks() {
+        detail::tunnel_handshake_failed_for_test.store(nullptr);
+        detail::proxy_connect_progress_for_test.store(nullptr);
+        authentication_observed.store(nullptr);
+    }
+};
+
+bool certificate_rejected(const client_error& error, const observed_route& observed,
+                          long expected) {
+    return error.stage == client_stage::tls && error.code.value() > 0 &&
+        error.code.value() != ETIMEDOUT && error.code.value() != ECANCELED &&
+        observed.client_handshake_failures == 1 && observed.client_handshake_error > 0 &&
+        observed.client_verification == expected;
+}
 
 task<void> serve_route(elio::net::tcp_listener& listener, bool secure,
         elio::tls::tls_context& tls_context, size_t count, observed_route& observed,
         elio::coro::cancel_token token) {
     auto accepted = co_await listener.accept(token);
-    if (!accepted) co_return;
+    if (!accepted) {
+        observed.accept_error = errno;
+        co_return;
+    }
     ++observed.accepted;
     auto stream = std::move(*accepted);
     if (secure) {
-        auto setup = co_await receive_request(stream, token);
+        auto setup = co_await receive_request(stream, token, &observed.connect_read);
         if (!setup) co_return;
         observed.requests.push_back(std::move(*setup));
         constexpr std::string_view connected =
@@ -140,7 +208,10 @@ task<void> serve_route(elio::net::tcp_listener& listener, bool secure,
         if ((co_await stream.write_exactly(connected, token)).result <= 0) co_return;
         elio::tls::tls_stream origin(std::move(stream), tls_context);
         observed.handshake = co_await origin.handshake(token);
-        if (!observed.handshake) co_return;
+        if (!observed.handshake) {
+            observed.server_handshake_error = errno;
+            co_return;
+        }
         for (size_t i = 0; i < count; ++i) {
             auto incoming = co_await receive_request(origin, token);
             if (!incoming) break;
@@ -231,6 +302,8 @@ struct setup_observation {
     elio::sync::event tls_entered;
     elio::sync::event connect_read;
     elio::sync::event expire;
+    elio::sync::event write_entered;
+    elio::sync::event accepted;
 };
 
 std::atomic<setup_observation*> setup_observed{nullptr};
@@ -253,6 +326,12 @@ task<elio::coro::cancel_result> observe_route_budget(std::chrono::steady_clock::
 
 void observe_tls_setup() { setup_observed.load()->tls_entered.set(); }
 
+task<void> gate_connect_write(elio::coro::cancel_token token) {
+    setup_observed.load()->write_entered.set();
+    elio::sync::event waiting;
+    (void)co_await waiting.wait(token);
+}
+
 struct setup_hooks {
     explicit setup_hooks(setup_observation& value) {
         setup_observed.store(&value);
@@ -267,6 +346,23 @@ struct setup_hooks {
         setup_observed.store(nullptr);
     }
 };
+
+struct connect_write_gate {
+    connect_write_gate() { detail::proxy_connect_write_wait_for_test.store(gate_connect_write); }
+    ~connect_write_gate() { detail::proxy_connect_write_wait_for_test.store(nullptr); }
+};
+
+task<void> unread_connect(elio::net::tcp_listener& listener, setup_observation& observed,
+        observed_route& route, elio::coro::cancel_token token) {
+    auto stream = co_await listener.accept(token);
+    if (!stream) {
+        route.accept_error = errno;
+        co_return;
+    }
+    ++route.accepted;
+    observed.accepted.set();
+    (void)co_await receive_request(*stream, token, &route.connect_read);
+}
 
 task<void> stalled_connect(elio::net::tcp_listener& listener, bool inner_tls,
         setup_observation& observed, elio::coro::cancel_token token) {
@@ -854,6 +950,8 @@ TEST_CASE("CONNECT and inner TLS retain one absolute TCP budget and settle cance
         client agent(owner, policy);
         setup_observation observed;
         setup_hooks hooks(observed);
+        observed_route authentication;
+        authentication_hooks authentication_scope(authentication);
         elio::coro::cancel_source server_stop;
         elio::coro::cancel_source user_stop;
         elio::runtime::scheduler scheduler(1);
@@ -883,10 +981,79 @@ TEST_CASE("CONNECT and inner TLS retain one absolute TCP budget and settle cance
         REQUIRE(error);
         REQUIRE(error->code.value() == (cancelled ? ECANCELED : ETIMEDOUT));
         REQUIRE(error->stage == (inner_tls ? client_stage::tls : client_stage::proxy_connect));
+        CHECK_FALSE(certificate_rejected(*error, authentication, X509_V_ERR_HOSTNAME_MISMATCH));
+        CHECK_FALSE(certificate_rejected(*error, authentication, X509_V_ERR_IP_ADDRESS_MISMATCH));
+        if (inner_tls) CHECK(authentication.client_verification == X509_V_OK);
         REQUIRE(observed.tcp_deadline == observed.route_deadline);
         REQUIRE(owner->admission_counters_for_test().live == 0);
         REQUIRE(owner->admission_counters_for_test().dialing == 0);
     }
+}
+
+TEST_CASE("CONNECT deadline before its first write is not certificate rejection",
+          "[http][proxy][routes][deadline][pre-connect-timeout][issue-1249]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto cancelled = GENERATE(false, true);
+    CAPTURE(selected, cancelled);
+    backend_guard backend_scope(selected);
+    auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    transport_config config;
+    config.proxy.emplace();
+    config.proxy->endpoint = "http://127.0.0.1:" + std::to_string(listener->local_address().port());
+    config.limits = pool_limits{};
+    config.acquisition_timeout = std::chrono::seconds(40);
+    auto owner = std::make_shared<transport>(config);
+    client_config policy;
+    policy.connect_timeout = std::chrono::seconds(20);
+    client agent(owner, policy);
+    setup_observation observed;
+    setup_hooks hooks(observed);
+    connect_write_gate gate;
+    observed_route route;
+    authentication_hooks authentication_scope(route);
+    elio::coro::cancel_source server_stop;
+    elio::coro::cancel_source user_stop;
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto server = scheduler.go_joinable(unread_connect(*listener, observed, route,
+                                                      server_stop.get_token()));
+    auto controlled = scheduler.go_joinable([&]() -> task<client_result<response>> {
+        auto call = scheduler.go_joinable(agent.get_result("https://127.0.0.1:9443/",
+                                                           user_stop.get_token()));
+        co_await observed.accepted.wait();
+        co_await observed.route_entered.wait();
+        co_await observed.write_entered.wait();
+        if (cancelled) user_stop.cancel();
+        else observed.expire.set();
+        auto result = co_await call;
+        co_await call.wait_destroyed_async();
+        co_return result;
+    });
+    controlled.wait_destroyed();
+    server_stop.cancel();
+    server.wait_destroyed();
+    owner->clear();
+    scheduler.shutdown();
+    auto result = controlled.await_resume();
+    server.await_resume();
+    const auto* error = std::get_if<client_error>(&result);
+    REQUIRE(error);
+    CHECK(error->stage == client_stage::proxy_connect);
+    CHECK(error->code.value() == (cancelled ? ECANCELED : ETIMEDOUT));
+    CHECK(route.accepted == 1);
+    CHECK(route.accept_error == 0);
+    CHECK(route.connect_read.bytes == 0);
+    CHECK_FALSE(route.connect_read.complete);
+    CHECK(route.client_connect_writing);
+    CHECK(route.client_connect_written == 0);
+    CHECK_FALSE(route.client_connect_reading);
+    CHECK(route.client_handshake_failures == 0);
+    CHECK_FALSE(certificate_rejected(*error, route, X509_V_ERR_IP_ADDRESS_MISMATCH));
+    CHECK(observed.tcp_deadline == observed.route_deadline);
+    CHECK(route.client_setup_deadline == observed.route_deadline);
+    CHECK(owner->active_operations_for_test() == 0);
+    CHECK(owner->admission_counters_for_test().live == 0);
 }
 
 TEST_CASE("CONNECT origin trust hostname and unsupported ALPN fail before origin requests",
@@ -917,6 +1084,7 @@ TEST_CASE("CONNECT origin trust hostname and unsupported ALPN fail before origin
                                                       "https://localhost/path");
         REQUIRE(target);
         observed_route observed;
+        authentication_hooks authentication_scope(observed);
         elio::coro::cancel_source stop;
         elio::runtime::scheduler scheduler(1);
         scheduler.start();
@@ -933,9 +1101,21 @@ TEST_CASE("CONNECT origin trust hostname and unsupported ALPN fail before origin
         REQUIRE(results.size() == 1);
         const auto* error = std::get_if<client_error>(&results[0]);
         REQUIRE(error);
+        CAPTURE(error->code.value(), observed.accepted, observed.accept_error,
+                observed.connect_read.bytes, observed.connect_read.terminal_error,
+                observed.connect_read.complete, observed.server_handshake_error,
+                observed.client_handshake_error, observed.client_verification,
+                observed.client_connect_writing, observed.client_connect_written,
+                observed.client_connect_reading, observed.client_connect_received,
+                observed.client_connect_error);
         REQUIRE(error->stage == client_stage::tls);
-        REQUIRE(error->code.value() > 0);
-        if (rejection == 2) REQUIRE(error->code.value() == EPROTONOSUPPORT);
+        if (rejection == 2) {
+            REQUIRE(error->code.value() == EPROTONOSUPPORT);
+            CHECK(observed.client_handshake_failures == 0);
+        } else {
+            CHECK(certificate_rejected(*error, observed, rejection == 0 ?
+                X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT : X509_V_ERR_HOSTNAME_MISMATCH));
+        }
         REQUIRE(observed.requests.size() == 1);
         REQUIRE(observed.requests[0].get_method() == method::CONNECT);
         REQUIRE(owner->admission_counters_for_test().live == 0);
@@ -1073,6 +1253,7 @@ TEST_CASE("CONNECT authenticates numeric origin IP SANs without SNI over IPv4 an
                                           "https://127.0.0.1:9443/path");
     REQUIRE(target);
     observed_route observed;
+    authentication_hooks authentication_scope(observed);
     SSL_CTX_set_tlsext_servername_callback(server_context.native_handle(), record_sni);
     SSL_CTX_set_tlsext_servername_arg(server_context.native_handle(), &observed);
     elio::coro::cancel_source stop;
@@ -1088,6 +1269,12 @@ TEST_CASE("CONNECT authenticates numeric origin IP SANs without SNI over IPv4 an
     scheduler.shutdown();
     const auto results = calls.await_resume();
     server.await_resume();
+    CAPTURE(observed.accepted, observed.accept_error, observed.connect_read.bytes,
+            observed.connect_read.terminal_error, observed.connect_read.complete,
+            observed.server_handshake_error, observed.client_handshake_error,
+            observed.client_verification, observed.client_connect_writing,
+            observed.client_connect_written, observed.client_connect_reading,
+            observed.client_connect_received, observed.client_connect_error);
     REQUIRE(results.size() == 1);
     const bool authentic = std::string_view(identities) == "IP:127.0.0.1,IP:::1";
     if (authentic) {
@@ -1100,7 +1287,9 @@ TEST_CASE("CONNECT authenticates numeric origin IP SANs without SNI over IPv4 an
     } else {
         const auto* error = std::get_if<client_error>(&results[0]);
         REQUIRE(error);
+        CAPTURE(error->code.value());
         CHECK(error->stage == client_stage::tls);
+        CHECK(certificate_rejected(*error, observed, X509_V_ERR_IP_ADDRESS_MISMATCH));
         CHECK_FALSE(observed.handshake);
         REQUIRE(observed.requests.size() == 1);
     }

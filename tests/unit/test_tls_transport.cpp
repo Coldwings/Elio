@@ -3,13 +3,185 @@
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS && defined(ELIO_RUNTIME_TEST_HOOKS)
 #include <elio/tls/detail/tls_transport.hpp>
 #include <elio/tls/tls_stream.hpp>
+#include <elio/net/byte_stream.hpp>
+#include <elio/runtime/scheduler.hpp>
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
 
 namespace {
 using elio::tls::detail::tls_transport;
+using elio::tls::detail::basic_tls_transport;
 using elio::coro::detail::task_access;
 
 std::shared_ptr<tls_transport> notification_transport() {
     return std::make_shared<tls_transport>(elio::net::tcp_stream{-1}, 32);
+}
+
+std::vector<std::byte> bytes_of(std::string_view text) {
+    std::vector<std::byte> bytes(text.size());
+    std::memcpy(bytes.data(), text.data(), text.size());
+    return bytes;
+}
+
+std::string text_of(const std::vector<std::byte>& bytes) {
+    std::string text(bytes.size(), '\0');
+    std::memcpy(text.data(), bytes.data(), bytes.size());
+    return text;
+}
+
+struct scripted_lower_state {
+    std::deque<elio::io::io_result> reads;
+    std::deque<elio::io::io_result> writes;
+    std::vector<std::byte> read_bytes;
+    size_t read_offset = 0;
+    std::vector<std::byte> written_bytes;
+    void* callback_context = nullptr;
+    void (*after_positive_read)(void*) = nullptr;
+    void (*after_positive_write)(void*) = nullptr;
+    unsigned read_calls = 0;
+    unsigned write_calls = 0;
+    unsigned aborts = 0;
+    unsigned finishes = 0;
+};
+
+class scripted_lower_stream {
+public:
+    using byte_stream_contract = elio::net::publishing_byte_stream_contract;
+
+    explicit scripted_lower_stream(std::shared_ptr<scripted_lower_state> state)
+        : state_(std::move(state)) {}
+    scripted_lower_stream(scripted_lower_stream&&) noexcept = default;
+    scripted_lower_stream& operator=(scripted_lower_stream&&) noexcept = default;
+    scripted_lower_stream(const scripted_lower_stream&) = delete;
+    scripted_lower_stream& operator=(const scripted_lower_stream&) = delete;
+
+    elio::coro::task<elio::io::io_result> read(
+        void* buffer, size_t length, elio::coro::cancel_token token) {
+        ++state_->read_calls;
+        if (state_->reads.empty()) co_return elio::io::io_result{-EAGAIN, 0};
+        auto result = state_->reads.front();
+        state_->reads.pop_front();
+        if (result.result > 0) {
+            const auto count = static_cast<size_t>(result.result);
+            if (count > length ||
+                count > state_->read_bytes.size() - state_->read_offset) {
+                co_return elio::io::io_result{-EOVERFLOW, 0};
+            }
+            std::memcpy(buffer, state_->read_bytes.data() + state_->read_offset, count);
+            state_->read_offset += count;
+            if (state_->after_positive_read) {
+                state_->after_positive_read(state_->callback_context);
+            }
+            co_return result;
+        }
+        if (token.is_cancelled() && result.result >= 0)
+            co_return elio::io::io_result{-ECANCELED, 0};
+        co_return result;
+    }
+
+    elio::coro::task<elio::io::io_result> write(
+        const void* buffer, size_t length, elio::coro::cancel_token token) {
+        ++state_->write_calls;
+        elio::io::io_result result{static_cast<int32_t>(length), 0};
+        if (!state_->writes.empty()) {
+            result = state_->writes.front();
+            state_->writes.pop_front();
+        }
+        if (result.result > 0) {
+            const auto count = static_cast<size_t>(result.result);
+            if (count > length) co_return elio::io::io_result{-EOVERFLOW, 0};
+            const auto* first = static_cast<const std::byte*>(buffer);
+            state_->written_bytes.insert(state_->written_bytes.end(), first, first + count);
+            if (state_->after_positive_write) {
+                state_->after_positive_write(state_->callback_context);
+            }
+            co_return result;
+        }
+        if (token.is_cancelled() && result.result >= 0)
+            co_return elio::io::io_result{-ECANCELED, 0};
+        co_return result;
+    }
+
+    elio::coro::task<elio::net::write_finish_result> finish_write(
+        elio::coro::cancel_token token, std::chrono::milliseconds) {
+        ++state_->finishes;
+        if (token.is_cancelled()) {
+            co_return elio::net::write_finish_result{
+                elio::net::close_scope::write_direction, ECANCELED};
+        }
+        co_return elio::net::write_finish_result{
+            elio::net::close_scope::write_direction, 0, true, false};
+    }
+
+    elio::net::close_scope read_end_scope() const noexcept {
+        return elio::net::close_scope::write_direction;
+    }
+
+    elio::coro::task<void> abort_and_settle() {
+        ++state_->aborts;
+        co_return;
+    }
+
+private:
+    std::shared_ptr<scripted_lower_state> state_;
+};
+
+static_assert(elio::net::publishing_byte_stream<scripted_lower_stream>);
+
+using scripted_transport = basic_tls_transport<scripted_lower_stream>;
+
+std::shared_ptr<scripted_transport>
+make_scripted_transport(const std::shared_ptr<scripted_lower_state>& state) {
+    return std::make_shared<scripted_transport>(scripted_lower_stream{state}, 64);
+}
+
+void cancel_source_callback(void* context) {
+    static_cast<elio::coro::cancel_source*>(context)->cancel();
+}
+
+struct counted_cancel {
+    elio::coro::cancel_source* source = nullptr;
+    unsigned target = 0;
+    unsigned calls = 0;
+};
+
+void counted_cancel_callback(void* context) {
+    auto& state = *static_cast<counted_cancel*>(context);
+    if (++state.calls == state.target) state.source->cancel();
+}
+
+template<typename Function>
+void run_transport_on_scheduler(Function work) {
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    std::atomic<bool> done{false};
+    bool threw = false;
+    scheduler.go([&]() -> elio::coro::task<void> {
+        try {
+            co_await work();
+        } catch (...) {
+            threw = true;
+        }
+        done.store(true, std::memory_order_release);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    REQUIRE(done.load(std::memory_order_acquire));
+    REQUIRE(scheduler.shutdown(std::chrono::seconds(5)));
+    REQUIRE_FALSE(threw);
 }
 }
 
@@ -74,6 +246,80 @@ TEST_CASE("TLS read poll rechecks progress at source publication", "[tls][transp
     REQUIRE(handle.done());
     CHECK(wait.await_resume().result == 0);
     CHECK(transport->generation == 1);
+}
+
+TEST_CASE("TLS transport publishes short lower reads before racing cancellation",
+          "[tls][transport][generic][issue-1244]") {
+    auto state = std::make_shared<scripted_lower_state>();
+    state->reads.push_back(elio::io::io_result{5, 0});
+    state->read_bytes = bytes_of("hello");
+    elio::coro::cancel_source cancel;
+    state->callback_context = &cancel;
+    state->after_positive_read = cancel_source_callback;
+    auto transport = make_scripted_transport(state);
+    std::unique_ptr<BIO, decltype(&BIO_free)> input(BIO_new(BIO_s_mem()), BIO_free);
+    REQUIRE(input);
+    transport->input = input.get();
+
+    auto wait = transport->wait_read(transport->generation, cancel.get_token());
+    auto handle = task_access::handle(wait);
+    handle.resume();
+
+    REQUIRE(handle.done());
+    CHECK(wait.await_resume().result == 0);
+    CHECK(cancel.is_cancelled());
+    CHECK(state->read_calls == 1);
+    std::array<char, 5> received{};
+    REQUIRE(BIO_read(input.get(), received.data(), static_cast<int>(received.size())) == 5);
+    CHECK(std::string_view(received.data(), received.size()) == "hello");
+    CHECK(transport->output.error() == 0);
+}
+
+TEST_CASE("TLS transport drains short lower writes before racing cancellation",
+          "[tls][transport][generic][issue-1244]") {
+    auto state = std::make_shared<scripted_lower_state>();
+    state->writes.push_back(elio::io::io_result{2, 0});
+    elio::coro::cancel_source cancel;
+    counted_cancel race{&cancel, 2};
+    state->callback_context = &race;
+    state->after_positive_write = counted_cancel_callback;
+    auto transport = make_scripted_transport(state);
+    std::unique_ptr<BIO, decltype(&BIO_free)> output(transport->output.make_bio(), BIO_free);
+    REQUIRE(output);
+    REQUIRE(BIO_write(output.get(), "abcdef", 6) == 6);
+
+    elio::io::io_result flushed{};
+    run_transport_on_scheduler([&]() -> elio::coro::task<void> {
+        flushed = co_await transport->flush_to(6, cancel.get_token());
+    });
+
+    CHECK(flushed.result == 0);
+    CHECK(cancel.is_cancelled());
+    CHECK(race.calls == 2);
+    CHECK(state->write_calls == 2);
+    CHECK(text_of(state->written_bytes) == "abcdef");
+    CHECK(transport->output.error() == 0);
+    CHECK(transport->output.drained_bytes() == 6);
+}
+
+TEST_CASE("TLS transport treats lower zero writes as terminal no-progress failure",
+          "[tls][transport][generic][issue-1244]") {
+    auto state = std::make_shared<scripted_lower_state>();
+    state->writes.push_back(elio::io::io_result{0, 0});
+    auto transport = make_scripted_transport(state);
+    std::unique_ptr<BIO, decltype(&BIO_free)> output(transport->output.make_bio(), BIO_free);
+    REQUIRE(output);
+    REQUIRE(BIO_write(output.get(), "cipher", 6) == 6);
+
+    elio::io::io_result flushed{};
+    run_transport_on_scheduler([&]() -> elio::coro::task<void> {
+        flushed = co_await transport->flush_to(6, {});
+    });
+
+    CHECK(flushed.result == -EPIPE);
+    CHECK(state->write_calls == 1);
+    CHECK(state->written_bytes.empty());
+    CHECK(transport->output.error() == EPIPE);
 }
 
 TEST_CASE("TLS output launch failure releases pump ownership and wakes waiters", "[tls][transport][issue-1215]") {

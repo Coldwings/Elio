@@ -4604,15 +4604,18 @@ public:
 };
 ```
 
-`Lower` is move-owned by the TLS stream and must provide cancellable asynchronous
-`read(void*, size_t, cancel_token)` and
-`write(const void*, size_t, cancel_token)` operations with the same borrowed
-buffer lifetime rule as Elio byte streams: the buffer remains live until the
-awaited operation returns. A lower stream may optionally expose
-`shutdown_socket()` for abort propagation and `fd()` for diagnostics. Exposing
-`fd()` does not authorize TLS to bypass that lower protocol. The raw descriptor
-output fast path is used only by the TCP facade; generic and nested streams
-publish ciphertext by awaiting the lower stream's `write()`.
+`Lower` is move-owned by the TLS stream. Apart from the TCP facade,
+`basic_tls_stream<Lower>` requires `Lower` to satisfy
+`net::publishing_byte_stream`: it must explicitly opt in with
+`publishing_byte_stream_contract`, provide cancellable asynchronous `read()` and
+`write()`, report EOF scope, support protocol finish, and provide
+`abort_and_settle()` for whole-chain abort. The borrowed buffer lifetime rule is
+the same as other Elio byte streams: the buffer remains live until the awaited
+operation returns. A lower stream may optionally expose `shutdown_socket()` for
+synchronous abort propagation and `fd()` for diagnostics. Exposing `fd()` does
+not authorize TLS to bypass that lower protocol. The raw descriptor output fast
+path is used only by the TCP facade; generic and nested streams publish
+ciphertext by awaiting the lower stream's `write()`.
 
 Generic TLS layers keep independent `tls_context`, SNI, certificate
 verification, ALPN, session state and close semantics. A TLS-over-TLS stack is

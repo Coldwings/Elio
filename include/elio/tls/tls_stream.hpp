@@ -2,6 +2,7 @@
 
 #include <elio/tls/tls_context.hpp>
 #include <elio/tls/detail/tls_transport.hpp>
+#include <elio/net/byte_stream.hpp>
 #include <elio/net/tcp.hpp>
 #include <elio/net/stream_close.hpp>
 #include <elio/net/resolve.hpp>
@@ -93,11 +94,21 @@ struct tls_stream_options {
 /// await its I/O leases. Destruction requests abort, never asynchronous normal
 /// finalization; transport ownership survives outstanding internal cleanup.
 /// Cancellation does not authorize destruction of active public task frames.
-/// Generic lower streams are always driven through their ``read`` / ``write``
+/// Generic lower streams must explicitly opt in to the publishing byte-stream
+/// contract. They are always driven through their ``read`` / ``write``
 /// operations; only the TCP facade may use the raw-descriptor output fast path.
+namespace detail {
+template<typename Lower>
+concept tls_lower_stream =
+    std::same_as<Lower, net::tcp_stream> || net::publishing_byte_stream<Lower>;
+} // namespace detail
+
 template<typename Lower = net::tcp_stream>
+requires detail::tls_lower_stream<Lower>
 class basic_tls_stream {
 public:
+    using byte_stream_contract = net::publishing_byte_stream_contract;
+
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     void set_dispatch_test_hooks(detail::tls_dispatch_test_hooks* hooks) noexcept {
         dispatch_test_hooks_ = hooks;
@@ -562,7 +573,7 @@ public:
 
     /// Interpret a zero-byte read without closing the reverse write direction.
     /// An error return from read is not authenticated EOF, regardless of scope.
-    net::close_scope read_end_scope() const {
+    net::close_scope read_end_scope() const noexcept {
         auto lock = lock_ssl_state();
         return close_.whole ? net::close_scope::whole_session : net::close_scope::write_direction;
     }
@@ -585,6 +596,18 @@ public:
             (void)co_await finish_write_impl({}, timeout, true);
         // Legacy shutdown remains serialized against all public operations.
         handshake_complete_ = false;
+    }
+
+    /// Abort the owned lower chain and settle internal output work.
+    coro::task<void> abort_and_settle() {
+        if (transport_) {
+            transport_->fail(ECANCELED);
+            if constexpr (net::publishing_byte_stream<Lower>) {
+                co_await transport_->lower.abort_and_settle();
+            }
+            co_await transport_->settle_output();
+        }
+        co_return;
     }
     
     /// Get negotiated ALPN protocol
@@ -647,16 +670,16 @@ public:
         externally_shut_down_.store(true, std::memory_order_release);
     }
 
-    /// Convenience: kernel-side ``::shutdown(fd, SHUT_RDWR)`` plus
-    /// ``mark_externally_shut_down()``. Intended for watchdog code that
-    /// needs to interrupt a pending recv on a different thread.
+    /// Convenience abort hook plus ``mark_externally_shut_down()``. TCP lowers
+    /// interrupt the kernel socket; generic lowers use their explicit hook or
+    /// fall back to a transport failure without bypassing the lower protocol.
     void shutdown_socket() noexcept {
         mark_externally_shut_down();
         if (transport_) {
             if constexpr (requires(Lower& stream) { stream.shutdown_socket(); }) {
                 transport_->lower.shutdown_socket();
-            } else if (int descriptor = fd(); descriptor >= 0) {
-                ::shutdown(descriptor, SHUT_RDWR);
+            } else {
+                transport_->fail(ECANCELED);
             }
         }
     }

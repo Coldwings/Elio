@@ -180,7 +180,7 @@ public:
             } else if (result.result > 0) {
                 const int accepted = BIO_write(input, buffer.data(), result.result);
                 if (accepted != result.result) {
-                    output.fail(accepted < 0 && errno > 0 ? errno : EIO);
+                    output.fail(EIO);
                     result = {-output.error(), 0};
                 } else {
                     result = {0, 0};

@@ -153,7 +153,8 @@ coro::task<void> connect_example() {
 `tls_stream` is the TCP convenience facade. The TLS engine itself is available
 as `basic_tls_stream<Lower>` for any move-owned lower stream that provides
 cancellable asynchronous `read(void*, size_t, cancel_token)` and
-`write(const void*, size_t, cancel_token)` operations:
+`write(const void*, size_t, cancel_token)` operations and explicitly satisfies
+`net::publishing_byte_stream`:
 
 ```cpp
 // The lower stream can be a tunnel, buffered channel, or another TLS stream.

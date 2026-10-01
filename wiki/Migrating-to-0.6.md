@@ -81,8 +81,11 @@ Existing direct TCP TLS code can keep using `tls::tls_stream`; it is now the
 TCP facade for `tls::basic_tls_stream<net::tcp_stream>`. Code that wants TLS
 over a tunnel, buffered channel, scripted test stream or another TLS stream can
 instantiate `basic_tls_stream<Lower>` directly, where `Lower` is move-owned and
-provides cancellable `read(void*, size_t, cancel_token)` and
-`write(const void*, size_t, cancel_token)`.
+explicitly satisfies `net::publishing_byte_stream`. In addition to cancellable
+`read(void*, size_t, cancel_token)` and
+`write(const void*, size_t, cancel_token)`, the lower must opt in with
+`publishing_byte_stream_contract` and provide EOF scope, finish, and
+`abort_and_settle()` semantics.
 
 Do not rely on `fd()` to mean "safe to write around the lower stream." The TCP
 facade is the only specialization that may use the raw descriptor output fast

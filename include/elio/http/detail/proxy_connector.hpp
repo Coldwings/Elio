@@ -31,7 +31,7 @@ inline coro::task<client_result<route_connection>> finish_proxy_setup(
     connect_channel lower(std::move(established.as_tcp()), std::move(prefix),
                           profile.limits.max_read_ahead, retirement);
     connect_tls_stream inner(std::move(lower), *plan.snapshot().origin_tls);
-    inner.set_hostname(plan.target().host);
+    inner.set_hostname(proxy_origin_tls_name(plan.target().host));
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     if (auto hook = tls_setup_entered_for_test.load(std::memory_order_acquire)) hook();
 #endif

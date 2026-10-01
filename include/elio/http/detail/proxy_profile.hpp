@@ -11,6 +11,7 @@
 #include <array>
 #include <charconv>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -51,7 +52,32 @@ inline bool valid_proxy_uri_authority(std::string_view source, const url& parsed
     return source.empty() || source.front() != '[' || parsed.host.find(':') != std::string::npos;
 }
 
-inline std::string local_proxy_host(std::string_view host) {
+inline std::optional<char> proxy_unreserved_octet(std::string_view hex) noexcept {
+    if (hex.size() != 2) return std::nullopt;
+    unsigned int octet = 0;
+    const auto* end = hex.data() + hex.size();
+    const auto [parsed, error] = std::from_chars(hex.data(), end, octet, 16);
+    const bool unreserved = (octet >= 'a' && octet <= 'z') ||
+        (octet >= 'A' && octet <= 'Z') || (octet >= '0' && octet <= '9') ||
+        octet == '-' || octet == '.' || octet == '_' || octet == '~';
+    if (error != std::errc{} || parsed != end || !unreserved) return std::nullopt;
+    return static_cast<char>(octet);
+}
+
+inline bool valid_proxy_tls_reference(std::string_view host) noexcept {
+    if (!valid_proxy_host(host) || host.empty() || host.front() == '.') return false;
+    for (size_t pos = 0; pos < host.size(); ++pos) {
+        if (host[pos] != '%') continue;
+        const auto octet = proxy_unreserved_octet(host.substr(pos + 1, 2));
+        // OpenSSL interprets a leading dot as a subdomain reference, not an
+        // exact destination. URI decoding must not widen origin authentication.
+        if (!octet || (pos == 0 && *octet == '.')) return false;
+        pos += 2;
+    }
+    return true;
+}
+
+inline std::string decoded_proxy_host(std::string_view host) {
     std::string decoded;
     decoded.reserve(host.size());
     for (size_t pos = 0; pos < host.size(); ++pos) {
@@ -59,22 +85,23 @@ inline std::string local_proxy_host(std::string_view host) {
             decoded.push_back(host[pos]);
             continue;
         }
-        unsigned int octet = 0;
         if (host.size() - pos < 3)
             throw std::invalid_argument("Invalid encoded proxy hostname");
-        const auto* end = host.data() + pos + 3;
-        const auto [parsed, error] = std::from_chars(host.data() + pos + 1, end, octet, 16);
-        const bool unreserved = (octet >= 'a' && octet <= 'z') ||
-            (octet >= 'A' && octet <= 'Z') || (octet >= '0' && octet <= '9') ||
-            octet == '-' || octet == '.' || octet == '_' || octet == '~';
+        const auto octet = proxy_unreserved_octet(host.substr(pos + 1, 2));
         // Decode once, after URI splitting. Unsupported encoded octets must
         // not create a new delimiter, nested escape, or implicit IDNA policy.
-        if (error != std::errc{} || parsed != end || !unreserved)
+        if (!octet)
             throw std::invalid_argument("Unsupported encoded proxy hostname octet");
-        decoded.push_back(static_cast<char>(octet));
+        decoded.push_back(*octet);
         pos += 2;
     }
     return decoded;
+}
+
+inline std::string proxy_origin_tls_name(std::string_view host) {
+    if (!valid_proxy_tls_reference(host))
+        throw std::invalid_argument("Invalid proxy origin TLS reference name");
+    return normalize_route_host(decoded_proxy_host(host));
 }
 
 struct proxy_profile {
@@ -118,7 +145,7 @@ inline std::shared_ptr<const proxy_profile> freeze_proxy_profile(const http_prox
         !valid_proxy_uri_authority(config.endpoint, *parsed))
         throw std::invalid_argument("HTTP proxy endpoint must be a plain HTTP authority");
     auto profile = std::make_shared<proxy_profile>();
-    profile->endpoint = route_endpoint::from(local_proxy_host(parsed->host), parsed->effective_port());
+    profile->endpoint = route_endpoint::from(decoded_proxy_host(parsed->host), parsed->effective_port());
     profile->limits = config.connect_limits;
     if (config.basic_auth) {
         profile->authorization = proxy_basic_authorization(*config.basic_auth);

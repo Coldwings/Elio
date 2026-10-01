@@ -128,7 +128,13 @@ are rejected before dialing. For the locally resolved proxy endpoint, escapes
 must encode ASCII unreserved octets; they are decoded once before both hop-key
 publication and DNS. Encoded delimiters, nested escapes and non-ASCII octets are
 rejected during construction; use an IDNA ASCII label for an internationalized
-proxy name. Target URI escapes remain unchanged on the proxy wire. IPvFuture
+proxy name. Target URI escapes remain unchanged in CONNECT and HTTP Host/request
+targets on the proxy wire. HTTPS origins use a separate TLS reference name:
+ASCII unreserved escapes are decoded once and the name is case-folded before
+certificate verification/SNI. Unsupported encoded octets and literal or encoded
+leading-dot reference names are rejected before acquisition; use an IDNA ASCII
+label for internationalized origins. This does not change the generic direct
+TLS naming policy. IPvFuture
 and scoped IPv6 zone syntax are not
 supported by the explicit proxy connector: it does not reinterpret or forward
 node-local scope identifiers. Direct route normalization is unchanged.

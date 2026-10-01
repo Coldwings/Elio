@@ -532,6 +532,34 @@ TEST_CASE("Proxy target authority rejects malformed grammar before dialing",
     CHECK(observed.dials == 0);
 }
 
+TEST_CASE("CONNECT rejects unsupported TLS reference names before acquisition",
+          "[http][proxy][routes][origin-reference][issue-1249]") {
+    transport_config config;
+    config.proxy.emplace();
+    config.proxy->endpoint = "http://proxy.example/";
+    config.limits = pool_limits{};
+    auto owner = std::make_shared<transport>(config);
+    client agent(owner);
+    handoff_observation observed;
+    handoff_hooks hooks(observed);
+    for (const auto input : {"https://origin%2Fhost/path", "https://origin%00host/path",
+                             "https://origin%25host/path", "https://origin%5Chost/path",
+                             "https://origin%C3%A9.example/path", "https://.example.com/path",
+                             "https://%2eexample.com/path"}) {
+        CAPTURE(input);
+        auto result = handoff_immediate(agent.get_result(input));
+        const auto* error = std::get_if<client_error>(&result);
+        CHECK(error);
+        if (error) {
+            CHECK(error->code.value() == EINVAL);
+            CHECK(error->stage == client_stage::target);
+        }
+    }
+    CHECK(observed.dials == 0);
+    CHECK(owner->admission_counters_for_test().live == 0);
+    CHECK(owner->admission_counters_for_test().dialing == 0);
+}
+
 TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS output",
           "[http][proxy][routes][review-1249][issue-1249]") {
     elio::tls::tls_context server_context(elio::tls::tls_mode::server);
@@ -879,7 +907,7 @@ TEST_CASE("CONNECT origin trust hostname and unsupported ALPN fail before origin
 }
 
 TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target-bound reuse",
-          "[http][proxy][routes][proxy-endpoint-dns][issue-1249]") {
+          "[http][proxy][routes][proxy-endpoint-dns][origin-reference][issue-1249]") {
     elio::tls::tls_context server_context(elio::tls::tls_mode::server);
     temporary_pem ca;
     install_certificate(server_context, ca);
@@ -912,7 +940,7 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
         client_config request_policy;
         request_policy.read_timeout = std::chrono::seconds(5);
         client agent(owner, request_policy);
-        const auto target = url::parse(secure ? "https://localhost:9443/path" :
+        const auto target = url::parse(secure ? "https://local%68ost:9443/path" :
                                                "http://unresolved-origin.invalid:8081/path");
         REQUIRE(target);
         const auto plan = owner->route_plan_for_test(*target);
@@ -952,8 +980,8 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
             REQUIRE(observed.handshake);
             REQUIRE(observed.sni == "localhost");
             REQUIRE(observed.requests[0].get_method() == method::CONNECT);
-            REQUIRE(observed.requests[0].path() == "localhost:9443");
-            REQUIRE(observed.requests[0].header("Host") == "localhost:9443");
+            REQUIRE(observed.requests[0].path() == "local%68ost:9443");
+            REQUIRE(observed.requests[0].header("Host") == "local%68ost:9443");
             REQUIRE(observed.requests[0].header("Proxy-Authorization") == frozen_authorization);
         }
         for (size_t i = 0; i < 2; ++i) {
@@ -963,7 +991,7 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
             REQUIRE(received.path_with_query() == wanted);
             REQUIRE(received.header("Authorization") == "Bearer origin-secret");
             REQUIRE(received.header("Proxy-Authorization") == (secure ? "" : frozen_authorization));
-            REQUIRE(received.header("Host") == (secure ? "localhost:9443" :
+            REQUIRE(received.header("Host") == (secure ? "local%68ost:9443" :
                                                  "unresolved-origin.invalid:8081"));
         }
         if (finite) REQUIRE(owner->admission_counters_for_test().live == 0);

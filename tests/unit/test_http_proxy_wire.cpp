@@ -58,6 +58,42 @@ TEST_CASE("Proxy authority validation rejects embedded NUL rather than truncatin
     }
 }
 
+TEST_CASE("HTTPS proxy projection rejects unsafe TLS reference names without changing HTTP spelling",
+          "[http][proxy][wire][origin-reference][issue-1249]") {
+    const auto host = GENERATE("origin%2Fhost", "origin%00host", "origin%25host",
+        "origin%5Chost", "origin%C3%A9.example", ".example.com", "%2eexample.com");
+    url target;
+    target.scheme = "https";
+    target.host = host;
+    request req(method::GET, "/path");
+    const auto profile = wire_profile();
+    CHECK_FALSE(detail::request_wire_view::valid_authority(target));
+    CHECK_THROWS_AS(detail::request_wire_view::serialize(req, target,
+        detail::route_mode::connect_tunnel, profile.get()), std::invalid_argument);
+    target.scheme = "http";
+    REQUIRE(detail::request_wire_view::valid_authority(target));
+    CHECK(detail::request_wire_view::serialize(req, target,
+        detail::route_mode::forward_proxy, profile.get()).starts_with(
+            "GET http://" + std::string(host) + "/path HTTP/1.1\r\n"));
+}
+
+TEST_CASE("CONNECT TLS reference decodes unreserved ASCII independently of its wire spelling",
+          "[http][proxy][wire][origin-reference][issue-1249]") {
+    const auto host = GENERATE("local%68ost", "%4COcALhost", "local%68%6fst");
+    url target;
+    target.scheme = "https";
+    target.host = host;
+    request req(method::GET, "/path");
+    req.set_host(target.host_authority());
+    const auto profile = wire_profile();
+    REQUIRE(detail::request_wire_view::valid_authority(target));
+    CHECK(detail::proxy_origin_tls_name(host) == "localhost");
+    const auto wire = detail::request_wire_view::serialize(req, target,
+        detail::route_mode::connect_tunnel, profile.get());
+    CHECK(wire.starts_with("GET /path HTTP/1.1\r\n"));
+    CHECK(wire.find("Host: " + target.host_authority() + "\r\n") != std::string::npos);
+}
+
 TEST_CASE("HTTP forwarding projects absolute form without URI or generic hop secrets",
           "[http][proxy][wire][issue-1249]") {
     const auto parsed = url::parse("http://uri-user:uri-secret@[2001:db8::1]:8081/path?q=1#secret-fragment");

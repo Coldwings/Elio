@@ -89,6 +89,12 @@ public:
     /// Per-acquisition snapshot; an explicit null domain selects the shared
     /// resolver default instead of retaining a constructor-time custom domain.
     struct dns_options {
+        dns_options() = default;
+
+        dns_options(std::chrono::nanoseconds timeout_value,
+                    std::shared_ptr<net::resolve_domain> domain_value = {}) noexcept
+            : timeout(timeout_value), domain(std::move(domain_value)) {}
+
         std::chrono::nanoseconds timeout{0};
         std::shared_ptr<net::resolve_domain> domain{};
     };

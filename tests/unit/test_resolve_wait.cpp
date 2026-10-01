@@ -16,6 +16,7 @@
 #include "../test_main.cpp"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -423,6 +424,96 @@ TEST_CASE("public DNS worker-side pool teardown rejects inline libc dispatch",
 }
 
 #if defined(ELIO_HAS_HTTP) && ELIO_HAS_HTTP
+TEST_CASE("HTTP connection pool DNS override snapshots survive direct co_await calls",
+          "[dns][resolve_wait][public][client][http][lifetime][regression]") {
+    STATIC_REQUIRE(!std::is_aggregate_v<elio::http::connection_pool::dns_options>);
+    scheduler sched(1);
+    lookup_control lookup;
+    lookup_guard guard(lookup, [&] { sched.shutdown(); });
+    auto domain = std::make_shared<elio::net::resolve_domain>(0);
+    sched.start();
+    auto observer = sched.go_joinable([domain]() -> task<long> {
+        elio::http::client_config config;
+        config.resolve_options.use_cache = false;
+        elio::http::connection_pool pool(config);
+        auto result = co_await pool.acquire_result("direct-snapshot.example", 80, false,
+            nullptr, std::chrono::nanoseconds::zero(), {},
+            elio::http::connection_pool::dns_options{
+                std::chrono::nanoseconds::zero(), domain});
+        const auto* error = std::get_if<elio::http::client_error>(&result);
+        if (!error || error->stage != elio::http::client_stage::resolve ||
+            error->code.value() != EAGAIN) {
+            co_return -1;
+        }
+        co_return domain.use_count();
+    });
+    REQUIRE(wait_for([&] { return observer.await_ready(); }));
+    REQUIRE(observer.await_resume() == 2);
+    observer.wait_destroyed();
+    REQUIRE(domain.use_count() == 1);
+    REQUIRE(domain->outstanding() == 0);
+    REQUIRE(lookup.calls.load() == 0);
+}
+
+TEST_CASE("HTTP connection pool direct DNS override branches keep constructor and null-domain semantics",
+          "[dns][resolve_wait][public][client][http][configuration][regression]") {
+    const int method = GENERATE(0, 1);
+    const int override_mode = GENERATE(0, 1);
+    scheduler sched(2);
+    lookup_control lookup;
+    lookup.lookup_error = ENETUNREACH;
+    lookup_guard guard(lookup, [&] { sched.shutdown(); }, true);
+    auto domain = std::make_shared<elio::net::resolve_domain>(1);
+    if (override_mode == 1) release_flag(lookup.release);
+    sched.start();
+    auto observer = sched.go_joinable([domain, method, override_mode]() -> task<int> {
+        elio::http::client_config config;
+        config.resolve_options.use_cache = false;
+        config.dns_domain = domain;
+        config.dns_timeout = std::chrono::hours(1);
+        elio::http::connection_pool pool(config);
+        if (method == 0) {
+            if (override_mode == 0) {
+                auto result = co_await pool.acquire_result("direct-override.example", 80, false);
+                const auto* error = std::get_if<elio::http::client_error>(&result);
+                if (!error || error->stage != elio::http::client_stage::resolve) co_return 0;
+                co_return error->code.value();
+            }
+            auto result = co_await pool.acquire_result("direct-override.example", 80, false,
+                nullptr, std::chrono::nanoseconds::zero(), {},
+                elio::http::connection_pool::dns_options{});
+            const auto* error = std::get_if<elio::http::client_error>(&result);
+            if (!error || error->stage != elio::http::client_stage::resolve) co_return 0;
+            co_return error->code.value();
+        }
+        errno = 0;
+        std::optional<elio::http::connection> conn;
+        if (override_mode == 0) {
+            conn = co_await pool.acquire("direct-override.example", 80, false);
+        } else {
+            conn = co_await pool.acquire("direct-override.example", 80, false,
+                nullptr, std::chrono::nanoseconds::zero(), {},
+                elio::http::connection_pool::dns_options{});
+        }
+        if (conn) co_return 0;
+        co_return errno;
+    });
+    REQUIRE(wait_for([&] { return lookup.entered.load(std::memory_order_acquire); }));
+    if (override_mode == 0) {
+        REQUIRE(wait_for([&] { return lookup.timer_entered.load(std::memory_order_acquire); }));
+        lookup.expire.set();
+    }
+    REQUIRE(wait_for([&] { return observer.await_ready(); }));
+    REQUIRE(observer.await_resume() == (override_mode == 0 ? ETIMEDOUT : ENETUNREACH));
+    observer.wait_destroyed();
+    REQUIRE(lookup.calls.load() == 1);
+    REQUIRE(lookup.timer_entered.load(std::memory_order_acquire) == (override_mode == 0));
+    REQUIRE(domain->outstanding() == (override_mode == 0 ? 1 : 0));
+    release_flag(lookup.release);
+    sched.shutdown();
+    REQUIRE(domain->outstanding() == 0);
+}
+
 TEST_CASE("HTTP DNS admission reflects accessor updates including clearing a custom domain",
           "[dns][resolve_wait][public][client][http][configuration][regression]") {
     const int update = GENERATE(0, 1, 2);

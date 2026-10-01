@@ -229,6 +229,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TLS numeric peer identity**: IPv4/IPv6 references now match IP-address SANs
+  rather than DNS SANs/Common Names and do not send numeric SNI. Replacing the
+  reference clears the previous DNS/IP type. Identity-setup errors fail closed;
+  explicit empty-reference clearing remains supported. Numeric deployments
+  using textual-IP DNS certificates must migrate to IP SANs (#1270).
+
 - **Standalone WebSocket client header**: move the unchanged connection-state
   enum to a shared header included by both endpoints. Client/server headers
   now compile independently and in either order; the public type and values

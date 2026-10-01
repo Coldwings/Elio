@@ -86,6 +86,24 @@ ctx.load_verify_locations("/path/to/ca-bundle.crt", "/etc/ssl/certs/");
 ctx.use_default_verify_paths();
 ```
 
+### Peer Reference Identity
+
+Call `stream.set_hostname(reference)` before the handshake when wrapping a
+connection yourself. DNS names select DNS certificate matching and DNS SNI.
+Unbracketed numeric IPv4/IPv6 addresses select only IP-address SAN matching and
+do not send SNI. A numeric DNS SAN or Common Name is not a substitute for an IP
+SAN. `tls_connect()` and the HTTP clients select the reference from the target.
+Changing a reference replaces the previous DNS/IP identity; an empty reference
+preserves the legacy explicit clearing behavior (trust-chain verification alone
+is not endpoint authentication). Embedded NUL is rejected, and native identity
+configuration failure throws and makes that TLS session terminal.
+
+Callers still select the destination and trust/verification policy, provide DNS
+names in IDNA ASCII-label form, and serialize reference changes with the
+handshake and all public stream operations. URI decoding belongs to the URI
+consumer, not this generic TLS setter. Numeric deployments should migrate any
+textual-IP DNS certificates to certificates with the appropriate IP SAN.
+
 ## Client Certificates (Mutual TLS)
 
 For mutual TLS authentication:

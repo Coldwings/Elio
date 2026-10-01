@@ -16,6 +16,7 @@
 #include <openssl/err.h>
 
 #include <sys/socket.h>
+#include <arpa/inet.h>
 
 #include <algorithm>
 #include <atomic>
@@ -223,16 +224,39 @@ public:
         return *this;
     }
 
-    /// Set SNI hostname (for client connections)
+    /// Select the peer reference: DNS names use SNI; numeric IPs match IP SANs.
     void set_hostname(std::string_view hostname) {
-        hostname_ = std::string(hostname);
-        auto lock = lock_ssl_state();
-        // Set SNI extension
-        SSL_set_tlsext_host_name(ssl_, hostname_.c_str());
-
-        // Configure hostname verification for OpenSSL 1.1.0+
-        X509_VERIFY_PARAM* param = SSL_get0_param(ssl_);
-        X509_VERIFY_PARAM_set1_host(param, hostname_.c_str(), hostname_.size());
+        if (hostname.find('\0') != std::string_view::npos) {
+            transport_->fail(EINVAL);
+            throw std::invalid_argument("TLS peer reference contains NUL");
+        }
+        std::string name(hostname);
+        std::array<unsigned char, 16> address{};
+        size_t address_size = 0;
+        if (::inet_pton(AF_INET, name.c_str(), address.data()) == 1) address_size = 4;
+        else if (::inet_pton(AF_INET6, name.c_str(), address.data()) == 1) address_size = 16;
+        bool configured;
+        {
+            auto lock = lock_ssl_state();
+            auto* param = SSL_get0_param(ssl_);
+            // A replaced reference must not keep the opposite identity type.
+            if (address_size) {
+                configured = X509_VERIFY_PARAM_set1_host(param, nullptr, 0) == 1 &&
+                    X509_VERIFY_PARAM_set1_ip(param, address.data(), address_size) == 1 &&
+                    SSL_set_tlsext_host_name(ssl_, nullptr) == 1;
+            } else {
+                const char* sni = name.empty() ? nullptr : name.c_str();
+                configured = X509_VERIFY_PARAM_set1_ip(param, nullptr, 0) == 1 &&
+                    X509_VERIFY_PARAM_set1_host(param, name.data(), name.size()) == 1 &&
+                    SSL_set_tlsext_host_name(ssl_, sni) == 1;
+            }
+            if (configured) hostname_ = std::move(name);
+        }
+        if (!configured) {
+            // Never permit a handshake after partial/failed identity setup.
+            transport_->fail(EIO);
+            throw std::runtime_error("Failed to configure TLS peer reference");
+        }
     }
     
     /// Perform the local TLS handshake; the owned output pump also drives

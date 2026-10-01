@@ -212,10 +212,15 @@ TEST_CASE("HTTP pool compares complete route keys under deliberate hash collisio
     auto miss = immediate(pool.acquire_plan_for_test(absent, stopped.get_token()));
     REQUIRE(std::holds_alternative<client_error>(miss));
     REQUIRE(std::get<client_error>(miss).code.value() == ECANCELED);
-    auto two_result = immediate(pool.acquire_plan_for_test(second, stopped.get_token()));
+    // Transport acquisition checks cancellation even for an idle match; the
+    // public standalone legacy adapter below retains its historical behavior.
+    auto stopped_match = immediate(pool.acquire_plan_for_test(second, stopped.get_token()));
+    REQUIRE(std::holds_alternative<client_error>(stopped_match));
+    REQUIRE(std::get<client_error>(stopped_match).code.value() == ECANCELED);
+    auto two_result = immediate(pool.acquire_plan_for_test(second));
     REQUIRE(std::holds_alternative<connection>(two_result));
     REQUIRE(std::get<connection>(two_result).fd() == two_fd);
-    auto one_result = immediate(pool.acquire_plan_for_test(first, stopped.get_token()));
+    auto one_result = immediate(pool.acquire_plan_for_test(first));
     REQUIRE(std::holds_alternative<connection>(one_result));
     REQUIRE(std::get<connection>(one_result).fd() == one_fd);
     auto isolated = immediate(pool.acquire_plan_for_test(first, stopped.get_token()));

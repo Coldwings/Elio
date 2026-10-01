@@ -46,6 +46,9 @@ using route_connect_hook = coro::task<client_result<net::stream>> (*)(
 inline std::atomic<route_connect_hook> route_connect_for_test{nullptr};
 using route_deadline_hook = void (*)(std::optional<std::chrono::steady_clock::time_point>);
 inline std::atomic<route_deadline_hook> route_deadline_for_test{nullptr};
+using acquisition_now_hook = std::chrono::steady_clock::time_point (*)() noexcept;
+inline std::atomic<acquisition_now_hook> acquisition_now_for_test{nullptr};
+inline std::atomic<void(*)()> idle_taken_for_test{nullptr};
 using lease_disposition_hook = void (*)(int, bool);
 inline std::atomic<lease_disposition_hook> lease_disposition_for_test{nullptr};
 using lease_return_hook = void (*)();
@@ -68,6 +71,15 @@ using response_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
 inline std::atomic<response_watchdog_wait_hook> response_watchdog_wait_for_test{nullptr};
 } // namespace detail
 #endif
+
+namespace detail {
+inline std::chrono::steady_clock::time_point acquisition_now() noexcept {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (auto hook = acquisition_now_for_test.load(std::memory_order_acquire)) return hook();
+#endif
+    return std::chrono::steady_clock::now();
+}
+} // namespace detail
 
 /// HTTP client configuration
 struct client_config : base_client_config {
@@ -349,9 +361,18 @@ private:
             std::optional<std::chrono::steady_clock::time_point> deadline = {}) {
         if (token.is_cancelled())
             co_return detail::make_client_error(ECANCELED, client_stage::acquire);
-        if (deadline && *deadline <= std::chrono::steady_clock::now())
+        if (deadline && *deadline <= detail::acquisition_now())
             co_return detail::make_client_error(ETIMEDOUT, client_stage::acquire);
-        if (auto conn = take_idle(plan.key())) co_return std::move(*conn);
+        if (auto conn = take_idle(plan.key())) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::idle_taken_for_test.load(std::memory_order_acquire)) hook();
+#endif
+            if (token.is_cancelled())
+                co_return detail::make_client_error(ECANCELED, client_stage::acquire);
+            if (deadline && *deadline <= detail::acquisition_now())
+                co_return detail::make_client_error(ETIMEDOUT, client_stage::acquire);
+            co_return std::move(*conn);
+        }
         co_return co_await connect_plan(std::move(plan), connect_timeout, std::move(token), deadline);
     }
 
@@ -685,7 +706,7 @@ private:
         if (!lease) co_return detail::make_client_error(ESHUTDOWN, client_stage::acquire);
         std::optional<std::chrono::steady_clock::time_point> deadline;
         if (owner->config.acquisition_timeout.count() > 0) {
-            const auto now = std::chrono::steady_clock::now();
+            const auto now = detail::acquisition_now();
             const auto remaining = std::chrono::steady_clock::time_point::max() - now;
             deadline = owner->config.acquisition_timeout >= remaining
                 ? std::chrono::steady_clock::time_point::max()
@@ -699,7 +720,7 @@ private:
             capacity = std::move(granted.capacity);
             if (token.is_cancelled())
                 co_return detail::make_client_error(ECANCELED, client_stage::acquire);
-            if (deadline && *deadline <= std::chrono::steady_clock::now())
+            if (deadline && *deadline <= detail::acquisition_now())
                 co_return detail::make_client_error(ETIMEDOUT, client_stage::acquire);
             if (granted.idle)
                 co_return connection_lease(std::move(*lease), std::move(plan),

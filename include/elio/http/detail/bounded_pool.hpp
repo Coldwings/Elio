@@ -19,6 +19,7 @@ namespace elio::http::detail {
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 inline std::atomic<void(*)()> pool_waiter_queued_for_test{nullptr};
+inline std::atomic<void(*)()> pool_waiter_notified_for_test{nullptr};
 #endif
 
 template<typename Stream>
@@ -93,6 +94,9 @@ public:
                 auto node = std::move(notifications);
                 notifications = std::move(node->next_notification);
                 node->ready->set_value();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (auto hook = pool_waiter_notified_for_test.load(std::memory_order_acquire)) hook();
+#endif
             }
         }
         bool retained = false;

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <latch>
+#include <fcntl.h>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -208,6 +209,68 @@ struct backend_guard {
     explicit backend_guard(elio::io::io_context::backend_type value)
         : old(elio::runtime::detail::worker_io_backend_for_test.exchange(value)) {}
     ~backend_guard() { elio::runtime::detail::worker_io_backend_for_test.store(old); }
+};
+
+struct idle_departure_observation {
+    elio::coro::cancel_source stop;
+    std::chrono::steady_clock::time_point initial = std::chrono::steady_clock::now();
+    bool expire = false;
+    bool taken = false;
+};
+std::atomic<idle_departure_observation*> observing_idle_departure{nullptr};
+std::chrono::steady_clock::time_point idle_clock() noexcept {
+    auto& observed = *observing_idle_departure.load();
+    return observed.initial + std::chrono::seconds(observed.taken && observed.expire ? 61 : 0);
+}
+void leave_during_idle_take() {
+    auto& observed = *observing_idle_departure.load();
+    observed.taken = true;
+    if (!observed.expire) observed.stop.cancel();
+}
+struct idle_departure_guard {
+    explicit idle_departure_guard(idle_departure_observation& value) {
+        observing_idle_departure.store(&value);
+        detail::acquisition_now_for_test.store(idle_clock);
+        detail::idle_taken_for_test.store(leave_during_idle_take);
+    }
+    ~idle_departure_guard() {
+        detail::idle_taken_for_test.store(nullptr);
+        detail::acquisition_now_for_test.store(nullptr);
+        observing_idle_departure.store(nullptr);
+    }
+};
+
+std::atomic<elio::coro::cancel_source*> cancel_selected_grant{nullptr};
+void selected_grant_cancel() { cancel_selected_grant.load()->cancel(); }
+struct selected_cancel_guard {
+    explicit selected_cancel_guard(elio::coro::cancel_source& stop) {
+        cancel_selected_grant.store(&stop);
+        detail::pool_waiter_notified_for_test.store(selected_grant_cancel);
+    }
+    ~selected_cancel_guard() {
+        detail::pool_waiter_notified_for_test.store(nullptr);
+        cancel_selected_grant.store(nullptr);
+    }
+};
+
+struct tls_setup_observation {
+    elio::sync::event entered;
+};
+std::atomic<tls_setup_observation*> observing_tls_setup{nullptr};
+void tls_entered() { observing_tls_setup.load()->entered.set(); }
+struct setup_clock_guard {
+    setup_clock_guard(timer_observation& timer, tls_setup_observation& tls) {
+        observing_timer.store(&timer);
+        observing_tls_setup.store(&tls);
+        detail::setup_watchdog_wait_for_test.store(controlled_timer);
+        detail::tls_setup_entered_for_test.store(tls_entered);
+    }
+    ~setup_clock_guard() {
+        detail::tls_setup_entered_for_test.store(nullptr);
+        detail::setup_watchdog_wait_for_test.store(nullptr);
+        observing_tls_setup.store(nullptr);
+        observing_timer.store(nullptr);
+    }
 };
 
 template<typename F>
@@ -683,4 +746,128 @@ TEST_CASE("HTTP Transport dial failure and exception return reserved permits exa
     CHECK(owner.admission_counters_for_test().dialing == 0);
     CHECK(owner.admission_counters_for_test().routes == 0);
     CHECK(immediate(owner.shutdown()) == elio::coro::cancel_result::completed);
+}
+
+TEST_CASE("HTTP legacy idle delivery rechecks cancellation and the absolute acquisition clock",
+          "[http][pool][issue-1248]") {
+    const bool expire = GENERATE(false, true);
+    transport_config config;
+    config.acquisition_timeout = std::chrono::seconds(60);
+    transport owner(config);
+    transport_dials dials;
+    socket_pair pair(dials);
+    transport_dial_guard connector(dials);
+    const auto target = *url::parse("http://one.invalid/");
+    auto warm = immediate(owner.acquire_lease_for_test(target));
+    REQUIRE(std::holds_alternative<transport::connection_lease_for_test>(warm));
+    const int descriptor = std::get<transport::connection_lease_for_test>(warm).stream().fd();
+    transport::return_lease_for_test(std::get<transport::connection_lease_for_test>(warm));
+    idle_departure_observation observed;
+    observed.expire = expire;
+    {
+        idle_departure_guard departure(observed);
+        auto result = immediate(owner.acquire_lease_for_test(target, observed.stop.get_token()));
+        REQUIRE(observed.taken);
+        REQUIRE(std::holds_alternative<client_error>(result));
+        CHECK(std::get<client_error>(result).code.value() == (expire ? ETIMEDOUT : ECANCELED));
+        CHECK(std::get<client_error>(result).stage == client_stage::acquire);
+    }
+    CHECK(dials.calls == 1);
+    CHECK(::fcntl(descriptor, F_GETFD) == -1);
+    CHECK(immediate(owner.shutdown()) == elio::coro::cancel_result::completed);
+}
+
+TEST_CASE("HTTP Transport retires cancellation after selected idle or dial handoff before use",
+          "[http][pool][issue-1248]") {
+    const bool idle = GENERATE(false, true);
+    transport_config config;
+    config.limits = pool_limits{};
+    config.limits->max_live_total = 1;
+    transport owner(config);
+    transport_dials dials;
+    socket_pair pair(dials);
+    transport_dial_guard connector(dials);
+    queue_observation queue;
+    queue_guard queued(queue);
+    run([&]() -> task<void> {
+        const auto target = *url::parse("http://one.invalid/");
+        auto first_result = co_await owner.acquire_lease_for_test(target);
+        REQUIRE(std::holds_alternative<transport::connection_lease_for_test>(first_result));
+        auto& first = std::get<transport::connection_lease_for_test>(first_result);
+        const int descriptor = first.stream().fd();
+        elio::coro::cancel_source stop;
+        auto waiting = elio::runtime::scheduler::current()->go_joinable([&]() {
+            return owner.acquire_lease_for_test(target, stop.get_token());
+        });
+        co_await queue.queued.wait();
+        {
+            selected_cancel_guard after_grant(stop);
+            if (idle) transport::return_lease_for_test(first);
+            else first.retire();
+            auto result = co_await waiting;
+            co_await waiting.wait_destroyed_async();
+            REQUIRE(std::holds_alternative<client_error>(result));
+            CHECK(std::get<client_error>(result).code.value() == ECANCELED);
+            CHECK(std::get<client_error>(result).stage == client_stage::acquire);
+        }
+        CHECK(dials.calls == 1);
+        CHECK(::fcntl(descriptor, F_GETFD) == -1);
+        CHECK(owner.admission_counters_for_test().live == 0);
+        CHECK(owner.admission_counters_for_test().dialing == 0);
+        CHECK(owner.admission_counters_for_test().waiting == 0);
+        CHECK(owner.admission_counters_for_test().routes == 0);
+        CHECK(co_await owner.shutdown() == elio::coro::cancel_result::completed);
+    });
+}
+
+TEST_CASE("HTTP real TCP plus pending TLS setup intersects acquisition and connect deadlines",
+          "[http][pool][tls][issue-1248]") {
+    const auto backend = GENERATE(elio::io::io_context::backend_type::epoll,
+                                 elio::io::io_context::backend_type::io_uring);
+#if ELIO_HAS_IO_URING
+    if (backend == elio::io::io_context::backend_type::io_uring &&
+        !elio::io::io_uring_backend::is_available()) SKIP("io_uring unavailable");
+#else
+    if (backend == elio::io::io_context::backend_type::io_uring) SKIP("io_uring not compiled");
+#endif
+    const bool connect_cap_first = GENERATE(false, true);
+    backend_guard restore(backend);
+    timer_observation timer;
+    tls_setup_observation tls;
+    setup_clock_guard clock(timer, tls);
+    auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    elio::tls::tls_context context(elio::tls::tls_mode::client);
+    context.set_verify_mode(elio::tls::verify_mode::none);
+    elio::sync::event accepted;
+    elio::sync::event release_peer;
+    run([&]() -> task<void> {
+        auto* scheduler = elio::runtime::scheduler::current();
+        auto server = scheduler->go_joinable([&]() -> task<void> {
+            auto peer = co_await listener->accept();
+            if (!peer) throw std::runtime_error("setup fixture accept failed");
+            accepted.set();
+            co_await release_peer.wait();
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        const auto connect_cap = std::chrono::seconds(connect_cap_first ? 10 : 120);
+        auto connecting = scheduler->go_joinable([&]() -> task<client_result<connection>> {
+            co_return co_await client_connect_result("127.0.0.1", listener->local_address().port(),
+                true, &context, {}, false, connect_cap, {}, {}, {}, deadline);
+        });
+        co_await accepted.wait();
+        co_await tls.entered.wait();
+        co_await timer.entered.wait();
+        if (connect_cap_first) CHECK(timer.deadline < deadline);
+        else CHECK(timer.deadline == deadline);
+        timer.expire.set();
+        auto result = co_await connecting;
+        co_await connecting.wait_destroyed_async();
+        release_peer.set();
+        co_await server;
+        co_await server.wait_destroyed_async();
+        REQUIRE(std::holds_alternative<client_error>(result));
+        CHECK(std::get<client_error>(result).code.value() == ETIMEDOUT);
+        CHECK(std::get<client_error>(result).stage == client_stage::tls);
+    });
 }

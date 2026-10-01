@@ -48,6 +48,10 @@ using fd_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
     std::chrono::nanoseconds, coro::cancel_token);
 inline std::atomic<fd_watchdog_wait_hook> fd_watchdog_wait_for_test{nullptr};
 inline std::atomic<size_t> fd_watchdog_shutdowns_for_test{0};
+using setup_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
+    std::chrono::steady_clock::time_point, coro::cancel_token);
+inline std::atomic<setup_watchdog_wait_hook> setup_watchdog_wait_for_test{nullptr};
+inline std::atomic<void(*)()> tls_setup_entered_for_test{nullptr};
 
 inline void arm_client_response_read_observer_for_test() noexcept {
     if (observe_client_response_read_entry_for_test.load(
@@ -337,8 +341,14 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
              timer_source = timer_cancel_src,
              op_source = op_cancel_src,
              flag = timed_out]() -> coro::task<void> {
-                auto r = co_await elio::time::sleep_for(
-                    deadline - std::chrono::steady_clock::now(), timer_source->get_token());
+                coro::cancel_result r;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (auto hook = detail::setup_watchdog_wait_for_test.load(std::memory_order_acquire))
+                    r = co_await hook(deadline, timer_source->get_token());
+                else
+#endif
+                    r = co_await elio::time::sleep_for(
+                        deadline - std::chrono::steady_clock::now(), timer_source->get_token());
                 if (r == coro::cancel_result::completed) {
                     flag->store(true, std::memory_order_release);
                     op_source->cancel();
@@ -395,6 +405,9 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
 
             tls::tls_stream tls_stream(std::move(*tcp), *tls_ctx);
             tls_stream.set_hostname(host);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::tls_setup_entered_for_test.load(std::memory_order_acquire)) hook();
+#endif
             auto hs = co_await tls_stream.handshake(op_cancel_src->get_token());
             const int tls_error = hs ? 0 : (errno ? errno : EIO);
             if (auto error = stopped_error(client_stage::tls)) {

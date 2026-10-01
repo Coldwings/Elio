@@ -68,11 +68,17 @@ certificate store, or published context reference that can be retained after
 publication. If resolver, DNS, TLS verification, or
 pooling policy changes, create a new transport and move new clients to it; do
 not expect existing idle or in-flight connections to migrate across policy
-domains. `transport::clear()` drops idle pooled connections only.
+domains. `transport::clear()` drops idle pooled connections and invalidates
+returns from pre-clear leases without interrupting their current I/O; new work
+can still acquire. This strengthens clear's pool boundary, not its cancellation
+or frame-destruction guarantees.
 `co_await transport::shutdown()` closes the transport to new acquisitions, drops
 idle connections, and waits for client-managed active exchanges to settle.
 Route identities are now internal immutable plans shared by connection setup
-and pooling. Explicit external leases, proxy connectors, and global admission
+and pooling. Buffered and scoped streaming exchanges use an internal move-only
+lease that retains the original state owner and defaults to abort/retirement.
+Only validated completion returns it; destruction never drains or reuses an
+unfinished body. Explicit external leases, proxy connectors, and global admission
 remain separate follow-up features; raw transport acquire/release is not public
 API in 0.6. Existing standalone `connection_pool` signatures remain adapters in
 a separate identity namespace. They still require the original return authority
@@ -80,8 +86,8 @@ and a stable caller-owned TLS/DNS policy. Settle all old operations and dispose
 of checked-out connections before clearing for a policy change; clearing alone
 does not prevent late returns. Alternatively, use a fresh pool and keep the old
 pool/context alive and unchanged for old operations/returns. Prefer a shared
-Transport for automatic security-domain
-isolation. See [HTTP routing and reuse](HTTP-Routing.md).
+Transport for automatic security-domain isolation and route-bound disposition.
+See [HTTP routing and reuse](HTTP-Routing.md).
 
 ## Generic TLS Stream Core
 

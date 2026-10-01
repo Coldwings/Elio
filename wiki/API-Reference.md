@@ -3057,8 +3057,10 @@ kind of copied value snapshot after publication. This is a breaking HTTP/1
 client migration from the previous mutable accessor; WebSocket, SSE, and HTTP/2
 keep their mutable per-client TLS context APIs.
 
-`transport::clear()` drops idle pooled connections. Active or dialing operations
-continue normally. `transport::shutdown()` marks the transport closed, drops idle
+`transport::clear()` drops idle pooled connections and invalidates returns from
+pre-clear leases. Active or dialing operations continue normally, then retire
+instead of returning to that pool generation. New acquisitions remain allowed.
+`transport::shutdown()` marks the transport closed, drops idle
 connections, rejects new acquisitions with `ESHUTDOWN`, and asynchronously waits
 for client-managed dialing/acquired exchanges to settle. It does not destroy
 caller coroutine frames or abort already active exchanges; callers still keep
@@ -3066,6 +3068,10 @@ the client, transport, request/URL objects, caches, and borrowed strings alive
 until awaited return.
 Transport acquisition/release is intentionally client-managed in this release;
 raw external leases and cross-transport connection injection are not public API.
+Internally a move-only lease retains the original route and strong state owner,
+returns at most once only after the exchange proves safe completion, and otherwise
+aborts/disconnects. Destruction does not asynchronously drain or mark a partial
+response reusable. Both buffered and scoped streaming exchanges use this owner.
 
 HTTP/1 connection establishment and idle pooling now consume one internal
 immutable route plan per exchange. Its structured key compares normalized

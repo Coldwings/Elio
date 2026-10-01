@@ -21,6 +21,8 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <concepts>
+#include <cstring>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -28,6 +30,8 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <type_traits>
+#include <utility>
 
 namespace elio::tls {
 
@@ -75,7 +79,9 @@ struct tls_stream_options {
     std::chrono::milliseconds session_close_timeout{5000};
 };
 
-/// TLS stream wrapping a TCP connection with SSL/TLS encryption
+/// TLS stream wrapping an async byte stream with SSL/TLS encryption.
+/// ``tls_stream`` remains the TCP facade alias for
+/// ``basic_tls_stream<net::tcp_stream>``.
 ///
 /// **Thread safety:** after handshake, one reader and one writer may overlap.
 /// SSL dispatch and pending-write retry ownership are serialized internally.
@@ -87,7 +93,10 @@ struct tls_stream_options {
 /// await its I/O leases. Destruction requests abort, never asynchronous normal
 /// finalization; transport ownership survives outstanding internal cleanup.
 /// Cancellation does not authorize destruction of active public task frames.
-class tls_stream {
+/// Generic lower streams are always driven through their ``read`` / ``write``
+/// operations; only the TCP facade may use the raw-descriptor output fast path.
+template<typename Lower = net::tcp_stream>
+class basic_tls_stream {
 public:
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     void set_dispatch_test_hooks(detail::tls_dispatch_test_hooks* hooks) noexcept {
@@ -117,36 +126,39 @@ public:
                 transport_->output.drained_bytes()};
     }
 #endif
-    /// Create a TLS stream from an existing TCP stream
-    /// @param tcp The underlying TCP stream (takes ownership)
+    /// Create a TLS stream from an existing async byte stream
+    /// @param lower The underlying byte stream (takes ownership)
     /// @param ctx TLS context to use
-    tls_stream(net::tcp_stream tcp, tls_context& ctx, tls_stream_options options = {})
-        : transport_(std::make_shared<detail::tls_transport>(
-              std::move(tcp), options.ciphertext_budget)) {
+    basic_tls_stream(Lower lower, tls_context& ctx, tls_stream_options options = {})
+        : transport_(make_transport(std::move(lower), options.ciphertext_budget)) {
         session_close_timeout_ = options.session_close_timeout;
         ssl_ = SSL_new(ctx.native_handle());
         if (!ssl_) throw std::runtime_error("Failed to create SSL object");
-        if (SSL_set_fd(ssl_, transport_->tcp.fd()) != 1) {
+        BIO* input = BIO_new(BIO_s_mem());
+        if (!input) {
             SSL_free(std::exchange(ssl_, nullptr));
             throw std::runtime_error("Failed to attach TLS input");
         }
+        BIO_set_mem_eof_return(input, -1);
         BIO* output = transport_->output.make_bio();
         if (!output) {
+            BIO_free(input);
             SSL_free(std::exchange(ssl_, nullptr));
             throw std::bad_alloc();
         }
-        SSL_set0_wbio(ssl_, output);
+        transport_->input = input;
+        SSL_set_bio(ssl_, input, output);
         SSL_set_mode(ssl_, SSL_MODE_ENABLE_PARTIAL_WRITE);
         mode_ = ctx.mode();
         if (mode_ == tls_mode::client) SSL_set_connect_state(ssl_);
         else SSL_set_accept_state(ssl_);
     }
 
-    ~tls_stream() { release_ssl(); }
-    tls_stream(const tls_stream&) = delete;
-    tls_stream& operator=(const tls_stream&) = delete;
+    ~basic_tls_stream() { release_ssl(); }
+    basic_tls_stream(const basic_tls_stream&) = delete;
+    basic_tls_stream& operator=(const basic_tls_stream&) = delete;
 
-    tls_stream(tls_stream&& other) noexcept
+    basic_tls_stream(basic_tls_stream&& other) noexcept
         : transport_(std::move(other.transport_))
         , ssl_(std::exchange(other.ssl_, nullptr))
         , write_retry_exclusive_(std::exchange(other.write_retry_exclusive_, false))
@@ -159,7 +171,7 @@ public:
         , externally_shut_down_(other.externally_shut_down_.load(std::memory_order_acquire))
         , hostname_(std::move(other.hostname_)) {}
 
-    tls_stream& operator=(tls_stream&& other) noexcept {
+    basic_tls_stream& operator=(basic_tls_stream&& other) noexcept {
         if (this != &other) {
             release_ssl();
             transport_ = std::move(other.transport_);
@@ -599,12 +611,19 @@ public:
         return SSL_get_cipher_name(ssl_);
     }
     
-    /// Get underlying file descriptor
-    int fd() const noexcept { return transport_ ? transport_->tcp.fd() : -1; }
+    /// Get underlying file descriptor when the lower stream exposes one.
+    int fd() const noexcept {
+        if (!transport_) return -1;
+        if constexpr (requires(const Lower& stream) { stream.fd(); }) {
+            return transport_->lower.fd();
+        } else {
+            return -1;
+        }
+    }
 
     /// Get underlying TCP stream (const)
-    const net::tcp_stream& tcp() const noexcept {
-        if (transport_) return transport_->tcp;
+    const net::tcp_stream& tcp() const noexcept requires std::same_as<Lower, net::tcp_stream> {
+        if (transport_) return transport_->lower;
         static const net::tcp_stream disconnected(-1);
         return disconnected;
     }
@@ -633,8 +652,12 @@ public:
     /// needs to interrupt a pending recv on a different thread.
     void shutdown_socket() noexcept {
         mark_externally_shut_down();
-        if (int descriptor = fd(); descriptor >= 0) {
-            ::shutdown(descriptor, SHUT_RDWR);
+        if (transport_) {
+            if constexpr (requires(Lower& stream) { stream.shutdown_socket(); }) {
+                transport_->lower.shutdown_socket();
+            } else if (int descriptor = fd(); descriptor >= 0) {
+                ::shutdown(descriptor, SHUT_RDWR);
+            }
         }
     }
     
@@ -651,6 +674,21 @@ public:
     }
     
 private:
+    static int direct_output_fd(const Lower& lower) noexcept {
+        if constexpr (std::same_as<Lower, net::tcp_stream>) {
+            return lower.fd();
+        } else {
+            return -1;
+        }
+    }
+
+    static std::shared_ptr<detail::basic_tls_transport<Lower>>
+    make_transport(Lower lower, size_t ciphertext_budget) {
+        const int output_fd = direct_output_fd(lower);
+        return std::make_shared<detail::basic_tls_transport<Lower>>(
+            std::move(lower), ciphertext_budget, output_fd);
+    }
+
     struct close_state {
         bool write_closed = false;
         bool peer_closed = false;
@@ -874,12 +912,12 @@ private:
     }
 
     struct close_watchdog_ticket {
-        explicit close_watchdog_ticket(std::shared_ptr<detail::tls_transport> value)
+        explicit close_watchdog_ticket(std::shared_ptr<detail::basic_tls_transport<Lower>> value)
             : transport(std::move(value)) {}
         ~close_watchdog_ticket() {
             if (!entered.load(std::memory_order_acquire)) transport->fail(EIO);
         }
-        std::shared_ptr<detail::tls_transport> transport;
+        std::shared_ptr<detail::basic_tls_transport<Lower>> transport;
         std::atomic<bool> entered{false};
     };
 
@@ -1137,17 +1175,22 @@ private:
         if (externally_shut_down_.load(std::memory_order_acquire)) {
             return true;
         }
-        int fd = transport_->tcp.fd();
-        if (fd < 0) {
+        if (!transport_) return true;
+        if constexpr (requires(const Lower& stream) { stream.fd(); }) {
+            int fd = transport_->lower.fd();
+            if (fd < 0) {
+                return true;
+            }
+            int sock_err = 0;
+            socklen_t len = sizeof(sock_err);
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &sock_err, &len) == 0
+                && sock_err != 0) {
+                return true;
+            }
+            return false;
+        } else {
             return true;
         }
-        int sock_err = 0;
-        socklen_t len = sizeof(sock_err);
-        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &sock_err, &len) == 0
-            && sock_err != 0) {
-            return true;
-        }
-        return false;
     }
 
     static std::string get_ssl_error_string(int err) {
@@ -1169,7 +1212,7 @@ private:
         }
     }
     
-    std::shared_ptr<detail::tls_transport> transport_;
+    std::shared_ptr<detail::basic_tls_transport<Lower>> transport_;
 #ifdef ELIO_RUNTIME_TEST_HOOKS
     detail::tls_dispatch_test_hooks* dispatch_test_hooks_ = nullptr;
     void (*shutdown_timer_test_hook_)() = nullptr;
@@ -1191,6 +1234,8 @@ private:
     std::atomic<bool> externally_shut_down_{false};
     std::string hostname_;  // Store hostname for SNI and verification
 };
+
+using tls_stream = basic_tls_stream<net::tcp_stream>;
 
 /// Connect to a TLS server
 /// @param ctx TLS context (client mode)

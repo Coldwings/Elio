@@ -21,6 +21,7 @@
 #include <optional>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 namespace {
@@ -269,6 +270,107 @@ void duplex_versions(backend_type backend, bool cancel_pending) {
     SECTION("TLS 1.2") { run_duplex(backend, tls::tls_version::tls_1_2, cancel_pending); }
     SECTION("TLS 1.3") { run_duplex(backend, tls::tls_version::tls_1_3, cancel_pending); }
 }
+
+class fdless_tcp_stream {
+public:
+    explicit fdless_tcp_stream(net::tcp_stream stream) noexcept
+        : stream_(std::move(stream)) {}
+    fdless_tcp_stream(fdless_tcp_stream&&) noexcept = default;
+    fdless_tcp_stream& operator=(fdless_tcp_stream&&) noexcept = default;
+    fdless_tcp_stream(const fdless_tcp_stream&) = delete;
+    fdless_tcp_stream& operator=(const fdless_tcp_stream&) = delete;
+
+    coro::task<io::io_result> read(void* buffer, size_t length,
+                                   coro::cancel_token token) {
+        return stream_.read(buffer, length, std::move(token));
+    }
+
+    coro::task<io::io_result> write(const void* buffer, size_t length,
+                                    coro::cancel_token token) {
+        return stream_.write(buffer, length, std::move(token));
+    }
+
+    void shutdown_socket() noexcept { stream_.shutdown_socket(); }
+
+private:
+    net::tcp_stream stream_;
+};
+
+template<typename Stream>
+concept exposes_fd = requires(const Stream& stream) {
+    stream.fd();
+};
+
+template<typename ServerStream, typename ClientStream>
+void complete_tls_pair_handshake(ServerStream& server, ClientStream& client) {
+    runtime::scheduler scheduler(2);
+    scheduler.start();
+    coro::cancel_source cancel;
+    std::array<bool, 2> handshakes{};
+    std::atomic<unsigned> finished{0};
+    scheduler.go([&]() -> coro::task<void> {
+        try { handshakes[0] = co_await server.handshake(cancel.get_token()); } catch (...) {}
+        finished.fetch_add(1, std::memory_order_release);
+    });
+    scheduler.go([&]() -> coro::task<void> {
+        try { handshakes[1] = co_await client.handshake(cancel.get_token()); } catch (...) {}
+        finished.fetch_add(1, std::memory_order_release);
+    });
+    const bool ready = duplex_observe([&] {
+        return finished.load(std::memory_order_acquire) == 2;
+    });
+    if (!ready || !handshakes[0] || !handshakes[1]) {
+        cancel.cancel();
+        server.shutdown_socket();
+        client.shutdown_socket();
+    }
+    REQUIRE(scheduler.shutdown(test::scaled_ms(15000)));
+    REQUIRE(ready);
+    REQUIRE(handshakes[0]);
+    REQUIRE(handshakes[1]);
+}
+
+template<typename SenderStream, typename ReceiverStream>
+void exchange_tls_payload(SenderStream& sender, ReceiverStream& receiver,
+                          std::string_view payload) {
+    runtime::scheduler scheduler(2);
+    scheduler.start();
+    coro::cancel_source cancel;
+    std::string received(payload.size(), '\0');
+    io::io_result write_result{};
+    io::io_result read_result{};
+    std::atomic<unsigned> finished{0};
+    scheduler.go([&]() -> coro::task<void> {
+        try { write_result = co_await sender.write_exactly(payload, cancel.get_token()); }
+        catch (...) { write_result = {-EIO, 0}; }
+        finished.fetch_add(1, std::memory_order_release);
+    });
+    scheduler.go([&]() -> coro::task<void> {
+        try {
+            read_result = co_await receiver.read_exactly(
+                received.data(), received.size(), cancel.get_token());
+        } catch (...) { read_result = {-EIO, 0}; }
+        finished.fetch_add(1, std::memory_order_release);
+    });
+    const bool ready = duplex_observe([&] {
+        return finished.load(std::memory_order_acquire) == 2;
+    });
+    if (!ready) {
+        cancel.cancel();
+        sender.shutdown_socket();
+        receiver.shutdown_socket();
+    }
+    REQUIRE(scheduler.shutdown(test::scaled_ms(15000)));
+    REQUIRE(ready);
+    REQUIRE(write_result.result == static_cast<int>(payload.size()));
+    REQUIRE(read_result.result == static_cast<int>(payload.size()));
+    REQUIRE(received == payload);
+}
+
+void generic_tls_contexts(tls::tls_context& server, tls::tls_context& client) {
+    REQUIRE(duplex_certificate(server));
+    client.set_verify_mode(tls::verify_mode::none);
+}
 }
 
 TEST_CASE("TLS real duplex keeps bounded writes and opposite reads progressing", "[tls][duplex][issue-1215]") {
@@ -293,5 +395,48 @@ TEST_CASE("TLS real pending duplex writes cancel before borrowed frames retire",
         SKIP("io_uring support is not compiled");
 #endif
     }
+}
+
+TEST_CASE("TLS stream can wrap fd-less async byte streams", "[tls][generic][issue-1244]") {
+    STATIC_REQUIRE(!exposes_fd<fdless_tcp_stream>);
+    STATIC_REQUIRE(std::is_move_constructible_v<tls::basic_tls_stream<fdless_tcp_stream>>);
+    int sockets[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+    tls::tls_context server_context(tls::tls_mode::server);
+    tls::tls_context client_context(tls::tls_mode::client);
+    generic_tls_contexts(server_context, client_context);
+    tls::basic_tls_stream<fdless_tcp_stream> server(
+        fdless_tcp_stream{net::tcp_stream{sockets[0]}}, server_context);
+    tls::basic_tls_stream<fdless_tcp_stream> client(
+        fdless_tcp_stream{net::tcp_stream{sockets[1]}}, client_context);
+
+    complete_tls_pair_handshake(server, client);
+    exchange_tls_payload(client, server, "generic lower stream payload");
+    server.shutdown_socket();
+    client.shutdown_socket();
+}
+
+TEST_CASE("TLS stream can layer over another TLS stream without fd bypass", "[tls][generic][nested][issue-1244]") {
+    int sockets[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+    tls::tls_context inner_server_context(tls::tls_mode::server);
+    tls::tls_context inner_client_context(tls::tls_mode::client);
+    tls::tls_context outer_server_context(tls::tls_mode::server);
+    tls::tls_context outer_client_context(tls::tls_mode::client);
+    generic_tls_contexts(inner_server_context, inner_client_context);
+    generic_tls_contexts(outer_server_context, outer_client_context);
+
+    tls::tls_stream inner_server{net::tcp_stream{sockets[0]}, inner_server_context};
+    tls::tls_stream inner_client{net::tcp_stream{sockets[1]}, inner_client_context};
+    complete_tls_pair_handshake(inner_server, inner_client);
+
+    tls::basic_tls_stream<tls::tls_stream> outer_server(
+        std::move(inner_server), outer_server_context);
+    tls::basic_tls_stream<tls::tls_stream> outer_client(
+        std::move(inner_client), outer_client_context);
+    complete_tls_pair_handshake(outer_server, outer_client);
+    exchange_tls_payload(outer_client, outer_server, "nested TLS lower stream payload");
+    outer_server.shutdown_socket();
+    outer_client.shutdown_socket();
 }
 #endif

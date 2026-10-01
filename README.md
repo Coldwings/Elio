@@ -262,7 +262,7 @@ elio::
 │   └── sse                  // Server-Sent Events
 │
 ├── tls::                    // TLS/SSL support
-│   └── tls_stream           // OpenSSL wrapper
+│   └── tls_stream           // TCP facade over the generic OpenSSL wrapper
 │
 └── log::                    // Logging infrastructure
     ├── logger               // Thread-safe logger

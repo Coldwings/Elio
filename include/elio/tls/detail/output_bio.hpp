@@ -112,7 +112,11 @@ private:
         try {
             size_t sent = 0;
             // Never bypass a retained prefix, including one leased by a drain.
-            if (!head_) {
+            if (!head_ && (fd_ >= 0
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                    || hooks_.send
+#endif
+                )) {
                 ssize_t result;
 #ifdef ELIO_RUNTIME_TEST_HOOKS
                 if (hooks_.send) result = hooks_.send(hooks_.context, fd_, data, size, MSG_DONTWAIT | MSG_NOSIGNAL);

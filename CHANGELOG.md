@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot mutate an active security identity. Raw transport acquire/release stays
   private to the client-managed lifecycle in 0.6 (#1245).
 
+- **Generic TLS stream core**: `tls::basic_tls_stream<Lower>` can wrap a
+  move-owned asynchronous byte stream while the existing `tls::tls_stream`
+  remains the TCP facade. OpenSSL now uses bounded input/output BIO driving
+  through the lower stream, so nested TLS and descriptor-free channels do not
+  bypass lower protocols. The raw descriptor output fast path is retained only
+  for the TCP facade; each TLS layer keeps independent SNI, verification, ALPN,
+  session and close state (#1244).
+
 - **Pool-integrated HTTP/1 response consumption**: `client::with_response`
   owns its request/target/handler and delivers final headers before a scoped
   `response_body_reader`. Borrowed-span reads report short progress, completion,

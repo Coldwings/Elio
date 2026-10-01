@@ -5,7 +5,7 @@
 /// 
 /// This header provides TLS functionality including:
 /// - TLS context configuration (certificates, ciphers, verification)
-/// - TLS stream wrapper for encrypted TCP connections
+/// - TLS stream wrappers for encrypted TCP or lower async byte streams
 /// - ALPN protocol negotiation (for HTTP/2)
 /// - Support for TLS 1.2 and TLS 1.3
 /// - Full IPv4 and IPv6 support

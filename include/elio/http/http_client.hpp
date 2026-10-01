@@ -6,6 +6,7 @@
 #include <elio/http/http_response_body_reader.hpp>
 #include <elio/http/http_message.hpp>
 #include <elio/http/client_base.hpp>
+#include <elio/http/detail/route_plan.hpp>
 #include <elio/net/stream.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
@@ -38,6 +39,9 @@ namespace elio::http {
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
 namespace detail {
+using route_connect_hook = coro::task<client_result<net::stream>> (*)(
+    const route_plan&, std::chrono::nanoseconds, coro::cancel_token);
+inline std::atomic<route_connect_hook> route_connect_for_test{nullptr};
 // Expire only the Expect clock after final headers, allowing a regression to
 // hold the final body behind a barrier without relying on timer scheduling.
 inline std::atomic<bool> expire_expect_after_headers_for_test{false};
@@ -167,7 +171,11 @@ struct transport_config {
 /// Connection wrapper using unified net::stream
 using connection = net::stream;
 
-/// Connection pool for HTTP keep-alive
+/// Connection pool for HTTP keep-alive. Legacy host/port/scheme adapters require
+/// the original return authority and one stable caller-owned TLS/resolver policy
+/// per pool. For a policy change, settle old operations and dispose of checked-out
+/// connections before clearing, or keep a separate old pool/context alive for
+/// old operations/returns. Shared transports use the private plan-based path.
 class connection_pool {
 public:
     static constexpr size_t shard_count = 16;
@@ -200,30 +208,7 @@ public:
                                                        std::chrono::nanoseconds::zero(),
                                                    coro::cancel_token token = {},
                                                    std::optional<dns_options> dns = std::nullopt) {
-        std::string key = make_key(host, port, secure);
-        auto& shard = shard_for(key);
-
-        // Try to get an existing connection.  Extract it under the lock
-        // into a local variable, then release the lock BEFORE any
-        // suspension point (co_return) so we never hold a std::mutex
-        // across a coroutine suspension.
-        std::optional<connection> conn;
-        {
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            auto it = shard.pools.find(key);
-            if (it != shard.pools.end() && !it->second.empty()) {
-                auto candidate = std::move(it->second.front());
-                it->second.pop_front();
-
-                // Check if connection is still valid (not too old)
-                auto age = std::chrono::steady_clock::now() - candidate.last_use();
-                if (age < config_.pool_idle_timeout) {
-                    candidate.touch();
-                    conn = std::move(candidate);
-                }
-                // Connection too old, let it close
-            }
-        }
+        auto conn = take_idle(make_legacy_key(host, port, secure));
         if (conn.has_value()) {
             co_return std::move(*conn);
         }
@@ -262,17 +247,7 @@ public:
 
     /// Return a connection to the pool
     void release(const std::string& host, uint16_t port, bool secure, connection conn) {
-        std::string key = make_key(host, port, secure);
-        auto& shard = shard_for(key);
-
-        std::lock_guard<std::mutex> lock(shard.mutex);
-        auto& pool = shard.pools[key];
-
-        if (pool.size() < config_.max_connections_per_host) {
-            conn.touch();
-            pool.push_back(std::move(conn));
-        }
-        // Otherwise let connection close
+        release_key(make_legacy_key(host, port, secure), std::move(conn));
     }
 
     /// Clear all pooled connections
@@ -283,21 +258,93 @@ public:
         }
     }
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    coro::task<client_result<connection>> acquire_plan_for_test(
+            detail::route_plan plan, coro::cancel_token token = {}) {
+        return acquire_plan(std::move(plan), {}, std::move(token));
+    }
+    void release_plan_for_test(const detail::route_plan& plan, connection conn) {
+        release_key(plan.key(), std::move(conn));
+    }
+#endif
+
 private:
-    static std::string make_key(const std::string& host, uint16_t port, bool secure) {
-        return (secure ? "https://" : "http://") + host + ":" + std::to_string(port);
+    friend class transport;
+
+    detail::connection_key make_legacy_key(const std::string& host, uint16_t port,
+                                           bool secure) const {
+        detail::connection_key key;
+        key.target = detail::route_endpoint::from(host, port);
+        key.target_secure = secure;
+        key.connector_domain = legacy_domain_;
+        key.resolution_domain = legacy_domain_;
+        return key;
+    }
+
+    std::optional<connection> take_idle(const detail::connection_key& key) {
+        auto& shard = shard_for(key);
+        std::lock_guard lock(shard.mutex);
+        auto it = shard.pools.find(key);
+        if (it == shard.pools.end()) return std::nullopt;
+        std::optional<connection> conn;
+        while (!it->second.empty()) {
+            auto candidate = std::move(it->second.front());
+            it->second.pop_front();
+            if (std::chrono::steady_clock::now() - candidate.last_use() <
+                    config_.pool_idle_timeout) {
+                candidate.touch();
+                conn = std::move(candidate);
+                break;
+            }
+        }
+        if (it->second.empty()) shard.pools.erase(it);
+        return conn;
+    }
+
+    void release_key(const detail::connection_key& key, connection conn) {
+        if (config_.max_connections_per_host == 0) return;
+        auto& shard = shard_for(key);
+        std::lock_guard lock(shard.mutex);
+        auto& pool = shard.pools[key];
+        if (pool.size() < config_.max_connections_per_host) {
+            conn.touch();
+            pool.push_back(std::move(conn));
+        }
+    }
+
+    coro::task<client_result<connection>> acquire_plan(detail::route_plan plan,
+            std::chrono::nanoseconds connect_timeout, coro::cancel_token token) {
+        if (auto conn = take_idle(plan.key())) co_return std::move(*conn);
+        if (token.is_cancelled())
+            co_return detail::make_client_error(ECANCELED, client_stage::acquire);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = detail::route_connect_for_test.load(std::memory_order_acquire))
+            co_return co_await hook(plan, connect_timeout, std::move(token));
+#endif
+        // Identity is modeled now; proxy connectors are delivered separately.
+        if (plan.key().mode != detail::route_mode::direct || !plan.key().hops.empty() ||
+            plan.key().protocol != detail::route_protocol::http1 ||
+            plan.key().target_dns != detail::route_dns_mode::local)
+            co_return detail::make_client_error(ENOTSUP, client_stage::acquire);
+        const auto& snapshot = plan.snapshot();
+        co_return co_await client_connect_result(plan.target().host, plan.target().port,
+            plan.key().target_secure, snapshot.origin_tls.get(), snapshot.resolve_options,
+            snapshot.rotate_resolved_addresses, connect_timeout, std::move(token),
+            snapshot.dns_timeout, snapshot.dns_domain);
     }
 
     struct pool_shard {
         std::mutex mutex;
-        std::unordered_map<std::string, std::deque<connection>> pools;
+        std::unordered_map<detail::connection_key, std::deque<connection>,
+                           detail::connection_key_hash> pools;
     };
 
-    pool_shard& shard_for(const std::string& key) noexcept {
-        return shards_[std::hash<std::string>{}(key) % shard_count];
+    pool_shard& shard_for(const detail::connection_key& key) noexcept {
+        return shards_[detail::connection_key_hash{}(key) % shard_count];
     }
 
     transport_config config_;
+    const uint64_t legacy_domain_ = detail::new_route_domain();
     std::array<pool_shard, shard_count> shards_;
 };
 
@@ -308,8 +355,8 @@ class transport {
 public:
     explicit transport(transport_config config = {})
         : config_(std::move(config))
-        , pool_(config_)
-        , tls_ctx_(make_tls_context(config_)) {
+        , route_snapshot_(make_route_snapshot(config_))
+        , pool_(config_) {
         settled_.set();
     }
 
@@ -352,7 +399,8 @@ public:
     }
 
     transport_tls_diagnostics tls_diagnostics() const noexcept {
-        return {.mode = tls_ctx_.mode(), .verify_mode = tls_ctx_.verify_mode()};
+        return {.mode = route_snapshot_->origin_tls->mode(),
+                .verify_mode = route_snapshot_->origin_tls->verify_mode()};
     }
     const transport_config& config() const noexcept { return config_; }
     bool is_shutdown() const noexcept {
@@ -370,6 +418,9 @@ public:
 
     void finish_operation_for_test() noexcept { finish_operation(); }
     void signal_settled_for_test() { settled_.set(); }
+    detail::route_plan route_plan_for_test(const url& target) const {
+        return detail::route_plan(target, route_snapshot_);
+    }
     coro::task<client_result<connection>> acquire_result_for_test(
             const url& target,
             std::chrono::nanoseconds connect_timeout,
@@ -392,10 +443,9 @@ private:
         co_return std::move(leased.conn);
     }
 
-    void release(const url& target, connection conn) {
+    void release(const detail::route_plan& plan, connection conn) {
         if (is_shutdown()) return;
-        pool_.release(target.host, target.effective_port(), target.is_secure(),
-                      std::move(conn));
+        pool_.release_key(plan.key(), std::move(conn));
         if (is_shutdown()) pool_.clear();
     }
 
@@ -405,6 +455,17 @@ private:
             config.configure_tls(tls_config);
         }
         return std::move(tls_config).release_context();
+    }
+
+    static std::shared_ptr<const detail::route_snapshot> make_route_snapshot(
+            const transport_config& config) {
+        detail::route_snapshot snapshot;
+        snapshot.resolve_options = config.resolve_options;
+        snapshot.rotate_resolved_addresses = config.rotate_resolved_addresses;
+        snapshot.dns_timeout = config.dns_timeout;
+        snapshot.dns_domain = config.dns_domain;
+        snapshot.origin_tls = std::make_shared<tls::tls_context>(make_tls_context(config));
+        return std::make_shared<const detail::route_snapshot>(std::move(snapshot));
     }
 
     class operation_lease {
@@ -433,6 +494,7 @@ private:
     };
 
     struct leased_connection {
+        detail::route_plan plan;
         connection conn;
         operation_lease lease;
     };
@@ -454,37 +516,23 @@ private:
         if (notify) settled_.set();
     }
 
-    coro::task<client_result<connection>> acquire_result_open(
-            const url& target,
-            std::chrono::nanoseconds connect_timeout,
-            coro::cancel_token token) {
-        // Keep the owning snapshot and task construction outside the await
-        // expression; some coroutine toolchains mishandle aggregate temporaries.
-        std::optional<connection_pool::dns_options> dns{std::in_place};
-        dns->timeout = config_.dns_timeout;
-        dns->domain = config_.dns_domain;
-        auto acquisition = pool_.acquire_result(target.host, target.effective_port(),
-            target.is_secure(), &tls_ctx_, connect_timeout, std::move(token),
-            std::move(dns));
-        co_return co_await std::move(acquisition);
-    }
-
     coro::task<client_result<leased_connection>> acquire_leased_result(
             const url& target,
             std::chrono::nanoseconds connect_timeout,
             coro::cancel_token token) {
         auto lease = try_acquire_lease();
         if (!lease) co_return detail::make_client_error(ESHUTDOWN, client_stage::acquire);
-        auto conn_result = co_await acquire_result_open(
-            target, connect_timeout, std::move(token));
+        detail::route_plan plan(target, route_snapshot_);
+        auto acquisition = pool_.acquire_plan(plan, connect_timeout, std::move(token));
+        auto conn_result = co_await std::move(acquisition);
         if (const auto* error = std::get_if<client_error>(&conn_result)) co_return *error;
         co_return leased_connection{
-            std::move(std::get<connection>(conn_result)), std::move(*lease)};
+            std::move(plan), std::move(std::get<connection>(conn_result)), std::move(*lease)};
     }
 
-    transport_config config_;
+    const transport_config config_;
+    const std::shared_ptr<const detail::route_snapshot> route_snapshot_;
     connection_pool pool_;
-    tls::tls_context tls_ctx_;
     mutable std::mutex lifecycle_mutex_;
     sync::event settled_;
     size_t active_operations_ = 0;
@@ -797,10 +845,11 @@ private:
     class exchange_state final {
     public:
         exchange_state(connection conn, transport::operation_lease transport_lease,
-                       const client_config& config, const url& target,
+                       detail::route_plan plan, const client_config& config, const url& target,
                        method request_method, std::string_view request_body, bool defer_body,
                        size_t informational_limit)
-            : conn_(std::move(conn)), transport_lease_(std::move(transport_lease)),
+            : plan_(std::move(plan)), conn_(std::move(conn)),
+              transport_lease_(std::move(transport_lease)),
               config_(config), target_(target),
               reader_(config.read_buffer_size), request_method_(request_method),
               request_body_(request_body), informational_limit_(informational_limit),
@@ -819,6 +868,8 @@ private:
         exchange_state& operator=(const exchange_state&) = delete;
         exchange_state(exchange_state&&) = delete;
         exchange_state& operator=(exchange_state&&) = delete;
+
+        const detail::route_plan& plan() const noexcept { return plan_; }
 
         coro::task<std::optional<client_error>> send_initial(
                 std::string_view data, coro::cancel_token token) {
@@ -1016,6 +1067,7 @@ private:
             co_return result;
         }
 
+        detail::route_plan plan_;
         connection conn_;
         transport::operation_lease transport_lease_;
         const client_config& config_;
@@ -1063,13 +1115,12 @@ private:
             ELIO_LOG_ERROR("Invalid outbound HTTP request: {}", ex.what());
             co_return detail::make_client_error(EINVAL, client_stage::request);
         }
-        ELIO_LOG_DEBUG("Sending request to {}:{}\n{}", target.host,
-                       target.effective_port(), request_data);
+        ELIO_LOG_DEBUG("Sending HTTP request to {}:{}", target.host, target.effective_port());
         if (token.is_cancelled()) {
             co_return detail::make_client_error(ECANCELED, client_stage::request);
         }
         auto exchange = std::make_unique<exchange_state>(std::move(conn),
-            std::move(leased.lease), config_, target, req.get_method(),
+            std::move(leased.lease), std::move(leased.plan), config_, target, req.get_method(),
             req.body(), defer_body, informational_limit);
         if (auto error = co_await exchange->send_initial(request_data, token)) co_return *error;
         co_return std::move(exchange);
@@ -1087,21 +1138,22 @@ private:
             redirect_count >= config_.max_redirects) return std::nullopt;
         auto location = resp.header("Location");
         if (location.empty()) return std::nullopt;
-        ELIO_LOG_DEBUG("Following redirect to: {}", location);
         if (!detail::is_valid_url_input(location)) {
-            ELIO_LOG_WARNING("Rejecting invalid redirect Location: {}", location);
+            ELIO_LOG_WARNING("Rejecting invalid HTTP redirect Location");
             return std::nullopt;
         }
         auto redirect_url = url::resolve_reference(target, location);
         if (!redirect_url) return std::nullopt;
         if (!detail::is_supported_http_url_scheme(redirect_url->scheme)) {
-            ELIO_LOG_WARNING("Rejecting unsupported redirect scheme: {}", redirect_url->scheme);
+            ELIO_LOG_WARNING("Rejecting unsupported HTTP redirect scheme");
             return std::nullopt;
         }
         if (target.is_secure() && !redirect_url->is_secure()) {
-            ELIO_LOG_WARNING("Rejecting insecure redirect from HTTPS to HTTP: {}", location);
+            ELIO_LOG_WARNING("Rejecting insecure redirect from HTTPS to HTTP");
             return std::nullopt;
         }
+        ELIO_LOG_DEBUG("Following HTTP redirect to {}:{}", redirect_url->host,
+                       redirect_url->effective_port());
         method redirect_method = req.get_method();
         if ((resp.get_status() == status::see_other && req.get_method() != method::HEAD) ||
             ((resp.get_status() == status::moved_permanently || resp.get_status() == status::found) &&
@@ -1179,7 +1231,7 @@ private:
                 co_return detail::make_client_error(ECANCELED, client_stage::body);
             }
             if (body.complete() && exchange->reusable()) {
-                transport_->release(target, exchange->take_connection());
+                transport_->release(exchange->plan(), exchange->take_connection());
             } else {
                 exchange->abort();
             }
@@ -1220,7 +1272,7 @@ private:
         // head of the next response (response-splitting). On any failure of
         // these conditions the connection is simply dropped on scope exit.
         if (exchange->reusable()) {
-            transport_->release(target, exchange->take_connection());
+            transport_->release(exchange->plan(), exchange->take_connection());
         }
 
         if (auto redirect = make_redirect(req, target, resp, redirect_count)) {

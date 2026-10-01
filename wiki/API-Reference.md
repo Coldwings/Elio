@@ -3067,6 +3067,15 @@ until awaited return.
 Transport acquisition/release is intentionally client-managed in this release;
 raw external leases and cross-transport connection injection are not public API.
 
+HTTP/1 connection establishment and idle pooling now consume one internal
+immutable route plan per exchange. Its structured key compares normalized
+origin authority, route mode, ordered proxy-hop identities, security/authentication
+domains, protocol requirements, and connector/resolution domains by full value
+equality. Direct routes are implemented; proxy identity fields are reserved for
+the subsequent connectors. Redirects create fresh plans, and returns retain the
+acquisition plan. See [[HTTP Routing]] (`HTTP-Routing.md`) for the compatibility
+matrix, normalization, and standalone-pool responsibility boundary.
+
 #### Owned HTTP Client Errors
 
 Opt in by replacing `get()` with `get_result()`, `send()` with `send_result()`,

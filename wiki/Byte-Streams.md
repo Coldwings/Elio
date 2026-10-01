@@ -14,9 +14,10 @@ concurrency, and output-finish guarantees remain unchanged. See
 
 ## Required Interface
 
-A stream is move-constructible, cannot be constructed or assigned from another
-stream lvalue (including const/volatile-qualified sources), and explicitly
-declares:
+The concept accepts a concrete, unqualified stream type, not a cv-qualified
+type or reference. It is move-constructible and cannot be constructed or
+assigned from another stream lvalue (including const/volatile-qualified
+sources and lvalue/rvalue destinations). It explicitly declares:
 
 ```cpp
 using byte_stream_contract = elio::net::publishing_byte_stream_contract;
@@ -48,6 +49,12 @@ Reads and writes preserve reliable byte ordering, support short positive
 progress, and wait for readiness rather than exposing transient would-block
 as a normal public result. `io_result::result` carries the actual count or a
 negative error. Positive progress never exceeds the requested count.
+
+A successful nonempty write returns a positive count. It must not return zero:
+an underlying zero-progress write must become a negative error (`-EIO` when no
+more specific cause is available), not an unbounded retry loop. An empty write
+may return zero; cancellation or another error may still produce a negative
+result. This does not give empty operations precedence over cancellation.
 
 Accepted bytes are bytes the current layer has taken responsibility for.
 Published bytes have advanced through every owned lower layer's publishing
@@ -128,8 +135,9 @@ not report only the top layer's queue as a whole-chain bound. Caller-owned
 borrowed payload, protocol/control state, and OpenSSL's unrelated allocations
 are outside a payload-only limit and must not be advertised as bounded by it.
 
-Every adapter must add scripted short-progress, ordered read-ahead, EOF-scope,
-publication, completion/cancellation-race, and overlapping-abort regressions.
+Every adapter must add scripted short-progress, nonempty-write zero-progress,
+ordered read-ahead, EOF-scope, publication, completion/cancellation-race, and
+overlapping-abort regressions.
 Use barriers or test hooks where feasible rather than sleeps. Concept syntax
 checks alone do not validate these runtime requirements. Generic TLS and HTTP
 Transport implementations remain separate work following this foundation.

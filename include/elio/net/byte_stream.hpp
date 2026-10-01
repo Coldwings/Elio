@@ -15,10 +15,23 @@ namespace elio::net {
 /// Explicit semantic opt-in, not a compile-time proof of correct I/O behavior.
 struct publishing_byte_stream_contract final {};
 
+namespace detail {
+
+template<typename Stream, typename... Destinations>
+inline constexpr bool byte_stream_lvalue_assignment =
+    ((std::is_assignable_v<Destinations, Stream&> ||
+      std::is_assignable_v<Destinations, const Stream&> ||
+      std::is_assignable_v<Destinations, volatile Stream&> ||
+      std::is_assignable_v<Destinations, const volatile Stream&>) || ...);
+
+} // namespace detail
+
 /// An exclusively owned, ordered byte stream with one reader and one writer.
 /// Positive write progress is published recursively through the owned lower
 /// chain before return; at a TCP root this proves kernel acceptance, not peer
 /// receipt. Accepted-only buffering requires a publishing adapter.
+/// A successful nonempty write makes positive progress; inability to do so is
+/// a negative error (EIO for otherwise unexplained zero progress), never zero.
 ///
 /// Cancellation must settle the operation's owned I/O before releasing borrowed
 /// buffers. It never permits asynchronous public-frame destruction. Protocol
@@ -44,15 +57,16 @@ struct publishing_byte_stream_contract final {};
 /// the lifecycle matrix and the distinction from legacy stream close APIs.
 template<typename Stream>
 concept publishing_byte_stream =
+    std::same_as<Stream, std::remove_cvref_t<Stream>> &&
     std::move_constructible<Stream> &&
     !std::is_constructible_v<Stream, Stream&> &&
     !std::is_constructible_v<Stream, const Stream&> &&
     !std::is_constructible_v<Stream, volatile Stream&> &&
     !std::is_constructible_v<Stream, const volatile Stream&> &&
-    !std::is_assignable_v<Stream&, Stream&> &&
-    !std::is_assignable_v<Stream&, const Stream&> &&
-    !std::is_assignable_v<Stream&, volatile Stream&> &&
-    !std::is_assignable_v<Stream&, const volatile Stream&> &&
+    !detail::byte_stream_lvalue_assignment<Stream,
+        Stream&, Stream&&, const Stream&, const Stream&&,
+        volatile Stream&, volatile Stream&&,
+        const volatile Stream&, const volatile Stream&&> &&
     requires(Stream& stream, const Stream& const_stream, void* input,
              const void* output, size_t size, coro::cancel_token token,
              std::chrono::milliseconds timeout) {

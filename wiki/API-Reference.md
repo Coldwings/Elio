@@ -2702,7 +2702,8 @@ wrap `SO_RCVBUF` and `SO_SNDBUF`, while `set_pass_credentials()` wraps
 ### `net::publishing_byte_stream`
 
 Include `<elio/net/byte_stream.hpp>` (also available through `<elio/elio.hpp>`).
-The C++20 concept checks move construction, absence of copying, the exact
+The C++20 concept checks an unqualified object type, move construction,
+absence of copying, the exact
 `publishing_byte_stream_contract` opt-in, and these operations:
 
 ```cpp

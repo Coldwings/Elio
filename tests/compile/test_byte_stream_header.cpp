@@ -32,6 +32,27 @@ struct rvalue_token_stream : syntax_stream {
     task<write_finish_result> finish_write(cancel_token&&, std::chrono::milliseconds);
 };
 
+struct const_reference_token_stream : syntax_stream {
+    task<io_result> read(void*, size_t, const cancel_token&);
+    task<io_result> write(const void*, size_t, const cancel_token&);
+    task<write_finish_result> finish_write(const cancel_token&, std::chrono::milliseconds);
+};
+
+struct rvalue_copy_assign_stream : syntax_stream {
+    rvalue_copy_assign_stream() = default;
+    rvalue_copy_assign_stream(rvalue_copy_assign_stream&&) = default;
+    rvalue_copy_assign_stream(const rvalue_copy_assign_stream&) = delete;
+    rvalue_copy_assign_stream& operator=(const rvalue_copy_assign_stream&) &&;
+};
+
+struct const_rvalue_copy_assign_stream : syntax_stream {
+    const_rvalue_copy_assign_stream() = default;
+    const_rvalue_copy_assign_stream(const_rvalue_copy_assign_stream&&) = default;
+    const_rvalue_copy_assign_stream(const const_rvalue_copy_assign_stream&) = delete;
+    const_rvalue_copy_assign_stream& operator=(const const_rvalue_copy_assign_stream&) && = delete;
+    const const_rvalue_copy_assign_stream& operator=(const const_rvalue_copy_assign_stream&) const &&;
+};
+
 struct copy_assignable_stream : syntax_stream {
     copy_assignable_stream() = default;
     copy_assignable_stream(copy_assignable_stream&&) = default;
@@ -172,6 +193,9 @@ struct synchronous_abort : syntax_stream {
 
 static_assert(publishing_byte_stream<syntax_stream>);
 static_assert(publishing_byte_stream<rvalue_token_stream>);
+static_assert(publishing_byte_stream<const_reference_token_stream>);
+static_assert(!publishing_byte_stream<rvalue_copy_assign_stream>);
+static_assert(!publishing_byte_stream<const_rvalue_copy_assign_stream>);
 static_assert(!publishing_byte_stream<syntax_operations>);
 static_assert(!publishing_byte_stream<copy_assignable_stream>);
 static_assert(!publishing_byte_stream<immovable_stream>);
@@ -197,7 +221,10 @@ static_assert(!publishing_byte_stream<mutable_eof_scope>);
 static_assert(!publishing_byte_stream<missing_abort>);
 static_assert(!publishing_byte_stream<synchronous_abort>);
 static_assert(!publishing_byte_stream<const syntax_stream>);
+static_assert(!publishing_byte_stream<volatile syntax_stream>);
+static_assert(!publishing_byte_stream<const volatile syntax_stream>);
 static_assert(!publishing_byte_stream<syntax_stream&>);
+static_assert(!publishing_byte_stream<syntax_stream&&>);
 static_assert(!publishing_byte_stream<int>);
 
 } // namespace

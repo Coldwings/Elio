@@ -259,7 +259,7 @@ if(TARGET elio_rdma_ibverbs AND TARGET elio_rdma_cm)
     )
 endif()
 
-set(ELIO_ADDITIONAL_TEST_TARGETS elio_file_transfer_header)
+set(ELIO_ADDITIONAL_TEST_TARGETS elio_file_transfer_header elio_byte_stream_header)
 set(_elio_watchdog_variants normal)
 if(ELIO_BUILD_SANITIZER_TESTS)
     list(APPEND _elio_watchdog_variants asan tsan)

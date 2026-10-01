@@ -63,6 +63,34 @@ read response is reusable. The exchange still requires complete framing,
 keep-alive, no EOF/close-delimited body, and no unread suffix before returning a
 connection.
 
+## Internal Connection Leases
+
+Buffered requests and scoped `with_response` exchanges carry a move-only
+internal lease. It owns the original route plan and a strong reference to the
+original Transport state from dialing until disposition. Moving a lease
+transfers its single disposition; moved-from destruction does nothing.
+
+Only the exchange owner can return it after complete, unambiguous HTTP/1
+framing, keep-alive eligibility, no EOF/close-delimited body, no read-ahead
+suffix, and settlement of its I/O/watchdogs. Every other path retires by aborting
+and disconnecting the stream. Destruction never marks an unfinished response
+reusable, drains a body, or starts hidden asynchronous TLS shutdown. Allocation
+exceptions during pool insertion still leave the lease responsible for
+retirement. There is no public unchecked reuse flag or escaping lease API.
+
+`transport::clear()` drops idle entries and changes the pool generation. An
+already acquired or dialing lease may finish its current exchange, but its late
+return is retired. New work may acquire normally. `shutdown()` additionally
+closes acquisition and awaits settlement; cancelling that wait does not cancel
+or destroy active public frames. A returned CONNECT identity remains bound to
+its target; retiring it never recovers the underlying proxy channel for a new
+tunnel (the connectors are still separate follow-ups).
+
+Internal state retention does not relax caller lifetimes: keep the client,
+scheduler, borrowed request/URL/string inputs, and configured resolver cache
+alive until normal awaited return. Scoped streaming readers and their pending
+reads must not escape the handler.
+
 ## Standalone Pool Compatibility
 
 Legacy `connection_pool::{acquire_result,acquire,release}` signatures remain
@@ -77,4 +105,4 @@ barrier against late returns. Alternatively, route new work through a fresh pool
 and keep the old pool/context alive and unchanged for old operations/returns.
 For automatic route/security isolation and client-managed lifecycle, migrate to
 `client(shared_ptr<transport>, policy)`.
-The route-bound lease migration is a separate follow-up.
+These legacy adapters do not gain the Transport's lease/generation guarantees.

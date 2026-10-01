@@ -71,6 +71,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry policy, escaping lease, or end-to-end zero-copy guarantee is added
   (#1228).
 
+- **Route-bound HTTP/1 connection leases**: buffered and scoped streaming
+  exchanges retain their acquisition plan and strong original Transport state
+  in a move-only internal lease. Only validated, settled completion can return
+  once; errors, cancellation, early exit, and destruction abort/retire without
+  hidden body draining. `transport::clear()` now rejects late returns from the
+  previous pool generation while active I/O continues. Standalone legacy pool
+  adapters and public frame-lifetime responsibilities are unchanged (#1247).
+
 - **Bounded joinable-result observation**: `join_handle<T>::wait()` and
   `wait_until()` observe readiness without consuming results, propagating child
   exceptions, or cancelling the task. Explicit cancellation/deadlines select one

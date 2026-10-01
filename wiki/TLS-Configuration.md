@@ -148,6 +148,37 @@ coro::task<void> connect_example() {
 }
 ```
 
+### Wrapping an Existing Async Byte Stream
+
+`tls_stream` is the TCP convenience facade. The TLS engine itself is available
+as `basic_tls_stream<Lower>` for any move-owned lower stream that provides
+cancellable asynchronous `read(void*, size_t, cancel_token)` and
+`write(const void*, size_t, cancel_token)` operations and explicitly satisfies
+`net::publishing_byte_stream`:
+
+```cpp
+// The lower stream can be a tunnel, buffered channel, or another TLS stream.
+auto lower = co_await open_lower_channel();
+tls_context origin_tls(tls_mode::client);
+origin_tls.use_default_verify_paths();
+origin_tls.set_verify_mode(verify_mode::peer);
+
+basic_tls_stream<decltype(lower)> stream(std::move(lower), origin_tls);
+stream.set_hostname("origin.example");
+
+if (!co_await stream.handshake(token)) {
+    // errno describes the local TLS/lower-stream failure.
+    co_return;
+}
+```
+
+Each TLS layer has its own context, SNI, verification mode, ALPN and session
+state. For example, HTTPS-through-HTTPS proxying uses an outer TLS stream for
+the proxy connection, then an inner `basic_tls_stream<tls_stream>` for the
+origin after the CONNECT tunnel is established. The inner layer's ciphertext is
+written through the outer stream; `fd()` diagnostics never authorize bypassing
+the lower protocol.
+
 ### TLS Listener (Server)
 
 ```cpp

@@ -6,11 +6,17 @@
 boundary for future TLS, buffered-channel, and HTTP Transport adapters, not an
 arbitrary `read`/`write` duck type.
 
-This foundation supplies a contract and syntax checks, not those adapters.
-Existing `tcp_stream`, `tls_stream`, and the closed TCP/TLS `net::stream`
-variant are not automatically opted in. Their current close, cancellation,
-concurrency, and output-finish guarantees remain unchanged. See
-[[API Contracts]] and [[Migrating to 0.6]].
+This foundation supplies a contract and syntax checks, not every adapter.
+Existing `tcp_stream` and the closed TCP/TLS `net::stream` variant are not
+automatically opted in. `tls::tls_stream` and `tls::basic_tls_stream<Lower>`
+do opt in as the TLS publishing layer: successful plaintext writes publish
+ciphertext through the owned lower chain, `finish_write()` finishes the current
+TLS layer, and `abort_and_settle()` settles the TLS layer plus any publishing
+lower chain. Generic TLS lowers must either be the TCP facade path or explicitly
+opt in to `net::publishing_byte_stream`; descriptor exposure alone is not an
+opt-in. Public close, cancellation, concurrency, and output-finish guarantees
+remain those documented for the concrete stream. See [[API Contracts]] and
+[[Migrating to 0.6]].
 
 ## Required Interface
 

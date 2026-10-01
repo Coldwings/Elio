@@ -6,25 +6,47 @@
 #include "../../sync/detail/wake_state.hpp"
 #include "../../runtime/scheduler.hpp"
 
+#include <openssl/bio.h>
+
+#include <cstddef>
 #include <cstdint>
 #include <array>
 #include <cassert>
+#include <concepts>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
+#include <type_traits>
 
 namespace elio::tls::detail {
 
-// Owns ciphertext and the socket, never SSL or caller plaintext. The TLS owner
-// must call fail() on abandonment: an active pump deliberately retains this
-// object until the kernel has released its borrowed ciphertext lease.
-class tls_transport : public std::enable_shared_from_this<tls_transport> {
+// Owns ciphertext and the lower stream, never SSL or caller plaintext. The TLS
+// owner must call fail() on abandonment: an active pump deliberately retains
+// this object until the lower layer has released its borrowed ciphertext lease.
+template<typename Lower>
+class basic_tls_transport : public std::enable_shared_from_this<basic_tls_transport<Lower>> {
+    using self_type = basic_tls_transport<Lower>;
     using wake_ptr = sync::detail::wake_state_ptr;
     using wake_list = std::list<wake_ptr>;
 
+    static consteval bool compute_progress_interrupts_read() {
+        if constexpr (std::same_as<Lower, net::tcp_stream>) {
+            return true;
+        } else if constexpr (requires {
+                                 { Lower::tls_progress_interrupts_read } -> std::convertible_to<bool>;
+                             }) {
+            return Lower::tls_progress_interrupts_read;
+        } else {
+            return false;
+        }
+    }
+
+    static constexpr bool progress_interrupts_read = compute_progress_interrupts_read();
+
     struct launch_ticket {
-        std::shared_ptr<tls_transport> owner;
+        std::shared_ptr<self_type> owner;
         std::atomic<bool> entered{false};
         ~launch_ticket() {
             if (entered.load(std::memory_order_acquire)) return;
@@ -40,7 +62,7 @@ class tls_transport : public std::enable_shared_from_this<tls_transport> {
 
     class change_waiter {
     public:
-        change_waiter(std::shared_ptr<tls_transport> owner, uint64_t observed,
+        change_waiter(std::shared_ptr<self_type> owner, uint64_t observed,
                       coro::cancel_token token)
             : owner_(std::move(owner)), observed_(observed),
               wake_(sync::detail::make_wake_state()) {
@@ -73,7 +95,7 @@ class tls_transport : public std::enable_shared_from_this<tls_transport> {
             return {wake_->was_cancelled() ? -ECANCELED : 0, 0};
         }
     private:
-        std::shared_ptr<tls_transport> owner_;
+        std::shared_ptr<self_type> owner_;
         uint64_t observed_;
         wake_ptr wake_;
         wake_list pending_;
@@ -81,11 +103,12 @@ class tls_transport : public std::enable_shared_from_this<tls_transport> {
     };
 
 public:
-    tls_transport(net::tcp_stream stream, size_t budget)
-        : tcp(std::move(stream)), output(tcp.fd(), budget) {}
+    basic_tls_transport(Lower stream, size_t budget, int direct_output_fd = -1)
+        : lower(std::move(stream)), output(direct_output_fd, budget) {}
 
-    net::tcp_stream tcp;
+    Lower lower;
     output_bio_state output;
+    BIO* input = nullptr;
     std::mutex mutex;
     // Read or modify only under mutex. All methods below acquire mutex and
     // therefore must be called outside the SSL/state critical section.
@@ -117,7 +140,7 @@ public:
         {
             std::lock_guard lock(mutex);
             ++generation;
-            reader = read_poll_;
+            if constexpr (progress_interrupts_read) reader = read_poll_;
             ready.splice(ready.end(), waiters_);
             for (const auto& wake : ready) wake->claim_notification();
             if (!pump_active_) {
@@ -125,7 +148,7 @@ public:
                     auto& slot = cleanup_slots_[i];
                     if (!slot.registered) continue;
                     slot.registered = false;
-                    settled[i] = wake_ptr(shared_from_this(), &slot.wake);
+                    settled[i] = wake_ptr(this->shared_from_this(), &slot.wake);
                     slot.wake.claim_notification();
                 }
             }
@@ -136,11 +159,12 @@ public:
     }
 
     coro::task<io::io_result> wait_change(uint64_t observed, coro::cancel_token token) {
-        co_return co_await change_waiter(shared_from_this(), observed, std::move(token));
+        co_return co_await change_waiter(this->shared_from_this(), observed, std::move(token));
     }
 
     coro::task<io::io_result> wait_read(uint64_t observed, coro::cancel_token token) {
-        auto self = shared_from_this();
+        auto keepalive = this->shared_from_this();
+        (void)keepalive;
         if (co_await read_mutex_.lock(token) == coro::cancel_result::cancelled)
             co_return io::io_result{-ECANCELED, 0};
         sync::lock_guard guard(read_mutex_);
@@ -153,27 +177,47 @@ public:
             std::lock_guard lock(mutex);
             if (output.error()) co_return io::io_result{-output.error(), 0};
             if (generation != observed) co_return io::io_result{0, 0};
+            if (!input) { output.fail(EIO); co_return io::io_result{-EIO, 0}; }
             read_poll_ = source;
         }
         io::io_result result;
+        std::array<std::byte, 16 * 1024> buffer{};
         try {
-            auto polled = co_await tcp.poll_read(source->get_token());
-            result = polled.io;
+            result = co_await lower.read(buffer.data(), buffer.size(), source->get_token());
         } catch (...) {
             std::lock_guard lock(mutex);
             if (read_poll_ == source) read_poll_.reset();
             throw;
         }
+        bool made_progress = false;
         {
             std::lock_guard lock(mutex);
             if (read_poll_ == source) read_poll_.reset();
-            if (output.error()) result = {-output.error(), 0};
-            else if (token.is_cancelled()) result = {-ECANCELED, 0};
-            else if (source->is_cancelled()) result = {0, 0};
+            if (output.error()) {
+                result = {-output.error(), 0};
+            } else if (result.result > 0) {
+                const int accepted = BIO_write(input, buffer.data(), result.result);
+                if (accepted != result.result) {
+                    output.fail(EIO);
+                    result = {-output.error(), 0};
+                } else {
+                    result = {0, 0};
+                    made_progress = true;
+                }
+            } else if (token.is_cancelled()) {
+                result = {-ECANCELED, 0};
+            } else if (source->is_cancelled() && result.result == -ECANCELED) {
+                result = {0, 0};
+            } else if (result.result == 0) {
+                output.fail(EPIPE);
+                result = {-EPIPE, 0};
+            } else if (result.result < 0) {
+                output.fail(-result.result);
+            }
         }
         // The next logical reader must retry SSL before registering another
-        // poll: this readiness may already have been consumed by its sibling.
-        if (result.result >= 0) notify_progress();
+        // lower read: this ciphertext may already have been consumed by its sibling.
+        if (made_progress || result.result >= 0) notify_progress();
         co_return result;
     }
 
@@ -190,7 +234,7 @@ public:
         try {
             auto* scheduler = runtime::scheduler::current();
             if (!scheduler) throw std::runtime_error("TLS output requires a scheduler");
-            auto self = shared_from_this();
+            auto self = this->shared_from_this();
             ticket = std::make_shared<launch_ticket>();
             ticket->owner = self;
             scheduler->go(pump(std::move(self), ticket));
@@ -207,7 +251,8 @@ public:
     }
 
     coro::task<io::io_result> wait_write(coro::cancel_token token) {
-        auto self = shared_from_this();
+        auto keepalive = this->shared_from_this();
+        (void)keepalive;
         if (co_await write_mutex_.lock(token) == coro::cancel_result::cancelled)
             co_return io::io_result{-ECANCELED, 0};
         sync::lock_guard guard(write_mutex_);
@@ -215,40 +260,55 @@ public:
             std::lock_guard lock(mutex);
             if (output.error()) co_return io::io_result{-output.error(), 0};
         }
-        auto ready = co_await tcp.poll_write(token);
-        co_return ready.was_cancelled() ? io::io_result{-ECANCELED, 0} : ready.io;
+        uint64_t observed;
+        {
+            std::lock_guard lock(mutex);
+            observed = generation;
+        }
+        co_return co_await wait_change(observed, std::move(token));
     }
 
     coro::task<io::io_result> flush_to(uint64_t watermark, coro::cancel_token token) {
-        auto self = shared_from_this();
+        auto keepalive = this->shared_from_this();
+        (void)keepalive;
         start_output();
         for (;;) {
             uint64_t observed;
             {
                 std::lock_guard lock(mutex);
-                if (output.error()) co_return io::io_result{-output.error(), 0};
                 if (output.drained_bytes() >= watermark) co_return io::io_result{0, 0};
+                if (output.error()) co_return io::io_result{-output.error(), 0};
                 observed = generation;
             }
             auto result = co_await wait_change(observed, token);
-            if (result.result < 0) co_return result;
+            if (result.result < 0) {
+                std::lock_guard lock(mutex);
+                if (output.drained_bytes() >= watermark) co_return io::io_result{0, 0};
+                if (output.error()) co_return io::io_result{-output.error(), 0};
+                co_return result;
+            }
         }
     }
 
     void fail(int error) noexcept {
+        std::shared_ptr<coro::cancel_source> reader;
         {
             std::lock_guard lock(mutex);
             output.fail(error);
+            reader = read_poll_;
         }
-        // Do not close/reuse the descriptor while an operation owns it.
-        if (tcp.fd() >= 0) ::shutdown(tcp.fd(), SHUT_RDWR);
+        cancel_noexcept(reader);
+        // Do not close/reuse a descriptor while an operation owns it.
+        if constexpr (requires(Lower& stream) { { stream.shutdown_socket() } noexcept; }) {
+            lower.shutdown_socket();
+        }
         try { pump_cancel_.cancel(); } catch (...) {}
         notify_progress();
     }
 
     class output_settlement {
     public:
-        explicit output_settlement(std::shared_ptr<tls_transport> owner) noexcept
+        explicit output_settlement(std::shared_ptr<self_type> owner) noexcept
             : owner_(std::move(owner)) {}
         output_settlement(output_settlement&&) noexcept = default;
         output_settlement(const output_settlement&) = delete;
@@ -281,12 +341,12 @@ public:
         }
         void await_resume() const noexcept {}
     private:
-        std::shared_ptr<tls_transport> owner_;
+        std::shared_ptr<self_type> owner_;
         wake_ptr wake_;
     };
 
     output_settlement settle_output() noexcept {
-        return output_settlement(shared_from_this());
+        return output_settlement(this->shared_from_this());
     }
 
 private:
@@ -294,7 +354,7 @@ private:
         if (source) { try { source->cancel(); } catch (...) {} }
     }
 
-    static coro::task<void> pump(std::shared_ptr<tls_transport> self,
+    static coro::task<void> pump(std::shared_ptr<self_type> self,
                                std::shared_ptr<launch_ticket> ticket) {
         ticket->entered.store(true, std::memory_order_release);
         ticket.reset();
@@ -322,24 +382,18 @@ private:
                 }
                 // Keep the head allocation until completion cleanup, including
                 // a late positive completion after terminal cancellation.
-                auto sent = co_await io::async_send(self->tcp.fd(), bytes.data(),
-                    bytes.size(), MSG_NOSIGNAL, self->pump_cancel_.get_token());
-                if (sent.io.result > 0) {
+                auto sent = co_await self->lower.write(bytes.data(), bytes.size(),
+                    self->pump_cancel_.get_token());
+                if (sent.result > 0) {
                     {
                         std::lock_guard lock(self->mutex);
-                        self->output.consume(static_cast<size_t>(sent.io.result));
+                        self->output.consume(static_cast<size_t>(sent.result));
                     }
                     self->notify_progress();
                     continue;
                 }
-                if (sent.io.result == -EINTR) continue;
-                if (sent.io.result == -EAGAIN || sent.io.result == -EWOULDBLOCK) {
-                    auto ready = co_await self->tcp.poll_write(self->pump_cancel_.get_token());
-                    if (ready.io.result >= 0 && !ready.was_cancelled()) continue;
-                    self->fail(ready.io.result < 0 ? -ready.io.result : ECANCELED);
-                } else {
-                    self->fail(sent.io.result < 0 ? -sent.io.result : EPIPE);
-                }
+                if (sent.result == -EINTR) continue;
+                self->fail(sent.result < 0 ? -sent.result : EPIPE);
             }
         } catch (const std::bad_alloc&) {
             self->fail(ENOMEM);
@@ -367,5 +421,7 @@ private:
     };
     std::array<cleanup_slot, 2> cleanup_slots_;
 };
+
+using tls_transport = basic_tls_transport<net::tcp_stream>;
 
 } // namespace elio::tls::detail

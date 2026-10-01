@@ -4514,13 +4514,24 @@ public:
 };
 ```
 
-### `tls_stream`
+### `basic_tls_stream` and `tls_stream`
 
-TLS-wrapped TCP stream.
+TLS wrapper over a move-owned asynchronous byte stream. The existing
+`tls_stream` name remains the concrete TCP facade:
 
-After the TLS handshake completes, `tls_stream` serializes OpenSSL dispatch
-and retry ownership internally. One read-side operation and one write-side
-operation may overlap while either side is suspended on socket readiness.
+```cpp
+template<typename Lower>
+class basic_tls_stream;
+
+class tls_stream : public basic_tls_stream<net::tcp_stream> {
+public:
+    using basic_tls_stream<net::tcp_stream>::basic_tls_stream;
+};
+```
+
+After the TLS handshake completes, TLS streams serialize OpenSSL dispatch and
+retry ownership internally. One read-side operation and one write-side operation
+may overlap while either side is suspended on lower-layer progress.
 Callers must still serialize handshake-starting operations, multiple concurrent
 reads, multiple concurrent writes, and shutdown/destruction against active I/O
 at the protocol layer.
@@ -4531,9 +4542,10 @@ struct tls_stream_options {
     std::chrono::milliseconds session_close_timeout{5000};
 };
 
-class tls_stream {
+template<typename Lower = net::tcp_stream>
+class basic_tls_stream {
 public:
-    tls_stream(net::tcp_stream tcp, tls_context& ctx, tls_stream_options options = {});
+    basic_tls_stream(Lower lower, tls_context& ctx, tls_stream_options options = {});
     
     // Set SNI hostname
     void set_hostname(std::string_view hostname);
@@ -4583,7 +4595,7 @@ public:
     const char* cipher() const;
 
     int fd() const noexcept;
-    const net::tcp_stream& tcp() const noexcept;
+    const net::tcp_stream& tcp() const noexcept; // TCP facade only
     bool is_handshake_complete() const noexcept;
 
     // Watchdog helpers for externally interrupted sockets
@@ -4595,6 +4607,34 @@ public:
 };
 ```
 
+`Lower` is move-owned by the TLS stream. Apart from the TCP facade,
+`basic_tls_stream<Lower>` requires `Lower` to satisfy
+`net::publishing_byte_stream`: it must explicitly opt in with
+`publishing_byte_stream_contract`, provide cancellable asynchronous `read()` and
+`write()`, report EOF scope, support protocol finish, and provide
+`abort_and_settle()` for whole-chain abort. The borrowed buffer lifetime rule is
+the same as other Elio byte streams: the buffer remains live until the awaited
+operation returns. A lower stream may optionally expose `shutdown_socket()` for
+synchronous abort propagation and `fd()` for diagnostics. Exposing `fd()` does
+not authorize TLS to bypass that lower protocol. The raw descriptor output fast
+path is used only by the TCP facade; generic and nested streams publish
+ciphertext by awaiting the lower stream's `write()`.
+
+A lower stream may also expose
+`static constexpr bool tls_progress_interrupts_read = true` when canceling an
+in-flight lower `read()` is nonterminal. TLS uses that opt-in to interrupt a
+parked lower read after sibling TLS progress so the logical reader can retry
+OpenSSL state. Omit the hook, or leave it `false`, when read cancellation closes,
+poisons, or otherwise aborts the lower protocol. TLS treats its own
+progress-cancelled `-ECANCELED` result as a retry signal; genuine lower errors
+such as `-ECONNRESET` remain terminal.
+
+Generic TLS layers keep independent `tls_context`, SNI, certificate
+verification, ALPN, session state and close semantics. A TLS-over-TLS stack is
+therefore just `basic_tls_stream<tls_stream>` (or another conforming lower
+stream), not a special double-TLS type. Finish and shutdown apply to the current
+TLS layer; callers decide when lower layers are finished or aborted.
+
 `tls_stream::read_exactly()` reports EOF before the requested byte count as
 `io_result::result == -ENODATA`, matching the TCP and UDS exact-length helpers.
 Success reports the full requested count.
@@ -4604,13 +4644,15 @@ call. `writev()` applies this to its first nonempty slice. Use `write_exactly()`
 or explicitly advance after short progress; HTTP `body_writer` already manages
 this internally. Keep plaintext buffers valid through the awaited operation.
 
-Ciphertext goes directly to the nonblocking socket when there is no queued
-prefix. Backpressure retains only the unsent ciphertext in an owned output BIO;
-an internal pump drains it without accessing SSL or caller plaintext. There is
-no application-body aggregation or background plaintext queue. A successful
-read does not wait for unrelated outgoing ciphertext. Handshake success means
-local TLS establishment, not peer receipt: final handshake/control records may
-still be owned by that output pump.
+For the TCP facade, ciphertext may go directly to the nonblocking socket when
+there is no queued prefix. Generic lower streams always route ciphertext through
+their `write()` operation, so an inner TLS layer, tunnel or buffered channel is
+not bypassed even if it exposes a descriptor. Backpressure retains only the
+unsent ciphertext in an owned output BIO; an internal pump drains it without
+accessing SSL or caller plaintext. There is no application-body aggregation or
+background plaintext queue. A successful read does not wait for unrelated
+outgoing ciphertext. Handshake success means local TLS establishment, not peer
+receipt: final handshake/control records may still be owned by that output pump.
 
 `ciphertext_budget` limits retained output-BIO payload allocations, defaults to
 1 MiB, and is allocated on demand. A partially consumed block and an in-flight
@@ -4660,9 +4702,11 @@ cannot roll back transmitted bytes. The exact helpers also check cancellation
 between completed slices; cancellation at that boundary has no unfinished SSL
 operation and does not itself abort the stream.
 
-Moved-from streams support destruction, reassignment, `fd()`/`tcp()` queries
-(descriptor -1), `is_handshake_complete()` (false), and inert `shutdown()` /
-`shutdown_socket()`. Other operations require a live, unmoved stream.
+Moved-from TCP-facade streams support destruction, reassignment, `fd()`/`tcp()`
+queries (descriptor -1), `is_handshake_complete()` (false), and inert
+`shutdown()` / `shutdown_socket()`. Generic specializations support the same
+inert lifetime operations except for `tcp()`, which is available only on the
+TCP facade. Other operations require a live, unmoved stream.
 
 Callers must serialize shutdown/destruction against public reads/writes, request
 cancellation where needed, and await those operations before releasing stream

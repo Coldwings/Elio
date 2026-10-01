@@ -124,7 +124,12 @@ IPv6 authorities retain brackets and effective ports. General route identity
 keeps IPv6 zone identifiers case-sensitive. Explicit proxy URI endpoints and
 targets accept RFC 3986 reg-names (including well-formed percent escapes) or
 IPv4/IPv6 literals; malformed escapes, backslashes and bracketed non-IP names
-are rejected before dialing. IPvFuture and scoped IPv6 zone syntax are not
+are rejected before dialing. For the locally resolved proxy endpoint, escapes
+must encode ASCII unreserved octets; they are decoded once before both hop-key
+publication and DNS. Encoded delimiters, nested escapes and non-ASCII octets are
+rejected during construction; use an IDNA ASCII label for an internationalized
+proxy name. Target URI escapes remain unchanged on the proxy wire. IPvFuture
+and scoped IPv6 zone syntax are not
 supported by the explicit proxy connector: it does not reinterpret or forward
 node-local scope identifiers. Direct route normalization is unchanged.
 Trailing-dot DNS names and alternate/ambiguous IPv4

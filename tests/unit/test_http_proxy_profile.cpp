@@ -42,17 +42,26 @@ TEST_CASE("HTTP proxy profiles reject unsupported or unsafe endpoint configurati
         "http://proxy\\host/", "http://[::gg]/", "http://[not-ip]/",
         "http://[v1.name]/", "http://[fe80::1%25]/", "http://[fe80::1%25ethA]/",
         "http://[fe80::1%ethA]/",
+        "http://proxy%00.example/", "http://proxy%2Fhost/", "http://proxy%40host/",
+        "http://proxy%3Ahost/", "http://proxy%25host/", "http://proxy%5Chost/",
+        "http://proxy%C3%A9.example/", "http://proxy%7F.example/", "http://proxy%2Bhost/",
         "http://proxy.example/\r\nInjected: value");
     http_proxy_config config;
     config.endpoint = endpoint;
     REQUIRE_THROWS_AS(detail::freeze_proxy_profile(config), std::invalid_argument);
 }
 
-TEST_CASE("HTTP proxy profiles preserve valid reg-name escapes and normalize IPv6 spelling",
+TEST_CASE("HTTP proxy profiles decode local reg-name escapes and normalize IPv6 spelling",
           "[http][proxy][profile][authority][issue-1249]") {
     http_proxy_config config;
     config.endpoint = "http://proxy%41.example:8080/";
-    REQUIRE(detail::freeze_proxy_profile(config)->endpoint.host == "proxy%41.example");
+    REQUIRE(detail::freeze_proxy_profile(config)->endpoint.host == "proxya.example");
+    config.endpoint = "http://local%68ost:8080/";
+    REQUIRE(detail::freeze_proxy_profile(config)->endpoint.host == "localhost");
+    config.endpoint = "http://%31%32%37.0.0.1/";
+    REQUIRE(detail::freeze_proxy_profile(config)->endpoint.host == "127.0.0.1");
+    config.endpoint = "http://proxy+host/";
+    REQUIRE(detail::freeze_proxy_profile(config)->endpoint.host == "proxy+host");
     config.endpoint = "http://[2001:0DB8:0:0:0:0:0:1]:8080/";
     REQUIRE(detail::freeze_proxy_profile(config)->endpoint.authority() == "[2001:db8::1]:8080");
 }

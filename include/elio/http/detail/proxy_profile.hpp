@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -48,6 +49,32 @@ inline bool valid_proxy_uri_authority(std::string_view source, const url& parsed
     const auto userinfo = source.find('@');
     if (userinfo != std::string_view::npos) source.remove_prefix(userinfo + 1);
     return source.empty() || source.front() != '[' || parsed.host.find(':') != std::string::npos;
+}
+
+inline std::string local_proxy_host(std::string_view host) {
+    std::string decoded;
+    decoded.reserve(host.size());
+    for (size_t pos = 0; pos < host.size(); ++pos) {
+        if (host[pos] != '%') {
+            decoded.push_back(host[pos]);
+            continue;
+        }
+        unsigned int octet = 0;
+        if (host.size() - pos < 3)
+            throw std::invalid_argument("Invalid encoded proxy hostname");
+        const auto* end = host.data() + pos + 3;
+        const auto [parsed, error] = std::from_chars(host.data() + pos + 1, end, octet, 16);
+        const bool unreserved = (octet >= 'a' && octet <= 'z') ||
+            (octet >= 'A' && octet <= 'Z') || (octet >= '0' && octet <= '9') ||
+            octet == '-' || octet == '.' || octet == '_' || octet == '~';
+        // Decode once, after URI splitting. Unsupported encoded octets must
+        // not create a new delimiter, nested escape, or implicit IDNA policy.
+        if (error != std::errc{} || parsed != end || !unreserved)
+            throw std::invalid_argument("Unsupported encoded proxy hostname octet");
+        decoded.push_back(static_cast<char>(octet));
+        pos += 2;
+    }
+    return decoded;
 }
 
 struct proxy_profile {
@@ -91,7 +118,7 @@ inline std::shared_ptr<const proxy_profile> freeze_proxy_profile(const http_prox
         !valid_proxy_uri_authority(config.endpoint, *parsed))
         throw std::invalid_argument("HTTP proxy endpoint must be a plain HTTP authority");
     auto profile = std::make_shared<proxy_profile>();
-    profile->endpoint = route_endpoint::from(parsed->host, parsed->effective_port());
+    profile->endpoint = route_endpoint::from(local_proxy_host(parsed->host), parsed->effective_port());
     profile->limits = config.connect_limits;
     if (config.basic_auth) {
         profile->authorization = proxy_basic_authorization(*config.basic_auth);

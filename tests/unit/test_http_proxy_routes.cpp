@@ -879,7 +879,7 @@ TEST_CASE("CONNECT origin trust hostname and unsupported ALPN fail before origin
 }
 
 TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target-bound reuse",
-          "[http][proxy][routes][issue-1249]") {
+          "[http][proxy][routes][proxy-endpoint-dns][issue-1249]") {
     elio::tls::tls_context server_context(elio::tls::tls_mode::server);
     temporary_pem ca;
     install_certificate(server_context, ca);
@@ -893,7 +893,7 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
         REQUIRE(listener);
         transport_config config;
         config.proxy = http_proxy_config{};
-        config.proxy->endpoint = "http://127.0.0.1:" + std::to_string(listener->local_address().port());
+        config.proxy->endpoint = "http://%31%32%37.0.0.1:" + std::to_string(listener->local_address().port());
         config.proxy->basic_auth = proxy_basic_credentials{"user", "password"};
         config.acquisition_timeout = std::chrono::seconds(5);
         config.configure_tls = [&](transport_tls_config& policy) {
@@ -920,6 +920,7 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
                                             detail::route_mode::forward_proxy));
         REQUIRE(plan.key().target_dns == detail::route_dns_mode::proxy);
         REQUIRE(plan.key().hops.size() == 1);
+        CHECK(plan.key().hops.front().endpoint.host == "127.0.0.1");
         observed_route observed;
         SSL_CTX_set_tlsext_servername_callback(server_context.native_handle(), record_sni);
         SSL_CTX_set_tlsext_servername_arg(server_context.native_handle(), &observed);

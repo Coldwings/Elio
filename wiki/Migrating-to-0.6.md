@@ -78,9 +78,14 @@ Route identities are now internal immutable plans shared by connection setup
 and pooling. Buffered and scoped streaming exchanges use an internal move-only
 lease that retains the original state owner and defaults to abort/retirement.
 Only validated completion returns it; destruction never drains or reuses an
-unfinished body. Explicit external leases, proxy connectors, and global admission
-remain separate follow-up features; raw transport acquire/release is not public
-API in 0.6. Existing standalone `connection_pool` signatures remain adapters in
+unfinished body. Explicit external leases remain a follow-up feature; raw
+transport acquire/release is not public API in 0.6. Transport-wide live/dial
+admission is opt-in through `transport_config::limits`. Explicit plain HTTP
+proxy forwarding and CONNECT routes are supported; HTTPS proxies remain a
+follow-up. Client-managed exchanges strip generic `Proxy-Authorization` headers
+and use only `proxy.basic_auth` for hop credentials, including when callers
+previously set that header on direct routes.
+Existing standalone `connection_pool` signatures remain adapters in
 a separate identity namespace. They still require the original return authority
 and a stable caller-owned TLS/DNS policy. Settle all old operations and dispose
 of checked-out connections before clearing for a policy change; clearing alone

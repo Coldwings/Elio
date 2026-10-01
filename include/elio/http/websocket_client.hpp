@@ -12,6 +12,7 @@
 
 #include <elio/http/websocket_frame.hpp>
 #include <elio/http/websocket_handshake.hpp>
+#include <elio/http/websocket_state.hpp>
 #include <elio/http/http_common.hpp>
 #include <elio/http/http_parser.hpp>
 #include <elio/http/client_base.hpp>

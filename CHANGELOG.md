@@ -167,6 +167,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Standalone WebSocket client header**: move the unchanged connection-state
+  enum to a shared header included by both endpoints. Client/server headers
+  now compile independently and in either order; the public type and values
+  remain unchanged (#1262).
+
 - **HTTP-based client watchdog cleanup**: request writes and WebSocket/SSE
   response-header reads cancel and join their FD watchdog before propagating
   operation-creation or awaited exceptions. A stale timeout cannot reach a

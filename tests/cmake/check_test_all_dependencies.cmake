@@ -29,6 +29,10 @@ if(ELIO_BUILD_HTTP_INTEROP_TESTS)
     list(APPEND _expected elio_http_streaming_peer elio_http_connect_peer
         elio_http_streaming_cost_probe elio_http_streaming_transport_tests)
 endif()
+if(TARGET elio_http)
+    list(APPEND _expected elio_websocket_client_header elio_websocket_server_header
+        elio_websocket_client_server_header elio_websocket_server_client_header)
+endif()
 if(ELIO_BUILD_HTTP_METRICS)
     list(APPEND _expected elio_http_streaming_metrics_server)
 endif()

@@ -4620,6 +4620,15 @@ not authorize TLS to bypass that lower protocol. The raw descriptor output fast
 path is used only by the TCP facade; generic and nested streams publish
 ciphertext by awaiting the lower stream's `write()`.
 
+A lower stream may also expose
+`static constexpr bool tls_progress_interrupts_read = true` when canceling an
+in-flight lower `read()` is nonterminal. TLS uses that opt-in to interrupt a
+parked lower read after sibling TLS progress so the logical reader can retry
+OpenSSL state. Omit the hook, or leave it `false`, when read cancellation closes,
+poisons, or otherwise aborts the lower protocol. TLS treats its own
+progress-cancelled `-ECANCELED` result as a retry signal; genuine lower errors
+such as `-ECONNRESET` remain terminal.
+
 Generic TLS layers keep independent `tls_context`, SNI, certificate
 verification, ALPN, session state and close semantics. A TLS-over-TLS stack is
 therefore just `basic_tls_stream<tls_stream>` (or another conforming lower

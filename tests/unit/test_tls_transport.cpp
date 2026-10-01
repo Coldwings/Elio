@@ -49,6 +49,7 @@ struct scripted_lower_state {
     std::vector<std::byte> written_bytes;
     void* callback_context = nullptr;
     void (*after_positive_read)(void*) = nullptr;
+    void (*before_read_return)(void*) = nullptr;
     void (*after_positive_write)(void*) = nullptr;
     unsigned read_calls = 0;
     unsigned write_calls = 0;
@@ -98,6 +99,9 @@ public:
                 state_->after_positive_read(state_->callback_context);
             }
             co_return result;
+        }
+        if (state_->before_read_return) {
+            state_->before_read_return(state_->callback_context);
         }
         if (token.is_cancelled() && result.result >= 0)
             co_return elio::io::io_result{-ECANCELED, 0};
@@ -168,6 +172,10 @@ make_scripted_transport(const std::shared_ptr<scripted_lower_state>& state) {
 
 void cancel_source_callback(void* context) {
     static_cast<elio::coro::cancel_source*>(context)->cancel();
+}
+
+void notify_progress_callback(void* context) {
+    static_cast<scripted_transport*>(context)->notify_progress();
 }
 
 struct counted_cancel {
@@ -330,6 +338,28 @@ TEST_CASE("TLS transport progress notification interrupts a published lower read
     REQUIRE(done.load(std::memory_order_acquire));
     CHECK(waited.result == 0);
     CHECK(transport->output.error() == 0);
+    CHECK(state->read_calls == 1);
+}
+
+TEST_CASE("TLS transport preserves lower read errors during progress interruption",
+          "[tls][transport][generic][issue-1244]") {
+    auto state = std::make_shared<scripted_lower_state>();
+    state->reads.push_back(elio::io::io_result{-ECONNRESET, 0});
+    auto transport = make_scripted_transport(state);
+    std::unique_ptr<BIO, decltype(&BIO_free)> input(BIO_new(BIO_s_mem()), BIO_free);
+    REQUIRE(input);
+    transport->input = input.get();
+    state->callback_context = transport.get();
+    state->before_read_return = notify_progress_callback;
+
+    auto wait = transport->wait_read(transport->generation, {});
+    auto handle = task_access::handle(wait);
+    handle.resume();
+
+    REQUIRE(handle.done());
+    const auto result = wait.await_resume();
+    CHECK(result.result == -ECONNRESET);
+    CHECK(transport->output.error() == ECONNRESET);
     CHECK(state->read_calls == 1);
 }
 

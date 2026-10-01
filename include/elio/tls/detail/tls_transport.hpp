@@ -206,7 +206,7 @@ public:
                 }
             } else if (token.is_cancelled()) {
                 result = {-ECANCELED, 0};
-            } else if (source->is_cancelled()) {
+            } else if (source->is_cancelled() && result.result == -ECANCELED) {
                 result = {0, 0};
             } else if (result.result == 0) {
                 output.fail(EPIPE);

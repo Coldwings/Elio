@@ -514,7 +514,7 @@ TEST_CASE("HTTP connection pool direct DNS override branches keep constructor an
     REQUIRE(domain->outstanding() == 0);
 }
 
-TEST_CASE("HTTP DNS admission reflects accessor updates including clearing a custom domain",
+TEST_CASE("HTTP DNS admission is frozen in the owning transport",
           "[dns][resolve_wait][public][client][http][configuration][regression]") {
     const int update = GENERATE(0, 1, 2);
     scheduler sched(1);
@@ -536,9 +536,9 @@ TEST_CASE("HTTP DNS admission reflects accessor updates including clearing a cus
         co_return error->code.value();
     });
     REQUIRE(wait_for([&] { return observer.await_ready(); }));
-    REQUIRE(observer.await_resume() == (update == 0 ? EAGAIN : ENETUNREACH));
+    REQUIRE(observer.await_resume() == (update == 0 ? ENETUNREACH : EAGAIN));
     observer.wait_destroyed();
-    REQUIRE(lookup.calls.load() == (update == 0 ? 0 : 1));
+    REQUIRE(lookup.calls.load() == (update == 0 ? 1 : 0));
 }
 
 TEST_CASE("HTTP WebSocket and SSE DNS waiting uses an independent disabled-by-default budget",
@@ -560,10 +560,8 @@ TEST_CASE("HTTP WebSocket and SSE DNS waiting uses an independent disabled-by-de
         };
         if (client_kind == 0) {
             elio::http::client_config config;
-            config.resolve_options.use_cache = false;
-            config.connect_timeout = std::chrono::seconds(1);
+            configure(config);
             elio::http::client client(config);
-            configure(client.config());
             auto result = co_await client.get_result("http://client-dns.example/", token);
             const auto* error = std::get_if<elio::http::client_error>(&result);
             if (!error || error->stage != elio::http::client_stage::resolve) co_return 0;

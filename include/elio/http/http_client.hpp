@@ -78,6 +78,29 @@ struct client_config : base_client_config {
     }
 };
 
+/// Immutable connection-establishment and pooling configuration owned by
+/// http::transport. Request policy stays on http::client.
+struct transport_config {
+    bool verify_certificate = true;               ///< Verify TLS certificates
+    net::resolve_options resolve_options = net::default_cached_resolve_options();
+    bool rotate_resolved_addresses = true;        ///< Rotate through DNS results
+    std::chrono::nanoseconds dns_timeout{0};      ///< DNS observer budget
+    std::shared_ptr<net::resolve_domain> dns_domain; ///< DNS admission domain
+    size_t max_connections_per_host = 6;          ///< Max retained idle connections per host
+    std::chrono::seconds pool_idle_timeout{60};   ///< Idle connection timeout
+
+    transport_config() = default;
+
+    explicit transport_config(const client_config& config)
+        : verify_certificate(config.verify_certificate)
+        , resolve_options(config.resolve_options)
+        , rotate_resolved_addresses(config.rotate_resolved_addresses)
+        , dns_timeout(config.dns_timeout)
+        , dns_domain(config.dns_domain)
+        , max_connections_per_host(config.max_connections_per_host)
+        , pool_idle_timeout(config.pool_idle_timeout) {}
+};
+
 /// Connection wrapper using unified net::stream
 using connection = net::stream;
 
@@ -99,8 +122,11 @@ public:
         std::shared_ptr<net::resolve_domain> domain{};
     };
 
-    explicit connection_pool(client_config config = {})
+    explicit connection_pool(transport_config config = {})
         : config_(config) {}
+
+    explicit connection_pool(const client_config& config)
+        : connection_pool(transport_config(config)) {}
     
     /// Get or create a connection to host
     coro::task<client_result<connection>> acquire_result(const std::string& host,
@@ -208,8 +234,59 @@ private:
         return shards_[std::hash<std::string>{}(key) % shard_count];
     }
     
-    client_config config_;
+    transport_config config_;
     std::array<pool_shard, shard_count> shards_;
+};
+
+/// Shared owner for HTTP/1 connection establishment, TLS security context and
+/// idle pooling. Separate client instances may share a transport while keeping
+/// independent redirect/body/user-agent request policy.
+class transport {
+public:
+    explicit transport(transport_config config = {})
+        : config_(std::move(config))
+        , pool_(config_)
+        , tls_ctx_(tls::tls_mode::client) {
+        init_client_tls_context(tls_ctx_, config_.verify_certificate);
+    }
+
+    explicit transport(const client_config& config)
+        : transport(transport_config(config)) {}
+
+    transport(const transport&) = delete;
+    transport& operator=(const transport&) = delete;
+    transport(transport&&) = delete;
+    transport& operator=(transport&&) = delete;
+
+    coro::task<client_result<connection>> acquire_result(
+            const url& target,
+            std::chrono::nanoseconds connect_timeout,
+            coro::cancel_token token = {}) {
+        // Keep the owning snapshot and task construction outside the await
+        // expression; some coroutine toolchains mishandle aggregate temporaries.
+        std::optional<connection_pool::dns_options> dns{std::in_place};
+        dns->timeout = config_.dns_timeout;
+        dns->domain = config_.dns_domain;
+        auto acquisition = pool_.acquire_result(target.host, target.effective_port(),
+            target.is_secure(), &tls_ctx_, connect_timeout, std::move(token),
+            std::move(dns));
+        co_return co_await std::move(acquisition);
+    }
+
+    void release(const url& target, connection conn) {
+        pool_.release(target.host, target.effective_port(), target.is_secure(),
+                      std::move(conn));
+    }
+
+    void clear() { pool_.clear(); }
+
+    tls::tls_context& tls_context() noexcept { return tls_ctx_; }
+    const transport_config& config() const noexcept { return config_; }
+
+private:
+    transport_config config_;
+    connection_pool pool_;
+    tls::tls_context tls_ctx_;
 };
 
 /// HTTP client
@@ -220,11 +297,17 @@ public:
 
     /// Create client with configuration
     explicit client(client_config config)
-        : config_(config)
-        , pool_(config)
-        , tls_ctx_(tls::tls_mode::client) {
-        // Setup TLS context using shared utility
-        init_client_tls_context(tls_ctx_, config_.verify_certificate);
+        : config_(std::move(config))
+        , transport_(std::make_shared<transport>(config_)) {}
+
+    /// Create client with an explicitly shared transport and independent
+    /// request policy. The transport owns connection pooling and TLS security
+    /// snapshots; this client owns redirects, headers and response limits.
+    explicit client(std::shared_ptr<transport> shared_transport,
+                    client_config config = {})
+        : config_(std::move(config))
+        , transport_(std::move(shared_transport)) {
+        if (!transport_) throw std::invalid_argument("http::client requires a transport");
     }
     
     /// Perform HTTP GET request
@@ -355,7 +438,7 @@ public:
     }
     
     /// Get TLS context for configuration
-    tls::tls_context& tls_context() noexcept { return tls_ctx_; }
+    tls::tls_context& tls_context() noexcept { return transport_->tls_context(); }
     
     /// Get configuration
     client_config& config() noexcept { return config_; }
@@ -751,15 +834,8 @@ private:
             ELIO_LOG_ERROR("Invalid outbound HTTP request target");
             co_return detail::make_client_error(EINVAL, client_stage::target);
         }
-        // Keep the owning snapshot and task construction outside the await
-        // expression; some coroutine toolchains mishandle aggregate temporaries.
-        std::optional<connection_pool::dns_options> dns{std::in_place};
-        dns->timeout = config_.dns_timeout;
-        dns->domain = config_.dns_domain;
-        auto acquisition = pool_.acquire_result(target.host, target.effective_port(),
-            target.is_secure(), &tls_ctx_, config_.connect_timeout, token,
-            std::move(dns));
-        auto conn_result = co_await std::move(acquisition);
+        auto conn_result = co_await transport_->acquire_result(
+            target, config_.connect_timeout, token);
         if (const auto* error = std::get_if<client_error>(&conn_result)) co_return *error;
         auto conn = std::move(std::get<connection>(conn_result));
         if (req.header("Host").empty()) req.set_host(target.host_authority());
@@ -889,8 +965,7 @@ private:
                 co_return detail::make_client_error(ECANCELED, client_stage::body);
             }
             if (body.complete() && exchange->reusable()) {
-                pool_.release(target.host, target.effective_port(), target.is_secure(),
-                              exchange->take_connection());
+                transport_->release(target, exchange->take_connection());
             } else {
                 exchange->abort();
             }
@@ -931,8 +1006,7 @@ private:
         // head of the next response (response-splitting). On any failure of
         // these conditions the connection is simply dropped on scope exit.
         if (exchange->reusable()) {
-            pool_.release(target.host, target.effective_port(), target.is_secure(),
-                          exchange->take_connection());
+            transport_->release(target, exchange->take_connection());
         }
         
         if (auto redirect = make_redirect(req, target, resp, redirect_count)) {
@@ -944,8 +1018,7 @@ private:
     }
     
     client_config config_;
-    connection_pool pool_;
-    tls::tls_context tls_ctx_;
+    std::shared_ptr<transport> transport_;
 };
 
 /// Simple convenience functions for one-off requests

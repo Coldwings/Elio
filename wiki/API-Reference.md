@@ -2884,13 +2884,15 @@ references, scheme-relative references, and dot-segment removal.
 
 ### `client`
 
-HTTP client with connection pooling.
+HTTP client with private or explicitly shared connection transport ownership.
 
 ```cpp
 class client {
 public:
     client();
     explicit client(client_config config);
+    explicit client(std::shared_ptr<transport> shared_transport,
+                    client_config config = {});
 
     // GET request (awaitable)
     /* awaitable */ get(std::string_view url);
@@ -2967,6 +2969,72 @@ public:
                      std::string_view content_type = mime::application_form_urlencoded);
 ```
 
+`client()` and `client(client_config)` create a private `http::transport`.
+`client(shared_ptr<transport>, client_config)` shares that transport's resolver,
+DNS admission, TLS security context, and idle connection pool while retaining an
+independent request policy on each client. Request policy includes redirects,
+User-Agent, read/Expect timeouts, response limits, and the TCP/TLS
+`connect_timeout` budget passed to each acquisition.
+
+### `transport_config` and `transport`
+
+```cpp
+struct transport_config {
+    bool verify_certificate = true;
+    net::resolve_options resolve_options = net::default_cached_resolve_options();
+    bool rotate_resolved_addresses = true;
+    std::chrono::nanoseconds dns_timeout{0};
+    std::shared_ptr<net::resolve_domain> dns_domain;
+    size_t max_connections_per_host = 6;
+    std::chrono::seconds pool_idle_timeout{60};
+
+    transport_config();
+    explicit transport_config(const client_config& config);
+};
+
+class transport {
+public:
+    explicit transport(transport_config config = {});
+    explicit transport(const client_config& config);
+
+    transport(const transport&) = delete;
+    transport& operator=(const transport&) = delete;
+    transport(transport&&) = delete;
+    transport& operator=(transport&&) = delete;
+
+    coro::task<client_result<connection>> acquire_result(
+        const url& target,
+        std::chrono::nanoseconds connect_timeout,
+        coro::cancel_token token = {});
+
+    void release(const url& target, connection conn);
+    void clear();
+
+    tls::tls_context& tls_context() noexcept;
+    const transport_config& config() const noexcept;
+};
+```
+
+`transport_config(client_config)` copies only connection-affecting fields:
+certificate verification, resolver/cache/address-rotation policy, DNS
+observation/admission, and idle-pool limits. It intentionally does not copy
+request/response policy such as redirect limits, User-Agent, body limits,
+header limits, read timeout, or Expect fallback timeout.
+
+For HTTP clients, connection-affecting fields are frozen when the private or
+shared transport is constructed. Mutating `client.config()` later changes only
+the client request policy plus the per-acquisition `connect_timeout`; it does
+not mutate resolver, DNS, TLS verification, or pool identity. Publish a new
+transport to change those connection-policy domains. `client::tls_context()`
+and `transport::tls_context()` expose the transport TLS context for source
+compatibility; configure it before sharing the transport or starting requests,
+and serialize any compatibility mutation with transport use.
+
+`transport::clear()` drops idle pooled connections. Active or dialing
+operations still follow the usual client lifetime rule: keep the client,
+transport, request/URL objects, caches/TLS context, and borrowed strings alive
+until awaited return.
+
 #### Owned HTTP Client Errors
 
 Opt in by replacing `get()` with `get_result()`, `send()` with `send_result()`,
@@ -3022,13 +3090,13 @@ pool reuse rules, and caller retry policy are unchanged. New connection DNS
 observation is cancellable and uses `dns_timeout`/`dns_domain`; the independent
 TCP/TLS connect budget still begins after resolution.
 
-HTTP acquisition takes an operation-owned snapshot of the current
-`client.config().dns_timeout` and `dns_domain`. Set these before starting the
-operation; configuration mutation and client use must remain serialized.
-`connection_pool::{acquire_result,acquire}` accept a trailing optional
-`connection_pool::dns_options{timeout, domain}` after the token. An omitted
-override uses the pool configuration; an engaged null domain selects the shared
-resolver default, including after clearing a constructor-time custom domain.
+HTTP acquisition takes an operation-owned snapshot of the owning transport's
+`transport_config::dns_timeout` and `dns_domain`. Configure these before
+publishing the transport. `connection_pool::{acquire_result,acquire}` accept a
+trailing optional `connection_pool::dns_options{timeout, domain}` after the
+token. An omitted override uses the pool configuration; an engaged null domain
+selects the shared resolver default, including after clearing a constructor-time
+custom domain.
 
 The same vocabulary is available in `client_connect_result()` and
 `connection_pool::acquire_result()`; their optional counterparts remain adapters.
@@ -3124,6 +3192,11 @@ struct base_client_config {
 - `max_headers`: Maximum response headers accepted by parsers.
 - `max_header_size`: Maximum size of one response header line in bytes.
 
+For `http::client`, `verify_certificate`, `resolve_options`,
+`rotate_resolved_addresses`, `dns_timeout`, and `dns_domain` are copied into the
+owning `http::transport` at construction. WebSocket, SSE, and HTTP/2 clients
+still own their connection policy directly in their client configuration.
+
 ### `client_config`
 
 ```cpp
@@ -3137,6 +3210,13 @@ struct client_config : base_client_config {
     // Inherits all base_client_config fields.
 };
 ```
+
+For `http::client`, `max_connections_per_host` and `pool_idle_timeout` are
+transport-policy fields. They are copied into a private transport by
+`client(client_config)` or into an explicit `transport_config` by
+`transport_config(client_config)`. Mutating them through `client.config()` after
+construction does not resize an existing pool. `connect_timeout` remains
+per-client/per-acquisition for compatibility.
 
 When `follow_redirects` is enabled, the client resolves `Location` values with
 `url::resolve_reference()`, rejects unsupported schemes, and rejects HTTPS to

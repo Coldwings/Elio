@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1993,6 +1994,100 @@ TEST_CASE("HTTP client returns OK for clean keep-alive responses",
     REQUIRE(server_done);
     REQUIRE(server_accepted);
     REQUIRE(got_status == 200);
+}
+
+TEST_CASE("HTTP clients sharing a transport reuse pooled connections",
+          "[http][client][transport][issue-1245]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> server_accepted{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> tls_context_shared{false};
+    std::atomic<int> first_status{0};
+    std::atomic<int> second_status{0};
+    std::string first_body;
+    std::string second_body;
+    std::string first_request;
+    std::string second_request;
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        server_accepted = stream.has_value();
+        if (!stream) {
+            server_done = true;
+            co_return;
+        }
+
+        first_request = co_await read_request_headers(*stream);
+        std::string first_resp =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 3\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n"
+            "one";
+        co_await stream->write(first_resp);
+
+        second_request = co_await read_request_headers(*stream);
+        std::string second_resp =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 3\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "two";
+        co_await stream->write(second_resp);
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        auto shared = std::make_shared<elio::http::transport>();
+        elio::http::client_config first_cfg;
+        first_cfg.user_agent = "transport-first";
+        elio::http::client_config second_cfg;
+        second_cfg.user_agent = "transport-second";
+
+        elio::http::client first(shared, first_cfg);
+        elio::http::client second(shared, second_cfg);
+        tls_context_shared =
+            &first.tls_context() == &second.tls_context();
+
+        auto first_resp = co_await first.get(make_url(port, "/first"));
+        if (first_resp) {
+            first_status = first_resp->status_code();
+            first_body = std::string(first_resp->body());
+        }
+
+        auto second_resp = co_await second.get(make_url(port, "/second"));
+        if (second_resp) {
+            second_status = second_resp->status_code();
+            second_body = std::string(second_resp->body());
+        }
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(server_accepted);
+    REQUIRE(tls_context_shared);
+    REQUIRE(first_status == 200);
+    REQUIRE(second_status == 200);
+    REQUIRE(first_body == "one");
+    REQUIRE(second_body == "two");
+    REQUIRE(first_request.find("GET /first HTTP/1.1\r\n") != std::string::npos);
+    REQUIRE(second_request.find("GET /second HTTP/1.1\r\n") != std::string::npos);
+    REQUIRE(request_header_value(first_request, "User-Agent") == "transport-first");
+    REQUIRE(request_header_value(second_request, "User-Agent") == "transport-second");
 }
 
 TEST_CASE("HTTP client resolves redirect Location references",

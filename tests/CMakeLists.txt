@@ -145,6 +145,7 @@ if(TARGET elio_tls)
         unit/test_http_proxy_connect.cpp
         unit/test_http_proxy_pool.cpp
         unit/test_http_proxy_wire.cpp
+        unit/test_http_proxy_routes.cpp
         unit/test_http_fd_watchdog.cpp
         unit/test_http_empty_redirect.cpp
     )

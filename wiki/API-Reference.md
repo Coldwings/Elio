@@ -3021,6 +3021,7 @@ struct transport_config {
     std::chrono::seconds pool_idle_timeout{60};
     std::optional<pool_limits> limits;
     std::chrono::nanoseconds acquisition_timeout{0};
+    std::optional<http_proxy_config> proxy;
     std::function<void(transport_tls_config&)> configure_tls;
 
     transport_config();
@@ -3048,7 +3049,7 @@ public:
 
 `transport_config(client_config)` copies only connection-affecting fields:
 certificate verification, resolver/cache/address-rotation policy, DNS
-observation/admission, idle-pool limits, opt-in finite pool admission, and the
+observation/admission, the explicit proxy profile, idle-pool limits, opt-in finite pool admission, and the
 absolute acquisition budget. It intentionally does not copy
 request/response policy such as redirect limits, User-Agent, body limits,
 header limits, read timeout, or Expect fallback timeout.
@@ -3056,7 +3057,7 @@ header limits, read timeout, or Expect fallback timeout.
 For HTTP clients, connection-affecting fields are frozen when the private or
 shared transport is constructed. Mutating `client.config()` later changes only
 the client request policy plus the per-acquisition `connect_timeout`; it does
-not mutate resolver, DNS, TLS verification, or pool identity. Publish a new
+not mutate resolver, DNS, TLS verification, proxy configuration, or pool identity. Publish a new
 transport to change those connection-policy domains.
 `transport_config::configure_tls` runs once during transport construction after
 default client TLS initialization; use the supplied `transport_tls_config`
@@ -3090,10 +3091,46 @@ HTTP/1 connection establishment and idle pooling now consume one internal
 immutable route plan per exchange. Its structured key compares normalized
 origin authority, route mode, ordered proxy-hop identities, security/authentication
 domains, protocol requirements, and connector/resolution domains by full value
-equality. Direct routes are implemented; proxy identity fields are reserved for
-the subsequent connectors. Redirects create fresh plans, and returns retain the
+equality. Direct routes and one explicit plain HTTP proxy are implemented;
+HTTPS proxy hops remain separate. Redirects create fresh plans, and returns retain the
 acquisition plan. See [[HTTP Routing]] (`HTTP-Routing.md`) for the compatibility
 matrix, normalization, and standalone-pool responsibility boundary.
+
+#### Explicit HTTP Proxy Configuration
+
+```cpp
+struct proxy_basic_credentials {
+    std::string username;
+    std::string password;
+};
+struct proxy_connect_limits {
+    size_t max_headers = 100;
+    size_t max_header_size = 8192;
+    size_t max_response_bytes = 65536;
+    size_t max_informational_responses = 8;
+    size_t max_read_ahead = 8192;
+};
+struct http_proxy_config {
+    std::string endpoint; // explicit plain http://host[:port] authority
+    std::optional<proxy_basic_credentials> basic_auth;
+    proxy_connect_limits connect_limits;
+};
+```
+
+Set `transport_config::proxy` (or `client_config::proxy` before constructing a
+private Transport). The Transport freezes endpoint, authentication domain and
+CONNECT limits. HTTP origins use absolute-form forwarding, HTTPS origins use
+target-bound CONNECT then independently verified origin TLS. Only the proxy
+endpoint is resolved locally. Credentials are explicitly selected preemptive
+Basic octets; there is no automatic 407 challenge replay or environment discovery.
+Plain HTTP does not encrypt proxy credentials. Generic `Proxy-Authorization`
+request headers are stripped from direct/tunneled requests, and only the frozen
+profile supplies forwarding/CONNECT hop credentials. To migrate custom proxy
+headers, configure `proxy.basic_auth`; public request serialization remains
+unchanged. HTTPS proxy, SOCKS, chained proxy and HTTP/2 routes are not supported.
+Standalone `connection_pool` remains direct-only and rejects construction with
+an explicit proxy option (`std::invalid_argument`) rather than ignoring it.
+Full encoding, zero-bound, error and ownership rules are in [[HTTP Routing]].
 
 #### Owned HTTP Client Errors
 
@@ -3107,7 +3144,7 @@ an empty optional plus `errno`. Capture that legacy errno immediately.
 
 ```cpp
 enum class client_stage {
-    target, resolve, acquire, connect, tls, request, headers, body, framing
+    target, resolve, acquire, connect, tls, request, headers, body, framing, proxy_connect
 };
 struct client_error {
     std::error_code code;
@@ -3136,6 +3173,7 @@ changes. This is not a promise that existing debug logging redacts requests.
 | `acquire` | Cancellation before connection acquisition |
 | `connect` | TCP connection failure, cancellation, or connect deadline |
 | `tls` | TLS context validation, handshake failure/cancellation/deadline |
+| `proxy_connect` | CONNECT negotiation, status rejection, framing/size bound, cancellation or setup deadline |
 | `request` | Request/header validation, serialization, or request write failure/cancellation/deadline |
 | `headers` | Transport failure, cancellation, or deadline before final headers complete |
 | `body` | Transport failure, cancellation, or deadline after headers; aggregate body limit (`EMSGSIZE`) |
@@ -3148,7 +3186,8 @@ than embedding OpenSSL diagnostics. A race can still be won by actual I/O
 completion, and stages do not prescribe retry/replay policy. Redirect processing,
 pool reuse rules, and caller retry policy are unchanged. New connection DNS
 observation is cancellable and uses `dns_timeout`/`dns_domain`; the independent
-TCP/TLS connect budget still begins after resolution.
+TCP/TLS connect budget still begins after resolution; proxy routes include CONNECT
+without restarting that budget.
 
 HTTP acquisition takes an operation-owned snapshot of the owning transport's
 `transport_config::dns_timeout` and `dns_domain`. Configure these before
@@ -3267,6 +3306,7 @@ struct client_config : base_client_config {
     std::chrono::seconds pool_idle_timeout{60};
     std::optional<pool_limits> limits;
     std::chrono::nanoseconds acquisition_timeout{0};
+    std::optional<http_proxy_config> proxy;
     size_t max_response_size = 16 * 1024 * 1024;
     std::chrono::milliseconds expect_continue_timeout{1000};
     // Inherits all base_client_config fields.
@@ -3274,7 +3314,7 @@ struct client_config : base_client_config {
 ```
 
 For `http::client`, `max_connections_per_host`, `pool_idle_timeout`, `limits`,
-and `acquisition_timeout` are
+`acquisition_timeout`, and `proxy` are
 transport-policy fields. They are copied into a private transport by
 `client(client_config)` or into an explicit `transport_config` by
 `transport_config(client_config)`. Mutating them through `client.config()` after
@@ -3285,7 +3325,7 @@ An absent `limits` keeps legacy unbounded live admission and idle-only
 `max_connections_per_host`. When enabled, finite idle limits replace that legacy
 retention option. Every zero limit denies the named resource, not infinity.
 `acquisition_timeout` defaults to disabled (`<= 0`); when positive, one absolute
-budget covers queueing, DNS, TCP and TLS, independently of finite admission.
+budget covers queueing, DNS, TCP, CONNECT and TLS, independently of finite admission.
 Independent DNS/connect caps can shorten it. Global FIFO and overload semantics,
 streaming capacity ownership and migration hazards are described in
 [HTTP Connection Routing And Reuse](HTTP-Routing.md#opt-in-finite-admission).

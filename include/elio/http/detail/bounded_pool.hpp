@@ -62,6 +62,28 @@ public:
     };
 
     struct grant {
+        grant(permit value, std::optional<Stream> stream) noexcept
+            : capacity(std::move(value)), idle(std::move(stream)) {}
+        grant(grant&&) noexcept = default;
+        grant& operator=(grant&& other) noexcept {
+            if (this != &other) {
+                reset();
+                capacity = std::move(other.capacity);
+                idle = std::move(other.idle);
+            }
+            return *this;
+        }
+        grant(const grant&) = delete;
+        grant& operator=(const grant&) = delete;
+        ~grant() { reset(); }
+        void reset() noexcept {
+            if (idle) {
+                if constexpr (requires { defer_stream_retirement(*idle, capacity); })
+                    defer_stream_retirement(*idle, capacity);
+                idle.reset();
+            }
+            capacity.reset();
+        }
         permit capacity;
         std::optional<Stream> idle;
     };
@@ -69,6 +91,10 @@ public:
 private:
     struct idle_entry {
         explicit idle_entry(Stream value) : stream(std::move(value)) {}
+        ~idle_entry() {
+            if constexpr (requires { defer_stream_retirement(stream, capacity); })
+                defer_stream_retirement(stream, capacity);
+        }
         // Detached idle entries acquire their retiring permit before unlinking.
         // Member order closes the stream before releasing physical capacity.
         permit capacity;
@@ -299,10 +325,7 @@ private:
                 owner_->dispatch(result);
             }
             // Close an unused selected stream before releasing its live permit.
-            if (recovered) {
-                recovered->idle.reset();
-                recovered->capacity.reset();
-            }
+            if (recovered) recovered->reset();
         }
     private:
         std::shared_ptr<state> owner_;

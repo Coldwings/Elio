@@ -20,6 +20,8 @@
 
 namespace elio::http::detail {
 
+struct proxy_profile;
+
 // These tokens identify published policy domains, never object addresses or
 // credential contents. Refuse exhaustion rather than reusing an identity.
 inline uint64_t new_route_domain() {
@@ -67,7 +69,7 @@ struct route_endpoint {
 };
 
 enum class route_mode { direct, forward_proxy, connect_tunnel };
-enum class route_dns_mode { local, proxy }; // Reserved for later proxy DNS routes.
+enum class route_dns_mode { local, proxy };
 enum class route_protocol { http1, http2 };
 
 struct route_hop_identity {
@@ -130,7 +132,7 @@ struct connection_key_hash {
 
 // Published only through shared_ptr<const route_snapshot>. The cache remains
 // borrowed under the resolver's existing lifetime contract; DNS/TLS owners are
-// retained by every plan. Proxy profiles will add owned hop state here.
+// retained by every plan, along with the frozen hop profile when configured.
 struct route_snapshot {
     route_mode mode = route_mode::direct;
     std::vector<route_hop_identity> hops;
@@ -144,6 +146,7 @@ struct route_snapshot {
     std::chrono::nanoseconds dns_timeout{0};
     std::shared_ptr<net::resolve_domain> dns_domain;
     std::shared_ptr<tls::tls_context> origin_tls;
+    std::shared_ptr<const proxy_profile> proxy;
 };
 
 class route_plan final {
@@ -151,7 +154,9 @@ public:
     route_plan(const url& target, std::shared_ptr<const route_snapshot> snapshot)
         : snapshot_(std::move(snapshot)) {
         if (!snapshot_) throw std::invalid_argument("HTTP route requires a snapshot");
-        key_.mode = snapshot_->mode;
+        key_.mode = snapshot_->proxy
+            ? (target.is_secure() ? route_mode::connect_tunnel : route_mode::forward_proxy)
+            : snapshot_->mode;
         key_.target = route_endpoint::from(target.host, target.effective_port());
         key_.target_secure = target.is_secure();
         key_.hops = snapshot_->hops;

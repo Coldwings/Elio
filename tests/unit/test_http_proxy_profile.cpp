@@ -37,6 +37,7 @@ TEST_CASE("HTTP proxy profiles reject unsupported or unsafe endpoint configurati
         "socks5://proxy.example:1080", "http://user:secret@proxy.example/",
         "http://proxy.example/path", "http://proxy.example/?token=value",
         "http://proxy.example/#fragment", "http://proxy.example:0/",
+        "http://@proxy.example/", "http://proxy.example/?", "http://proxy.example/#",
         "http://proxy.example/\r\nInjected: value");
     http_proxy_config config;
     config.endpoint = endpoint;

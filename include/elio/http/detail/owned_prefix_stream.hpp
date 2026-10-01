@@ -24,8 +24,8 @@ template<typename Lower>
 requires (std::same_as<Lower, net::tcp_stream> || net::publishing_byte_stream<Lower>)
 class owned_prefix_stream {
     struct state {
-        state(Lower value, std::vector<char> bytes)
-            : lower(std::move(value)), prefix(std::move(bytes)) {}
+        state(Lower value, std::vector<char> bytes, std::shared_ptr<void> lifetime)
+            : retirement(std::move(lifetime)), lower(std::move(value)), prefix(std::move(bytes)) {}
 
         int begin(bool write) {
             std::lock_guard lock(mutex);
@@ -60,6 +60,9 @@ class owned_prefix_stream {
                 lower.shutdown_socket();
         }
 
+        // Physical lower closure precedes permit/operation-owner release,
+        // including when a TLS output pump retains this state after retirement.
+        std::shared_ptr<void> retirement;
         Lower lower;
         std::vector<char> prefix;
         size_t offset = 0;
@@ -113,11 +116,18 @@ class owned_prefix_stream {
 
 public:
     using byte_stream_contract = net::publishing_byte_stream_contract;
+    static constexpr bool tls_progress_interrupts_read = [] {
+        if constexpr (std::same_as<Lower, net::tcp_stream>) return true;
+        else if constexpr (requires { Lower::tls_progress_interrupts_read; })
+            return static_cast<bool>(Lower::tls_progress_interrupts_read);
+        else return false;
+    }();
 
-    owned_prefix_stream(Lower lower, std::vector<char> prefix, size_t prefix_limit) {
+    owned_prefix_stream(Lower lower, std::vector<char> prefix, size_t prefix_limit,
+                        std::shared_ptr<void> retirement = {}) {
         if (prefix.size() > prefix_limit)
             throw std::invalid_argument("HTTP CONNECT read-ahead exceeds its bound");
-        owner_ = std::make_shared<state>(std::move(lower), std::move(prefix));
+        owner_ = std::make_shared<state>(std::move(lower), std::move(prefix), std::move(retirement));
     }
     owned_prefix_stream(owned_prefix_stream&&) noexcept = default;
     owned_prefix_stream& operator=(owned_prefix_stream&& other) noexcept {

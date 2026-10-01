@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Explicit plain HTTP proxy routes**: frozen `http_proxy_config` enables
+  absolute-form HTTP forwarding and target-bound CONNECT followed by origin TLS.
+  Owned, bounded CONNECT read-ahead is passed once through the generic TLS lower;
+  origin trust/SNI remains separate from the proxy endpoint. One remaining
+  post-DNS connect budget covers TCP/CONNECT/TLS, and finite live permits remain
+  held until physical owned-root retirement. Explicit preemptive Basic is hop-only:
+  generic Proxy-Authorization is stripped from direct/tunneled requests and
+  forwarding uses only the frozen profile. Configure `proxy.basic_auth` instead
+  of custom hop headers; public request serialization and standalone connection
+  types/pools are unchanged. No environment discovery, automatic replay, HTTPS
+  proxy, SOCKS, multi-hop or HTTP/2 proxy is added (#1249).
+
 - **Opt-in finite HTTP Transport admission**: separate route/global idle and
   live limits, reserved dial slots, bounded FIFO waiters and route metadata.
   Move-only permits retain capacity through scoped streaming and release it
@@ -67,7 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so hash collisions cannot authorize reuse. Redirects resolve new plans and
   replacement transports keep separate published policy domains. Proxy and
   layered-TLS identity fields are modeled conservatively per origin; their
-  connectors remain separate features. Legacy standalone pool adapters retain
+  plain HTTP proxy connectors are now provided by #1249; HTTPS proxy connectors
+  remain separate features. Legacy standalone pool adapters retain
   their stable caller-policy contract in a separate namespace. HTTP/1 diagnostics
   no longer log serialized requests or complete redirect URLs (#1246).
 

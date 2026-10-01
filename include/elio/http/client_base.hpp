@@ -234,7 +234,7 @@ inline bool response_header_limits_exceeded(
 /// Base configuration shared by all HTTP-based clients
 /// Can be embedded in more specific configuration structures
 struct base_client_config {
-    std::chrono::seconds connect_timeout{10};     ///< TCP connect + TLS handshake timeout; <=0 disables
+    std::chrono::seconds connect_timeout{10};     ///< Post-DNS setup; HTTP proxy also includes CONNECT; <=0 disables
     std::chrono::seconds read_timeout{30};        ///< Read timeout; <=0 disables
     size_t read_buffer_size = 8192;               ///< Read buffer size
     std::string user_agent;                          ///< User-Agent header (empty = no header)
@@ -261,6 +261,25 @@ inline void init_client_tls_context(tls::tls_context& ctx, bool verify_certifica
     }
 }
 
+namespace detail {
+
+// The private output is borrowed only by the awaiting route connector. It
+// exposes the post-DNS setup deadline so later CONNECT/TLS layers can consume
+// the same remaining budget without changing the public utility signature.
+inline coro::task<client_result<net::stream>>
+client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
+               tls::tls_context* tls_ctx,
+               net::resolve_options resolve_opts,
+               bool rotate_resolved_addresses,
+               std::chrono::nanoseconds connect_timeout,
+               coro::cancel_token token,
+               std::chrono::nanoseconds dns_timeout,
+               std::shared_ptr<net::resolve_domain> dns_domain,
+               std::optional<std::chrono::steady_clock::time_point> acquisition_deadline,
+               std::optional<std::chrono::steady_clock::time_point>* setup_deadline_output);
+
+} // namespace detail
+
 /// Connect to a host with TLS context setup
 /// @param host Hostname
 /// @param port Port number
@@ -282,6 +301,24 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
                std::chrono::nanoseconds dns_timeout = std::chrono::nanoseconds::zero(),
                std::shared_ptr<net::resolve_domain> dns_domain = {},
                std::optional<std::chrono::steady_clock::time_point> acquisition_deadline = {}) {
+    return detail::client_connect_result_impl(host, port, secure, tls_ctx, resolve_opts,
+        rotate_resolved_addresses, connect_timeout, std::move(token), dns_timeout,
+        std::move(dns_domain), acquisition_deadline, nullptr);
+}
+
+namespace detail {
+
+inline coro::task<client_result<net::stream>>
+client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
+               tls::tls_context* tls_ctx,
+               net::resolve_options resolve_opts,
+               bool rotate_resolved_addresses,
+               std::chrono::nanoseconds connect_timeout,
+               coro::cancel_token token,
+               std::chrono::nanoseconds dns_timeout,
+               std::shared_ptr<net::resolve_domain> dns_domain,
+               std::optional<std::chrono::steady_clock::time_point> acquisition_deadline,
+               std::optional<std::chrono::steady_clock::time_point>* setup_deadline_output) {
 
     if (token.is_cancelled()) {
         co_return detail::make_client_error(ECANCELED, client_stage::resolve);
@@ -327,6 +364,7 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
             ? std::chrono::steady_clock::time_point::max() : now + connect_timeout;
         if (!setup_deadline || cap < *setup_deadline) setup_deadline = cap;
     }
+    if (setup_deadline_output) *setup_deadline_output = setup_deadline;
     const bool deadline_enforced = sched != nullptr && setup_deadline.has_value();
     auto op_cancel_src = std::make_shared<coro::cancel_source>();
     auto timer_cancel_src = std::make_shared<coro::cancel_source>();
@@ -450,6 +488,8 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
         co_return last_error;
     }
 }
+
+} // namespace detail
 
 /// Compatibility wrapper; capture errno immediately on an empty result.
 inline coro::task<std::optional<net::stream>>

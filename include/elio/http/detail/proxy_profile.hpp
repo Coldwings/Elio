@@ -44,7 +44,10 @@ inline std::string proxy_basic_authorization(const proxy_basic_credentials& cred
 }
 
 inline std::shared_ptr<const proxy_profile> freeze_proxy_profile(const http_proxy_config& config) {
-    if (config.endpoint.size() > 8192 || config.endpoint.find("://") == std::string::npos)
+    // The shared parser stores empty and absent URI decorations alike. Reject
+    // their delimiters too: the endpoint policy accepts only an authority.
+    if (config.endpoint.size() > 8192 || config.endpoint.find("://") == std::string::npos ||
+        config.endpoint.find_first_of("@?#") != std::string::npos)
         throw std::invalid_argument("HTTP proxy requires an explicit bounded endpoint URI");
     const auto parsed = url::parse(config.endpoint);
     if (!parsed || parsed->scheme != "http" || !parsed->userinfo.empty() ||

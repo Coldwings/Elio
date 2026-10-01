@@ -76,8 +76,11 @@ and pooling. Explicit external leases, proxy connectors, and global admission
 remain separate follow-up features; raw transport acquire/release is not public
 API in 0.6. Existing standalone `connection_pool` signatures remain adapters in
 a separate identity namespace. They still require the original return authority
-and a stable caller-owned TLS/DNS policy; clear or replace the pool before
-changing that policy. Prefer a shared Transport for automatic security-domain
+and a stable caller-owned TLS/DNS policy. Settle all old operations and dispose
+of checked-out connections before clearing for a policy change; clearing alone
+does not prevent late returns. Alternatively, use a fresh pool and keep the old
+pool/context alive and unchanged for old operations/returns. Prefer a shared
+Transport for automatic security-domain
 isolation. See [HTTP routing and reuse](HTTP-Routing.md).
 
 ## Generic TLS Stream Core

@@ -173,8 +173,9 @@ using connection = net::stream;
 
 /// Connection pool for HTTP keep-alive. Legacy host/port/scheme adapters require
 /// the original return authority and one stable caller-owned TLS/resolver policy
-/// per pool. Clear/replace it before changing those domains. Shared transports
-/// use the private plan-based path instead.
+/// per pool. For a policy change, settle old operations and dispose of checked-out
+/// connections before clearing, or keep a separate old pool/context alive for
+/// old operations/returns. Shared transports use the private plan-based path.
 class connection_pool {
 public:
     static constexpr size_t shard_count = 16;

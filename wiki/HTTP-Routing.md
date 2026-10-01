@@ -70,7 +70,11 @@ available and use a separate legacy identity namespace. They cannot inject a
 connection into a Transport's plan-based pool. Their loose acquire/release
 contract still requires callers to supply the original host/port/scheme and
 keep one stable TLS/resolver policy per standalone pool; they cannot infer a
-security domain from a borrowed mutable TLS context. Clear or replace that pool
-before changing its TLS or DNS policy. For automatic route/security isolation
-and client-managed lifecycle, migrate to `client(shared_ptr<transport>, policy)`.
+security domain from a borrowed mutable TLS context. To change its TLS or DNS
+policy, first settle all old acquisitions/exchanges and dispose of all
+checked-out connections, then clear the idle entries. `clear()` alone is not a
+barrier against late returns. Alternatively, route new work through a fresh pool
+and keep the old pool/context alive and unchanged for old operations/returns.
+For automatic route/security isolation and client-managed lifecycle, migrate to
+`client(shared_ptr<transport>, policy)`.
 The route-bound lease migration is a separate follow-up.

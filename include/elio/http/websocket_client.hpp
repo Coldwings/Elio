@@ -318,7 +318,9 @@ private:
             config_.resolve_options,
             config_.rotate_resolved_addresses,
             config_.connect_timeout,
-            token);
+            token,
+            config_.dns_timeout,
+            config_.dns_domain);
         if (!conn_result) {
             state_ = connection_state::closed;
             co_return false;

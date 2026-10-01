@@ -538,6 +538,8 @@ TEST_CASE("HTTP/2 client configuration", "[http2][config]") {
         REQUIRE(client_cfg.enable_push);
         REQUIRE(client_cfg.max_response_headers == 100);
         REQUIRE(client_cfg.max_response_header_bytes == 64 * 1024);
+        REQUIRE(client_cfg.dns_timeout == std::chrono::nanoseconds::zero());
+        REQUIRE_FALSE(client_cfg.dns_domain);
     }
 
     SECTION("session config defaults match documented client defaults") {

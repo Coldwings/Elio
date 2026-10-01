@@ -256,6 +256,7 @@ namespace detail {
 struct dns_lookup_result {
     std::vector<socket_address> addresses;
     int error = 0;
+    bool cacheable = true;
 };
 
 struct dns_lookup_request {

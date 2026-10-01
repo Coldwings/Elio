@@ -166,6 +166,72 @@ coro::task<void> client(const std::string& host, uint16_t port) {
 }
 ```
 
+### Bounded, Cancellable DNS Waiting
+
+Include `<elio/net/resolve_wait.hpp>` or the umbrella header for the additive
+four-argument resolver. The original `resolve_all(host, port, resolve_options)`
+and `resolve_hostname` remain unchanged, including their vector/optional and
+`errno` behavior. An explicit fourth token also keeps legacy calls with `{}`
+options unambiguous.
+
+```cpp
+coro::task<bool> resolve_probe(std::string host, uint16_t port,
+                               coro::cancel_token token) {
+    net::resolve_wait_options options;
+    options.lookup = net::default_cached_resolve_options();
+    options.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    auto result = co_await net::resolve_all(host, port, options, token);
+    if (!result) {
+        // Owned positive errno: ECANCELED, ETIMEDOUT, EAGAIN, or lookup failure.
+        ELIO_LOG_ERROR("Resolve failed: {}", result.error);
+        co_return false;
+    }
+    co_return !result.addresses.empty();
+}
+```
+
+`resolve_result` owns its addresses, `resolve_status` (`resolved`, `failed`,
+`cancelled`, `timed_out`), and positive `error` (zero on success); do not read
+ambient `errno` for this overload. The factory copies the hostname before
+returning its lazy task. Setup/allocation and lookup exceptions may propagate.
+Entry pre-cancellation wins before an already-expired deadline, and both are
+checked before literals or cache access. Otherwise literals/wildcards and
+positive/negative cache hits need neither admission nor a scheduler. A lookup
+miss requires a running scheduler worker (`ENOTSUP` otherwise).
+
+Completion, cancellation, and the absolute steady-clock deadline select one
+observer outcome. A ready completion wins over subsequently stale cancellation
+or expiry; later events do not rewrite a selected result. Deadline expiry means
+stop waiting when its event wins, subject to cooperative scheduler dispatch,
+not an exact physical upper bound. Running libc `getaddrinfo` is not interrupted.
+Its owned late value/exception is safely reclaimed without another observer
+resume. Queued departure skips lookup when that item is eventually dequeued.
+Normal scheduler shutdown still drains running producers and can be delayed
+by libc. Forced shutdown/frame destruction is not a safe departure mechanism.
+
+By default, new waits share `default_resolve_domain()` with capacity 64.
+Assign one `std::shared_ptr<net::resolve_domain>` to multiple options/configs to
+share a different fixed capacity across schedulers and clients. Copies of a
+domain share admission state. Zero capacity rejects lookup misses but permits
+fast paths. `capacity()` and `outstanding()` expose the configured limit and a
+snapshot count. Queued, running, and observer-departed work retains a permit
+until actual work reclamation. Capacity limits work count, not all caller/frame
+memory or arbitrary hostname bytes. Rejected capacity or shared fixed-pool
+queue admission returns `EAGAIN`; there is no detached-thread fallback or
+blocking libc execution on scheduler workers. Other producers in that pool can
+also cause rejection. The legacy resolver is not covered by this new domain.
+
+A custom `resolve_options::cache` remains borrowed: retain it through normal
+awaited return, including exception cleanup. Only the live observer reads or
+publishes the cache; the producer never owns a cache pointer. A cancellation or
+deadline winner prevents late publication, so the cache may be destroyed after
+that normal return while lookup is still running. A selected live completion
+may publish despite a later token cancellation. Rejections are not cached.
+This is not lookup coalescing: independent calls do not cancel each other.
+Cache TTLs, invalidation, DNS trust, address ordering, and retry policy remain
+application choices. An end-to-end deadline must also cover subsequent connect
+and protocol steps; do not restart a full overall budget at each stage.
+
 ### Address Types
 
 Elio provides three address types for TCP networking: `ipv4_address`, `ipv6_address`, and `socket_address` (a variant wrapper that holds either).
@@ -419,6 +485,8 @@ coro::task<void> advanced_client() {
     config.follow_redirects = true;
     config.max_redirects = 5;
     config.connect_timeout = std::chrono::seconds(10);  // TCP connect + TLS handshake
+    config.dns_timeout = std::chrono::seconds(1);        // independent DNS wait; default disabled
+    config.dns_domain = std::make_shared<net::resolve_domain>(32);
     config.read_timeout = std::chrono::seconds(30);     // request/response I/O
     config.verify_certificate = true;
     config.max_headers = 100;
@@ -454,12 +522,27 @@ coro::task<void> advanced_client() {
 ```
 
 HTTP client overloads that accept `coro::cancel_token` propagate cancellation
-into pending TCP connect, TLS handshake, request write, and response reads. A
+into pending DNS observation, TCP connect, TLS handshake, request write, and response reads. A
 cancelled request returns `std::nullopt` and sets `errno` to `ECANCELED`.
 
 HTTP, WebSocket, and SSE client configs inherit `base_client_config`, including
 read buffer sizing, TLS certificate verification, DNS resolve/cache options,
 address rotation across resolved endpoints, and response-header limits.
+Their `dns_timeout` is an independent per-new-connection DNS observer budget
+(default zero/disabled), and `dns_domain` selects shared admission. The same
+two options are available in `h2_client_config`; no new HTTP/2 cancellation API
+is implied. `connect_timeout` still starts only after DNS and covers TCP/TLS.
+A reused connection does not resolve again; redirects/new connections get new
+stage budgets, not one total exchange deadline. DNS cancellation/expiry can
+leave running lookup work behind, so shutdown drain may still wait for libc.
+
+HTTP snapshots the current `client.config().dns_timeout` and `dns_domain` for
+each acquisition. Configure them before starting the operation and serialize
+mutable client use; do not mutate configuration concurrently. Resetting the
+domain selects the shared resolver default. Direct `connection_pool` users can
+pass an optional `connection_pool::dns_options` value after the cancellation
+token to override both settings; omitting it retains the pool's configuration.
+An engaged override with a null domain deliberately selects the shared default.
 
 For pool-integrated incremental body consumption, use
 `client::with_response(req, target, token, handler, options)` instead of a buffered

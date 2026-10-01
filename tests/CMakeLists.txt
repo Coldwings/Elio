@@ -31,6 +31,12 @@ if(TARGET elio_http)
     endforeach()
 endif()
 
+add_executable(elio_resolve_wait_header compile/test_resolve_wait_header.cpp)
+target_link_libraries(elio_resolve_wait_header PRIVATE elio)
+target_compile_definitions(elio_resolve_wait_header PRIVATE ELIO_DEBUG)
+add_test(NAME resolve_wait_direct_header COMMAND elio_resolve_wait_header)
+set_tests_properties(resolve_wait_direct_header PROPERTIES TIMEOUT 30)
+
 set(TEST_SOURCES
     test_main.cpp
     test_watchdog.cpp
@@ -52,6 +58,7 @@ set(TEST_SOURCES
     unit/test_spawn_blocking_uaf.cpp
     unit/test_affinity.cpp
     unit/test_io.cpp
+    unit/test_resolve_wait.cpp
     unit/test_file_transfer.cpp
     unit/test_file_operations.cpp
     unit/test_batch_io.cpp
@@ -274,7 +281,7 @@ if(TARGET elio_rdma_ibverbs AND TARGET elio_rdma_cm)
 endif()
 
 set(ELIO_ADDITIONAL_TEST_TARGETS elio_file_transfer_header elio_byte_stream_header
-    ${_elio_websocket_header_targets})
+    ${_elio_websocket_header_targets} elio_resolve_wait_header)
 set(_elio_watchdog_variants normal)
 if(ELIO_BUILD_SANITIZER_TESTS)
     list(APPEND _elio_watchdog_variants asan tsan)
@@ -341,8 +348,8 @@ endif()
 if(TARGET elio_tls)
     target_link_libraries(elio_tests PRIVATE elio_tls)
 endif()
-if(TARGET nghttp2_static)
-    target_link_libraries(elio_tests PRIVATE nghttp2_static)
+if(TARGET elio_http2)
+    target_link_libraries(elio_tests PRIVATE elio_http2)
 endif()
 if(TARGET elio_rdma_cm)
     target_link_libraries(elio_tests PRIVATE elio_rdma_cm)
@@ -362,8 +369,8 @@ if(ELIO_BUILD_SANITIZER_TESTS)
     if(TARGET elio_tls)
         target_link_libraries(elio_tests_asan PRIVATE elio_tls)
     endif()
-    if(TARGET nghttp2_static)
-        target_link_libraries(elio_tests_asan PRIVATE nghttp2_static)
+    if(TARGET elio_http2)
+        target_link_libraries(elio_tests_asan PRIVATE elio_http2)
     endif()
     if(TARGET elio_rdma_cm)
         target_link_libraries(elio_tests_asan PRIVATE elio_rdma_cm)
@@ -384,8 +391,8 @@ if(ELIO_BUILD_SANITIZER_TESTS)
     if(TARGET elio_tls)
         target_link_libraries(elio_tests_tsan PRIVATE elio_tls)
     endif()
-    if(TARGET nghttp2_static)
-        target_link_libraries(elio_tests_tsan PRIVATE nghttp2_static)
+    if(TARGET elio_http2)
+        target_link_libraries(elio_tests_tsan PRIVATE elio_http2)
     endif()
     if(TARGET elio_rdma_cm)
         target_link_libraries(elio_tests_tsan PRIVATE elio_rdma_cm)
@@ -405,6 +412,24 @@ if(ELIO_BUILD_SANITIZER_TESTS)
     set_tests_properties(elio_fork_boundary_asan PROPERTIES
         TIMEOUT 60
         RUN_SERIAL TRUE)
+endif()
+
+# Inspect effective definitions so HTTP/2-specific regressions cannot silently
+# disappear from an enabled normal or sanitizer suite.
+if(TARGET elio_http2)
+    set(_elio_http2_test_definitions "elio_tests:$<TARGET_PROPERTY:elio_tests,COMPILE_DEFINITIONS>\n")
+    if(ELIO_BUILD_SANITIZER_TESTS)
+        string(APPEND _elio_http2_test_definitions
+            "elio_tests_asan:$<TARGET_PROPERTY:elio_tests_asan,COMPILE_DEFINITIONS>\n"
+            "elio_tests_tsan:$<TARGET_PROPERTY:elio_tests_tsan,COMPILE_DEFINITIONS>\n")
+    endif()
+    file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/http2-test-definitions-$<CONFIG>.txt"
+        CONTENT "${_elio_http2_test_definitions}")
+    add_test(NAME http2_test_compile_definitions
+        COMMAND ${CMAKE_COMMAND}
+            -DELIO_DEFINITIONS_FILE=${CMAKE_CURRENT_BINARY_DIR}/http2-test-definitions-$<CONFIG>.txt
+            -DELIO_SANITIZER_SUITES=${ELIO_BUILD_SANITIZER_TESTS}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_http2_test_definitions.cmake)
 endif()
 
 # Stress test executable for shared_mutex

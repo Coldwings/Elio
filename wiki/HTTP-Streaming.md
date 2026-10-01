@@ -123,8 +123,11 @@ This is not a total exchange/handler timer: DNS and TCP/TLS setup are outside
 that read deadline, redirects establish a new hop deadline, and application
 computation/idle waits are not preempted. Already-buffered payload can be copied
 without a new network wait or timer. `connect_timeout` remains the existing
-post-resolution TCP/TLS setup budget; this API does not make legacy DNS waiting
-promptly cancellable. An application can propagate cancellation into its own
+post-resolution TCP/TLS setup budget. New client connection setup uses bounded,
+cancellable DNS observation, with an independent `dns_timeout` disabled by
+default; `dns_domain` configures shared admission. Running libc work can outlive
+observer cancellation/expiry and delay scheduler shutdown. The standalone
+legacy resolver overload is unchanged. An application can propagate cancellation into its own
 waits, but structured cancellation still awaits normal completion and cannot
 promise a physical upper bound on return time.
 

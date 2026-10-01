@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   public operations. Syntax checks do not provide runtime adapters or alter
   legacy TCP/TLS/common-stream close behavior; see `wiki/Byte-Streams.md` (#1243).
 
+- **Bounded cancellable DNS observation**: the additive four-argument
+  `net::resolve_all` owns input and operational outcomes while cancellation or
+  an absolute deadline can end observation without interrupting libc. Shared
+  configurable admission retains queued/running/departed work until reclamation;
+  overload is `EAGAIN`, with no detached-thread or worker-inline fallback.
+  Only live observers access/publish borrowed caches. HTTP, WebSocket, SSE, and
+  HTTP/2 gain independent `dns_timeout` (disabled by default) and `dns_domain`;
+  TCP/TLS-only `connect_timeout` and legacy resolver overloads are unchanged.
+  Normal shutdown may still drain late libc work (#1229).
+
 - **Pool-integrated HTTP/1 response consumption**: `client::with_response`
   owns its request/target/handler and delivers final headers before a scoped
   `response_body_reader`. Borrowed-span reads report short progress, completion,

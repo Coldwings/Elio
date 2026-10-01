@@ -2256,6 +2256,46 @@ int main() {
 
 ## Networking (`elio::net`)
 
+### Bounded Resolver Waiting
+
+Include `<elio/net/resolve_wait.hpp>` or `<elio/elio.hpp>`:
+
+```cpp
+enum class resolve_status { resolved, failed, cancelled, timed_out };
+struct resolve_result {
+    std::vector<socket_address> addresses;
+    resolve_status status = resolve_status::failed;
+    int error = EHOSTUNREACH;  // positive errno, zero on success
+    explicit operator bool() const noexcept;
+};
+class resolve_domain {
+public:
+    explicit resolve_domain(size_t capacity = 64);
+    size_t capacity() const noexcept;
+    size_t outstanding() const noexcept;
+};
+std::shared_ptr<resolve_domain> default_resolve_domain();
+struct resolve_wait_options {
+    resolve_options lookup;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    std::shared_ptr<resolve_domain> domain; // null selects shared default
+};
+coro::task<resolve_result> resolve_all(std::string_view host, uint16_t port,
+    resolve_wait_options options, coro::cancel_token token);
+```
+
+The explicit fourth token preserves legacy three-argument resolver calls.
+Input is copied at factory invocation. Entry cancellation/expiry precedes fast
+paths; misses need a running scheduler worker. Cancellation/deadline leaves
+observation, not running libc: its owned late work remains admitted until
+reclamation, and normal shutdown still drains it. Capacity/pool rejection is
+`EAGAIN`; literal/cache fast paths consume no permit. Only live completion
+accesses/publishes a borrowed cache, retained through normal awaited return.
+No late cache publication, coalescing, detached threads, forced interruption,
+or exact wall-clock bound is promised. Exceptions may propagate. See
+[Networking](Networking.md#bounded-cancellable-dns-waiting) for arbitration,
+cache, admission, and client-budget details.
+
 ### `ipv4_address`
 
 IPv4 address with port.
@@ -2978,8 +3018,17 @@ and malformed/truncated framing uses `EBADMSG`. Decoder size limits can use
 `EMSGSIZE`. TLS errors preserve the TLS stream's positive errno mapping rather
 than embedding OpenSSL diagnostics. A race can still be won by actual I/O
 completion, and stages do not prescribe retry/replay policy. Redirect processing,
-pool reuse rules, configured budgets, and the existing DNS wait behavior are
-unchanged; the connect budget begins after resolution.
+pool reuse rules, and caller retry policy are unchanged. New connection DNS
+observation is cancellable and uses `dns_timeout`/`dns_domain`; the independent
+TCP/TLS connect budget still begins after resolution.
+
+HTTP acquisition takes an operation-owned snapshot of the current
+`client.config().dns_timeout` and `dns_domain`. Set these before starting the
+operation; configuration mutation and client use must remain serialized.
+`connection_pool::{acquire_result,acquire}` accept a trailing optional
+`connection_pool::dns_options{timeout, domain}` after the token. An omitted
+override uses the pool configuration; an engaged null domain selects the shared
+resolver default, including after clearing a constructor-time custom domain.
 
 The same vocabulary is available in `client_connect_result()` and
 `connection_pool::acquire_result()`; their optional counterparts remain adapters.
@@ -3056,10 +3105,15 @@ struct base_client_config {
     bool rotate_resolved_addresses = true;
     size_t max_headers = 100;
     size_t max_header_size = 8192;
+    std::chrono::nanoseconds dns_timeout{0};
+    std::shared_ptr<net::resolve_domain> dns_domain;
 };
 ```
 
 - `connect_timeout`: TCP connect and TLS handshake deadline. `<=0` disables it.
+- `dns_timeout`: Independent per-new-connection DNS observer budget; `<=0`
+  disables it (the default). It does not change `connect_timeout` scope.
+- `dns_domain`: Shared DNS admission; null selects the capacity-64 default.
 - `read_timeout`: Request/response, WebSocket upgrade, or SSE response header
   read deadline depending on the client. `<=0` disables it.
 - `read_buffer_size`: Per-client read buffer size.
@@ -4243,6 +4297,8 @@ struct h2_client_config {
     bool rotate_resolved_addresses = true;
     size_t max_response_headers = 100;             // Max accepted field lines
     size_t max_response_header_bytes = 64 * 1024; // Max accepted name/value bytes
+    std::chrono::nanoseconds dns_timeout{0};     // Independent DNS observer budget
+    std::shared_ptr<net::resolve_domain> dns_domain;
 };
 ```
 

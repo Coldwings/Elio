@@ -37,6 +37,8 @@ struct h2_client_config {
     bool rotate_resolved_addresses = true;        ///< Rotate start index across resolved addresses
     size_t max_response_headers = 100;             ///< Max accepted response field lines per stream
     size_t max_response_header_bytes = 64 * 1024; ///< Max accepted response name/value bytes per stream
+    std::chrono::nanoseconds dns_timeout{0};      ///< Independent DNS observer timeout; <=0 disables
+    std::shared_ptr<net::resolve_domain> dns_domain{}; ///< Null selects shared default DNS admission
 };
 
 namespace detail {
@@ -341,7 +343,8 @@ private:
         auto stream = co_await client_connect(host, port, true, &tls_ctx_,
                                               config_.resolve_options,
                                               config_.rotate_resolved_addresses,
-                                              config_.connect_timeout);
+                                              config_.connect_timeout, {},
+                                              config_.dns_timeout, config_.dns_domain);
         if (!stream) {
             if (errno == 0) {
                 errno = ECONNREFUSED;

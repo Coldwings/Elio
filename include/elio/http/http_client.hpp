@@ -86,6 +86,19 @@ class connection_pool {
 public:
     static constexpr size_t shard_count = 16;
 
+    /// Per-acquisition snapshot; an explicit null domain selects the shared
+    /// resolver default instead of retaining a constructor-time custom domain.
+    struct dns_options {
+        dns_options() = default;
+
+        dns_options(std::chrono::nanoseconds timeout_value,
+                    std::shared_ptr<net::resolve_domain> domain_value = {}) noexcept
+            : timeout(timeout_value), domain(std::move(domain_value)) {}
+
+        std::chrono::nanoseconds timeout{0};
+        std::shared_ptr<net::resolve_domain> domain{};
+    };
+
     explicit connection_pool(client_config config = {})
         : config_(config) {}
     
@@ -96,7 +109,8 @@ public:
                                                    tls::tls_context* tls_ctx = nullptr,
                                                    std::chrono::nanoseconds connect_timeout =
                                                        std::chrono::nanoseconds::zero(),
-                                                   coro::cancel_token token = {}) {
+                                                   coro::cancel_token token = {},
+                                                   std::optional<dns_options> dns = std::nullopt) {
         std::string key = make_key(host, port, secure);
         auto& shard = shard_for(key);
 
@@ -137,16 +151,19 @@ public:
             config_.resolve_options,
             config_.rotate_resolved_addresses,
             connect_timeout,
-            std::move(token));
+            std::move(token),
+            dns ? dns->timeout : config_.dns_timeout,
+            dns ? dns->domain : config_.dns_domain);
         co_return std::move(result);
     }
 
     coro::task<std::optional<connection>> acquire(const std::string& host,
             uint16_t port, bool secure, tls::tls_context* tls_ctx = nullptr,
             std::chrono::nanoseconds connect_timeout = std::chrono::nanoseconds::zero(),
-            coro::cancel_token token = {}) {
+            coro::cancel_token token = {},
+            std::optional<dns_options> dns = std::nullopt) {
         auto result = co_await acquire_result(host, port, secure, tls_ctx,
-                                             connect_timeout, std::move(token));
+                                             connect_timeout, std::move(token), std::move(dns));
         if (const auto* error = std::get_if<client_error>(&result)) {
             errno = error->code.value();
             co_return std::nullopt;
@@ -734,8 +751,15 @@ private:
             ELIO_LOG_ERROR("Invalid outbound HTTP request target");
             co_return detail::make_client_error(EINVAL, client_stage::target);
         }
-        auto conn_result = co_await pool_.acquire_result(target.host, target.effective_port(),
-            target.is_secure(), &tls_ctx_, config_.connect_timeout, token);
+        // Keep the owning snapshot and task construction outside the await
+        // expression; some coroutine toolchains mishandle aggregate temporaries.
+        std::optional<connection_pool::dns_options> dns{std::in_place};
+        dns->timeout = config_.dns_timeout;
+        dns->domain = config_.dns_domain;
+        auto acquisition = pool_.acquire_result(target.host, target.effective_port(),
+            target.is_secure(), &tls_ctx_, config_.connect_timeout, token,
+            std::move(dns));
+        auto conn_result = co_await std::move(acquisition);
         if (const auto* error = std::get_if<client_error>(&conn_result)) co_return *error;
         auto conn = std::move(std::get<connection>(conn_result));
         if (req.header("Host").empty()) req.set_host(target.host_authority());

@@ -47,6 +47,7 @@ using lease_disposition_hook = void (*)(int, bool);
 inline std::atomic<lease_disposition_hook> lease_disposition_for_test{nullptr};
 using lease_return_hook = void (*)();
 inline std::atomic<lease_return_hook> lease_before_return_for_test{nullptr};
+inline std::atomic<lease_return_hook> transport_clear_visible_for_test{nullptr};
 // Expire only the Expect clock after final headers, allowing a regression to
 // hold the final body behind a barrier without relying on timer scheduling.
 inline std::atomic<bool> expire_expect_after_headers_for_test{false};
@@ -257,13 +258,7 @@ public:
 
     /// Clear all pooled connections
     void clear() {
-        for (auto& shard : shards_) {
-            decltype(shard.pools) retired;
-            {
-                std::lock_guard lock(shard.mutex);
-                retired.swap(shard.pools);
-            }
-        }
+        auto retired = detach_idle();
     }
 
 #ifdef ELIO_RUNTIME_TEST_HOOKS
@@ -278,6 +273,19 @@ public:
 
 private:
     friend class transport;
+
+    using pool_map = std::unordered_map<detail::connection_key, std::deque<connection>,
+                                       detail::connection_key_hash>;
+    using retired_pools = std::array<pool_map, shard_count>;
+
+    retired_pools detach_idle() {
+        retired_pools retired;
+        for (size_t i = 0; i < shard_count; ++i) {
+            std::lock_guard lock(shards_[i].mutex);
+            retired[i].swap(shards_[i].pools);
+        }
+        return retired;
+    }
 
     detail::connection_key make_legacy_key(const std::string& host, uint16_t port,
                                            bool secure) const {
@@ -350,8 +358,7 @@ private:
 
     struct pool_shard {
         std::mutex mutex;
-        std::unordered_map<detail::connection_key, std::deque<connection>,
-                           detail::connection_key_hash> pools;
+        pool_map pools;
     };
 
     pool_shard& shard_for(const detail::connection_key& key) noexcept {
@@ -524,11 +531,15 @@ public:
     /// Drop idle entries and reject later returns of pre-clear leases. Existing
     /// I/O continues; use shutdown() to stop new acquisitions and await settlement.
     void clear() {
+        connection_pool::retired_pools retired;
         {
             std::lock_guard lock(state_->mutex);
             state_->generation = detail::new_route_domain();
+            retired = state_->pool.detach_idle();
         }
-        state_->pool.clear();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = detail::transport_clear_visible_for_test.load()) hook();
+#endif
     }
 
     /// Stop acquisitions and await client-managed dialing/exchange settlement.
@@ -536,10 +547,13 @@ public:
     coro::task<coro::cancel_result> shutdown(coro::cancel_token token = {}) {
         const auto owner = state_;
         {
-            std::lock_guard lock(owner->mutex);
-            owner->closing = true;
+            connection_pool::retired_pools retired;
+            {
+                std::lock_guard lock(owner->mutex);
+                owner->closing = true;
+                retired = owner->pool.detach_idle();
+            }
         }
-        owner->pool.clear();
         for (;;) {
             {
                 std::lock_guard lock(owner->mutex);

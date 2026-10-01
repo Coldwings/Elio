@@ -143,6 +143,31 @@ struct backend_guard {
     ~backend_guard() { elio::runtime::detail::worker_io_backend_for_test.store(old); }
 };
 
+struct clear_observation {
+    transport& owner;
+    std::optional<lease> acquired;
+};
+std::atomic<clear_observation*> observing_clear{nullptr};
+
+void acquire_visible_generation() {
+    auto& observation = *observing_clear.load();
+    auto result = immediate(observation.owner.acquire_lease_for_test(
+        *url::parse("http://origin.invalid/")));
+    if (auto* acquired = std::get_if<lease>(&result))
+        observation.acquired.emplace(std::move(*acquired));
+}
+
+struct clear_guard {
+    explicit clear_guard(clear_observation& observation) {
+        observing_clear.store(&observation);
+        detail::transport_clear_visible_for_test.store(acquire_visible_generation);
+    }
+    ~clear_guard() {
+        detail::transport_clear_visible_for_test.store(nullptr);
+        observing_clear.store(nullptr);
+    }
+};
+
 } // namespace
 
 TEST_CASE("HTTP lease moves preserve the original owner and settle each disposition once",
@@ -348,6 +373,36 @@ TEST_CASE("HTTP full or expired idle buckets cannot duplicate lease disposition"
     }
     REQUIRE(::fcntl(one_fd, F_GETFD) == -1);
     REQUIRE(::fcntl(two_fd, F_GETFD) == -1);
+}
+
+TEST_CASE("HTTP clear removes old idle entries before exposing a new generation",
+          "[http][lease][clear-acquire][issue-1247]") {
+    socket_pair old;
+    socket_pair fresh;
+    const int old_fd = old.client.fd();
+    const int fresh_fd = fresh.client.fd();
+    dial_observation dials;
+    dials.connections.emplace_back(std::move(old.client));
+    dials.connections.emplace_back(std::move(fresh.client));
+    dial_guard dial(dials);
+    disposition_observation dispositions;
+    disposition_guard observe(dispositions);
+    transport owner;
+    auto warm = immediate(owner.acquire_lease_for_test(*url::parse("http://origin.invalid/")));
+    REQUIRE(std::holds_alternative<lease>(warm));
+    transport::return_lease_for_test(std::get<lease>(warm));
+    clear_observation observation{owner, std::nullopt};
+    {
+        clear_guard at_publication(observation);
+        owner.clear();
+    }
+    REQUIRE(observation.acquired);
+    REQUIRE(observation.acquired->stream().fd() == fresh_fd);
+    REQUIRE(dials.calls.load() == 2);
+    REQUIRE(::fcntl(old_fd, F_GETFD) == -1);
+    transport::return_lease_for_test(*observation.acquired);
+    REQUIRE(dispositions.events == std::vector<std::pair<int, bool>>{
+        {old_fd, true}, {fresh_fd, true}});
 }
 
 TEST_CASE("HTTP Transport clear rejects returns from pre-clear exchanges",

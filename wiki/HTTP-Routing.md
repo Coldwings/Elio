@@ -78,7 +78,8 @@ reusable, drains a body, or starts hidden asynchronous TLS shutdown. Allocation
 exceptions during pool insertion still leave the lease responsible for
 retirement. There is no public unchecked reuse flag or escaping lease API.
 
-`transport::clear()` drops idle entries and changes the pool generation. An
+`transport::clear()` atomically detaches idle entries with the pool-generation
+change; detached streams are destroyed outside lifecycle/pool locks. An
 already acquired or dialing lease may finish its current exchange, but its late
 return is retired. New work may acquire normally. `shutdown()` additionally
 closes acquisition and awaits settlement; cancelling that wait does not cancel

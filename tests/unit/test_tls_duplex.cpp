@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <type_traits>
@@ -354,6 +355,42 @@ private:
     std::shared_ptr<stats> counters_;
 };
 
+class throwing_fd_stream {
+public:
+    using byte_stream_contract = net::publishing_byte_stream_contract;
+
+    throwing_fd_stream() = default;
+    throwing_fd_stream(throwing_fd_stream&&) noexcept = default;
+    throwing_fd_stream& operator=(throwing_fd_stream&&) noexcept = default;
+    throwing_fd_stream(const throwing_fd_stream&) = delete;
+    throwing_fd_stream& operator=(const throwing_fd_stream&) = delete;
+
+    coro::task<io::io_result> read(void*, size_t, coro::cancel_token) {
+        co_return io::io_result{-ENOTCONN, 0};
+    }
+
+    coro::task<io::io_result> write(const void*, size_t, coro::cancel_token) {
+        co_return io::io_result{-ENOTCONN, 0};
+    }
+
+    coro::task<net::write_finish_result> finish_write(
+        coro::cancel_token, std::chrono::milliseconds) {
+        co_return net::write_finish_result{net::close_scope::whole_session, ENOTCONN};
+    }
+
+    net::close_scope read_end_scope() const noexcept {
+        return net::close_scope::whole_session;
+    }
+
+    coro::task<void> abort_and_settle() { co_return; }
+
+    int fd() const { throw std::runtime_error("diagnostic fd only"); }
+};
+
+struct non_descriptor_fd_probe {
+    const char* fd() const noexcept { return "not a descriptor"; }
+};
+
 template<typename Stream>
 concept exposes_fd = requires(const Stream& stream) {
     stream.fd();
@@ -501,6 +538,15 @@ TEST_CASE("TLS real pending duplex writes cancel before borrowed frames retire",
         SKIP("io_uring support is not compiled");
 #endif
     }
+}
+
+TEST_CASE("TLS stream ignores unsafe diagnostic lower fd hooks", "[tls][generic][issue-1244]") {
+    STATIC_REQUIRE(net::publishing_byte_stream<throwing_fd_stream>);
+    STATIC_REQUIRE(!tls::detail::noexcept_int_fd<throwing_fd_stream>);
+    STATIC_REQUIRE(!tls::detail::noexcept_int_fd<non_descriptor_fd_probe>);
+    tls::tls_context context(tls::tls_mode::client);
+    tls::basic_tls_stream<throwing_fd_stream> stream(throwing_fd_stream{}, context);
+    CHECK(stream.fd() == -1);
 }
 
 TEST_CASE("TLS stream can wrap fd-less async byte streams", "[tls][generic][issue-1244]") {

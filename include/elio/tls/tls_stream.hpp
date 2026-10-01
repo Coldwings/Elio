@@ -102,6 +102,20 @@ namespace detail {
 template<typename Lower>
 concept tls_lower_stream =
     std::same_as<Lower, net::tcp_stream> || net::publishing_byte_stream<Lower>;
+
+template<typename Lower>
+concept noexcept_int_fd = requires(const Lower& stream) {
+    { stream.fd() } noexcept -> std::convertible_to<int>;
+};
+
+template<typename Lower>
+int lower_fd_or_negative(const Lower& lower) noexcept {
+    if constexpr (noexcept_int_fd<Lower>) {
+        return static_cast<int>(lower.fd());
+    } else {
+        return -1;
+    }
+}
 } // namespace detail
 
 template<typename Lower = net::tcp_stream>
@@ -648,11 +662,7 @@ public:
     /// Get underlying file descriptor when the lower stream exposes one.
     int fd() const noexcept {
         if (!transport_) return -1;
-        if constexpr (requires(const Lower& stream) { stream.fd(); }) {
-            return transport_->lower.fd();
-        } else {
-            return -1;
-        }
+        return detail::lower_fd_or_negative(transport_->lower);
     }
 
     /// Get underlying TCP stream (const)
@@ -1210,8 +1220,8 @@ private:
             return true;
         }
         if (!transport_) return true;
-        if constexpr (requires(const Lower& stream) { stream.fd(); }) {
-            int fd = transport_->lower.fd();
+        if constexpr (detail::noexcept_int_fd<Lower>) {
+            int fd = detail::lower_fd_or_negative(transport_->lower);
             if (fd < 0) {
                 return true;
             }

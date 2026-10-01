@@ -964,7 +964,10 @@ private:
             fail("Invalid header value");
             return;
         }
-        if (detail::ascii_iequals(name, "Content-Length") &&
+        const bool tunnel_length = request_method_ == method::CONNECT &&
+            status_code() >= 200 && status_code() < 300 &&
+            detail::ascii_iequals(name, "Content-Length");
+        if (!tunnel_length && detail::ascii_iequals(name, "Content-Length") &&
             headers_.contains("Content-Length") &&
             detail::trim_ows(headers_.get("Content-Length")) != value) {
             fail("Conflicting Content-Length headers");
@@ -975,7 +978,10 @@ private:
             return;
         }
         ++header_count_;
-        headers_.add(name, value);
+        // Successful CONNECT ignores framing semantics, including conflicting
+        // lengths. Retain one value without weakening syntax or metadata bounds.
+        if (tunnel_length) headers_.set(name, value);
+        else headers_.add(name, value);
     }
 
     void select_framing() {

@@ -24,12 +24,26 @@ namespace {
 
 using backend = elio::io::io_context::backend_type;
 
+void require_backend(backend selected);
+
 struct backend_guard {
     backend previous;
     explicit backend_guard(backend selected)
-        : previous(elio::runtime::detail::worker_io_backend_for_test.exchange(selected)) {}
+        : previous(elio::runtime::detail::worker_io_backend_for_test.load()) {
+        require_backend(selected);
+        elio::runtime::detail::worker_io_backend_for_test.store(selected);
+    }
     ~backend_guard() { elio::runtime::detail::worker_io_backend_for_test.store(previous); }
 };
+
+void require_backend(backend selected) {
+#if ELIO_HAS_IO_URING
+    if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
+#endif
+}
 
 struct temporary_pem {
     std::array<char, 32> path{};
@@ -150,6 +164,24 @@ int record_sni(SSL* session, int*, void* context) noexcept {
             static_cast<observed_route*>(context)->sni = name;
         return SSL_TLSEXT_ERR_OK;
     } catch (...) { return SSL_TLSEXT_ERR_ALERT_FATAL; }
+}
+
+task<void> redirect_route(elio::net::tcp_listener& listener,
+        elio::tls::tls_context& context, observed_route& observed,
+        elio::coro::cancel_token token) {
+    auto first = co_await listener.accept(token);
+    if (!first) co_return;
+    ++observed.accepted;
+    auto initial = co_await receive_request(*first, token);
+    if (!initial) co_return;
+    observed.requests.push_back(std::move(*initial));
+    if ((co_await first->write_exactly(
+        "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n"
+        "Location: https://localhost:9443/final?done=1#client-only\r\n\r\n", token)).result <= 0)
+        co_return;
+    // Keep the old forward channel open; the redirected CONNECT route must
+    // acquire a new, target/security-bound channel, not reinterpret this one.
+    co_await serve_route(listener, true, context, 1, observed, token);
 }
 
 task<std::vector<client_result<response>>> send_requests(client& agent, const url& target,
@@ -354,6 +386,41 @@ struct handoff_hooks {
     }
 };
 
+struct output_observation {
+    uint64_t handshake_bytes = 0;
+    std::atomic<bool> held{false};
+    elio::sync::event paused;
+    elio::sync::event release;
+};
+
+std::atomic<output_observation*> output_observed{nullptr};
+
+task<void> pause_drained_output(void* context, uint64_t drained) {
+    auto& observed = *static_cast<output_observation*>(context);
+    if (drained <= observed.handshake_bytes || observed.held.exchange(true)) co_return;
+    observed.paused.set();
+    // Intentionally retain the owned pump after cancellation, until the test
+    // releases it. Its lower write has completed, but its frame has not settled.
+    (void)co_await observed.release.wait();
+}
+
+void observe_tunnel_output(detail::connect_tls_stream& inner) {
+    auto* observed = output_observed.load();
+    observed->handshake_bytes = inner.finish_state_for_test().accepted_ciphertext;
+    inner.set_output_progress_test_hook(observed, pause_drained_output);
+}
+
+struct output_hooks {
+    explicit output_hooks(output_observation& value) {
+        output_observed.store(&value);
+        detail::tunnel_ready_for_test.store(observe_tunnel_output);
+    }
+    ~output_hooks() {
+        detail::tunnel_ready_for_test.store(nullptr);
+        output_observed.store(nullptr);
+    }
+};
+
 struct returned_thread {
     handoff_observation& observed;
     std::thread worker;
@@ -433,6 +500,91 @@ TEST_CASE("Standalone connection pools reject explicit proxy policy rather than 
     client_options.proxy = *transport_options.proxy;
     REQUIRE_THROWS_AS(connection_pool{client_options}, std::invalid_argument);
     REQUIRE_NOTHROW(connection_pool{});
+}
+
+TEST_CASE("Proxy target authority rejects URI credential delimiters before dialing",
+          "[http][proxy][routes][review-1249][issue-1249]") {
+    transport_config config;
+    config.proxy = http_proxy_config{};
+    config.proxy->endpoint = "http://proxy.example/";
+    auto owner = std::make_shared<transport>(config);
+    client agent(owner);
+    handoff_observation observed;
+    handoff_hooks hooks(observed);
+    for (const auto input : {"http://user:pa@ss@origin.example/path",
+                             "https://user:pa@ss@origin.example/path"}) {
+        auto result = handoff_immediate(agent.get_result(input));
+        const auto* error = std::get_if<client_error>(&result);
+        REQUIRE(error);
+        CHECK(error->code.value() == EINVAL);
+        CHECK(error->stage == client_stage::target);
+    }
+    CHECK(observed.dials == 0);
+}
+
+TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS output",
+          "[http][proxy][routes][review-1249][issue-1249]") {
+    elio::tls::tls_context server_context(elio::tls::tls_mode::server);
+    temporary_pem ca;
+    install_certificate(server_context, ca);
+    for (const auto selected : {backend::epoll, backend::io_uring})
+    for (const bool finite : {false, true}) {
+        CAPTURE(selected, finite);
+        backend_guard backend_scope(selected);
+        auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+        REQUIRE(listener);
+        transport_config config;
+        config.proxy = http_proxy_config{};
+        config.proxy->endpoint = "http://127.0.0.1:" + std::to_string(listener->local_address().port());
+        config.configure_tls = [&](transport_tls_config& policy) {
+            if (!policy.load_verify_locations(ca.path.data()))
+                throw std::runtime_error("output fixture trust setup failed");
+        };
+        if (finite) config.limits = pool_limits{};
+        auto owner = std::make_shared<transport>(config);
+        client agent(owner);
+        output_observation output;
+        output_hooks hooks(output);
+        observed_route observed;
+        elio::coro::cancel_source stop;
+        elio::runtime::scheduler scheduler(1);
+        scheduler.start();
+        auto server = scheduler.go_joinable(serve_route(*listener, true, server_context,
+                                                       1, observed, stop.get_token()));
+        auto controlled = scheduler.go_joinable([&]() -> task<client_result<response>> {
+            auto call = scheduler.go_joinable(agent.get_result("https://localhost/path"));
+            co_await output.paused.wait();
+            auto result = co_await call;
+            co_await call.wait_destroyed_async();
+            CHECK(owner->active_operations_for_test() == 1);
+            if (finite) {
+                CHECK(owner->admission_counters_for_test().live == 1);
+                CHECK(owner->admission_counters_for_test().idle == 0);
+            }
+            elio::sync::event shutdown_entered;
+            auto shutdown = scheduler.go_joinable([&]() -> task<elio::coro::cancel_result> {
+                shutdown_entered.set();
+                co_return co_await owner->shutdown();
+            });
+            co_await shutdown_entered.wait();
+            CHECK_FALSE(shutdown.is_ready());
+            output.release.set();
+            CHECK(co_await shutdown == elio::coro::cancel_result::completed);
+            co_await shutdown.wait_destroyed_async();
+            CHECK(owner->active_operations_for_test() == 0);
+            if (finite) CHECK(owner->admission_counters_for_test().live == 0);
+            co_return result;
+        });
+        controlled.wait_destroyed();
+        stop.cancel();
+        server.wait_destroyed();
+        scheduler.shutdown();
+        auto result = controlled.await_resume();
+        server.await_resume();
+        REQUIRE(std::holds_alternative<response>(result));
+        REQUIRE(std::get<response>(result).body() == "ok");
+        REQUIRE(observed.accepted == 1);
+    }
 }
 
 TEST_CASE("CONNECT 407 is bounded and never pools or automatically replays a rejected channel",
@@ -539,6 +691,64 @@ TEST_CASE("Functional forward and CONNECT pools do not share channels across tar
             REQUIRE(incoming.header("Host") == targets[i].host_authority());
             REQUIRE(incoming.header("Proxy-Authorization").empty());
         }
+        REQUIRE(owner->admission_counters_for_test().live == 0);
+    }
+}
+
+TEST_CASE("Forward-to-CONNECT redirects keep credentials only on the proxy hop",
+          "[http][proxy][routes][redirect][issue-1249]") {
+    elio::tls::tls_context server_context(elio::tls::tls_mode::server);
+    temporary_pem ca;
+    install_certificate(server_context, ca);
+    for (const auto selected : {backend::epoll, backend::io_uring}) {
+        CAPTURE(selected);
+        backend_guard backend_scope(selected);
+        auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+        REQUIRE(listener);
+        transport_config config;
+        config.proxy = http_proxy_config{};
+        config.proxy->endpoint = "http://127.0.0.1:" + std::to_string(listener->local_address().port());
+        config.proxy->basic_auth = proxy_basic_credentials{"hop", "secret"};
+        config.limits = pool_limits{};
+        config.limits->max_live_total = 2;
+        config.limits->max_live_per_route = 1;
+        config.acquisition_timeout = std::chrono::seconds(5);
+        config.configure_tls = [&](transport_tls_config& policy) {
+            if (!policy.load_verify_locations(ca.path.data()))
+                throw std::runtime_error("redirect fixture trust setup failed");
+        };
+        auto owner = std::make_shared<transport>(config);
+        client agent(owner);
+        const auto target = url::parse("http://uri-user:uri-secret@first.invalid:8081/path#not-on-wire");
+        REQUIRE(target);
+        observed_route observed;
+        elio::coro::cancel_source stop;
+        elio::runtime::scheduler scheduler(1);
+        scheduler.start();
+        auto server = scheduler.go_joinable(redirect_route(*listener, server_context,
+                                                          observed, stop.get_token()));
+        auto calls = scheduler.go_joinable(send_requests(agent, *target, 1));
+        calls.wait_destroyed();
+        stop.cancel();
+        server.wait_destroyed();
+        owner->clear();
+        scheduler.shutdown();
+        auto results = calls.await_resume();
+        server.await_resume();
+        REQUIRE(results.size() == 1);
+        REQUIRE(std::holds_alternative<response>(results[0]));
+        REQUIRE(std::get<response>(results[0]).body() == "ok");
+        REQUIRE(observed.accepted == 2);
+        REQUIRE(observed.requests.size() == 3);
+        const auto authorization = detail::proxy_basic_authorization(*config.proxy->basic_auth);
+        REQUIRE(observed.requests[0].path_with_query() == "http://first.invalid:8081/path?q=0");
+        REQUIRE(observed.requests[0].header("Proxy-Authorization") == authorization);
+        REQUIRE(observed.requests[1].get_method() == method::CONNECT);
+        REQUIRE(observed.requests[1].path() == "localhost:9443");
+        REQUIRE(observed.requests[1].header("Proxy-Authorization") == authorization);
+        REQUIRE(observed.requests[2].path_with_query() == "/final?done=1");
+        REQUIRE(observed.requests[2].header("Host") == "localhost:9443");
+        REQUIRE(observed.requests[2].header("Proxy-Authorization").empty());
         REQUIRE(owner->admission_counters_for_test().live == 0);
     }
 }

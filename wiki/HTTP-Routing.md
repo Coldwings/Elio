@@ -9,6 +9,9 @@ not reconstruct a key from the current URL or a replacement Transport.
 The current connector implements direct HTTP/HTTPS and one explicitly configured
 plain HTTP proxy: absolute-form forwarding for HTTP origins and CONNECT followed
 by origin TLS for HTTPS origins. HTTPS proxy hops remain a separate feature.
+
+Malformed target authorities, including an extra unescaped userinfo delimiter,
+fail with `EINVAL` at the `target` stage before any proxy acquisition or CONNECT.
 Route plans and keys are implementation details, not a public dialing or
 connection-injection API.
 
@@ -71,8 +74,8 @@ nonempty negotiated ALPN other than `http/1.1` is unsupported on these routes.
 Forwarding uses an absolute URI and its corresponding origin `Host`, never URI
 userinfo or fragment. Custom forwarded requests must supply an origin-form
 path/query (or `OPTIONS *`); alternate authorities and raw fragment components
-are rejected. `OPTIONS *` uses an empty-path absolute URI so the final proxy can
-forward asterisk form. CONNECT uses authority form with the effective port,
+are rejected. Server-wide `OPTIONS *` preserves asterisk form, the client-side
+exception to absolute-form forwarding. CONNECT uses authority form with the effective port,
 including IPv6 brackets, followed by ordinary origin-form HTTP inside TLS.
 See [RFC 9112 request-target forms](https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2).
 
@@ -157,6 +160,10 @@ and disconnecting the stream. Destruction never marks an unfinished response
 reusable, drains a body, or starts hidden asynchronous TLS shutdown. Allocation
 exceptions during pool insertion still leave the lease responsible for
 retirement. There is no public unchecked reuse flag or escaping lease API.
+CONNECT tunnels are conservatively retired when TLS output or an owned lower
+frame remains after HTTP completion; drained request bytes alone do not prove
+quiescence. Terminal settlement retains the operation owner and physical permit
+until that work releases the root.
 
 `transport::clear()` atomically detaches idle entries with the pool-generation
 change; detached streams are destroyed outside lifecycle/pool locks. An

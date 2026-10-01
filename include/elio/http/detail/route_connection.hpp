@@ -102,6 +102,11 @@ public:
 
     const std::shared_ptr<route_retirement>& retirement_anchor() const noexcept { return retirement_; }
 
+    bool io_quiescent() const noexcept {
+        const auto* tunnel = std::get_if<connect_tls_stream>(&stream_);
+        return !tunnel || tls::detail::tls_idle_access::is_quiescent(*tunnel);
+    }
+
     int fd() const noexcept {
         // Layered connections intentionally expose no root fd to watchdogs.
         const auto* legacy = std::get_if<net::stream>(&stream_);

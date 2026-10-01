@@ -66,7 +66,7 @@ TEST_CASE("Direct and CONNECT inner requests strip generic proxy authorization o
     REQUIRE(req.header("Proxy-Authorization") == "Basic caller-secret");
 }
 
-TEST_CASE("HTTP forward OPTIONS asterisk uses empty-path absolute form",
+TEST_CASE("HTTP forward server-wide OPTIONS preserves asterisk form",
           "[http][proxy][wire][issue-1249]") {
     const auto parsed = url::parse("http://origin.example:80/ignored");
     REQUIRE(parsed);
@@ -74,7 +74,7 @@ TEST_CASE("HTTP forward OPTIONS asterisk uses empty-path absolute form",
     auto profile = wire_profile();
     const auto wire = detail::request_wire_view::serialize(req, *parsed,
         detail::route_mode::forward_proxy, profile.get());
-    REQUIRE(wire.starts_with("OPTIONS http://origin.example HTTP/1.1\r\n"));
+    REQUIRE(wire.starts_with("OPTIONS * HTTP/1.1\r\n"));
     REQUIRE(wire.find("Host: origin.example\r\n") != std::string::npos);
 }
 

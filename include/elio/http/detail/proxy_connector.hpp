@@ -10,6 +10,10 @@
 
 namespace elio::http::detail {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline std::atomic<void (*)(connect_tls_stream&)> tunnel_ready_for_test{nullptr};
+#endif
+
 inline coro::task<client_result<route_connection>> finish_proxy_setup(
         net::stream& established, const route_plan& plan, coro::cancel_token token,
         std::optional<std::chrono::steady_clock::time_point> deadline,
@@ -43,6 +47,9 @@ inline coro::task<client_result<route_connection>> finish_proxy_setup(
         co_await inner.abort_and_settle();
         co_return make_client_error(EPROTONOSUPPORT, client_stage::tls);
     }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (auto hook = tunnel_ready_for_test.load(std::memory_order_acquire)) hook(inner);
+#endif
     co_return route_connection(std::move(inner), std::move(retirement));
 }
 

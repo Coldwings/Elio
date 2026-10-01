@@ -113,6 +113,57 @@ TEST_CASE("CONNECT negotiation rejects terminal proxy replies without replaying 
     REQUIRE(stream.output.find("CONNECT", 1) == std::string::npos);
 }
 
+TEST_CASE("Successful CONNECT ignores all repeated framing fields before handing off",
+          "[http][proxy][connect][review-1249][issue-1249]") {
+    const auto status = GENERATE(200, 204, 299);
+    scripted_proxy stream;
+    stream.input = "HTTP/1.1 " + std::to_string(status) + " Tunnel\r\n"
+                   "Content-Length: 0\r\nContent-Length: 1\r\n"
+                   "Transfer-Encoding: unknown\r\nTransfer-Encoding: chunked\r\n\r\nTLS";
+    auto result = immediate(detail::negotiate_connect(stream,
+        detail::route_endpoint::from("origin.example", 443), *profile()));
+    REQUIRE(std::holds_alternative<std::vector<char>>(result));
+    const auto& prefix = std::get<std::vector<char>>(result);
+    REQUIRE(std::string(prefix.begin(), prefix.end()) == "TLS");
+}
+
+TEST_CASE("CONNECT rejects out-of-range status codes rather than treating them as interim",
+          "[http][proxy][connect][review-1249][issue-1249]") {
+    const auto status = GENERATE("000", "099", "600", "999");
+    scripted_proxy stream;
+    stream.input = "HTTP/1.1 " + std::string(status) + " Invalid\r\nContent-Length: 0\r\n\r\n"
+                   "HTTP/1.1 200 Tunnel\r\n\r\nTLS";
+    auto result = immediate(detail::negotiate_connect(stream,
+        detail::route_endpoint::from("origin.example", 443), *profile()));
+    check_error(result, EBADMSG);
+}
+
+TEST_CASE("CONNECT zero read-ahead leaves subsequent tunnel bytes on the stream",
+          "[http][proxy][connect][issue-1249]") {
+    scripted_proxy stream;
+    stream.input = "HTTP/1.1 200 Tunnel\r\n\r\nTLS";
+    auto proxy = *profile();
+    proxy.limits.max_read_ahead = 0;
+    auto result = immediate(detail::negotiate_connect(stream,
+        detail::route_endpoint::from("origin.example", 443), proxy));
+    REQUIRE(std::holds_alternative<std::vector<char>>(result));
+    REQUIRE(std::get<std::vector<char>>(result).empty());
+    std::array<char, 3> following{};
+    REQUIRE(immediate(stream.read(following.data(), following.size(), {})).result == 3);
+    REQUIRE(std::string(following.data(), following.size()) == "TLS");
+}
+
+TEST_CASE("Successful CONNECT framing exceptions preserve metadata limits",
+          "[http][proxy][connect][issue-1249]") {
+    scripted_proxy stream;
+    stream.input = "HTTP/1.1 200 Tunnel\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\nTLS";
+    auto proxy = *profile();
+    proxy.limits.max_headers = 1;
+    auto result = immediate(detail::negotiate_connect(stream,
+        detail::route_endpoint::from("origin.example", 443), proxy));
+    check_error(result, EMSGSIZE);
+}
+
 TEST_CASE("CONNECT negotiation bounds response bytes metadata informational replies and zero writes",
           "[http][proxy][connect][issue-1249]") {
     const auto limit = GENERATE(0, 1, 2, 3, 4);

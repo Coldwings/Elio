@@ -548,6 +548,12 @@ private:
         // No public boolean can bypass the response framing and I/O settlement.
         void return_reusable() {
             if (disposition_ != disposition::active) return;
+            // HTTP framing does not settle TLS control/output work. Retire a
+            // tunnel whose owned transport still has a pump/lower frame.
+            if (!conn_.io_quiescent()) {
+                retire();
+                return;
+            }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
             if (auto hook = detail::lease_before_return_for_test.load()) hook();
 #endif
@@ -1398,6 +1404,7 @@ private:
             co_return detail::make_client_error(ECANCELED, client_stage::acquire);
         }
         if (!detail::is_valid_url_input(target.host_authority()) ||
+            (transport_->config().proxy && !detail::request_wire_view::valid_authority(target)) ||
             !detail::is_valid_request_target(req.path_with_query())) {
             ELIO_LOG_ERROR("Invalid outbound HTTP request target");
             co_return detail::make_client_error(EINVAL, client_stage::target);

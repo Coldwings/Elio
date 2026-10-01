@@ -71,6 +71,8 @@ coro::task<client_result<std::vector<char>>> negotiate_connect(Stream& stream,
         if (next.error) co_return make_client_error(next.error, client_stage::proxy_connect);
         const auto code = reader.decoder().status_code();
         if (next.event == response_event::headers_complete) {
+            if (code < 100 || code > 599)
+                co_return make_client_error(EBADMSG, client_stage::proxy_connect);
             if (code == 101) co_return make_client_error(ENOTSUP, client_stage::proxy_connect);
             if (code >= 300)
                 co_return make_client_error(code == 407 ? EACCES : ECONNREFUSED,

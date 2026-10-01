@@ -4587,7 +4587,7 @@ class basic_tls_stream {
 public:
     basic_tls_stream(Lower lower, tls_context& ctx, tls_stream_options options = {});
     
-    // Set SNI hostname
+    // Select DNS/SNI or an unbracketed numeric IP SAN reference
     void set_hostname(std::string_view hostname);
     
     // Perform TLS handshake (awaitable)
@@ -4674,6 +4674,20 @@ verification, ALPN, session state and close semantics. A TLS-over-TLS stack is
 therefore just `basic_tls_stream<tls_stream>` (or another conforming lower
 stream), not a special double-TLS type. Finish and shutdown apply to the current
 TLS layer; callers decide when lower layers are finished or aborted.
+
+`set_hostname()` selects DNS certificate matching and SNI for names, or
+IP-address SAN matching without SNI for numeric IPv4/IPv6 references. It replaces
+the previous reference, including the opposite identity type. Numeric DNS SANs
+do not substitute for IP SANs.
+IPv6 `%zone` suffixes select local socket scope and are excluded from the
+certificate identity and SNI. The resolver/caller owns interface selection and
+zone validity; an empty zone is rejected. This is not URI decoding.
+Empty input retains explicit reference clearing;
+that leaves trust-chain verification, not endpoint-name authentication. Embedded
+NUL or failed native identity setup throws and makes the session terminal.
+Configure a reference before the handshake and serialize it with public stream
+operations. Callers supply IDNA ASCII names and their chosen verification/trust
+policy; this setter does not decode URI escapes.
 
 `tls_stream::read_exactly()` reports EOF before the requested byte count as
 `io_result::result == -ENODATA`, matching the TCP and UDS exact-length helpers.
@@ -4774,7 +4788,8 @@ tls_connect(tls_context& ctx,
                 net::default_cached_resolve_options());
 ```
 
-`tls_connect()` resolves the host, connects TCP, applies SNI from `host`, and
+`tls_connect()` resolves the host, connects TCP, selects the DNS/IP reference
+from `host` (SNI for DNS names only), and
 performs the TLS handshake. It returns `std::optional<tls_stream>`; an empty
 optional means resolution, TCP connect, or TLS handshake failed.
 

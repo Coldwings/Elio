@@ -126,6 +126,7 @@ endif()
 if(TARGET elio_tls)
     list(APPEND TEST_SOURCES
         unit/test_tls_retry.cpp
+        unit/test_tls_peer_identity.cpp
         unit/test_tls_output_bio.cpp
         unit/test_tls_duplex.cpp
         unit/test_tls_transport.cpp

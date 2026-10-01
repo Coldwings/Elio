@@ -12,6 +12,7 @@
 
 #include <elio/http/websocket_frame.hpp>
 #include <elio/http/websocket_handshake.hpp>
+#include <elio/http/websocket_state.hpp>
 #include <elio/http/http_server.hpp>
 #include <elio/http/http_response_sender.hpp>
 #include <elio/http/http_parser.hpp>
@@ -48,14 +49,6 @@ class ws_connection;
 enum class message_type {
     text,    ///< Text message (UTF-8)
     binary   ///< Binary message
-};
-
-/// WebSocket connection state
-enum class connection_state {
-    connecting,  ///< Handshake in progress
-    open,        ///< Connection open
-    closing,     ///< Close handshake in progress
-    closed       ///< Connection closed
 };
 
 /// WebSocket server configuration

@@ -17,6 +17,20 @@ target_link_libraries(elio_byte_stream_header PRIVATE elio)
 add_test(NAME byte_stream_direct_header COMMAND elio_byte_stream_header)
 set_tests_properties(byte_stream_direct_header PROPERTIES TIMEOUT 30)
 
+set(_elio_websocket_header_targets)
+if(TARGET elio_http)
+    foreach(_variant IN ITEMS client server client_server server_client)
+        set(_target elio_websocket_${_variant}_header)
+        string(TOUPPER "${_variant}" _definition)
+        add_executable(${_target} compile/test_websocket_headers.cpp)
+        target_link_libraries(${_target} PRIVATE elio_http)
+        target_compile_definitions(${_target} PRIVATE ELIO_TEST_WEBSOCKET_${_definition})
+        add_test(NAME websocket_${_variant}_direct_header COMMAND ${_target})
+        set_tests_properties(websocket_${_variant}_direct_header PROPERTIES TIMEOUT 30)
+        list(APPEND _elio_websocket_header_targets ${_target})
+    endforeach()
+endif()
+
 set(TEST_SOURCES
     test_main.cpp
     test_watchdog.cpp
@@ -259,7 +273,8 @@ if(TARGET elio_rdma_ibverbs AND TARGET elio_rdma_cm)
     )
 endif()
 
-set(ELIO_ADDITIONAL_TEST_TARGETS elio_file_transfer_header elio_byte_stream_header)
+set(ELIO_ADDITIONAL_TEST_TARGETS elio_file_transfer_header elio_byte_stream_header
+    ${_elio_websocket_header_targets})
 set(_elio_watchdog_variants normal)
 if(ELIO_BUILD_SANITIZER_TESTS)
     list(APPEND _elio_watchdog_variants asan tsan)

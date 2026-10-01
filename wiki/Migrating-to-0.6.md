@@ -33,6 +33,48 @@ it is independent and disabled by default. `connect_timeout` keeps its TCP/TLS
 scope. Pool reuse and per-hop stage budgets are not a total-exchange deadline.
 See [Networking](Networking.md#bounded-cancellable-dns-waiting).
 
+## HTTP Transport Ownership
+
+Existing `http::client(config)` construction still works, but it now creates a
+private `http::transport` from the connection-affecting parts of that config.
+Resolver options, DNS timeout/domain, TLS verification/native TLS setup, maximum
+idle connections per host, and idle timeout are frozen in that transport. Mutating
+`client.config()` later changes request policy such as redirects, User-Agent,
+body limits, read/Expect timeouts, and the per-acquisition `connect_timeout`;
+it does not reconfigure the existing pool or DNS/TLS identity.
+
+To share compatible connections intentionally, create and publish a transport:
+
+```cpp
+elio::http::transport_config transport_cfg;
+transport_cfg.dns_timeout = std::chrono::milliseconds(250);
+auto shared = std::make_shared<elio::http::transport>(transport_cfg);
+
+elio::http::client_config registry_policy;
+registry_policy.user_agent = "registry-client";
+elio::http::client registry(shared, registry_policy);
+
+elio::http::client_config metadata_policy;
+metadata_policy.follow_redirects = false;
+elio::http::client metadata(shared, metadata_policy);
+```
+
+Breaking HTTP/1 TLS customization change: `client::tls_context()` and
+`transport::tls_context()` are replaced by copied `tls_diagnostics()` snapshots. Use
+`transport_cfg.configure_tls` with the construction-only
+`http::transport_tls_config` builder for custom trust roots or ciphers before
+constructing the transport. The builder does not expose a native handle,
+certificate store, or published context reference that can be retained after
+publication. If resolver, DNS, TLS verification, or
+pooling policy changes, create a new transport and move new clients to it; do
+not expect existing idle or in-flight connections to migrate across policy
+domains. `transport::clear()` drops idle pooled connections only.
+`co_await transport::shutdown()` closes the transport to new acquisitions, drops
+idle connections, and waits for client-managed active exchanges to settle.
+Route identities, explicit external leases, proxy connectors, and global
+admission remain separate follow-up features; raw transport acquire/release is
+not public API in 0.6.
+
 ## Finishing Stream Output
 
 Use `co_await stream.finish_write(token)` to finish application output without

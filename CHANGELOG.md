@@ -27,6 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TCP/TLS-only `connect_timeout` and legacy resolver overloads are unchanged.
   Normal shutdown may still drain late libc work (#1229).
 
+- **Shareable HTTP transport owner**: `http::transport_config` now freezes
+  resolver/DNS, TLS verification/native TLS setup, and idle-pool limits in an
+  explicit `http::transport`. `http::client(shared_ptr<transport>, client_config)`
+  lets multiple move-only clients share one connection/security owner while
+  retaining independent request policy such as redirects, User-Agent, body
+  limits, and connect deadlines. `transport::shutdown()` rejects new acquisitions
+  and awaits client-managed active exchanges. Existing client constructors remain
+  adapters that create private transports. Breaking HTTP/1 TLS customization
+  now moves from mutable `client::tls_context()` calls to
+  the construction-only `transport_config::configure_tls` builder; the
+  published client/transport TLS context is not exposed, and only copied
+  `tls_diagnostics()` values are available after publication so shared clients
+  cannot mutate an active security identity. Raw transport acquire/release stays
+  private to the client-managed lifecycle in 0.6 (#1245).
+
 - **Pool-integrated HTTP/1 response consumption**: `client::with_response`
   owns its request/target/handler and delivers final headers before a scoped
   `response_body_reader`. Borrowed-span reads report short progress, completion,

@@ -301,6 +301,14 @@ public:
             {
                 std::lock_guard lock(lifecycle_mutex_);
                 if (active_operations_ == 0) co_return coro::cancel_result::completed;
+                // finish_operation() signals outside lifecycle_mutex_ so it
+                // cannot resume waiters under this lock. That means a stale
+                // zero-count notification from an earlier generation can race
+                // with the zero-to-one reset for a later operation. Clear any
+                // such signal while the active-count predicate is protected;
+                // the current generation cannot publish its real zero-count
+                // notification until this lock is released.
+                settled_.reset();
             }
             if (co_await settled_.wait(token) == coro::cancel_result::cancelled)
                 co_return coro::cancel_result::cancelled;
@@ -313,6 +321,18 @@ public:
         std::lock_guard lock(lifecycle_mutex_);
         return closing_;
     }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    bool start_operation_for_test() {
+        std::lock_guard lock(lifecycle_mutex_);
+        if (closing_) return false;
+        if (active_operations_++ == 0) settled_.reset();
+        return true;
+    }
+
+    void finish_operation_for_test() noexcept { finish_operation(); }
+    void signal_settled_for_test() { settled_.set(); }
+#endif
 
 private:
     friend class client;

@@ -2308,6 +2308,53 @@ TEST_CASE("HTTP transport shutdown waits for active client exchanges",
     REQUIRE(shutdown_result.load() == elio::coro::cancel_result::completed);
 }
 
+TEST_CASE("HTTP transport shutdown ignores stale settlement notifications",
+          "[http][client][transport][issue-1245]") {
+    auto shared = std::make_shared<elio::http::transport>();
+    REQUIRE(shared->start_operation_for_test());
+    shared->signal_settled_for_test();
+
+    scheduler sched(1);
+    sched.start();
+
+    std::atomic<bool> shutdown_started{false};
+    std::atomic<bool> shutdown_done{false};
+    std::atomic<bool> marker_ran{false};
+    std::atomic<elio::coro::cancel_result> shutdown_result{
+        elio::coro::cancel_result::cancelled};
+
+    sched.go([&]() -> task<void> {
+        shutdown_started.store(true, std::memory_order_release);
+        shutdown_result = co_await shared->shutdown();
+        shutdown_done.store(true, std::memory_order_release);
+    });
+
+    const bool started = wait_for_flag(shutdown_started);
+    if (started) {
+        sched.go([&]() -> task<void> {
+            marker_ran.store(true, std::memory_order_release);
+            co_return;
+        });
+    }
+
+    const bool marker_observed = started && wait_for_flag(marker_ran);
+    if (!marker_observed || shutdown_done.load(std::memory_order_acquire)) {
+        shared->finish_operation_for_test();
+        (void)wait_for_flag(shutdown_done);
+        sched.shutdown();
+    }
+
+    REQUIRE(started);
+    REQUIRE(marker_observed);
+    REQUIRE_FALSE(shutdown_done.load(std::memory_order_acquire));
+
+    shared->finish_operation_for_test();
+    REQUIRE(wait_for_flag(shutdown_done));
+    sched.shutdown();
+
+    REQUIRE(shutdown_result.load() == elio::coro::cancel_result::completed);
+}
+
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS
 TEST_CASE("HTTP transport shutdown waits for dialing acquisitions and rejects later ones",
           "[http][client][transport][issue-1245]") {

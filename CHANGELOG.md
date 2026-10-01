@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Composable publishing-stream contract**: TLS-free C++20
+  `net::publishing_byte_stream` and an explicit semantic opt-in define exclusive
+  ownership, recursive positive-write publication, protocol-aware finish/EOF,
+  finite per-layer buffering, and asynchronous whole-chain abort that may
+  overlap one reader and one writer. Callers still retain and normally join
+  public operations. Syntax checks do not provide runtime adapters or alter
+  legacy TCP/TLS/common-stream close behavior; see `wiki/Byte-Streams.md` (#1243).
+
 - **Pool-integrated HTTP/1 response consumption**: `client::with_response`
   owns its request/target/handler and delivers final headers before a scoped
   `response_body_reader`. Borrowed-span reads report short progress, completion,

@@ -1,5 +1,21 @@
 # Migrating To 0.6
 
+## Composable Publishing Stream Contract
+
+`<elio/net/byte_stream.hpp>` adds the TLS-free `net::publishing_byte_stream`
+concept and `net::publishing_byte_stream_contract` opt-in. Existing TCP/TLS
+streams and the common `net::stream` variant require no migration and are not
+automatically opted in. Do not add the tag merely because read/write signatures
+match: accepted-only buffering needs a publishing adapter, and synchronous
+`close()` is not asynchronous whole-chain settlement.
+
+New adapters must meet [[Byte Streams]], including one-reader/one-writer
+overlap, recursive positive-write publication, layer-local protocol finish,
+and an abort that may overlap those operations while sealing new I/O and
+settling owned internal work. Callers still keep objects and borrowed buffers
+alive and normally join public operations before moving or destroying them.
+The concept does not supply adapters or change legacy close behavior.
+
 ## Finishing Stream Output
 
 Use `co_await stream.finish_write(token)` to finish application output without

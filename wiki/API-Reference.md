@@ -2699,6 +2699,32 @@ the descriptor; `shutdown(int)` is the direct half-close wrapper. Buffer setters
 wrap `SO_RCVBUF` and `SO_SNDBUF`, while `set_pass_credentials()` wraps
 `SO_PASSCRED`.
 
+### `net::publishing_byte_stream`
+
+Include `<elio/net/byte_stream.hpp>` (also available through `<elio/elio.hpp>`).
+The C++20 concept checks an unqualified object type, move construction,
+absence of copying, the exact
+`publishing_byte_stream_contract` opt-in, and these operations:
+
+```cpp
+// Representative compatible members, not declarations on net::stream.
+// The concept checks call expressions/results, not exact parameter signatures.
+using byte_stream_contract = net::publishing_byte_stream_contract;
+coro::task<io::io_result> read(void*, size_t, coro::cancel_token);
+coro::task<io::io_result> write(const void*, size_t, coro::cancel_token);
+coro::task<net::write_finish_result> finish_write(
+    coro::cancel_token, std::chrono::milliseconds);
+net::close_scope read_end_scope() const noexcept;
+coro::task<void> abort_and_settle();
+```
+
+No descriptor, readiness probe, or TLS header is required. The opt-in promises
+recursive positive-write publication and the full ownership/EOF/finish/abort
+contract in [[Byte Streams]]; syntax cannot verify those runtime semantics.
+One abort may overlap one reader and one writer, but internal settlement is not
+public-frame destruction. Existing TCP/TLS/common-stream types are not marked
+as conforming by this foundation; adapters are separate implementations.
+
 ### `net::stream`
 
 Type-erased wrapper over `tcp_stream` and, when TLS support is enabled,

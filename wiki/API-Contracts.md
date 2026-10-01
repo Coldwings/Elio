@@ -118,6 +118,21 @@ Case law (frozen): process-wide `SIGPIPE` disposition at runtime/server entry â€
 
 ## I/O, Networking, And Streams
 
+### Composable Publishing Streams
+
+`net::publishing_byte_stream` is an additive, TLS-free C++20 concept with an
+explicit semantic opt-in. It requires exclusively owned, ordered byte I/O,
+recursive publication of positive writes, layer-local protocol finish, and
+asynchronous whole-owned-chain abort/settlement. One abort may overlap one
+reader and one writer; it seals new I/O and settles internal work, while callers
+still retain and normally join every public operation before freeing objects
+or borrowed buffers. Passing the concept is not proof of those runtime promises.
+
+[[Byte Streams]] defines the operation/lifetime/closure matrix, EOF and
+publication scope, finite per-layer buffering, and adapter verification rules.
+The existing TCP/TLS/common-stream types are not automatically opted in and
+their serialized legacy close/destruction boundaries remain unchanged.
+
 ### Finishing Stream Output
 
 `tcp_stream`, `tls_stream`, and `net::stream` provide `finish_write(token,
@@ -217,7 +232,8 @@ awaited operation and cleanup finish.
 | `net::uds_listener` | Binds/listens/accepts Unix-domain sockets asynchronously. `close()` invalidates the listener and prevents later accepts from succeeding, but it does not request cancellation of an accept already submitted to an I/O backend. Socket creation failures, and bind/listen failures after address conversion succeeds, are reported as `std::nullopt` with `errno` set. | Keep path ownership and unlink behavior under application control. Keep the listener open and alive while accepts are pending. To stop an accept loop, use `accept(coro::cancel_token)`, request cancellation, await the loop task, and only then close or destroy the listener. Treat overlong `unix_address` values as caller precondition failures, not socket syscall failures. |
 | `net::uds_connect()` | Converts the supplied UDS address, attempts the connection, and reports socket/connect failures as `std::nullopt` with `errno` set from the failing operation. Cancellable overloads honor the supplied token at the connect wait. | Ensure the address meets `unix_address` length rules and represents an intended filesystem or abstract namespace target. Check the optional result before use. Pass a token when the connection attempt must stop on caller cancellation. |
 | `net::uds_stream` | Provides stream I/O semantics matching TCP stream base/exact helpers over Unix-domain sockets, including cancellation-aware read/write helpers and per-call `SIGPIPE` suppression where supported for socket writes. One read-side operation and one write-side operation may overlap. Under the epoll backend, `close()` and destruction on the stream's owning worker fail any I/O still parked on the stream's fd with `-ECANCELED`, resuming each parked awaiter exactly once; destruction off the owning worker raw-closes the fd and leaves a parked op suspended until the recycled fd number is next prepared or the backend is destroyed. Under io_uring, in-flight operations hold a kernel file reference and complete normally later against the old file description. | Apply the same short I/O, cancellation, buffer-lifetime, and external serialization rules as TCP streams. A stoppable reader/writer should still prefer the cancellable overload, request cancellation, and await the operation before closing; the stream must remain alive until parked operations have resumed. |
-| `net::stream` concept/helpers | Expose generic stream requirements for APIs that accept stream-like types. | Provide streams that satisfy the expected read/write/close contract for the consuming API. |
+| `net::stream` | Dispatches to its closed TCP/TLS transport variant, preserving that concrete transport's public guarantees. It is not the arbitrary-stream composition concept. | Follow the active transport's operation and lifetime rules; serialize legacy close against I/O. |
+| `net::publishing_byte_stream` and `net::publishing_byte_stream_contract` | Check opt-in and move-only task-returning syntax for the semantic lifecycle contract in [[Byte Streams]], without a mandatory TLS dependency. | Opt in only when the implementation fulfills the complete publishing, ownership, cancellation, buffering, finish, and overlapping-abort contract. Keep public operation frames and borrowed buffers alive through normal completion. |
 | `io::io_op`, `io::io_request`, and `io::io_backend` | Define the low-level backend request/result contract used by concrete I/O backends. `io_context` does not expose mutable raw backend access. | Treat direct backend instances as standalone backend integration interfaces. Serialize and drive them yourself, and keep request-owned buffers, addresses, and op state alive according to the backend contract. |
 | `io::io_uring_backend` and `io::epoll_backend` | Normalize supported backend completions into Elio awaitable results and release operation ownership before resuming the continuation. | Select a backend supported by the kernel and deployment. Do not bypass owner-thread rules or infer stream/fd concurrency safety from backend queue acceptance. |
 

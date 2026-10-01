@@ -85,6 +85,7 @@ Elio is built around a few key technical decisions:
 - [[Migrating to 0.6]] - Breaking changes and upgrade checklist for 0.5.x users
 - [[Signal Handling]] - Safe signal handling with signalfd
 - [[Networking]] - TCP, HTTP/1.1, and connections
+- [[Byte Streams]] - Publishing-stream composition, ownership, and lifecycle
 - [[HTTP Streaming]] - Owned streaming replies, incremental receive, borrowed buffers,
   framing, and server-owned CONNECT tunnels over TCP or HTTPS proxies
 - [[HTTP2 Guide]] - HTTP/2 client usage and multiplexing

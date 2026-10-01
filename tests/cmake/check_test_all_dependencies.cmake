@@ -13,7 +13,7 @@ cmake_minimum_required(VERSION 3.20)
 project(elio_test_all_dependency_probe LANGUAGES CXX)
 add_subdirectory("${ELIO_SOURCE_DIR}" elio)
 
-set(_expected elio_tests elio_file_transfer_header elio_fork_boundary_tests
+set(_expected elio_tests elio_file_transfer_header elio_byte_stream_header elio_fork_boundary_tests
     elio_rdma_cuda_lifetime_tests elio_test_watchdog_probe_normal)
 if(NOT ELIO_ENABLE_RDMA_IBVERBS)
     list(APPEND _expected elio_rdma_ibverbs_backend_stub_tests)

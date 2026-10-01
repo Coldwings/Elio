@@ -10,6 +10,8 @@
 
 namespace elio::http {
 
+namespace detail { struct request_wire_view; }
+
 /// HTTP request
 class request {
 public:
@@ -119,37 +121,8 @@ public:
     /// Serialize request line and headers only (HTTP/1.1 format, no body).
     /// serialize() shares this and appends the body.
     std::string serialize_headers() const {
-        std::string result;
-
-        // Request line
-        result += method_to_string(method_);
-        result += ' ';
         auto target = path_with_query();
-        detail::validate_request_target(target);
-        result += target;
-        result += ' ';
-        std::string_view version =
-            version_.empty() ? std::string_view("HTTP/1.1")
-                             : std::string_view(version_);
-        detail::validate_http_version(version);
-        result += version;
-        result += "\r\n";
-
-        // Headers. A bodyless request must not advertise
-        // Expect: 100-continue (RFC 9110 §10.1.1); drop the setter-managed
-        // header only for that case.
-        if (expect_continue_ && body_.empty()) {
-            auto no_expect = headers_;
-            no_expect.remove("Expect");
-            result += no_expect.serialize();
-        } else {
-            result += headers_.serialize();
-        }
-
-        // End of headers
-        result += "\r\n";
-
-        return result;
+        return serialize_headers_for(target, headers_);
     }
 
     /// Serialize request to string (HTTP/1.1 format)
@@ -174,6 +147,31 @@ public:
     }
     
 private:
+    friend struct detail::request_wire_view;
+
+    std::string serialize_headers_for(std::string_view target, const headers& fields) const {
+        detail::validate_request_target(target);
+        const std::string_view version = version_.empty() ? std::string_view("HTTP/1.1")
+                                                        : std::string_view(version_);
+        detail::validate_http_version(version);
+        std::string result(method_to_string(method_));
+        result += ' ';
+        result += target;
+        result += ' ';
+        result += version;
+        result += "\r\n";
+        // Preserve the existing bodyless Expect rule for every route projection.
+        if (expect_continue_ && body_.empty()) {
+            auto no_expect = fields;
+            no_expect.remove("Expect");
+            result += no_expect.serialize();
+        } else {
+            result += fields.serialize();
+        }
+        result += "\r\n";
+        return result;
+    }
+
     method method_ = method::GET;
     std::string path_ = "/";
     std::string query_;

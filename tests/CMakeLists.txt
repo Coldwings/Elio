@@ -348,8 +348,8 @@ endif()
 if(TARGET elio_tls)
     target_link_libraries(elio_tests PRIVATE elio_tls)
 endif()
-if(TARGET nghttp2_static)
-    target_link_libraries(elio_tests PRIVATE nghttp2_static)
+if(TARGET elio_http2)
+    target_link_libraries(elio_tests PRIVATE elio_http2)
 endif()
 if(TARGET elio_rdma_cm)
     target_link_libraries(elio_tests PRIVATE elio_rdma_cm)
@@ -369,8 +369,8 @@ if(ELIO_BUILD_SANITIZER_TESTS)
     if(TARGET elio_tls)
         target_link_libraries(elio_tests_asan PRIVATE elio_tls)
     endif()
-    if(TARGET nghttp2_static)
-        target_link_libraries(elio_tests_asan PRIVATE nghttp2_static)
+    if(TARGET elio_http2)
+        target_link_libraries(elio_tests_asan PRIVATE elio_http2)
     endif()
     if(TARGET elio_rdma_cm)
         target_link_libraries(elio_tests_asan PRIVATE elio_rdma_cm)
@@ -391,8 +391,8 @@ if(ELIO_BUILD_SANITIZER_TESTS)
     if(TARGET elio_tls)
         target_link_libraries(elio_tests_tsan PRIVATE elio_tls)
     endif()
-    if(TARGET nghttp2_static)
-        target_link_libraries(elio_tests_tsan PRIVATE nghttp2_static)
+    if(TARGET elio_http2)
+        target_link_libraries(elio_tests_tsan PRIVATE elio_http2)
     endif()
     if(TARGET elio_rdma_cm)
         target_link_libraries(elio_tests_tsan PRIVATE elio_rdma_cm)
@@ -412,6 +412,24 @@ if(ELIO_BUILD_SANITIZER_TESTS)
     set_tests_properties(elio_fork_boundary_asan PROPERTIES
         TIMEOUT 60
         RUN_SERIAL TRUE)
+endif()
+
+# Inspect effective definitions so HTTP/2-specific regressions cannot silently
+# disappear from an enabled normal or sanitizer suite.
+if(TARGET elio_http2)
+    set(_elio_http2_test_definitions "elio_tests:$<TARGET_PROPERTY:elio_tests,COMPILE_DEFINITIONS>\n")
+    if(ELIO_BUILD_SANITIZER_TESTS)
+        string(APPEND _elio_http2_test_definitions
+            "elio_tests_asan:$<TARGET_PROPERTY:elio_tests_asan,COMPILE_DEFINITIONS>\n"
+            "elio_tests_tsan:$<TARGET_PROPERTY:elio_tests_tsan,COMPILE_DEFINITIONS>\n")
+    endif()
+    file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/http2-test-definitions-$<CONFIG>.txt"
+        CONTENT "${_elio_http2_test_definitions}")
+    add_test(NAME http2_test_compile_definitions
+        COMMAND ${CMAKE_COMMAND}
+            -DELIO_DEFINITIONS_FILE=${CMAKE_CURRENT_BINARY_DIR}/http2-test-definitions-$<CONFIG>.txt
+            -DELIO_SANITIZER_SUITES=${ELIO_BUILD_SANITIZER_TESTS}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_http2_test_definitions.cmake)
 endif()
 
 # Stress test executable for shared_mutex

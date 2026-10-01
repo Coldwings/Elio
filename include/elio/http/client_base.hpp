@@ -242,7 +242,7 @@ struct base_client_config {
     size_t max_headers = 100;                     ///< Max number of response headers
     size_t max_header_size = 8192;                ///< Max size of a single header line (bytes)
     std::chrono::nanoseconds dns_timeout{0};      ///< DNS observer budget; <=0 disables, independent of TCP/TLS
-    std::shared_ptr<net::resolve_domain> dns_domain; ///< Null selects the shared default admission domain
+    std::shared_ptr<net::resolve_domain> dns_domain{}; ///< Null selects the shared default admission domain
 };
 
 /// Initialize a TLS context for client use with default settings

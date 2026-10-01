@@ -3022,6 +3022,14 @@ pool reuse rules, and caller retry policy are unchanged. New connection DNS
 observation is cancellable and uses `dns_timeout`/`dns_domain`; the independent
 TCP/TLS connect budget still begins after resolution.
 
+HTTP acquisition takes an operation-owned snapshot of the current
+`client.config().dns_timeout` and `dns_domain`. Set these before starting the
+operation; configuration mutation and client use must remain serialized.
+`connection_pool::{acquire_result,acquire}` accept a trailing optional
+`connection_pool::dns_options{timeout, domain}` after the token. An omitted
+override uses the pool configuration; an engaged null domain selects the shared
+resolver default, including after clearing a constructor-time custom domain.
+
 The same vocabulary is available in `client_connect_result()` and
 `connection_pool::acquire_result()`; their optional counterparts remain adapters.
 Pool acquisition preserves the legacy immediate-completion rule: a fresh cached

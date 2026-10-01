@@ -38,7 +38,7 @@ struct h2_client_config {
     size_t max_response_headers = 100;             ///< Max accepted response field lines per stream
     size_t max_response_header_bytes = 64 * 1024; ///< Max accepted response name/value bytes per stream
     std::chrono::nanoseconds dns_timeout{0};      ///< Independent DNS observer timeout; <=0 disables
-    std::shared_ptr<net::resolve_domain> dns_domain; ///< Null selects shared default DNS admission
+    std::shared_ptr<net::resolve_domain> dns_domain{}; ///< Null selects shared default DNS admission
 };
 
 namespace detail {

@@ -423,6 +423,33 @@ TEST_CASE("public DNS worker-side pool teardown rejects inline libc dispatch",
 }
 
 #if defined(ELIO_HAS_HTTP) && ELIO_HAS_HTTP
+TEST_CASE("HTTP DNS admission reflects accessor updates including clearing a custom domain",
+          "[dns][resolve_wait][public][client][http][configuration][regression]") {
+    const int update = GENERATE(0, 1, 2);
+    scheduler sched(1);
+    lookup_control lookup;
+    lookup.lookup_error = ENETUNREACH;
+    release_flag(lookup.release);
+    lookup_guard guard(lookup, [&] { sched.shutdown(); });
+    sched.start();
+    auto observer = sched.go_joinable([update]() -> task<int> {
+        elio::http::client_config config;
+        config.resolve_options.use_cache = false;
+        config.dns_domain = std::make_shared<elio::net::resolve_domain>(update == 0 ? 1 : 0);
+        elio::http::client client(config);
+        if (update == 2) client.config().dns_domain.reset();
+        else client.config().dns_domain = std::make_shared<elio::net::resolve_domain>(update == 0 ? 0 : 1);
+        auto result = co_await client.get_result("http://updated-domain.example/");
+        const auto* error = std::get_if<elio::http::client_error>(&result);
+        if (!error || error->stage != elio::http::client_stage::resolve) co_return 0;
+        co_return error->code.value();
+    });
+    REQUIRE(wait_for([&] { return observer.await_ready(); }));
+    REQUIRE(observer.await_resume() == (update == 0 ? EAGAIN : ENETUNREACH));
+    observer.wait_destroyed();
+    REQUIRE(lookup.calls.load() == (update == 0 ? 0 : 1));
+}
+
 TEST_CASE("HTTP WebSocket and SSE DNS waiting uses an independent disabled-by-default budget",
           "[dns][resolve_wait][public][client][http][regression]") {
     const int client_kind = GENERATE(0, 1, 2);
@@ -442,8 +469,10 @@ TEST_CASE("HTTP WebSocket and SSE DNS waiting uses an independent disabled-by-de
         };
         if (client_kind == 0) {
             elio::http::client_config config;
-            configure(config);
+            config.resolve_options.use_cache = false;
+            config.connect_timeout = std::chrono::seconds(1);
             elio::http::client client(config);
+            configure(client.config());
             auto result = co_await client.get_result("http://client-dns.example/", token);
             const auto* error = std::get_if<elio::http::client_error>(&result);
             if (!error || error->stage != elio::http::client_stage::resolve) co_return 0;

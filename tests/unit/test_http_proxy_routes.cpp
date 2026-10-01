@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <elio/http/http_client.hpp>
 
 #include <openssl/pem.h>
@@ -388,6 +389,7 @@ struct handoff_hooks {
 
 struct output_observation {
     uint64_t handshake_bytes = 0;
+    bool hold_inactive = false;
     std::atomic<bool> held{false};
     elio::sync::event paused;
     elio::sync::event release;
@@ -407,7 +409,9 @@ task<void> pause_drained_output(void* context, uint64_t drained) {
 void observe_tunnel_output(detail::connect_tls_stream& inner) {
     auto* observed = output_observed.load();
     observed->handshake_bytes = inner.finish_state_for_test().accepted_ciphertext;
-    inner.set_output_progress_test_hook(observed, pause_drained_output);
+    inner.set_output_progress_test_hook(observed,
+        observed->hold_inactive ? nullptr : pause_drained_output,
+        observed->hold_inactive ? pause_drained_output : nullptr);
 }
 
 struct output_hooks {
@@ -502,8 +506,8 @@ TEST_CASE("Standalone connection pools reject explicit proxy policy rather than 
     REQUIRE_NOTHROW(connection_pool{});
 }
 
-TEST_CASE("Proxy target authority rejects URI credential delimiters before dialing",
-          "[http][proxy][routes][review-1249][issue-1249]") {
+TEST_CASE("Proxy target authority rejects malformed grammar before dialing",
+          "[http][proxy][routes][authority][review-1249][issue-1249]") {
     transport_config config;
     config.proxy = http_proxy_config{};
     config.proxy->endpoint = "http://proxy.example/";
@@ -512,7 +516,13 @@ TEST_CASE("Proxy target authority rejects URI credential delimiters before diali
     handoff_observation observed;
     handoff_hooks hooks(observed);
     for (const auto input : {"http://user:pa@ss@origin.example/path",
-                             "https://user:pa@ss@origin.example/path"}) {
+                             "https://user:pa@ss@origin.example/path",
+                             "http://origin%ZZ.example/path", "https://origin%ZZ.example/path",
+                             "http://origin\\host/path", "https://origin\\host/path",
+                             "http://[::gg]/path", "https://[::gg]/path",
+                             "http://[not-ip]/path", "https://[not-ip]/path",
+                             "http://[v1.name]/path", "https://[v1.name]/path",
+                             "http://[fe80::1%25ethA]/path", "https://[fe80::1%25ethA]/path"}) {
         auto result = handoff_immediate(agent.get_result(input));
         const auto* error = std::get_if<client_error>(&result);
         REQUIRE(error);
@@ -527,9 +537,11 @@ TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS o
     elio::tls::tls_context server_context(elio::tls::tls_mode::server);
     temporary_pem ca;
     install_certificate(server_context, ca);
-    for (const auto selected : {backend::epoll, backend::io_uring})
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    for (const size_t workers : {1, 2})
+    for (const bool hold_inactive : {false, true})
     for (const bool finite : {false, true}) {
-        CAPTURE(selected, finite);
+        CAPTURE(selected, workers, hold_inactive, finite);
         backend_guard backend_scope(selected);
         auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
         REQUIRE(listener);
@@ -544,10 +556,11 @@ TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS o
         auto owner = std::make_shared<transport>(config);
         client agent(owner);
         output_observation output;
+        output.hold_inactive = hold_inactive;
         output_hooks hooks(output);
         observed_route observed;
         elio::coro::cancel_source stop;
-        elio::runtime::scheduler scheduler(1);
+        elio::runtime::scheduler scheduler(workers);
         scheduler.start();
         auto server = scheduler.go_joinable(serve_route(*listener, true, server_context,
                                                        1, observed, stop.get_token()));
@@ -589,7 +602,8 @@ TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS o
 
 TEST_CASE("CONNECT 407 is bounded and never pools or automatically replays a rejected channel",
           "[http][proxy][routes][auth][issue-1249]") {
-    for (const auto selected : {backend::epoll, backend::io_uring}) {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    {
         backend_guard backend_scope(selected);
         auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
         REQUIRE(listener);
@@ -641,7 +655,7 @@ TEST_CASE("Functional forward and CONNECT pools do not share channels across tar
     elio::tls::tls_context server_context(elio::tls::tls_mode::server);
     temporary_pem ca;
     install_certificate(server_context, ca);
-    for (const auto selected : {backend::epoll, backend::io_uring})
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
     for (const bool secure : {false, true}) {
         CAPTURE(selected, secure);
         backend_guard backend_scope(selected);
@@ -700,7 +714,8 @@ TEST_CASE("Forward-to-CONNECT redirects keep credentials only on the proxy hop",
     elio::tls::tls_context server_context(elio::tls::tls_mode::server);
     temporary_pem ca;
     install_certificate(server_context, ca);
-    for (const auto selected : {backend::epoll, backend::io_uring}) {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    {
         CAPTURE(selected);
         backend_guard backend_scope(selected);
         auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
@@ -755,7 +770,7 @@ TEST_CASE("Forward-to-CONNECT redirects keep credentials only on the proxy hop",
 
 TEST_CASE("CONNECT and inner TLS retain one absolute TCP budget and settle cancellation",
           "[http][proxy][routes][deadline][issue-1249]") {
-    for (const auto selected : {backend::epoll, backend::io_uring})
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
     for (const bool inner_tls : {false, true})
     for (const bool cancelled : {false, true}) {
         CAPTURE(selected, inner_tls, cancelled);
@@ -812,7 +827,7 @@ TEST_CASE("CONNECT and inner TLS retain one absolute TCP budget and settle cance
 
 TEST_CASE("CONNECT origin trust hostname and unsupported ALPN fail before origin requests",
           "[http][proxy][routes][tls-policy][issue-1249]") {
-    for (const auto selected : {backend::epoll, backend::io_uring})
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
     for (const int rejection : {0, 1, 2}) {
         CAPTURE(selected, rejection);
         backend_guard backend_scope(selected);
@@ -868,7 +883,7 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
     elio::tls::tls_context server_context(elio::tls::tls_mode::server);
     temporary_pem ca;
     install_certificate(server_context, ca);
-    for (const auto selected : {backend::epoll, backend::io_uring})
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
     for (const bool finite : {false, true})
     for (const bool secure : {false, true})
     for (const bool streaming : {false, true}) {

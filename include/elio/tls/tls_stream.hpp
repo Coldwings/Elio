@@ -139,10 +139,12 @@ public:
         transport_->output.set_test_hooks(hooks);
     }
     void set_output_progress_test_hook(void* context,
-            coro::task<void> (*hook)(void*, uint64_t)) {
+            coro::task<void> (*hook)(void*, uint64_t),
+            coro::task<void> (*inactive_hook)(void*, uint64_t) = nullptr) {
         auto lock = lock_ssl_state();
         transport_->output_progress_context = context;
         transport_->after_output_progress = hook;
+        transport_->after_output_inactive = inactive_hook;
     }
     detail::tls_shutdown_test_state shutdown_state_for_test() const {
         auto lock = lock_ssl_state();

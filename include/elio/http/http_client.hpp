@@ -1023,7 +1023,8 @@ private:
         }
 
         auto parsed = url::parse(url_str);
-        if (!parsed) {
+        if (!parsed || (transport_->config().proxy &&
+                        !detail::valid_proxy_uri_authority(url_str, *parsed))) {
             co_return detail::make_client_error(EINVAL, client_stage::target);
         }
         if (!detail::is_supported_http_url_scheme(parsed->scheme)) {
@@ -1456,6 +1457,12 @@ private:
         }
         auto redirect_url = url::resolve_reference(target, location);
         if (!redirect_url) return std::nullopt;
+        if (transport_->config().proxy &&
+            ((detail::has_uri_scheme(location) || location.starts_with("//")) &&
+             !detail::valid_proxy_uri_authority(location, *redirect_url))) {
+            ELIO_LOG_WARNING("Rejecting invalid proxy redirect authority");
+            return std::nullopt;
+        }
         if (!detail::is_supported_http_url_scheme(redirect_url->scheme)) {
             ELIO_LOG_WARNING("Rejecting unsupported HTTP redirect scheme");
             return std::nullopt;

@@ -120,8 +120,14 @@ the owned protocol chain rather than bypassing it through a root descriptor.
 ## Normalization And Policy Ownership
 
 ASCII DNS names are case-folded. Parsed IPv4 and IPv6 literals are canonicalized;
-IPv6 authorities retain brackets and effective ports. IPv6 zone identifiers
-remain case-sensitive. Trailing-dot DNS names and alternate/ambiguous IPv4
+IPv6 authorities retain brackets and effective ports. General route identity
+keeps IPv6 zone identifiers case-sensitive. Explicit proxy URI endpoints and
+targets accept RFC 3986 reg-names (including well-formed percent escapes) or
+IPv4/IPv6 literals; malformed escapes, backslashes and bracketed non-IP names
+are rejected before dialing. IPvFuture and scoped IPv6 zone syntax are not
+supported by the explicit proxy connector: it does not reinterpret or forward
+node-local scope identifiers. Direct route normalization is unchanged.
+Trailing-dot DNS names and alternate/ambiguous IPv4
 spellings are conservatively distinct. Implicit and explicit default ports
 compare equal. Paths, queries, fragments, URI userinfo, and application headers
 are not connection identity fields. No secret URL components are retained in the

@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <elio/http/detail/request_wire.hpp>
 
 using namespace elio::http;
@@ -13,6 +14,49 @@ auto wire_profile() {
 }
 
 } // namespace
+
+TEST_CASE("Proxy wire rejects malformed host grammar before projecting hop credentials",
+          "[http][proxy][wire][authority][issue-1249]") {
+    const auto host = GENERATE("origin%ZZ.example", "origin%.example", "origin%2.example",
+        "origin\\host", "::gg", "fe80::1%25", "origin|host", "origin^host",
+        "fe80::1%25ethA", "fe80::1%ethA");
+    url target;
+    target.scheme = "http";
+    target.host = host;
+    request req(method::GET, "/path");
+    const auto profile = wire_profile();
+    CHECK_FALSE(detail::request_wire_view::valid_authority(target));
+    REQUIRE_THROWS_AS(detail::request_wire_view::serialize(req, target,
+        detail::route_mode::forward_proxy, profile.get()), std::invalid_argument);
+}
+
+TEST_CASE("Proxy wire preserves valid authority spelling without decoding escapes",
+          "[http][proxy][wire][authority][issue-1249]") {
+    const auto input = GENERATE("http://origin%41.example/path",
+        "http://[2001:db8::1]:8080/path", "http://[::ffff:192.0.2.1]/path");
+    const auto target = url::parse(input);
+    REQUIRE(target);
+    request req(method::GET, target->path);
+    const auto profile = wire_profile();
+    REQUIRE(detail::request_wire_view::valid_authority(*target));
+    REQUIRE(detail::request_wire_view::serialize(req, *target,
+        detail::route_mode::forward_proxy, profile.get()).starts_with(
+            "GET " + std::string(input) + " HTTP/1.1\r\n"));
+}
+
+TEST_CASE("Proxy authority validation rejects embedded NUL rather than truncating IPv6",
+          "[http][proxy][wire][authority][issue-1249]") {
+    url target;
+    target.scheme = "http";
+    request req(method::GET, "/path");
+    const auto profile = wire_profile();
+    for (const auto& host : {std::string("::1\0evil", 8), std::string("origin\0host", 11)}) {
+        target.host = host;
+        CHECK_FALSE(detail::request_wire_view::valid_authority(target));
+        REQUIRE_THROWS_AS(detail::request_wire_view::serialize(req, target,
+            detail::route_mode::forward_proxy, profile.get()), std::invalid_argument);
+    }
+}
 
 TEST_CASE("HTTP forwarding projects absolute form without URI or generic hop secrets",
           "[http][proxy][wire][issue-1249]") {

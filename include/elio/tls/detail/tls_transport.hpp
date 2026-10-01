@@ -129,6 +129,7 @@ public:
     void (*before_read_publish)(void*) = nullptr;
     void* output_progress_context = nullptr;
     coro::task<void> (*after_output_progress)(void*, uint64_t) = nullptr;
+    coro::task<void> (*after_output_inactive)(void*, uint64_t) = nullptr;
     bool output_active_for_test() const noexcept { return pump_active_; }
     void set_output_active_for_test(bool active) noexcept {
         std::lock_guard lock(mutex);
@@ -371,16 +372,29 @@ private:
                 sync::lock_guard write_guard(self->write_mutex_);
                 std::span<const std::byte> bytes;
                 bool finished = false;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                void* inactive_context = nullptr;
+                coro::task<void> (*inactive_hook)(void*, uint64_t) = nullptr;
+                uint64_t inactive_drained = 0;
+#endif
                 {
                     std::lock_guard lock(self->mutex);
                     bytes = self->output.pending();
                     if (bytes.empty()) {
                         self->pump_active_ = false;
                         finished = true;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                        inactive_context = self->output_progress_context;
+                        inactive_hook = self->after_output_inactive;
+                        inactive_drained = self->output.drained_bytes();
+#endif
                     }
                 }
                 if (finished) {
                     self->notify_progress();
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                    if (inactive_hook) co_await inactive_hook(inactive_context, inactive_drained);
+#endif
                     co_return;
                 }
                 // Keep the head allocation until completion cleanup, including

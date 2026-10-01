@@ -5,14 +5,50 @@
 #include <elio/http/http_common.hpp>
 
 #include <openssl/evp.h>
+#include <arpa/inet.h>
 
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
 namespace elio::http::detail {
+
+inline bool valid_proxy_host(std::string_view host) noexcept {
+    if (!is_valid_url_input(host)) return false;
+    if (host.find(':') != std::string_view::npos) {
+        std::array<char, INET6_ADDRSTRLEN> text{};
+        if (host.size() >= text.size()) return false;
+        std::copy(host.begin(), host.end(), text.begin());
+        in6_addr address{};
+        return ::inet_pton(AF_INET6, text.data(), &address) == 1;
+    }
+    for (size_t pos = 0; pos < host.size(); ++pos) {
+        if (host[pos] == '%') {
+            if (host.size() - pos < 3 || !connect_hex_digit(host[pos + 1]) ||
+                !connect_hex_digit(host[pos + 2])) return false;
+            pos += 2;
+        } else if (!connect_host_char(host[pos])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool valid_proxy_uri_authority(std::string_view source, const url& parsed) noexcept {
+    if (!valid_proxy_host(parsed.host)) return false;
+    // url::parse drops IP-literal brackets. Do not reinterpret a bracketed
+    // non-IP host as a reg-name when projecting it onto the proxy wire.
+    const auto scheme = source.find("://");
+    if (scheme != std::string_view::npos) source.remove_prefix(scheme + 3);
+    else if (source.starts_with("//")) source.remove_prefix(2);
+    source = source.substr(0, source.find_first_of("/?#"));
+    const auto userinfo = source.find('@');
+    if (userinfo != std::string_view::npos) source.remove_prefix(userinfo + 1);
+    return source.empty() || source.front() != '[' || parsed.host.find(':') != std::string::npos;
+}
 
 struct proxy_profile {
     route_endpoint endpoint;
@@ -51,7 +87,8 @@ inline std::shared_ptr<const proxy_profile> freeze_proxy_profile(const http_prox
         throw std::invalid_argument("HTTP proxy requires an explicit bounded endpoint URI");
     const auto parsed = url::parse(config.endpoint);
     if (!parsed || parsed->scheme != "http" || !parsed->userinfo.empty() ||
-        parsed->path != "/" || !parsed->query.empty() || !parsed->fragment.empty())
+        parsed->path != "/" || !parsed->query.empty() || !parsed->fragment.empty() ||
+        !valid_proxy_uri_authority(config.endpoint, *parsed))
         throw std::invalid_argument("HTTP proxy endpoint must be a plain HTTP authority");
     auto profile = std::make_shared<proxy_profile>();
     profile->endpoint = route_endpoint::from(parsed->host, parsed->effective_port());

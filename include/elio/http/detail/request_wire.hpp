@@ -12,8 +12,7 @@ namespace elio::http::detail {
 // the enclosing exchange; route selection must not copy or mutate them.
 struct request_wire_view {
     static bool valid_authority(const url& target) noexcept {
-        return !target.host.empty() && target.host.find_first_of("@/?#[]") == std::string::npos &&
-            is_valid_url_input(target.host);
+        return valid_proxy_host(target.host);
     }
     static std::string serialize(const request& req, const url& target,
             route_mode mode, const proxy_profile* proxy) {

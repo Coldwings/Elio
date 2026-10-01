@@ -3001,6 +3001,16 @@ struct transport_tls_diagnostics {
     long verify_mode;
 };
 
+struct pool_limits {
+    size_t max_idle_per_route = 6;
+    size_t max_idle_total = 64;
+    size_t max_live_per_route = 12;
+    size_t max_live_total = 128;
+    size_t max_dials_total = 16;
+    size_t max_waiters_total = 256;
+    size_t max_route_buckets = 128;
+};
+
 struct transport_config {
     bool verify_certificate = true;
     net::resolve_options resolve_options = net::default_cached_resolve_options();
@@ -3009,6 +3019,8 @@ struct transport_config {
     std::shared_ptr<net::resolve_domain> dns_domain;
     size_t max_connections_per_host = 6;
     std::chrono::seconds pool_idle_timeout{60};
+    std::optional<pool_limits> limits;
+    std::chrono::nanoseconds acquisition_timeout{0};
     std::function<void(transport_tls_config&)> configure_tls;
 
     transport_config();
@@ -3036,7 +3048,8 @@ public:
 
 `transport_config(client_config)` copies only connection-affecting fields:
 certificate verification, resolver/cache/address-rotation policy, DNS
-observation/admission, and idle-pool limits. It intentionally does not copy
+observation/admission, idle-pool limits, opt-in finite pool admission, and the
+absolute acquisition budget. It intentionally does not copy
 request/response policy such as redirect limits, User-Agent, body limits,
 header limits, read timeout, or Expect fallback timeout.
 
@@ -3252,18 +3265,30 @@ struct client_config : base_client_config {
     bool follow_redirects = true;
     size_t max_connections_per_host = 6;
     std::chrono::seconds pool_idle_timeout{60};
+    std::optional<pool_limits> limits;
+    std::chrono::nanoseconds acquisition_timeout{0};
     size_t max_response_size = 16 * 1024 * 1024;
     std::chrono::milliseconds expect_continue_timeout{1000};
     // Inherits all base_client_config fields.
 };
 ```
 
-For `http::client`, `max_connections_per_host` and `pool_idle_timeout` are
+For `http::client`, `max_connections_per_host`, `pool_idle_timeout`, `limits`,
+and `acquisition_timeout` are
 transport-policy fields. They are copied into a private transport by
 `client(client_config)` or into an explicit `transport_config` by
 `transport_config(client_config)`. Mutating them through `client.config()` after
 construction does not resize an existing pool. `connect_timeout` remains
 per-client/per-acquisition for compatibility.
+
+An absent `limits` keeps legacy unbounded live admission and idle-only
+`max_connections_per_host`. When enabled, finite idle limits replace that legacy
+retention option. Every zero limit denies the named resource, not infinity.
+`acquisition_timeout` defaults to disabled (`<= 0`); when positive, one absolute
+budget covers queueing, DNS, TCP and TLS, independently of finite admission.
+Independent DNS/connect caps can shorten it. Global FIFO and overload semantics,
+streaming capacity ownership and migration hazards are described in
+[HTTP Connection Routing And Reuse](HTTP-Routing.md#opt-in-finite-admission).
 
 When `follow_redirects` is enabled, the client resolves `Location` values with
 `url::resolve_reference()`, rejects unsupported schemes, and rejects HTTPS to

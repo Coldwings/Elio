@@ -57,9 +57,10 @@ Publishing another Transport during a suspended acquisition does not change the
 old plan, the old connection's return key, or the old pool owner.
 
 Read/Expect/body/redirect/User-Agent policy and per-acquisition connect deadlines
-remain request policy. They do not split connection identity. A plan does not
-change timeout budgets, introduce admission limits, or prove that a partially
-read response is reusable. The exchange still requires complete framing,
+remain request policy. They do not split connection identity. A route plan by
+itself does not prove that a partially read response is reusable. Transport
+admission and acquisition budgets are configured separately below. The exchange
+still requires complete framing,
 keep-alive, no EOF/close-delimited body, and no unread suffix before returning a
 connection.
 
@@ -92,6 +93,90 @@ scheduler, borrowed request/URL/string inputs, and configured resolver cache
 alive until normal awaited return. Scoped streaming readers and their pending
 reads must not escape the handler.
 
+## Opt-In Finite Admission
+
+Default Transport admission remains unbounded for compatibility.
+`max_connections_per_host` still caps retained idle connections per route; it is
+not a concurrent/live-connection limit. To opt in, set `transport_config::limits`
+to `pool_limits{}` and adjust the distinct resources:
+
+```cpp
+elio::http::transport_config config;
+config.limits = elio::http::pool_limits{};
+config.limits->max_live_total = 128;
+config.acquisition_timeout = std::chrono::seconds(10);
+auto owner = std::make_shared<elio::http::transport>(config);
+elio::http::client client(owner);
+```
+
+| Limit | Finite preset | Meaning |
+| --- | --- | --- |
+| `max_idle_per_route` | 6 | Retained idle streams in one compatibility route |
+| `max_idle_total` | 64 | Retained idle streams in the whole Transport |
+| `max_live_per_route` | 12 | Idle, leased, retiring, and reserved streams in one route |
+| `max_live_total` | 128 | The same live states across the whole Transport |
+| `max_dials_total` | 16 | Reserved/in-progress DNS, TCP and TLS establishments |
+| `max_waiters_total` | 256 | Queued acquisitions, not already granted handoffs |
+| `max_route_buckets` | 128 | Route accounting/idle-cache metadata buckets |
+
+Every zero limit denies that resource rather than meaning unlimited. Zero idle
+limits disable retention without disabling new requests. Zero waiter capacity
+means fail-fast when immediate admission is unavailable. The finite idle limits
+replace the legacy idle setting when `limits` is present. The convenience
+`client_config` constructor copies these options into its private Transport;
+clients sharing an explicit Transport use that owner's immutable configuration.
+
+Capacity is reserved before DNS/dialing. Successful establishment releases its
+dial slot but retains live capacity through the whole exchange, including a
+scoped streaming handler and its unread body. Moving a lease or permit transfers
+its capacity ownership to the destination; it does not make capacity available.
+Failure, cancellation, timeout, destruction and late-return retirement release
+the permit once. Idle retirement closes
+the stream before releasing live capacity. Empty metadata buckets are removed;
+idle-only buckets/streams may be evicted to admit a different route within the
+metadata/global-live caps. Active or queued buckets are not evicted.
+
+Waiters use global FIFO: a saturated head route can delay later routes, even if
+those routes have capacity. New acquisitions do not bypass queued waiters.
+Queueing does not block a scheduler worker and is cancellable. A full waiter or
+metadata budget, or a resource denied by a zero limit, returns `EAGAIN` at stage
+`acquire`. A pending wait without a running scheduler is unsupported. Shutdown
+wakes queued acquisitions with `ESHUTDOWN`, stops new admission, and waits for
+already reserved/leased exchanges. Cancellation returns `ECANCELED`; a selected
+handoff can beat cancellation, but the client checks cancellation before dialing
+or using its stream. Cancelling a shutdown observer does not cancel exchanges.
+
+Per-route accounting uses the complete compatibility key, including origin,
+proxy/security/authentication domains and DNS semantics. It is not an aggregate
+per-origin or per-proxy-endpoint quota across different routes. This version
+does not advertise a separate endpoint quota or cross-origin forward-channel
+sharing. Global live/dial limits bound pressure across all routes in one shared
+Transport; independent Transports have independent budgets.
+
+## Absolute Acquisition Budget
+
+`acquisition_timeout` is disabled by default (`<= 0`). When enabled, it creates
+one absolute steady-clock deadline on acquisition entry, before queueing. The
+same deadline bounds the queue, DNS observer, TCP retries and TLS handshake;
+stage transitions and retries never restart it. It applies independently of
+whether finite limits are enabled. Timeout errors retain the active stage:
+`acquire` for queue expiry, `resolve` for DNS, and `connect`/`tls` for setup.
+
+The independent `dns_timeout` cap may shorten the DNS portion.
+`client_config::connect_timeout` retains its TCP-plus-TLS semantics starting
+after DNS, but is intersected with the remaining absolute acquisition budget.
+Read/write/Expect clocks retain their existing request/response semantics; this
+is not a total-response or handler-execution deadline. DNS observer departure
+does not destroy running libc work: the separate DNS admission domain retains
+that work's capacity until actual completion.
+
+Finite admission can introduce queueing that legacy callers never experienced.
+In particular, do not await a nested request on a fully saturated Transport
+while holding every lease needed for its progress; use adequate capacity or a
+separate Transport. Use a finite acquisition timeout when indefinite FIFO
+waiting is unacceptable. Operational overload/deadline errors use the existing
+`client_result`/`client_error` API; no additional error taxonomy is introduced.
+
 ## Standalone Pool Compatibility
 
 Legacy `connection_pool::{acquire_result,acquire,release}` signatures remain
@@ -107,3 +192,6 @@ and keep the old pool/context alive and unchanged for old operations/returns.
 For automatic route/security isolation and client-managed lifecycle, migrate to
 `client(shared_ptr<transport>, policy)`.
 These legacy adapters do not gain the Transport's lease/generation guarantees.
+They also do not acquire finite live/dial/waiter admission; finite `limits` and
+the queue-inclusive acquisition budget are Transport-managed options, not a
+reinterpretation of standalone acquire/release.

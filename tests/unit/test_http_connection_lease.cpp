@@ -245,8 +245,9 @@ TEST_CASE("HTTP default lease destruction aborts without draining and retains it
 }
 
 TEST_CASE("HTTP clear and shutdown linearize with a returning lease without early I/O release",
-          "[http][lease][issue-1247]") {
+          "[http][lease][issue-1247][issue-1248]") {
     const bool shutdown = GENERATE(false, true);
+    const bool bounded = GENERATE(false, true);
     socket_pair pair;
     const int descriptor = pair.client.fd();
     dial_observation dials;
@@ -254,7 +255,9 @@ TEST_CASE("HTTP clear and shutdown linearize with a returning lease without earl
     dial_guard dial(dials);
     disposition_observation dispositions;
     disposition_guard observe(dispositions);
-    auto owner = std::make_shared<transport>();
+    transport_config policy;
+    if (bounded) policy.limits = pool_limits{};
+    auto owner = std::make_shared<transport>(policy);
     auto result = immediate(owner->acquire_lease_for_test(*url::parse("http://origin.invalid/")));
     REQUIRE(std::holds_alternative<lease>(result));
     auto active = std::move(std::get<lease>(result));
@@ -279,6 +282,7 @@ TEST_CASE("HTTP clear and shutdown linearize with a returning lease without earl
     REQUIRE(descriptor_alive);
     REQUIRE(dispositions.events == std::vector<std::pair<int, bool>>{{descriptor, false}});
     REQUIRE(::fcntl(descriptor, F_GETFD) == -1);
+    if (bounded) REQUIRE(owner->admission_counters_for_test().live == 0);
     active.retire();
     if (waiting) {
         REQUIRE(elio::coro::detail::task_access::handle(*waiting).done());
@@ -482,7 +486,7 @@ TEST_CASE("HTTP Transport clear rejects returns from pre-clear exchanges",
 }
 
 TEST_CASE("HTTP exchange alone proves lease reuse and failures retire once",
-          "[http][lease][issue-1247]") {
+          "[http][lease][issue-1247][issue-1248]") {
     const auto backend = GENERATE(elio::io::io_context::backend_type::epoll,
                                  elio::io::io_context::backend_type::io_uring);
 #if ELIO_HAS_IO_URING
@@ -492,6 +496,7 @@ TEST_CASE("HTTP exchange alone proves lease reuse and failures retire once",
     if (backend == elio::io::io_context::backend_type::io_uring) SKIP("io_uring not compiled");
 #endif
     const int scenario = GENERATE(0, 1, 2, 3, 4, 5, 6, 7, 8);
+    const bool bounded = GENERATE(false, true);
     INFO("scenario " << scenario << " backend " << static_cast<int>(backend));
     const std::string reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
         "Connection: keep-alive\r\n\r\nok";
@@ -533,7 +538,13 @@ TEST_CASE("HTTP exchange alone proves lease reuse and failures retire once",
     disposition_guard observe(dispositions);
     clock_guard clock;
     expire_response_clock.store(scenario == 6);
-    auto owner = std::make_shared<transport>();
+    transport_config config;
+    if (bounded) {
+        config.limits = pool_limits{};
+        config.limits->max_live_total = 1;
+        config.limits->max_dials_total = 1;
+    }
+    auto owner = std::make_shared<transport>(config);
     client_config policy;
     if (scenario == 8) policy.max_response_size = 2;
     client requestor(owner, policy);
@@ -587,4 +598,9 @@ TEST_CASE("HTTP exchange alone proves lease reuse and failures retire once",
     REQUIRE(dials.calls.load() == (scenario == 0 ? 1 : 2));
     REQUIRE(dispositions.events == std::vector<std::pair<int, bool>>{
         {old_fd, scenario == 0}, {scenario == 0 ? old_fd : fresh_fd, true}});
+    if (bounded) {
+        REQUIRE(owner->admission_counters_for_test().live == 1);
+        REQUIRE(owner->admission_counters_for_test().idle == 1);
+        REQUIRE(owner->admission_counters_for_test().dialing == 0);
+    }
 }

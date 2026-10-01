@@ -48,6 +48,10 @@ using fd_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
     std::chrono::nanoseconds, coro::cancel_token);
 inline std::atomic<fd_watchdog_wait_hook> fd_watchdog_wait_for_test{nullptr};
 inline std::atomic<size_t> fd_watchdog_shutdowns_for_test{0};
+using setup_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
+    std::chrono::steady_clock::time_point, coro::cancel_token);
+inline std::atomic<setup_watchdog_wait_hook> setup_watchdog_wait_for_test{nullptr};
+inline std::atomic<void(*)()> tls_setup_entered_for_test{nullptr};
 
 inline void arm_client_response_read_observer_for_test() noexcept {
     if (observe_client_response_read_entry_for_test.load(
@@ -265,6 +269,8 @@ inline void init_client_tls_context(tls::tls_context& ctx, bool verify_certifica
 /// @param connect_timeout TCP connect + TLS handshake timeout; <=0 disables
 /// @param dns_timeout Independent DNS observer timeout; <=0 disables
 /// @param dns_domain Shared DNS admission; null selects the default
+/// @param acquisition_deadline Optional absolute queue-inclusive budget supplied
+/// by the Transport. DNS/connect caps can shorten it, never restart or extend it.
 /// @return Connected stream or owned operational error; setup exceptions may throw.
 inline coro::task<client_result<net::stream>>
 client_connect_result(std::string_view host, uint16_t port, bool secure,
@@ -274,10 +280,14 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
                std::chrono::nanoseconds connect_timeout = std::chrono::nanoseconds::zero(),
                coro::cancel_token token = {},
                std::chrono::nanoseconds dns_timeout = std::chrono::nanoseconds::zero(),
-               std::shared_ptr<net::resolve_domain> dns_domain = {}) {
+               std::shared_ptr<net::resolve_domain> dns_domain = {},
+               std::optional<std::chrono::steady_clock::time_point> acquisition_deadline = {}) {
 
     if (token.is_cancelled()) {
         co_return detail::make_client_error(ECANCELED, client_stage::resolve);
+    }
+    if (acquisition_deadline && *acquisition_deadline <= std::chrono::steady_clock::now()) {
+        co_return detail::make_client_error(ETIMEDOUT, client_stage::resolve);
     }
 
     net::resolve_wait_options dns_options;
@@ -289,12 +299,18 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
         dns_options.deadline = dns_timeout >= remaining
             ? std::chrono::steady_clock::time_point::max() : now + dns_timeout;
     }
+    if (acquisition_deadline && (!dns_options.deadline ||
+                                *acquisition_deadline < *dns_options.deadline))
+        dns_options.deadline = acquisition_deadline;
     auto resolved = co_await net::resolve_all(host, port, std::move(dns_options), token);
     if (!resolved) {
         co_return detail::make_client_error(resolved.error, client_stage::resolve);
     }
     if (token.is_cancelled()) {
         co_return detail::make_client_error(ECANCELED, client_stage::resolve);
+    }
+    if (acquisition_deadline && *acquisition_deadline <= std::chrono::steady_clock::now()) {
+        co_return detail::make_client_error(ETIMEDOUT, client_stage::resolve);
     }
     auto addresses = std::move(resolved.addresses);
 
@@ -303,7 +319,15 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
         : 0;
 
     auto* sched = runtime::scheduler::current();
-    const bool deadline_enforced = sched != nullptr && connect_timeout.count() > 0;
+    auto setup_deadline = acquisition_deadline;
+    if (connect_timeout.count() > 0) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto remaining = std::chrono::steady_clock::time_point::max() - now;
+        const auto cap = connect_timeout >= remaining
+            ? std::chrono::steady_clock::time_point::max() : now + connect_timeout;
+        if (!setup_deadline || cap < *setup_deadline) setup_deadline = cap;
+    }
+    const bool deadline_enforced = sched != nullptr && setup_deadline.has_value();
     auto op_cancel_src = std::make_shared<coro::cancel_source>();
     auto timer_cancel_src = std::make_shared<coro::cancel_source>();
     auto timed_out = std::make_shared<std::atomic<bool>>(false);
@@ -313,12 +337,18 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
 
     if (deadline_enforced) {
         watchdog.emplace(sched->go_joinable(
-            [timeout = connect_timeout,
+            [deadline = *setup_deadline,
              timer_source = timer_cancel_src,
              op_source = op_cancel_src,
              flag = timed_out]() -> coro::task<void> {
-                auto r = co_await elio::time::sleep_for(
-                    timeout, timer_source->get_token());
+                coro::cancel_result r;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (auto hook = detail::setup_watchdog_wait_for_test.load(std::memory_order_acquire))
+                    r = co_await hook(deadline, timer_source->get_token());
+                else
+#endif
+                    r = co_await elio::time::sleep_for(
+                        deadline - std::chrono::steady_clock::now(), timer_source->get_token());
                 if (r == coro::cancel_result::completed) {
                     flag->store(true, std::memory_order_release);
                     op_source->cancel();
@@ -338,7 +368,8 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
     };
 
     auto stopped_error = [&](client_stage stage) -> std::optional<client_error> {
-        if (timed_out->load(std::memory_order_acquire)) {
+        if (timed_out->load(std::memory_order_acquire) ||
+            (setup_deadline && *setup_deadline <= std::chrono::steady_clock::now())) {
             return detail::make_client_error(ETIMEDOUT, stage);
         }
         if (token.is_cancelled()) {
@@ -374,6 +405,9 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
 
             tls::tls_stream tls_stream(std::move(*tcp), *tls_ctx);
             tls_stream.set_hostname(host);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::tls_setup_entered_for_test.load(std::memory_order_acquire)) hook();
+#endif
             auto hs = co_await tls_stream.handshake(op_cancel_src->get_token());
             const int tls_error = hs ? 0 : (errno ? errno : EIO);
             if (auto error = stopped_error(client_stage::tls)) {

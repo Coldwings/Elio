@@ -44,8 +44,15 @@ struct publishing_byte_stream_contract final {};
 /// the lifecycle matrix and the distinction from legacy stream close APIs.
 template<typename Stream>
 concept publishing_byte_stream =
-    std::move_constructible<Stream> && !std::copy_constructible<Stream> &&
-    !std::is_copy_assignable_v<Stream> &&
+    std::move_constructible<Stream> &&
+    !std::is_constructible_v<Stream, Stream&> &&
+    !std::is_constructible_v<Stream, const Stream&> &&
+    !std::is_constructible_v<Stream, volatile Stream&> &&
+    !std::is_constructible_v<Stream, const volatile Stream&> &&
+    !std::is_assignable_v<Stream&, Stream&> &&
+    !std::is_assignable_v<Stream&, const Stream&> &&
+    !std::is_assignable_v<Stream&, volatile Stream&> &&
+    !std::is_assignable_v<Stream&, const volatile Stream&> &&
     requires(Stream& stream, const Stream& const_stream, void* input,
              const void* output, size_t size, coro::cancel_token token,
              std::chrono::milliseconds timeout) {

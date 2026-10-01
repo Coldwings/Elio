@@ -26,6 +26,12 @@ struct syntax_stream : syntax_operations {
     syntax_stream(const syntax_stream&) = delete;
 };
 
+struct rvalue_token_stream : syntax_stream {
+    task<io_result> read(void*, size_t, cancel_token&&);
+    task<io_result> write(const void*, size_t, cancel_token&&);
+    task<write_finish_result> finish_write(cancel_token&&, std::chrono::milliseconds);
+};
+
 struct copy_assignable_stream : syntax_stream {
     copy_assignable_stream() = default;
     copy_assignable_stream(copy_assignable_stream&&) = default;
@@ -37,6 +43,66 @@ struct immovable_stream : syntax_stream {
     immovable_stream() = default;
     immovable_stream(immovable_stream&&) = delete;
     immovable_stream(const immovable_stream&) = delete;
+};
+
+struct explicit_copy_stream : syntax_operations {
+    explicit_copy_stream() = default;
+    explicit_copy_stream(explicit_copy_stream&&) = default;
+    explicit explicit_copy_stream(const explicit_copy_stream&) = default;
+    explicit_copy_stream& operator=(const explicit_copy_stream&) = delete;
+};
+
+struct mutable_copy_stream : syntax_operations {
+    mutable_copy_stream() = default;
+    mutable_copy_stream(mutable_copy_stream&&) = default;
+    mutable_copy_stream(mutable_copy_stream&);
+    mutable_copy_stream(const mutable_copy_stream&) = delete;
+    mutable_copy_stream& operator=(const mutable_copy_stream&) = delete;
+};
+
+struct volatile_copy_stream : syntax_operations {
+    volatile_copy_stream() = default;
+    volatile_copy_stream(volatile_copy_stream&&) = default;
+    volatile_copy_stream(volatile_copy_stream&) = delete;
+    volatile_copy_stream(const volatile_copy_stream&) = delete;
+    volatile_copy_stream(volatile volatile_copy_stream&);
+    volatile_copy_stream& operator=(const volatile_copy_stream&) = delete;
+};
+
+struct cv_copy_stream : syntax_operations {
+    cv_copy_stream() = default;
+    cv_copy_stream(cv_copy_stream&&) = default;
+    cv_copy_stream(cv_copy_stream&) = delete;
+    cv_copy_stream(const cv_copy_stream&) = delete;
+    cv_copy_stream(volatile cv_copy_stream&) = delete;
+    cv_copy_stream(const volatile cv_copy_stream&);
+    cv_copy_stream& operator=(const cv_copy_stream&) = delete;
+};
+
+struct mutable_assign_stream : syntax_stream {
+    mutable_assign_stream() = default;
+    mutable_assign_stream(mutable_assign_stream&&) = default;
+    mutable_assign_stream(const mutable_assign_stream&) = delete;
+    mutable_assign_stream& operator=(mutable_assign_stream&);
+};
+
+struct volatile_assign_stream : syntax_stream {
+    volatile_assign_stream() = default;
+    volatile_assign_stream(volatile_assign_stream&&) = default;
+    volatile_assign_stream(const volatile_assign_stream&) = delete;
+    volatile_assign_stream& operator=(volatile_assign_stream&) = delete;
+    volatile_assign_stream& operator=(const volatile_assign_stream&) = delete;
+    volatile_assign_stream& operator=(volatile volatile_assign_stream&);
+};
+
+struct cv_assign_stream : syntax_stream {
+    cv_assign_stream() = default;
+    cv_assign_stream(cv_assign_stream&&) = default;
+    cv_assign_stream(const cv_assign_stream&) = delete;
+    cv_assign_stream& operator=(cv_assign_stream&) = delete;
+    cv_assign_stream& operator=(const cv_assign_stream&) = delete;
+    cv_assign_stream& operator=(volatile cv_assign_stream&) = delete;
+    cv_assign_stream& operator=(const volatile cv_assign_stream&);
 };
 
 struct untagged_stream {
@@ -105,9 +171,17 @@ struct synchronous_abort : syntax_stream {
 };
 
 static_assert(publishing_byte_stream<syntax_stream>);
+static_assert(publishing_byte_stream<rvalue_token_stream>);
 static_assert(!publishing_byte_stream<syntax_operations>);
 static_assert(!publishing_byte_stream<copy_assignable_stream>);
 static_assert(!publishing_byte_stream<immovable_stream>);
+static_assert(!publishing_byte_stream<explicit_copy_stream>);
+static_assert(!publishing_byte_stream<mutable_copy_stream>);
+static_assert(!publishing_byte_stream<volatile_copy_stream>);
+static_assert(!publishing_byte_stream<cv_copy_stream>);
+static_assert(!publishing_byte_stream<mutable_assign_stream>);
+static_assert(!publishing_byte_stream<volatile_assign_stream>);
+static_assert(!publishing_byte_stream<cv_assign_stream>);
 static_assert(!publishing_byte_stream<untagged_stream>);
 static_assert(!publishing_byte_stream<accepted_only_stream>);
 static_assert(!publishing_byte_stream<wrong_read_result>);

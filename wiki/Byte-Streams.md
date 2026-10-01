@@ -14,8 +14,9 @@ concurrency, and output-finish guarantees remain unchanged. See
 
 ## Required Interface
 
-A stream is move-constructible, neither copy-constructible nor copy-assignable,
-and explicitly declares:
+A stream is move-constructible, cannot be constructed or assigned from another
+stream lvalue (including const/volatile-qualified sources), and explicitly
+declares:
 
 ```cpp
 using byte_stream_contract = elio::net::publishing_byte_stream_contract;
@@ -26,9 +27,9 @@ a `std::chrono::milliseconds` budget, the concept checks these exact types:
 
 | Expression | Required result |
 |---|---|
-| `stream.read(void_buffer, size, token)` | `coro::task<io::io_result>` |
-| `stream.write(const_void_buffer, size, token)` | `coro::task<io::io_result>` |
-| `stream.finish_write(token, budget)` | `coro::task<net::write_finish_result>` |
+| `stream.read(void_buffer, size, std::move(token))` | `coro::task<io::io_result>` |
+| `stream.write(const_void_buffer, size, std::move(token))` | `coro::task<io::io_result>` |
+| `stream.finish_write(std::move(token), budget)` | `coro::task<net::write_finish_result>` |
 | `const_stream.read_end_scope()` | `net::close_scope`, `noexcept` |
 | `stream.abort_and_settle()` | `coro::task<void>` |
 
@@ -37,6 +38,9 @@ cannot prove correct buffering, cancellation arbitration, or wire behavior.
 No native descriptor, polling API, runtime type erasure, TLS include, or
 move-assignment operation is required. An accepted-only buffered stream cannot
 opt in truthfully without a publishing adapter.
+Parameter types need only accept the checked expressions: tokens may be passed
+by value, const reference, or rvalue reference. Exact parameter signatures are
+not required, but the table's result types and EOF `noexcept` requirement are.
 
 ## Progress And Publication
 

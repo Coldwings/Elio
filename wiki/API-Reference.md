@@ -2706,7 +2706,8 @@ The C++20 concept checks move construction, absence of copying, the exact
 `publishing_byte_stream_contract` opt-in, and these operations:
 
 ```cpp
-// Required members of an opted-in Stream; not declarations on net::stream.
+// Representative compatible members, not declarations on net::stream.
+// The concept checks call expressions/results, not exact parameter signatures.
 using byte_stream_contract = net::publishing_byte_stream_contract;
 coro::task<io::io_result> read(void*, size_t, coro::cancel_token);
 coro::task<io::io_result> write(const void*, size_t, coro::cancel_token);

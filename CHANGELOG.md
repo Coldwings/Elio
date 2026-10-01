@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Explicit plain HTTP proxy routes**: frozen `http_proxy_config` enables
   absolute-form HTTP forwarding and target-bound CONNECT followed by origin TLS.
+  Caller CONNECT requests on explicit proxy clients fail with `ENOTSUP` before
+  acquisition; route-owned CONNECT does not expose a raw tunnel response API.
   Owned, bounded CONNECT read-ahead is passed once through the generic TLS lower;
   origin trust/SNI remains separate from the proxy endpoint. One remaining
   post-DNS connect budget covers TCP/CONNECT/TLS, and finite live permits remain

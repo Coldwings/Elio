@@ -19,6 +19,8 @@ struct request_wire_view {
             route_mode mode, const proxy_profile* proxy) {
         if (mode != route_mode::direct && !valid_authority(target))
             throw std::invalid_argument("Invalid proxy target authority");
+        if (mode != route_mode::direct && req.get_method() == method::CONNECT)
+            throw std::invalid_argument("Caller CONNECT requires a raw tunnel API");
         auto fields = req.get_headers();
         // Generic caller headers never select a hop credential domain, and a
         // CONNECT tunnel's inner request must not carry proxy credentials.

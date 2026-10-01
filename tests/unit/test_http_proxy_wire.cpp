@@ -158,6 +158,22 @@ TEST_CASE("HTTP forward server-wide OPTIONS preserves asterisk form",
     REQUIRE(wire.find("Host: origin.example\r\n") != std::string::npos);
 }
 
+TEST_CASE("Proxy request projection rejects caller CONNECT without changing direct serialization",
+          "[http][proxy][wire][caller-connect][issue-1249]") {
+    const auto profile = wire_profile();
+    for (const auto input : {"http://origin.example/path", "https://origin.example/path"}) {
+        const auto target = url::parse(input);
+        REQUIRE(target);
+        request req(method::CONNECT, "/path");
+        const auto mode = target->is_secure() ? detail::route_mode::connect_tunnel
+                                             : detail::route_mode::forward_proxy;
+        CHECK_THROWS_AS(detail::request_wire_view::serialize(req, *target,
+            mode, profile.get()), std::invalid_argument);
+        CHECK(detail::request_wire_view::serialize(req, *target,
+            detail::route_mode::direct, nullptr) == req.serialize_headers());
+    }
+}
+
 TEST_CASE("HTTP forward projection rejects alternate authority or fragment paths",
           "[http][proxy][wire][issue-1249]") {
     const auto parsed = url::parse("http://origin.example/");

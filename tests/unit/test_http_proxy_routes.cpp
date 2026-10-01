@@ -560,6 +560,41 @@ TEST_CASE("CONNECT rejects unsupported TLS reference names before acquisition",
     CHECK(owner->admission_counters_for_test().dialing == 0);
 }
 
+TEST_CASE("Explicit proxy clients reject caller CONNECT before transport acquisition",
+          "[http][proxy][routes][caller-connect][issue-1249]") {
+    const auto finite = GENERATE(false, true);
+    transport_config config;
+    config.proxy.emplace();
+    config.proxy->endpoint = "http://proxy.example/";
+    if (finite) config.limits = pool_limits{};
+    auto owner = std::make_shared<transport>(config);
+    client agent(owner);
+    handoff_observation observed;
+    handoff_hooks hooks(observed);
+    for (const auto input : {"http://origin.example/path", "https://origin.example/path"}) {
+        CAPTURE(finite, input);
+        const auto target = url::parse(input);
+        REQUIRE(target);
+        request req(method::CONNECT, target->path);
+        auto typed = handoff_immediate(agent.send_result(req, *target));
+        auto text = handoff_immediate(agent.request_result(method::CONNECT, input));
+        for (const auto* result : {&typed, &text}) {
+            const auto* error = std::get_if<client_error>(result);
+            REQUIRE(error);
+            CHECK(error->code.value() == ENOTSUP);
+            CHECK(error->stage == client_stage::request);
+        }
+        CHECK_FALSE(handoff_immediate(agent.send(req, *target)));
+    }
+    CHECK(observed.dials == 0);
+    CHECK(owner->active_operations_for_test() == 0);
+    if (finite) {
+        CHECK(owner->admission_counters_for_test().live == 0);
+        CHECK(owner->admission_counters_for_test().dialing == 0);
+        CHECK(owner->admission_counters_for_test().idle == 0);
+    }
+}
+
 TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS output",
           "[http][proxy][routes][review-1249][issue-1249]") {
     elio::tls::tls_context server_context(elio::tls::tls_mode::server);

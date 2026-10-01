@@ -79,6 +79,13 @@ exception to absolute-form forwarding. CONNECT uses authority form with the effe
 including IPv6 brackets, followed by ordinary origin-form HTTP inside TLS.
 See [RFC 9112 request-target forms](https://www.rfc-editor.org/rfc/rfc9112.html#section-3.2).
 
+The route connector owns that CONNECT negotiation. Caller-supplied `CONNECT`
+requests through an explicitly proxied `client` are unsupported: value APIs
+return `ENOTSUP` at the `request` stage before transport acquisition, and
+optional adapters return empty. These high-level APIs return HTTP responses,
+not raw tunnel handoffs. Direct-route and public request serialization behavior
+are unchanged.
+
 Proxy Basic credentials are bounded caller-selected octets, not implicitly
 charset/locale converted. Controls and a colon in the username are rejected;
 a password may contain a colon. They are encoded using

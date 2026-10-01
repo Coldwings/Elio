@@ -1410,6 +1410,10 @@ private:
             ELIO_LOG_ERROR("Invalid outbound HTTP request target");
             co_return detail::make_client_error(EINVAL, client_stage::target);
         }
+        if (transport_->config().proxy && req.get_method() == method::CONNECT) {
+            // This client returns HTTP responses, not caller-owned raw tunnels.
+            co_return detail::make_client_error(ENOTSUP, client_stage::request);
+        }
         auto acquired = co_await transport_->acquire_leased_result(
             target, config_.connect_timeout, token);
         if (const auto* error = std::get_if<client_error>(&acquired)) co_return *error;

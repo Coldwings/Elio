@@ -3125,7 +3125,13 @@ endpoint is resolved locally. Credentials are explicitly selected preemptive
 Basic octets; there is no automatic 407 challenge replay or environment discovery.
 Plain HTTP does not encrypt proxy credentials. Generic `Proxy-Authorization`
 request headers are stripped from direct/tunneled requests, and only the frozen
-profile supplies forwarding/CONNECT hop credentials. To migrate custom proxy
+profile supplies forwarding/CONNECT hop credentials. Caller-supplied CONNECT
+requests are unsupported through an explicitly proxied high-level client:
+value APIs return `ENOTSUP` at `client_stage::request` before acquisition;
+optional adapters return empty. Only the route connector owns CONNECT and its
+handoff into origin TLS; there is no caller-facing raw tunnel API here.
+Direct-route and public request serialization behavior are unchanged.
+To migrate custom proxy
 headers, configure `proxy.basic_auth`; public request serialization remains
 unchanged. HTTPS proxy, SOCKS, chained proxy and HTTP/2 routes are not supported.
 Standalone `connection_pool` remains direct-only and rejects construction with

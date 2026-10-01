@@ -12,6 +12,11 @@ target_compile_definitions(elio_file_transfer_header PRIVATE ELIO_DEBUG)
 add_test(NAME file_transfer_direct_header COMMAND elio_file_transfer_header)
 set_tests_properties(file_transfer_direct_header PROPERTIES TIMEOUT 30)
 
+add_executable(elio_byte_stream_header compile/test_byte_stream_header.cpp)
+target_link_libraries(elio_byte_stream_header PRIVATE elio)
+add_test(NAME byte_stream_direct_header COMMAND elio_byte_stream_header)
+set_tests_properties(byte_stream_direct_header PROPERTIES TIMEOUT 30)
+
 set(TEST_SOURCES
     test_main.cpp
     test_watchdog.cpp

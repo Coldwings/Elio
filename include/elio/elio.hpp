@@ -54,6 +54,7 @@
 #include "io/file_operations.hpp"
 
 // Networking
+#include "net/byte_stream.hpp"
 #include "net/tcp.hpp"
 #include "net/resolve.hpp"
 #include "net/uds.hpp"

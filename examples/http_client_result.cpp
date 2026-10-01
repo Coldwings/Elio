@@ -2,12 +2,19 @@
 #include <elio/http/http_client.hpp>
 
 #include <array>
+#include <chrono>
 #include <iostream>
+#include <memory>
 #include <string>
 
 elio::coro::task<int> async_main(int, char**) {
     using namespace elio;
-    http::client client;
+    http::transport_config config;
+    config.limits = http::pool_limits{};
+    config.limits->max_live_total = 4;
+    config.acquisition_timeout = std::chrono::seconds(5);
+    auto owner = std::make_shared<http::transport>(config);
+    http::client client(owner);
     auto invalid = co_await client.get_result("unsupported://host/");
     const auto* saved = std::get_if<http::client_error>(&invalid);
     if (!saved) co_return 1;

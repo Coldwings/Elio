@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Opt-in finite HTTP Transport admission**: separate route/global idle and
+  live limits, reserved dial slots, bounded FIFO waiters and route metadata.
+  Move-only permits retain capacity through scoped streaming and release it
+  once after retirement; zero limits deny the named resource. Defaults preserve
+  legacy unbounded admission and the idle-only `max_connections_per_host` meaning.
+  Optional `acquisition_timeout` adds one absolute queue/DNS/TCP/TLS budget,
+  intersected with existing DNS/connect caps, without destroying departed DNS
+  work. Overload, cancellation, expiry and shutdown retain distinct value errors;
+  see `wiki/HTTP-Routing.md` (#1248).
+
 - **Composable publishing-stream contract**: TLS-free C++20
   `net::publishing_byte_stream` and an explicit semantic opt-in define exclusive
   ownership, recursive positive-write publication, protocol-aware finish/EOF,

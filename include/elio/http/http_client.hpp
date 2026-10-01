@@ -7,6 +7,7 @@
 #include <elio/http/http_message.hpp>
 #include <elio/http/client_base.hpp>
 #include <elio/http/detail/route_plan.hpp>
+#include <elio/http/detail/bounded_pool.hpp>
 #include <elio/net/stream.hpp>
 #include <elio/io/io_context.hpp>
 #include <elio/coro/task.hpp>
@@ -43,6 +44,8 @@ namespace detail {
 using route_connect_hook = coro::task<client_result<net::stream>> (*)(
     const route_plan&, std::chrono::nanoseconds, coro::cancel_token);
 inline std::atomic<route_connect_hook> route_connect_for_test{nullptr};
+using route_deadline_hook = void (*)(std::optional<std::chrono::steady_clock::time_point>);
+inline std::atomic<route_deadline_hook> route_deadline_for_test{nullptr};
 using lease_disposition_hook = void (*)(int, bool);
 inline std::atomic<lease_disposition_hook> lease_disposition_for_test{nullptr};
 using lease_return_hook = void (*)();
@@ -72,6 +75,8 @@ struct client_config : base_client_config {
     bool follow_redirects = true;                 ///< Auto-follow redirects
     size_t max_connections_per_host = 6;          ///< Max connections per host
     std::chrono::seconds pool_idle_timeout{60};   ///< Idle connection timeout
+    std::optional<pool_limits> limits;             ///< Opt-in finite Transport admission
+    std::chrono::nanoseconds acquisition_timeout{0}; ///< Queue + DNS + TCP + TLS; <=0 disables
     /// Buffered APIs cap the accumulated final body and, separately, the
     /// cumulative informational wire bytes. with_response uses its own options
     /// for these limits and never allocates a body-sized receive buffer.
@@ -157,6 +162,8 @@ struct transport_config {
     std::shared_ptr<net::resolve_domain> dns_domain; ///< DNS admission domain
     size_t max_connections_per_host = 6;          ///< Max retained idle connections per host
     std::chrono::seconds pool_idle_timeout{60};   ///< Idle connection timeout
+    std::optional<pool_limits> limits;             ///< Absent preserves legacy admission
+    std::chrono::nanoseconds acquisition_timeout{0}; ///< One absolute acquisition budget
     /// Optional construction-time TLS customization. It runs after Elio's
     /// default client TLS initialization on a builder that is moved into the
     /// transport only after this callback returns.
@@ -171,7 +178,9 @@ struct transport_config {
         , dns_timeout(config.dns_timeout)
         , dns_domain(config.dns_domain)
         , max_connections_per_host(config.max_connections_per_host)
-        , pool_idle_timeout(config.pool_idle_timeout) {}
+        , pool_idle_timeout(config.pool_idle_timeout)
+        , limits(config.limits)
+        , acquisition_timeout(config.acquisition_timeout) {}
 };
 
 /// Connection wrapper using unified net::stream
@@ -336,11 +345,23 @@ private:
     }
 
     coro::task<client_result<connection>> acquire_plan(detail::route_plan plan,
-            std::chrono::nanoseconds connect_timeout, coro::cancel_token token) {
+            std::chrono::nanoseconds connect_timeout, coro::cancel_token token,
+            std::optional<std::chrono::steady_clock::time_point> deadline = {}) {
+        if (token.is_cancelled())
+            co_return detail::make_client_error(ECANCELED, client_stage::acquire);
+        if (deadline && *deadline <= std::chrono::steady_clock::now())
+            co_return detail::make_client_error(ETIMEDOUT, client_stage::acquire);
         if (auto conn = take_idle(plan.key())) co_return std::move(*conn);
+        co_return co_await connect_plan(std::move(plan), connect_timeout, std::move(token), deadline);
+    }
+
+    coro::task<client_result<connection>> connect_plan(detail::route_plan plan,
+            std::chrono::nanoseconds connect_timeout, coro::cancel_token token,
+            std::optional<std::chrono::steady_clock::time_point> deadline = {}) {
         if (token.is_cancelled())
             co_return detail::make_client_error(ECANCELED, client_stage::acquire);
 #ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = detail::route_deadline_for_test.load(std::memory_order_acquire)) hook(deadline);
         if (auto hook = detail::route_connect_for_test.load(std::memory_order_acquire))
             co_return co_await hook(plan, connect_timeout, std::move(token));
 #endif
@@ -353,7 +374,7 @@ private:
         co_return co_await client_connect_result(plan.target().host, plan.target().port,
             plan.key().target_secure, snapshot.origin_tls.get(), snapshot.resolve_options,
             snapshot.rotate_resolved_addresses, connect_timeout, std::move(token),
-            snapshot.dns_timeout, snapshot.dns_domain);
+            snapshot.dns_timeout, snapshot.dns_domain, deadline);
     }
 
     struct pool_shard {
@@ -378,7 +399,9 @@ private:
     friend class client;
     struct state {
         explicit state(transport_config value)
-            : config(std::move(value)), snapshot(make_route_snapshot(config)), pool(config) {
+            : config(std::move(value)), snapshot(make_route_snapshot(config)), pool(config),
+              admission(config.limits ? std::make_unique<detail::bounded_pool<connection>>(
+                  *config.limits, config.pool_idle_timeout) : nullptr) {
             settled.set();
         }
 
@@ -396,6 +419,7 @@ private:
         const transport_config config;
         const std::shared_ptr<const detail::route_snapshot> snapshot;
         connection_pool pool;
+        std::unique_ptr<detail::bounded_pool<connection>> admission;
         mutable std::mutex mutex;
         sync::event settled;
         size_t active_operations = 0;
@@ -436,7 +460,7 @@ private:
     public:
         connection_lease(connection_lease&& other) noexcept
             : operation_(std::move(other.operation_)), plan_(std::move(other.plan_)),
-              conn_(std::move(other.conn_)), disposition_(
+              conn_(std::move(other.conn_)), capacity_(std::move(other.capacity_)), disposition_(
                   std::exchange(other.disposition_, disposition::empty)) {}
         connection_lease& operator=(connection_lease&& other) noexcept {
             if (this != &other) {
@@ -444,6 +468,7 @@ private:
                 operation_ = std::move(other.operation_);
                 plan_ = std::move(other.plan_);
                 conn_ = std::move(other.conn_);
+                capacity_ = std::move(other.capacity_);
                 disposition_ = std::exchange(other.disposition_, disposition::empty);
             }
             return *this;
@@ -460,6 +485,7 @@ private:
             disposition_ = disposition::retired;
             detail::abort_stream_io(conn_);
             conn_.disconnect();
+            capacity_.reset();
             observe_disposition(fd, false);
             operation_.reset();
         }
@@ -470,9 +496,10 @@ private:
         enum class disposition { empty, active, returned, retired };
 
         connection_lease(operation_lease operation, detail::route_plan plan,
-                         connection conn) noexcept
+                         connection conn,
+                         detail::bounded_pool<connection>::permit capacity = {}) noexcept
             : operation_(std::move(operation)), plan_(std::move(plan)),
-              conn_(std::move(conn)) {}
+              conn_(std::move(conn)), capacity_(std::move(capacity)) {}
 
         // Only the exchange owner may call this after validating completion.
         // No public boolean can bypass the response framing and I/O settlement.
@@ -484,12 +511,17 @@ private:
             const auto owner = operation_.owner();
             bool retained = false;
             const int fd = conn_.fd();
+            std::optional<detail::bounded_pool<connection>::change> admission_change;
             {
                 // clear/shutdown publish their boundary under this lock, so a
                 // late insertion cannot escape it. Stream cleanup runs outside.
                 std::lock_guard lock(owner->mutex);
-                if (!owner->closing && operation_.generation() == owner->generation)
-                    retained = owner->pool.retain_key(plan_.key(), conn_);
+                if (!owner->closing && operation_.generation() == owner->generation) {
+                    if (owner->admission) {
+                        admission_change.emplace(owner->admission->retain(capacity_, conn_));
+                        retained = admission_change->retained;
+                    } else retained = owner->pool.retain_key(plan_.key(), conn_);
+                }
             }
             if (!retained) {
                 retire();
@@ -514,6 +546,7 @@ private:
         operation_lease operation_;
         detail::route_plan plan_;
         connection conn_;
+        detail::bounded_pool<connection>::permit capacity_;
         disposition disposition_ = disposition::active;
     };
 
@@ -532,10 +565,12 @@ public:
     /// I/O continues; use shutdown() to stop new acquisitions and await settlement.
     void clear() {
         connection_pool::retired_pools retired;
+        std::optional<detail::bounded_pool<connection>::change> admission_change;
         {
             std::lock_guard lock(state_->mutex);
             state_->generation = detail::new_route_domain();
             retired = state_->pool.detach_idle();
+            if (state_->admission) admission_change.emplace(state_->admission->clear());
         }
 #ifdef ELIO_RUNTIME_TEST_HOOKS
         if (auto hook = detail::transport_clear_visible_for_test.load()) hook();
@@ -548,10 +583,12 @@ public:
         const auto owner = state_;
         {
             connection_pool::retired_pools retired;
+            std::optional<detail::bounded_pool<connection>::change> admission_change;
             {
                 std::lock_guard lock(owner->mutex);
                 owner->closing = true;
                 retired = owner->pool.detach_idle();
+                if (owner->admission) admission_change.emplace(owner->admission->clear(true));
             }
         }
         for (;;) {
@@ -591,6 +628,9 @@ public:
     }
     std::weak_ptr<void> state_owner_for_test() const { return state_; }
     using connection_lease_for_test = connection_lease;
+    auto admission_counters_for_test() const {
+        return state_->admission->counters_for_test();
+    }
     coro::task<client_result<connection_lease>> acquire_lease_for_test(
             url target, coro::cancel_token token = {}) {
         return acquire_leased_result(target, {}, std::move(token));
@@ -599,6 +639,8 @@ public:
     coro::task<client_result<connection>> acquire_result_for_test(
             const url& target, std::chrono::nanoseconds connect_timeout,
             coro::cancel_token token = {}) {
+        if (state_->admission)
+            co_return detail::make_client_error(ENOTSUP, client_stage::acquire);
         auto result = co_await acquire_leased_result(target, connect_timeout, std::move(token));
         if (const auto* error = std::get_if<client_error>(&result)) co_return *error;
         auto lease = std::move(std::get<connection_lease>(result));
@@ -641,11 +683,36 @@ private:
             coro::cancel_token token) {
         auto lease = try_acquire_lease(owner);
         if (!lease) co_return detail::make_client_error(ESHUTDOWN, client_stage::acquire);
-        auto acquisition = owner->pool.acquire_plan(plan, connect_timeout, std::move(token));
+        std::optional<std::chrono::steady_clock::time_point> deadline;
+        if (owner->config.acquisition_timeout.count() > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto remaining = std::chrono::steady_clock::time_point::max() - now;
+            deadline = owner->config.acquisition_timeout >= remaining
+                ? std::chrono::steady_clock::time_point::max()
+                : now + owner->config.acquisition_timeout;
+        }
+        detail::bounded_pool<connection>::permit capacity;
+        if (owner->admission) {
+            auto admitted = co_await owner->admission->acquire(plan.key(), deadline, token);
+            if (const auto* error = std::get_if<client_error>(&admitted)) co_return *error;
+            auto granted = std::move(std::get<detail::bounded_pool<connection>::grant>(admitted));
+            capacity = std::move(granted.capacity);
+            if (token.is_cancelled())
+                co_return detail::make_client_error(ECANCELED, client_stage::acquire);
+            if (deadline && *deadline <= std::chrono::steady_clock::now())
+                co_return detail::make_client_error(ETIMEDOUT, client_stage::acquire);
+            if (granted.idle)
+                co_return connection_lease(std::move(*lease), std::move(plan),
+                    std::move(*granted.idle), std::move(capacity));
+        }
+        auto acquisition = owner->admission
+            ? owner->pool.connect_plan(plan, connect_timeout, token, deadline)
+            : owner->pool.acquire_plan(plan, connect_timeout, token, deadline);
         auto conn_result = co_await std::move(acquisition);
+        capacity.dial_complete();
         if (const auto* error = std::get_if<client_error>(&conn_result)) co_return *error;
         co_return connection_lease(std::move(*lease), std::move(plan),
-            std::move(std::get<connection>(conn_result)));
+            std::move(std::get<connection>(conn_result)), std::move(capacity));
     }
 
     const std::shared_ptr<state> state_;

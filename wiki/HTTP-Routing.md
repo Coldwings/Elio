@@ -128,8 +128,10 @@ clients sharing an explicit Transport use that owner's immutable configuration.
 
 Capacity is reserved before DNS/dialing. Successful establishment releases its
 dial slot but retains live capacity through the whole exchange, including a
-scoped streaming handler and its unread body. Failure, cancellation, timeout,
-move/destruction and late returns release the permit once. Idle retirement closes
+scoped streaming handler and its unread body. Moving a lease or permit transfers
+its capacity ownership to the destination; it does not make capacity available.
+Failure, cancellation, timeout, destruction and late-return retirement release
+the permit once. Idle retirement closes
 the stream before releasing live capacity. Empty metadata buckets are removed;
 idle-only buckets/streams may be evicted to admit a different route within the
 metadata/global-live caps. Active or queued buckets are not evicted.

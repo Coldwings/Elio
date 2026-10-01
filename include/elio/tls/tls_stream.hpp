@@ -234,7 +234,18 @@ public:
         std::array<unsigned char, 16> address{};
         size_t address_size = 0;
         if (::inet_pton(AF_INET, name.c_str(), address.data()) == 1) address_size = 4;
-        else if (::inet_pton(AF_INET6, name.c_str(), address.data()) == 1) address_size = 16;
+        else {
+            const auto zone = name.find('%');
+            const auto ipv6 = name.substr(0, zone);
+            if (::inet_pton(AF_INET6, ipv6.c_str(), address.data()) == 1) {
+                if (zone != std::string::npos && zone + 1 == name.size()) {
+                    transport_->fail(EINVAL);
+                    throw std::invalid_argument("TLS IPv6 peer reference has an empty zone");
+                }
+                // A zone selects the local interface, not a certificate identity.
+                address_size = 16;
+            }
+        }
         bool configured;
         {
             auto lock = lock_ssl_state();

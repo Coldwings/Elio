@@ -230,7 +230,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **TLS numeric peer identity**: IPv4/IPv6 references now match IP-address SANs
-  rather than DNS SANs/Common Names and do not send numeric SNI. Replacing the
+  rather than DNS SANs/Common Names and do not send numeric SNI. An IPv6 local
+  `%zone` is excluded from identity and SNI. Replacing the
   reference clears the previous DNS/IP type. Identity-setup errors fail closed;
   explicit empty-reference clearing remains supported. Numeric deployments
   using textual-IP DNS certificates must migrate to IP SANs (#1270).

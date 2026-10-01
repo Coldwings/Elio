@@ -118,14 +118,20 @@ TEST_CASE("TLS references distinguish IP SANs from DNS SANs and replace previous
     const std::array cases{
         identity_case{"", "127.0.0.1", X509_V_OK, ""},
         identity_case{"", "::1", X509_V_OK, ""},
+        identity_case{"", "::1%2", X509_V_OK, ""},
+        identity_case{"", "::1%lo", X509_V_OK, ""},
         identity_case{"", "127.0.0.2", X509_V_ERR_IP_ADDRESS_MISMATCH, ""},
         identity_case{"", "::2", X509_V_ERR_IP_ADDRESS_MISMATCH, ""},
+        identity_case{"", "::2%lo", X509_V_ERR_IP_ADDRESS_MISMATCH, ""},
         identity_case{"", "localhost", X509_V_OK, "localhost"},
         identity_case{"wrong.invalid", "127.0.0.1", X509_V_OK, ""},
+        identity_case{"wrong.invalid", "::1%lo", X509_V_OK, ""},
         identity_case{"127.0.0.2", "localhost", X509_V_OK, "localhost"},
         identity_case{"127.0.0.1", "127.0.0.2", X509_V_ERR_IP_ADDRESS_MISMATCH, ""},
         identity_case{"localhost", "wrong.invalid", X509_V_ERR_HOSTNAME_MISMATCH, "wrong.invalid"},
-        identity_case{"localhost", "", X509_V_OK, ""}
+        identity_case{"localhost", "", X509_V_OK, ""},
+        identity_case{"127.0.0.2", "", X509_V_OK, ""},
+        identity_case{"127.0.0.1", "::1", X509_V_OK, ""}
     };
     for (const auto& item : cases) {
         CAPTURE(selected, version, item.previous, item.reference);
@@ -158,16 +164,16 @@ TEST_CASE("TLS references distinguish IP SANs from DNS SANs and replace previous
     }
 }
 
-TEST_CASE("TLS peer reference rejects embedded NUL without permitting a later handshake",
+TEST_CASE("TLS invalid peer references cannot permit a later handshake",
           "[tls][identity][issue-1270]") {
+    const auto reference = GENERATE(std::string("127.0.0.1\0evil", 14), std::string("::1%"));
     std::array<int, 2> descriptors{};
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
                          0, descriptors.data()) == 0);
     net::tcp_stream peer(descriptors[1]);
     tls::tls_context context(tls::tls_mode::client);
     tls::tls_stream stream(net::tcp_stream{descriptors[0]}, context);
-    REQUIRE_THROWS_AS(stream.set_hostname(std::string_view("127.0.0.1\0evil", 14)),
-                      std::invalid_argument);
+    REQUIRE_THROWS_AS(stream.set_hostname(reference), std::invalid_argument);
     stream.set_hostname("localhost");
     runtime::scheduler scheduler(1);
     scheduler.start();
@@ -177,5 +183,27 @@ TEST_CASE("TLS peer reference rejects embedded NUL without permitting a later ha
     const auto result = checking.await_resume();
     CHECK_FALSE(result.authenticated);
     CHECK(result.error == EINVAL);
+}
+
+TEST_CASE("TLS native peer identity setup failure cannot be revived by a later reference",
+          "[tls][identity][issue-1270]") {
+    std::array<int, 2> descriptors{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                         0, descriptors.data()) == 0);
+    net::tcp_stream peer(descriptors[1]);
+    tls::tls_context context(tls::tls_mode::client);
+    tls::tls_stream stream(net::tcp_stream{descriptors[0]}, context);
+    // OpenSSL rejects SNI names longer than its 255-octet limit, after the DNS
+    // verification parameter has been configured successfully.
+    REQUIRE_THROWS_AS(stream.set_hostname(std::string(256, 'a')), std::runtime_error);
+    stream.set_hostname("127.0.0.1");
+    runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto checking = scheduler.go_joinable(check_identity(stream));
+    checking.wait_destroyed();
+    scheduler.shutdown();
+    const auto result = checking.await_resume();
+    CHECK_FALSE(result.authenticated);
+    CHECK(result.error == EIO);
 }
 #endif

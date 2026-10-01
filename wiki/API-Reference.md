@@ -4678,7 +4678,11 @@ TLS layer; callers decide when lower layers are finished or aborted.
 `set_hostname()` selects DNS certificate matching and SNI for names, or
 IP-address SAN matching without SNI for numeric IPv4/IPv6 references. It replaces
 the previous reference, including the opposite identity type. Numeric DNS SANs
-do not substitute for IP SANs. Empty input retains explicit reference clearing;
+do not substitute for IP SANs.
+IPv6 `%zone` suffixes select local socket scope and are excluded from the
+certificate identity and SNI. The resolver/caller owns interface selection and
+zone validity; an empty zone is rejected. This is not URI decoding.
+Empty input retains explicit reference clearing;
 that leaves trust-chain verification, not endpoint-name authentication. Embedded
 NUL or failed native identity setup throws and makes the session terminal.
 Configure a reference before the handshake and serialize it with public stream

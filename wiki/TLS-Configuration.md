@@ -92,7 +92,12 @@ Call `stream.set_hostname(reference)` before the handshake when wrapping a
 connection yourself. DNS names select DNS certificate matching and DNS SNI.
 Unbracketed numeric IPv4/IPv6 addresses select only IP-address SAN matching and
 do not send SNI. A numeric DNS SAN or Common Name is not a substitute for an IP
-SAN. `tls_connect()` and the HTTP clients select the reference from the target.
+SAN. An IPv6 `%zone` suffix is a local socket selector, not part of certificate
+identity: the setter matches the zone-free IPv6 address and does not send the
+zone in SNI. The resolver/caller owns interface selection and zone validity;
+an empty zone is rejected. This is not URI percent-decoding and does not extend
+the proxy route's supported authority syntax.
+`tls_connect()` and the HTTP clients select the reference from the target.
 Changing a reference replaces the previous DNS/IP identity; an empty reference
 preserves the legacy explicit clearing behavior (trust-chain verification alone
 is not endpoint authentication). Embedded NUL is rejected, and native identity

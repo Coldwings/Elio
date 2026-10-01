@@ -281,8 +281,10 @@ auto resp = co_await client.get("https://example.com/");
 
 HTTP/1 transports seal their active TLS context at construction so shared
 clients cannot mutate a published security identity. Use
-`transport_config::configure_tls` before constructing the transport. WebSocket,
-SSE, and HTTP/2 clients continue to expose mutable per-client TLS contexts.
+`transport_config::configure_tls` before constructing the transport. This is a
+breaking HTTP/1 client migration from older `client.tls_context().load_*` or
+`set_*` customization calls. WebSocket, SSE, and HTTP/2 clients continue to
+expose mutable per-client TLS contexts.
 
 ### HTTP/2 Client TLS Configuration
 

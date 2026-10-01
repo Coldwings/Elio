@@ -271,9 +271,11 @@ public:
             const url& target,
             std::chrono::nanoseconds connect_timeout,
             coro::cancel_token token = {}) {
-        auto lease = try_acquire_lease();
-        if (!lease) co_return detail::make_client_error(ESHUTDOWN, client_stage::acquire);
-        co_return co_await acquire_result_open(target, connect_timeout, std::move(token));
+        auto acquired = co_await acquire_leased_result(
+            target, connect_timeout, std::move(token));
+        if (const auto* error = std::get_if<client_error>(&acquired)) co_return *error;
+        auto leased = std::move(std::get<leased_connection>(acquired));
+        co_return std::move(leased.conn);
     }
 
     void release(const url& target, connection conn) {
@@ -340,6 +342,11 @@ private:
         transport* owner_ = nullptr;
     };
 
+    struct leased_connection {
+        connection conn;
+        operation_lease lease;
+    };
+
     std::optional<operation_lease> try_acquire_lease() {
         std::lock_guard lock(lifecycle_mutex_);
         if (closing_) return std::nullopt;
@@ -370,6 +377,19 @@ private:
             target.is_secure(), &tls_ctx_, connect_timeout, std::move(token),
             std::move(dns));
         co_return co_await std::move(acquisition);
+    }
+
+    coro::task<client_result<leased_connection>> acquire_leased_result(
+            const url& target,
+            std::chrono::nanoseconds connect_timeout,
+            coro::cancel_token token) {
+        auto lease = try_acquire_lease();
+        if (!lease) co_return detail::make_client_error(ESHUTDOWN, client_stage::acquire);
+        auto conn_result = co_await acquire_result_open(
+            target, connect_timeout, std::move(token));
+        if (const auto* error = std::get_if<client_error>(&conn_result)) co_return *error;
+        co_return leased_connection{
+            std::move(std::get<connection>(conn_result)), std::move(*lease)};
     }
 
     transport_config config_;
@@ -934,13 +954,11 @@ private:
             ELIO_LOG_ERROR("Invalid outbound HTTP request target");
             co_return detail::make_client_error(EINVAL, client_stage::target);
         }
-        auto conn_result = co_await transport_->acquire_result(
+        auto acquired = co_await transport_->acquire_leased_result(
             target, config_.connect_timeout, token);
-        if (const auto* error = std::get_if<client_error>(&conn_result)) co_return *error;
-        auto transport_lease = transport_->try_acquire_lease();
-        if (!transport_lease)
-            co_return detail::make_client_error(ESHUTDOWN, client_stage::acquire);
-        auto conn = std::move(std::get<connection>(conn_result));
+        if (const auto* error = std::get_if<client_error>(&acquired)) co_return *error;
+        auto leased = std::move(std::get<transport::leased_connection>(acquired));
+        auto conn = std::move(leased.conn);
         if (req.header("Host").empty()) req.set_host(target.host_authority());
         if (!req.get_headers().contains("Connection")) {
             req.set_header("Connection", "keep-alive");
@@ -959,7 +977,7 @@ private:
             co_return detail::make_client_error(ECANCELED, client_stage::request);
         }
         auto exchange = std::make_unique<exchange_state>(std::move(conn),
-            std::move(*transport_lease), config_, target, req.get_method(),
+            std::move(leased.lease), config_, target, req.get_method(),
             req.body(), defer_body, informational_limit);
         if (auto error = co_await exchange->send_initial(request_data, token)) co_return *error;
         co_return std::move(exchange);

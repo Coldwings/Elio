@@ -3035,7 +3035,9 @@ transport to change those connection-policy domains.
 default client TLS initialization; use it for custom trust roots, ciphers, or
 other native TLS policy before the transport is published. `client::tls_context()`
 and `transport::tls_context()` return a const view of the sealed active context
-for diagnostics.
+for diagnostics. This is a breaking HTTP/1 client migration from the previous
+mutable accessor; WebSocket, SSE, and HTTP/2 keep their mutable per-client TLS
+context APIs.
 
 `transport::clear()` drops idle pooled connections. Active or dialing operations
 continue normally. `transport::shutdown()` marks the transport closed, drops idle

@@ -34,7 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retaining independent request policy such as redirects, User-Agent, body
   limits, and connect deadlines. `transport::shutdown()` rejects new acquisitions
   and awaits client-managed active exchanges. Existing client constructors remain
-  adapters that create private transports (#1245).
+  adapters that create private transports. Breaking HTTP/1 TLS customization
+  now moves from mutable `client::tls_context()` calls to
+  `transport_config::configure_tls`; the published client/transport TLS context
+  is const so shared clients cannot mutate an active security identity (#1245).
 
 - **Pool-integrated HTTP/1 response consumption**: `client::with_response`
   owns its request/target/handler and delivers final headers before a scoped

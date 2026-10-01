@@ -274,7 +274,7 @@ public:
         }
         cancel_noexcept(reader);
         // Do not close/reuse a descriptor while an operation owns it.
-        if constexpr (requires(Lower& stream) { stream.shutdown_socket(); }) {
+        if constexpr (requires(Lower& stream) { { stream.shutdown_socket() } noexcept; }) {
             lower.shutdown_socket();
         }
         try { pump_cancel_.cancel(); } catch (...) {}

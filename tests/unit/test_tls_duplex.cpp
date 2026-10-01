@@ -277,6 +277,11 @@ public:
     struct stats {
         std::atomic<unsigned> clamped_reads{0};
         std::atomic<unsigned> clamped_writes{0};
+        std::atomic<unsigned> reads{0};
+        std::atomic<unsigned> writes{0};
+        std::atomic<unsigned> finishes{0};
+        std::atomic<unsigned> aborts{0};
+        std::atomic<unsigned> shutdowns{0};
     };
 
     using byte_stream_contract = net::publishing_byte_stream_contract;
@@ -297,6 +302,8 @@ public:
 
     coro::task<io::io_result> read(void* buffer, size_t length,
                                    coro::cancel_token token) {
+        if (counters_)
+            counters_->reads.fetch_add(1, std::memory_order_relaxed);
         const auto requested = length;
         length = std::min(length, max_read_);
         if (counters_ && length < requested)
@@ -306,6 +313,8 @@ public:
 
     coro::task<io::io_result> write(const void* buffer, size_t length,
                                     coro::cancel_token token) {
+        if (counters_)
+            counters_->writes.fetch_add(1, std::memory_order_relaxed);
         const auto requested = length;
         length = std::min(length, max_write_);
         if (counters_ && length < requested)
@@ -315,6 +324,8 @@ public:
 
     coro::task<net::write_finish_result> finish_write(
         coro::cancel_token token, std::chrono::milliseconds timeout) {
+        if (counters_)
+            counters_->finishes.fetch_add(1, std::memory_order_relaxed);
         co_return co_await stream_.finish_write(std::move(token), timeout);
     }
 
@@ -323,11 +334,17 @@ public:
     }
 
     coro::task<void> abort_and_settle() {
+        if (counters_)
+            counters_->aborts.fetch_add(1, std::memory_order_relaxed);
         stream_.shutdown_socket();
         co_return;
     }
 
-    void shutdown_socket() noexcept { stream_.shutdown_socket(); }
+    void shutdown_socket() noexcept {
+        if (counters_)
+            counters_->shutdowns.fetch_add(1, std::memory_order_relaxed);
+        stream_.shutdown_socket();
+    }
 
 private:
     net::tcp_stream stream_;
@@ -405,6 +422,54 @@ void exchange_tls_payload(SenderStream& sender, ReceiverStream& receiver,
     REQUIRE(write_result.result == static_cast<int>(payload.size()));
     REQUIRE(read_result.result == static_cast<int>(payload.size()));
     REQUIRE(received == payload);
+}
+
+template<typename Stream>
+net::write_finish_result finish_tls_write(Stream& stream) {
+    runtime::scheduler scheduler(2);
+    scheduler.start();
+    net::write_finish_result finished{
+        net::close_scope::whole_session, EIO, false, false};
+    std::atomic<bool> done{false};
+    scheduler.go([&]() -> coro::task<void> {
+        try {
+            finished = co_await stream.finish_write(
+                {}, std::chrono::milliseconds(5000));
+        } catch (...) {
+            finished.error = EIO;
+        }
+        done.store(true, std::memory_order_release);
+    });
+    const bool ready = duplex_observe([&] {
+        return done.load(std::memory_order_acquire);
+    });
+    if (!ready) stream.shutdown_socket();
+    REQUIRE(scheduler.shutdown(test::scaled_ms(15000)));
+    REQUIRE(ready);
+    return finished;
+}
+
+template<typename Stream>
+void abort_tls_stream(Stream& stream) {
+    runtime::scheduler scheduler(1);
+    scheduler.start();
+    std::atomic<bool> done{false};
+    bool threw = false;
+    scheduler.go([&]() -> coro::task<void> {
+        try {
+            co_await stream.abort_and_settle();
+        } catch (...) {
+            threw = true;
+        }
+        done.store(true, std::memory_order_release);
+    });
+    const bool ready = duplex_observe([&] {
+        return done.load(std::memory_order_acquire);
+    });
+    if (!ready) stream.shutdown_socket();
+    REQUIRE(scheduler.shutdown(test::scaled_ms(15000)));
+    REQUIRE(ready);
+    REQUIRE_FALSE(threw);
 }
 
 void generic_tls_contexts(tls::tls_context& server, tls::tls_context& client) {
@@ -485,6 +550,54 @@ TEST_CASE("TLS stream retries short positive generic lower reads and writes",
     CHECK(server_stats->clamped_writes.load(std::memory_order_relaxed) > 0);
     CHECK(client_stats->clamped_reads.load(std::memory_order_relaxed) > 0);
     CHECK(client_stats->clamped_writes.load(std::memory_order_relaxed) > 0);
+}
+
+TEST_CASE("TLS stream finish_write drains close notify through fd-less lowers",
+          "[tls][generic][finish][issue-1244]") {
+    int sockets[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+    tls::tls_context server_context(tls::tls_mode::server, tls::tls_version::tls_1_3);
+    tls::tls_context client_context(tls::tls_mode::client, tls::tls_version::tls_1_3);
+    generic_tls_contexts(server_context, client_context);
+    auto server_stats = std::make_shared<fdless_tcp_stream::stats>();
+    auto client_stats = std::make_shared<fdless_tcp_stream::stats>();
+    tls::basic_tls_stream<fdless_tcp_stream> server(
+        fdless_tcp_stream{net::tcp_stream{sockets[0]}, 7, 5, server_stats},
+        server_context);
+    tls::basic_tls_stream<fdless_tcp_stream> client(
+        fdless_tcp_stream{net::tcp_stream{sockets[1]}, 7, 5, client_stats},
+        client_context);
+
+    complete_tls_pair_handshake(server, client);
+    exchange_tls_payload(client, server, "generic finish payload");
+    const auto writes_before_finish =
+        client_stats->writes.load(std::memory_order_relaxed);
+
+    auto finished = finish_tls_write(client);
+
+    CHECK(finished.error == 0);
+    CHECK(finished.scope == net::close_scope::write_direction);
+    CHECK(finished.local_end_flushed);
+    CHECK(client_stats->writes.load(std::memory_order_relaxed) > writes_before_finish);
+    server.shutdown_socket();
+    client.shutdown_socket();
+}
+
+TEST_CASE("TLS stream abort_and_settle forwards through fd-less lowers",
+          "[tls][generic][abort][issue-1244]") {
+    int sockets[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+    tls::tls_context context(tls::tls_mode::client);
+    auto stats = std::make_shared<fdless_tcp_stream::stats>();
+    tls::basic_tls_stream<fdless_tcp_stream> stream(
+        fdless_tcp_stream{net::tcp_stream{sockets[0]}, 7, 5, stats}, context);
+
+    abort_tls_stream(stream);
+
+    CHECK(stats->aborts.load(std::memory_order_relaxed) == 1);
+    CHECK(stream.shutdown_state_for_test().transport_error == ECANCELED);
+    CHECK_FALSE(stream.shutdown_state_for_test().pump_active);
+    ::close(sockets[1]);
 }
 
 TEST_CASE("TLS stream can layer over another TLS stream without fd bypass", "[tls][generic][nested][issue-1244]") {

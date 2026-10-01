@@ -13,6 +13,7 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -52,6 +53,9 @@ struct scripted_lower_state {
     unsigned write_calls = 0;
     unsigned aborts = 0;
     unsigned finishes = 0;
+    unsigned shutdowns = 0;
+    bool abort_throws = false;
+    bool shutdown_throws = false;
 };
 
 class scripted_lower_stream {
@@ -129,7 +133,13 @@ public:
 
     elio::coro::task<void> abort_and_settle() {
         ++state_->aborts;
+        if (state_->abort_throws) throw std::runtime_error("scripted abort");
         co_return;
+    }
+
+    void shutdown_socket() {
+        ++state_->shutdowns;
+        if (state_->shutdown_throws) throw std::runtime_error("scripted shutdown");
     }
 
 private:
@@ -320,6 +330,56 @@ TEST_CASE("TLS transport treats lower zero writes as terminal no-progress failur
     CHECK(state->write_calls == 1);
     CHECK(state->written_bytes.empty());
     CHECK(transport->output.error() == EPIPE);
+}
+
+TEST_CASE("TLS transport ignores throwing optional shutdown hooks from noexcept failure",
+          "[tls][transport][generic][issue-1244]") {
+    auto state = std::make_shared<scripted_lower_state>();
+    state->shutdown_throws = true;
+    auto transport = make_scripted_transport(state);
+
+    REQUIRE_NOTHROW(transport->fail(ECANCELED));
+
+    CHECK(state->shutdowns == 0);
+    CHECK(transport->output.error() == ECANCELED);
+}
+
+TEST_CASE("TLS stream shutdown_socket falls back when lower shutdown hook may throw",
+          "[tls][generic][issue-1244]") {
+    elio::tls::tls_context context(elio::tls::tls_mode::client);
+    auto state = std::make_shared<scripted_lower_state>();
+    state->shutdown_throws = true;
+    elio::tls::basic_tls_stream<scripted_lower_stream> stream(
+        scripted_lower_stream{state}, context);
+
+    REQUIRE_NOTHROW(stream.shutdown_socket());
+
+    CHECK(state->shutdowns == 0);
+    CHECK(stream.shutdown_state_for_test().transport_error == ECANCELED);
+}
+
+TEST_CASE("TLS abort settles local output before rethrowing lower abort failure",
+          "[tls][generic][issue-1244]") {
+    elio::tls::tls_context context(elio::tls::tls_mode::client);
+    auto state = std::make_shared<scripted_lower_state>();
+    state->abort_throws = true;
+    elio::tls::basic_tls_stream<scripted_lower_stream> stream(
+        scripted_lower_stream{state}, context);
+    stream.set_output_active_for_test(true);
+
+    auto abort = stream.abort_and_settle();
+    auto handle = task_access::handle(abort);
+    handle.resume();
+
+    REQUIRE(state->aborts == 1);
+    REQUIRE_FALSE(handle.done());
+    CHECK(stream.shutdown_state_for_test().pump_active);
+
+    stream.set_output_active_for_test(false);
+    REQUIRE(handle.done());
+    REQUIRE_THROWS_AS(abort.await_resume(), std::runtime_error);
+    CHECK_FALSE(stream.shutdown_state_for_test().pump_active);
+    CHECK(stream.shutdown_state_for_test().transport_error == ECANCELED);
 }
 
 TEST_CASE("TLS output launch failure releases pump ownership and wakes waiters", "[tls][transport][issue-1215]") {

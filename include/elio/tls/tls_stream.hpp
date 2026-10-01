@@ -25,6 +25,7 @@
 #include <concepts>
 #include <cstring>
 #include <cstdint>
+#include <exception>
 #include <string>
 #include <string_view>
 #include <memory>
@@ -121,6 +122,10 @@ public:
         auto lock = lock_ssl_state();
         return {SSL_get_shutdown(ssl_), transport_->output.error(),
                 transport_->output_active_for_test()};
+    }
+    void set_output_active_for_test(bool active) {
+        transport_->set_output_active_for_test(active);
+        transport_->notify_progress();
     }
     void set_shutdown_timer_test_hook(void (*hook)()) noexcept {
         shutdown_timer_test_hook_ = hook;
@@ -601,11 +606,17 @@ public:
     /// Abort the owned lower chain and settle internal output work.
     coro::task<void> abort_and_settle() {
         if (transport_) {
+            std::exception_ptr lower_exception;
             transport_->fail(ECANCELED);
             if constexpr (net::publishing_byte_stream<Lower>) {
-                co_await transport_->lower.abort_and_settle();
+                try {
+                    co_await transport_->lower.abort_and_settle();
+                } catch (...) {
+                    lower_exception = std::current_exception();
+                }
             }
             co_await transport_->settle_output();
+            if (lower_exception) std::rethrow_exception(lower_exception);
         }
         co_return;
     }
@@ -676,7 +687,7 @@ public:
     void shutdown_socket() noexcept {
         mark_externally_shut_down();
         if (transport_) {
-            if constexpr (requires(Lower& stream) { stream.shutdown_socket(); }) {
+            if constexpr (requires(Lower& stream) { { stream.shutdown_socket() } noexcept; }) {
                 transport_->lower.shutdown_socket();
             } else {
                 transport_->fail(ECANCELED);

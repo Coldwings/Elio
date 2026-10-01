@@ -5,6 +5,7 @@
 #include <elio/tls/tls_stream.hpp>
 #include <elio/net/byte_stream.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/time/timer.hpp>
 
 #include <array>
 #include <atomic>
@@ -56,11 +57,14 @@ struct scripted_lower_state {
     unsigned shutdowns = 0;
     bool abort_throws = false;
     bool shutdown_throws = false;
+    bool read_blocks_until_cancel = false;
+    std::atomic<bool> blocking_read_entered{false};
 };
 
 class scripted_lower_stream {
 public:
     using byte_stream_contract = elio::net::publishing_byte_stream_contract;
+    static constexpr bool tls_progress_interrupts_read = true;
 
     explicit scripted_lower_stream(std::shared_ptr<scripted_lower_state> state)
         : state_(std::move(state)) {}
@@ -72,6 +76,13 @@ public:
     elio::coro::task<elio::io::io_result> read(
         void* buffer, size_t length, elio::coro::cancel_token token) {
         ++state_->read_calls;
+        if (state_->read_blocks_until_cancel) {
+            state_->blocking_read_entered.store(true, std::memory_order_release);
+            while (!token.is_cancelled()) {
+                co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+            }
+            co_return elio::io::io_result{-ECANCELED, 0};
+        }
         if (state_->reads.empty()) co_return elio::io::io_result{-EAGAIN, 0};
         auto result = state_->reads.front();
         state_->reads.pop_front();
@@ -283,6 +294,43 @@ TEST_CASE("TLS transport publishes short lower reads before racing cancellation"
     REQUIRE(BIO_read(input.get(), received.data(), static_cast<int>(received.size())) == 5);
     CHECK(std::string_view(received.data(), received.size()) == "hello");
     CHECK(transport->output.error() == 0);
+}
+
+TEST_CASE("TLS transport progress notification interrupts a published lower read",
+          "[tls][transport][generic][issue-1244]") {
+    auto state = std::make_shared<scripted_lower_state>();
+    state->read_blocks_until_cancel = true;
+    auto transport = make_scripted_transport(state);
+    std::unique_ptr<BIO, decltype(&BIO_free)> input(BIO_new(BIO_s_mem()), BIO_free);
+    REQUIRE(input);
+    transport->input = input.get();
+
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    std::atomic<bool> done{false};
+    elio::io::io_result waited{-EIO, 0};
+    const auto observed = transport->generation;
+    scheduler.go([&]() -> elio::coro::task<void> {
+        waited = co_await transport->wait_read(observed, {});
+        done.store(true, std::memory_order_release);
+    });
+
+    for (int i = 0; i < 500 &&
+        !state->blocking_read_entered.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(state->blocking_read_entered.load(std::memory_order_acquire));
+
+    transport->notify_progress();
+
+    for (int i = 0; i < 500 && !done.load(std::memory_order_acquire); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(scheduler.shutdown(std::chrono::milliseconds(5000)));
+    REQUIRE(done.load(std::memory_order_acquire));
+    CHECK(waited.result == 0);
+    CHECK(transport->output.error() == 0);
+    CHECK(state->read_calls == 1);
 }
 
 TEST_CASE("TLS transport drains short lower writes before racing cancellation",

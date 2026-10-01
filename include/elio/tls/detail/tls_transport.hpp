@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <array>
 #include <cassert>
+#include <concepts>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -29,6 +30,20 @@ class basic_tls_transport : public std::enable_shared_from_this<basic_tls_transp
     using self_type = basic_tls_transport<Lower>;
     using wake_ptr = sync::detail::wake_state_ptr;
     using wake_list = std::list<wake_ptr>;
+
+    static consteval bool compute_progress_interrupts_read() {
+        if constexpr (std::same_as<Lower, net::tcp_stream>) {
+            return true;
+        } else if constexpr (requires {
+                                 { Lower::tls_progress_interrupts_read } -> std::convertible_to<bool>;
+                             }) {
+            return Lower::tls_progress_interrupts_read;
+        } else {
+            return false;
+        }
+    }
+
+    static constexpr bool progress_interrupts_read = compute_progress_interrupts_read();
 
     struct launch_ticket {
         std::shared_ptr<self_type> owner;
@@ -121,9 +136,11 @@ public:
     void notify_progress() noexcept {
         wake_list ready;
         std::array<wake_ptr, 2> settled;
+        std::shared_ptr<coro::cancel_source> reader;
         {
             std::lock_guard lock(mutex);
             ++generation;
+            if constexpr (progress_interrupts_read) reader = read_poll_;
             ready.splice(ready.end(), waiters_);
             for (const auto& wake : ready) wake->claim_notification();
             if (!pump_active_) {
@@ -136,6 +153,7 @@ public:
                 }
             }
         }
+        cancel_noexcept(reader);
         for (const auto& wake : ready) wake->schedule_claimed();
         for (const auto& wake : settled) if (wake) wake->schedule_claimed();
     }
@@ -186,8 +204,10 @@ public:
                     result = {0, 0};
                     made_progress = true;
                 }
-            } else if (token.is_cancelled() || source->is_cancelled()) {
+            } else if (token.is_cancelled()) {
                 result = {-ECANCELED, 0};
+            } else if (source->is_cancelled()) {
+                result = {0, 0};
             } else if (result.result == 0) {
                 output.fail(EPIPE);
                 result = {-EPIPE, 0};

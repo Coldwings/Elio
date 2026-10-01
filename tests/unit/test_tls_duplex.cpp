@@ -285,6 +285,7 @@ public:
     };
 
     using byte_stream_contract = net::publishing_byte_stream_contract;
+    static constexpr bool tls_progress_interrupts_read = true;
 
     explicit fdless_tcp_stream(
         net::tcp_stream stream,

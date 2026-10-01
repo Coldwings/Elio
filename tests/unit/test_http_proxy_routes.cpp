@@ -67,7 +67,8 @@ struct temporary_pem {
     }
 };
 
-void install_certificate(elio::tls::tls_context& context, temporary_pem& ca) {
+void install_certificate(elio::tls::tls_context& context, temporary_pem& ca,
+                         const char* identities = "DNS:localhost") {
     std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> generator(
         EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr), EVP_PKEY_CTX_free);
     if (!generator || EVP_PKEY_keygen_init(generator.get()) <= 0 ||
@@ -91,7 +92,7 @@ void install_certificate(elio::tls::tls_context& context, temporary_pem& ca) {
         throw std::runtime_error("proxy certificate subject failed");
     std::unique_ptr<X509_EXTENSION, decltype(&X509_EXTENSION_free)> san(
         X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name,
-                          const_cast<char*>("DNS:localhost")), X509_EXTENSION_free);
+                          const_cast<char*>(identities)), X509_EXTENSION_free);
     if (!san || X509_add_ext(certificate.get(), san.get(), -1) != 1 ||
         X509_sign(certificate.get(), key.get(), EVP_sha256()) <= 0 ||
         SSL_CTX_use_certificate(context.native_handle(), certificate.get()) != 1 ||
@@ -1031,6 +1032,85 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
         }
         if (finite) REQUIRE(owner->admission_counters_for_test().live == 0);
     }
+}
+
+TEST_CASE("CONNECT authenticates numeric origin IP SANs without SNI over IPv4 and IPv6 proxies",
+          "[http][proxy][routes][ip-origin][issue-1249]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto ipv6 = GENERATE(false, true);
+    const auto identities = GENERATE("IP:127.0.0.1,IP:::1",
+                                     "IP:127.0.0.2,IP:::2",
+                                     "DNS:127.0.0.1,DNS:::1");
+    const auto finite = GENERATE(false, true);
+    const auto streaming = GENERATE(false, true);
+    CAPTURE(selected, ipv6, identities, finite, streaming);
+    backend_guard backend_scope(selected);
+    auto listener = ipv6
+        ? elio::net::tcp_listener::bind(elio::net::ipv6_address("::1", 0))
+        : elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+    if (ipv6 && !listener && (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT ||
+                              errno == EADDRNOTAVAIL))
+        SKIP("IPv6 loopback unavailable on this host");
+    REQUIRE(listener);
+    elio::tls::tls_context server_context(elio::tls::tls_mode::server);
+    temporary_pem ca;
+    install_certificate(server_context, ca, identities);
+    transport_config config;
+    config.proxy.emplace();
+    config.proxy->endpoint = std::string(ipv6 ? "http://[::1]:" : "http://127.0.0.1:") +
+        std::to_string(listener->local_address().port());
+    config.acquisition_timeout = std::chrono::seconds(5);
+    config.configure_tls = [&](transport_tls_config& policy) {
+        if (!policy.load_verify_locations(ca.path.data()))
+            throw std::runtime_error("numeric origin trust loading failed");
+    };
+    if (finite) config.limits = pool_limits{};
+    auto owner = std::make_shared<transport>(config);
+    client_config request_policy;
+    request_policy.read_timeout = std::chrono::seconds(5);
+    client agent(owner, request_policy);
+    const auto target = url::parse(ipv6 ? "https://[::1]:9443/path" :
+                                          "https://127.0.0.1:9443/path");
+    REQUIRE(target);
+    observed_route observed;
+    SSL_CTX_set_tlsext_servername_callback(server_context.native_handle(), record_sni);
+    SSL_CTX_set_tlsext_servername_arg(server_context.native_handle(), &observed);
+    elio::coro::cancel_source stop;
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto server = scheduler.go_joinable(serve_route(*listener, true, server_context,
+                                                   1, observed, stop.get_token()));
+    auto calls = scheduler.go_joinable(send_requests(agent, *target, 1, streaming));
+    calls.wait_destroyed();
+    stop.cancel();
+    server.wait_destroyed();
+    owner->clear();
+    scheduler.shutdown();
+    const auto results = calls.await_resume();
+    server.await_resume();
+    REQUIRE(results.size() == 1);
+    const bool authentic = std::string_view(identities) == "IP:127.0.0.1,IP:::1";
+    if (authentic) {
+        REQUIRE(std::holds_alternative<response>(results[0]));
+        CHECK(std::get<response>(results[0]).body() == "ok");
+        CHECK(observed.handshake);
+        REQUIRE(observed.requests.size() == 2);
+        CHECK(observed.requests[1].path_with_query() == "/path?q=0");
+        CHECK(observed.requests[1].header("Host") == target->host_authority());
+    } else {
+        const auto* error = std::get_if<client_error>(&results[0]);
+        REQUIRE(error);
+        CHECK(error->stage == client_stage::tls);
+        CHECK_FALSE(observed.handshake);
+        REQUIRE(observed.requests.size() == 1);
+    }
+    CHECK(observed.accepted == 1);
+    CHECK(observed.sni.empty());
+    CHECK(observed.requests[0].get_method() == method::CONNECT);
+    CHECK(observed.requests[0].path() == target->host_authority());
+    CHECK(observed.requests[0].header("Host") == target->host_authority());
+    CHECK(owner->active_operations_for_test() == 0);
+    if (finite) CHECK(owner->admission_counters_for_test().live == 0);
 }
 
 TEST_CASE("CONNECT retirement holds physical capacity until the owned lower frame releases",

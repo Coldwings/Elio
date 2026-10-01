@@ -57,6 +57,7 @@
 #include "net/byte_stream.hpp"
 #include "net/tcp.hpp"
 #include "net/resolve.hpp"
+#include "net/resolve_wait.hpp"
 #include "net/uds.hpp"
 
 // Timers

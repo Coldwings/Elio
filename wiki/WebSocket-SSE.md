@@ -300,6 +300,14 @@ handshake setup. `read_timeout` bounds the protocol response headers read by
 `text/event-stream` response headers. Values less than or equal to zero disable
 these client-side read deadlines.
 
+`dns_timeout` independently bounds DNS observation during each new connection
+attempt; zero/negative disables it and the default is zero. `dns_domain` selects
+shared bounded admission (null uses the capacity-64 default). The TCP/TLS budget
+still starts after DNS. Cancellation/expiry can leave owned running libc work
+behind until it returns, so normal shutdown may still drain it. See
+[Networking](Networking.md#bounded-cancellable-dns-waiting) for cache lifetime,
+overload, and absolute deadline semantics.
+
 Both client configs inherit the shared HTTP `base_client_config` fields:
 `read_buffer_size`, `user_agent`, `verify_certificate`, `resolve_options`,
 `rotate_resolved_addresses`, `max_headers`, and `max_header_size`. These control
@@ -307,7 +315,7 @@ buffer sizing, TLS verification, DNS cache/rotation behavior, and response
 header parser limits during connection setup.
 
 Both clients also provide cancellation-token overloads. Cancelling the token
-passed to `connect()` aborts pending TCP connect, TLS handshake, request write,
+passed to `connect()` leaves pending DNS observation or aborts pending TCP connect, TLS handshake, request write,
 and response header reads. Cancelling the token passed to `receive()` aborts a
 blocked WebSocket frame or SSE event read. Cancellation returns `false` or
 `std::nullopt` and sets `errno` to `ECANCELED`.

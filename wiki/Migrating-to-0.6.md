@@ -16,6 +16,23 @@ settling owned internal work. Callers still keep objects and borrowed buffers
 alive and normally join public operations before moving or destroying them.
 The concept does not supply adapters or change legacy close behavior.
 
+## DNS Waiting And Client Budgets
+
+Standalone legacy resolver overloads do not change. For owned cancellable
+observation, include `<elio/net/resolve_wait.hpp>` and pass both
+`resolve_wait_options` and an explicit fourth token to `resolve_all`; read
+`resolve_result::error`, not `errno`. Retain a borrowed custom cache through
+normal awaited return. Running libc work can continue after cancellation or
+expiry, without retaining that cache, and normal shutdown may still drain it.
+
+New HTTP, WebSocket, SSE, and HTTP/2 connections use bounded DNS admission.
+Expect `EAGAIN` when shared capacity/pool admission is unavailable and choose
+application retry/backoff deliberately. Share a configured `dns_domain` when
+the capacity-64 default is unsuitable. Set `dns_timeout` explicitly if desired;
+it is independent and disabled by default. `connect_timeout` keeps its TCP/TLS
+scope. Pool reuse and per-hop stage budgets are not a total-exchange deadline.
+See [Networking](Networking.md#bounded-cancellable-dns-waiting).
+
 ## Finishing Stream Output
 
 Use `co_await stream.finish_write(token)` to finish application output without

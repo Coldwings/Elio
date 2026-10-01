@@ -35,6 +35,8 @@ public:
         return outstanding_.load(std::memory_order_acquire);
     }
 
+    [[nodiscard]] size_t limit() const noexcept { return limit_; }
+
 private:
     const size_t limit_;
     std::atomic<size_t> outstanding_{0};
@@ -116,6 +118,13 @@ public:
           state_(std::make_shared<dns_job_state>()) {}
 
     [[nodiscard]] std::shared_ptr<dns_job_state> state() const noexcept { return state_; }
+
+    void reject(int error) noexcept {
+        if (state_->begin_lookup()) {
+            state_->result_state()->set_value(dns_lookup_result{{}, error, false});
+        }
+        state_->retire();
+    }
 
     void run() noexcept {
         if (!state_->begin_lookup()) {

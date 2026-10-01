@@ -3,7 +3,16 @@
 #include <catch2/matchers/catch_matchers.hpp>
 #include <elio/coro/join_wait.hpp>
 #include <elio/net/detail/resolve_job.hpp>
+#include <elio/net/resolve_wait.hpp>
 #include <elio/sync/event.hpp>
+#if defined(ELIO_HAS_HTTP) && ELIO_HAS_HTTP
+#include <elio/http/http_client.hpp>
+#include <elio/http/websocket.hpp>
+#include <elio/http/sse_client.hpp>
+#if defined(ELIO_HAS_HTTP2) && ELIO_HAS_HTTP2
+#include <elio/http/http2_client.hpp>
+#endif
+#endif
 #include "../test_main.cpp"
 
 #include <atomic>
@@ -73,6 +82,7 @@ struct lookup_control {
     std::string observed_host;
     uint16_t observed_port = 0;
     bool throw_failure = false;
+    int lookup_error = 0;
 };
 
 std::atomic<lookup_control*> current_lookup_control{nullptr};
@@ -86,6 +96,7 @@ dns_lookup_result controlled_lookup(std::string_view host, uint16_t port) {
     release_flag(control->entered);
     hold_until_released(control->release);
     if (control->throw_failure) throw std::runtime_error("controlled DNS failure");
+    if (control->lookup_error) return {{}, control->lookup_error};
     dns_lookup_result result;
     result.addresses.emplace_back(elio::net::ipv4_address("127.0.0.1", port));
     return result;
@@ -142,6 +153,364 @@ task<join_wait_outcome> observe_job(std::shared_ptr<dns_job_state> state, cancel
 }
 
 } // namespace
+
+TEST_CASE("public DNS fast paths bypass admission and retain owned outcomes",
+          "[dns][resolve_wait][public][cache][contract]") {
+    scheduler sched(1);
+    lookup_control lookup;
+    elio::net::resolve_cache cache;
+    lookup_guard guard(lookup, [&] { sched.shutdown(); });
+    auto domain = std::make_shared<elio::net::resolve_domain>(0);
+    elio::net::resolve_wait_options options;
+    options.domain = domain;
+    options.lookup.use_cache = true;
+    options.lookup.cache = &cache;
+    cache.store({"cached.example", 80},
+        {elio::net::socket_address(elio::net::ipv4_address("127.0.0.1", 80))},
+        std::chrono::seconds(60));
+    cache.store({"negative.example", 80}, {}, std::chrono::seconds(60), ENETUNREACH);
+    sched.start();
+    for (const std::string host : {"127.0.0.1", "::1", "", "cached.example", "negative.example", "miss.example"}) {
+        auto observer = sched.go_joinable([host, options]() -> task<elio::net::resolve_result> {
+            co_return co_await elio::net::resolve_all(host, 80, options, {});
+        });
+        REQUIRE(wait_for([&] { return observer.await_ready(); }));
+        auto result = observer.await_resume();
+        observer.wait_destroyed();
+        if (host == "negative.example" || host == "miss.example") {
+            REQUIRE_FALSE(result);
+            REQUIRE(result.status == elio::net::resolve_status::failed);
+            REQUIRE(result.error == (host == "negative.example" ? ENETUNREACH : EAGAIN));
+        } else {
+            REQUIRE(result);
+            REQUIRE(result.error == 0);
+            REQUIRE(result.addresses.size() == 1);
+            REQUIRE(result.addresses.front().port() == 80);
+        }
+        REQUIRE(domain->outstanding() == 0);
+    }
+    REQUIRE(lookup.calls.load() == 0);
+}
+
+TEST_CASE("public DNS precancellation and expired deadlines do not touch cache or libc",
+          "[dns][resolve_wait][public][cancellation][deadline][contract]") {
+    const bool cancel = GENERATE(false, true);
+    const std::string host = GENERATE("127.0.0.1", "preflight.example");
+    scheduler sched(1);
+    lookup_control lookup;
+    elio::net::resolve_cache cache;
+    lookup_guard guard(lookup, [&] { sched.shutdown(); });
+    elio::net::resolve_wait_options options;
+    options.lookup.use_cache = true;
+    options.lookup.cache = &cache;
+    options.domain = std::make_shared<elio::net::resolve_domain>(1);
+    cancel_source source;
+    if (cancel) source.cancel();
+    else options.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    sched.start();
+    auto observer = sched.go_joinable([host, options, token = source.get_token()]() -> task<elio::net::resolve_result> {
+        co_return co_await elio::net::resolve_all(host, 80, options, token);
+    });
+    REQUIRE(wait_for([&] { return observer.await_ready(); }));
+    auto result = observer.await_resume();
+    observer.wait_destroyed();
+    REQUIRE_FALSE(result);
+    REQUIRE(result.status == (cancel ? elio::net::resolve_status::cancelled : elio::net::resolve_status::timed_out));
+    REQUIRE(result.error == (cancel ? ECANCELED : ETIMEDOUT));
+    REQUIRE(options.domain->outstanding() == 0);
+    REQUIRE(lookup.calls.load() == 0);
+    REQUIRE(cache.stats().cache_misses == 0);
+}
+
+TEST_CASE("public DNS departure releases the observer and its borrowed cache before late work",
+          "[dns][resolve_wait][public][running][lifetime][regression]") {
+    const bool deadline = GENERATE(false, true);
+    const bool throw_failure = GENERATE(false, true);
+    scheduler sched(2);
+    lookup_control lookup;
+    lookup.throw_failure = throw_failure;
+    auto cache = std::make_unique<elio::net::resolve_cache>();
+    lookup_guard guard(lookup, [&] { sched.shutdown(); }, deadline);
+    auto domain = std::make_shared<elio::net::resolve_domain>(1);
+    elio::net::resolve_wait_options options;
+    options.domain = domain;
+    options.lookup.use_cache = true;
+    options.lookup.cache = cache.get();
+    if (deadline) options.deadline = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    cancel_source source;
+    std::string host(256, 'h');
+    auto operation = elio::net::resolve_all(host, 8080, options, source.get_token());
+    host.assign(256, 'x');
+    sched.start();
+    const auto previous_installs = elio::coro::detail::join_observer_installed_for_test.load(std::memory_order_acquire);
+    auto observer = sched.go_joinable(std::move(operation));
+    REQUIRE(wait_for([&] { return lookup.entered.load(std::memory_order_acquire); }));
+    REQUIRE(lookup.observed_host == std::string(256, 'h'));
+    REQUIRE(wait_for([&] {
+        return elio::coro::detail::join_observer_installed_for_test.load(std::memory_order_acquire) > previous_installs;
+    }));
+    if (deadline) {
+        REQUIRE(wait_for([&] { return lookup.timer_entered.load(std::memory_order_acquire); }));
+        lookup.expire.set();
+    } else source.cancel();
+    REQUIRE(wait_for([&] { return observer.await_ready(); }));
+    auto result = observer.await_resume();
+    observer.wait_destroyed();
+    REQUIRE_FALSE(result);
+    REQUIRE(result.status == (deadline ? elio::net::resolve_status::timed_out : elio::net::resolve_status::cancelled));
+    REQUIRE(result.error == (deadline ? ETIMEDOUT : ECANCELED));
+    REQUIRE(domain->outstanding() == 1);
+    REQUIRE_FALSE(lookup.release.load(std::memory_order_acquire));
+    cache.reset();
+    auto overloaded = sched.go_joinable([domain]() -> task<elio::net::resolve_result> {
+        elio::net::resolve_wait_options next;
+        next.domain = domain;
+        co_return co_await elio::net::resolve_all("overload.example", 80, next, {});
+    });
+    REQUIRE(wait_for([&] { return overloaded.await_ready(); }));
+    REQUIRE(overloaded.await_resume().error == EAGAIN);
+    overloaded.wait_destroyed();
+    release_flag(lookup.release);
+    sched.shutdown();
+    REQUIRE(domain->outstanding() == 0);
+    REQUIRE(lookup.calls.load() == 1);
+}
+
+TEST_CASE("public DNS live completion alone publishes positive and negative cache entries",
+          "[dns][resolve_wait][public][cache][completion][regression]") {
+    const int error = GENERATE(0, ENETUNREACH);
+    scheduler sched(1);
+    lookup_control lookup;
+    lookup.lookup_error = error;
+    release_flag(lookup.release);
+    elio::net::resolve_cache cache;
+    lookup_guard guard(lookup, [&] { sched.shutdown(); });
+    auto domain = std::make_shared<elio::net::resolve_domain>(1);
+    elio::net::resolve_wait_options options;
+    options.lookup.use_cache = true;
+    options.lookup.cache = &cache;
+    options.domain = domain;
+    sched.start();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        auto observer = sched.go_joinable([options]() -> task<elio::net::resolve_result> {
+            co_return co_await elio::net::resolve_all("published.example", 443, options, {});
+        });
+        REQUIRE(wait_for([&] { return observer.await_ready(); }));
+        auto result = observer.await_resume();
+        observer.wait_destroyed();
+        REQUIRE(static_cast<bool>(result) == (error == 0));
+        REQUIRE(result.error == error);
+        errno = ENOSPC;
+        REQUIRE(result.error == error);
+    }
+    REQUIRE(lookup.calls.load() == 1);
+    REQUIRE(cache.stats().cache_stores == 1);
+    REQUIRE(cache.stats().cache_hits == 1);
+}
+
+TEST_CASE("public queued DNS cancellation stays bounded and skips lookup on dequeue",
+          "[dns][resolve_wait][public][queued][admission][regression]") {
+    scheduler sched(1, elio::runtime::wait_strategy::blocking(), 1);
+    lookup_control lookup;
+    std::atomic<bool> blocker_entered{false};
+    std::atomic<bool> blocker_release{false};
+    lookup_guard guard(lookup, [&] {
+        release_flag(blocker_release);
+        sched.shutdown();
+    });
+    auto* pool = sched.get_blocking_pool();
+    std::function<void()> blocker = [&] {
+        release_flag(blocker_entered);
+        hold_until_released(blocker_release);
+    };
+    REQUIRE(pool->submit_bounded(std::move(blocker), 1));
+    REQUIRE(wait_for([&] { return blocker_entered.load(std::memory_order_acquire); }));
+    auto domain = std::make_shared<elio::net::resolve_domain>(1);
+    elio::net::resolve_wait_options options;
+    options.domain = domain;
+    cancel_source source;
+    sched.start();
+    auto observer = sched.go_joinable([options, token = source.get_token()]() -> task<elio::net::resolve_result> {
+        co_return co_await elio::net::resolve_all("queued.example", 80, options, token);
+    });
+    REQUIRE(wait_for([&] { return pool->queued_count_for_test() == 1; }));
+    source.cancel();
+    REQUIRE(wait_for([&] { return observer.await_ready(); }));
+    REQUIRE(observer.await_resume().status == elio::net::resolve_status::cancelled);
+    observer.wait_destroyed();
+    REQUIRE(domain->outstanding() == 1);
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        auto rejected = sched.go_joinable([options]() -> task<elio::net::resolve_result> {
+            co_return co_await elio::net::resolve_all("rejected.example", 80, options, {});
+        });
+        REQUIRE(wait_for([&] { return rejected.await_ready(); }));
+        REQUIRE(rejected.await_resume().error == EAGAIN);
+        rejected.wait_destroyed();
+        REQUIRE(domain->outstanding() == 1);
+        REQUIRE(pool->queued_count_for_test() == 1);
+    }
+    release_flag(blocker_release);
+    REQUIRE(wait_for([&] { return domain->outstanding() == 0; }));
+    REQUIRE(lookup.calls.load() == 0);
+}
+
+TEST_CASE("public DNS stopped-pool rejection releases admission and never caches overload",
+          "[dns][resolve_wait][public][shutdown][cache][regression]") {
+    scheduler sched(1);
+    lookup_control lookup;
+    elio::net::resolve_cache cache;
+    lookup_guard guard(lookup, [&] { sched.shutdown(); });
+    auto domain = std::make_shared<elio::net::resolve_domain>(1);
+    elio::net::resolve_wait_options options;
+    options.lookup.use_cache = true;
+    options.lookup.cache = &cache;
+    options.domain = domain;
+    sched.get_blocking_pool()->shutdown();
+    sched.start();
+    auto observer = sched.go_joinable([options]() -> task<elio::net::resolve_result> {
+        co_return co_await elio::net::resolve_all("stopped.example", 80, options, {});
+    });
+    REQUIRE(wait_for([&] { return observer.await_ready(); }));
+    REQUIRE(observer.await_resume().error == EAGAIN);
+    observer.wait_destroyed();
+    REQUIRE(domain->outstanding() == 0);
+    REQUIRE(lookup.calls.load() == 0);
+    REQUIRE(cache.stats().cache_stores == 0);
+}
+
+TEST_CASE("public DNS worker-side pool teardown rejects inline libc dispatch",
+          "[dns][resolve_wait][public][shutdown][worker][regression]") {
+    scheduler sched(2, elio::runtime::wait_strategy::blocking(), 1);
+    lookup_control lookup;
+    elio::net::resolve_cache cache;
+    std::atomic<bool> blocker_entered{false};
+    std::atomic<bool> blocker_release{false};
+    lookup_guard guard(lookup, [&] {
+        release_flag(blocker_release);
+        sched.shutdown();
+    });
+    auto* pool = sched.get_blocking_pool();
+    std::function<void()> blocker = [&] {
+        release_flag(blocker_entered);
+        hold_until_released(blocker_release);
+    };
+    REQUIRE(pool->submit_bounded(std::move(blocker), 1));
+    REQUIRE(wait_for([&] { return blocker_entered.load(std::memory_order_acquire); }));
+    auto domain = std::make_shared<elio::net::resolve_domain>(1);
+    elio::net::resolve_wait_options options;
+    options.domain = domain;
+    options.lookup.use_cache = true;
+    options.lookup.cache = &cache;
+    sched.start();
+    auto observer = sched.go_joinable([options]() -> task<elio::net::resolve_result> {
+        co_return co_await elio::net::resolve_all("inline.example", 80, options, {});
+    });
+    REQUIRE(wait_for([&] { return pool->queued_count_for_test() == 1; }));
+    auto teardown = sched.go_joinable([pool]() -> task<void> {
+        pool->shutdown();
+        co_return;
+    });
+    REQUIRE(wait_for([&] { return pool->stopped_for_test(); }));
+    release_flag(blocker_release);
+    REQUIRE(wait_for([&] { return observer.await_ready() && teardown.await_ready(); }));
+    REQUIRE(observer.await_resume().error == EAGAIN);
+    teardown.await_resume();
+    observer.wait_destroyed();
+    teardown.wait_destroyed();
+    REQUIRE(domain->outstanding() == 0);
+    REQUIRE(lookup.calls.load() == 0);
+    REQUIRE(cache.stats().cache_stores == 0);
+}
+
+#if defined(ELIO_HAS_HTTP) && ELIO_HAS_HTTP
+TEST_CASE("HTTP WebSocket and SSE DNS waiting uses an independent disabled-by-default budget",
+          "[dns][resolve_wait][public][client][http][regression]") {
+    const int client_kind = GENERATE(0, 1, 2);
+    const bool deadline = GENERATE(false, true);
+    scheduler sched(2);
+    lookup_control lookup;
+    lookup_guard guard(lookup, [&] { sched.shutdown(); }, deadline);
+    auto domain = std::make_shared<elio::net::resolve_domain>(1);
+    cancel_source source;
+    sched.start();
+    auto observer = sched.go_joinable([domain, client_kind, deadline, token = source.get_token()]() -> task<int> {
+        auto configure = [&](auto& config) {
+            config.dns_domain = domain;
+            config.resolve_options.use_cache = false;
+            config.connect_timeout = std::chrono::seconds(1);
+            if (deadline) config.dns_timeout = std::chrono::hours(1);
+        };
+        if (client_kind == 0) {
+            elio::http::client_config config;
+            configure(config);
+            elio::http::client client(config);
+            auto result = co_await client.get_result("http://client-dns.example/", token);
+            const auto* error = std::get_if<elio::http::client_error>(&result);
+            if (!error || error->stage != elio::http::client_stage::resolve) co_return 0;
+            co_return error->code.value();
+        }
+        if (client_kind == 1) {
+            elio::http::websocket::client_config config;
+            configure(config);
+            elio::http::websocket::ws_client client(config);
+            if (co_await client.connect("ws://client-dns.example/", token)) co_return 0;
+            co_return errno;
+        }
+        elio::http::sse::client_config config;
+        configure(config);
+        elio::http::sse::sse_client client(config);
+        if (co_await client.connect("http://client-dns.example/", token)) co_return 0;
+        co_return errno;
+    });
+    REQUIRE(wait_for([&] { return lookup.entered.load(std::memory_order_acquire); }));
+    if (deadline) {
+        REQUIRE(wait_for([&] { return lookup.timer_entered.load(std::memory_order_acquire); }));
+        lookup.expire.set();
+    } else {
+        REQUIRE_FALSE(lookup.timer_entered.load(std::memory_order_acquire));
+        source.cancel();
+    }
+    REQUIRE(wait_for([&] { return observer.await_ready(); }));
+    REQUIRE(observer.await_resume() == (deadline ? ETIMEDOUT : ECANCELED));
+    observer.wait_destroyed();
+    REQUIRE(domain->outstanding() == 1);
+    REQUIRE_FALSE(lookup.release.load(std::memory_order_acquire));
+    release_flag(lookup.release);
+    sched.shutdown();
+    REQUIRE(domain->outstanding() == 0);
+}
+#if defined(ELIO_HAS_HTTP2) && ELIO_HAS_HTTP2
+TEST_CASE("HTTP2 DNS budget expires before TCP TLS setup without changing connect timeout",
+          "[dns][resolve_wait][public][client][http2][regression]") {
+    scheduler sched(2);
+    lookup_control lookup;
+    lookup_guard guard(lookup, [&] { sched.shutdown(); }, true);
+    auto domain = std::make_shared<elio::net::resolve_domain>(1);
+    sched.start();
+    auto observer = sched.go_joinable([domain]() -> task<int> {
+        elio::http::h2_client_config config;
+        config.dns_domain = domain;
+        config.dns_timeout = std::chrono::hours(1);
+        config.connect_timeout = std::chrono::seconds(1);
+        config.resolve_options.use_cache = false;
+        elio::http::h2_client client(config);
+        if (co_await client.get("https://client-dns.example/")) co_return 0;
+        co_return errno;
+    });
+    REQUIRE(wait_for([&] { return lookup.entered.load(std::memory_order_acquire); }));
+    REQUIRE(wait_for([&] { return lookup.timer_entered.load(std::memory_order_acquire); }));
+    lookup.expire.set();
+    REQUIRE(wait_for([&] { return observer.await_ready(); }));
+    REQUIRE(observer.await_resume() == ETIMEDOUT);
+    observer.wait_destroyed();
+    REQUIRE(domain->outstanding() == 1);
+    REQUIRE_FALSE(lookup.release.load(std::memory_order_acquire));
+    release_flag(lookup.release);
+    sched.shutdown();
+    REQUIRE(domain->outstanding() == 0);
+}
+#endif
+#endif
 
 TEST_CASE("DNS admission leases bound all simultaneous reservations",
           "[dns][resolve_wait][admission][contract]") {

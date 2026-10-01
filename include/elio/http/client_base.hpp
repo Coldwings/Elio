@@ -10,7 +10,7 @@
 
 #include <elio/net/stream.hpp>
 #include <elio/http/client_result.hpp>
-#include <elio/net/resolve.hpp>
+#include <elio/net/resolve_wait.hpp>
 #include <elio/tls/tls_context.hpp>
 #include <elio/coro/cancel_token.hpp>
 #include <elio/io/io_context.hpp>
@@ -241,6 +241,8 @@ struct base_client_config {
     // DoS protection limits
     size_t max_headers = 100;                     ///< Max number of response headers
     size_t max_header_size = 8192;                ///< Max size of a single header line (bytes)
+    std::chrono::nanoseconds dns_timeout{0};      ///< DNS observer budget; <=0 disables, independent of TCP/TLS
+    std::shared_ptr<net::resolve_domain> dns_domain; ///< Null selects the shared default admission domain
 };
 
 /// Initialize a TLS context for client use with default settings
@@ -261,6 +263,8 @@ inline void init_client_tls_context(tls::tls_context& ctx, bool verify_certifica
 /// @param secure If true, use TLS
 /// @param tls_ctx TLS context (required if secure)
 /// @param connect_timeout TCP connect + TLS handshake timeout; <=0 disables
+/// @param dns_timeout Independent DNS observer timeout; <=0 disables
+/// @param dns_domain Shared DNS admission; null selects the default
 /// @return Connected stream or owned operational error; setup exceptions may throw.
 inline coro::task<client_result<net::stream>>
 client_connect_result(std::string_view host, uint16_t port, bool secure,
@@ -268,20 +272,31 @@ client_connect_result(std::string_view host, uint16_t port, bool secure,
                net::resolve_options resolve_opts = net::default_cached_resolve_options(),
                bool rotate_resolved_addresses = true,
                std::chrono::nanoseconds connect_timeout = std::chrono::nanoseconds::zero(),
-               coro::cancel_token token = {}) {
+               coro::cancel_token token = {},
+               std::chrono::nanoseconds dns_timeout = std::chrono::nanoseconds::zero(),
+               std::shared_ptr<net::resolve_domain> dns_domain = {}) {
 
     if (token.is_cancelled()) {
         co_return detail::make_client_error(ECANCELED, client_stage::resolve);
     }
 
-    auto addresses = co_await net::resolve_all(host, port, resolve_opts);
+    net::resolve_wait_options dns_options;
+    dns_options.lookup = resolve_opts;
+    dns_options.domain = std::move(dns_domain);
+    if (dns_timeout.count() > 0) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto remaining = std::chrono::steady_clock::time_point::max() - now;
+        dns_options.deadline = dns_timeout >= remaining
+            ? std::chrono::steady_clock::time_point::max() : now + dns_timeout;
+    }
+    auto resolved = co_await net::resolve_all(host, port, std::move(dns_options), token);
+    if (!resolved) {
+        co_return detail::make_client_error(resolved.error, client_stage::resolve);
+    }
     if (token.is_cancelled()) {
         co_return detail::make_client_error(ECANCELED, client_stage::resolve);
     }
-    if (addresses.empty()) {
-        co_return detail::make_client_error(errno ? errno : EHOSTUNREACH,
-                                            client_stage::resolve);
-    }
+    auto addresses = std::move(resolved.addresses);
 
     size_t offset = rotate_resolved_addresses
         ? detail::next_rotation_offset(std::string(host), port, addresses.size())
@@ -409,9 +424,12 @@ client_connect(std::string_view host, uint16_t port, bool secure,
                net::resolve_options resolve_opts = net::default_cached_resolve_options(),
                bool rotate_resolved_addresses = true,
                std::chrono::nanoseconds connect_timeout = std::chrono::nanoseconds::zero(),
-               coro::cancel_token token = {}) {
+               coro::cancel_token token = {},
+               std::chrono::nanoseconds dns_timeout = std::chrono::nanoseconds::zero(),
+               std::shared_ptr<net::resolve_domain> dns_domain = {}) {
     auto result = co_await client_connect_result(host, port, secure, tls_ctx,
-        resolve_opts, rotate_resolved_addresses, connect_timeout, std::move(token));
+        resolve_opts, rotate_resolved_addresses, connect_timeout, std::move(token),
+        dns_timeout, std::move(dns_domain));
     if (const auto* error = std::get_if<client_error>(&result)) {
         errno = error->code.value();
         co_return std::nullopt;

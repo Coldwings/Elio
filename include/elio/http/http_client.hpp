@@ -137,7 +137,9 @@ public:
             config_.resolve_options,
             config_.rotate_resolved_addresses,
             connect_timeout,
-            std::move(token));
+            std::move(token),
+            config_.dns_timeout,
+            config_.dns_domain);
         co_return std::move(result);
     }
 

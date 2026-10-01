@@ -560,7 +560,9 @@ private:
             config_.resolve_options,
             config_.rotate_resolved_addresses,
             config_.connect_timeout,
-            connect_token);
+            connect_token,
+            config_.dns_timeout,
+            config_.dns_domain);
         if (!conn_result) {
             state_ = client_state::disconnected;
             co_return false;

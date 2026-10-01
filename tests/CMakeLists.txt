@@ -31,6 +31,12 @@ if(TARGET elio_http)
     endforeach()
 endif()
 
+add_executable(elio_resolve_wait_header compile/test_resolve_wait_header.cpp)
+target_link_libraries(elio_resolve_wait_header PRIVATE elio)
+target_compile_definitions(elio_resolve_wait_header PRIVATE ELIO_DEBUG)
+add_test(NAME resolve_wait_direct_header COMMAND elio_resolve_wait_header)
+set_tests_properties(resolve_wait_direct_header PROPERTIES TIMEOUT 30)
+
 set(TEST_SOURCES
     test_main.cpp
     test_watchdog.cpp
@@ -275,7 +281,7 @@ if(TARGET elio_rdma_ibverbs AND TARGET elio_rdma_cm)
 endif()
 
 set(ELIO_ADDITIONAL_TEST_TARGETS elio_file_transfer_header elio_byte_stream_header
-    ${_elio_websocket_header_targets})
+    ${_elio_websocket_header_targets} elio_resolve_wait_header)
 set(_elio_watchdog_variants normal)
 if(ELIO_BUILD_SANITIZER_TESTS)
     list(APPEND _elio_watchdog_variants asan tsan)

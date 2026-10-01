@@ -130,8 +130,11 @@ or borrowed buffers. Passing the concept is not proof of those runtime promises.
 
 [[Byte Streams]] defines the operation/lifetime/closure matrix, EOF and
 publication scope, finite per-layer buffering, and adapter verification rules.
-The existing TCP/TLS/common-stream types are not automatically opted in and
-their serialized legacy close/destruction boundaries remain unchanged.
+Existing `tcp_stream` and the closed `net::stream` variant are not automatically
+opted in. `tls::tls_stream` and `tls::basic_tls_stream<Lower>` opt in as TLS
+publishing layers; they publish ciphertext through their owned lower chain and
+settle publishing lowers on whole-chain abort, but public operations still keep
+the documented TLS serialization and lifetime requirements.
 
 ### Finishing Stream Output
 

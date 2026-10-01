@@ -84,8 +84,8 @@ struct client_config : base_client_config {
 ///
 /// The builder exposes TLS policy mutators before publication without handing
 /// callbacks a mutable reference to the transport's published tls_context.
-/// A const native handle is available for diagnostics, but retained callbacks
-/// cannot keep a mutable SSL_CTX* through this API.
+/// Diagnostics are limited to copied values so callbacks cannot retain access
+/// to mutable OpenSSL-owned state after publication.
 class transport_tls_config {
 public:
     explicit transport_tls_config(bool verify_certificate = true)
@@ -121,8 +121,8 @@ public:
         return ctx_.set_ciphersuites(ciphersuites);
     }
 
-    const SSL_CTX* native_handle() const noexcept { return ctx_.native_handle(); }
     tls::tls_mode mode() const noexcept { return ctx_.mode(); }
+    long verify_mode() const noexcept { return ctx_.verify_mode(); }
 
 private:
     friend class transport;
@@ -130,6 +130,11 @@ private:
     tls::tls_context release_context() && noexcept { return std::move(ctx_); }
 
     tls::tls_context ctx_;
+};
+
+struct transport_tls_diagnostics {
+    tls::tls_mode mode = tls::tls_mode::client;
+    long verify_mode = 0;
 };
 
 /// Immutable connection-establishment and pooling configuration owned by
@@ -316,24 +321,6 @@ public:
     transport(transport&&) = delete;
     transport& operator=(transport&&) = delete;
 
-    coro::task<client_result<connection>> acquire_result(
-            const url& target,
-            std::chrono::nanoseconds connect_timeout,
-            coro::cancel_token token = {}) {
-        auto acquired = co_await acquire_leased_result(
-            target, connect_timeout, std::move(token));
-        if (const auto* error = std::get_if<client_error>(&acquired)) co_return *error;
-        auto leased = std::move(std::get<leased_connection>(acquired));
-        co_return std::move(leased.conn);
-    }
-
-    void release(const url& target, connection conn) {
-        if (is_shutdown()) return;
-        pool_.release(target.host, target.effective_port(), target.is_secure(),
-                      std::move(conn));
-        if (is_shutdown()) pool_.clear();
-    }
-
     /// Drop currently idle pooled connections. Active/dialing operations are
     /// unaffected; use shutdown() to stop new acquisitions and await settlement.
     void clear() { pool_.clear(); }
@@ -364,7 +351,9 @@ public:
         }
     }
 
-    const tls::tls_context& tls_context() const noexcept { return tls_ctx_; }
+    transport_tls_diagnostics tls_diagnostics() const noexcept {
+        return {.mode = tls_ctx_.mode(), .verify_mode = tls_ctx_.verify_mode()};
+    }
     const transport_config& config() const noexcept { return config_; }
     bool is_shutdown() const noexcept {
         std::lock_guard lock(lifecycle_mutex_);
@@ -381,10 +370,34 @@ public:
 
     void finish_operation_for_test() noexcept { finish_operation(); }
     void signal_settled_for_test() { settled_.set(); }
+    coro::task<client_result<connection>> acquire_result_for_test(
+            const url& target,
+            std::chrono::nanoseconds connect_timeout,
+            coro::cancel_token token = {}) {
+        co_return co_await acquire_result(target, connect_timeout, std::move(token));
+    }
 #endif
 
 private:
     friend class client;
+
+    coro::task<client_result<connection>> acquire_result(
+            const url& target,
+            std::chrono::nanoseconds connect_timeout,
+            coro::cancel_token token = {}) {
+        auto acquired = co_await acquire_leased_result(
+            target, connect_timeout, std::move(token));
+        if (const auto* error = std::get_if<client_error>(&acquired)) co_return *error;
+        auto leased = std::move(std::get<leased_connection>(acquired));
+        co_return std::move(leased.conn);
+    }
+
+    void release(const url& target, connection conn) {
+        if (is_shutdown()) return;
+        pool_.release(target.host, target.effective_port(), target.is_secure(),
+                      std::move(conn));
+        if (is_shutdown()) pool_.clear();
+    }
 
     static tls::tls_context make_tls_context(const transport_config& config) {
         transport_tls_config tls_config(config.verify_certificate);
@@ -631,8 +644,10 @@ public:
                                   std::move(handler), options);
     }
 
-    /// Inspect the sealed transport TLS context.
-    const tls::tls_context& tls_context() const noexcept { return transport_->tls_context(); }
+    /// Inspect sealed transport TLS diagnostics without exposing OpenSSL state.
+    transport_tls_diagnostics tls_diagnostics() const noexcept {
+        return transport_->tls_diagnostics();
+    }
 
     /// Get configuration
     client_config& config() noexcept { return config_; }

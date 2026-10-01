@@ -2951,8 +2951,8 @@ public:
         request req, url target, coro::cancel_token token, Handler handler,
         streaming_response_options options = {});
 
-    // Inspect sealed transport TLS context and mutate request policy.
-    const tls::tls_context& tls_context() const noexcept;
+    // Inspect sealed transport TLS diagnostics and mutate request policy.
+    transport_tls_diagnostics tls_diagnostics() const noexcept;
     client_config& config() noexcept;
     const client_config& config() const noexcept;
 };
@@ -2992,8 +2992,13 @@ public:
     bool set_alpn_protocols(std::string_view protocols);
     bool set_ciphers(std::string_view ciphers);
     bool set_ciphersuites(std::string_view ciphersuites);
-    const SSL_CTX* native_handle() const noexcept;
     tls::tls_mode mode() const noexcept;
+    long verify_mode() const noexcept;
+};
+
+struct transport_tls_diagnostics {
+    tls::tls_mode mode;
+    long verify_mode;
 };
 
 struct transport_config {
@@ -3020,16 +3025,10 @@ public:
     transport(transport&&) = delete;
     transport& operator=(transport&&) = delete;
 
-    coro::task<client_result<connection>> acquire_result(
-        const url& target,
-        std::chrono::nanoseconds connect_timeout,
-        coro::cancel_token token = {});
-
-    void release(const url& target, connection conn);
     void clear();
     coro::task<coro::cancel_result> shutdown(coro::cancel_token token = {});
 
-    const tls::tls_context& tls_context() const noexcept;
+    transport_tls_diagnostics tls_diagnostics() const noexcept;
     const transport_config& config() const noexcept;
     bool is_shutdown() const noexcept;
 };
@@ -3049,12 +3048,14 @@ transport to change those connection-policy domains.
 `transport_config::configure_tls` runs once during transport construction after
 default client TLS initialization; use the supplied `transport_tls_config`
 builder for custom trust roots or ciphers before the transport is published.
-The builder forwards common TLS policy mutators but exposes only a const native
-handle for diagnostics, so callbacks cannot retain mutable access to the
-published context. `client::tls_context()` and `transport::tls_context()` return
-a const view of the sealed active context for diagnostics. This is a breaking
-HTTP/1 client migration from the previous mutable accessor; WebSocket, SSE, and
-HTTP/2 keep their mutable per-client TLS context APIs.
+The builder forwards common TLS policy mutators but exposes only copied
+diagnostic values such as mode and OpenSSL verification flags. It does not
+expose an `SSL_CTX*`, `X509_STORE*`, or the published `tls_context`, so callbacks
+cannot retain mutable access to the active security identity.
+`client::tls_diagnostics()` and `transport::tls_diagnostics()` return the same
+kind of copied value snapshot after publication. This is a breaking HTTP/1
+client migration from the previous mutable accessor; WebSocket, SSE, and HTTP/2
+keep their mutable per-client TLS context APIs.
 
 `transport::clear()` drops idle pooled connections. Active or dialing operations
 continue normally. `transport::shutdown()` marks the transport closed, drops idle
@@ -3063,6 +3064,8 @@ for client-managed dialing/acquired exchanges to settle. It does not destroy
 caller coroutine frames or abort already active exchanges; callers still keep
 the client, transport, request/URL objects, caches, and borrowed strings alive
 until awaited return.
+Transport acquisition/release is intentionally client-managed in this release;
+raw external leases and cross-transport connection injection are not public API.
 
 #### Owned HTTP Client Errors
 

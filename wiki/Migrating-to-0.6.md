@@ -60,18 +60,20 @@ elio::http::client metadata(shared, metadata_policy);
 ```
 
 Breaking HTTP/1 TLS customization change: `client::tls_context()` and
-`transport::tls_context()` now expose only a const diagnostics view. Use
+`transport::tls_context()` are replaced by copied `tls_diagnostics()` snapshots. Use
 `transport_cfg.configure_tls` with the construction-only
 `http::transport_tls_config` builder for custom trust roots or ciphers before
-constructing the transport. The builder does not expose a mutable native handle
-that can be retained after publication. If resolver, DNS, TLS verification, or
+constructing the transport. The builder does not expose a native handle,
+certificate store, or published context reference that can be retained after
+publication. If resolver, DNS, TLS verification, or
 pooling policy changes, create a new transport and move new clients to it; do
 not expect existing idle or in-flight connections to migrate across policy
 domains. `transport::clear()` drops idle pooled connections only.
 `co_await transport::shutdown()` closes the transport to new acquisitions, drops
 idle connections, and waits for client-managed active exchanges to settle.
 Route identities, explicit external leases, proxy connectors, and global
-admission remain separate follow-up features.
+admission remain separate follow-up features; raw transport acquire/release is
+not public API in 0.6.
 
 ## Finishing Stream Output
 

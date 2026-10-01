@@ -1951,9 +1951,7 @@ TEST_CASE("HTTP transport configure_tls runs once after default TLS setup",
     cfg.configure_tls = [&](elio::http::transport_tls_config& ctx) {
         callback_calls.fetch_add(1, std::memory_order_relaxed);
         callback_config_object = &ctx;
-        observed_verify_mode.store(
-            SSL_CTX_get_verify_mode(ctx.native_handle()),
-            std::memory_order_relaxed);
+        observed_verify_mode.store(ctx.verify_mode(), std::memory_order_relaxed);
         ctx.set_verify_mode(elio::tls::verify_mode::none);
     };
 
@@ -1963,10 +1961,12 @@ TEST_CASE("HTTP transport configure_tls runs once after default TLS setup",
 
     REQUIRE(callback_calls.load(std::memory_order_relaxed) == 1);
     REQUIRE((observed_verify_mode.load(std::memory_order_relaxed) & SSL_VERIFY_PEER) != 0);
-    REQUIRE(SSL_CTX_get_verify_mode(shared->tls_context().native_handle()) == SSL_VERIFY_NONE);
-    REQUIRE(callback_config_object != static_cast<const void*>(&shared->tls_context()));
-    REQUIRE(&first.tls_context() == &second.tls_context());
-    REQUIRE(first.tls_context().native_handle() == shared->tls_context().native_handle());
+    const auto shared_tls = shared->tls_diagnostics();
+    REQUIRE(shared_tls.mode == elio::tls::tls_mode::client);
+    REQUIRE(shared_tls.verify_mode == SSL_VERIFY_NONE);
+    REQUIRE(callback_config_object != static_cast<const void*>(shared.get()));
+    REQUIRE(first.tls_diagnostics().verify_mode == second.tls_diagnostics().verify_mode);
+    REQUIRE(first.tls_diagnostics().verify_mode == shared_tls.verify_mode);
 }
 #endif
 
@@ -2043,7 +2043,7 @@ TEST_CASE("HTTP clients sharing a transport reuse pooled connections",
     std::atomic<bool> server_done{false};
     std::atomic<bool> server_accepted{false};
     std::atomic<bool> client_done{false};
-    std::atomic<bool> tls_context_shared{false};
+    std::atomic<bool> tls_diagnostics_match{false};
     std::atomic<int> first_status{0};
     std::atomic<int> second_status{0};
     std::string first_body;
@@ -2088,8 +2088,8 @@ TEST_CASE("HTTP clients sharing a transport reuse pooled connections",
 
         elio::http::client first(shared, first_cfg);
         elio::http::client second(shared, second_cfg);
-        tls_context_shared =
-            &first.tls_context() == &second.tls_context();
+        tls_diagnostics_match =
+            first.tls_diagnostics().verify_mode == second.tls_diagnostics().verify_mode;
 
         auto first_resp = co_await first.get(make_url(port, "/first"));
         if (first_resp) {
@@ -2114,7 +2114,7 @@ TEST_CASE("HTTP clients sharing a transport reuse pooled connections",
     REQUIRE(client_done);
     REQUIRE(server_done);
     REQUIRE(server_accepted);
-    REQUIRE(tls_context_shared);
+    REQUIRE(tls_diagnostics_match);
     REQUIRE(first_status == 200);
     REQUIRE(second_status == 200);
     REQUIRE(first_body == "one");
@@ -2395,7 +2395,7 @@ TEST_CASE("HTTP transport shutdown waits for dialing acquisitions and rejects la
     });
 
     sched.go([&]() -> task<void> {
-        (void)co_await shared->acquire_result(
+        (void)co_await shared->acquire_result_for_test(
             *target, std::chrono::seconds(10));
         first_acquire_done.store(true, std::memory_order_release);
     });
@@ -2413,7 +2413,7 @@ TEST_CASE("HTTP transport shutdown waits for dialing acquisitions and rejects la
         while (!shared->is_shutdown()) {
             co_await elio::time::sleep_for(std::chrono::milliseconds(1));
         }
-        auto later = co_await shared->acquire_result(
+        auto later = co_await shared->acquire_result_for_test(
             *target, std::chrono::seconds(10));
         if (const auto* error = std::get_if<elio::http::client_error>(&later)) {
             later_acquire_errno.store(error->code.value(), std::memory_order_release);

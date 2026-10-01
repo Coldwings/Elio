@@ -343,6 +343,9 @@ public:
     
     /// Get context mode
     tls_mode mode() const noexcept { return mode_; }
+
+    /// Get the current OpenSSL verification mode bitmask.
+    long verify_mode() const noexcept { return SSL_CTX_get_verify_mode(ctx_); }
     
     /// Create a default client context with system CA certificates
     static tls_context make_client() {

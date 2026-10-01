@@ -37,8 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adapters that create private transports. Breaking HTTP/1 TLS customization
   now moves from mutable `client::tls_context()` calls to
   the construction-only `transport_config::configure_tls` builder; the
-  published client/transport TLS context is const so shared clients cannot
-  mutate an active security identity (#1245).
+  published client/transport TLS context is not exposed, and only copied
+  `tls_diagnostics()` values are available after publication so shared clients
+  cannot mutate an active security identity. Raw transport acquire/release stays
+  private to the client-managed lifecycle in 0.6 (#1245).
 
 - **Pool-integrated HTTP/1 response consumption**: `client::with_response`
   owns its request/target/handler and delivers final headers before a scoped

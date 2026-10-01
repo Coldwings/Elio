@@ -283,10 +283,13 @@ HTTP/1 transports seal their active TLS context at construction so shared
 clients cannot mutate a published security identity. Use
 `transport_config::configure_tls` before constructing the transport. The
 callback receives `http::transport_tls_config`, a construction-only builder that
-forwards common TLS policy mutators and exposes only a const native handle for
-diagnostics. This is a breaking HTTP/1 client migration from older
-`client.tls_context().load_*` or `set_*` customization calls. WebSocket, SSE,
-and HTTP/2 clients continue to expose mutable per-client TLS contexts.
+forwards common TLS policy mutators and exposes only copied diagnostics such as
+mode and verification flags. It does not expose `SSL_CTX*`, `X509_STORE*`, or
+the published TLS context. This is a breaking HTTP/1 client migration from older
+`client.tls_context().load_*` or `set_*` customization calls; use
+`client.tls_diagnostics()` only for post-publication value inspection.
+WebSocket, SSE, and HTTP/2 clients continue to expose mutable per-client TLS
+contexts.
 
 ### HTTP/2 Client TLS Configuration
 

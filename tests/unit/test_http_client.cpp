@@ -1908,8 +1908,8 @@ TEST_CASE("HTTP client connect_timeout fires on a stalled TLS handshake",
         elio::http::client_config cfg;
         cfg.connect_timeout = std::chrono::seconds(1);
         cfg.read_timeout = std::chrono::seconds(10);
+        cfg.verify_certificate = false;
         elio::http::client c(cfg);
-        c.tls_context().set_verify_mode(elio::tls::verify_mode::none);
 
         auto t0 = std::chrono::steady_clock::now();
         auto resp = co_await c.get(make_https_url(port));
@@ -1998,6 +1998,11 @@ TEST_CASE("HTTP client returns OK for clean keep-alive responses",
 
 TEST_CASE("HTTP clients sharing a transport reuse pooled connections",
           "[http][client][transport][issue-1245]") {
+    STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<elio::http::client>);
+    STATIC_REQUIRE_FALSE(std::is_copy_assignable_v<elio::http::client>);
+    STATIC_REQUIRE(std::is_move_constructible_v<elio::http::client>);
+    STATIC_REQUIRE(std::is_move_assignable_v<elio::http::client>);
+
     auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
     REQUIRE(listener.has_value());
     uint16_t port = listener->local_address().port();
@@ -2088,6 +2093,192 @@ TEST_CASE("HTTP clients sharing a transport reuse pooled connections",
     REQUIRE(second_request.find("GET /second HTTP/1.1\r\n") != std::string::npos);
     REQUIRE(request_header_value(first_request, "User-Agent") == "transport-first");
     REQUIRE(request_header_value(second_request, "User-Agent") == "transport-second");
+}
+
+TEST_CASE("HTTP default clients keep private transports isolated",
+          "[http][client][transport][issue-1245]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<unsigned> accepted{0};
+    std::array<int, 2> statuses{};
+    std::array<std::string, 2> requests{};
+
+    sched.go([&]() -> task<void> {
+        for (unsigned index = 0; index < 2; ++index) {
+            auto stream = co_await listener->accept();
+            if (!stream) break;
+            accepted.fetch_add(1, std::memory_order_release);
+            requests[index] = co_await read_request_headers(*stream);
+            std::string resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Length: 2\r\n"
+                "Connection: keep-alive\r\n"
+                "\r\n"
+                "ok";
+            co_await stream->write(resp);
+        }
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::client first;
+        elio::http::client second;
+        auto first_resp = co_await first.get(make_url(port, "/one"));
+        if (first_resp) statuses[0] = first_resp->status_code();
+        auto second_resp = co_await second.get(make_url(port, "/two"));
+        if (second_resp) statuses[1] = second_resp->status_code();
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(accepted.load(std::memory_order_acquire) == 2);
+    REQUIRE(statuses[0] == 200);
+    REQUIRE(statuses[1] == 200);
+    REQUIRE(requests[0].find("GET /one HTTP/1.1\r\n") != std::string::npos);
+    REQUIRE(requests[1].find("GET /two HTTP/1.1\r\n") != std::string::npos);
+}
+
+TEST_CASE("HTTP transport clear drops idle shared connections",
+          "[http][client][transport][issue-1245]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(2);
+    sched.start();
+
+    std::atomic<bool> server_done{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<unsigned> accepted{0};
+    std::array<int, 2> statuses{};
+
+    sched.go([&]() -> task<void> {
+        for (unsigned index = 0; index < 2; ++index) {
+            auto stream = co_await listener->accept();
+            if (!stream) break;
+            accepted.fetch_add(1, std::memory_order_release);
+            (void)co_await read_request_headers(*stream);
+            std::string resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Length: 2\r\n"
+                "Connection: keep-alive\r\n"
+                "\r\n"
+                "ok";
+            co_await stream->write(resp);
+        }
+        server_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        auto shared = std::make_shared<elio::http::transport>();
+        elio::http::client first(shared);
+        elio::http::client second(shared);
+        auto first_resp = co_await first.get(make_url(port, "/before-clear"));
+        if (first_resp) statuses[0] = first_resp->status_code();
+        shared->clear();
+        auto second_resp = co_await second.get(make_url(port, "/after-clear"));
+        if (second_resp) statuses[1] = second_resp->status_code();
+        client_done = true;
+    });
+
+    for (int i = 0; i < 500 && !(client_done && server_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(server_done);
+    REQUIRE(accepted.load(std::memory_order_acquire) == 2);
+    REQUIRE(statuses[0] == 200);
+    REQUIRE(statuses[1] == 200);
+}
+
+TEST_CASE("HTTP transport shutdown waits for active client exchanges",
+          "[http][client][transport][issue-1245]") {
+    auto listener = tcp_listener::bind(ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener.has_value());
+    uint16_t port = listener->local_address().port();
+
+    scheduler sched(3);
+    sched.start();
+
+    std::atomic<bool> server_read{false};
+    std::atomic<bool> release_response{false};
+    std::atomic<bool> client_done{false};
+    std::atomic<bool> shutdown_started{false};
+    std::atomic<bool> shutdown_done{false};
+    std::atomic<int> status{0};
+    std::atomic<elio::coro::cancel_result> shutdown_result{
+        elio::coro::cancel_result::cancelled};
+    auto shared = std::make_shared<elio::http::transport>();
+
+    sched.go([&]() -> task<void> {
+        auto stream = co_await listener->accept();
+        if (!stream) co_return;
+        (void)co_await read_request_headers(*stream);
+        server_read.store(true, std::memory_order_release);
+        while (!release_response.load(std::memory_order_acquire)) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::string resp =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Length: 2\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "ok";
+        co_await stream->write(resp);
+    });
+
+    sched.go([&]() -> task<void> {
+        elio::http::client c(shared);
+        auto resp = co_await c.get(make_url(port, "/shutdown"));
+        if (resp) status = resp->status_code();
+        client_done = true;
+    });
+
+    sched.go([&]() -> task<void> {
+        while (!server_read.load(std::memory_order_acquire)) {
+            co_await elio::time::sleep_for(std::chrono::milliseconds(1));
+        }
+        shutdown_started = true;
+        shutdown_result = co_await shared->shutdown();
+        shutdown_done = true;
+    });
+
+    for (int i = 0; i < 500 &&
+        !(server_read.load(std::memory_order_acquire) && shutdown_started.load()); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(server_read.load(std::memory_order_acquire));
+    REQUIRE(shutdown_started.load());
+    REQUIRE_FALSE(shutdown_done.load());
+
+    release_response = true;
+    for (int i = 0; i < 500 && !(client_done && shutdown_done); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    sched.shutdown();
+
+    REQUIRE(client_done);
+    REQUIRE(shutdown_done);
+    REQUIRE(status == 200);
+    REQUIRE(shutdown_result.load() == elio::coro::cancel_result::completed);
 }
 
 TEST_CASE("HTTP client resolves redirect Location references",

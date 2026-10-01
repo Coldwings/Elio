@@ -11,6 +11,7 @@
 #include <elio/coro/task.hpp>
 #include <elio/coro/cancel_token.hpp>
 #include <elio/runtime/scheduler.hpp>
+#include <elio/sync/event.hpp>
 #include <elio/time/timer.hpp>
 #include <elio/log/macros.hpp>
 
@@ -27,6 +28,7 @@
 #include <chrono>
 #include <concepts>
 #include <exception>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
@@ -88,6 +90,9 @@ struct transport_config {
     std::shared_ptr<net::resolve_domain> dns_domain; ///< DNS admission domain
     size_t max_connections_per_host = 6;          ///< Max retained idle connections per host
     std::chrono::seconds pool_idle_timeout{60};   ///< Idle connection timeout
+    /// Optional construction-time TLS customization. It runs after Elio's
+    /// default client TLS initialization and before the transport is published.
+    std::function<void(tls::tls_context&)> configure_tls;
 
     transport_config() = default;
 
@@ -127,7 +132,7 @@ public:
 
     explicit connection_pool(const client_config& config)
         : connection_pool(transport_config(config)) {}
-    
+
     /// Get or create a connection to host
     coro::task<client_result<connection>> acquire_result(const std::string& host,
                                                    uint16_t port,
@@ -196,22 +201,22 @@ public:
         }
         co_return std::move(std::get<connection>(result));
     }
-    
+
     /// Return a connection to the pool
     void release(const std::string& host, uint16_t port, bool secure, connection conn) {
         std::string key = make_key(host, port, secure);
         auto& shard = shard_for(key);
-        
+
         std::lock_guard<std::mutex> lock(shard.mutex);
         auto& pool = shard.pools[key];
-        
+
         if (pool.size() < config_.max_connections_per_host) {
             conn.touch();
             pool.push_back(std::move(conn));
         }
         // Otherwise let connection close
     }
-    
+
     /// Clear all pooled connections
     void clear() {
         for (auto& shard : shards_) {
@@ -219,7 +224,7 @@ public:
             shard.pools.clear();
         }
     }
-    
+
 private:
     static std::string make_key(const std::string& host, uint16_t port, bool secure) {
         return (secure ? "https://" : "http://") + host + ":" + std::to_string(port);
@@ -233,7 +238,7 @@ private:
     pool_shard& shard_for(const std::string& key) noexcept {
         return shards_[std::hash<std::string>{}(key) % shard_count];
     }
-    
+
     transport_config config_;
     std::array<pool_shard, shard_count> shards_;
 };
@@ -248,6 +253,10 @@ public:
         , pool_(config_)
         , tls_ctx_(tls::tls_mode::client) {
         init_client_tls_context(tls_ctx_, config_.verify_certificate);
+        if (config_.configure_tls) {
+            config_.configure_tls(tls_ctx_);
+        }
+        settled_.set();
     }
 
     explicit transport(const client_config& config)
@@ -262,6 +271,96 @@ public:
             const url& target,
             std::chrono::nanoseconds connect_timeout,
             coro::cancel_token token = {}) {
+        auto lease = try_acquire_lease();
+        if (!lease) co_return detail::make_client_error(ESHUTDOWN, client_stage::acquire);
+        co_return co_await acquire_result_open(target, connect_timeout, std::move(token));
+    }
+
+    void release(const url& target, connection conn) {
+        if (is_shutdown()) return;
+        pool_.release(target.host, target.effective_port(), target.is_secure(),
+                      std::move(conn));
+        if (is_shutdown()) pool_.clear();
+    }
+
+    /// Drop currently idle pooled connections. Active/dialing operations are
+    /// unaffected; use shutdown() to stop new acquisitions and await settlement.
+    void clear() { pool_.clear(); }
+
+    /// Stop new acquisitions, drop idle pooled connections, and wait for
+    /// client-managed in-flight acquisitions/exchanges to settle.
+    coro::task<coro::cancel_result> shutdown(coro::cancel_token token = {}) {
+        {
+            std::lock_guard lock(lifecycle_mutex_);
+            closing_ = true;
+        }
+        pool_.clear();
+        for (;;) {
+            {
+                std::lock_guard lock(lifecycle_mutex_);
+                if (active_operations_ == 0) co_return coro::cancel_result::completed;
+            }
+            if (co_await settled_.wait(token) == coro::cancel_result::cancelled)
+                co_return coro::cancel_result::cancelled;
+        }
+    }
+
+    const tls::tls_context& tls_context() const noexcept { return tls_ctx_; }
+    const transport_config& config() const noexcept { return config_; }
+    bool is_shutdown() const noexcept {
+        std::lock_guard lock(lifecycle_mutex_);
+        return closing_;
+    }
+
+private:
+    friend class client;
+
+    class operation_lease {
+    public:
+        operation_lease() noexcept = default;
+        operation_lease(operation_lease&& other) noexcept
+            : owner_(std::exchange(other.owner_, nullptr)) {}
+        operation_lease& operator=(operation_lease&& other) noexcept {
+            if (this != &other) {
+                reset();
+                owner_ = std::exchange(other.owner_, nullptr);
+            }
+            return *this;
+        }
+        operation_lease(const operation_lease&) = delete;
+        operation_lease& operator=(const operation_lease&) = delete;
+        ~operation_lease() { reset(); }
+
+    private:
+        friend class transport;
+        explicit operation_lease(transport& owner) noexcept : owner_(&owner) {}
+        void reset() noexcept {
+            if (auto* owner = std::exchange(owner_, nullptr)) owner->finish_operation();
+        }
+        transport* owner_ = nullptr;
+    };
+
+    std::optional<operation_lease> try_acquire_lease() {
+        std::lock_guard lock(lifecycle_mutex_);
+        if (closing_) return std::nullopt;
+        if (active_operations_++ == 0) settled_.reset();
+        return operation_lease(*this);
+    }
+
+    void finish_operation() noexcept {
+        bool notify = false;
+        {
+            std::lock_guard lock(lifecycle_mutex_);
+            if (active_operations_ == 0) return;
+            notify = --active_operations_ == 0;
+        }
+        if (notify) settled_.set();
+    }
+
+    coro::task<client_result<connection>> acquire_result_open(
+            const url& target,
+            std::chrono::nanoseconds connect_timeout,
+            coro::cancel_token token) {
         // Keep the owning snapshot and task construction outside the await
         // expression; some coroutine toolchains mishandle aggregate temporaries.
         std::optional<connection_pool::dns_options> dns{std::in_place};
@@ -273,20 +372,13 @@ public:
         co_return co_await std::move(acquisition);
     }
 
-    void release(const url& target, connection conn) {
-        pool_.release(target.host, target.effective_port(), target.is_secure(),
-                      std::move(conn));
-    }
-
-    void clear() { pool_.clear(); }
-
-    tls::tls_context& tls_context() noexcept { return tls_ctx_; }
-    const transport_config& config() const noexcept { return config_; }
-
-private:
     transport_config config_;
     connection_pool pool_;
     tls::tls_context tls_ctx_;
+    mutable std::mutex lifecycle_mutex_;
+    sync::event settled_;
+    size_t active_operations_ = 0;
+    bool closing_ = false;
 };
 
 /// HTTP client
@@ -309,34 +401,39 @@ public:
         , transport_(std::move(shared_transport)) {
         if (!transport_) throw std::invalid_argument("http::client requires a transport");
     }
-    
+
+    client(const client&) = delete;
+    client& operator=(const client&) = delete;
+    client(client&&) noexcept = default;
+    client& operator=(client&&) noexcept = default;
+
     /// Perform HTTP GET request
     /// @return Response on success, std::nullopt on error (check errno)
     coro::task<std::optional<response>> get(std::string_view url_str) {
         return request_url(method::GET, url_str, "", "", coro::cancel_token{});
     }
-    
+
     /// Perform HTTP GET request with cancellation support
     coro::task<std::optional<response>> get(std::string_view url_str, coro::cancel_token token) {
         return request_url(method::GET, url_str, "", "", std::move(token));
     }
-    
+
     /// Perform HTTP POST request
     /// @return Response on success, std::nullopt on error (check errno)
-    coro::task<std::optional<response>> post(std::string_view url_str, 
+    coro::task<std::optional<response>> post(std::string_view url_str,
                                                    std::string_view body,
                                                    std::string_view content_type = mime::application_form_urlencoded) {
         return request_url(method::POST, url_str, body, content_type, coro::cancel_token{});
     }
-    
+
     /// Perform HTTP POST request with cancellation support
-    coro::task<std::optional<response>> post(std::string_view url_str, 
+    coro::task<std::optional<response>> post(std::string_view url_str,
                                                    std::string_view body,
                                                    coro::cancel_token token,
                                                    std::string_view content_type = mime::application_form_urlencoded) {
         return request_url(method::POST, url_str, body, content_type, std::move(token));
     }
-    
+
     /// Perform HTTP PUT request
     /// @return Response on success, std::nullopt on error (check errno)
     coro::task<std::optional<response>> put(std::string_view url_str,
@@ -344,7 +441,7 @@ public:
                                                   std::string_view content_type = mime::application_json) {
         return request_url(method::PUT, url_str, body, content_type, coro::cancel_token{});
     }
-    
+
     /// Perform HTTP PUT request with cancellation support
     coro::task<std::optional<response>> put(std::string_view url_str,
                                                   std::string_view body,
@@ -352,18 +449,18 @@ public:
                                                   std::string_view content_type = mime::application_json) {
         return request_url(method::PUT, url_str, body, content_type, std::move(token));
     }
-    
+
     /// Perform HTTP DELETE request
     /// @return Response on success, std::nullopt on error (check errno)
     coro::task<std::optional<response>> del(std::string_view url_str) {
         return request_url(method::DELETE_, url_str, "", "", coro::cancel_token{});
     }
-    
+
     /// Perform HTTP DELETE request with cancellation support
     coro::task<std::optional<response>> del(std::string_view url_str, coro::cancel_token token) {
         return request_url(method::DELETE_, url_str, "", "", std::move(token));
     }
-    
+
     /// Perform HTTP PATCH request
     /// @return Response on success, std::nullopt on error (check errno)
     coro::task<std::optional<response>> patch(std::string_view url_str,
@@ -371,7 +468,7 @@ public:
                                                     std::string_view content_type = mime::application_json) {
         return request_url(method::PATCH, url_str, body, content_type, coro::cancel_token{});
     }
-    
+
     /// Perform HTTP PATCH request with cancellation support
     coro::task<std::optional<response>> patch(std::string_view url_str,
                                                     std::string_view body,
@@ -379,24 +476,24 @@ public:
                                                     std::string_view content_type = mime::application_json) {
         return request_url(method::PATCH, url_str, body, content_type, std::move(token));
     }
-    
+
     /// Perform HTTP HEAD request
     /// @return Response on success, std::nullopt on error (check errno)
     coro::task<std::optional<response>> head(std::string_view url_str) {
         return request_url(method::HEAD, url_str, "", "", coro::cancel_token{});
     }
-    
+
     /// Perform HTTP HEAD request with cancellation support
     coro::task<std::optional<response>> head(std::string_view url_str, coro::cancel_token token) {
         return request_url(method::HEAD, url_str, "", "", std::move(token));
     }
-    
+
     /// Send a custom request
     /// @return Response on success, std::nullopt on error (check errno)
     coro::task<std::optional<response>> send(request& req, const url& target) {
         co_return co_await send(req, target, coro::cancel_token{});
     }
-    
+
     /// Send a custom request with cancellation support
     coro::task<std::optional<response>> send(request& req, const url& target, coro::cancel_token token) {
         co_return optional_response(co_await send_result(req, target, std::move(token)));
@@ -436,14 +533,14 @@ public:
         return with_response_impl(std::move(req), std::move(target), std::move(token),
                                   std::move(handler), options);
     }
-    
-    /// Get TLS context for configuration
-    tls::tls_context& tls_context() noexcept { return transport_->tls_context(); }
-    
+
+    /// Inspect the sealed transport TLS context.
+    const tls::tls_context& tls_context() const noexcept { return transport_->tls_context(); }
+
     /// Get configuration
     client_config& config() noexcept { return config_; }
     const client_config& config() const noexcept { return config_; }
-    
+
     /// Method-general value API. Borrowed string inputs and this client must
     /// remain valid through awaited return; successful HTTP statuses are values.
     coro::task<client_result<response>> request_result(method m,
@@ -463,7 +560,7 @@ private:
         if (token.is_cancelled()) {
             co_return detail::make_client_error(ECANCELED, client_stage::target);
         }
-        
+
         auto parsed = url::parse(url_str);
         if (!parsed) {
             co_return detail::make_client_error(EINVAL, client_stage::target);
@@ -480,21 +577,21 @@ private:
             !detail::is_valid_header_value(content_type)) {
             co_return detail::make_client_error(EINVAL, client_stage::request);
         }
-        
+
         request req(m, parsed->path_with_query());
         req.set_host(parsed->host_authority());
-        
+
         if (!body.empty() || (honor_empty_representation && !content_type.empty())) {
             req.set_body(body);
             if (!content_type.empty()) {
                 req.set_content_type(content_type);
             }
         }
-        
+
         if (!config_.user_agent.empty()) {
             req.set_header("User-Agent", config_.user_agent);
         }
-        
+
         co_return co_await send_request(req, *parsed, 0, std::move(token));
     }
 
@@ -513,7 +610,7 @@ private:
         co_return optional_response(co_await request_url_result(
             m, url_str, body, content_type, std::move(token), false));
     }
-    
+
     static bool is_informational_status(uint16_t code) noexcept {
         return code >= 100 && code < 200;
     }
@@ -587,10 +684,12 @@ private:
 
     class exchange_state final {
     public:
-        exchange_state(connection conn, const client_config& config, const url& target,
+        exchange_state(connection conn, transport::operation_lease transport_lease,
+                       const client_config& config, const url& target,
                        method request_method, std::string_view request_body, bool defer_body,
                        size_t informational_limit)
-            : conn_(std::move(conn)), config_(config), target_(target),
+            : conn_(std::move(conn)), transport_lease_(std::move(transport_lease)),
+              config_(config), target_(target),
               reader_(config.read_buffer_size), request_method_(request_method),
               request_body_(request_body), informational_limit_(informational_limit),
               body_pending_(defer_body),
@@ -806,6 +905,7 @@ private:
         }
 
         connection conn_;
+        transport::operation_lease transport_lease_;
         const client_config& config_;
         const url& target_;
         response_reader reader_;
@@ -837,6 +937,9 @@ private:
         auto conn_result = co_await transport_->acquire_result(
             target, config_.connect_timeout, token);
         if (const auto* error = std::get_if<client_error>(&conn_result)) co_return *error;
+        auto transport_lease = transport_->try_acquire_lease();
+        if (!transport_lease)
+            co_return detail::make_client_error(ESHUTDOWN, client_stage::acquire);
         auto conn = std::move(std::get<connection>(conn_result));
         if (req.header("Host").empty()) req.set_host(target.host_authority());
         if (!req.get_headers().contains("Connection")) {
@@ -855,8 +958,9 @@ private:
         if (token.is_cancelled()) {
             co_return detail::make_client_error(ECANCELED, client_stage::request);
         }
-        auto exchange = std::make_unique<exchange_state>(std::move(conn), config_, target,
-            req.get_method(), req.body(), defer_body, informational_limit);
+        auto exchange = std::make_unique<exchange_state>(std::move(conn),
+            std::move(*transport_lease), config_, target, req.get_method(),
+            req.body(), defer_body, informational_limit);
         if (auto error = co_await exchange->send_initial(request_data, token)) co_return *error;
         co_return std::move(exchange);
     }
@@ -1008,15 +1112,15 @@ private:
         if (exchange->reusable()) {
             transport_->release(target, exchange->take_connection());
         }
-        
+
         if (auto redirect = make_redirect(req, target, resp, redirect_count)) {
             co_return co_await send_request(redirect->req, redirect->target,
                                           redirect_count + 1, token);
         }
-        
+
         co_return resp;
     }
-    
+
     client_config config_;
     std::shared_ptr<transport> transport_;
 };

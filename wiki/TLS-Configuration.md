@@ -268,16 +268,21 @@ coro::task<void> inspect_connection() {
 ### HTTP Client TLS Configuration
 
 ```cpp
-http::client_config config;
+http::transport_config transport_config;
+transport_config.configure_tls = [](tls_context& tls_ctx) {
+    tls_ctx.load_verify_locations("/path/to/custom-ca.crt");
+};
 
-http::client client(config);
-
-// Access and customize TLS context
-auto& tls_ctx = client.tls_context();
-tls_ctx.load_verify_locations("/path/to/custom-ca.crt");
+auto transport = std::make_shared<http::transport>(transport_config);
+http::client client(transport);
 
 auto resp = co_await client.get("https://example.com/");
 ```
+
+HTTP/1 transports seal their active TLS context at construction so shared
+clients cannot mutate a published security identity. Use
+`transport_config::configure_tls` before constructing the transport. WebSocket,
+SSE, and HTTP/2 clients continue to expose mutable per-client TLS contexts.
 
 ### HTTP/2 Client TLS Configuration
 

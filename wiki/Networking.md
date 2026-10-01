@@ -536,13 +536,16 @@ A reused connection does not resolve again; redirects/new connections get new
 stage budgets, not one total exchange deadline. DNS cancellation/expiry can
 leave running lookup work behind, so shutdown drain may still wait for libc.
 
-HTTP snapshots the current `client.config().dns_timeout` and `dns_domain` for
-each acquisition. Configure them before starting the operation and serialize
-mutable client use; do not mutate configuration concurrently. Resetting the
-domain selects the shared resolver default. Direct `connection_pool` users can
-pass an optional `connection_pool::dns_options` value after the cancellation
-token to override both settings; omitting it retains the pool's configuration.
-An engaged override with a null domain deliberately selects the shared default.
+HTTP snapshots `transport_config::dns_timeout` and `dns_domain` from its owning
+`http::transport`; configure them before constructing or publishing that
+transport. Mutating `client.config()` after construction changes request policy
+and the per-acquisition `connect_timeout`, not HTTP DNS admission. WebSocket,
+SSE, and HTTP/2 clients still own their connection configuration directly, so
+their `client.config().dns_timeout` and `dns_domain` are read when they start a
+new connection. Direct `connection_pool` users can pass an optional
+`connection_pool::dns_options` value after the cancellation token to override
+both settings; omitting it retains the pool's configuration. An engaged override
+with a null domain deliberately selects the shared default.
 
 For pool-integrated incremental body consumption, use
 `client::with_response(req, target, token, handler, options)` instead of a buffered

@@ -37,8 +37,8 @@ See [Networking](Networking.md#bounded-cancellable-dns-waiting).
 
 Existing `http::client(config)` construction still works, but it now creates a
 private `http::transport` from the connection-affecting parts of that config.
-Resolver options, DNS timeout/domain, TLS verification, maximum idle
-connections per host, and idle timeout are frozen in that transport. Mutating
+Resolver options, DNS timeout/domain, TLS verification/native TLS setup, maximum
+idle connections per host, and idle timeout are frozen in that transport. Mutating
 `client.config()` later changes request policy such as redirects, User-Agent,
 body limits, read/Expect timeouts, and the per-acquisition `connect_timeout`;
 it does not reconfigure the existing pool or DNS/TLS identity.
@@ -59,12 +59,15 @@ metadata_policy.follow_redirects = false;
 elio::http::client metadata(shared, metadata_policy);
 ```
 
-Configure the transport TLS context before sharing the transport or starting
-requests. If resolver, DNS, TLS verification, or pooling policy changes, create
-a new transport and move new clients to it; do not expect existing idle or
-in-flight connections to migrate across policy domains. `transport::clear()`
-drops idle pooled connections only. Route identities, explicit leases, proxy
-connectors, and global admission remain separate follow-up features.
+Use `transport_cfg.configure_tls` for custom trust roots, ciphers, or native TLS
+policy before constructing the transport. If resolver, DNS, TLS verification, or
+pooling policy changes, create a new transport and move new clients to it; do
+not expect existing idle or in-flight connections to migrate across policy
+domains. `transport::clear()` drops idle pooled connections only.
+`co_await transport::shutdown()` closes the transport to new acquisitions, drops
+idle connections, and waits for client-managed active exchanges to settle.
+Route identities, explicit external leases, proxy connectors, and global
+admission remain separate follow-up features.
 
 ## Finishing Stream Output
 

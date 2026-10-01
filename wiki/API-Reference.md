@@ -2951,8 +2951,8 @@ public:
         request req, url target, coro::cancel_token token, Handler handler,
         streaming_response_options options = {});
 
-    // Configure TLS and client options
-    tls::tls_context& tls_context() noexcept;
+    // Inspect sealed transport TLS context and mutate request policy.
+    const tls::tls_context& tls_context() const noexcept;
     client_config& config() noexcept;
     const client_config& config() const noexcept;
 };
@@ -2971,10 +2971,12 @@ public:
 
 `client()` and `client(client_config)` create a private `http::transport`.
 `client(shared_ptr<transport>, client_config)` shares that transport's resolver,
-DNS admission, TLS security context, and idle connection pool while retaining an
+DNS admission, sealed TLS security context, and idle connection pool while retaining an
 independent request policy on each client. Request policy includes redirects,
 User-Agent, read/Expect timeouts, response limits, and the TCP/TLS
-`connect_timeout` budget passed to each acquisition.
+`connect_timeout` budget passed to each acquisition. `client` is move-only; copy
+construction/assignment is deleted so sharing remains explicit through
+`shared_ptr<transport>`.
 
 ### `transport_config` and `transport`
 
@@ -2987,6 +2989,7 @@ struct transport_config {
     std::shared_ptr<net::resolve_domain> dns_domain;
     size_t max_connections_per_host = 6;
     std::chrono::seconds pool_idle_timeout{60};
+    std::function<void(tls::tls_context&)> configure_tls;
 
     transport_config();
     explicit transport_config(const client_config& config);
@@ -3009,9 +3012,11 @@ public:
 
     void release(const url& target, connection conn);
     void clear();
+    coro::task<coro::cancel_result> shutdown(coro::cancel_token token = {});
 
-    tls::tls_context& tls_context() noexcept;
+    const tls::tls_context& tls_context() const noexcept;
     const transport_config& config() const noexcept;
+    bool is_shutdown() const noexcept;
 };
 ```
 
@@ -3025,14 +3030,19 @@ For HTTP clients, connection-affecting fields are frozen when the private or
 shared transport is constructed. Mutating `client.config()` later changes only
 the client request policy plus the per-acquisition `connect_timeout`; it does
 not mutate resolver, DNS, TLS verification, or pool identity. Publish a new
-transport to change those connection-policy domains. `client::tls_context()`
-and `transport::tls_context()` expose the transport TLS context for source
-compatibility; configure it before sharing the transport or starting requests,
-and serialize any compatibility mutation with transport use.
+transport to change those connection-policy domains.
+`transport_config::configure_tls` runs once during transport construction after
+default client TLS initialization; use it for custom trust roots, ciphers, or
+other native TLS policy before the transport is published. `client::tls_context()`
+and `transport::tls_context()` return a const view of the sealed active context
+for diagnostics.
 
-`transport::clear()` drops idle pooled connections. Active or dialing
-operations still follow the usual client lifetime rule: keep the client,
-transport, request/URL objects, caches/TLS context, and borrowed strings alive
+`transport::clear()` drops idle pooled connections. Active or dialing operations
+continue normally. `transport::shutdown()` marks the transport closed, drops idle
+connections, rejects new acquisitions with `ESHUTDOWN`, and asynchronously waits
+for client-managed dialing/acquired exchanges to settle. It does not destroy
+caller coroutine frames or abort already active exchanges; callers still keep
+the client, transport, request/URL objects, caches, and borrowed strings alive
 until awaited return.
 
 #### Owned HTTP Client Errors

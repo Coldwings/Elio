@@ -25,12 +25,14 @@
 #include <string>
 #include <string_view>
 #include <chrono>
+#include <cstddef>
 #include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 
@@ -78,9 +80,13 @@ inline size_t next_rotation_offset(const std::string& host, uint16_t port, size_
     return offset;
 }
 
-inline coro::task<void> fd_shutdown_watchdog_task(
+template<typename Abort = std::nullptr_t>
+coro::task<void> fd_shutdown_watchdog_task(
         int fd, std::chrono::nanoseconds timeout, coro::cancel_token tok,
-        std::shared_ptr<std::atomic<bool>> flag) {
+        std::shared_ptr<std::atomic<bool>> flag, Abort abort = nullptr) {
+    static_assert(std::is_same_v<Abort, std::nullptr_t> ||
+                  std::is_nothrow_invocable_v<Abort&>);
+    (void)abort;
     coro::cancel_result r;
     try {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
@@ -117,27 +123,30 @@ inline coro::task<void> fd_shutdown_watchdog_task(
 /// Spawn a watchdog that shutdown(2)s `fd` after `timeout` elapses.
 /// The caller cancels the token on completion and joins before releasing `fd`.
 /// Timer exceptions interrupt active sibling I/O without setting `timed_out`.
-inline coro::join_handle<void>
+template<typename Abort = std::nullptr_t>
+coro::join_handle<void>
 arm_fd_shutdown_watchdog(runtime::scheduler* sched,
                          int fd,
                          std::chrono::nanoseconds timeout,
                          coro::cancel_token watchdog_token,
-                         std::shared_ptr<std::atomic<bool>> timed_out) {
+                         std::shared_ptr<std::atomic<bool>> timed_out,
+                         Abort abort = nullptr) {
     // Construct the owning frame before admission: a lazy callable wrapper
     // could fail allocating it after the sibling I/O has already suspended.
     return sched->go_joinable(fd_shutdown_watchdog_task(
-        fd, timeout, std::move(watchdog_token), std::move(timed_out)));
+        fd, timeout, std::move(watchdog_token), std::move(timed_out), std::move(abort)));
 }
 
 // Admit the watchdog inside this frame, before invoking the factory. Creating
 // the operation task can itself throw, so accepting a pre-built task is unsafe.
-template<typename OperationFactory>
+template<typename OperationFactory, typename Abort = std::nullptr_t>
 coro::task<io::io_result> await_fd_operation_with_watchdog(
         OperationFactory operation, runtime::scheduler* scheduler, int fd,
-        std::chrono::nanoseconds timeout, std::shared_ptr<std::atomic<bool>> timed_out) {
+        std::chrono::nanoseconds timeout, std::shared_ptr<std::atomic<bool>> timed_out,
+        Abort abort = nullptr) {
     coro::cancel_source stop;
     auto watchdog = arm_fd_shutdown_watchdog(
-        scheduler, fd, timeout, stop.get_token(), std::move(timed_out));
+        scheduler, fd, timeout, stop.get_token(), std::move(timed_out), std::move(abort));
     io::io_result result{};
     std::exception_ptr failure;
     try {

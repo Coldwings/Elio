@@ -1,7 +1,9 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #if defined(ELIO_HAS_TLS) && ELIO_HAS_TLS && defined(ELIO_RUNTIME_TEST_HOOKS)
 #include <elio/tls/tls_stream.hpp>
+#include <elio/http/client_base.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/sync/event.hpp>
 #include <openssl/evp.h>
@@ -522,6 +524,130 @@ void generic_tls_contexts(tls::tls_context& server, tls::tls_context& client) {
     REQUIRE(duplex_certificate(server));
     client.set_verify_mode(tls::verify_mode::none);
 }
+
+struct tls_watchdog_control {
+    sync::event entered;
+    sync::event release;
+    sync::event failed;
+    bool cancelled = false;
+};
+
+std::atomic<tls_watchdog_control*> tls_watchdog_active{nullptr};
+
+coro::task<coro::cancel_result> tls_watchdog_wait(
+        std::chrono::nanoseconds, coro::cancel_token token) {
+    auto* control = tls_watchdog_active.load(std::memory_order_acquire);
+    if (!control) throw std::logic_error("missing TLS watchdog control");
+    control->entered.set();
+    const auto result = co_await control->release.wait(std::move(token));
+    control->cancelled = result == coro::cancel_result::cancelled;
+    control->failed.set();
+    throw std::runtime_error("TLS watchdog timer failure");
+}
+
+struct tls_watchdog_hook_guard {
+    explicit tls_watchdog_hook_guard(tls_watchdog_control& control) {
+        tls_watchdog_active.store(&control, std::memory_order_release);
+        http::detail::fd_watchdog_shutdowns_for_test.store(0);
+        http::detail::fd_watchdog_wait_for_test.store(tls_watchdog_wait,
+                                                   std::memory_order_release);
+    }
+    ~tls_watchdog_hook_guard() {
+        http::detail::fd_watchdog_wait_for_test.store(nullptr, std::memory_order_release);
+        tls_watchdog_active.store(nullptr, std::memory_order_release);
+    }
+};
+}
+
+TEST_CASE("FD watchdog TLS abort marks healthy completed I/O but not cancelled cleanup",
+          "[tls][http][watchdog][exception][issue-1278]") {
+    const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
+    const auto version = GENERATE(tls::tls_version::tls_1_2, tls::tls_version::tls_1_3);
+    const bool cleanup_exception = GENERATE(false, true);
+    CAPTURE(backend, version, cleanup_exception);
+    if (backend == backend_type::io_uring) {
+#if ELIO_HAS_IO_URING
+        if (!io::io_uring_backend::is_available()) SKIP("io_uring unavailable on this host");
+#else
+        SKIP("io_uring support is not compiled");
+#endif
+    }
+    duplex_backend_guard backend_scope(backend);
+    duplex_sockets sockets;
+    sockets.open();
+    tls::tls_context server_context(tls::tls_mode::server, version);
+    tls::tls_context client_context(tls::tls_mode::client, version);
+    generic_tls_contexts(server_context, client_context);
+    tls::tls_stream server(net::tcp_stream(std::exchange(sockets.server, -1)), server_context);
+    net::stream client(tls::tls_stream(
+        net::tcp_stream(std::exchange(sockets.client, -1)), client_context));
+    complete_tls_pair_handshake(server, client.as_tls());
+
+    tls_watchdog_control control;
+    tls_watchdog_hook_guard hook(control);
+    auto timed_out = std::make_shared<std::atomic<bool>>(false);
+    std::atomic<bool> positive_io{false};
+    std::atomic<bool> done{false};
+    std::exception_ptr failure;
+    io::io_result read_result{};
+    io::io_result write_result{};
+    char byte = '\0';
+    // One worker makes event notification queue the completed operation until
+    // the active timer has unwound through the watchdog's exception handler.
+    runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto writer = scheduler.go_joinable([&]() -> coro::task<void> {
+        write_result = co_await server.write_exactly("x", 1);
+    });
+    auto operation = scheduler.go_joinable([&]() -> coro::task<void> {
+        try {
+            (void)co_await http::detail::await_fd_operation_with_watchdog(
+                [&]() -> coro::task<io::io_result> {
+                    co_await control.entered.wait();
+                    read_result = co_await client.read(&byte, 1);
+                    positive_io.store(true, std::memory_order_release);
+                    if (!cleanup_exception) co_await control.failed.wait();
+                    co_return read_result;
+                }, &scheduler, client.fd(), std::chrono::hours(1), timed_out,
+                [&client]() noexcept { http::detail::abort_stream_io(client); });
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        done.store(true, std::memory_order_release);
+    });
+    const bool completed_io = duplex_observe([&] {
+        return positive_io.load(std::memory_order_acquire);
+    });
+    if (!cleanup_exception || !completed_io) control.release.set();
+    const bool completed = duplex_observe([&] { return done.load(std::memory_order_acquire); });
+    if (!completed) {
+        control.release.set();
+        server.shutdown_socket();
+        client.as_tls().shutdown_socket();
+    }
+    if (!scheduler.shutdown(test::scaled_ms(15000))) std::terminate();
+    writer.wait_destroyed();
+    writer.await_resume();
+    operation.wait_destroyed();
+    operation.await_resume();
+    REQUIRE(completed_io);
+    REQUIRE(completed);
+    REQUIRE(read_result.result == 1);
+    REQUIRE(write_result.result == 1);
+    REQUIRE(byte == 'x');
+    REQUIRE(failure);
+    REQUIRE_THROWS_WITH(std::rethrow_exception(failure), "TLS watchdog timer failure");
+    CHECK_FALSE(timed_out->load(std::memory_order_acquire));
+    CHECK(control.cancelled == cleanup_exception);
+    const auto state = client.as_tls().shutdown_state_for_test();
+    CHECK(state.transport_error == 0);
+    CHECK_FALSE(state.pump_active);
+    CHECK(state.externally_shut_down == !cleanup_exception);
+    CHECK(http::detail::fd_watchdog_shutdowns_for_test.load() ==
+          (cleanup_exception ? 0 : 1));
+    if (cleanup_exception) exchange_tls_payload(server, client.as_tls(), "still reusable");
+    server.shutdown_socket();
+    client.as_tls().shutdown_socket();
 }
 
 TEST_CASE("TLS real duplex keeps bounded writes and opposite reads progressing", "[tls][duplex][issue-1215]") {

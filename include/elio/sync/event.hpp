@@ -292,6 +292,29 @@ public:
         std::lock_guard guard(mutex_);
         return waiters_.size();
     }
+
+    // Fixture recovery cannot call set(): this test suite intentionally
+    // exercises set()'s throwing dispatch-storage boundary. Publish the
+    // signal and drain one retained wake at a time without allocating.
+    void release_waiters_for_test() noexcept {
+        signaled_.store(true, std::memory_order_release);
+        for (;;) {
+            detail::wake_state_ptr to_schedule;
+            {
+                std::lock_guard guard(mutex_);
+                if (waiters_.empty()) return;
+
+                auto* waiter = waiters_.pop_front();
+                if (waiter->cancellable_ &&
+                    detail::claim_wake_state(waiter->wake_state_) ==
+                        detail::wake_action::rejected) {
+                    continue;
+                }
+                to_schedule = waiter->wake_state_;
+            }
+            detail::schedule_wake_state(to_schedule);
+        }
+    }
 #endif
 
 private:

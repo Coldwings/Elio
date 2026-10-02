@@ -102,7 +102,7 @@ TEST_CASE("Event dispatch allocation failure preserves pending wakes",
         // roots, normally join every retained handle, then preserve the first
         // launch exception. No dispatch fault hook is armed on this path.
         if (cancellable) stop.cancel();
-        else signal.set();
+        else signal.release_waiters_for_test();
         for (auto& wait : waits) if (wait) wait->wait_destroyed();
         const bool launch_cleanup_drained = scheduler.shutdown(elio::test::scaled_ms(5000));
         for (auto& wait : waits) {

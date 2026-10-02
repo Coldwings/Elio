@@ -53,6 +53,8 @@ struct watchdog_control {
     std::atomic<bool> cancelled{false};
     bool throw_after_cancel = false;
     bool hold_after_cancel = false;
+    bool throw_before_cancel = false;
+    bool allocation_failure = false;
 };
 
 std::atomic<watchdog_control*> active_control{nullptr};
@@ -68,6 +70,10 @@ task<cancel_result> controlled_wait(std::chrono::nanoseconds,
         co_await control->settled.wait();
     }
     control->finished.store(true, std::memory_order_release);
+    if (result == cancel_result::completed && control->throw_before_cancel) {
+        if (control->allocation_failure) throw std::bad_alloc();
+        throw std::runtime_error("original timer failure");
+    }
     if (result == cancel_result::cancelled && control->throw_after_cancel) {
         throw std::logic_error("secondary watchdog failure");
     }
@@ -176,6 +182,132 @@ TEST_CASE("FD watchdog is joined before propagating operation exceptions",
         REQUIRE_THROWS_WITH(std::rethrow_exception(failure), "original operation failure");
     }
     require_socket_usable(original.descriptors[0], replacement.descriptors[1]);
+}
+
+TEST_CASE("FD watchdog timer failures release blocked sibling I/O before propagation",
+          "[http][watchdog][exception][issue-1278]") {
+    using backend_type = elio::io::io_context::backend_type;
+    const auto backend = GENERATE(backend_type::epoll, backend_type::io_uring);
+    const auto workers = GENERATE(1u, 2u);
+    const bool writing = GENERATE(false, true);
+    const bool allocation_failure = GENERATE(false, true);
+    CAPTURE(static_cast<int>(backend), workers, writing, allocation_failure);
+#if ELIO_HAS_IO_URING
+    if (backend == backend_type::io_uring && !elio::io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (backend == backend_type::io_uring) SKIP("io_uring support is not compiled");
+#endif
+    struct backend_guard {
+        backend_type previous;
+        explicit backend_guard(backend_type value)
+            : previous(elio::runtime::detail::worker_io_backend_for_test.exchange(value)) {}
+        ~backend_guard() { elio::runtime::detail::worker_io_backend_for_test.store(previous); }
+    } backend_scope(backend);
+    socket_pair sockets;
+    const int stream_fd = ::dup(sockets.descriptors[0]);
+    REQUIRE(stream_fd >= 0);
+    elio::net::tcp_stream stream(stream_fd);
+    std::array<char, 4096> buffer{};
+    if (writing) {
+        // Fill the actual nonblocking socket before admitting the Elio write.
+        for (;;) {
+            const auto sent = ::send(sockets.descriptors[0], buffer.data(), buffer.size(), MSG_NOSIGNAL);
+            if (sent >= 0) continue;
+            if (errno == EINTR) continue;
+            REQUIRE((errno == EAGAIN || errno == EWOULDBLOCK));
+            break;
+        }
+    }
+    watchdog_control control;
+    control.throw_before_cancel = true;
+    control.allocation_failure = allocation_failure;
+    watchdog_hook_guard hook(control);
+    auto timed_out = std::make_shared<std::atomic<bool>>(false);
+    std::exception_ptr failure;
+    std::atomic<bool> done{false};
+    bool timer_finished_at_return = false;
+    elio::coro::cancel_source recovery;
+    elio::runtime::scheduler scheduler(workers);
+    release_guard release{control};
+    scheduler.start();
+    auto operation = scheduler.go_joinable([&]() -> task<void> {
+        try {
+            (void)co_await elio::http::detail::await_fd_operation_with_watchdog(
+                [&]() -> task<elio::io::io_result> {
+                    co_await control.entered.wait();
+                    if (writing)
+                        co_return co_await stream.write(buffer.data(), buffer.size(), recovery.get_token());
+                    co_return co_await stream.read(buffer.data(), buffer.size(), recovery.get_token());
+                }, &scheduler, stream.fd(), std::chrono::hours(1), timed_out);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        timer_finished_at_return = control.finished.load(std::memory_order_acquire);
+        done.store(true, std::memory_order_release);
+    });
+    const bool parked = wait_for([&] {
+        size_t pending = 0;
+        for (unsigned index = 0; index < workers; ++index)
+            pending += scheduler.get_worker(index)->io_context().pending_count();
+        return pending != 0 && !done.load(std::memory_order_acquire);
+    });
+    control.release.set();
+    const bool returned_without_recovery = wait_for([&] {
+        return done.load(std::memory_order_acquire);
+    });
+    recovery.cancel();
+    const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
+    operation.wait_destroyed();
+    operation.await_resume();
+    REQUIRE(drained);
+    REQUIRE(parked);
+    REQUIRE(returned_without_recovery);
+    REQUIRE(timer_finished_at_return);
+    REQUIRE_FALSE(control.cancelled.load(std::memory_order_acquire));
+    REQUIRE_FALSE(timed_out->load(std::memory_order_acquire));
+    REQUIRE(failure);
+    if (allocation_failure) {
+        REQUIRE_THROWS_AS(std::rethrow_exception(failure), std::bad_alloc);
+    } else {
+        REQUIRE_THROWS_WITH(std::rethrow_exception(failure), "original timer failure");
+    }
+    // Completion returned borrowed storage: it can be reused without pending I/O.
+    buffer.fill('r');
+    CHECK(done.load(std::memory_order_acquire));
+}
+
+TEST_CASE("FD watchdog join-state allocation failure never starts its sibling operation",
+          "[http][watchdog][exception][issue-1278]") {
+    socket_pair sockets;
+    auto timed_out = std::make_shared<std::atomic<bool>>(false);
+    bool invoked = false;
+    std::exception_ptr failure;
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto operation = scheduler.go_joinable([&]() -> task<void> {
+        // Inject join-state allocation failure before initial admission;
+        // the sibling factory must not be invoked after that exception.
+        elio::runtime::detail::fail_next_join_state_allocation_for_test.store(true);
+        try {
+            (void)co_await elio::http::detail::await_fd_operation_with_watchdog(
+                [&]() -> task<elio::io::io_result> {
+                    invoked = true;
+                    co_return elio::io::io_result{1, 0};
+                }, &scheduler, sockets.descriptors[0], std::chrono::hours(1), timed_out);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        elio::runtime::detail::fail_next_join_state_allocation_for_test.store(false);
+    });
+    operation.wait_destroyed();
+    operation.await_resume();
+    REQUIRE(scheduler.shutdown(elio::test::scaled_ms(5000)));
+    REQUIRE_FALSE(invoked);
+    REQUIRE_FALSE(timed_out->load(std::memory_order_acquire));
+    REQUIRE(failure);
+    REQUIRE_THROWS_AS(std::rethrow_exception(failure), std::bad_alloc);
+    require_socket_usable(sockets.descriptors[0], sockets.descriptors[1]);
 }
 
 TEST_CASE("FD watchdog cleanup preserves successful and failed I/O results",

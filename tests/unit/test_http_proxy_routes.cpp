@@ -3,6 +3,7 @@
 #include <elio/coro/detail/completion_waiter.hpp>
 #include <elio/http/http_client.hpp>
 #include <elio/coro/join_wait.hpp>
+#include <elio/io/io_awaitables.hpp>
 #include <elio/runtime/affinity.hpp>
 #include <elio/time/timer.hpp>
 
@@ -75,6 +76,54 @@ struct temporary_pem {
     }
 };
 
+struct empty_connection_probe {
+    int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    ~empty_connection_probe() { if (fd >= 0) ::close(fd); }
+    empty_connection_probe() = default;
+    empty_connection_probe(const empty_connection_probe&) = delete;
+    empty_connection_probe& operator=(const empty_connection_probe&) = delete;
+};
+
+task<int> peek_fixture_payload(elio::net::tcp_stream& stream,
+                               elio::coro::cancel_token token) {
+    char first;
+    for (;;) {
+        auto read = co_await elio::io::async_recv(
+            stream.fd(), &first, 1, MSG_PEEK, token);
+        if (read.was_cancelled()) co_return -ECANCELED;
+        if (read.io.result == -EINTR) continue;
+        if (read.io.result != -EAGAIN && read.io.result != -EWOULDBLOCK)
+            co_return read.io.result;
+        auto ready = co_await stream.poll_read(token);
+        if (ready.was_cancelled()) co_return -ECANCELED;
+        if (ready.io.result < 0) co_return ready.io.result;
+    }
+}
+
+task<std::optional<elio::net::tcp_stream>> accept_fixture_payload(
+        elio::net::tcp_listener& listener, elio::coro::cancel_token token,
+        size_t* empty_connections = nullptr, int* accept_error = nullptr) {
+    for (;;) {
+        auto accepted = co_await listener.accept(token);
+        if (!accepted) {
+            if (accept_error) *accept_error = errno;
+            co_return std::nullopt;
+        }
+        // Local probes can arrive before the fixture's client. Peek so neither
+        // CONNECT/application bytes nor a later TLS ClientHello are consumed.
+        const auto payload = co_await peek_fixture_payload(*accepted, token);
+        if (payload == 0) {
+            if (empty_connections) ++*empty_connections;
+            continue;
+        }
+        if (payload < 0) {
+            if (accept_error) *accept_error = -payload;
+            co_return std::nullopt;
+        }
+        co_return accepted;
+    }
+}
+
 void install_certificate(elio::tls::tls_context& context, temporary_pem& ca,
                          const char* identities = "DNS:localhost") {
     std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> generator(
@@ -139,6 +188,7 @@ task<std::optional<request>> receive_request(Stream& stream, elio::coro::cancel_
 
 struct observed_route {
     size_t accepted = 0;
+    size_t empty_connections = 0;
     int accept_error = 0;
     request_read_observation connect_read;
     std::vector<request> requests;
@@ -200,11 +250,9 @@ bool certificate_rejected(const client_error& error, const observed_route& obser
 task<void> serve_route(elio::net::tcp_listener& listener, bool secure,
         elio::tls::tls_context& tls_context, size_t count, observed_route& observed,
         elio::coro::cancel_token token) {
-    auto accepted = co_await listener.accept(token);
-    if (!accepted) {
-        observed.accept_error = errno;
-        co_return;
-    }
+    auto accepted = co_await accept_fixture_payload(listener, token,
+        &observed.empty_connections, &observed.accept_error);
+    if (!accepted) co_return;
     ++observed.accepted;
     auto stream = std::move(*accepted);
     if (secure) {
@@ -1775,6 +1823,74 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
         }
         if (finite) REQUIRE(owner->admission_counters_for_test().live == 0);
     }
+}
+
+TEST_CASE("Proxy route fixtures skip local peers that close before sending payload",
+          "[http][proxy][routes][fixture-peer][issue-1249]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    CAPTURE(selected);
+    backend_guard backend_scope(selected);
+    elio::tls::tls_context server_context(elio::tls::tls_mode::server);
+    temporary_pem ca;
+    install_certificate(server_context, ca);
+    auto listener = elio::net::tcp_listener::bind(
+        elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    empty_connection_probe probe;
+    REQUIRE(probe.fd >= 0);
+    const auto proxy_address = elio::net::ipv4_address(
+        "127.0.0.1", listener->local_address().port()).to_sockaddr();
+    REQUIRE(::connect(probe.fd, reinterpret_cast<const sockaddr*>(&proxy_address),
+                      sizeof(proxy_address)) == 0);
+    REQUIRE(::shutdown(probe.fd, SHUT_WR) == 0);
+    transport_config config;
+    config.proxy.emplace();
+    config.proxy->endpoint = "http://127.0.0.1:" +
+        std::to_string(listener->local_address().port());
+    config.limits = pool_limits{};
+    config.acquisition_timeout = std::chrono::seconds(5);
+    config.configure_tls = [&](transport_tls_config& policy) {
+        if (!policy.load_verify_locations(ca.path.data()))
+            throw std::runtime_error("fixture-peer trust loading failed");
+    };
+    auto owner = std::make_shared<transport>(config);
+    client agent(owner);
+    const auto target = url::parse("https://localhost:9443/path");
+    REQUIRE(target);
+    observed_route observed;
+    authentication_hooks authentication_scope(observed);
+    elio::coro::cancel_source stop;
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto [server, calls] = launch_fixture_pair(scheduler, stop,
+        serve_route(*listener, true, server_context, 1, observed, stop.get_token()),
+        send_requests(agent, *target, 1));
+    calls.wait_destroyed();
+    stop.cancel();
+    server.wait_destroyed();
+    owner->clear();
+    scheduler.shutdown();
+    const auto results = calls.await_resume();
+    server.await_resume();
+    REQUIRE(results.size() == 1);
+    if (const auto* error = std::get_if<client_error>(&results.front())) {
+        CAPTURE(error->stage, error->code.value(), observed.accepted,
+                observed.empty_connections, observed.accept_error,
+                observed.connect_read.bytes, observed.connect_read.terminal_error,
+                observed.connect_read.complete, observed.requests.size(),
+                observed.client_connect_writing, observed.client_connect_written,
+                observed.client_connect_reading, observed.client_connect_received,
+                observed.client_connect_error);
+        REQUIRE_FALSE(error);
+    }
+    REQUIRE(std::holds_alternative<response>(results.front()));
+    CHECK(std::get<response>(results.front()).body() == "ok");
+    CHECK(observed.empty_connections == 1);
+    CHECK(observed.accepted == 1);
+    REQUIRE(observed.requests.size() == 2);
+    CHECK(observed.requests.front().get_method() == method::CONNECT);
+    CHECK(owner->active_operations_for_test() == 0);
+    CHECK(owner->admission_counters_for_test().live == 0);
 }
 
 TEST_CASE("CONNECT authenticates numeric origin IP SANs without SNI over IPv4 and IPv6 proxies",

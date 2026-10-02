@@ -229,6 +229,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **FD watchdog admission rejection**: observe an already-exceptional watchdog
+  handle before invoking its sibling I/O factory, preventing accepted
+  HTTP-family calls from starting unbounded I/O during scheduler drain (#1282).
+
 - **HTTP Transport TCP retirement**: private root sockets retain their immediate,
   non-lingering local close policy across moves and setup exceptions. Plain HTTP
   active discard, idle clearing and shutdown now close the descriptor before

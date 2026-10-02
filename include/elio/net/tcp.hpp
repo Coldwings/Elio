@@ -1202,9 +1202,10 @@ private:
 class tcp_connect_awaitable : public io::io_awaitable_base {
     friend struct detail::tcp_retirement_access;
 
-    tcp_connect_awaitable(const socket_address& addr, coro::cancel_token token,
+    tcp_connect_awaitable(const socket_address& addr, const tcp_options& opts,
+                          coro::cancel_token token,
                           bool settled_root)
-        : tcp_connect_awaitable(addr, tcp_options{}, std::move(token)) {
+        : tcp_connect_awaitable(addr, opts, std::move(token)) {
         settled_root_ = settled_root;
     }
 
@@ -1417,7 +1418,7 @@ private:
 
 inline tcp_connect_awaitable detail::tcp_retirement_access::connect(
         const socket_address& address, coro::cancel_token token, bool settled_root) {
-    return tcp_connect_awaitable(address, std::move(token), settled_root);
+    return tcp_connect_awaitable(address, tcp_options{}, std::move(token), settled_root);
 }
 
 /// Connect to a remote TCP server (IPv4)

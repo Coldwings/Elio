@@ -309,12 +309,17 @@ namespace {
 struct watchdog_observation {
     elio::sync::event cancelled;
     bool saw_cancellation = false;
+    bool fail_cancellation_callback = false;
 };
 std::atomic<watchdog_observation*> watchdog_observed{nullptr};
 
 task<elio::coro::cancel_result> fail_watchdog_cleanup(
         std::chrono::steady_clock::time_point, elio::coro::cancel_token token) {
     auto& observed = *watchdog_observed.load();
+    auto failure_registration = token.on_cancel([&observed]() {
+        if (observed.fail_cancellation_callback)
+            throw std::runtime_error("watchdog cancellation failure");
+    });
     const auto result = co_await observed.cancelled.wait(token);
     observed.saw_cancellation = result == elio::coro::cancel_result::cancelled;
     throw std::runtime_error("watchdog cleanup failure");
@@ -336,7 +341,7 @@ struct watchdog_failure_hooks {
 TEST_CASE("Connector preserves setup failure when watchdog cleanup also fails",
           "[http][root-close][issue-1276][watchdog-precedence]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
-    const auto phase = GENERATE(0, 1, 2);
+    const auto phase = GENERATE(0, 1, 2, 3, 4);
     CAPTURE(selected, phase);
 #if ELIO_HAS_IO_URING
     if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
@@ -346,9 +351,12 @@ TEST_CASE("Connector preserves setup failure when watchdog cleanup also fails",
 #endif
     close_observation observed;
     close_hooks hooks(selected, observed);
-    setup_failure_hooks failure_hooks(phase == 0);
-    if (phase == 2) elio::net::detail::fail_root_linger_configuration_for_test.store(false);
+    const bool allocation_failure = phase == 0 || phase == 3;
+    setup_failure_hooks failure_hooks(allocation_failure);
+    if (phase == 2 || phase == 4)
+        elio::net::detail::fail_root_linger_configuration_for_test.store(false);
     watchdog_observation watchdog;
+    watchdog.fail_cancellation_callback = phase >= 3;
     watchdog_failure_hooks timer_hooks(watchdog);
     auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
     REQUIRE(listener);
@@ -368,12 +376,13 @@ TEST_CASE("Connector preserves setup failure when watchdog cleanup also fails",
         try {
             (void)co_await agent.get_result(target);
         } catch (const std::bad_alloc&) {
-            expected_failure = phase == 0;
+            expected_failure = allocation_failure;
         } catch (const std::system_error& error) {
             expected_failure = phase == 1 && error.code().value() == ENOMEM;
         } catch (const std::runtime_error& error) {
             cleanup_message = error.what();
-            expected_failure = phase == 2 && cleanup_message == "watchdog cleanup failure";
+            expected_failure = (phase == 2 && cleanup_message == "watchdog cleanup failure") ||
+                (phase == 4 && cleanup_message == "watchdog cancellation failure");
         } catch (...) {
             unexpected = std::current_exception();
         }

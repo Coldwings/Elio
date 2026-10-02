@@ -351,16 +351,6 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
             }));
     }
 
-    auto stop_watchdog = [&]() -> coro::task<void> {
-        timer_cancel_src->cancel();
-        if (watchdog) {
-            auto wd = std::move(*watchdog);
-            watchdog.reset();
-            co_await std::move(wd);
-        }
-        co_return;
-    };
-
     auto stopped_error = [&](client_stage stage) -> std::optional<client_error> {
         if (timed_out->load(std::memory_order_acquire) ||
             (setup_deadline && *setup_deadline <= std::chrono::steady_clock::now())) {
@@ -447,7 +437,22 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
     } catch (...) {
         setup_failure = std::current_exception();
     }
-    co_await stop_watchdog();
+    // Stop the owned timer before allocating any cleanup frame, and preserve
+    // the first setup failure even if cancellation or watchdog retrieval throws.
+    try {
+        timer_cancel_src->cancel();
+    } catch (...) {
+        if (!setup_failure) setup_failure = std::current_exception();
+    }
+    if (watchdog) {
+        auto wd = std::move(*watchdog);
+        watchdog.reset();
+        try {
+            co_await std::move(wd);
+        } catch (...) {
+            if (!setup_failure) setup_failure = std::current_exception();
+        }
+    }
     if (setup_failure) std::rethrow_exception(setup_failure);
     co_return std::move(*connected);
 }

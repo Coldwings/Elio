@@ -3,6 +3,7 @@
 #include <catch2/matchers/catch_matchers.hpp>
 #include <elio/http/detail/route_operation.hpp>
 #include <elio/net/tcp.hpp>
+#include <elio/sync/event.hpp>
 #include "../test_main.cpp"
 
 #include <array>
@@ -42,6 +43,7 @@ struct route_probe {
     std::atomic<bool> recovered{false};
     std::exception_ptr failure;
     elio::coro::cancel_source recovery;
+    elio::sync::event admission_closed;
     std::array<char, 1> storage{};
 };
 
@@ -58,11 +60,7 @@ bool observe(Predicate predicate) {
 task<void> exercise_route(elio::net::tcp_stream& stream, route_probe& probe,
                           bool during_drain) {
     probe.entered.store(true, std::memory_order_release);
-    if (during_drain) {
-        while (!elio::runtime::detail::graceful_admission_closed_for_test.load(
-                   std::memory_order_acquire))
-            co_await elio::time::yield();
-    }
+    if (during_drain) co_await probe.admission_closed.wait();
     try {
         (void)co_await elio::http::detail::await_route_operation<elio::io::io_result>(
             [&](elio::coro::cancel_token token) -> task<elio::io::io_result> {
@@ -76,21 +74,6 @@ task<void> exercise_route(elio::net::tcp_stream& stream, route_probe& probe,
         probe.failure = std::current_exception();
     }
     probe.done.store(true, std::memory_order_release);
-}
-
-task<void> recover_accepted_route(route_probe& probe) {
-    while (!elio::runtime::detail::graceful_admission_closed_for_test.load(
-               std::memory_order_acquire))
-        co_await elio::time::yield();
-    const auto deadline = std::chrono::steady_clock::now() + elio::test::scaled_ms(2000);
-    while (!probe.done.load(std::memory_order_acquire)) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-            probe.recovered.store(true, std::memory_order_release);
-            probe.recovery.cancel();
-            break;
-        }
-        co_await elio::time::yield();
-    }
 }
 
 void fail_construction() { throw std::bad_alloc(); }
@@ -173,18 +156,28 @@ TEST_CASE("Accepted layered routes observe rejected watchdogs during graceful dr
     elio::runtime::scheduler scheduler(1);
     scheduler.start();
     auto operation = scheduler.go_joinable(exercise_route(stream, probe, true));
-    // Both roots are admitted before shutdown closes independent admission.
-    // Recovery uses cooperative cancellation and normal joins, never force-stop.
-    auto recovery = scheduler.go_joinable(recover_accepted_route(probe));
     const bool entered = observe([&] { return probe.entered.load(std::memory_order_acquire); });
-    const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
+    bool drained = false;
+    // Observe actual admission closure from outside the scheduler. A polling
+    // coroutine on one worker could starve the accepted route's continuation.
+    std::thread shutdown([&] { drained = scheduler.shutdown(elio::test::scaled_ms(5000)); });
+    const bool closed = observe([] {
+        return elio::runtime::detail::graceful_admission_closed_for_test.load(
+            std::memory_order_acquire);
+    });
+    probe.admission_closed.set();
+    const bool completed = observe([&] { return probe.done.load(std::memory_order_acquire); });
+    if (!completed) {
+        probe.recovered.store(true, std::memory_order_release);
+        probe.recovery.cancel();
+    }
+    shutdown.join();
     operation.wait_destroyed();
-    recovery.wait_destroyed();
     operation.await_resume();
-    recovery.await_resume();
     REQUIRE(entered);
+    REQUIRE(closed);
     REQUIRE(drained);
-    CHECK(probe.done.load(std::memory_order_acquire));
+    CHECK(completed);
     CHECK_FALSE(probe.invoked.load(std::memory_order_acquire));
     CHECK_FALSE(probe.recovered.load(std::memory_order_acquire));
     REQUIRE(probe.failure);

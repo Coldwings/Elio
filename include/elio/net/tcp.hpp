@@ -1019,12 +1019,13 @@ public:
                     }
                     cancel_registration_.unregister();
                 })) {
+                const auto failure = prepare_failure_result();
                 clear_op_state();
                 if (cancel_state_) {
                     cancel_state_->op = nullptr;
                 }
                 cancel_registration_.unregister();
-                result_ = io::io_result{-EAGAIN, 0};
+                result_ = failure;
                 return false;  // Don't suspend, resume immediately
             }
             io::detail::recheck_io_cancel(cancel_state_);
@@ -1278,6 +1279,7 @@ public:
                 }
                 cancel_registration_.unregister();
             })) {
+            const auto failure = prepare_failure_result();
             clear_op_state();
             if (cancel_state_) {
                 cancel_state_->op = nullptr;
@@ -1285,7 +1287,7 @@ public:
             cancel_registration_.unregister();
             ::close(fd_);
             fd_ = -1;
-            result_ = io::io_result{-EAGAIN, 0};
+            result_ = failure;
             return false;  // Don't suspend, resume immediately
         }
         io::detail::recheck_io_cancel(cancel_state_);

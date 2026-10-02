@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Owned, bounded CONNECT read-ahead is passed once through the generic TLS lower;
   origin trust/SNI remains separate from the proxy endpoint. One remaining
   post-DNS connect budget covers TCP/CONNECT/TLS, and finite live permits remain
-  held until physical owned-root retirement. Explicit preemptive Basic is hop-only:
+  held until physical owned-root retirement. Route timeout watchdogs are owned
+  before sibling I/O, and a ready exceptional watchdog is fully destroyed before
+  its failure is rethrown. Explicit preemptive Basic is hop-only:
   generic Proxy-Authorization is stripped from direct/tunneled requests and
   forwarding uses only the frozen profile. Configure `proxy.basic_auth` instead
   of custom hop headers; public request serialization and standalone connection

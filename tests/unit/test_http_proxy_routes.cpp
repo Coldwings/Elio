@@ -538,7 +538,7 @@ task<elio::coro::cancel_result> observe_connect_phase(
     co_return co_await phase.wait(std::move(token));
 }
 
-task<bool> await_connect_fixture_phase(output_observation& output,
+task<bool> await_connect_fixture_event(elio::sync::event& expected, output_observation& output,
         elio::coro::cancel_source& stop, std::exception_ptr& failure,
         std::chrono::milliseconds budget = std::chrono::seconds(10)) {
     auto* scheduler = elio::runtime::scheduler::current();
@@ -547,7 +547,7 @@ task<bool> await_connect_fixture_phase(output_observation& output,
     bool reached = false;
     try {
         phase.emplace(scheduler->go_joinable(
-            observe_connect_phase(output.paused, phase_stop.get_token())));
+            observe_connect_phase(expected, phase_stop.get_token())));
         reached = co_await phase->wait_until(std::chrono::steady_clock::now() + budget) ==
             elio::coro::join_wait_outcome::completed;
     } catch (...) { if (!failure) failure = std::current_exception(); }
@@ -564,6 +564,12 @@ task<bool> await_connect_fixture_phase(output_observation& output,
     }
     if (failure) settle_connect_fixture(output, stop, failure, true);
     co_return reached && !failure;
+}
+
+task<bool> await_connect_fixture_phase(output_observation& output,
+        elio::coro::cancel_source& stop, std::exception_ptr& failure,
+        std::chrono::milliseconds budget = std::chrono::seconds(10)) {
+    return await_connect_fixture_event(output.paused, output, stop, failure, budget);
 }
 
 template<typename T>
@@ -1068,15 +1074,23 @@ TEST_CASE("CONNECT and inner TLS retain one absolute TCP budget and settle cance
         auto server = scheduler.go_joinable(stalled_connect(*listener, inner_tls, observed,
                                                             server_stop.get_token()));
         auto controlled = scheduler.go_joinable([&]() -> task<client_result<response>> {
+            output_observation cleanup;
+            std::exception_ptr failure;
             auto call = scheduler.go_joinable(agent.get_result("https://unresolved-origin.invalid/",
                                                                user_stop.get_token()));
-            co_await observed.connect_read.wait();
-            co_await observed.route_entered.wait();
-            if (inner_tls) co_await observed.tls_entered.wait();
-            if (cancelled) user_stop.cancel();
-            else observed.expire.set();
-            auto result = co_await call;
-            co_await call.wait_destroyed_async();
+            bool reached = co_await await_connect_fixture_event(
+                observed.connect_read, cleanup, user_stop, failure);
+            if (reached) reached = co_await await_connect_fixture_event(
+                observed.route_entered, cleanup, user_stop, failure);
+            if (reached && inner_tls) reached = co_await await_connect_fixture_event(
+                observed.tls_entered, cleanup, user_stop, failure);
+            CHECK(reached);
+            if (reached) {
+                if (cancelled) user_stop.cancel();
+                else observed.expire.set();
+            }
+            auto result = co_await join_connect_fixture(call, cleanup, user_stop, failure);
+            if (failure) std::rethrow_exception(failure);
             co_return result;
         });
         controlled.wait_destroyed();
@@ -1128,15 +1142,23 @@ TEST_CASE("CONNECT deadline before its first write is not certificate rejection"
     auto server = scheduler.go_joinable(unread_connect(*listener, observed, route,
                                                       server_stop.get_token()));
     auto controlled = scheduler.go_joinable([&]() -> task<client_result<response>> {
+        output_observation cleanup;
+        std::exception_ptr failure;
         auto call = scheduler.go_joinable(agent.get_result("https://127.0.0.1:9443/",
                                                            user_stop.get_token()));
-        co_await observed.accepted.wait();
-        co_await observed.route_entered.wait();
-        co_await observed.write_entered.wait();
-        if (cancelled) user_stop.cancel();
-        else observed.expire.set();
-        auto result = co_await call;
-        co_await call.wait_destroyed_async();
+        bool reached = co_await await_connect_fixture_event(
+            observed.accepted, cleanup, user_stop, failure);
+        if (reached) reached = co_await await_connect_fixture_event(
+            observed.route_entered, cleanup, user_stop, failure);
+        if (reached) reached = co_await await_connect_fixture_event(
+            observed.write_entered, cleanup, user_stop, failure);
+        CHECK(reached);
+        if (reached) {
+            if (cancelled) user_stop.cancel();
+            else observed.expire.set();
+        }
+        auto result = co_await join_connect_fixture(call, cleanup, user_stop, failure);
+        if (failure) std::rethrow_exception(failure);
         co_return result;
     });
     controlled.wait_destroyed();
@@ -1291,6 +1313,14 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
         scheduler.shutdown();
         auto results = calls.await_resume();
         server.await_resume();
+        const auto* first_error = results.empty() ? nullptr :
+            std::get_if<client_error>(&results.front());
+        const int first_error_code = first_error ? first_error->code.value() : 0;
+        const int first_error_stage = first_error ? static_cast<int>(first_error->stage) : -1;
+        CAPTURE(first_error_code, first_error_stage, observed.accepted, observed.accept_error,
+                observed.handshake, observed.server_handshake_error, observed.sni,
+                observed.requests.size(), observed.connect_read.bytes,
+                observed.connect_read.terminal_error, observed.connect_read.complete);
         REQUIRE(results.size() == 2);
         for (const auto& result : results) {
             if (const auto* error = std::get_if<client_error>(&result)) {

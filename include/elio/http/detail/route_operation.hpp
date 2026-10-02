@@ -19,7 +19,46 @@ namespace elio::http::detail {
 using route_operation_wait_hook = coro::task<coro::cancel_result> (*)(
     std::chrono::steady_clock::time_point, coro::cancel_token);
 inline std::atomic<route_operation_wait_hook> route_operation_wait_for_test{nullptr};
+inline std::atomic<void (*)()> route_watchdog_before_construct_for_test{nullptr};
 #endif
+
+inline coro::task<void> route_watchdog_task(
+        std::chrono::steady_clock::time_point deadline,
+        std::shared_ptr<coro::cancel_source> stop,
+        std::shared_ptr<std::atomic<bool>> expired,
+        coro::cancel_token timer_token) {
+    coro::cancel_result result;
+    try {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = route_operation_wait_for_test.load(std::memory_order_acquire))
+            result = co_await hook(deadline, timer_token);
+        else
+#endif
+        result = co_await time::sleep_for(deadline - std::chrono::steady_clock::now(),
+                                          timer_token);
+    } catch (...) {
+        auto failure = std::current_exception();
+        try { stop->cancel(); } catch (...) {}
+        std::rethrow_exception(failure);
+    }
+    if (result == coro::cancel_result::completed) {
+        expired->store(true, std::memory_order_release);
+        stop->cancel();
+    }
+}
+
+inline coro::task<void> make_route_watchdog(
+        std::chrono::steady_clock::time_point deadline,
+        std::shared_ptr<coro::cancel_source> stop,
+        std::shared_ptr<std::atomic<bool>> expired,
+        coro::cancel_token timer_token) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (auto hook = route_watchdog_before_construct_for_test.load(std::memory_order_acquire))
+        hook();
+#endif
+    return route_watchdog_task(deadline, std::move(stop), std::move(expired),
+                               std::move(timer_token));
+}
 
 template<typename Result>
 struct route_operation_result {
@@ -44,24 +83,8 @@ coro::task<route_operation_result<Result>> await_route_operation(Operation opera
     auto watchdog = scheduler->go_joinable(
         [deadline = *deadline, stop, expired,
          timer_token = timer_stop.get_token()]() -> coro::task<void> {
-            coro::cancel_result result;
-            try {
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-                if (auto hook = route_operation_wait_for_test.load(std::memory_order_acquire))
-                    result = co_await hook(deadline, timer_token);
-                else
-#endif
-                result = co_await time::sleep_for(deadline - std::chrono::steady_clock::now(),
-                                                  timer_token);
-            } catch (...) {
-                auto failure = std::current_exception();
-                try { stop->cancel(); } catch (...) {}
-                std::rethrow_exception(failure);
-            }
-            if (result == coro::cancel_result::completed) {
-                expired->store(true, std::memory_order_release);
-                stop->cancel();
-            }
+            return make_route_watchdog(deadline, std::move(stop), std::move(expired),
+                                        std::move(timer_token));
         });
     std::optional<Result> value;
     std::exception_ptr failure;

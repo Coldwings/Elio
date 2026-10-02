@@ -232,7 +232,7 @@ elio::
 │   ├── mutex                // Async mutex with waiter cleanup
 │   ├── shared_mutex         // Reader-writer mutex with waiter cleanup
 │   ├── semaphore            // Counting semaphore with waiter cleanup
-│   ├── event                // One-shot event with waiter cleanup
+│   ├── event                // Manual-reset event with waiter cleanup
 │   ├── channel<T>           // MPMC channel with waiter cleanup
 │   ├── spinlock             // Busy-wait lock
 │   └── condition_variable   // Async condition variable with waiter cleanup

@@ -136,12 +136,19 @@ TEST_CASE("Event dispatch allocation failure preserves pending wakes",
     }
     // Retry removes all remaining nodes before rescuing selected old-code
     // wakes. schedule_selected() claims each wake once, rejecting duplicates.
-    signal.set();
+    std::exception_ptr retry_failure;
+    try {
+        signal.set();
+    } catch (...) {
+        retry_failure = std::current_exception();
+        signal.release_waiters_for_test();
+    }
     size_t rescued = 0;
     for (const auto& wake : retained) if (wake && wake->schedule_selected()) ++rescued;
     for (auto& wait : waits) wait->wait_destroyed();
     const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
     for (auto& wait : waits) wait->await_resume();
+    if (retry_failure) std::rethrow_exception(retry_failure);
     REQUIRE(drained);
     CHECK(published);
     CHECK(allocation_failed == (published && fail_call == 0));

@@ -227,9 +227,11 @@ TEST_CASE("Rejected FD watchdog admission does not invoke sibling I/O",
     // An unstarted scheduler has the same initial-admission rejection as
     // graceful drain. The factory is observable and needs no forced recovery.
     auto guarded = elio::http::detail::await_fd_operation_with_watchdog(
-        [&]() -> task<elio::io::io_result> {
+        [&] {
             invoked = true;
-            co_return elio::io::io_result{1, 0};
+            return []() -> task<elio::io::io_result> {
+                co_return elio::io::io_result{1, 0};
+            }();
         }, &rejecting_scheduler, sockets.descriptors[0], std::chrono::hours(1), timed_out);
     auto handle = elio::coro::detail::task_access::handle(guarded);
     handle.resume();

@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <elio/http/http_client.hpp>
+#include <elio/coro/join_wait.hpp>
 
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
@@ -522,6 +523,67 @@ struct output_hooks {
     }
 };
 
+void settle_connect_fixture(output_observation& output, elio::coro::cancel_source& stop,
+        std::exception_ptr& failure, bool cancel = false) noexcept {
+    try { output.release.set(); }
+    catch (...) { if (!failure) failure = std::current_exception(); }
+    if (cancel || failure) {
+        try { stop.cancel(); }
+        catch (...) { if (!failure) failure = std::current_exception(); }
+    }
+}
+
+task<elio::coro::cancel_result> observe_connect_phase(
+        elio::sync::event& phase, elio::coro::cancel_token token) {
+    co_return co_await phase.wait(std::move(token));
+}
+
+task<bool> await_connect_fixture_phase(output_observation& output,
+        elio::coro::cancel_source& stop, std::exception_ptr& failure,
+        std::chrono::milliseconds budget = std::chrono::seconds(10)) {
+    auto* scheduler = elio::runtime::scheduler::current();
+    elio::coro::cancel_source phase_stop;
+    std::optional<elio::coro::join_handle<elio::coro::cancel_result>> phase;
+    bool reached = false;
+    try {
+        phase.emplace(scheduler->go_joinable(
+            observe_connect_phase(output.paused, phase_stop.get_token())));
+        reached = co_await phase->wait_until(std::chrono::steady_clock::now() + budget) ==
+            elio::coro::join_wait_outcome::completed;
+    } catch (...) { if (!failure) failure = std::current_exception(); }
+    if (!reached || failure) settle_connect_fixture(output, stop, failure, true);
+    try { phase_stop.cancel(); }
+    catch (...) { if (!failure) failure = std::current_exception(); }
+    if (phase) {
+        try {
+            auto& joined = *phase;
+            reached = co_await joined == elio::coro::cancel_result::completed && reached;
+        } catch (...) { if (!failure) failure = std::current_exception(); }
+        try { co_await phase->wait_destroyed_async(); }
+        catch (...) { if (!failure) failure = std::current_exception(); }
+    }
+    if (failure) settle_connect_fixture(output, stop, failure, true);
+    co_return reached && !failure;
+}
+
+template<typename T>
+task<T> join_connect_fixture(elio::coro::join_handle<T>& joined,
+        output_observation& output, elio::coro::cancel_source& stop,
+        std::exception_ptr& failure) {
+    std::optional<T> result;
+    try { result.emplace(co_await joined); }
+    catch (...) {
+        if (!failure) failure = std::current_exception();
+        settle_connect_fixture(output, stop, failure, true);
+    }
+    try { co_await joined.wait_destroyed_async(); }
+    catch (...) {
+        if (!failure) failure = std::current_exception();
+        settle_connect_fixture(output, stop, failure, true);
+    }
+    co_return result ? std::move(*result) : T{};
+}
+
 struct returned_thread {
     handoff_observation& observed;
     std::thread worker;
@@ -725,14 +787,19 @@ TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS o
         auto server = scheduler.go_joinable(serve_route(*listener, true, server_context,
                                                        1, observed, stop.get_token()));
         auto controlled = scheduler.go_joinable([&]() -> task<client_result<response>> {
-            auto call = scheduler.go_joinable(agent.get_result("https://localhost/path"));
-            co_await output.paused.wait();
-            auto result = co_await call;
-            co_await call.wait_destroyed_async();
-            CHECK(owner->active_operations_for_test() == 1);
-            if (finite) {
-                CHECK(owner->admission_counters_for_test().live == 1);
-                CHECK(owner->admission_counters_for_test().idle == 0);
+            elio::coro::cancel_source call_stop;
+            std::exception_ptr failure;
+            auto call = scheduler.go_joinable(agent.get_result(
+                "https://localhost/path", call_stop.get_token()));
+            const bool paused = co_await await_connect_fixture_phase(output, call_stop, failure);
+            auto result = co_await join_connect_fixture(call, output, call_stop, failure);
+            CHECK(paused);
+            if (paused && !failure) {
+                CHECK(owner->active_operations_for_test() == 1);
+                if (finite) {
+                    CHECK(owner->admission_counters_for_test().live == 1);
+                    CHECK(owner->admission_counters_for_test().idle == 0);
+                }
             }
             elio::sync::event shutdown_entered;
             auto shutdown = scheduler.go_joinable([&]() -> task<elio::coro::cancel_result> {
@@ -740,12 +807,13 @@ TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS o
                 co_return co_await owner->shutdown();
             });
             co_await shutdown_entered.wait();
-            CHECK_FALSE(shutdown.is_ready());
-            output.release.set();
-            CHECK(co_await shutdown == elio::coro::cancel_result::completed);
-            co_await shutdown.wait_destroyed_async();
+            if (paused && !failure) CHECK_FALSE(shutdown.is_ready());
+            settle_connect_fixture(output, call_stop, failure);
+            CHECK(co_await join_connect_fixture(shutdown, output, call_stop, failure) ==
+                  elio::coro::cancel_result::completed);
             CHECK(owner->active_operations_for_test() == 0);
             if (finite) CHECK(owner->admission_counters_for_test().live == 0);
+            if (failure) std::rethrow_exception(failure);
             co_return result;
         });
         controlled.wait_destroyed();
@@ -758,6 +826,47 @@ TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS o
         REQUIRE(std::get<response>(result).body() == "ok");
         REQUIRE(observed.accepted == 1);
     }
+}
+
+TEST_CASE("CONNECT output fixture cleans up when an early error never reaches its hook",
+          "[http][proxy][routes][fixture][issue-1249]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    backend_guard backend_scope(selected);
+    transport_config config;
+    config.proxy.emplace();
+    config.proxy->endpoint = "http://127.0.0.1:1";
+    auto owner = std::make_shared<transport>(config);
+    client agent(owner);
+    output_observation output;
+    elio::coro::cancel_source stop;
+    std::exception_ptr failure;
+    bool paused = true;
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto controller = scheduler.go_joinable([&]() -> task<client_result<response>> {
+        // Invalid identity returns a real owned target error before acquisition;
+        // no output hook can fire. The fixture still joins every observer/frame.
+        auto call = scheduler.go_joinable(agent.get_result(
+            "https://[not-ip]/path", stop.get_token()));
+        paused = co_await await_connect_fixture_phase(
+            output, stop, failure, std::chrono::milliseconds(10));
+        auto result = co_await join_connect_fixture(call, output, stop, failure);
+        (void)co_await owner->shutdown();
+        if (failure) std::rethrow_exception(failure);
+        co_return result;
+    });
+    controller.wait_destroyed();
+    scheduler.shutdown();
+    auto result = controller.await_resume();
+    REQUIRE_FALSE(paused);
+    REQUIRE(output.release.is_set());
+    REQUIRE(stop.is_cancelled());
+    REQUIRE_FALSE(failure);
+    const auto* error = std::get_if<client_error>(&result);
+    REQUIRE(error);
+    CHECK(error->stage == client_stage::target);
+    CHECK(error->code.value() == EINVAL);
+    CHECK(owner->active_operations_for_test() == 0);
 }
 
 TEST_CASE("CONNECT 407 is bounded and never pools or automatically replays a rejected channel",

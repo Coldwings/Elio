@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <new>
 #include <stdexcept>
 #include <thread>
 
@@ -24,12 +25,51 @@ struct backend_guard {
 
 struct setup_probe {
     elio::sync::event hello_received;
+    elio::sync::event release_start;
     elio::coro::cancel_source recovery;
     std::atomic<bool> timer_failed{false};
     std::atomic<bool> peer_received{false};
     std::atomic<bool> done{false};
+    std::atomic<bool> before_start{false};
+    std::atomic<bool> construction_failed{false};
+    std::atomic<bool> tls_entered{false};
     bool recovered = false;
     std::exception_ptr failure;
+};
+
+task<void> pause_before_timer() {
+    auto& probe = *observed.load(std::memory_order_acquire);
+    probe.before_start.store(true, std::memory_order_release);
+    (void)co_await probe.release_start.wait(probe.recovery.get_token());
+}
+
+void fail_timer_construction() {
+    observed.load(std::memory_order_acquire)->construction_failed.store(true, std::memory_order_release);
+    throw std::bad_alloc();
+}
+
+void observe_tls_entry() {
+    observed.load(std::memory_order_acquire)->tls_entered.store(true, std::memory_order_release);
+}
+
+struct startup_guard {
+    void (*previous_construction)();
+    task<void> (*previous_start)();
+    void (*previous_tls)();
+    explicit startup_guard(bool during_drain)
+        : previous_construction(elio::http::detail::setup_watchdog_before_construct_for_test.exchange(
+              during_drain ? nullptr : fail_timer_construction))
+        , previous_start(elio::http::detail::setup_watchdog_before_start_for_test.exchange(
+              during_drain ? pause_before_timer : nullptr))
+        , previous_tls(elio::http::detail::tls_setup_entered_for_test.exchange(observe_tls_entry)) {
+        elio::runtime::detail::graceful_admission_closed_for_test.store(false);
+    }
+    ~startup_guard() {
+        elio::http::detail::tls_setup_entered_for_test.store(previous_tls);
+        elio::http::detail::setup_watchdog_before_start_for_test.store(previous_start);
+        elio::http::detail::setup_watchdog_before_construct_for_test.store(previous_construction);
+        elio::runtime::detail::graceful_admission_closed_for_test.store(false);
+    }
 };
 
 std::atomic<setup_probe*> observed{nullptr};
@@ -89,7 +129,7 @@ task<void> exercise_setup(uint16_t port, elio::tls::tls_context& context, setup_
 } // namespace
 
 TEST_CASE("Connector timer failure cancels a pending real TLS handshake",
-          "[http][setup][watchdog][setup-timer-failure]") {
+          "[http][setup][watchdog][setup-timer-failure][issue-1287]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     CAPTURE(static_cast<int>(selected));
 #if ELIO_HAS_IO_URING
@@ -125,4 +165,61 @@ TEST_CASE("Connector timer failure cancels a pending real TLS handshake",
     REQUIRE(probe.failure);
     try { std::rethrow_exception(probe.failure); }
     catch (const std::runtime_error& error) { CHECK(std::string_view(error.what()) == "setup timer failed"); }
+}
+
+TEST_CASE("Connector observes unconstructible or rejected timers before TLS setup",
+          "[http][setup][watchdog][setup-startup][issue-1287]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto during_drain = GENERATE(false, true);
+    CAPTURE(static_cast<int>(selected), during_drain);
+#if ELIO_HAS_IO_URING
+    if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
+#endif
+    backend_guard backend_scope(selected);
+    auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    elio::tls::tls_context context(elio::tls::tls_mode::client);
+    setup_probe probe;
+    timer_guard timer(probe);
+    startup_guard startup(during_drain);
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto peer = scheduler.go_joinable(withhold_tls_reply(*listener, probe));
+    auto operation = scheduler.go_joinable(exercise_setup(listener->local_address().port(), context, probe));
+    bool entered = true;
+    bool closed = true;
+    bool drained = false;
+    std::thread shutdown;
+    if (during_drain) {
+        entered = observe([&] { return probe.before_start.load(std::memory_order_acquire); });
+        shutdown = std::thread([&] { drained = scheduler.shutdown(elio::test::scaled_ms(5000)); });
+        closed = observe([] {
+            return elio::runtime::detail::graceful_admission_closed_for_test.load(std::memory_order_acquire);
+        });
+        probe.release_start.set();
+    }
+    const bool completed = observe([&] { return probe.done.load(std::memory_order_acquire); });
+    if (!completed) probe.recovered = true;
+    probe.recovery.cancel();
+    operation.wait_destroyed();
+    peer.wait_destroyed();
+    if (shutdown.joinable()) shutdown.join();
+    else drained = scheduler.shutdown(elio::test::scaled_ms(5000));
+    operation.await_resume();
+    peer.await_resume();
+    REQUIRE(drained);
+    CHECK(entered);
+    CHECK(closed);
+    CHECK(completed);
+    CHECK_FALSE(probe.recovered);
+    CHECK_FALSE(probe.tls_entered.load(std::memory_order_acquire));
+    CHECK_FALSE(probe.peer_received.load(std::memory_order_acquire));
+    CHECK(probe.construction_failed.load(std::memory_order_acquire) == !during_drain);
+    REQUIRE(probe.failure);
+    if (during_drain) CHECK_THROWS_AS(std::rethrow_exception(probe.failure), std::runtime_error);
+    else CHECK_THROWS_AS(std::rethrow_exception(probe.failure), std::bad_alloc);
+    // Construction injection is a pre-frame surrogate, not native exhaustion.
 }

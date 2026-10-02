@@ -22,7 +22,7 @@ inline coro::task<client_result<route_connection>> finish_proxy_setup(
         std::shared_ptr<void> operation) {
     const auto& profile = *plan.snapshot().proxy;
     stage = client_stage::proxy_connect;
-    auto negotiated = co_await negotiate_connect(established, plan.target(), profile, token, deadline);
+    auto negotiated = co_await negotiate_connect(established, plan.wire_target(), profile, token, deadline);
     if (const auto* error = std::get_if<client_error>(&negotiated)) co_return *error;
     stage = client_stage::tls;
     auto prefix = std::move(std::get<std::vector<char>>(negotiated));

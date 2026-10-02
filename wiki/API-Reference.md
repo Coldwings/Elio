@@ -3130,7 +3130,8 @@ requests are unsupported through an explicitly proxied high-level client:
 value APIs return `ENOTSUP` at `client_stage::request` before acquisition;
 optional adapters return empty. Only the route connector owns CONNECT and its
 handoff into origin TLS; there is no caller-facing raw tunnel API here.
-Direct-route and public request serialization behavior are unchanged.
+Direct-route caller CONNECT handling and public request serialization are unchanged;
+the credential-header migration below still applies to direct requests.
 To migrate custom proxy
 headers, configure `proxy.basic_auth`; public request serialization remains
 unchanged. HTTPS proxy, SOCKS, chained proxy and HTTP/2 routes are not supported.

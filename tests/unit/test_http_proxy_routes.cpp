@@ -1156,7 +1156,7 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
         client_config request_policy;
         request_policy.read_timeout = std::chrono::seconds(5);
         client agent(owner, request_policy);
-        const auto target = url::parse(secure ? "https://local%68ost:9443/path" :
+        const auto target = url::parse(secure ? "https://%4COcALhost:9443/path" :
                                                "http://unresolved-origin.invalid:8081/path");
         REQUIRE(target);
         const auto plan = owner->route_plan_for_test(*target);
@@ -1165,6 +1165,7 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
         REQUIRE(plan.key().target_dns == detail::route_dns_mode::proxy);
         REQUIRE(plan.key().hops.size() == 1);
         CHECK(plan.key().hops.front().endpoint.host == "127.0.0.1");
+        if (secure) CHECK(plan.key().target.host == "%4cocalhost");
         observed_route observed;
         SSL_CTX_set_tlsext_servername_callback(server_context.native_handle(), record_sni);
         SSL_CTX_set_tlsext_servername_arg(server_context.native_handle(), &observed);
@@ -1196,8 +1197,8 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
             REQUIRE(observed.handshake);
             REQUIRE(observed.sni == "localhost");
             REQUIRE(observed.requests[0].get_method() == method::CONNECT);
-            REQUIRE(observed.requests[0].path() == "local%68ost:9443");
-            REQUIRE(observed.requests[0].header("Host") == "local%68ost:9443");
+            REQUIRE(observed.requests[0].path() == "%4COcALhost:9443");
+            REQUIRE(observed.requests[0].header("Host") == "%4COcALhost:9443");
             REQUIRE(observed.requests[0].header("Proxy-Authorization") == frozen_authorization);
         }
         for (size_t i = 0; i < 2; ++i) {
@@ -1207,7 +1208,7 @@ TEST_CASE("HTTP Transport forward and CONNECT routes perform real I/O and target
             REQUIRE(received.path_with_query() == wanted);
             REQUIRE(received.header("Authorization") == "Bearer origin-secret");
             REQUIRE(received.header("Proxy-Authorization") == (secure ? "" : frozen_authorization));
-            REQUIRE(received.header("Host") == (secure ? "local%68ost:9443" :
+            REQUIRE(received.header("Host") == (secure ? "%4COcALhost:9443" :
                                                  "unresolved-origin.invalid:8081"));
         }
         if (finite) REQUIRE(owner->admission_counters_for_test().live == 0);
@@ -1249,9 +1250,10 @@ TEST_CASE("CONNECT authenticates numeric origin IP SANs without SNI over IPv4 an
     client_config request_policy;
     request_policy.read_timeout = std::chrono::seconds(5);
     client agent(owner, request_policy);
-    const auto target = url::parse(ipv6 ? "https://[::1]:9443/path" :
+    const auto target = url::parse(ipv6 ? "https://[0:0:0:0:0:0:0:1]:9443/path" :
                                           "https://127.0.0.1:9443/path");
     REQUIRE(target);
+    CHECK(owner->route_plan_for_test(*target).key().target.host == (ipv6 ? "::1" : "127.0.0.1"));
     observed_route observed;
     authentication_hooks authentication_scope(observed);
     SSL_CTX_set_tlsext_servername_callback(server_context.native_handle(), record_sni);

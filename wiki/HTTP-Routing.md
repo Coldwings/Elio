@@ -83,8 +83,8 @@ The route connector owns that CONNECT negotiation. Caller-supplied `CONNECT`
 requests through an explicitly proxied `client` are unsupported: value APIs
 return `ENOTSUP` at the `request` stage before transport acquisition, and
 optional adapters return empty. These high-level APIs return HTTP responses,
-not raw tunnel handoffs. Direct-route and public request serialization behavior
-are unchanged.
+not raw tunnel handoffs. Direct-route caller CONNECT handling and public request
+serialization are unchanged; the credential-header migration below still applies.
 
 Proxy Basic credentials are bounded caller-selected octets, not implicitly
 charset/locale converted. Controls and a colon in the username are rejected;

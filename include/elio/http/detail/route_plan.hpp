@@ -158,6 +158,8 @@ public:
             ? (target.is_secure() ? route_mode::connect_tunnel : route_mode::forward_proxy)
             : snapshot_->mode;
         key_.target = route_endpoint::from(target.host, target.effective_port());
+        // Pool identity is normalized; CONNECT must retain URI host spelling.
+        wire_target_ = {target.host, target.effective_port()};
         key_.target_secure = target.is_secure();
         key_.hops = snapshot_->hops;
         for (auto& hop : key_.hops)
@@ -172,10 +174,12 @@ public:
     const connection_key& key() const noexcept { return key_; }
     const route_snapshot& snapshot() const noexcept { return *snapshot_; }
     const route_endpoint& target() const noexcept { return key_.target; }
+    const route_endpoint& wire_target() const noexcept { return wire_target_; }
 
 private:
     std::shared_ptr<const route_snapshot> snapshot_;
     connection_key key_;
+    route_endpoint wire_target_;
 };
 
 } // namespace elio::http::detail

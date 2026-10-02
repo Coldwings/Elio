@@ -64,6 +64,7 @@ set(TEST_SOURCES
     unit/test_file_operations.cpp
     unit/test_batch_io.cpp
     unit/test_sync.cpp
+    unit/test_event_signal_allocation.cpp
     unit/test_intrusive_list.cpp
     unit/test_sync_cancellation.cpp
     unit/test_channel_debug.cpp

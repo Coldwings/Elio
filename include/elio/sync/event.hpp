@@ -13,6 +13,12 @@
 
 namespace elio::sync {
 
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+namespace detail {
+inline std::atomic<void (*)()> event_dispatch_storage_for_test{nullptr};
+}
+#endif
+
 /// Coroutine-aware event (manual reset)
 class event {
 public:
@@ -252,6 +258,12 @@ public:
                         continue;
                     }
                 }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                if (to_schedule.size() == to_schedule.capacity()) {
+                    if (auto hook = detail::event_dispatch_storage_for_test.load(std::memory_order_acquire))
+                        hook();
+                }
+#endif
                 to_schedule.push_back(waiter->wake_state_);
             }
         }
@@ -270,6 +282,13 @@ public:
     bool is_set() const noexcept {
         return signaled_.load(std::memory_order_acquire);
     }
+
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    size_t waiter_count_for_test() {
+        std::lock_guard guard(mutex_);
+        return waiters_.size();
+    }
+#endif
 
 private:
     std::mutex mutex_;

@@ -130,8 +130,10 @@ ASCII DNS names are case-folded. Parsed IPv4 and IPv6 literals are canonicalized
 IPv6 authorities retain brackets and effective ports. General route identity
 keeps IPv6 zone identifiers case-sensitive. Explicit proxy URI endpoints and
 targets accept RFC 3986 reg-names (including well-formed percent escapes) or
-IPv4/IPv6 literals; malformed escapes, backslashes and bracketed non-IP names
-are rejected before dialing. For the locally resolved proxy endpoint, escapes
+IPv4/IPv6 literals. Malformed escapes and backslashes are rejected before dialing.
+URI-string entry points and redirects additionally reject bracketed non-IP
+authorities. APIs taking `url` validate supplied components and cannot recover
+bracket provenance discarded by `url::parse`. For the locally resolved proxy endpoint, escapes
 must encode ASCII unreserved octets; they are decoded once before both hop-key
 publication and DNS. Encoded delimiters, nested escapes and non-ASCII octets are
 rejected during construction; use an IDNA ASCII label for an internationalized

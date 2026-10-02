@@ -416,7 +416,18 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
         if (auto hook = setup_watchdog_after_start_for_test.load(std::memory_order_acquire))
             co_await hook();
 #endif
-        if (watchdog->is_ready()) watchdog->await_resume();
+        if (watchdog->is_ready()) {
+            // Admission rejection is already destroyed, but an admitted timer
+            // may publish its result before its owning detached frame retires.
+            std::exception_ptr startup_failure;
+            try { watchdog->await_resume(); }
+            catch (...) { startup_failure = std::current_exception(); }
+            try { co_await watchdog->wait_destroyed_async(); }
+            catch (...) {
+                if (!startup_failure) startup_failure = std::current_exception();
+            }
+            if (startup_failure) std::rethrow_exception(startup_failure);
+        }
     }
 
     auto stopped_error = [&](client_stage stage) -> std::optional<client_error> {

@@ -11,8 +11,11 @@
 #include <atomic>
 #include <cstdio>
 #include <memory>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <unistd.h>
 
 namespace {
@@ -83,6 +86,14 @@ enum class expect_action {
 struct expect_observation {
     sync::event headers_received;
     sync::event body_received;
+    sync::event upload_timer_release;
+    sync::event failed_read_observed;
+    sync::event release_response;
+    bool blocked_upload = false;
+    bool positive_before_cancel = false;
+    std::atomic<int> client_fd{-1};
+    std::atomic<bool> upload_timer_started{false};
+    std::atomic<bool> positive_read{false};
     expect_action action = expect_action::fallback;
     coro::cancel_source* request_stop = nullptr;
     bool accepted = false;
@@ -97,6 +108,31 @@ struct expect_observation {
     int server_error = 0;
 };
 std::atomic<expect_observation*> expect_observed{nullptr};
+
+coro::task<coro::cancel_result> hold_upload_timer(std::chrono::nanoseconds,
+        coro::cancel_token token) {
+    auto& observed = *expect_observed.load();
+    observed.upload_timer_started.store(true, std::memory_order_release);
+    co_return co_await observed.upload_timer_release.wait(token);
+}
+
+void limit_upload_buffer(int fd) {
+    const int size = 4096;
+    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) != 0)
+        throw std::system_error(errno, std::generic_category(), "upload send buffer");
+    expect_observed.load()->client_fd.store(fd, std::memory_order_release);
+}
+
+coro::task<void> wait_for_failed_sibling_read(const std::optional<http::client_error>& result) {
+    if (result && result->code.value() == ETIMEDOUT)
+        co_await expect_observed.load()->failed_read_observed.wait();
+}
+
+void observe_response_transport(io::io_result result) {
+    auto& observed = *expect_observed.load();
+    if (result.result <= 0) observed.failed_read_observed.set();
+    else observed.positive_read.store(true, std::memory_order_release);
+}
 
 io::io_result fail_deferred_upload(std::string_view data) {
     if (data != "payload") throw std::logic_error("unexpected write after Expect headers");
@@ -120,6 +156,8 @@ coro::task<coro::cancel_result> expire_after_headers(std::chrono::nanoseconds re
     auto ready = co_await observed.headers_received.wait(stop);
     if (ready != coro::cancel_result::completed) co_return ready;
     observed.read_staged = http::detail::client_response_read_staged_for_test.load();
+    if (observed.blocked_upload)
+        http::detail::fd_watchdog_wait_for_test.store(hold_upload_timer);
     if (observed.action == expect_action::external_cancel) {
         observed.request_stop->cancel();
         co_return coro::cancel_result::cancelled;
@@ -137,6 +175,10 @@ struct expect_hooks {
     backend previous_backend;
     http::detail::response_watchdog_wait_hook previous_wait;
     http::detail::request_write_hook previous_write;
+    http::detail::fd_watchdog_wait_hook previous_fd_wait;
+    void(*previous_upload)(int);
+    http::detail::deferred_upload_result_hook previous_upload_result;
+    void(*previous_response_result)(io::io_result);
     bool previous_observer;
     bool previous_staged;
     expect_observation* previous_observation;
@@ -144,6 +186,10 @@ struct expect_hooks {
         : previous_backend(runtime::detail::worker_io_backend_for_test.exchange(selected))
         , previous_wait(http::detail::response_watchdog_wait_for_test.exchange(expire_after_headers))
         , previous_write(http::detail::request_write_result_for_test.exchange(nullptr))
+        , previous_fd_wait(http::detail::fd_watchdog_wait_for_test.exchange(nullptr))
+        , previous_upload(http::detail::deferred_upload_for_test.exchange(nullptr))
+        , previous_upload_result(http::detail::deferred_upload_result_for_test.exchange(nullptr))
+        , previous_response_result(http::detail::response_transport_result_for_test.exchange(nullptr))
         , previous_observer(http::detail::observe_client_response_read_entry_for_test.exchange(true))
         , previous_staged(http::detail::client_response_read_staged_for_test.exchange(false))
         , previous_observation(expect_observed.exchange(&observed)) {}
@@ -153,6 +199,10 @@ struct expect_hooks {
         http::detail::observe_client_response_read_entry_for_test.store(previous_observer);
         http::detail::response_watchdog_wait_for_test.store(previous_wait);
         http::detail::request_write_result_for_test.store(previous_write);
+        http::detail::fd_watchdog_wait_for_test.store(previous_fd_wait);
+        http::detail::deferred_upload_for_test.store(previous_upload);
+        http::detail::deferred_upload_result_for_test.store(previous_upload_result);
+        http::detail::response_transport_result_for_test.store(previous_response_result);
         runtime::detail::worker_io_backend_for_test.store(previous_backend);
     }
 };
@@ -183,7 +233,20 @@ coro::task<void> serve_no_continue(net::tcp_listener& listener, tls::tls_context
     }
     observed.saw_expect = parser.get_headers().get("Expect") == "100-continue";
     observed.early_body = !parser.body().empty();
+    if (observed.blocked_upload) {
+        const int size = 4096;
+        if (::setsockopt(peer->fd(), SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) != 0)
+            throw std::system_error(errno, std::generic_category(), "upload receive buffer");
+    }
     observed.headers_received.set();
+    if (observed.blocked_upload) {
+        if (observed.positive_before_cancel &&
+            co_await observed.release_response.wait(token) == coro::cancel_result::completed)
+            (void)co_await peer->write_exactly("HTTP/1.1 103 Early Hints\r\n\r\n", token);
+        sync::event stopped;
+        (void)co_await stopped.wait(token);
+        co_return;
+    }
     if (observed.action == expect_action::final_rejection) {
         (void)co_await peer->write_exactly(
             "HTTP/1.1 417 Expectation Failed\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno", token);
@@ -354,6 +417,127 @@ TEST_CASE("Expect client distinguishes upload expiry cancellation and failures",
         CHECK(error->code.value() == (action == expect_action::write_error ? ENOSPC
             : action == expect_action::external_cancel ? ECANCELED : ETIMEDOUT));
     }
+    CHECK(shutdown_result == coro::cancel_result::completed);
+    CHECK(owner->admission_counters_for_test().live == 0);
+}
+
+TEST_CASE("Blocked Expect uploads preserve timeout provenance and join cancellation",
+          "[http][client][expect-continue][backpressure][issue-1275]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto encrypted = GENERATE(false, true);
+    const auto workers = GENERATE(size_t{1}, size_t{2});
+    const auto outcome = GENERATE(0, 1, 2); // Deadline, cancellation, positive read then cancellation.
+    CAPTURE(selected, encrypted, workers, outcome);
+#if ELIO_HAS_IO_URING
+    if (selected == backend::io_uring && !io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
+#endif
+    expect_observation observed;
+    observed.blocked_upload = true;
+    observed.positive_before_cancel = outcome == 2;
+    expect_hooks hooks(selected, observed);
+    http::detail::deferred_upload_for_test.store(limit_upload_buffer);
+    http::detail::deferred_upload_result_for_test.store(wait_for_failed_sibling_read);
+    http::detail::response_transport_result_for_test.store(observe_response_transport);
+    auto listener = net::tcp_listener::bind(net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    tls::tls_context server_context(tls::tls_mode::server);
+    certificate_file ca;
+    if (encrypted) install_certificate(server_context, ca);
+    http::transport_config config;
+    config.limits = http::pool_limits{};
+    if (encrypted) config.configure_tls = [&](http::transport_tls_config& policy) {
+        if (!policy.load_verify_locations(ca.path.data()))
+            throw std::runtime_error("blocked Expect CA setup failed");
+    };
+    auto owner = std::make_shared<http::transport>(config);
+    http::client_config policy;
+    policy.read_timeout = std::chrono::seconds(30);
+    policy.expect_continue_timeout = std::chrono::seconds(10);
+    http::client client(owner, policy);
+    auto target = http::url::parse(std::string(encrypted ? "https" : "http") +
+        "://127.0.0.1:" + std::to_string(listener->local_address().port()) + "/");
+    REQUIRE(target);
+    http::request request(http::method::POST, "/");
+    request.set_body(std::string(4 * 1024 * 1024, 'u'));
+    request.set_expect_continue();
+    coro::cancel_source stop;
+    coro::cancel_source request_stop;
+    observed.request_stop = &request_stop;
+    std::optional<http::client_error> error;
+    std::exception_ptr failure;
+    runtime::scheduler scheduler(workers);
+    scheduler.start();
+    auto server = scheduler.go_joinable(serve_no_continue(
+        *listener, server_context, encrypted, observed, stop.get_token()));
+    auto requested = scheduler.go_joinable([&]() -> coro::task<void> {
+        try {
+            auto result = co_await client.send_result(request, *target, request_stop.get_token());
+            if (auto* failed = std::get_if<http::client_error>(&result)) error = *failed;
+        } catch (...) { failure = std::current_exception(); }
+    });
+    auto observe = [](auto predicate) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!predicate()) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::yield();
+        }
+        return true;
+    };
+    bool parked = false;
+    (void)observe([&] {
+        if (requested.is_ready()) return true;
+        const int fd = observed.client_fd.load(std::memory_order_acquire);
+        if (fd < 0 || !observed.upload_timer_started.load(std::memory_order_acquire)) return false;
+        pollfd readiness{fd, POLLOUT, 0};
+        if (::poll(&readiness, 1, 0) != 0) return false;
+        size_t pending = 0;
+        for (size_t index = 0; index < workers; ++index)
+            pending += scheduler.get_worker(index)->io_context().pending_count();
+        // No server I/O or timer is admitted here: these are the actual
+        // response read and lower output write on a non-writable socket.
+        parked = pending >= 2;
+        return parked;
+    });
+    bool positive = false;
+    if (parked && outcome == 2) {
+        observed.release_response.set();
+        positive = observe([&] { return observed.positive_read.load(std::memory_order_acquire); });
+    }
+    if (parked && outcome == 0) observed.upload_timer_release.set();
+    else request_stop.cancel();
+    const bool completed = observe([&] { return requested.is_ready(); });
+    if (!completed) {
+        // Release every test-owned barrier before awaiting normal teardown.
+        observed.failed_read_observed.set();
+        observed.upload_timer_release.set();
+        request_stop.cancel();
+    }
+    requested.wait_destroyed();
+    auto shutdown = scheduler.go_joinable(owner->shutdown());
+    shutdown.wait_destroyed();
+    stop.cancel();
+    server.wait_destroyed();
+    const auto stopped = scheduler.shutdown(std::chrono::seconds(10));
+    requested.await_resume();
+    const auto shutdown_result = shutdown.await_resume();
+    server.await_resume();
+    if (failure) std::rethrow_exception(failure);
+    REQUIRE(stopped);
+    CHECK(parked);
+    CHECK(completed);
+    if (outcome == 2) CHECK(positive);
+    CHECK(observed.accepted);
+    if (encrypted) CHECK(observed.handshake);
+    CHECK(observed.saw_expect);
+    CHECK_FALSE(observed.early_body);
+    CHECK_FALSE(observed.received_body);
+    REQUIRE(error);
+    CAPTURE(error->stage, error->code.value());
+    CHECK(error->code.value() == (outcome == 0 ? ETIMEDOUT : ECANCELED));
+    if (outcome == 0) CHECK(error->stage == http::client_stage::request);
     CHECK(shutdown_result == coro::cancel_result::completed);
     CHECK(owner->admission_counters_for_test().live == 0);
 }

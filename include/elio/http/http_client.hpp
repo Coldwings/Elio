@@ -69,6 +69,10 @@ inline std::atomic<response_deadline_hook> response_deadline_for_test{nullptr};
 using response_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
     std::chrono::nanoseconds, coro::cancel_token, client_stage);
 inline std::atomic<response_watchdog_wait_hook> response_watchdog_wait_for_test{nullptr};
+inline std::atomic<void(*)(int)> deferred_upload_for_test{nullptr};
+using deferred_upload_result_hook = coro::task<void> (*)(const std::optional<client_error>&);
+inline std::atomic<deferred_upload_result_hook> deferred_upload_result_for_test{nullptr};
+inline std::atomic<void(*)(io::io_result)> response_transport_result_for_test{nullptr};
 } // namespace detail
 #endif
 
@@ -1168,13 +1172,20 @@ private:
         coro::task<std::optional<client_error>> send_pending_body(
                 const coro::cancel_token& token) {
             if (!body_pending_) co_return std::nullopt;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::deferred_upload_for_test.load()) hook(conn_.fd());
+#endif
             body_pending_ = false;
             const auto remaining = response_deadline_ - std::chrono::steady_clock::now();
             if (deadline_enforced_ && remaining <= std::chrono::steady_clock::duration::zero()) {
                 co_return detail::make_client_error(ETIMEDOUT, client_stage::request);
             }
-            co_return co_await write_request_data(conn_, request_body_, target_,
+            auto result = co_await write_request_data(conn_, request_body_, target_,
                 deadline_enforced_ ? remaining : io_deadline_, deadline_enforced_, scheduler_, token);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::deferred_upload_result_for_test.load()) co_await hook(result);
+#endif
+            co_return result;
         }
 
         coro::task<io::io_result> receive_data(void* data, size_t size,
@@ -1285,6 +1296,9 @@ private:
                 catch (...) { if (!failure) failure = std::current_exception(); }
             }
             read_completed->store(true, std::memory_order_release);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::response_transport_result_for_test.load()) hook(result);
+#endif
             try {
                 watchdog_cancel.cancel();
             } catch (...) {

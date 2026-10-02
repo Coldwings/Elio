@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <elio/http/http_client.hpp>
+#include <elio/sync/event.hpp>
 
 #include <array>
 #include <atomic>
@@ -302,4 +303,92 @@ TEST_CASE("Settled TCP root moves retain the non-lingering close policy",
     CHECK(linger_disabled);
     CHECK(moved_empty);
     CHECK(observed.closed);
+}
+
+namespace {
+struct watchdog_observation {
+    elio::sync::event cancelled;
+    bool saw_cancellation = false;
+};
+std::atomic<watchdog_observation*> watchdog_observed{nullptr};
+
+task<elio::coro::cancel_result> fail_watchdog_cleanup(
+        std::chrono::steady_clock::time_point, elio::coro::cancel_token token) {
+    auto& observed = *watchdog_observed.load();
+    const auto result = co_await observed.cancelled.wait(token);
+    observed.saw_cancellation = result == elio::coro::cancel_result::cancelled;
+    throw std::runtime_error("watchdog cleanup failure");
+}
+
+struct watchdog_failure_hooks {
+    detail::setup_watchdog_wait_hook previous_wait;
+    watchdog_observation* previous_observation;
+    explicit watchdog_failure_hooks(watchdog_observation& observed)
+        : previous_wait(detail::setup_watchdog_wait_for_test.exchange(fail_watchdog_cleanup))
+        , previous_observation(watchdog_observed.exchange(&observed)) {}
+    ~watchdog_failure_hooks() {
+        watchdog_observed.store(previous_observation);
+        detail::setup_watchdog_wait_for_test.store(previous_wait);
+    }
+};
+} // namespace
+
+TEST_CASE("Connector preserves setup failure when watchdog cleanup also fails",
+          "[http][root-close][issue-1276][watchdog-precedence]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto phase = GENERATE(0, 1, 2);
+    CAPTURE(selected, phase);
+#if ELIO_HAS_IO_URING
+    if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
+#endif
+    close_observation observed;
+    close_hooks hooks(selected, observed);
+    setup_failure_hooks failure_hooks(phase == 0);
+    if (phase == 2) elio::net::detail::fail_root_linger_configuration_for_test.store(false);
+    watchdog_observation watchdog;
+    watchdog_failure_hooks timer_hooks(watchdog);
+    auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    transport_config config;
+    config.limits = pool_limits{};
+    auto owner = std::make_shared<transport>(config);
+    client_config policy;
+    policy.connect_timeout = std::chrono::hours(1);
+    client agent(owner, policy);
+    const auto target = "http://127.0.0.1:" + std::to_string(listener->local_address().port()) + "/";
+    bool expected_failure = false;
+    std::string cleanup_message;
+    std::exception_ptr unexpected;
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto requested = scheduler.go_joinable([&]() -> task<void> {
+        try {
+            (void)co_await agent.get_result(target);
+        } catch (const std::bad_alloc&) {
+            expected_failure = phase == 0;
+        } catch (const std::system_error& error) {
+            expected_failure = phase == 1 && error.code().value() == ENOMEM;
+        } catch (const std::runtime_error& error) {
+            cleanup_message = error.what();
+            expected_failure = phase == 2 && cleanup_message == "watchdog cleanup failure";
+        } catch (...) {
+            unexpected = std::current_exception();
+        }
+        observed.closed = ::fcntl(observed.fd, F_GETFD) < 0 && errno == EBADF;
+    });
+    requested.wait_destroyed();
+    const auto stopped = scheduler.shutdown(std::chrono::seconds(10));
+    requested.await_resume();
+    if (unexpected) std::rethrow_exception(unexpected);
+    REQUIRE(stopped);
+    CAPTURE(cleanup_message);
+    CHECK(expected_failure);
+    CHECK(watchdog.saw_cancellation);
+    CHECK(observed.fd >= 0);
+    CHECK(observed.closed);
+    CHECK(owner->active_operations_for_test() == 0);
+    CHECK(owner->admission_counters_for_test().live == 0);
 }

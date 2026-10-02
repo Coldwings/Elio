@@ -244,6 +244,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Connector setup watchdog failures**: construct the owning TCP/TLS deadline
+  frame before admission, observe rejected admission before starting setup, and
+  cooperatively cancel pending sibling I/O if timer evaluation throws. Normal
+  cleanup preserves the original exception without forcing frame destruction
+  (#1287).
+
 - **FD watchdog admission rejection**: observe an already-exceptional watchdog
   handle before invoking its sibling I/O factory, preventing accepted
   HTTP-family calls from starting unbounded I/O during scheduler drain (#1282).

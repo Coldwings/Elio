@@ -150,6 +150,9 @@ coro::task<io::io_result> await_fd_operation_with_watchdog(
     coro::cancel_source stop;
     auto watchdog = arm_fd_shutdown_watchdog(
         scheduler, fd, timeout, stop.get_token(), std::move(timed_out), std::move(abort));
+    // Rejected admission returns an exceptional ready handle, not a throw.
+    // Observe it before starting I/O that would otherwise have no watchdog.
+    if (watchdog.is_ready()) watchdog.await_resume();
     io::io_result result{};
     std::exception_ptr failure;
     try {

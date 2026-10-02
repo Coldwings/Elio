@@ -350,6 +350,31 @@ TEST_CASE("FD watchdog cleanup preserves successful and failed I/O results",
     require_socket_usable(sockets.descriptors[0], sockets.descriptors[1]);
 }
 
+TEST_CASE("Rejected FD watchdog admission does not invoke sibling I/O",
+          "[http][watchdog][exception][issue-1282]") {
+    socket_pair sockets;
+    auto timed_out = std::make_shared<std::atomic<bool>>(false);
+    bool invoked = false;
+    elio::runtime::scheduler rejecting_scheduler(1);
+    // An unstarted scheduler has the same initial-admission rejection as
+    // graceful drain. The factory is observable and needs no forced recovery.
+    auto guarded = elio::http::detail::await_fd_operation_with_watchdog(
+        [&] {
+            invoked = true;
+            return []() -> task<elio::io::io_result> {
+                co_return elio::io::io_result{1, 0};
+            }();
+        }, &rejecting_scheduler, sockets.descriptors[0], std::chrono::hours(1), timed_out);
+    auto handle = elio::coro::detail::task_access::handle(guarded);
+    handle.resume();
+    REQUIRE(handle.done());
+    CHECK_FALSE(invoked);
+    REQUIRE_THROWS_WITH(guarded.await_resume(),
+                        "scheduler rejected joinable task before execution");
+    CHECK_FALSE(timed_out->load(std::memory_order_acquire));
+    require_socket_usable(sockets.descriptors[0], sockets.descriptors[1]);
+}
+
 TEST_CASE("FD watchdog expiry still interrupts stalled I/O",
           "[http][watchdog][timeout]") {
     socket_pair sockets;

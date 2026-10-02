@@ -147,8 +147,13 @@ TEST_CASE("Event dispatch allocation failure preserves pending wakes",
     for (const auto& wake : retained) if (wake && wake->schedule_selected()) ++rescued;
     for (auto& wait : waits) wait->wait_destroyed();
     const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
+    if (retry_failure) {
+        for (auto& wait : waits) {
+            try { wait->await_resume(); } catch (...) {}
+        }
+        std::rethrow_exception(retry_failure);
+    }
     for (auto& wait : waits) wait->await_resume();
-    if (retry_failure) std::rethrow_exception(retry_failure);
     REQUIRE(drained);
     CHECK(published);
     CHECK(allocation_failed == (published && fail_call == 0));

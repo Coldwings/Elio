@@ -967,8 +967,18 @@ TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS o
         client agent(owner);
         output_observation output;
         output.hold_inactive = hold_inactive;
-        output_hooks hooks(output);
         observed_route observed;
+        authentication_hooks authentication_scope(observed);
+        output_hooks hooks(output);
+        struct {
+            bool paused_before_recovery = false;
+            bool call_completed_before_recovery = false;
+            bool call_ready_before_recovery = false;
+            bool result_ready_before_recovery = false;
+            bool observer_expired = false;
+            int64_t wait_milliseconds = 0;
+        } phase_snapshot;
+        std::atomic<bool> call_completed{false};
         elio::coro::cancel_source stop;
         elio::runtime::scheduler scheduler(workers);
         scheduler.start();
@@ -977,13 +987,63 @@ TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS o
             [&]() -> task<client_result<response>> {
             elio::coro::cancel_source call_stop;
             std::exception_ptr failure;
-            auto call = admit_connect_fixture([&] {
-                return agent.get_result("https://localhost/path", call_stop.get_token());
+            auto call = admit_connect_fixture([&]() -> task<client_result<response>> {
+                try {
+                    auto result = co_await agent.get_result(
+                        "https://localhost/path", call_stop.get_token());
+                    call_completed.store(true, std::memory_order_release);
+                    co_return result;
+                } catch (...) {
+                    call_completed.store(true, std::memory_order_release);
+                    throw;
+                }
             }, output, call_stop, failure);
             bool paused = false;
             try {
-                if (call)
-                    paused = co_await await_connect_fixture_phase(output, call_stop, failure);
+                if (call) {
+                    const auto started = std::chrono::steady_clock::now();
+                    elio::coro::cancel_source phase_stop;
+                    std::optional<elio::coro::join_handle<elio::coro::cancel_result>> phase;
+                    bool observed_pause = false;
+                    try {
+                        phase.emplace(elio::runtime::scheduler::current()->go_joinable(
+                            observe_connect_phase(output.paused, phase_stop.get_token())));
+                        observed_pause = co_await phase->wait_until(
+                            started + std::chrono::seconds(10)) ==
+                            elio::coro::join_wait_outcome::completed;
+                    } catch (...) {
+                        if (!failure) failure = std::current_exception();
+                    }
+                    const auto observed_at = std::chrono::steady_clock::now();
+                    phase_snapshot.paused_before_recovery = output.paused.is_set();
+                    phase_snapshot.call_completed_before_recovery =
+                        call_completed.load(std::memory_order_acquire);
+                    phase_snapshot.call_ready_before_recovery = call->is_ready();
+                    phase_snapshot.observer_expired = !observed_pause;
+                    phase_snapshot.wait_milliseconds =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            observed_at - started).count();
+                    paused = phase_snapshot.paused_before_recovery;
+                    try { phase_stop.cancel(); }
+                    catch (...) { if (!failure) failure = std::current_exception(); }
+                    if (phase) {
+                        try {
+                            auto& joined = *phase;
+                            (void)co_await joined;
+                        } catch (...) { if (!failure) failure = std::current_exception(); }
+                        try { co_await phase->wait_destroyed_async(); }
+                        catch (...) { if (!failure) failure = std::current_exception(); }
+                    }
+                    if (paused && !failure) {
+                        phase_snapshot.result_ready_before_recovery =
+                            co_await call->wait_until(std::chrono::steady_clock::now() +
+                                std::chrono::seconds(10)) ==
+                            elio::coro::join_wait_outcome::completed;
+                    } else phase_snapshot.result_ready_before_recovery =
+                        phase_snapshot.call_ready_before_recovery;
+                    if (!paused || !phase_snapshot.result_ready_before_recovery || failure)
+                        settle_connect_fixture(output, call_stop, failure, true);
+                }
             } catch (...) {
                 if (!failure) failure = std::current_exception();
                 settle_connect_fixture(output, call_stop, failure, true);
@@ -1002,7 +1062,6 @@ TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS o
                     settle_connect_fixture(output, call_stop, failure, true);
                 }
             }
-            if (!failure) CHECK(paused);
             if (paused && !failure) {
                 CHECK(owner->active_operations_for_test() == 1);
                 if (finite) {
@@ -1060,6 +1119,26 @@ TEST_CASE("Completed CONNECT responses do not settle shutdown before owned TLS o
         scheduler.shutdown();
         auto result = controlled.await_resume();
         server.await_resume();
+        const auto* error = std::get_if<client_error>(&result);
+        const int error_code = error ? error->code.value() : 0;
+        const int error_stage = error ? static_cast<int>(error->stage) : -1;
+        CAPTURE(phase_snapshot.paused_before_recovery,
+                phase_snapshot.call_completed_before_recovery,
+                phase_snapshot.call_ready_before_recovery,
+                phase_snapshot.result_ready_before_recovery,
+                phase_snapshot.observer_expired, phase_snapshot.wait_milliseconds,
+                error_code, error_stage, output.paused.is_set(), output.release.is_set(),
+                output.held.load(std::memory_order_acquire), output.handshake_bytes,
+                observed.accepted, observed.accept_error, observed.connect_read.bytes,
+                observed.connect_read.terminal_error, observed.connect_read.complete,
+                observed.handshake, observed.server_handshake_error,
+                observed.client_handshake_failures, observed.client_handshake_error,
+                observed.client_verification, observed.client_connect_writing,
+                observed.client_connect_written, observed.client_connect_reading,
+                observed.client_connect_received, observed.client_connect_error,
+                observed.client_setup_deadline.has_value());
+        CHECK(phase_snapshot.paused_before_recovery);
+        CHECK(phase_snapshot.result_ready_before_recovery);
         REQUIRE(std::holds_alternative<response>(result));
         REQUIRE(std::get<response>(result).body() == "ok");
         REQUIRE(observed.accepted == 1);

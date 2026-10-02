@@ -229,6 +229,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TLS duplex abort cleanup**: reserve allocation-free terminal output
+  settlement for the permitted reader, writer and concurrent abort, rather than
+  terminating when the third operation waits for the owning pump (#1279).
+
 - **HTTP Transport TCP retirement**: private root sockets retain their immediate,
   non-lingering local close policy across moves and setup exceptions. Plain HTTP
   active discard, idle clearing and shutdown now close the descriptor before

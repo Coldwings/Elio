@@ -4,10 +4,15 @@
 #include <elio/http/detail/owned_prefix_stream.hpp>
 #include <elio/runtime/scheduler.hpp>
 #include <elio/sync/event.hpp>
+#include <elio/time/timer.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstring>
+#include <exception>
 #include <limits>
+#include <optional>
+#include <stdexcept>
 #include <string>
 
 using namespace elio::http;
@@ -210,14 +215,37 @@ TEST_CASE("CONNECT negotiation cancellation settles pending request writes and r
     scheduler.start();
     auto operation = scheduler.go_joinable([&]() -> task<void> {
         elio::coro::cancel_source stop;
-        auto negotiating = scheduler.go_joinable([&]() {
-            return detail::negotiate_connect(stream, target, *proxy, stop.get_token());
-        });
-        co_await stream.entered.wait();
+        std::optional<elio::coro::join_handle<client_result<std::vector<char>>>> negotiating;
+        std::exception_ptr failure;
+        bool entered = false;
+        try {
+            negotiating.emplace(scheduler.go_joinable(
+                detail::negotiate_connect(stream, target, *proxy, stop.get_token())));
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(5);
+            while (!stream.entered.is_set() && !negotiating->is_ready() &&
+                   std::chrono::steady_clock::now() < deadline) {
+                co_await elio::time::yield();
+            }
+            entered = stream.entered.is_set();
+            if (!entered && !negotiating->is_ready())
+                throw std::runtime_error("CONNECT negotiation did not reach its pause marker");
+        } catch (...) {
+            failure = std::current_exception();
+        }
         stop.cancel();
-        auto result = co_await negotiating;
-        co_await negotiating.wait_destroyed_async();
-        check_error(result, ECANCELED);
+        std::optional<client_result<std::vector<char>>> result;
+        if (negotiating) {
+            auto& joined = *negotiating;
+            try { result.emplace(co_await joined); }
+            catch (...) { if (!failure) failure = std::current_exception(); }
+            try { co_await negotiating->wait_destroyed_async(); }
+            catch (...) { if (!failure) failure = std::current_exception(); }
+        }
+        if (failure) std::rethrow_exception(failure);
+        REQUIRE(entered);
+        REQUIRE(result);
+        check_error(*result, ECANCELED);
     });
     operation.wait_destroyed();
     scheduler.shutdown();

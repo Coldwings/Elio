@@ -3,12 +3,17 @@
 #include <elio/http/detail/owned_prefix_stream.hpp>
 #include <elio/http/detail/route_connection.hpp>
 #include <elio/sync/event.hpp>
+#include <elio/time/timer.hpp>
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -172,22 +177,65 @@ TEST_CASE("CONNECT channel abort settles overlapping sides even when lower abort
         scheduler.start();
         auto operation = scheduler.go_joinable([&]() -> task<void> {
             std::array<char, 4> bytes{};
-            auto reader = scheduler.go_joinable([&]() -> task<elio::io::io_result> {
+            auto read_start = [&]() -> task<elio::io::io_result> {
                 co_return co_await stream.read(bytes.data(), bytes.size(), {});
-            });
-            auto writer = scheduler.go_joinable([&]() -> task<elio::io::io_result> {
+            };
+            auto write_start = [&]() -> task<elio::io::io_result> {
                 co_return co_await stream.write("data", 4, {});
-            });
-            co_await observed->read_entered.wait();
-            co_await observed->write_entered.wait();
+            };
+            std::optional<elio::coro::join_handle<elio::io::io_result>> reader;
+            std::optional<elio::coro::join_handle<elio::io::io_result>> writer;
+            std::exception_ptr failure;
+            try {
+                reader.emplace(scheduler.go_joinable(std::move(read_start)));
+                writer.emplace(scheduler.go_joinable(std::move(write_start)));
+                const auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::seconds(5);
+                while ((!observed->read_entered.is_set() ||
+                        !observed->write_entered.is_set()) &&
+                       !reader->is_ready() && !writer->is_ready() &&
+                       std::chrono::steady_clock::now() < deadline) {
+                    co_await elio::time::yield();
+                }
+                if (!observed->read_entered.is_set() ||
+                    !observed->write_entered.is_set()) {
+                    throw std::runtime_error(
+                        "CONNECT channel side completed before its pause marker");
+                }
+            } catch (...) {
+                failure = std::current_exception();
+            }
+
+            // Seal first so recovery does not depend on constructing the
+            // allocation-owning abort task after either side was admitted.
+            stream.shutdown_socket();
             bool caught = false;
             try { co_await stream.abort_and_settle(); }
             catch (const std::runtime_error&) { caught = true; }
+            catch (...) { if (!failure) failure = std::current_exception(); }
+
+            std::optional<elio::io::io_result> read_result;
+            std::optional<elio::io::io_result> write_result;
+            if (reader) {
+                auto& joined = *reader;
+                try { read_result.emplace(co_await joined); }
+                catch (...) { if (!failure) failure = std::current_exception(); }
+                try { co_await reader->wait_destroyed_async(); }
+                catch (...) { if (!failure) failure = std::current_exception(); }
+            }
+            if (writer) {
+                auto& joined = *writer;
+                try { write_result.emplace(co_await joined); }
+                catch (...) { if (!failure) failure = std::current_exception(); }
+                try { co_await writer->wait_destroyed_async(); }
+                catch (...) { if (!failure) failure = std::current_exception(); }
+            }
+            if (failure) std::rethrow_exception(failure);
             REQUIRE(caught == throw_abort);
-            REQUIRE((co_await reader).result == -ECANCELED);
-            REQUIRE((co_await writer).result == -ECANCELED);
-            co_await reader.wait_destroyed_async();
-            co_await writer.wait_destroyed_async();
+            REQUIRE(read_result);
+            REQUIRE(write_result);
+            REQUIRE(read_result->result == -ECANCELED);
+            REQUIRE(write_result->result == -ECANCELED);
             REQUIRE(observed->sealed.load());
             REQUIRE(observed->aborts == 1);
             REQUIRE((co_await stream.read(bytes.data(), bytes.size(), {})).result == -ECANCELED);

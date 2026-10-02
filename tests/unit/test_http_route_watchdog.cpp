@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
+#include <elio/coro/detail/completion_waiter.hpp>
 #include <elio/http/detail/route_operation.hpp>
 #include <elio/net/tcp.hpp>
 #include <elio/sync/event.hpp>
@@ -36,6 +37,35 @@ struct socket_pair {
     socket_pair& operator=(const socket_pair&) = delete;
 };
 
+class watchdog_phase {
+    class awaiter {
+    public:
+        explicit awaiter(watchdog_phase& phase) noexcept
+            : phase_(phase), waiter_(phase.slot_) {}
+        bool await_ready() const noexcept {
+            return phase_.released_.load(std::memory_order_acquire);
+        }
+        bool await_suspend(std::coroutine_handle<> handle) noexcept {
+            return phase_.slot_.register_waiter(waiter_, handle,
+                [this] { return await_ready(); });
+        }
+        void await_resume() const noexcept {}
+    private:
+        watchdog_phase& phase_;
+        elio::coro::detail::completion_waiter waiter_;
+    };
+public:
+    auto wait() noexcept { return awaiter(*this); }
+    void set() noexcept {
+        released_.store(true, std::memory_order_release);
+        auto wake = slot_.take();
+        if (auto handle = wake.claim()) elio::runtime::schedule_handle(handle);
+    }
+private:
+    std::atomic<bool> released_{false};
+    elio::coro::detail::completion_waiter_slot slot_;
+};
+
 struct route_probe {
     std::atomic<bool> entered{false};
     std::atomic<bool> invoked{false};
@@ -43,7 +73,7 @@ struct route_probe {
     std::atomic<bool> recovered{false};
     std::exception_ptr failure;
     elio::coro::cancel_source recovery;
-    elio::sync::event admission_closed;
+    watchdog_phase admission_closed;
     std::array<char, 1> storage{};
 };
 
@@ -158,22 +188,44 @@ TEST_CASE("Accepted layered routes observe rejected watchdogs during graceful dr
     auto operation = scheduler.go_joinable(exercise_route(stream, probe, true));
     const bool entered = observe([&] { return probe.entered.load(std::memory_order_acquire); });
     bool drained = false;
+    bool closed = false;
+    bool completed = false;
+    std::exception_ptr fixture_failure;
+    std::exception_ptr shutdown_failure;
+    std::thread shutdown;
     // Observe actual admission closure from outside the scheduler. A polling
     // coroutine on one worker could starve the accepted route's continuation.
-    std::thread shutdown([&] { drained = scheduler.shutdown(elio::test::scaled_ms(5000)); });
-    const bool closed = observe([] {
-        return elio::runtime::detail::graceful_admission_closed_for_test.load(
-            std::memory_order_acquire);
-    });
-    probe.admission_closed.set();
-    const bool completed = observe([&] { return probe.done.load(std::memory_order_acquire); });
+    try {
+        shutdown = std::thread([&] {
+            try { drained = scheduler.shutdown(elio::test::scaled_ms(5000)); }
+            catch (...) { shutdown_failure = std::current_exception(); }
+        });
+        closed = observe([] {
+            return elio::runtime::detail::graceful_admission_closed_for_test.load(
+                std::memory_order_acquire);
+        });
+        probe.admission_closed.set();
+        completed = observe([&] { return probe.done.load(std::memory_order_acquire); });
+    } catch (...) {
+        fixture_failure = std::current_exception();
+        probe.admission_closed.set();
+        try { probe.recovery.cancel(); } catch (...) {}
+    }
     if (!completed) {
         probe.recovered.store(true, std::memory_order_release);
-        probe.recovery.cancel();
+        try { probe.recovery.cancel(); }
+        catch (...) { if (!fixture_failure) fixture_failure = std::current_exception(); }
     }
-    shutdown.join();
+    if (shutdown.joinable()) shutdown.join();
+    else {
+        try { drained = scheduler.shutdown(elio::test::scaled_ms(5000)); }
+        catch (...) { if (!shutdown_failure) shutdown_failure = std::current_exception(); }
+    }
     operation.wait_destroyed();
-    operation.await_resume();
+    try { operation.await_resume(); }
+    catch (...) { if (!fixture_failure) fixture_failure = std::current_exception(); }
+    if (!fixture_failure && shutdown_failure) fixture_failure = shutdown_failure;
+    if (fixture_failure) std::rethrow_exception(fixture_failure);
     REQUIRE(entered);
     REQUIRE(closed);
     REQUIRE(drained);

@@ -80,12 +80,13 @@ coro::task<route_operation_result<Result>> await_route_operation(Operation opera
     auto expired = std::make_shared<std::atomic<bool>>(false);
     auto forward = token.on_cancel([stop] { stop->cancel(); });
     coro::cancel_source timer_stop;
-    auto watchdog = scheduler->go_joinable(
-        [deadline = *deadline, stop, expired,
-         timer_token = timer_stop.get_token()]() -> coro::task<void> {
-            return make_route_watchdog(deadline, std::move(stop), std::move(expired),
-                                        std::move(timer_token));
-        });
+    // Construct the owning timer frame before admission or sibling I/O. A lazy
+    // scheduler factory can fail outside the timer body's cancellation catch.
+    auto watchdog = scheduler->go_joinable(make_route_watchdog(
+        *deadline, stop, expired, timer_stop.get_token()));
+    // Rejected independent admission returns an exceptional ready handle.
+    // Accepted request continuations must not start unprotected I/O in drain.
+    if (watchdog.is_ready()) watchdog.await_resume();
     std::optional<Result> value;
     std::exception_ptr failure;
     bool completed_late = false;

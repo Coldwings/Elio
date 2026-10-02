@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <elio/http/client_base.hpp>
+#include <elio/runtime/affinity.hpp>
 #include <elio/sync/event.hpp>
 #include "../test_main.cpp"
 
@@ -66,22 +67,26 @@ void observe_destruction_wait() {
 
 task<elio::coro::cancel_result> fail_ready_timer(
         std::chrono::steady_clock::time_point, elio::coro::cancel_token) {
+    co_await elio::runtime::set_affinity(1);
+    elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(true);
     observed.load(std::memory_order_acquire)->timer_failed.store(true, std::memory_order_release);
     throw std::runtime_error("ready setup timer failed");
     co_return elio::coro::cancel_result::completed;
 }
 
 struct ready_guard {
+    setup_probe& probe;
     task<void> (*previous_start)();
     void (*previous_connect)();
     void (*previous_observer)();
-    ready_guard()
-        : previous_start(elio::http::detail::setup_watchdog_after_start_for_test.exchange(pause_before_timer))
+    explicit ready_guard(setup_probe& observed_probe)
+        : probe(observed_probe)
+        , previous_start(elio::http::detail::setup_watchdog_after_start_for_test.exchange(pause_before_timer))
         , previous_connect(elio::http::detail::setup_connect_entered_for_test.exchange(observe_connect_entry))
         , previous_observer(elio::coro::detail::join_destroyed_observer_setup_for_test.exchange(
               observe_destruction_wait)) {
         elio::coro::detail::detached_frame_destroy_paused_for_test.store(false);
-        elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(true);
+        elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(false);
     }
     static void release() noexcept {
         elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(false);
@@ -89,6 +94,7 @@ struct ready_guard {
     }
     ~ready_guard() {
         release();
+        try { probe.recovery.cancel(); } catch (...) {}
         elio::coro::detail::join_destroyed_observer_setup_for_test.store(previous_observer);
         elio::http::detail::setup_connect_entered_for_test.store(previous_connect);
         elio::http::detail::setup_watchdog_after_start_for_test.store(previous_start);
@@ -280,7 +286,8 @@ TEST_CASE("Connector joins an already-ready admitted watchdog before rethrowing"
           "[http][setup][watchdog][setup-ready-destruction][issue-1287]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto secure = GENERATE(false, true);
-    CAPTURE(static_cast<int>(selected), secure);
+    const auto controller_failure = GENERATE(false, true);
+    CAPTURE(static_cast<int>(selected), secure, controller_failure);
 #if ELIO_HAS_IO_URING
     if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
         SKIP("io_uring unavailable on this host");
@@ -292,23 +299,34 @@ TEST_CASE("Connector joins an already-ready admitted watchdog before rethrowing"
     setup_probe probe;
     timer_guard timer(probe);
     elio::http::detail::setup_watchdog_wait_for_test.store(fail_ready_timer);
-    ready_guard ready;
     // One worker holds the actual detached-frame test barrier while the other
     // observes the connector. No scheduling delay is used to create the race.
     elio::runtime::scheduler scheduler(2);
+    ready_guard ready(probe);
     scheduler.start();
-    auto operation = scheduler.go_joinable(exercise_setup(9, context, probe, secure));
-    const bool timer_ready = observe([] {
-        return elio::coro::detail::detached_frame_destroy_paused_for_test.load(std::memory_order_acquire);
-    });
-    probe.release_start.set();
-    const bool connector_observed = observe([&] {
-        return probe.done.load(std::memory_order_acquire) ||
-               probe.destruction_observed.load(std::memory_order_acquire);
-    });
-    const bool completed_before_destroy = probe.done.load(std::memory_order_acquire);
-    const bool destruction_observed = probe.destruction_observed.load(std::memory_order_acquire);
+    auto operation = scheduler.go_joinable_to(0, exercise_setup(9, context, probe, secure));
+    bool timer_ready = false;
+    bool connector_observed = false;
+    bool completed_before_destroy = false;
+    bool destruction_observed = false;
+    std::exception_ptr control_failure;
+    try {
+        timer_ready = observe([&] {
+            return probe.timer_failed.load(std::memory_order_acquire) &&
+                   probe.before_start.load(std::memory_order_acquire) &&
+                   elio::coro::detail::detached_frame_destroy_paused_for_test.load(std::memory_order_acquire);
+        });
+        if (controller_failure) throw std::runtime_error("ready fixture controller failed");
+        probe.release_start.set();
+        connector_observed = observe([&] {
+            return probe.done.load(std::memory_order_acquire) ||
+                   probe.destruction_observed.load(std::memory_order_acquire);
+        });
+        completed_before_destroy = probe.done.load(std::memory_order_acquire);
+        destruction_observed = probe.destruction_observed.load(std::memory_order_acquire);
+    } catch (...) { control_failure = std::current_exception(); }
     ready.release();
+    if (control_failure) probe.recovery.cancel();
     const bool completed = observe([&] { return probe.done.load(std::memory_order_acquire); });
     probe.recovery.cancel();
     operation.wait_destroyed();
@@ -316,9 +334,18 @@ TEST_CASE("Connector joins an already-ready admitted watchdog before rethrowing"
     operation.await_resume();
     REQUIRE(drained);
     CHECK(timer_ready);
-    CHECK(connector_observed);
-    CHECK_FALSE(completed_before_destroy);
-    CHECK(destruction_observed);
+    if (controller_failure) {
+        REQUIRE(control_failure);
+        try { std::rethrow_exception(control_failure); }
+        catch (const std::runtime_error& error) {
+            CHECK(std::string_view(error.what()) == "ready fixture controller failed");
+        }
+    } else {
+        if (control_failure) std::rethrow_exception(control_failure);
+        CHECK(connector_observed);
+        CHECK_FALSE(completed_before_destroy);
+        CHECK(destruction_observed);
+    }
     CHECK(completed);
     CHECK_FALSE(probe.connect_entered.load(std::memory_order_acquire));
     REQUIRE(probe.failure);

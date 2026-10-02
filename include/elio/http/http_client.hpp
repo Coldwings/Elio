@@ -1275,9 +1275,11 @@ private:
                 detail::response_read_stage_for_test.store(
                     response_read_stage(reader_.decoder()), std::memory_order_release);
             }
-            detail::arm_client_response_read_observer_for_test();
 #endif
             if (!deadline_enforced_ && !waiting_expect) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                detail::arm_client_response_read_observer_for_test();
+#endif
                 co_return co_await conn_.read(data, size, token);
             }
             const bool expect_first = waiting_expect &&
@@ -1300,10 +1302,25 @@ private:
                     return response_watchdog_task(deadline, expect_first, expired,
                         read_cancel, read_completed, read_failed, stage, stop);
                 };
-            auto watchdog = scheduler_->go_joinable(std::move(make_watchdog));
+            // Construct the owning coroutine frame before admission and before
+            // any read can suspend: a lazy callable can allocate too late.
+            auto watchdog = scheduler_->go_joinable(make_watchdog());
             io::io_result result{};
             std::exception_ptr failure;
+            if (watchdog.is_ready()) {
+                try { watchdog.await_resume(); }
+                catch (...) { failure = std::current_exception(); }
+                if (failure) {
+                    // An admitted task can publish its exception before its
+                    // frame is destroyed. Keep this exchange alive through it.
+                    try { co_await watchdog.wait_destroyed_async(); } catch (...) {}
+                    std::rethrow_exception(failure);
+                }
+            }
             try {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                detail::arm_client_response_read_observer_for_test();
+#endif
                 result = co_await conn_.read(data, size, read_cancel->get_token());
             } catch (...) {
                 failure = std::current_exception();

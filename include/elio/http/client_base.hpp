@@ -55,6 +55,7 @@ using setup_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
 inline std::atomic<setup_watchdog_wait_hook> setup_watchdog_wait_for_test{nullptr};
 inline std::atomic<void (*)()> setup_watchdog_before_construct_for_test{nullptr};
 inline std::atomic<coro::task<void> (*)()> setup_watchdog_before_start_for_test{nullptr};
+inline std::atomic<coro::task<void> (*)()> setup_watchdog_after_start_for_test{nullptr};
 inline std::atomic<void (*)()> setup_connect_entered_for_test{nullptr};
 inline std::atomic<void(*)()> tls_setup_entered_for_test{nullptr};
 
@@ -411,6 +412,10 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
         // observe rejection before starting any TCP/TLS sibling work.
         watchdog.emplace(sched->go_joinable(make_setup_watchdog(
             *setup_deadline, timer_cancel_src, op_cancel_src, timed_out)));
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = setup_watchdog_after_start_for_test.load(std::memory_order_acquire))
+            co_await hook();
+#endif
         if (watchdog->is_ready()) watchdog->await_resume();
     }
 

@@ -34,6 +34,7 @@ struct setup_probe {
     std::atomic<bool> construction_failed{false};
     std::atomic<bool> tls_entered{false};
     std::atomic<bool> connect_entered{false};
+    std::atomic<bool> destruction_observed{false};
     bool recovered = false;
     std::exception_ptr failure;
 };
@@ -58,6 +59,42 @@ void observe_tls_entry() {
 void observe_connect_entry() {
     observed.load(std::memory_order_acquire)->connect_entered.store(true, std::memory_order_release);
 }
+
+void observe_destruction_wait() {
+    observed.load(std::memory_order_acquire)->destruction_observed.store(true, std::memory_order_release);
+}
+
+task<elio::coro::cancel_result> fail_ready_timer(
+        std::chrono::steady_clock::time_point, elio::coro::cancel_token) {
+    observed.load(std::memory_order_acquire)->timer_failed.store(true, std::memory_order_release);
+    throw std::runtime_error("ready setup timer failed");
+    co_return elio::coro::cancel_result::completed;
+}
+
+struct ready_guard {
+    task<void> (*previous_start)();
+    void (*previous_connect)();
+    void (*previous_observer)();
+    ready_guard()
+        : previous_start(elio::http::detail::setup_watchdog_after_start_for_test.exchange(pause_before_timer))
+        , previous_connect(elio::http::detail::setup_connect_entered_for_test.exchange(observe_connect_entry))
+        , previous_observer(elio::coro::detail::join_destroyed_observer_setup_for_test.exchange(
+              observe_destruction_wait)) {
+        elio::coro::detail::detached_frame_destroy_paused_for_test.store(false);
+        elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(true);
+    }
+    static void release() noexcept {
+        elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(false);
+        elio::coro::detail::pause_before_detached_frame_destroy_for_test.notify_all();
+    }
+    ~ready_guard() {
+        release();
+        elio::coro::detail::join_destroyed_observer_setup_for_test.store(previous_observer);
+        elio::http::detail::setup_connect_entered_for_test.store(previous_connect);
+        elio::http::detail::setup_watchdog_after_start_for_test.store(previous_start);
+        elio::coro::detail::detached_frame_destroy_paused_for_test.store(false);
+    }
+};
 
 struct startup_guard {
     void (*previous_construction)();
@@ -237,4 +274,54 @@ TEST_CASE("Connector observes unconstructible or rejected timers before TLS setu
     if (during_drain) CHECK_THROWS_AS(std::rethrow_exception(probe.failure), std::logic_error);
     else CHECK_THROWS_AS(std::rethrow_exception(probe.failure), std::bad_alloc);
     // Construction injection is a pre-frame surrogate, not native exhaustion.
+}
+
+TEST_CASE("Connector joins an already-ready admitted watchdog before rethrowing",
+          "[http][setup][watchdog][setup-ready-destruction][issue-1287]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto secure = GENERATE(false, true);
+    CAPTURE(static_cast<int>(selected), secure);
+#if ELIO_HAS_IO_URING
+    if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
+#endif
+    backend_guard backend_scope(selected);
+    elio::tls::tls_context context(elio::tls::tls_mode::client);
+    setup_probe probe;
+    timer_guard timer(probe);
+    elio::http::detail::setup_watchdog_wait_for_test.store(fail_ready_timer);
+    ready_guard ready;
+    // One worker holds the actual detached-frame test barrier while the other
+    // observes the connector. No scheduling delay is used to create the race.
+    elio::runtime::scheduler scheduler(2);
+    scheduler.start();
+    auto operation = scheduler.go_joinable(exercise_setup(9, context, probe, secure));
+    const bool timer_ready = observe([] {
+        return elio::coro::detail::detached_frame_destroy_paused_for_test.load(std::memory_order_acquire);
+    });
+    probe.release_start.set();
+    const bool connector_observed = observe([&] {
+        return probe.done.load(std::memory_order_acquire) ||
+               probe.destruction_observed.load(std::memory_order_acquire);
+    });
+    const bool completed_before_destroy = probe.done.load(std::memory_order_acquire);
+    const bool destruction_observed = probe.destruction_observed.load(std::memory_order_acquire);
+    ready.release();
+    const bool completed = observe([&] { return probe.done.load(std::memory_order_acquire); });
+    probe.recovery.cancel();
+    operation.wait_destroyed();
+    const bool drained = scheduler.shutdown(elio::test::scaled_ms(5000));
+    operation.await_resume();
+    REQUIRE(drained);
+    CHECK(timer_ready);
+    CHECK(connector_observed);
+    CHECK_FALSE(completed_before_destroy);
+    CHECK(destruction_observed);
+    CHECK(completed);
+    CHECK_FALSE(probe.connect_entered.load(std::memory_order_acquire));
+    REQUIRE(probe.failure);
+    try { std::rethrow_exception(probe.failure); }
+    catch (const std::runtime_error& error) { CHECK(std::string_view(error.what()) == "ready setup timer failed"); }
 }

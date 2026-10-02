@@ -497,6 +497,9 @@ TEST_CASE("Expect client distinguishes upload expiry cancellation and failures",
     if (unexpected) std::rethrow_exception(unexpected);
     REQUIRE(stopped);
     CAPTURE(observed.server_error);
+    CAPTURE(error ? static_cast<int>(error->stage) : -1,
+            error ? error->code.value() : 0, observed.timer_calls,
+            http::detail::client_response_read_staged_for_test.load());
     CHECK(observed.accepted);
     if (encrypted) CHECK(observed.handshake);
     CHECK(observed.saw_expect);

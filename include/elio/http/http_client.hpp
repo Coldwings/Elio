@@ -692,10 +692,6 @@ public:
         return detail::route_plan(target, state_->snapshot);
     }
     std::weak_ptr<void> state_owner_for_test() const { return state_; }
-    size_t active_operations_for_test() const {
-        std::lock_guard lock(state_->mutex);
-        return state_->active_operations;
-    }
     using connection_lease_for_test = connection_lease;
     auto admission_counters_for_test() const {
         return state_->admission->counters_for_test();

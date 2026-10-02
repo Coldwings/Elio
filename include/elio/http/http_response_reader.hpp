@@ -31,8 +31,8 @@ struct response_read_result {
 /// reader operations; keep borrowed views only until the next operation.
 /// Reading interims is explicit: observe completion, then next_response().
 /// The reader never pools, closes, or retries a connection on the caller's
-/// behalf. Transport errors preserve decoder state (e.g. an Expect wait may
-/// cancel only its pending read); the transport contract determines whether a
+/// behalf. Transport errors preserve decoder state, not transport health;
+/// the transport contract determines whether a
 /// subsequent read is valid. Framing errors are terminal until reset.
 class response_reader {
 public:

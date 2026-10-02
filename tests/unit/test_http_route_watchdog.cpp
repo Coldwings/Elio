@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <elio/http/detail/route_operation.hpp>
 #include <elio/net/tcp.hpp>
 #include "../test_main.cpp"
@@ -60,7 +61,7 @@ task<void> exercise_route(elio::net::tcp_stream& stream, route_probe& probe,
     if (during_drain) {
         while (!elio::runtime::detail::graceful_admission_closed_for_test.load(
                    std::memory_order_acquire))
-            co_await elio::coro::yield();
+            co_await elio::time::yield();
     }
     try {
         (void)co_await elio::http::detail::await_route_operation<elio::io::io_result>(
@@ -80,7 +81,7 @@ task<void> exercise_route(elio::net::tcp_stream& stream, route_probe& probe,
 task<void> recover_accepted_route(route_probe& probe) {
     while (!elio::runtime::detail::graceful_admission_closed_for_test.load(
                std::memory_order_acquire))
-        co_await elio::coro::yield();
+        co_await elio::time::yield();
     const auto deadline = std::chrono::steady_clock::now() + elio::test::scaled_ms(2000);
     while (!probe.done.load(std::memory_order_acquire)) {
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -88,7 +89,7 @@ task<void> recover_accepted_route(route_probe& probe) {
             probe.recovery.cancel();
             break;
         }
-        co_await elio::coro::yield();
+        co_await elio::time::yield();
     }
 }
 

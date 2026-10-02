@@ -833,10 +833,10 @@ private:
             plan.key().target_dns != detail::route_dns_mode::local)
             co_return detail::make_client_error(ENOTSUP, client_stage::acquire);
         const auto& snapshot = plan.snapshot();
-        auto result = co_await client_connect_result(plan.target().host, plan.target().port,
+        auto result = co_await detail::client_connect_result_impl(plan.target().host, plan.target().port,
             plan.key().target_secure, snapshot.origin_tls.get(), snapshot.resolve_options,
             snapshot.rotate_resolved_addresses, timeout, token,
-            snapshot.dns_timeout, snapshot.dns_domain, deadline);
+            snapshot.dns_timeout, snapshot.dns_domain, deadline, true);
         if (const auto* error = std::get_if<client_error>(&result)) co_return *error;
         co_return detail::route_connection(std::move(std::get<connection>(result)));
     }

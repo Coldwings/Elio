@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <new>
 #include <optional>
 #include <thread>
@@ -87,9 +88,32 @@ TEST_CASE("Event dispatch allocation failure preserves pending wakes",
     std::array<elio::sync::detail::wake_state_ptr, 3> retained;
     elio::runtime::scheduler scheduler(workers);
     scheduler.start();
-    for (size_t i = 0; i < waits.size(); ++i)
-        waits[i].emplace(scheduler.go_joinable(wait_signal(
-            signal, cancellable, stop.get_token(), probes[i])));
+    std::exception_ptr launch_failure;
+    try {
+        for (size_t i = 0; i < waits.size(); ++i)
+            waits[i].emplace(scheduler.go_joinable(wait_signal(
+                signal, cancellable, stop.get_token(), probes[i])));
+    } catch (...) {
+        launch_failure = std::current_exception();
+    }
+    if (launch_failure) {
+        // A later admission/allocation failure must not abandon an earlier
+        // root on this event. Release both already-published and not-yet-run
+        // roots, normally join every retained handle, then preserve the first
+        // launch exception. No dispatch fault hook is armed on this path.
+        if (cancellable) stop.cancel();
+        else signal.set();
+        for (auto& wait : waits) if (wait) wait->wait_destroyed();
+        const bool launch_cleanup_drained = scheduler.shutdown(elio::test::scaled_ms(5000));
+        for (auto& wait : waits) {
+            if (!wait) continue;
+            try { wait->await_resume(); } catch (...) {}
+        }
+        // Preserve the first launch failure even if bounded scheduler drain
+        // reports false; every retained frame has already been destroyed.
+        if (!launch_cleanup_drained) std::rethrow_exception(launch_failure);
+        std::rethrow_exception(launch_failure);
+    }
     const bool published = observe([&] { return signal.waiter_count_for_test() == waits.size(); });
     if (published) {
         for (size_t i = 0; i < probes.size(); ++i) retained[i] = probes[i].suspended->snapshot();

@@ -78,52 +78,55 @@ inline size_t next_rotation_offset(const std::string& host, uint16_t port, size_
     return offset;
 }
 
+inline coro::task<void> fd_shutdown_watchdog_task(
+        int fd, std::chrono::nanoseconds timeout, coro::cancel_token tok,
+        std::shared_ptr<std::atomic<bool>> flag) {
+    coro::cancel_result r;
+    try {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = fd_watchdog_wait_for_test.load(std::memory_order_acquire)) {
+            r = co_await hook(timeout, tok);
+        } else
+#endif
+        {
+            r = co_await elio::time::sleep_for(timeout, tok);
+        }
+    } catch (...) {
+        // The helper cannot join us until its sibling I/O returns.
+        // A cleanup-time exception must not abort successful I/O.
+        if (!tok.is_cancelled() && fd >= 0) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            fd_watchdog_shutdowns_for_test.fetch_add(1, std::memory_order_relaxed);
+#endif
+            ::shutdown(fd, SHUT_RDWR);
+        }
+        throw;
+    }
+    if (r == coro::cancel_result::completed) {
+        flag->store(true, std::memory_order_release);
+        if (fd >= 0) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            fd_watchdog_shutdowns_for_test.fetch_add(1, std::memory_order_relaxed);
+#endif
+            ::shutdown(fd, SHUT_RDWR);
+        }
+    }
+    co_return;
+}
+
 /// Spawn a watchdog that shutdown(2)s `fd` after `timeout` elapses.
-///
-/// The returned join_handle must be awaited after the I/O operation completes;
-/// the caller cancels `watchdog_token` to wake the watchdog early on success.
-/// `timed_out` is set only when the deadline fired before cancellation.
+/// The caller cancels the token on completion and joins before releasing `fd`.
+/// Timer exceptions interrupt active sibling I/O without setting `timed_out`.
 inline coro::join_handle<void>
 arm_fd_shutdown_watchdog(runtime::scheduler* sched,
                          int fd,
                          std::chrono::nanoseconds timeout,
                          coro::cancel_token watchdog_token,
                          std::shared_ptr<std::atomic<bool>> timed_out) {
-    return sched->go_joinable(
-        [fd, timeout, tok = std::move(watchdog_token),
-         flag = std::move(timed_out)]() -> coro::task<void> {
-            coro::cancel_result r;
-            try {
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-                if (auto hook = fd_watchdog_wait_for_test.load(std::memory_order_acquire)) {
-                    r = co_await hook(timeout, tok);
-                } else
-#endif
-                {
-                    r = co_await elio::time::sleep_for(timeout, tok);
-                }
-            } catch (...) {
-                // The helper cannot join us until its sibling I/O returns.
-                // A cleanup-time exception must not abort successful I/O.
-                if (!tok.is_cancelled() && fd >= 0) {
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-                    fd_watchdog_shutdowns_for_test.fetch_add(1, std::memory_order_relaxed);
-#endif
-                    ::shutdown(fd, SHUT_RDWR);
-                }
-                throw;
-            }
-            if (r == coro::cancel_result::completed) {
-                flag->store(true, std::memory_order_release);
-                if (fd >= 0) {
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-                    fd_watchdog_shutdowns_for_test.fetch_add(1, std::memory_order_relaxed);
-#endif
-                    ::shutdown(fd, SHUT_RDWR);
-                }
-            }
-            co_return;
-        });
+    // Construct the owning frame before admission: a lazy callable wrapper
+    // could fail allocating it after the sibling I/O has already suspended.
+    return sched->go_joinable(fd_shutdown_watchdog_task(
+        fd, timeout, std::move(watchdog_token), std::move(timed_out)));
 }
 
 // Admit the watchdog inside this frame, before invoking the factory. Creating

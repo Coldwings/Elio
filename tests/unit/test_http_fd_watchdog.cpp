@@ -192,6 +192,12 @@ TEST_CASE("FD watchdog timer failures release blocked sibling I/O before propaga
     const bool writing = GENERATE(false, true);
     const bool allocation_failure = GENERATE(false, true);
     CAPTURE(static_cast<int>(backend), workers, writing, allocation_failure);
+#if ELIO_HAS_IO_URING
+    if (backend == backend_type::io_uring && !elio::io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (backend == backend_type::io_uring) SKIP("io_uring support is not compiled");
+#endif
     struct backend_guard {
         backend_type previous;
         explicit backend_guard(backend_type value)
@@ -269,6 +275,39 @@ TEST_CASE("FD watchdog timer failures release blocked sibling I/O before propaga
     // Completion returned borrowed storage: it can be reused without pending I/O.
     buffer.fill('r');
     CHECK(done.load(std::memory_order_acquire));
+}
+
+TEST_CASE("FD watchdog admission failure never starts its sibling operation",
+          "[http][watchdog][exception][issue-1278]") {
+    socket_pair sockets;
+    auto timed_out = std::make_shared<std::atomic<bool>>(false);
+    bool invoked = false;
+    std::exception_ptr failure;
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto operation = scheduler.go_joinable([&]() -> task<void> {
+        // The owning watchdog task is constructed before join admission, and
+        // either creation/admission failure must precede the sibling factory.
+        elio::runtime::detail::fail_next_join_state_allocation_for_test.store(true);
+        try {
+            (void)co_await elio::http::detail::await_fd_operation_with_watchdog(
+                [&]() -> task<elio::io::io_result> {
+                    invoked = true;
+                    co_return elio::io::io_result{1, 0};
+                }, &scheduler, sockets.descriptors[0], std::chrono::hours(1), timed_out);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        elio::runtime::detail::fail_next_join_state_allocation_for_test.store(false);
+    });
+    operation.wait_destroyed();
+    operation.await_resume();
+    REQUIRE(scheduler.shutdown(elio::test::scaled_ms(5000)));
+    REQUIRE_FALSE(invoked);
+    REQUIRE_FALSE(timed_out->load(std::memory_order_acquire));
+    REQUIRE(failure);
+    REQUIRE_THROWS_AS(std::rethrow_exception(failure), std::bad_alloc);
+    require_socket_usable(sockets.descriptors[0], sockets.descriptors[1]);
 }
 
 TEST_CASE("FD watchdog cleanup preserves successful and failed I/O results",

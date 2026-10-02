@@ -244,6 +244,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **TLS duplex abort cleanup**: reserve allocation-free terminal output
+  settlement for the permitted reader, writer and concurrent abort, rather than
+  terminating when the third operation waits for the owning pump (#1279).
+
+- **HTTP Transport TCP retirement**: private root sockets retain their immediate,
+  non-lingering local close policy across moves and setup exceptions. Plain HTTP
+  active discard, idle clearing and shutdown now close the descriptor before
+  releasing live capacity; asynchronous close submission is not settlement.
+  Ordinary standalone TCP teardown is unchanged (#1276).
+
+- **HTTPS Expect fallback**: expiry of only the `100-continue` wait starts the
+  deferred body upload alongside the healthy response read instead of
+  terminally cancelling TLS and reusing the failed session. Upload/read cleanup
+  is joined, the original response deadline is retained, and external
+  cancellation or response expiry remains terminal (#1275).
+
 - **TCP preparation error reporting**: listener accept and outbound TCP connect
   preserve backend-published preparation errors through cleanup instead of
   replacing them with `EAGAIN`. The fallback remains `EAGAIN` when no negative

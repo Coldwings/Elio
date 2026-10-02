@@ -31,6 +31,8 @@ class basic_tls_transport : public std::enable_shared_from_this<basic_tls_transp
     using self_type = basic_tls_transport<Lower>;
     using wake_ptr = sync::detail::wake_state_ptr;
     using wake_list = std::list<wake_ptr>;
+    // The terminal contract permits one reader, one writer, and one abort.
+    static constexpr size_t cleanup_capacity = 3;
 
     static consteval bool compute_progress_interrupts_read() {
         if constexpr (std::same_as<Lower, net::tcp_stream>) {
@@ -139,7 +141,7 @@ public:
 
     void notify_progress() noexcept {
         wake_list ready;
-        std::array<wake_ptr, 2> settled;
+        std::array<wake_ptr, cleanup_capacity> settled;
         std::shared_ptr<coro::cancel_source> reader;
         {
             std::lock_guard lock(mutex);
@@ -326,8 +328,8 @@ public:
                 std::lock_guard lock(owner_->mutex);
                 if (!owner_->pump_active_) return false;
                 // Settlement is terminal (failure or whole-session retirement).
-                // At most the one reader and one writer can be outstanding;
-                // no successor pump may start after either of them settles.
+                // Reader, writer and the one concurrent abort each need a slot;
+                // no successor pump may start after terminal settlement begins.
                 assert(owner_->operation_error());
                 for (auto& slot : owner_->cleanup_slots_) {
                     if (slot.used) continue;
@@ -449,7 +451,7 @@ private:
         bool used = false;
         bool registered = false;
     };
-    std::array<cleanup_slot, 2> cleanup_slots_;
+    std::array<cleanup_slot, cleanup_capacity> cleanup_slots_;
 };
 
 using tls_transport = basic_tls_transport<net::tcp_stream>;

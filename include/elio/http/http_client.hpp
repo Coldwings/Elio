@@ -75,6 +75,10 @@ inline std::atomic<response_deadline_hook> response_deadline_for_test{nullptr};
 using response_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
     std::chrono::nanoseconds, coro::cancel_token, client_stage);
 inline std::atomic<response_watchdog_wait_hook> response_watchdog_wait_for_test{nullptr};
+inline std::atomic<void(*)(int)> deferred_upload_for_test{nullptr};
+using deferred_upload_result_hook = coro::task<void> (*)(const std::optional<client_error>&);
+inline std::atomic<deferred_upload_result_hook> deferred_upload_result_for_test{nullptr};
+inline std::atomic<void(*)(io::io_result)> response_transport_result_for_test{nullptr};
 } // namespace detail
 #endif
 
@@ -404,10 +408,10 @@ private:
             plan.key().target_dns != detail::route_dns_mode::local)
             co_return detail::make_client_error(ENOTSUP, client_stage::acquire);
         const auto& snapshot = plan.snapshot();
-        co_return co_await client_connect_result(plan.target().host, plan.target().port,
+        co_return co_await detail::client_connect_result_impl(plan.target().host, plan.target().port,
             plan.key().target_secure, snapshot.origin_tls.get(), snapshot.resolve_options,
             snapshot.rotate_resolved_addresses, connect_timeout, std::move(token),
-            snapshot.dns_timeout, snapshot.dns_domain, deadline);
+            snapshot.dns_timeout, snapshot.dns_domain, deadline, true);
     }
 
     struct pool_shard {
@@ -679,6 +683,10 @@ public:
         return true;
     }
     void finish_operation_for_test() noexcept { state_->finish_operation(); }
+    size_t active_operations_for_test() const {
+        std::lock_guard lock(state_->mutex);
+        return state_->active_operations;
+    }
     void signal_settled_for_test() { state_->settled.set(); }
     detail::route_plan route_plan_for_test(const url& target) const {
         return detail::route_plan(target, state_->snapshot);
@@ -1204,6 +1212,7 @@ private:
                         response_read_stage(reader_.decoder()));
                 }
                 auto part = co_await reader_.read_with(receive, token);
+                if (fallback_error_) co_return *fallback_error_;
                 if (!part.success()) {
                     if (expect_expired_ && body_pending_ && !token.is_cancelled()) {
                         if (auto error = co_await send_pending_body(token)) co_return *error;
@@ -1275,13 +1284,20 @@ private:
         coro::task<std::optional<client_error>> send_pending_body(
                 const coro::cancel_token& token) {
             if (!body_pending_) co_return std::nullopt;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::deferred_upload_for_test.load()) hook(conn_.fd());
+#endif
             body_pending_ = false;
             const auto remaining = response_deadline_ - std::chrono::steady_clock::now();
             if (deadline_enforced_ && remaining <= std::chrono::steady_clock::duration::zero()) {
                 co_return detail::make_client_error(ETIMEDOUT, client_stage::request);
             }
-            co_return co_await write_request_data(conn_, request_body_, target_,
+            auto result = co_await write_request_data(conn_, request_body_, target_,
                 deadline_enforced_ ? remaining : io_deadline_, deadline_enforced_, scheduler_, token);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::deferred_upload_result_for_test.load()) co_await hook(result);
+#endif
+            co_return result;
         }
 
         coro::task<io::io_result> receive_data(void* data, size_t size,
@@ -1318,13 +1334,15 @@ private:
             auto read_cancel = std::make_shared<coro::cancel_source>();
             auto forward = token.on_cancel([read_cancel] { read_cancel->cancel(); });
             auto expired = std::make_shared<std::atomic<bool>>(false);
+            auto read_completed = std::make_shared<std::atomic<bool>>(false);
+            auto read_failed = std::make_shared<std::atomic<bool>>(false);
             coro::cancel_source watchdog_cancel;
             auto watchdog = scheduler_->go_joinable(
-                [deadline, expired, read_cancel,
+                [this, deadline, expect_first, expired, read_cancel, read_completed, read_failed,
                  stage = response_read_stage(reader_.decoder()),
                  stop = watchdog_cancel.get_token()]() -> coro::task<void> {
-                    coro::cancel_result result;
                     try {
+                        coro::cancel_result result;
                         const auto remaining = deadline - std::chrono::steady_clock::now();
 #ifdef ELIO_RUNTIME_TEST_HOOKS
                         if (auto hook = detail::response_watchdog_wait_for_test.load(
@@ -1336,16 +1354,46 @@ private:
                             (void)stage;
                             result = co_await elio::time::sleep_for(remaining, stop);
                         }
+                        if (result != coro::cancel_result::completed ||
+                            read_completed->load(std::memory_order_acquire)) co_return;
+                        if (expect_first) {
+                            // Expect expiry starts the deferred upload alongside
+                            // the healthy read; cancelling TLS here is terminal.
+                            if (auto error = co_await send_pending_body(read_cancel->get_token())) {
+                                // The upload deadline can terminate the read first;
+                                // retain that timeout, not the sibling's abort error.
+                                if (error->code.value() == ETIMEDOUT ||
+                                    !read_failed->load(std::memory_order_acquire))
+                                    fallback_error_ = std::move(*error);
+                                read_cancel->cancel();
+                                co_return;
+                            }
+                            if (!deadline_enforced_ ||
+                                read_completed->load(std::memory_order_acquire)) co_return;
+                            const auto response_remaining = response_deadline_ -
+                                std::chrono::steady_clock::now();
+                            if (response_remaining > std::chrono::steady_clock::duration::zero()) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                                if (auto hook = detail::response_watchdog_wait_for_test.load(
+                                        std::memory_order_acquire)) {
+                                    result = co_await hook(response_remaining, stop, stage);
+                                } else
+#endif
+                                {
+                                    result = co_await elio::time::sleep_for(response_remaining, stop);
+                                }
+                                if (result != coro::cancel_result::completed ||
+                                    read_completed->load(std::memory_order_acquire)) co_return;
+                            }
+                        }
+                        expired->store(true, std::memory_order_release);
+                        read_cancel->cancel();
                     } catch (...) {
-                        // A failed timer must release its sibling read. Keep
-                        // that exception even if cancellation callbacks fail.
+                        // Timer and fallback-write exceptions both release the
+                        // sibling read without replacing the first exception.
                         auto failure = std::current_exception();
                         try { read_cancel->cancel(); } catch (...) {}
                         std::rethrow_exception(failure);
-                    }
-                    if (result == coro::cancel_result::completed) {
-                        expired->store(true, std::memory_order_release);
-                        read_cancel->cancel();
                     }
                 });
             io::io_result result{};
@@ -1355,6 +1403,17 @@ private:
             } catch (...) {
                 failure = std::current_exception();
             }
+            if (failure || result.result <= 0) {
+                // A failed read stops a pending upload, but its cancellation
+                // result must not replace the original read failure.
+                read_failed->store(true, std::memory_order_release);
+                try { read_cancel->cancel(); }
+                catch (...) { if (!failure) failure = std::current_exception(); }
+            }
+            read_completed->store(true, std::memory_order_release);
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+            if (auto hook = detail::response_transport_result_for_test.load()) hook(result);
+#endif
             try {
                 watchdog_cancel.cancel();
             } catch (...) {
@@ -1372,8 +1431,6 @@ private:
             }
             if (failure) std::rethrow_exception(failure);
             if (expired->load(std::memory_order_acquire)) {
-                if (expect_first && result.result > 0) co_return result;
-                expect_expired_ = expect_first;
                 co_return io::io_result{-ETIMEDOUT, 0};
             }
             co_return result;
@@ -1396,6 +1453,7 @@ private:
         bool expect_bounded_;
         std::chrono::steady_clock::time_point expect_deadline_{};
         bool expect_expired_ = false;
+        std::optional<client_error> fallback_error_;
     };
 
     coro::task<client_result<std::unique_ptr<exchange_state>>> prepare_exchange(

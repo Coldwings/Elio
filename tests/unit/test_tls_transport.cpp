@@ -509,7 +509,8 @@ TEST_CASE("TLS output launch failure releases pump ownership and wakes waiters",
     settled.await_resume();
 }
 
-TEST_CASE("TLS terminal output settlement reserves both waiters without allocation", "[tls][transport][issue-1215]") {
+TEST_CASE("TLS terminal output settlement reserves reader writer and abort without allocation",
+          "[tls][transport][issue-1215][issue-1279]") {
     auto transport = notification_transport();
     // Hold the pump-active boundary, not a fake kernel completion. This test
     // isolates cleanup publication from the independently tested native pump.
@@ -520,22 +521,27 @@ TEST_CASE("TLS terminal output settlement reserves both waiters without allocati
     };
     auto first = settle();
     auto second = settle();
+    auto abort = settle();
     auto first_handle = task_access::handle(first);
     auto second_handle = task_access::handle(second);
+    auto abort_handle = task_access::handle(abort);
     const auto allocations = elio::sync::detail::wake_state_allocations_for_test.load();
     elio::sync::detail::fail_next_wake_state_allocation_for_test.store(true);
     first_handle.resume();
     second_handle.resume();
-    const bool both_parked = !first_handle.done() && !second_handle.done();
+    abort_handle.resume();
+    const bool all_parked = !first_handle.done() && !second_handle.done() && !abort_handle.done();
     transport->set_output_active_for_test(false);
     transport->notify_progress();
     const bool allocation_unused =
         elio::sync::detail::fail_next_wake_state_allocation_for_test.exchange(false);
     REQUIRE(first_handle.done());
     REQUIRE(second_handle.done());
+    REQUIRE(abort_handle.done());
     first.await_resume();
     second.await_resume();
-    CHECK(both_parked);
+    abort.await_resume();
+    CHECK(all_parked);
     CHECK(allocation_unused);
     CHECK(elio::sync::detail::wake_state_allocations_for_test.load() == allocations);
     CHECK(transport->output.error() == ENOMEM);

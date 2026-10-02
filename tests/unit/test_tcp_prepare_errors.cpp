@@ -66,6 +66,14 @@ elio::coro::task<int> rejected_connect(elio::net::socket_address address,
 }
 } // namespace
 
+TEST_CASE("TCP connect awaitable preserves braced public construction",
+          "[net][tcp][compatibility][issue-1276]") {
+    const elio::net::socket_address address(elio::net::ipv4_address("127.0.0.1", 80));
+    // A private policy constructor must not steal this existing public call.
+    elio::net::tcp_connect_awaitable operation(address, {}, {});
+    CHECK_FALSE(operation.await_ready());
+}
+
 TEST_CASE("TCP listener preserves backend preparation errors and fallback",
           "[net][tcp][prepare][issue-1273]") {
     const auto error = GENERATE(EPERM, ENOSPC, ENOMEM, 0);

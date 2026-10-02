@@ -74,7 +74,7 @@ inline coro::task<client_result<route_connection>> connect_proxy_route(
     auto connected = co_await client_connect_result_impl(endpoint.host, endpoint.port,
         false, nullptr, snapshot.resolve_options, snapshot.rotate_resolved_addresses,
         connect_timeout, token, snapshot.dns_timeout, snapshot.dns_domain,
-        acquisition_deadline, &setup_deadline);
+        acquisition_deadline, true, &setup_deadline);
     if (const auto* error = std::get_if<client_error>(&connected)) co_return *error;
     auto stream = std::move(std::get<net::stream>(connected));
     if (token.is_cancelled()) co_return make_client_error(ECANCELED, client_stage::connect);

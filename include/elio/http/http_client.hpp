@@ -1248,7 +1248,10 @@ private:
                             // Expect expiry starts the deferred upload alongside
                             // the healthy read; cancelling TLS here is terminal.
                             if (auto error = co_await send_pending_body(read_cancel->get_token())) {
-                                if (!read_failed->load(std::memory_order_acquire))
+                                // The upload deadline can terminate the read first;
+                                // retain that timeout, not the sibling's abort error.
+                                if (error->code.value() == ETIMEDOUT ||
+                                    !read_failed->load(std::memory_order_acquire))
                                     fallback_error_ = std::move(*error);
                                 read_cancel->cancel();
                                 co_return;

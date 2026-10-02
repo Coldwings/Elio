@@ -90,9 +90,19 @@ coro::task<route_operation_result<Result>> await_route_operation(Operation opera
     if (auto hook = route_watchdog_after_start_for_test.load(std::memory_order_acquire))
         co_await hook();
 #endif
-    // Rejected independent admission returns an exceptional ready handle.
-    // Accepted request continuations must not start unprotected I/O in drain.
-    if (watchdog.is_ready()) watchdog.await_resume();
+    // Rejected independent admission returns an exceptional ready handle, but
+    // an admitted watchdog can publish its result before its owning frame is
+    // destroyed. Do not start or return sibling I/O until either kind settles.
+    if (watchdog.is_ready()) {
+        std::exception_ptr startup_failure;
+        try { watchdog.await_resume(); }
+        catch (...) { startup_failure = std::current_exception(); }
+        try { co_await watchdog.wait_destroyed_async(); }
+        catch (...) {
+            if (!startup_failure) startup_failure = std::current_exception();
+        }
+        if (startup_failure) std::rethrow_exception(startup_failure);
+    }
     std::optional<Result> value;
     std::exception_ptr failure;
     bool completed_late = false;

@@ -643,6 +643,10 @@ public:
         return true;
     }
     void finish_operation_for_test() noexcept { state_->finish_operation(); }
+    size_t active_operations_for_test() const {
+        std::lock_guard lock(state_->mutex);
+        return state_->active_operations;
+    }
     void signal_settled_for_test() { state_->settled.set(); }
     detail::route_plan route_plan_for_test(const url& target) const {
         return detail::route_plan(target, state_->snapshot);

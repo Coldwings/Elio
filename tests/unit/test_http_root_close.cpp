@@ -10,9 +10,13 @@
 #include <fcntl.h>
 #include <new>
 #include <string>
+#include <type_traits>
 
 using namespace elio::http;
 using elio::coro::task;
+
+static_assert(std::is_same_v<decltype(&elio::io::close_stream_fd_for_destructor),
+                            void(*)(int) noexcept>);
 
 namespace {
 using backend = elio::io::io_context::backend_type;
@@ -317,6 +321,8 @@ task<elio::coro::cancel_result> fail_watchdog_cleanup(
         std::chrono::steady_clock::time_point, elio::coro::cancel_token token) {
     auto& observed = *watchdog_observed.load();
     auto failure_registration = token.on_cancel([&observed]() {
+        // A pre-cancelled registration observes cancellation before wait().
+        observed.saw_cancellation = true;
         if (observed.fail_cancellation_callback)
             throw std::runtime_error("watchdog cancellation failure");
     });
@@ -400,4 +406,35 @@ TEST_CASE("Connector preserves setup failure when watchdog cleanup also fails",
     CHECK(observed.closed);
     CHECK(owner->active_operations_for_test() == 0);
     CHECK(owner->admission_counters_for_test().live == 0);
+}
+
+TEST_CASE("Ordinary adopted TCP streams retain their backend close policy",
+          "[net][tcp][root-close][compatibility][issue-1276]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+#if ELIO_HAS_IO_URING
+    if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
+#endif
+    close_observation observed;
+    close_hooks hooks(selected, observed);
+    bool open_before_poll = false;
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto retired = scheduler.go_joinable([&]() -> task<void> {
+        observed.fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (observed.fd < 0) co_return;
+        { elio::net::tcp_stream ordinary(observed.fd); }
+        open_before_poll = ::fcntl(observed.fd, F_GETFD) >= 0;
+        co_return;
+    });
+    retired.wait_destroyed();
+    const auto stopped = scheduler.shutdown(std::chrono::seconds(10));
+    retired.await_resume();
+    REQUIRE(stopped);
+    REQUIRE(observed.fd >= 0);
+    CHECK(open_before_poll == (selected == backend::io_uring));
+    CHECK(::fcntl(observed.fd, F_GETFD) < 0);
+    CHECK(errno == EBADF);
 }

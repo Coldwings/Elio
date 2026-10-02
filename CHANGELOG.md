@@ -244,6 +244,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **FD watchdog admission rejection**: observe an already-exceptional watchdog
+  handle before invoking its sibling I/O factory, preventing accepted
+  HTTP-family calls from starting unbounded I/O during scheduler drain (#1282).
+
 - **FD watchdog timer exceptions**: HTTP-family timer failures interrupt their
   still-owned sibling I/O so cleanup can join both operations and propagate the
   exception. Owned stream callbacks also record TLS external-abort state when

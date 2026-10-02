@@ -543,9 +543,9 @@ private:
                 auto timed_out = std::make_shared<std::atomic<bool>>(false);
                 read_result = co_await http::detail::await_fd_operation_with_watchdog(
                     [&] { return read(buffer_.data(), buffer_.size(), token); },
-                    sched, stream_.fd(), remaining, timed_out);
+                    sched, stream_.fd(), remaining, timed_out,
+                    [this]() noexcept { http::detail::abort_stream_io(stream_); });
                 if (timed_out->load(std::memory_order_acquire)) {
-                    stream_.mark_externally_shut_down();
                     ELIO_LOG_ERROR("WebSocket handshake response timed out after {}s",
                                    config_.read_timeout.count());
                     errno = ETIMEDOUT;

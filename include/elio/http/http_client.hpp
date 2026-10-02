@@ -1119,9 +1119,9 @@ private:
             auto timed_out = std::make_shared<std::atomic<bool>>(false);
             write_result = co_await detail::await_fd_operation_with_watchdog(
                 [&] { return conn.write_all(data, token); },
-                sched, conn.fd(), io_deadline, timed_out);
+                sched, conn.fd(), io_deadline, timed_out,
+                [&conn]() noexcept { detail::abort_stream_io(conn); });
             if (timed_out->load(std::memory_order_acquire)) {
-                conn.mark_externally_shut_down();
                 ELIO_LOG_ERROR("Write to {}:{} timed out after {}s",
                                target.host, target.effective_port(),
                                std::chrono::duration_cast<std::chrono::seconds>(io_deadline).count());

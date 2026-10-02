@@ -57,6 +57,7 @@ struct tls_shutdown_test_state {
     int ssl_shutdown_flags;
     int transport_error;
     bool pump_active;
+    bool externally_shut_down;
 };
 struct tls_finish_test_state {
     bool write_closed;
@@ -149,7 +150,8 @@ public:
     detail::tls_shutdown_test_state shutdown_state_for_test() const {
         auto lock = lock_ssl_state();
         return {SSL_get_shutdown(ssl_), transport_->output.error(),
-                transport_->output_active_for_test()};
+                transport_->output_active_for_test(),
+                externally_shut_down_.load(std::memory_order_acquire)};
     }
     void set_output_active_for_test(bool active) {
         transport_->set_output_active_for_test(active);

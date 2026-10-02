@@ -1,18 +1,22 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <elio/coro/detail/completion_waiter.hpp>
 #include <elio/http/http_client.hpp>
 #include <elio/coro/join_wait.hpp>
+#include <elio/runtime/affinity.hpp>
 
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 #include <openssl/x509v3.h>
 
 #include <array>
+#include <coroutine>
 #include <cstdio>
 #include <exception>
 #include <fcntl.h>
 #include <memory>
 #include <latch>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -347,6 +351,141 @@ struct setup_hooks {
         setup_observed.store(nullptr);
     }
 };
+
+class route_test_phase {
+    class awaiter {
+    public:
+        explicit awaiter(route_test_phase& phase) noexcept
+            : phase_(phase), waiter_(phase.slot_) {}
+        bool await_ready() const noexcept {
+            return phase_.released_.load(std::memory_order_acquire);
+        }
+        bool await_suspend(std::coroutine_handle<> handle) noexcept {
+            return phase_.slot_.register_waiter(waiter_, handle,
+                [this] { return await_ready(); });
+        }
+        void await_resume() const noexcept {}
+    private:
+        route_test_phase& phase_;
+        elio::coro::detail::completion_waiter waiter_;
+    };
+public:
+    auto wait() noexcept { return awaiter(*this); }
+    void set() noexcept {
+        released_.store(true, std::memory_order_release);
+        auto wake = slot_.take();
+        if (auto handle = wake.claim()) elio::runtime::schedule_handle(handle);
+    }
+private:
+    std::atomic<bool> released_{false};
+    elio::coro::detail::completion_waiter_slot slot_;
+};
+
+struct route_ready_probe {
+    route_test_phase release_parent;
+    std::atomic<bool> parent_waiting{false};
+    std::atomic<bool> timer_failed{false};
+    std::atomic<bool> operation_entered{false};
+    std::atomic<bool> destruction_observed{false};
+    std::atomic<bool> done{false};
+    std::mutex barrier_mutex;
+    bool barrier_released = false;
+    std::exception_ptr failure;
+};
+
+std::atomic<route_ready_probe*> route_ready_observed{nullptr};
+
+task<void> pause_after_route_watchdog_start() {
+    auto& probe = *route_ready_observed.load(std::memory_order_acquire);
+    probe.parent_waiting.store(true, std::memory_order_release);
+    co_await probe.release_parent.wait();
+}
+
+task<elio::coro::cancel_result> fail_ready_route_watchdog(
+        std::chrono::steady_clock::time_point, elio::coro::cancel_token) {
+    co_await elio::runtime::set_affinity(1);
+    auto& probe = *route_ready_observed.load(std::memory_order_acquire);
+    {
+        std::lock_guard lock(probe.barrier_mutex);
+        if (!probe.barrier_released)
+            elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(true);
+        probe.timer_failed.store(true, std::memory_order_release);
+    }
+    throw std::runtime_error("ready route watchdog failed");
+    co_return elio::coro::cancel_result::completed;
+}
+
+void observe_route_operation_entry() {
+    route_ready_observed.load(std::memory_order_acquire)->operation_entered.store(
+        true, std::memory_order_release);
+}
+
+void observe_route_destruction_wait() {
+    route_ready_observed.load(std::memory_order_acquire)->destruction_observed.store(
+        true, std::memory_order_release);
+}
+
+struct route_ready_guard {
+    route_ready_probe& probe;
+    route_ready_probe* previous_probe;
+    detail::route_operation_wait_hook previous_wait;
+    task<void> (*previous_start)();
+    void (*previous_operation)();
+    void (*previous_observer)();
+    explicit route_ready_guard(route_ready_probe& value)
+        : probe(value)
+        , previous_probe(route_ready_observed.exchange(&value))
+        , previous_wait(detail::route_operation_wait_for_test.exchange(
+              fail_ready_route_watchdog))
+        , previous_start(detail::route_watchdog_after_start_for_test.exchange(
+              pause_after_route_watchdog_start))
+        , previous_operation(detail::route_operation_entered_for_test.exchange(
+              observe_route_operation_entry))
+        , previous_observer(elio::coro::detail::join_destroyed_observer_setup_for_test.exchange(
+              observe_route_destruction_wait)) {
+        elio::coro::detail::detached_frame_destroy_paused_for_test.store(false);
+        elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(false);
+    }
+    void release() const noexcept {
+        {
+            std::lock_guard lock(probe.barrier_mutex);
+            // Release is terminal: a late timer may not park its worker after
+            // controller recovery has started joining all owned frames.
+            probe.barrier_released = true;
+            elio::coro::detail::pause_before_detached_frame_destroy_for_test.store(false);
+            elio::coro::detail::pause_before_detached_frame_destroy_for_test.notify_all();
+        }
+        probe.release_parent.set();
+    }
+    ~route_ready_guard() {
+        release();
+        elio::coro::detail::join_destroyed_observer_setup_for_test.store(previous_observer);
+        detail::route_operation_entered_for_test.store(previous_operation);
+        detail::route_watchdog_after_start_for_test.store(previous_start);
+        detail::route_operation_wait_for_test.store(previous_wait);
+        route_ready_observed.store(previous_probe);
+        elio::coro::detail::detached_frame_destroy_paused_for_test.store(false);
+    }
+};
+
+template<typename Predicate>
+bool observe_route_ready(Predicate predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+task<void> exercise_ready_route_watchdog(route_ready_probe& probe) {
+    try {
+        (void)co_await detail::await_route_operation<int>(
+            [](elio::coro::cancel_token) -> task<int> { co_return 7; }, {},
+            std::chrono::steady_clock::now() + std::chrono::seconds(30));
+    } catch (...) { probe.failure = std::current_exception(); }
+    probe.done.store(true, std::memory_order_release);
+}
 
 struct connect_write_gate {
     connect_write_gate() { detail::proxy_connect_write_wait_for_test.store(gate_connect_write); }
@@ -1040,6 +1179,65 @@ TEST_CASE("Forward-to-CONNECT redirects keep credentials only on the proxy hop",
         REQUIRE(observed.requests[2].header("Host") == "localhost:9443");
         REQUIRE(observed.requests[2].header("Proxy-Authorization").empty());
         REQUIRE(owner->admission_counters_for_test().live == 0);
+    }
+}
+
+TEST_CASE("Route operation joins an already-ready admitted watchdog before rethrowing",
+          "[http][proxy][routes][watchdog-ready-destruction][issue-1249]") {
+    const auto controller_failure = GENERATE(false, true);
+    CAPTURE(controller_failure);
+    route_ready_probe probe;
+    route_ready_guard ready(probe);
+    elio::runtime::scheduler scheduler(2);
+    scheduler.start();
+    auto operation = scheduler.go_joinable_to(0, exercise_ready_route_watchdog(probe));
+    bool timer_ready = false;
+    bool parent_observed = false;
+    bool completed_before_destroy = false;
+    bool destruction_observed = false;
+    std::exception_ptr control_failure;
+    try {
+        timer_ready = observe_route_ready([&] {
+            return probe.timer_failed.load(std::memory_order_acquire) &&
+                   probe.parent_waiting.load(std::memory_order_acquire) &&
+                   elio::coro::detail::detached_frame_destroy_paused_for_test.load(
+                       std::memory_order_acquire);
+        });
+        if (controller_failure) throw std::runtime_error("route fixture controller failed");
+        probe.release_parent.set();
+        parent_observed = observe_route_ready([&] {
+            return probe.done.load(std::memory_order_acquire) ||
+                   probe.destruction_observed.load(std::memory_order_acquire);
+        });
+        completed_before_destroy = probe.done.load(std::memory_order_acquire);
+        destruction_observed = probe.destruction_observed.load(std::memory_order_acquire);
+    } catch (...) { control_failure = std::current_exception(); }
+    ready.release();
+    const bool completed = observe_route_ready(
+        [&] { return probe.done.load(std::memory_order_acquire); });
+    operation.wait_destroyed();
+    const bool drained = scheduler.shutdown(std::chrono::seconds(5));
+    operation.await_resume();
+    REQUIRE(drained);
+    CHECK(timer_ready);
+    if (controller_failure) {
+        REQUIRE(control_failure);
+        try { std::rethrow_exception(control_failure); }
+        catch (const std::runtime_error& error) {
+            CHECK(std::string_view(error.what()) == "route fixture controller failed");
+        }
+    } else {
+        if (control_failure) std::rethrow_exception(control_failure);
+        CHECK(parent_observed);
+        CHECK_FALSE(completed_before_destroy);
+        CHECK(destruction_observed);
+    }
+    CHECK(completed);
+    CHECK_FALSE(probe.operation_entered.load(std::memory_order_acquire));
+    REQUIRE(probe.failure);
+    try { std::rethrow_exception(probe.failure); }
+    catch (const std::runtime_error& error) {
+        CHECK(std::string_view(error.what()) == "ready route watchdog failed");
     }
 }
 

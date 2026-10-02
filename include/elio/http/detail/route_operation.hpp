@@ -20,6 +20,8 @@ using route_operation_wait_hook = coro::task<coro::cancel_result> (*)(
     std::chrono::steady_clock::time_point, coro::cancel_token);
 inline std::atomic<route_operation_wait_hook> route_operation_wait_for_test{nullptr};
 inline std::atomic<void (*)()> route_watchdog_before_construct_for_test{nullptr};
+inline std::atomic<coro::task<void> (*)()> route_watchdog_after_start_for_test{nullptr};
+inline std::atomic<void (*)()> route_operation_entered_for_test{nullptr};
 #endif
 
 inline coro::task<void> route_watchdog_task(
@@ -84,6 +86,10 @@ coro::task<route_operation_result<Result>> await_route_operation(Operation opera
     // scheduler factory can fail outside the timer body's cancellation catch.
     auto watchdog = scheduler->go_joinable(make_route_watchdog(
         *deadline, stop, expired, timer_stop.get_token()));
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+    if (auto hook = route_watchdog_after_start_for_test.load(std::memory_order_acquire))
+        co_await hook();
+#endif
     // Rejected independent admission returns an exceptional ready handle.
     // Accepted request continuations must not start unprotected I/O in drain.
     if (watchdog.is_ready()) watchdog.await_resume();
@@ -91,6 +97,9 @@ coro::task<route_operation_result<Result>> await_route_operation(Operation opera
     std::exception_ptr failure;
     bool completed_late = false;
     try {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = route_operation_entered_for_test.load(std::memory_order_acquire)) hook();
+#endif
         value.emplace(co_await std::invoke(operation, stop->get_token()));
         completed_late = std::chrono::steady_clock::now() >= *deadline;
     } catch (...) {

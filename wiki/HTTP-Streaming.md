@@ -119,6 +119,13 @@ budget. The Expect deadline bounds only the pre-upload wait, is capped by the
 response deadline, and is disabled once final headers arrive. A response-deadline
 expiry fails rather than sending the fallback upload.
 
+When only the Expect wait expires, the deferred upload runs alongside the
+healthy pending response read; it does not cancel and reuse a failed TLS
+session. The response clock keeps its original deadline. Both operations are
+normally joined before the exchange releases their borrowed state. External
+cancellation and response expiry still terminate the transport; this does not
+relax the public TLS stream's cancellation contract.
+
 This is not a total exchange/handler timer: DNS and TCP/TLS setup are outside
 that read deadline, redirects establish a new hop deadline, and application
 computation/idle waits are not preempted. Already-buffered payload can be copied
@@ -479,8 +486,9 @@ write no more than capacity, and stop accessing the buffer before returning.
 Capture/pass cancellation into that callback's transport operation explicitly;
 the reader does not pass the token as a third callback argument.
 
-Transport errors preserve parsing state, which allows the HTTP client's Expect
-wait to cancel a pending read and continue when the transport permits it.
+Transport errors preserve parsing state, but not the health of a failed
+transport. The HTTP client's Expect fallback keeps a healthy pending read
+while uploading, rather than cancelling that read and retrying a TLS session.
 This is not permission to retry arbitrary failed transports. Framing errors
 are terminal until reset. The reader does not impose a timeout, close a stream,
 pool a connection, automatically reconnect, or replay application work.

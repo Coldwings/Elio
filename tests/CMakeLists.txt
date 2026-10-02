@@ -137,6 +137,7 @@ if(TARGET elio_tls)
         unit/test_http_client.cpp
         unit/test_http_client_streaming.cpp
         unit/test_http_client_result.cpp
+        unit/test_http_expect_tls.cpp
         unit/test_http_route_plan.cpp
         unit/test_http_connection_lease.cpp
         unit/test_http_root_close.cpp

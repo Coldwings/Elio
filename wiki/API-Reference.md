@@ -4726,8 +4726,8 @@ result does not establish lossless peer delivery. This is not a directional
 half-close API; use `finish_write()` for protocol-aware output completion.
 The HTTP CONNECT handoff is a separate feature, not supplied by TLS closure.
 Whole-session shutdown retires the transport; this object has no TLS-session
-reset or re-handshake API. Terminal output settlement uses two pre-reserved
-notification slots for the permitted reader/writer pair, without allocating
+reset or re-handshake API. Terminal output settlement uses three pre-reserved
+notification slots for the permitted reader, writer and concurrent abort, without allocating
 new cleanup waiters.
 
 `finish_write()` requires a completed handshake. It leaves

@@ -233,6 +233,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle before invoking its sibling I/O factory, preventing accepted
   HTTP-family calls from starting unbounded I/O during scheduler drain (#1282).
 
+- **FD watchdog timer exceptions**: HTTP-family timer failures interrupt their
+  still-owned sibling I/O so cleanup can join both operations and propagate the
+  exception. Owned stream callbacks also record TLS external-abort state when
+  healthy I/O races the active timer failure. Cleanup-time failures after timer
+  cancellation do not abort a successful operation or masquerade as ordinary
+  deadline expiry (#1278).
+
 - **TLS duplex abort cleanup**: reserve allocation-free terminal output
   settlement for the permitted reader, writer and concurrent abort, rather than
   terminating when the third operation waits for the owning pump (#1279).

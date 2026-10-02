@@ -510,7 +510,12 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
         auto wd = std::move(*watchdog);
         watchdog.reset();
         try {
-            co_await std::move(wd);
+            co_await wd;
+        } catch (...) {
+            if (!setup_failure) setup_failure = std::current_exception();
+        }
+        try {
+            co_await wd.wait_destroyed_async();
         } catch (...) {
             if (!setup_failure) setup_failure = std::current_exception();
         }

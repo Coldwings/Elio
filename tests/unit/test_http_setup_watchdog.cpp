@@ -37,6 +37,8 @@ struct setup_probe {
     std::exception_ptr failure;
 };
 
+std::atomic<setup_probe*> observed{nullptr};
+
 task<void> pause_before_timer() {
     auto& probe = *observed.load(std::memory_order_acquire);
     probe.before_start.store(true, std::memory_order_release);
@@ -71,8 +73,6 @@ struct startup_guard {
         elio::runtime::detail::graceful_admission_closed_for_test.store(false);
     }
 };
-
-std::atomic<setup_probe*> observed{nullptr};
 
 task<elio::coro::cancel_result> fail_active_timer(
         std::chrono::steady_clock::time_point, elio::coro::cancel_token token) {

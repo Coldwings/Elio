@@ -55,6 +55,7 @@ using setup_watchdog_wait_hook = coro::task<coro::cancel_result> (*)(
 inline std::atomic<setup_watchdog_wait_hook> setup_watchdog_wait_for_test{nullptr};
 inline std::atomic<void (*)()> setup_watchdog_before_construct_for_test{nullptr};
 inline std::atomic<coro::task<void> (*)()> setup_watchdog_before_start_for_test{nullptr};
+inline std::atomic<void (*)()> setup_connect_entered_for_test{nullptr};
 inline std::atomic<void(*)()> tls_setup_entered_for_test{nullptr};
 
 inline void arm_client_response_read_observer_for_test() noexcept {
@@ -427,6 +428,9 @@ client_connect_result_impl(std::string_view host, uint16_t port, bool secure,
     auto last_error = detail::make_client_error(ECONNREFUSED, client_stage::connect);
 
     auto connect_addresses = [&]() -> coro::task<client_result<net::stream>> {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (auto hook = setup_connect_entered_for_test.load(std::memory_order_acquire)) hook();
+#endif
         if (secure) {
             if (!tls_ctx) {
                 co_return detail::make_client_error(EINVAL, client_stage::tls);

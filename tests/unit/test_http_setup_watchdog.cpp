@@ -33,6 +33,7 @@ struct setup_probe {
     std::atomic<bool> before_start{false};
     std::atomic<bool> construction_failed{false};
     std::atomic<bool> tls_entered{false};
+    std::atomic<bool> connect_entered{false};
     bool recovered = false;
     std::exception_ptr failure;
 };
@@ -54,19 +55,26 @@ void observe_tls_entry() {
     observed.load(std::memory_order_acquire)->tls_entered.store(true, std::memory_order_release);
 }
 
+void observe_connect_entry() {
+    observed.load(std::memory_order_acquire)->connect_entered.store(true, std::memory_order_release);
+}
+
 struct startup_guard {
     void (*previous_construction)();
     task<void> (*previous_start)();
     void (*previous_tls)();
+    void (*previous_connect)();
     explicit startup_guard(bool during_drain)
         : previous_construction(elio::http::detail::setup_watchdog_before_construct_for_test.exchange(
               during_drain ? nullptr : fail_timer_construction))
         , previous_start(elio::http::detail::setup_watchdog_before_start_for_test.exchange(
               during_drain ? pause_before_timer : nullptr))
-        , previous_tls(elio::http::detail::tls_setup_entered_for_test.exchange(observe_tls_entry)) {
+        , previous_tls(elio::http::detail::tls_setup_entered_for_test.exchange(observe_tls_entry))
+        , previous_connect(elio::http::detail::setup_connect_entered_for_test.exchange(observe_connect_entry)) {
         elio::runtime::detail::graceful_admission_closed_for_test.store(false);
     }
     ~startup_guard() {
+        elio::http::detail::setup_connect_entered_for_test.store(previous_connect);
         elio::http::detail::tls_setup_entered_for_test.store(previous_tls);
         elio::http::detail::setup_watchdog_before_start_for_test.store(previous_start);
         elio::http::detail::setup_watchdog_before_construct_for_test.store(previous_construction);
@@ -118,9 +126,11 @@ task<void> withhold_tls_reply(elio::net::tcp_listener& listener, setup_probe& pr
     (void)co_await until_stopped.wait(token);
 }
 
-task<void> exercise_setup(uint16_t port, elio::tls::tls_context& context, setup_probe& probe) {
+task<void> exercise_setup(uint16_t port, elio::tls::tls_context& context, setup_probe& probe,
+                          bool secure = true) {
     try {
-        (void)co_await elio::http::client_connect_result("127.0.0.1", port, true, &context,
+        (void)co_await elio::http::client_connect_result("127.0.0.1", port, secure,
+            secure ? &context : nullptr,
             elio::net::default_cached_resolve_options(), false, std::chrono::seconds(30),
             probe.recovery.get_token());
     } catch (...) { probe.failure = std::current_exception(); }
@@ -131,7 +141,8 @@ task<void> exercise_setup(uint16_t port, elio::tls::tls_context& context, setup_
 TEST_CASE("Connector timer failure cancels a pending real TLS handshake",
           "[http][setup][watchdog][setup-timer-failure][issue-1287]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
-    CAPTURE(static_cast<int>(selected));
+    const auto workers = GENERATE(size_t{1}, size_t{2});
+    CAPTURE(static_cast<int>(selected), workers);
 #if ELIO_HAS_IO_URING
     if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
         SKIP("io_uring unavailable on this host");
@@ -144,7 +155,7 @@ TEST_CASE("Connector timer failure cancels a pending real TLS handshake",
     elio::tls::tls_context context(elio::tls::tls_mode::client);
     setup_probe probe;
     timer_guard timer(probe);
-    elio::runtime::scheduler scheduler(1);
+    elio::runtime::scheduler scheduler(workers);
     scheduler.start();
     auto peer = scheduler.go_joinable(withhold_tls_reply(*listener, probe));
     auto operation = scheduler.go_joinable(exercise_setup(listener->local_address().port(), context, probe));
@@ -170,8 +181,10 @@ TEST_CASE("Connector timer failure cancels a pending real TLS handshake",
 TEST_CASE("Connector observes unconstructible or rejected timers before TLS setup",
           "[http][setup][watchdog][setup-startup][issue-1287]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto workers = GENERATE(size_t{1}, size_t{2});
+    const auto secure = GENERATE(false, true);
     const auto during_drain = GENERATE(false, true);
-    CAPTURE(static_cast<int>(selected), during_drain);
+    CAPTURE(static_cast<int>(selected), workers, secure, during_drain);
 #if ELIO_HAS_IO_URING
     if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
         SKIP("io_uring unavailable on this host");
@@ -185,10 +198,11 @@ TEST_CASE("Connector observes unconstructible or rejected timers before TLS setu
     setup_probe probe;
     timer_guard timer(probe);
     startup_guard startup(during_drain);
-    elio::runtime::scheduler scheduler(1);
+    elio::runtime::scheduler scheduler(workers);
     scheduler.start();
     auto peer = scheduler.go_joinable(withhold_tls_reply(*listener, probe));
-    auto operation = scheduler.go_joinable(exercise_setup(listener->local_address().port(), context, probe));
+    auto operation = scheduler.go_joinable(exercise_setup(
+        listener->local_address().port(), context, probe, secure));
     bool entered = true;
     bool closed = true;
     bool drained = false;
@@ -216,10 +230,11 @@ TEST_CASE("Connector observes unconstructible or rejected timers before TLS setu
     CHECK(completed);
     CHECK_FALSE(probe.recovered);
     CHECK_FALSE(probe.tls_entered.load(std::memory_order_acquire));
+    CHECK_FALSE(probe.connect_entered.load(std::memory_order_acquire));
     CHECK_FALSE(probe.peer_received.load(std::memory_order_acquire));
     CHECK(probe.construction_failed.load(std::memory_order_acquire) == !during_drain);
     REQUIRE(probe.failure);
-    if (during_drain) CHECK_THROWS_AS(std::rethrow_exception(probe.failure), std::runtime_error);
+    if (during_drain) CHECK_THROWS_AS(std::rethrow_exception(probe.failure), std::logic_error);
     else CHECK_THROWS_AS(std::rethrow_exception(probe.failure), std::bad_alloc);
     // Construction injection is a pre-frame surrogate, not native exhaustion.
 }

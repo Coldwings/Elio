@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdio>
 #include <memory>
+#include <new>
 #include <poll.h>
 #include <stdexcept>
 #include <string>
@@ -281,6 +282,116 @@ coro::task<void> serve_no_continue(net::tcp_listener& listener, tls::tls_context
     if (extra.result > 0) observed.extra_body = true;
 }
 } // namespace
+
+namespace {
+std::atomic<bool> response_construction_failed{false};
+
+void fail_response_watchdog_construction() {
+    response_construction_failed.store(true, std::memory_order_release);
+    throw std::bad_alloc();
+}
+
+struct response_construction_hook_guard {
+    void(*previous)();
+    response_construction_hook_guard()
+        : previous(http::detail::response_watchdog_construct_for_test.exchange(
+              fail_response_watchdog_construction)) {
+        response_construction_failed.store(false);
+    }
+    ~response_construction_hook_guard() {
+        http::detail::response_watchdog_construct_for_test.store(previous);
+    }
+};
+} // namespace
+
+TEST_CASE("Response watchdog construction failure precedes sibling read",
+          "[http][client][expect-continue][allocation][issue-1283]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const bool encrypted = GENERATE(false, true);
+    const bool streaming = GENERATE(false, true);
+    CAPTURE(selected, encrypted, streaming);
+#if ELIO_HAS_IO_URING
+    if (selected == backend::io_uring && !io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
+#endif
+    expect_observation observed;
+    expect_hooks hooks(selected, observed);
+    response_construction_hook_guard construction_hook;
+    auto listener = net::tcp_listener::bind(net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    tls::tls_context server_context(tls::tls_mode::server);
+    certificate_file ca;
+    if (encrypted) install_certificate(server_context, ca);
+    http::transport_config config;
+    config.limits = http::pool_limits{};
+    if (encrypted) config.configure_tls = [&](http::transport_tls_config& policy) {
+        if (!policy.load_verify_locations(ca.path.data()))
+            throw std::runtime_error("response-frame CA trust setup failed");
+    };
+    auto owner = std::make_shared<http::transport>(config);
+    http::client_config policy;
+    policy.read_timeout = std::chrono::seconds(30);
+    policy.expect_continue_timeout = std::chrono::seconds(10);
+    http::client client(owner, policy);
+    const auto target = http::url::parse(std::string(encrypted ? "https" : "http") +
+        "://127.0.0.1:" + std::to_string(listener->local_address().port()) + "/");
+    REQUIRE(target);
+    http::request request(http::method::POST, "/");
+    request.set_body(std::string_view("payload"));
+    request.set_expect_continue();
+    coro::cancel_source stop;
+    coro::cancel_source request_stop;
+    bool bad_allocation = false;
+    bool handler_called = false;
+    std::exception_ptr unexpected;
+    runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto server = scheduler.go_joinable(serve_no_continue(
+        *listener, server_context, encrypted, observed, stop.get_token()));
+    auto requested = scheduler.go_joinable([&]() -> coro::task<void> {
+        try {
+            if (streaming) {
+                (void)co_await client.with_response(request, *target, request_stop.get_token(),
+                    [&](const http::response&, http::response_body_reader&,
+                            coro::cancel_token) -> coro::task<void> {
+                        handler_called = true;
+                        co_return;
+                    });
+            } else {
+                (void)co_await client.send_result(request, *target, request_stop.get_token());
+            }
+        } catch (const std::bad_alloc&) {
+            bad_allocation = true;
+        } catch (...) { unexpected = std::current_exception(); }
+    });
+    const auto observation_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!requested.is_ready() && std::chrono::steady_clock::now() < observation_deadline)
+        std::this_thread::yield();
+    const bool completed_without_recovery = requested.is_ready();
+    const bool read_staged = http::detail::client_response_read_staged_for_test.load();
+    // A pre-body construction failure cannot cancel an already parked read.
+    // On the red baseline, recover only by normal cooperative cancellation.
+    if (!completed_without_recovery) request_stop.cancel();
+    requested.wait_destroyed();
+    auto shutdown = scheduler.go_joinable(owner->shutdown());
+    shutdown.wait_destroyed();
+    stop.cancel();
+    server.wait_destroyed();
+    REQUIRE(scheduler.shutdown(std::chrono::seconds(10)));
+    requested.await_resume();
+    const auto shutdown_result = shutdown.await_resume();
+    server.await_resume();
+    if (unexpected) std::rethrow_exception(unexpected);
+    REQUIRE(response_construction_failed.load(std::memory_order_acquire));
+    CHECK(completed_without_recovery);
+    CHECK_FALSE(read_staged);
+    CHECK(bad_allocation);
+    CHECK_FALSE(handler_called);
+    CHECK(shutdown_result == coro::cancel_result::completed);
+    CHECK(owner->admission_counters_for_test().live == 0);
+}
 
 TEST_CASE("Expect client distinguishes upload expiry cancellation and failures",
           "[http][client][expect-continue][issue-1275]") {

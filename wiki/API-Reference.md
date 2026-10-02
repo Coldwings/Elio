@@ -5117,7 +5117,8 @@ coro::task<void> waiter() {
 
 ### `event`
 
-One-shot signaling primitive. One or more coroutines wait for the event to be set.
+Manual-reset signaling primitive. One or more coroutines wait for the event to
+be set; subsequent waits complete until `reset()` clears it.
 
 ```cpp
 class event {
@@ -5147,6 +5148,14 @@ owned wake state and may propagate `std::bad_alloc`; that state keeps a dequeued
 wake safe if the coroutine frame is destroyed before scheduling. Token-aware
 waits create their arbitration state eagerly so cancellation can race `set()`
 with exactly one terminal result.
+
+`set()` prepares dispatch storage before changing the signal or selecting
+pending waiters. Storage preparation can throw, for example `std::bad_alloc`;
+the prior signal state and pending waits remain unchanged, so callers can retry
+or cancel token-aware waits. Successful signaling dispatches outside the event
+mutex. Keep the event, scheduler, and waiter frames alive until pending
+operations normally complete; signaling failure does not authorize frame
+destruction.
 
 ### `channel<T>`
 

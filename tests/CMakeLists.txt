@@ -143,6 +143,7 @@ if(TARGET elio_tls)
         unit/test_http_root_close.cpp
         unit/test_http_pool_admission.cpp
         unit/test_http_fd_watchdog.cpp
+        unit/test_http_setup_watchdog.cpp
         unit/test_http_empty_redirect.cpp
     )
 endif()

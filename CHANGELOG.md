@@ -229,6 +229,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **FD watchdog timer exceptions**: HTTP-family timer failures interrupt their
+  still-owned sibling I/O so cleanup can join both operations and propagate the
+  exception. Cleanup-time failures after timer cancellation do not abort a
+  successful operation or masquerade as ordinary deadline expiry (#1278).
+
 - **HTTP Transport TCP retirement**: private root sockets retain their immediate,
   non-lingering local close policy across moves and setup exceptions. Plain HTTP
   active discard, idle clearing and shutdown now close the descriptor before

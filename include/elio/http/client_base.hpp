@@ -93,13 +93,25 @@ arm_fd_shutdown_watchdog(runtime::scheduler* sched,
         [fd, timeout, tok = std::move(watchdog_token),
          flag = std::move(timed_out)]() -> coro::task<void> {
             coro::cancel_result r;
+            try {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
-            if (auto hook = fd_watchdog_wait_for_test.load(std::memory_order_acquire)) {
-                r = co_await hook(timeout, tok);
-            } else
+                if (auto hook = fd_watchdog_wait_for_test.load(std::memory_order_acquire)) {
+                    r = co_await hook(timeout, tok);
+                } else
 #endif
-            {
-                r = co_await elio::time::sleep_for(timeout, tok);
+                {
+                    r = co_await elio::time::sleep_for(timeout, tok);
+                }
+            } catch (...) {
+                // The helper cannot join us until its sibling I/O returns.
+                // A cleanup-time exception must not abort successful I/O.
+                if (!tok.is_cancelled() && fd >= 0) {
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+                    fd_watchdog_shutdowns_for_test.fetch_add(1, std::memory_order_relaxed);
+#endif
+                    ::shutdown(fd, SHUT_RDWR);
+                }
+                throw;
             }
             if (r == coro::cancel_result::completed) {
                 flag->store(true, std::memory_order_release);

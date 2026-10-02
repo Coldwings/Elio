@@ -74,8 +74,17 @@ void install_certificate(tls::tls_context& context, certificate_file& ca) {
         throw std::runtime_error("Expect certificate publication failed");
 }
 
+enum class expect_action {
+    fallback, response_timeout, external_cancel, timer_exception,
+    write_error, write_exception, continue_response, final_rejection,
+    post_upload_timeout
+};
+
 struct expect_observation {
     sync::event headers_received;
+    sync::event body_received;
+    expect_action action = expect_action::fallback;
+    coro::cancel_source* request_stop = nullptr;
     bool accepted = false;
     bool handshake = false;
     bool saw_expect = false;
@@ -83,19 +92,43 @@ struct expect_observation {
     bool received_body = false;
     bool expiry = false;
     bool read_staged = false;
+    bool extra_body = false;
     size_t timer_calls = 0;
     int server_error = 0;
 };
 std::atomic<expect_observation*> expect_observed{nullptr};
 
+io::io_result fail_deferred_upload(std::string_view data) {
+    if (data != "payload") throw std::logic_error("unexpected write after Expect headers");
+    if (expect_observed.load()->action == expect_action::write_exception)
+        throw std::runtime_error("Expect upload failure");
+    return {-ENOSPC, 0};
+}
+
 coro::task<coro::cancel_result> expire_after_headers(std::chrono::nanoseconds remaining,
         coro::cancel_token stop, http::client_stage) {
     auto& observed = *expect_observed.load();
-    if (observed.timer_calls++ != 0)
+    const auto call = observed.timer_calls++;
+    if (observed.action == expect_action::continue_response ||
+        observed.action == expect_action::final_rejection)
         co_return co_await time::sleep_for(remaining, stop);
+    if (call != 0) {
+        if (observed.action == expect_action::post_upload_timeout)
+            co_return co_await observed.body_received.wait(stop);
+        co_return co_await time::sleep_for(remaining, stop);
+    }
     auto ready = co_await observed.headers_received.wait(stop);
     if (ready != coro::cancel_result::completed) co_return ready;
     observed.read_staged = http::detail::client_response_read_staged_for_test.load();
+    if (observed.action == expect_action::external_cancel) {
+        observed.request_stop->cancel();
+        co_return coro::cancel_result::cancelled;
+    }
+    if (observed.action == expect_action::timer_exception)
+        throw std::runtime_error("Expect watchdog failure");
+    if (observed.action == expect_action::write_error ||
+        observed.action == expect_action::write_exception)
+        http::detail::request_write_result_for_test.store(fail_deferred_upload);
     observed.expiry = true;
     co_return coro::cancel_result::completed;
 }
@@ -103,12 +136,14 @@ coro::task<coro::cancel_result> expire_after_headers(std::chrono::nanoseconds re
 struct expect_hooks {
     backend previous_backend;
     http::detail::response_watchdog_wait_hook previous_wait;
+    http::detail::request_write_hook previous_write;
     bool previous_observer;
     bool previous_staged;
     expect_observation* previous_observation;
     expect_hooks(backend selected, expect_observation& observed)
         : previous_backend(runtime::detail::worker_io_backend_for_test.exchange(selected))
         , previous_wait(http::detail::response_watchdog_wait_for_test.exchange(expire_after_headers))
+        , previous_write(http::detail::request_write_result_for_test.exchange(nullptr))
         , previous_observer(http::detail::observe_client_response_read_entry_for_test.exchange(true))
         , previous_staged(http::detail::client_response_read_staged_for_test.exchange(false))
         , previous_observation(expect_observed.exchange(&observed)) {}
@@ -117,6 +152,7 @@ struct expect_hooks {
         http::detail::client_response_read_staged_for_test.store(previous_staged);
         http::detail::observe_client_response_read_entry_for_test.store(previous_observer);
         http::detail::response_watchdog_wait_for_test.store(previous_wait);
+        http::detail::request_write_result_for_test.store(previous_write);
         runtime::detail::worker_io_backend_for_test.store(previous_backend);
     }
 };
@@ -147,28 +183,53 @@ coro::task<void> serve_no_continue(net::tcp_listener& listener, tls::tls_context
     }
     observed.saw_expect = parser.get_headers().get("Expect") == "100-continue";
     observed.early_body = !parser.body().empty();
-    // No informational response: the client must keep TLS healthy and upload.
     observed.headers_received.set();
+    if (observed.action == expect_action::final_rejection) {
+        (void)co_await peer->write_exactly(
+            "HTTP/1.1 417 Expectation Failed\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno", token);
+        const auto read = co_await peer->read(bytes.data(), bytes.size(), token);
+        observed.extra_body = read.result > 0;
+        co_return;
+    }
+    if (observed.action == expect_action::continue_response) {
+        (void)co_await peer->write_exactly("HTTP/1.1 100 Continue\r\n\r\n", token);
+    }
     while (!parser.is_complete()) {
         const auto read = co_await peer->read(bytes.data(), bytes.size(), token);
         if (read.result <= 0) { observed.server_error = -read.result; co_return; }
         const auto [parsed, consumed] = parser.parse(
             std::string_view(bytes.data(), static_cast<size_t>(read.result)));
-        (void)consumed;
+        if (parser.is_complete() && consumed < static_cast<size_t>(read.result))
+            observed.extra_body = true;
         if (parsed == http::parse_result::error) throw std::runtime_error("Expect body parse failed");
     }
     observed.received_body = parser.body() == "payload";
+    observed.body_received.set();
+    if (observed.action == expect_action::post_upload_timeout) {
+        (void)co_await observed.headers_received.wait(token);
+        sync::event stopped;
+        (void)co_await stopped.wait(token);
+        co_return;
+    }
     const auto written = co_await peer->write_exactly(
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok", token);
     if (written.result <= 0) observed.server_error = -written.result;
+    const auto extra = co_await peer->read(bytes.data(), bytes.size(), token);
+    if (extra.result > 0) observed.extra_body = true;
 }
 } // namespace
 
-TEST_CASE("Expect-only expiry uploads without cancelling a healthy TLS read",
+TEST_CASE("Expect client distinguishes upload expiry cancellation and failures",
           "[http][client][expect-continue][issue-1275]") {
     const auto selected = GENERATE(backend::epoll, backend::io_uring);
     const auto encrypted = GENERATE(false, true);
-    CAPTURE(selected, encrypted);
+    const auto streaming = GENERATE(false, true);
+    const auto action = GENERATE(expect_action::fallback, expect_action::response_timeout,
+        expect_action::external_cancel, expect_action::timer_exception,
+        expect_action::write_error, expect_action::write_exception,
+        expect_action::continue_response, expect_action::final_rejection,
+        expect_action::post_upload_timeout);
+    CAPTURE(selected, encrypted, streaming, static_cast<int>(action));
 #if ELIO_HAS_IO_URING
     if (selected == backend::io_uring && !io::io_uring_backend::is_available())
         SKIP("io_uring unavailable on this host");
@@ -176,6 +237,7 @@ TEST_CASE("Expect-only expiry uploads without cancelling a healthy TLS read",
     if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
 #endif
     expect_observation observed;
+    observed.action = action;
     expect_hooks hooks(selected, observed);
     auto listener = net::tcp_listener::bind(net::ipv4_address("127.0.0.1", 0));
     REQUIRE(listener);
@@ -192,6 +254,8 @@ TEST_CASE("Expect-only expiry uploads without cancelling a healthy TLS read",
     http::client_config policy;
     policy.read_timeout = std::chrono::seconds(30);
     policy.expect_continue_timeout = std::chrono::seconds(10);
+    if (action == expect_action::response_timeout)
+        policy.expect_continue_timeout = std::chrono::seconds(40);
     http::client client(owner, policy);
     const auto target = http::url::parse(std::string(encrypted ? "https" : "http") +
         "://127.0.0.1:" + std::to_string(listener->local_address().port()) + "/");
@@ -200,37 +264,95 @@ TEST_CASE("Expect-only expiry uploads without cancelling a healthy TLS read",
     request.set_body(std::string_view("payload"));
     request.set_expect_continue();
     coro::cancel_source stop;
+    coro::cancel_source request_stop;
+    observed.request_stop = &request_stop;
+    bool successful = false;
+    bool handler_called = false;
+    uint16_t response_status = 0;
+    std::string response_body;
+    std::optional<http::client_error> error;
+    std::string exception_message;
+    std::exception_ptr unexpected;
     runtime::scheduler scheduler(1);
     scheduler.start();
     auto server = scheduler.go_joinable(serve_no_continue(
         *listener, server_context, encrypted, observed, stop.get_token()));
-    auto requested = scheduler.go_joinable(client.send_result(request, *target));
+    auto requested = scheduler.go_joinable([&]() -> coro::task<void> {
+        try {
+            if (streaming) {
+                auto result = co_await client.with_response(request, *target, request_stop.get_token(),
+                    [&](const http::response& head, http::response_body_reader& body,
+                            coro::cancel_token token) -> coro::task<void> {
+                        handler_called = true;
+                        response_status = head.status_code();
+                        std::array<char, 3> buffer{};
+                        while (!body.complete()) {
+                            auto read = co_await body.read_into(std::span<char>(buffer), token);
+                            if (auto* failed = std::get_if<http::client_error>(&read)) {
+                                error = *failed;
+                                co_return;
+                            }
+                            response_body.append(buffer.data(),
+                                std::get<http::body_read_progress>(read).transferred);
+                        }
+                    });
+                if (auto* failed = std::get_if<http::client_error>(&result)) error = *failed;
+                else successful = true;
+            } else {
+                auto result = co_await client.send_result(request, *target, request_stop.get_token());
+                if (auto* failed = std::get_if<http::client_error>(&result)) error = *failed;
+                else {
+                    successful = true;
+                    response_status = std::get<http::response>(result).status_code();
+                    response_body = std::get<http::response>(result).body();
+                }
+            }
+        } catch (const std::runtime_error& failure) {
+            exception_message = failure.what();
+        } catch (...) { unexpected = std::current_exception(); }
+    });
     requested.wait_destroyed();
     auto shutdown = scheduler.go_joinable(owner->shutdown());
     shutdown.wait_destroyed();
     stop.cancel();
     server.wait_destroyed();
     const auto stopped = scheduler.shutdown(std::chrono::seconds(10));
-    const auto result = requested.await_resume();
+    requested.await_resume();
     const auto shutdown_result = shutdown.await_resume();
     server.await_resume();
+    if (unexpected) std::rethrow_exception(unexpected);
     REQUIRE(stopped);
     CAPTURE(observed.server_error);
     CHECK(observed.accepted);
     if (encrypted) CHECK(observed.handshake);
     CHECK(observed.saw_expect);
     CHECK_FALSE(observed.early_body);
-    CHECK(observed.expiry);
-    CHECK(observed.read_staged);
-    CHECK(observed.received_body);
-    if (const auto* error = std::get_if<http::client_error>(&result)) {
-        CAPTURE(error->stage, error->code.value());
+    const bool protocol_reply = action == expect_action::continue_response ||
+        action == expect_action::final_rejection;
+    if (!protocol_reply) CHECK(observed.read_staged);
+    CHECK_FALSE(observed.extra_body);
+    const bool uploaded = action == expect_action::fallback ||
+        action == expect_action::continue_response || action == expect_action::post_upload_timeout;
+    CHECK(observed.received_body == uploaded);
+    const bool expected_success = action == expect_action::fallback || protocol_reply;
+    CHECK(successful == expected_success);
+    if (expected_success) {
         CHECK_FALSE(error);
-    }
-    CHECK(std::holds_alternative<http::response>(result));
-    if (const auto* response = std::get_if<http::response>(&result)) {
-        CHECK(response->status_code() == 200);
-        CHECK(response->body() == "ok");
+        CHECK(exception_message.empty());
+        CHECK(response_status == (action == expect_action::final_rejection ? 417 : 200));
+        CHECK(response_body == (action == expect_action::final_rejection ? "no" : "ok"));
+        if (streaming) CHECK(handler_called);
+    } else if (action == expect_action::timer_exception || action == expect_action::write_exception) {
+        CHECK_FALSE(error);
+        CHECK(exception_message == (action == expect_action::timer_exception
+            ? "Expect watchdog failure" : "Expect upload failure"));
+    } else {
+        REQUIRE(error);
+        CHECK(exception_message.empty());
+        CHECK(error->stage == (action == expect_action::write_error
+            ? http::client_stage::request : http::client_stage::headers));
+        CHECK(error->code.value() == (action == expect_action::write_error ? ENOSPC
+            : action == expect_action::external_cancel ? ECANCELED : ETIMEDOUT));
     }
     CHECK(shutdown_result == coro::cancel_result::completed);
     CHECK(owner->admission_counters_for_test().live == 0);

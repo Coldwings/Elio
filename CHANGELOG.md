@@ -231,7 +231,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **FD watchdog timer exceptions**: HTTP-family timer failures interrupt their
   still-owned sibling I/O so cleanup can join both operations and propagate the
-  exception. Cleanup-time failures after timer cancellation do not abort a
+  exception. Owned stream callbacks also record TLS external-abort state when
+  healthy I/O races the active timer failure. Cleanup-time failures after timer cancellation do not abort a
   successful operation or masquerade as ordinary deadline expiry (#1278).
 
 - **HTTP Transport TCP retirement**: private root sockets retain their immediate,

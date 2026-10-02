@@ -86,7 +86,17 @@ coro::task<void> fd_shutdown_watchdog_task(
         std::shared_ptr<std::atomic<bool>> flag, Abort abort = nullptr) {
     static_assert(std::is_same_v<Abort, std::nullptr_t> ||
                   std::is_nothrow_invocable_v<Abort&>);
-    (void)abort;
+    auto interrupt = [&]() noexcept {
+        if constexpr (std::is_same_v<Abort, std::nullptr_t>) {
+            if (fd < 0) return;
+            ::shutdown(fd, SHUT_RDWR);
+        } else {
+            std::invoke(abort);
+        }
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        fd_watchdog_shutdowns_for_test.fetch_add(1, std::memory_order_relaxed);
+#endif
+    };
     coro::cancel_result r;
     try {
 #ifdef ELIO_RUNTIME_TEST_HOOKS
@@ -100,22 +110,12 @@ coro::task<void> fd_shutdown_watchdog_task(
     } catch (...) {
         // The helper cannot join us until its sibling I/O returns.
         // A cleanup-time exception must not abort successful I/O.
-        if (!tok.is_cancelled() && fd >= 0) {
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-            fd_watchdog_shutdowns_for_test.fetch_add(1, std::memory_order_relaxed);
-#endif
-            ::shutdown(fd, SHUT_RDWR);
-        }
+        if (!tok.is_cancelled()) interrupt();
         throw;
     }
     if (r == coro::cancel_result::completed) {
         flag->store(true, std::memory_order_release);
-        if (fd >= 0) {
-#ifdef ELIO_RUNTIME_TEST_HOOKS
-            fd_watchdog_shutdowns_for_test.fetch_add(1, std::memory_order_relaxed);
-#endif
-            ::shutdown(fd, SHUT_RDWR);
-        }
+        interrupt();
     }
     co_return;
 }
@@ -123,6 +123,9 @@ coro::task<void> fd_shutdown_watchdog_task(
 /// Spawn a watchdog that shutdown(2)s `fd` after `timeout` elapses.
 /// The caller cancels the token on completion and joins before releasing `fd`.
 /// Timer exceptions interrupt active sibling I/O without setting `timed_out`.
+/// An optional noexcept callback also records layered-stream abort state.
+/// Its borrowed stream must remain unmoved/alive until the watchdog is joined;
+/// callback destruction must not access that stream.
 template<typename Abort = std::nullptr_t>
 coro::join_handle<void>
 arm_fd_shutdown_watchdog(runtime::scheduler* sched,

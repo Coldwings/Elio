@@ -277,7 +277,7 @@ TEST_CASE("FD watchdog timer failures release blocked sibling I/O before propaga
     CHECK(done.load(std::memory_order_acquire));
 }
 
-TEST_CASE("FD watchdog admission failure never starts its sibling operation",
+TEST_CASE("FD watchdog join-state allocation failure never starts its sibling operation",
           "[http][watchdog][exception][issue-1278]") {
     socket_pair sockets;
     auto timed_out = std::make_shared<std::atomic<bool>>(false);
@@ -286,8 +286,8 @@ TEST_CASE("FD watchdog admission failure never starts its sibling operation",
     elio::runtime::scheduler scheduler(1);
     scheduler.start();
     auto operation = scheduler.go_joinable([&]() -> task<void> {
-        // The owning watchdog task is constructed before join admission, and
-        // either creation/admission failure must precede the sibling factory.
+        // Inject join-state allocation failure before initial admission;
+        // the sibling factory must not be invoked after that exception.
         elio::runtime::detail::fail_next_join_state_allocation_for_test.store(true);
         try {
             (void)co_await elio::http::detail::await_fd_operation_with_watchdog(

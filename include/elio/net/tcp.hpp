@@ -22,6 +22,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -43,6 +44,12 @@ struct tcp_options {
 };
 
 namespace detail {
+
+struct tcp_retirement_access;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+inline std::atomic<bool> fail_root_linger_configuration_for_test{false};
+inline std::atomic<void(*)(int)> root_connect_before_prepare_for_test{nullptr};
+#endif
 
 inline io::io_result validate_stream_iovecs(const struct iovec* parts,
                                            size_t count) noexcept {
@@ -295,6 +302,8 @@ private:
     std::variant<ipv4_address, ipv6_address> data_;
 };
 
+class tcp_connect_awaitable;
+
 /// TCP stream for connected sockets
 ///
 /// **Thread safety:** a ``tcp_stream`` is **not** safe for arbitrary
@@ -308,6 +317,7 @@ private:
 /// unless externally serialised. The same contract applies to
 /// ``tcp_listener::accept``: only one coroutine may be accepting at a time.
 class tcp_stream {
+    friend struct detail::tcp_retirement_access;
     struct configured_fd_t {};
 
     explicit tcp_stream(int fd, configured_fd_t) noexcept
@@ -343,6 +353,7 @@ public:
     /// Move constructor
     tcp_stream(tcp_stream&& other) noexcept
         : fd_(other.fd_)
+        , settled_root_(std::exchange(other.settled_root_, false))
         , peer_addr_(std::move(other.peer_addr_)) {
         other.fd_ = -1;
     }
@@ -352,6 +363,7 @@ public:
         if (this != &other) {
             close_sync();
             fd_ = other.fd_;
+            settled_root_ = std::exchange(other.settled_root_, false);
             peer_addr_ = std::move(other.peer_addr_);
             other.fd_ = -1;
         }
@@ -863,17 +875,48 @@ private:
     /// On a worker running the epoll backend the close goes through the
     /// backend, which fails any parked op on this fd with ``-ECANCELED``
     /// and drops the stale registration before closing. Falls back to a
-    /// plain ``::close`` only for non-worker teardown.
+    /// plain ``::close`` for non-worker teardown and private settled roots.
     void close_sync() {
         if (fd_ >= 0) {
-            io::close_stream_fd_for_destructor(fd_);
-            fd_ = -1;
+            const int fd = std::exchange(fd_, -1);
+            if (settled_root_) io::close_settled_stream_fd_for_destructor(fd);
+            else io::close_stream_fd_for_destructor(fd);
         }
     }
 
     int fd_ = -1;
+    bool settled_root_ = false;
     std::optional<socket_address> peer_addr_;
 };
+
+namespace detail {
+
+// Only for exclusively library-created Transport roots. No public root alias
+// may change socket options; the owning exchange/TLS state retains every lower
+// I/O frame until final destruction. Ordinary TCP teardown remains unchanged.
+struct tcp_retirement_access {
+    static tcp_connect_awaitable connect(const socket_address& address,
+        coro::cancel_token token, bool settled_root);
+
+    static void mark_settled_root(tcp_stream& stream) {
+        if (stream.settled_root_) return;
+        // Install cleanup policy before the checked call: even setup failure
+        // must close this library-created (already non-lingering) root now.
+        stream.settled_root_ = true;
+        if (stream.fd_ < 0) return;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (fail_root_linger_configuration_for_test.load(std::memory_order_acquire))
+            throw std::system_error(ENOMEM, std::generic_category(),
+                                    "Transport root linger configuration failed");
+#endif
+        const ::linger disabled{};
+        if (::setsockopt(stream.fd_, SOL_SOCKET, SO_LINGER, &disabled, sizeof(disabled)) != 0)
+            throw std::system_error(errno, std::generic_category(),
+                                    "Transport root linger configuration failed");
+    }
+};
+
+} // namespace detail
 
 /// TCP listener for accepting connections
 class tcp_listener {
@@ -1157,6 +1200,14 @@ private:
 
 /// Connect to a remote TCP server
 class tcp_connect_awaitable : public io::io_awaitable_base {
+    friend struct detail::tcp_retirement_access;
+
+    tcp_connect_awaitable(const socket_address& addr, coro::cancel_token token,
+                          bool settled_root)
+        : tcp_connect_awaitable(addr, tcp_options{}, std::move(token)) {
+        settled_root_ = settled_root;
+    }
+
 public:
     tcp_connect_awaitable(const socket_address& addr,
                           const tcp_options& opts = {})
@@ -1175,8 +1226,11 @@ public:
     ~tcp_connect_awaitable() noexcept {
         io::detail::retire_io_cancel_key(cancel_state_);
         if (fd_ >= 0) {
-            io::close_fd_for_destructor(fd_);
-            fd_ = -1;
+            const int fd = std::exchange(fd_, -1);
+            // The private socket is non-lingering from creation; an exception
+            // before backend admission must not leave a queued close behind.
+            if (settled_root_) io::close_settled_stream_fd_for_destructor(fd);
+            else io::close_fd_for_destructor(fd);
         }
     }
 
@@ -1257,6 +1311,12 @@ public:
         req.addr = reinterpret_cast<struct sockaddr*>(&sa_);
         req.addrlen = &sa_len_;
         req.awaiter = awaiter;
+#ifdef ELIO_RUNTIME_TEST_HOOKS
+        if (settled_root_) {
+            if (auto hook = detail::root_connect_before_prepare_for_test.load(std::memory_order_acquire))
+                hook(fd_);
+        }
+#endif
         req.state = setup_op_state(awaiter, ctx);
 
         if (cancel_state_) {
@@ -1329,8 +1389,8 @@ public:
             return std::nullopt;
         }
 
-        tcp_stream stream(fd_);
-        fd_ = -1;  // Transfer ownership
+        tcp_stream stream(std::exchange(fd_, -1));
+        if (settled_root_) detail::tcp_retirement_access::mark_settled_root(stream);
         stream.set_peer_address(addr_);
 
         ELIO_LOG_DEBUG("Connected to {}", addr_.to_string());
@@ -1350,9 +1410,15 @@ private:
     std::shared_ptr<io::detail::io_cancel_state> cancel_state_;
     bool cancellable_ = false;
     bool already_cancelled_before_setup_ = false;
+    bool settled_root_ = false;
 
     bool is_cancellable() const noexcept { return cancellable_; }
 };
+
+inline tcp_connect_awaitable detail::tcp_retirement_access::connect(
+        const socket_address& address, coro::cancel_token token, bool settled_root) {
+    return tcp_connect_awaitable(address, std::move(token), settled_root);
+}
 
 /// Connect to a remote TCP server (IPv4)
 inline auto tcp_connect(const ipv4_address& addr,

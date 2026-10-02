@@ -5,7 +5,9 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <exception>
 #include <fcntl.h>
+#include <new>
 #include <string>
 
 using namespace elio::http;
@@ -69,6 +71,30 @@ task<void> serve_close(elio::net::tcp_listener& listener, bool idle,
     (void)co_await peer->write_exactly(reply, token);
     (void)co_await peer->read(bytes.data(), bytes.size(), token);
 }
+
+std::atomic<bool> fail_before_prepare{false};
+
+void observe_connect_prepare(int fd) {
+    close_observed.load()->fd = fd;
+    if (fail_before_prepare.load()) throw std::bad_alloc();
+}
+
+struct setup_failure_hooks {
+    bool previous_prepare_failure;
+    bool previous_linger_failure;
+    void(*previous_prepare_hook)(int);
+    explicit setup_failure_hooks(bool before_prepare)
+        : previous_prepare_failure(fail_before_prepare.exchange(before_prepare))
+        , previous_linger_failure(
+            elio::net::detail::fail_root_linger_configuration_for_test.exchange(!before_prepare))
+        , previous_prepare_hook(
+            elio::net::detail::root_connect_before_prepare_for_test.exchange(observe_connect_prepare)) {}
+    ~setup_failure_hooks() {
+        elio::net::detail::root_connect_before_prepare_for_test.store(previous_prepare_hook);
+        elio::net::detail::fail_root_linger_configuration_for_test.store(previous_linger_failure);
+        fail_before_prepare.store(previous_prepare_failure);
+    }
+};
 } // namespace
 
 TEST_CASE("Plain Transport closes physical TCP roots before retiring capacity",
@@ -128,4 +154,152 @@ TEST_CASE("Plain Transport closes physical TCP roots before retiring capacity",
     CHECK(observed.closed);
     CHECK(operations == 0);
     if (finite) CHECK(live == 0);
+}
+
+TEST_CASE("Private TCP connect closes before reporting setup exceptions",
+          "[http][root-close][issue-1276][setup-failure]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto before_prepare = GENERATE(false, true);
+    CAPTURE(selected, before_prepare);
+#if ELIO_HAS_IO_URING
+    if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
+#endif
+    close_observation observed;
+    close_hooks hooks(selected, observed);
+    setup_failure_hooks failure_hooks(before_prepare);
+    auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    bool expected_failure = false;
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto connected = scheduler.go_joinable([&]() -> task<void> {
+        try {
+            (void)co_await elio::net::detail::tcp_retirement_access::connect(
+                listener->local_address(), {}, true);
+        } catch (const std::bad_alloc&) {
+            expected_failure = before_prepare;
+        } catch (const std::system_error& error) {
+            expected_failure = !before_prepare && error.code().value() == ENOMEM;
+        }
+        // Same-worker observation, before another poll can submit/drain close.
+        observed.closed = ::fcntl(observed.fd, F_GETFD) < 0 && errno == EBADF;
+    });
+    connected.wait_destroyed();
+    const auto stopped = scheduler.shutdown(std::chrono::seconds(10));
+    connected.await_resume();
+    REQUIRE(stopped);
+    CHECK(observed.fd >= 0);
+    CHECK(expected_failure);
+    CHECK(observed.closed);
+}
+
+TEST_CASE("Transport setup exceptions release accounting and join the watchdog",
+          "[http][root-close][issue-1276][setup-failure]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+    const auto before_prepare = GENERATE(false, true);
+    const auto finite = GENERATE(false, true);
+    const auto secure = GENERATE(false, true);
+    CAPTURE(selected, before_prepare, finite, secure);
+#if ELIO_HAS_IO_URING
+    if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
+#endif
+    close_observation observed;
+    close_hooks hooks(selected, observed);
+    setup_failure_hooks failure_hooks(before_prepare);
+    auto listener = elio::net::tcp_listener::bind(elio::net::ipv4_address("127.0.0.1", 0));
+    REQUIRE(listener);
+    const auto target = std::string(secure ? "https://" : "http://") +
+        "127.0.0.1:" + std::to_string(listener->local_address().port()) + "/";
+    transport_config config;
+    if (finite) config.limits = pool_limits{};
+    auto owner = std::make_shared<transport>(config);
+    client_config policy;
+    // An abandoned watchdog would outlive the bounded scheduler shutdown.
+    policy.connect_timeout = std::chrono::hours(1);
+    client agent(owner, policy);
+    bool expected_failure = false;
+    std::exception_ptr unexpected;
+    size_t operations = 1;
+    size_t live = 1;
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto controlled = scheduler.go_joinable([&]() -> task<void> {
+        try {
+            (void)co_await agent.get_result(target);
+        } catch (const std::bad_alloc&) {
+            expected_failure = before_prepare;
+        } catch (const std::system_error& error) {
+            expected_failure = !before_prepare && error.code().value() == ENOMEM;
+        } catch (...) {
+            unexpected = std::current_exception();
+        }
+        observed.closed = ::fcntl(observed.fd, F_GETFD) < 0 && errno == EBADF;
+        operations = owner->active_operations_for_test();
+        if (finite) live = owner->admission_counters_for_test().live;
+    });
+    controlled.wait_destroyed();
+    const auto stopped = scheduler.shutdown(std::chrono::seconds(10));
+    controlled.await_resume();
+    if (unexpected) std::rethrow_exception(unexpected);
+    REQUIRE(stopped);
+    CHECK(observed.fd >= 0);
+    CHECK(expected_failure);
+    CHECK(observed.closed);
+    CHECK(operations == 0);
+    if (finite) CHECK(live == 0);
+}
+
+TEST_CASE("Settled TCP root moves retain the non-lingering close policy",
+          "[http][root-close][issue-1276]") {
+    const auto selected = GENERATE(backend::epoll, backend::io_uring);
+#if ELIO_HAS_IO_URING
+    if (selected == backend::io_uring && !elio::io::io_uring_backend::is_available())
+        SKIP("io_uring unavailable on this host");
+#else
+    if (selected == backend::io_uring) SKIP("io_uring support is not compiled");
+#endif
+    close_observation observed;
+    close_hooks hooks(selected, observed);
+    bool created = false;
+    bool linger_enabled = false;
+    bool linger_disabled = false;
+    bool moved_empty = false;
+    elio::runtime::scheduler scheduler(1);
+    scheduler.start();
+    auto retired = scheduler.go_joinable([&]() -> task<void> {
+        const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0) co_return;
+        created = true;
+        observed.fd = fd;
+        {
+            elio::net::tcp_stream original(fd);
+            const ::linger enabled{1, 5};
+            linger_enabled = ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &enabled, sizeof(enabled)) == 0;
+            elio::net::detail::tcp_retirement_access::mark_settled_root(original);
+            ::linger option{};
+            socklen_t length = sizeof(option);
+            linger_disabled = ::getsockopt(fd, SOL_SOCKET, SO_LINGER, &option, &length) == 0 &&
+                option.l_onoff == 0;
+            elio::net::tcp_stream moved(std::move(original));
+            elio::net::tcp_stream assigned(-1);
+            assigned = std::move(moved);
+            moved_empty = original.fd() == -1 && moved.fd() == -1;
+        }
+        observed.closed = ::fcntl(fd, F_GETFD) < 0 && errno == EBADF;
+    });
+    retired.wait_destroyed();
+    const auto stopped = scheduler.shutdown(std::chrono::seconds(10));
+    retired.await_resume();
+    REQUIRE(stopped);
+    CHECK(created);
+    CHECK(linger_enabled);
+    CHECK(linger_disabled);
+    CHECK(moved_empty);
+    CHECK(observed.closed);
 }

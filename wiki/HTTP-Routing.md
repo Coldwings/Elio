@@ -131,8 +131,14 @@ dial slot but retains live capacity through the whole exchange, including a
 scoped streaming handler and its unread body. Moving a lease or permit transfers
 its capacity ownership to the destination; it does not make capacity available.
 Failure, cancellation, timeout, destruction and late-return retirement release
-the permit once. Idle retirement closes
-the stream before releasing live capacity. Empty metadata buckets are removed;
+the permit once. Plain TCP roots created privately by the Transport close their
+local descriptor before releasing retirement capacity, including setup
+exceptions, active discard, idle clearing and shutdown. This boundary is local
+descriptor closure, not peer acknowledgement or TCP protocol-state removal;
+queueing an asynchronous close is not sufficient. These exclusive roots disable
+positive `SO_LINGER`, so retirement does not wait for peer delivery on a worker.
+Ordinary standalone TCP stream/connector teardown is unchanged. TLS-owned frame
+retention is tracked separately in #1272. Empty metadata buckets are removed;
 idle-only buckets/streams may be evicted to admit a different route within the
 metadata/global-live caps. Active or queued buckets are not evicted.
 

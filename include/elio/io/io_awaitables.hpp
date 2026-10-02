@@ -945,7 +945,9 @@ inline void close_fd_for_destructor(int fd) noexcept {
 ///
 /// Always succeeds at releasing the fd: the worst case is an SQ-exhausted
 /// io_uring backend where we transparently degrade to ``::close``.
-inline void close_stream_fd_for_destructor(int fd) noexcept {
+// settled_root is private Transport policy: all borrowed lower operations have
+// exited and positive SO_LINGER is disabled. Do not apply it to arbitrary fds.
+inline void close_stream_fd_for_destructor_impl(int fd, [[maybe_unused]] bool settled_root) noexcept {
     if (fd < 0) {
         return;
     }
@@ -953,16 +955,18 @@ inline void close_stream_fd_for_destructor(int fd) noexcept {
     if (worker) {
         auto& ctx = worker->io_context();
 #if ELIO_HAS_IO_URING
-        if (ctx.is_io_uring()) {
+        if (ctx.is_io_uring() && !settled_root) {
             auto* backend = static_cast<io_uring_backend*>(
                 ctx.operation_backend());
             if (backend && backend->submit_close_async(fd)) {
                 return;
             }
-        } else if (auto* backend = static_cast<epoll_backend*>(
-                       ctx.operation_backend())) {
-            backend->close_fd_from_owner(fd);
-            return;
+        } else if (!ctx.is_io_uring()) {
+            auto* backend = static_cast<epoll_backend*>(ctx.operation_backend());
+            if (backend) {
+                backend->close_fd_from_owner(fd);
+                return;
+            }
         }
 #else
         if (auto* backend = static_cast<epoll_backend*>(
@@ -973,6 +977,14 @@ inline void close_stream_fd_for_destructor(int fd) noexcept {
 #endif
     }
     ::close(fd);
+}
+
+inline void close_stream_fd_for_destructor(int fd) noexcept {
+    close_stream_fd_for_destructor_impl(fd, false);
+}
+
+inline void close_settled_stream_fd_for_destructor(int fd) noexcept {
+    close_stream_fd_for_destructor_impl(fd, true);
 }
 
 /// Create an async poll awaitable for reading
